@@ -658,6 +658,30 @@ pub async fn seed_app_and_cluster_with_capacity(
     Ok((app_id, cluster_id, region_id))
 }
 
+/// Seed an enabled app whose compose declares one labelled and one unlabelled
+/// volume, for the per-volume storage breakdown (issue #260). Returns its id.
+///
+/// `storage_bytes` is the sum of the two volumes, matching what the admin API
+/// computes on create, so the response's breakdown can be checked against the
+/// total a client already renders.
+pub async fn seed_app_with_labelled_volumes(pool: &MySqlPool) -> anyhow::Result<u64> {
+    let suffix = hex::encode(&rand_bytes32()[..4]);
+    let compose = "services:\n  relay:\n    image: example/relay:latest\n    ports:\n               - { name: http, container: 80, protocol: http, expose: ingress }\n    volumes:\n               - { name: db, path: /app/db, size: 10Gi, label: events }\n               - { name: cache, path: /app/cache, size: 1Gi }\n";
+    let (app_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO app (name, display_name, description, icon, category, compose, amount, \
+             currency, interval_amount, interval_type, setup_amount, enabled, cpu_milli, \
+             memory_bytes, storage_bytes) \
+         VALUES (?, 'E2E Volumes', NULL, NULL, 'Nostr relay', ?, \
+             1000, 'USD', 1, 1, 0, 1, 250, 268435456, ?) RETURNING id",
+    )
+    .bind(format!("volumes-{suffix}"))
+    .bind(compose)
+    .bind(11u64 * 1024 * 1024 * 1024)
+    .fetch_one(pool)
+    .await?;
+    Ok(app_id)
+}
+
 fn random_mac() -> String {
     let b = rand_bytes32();
     format!(

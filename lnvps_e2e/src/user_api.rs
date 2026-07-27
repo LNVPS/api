@@ -1096,6 +1096,70 @@ mod tests {
         pool.close().await;
     }
 
+    /// The catalog reports storage per volume, with the purpose the app
+    /// authored (#260). A flat `storage_bytes` misreports any app that stores
+    /// more than one kind of thing — HAVEN's 30 GB is 10 GB of events and
+    /// 20 GB of media — and a client cannot infer purpose from volume names,
+    /// because they mean different things in different apps.
+    #[tokio::test]
+    async fn test_app_reports_per_volume_storage() {
+        let client = user_client_with_keys(nostr::Keys::generate());
+        let pool = crate::db::connect().await.unwrap();
+        let app_id = crate::db::seed_app_with_labelled_volumes(&pool)
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_auth(&format!("/api/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let volumes = body["data"]["volumes"].as_array().expect("volumes array");
+        assert_eq!(volumes.len(), 2);
+
+        // Declaration order is preserved within a service.
+        assert_eq!(volumes[0]["name"].as_str(), Some("db"));
+        assert_eq!(volumes[0]["label"].as_str(), Some("events"));
+        assert_eq!(volumes[0]["service"].as_str(), Some("relay"));
+        assert_eq!(
+            volumes[0]["size_bytes"].as_u64(),
+            Some(10 * 1024 * 1024 * 1024)
+        );
+
+        // An unlabelled volume is still reported, with a null label — nothing
+        // has to be backfilled for this to ship.
+        assert_eq!(volumes[1]["name"].as_str(), Some("cache"));
+        assert!(
+            volumes[1]["label"].is_null(),
+            "unlabelled volume sends null"
+        );
+        assert_eq!(volumes[1]["size_bytes"].as_u64(), Some(1024 * 1024 * 1024));
+
+        // The breakdown adds up to the total the client already shows.
+        let total: u64 = volumes
+            .iter()
+            .map(|v| v["size_bytes"].as_u64().unwrap())
+            .sum();
+        assert_eq!(body["data"]["storage_bytes"].as_u64(), Some(total));
+
+        // Present on the listing too, not just the detail endpoint.
+        let resp = client.get_auth("/api/v1/apps").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let listed = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"].as_u64() == Some(app_id))
+            .expect("seeded app listed");
+        assert_eq!(
+            listed["volumes"].as_array().map(|v| v.len()),
+            Some(2),
+            "listing carries the same breakdown"
+        );
+    }
+
     /// An unpaid order must not consume cluster capacity (#252). Nostr keys are
     /// free, so anyone can create deployments without paying; before the fix
     /// each one was counted against the cluster and could make a paying

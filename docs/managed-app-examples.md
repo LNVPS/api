@@ -48,9 +48,38 @@ form fields, injected as `${name}`). Per service:
 `image`, `resources: { cpu, memory }`, `ports` (`expose: none|ingress`, ingress
 is HTTP only), `env`, `volumes` (PVCs, read-write), `files` (ConfigMap/Secret,
 read-only, mounted via subPath), `depends_on`, `backup`, `user`,
-`init`. `${HOSTNAME}`
+`init`. Volumes take an optional `label` (see below). `${HOSTNAME}`
 resolves to `{deployment-name}.{cluster-ingress-domain}`; a service name
 resolves to its in-namespace DNS (e.g. `db:3306`).
+
+**`volumes[].label`** — optional, and what a **buyer** gets from that volume:
+`events`, `media`, `database`, `files`. Surfaced per volume on
+`GET /api/v1/apps`, so a listing can say "10 GB events + 20 GB media" instead of
+a flat "30 GB" that reads as 30 GB of events (issue #260):
+
+```yaml
+services:
+  haven:
+    image: holgerhatgarkeinenode/haven-docker:v1.2.2
+    user: "1000"
+    ports:
+      - { name: ws, container: 3355, protocol: http, expose: ingress }
+    volumes:
+      - { name: db,      path: /app/db,      size: 10Gi, label: events }
+      - { name: blossom, path: /app/blossom, size: 20Gi, label: media }
+```
+
+Write it here because **only the app definition knows what a volume is for**.
+The names do not generalise: `db` is HAVEN's event store and route96's MySQL,
+`data` is Pyramid's events and Buzz's Postgres, and Buzz declares two different
+volumes both called `data`. Any client-side mapping is right for today's apps
+and wrong for the next one.
+
+Leave it off for volumes nobody shops for — Buzz's `run` (a Postgres socket
+dir), `packs` (a cache), redis' RDB snapshots. An unlabelled volume is still
+reported with its size, and an app with no labels at all just reports its total,
+so no existing entry has to be backfilled. Keep it a lower-case noun, at most 40
+characters; it renders next to a size, not as a sentence.
 
 **`user`** — by default every service runs under the restricted Pod Security
 Standard with `runAsNonRoot: true`. Set `user: root` (or `"0"`) on a service
@@ -265,7 +294,7 @@ services:
               }
           }
     volumes:
-      - { name: db, path: /app/strfry-db, size: 5Gi }
+      - { name: db, path: /app/strfry-db, size: 5Gi, label: events }
 config:
   - { name: relay_name, label: "Relay name", type: string, default: "My strfry relay" }
   - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay" }
@@ -292,7 +321,7 @@ services:
       MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
       MARIADB_DATABASE: route96
     volumes:
-      - { name: data, path: /var/lib/mysql, size: 5Gi }
+      - { name: data, path: /var/lib/mysql, size: 5Gi, label: database }
     backup:
       command: ["sh", "-c", "exec mariadb-dump --all-databases -uroot -p\"$MARIADB_ROOT_PASSWORD\""]
       artifact: route96.sql
@@ -312,7 +341,7 @@ services:
           max_upload_bytes: 104857600
           public_url: "https://${HOSTNAME}"
     volumes:
-      - { name: blobs, path: /app/data, size: 20Gi }
+      - { name: blobs, path: /app/data, size: 20Gi, label: files }
     backup:
       volume: blobs
 secrets:
@@ -355,7 +384,7 @@ services:
             enabled: true
             requireAuth: true
     volumes:
-      - { name: data, path: /app/data, size: 20Gi }
+      - { name: data, path: /app/data, size: 20Gi, label: files }
 ```
 
 ---
@@ -390,7 +419,7 @@ services:
           address = "0.0.0.0"
           port = 8080
     volumes:
-      - { name: db, path: /usr/src/app/db, size: 10Gi }
+      - { name: db, path: /usr/src/app/db, size: 10Gi, label: events }
 config:
   - { name: relay_name, label: "Relay name", type: string, default: "My nostr-rs-relay" }
   - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay" }
@@ -431,7 +460,7 @@ services:
       DATA_PATH: "/app/data"
       NO_AUTO_UPDATES: "true"
     volumes:
-      - { name: data, path: /app/data, size: 20Gi }
+      - { name: data, path: /app/data, size: 20Gi, label: events }
 ```
 
 ---
@@ -512,8 +541,8 @@ services:
         content: |
           ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
     volumes:
-      - { name: db, path: /app/db, size: 10Gi }
-      - { name: blossom, path: /app/blossom, size: 20Gi }
+      - { name: db, path: /app/db, size: 10Gi, label: events }
+      - { name: blossom, path: /app/blossom, size: 20Gi, label: media }
 config:
   - { name: owner_npub, label: "Owner npub", type: string, required: true }
   # The private relay's name and description are served as NIP-11 metadata, so
@@ -581,7 +610,7 @@ services:
       # initdb refuses a non-empty directory, and a fresh ext4 PVC has lost+found
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
-      - { name: data, path: /var/lib/postgresql/data, size: 20Gi }
+      - { name: data, path: /var/lib/postgresql/data, size: 20Gi, label: database }
       # readOnlyRootFilesystem: the postmaster lock + unix socket need a writable dir
       - { name: run, path: /var/run/postgresql, size: 1Gi }
     backup:
@@ -613,7 +642,7 @@ services:
       RUSTFS_OBS_USE_STDOUT: "true"
       RUSTFS_OBS_LOGGER_LEVEL: warn
     volumes:
-      - { name: blobs, path: /data, size: 50Gi }
+      - { name: blobs, path: /data, size: 50Gi, label: media }
     backup:
       volume: blobs
   relay:
@@ -679,7 +708,7 @@ services:
       BUZZ_MAX_CONNECTIONS: "2000"
       RUST_LOG: "info"
     volumes:
-      - { name: git, path: /var/lib/buzz/git, size: 20Gi }
+      - { name: git, path: /var/lib/buzz/git, size: 20Gi, label: git repositories }
       - { name: packs, path: /var/cache/buzz/git-packs, size: 5Gi }
 secrets:
   - { name: DB_PASSWORD, generate: password }
