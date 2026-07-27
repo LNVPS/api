@@ -336,6 +336,44 @@ pub struct Volume {
     pub path: String,
     /// Requested size, e.g. `5Gi`.
     pub size: String,
+    /// What a buyer gets from this volume, in their words: `events`, `media`,
+    /// `database` (issue #260).
+    ///
+    /// Optional, and authored per app rather than inferred, because the name
+    /// carries no meaning that generalises: `db` is HAVEN's event store and
+    /// route96's MySQL, `data` is Pyramid's events and Buzz's Postgres, and
+    /// Buzz declares two different volumes both called `data`. Only the app
+    /// definition knows what a volume is *for*, so only it can say.
+    ///
+    /// Leave it off for volumes a buyer does not think about (`run`, `packs`):
+    /// an unlabelled volume is reported with its size and no label, and an app
+    /// with no labels at all just reports its total, so nothing has to be
+    /// backfilled.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Longest accepted volume label. A label is a noun a price card renders
+/// beside a size ("20 GB media"), not a sentence — bounded here so a catalog
+/// author cannot put a paragraph on a buyer's screen.
+pub const MAX_VOLUME_LABEL_LEN: usize = 40;
+
+/// One persistent volume of an app, resolved for display: which service it
+/// belongs to, what it is for, and how big it is (issue #260).
+///
+/// The sizes sum to the app's total `storage_bytes`, so a client can render a
+/// breakdown that adds up to the number it already shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeInfo {
+    /// Compose service the volume is mounted into. Carried because a volume
+    /// name is only unique within its service — Buzz has two called `data`.
+    pub service: String,
+    /// Compose volume name. Internal, not buyer-facing: prefer `label`.
+    pub name: String,
+    /// Buyer-facing purpose, when the app declares one.
+    pub label: Option<String>,
+    /// Size in bytes, parsed from the compose quantity.
+    pub size_bytes: u64,
 }
 
 /// Default generated-secret length in bytes. Hex-encoded, so 48 characters.
@@ -515,6 +553,22 @@ impl Compose {
             }
             for v in &svc.volumes {
                 validate_mount_path(sname, &v.name, &v.path)?;
+                if let Some(label) = &v.label {
+                    let l = label.trim();
+                    if l.is_empty() {
+                        bail!(
+                            "service '{sname}': volume '{}': label is empty — omit it instead",
+                            v.name
+                        );
+                    }
+                    if l.chars().count() > MAX_VOLUME_LABEL_LEN {
+                        bail!(
+                            "service '{sname}': volume '{}': label must be at most \
+                             {MAX_VOLUME_LABEL_LEN} characters",
+                            v.name
+                        );
+                    }
+                }
             }
             // depends_on must reference real services.
             for dep in &svc.depends_on {
@@ -765,6 +819,40 @@ impl Compose {
                 });
             }
             out.insert(sname.clone(), files);
+        }
+        Ok(out)
+    }
+
+    /// Every persistent volume the app declares, with its purpose and size
+    /// (issue #260).
+    ///
+    /// Sizes sum to [`Footprint::storage_bytes`], so a client can render a
+    /// breakdown that adds up to the total it already shows. Ordered by service
+    /// name, then by the order the volumes are declared in that service — an
+    /// author who wants a particular volume read first writes it first. There
+    /// is deliberately no "primary" flag: the two consumers this was built for
+    /// (HAVEN's `events` + `media`, route96's `files` + `database`) both render
+    /// every labelled volume, so a flag for "the main one" would be a second
+    /// mechanism guessing at the same intent. Easy to add later; hard to
+    /// retract once clients depend on it.
+    ///
+    /// Errors if any size quantity is malformed, exactly like
+    /// [`Compose::service_footprints`].
+    pub fn volumes(&self) -> Result<Vec<VolumeInfo>> {
+        let mut names: Vec<&String> = self.services.keys().collect();
+        names.sort();
+        let mut out = Vec::new();
+        for sname in names {
+            let svc = &self.services[sname];
+            for v in &svc.volumes {
+                out.push(VolumeInfo {
+                    service: sname.clone(),
+                    name: v.name.clone(),
+                    label: v.label.as_ref().map(|l| l.trim().to_string()),
+                    size_bytes: parse_bytes(&v.size)
+                        .map_err(|e| anyhow!("service '{sname}': volume '{}': {e}", v.name))?,
+                });
+            }
         }
         Ok(out)
     }
@@ -1581,6 +1669,110 @@ config:
             f.storage_bytes,
             sf.iter().map(|s| s.storage_bytes).sum::<u64>()
         );
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// A flat total misreports any app that stores more than one kind of thing
+    /// (#260): HAVEN's 30 GB is 10 GB of events and 20 GB of media, and read
+    /// next to event-only relays quoting 10 GB it looks like three times the
+    /// event storage a buyer gets. The breakdown carries the purpose the app
+    /// authored, and still sums to the total.
+    #[test]
+    fn volumes_report_their_purpose_and_sum_to_the_total() {
+        let c = Compose::parse(
+            "services:\n  haven:\n    image: x\n    volumes:\n      \
+             - { name: db, path: /app/db, size: 10Gi, label: events }\n      \
+             - { name: blossom, path: /app/blossom, size: 20Gi, label: media }\n",
+        )
+        .unwrap();
+        let v = c.volumes().unwrap();
+        assert_eq!(v.len(), 2);
+        // Declaration order within a service is preserved: an author who wants
+        // a volume read first writes it first.
+        assert_eq!(v[0].name, "db");
+        assert_eq!(v[0].label.as_deref(), Some("events"));
+        assert_eq!(v[0].size_bytes, 10 * GIB);
+        assert_eq!(v[1].label.as_deref(), Some("media"));
+        assert_eq!(v[1].size_bytes, 20 * GIB);
+        assert!(v.iter().all(|x| x.service == "haven"));
+
+        assert_eq!(
+            c.footprint().unwrap().storage_bytes,
+            v.iter().map(|x| x.size_bytes).sum::<u64>(),
+            "the breakdown must add up to the number already shown"
+        );
+    }
+
+    /// Labels are optional and nothing has to be backfilled: an unlabelled
+    /// volume still reports its size, and its service, because a volume name
+    /// is only unique within a service.
+    #[test]
+    fn volumes_without_labels_still_report_size_and_service() {
+        let c = Compose::parse(ROUTE96).unwrap();
+        let v = c.volumes().unwrap();
+        assert_eq!(v.len(), 2);
+        // Sorted by service name, so the same compose always renders the same
+        // order (services live in a map).
+        assert_eq!(v[0].service, "mariadb");
+        assert_eq!(v[1].service, "route96");
+        assert!(v.iter().all(|x| x.label.is_none()));
+        assert_eq!(v[0].size_bytes, 5 * GIB);
+        assert_eq!(v[1].size_bytes, 20 * GIB);
+    }
+
+    /// Two services can declare volumes with the same name (Buzz does), so the
+    /// owning service is what disambiguates them.
+    #[test]
+    fn volumes_from_different_services_can_share_a_name() {
+        let c = Compose::parse(
+            "services:\n  db:\n    image: x\n    volumes:\n      \
+             - { name: data, path: /var/lib/postgresql, size: 20Gi, label: database }\n  \
+             relay:\n    image: y\n    volumes:\n      \
+             - { name: data, path: /data, size: 10Gi, label: events }\n",
+        )
+        .unwrap();
+        let v = c.volumes().unwrap();
+        assert_eq!(v.len(), 2);
+        assert_eq!(
+            (v[0].service.as_str(), v[0].label.as_deref()),
+            ("db", Some("database"))
+        );
+        assert_eq!(
+            (v[1].service.as_str(), v[1].label.as_deref()),
+            ("relay", Some("events"))
+        );
+    }
+
+    /// A label lands on a price card next to a size, so it is a noun, not a
+    /// sentence — and an empty one is an authoring mistake, not "no label".
+    #[test]
+    fn validate_rejects_unusable_volume_labels() {
+        let vol = |label: &str| {
+            format!(
+                "services:\n  a:\n    image: x\n    volumes:\n      \
+                 - {{ name: d, path: /data, size: 1Gi, label: \"{label}\" }}\n"
+            )
+        };
+        let err = Compose::parse(&vol(""))
+            .expect_err("empty label")
+            .to_string();
+        assert!(err.contains("label is empty"), "{err}");
+
+        let long = "x".repeat(MAX_VOLUME_LABEL_LEN + 1);
+        let err = Compose::parse(&vol(&long))
+            .expect_err("overlong label")
+            .to_string();
+        assert!(err.contains("at most"), "{err}");
+
+        // At the limit is fine, and surrounding whitespace is trimmed off.
+        let c = Compose::parse(&vol(&"y".repeat(MAX_VOLUME_LABEL_LEN))).unwrap();
+        assert_eq!(
+            c.volumes().unwrap()[0].label.as_deref().map(str::len),
+            Some(MAX_VOLUME_LABEL_LEN)
+        );
+        let c = Compose::parse(&vol("  events  ")).unwrap();
+        assert_eq!(c.volumes().unwrap()[0].label.as_deref(), Some("events"));
     }
 
     #[test]

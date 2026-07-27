@@ -104,6 +104,19 @@ pub struct ApiApp {
     /// Per-service resource breakdown (sorted by name), summing to the totals
     /// above. Lets the UI show what each container in a multi-service app uses.
     pub services: Vec<ApiAppServiceResources>,
+    /// Per-volume storage breakdown, summing to `storage_bytes` (issue #260).
+    ///
+    /// `storage_bytes` alone misreports any app that stores more than one kind
+    /// of thing: HAVEN's 30 GB is 10 GB of events and 20 GB of media, and shown
+    /// next to event-only relays quoting 10 GB it reads as three times the
+    /// event storage a buyer actually gets. A client cannot fix this itself —
+    /// volume *names* carry no meaning that generalises across apps — so the
+    /// purpose is authored per app and sent here as `label`.
+    ///
+    /// Volumes with no `label` are still listed with their size; an app that
+    /// labels nothing yields a list a client can ignore in favour of the
+    /// total. Rendering only the labelled ones is a reasonable default.
+    pub volumes: Vec<ApiAppVolume>,
     /// Coarse grouping labels for filtering, facets and tag landing pages,
     /// ordered by slug so a chip row is stable across renders. Empty is a
     /// normal state — nothing on the page depends on an app being tagged.
@@ -122,6 +135,24 @@ pub struct ApiAppServiceResources {
     pub cpu_milli: u64,
     pub memory_bytes: u64,
     pub storage_bytes: u64,
+}
+
+/// One persistent volume of an app: what it is for, and how big (issue #260).
+#[derive(Serialize)]
+pub struct ApiAppVolume {
+    /// Compose service this volume belongs to. Sent because a volume name is
+    /// only unique within its service — Buzz declares two called `data`.
+    pub service: String,
+    /// Compose volume name. Internal plumbing, not buyer-facing: it means
+    /// different things in different apps (`db` is HAVEN's event store and
+    /// route96's MySQL). Render `label`, not this.
+    pub name: String,
+    /// What the buyer gets from it — `events`, `media`, `database`. Null when
+    /// the app does not declare one, which is the normal state for volumes
+    /// nobody shops for (`run`, `packs`).
+    pub label: Option<String>,
+    /// Size in bytes. These sum to the app's `storage_bytes`.
+    pub size_bytes: u64,
 }
 
 /// A grouping label as it appears on an app.
@@ -170,9 +201,12 @@ impl ApiApp {
     /// from. Callers load the whole result set's assignments in one query and
     /// hand in the slice.
     pub fn from_app(a: App, tags: Vec<ApiAppTag>) -> Self {
-        // Per-service breakdown from the (already-validated) compose; best-effort.
-        let services = lnvps_compose::Compose::parse(&a.compose)
-            .ok()
+        // Per-service and per-volume breakdowns from the (already-validated)
+        // compose; best-effort, so a row that somehow fails to parse still
+        // renders with its stored totals rather than failing the listing.
+        let parsed = lnvps_compose::Compose::parse(&a.compose).ok();
+        let services = parsed
+            .as_ref()
             .and_then(|c| c.service_footprints().ok())
             .unwrap_or_default()
             .into_iter()
@@ -181,6 +215,18 @@ impl ApiApp {
                 cpu_milli: s.cpu_milli,
                 memory_bytes: s.memory_bytes,
                 storage_bytes: s.storage_bytes,
+            })
+            .collect();
+        let volumes = parsed
+            .as_ref()
+            .and_then(|c| c.volumes().ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| ApiAppVolume {
+                service: v.service,
+                name: v.name,
+                label: v.label,
+                size_bytes: v.size_bytes,
             })
             .collect();
         Self {
@@ -203,6 +249,7 @@ impl ApiApp {
             memory_bytes: a.memory_bytes,
             storage_bytes: a.storage_bytes,
             services,
+            volumes,
             tags,
         }
     }
