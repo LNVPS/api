@@ -86,10 +86,13 @@ Standard with `runAsNonRoot: true`. Set `user: root` (or `"0"`) on a service
 whose image entrypoint must *start* as root and drop privileges itself —
 `mariadb`, `postgres`, `redis`, etc. That container gets `runAsNonRoot: false`
 and the deployment's namespace drops to the baseline Pod Security Standard
-(still blocking privileged pods, host namespaces/ports/PID/IPC and hostPath);
-all other hardening (no privilege escalation, drop ALL capabilities, read-only
-root filesystem) stays in force. Only set it where the image genuinely needs
-it.
+(still blocking privileged pods, host namespaces/ports/PID/IPC and hostPath).
+Such a container also gets `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `SETGID` and
+`SETUID` added back on top of `drop: ALL` — the chown of a fresh, root-owned
+data directory and the `gosu`/`su-exec` drop that follows it. That is the whole
+grant: no privilege escalation and the read-only root filesystem stay in force,
+and every other capability stays dropped. Only set it where the image genuinely
+needs it.
 
 **`init`** — one-shot setup steps that must succeed before the service's own
 container starts. They render as Kubernetes init containers in that service's
