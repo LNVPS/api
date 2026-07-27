@@ -7,3 +7,4 @@ edition.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_yaml = "0.9.34"
+rand = "0.9"

@@ -2974,6 +2974,7 @@ name = "lnvps_compose"
 version = "0.4.7"
 dependencies = [
  "anyhow",
+ "rand 0.9.4",
  "serde",
  "serde_yaml",
 ]

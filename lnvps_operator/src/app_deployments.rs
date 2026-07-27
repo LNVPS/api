@@ -40,7 +40,10 @@ use k8s_openapi::api::networking::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
-use lnvps_compose::{Compose, Expose, ResolvedFile, ResolvedInit, Service as ComposeService};
+use lnvps_compose::{
+    Compose, Expose, ROOT_ENTRYPOINT_CAPABILITIES, ResolvedFile, ResolvedInit,
+    Service as ComposeService,
+};
 
 /// Label value marking objects this operator owns.
 pub const MANAGED_BY: &str = "lnvps-operator";
@@ -316,23 +319,6 @@ fn pod_security_context_for(fs_group: Option<i64>) -> PodSecurityContext {
         ..Default::default()
     }
 }
-
-/// The capabilities a "start as root, then drop privileges" entrypoint needs
-/// after `drop: ALL` (issue #263).
-///
-/// `SETGID`/`SETUID` are what `gosu`/`su-exec` costs when the entrypoint drops
-/// to its service account — the first thing that fails today, with mariadb's
-/// `error: failed switching to 'mysql': operation not permitted`.
-/// `CHOWN`/`DAC_OVERRIDE`/`FOWNER` are what the `chown -R` of a freshly
-/// provisioned, root-owned data directory costs, which is the step after it.
-/// Dropping to a lower UID is not privilege escalation, so
-/// `allowPrivilegeEscalation: false` stays set.
-///
-/// All five are on the **baseline** PSS allow-list, which is the standard a
-/// deployment containing a root service already runs under
-/// ([`build_namespace_baseline`]).
-const ROOT_ENTRYPOINT_CAPABILITIES: [&str; 5] =
-    ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
 
 /// A locked-down container security context: no privilege escalation, all
 /// capabilities dropped, read-only root filesystem.
