@@ -593,9 +593,13 @@ mod tests {
         assert_ne!(resp.status(), StatusCode::OK, "duplicate app name rejected");
 
         // Invalid slug rejected.
+        // `category` is present so the request reaches slug validation: making
+        // it required (#239) means omitting it fails deserialization with 422
+        // first, which would pass an assert_ne but stop testing the slug rule.
         let bad = serde_json::json!({
             "name": "Bad Name",
             "display_name": "x",
+            "category": "Nostr relay",
             "compose": "services: {}",
             "amount": 1,
             "currency": "usd",
