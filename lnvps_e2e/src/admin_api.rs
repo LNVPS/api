@@ -1681,6 +1681,98 @@ mod tests {
         pool.close().await;
     }
 
+    /// Deleting an app or cluster is refused while *any* deployment row still
+    /// references it, soft-deleted included — the foreign key does not look at
+    /// `deleted`, so counting only live deployments turned the FK rejection
+    /// into a 500 (#238). Purging the dead rows unblocks both deletes.
+    #[tokio::test]
+    async fn test_admin_delete_app_blocked_until_deployments_purged() {
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+        let keys = nostr::Keys::generate();
+        let uid = crate::db::ensure_user(&pool, &keys).await.unwrap();
+        let (app_id, cluster_id, dep_id) = crate::db::seed_app_deployment(&pool, uid, "guard-me")
+            .await
+            .unwrap();
+
+        // Live deployment: both deletes refused, counts named.
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("1 active"), "{body}");
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/app_clusters/{cluster_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Soft-delete the deployment: the row and its foreign keys survive, so
+        // the deletes stay refused — with a 400 naming the purge, not a 500.
+        let resp = client
+            .delete_auth_body(
+                &format!("/api/admin/v1/app-deployments/{dep_id}"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("1 soft-deleted"), "{body}");
+        assert!(body.contains("purge"), "{body}");
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/app_clusters/{cluster_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = resp.text().await.unwrap();
+        assert!(body.contains("1 soft-deleted"), "{body}");
+
+        // Purge, then both deletes succeed — the guard and the FK now agree in
+        // both directions.
+        let resp = client
+            .delete_auth_body(
+                &format!("/api/admin/v1/app-deployments/{dep_id}"),
+                &serde_json::json!({ "purge": true }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/app_clusters/{cluster_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let apps: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app WHERE id = ?")
+            .bind(app_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(apps, 0, "app deleted once nothing references it");
+        let clusters: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM app_cluster WHERE id = ?")
+            .bind(cluster_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(clusters, 0, "cluster deleted once nothing references it");
+        pool.close().await;
+    }
+
     /// A deployment whose first payment was never confirmed is removed entirely
     /// by a plain delete — the same never-paid rule VMs use (#234).
     #[tokio::test]
