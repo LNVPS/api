@@ -70,3 +70,32 @@ cargo fmt
 # Check formatting without modifying
 cargo fmt -- --check
 ```
+
+## Catalog app composes
+
+A change to a catalog app's `compose` (a `docs/managed-app-examples.md` entry,
+or the document you are about to PATCH into `app.compose`) is not covered by
+`cargo test`. Validate it, then **start it** before opening the PR:
+
+```bash
+# 1. Static checks — the same parser and rules the admin API and operator apply.
+cargo run -q -p lnvps_compose --bin compose-validate -- app.yaml
+
+# 2. Render it as a runnable docker-compose under the cluster's hardening.
+cargo run -q -p lnvps_compose --bin compose-to-docker -- app.yaml \
+    --out-dir .local/app --config KEY=value --hostname localhost
+
+# 3. Do the fsGroup stand-in the tool prints, then start it.
+docker compose -f .local/app/docker-compose.yaml up --no-start
+docker run --rm -u 0 -v app_<service>-<volume>:/d busybox chown -R <uid>:<uid> /d
+docker compose -f .local/app/docker-compose.yaml up
+```
+
+Every service must still be up after ~45s, and a service with a volume must
+have written into it. Validation passing means the document is well-formed; it
+says nothing about whether the image can start read-only, as the declared user,
+with `cap_drop: ALL`. Four apps shipped enabled and priced that could not
+(#248, #256, #263, #264), and none of them was visible in the document.
+
+See "Running a compose document locally" in `docs/managed-app-examples.md` for
+what a green run does and does not prove.

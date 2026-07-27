@@ -306,6 +306,71 @@ cat app.yaml | cargo run -q -p lnvps_compose --bin compose-validate
 
 Exits non-zero if any document fails to parse or validate.
 
+## Running a compose document locally
+
+Validation is a static check on the document. It cannot tell you that the
+image's entrypoint wants to write to `/run`, or that the app exits because
+`RELAY_URL` resolved to an empty string. Those only surface when a container
+starts — which is how every managed-app outage so far was eventually found
+(#248, #256, #263, #264), long after the app shipped priced and enabled.
+
+`compose-to-docker` renders the document as a `docker-compose.yaml` you can run
+(issue #268):
+
+```sh
+cargo run -q -p lnvps_compose --bin compose-to-docker -- app.yaml \
+    --out-dir .local/haven --config owner_npub=npub1… --hostname localhost
+
+# Then what it prints: create the volumes, chown them (the fsGroup stand-in),
+# and start.
+docker compose -f .local/haven/docker-compose.yaml up --no-start
+docker run --rm -u 0 -v haven_haven-db:/d busybox chown -R 1000:1000 /d
+docker compose -f .local/haven/docker-compose.yaml up
+```
+
+It resolves config, secrets, `env`, `files` and `init` through the same
+functions the operator calls, so what starts locally is what the cluster would
+start. The out-dir holds the compose file, the rendered `files[]` (bind-mounted
+read-only) and `secrets.env` — generated once and reused, so a second run does
+not rotate the password the first run's database was initialised with.
+
+**The hardening is the point.** Every emitted service carries what
+`container_security_context_for` sets: `read_only: true`, `cap_drop: [ALL]`,
+`security_opt: [no-new-privileges:true]`, the declared `user:`, and — for a
+`user: root` service — the five capabilities a root entrypoint gets back
+(#263). `scratch:` becomes `tmpfs` at the same byte limit, `volumes[]` become
+named volumes, `init:` steps become one-shot services the service waits on with
+`condition: service_completed_successfully`. Take any of that out and the run
+stops meaning anything: a permissive docker-compose starts all four historically
+broken apps cleanly.
+
+A green `docker compose up` means the image starts and the app's own startup
+checks pass under our security context. **It is not a deployment test.**
+
+### Known non-equivalences
+
+- **Volume ownership.** Kubernetes sets `fsGroup` from `user:` so a fresh PVC is
+  writable by a non-root container. Docker has no equivalent: a fresh named
+  volume is root-owned `0755` and a non-root service cannot write to it. The
+  tool prints the `docker volume create … && chown` that stands in for it rather
+  than performing it — the failure it produces is local-only, and silently
+  fixing it would hide the difference.
+- **File-descriptor limits.** The tool sets `nofile` to containerd's default
+  (1048576) because dockerd's is lower — without it strfry aborts locally with
+  `Unable to set NOFILES limit to 1000000, exceeds max of 524288` while
+  starting fine in the cluster.
+- **Host ports.** Only `expose: ingress` ports are published, on loopback at the
+  same number. If that port is already taken on your machine, pass
+  `--no-publish`; services still reach each other by name.
+- **`scratch:` is `tmpfs` here, an `emptyDir` there** — memory-backed locally,
+  node disk in the cluster. The size limit is the same; the failure mode when an
+  app writes far more than it declared is not.
+- **No ingress, TLS or cert-manager.** `${HOSTNAME}` is whatever `--hostname`
+  says.
+- **No `Recreate` strategy, RWO PVC semantics, scheduler or capacity
+  accounting**, and `depends_on` is enforced locally where Kubernetes treats it
+  as advisory.
+
 ---
 
 ## strfry — Nostr relay

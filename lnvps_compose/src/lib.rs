@@ -414,6 +414,28 @@ pub const DEFAULT_SCRATCH_SIZE: &str = "256Mi";
 /// bigger belongs in a `volume`, where it is sized, billed and backed up.
 pub const MAX_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// The capabilities a "start as root, then drop privileges" entrypoint needs
+/// after dropping `ALL` (issue #263).
+///
+/// `SETGID`/`SETUID` are what `gosu`/`su-exec` costs when the entrypoint drops
+/// to its service account — the first thing that fails without them, with
+/// mariadb's `error: failed switching to 'mysql': operation not permitted`.
+/// `CHOWN`/`DAC_OVERRIDE`/`FOWNER` are what the `chown -R` of a freshly
+/// provisioned, root-owned data directory costs, which is the step after it.
+/// Dropping to a lower UID is not privilege escalation, so no-new-privileges
+/// stays set alongside them.
+///
+/// All five are on the Kubernetes **baseline** Pod Security Standard
+/// allow-list, which is the standard a deployment containing a root service
+/// already runs under.
+///
+/// It lives here, in the grammar crate, because two renderers have to agree on
+/// it: the operator's container SecurityContext and `compose-to-docker`'s
+/// `cap_add` (issue #268). A local run that granted a different set would
+/// reproduce a different bug from the one the cluster has.
+pub const ROOT_ENTRYPOINT_CAPABILITIES: [&str; 5] =
+    ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"];
+
 /// One persistent volume of an app, resolved for display: which service it
 /// belongs to, what it is for, and how big it is (issue #260).
 ///
