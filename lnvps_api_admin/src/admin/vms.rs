@@ -919,7 +919,21 @@ async fn admin_calculate_vm_refund(
     ApiData::ok(refund_info)
 }
 
-/// Process a refund for a VM automatically via work job
+/// Process a refund for a VM automatically.
+///
+/// **Refuses with 501 — automated refunds do not exist yet (issue #193).**
+///
+/// This used to queue a `WorkJob::ProcessVmRefund` and answer `200` with the
+/// job id, while the only handler for that job is
+/// `bail!("Refund processing is not yet implemented")` (`lnvps_api/src/worker.rs`).
+/// The failure happened in a background job after the response, so an operator
+/// saw a real pro-rated amount from `GET /refund`, submitted it, and was told
+/// it had been dispatched — while no money moved and no record was written.
+/// Neither side of the transaction could tell a refund from a no-op.
+///
+/// A refused request is the honest answer until the payout path exists: the
+/// request is still validated, so the shape a caller sends is checked the same
+/// way it will be when this is implemented, and the refusal names the state.
 async fn admin_process_vm_refund(
     auth: AdminAuth,
     State(this): State<RouterState>,
@@ -958,26 +972,17 @@ async fn admin_process_vm_refund(
         );
     }
 
-    // Send refund job via Redis stream for distributed processing
-    let refund_job = WorkJob::ProcessVmRefund {
-        vm_id,
-        admin_user_id: auth.user_id,
-        refund_from_date: req.refund_from_date,
-        reason: req.reason.clone(),
-        payment_method,
-        lightning_invoice: req.lightning_invoice.clone(),
-    };
-
-    match this.work_commander.send(refund_job).await {
-        Ok(stream_id) => {
-            info!("VM refund job queued with stream ID: {}", stream_id);
-            ApiData::ok(JobResponse { job_id: stream_id })
-        }
-        Err(e) => {
-            error!("Failed to queue VM refund job: {}", e);
-            ApiData::err("Failed to queue VM refund job")
-        }
-    }
+    // Deliberately no work job: the handler for it bails, so queueing one would
+    // report success for something that cannot happen.
+    info!(
+        "Admin {} attempted an automated {} refund for VM {} (from_date={:?}, reason={:?}) — \
+         refused, not implemented",
+        auth.user_id, payment_method, vm_id, req.refund_from_date, req.reason
+    );
+    Err(ApiError::not_implemented(
+        "Automated refund processing is not implemented: no funds are moved and no record is \
+         written. Issue the refund out-of-band and record it against the VM's payment.",
+    ))
 }
 
 /// Create a VM for a specific user (admin action)

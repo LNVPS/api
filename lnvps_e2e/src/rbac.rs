@@ -247,6 +247,27 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// The refund endpoint refuses everyone with 501, but the permission check
+    /// runs first — a read_only admin is still refused with 403, so the
+    /// not-implemented answer never leaks to a caller who could not have used
+    /// it anyway. Checked ahead of the VM lookup, so a bogus VM id still 403s.
+    #[tokio::test]
+    async fn test_read_only_cannot_process_vm_refund() {
+        setup_rbac().await;
+        let client = admin_client_with_keys(read_only_keys().clone());
+        let body = serde_json::json!({
+            "payment_method": "lightning",
+            "lightning_invoice": "lnbc1rbactestinvoice"
+        });
+        let resp = client
+            .post_auth("/api/admin/v1/vms/999999999/refund", &body)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("Insufficient permissions"), "{text}");
+    }
+
     // ========================================================================
     // payment_manager role: can manage payments, cannot manage VMs
     // ========================================================================
