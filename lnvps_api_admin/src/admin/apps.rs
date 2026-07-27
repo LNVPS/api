@@ -1,9 +1,10 @@
 use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
-    AdminAppClusterInfo, AdminAppDeploymentInfo, AdminAppInfo, AdminCreateAppClusterRequest,
-    AdminCreateAppRequest, AdminUpdateAppClusterRequest, AdminUpdateAppDeploymentRequest,
-    AdminUpdateAppRequest,
+    AdminAppClusterInfo, AdminAppDeploymentInfo, AdminAppInfo, AdminAppTagInfo, AdminAppTagRef,
+    AdminCreateAppClusterRequest, AdminCreateAppRequest, AdminCreateAppTagRequest,
+    AdminDeleteAppTagResult, AdminUpdateAppClusterRequest, AdminUpdateAppDeploymentRequest,
+    AdminUpdateAppRequest, AdminUpdateAppTagRequest,
 };
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
@@ -26,6 +27,16 @@ pub fn router() -> Router<RouterState> {
             get(admin_get_app)
                 .patch(admin_update_app)
                 .delete(admin_delete_app),
+        )
+        .route(
+            "/api/admin/v1/app-tags",
+            get(admin_list_app_tags).post(admin_create_app_tag),
+        )
+        .route(
+            "/api/admin/v1/app-tags/{id}",
+            get(admin_get_app_tag)
+                .patch(admin_update_app_tag)
+                .delete(admin_delete_app_tag),
         )
         .route(
             "/api/admin/v1/app-deployments",
@@ -102,6 +113,80 @@ fn validate_app_fields(
     Ok(())
 }
 
+/// Resolve tag slugs to ids, rejecting the first unknown one by name.
+///
+/// The vocabulary is controlled: an unrecognised slug is a `400` naming it,
+/// never an implicit create. Auto-creation is exactly the drift the tag table
+/// exists to prevent — `Nostr relay`, `nostr-relay` and `nostr` becoming three
+/// tags the first time two admins type them.
+///
+/// Slugs are trimmed and de-duplicated, so a request listing the same tag
+/// twice is one assignment rather than a unique-key violation from the driver.
+async fn resolve_tag_slugs(
+    db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+    slugs: &[String],
+) -> Result<Vec<u64>, lnvps_api_common::ApiError> {
+    let mut ids = Vec::with_capacity(slugs.len());
+    for slug in slugs {
+        let slug = slug.trim();
+        if slug.is_empty() {
+            continue;
+        }
+        let tag = db.get_app_tag_by_slug(slug).await.map_err(|_| {
+            lnvps_api_common::ApiError::new(format!("unknown tag slug: {slug}"))
+        })?;
+        if !ids.contains(&tag.id) {
+            ids.push(tag.id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Load one app's tags in the admin wire shape.
+async fn app_tag_refs(
+    db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+    app_id: u64,
+) -> Result<Vec<AdminAppTagRef>, lnvps_api_common::ApiError> {
+    Ok(db
+        .list_app_tag_assignments(&[app_id])
+        .await?
+        .into_iter()
+        .map(|(_, t)| t.into())
+        .collect())
+}
+
+/// Validate and normalise a tag slug: URL-safe, since it is a path segment in
+/// `/apps/tag/{slug}` and a query value. Same rule as an app's `name`.
+fn validate_tag_slug(slug: &str) -> Result<String, lnvps_api_common::ApiError> {
+    let slug = slug.trim();
+    if slug.is_empty() {
+        return Err(lnvps_api_common::ApiError::new("slug is required"));
+    }
+    if !slug
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        || slug.starts_with('-')
+        || slug.ends_with('-')
+    {
+        return Err(lnvps_api_common::ApiError::new(
+            "slug must be URL-safe (lowercase letters, digits, hyphens)",
+        ));
+    }
+    Ok(slug.to_string())
+}
+
+/// Trim and require a non-empty tag `display_name`.
+///
+/// Required rather than derived from the slug: title-casing in JS mangles
+/// `NIP-96`, `HTTP` and `Git`, which is why the column exists at all.
+fn validate_tag_display_name(name: String) -> Result<String, lnvps_api_common::ApiError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(lnvps_api_common::ApiError::new("display_name is required"));
+    }
+    Ok(name.to_string())
+}
+
 /// Trim and require a non-empty `category`.
 ///
 /// Kept out of `validate_app_fields` because that helper takes what both
@@ -156,8 +241,21 @@ async fn admin_list_apps(
         .db
         .admin_list_apps_filtered(limit, offset, params.enabled, params.search.as_deref())
         .await?;
+
+    // One assignment query for the whole page, not one per row.
+    let ids: Vec<u64> = apps.iter().map(|a| a.id).collect();
+    let mut tags: std::collections::BTreeMap<u64, Vec<AdminAppTagRef>> = Default::default();
+    for (app_id, tag) in this.db.list_app_tag_assignments(&ids).await? {
+        tags.entry(app_id).or_default().push(tag.into());
+    }
+
     ApiPaginatedData::ok(
-        apps.into_iter().map(Into::into).collect(),
+        apps.into_iter()
+            .map(|a| {
+                let app_tags = tags.remove(&a.id).unwrap_or_default();
+                AdminAppInfo::from_app(a, app_tags)
+            })
+            .collect(),
         total,
         limit,
         offset,
@@ -171,7 +269,8 @@ async fn admin_get_app(
 ) -> ApiResult<AdminAppInfo> {
     auth.require_permission(AdminResource::App, AdminAction::View)?;
     let app = this.db.get_app(id).await?;
-    ApiData::ok(app.into())
+    let tags = app_tag_refs(&this.db, id).await?;
+    ApiData::ok(AdminAppInfo::from_app(app, tags))
 }
 
 async fn admin_create_app(
@@ -182,6 +281,12 @@ async fn admin_create_app(
     auth.require_permission(AdminResource::App, AdminAction::Create)?;
     validate_app_fields(&req.name, &req.display_name, &req.compose, &req.currency)?;
     let category = validate_category(req.category)?;
+    // Resolve before the insert: an unknown slug should fail the whole request
+    // rather than leave a created-but-untagged app behind.
+    let tag_ids = match &req.tags {
+        Some(slugs) => Some(resolve_tag_slugs(&this.db, slugs).await?),
+        None => None,
+    };
     let footprint = compose_footprint(&req.compose)?;
 
     let app = App {
@@ -207,7 +312,11 @@ async fn admin_create_app(
         created: chrono::Utc::now(),
     };
     let id = this.db.insert_app(&app).await?;
-    ApiData::ok(this.db.get_app(id).await?.into())
+    if let Some(tag_ids) = tag_ids {
+        this.db.set_app_tags(id, &tag_ids).await?;
+    }
+    let tags = app_tag_refs(&this.db, id).await?;
+    ApiData::ok(AdminAppInfo::from_app(this.db.get_app(id).await?, tags))
 }
 
 async fn admin_update_app(
@@ -270,13 +379,24 @@ async fn admin_update_app(
     }
 
     validate_app_fields(&app.name, &app.display_name, &app.compose, &app.currency)?;
+    // Resolve before any write, so an unknown slug leaves the app untouched
+    // rather than half-applying the rest of the patch.
+    let tag_ids = match &req.tags {
+        Some(slugs) => Some(resolve_tag_slugs(&this.db, slugs).await?),
+        None => None,
+    };
     // Recompute the footprint from the (possibly updated) compose.
     let footprint = compose_footprint(&app.compose)?;
     app.cpu_milli = footprint.cpu_milli;
     app.memory_bytes = footprint.memory_bytes;
     app.storage_bytes = footprint.storage_bytes;
     this.db.update_app(&app).await?;
-    ApiData::ok(this.db.get_app(id).await?.into())
+    // Replace-set: an empty list clears, omitted leaves the set alone.
+    if let Some(tag_ids) = tag_ids {
+        this.db.set_app_tags(id, &tag_ids).await?;
+    }
+    let tags = app_tag_refs(&this.db, id).await?;
+    ApiData::ok(AdminAppInfo::from_app(this.db.get_app(id).await?, tags))
 }
 
 async fn admin_delete_app(
@@ -303,6 +423,151 @@ async fn admin_delete_app(
 
     this.db.delete_app(id).await?;
     ApiData::ok(true)
+}
+
+// ----- App tags (the vocabulary itself) -----
+//
+// All of these reuse `AdminResource::App`. Tags are catalog metadata, and a
+// separate resource would mean a new enum value, a new RBAC migration, and a
+// permission every existing app-admin role would have to be granted before the
+// feature worked at all.
+
+async fn admin_list_app_tags(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+) -> ApiResult<Vec<AdminAppTagInfo>> {
+    auth.require_permission(AdminResource::App, AdminAction::View)?;
+    let tags = this.db.list_app_tags_with_counts().await?;
+    ApiData::ok(
+        tags.into_iter()
+            .map(|(t, app_count)| AdminAppTagInfo {
+                id: t.id,
+                slug: t.slug,
+                display_name: t.display_name,
+                description: t.description,
+                app_count,
+                created: t.created,
+            })
+            .collect(),
+    )
+}
+
+async fn admin_get_app_tag(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<AdminAppTagInfo> {
+    auth.require_permission(AdminResource::App, AdminAction::View)?;
+    let tag = this.db.get_app_tag(id).await?;
+    // Count from the same source as the listing so the two cannot disagree.
+    let app_count = this
+        .db
+        .list_app_tags_with_counts()
+        .await?
+        .into_iter()
+        .find(|(t, _)| t.id == id)
+        .map(|(_, c)| c)
+        .unwrap_or(0);
+    ApiData::ok(AdminAppTagInfo {
+        id: tag.id,
+        slug: tag.slug,
+        display_name: tag.display_name,
+        description: tag.description,
+        app_count,
+        created: tag.created,
+    })
+}
+
+async fn admin_create_app_tag(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Json(req): Json<AdminCreateAppTagRequest>,
+) -> ApiResult<AdminAppTagInfo> {
+    auth.require_permission(AdminResource::App, AdminAction::Create)?;
+    let slug = validate_tag_slug(&req.slug)?;
+    let display_name = validate_tag_display_name(req.display_name)?;
+
+    let tag = lnvps_db::AppTag {
+        id: 0,
+        slug,
+        display_name,
+        description: req.description.filter(|s| !s.trim().is_empty()),
+        created: chrono::Utc::now(),
+    };
+    let id = this.db.insert_app_tag(&tag).await?;
+    let tag = this.db.get_app_tag(id).await?;
+    ApiData::ok(AdminAppTagInfo {
+        id: tag.id,
+        slug: tag.slug,
+        display_name: tag.display_name,
+        description: tag.description,
+        // Freshly created, so nothing can carry it yet.
+        app_count: 0,
+        created: tag.created,
+    })
+}
+
+async fn admin_update_app_tag(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<AdminUpdateAppTagRequest>,
+) -> ApiResult<AdminAppTagInfo> {
+    auth.require_permission(AdminResource::App, AdminAction::Update)?;
+    let mut tag = this.db.get_app_tag(id).await?;
+
+    if let Some(slug) = req.slug {
+        // Renaming a slug breaks any /apps/tag/{slug} link already indexed —
+        // allowed, because the alternative is an unfixable typo, but it is a
+        // deliberate act and not something to do casually.
+        tag.slug = validate_tag_slug(&slug)?;
+    }
+    if let Some(display_name) = req.display_name {
+        tag.display_name = validate_tag_display_name(display_name)?;
+    }
+    if let Some(description) = req.description {
+        tag.description = description.filter(|s| !s.trim().is_empty());
+    }
+
+    this.db.update_app_tag(&tag).await?;
+    let tag = this.db.get_app_tag(id).await?;
+    let app_count = this
+        .db
+        .list_app_tags_with_counts()
+        .await?
+        .into_iter()
+        .find(|(t, _)| t.id == id)
+        .map(|(_, c)| c)
+        .unwrap_or(0);
+    ApiData::ok(AdminAppTagInfo {
+        id: tag.id,
+        slug: tag.slug,
+        display_name: tag.display_name,
+        description: tag.description,
+        app_count,
+        created: tag.created,
+    })
+}
+
+/// Delete a tag from the vocabulary, cascading its assignments.
+///
+/// Unlike deleting an app, this is **not** refused when the tag is in use:
+/// untagging is the point of retiring a tag, and the assignment rows are not
+/// billable. The response reports how many apps it untagged, because the
+/// cascade is otherwise invisible.
+async fn admin_delete_app_tag(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<AdminDeleteAppTagResult> {
+    auth.require_permission(AdminResource::App, AdminAction::Delete)?;
+    // Confirm it exists first, so deleting a non-existent tag is a 404 rather
+    // than a 200 claiming it removed zero assignments.
+    this.db.get_app_tag(id).await?;
+    let assignments_removed = this.db.delete_app_tag(id).await?;
+    ApiData::ok(AdminDeleteAppTagResult {
+        assignments_removed,
+    })
 }
 
 // ----- App deployments -----
@@ -700,6 +965,38 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_validate_tag_slug() {
+        // Returns trimmed: the slug is a path segment in /apps/tag/{slug} and
+        // a query value, so a stray space is a broken URL, not a cosmetic slip.
+        assert_eq!(validate_tag_slug("  nostr  ").ok(), Some("nostr".to_string()));
+        assert_eq!(validate_tag_slug("media-server").ok(), Some("media-server".to_string()));
+        assert_eq!(validate_tag_slug("nip-96").ok(), Some("nip-96".to_string()));
+
+        assert!(validate_tag_slug("").is_err());
+        assert!(validate_tag_slug("   ").is_err());
+        // Uppercase and spaces would have to be escaped in a URL, and two
+        // admins typing `Nostr` and `nostr` is the vocabulary drift the
+        // controlled table exists to prevent.
+        assert!(validate_tag_slug("Nostr").is_err());
+        assert!(validate_tag_slug("media server").is_err());
+        assert!(validate_tag_slug("nostr_relay").is_err());
+        assert!(validate_tag_slug("-nostr").is_err());
+        assert!(validate_tag_slug("nostr-").is_err());
+    }
+
+    #[test]
+    fn test_validate_tag_display_name() {
+        // Required rather than derived from the slug: title-casing `nip-96` in
+        // JS yields `Nip-96`, which is why the column exists.
+        assert_eq!(
+            validate_tag_display_name("  NIP-96  ".to_string()).ok(),
+            Some("NIP-96".to_string())
+        );
+        assert!(validate_tag_display_name(String::new()).is_err());
+        assert!(validate_tag_display_name("   ".to_string()).is_err());
     }
 
     #[test]

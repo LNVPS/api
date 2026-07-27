@@ -4487,12 +4487,95 @@ pub struct AdminAppInfo {
     pub memory_bytes: u64,
     /// Persistent storage footprint in bytes.
     pub storage_bytes: u64,
+    /// Grouping labels currently assigned, ordered by slug. Returned so the
+    /// admin list is not a blind edit: `tags` on create/update is a replace-set
+    /// of slugs, so an editor has to be able to see the current set first.
+    pub tags: Vec<AdminAppTagRef>,
     pub created: DateTime<Utc>,
 }
 
-impl From<lnvps_db::App> for AdminAppInfo {
-    fn from(a: lnvps_db::App) -> Self {
+/// A tag as it appears on an app. The id is included so an admin UI can drive
+/// a picker off `GET /api/admin/v1/app-tags` without matching on strings.
+#[derive(Serialize)]
+pub struct AdminAppTagRef {
+    pub id: u64,
+    pub slug: String,
+    pub display_name: String,
+}
+
+impl From<lnvps_db::AppTag> for AdminAppTagRef {
+    fn from(t: lnvps_db::AppTag) -> Self {
         Self {
+            id: t.id,
+            slug: t.slug,
+            display_name: t.display_name,
+        }
+    }
+}
+
+/// Admin view of a tag in the vocabulary.
+#[derive(Serialize)]
+pub struct AdminAppTagInfo {
+    pub id: u64,
+    pub slug: String,
+    pub display_name: String,
+    pub description: Option<String>,
+    /// Number of **enabled** apps carrying this tag — the same count the
+    /// public facet endpoint reports, so an admin sees what a visitor sees.
+    /// A disabled app carrying the tag is not counted here.
+    pub app_count: u64,
+    pub created: DateTime<Utc>,
+}
+
+/// Create a tag. The vocabulary is controlled, so this is the only way one
+/// comes into existence — assigning an unknown slug to an app is an error, not
+/// an implicit create.
+#[derive(Deserialize)]
+pub struct AdminCreateAppTagRequest {
+    /// URL-safe slug, unique. Lowercase letters, digits and hyphens.
+    pub slug: String,
+    /// Chip / heading label. Required: deriving it from the slug is what
+    /// mangles `NIP-96`.
+    pub display_name: String,
+    /// Optional lede for a tag landing page.
+    pub description: Option<String>,
+}
+
+/// Patch a tag. All fields optional (omitted = unchanged).
+///
+/// `slug` and `display_name` are `Option<String>` rather than the nullable
+/// `Option<Option<String>>` used elsewhere, because both are `NOT NULL` and
+/// there is no null to clear to. `description` is nullable and accepts an
+/// explicit `null`.
+#[derive(Deserialize)]
+pub struct AdminUpdateAppTagRequest {
+    pub slug: Option<String>,
+    pub display_name: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub description: Option<Option<String>>,
+}
+
+/// Result of deleting a tag, which cascades its assignments.
+#[derive(Serialize)]
+pub struct AdminDeleteAppTagResult {
+    /// How many apps were untagged as a side effect. Reported because the
+    /// cascade is silent otherwise — an admin retiring a tag should be told
+    /// what it took with it.
+    pub assignments_removed: u64,
+}
+
+impl AdminAppInfo {
+    /// Build the admin view from a catalog row plus its already-loaded tags.
+    ///
+    /// Not a `From<App>` impl for the same reason as [`ApiApp::from_app`]:
+    /// tags do not live on `App`, and fetching them inside a per-item
+    /// conversion is where an N+1 over the listing would come from.
+    pub fn from_app(a: lnvps_db::App, tags: Vec<AdminAppTagRef>) -> Self {
+        Self {
+            tags,
             id: a.id,
             name: a.name,
             display_name: a.display_name,
@@ -4549,6 +4632,14 @@ pub struct AdminCreateAppRequest {
     /// Whether the app is offered in the catalog (default true).
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Grouping-label slugs to assign. Genuinely optional, unlike `category`:
+    /// an untagged app is a normal state, because nothing in the page title
+    /// depends on it.
+    ///
+    /// Every slug must already exist — an unknown one is a `400` naming it,
+    /// not an implicit create. Auto-creating is exactly the vocabulary drift a
+    /// controlled tag table exists to prevent.
+    pub tags: Option<Vec<String>>,
 }
 
 /// Update a catalog app (all fields optional; omitted = unchanged).
@@ -4601,6 +4692,14 @@ pub struct AdminUpdateAppRequest {
     pub interval_type: Option<ApiIntervalType>,
     pub setup_amount: Option<u64>,
     pub enabled: Option<bool>,
+    /// Replace-set of grouping-label slugs: omit to leave the set unchanged,
+    /// send `[]` to clear it, send a list to make that list exact. Unknown
+    /// slugs are a `400`.
+    ///
+    /// A plain `Option<Vec<String>>` is enough here, unlike `category` above:
+    /// `[]` is a meaningful, honourable "clear", so there is no need to tell an
+    /// explicit `null` apart from an omitted key.
+    pub tags: Option<Vec<String>>,
 }
 
 /// Admin view of an app cluster.

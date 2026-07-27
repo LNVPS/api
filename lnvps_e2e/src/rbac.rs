@@ -361,6 +361,90 @@ mod tests {
         }
     }
 
+    /// The tag vocabulary reuses `AdminResource::App` (issue #240), so it is
+    /// gated by exactly the permissions the catalog already had — no new enum
+    /// value and no RBAC migration. `read_only` therefore cannot read or write
+    /// any of it, while the public facet endpoint stays open to everyone.
+    #[tokio::test]
+    async fn test_read_only_cannot_manage_app_tags() {
+        setup_rbac().await;
+        let client = admin_client_with_keys(read_only_keys().clone());
+
+        // View is `app::view`, which only super_admin holds — so even reading
+        // the vocabulary through the admin API is 403.
+        let resp = client.get_auth("/api/admin/v1/app-tags").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = client.get_auth("/api/admin/v1/app-tags/1").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/app-tags",
+                &serde_json::json!({ "slug": "e2e-rbac-tag", "display_name": "RBAC" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.text().await.unwrap().contains("Insufficient permissions"));
+
+        // Patch and delete are checked before the lookup, so a non-existent id
+        // is still 403 and not 404 — the permission gate must not double as an
+        // existence oracle.
+        let resp = client
+            .patch_auth(
+                "/api/admin/v1/app-tags/999999999",
+                &serde_json::json!({ "display_name": "RBAC" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = client
+            .delete_auth("/api/admin/v1/app-tags/999999999")
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Assigning tags to an app rides on the app's own create/update
+        // permissions, which read_only also lacks.
+        let resp = client
+            .patch_auth(
+                "/api/admin/v1/apps/999999999",
+                &serde_json::json!({ "tags": ["nostr"] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // super_admin does hold them, so the same create reaches validation —
+        // this is a permission boundary, not a broken route.
+        let admin = admin_client_with_keys(super_admin_keys().clone());
+        let slug = format!(
+            "e2e-rbac-{}",
+            &nostr::Keys::generate().public_key().to_hex()[..8]
+        );
+        let resp = admin
+            .post_auth(
+                "/api/admin/v1/app-tags",
+                &serde_json::json!({ "slug": &slug, "display_name": "RBAC" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let id = body["data"]["id"].as_u64().expect("tag id");
+        let _ = admin
+            .delete_auth(&format!("/api/admin/v1/app-tags/{id}"))
+            .await;
+
+        // The public facet endpoint is unauthenticated, like the catalog it
+        // describes (#227) — the admin gate above must not have closed it.
+        let resp = crate::client::user_client_no_auth()
+            .get("/api/v1/app-tags")
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// `app_deployment::delete` is enough to delete a deployment but not to
     /// purge one — that stays super_admin-only. Like the VM purge, the check
     /// runs before the lookup, so a non-existent id still yields 403.

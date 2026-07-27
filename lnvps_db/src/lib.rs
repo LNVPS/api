@@ -1017,6 +1017,38 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn update_app(&self, app: &App) -> DbResult<()>;
     async fn delete_app(&self, id: u64) -> DbResult<()>;
 
+    // ----- App tags -----
+
+    /// The whole tag vocabulary, ordered by slug so a chip row or facet bar is
+    /// stable across renders.
+    async fn list_app_tags(&self) -> DbResult<Vec<AppTag>>;
+    /// The vocabulary with the number of **enabled** apps carrying each tag.
+    ///
+    /// The count is what lets a frontend render a facet bar, and decide not to
+    /// generate a landing page for a tag with one app behind it, without first
+    /// fetching every app. Disabled apps are excluded because they are not in
+    /// the public catalog, so counting them would advertise results a visitor
+    /// cannot see.
+    async fn list_app_tags_with_counts(&self) -> DbResult<Vec<(AppTag, u64)>>;
+    async fn get_app_tag(&self, id: u64) -> DbResult<AppTag>;
+    async fn get_app_tag_by_slug(&self, slug: &str) -> DbResult<AppTag>;
+    async fn insert_app_tag(&self, tag: &AppTag) -> DbResult<u64>;
+    async fn update_app_tag(&self, tag: &AppTag) -> DbResult<()>;
+    /// Delete a tag, cascading its assignments. Returns how many assignments
+    /// went with it — deleting a tag silently untags apps, so the caller needs
+    /// to be able to say what it just did.
+    async fn delete_app_tag(&self, id: u64) -> DbResult<u64>;
+    /// Tags for many apps in one query, as `(app_id, tag)` pairs ordered by
+    /// `app_id` then `slug`.
+    ///
+    /// Bulk by construction: the catalog listing maps every enabled app in one
+    /// pass, so a per-app lookup here would be an N+1. An empty `app_ids`
+    /// returns empty without touching the database.
+    async fn list_app_tag_assignments(&self, app_ids: &[u64]) -> DbResult<Vec<(u64, AppTag)>>;
+    /// Replace an app's tag set with exactly `tag_ids`. Adds what is missing
+    /// and removes what is no longer listed; an empty slice clears the set.
+    async fn set_app_tags(&self, app_id: u64, tag_ids: &[u64]) -> DbResult<()>;
+
     // ----- App clusters -----
 
     /// List app clusters. When `enabled_only` is set, only clusters that accept

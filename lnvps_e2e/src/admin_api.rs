@@ -98,6 +98,7 @@ mod tests {
             "/api/admin/v1/payment_methods",
             "/api/admin/v1/ip_space",
             "/api/admin/v1/apps",
+            "/api/admin/v1/app-tags",
             "/api/admin/v1/app-deployments",
             "/api/admin/v1/app_clusters",
         ];
@@ -916,6 +917,407 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// App tags (issue #240): the vocabulary CRUD, replace-set assignment on
+    /// an app, rejection of unknown slugs, the delete cascade, and all of it
+    /// reaching the public catalog — including the `?tag=` filter, which is
+    /// what a tag landing page is actually built on.
+    #[tokio::test]
+    async fn test_admin_app_tags() {
+        let client = setup().await;
+        // Unique slugs and app names so the test can be re-run against the
+        // same database, and so it cannot collide with the seeded vocabulary.
+        let suffix = nostr::Keys::generate().public_key().to_hex()[..8].to_string();
+        let tag_a = format!("e2e-alpha-{suffix}");
+        let tag_b = format!("e2e-beta-{suffix}");
+
+        // --- Vocabulary CRUD -------------------------------------------------
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/app-tags",
+                &serde_json::json!({ "slug": &tag_a, "display_name": "  Alpha  " }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let tag_a_id = body["data"]["id"].as_u64().expect("tag id");
+        assert_eq!(body["data"]["display_name"].as_str(), Some("Alpha"));
+        assert!(body["data"]["description"].is_null());
+        assert_eq!(body["data"]["app_count"].as_u64(), Some(0));
+
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/app-tags",
+                &serde_json::json!({
+                    "slug": &tag_b,
+                    "display_name": "NIP-96",
+                    "description": "Beta tag"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let tag_b_id = body["data"]["id"].as_u64().expect("tag id");
+        // display_name is stored verbatim, not derived: title-casing `nip-96`
+        // in a client would yield `Nip-96`.
+        assert_eq!(body["data"]["display_name"].as_str(), Some("NIP-96"));
+
+        // Duplicate slug is refused — the vocabulary is controlled, so two
+        // tags reading the same is the drift the table exists to prevent.
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/app-tags",
+                &serde_json::json!({ "slug": &tag_a, "display_name": "Alpha again" }),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK, "duplicate slug refused");
+
+        // Slug must be URL-safe: it is a path segment and a query value.
+        for bad in ["Alpha", "with space", "under_score", "-lead", "trail-", "  "] {
+            let resp = client
+                .post_auth(
+                    "/api/admin/v1/app-tags",
+                    &serde_json::json!({ "slug": bad, "display_name": "X" }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "slug {bad:?} should be rejected"
+            );
+        }
+        // display_name is required, not derivable.
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/app-tags",
+                &serde_json::json!({ "slug": format!("{tag_a}-x"), "display_name": "  " }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // PATCH: omitted leaves unchanged, description clears to null.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/app-tags/{tag_b_id}"),
+                &serde_json::json!({ "description": null }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(body["data"]["description"].is_null());
+        assert_eq!(
+            body["data"]["slug"].as_str(),
+            Some(tag_b.as_str()),
+            "omitted slug unchanged"
+        );
+
+        // --- Assignment on an app -------------------------------------------
+        let app_body = |tags: Option<Value>| {
+            let mut v = serde_json::json!({
+                "name": format!("e2e-tags-{suffix}"),
+                "display_name": "E2E Tagged",
+                "category": "Nostr relay",
+                "compose": "services:\n  relay:\n    image: example/relay:latest\n",
+                "amount": 1000,
+                "currency": "usd",
+                "interval_amount": 1,
+                "interval_type": "month",
+                "setup_amount": 0
+            });
+            if let Some(t) = tags {
+                v["tags"] = t;
+            }
+            v
+        };
+
+        // An unknown slug fails the whole create — naming the slug, and
+        // without leaving a created-but-untagged app behind.
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/apps",
+                &app_body(Some(serde_json::json!([&tag_a, "no-such-tag"]))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(resp.text().await.unwrap().contains("no-such-tag"));
+
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/apps",
+                &app_body(Some(serde_json::json!([&tag_a, &tag_b]))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "the rejected create must not have consumed the app name"
+        );
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let app_id = body["data"]["id"].as_u64().expect("app id");
+        let slugs = |v: &Value| -> Vec<String> {
+            v["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["slug"].as_str().unwrap().to_string())
+                .collect()
+        };
+        // Ordered by slug, and `-alpha-` sorts before `-beta-`.
+        assert_eq!(slugs(&body["data"]), vec![tag_a.clone(), tag_b.clone()]);
+
+        // Counts pick the assignment up.
+        let resp = client.get_auth("/api/admin/v1/app-tags").await.unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let count_of = |body: &Value, id: u64| -> u64 {
+            body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["id"].as_u64() == Some(id))
+                .expect("tag in vocabulary")["app_count"]
+                .as_u64()
+                .unwrap()
+        };
+        assert_eq!(count_of(&body, tag_a_id), 1);
+        assert_eq!(count_of(&body, tag_b_id), 1);
+
+        // Replace-set: the sent list becomes exact, not merged.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "tags": [&tag_b] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(slugs(&body["data"]), vec![tag_b.clone()]);
+
+        // Omitting `tags` leaves the set alone — it must not read as "clear".
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "display_name": "E2E Tagged Renamed" }),
+            )
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(slugs(&body["data"]), vec![tag_b.clone()], "omitted = unchanged");
+
+        // An unknown slug on PATCH leaves the existing set untouched rather
+        // than half-applying.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "tags": [&tag_a, "no-such-tag"] }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(slugs(&body["data"]), vec![tag_b.clone()]);
+
+        // `[]` clears.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "tags": [] }),
+            )
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(slugs(&body["data"]).is_empty());
+        // Restore both for the public-surface checks below.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "tags": [&tag_a, &tag_b, &tag_a] }),
+            )
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(
+            slugs(&body["data"]),
+            vec![tag_a.clone(), tag_b.clone()],
+            "a repeated slug is one assignment, not a duplicate-key error"
+        );
+
+        // --- Public surface --------------------------------------------------
+        let public = user_client_no_auth();
+
+        let resp = public.get(&format!("/api/v1/apps/{app_id}")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(slugs(&body["data"]), vec![tag_a.clone(), tag_b.clone()]);
+        // display_name rides along: a client cannot recover `NIP-96` from a slug.
+        let beta = body["data"]["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["slug"].as_str() == Some(tag_b.as_str()))
+            .unwrap();
+        assert_eq!(beta["display_name"].as_str(), Some("NIP-96"));
+
+        // The facet endpoint is public, like the catalog it describes.
+        let resp = public.get("/api/v1/app-tags").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let public_tag = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["slug"].as_str() == Some(tag_a.as_str()))
+            .expect("tag in public vocabulary");
+        assert_eq!(public_tag["app_count"].as_u64(), Some(1));
+
+        // The filter, in both spellings a client might build. Percent-decoding
+        // is axum's half of `tag_filter`, so it is exercised here rather than
+        // in the unit test.
+        let listed_ids = |body: &Value| -> Vec<u64> {
+            body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|a| a["id"].as_u64().unwrap())
+                .collect()
+        };
+        for query in [
+            format!("?tag={tag_a}&tag={tag_b}"),
+            format!("?tag={tag_a}%2C{tag_b}"),
+        ] {
+            let resp = public.get(&format!("/api/v1/apps{query}")).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            assert!(
+                listed_ids(&body).contains(&app_id),
+                "AND filter should match an app carrying both tags ({query})"
+            );
+        }
+
+        // AND, not OR: adding a tag the app does not carry excludes it.
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/app-tags",
+                &serde_json::json!({ "slug": format!("e2e-gamma-{suffix}"), "display_name": "Gamma" }),
+            )
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let tag_c_id = body["data"]["id"].as_u64().expect("tag id");
+        let resp = public
+            .get(&format!("/api/v1/apps?tag={tag_a}&tag=e2e-gamma-{suffix}"))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(!listed_ids(&body).contains(&app_id), "AND, not OR");
+
+        // An unknown or retired slug is an empty list with 200, not a 404: the
+        // caller is a filter UI and a stale chip should degrade to "no
+        // results", not to an error page.
+        let resp = public.get("/api/v1/apps?tag=no-such-tag").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(body["data"].as_array().unwrap().is_empty());
+
+        // A cleared filter means "no filter", not "the empty-string tag".
+        let resp = public.get("/api/v1/apps?tag=").await.unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(
+            listed_ids(&body).contains(&app_id),
+            "?tag= must not filter everything out"
+        );
+
+        // A disabled app leaves the public catalog and stops being counted,
+        // but keeps its assignments for when it is re-enabled.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "enabled": false }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(slugs(&body["data"]), vec![tag_a.clone(), tag_b.clone()]);
+        let resp = public.get("/api/v1/app-tags").await.unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let public_tag = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["slug"].as_str() == Some(tag_a.as_str()))
+            .expect("tag still in vocabulary");
+        assert_eq!(
+            public_tag["app_count"].as_u64(),
+            Some(0),
+            "disabled apps are not counted"
+        );
+
+        // --- Delete cascade --------------------------------------------------
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/app-tags/{tag_a_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(
+            body["data"]["assignments_removed"].as_u64(),
+            Some(1),
+            "the cascade is otherwise invisible, so it is reported"
+        );
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(slugs(&body["data"]), vec![tag_b.clone()]);
+
+        // Deleting a tag nothing carries reports zero, and a non-existent one
+        // is a 404 rather than a 200 claiming it removed nothing.
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/app-tags/{tag_c_id}"))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"]["assignments_removed"].as_u64(), Some(0));
+        let resp = client
+            .delete_auth("/api/admin/v1/app-tags/999999999")
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK, "unknown tag id is not a 200");
+
+        // Deleting the app cascades the other way: the tag survives, its
+        // assignment does not.
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/app-tags/{tag_b_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"]["app_count"].as_u64(), Some(0));
+
+        // Cleanup.
+        let _ = client
+            .delete_auth(&format!("/api/admin/v1/app-tags/{tag_b_id}"))
+            .await;
     }
 
     /// Top-level admin listing of all app deployments (oversight/support).
