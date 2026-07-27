@@ -353,14 +353,51 @@ fn container_security_context_for(
 const INIT_TMP_DIR: &str = "/tmp";
 const INIT_TMP_VOLUME: &str = "init-tmp";
 
+/// Pod-local name for a `scratch:` path's `emptyDir` (#264).
+///
+/// The declaration index makes it unique — slugging the path alone does not,
+/// since `/run/mysqld` and `/run-mysqld` are different paths compose accepts
+/// and would slug the same, and two volumes sharing a name is an invalid pod
+/// spec. The slug is carried anyway so `kubectl describe` reads as
+/// `scratch-0-run-mysqld` rather than `scratch-0`, truncated to keep the whole
+/// name inside the 63-character DNS-1123 label limit.
+fn scratch_volume_name(index: usize, path: &str) -> String {
+    let slug: String = path
+        .trim_matches('/')
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                c
+            } else if c.is_ascii_uppercase() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .take(40)
+        .collect();
+    // A DNS-1123 label must start and end alphanumeric, so a path that slugs to
+    // nothing usable (`/-`) falls back to the index alone.
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        format!("scratch-{index}")
+    } else {
+        format!("scratch-{index}-{slug}")
+    }
+}
+
 /// A compose `init:` step as a Kubernetes init container (#244).
 ///
 /// The kubelet runs these to completion, in declaration order, before the
 /// service's own container starts, and restarts a failed one — which is the
 /// gate: a service whose setup step has not succeeded never runs. It sees
-/// exactly what the service container sees (`mounts`: the service's volumes and
-/// config files), plus a writable [`INIT_TMP_DIR`], and is hardened the same
-/// way.
+/// exactly what the service container sees (`mounts`: the service's volumes,
+/// scratch paths and config files), plus a writable [`INIT_TMP_DIR`], and is
+/// hardened the same way.
+///
+/// A service that declares `scratch:` at `/tmp` already supplies that mount, so
+/// the step's own is skipped: two volumeMounts at one path is an invalid pod
+/// spec, and the service's declaration is the one the author asked for.
 ///
 /// Resources are taken as declared, unscaled by the deployment's size
 /// multiplier: a setup step does fixed work, and a pod reserves
@@ -368,11 +405,13 @@ const INIT_TMP_VOLUME: &str = "init-tmp";
 /// only ever cost less than the scaled service it precedes.
 pub fn build_init_container(init: &ResolvedInit, mounts: &[VolumeMount]) -> Container {
     let mut mounts = mounts.to_vec();
-    mounts.push(VolumeMount {
-        name: INIT_TMP_VOLUME.to_string(),
-        mount_path: INIT_TMP_DIR.to_string(),
-        ..Default::default()
-    });
+    if !mounts.iter().any(|m| m.mount_path == INIT_TMP_DIR) {
+        mounts.push(VolumeMount {
+            name: INIT_TMP_VOLUME.to_string(),
+            mount_path: INIT_TMP_DIR.to_string(),
+            ..Default::default()
+        });
+    }
 
     Container {
         name: init.name.clone(),
@@ -581,6 +620,29 @@ pub fn build_deployment(
         });
     }
 
+    // Scratch paths (#264): writable, node-local, discarded with the pod. The
+    // root filesystem is read-only, so an image that needs a runtime directory
+    // it does not persist — mariadb's `/run/mysqld`, postgres' socket dir,
+    // InnoDB's `/tmp` — has nowhere to write without one of these, and exits on
+    // startup. `sizeLimit` is what stops one tenant's scratch filling the node
+    // it shares: the kubelet evicts the pod that exceeds it.
+    for (i, s) in svc.scratch.iter().enumerate() {
+        let vol_name = scratch_volume_name(i, &s.path);
+        volumes.push(K8sVolume {
+            name: vol_name.clone(),
+            empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource {
+                size_limit: Some(Quantity(s.size_or_default().to_string())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        mounts.push(VolumeMount {
+            name: vol_name,
+            mount_path: s.path.clone(),
+            ..Default::default()
+        });
+    }
+
     // Config files: non-sensitive via ConfigMap, sensitive via Secret, each
     // mounted read-only at its path with subPath so it doesn't shadow the dir.
     let has_cm = files.iter().any(|f| !f.sensitive);
@@ -625,7 +687,14 @@ pub fn build_deployment(
         .iter()
         .map(|i| build_init_container(i, &mounts))
         .collect();
-    if !init_containers.is_empty() {
+    // ...unless the service declares its own `scratch:` at that path, in which
+    // case the steps mount that instead and this volume would go unreferenced.
+    let init_tmp_referenced = init_containers.iter().any(|c| {
+        c.volume_mounts
+            .as_ref()
+            .is_some_and(|m| m.iter().any(|m| m.name == INIT_TMP_VOLUME))
+    });
+    if init_tmp_referenced {
         volumes.push(K8sVolume {
             name: INIT_TMP_VOLUME.to_string(),
             empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource::default()),
@@ -1964,6 +2033,128 @@ config:
         assert!(render("s3").init_containers.is_none());
     }
 
+    /// A `scratch:` path renders an `emptyDir` with a `sizeLimit` and a mount
+    /// at that path, alongside — not instead of — the service's PVCs (#264).
+    /// Without one, a database image has nowhere to write its socket, pid file
+    /// or temporary files under the read-only root filesystem, and exits on
+    /// startup.
+    #[test]
+    fn scratch_renders_bounded_empty_dirs() {
+        let c = lnvps_compose::Compose::parse(
+            "services:\n  db:\n    image: mariadb:11\n    user: \"999\"\n    \
+             volumes:\n      - { name: data, path: /var/lib/mysql, size: 5Gi }\n    \
+             scratch:\n      - { path: /tmp, size: 512Mi }\n      - { path: /run/mysqld }\n",
+        )
+        .unwrap();
+        let pod = build_deployment(9, "db", &c.services["db"], &BTreeMap::new(), &[], 1, 1, &[])
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+
+        let volumes = pod.volumes.as_ref().unwrap();
+        let scratch: Vec<_> = volumes
+            .iter()
+            .filter(|v| v.empty_dir.is_some())
+            .map(|v| {
+                (
+                    v.name.clone(),
+                    v.empty_dir.as_ref().unwrap().size_limit.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            scratch,
+            vec![
+                ("scratch-0-tmp".to_string(), Some(Quantity("512Mi".into()))),
+                (
+                    "scratch-1-run-mysqld".to_string(),
+                    // Undeclared falls back rather than being unbounded — an
+                    // emptyDir with no limit can fill the node it shares.
+                    Some(Quantity(lnvps_compose::DEFAULT_SCRATCH_SIZE.into()))
+                ),
+            ]
+        );
+
+        // The data volume is still a PVC, and the scratch mounts sit beside it.
+        assert!(
+            volumes
+                .iter()
+                .any(|v| v.name == "db-data" && v.persistent_volume_claim.is_some())
+        );
+        let mounts = pod.containers[0].volume_mounts.as_ref().unwrap();
+        let at = |p: &str| mounts.iter().find(|m| m.mount_path == p).map(|m| &m.name);
+        assert_eq!(at("/var/lib/mysql"), Some(&"db-data".to_string()));
+        assert_eq!(at("/tmp"), Some(&"scratch-0-tmp".to_string()));
+        assert_eq!(at("/run/mysqld"), Some(&"scratch-1-run-mysqld".to_string()));
+
+        // Scratch is not storage: it is node-local and discarded with the pod,
+        // so it must not appear in what the customer is sold or billed for.
+        let fp = c.footprint().unwrap();
+        assert_eq!(fp.storage_bytes, 5 * 1024 * 1024 * 1024);
+    }
+
+    /// A service that declares `scratch:` at `/tmp` supplies the init steps'
+    /// scratch too — the step must not get a second mount at the same path,
+    /// which is an invalid pod spec, and the unused `init-tmp` volume drops out
+    /// with it (#264).
+    #[test]
+    fn service_scratch_at_tmp_replaces_the_init_step_default() {
+        let c = lnvps_compose::Compose::parse(
+            "services:\n  db:\n    image: mariadb:11\n    user: \"999\"\n    \
+             volumes:\n      - { name: data, path: /var/lib/mysql, size: 5Gi }\n    \
+             scratch:\n      - { path: /tmp }\n    init:\n      \
+             - name: seed\n        image: busybox\n        command: [\"true\"]\n",
+        )
+        .unwrap();
+        let resolved = c.resolve_init(&std::collections::HashMap::new()).unwrap();
+        let pod = build_deployment(
+            9,
+            "db",
+            &c.services["db"],
+            &BTreeMap::new(),
+            &[],
+            1,
+            1,
+            &resolved["db"],
+        )
+        .spec
+        .unwrap()
+        .template
+        .spec
+        .unwrap();
+
+        let step = &pod.init_containers.as_ref().unwrap()[0];
+        let mounts = step.volume_mounts.as_ref().unwrap();
+        assert_eq!(
+            mounts
+                .iter()
+                .filter(|m| m.mount_path == INIT_TMP_DIR)
+                .count(),
+            1,
+            "two mounts at one path is rejected by the kubelet"
+        );
+        assert_eq!(
+            mounts
+                .iter()
+                .find(|m| m.mount_path == INIT_TMP_DIR)
+                .map(|m| m.name.as_str()),
+            Some("scratch-0-tmp"),
+            "the step writes into the scratch the service declared"
+        );
+        // It also sees the service's data volume, as it always did.
+        assert!(mounts.iter().any(|m| m.mount_path == "/var/lib/mysql"));
+        assert!(
+            !pod.volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|v| v.name == INIT_TMP_VOLUME),
+            "the default scratch volume is unreferenced and must not be declared"
+        );
+    }
+
     /// A secret declaring `bytes:` is generated at that width, and one that
     /// does not keeps the historical 24 bytes.
     #[test]
@@ -2227,6 +2418,9 @@ config:
             let files = c
                 .resolve_files(&vars)
                 .unwrap_or_else(|e| panic!("{name}: resolve_files: {e}"));
+            let init = c
+                .resolve_init(&vars)
+                .unwrap_or_else(|e| panic!("{name}: resolve_init: {e}"));
 
             // Every service renders a Deployment with its image; ported services
             // render a Service; declared volumes render PVCs; resolved files stay
@@ -2241,7 +2435,16 @@ config:
                         f.path
                     );
                 }
-                let dep = build_deployment(id, sname, svc, &senv, &sfiles, 1, 1, &[]);
+                let dep = build_deployment(
+                    id,
+                    sname,
+                    svc,
+                    &senv,
+                    &sfiles,
+                    1,
+                    1,
+                    init.get(sname).map(Vec::as_slice).unwrap_or_default(),
+                );
                 let pod = dep.spec.unwrap().template.spec.unwrap();
                 let ctr = &pod.containers[0];
                 assert_eq!(ctr.image.as_deref(), Some(svc.image.as_str()));
@@ -2272,6 +2475,33 @@ config:
                         Some(uid),
                         "{name}/{sname}: fsGroup must match runAsUser"
                     );
+                }
+                // No container may mount two things at one path, and every
+                // mount must name a volume the pod declares. The kubelet
+                // rejects either, and neither is visible to compose validation
+                // — `scratch:` (#264) made both reachable by a catalog edit.
+                let declared: std::collections::BTreeSet<&str> = pod
+                    .volumes
+                    .iter()
+                    .flatten()
+                    .map(|v| v.name.as_str())
+                    .collect();
+                for c in std::iter::once(ctr).chain(pod.init_containers.iter().flatten()) {
+                    let mut paths = std::collections::BTreeSet::new();
+                    for m in c.volume_mounts.iter().flatten() {
+                        assert!(
+                            paths.insert(m.mount_path.as_str()),
+                            "{name}/{sname}: container '{}' mounts '{}' twice",
+                            c.name,
+                            m.mount_path
+                        );
+                        assert!(
+                            declared.contains(m.name.as_str()),
+                            "{name}/{sname}: container '{}' mounts undeclared volume '{}'",
+                            c.name,
+                            m.name
+                        );
+                    }
                 }
                 assert_eq!(
                     build_service(id, sname, svc).is_some(),

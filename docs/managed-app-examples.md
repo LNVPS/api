@@ -157,13 +157,54 @@ Rules worth knowing:
   build a URL out of one.
 
 **Read-only root filesystem** — this applies to *every* service, `user: root`
-included, and only declared `volumes` are writable. An image that writes
-outside its data directory needs either a small volume for that path or an env
-var redirecting it: `postgres` wants `/var/run/postgresql` (postmaster lock +
-unix socket), `redis` wants `/data` (otherwise its bgsave fails and it starts
+included. Only declared `volumes` and `scratch:` paths are writable. An image
+that writes outside its data directory needs one of those, or an env var
+redirecting it: `redis` wants `/data` (otherwise its bgsave fails and it starts
 refusing writes with `MISCONF`), and an image that logs to a file needs to be
 pointed at stdout. This is not caught at validation time — it shows up as a
 crash loop on first boot.
+
+**`scratch`** — writable paths the app does *not* keep, one `emptyDir` each:
+created empty with the pod, discarded with it (issue #264).
+
+```yaml
+services:
+  db:
+    image: mariadb:11
+    user: root                        # see `user` above
+    volumes:
+      - { name: data, path: /var/lib/mysql, size: 5Gi, label: database }
+    scratch:
+      - { path: /tmp }                # size defaults to 256Mi
+      - { path: /run/mysqld, size: 32Mi }
+  app:
+    image: example/app:latest
+    user: "1000"
+    depends_on: [db]
+    ports:
+      - { name: http, container: 3000, protocol: http, expose: ingress }
+```
+
+Every database image needs at least one. `mariadb` writes InnoDB's temporary
+files under `/tmp` and its pid file and unix socket under `/run/mysqld`;
+`postgres` writes its postmaster lock and socket under `/var/run/postgresql`.
+Without a writable path for those the process exits during startup — with
+`Can't create/write to file '/tmp/…' (Errcode: 30 "Read-only file system")` or
+`could not create lock file "/var/run/postgresql/.s.PGSQL.5432.lock"`.
+
+Use it, not a `volume`, for anything the app would be happy to lose: a volume
+is billed, backed up, counted in the storage the buyer is shown, and it hands
+the app back a stale pid file after a restart. Conversely, do not put data in
+scratch — it is gone on every restart, and validation rejects a `scratch:` that
+sits inside a volume (or a volume inside a scratch) for that reason.
+
+`size` defaults to `256Mi` and may not exceed `1Gi`: this is the node's own
+disk, shared with every other tenant, and the kubelet evicts a pod that writes
+past its limit. Something that needs more than that is storage — declare a
+`volume`.
+
+An `init:` step already gets a writable `/tmp`. If the service declares
+`scratch:` at `/tmp` the step shares that one instead.
 
 `user` also accepts a **numeric UID** (e.g. `user: "1000"`), which is required
 when the image's Dockerfile sets `USER` to a *name* rather than a number (e.g.
@@ -322,6 +363,11 @@ services:
       MARIADB_DATABASE: route96
     volumes:
       - { name: data, path: /var/lib/mysql, size: 5Gi, label: database }
+    scratch:
+      # readOnlyRootFilesystem: InnoDB's temporary files, and the pid file +
+      # unix socket mariadbd writes before it accepts a connection
+      - { path: /tmp }
+      - { path: /run/mysqld, size: 32Mi }
     backup:
       command: ["sh", "-c", "exec mariadb-dump --all-databases -uroot -p\"$MARIADB_ROOT_PASSWORD\""]
       artifact: route96.sql
@@ -611,8 +657,10 @@ services:
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - { name: data, path: /var/lib/postgresql/data, size: 20Gi, label: database }
-      # readOnlyRootFilesystem: the postmaster lock + unix socket need a writable dir
-      - { name: run, path: /var/run/postgresql, size: 1Gi }
+    scratch:
+      # readOnlyRootFilesystem: the postmaster lock + unix socket need a
+      # writable dir, but not a persistent one
+      - { path: /var/run/postgresql, size: 32Mi }
     backup:
       command: ["sh", "-c", "exec pg_dumpall -U buzz"]
       artifact: buzz.sql

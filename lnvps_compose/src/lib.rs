@@ -46,6 +46,9 @@ pub struct Service {
     /// Persistent volumes → PVCs.
     #[serde(default)]
     pub volumes: Vec<Volume>,
+    /// Writable-but-throwaway paths → `emptyDir`. See [`Scratch`].
+    #[serde(default)]
+    pub scratch: Vec<Scratch>,
     /// Advisory startup ordering hints (k8s has no hard ordering; apps retry).
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -358,6 +361,59 @@ pub struct Volume {
 /// author cannot put a paragraph on a buyer's screen.
 pub const MAX_VOLUME_LABEL_LEN: usize = 40;
 
+/// A writable throwaway path inside a service's container → one `emptyDir`
+/// (issue #264).
+///
+/// Every container runs with a read-only root filesystem, so the only writable
+/// paths are the declared `volumes`. That is right for app data and wrong for
+/// the runtime scratch an image needs before it has done anything worth
+/// keeping: `mariadb` writes InnoDB's temporary files under `/tmp` and its pid
+/// file and unix socket under `/run/mysqld`, `postgres` its lock file and
+/// socket under `/var/run/postgresql`. Without a writable path for those the
+/// process exits on startup — which is not a per-app quirk to work around but
+/// the normal shape of a database image.
+///
+/// A PVC for a socket directory is the wrong instrument: it is billed, backed
+/// up, counted against the app's storage footprint, and it survives a restart
+/// carrying a stale pid file. An `emptyDir` is none of those — it is created
+/// empty with the pod and discarded with it, which is exactly what a runtime
+/// directory wants.
+///
+/// It is declared per path rather than mounted blindly at `/tmp` because the
+/// paths differ per image (`/run/mysqld` vs `/var/run/postgresql`) and because
+/// a writable path a catalog author did not ask for is a place for an app to
+/// silently accumulate state that no backup covers.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Scratch {
+    /// Absolute mount path inside the container.
+    pub path: String,
+    /// Upper bound on what the app may write there, e.g. `256Mi`. Defaults to
+    /// [`DEFAULT_SCRATCH_SIZE`] and may not exceed [`MAX_SCRATCH_BYTES`].
+    ///
+    /// An `emptyDir` is backed by the node's own disk, which is shared by every
+    /// tenant on that node, so it is bounded: the kubelet evicts a pod that
+    /// exceeds its `sizeLimit` rather than letting one app fill the node.
+    #[serde(default)]
+    pub size: Option<String>,
+}
+
+impl Scratch {
+    /// Declared size, or [`DEFAULT_SCRATCH_SIZE`].
+    pub fn size_or_default(&self) -> &str {
+        self.size.as_deref().unwrap_or(DEFAULT_SCRATCH_SIZE)
+    }
+}
+
+/// Size of a `scratch:` path that does not declare one. Enough for a database
+/// image's socket, pid file and small temporary files; an app that needs more
+/// than this is asking for storage, not scratch.
+pub const DEFAULT_SCRATCH_SIZE: &str = "256Mi";
+
+/// Largest accepted `scratch:` size (1 GiB). Node-local disk is shared with
+/// every other tenant on the node and is not what a customer bought — anything
+/// bigger belongs in a `volume`, where it is sized, billed and backed up.
+pub const MAX_SCRATCH_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// One persistent volume of an app, resolved for display: which service it
 /// belongs to, what it is for, and how big it is (issue #260).
 ///
@@ -570,6 +626,59 @@ impl Compose {
                     }
                 }
             }
+            // Scratch paths: absolute, bounded, and not overlapping anything
+            // that holds data. A scratch mount that shadowed a volume would
+            // hide the customer's data behind an empty directory on every
+            // restart, and the app would look like it had lost it.
+            for (i, s) in svc.scratch.iter().enumerate() {
+                check_abs_no_traversal(sname, "scratch", &s.path)?;
+                let bytes = parse_bytes(s.size_or_default())
+                    .map_err(|e| anyhow!("service '{sname}': scratch '{}': {e}", s.path))?;
+                if bytes == 0 {
+                    bail!(
+                        "service '{sname}': scratch '{}': size must be non-zero",
+                        s.path
+                    );
+                }
+                if bytes > MAX_SCRATCH_BYTES {
+                    bail!(
+                        "service '{sname}': scratch '{}': size exceeds {MAX_SCRATCH_BYTES} bytes \
+                         — a path that needs more than that is a volume, not scratch",
+                        s.path
+                    );
+                }
+                for v in &svc.volumes {
+                    if s.path == v.path || path_is_within(&s.path, &v.path) {
+                        bail!(
+                            "service '{sname}': scratch '{}' is inside data volume '{}' — it would \
+                             shadow persisted data with an empty directory",
+                            s.path,
+                            v.path
+                        );
+                    }
+                    if path_is_within(&v.path, &s.path) {
+                        bail!(
+                            "service '{sname}': data volume '{}' is inside scratch '{}' — the \
+                             volume's data would not survive a restart",
+                            v.path,
+                            s.path
+                        );
+                    }
+                }
+                for other in svc.scratch.iter().skip(i + 1) {
+                    if s.path == other.path {
+                        bail!("service '{sname}': duplicate scratch path '{}'", s.path);
+                    }
+                    if path_is_within(&s.path, &other.path) || path_is_within(&other.path, &s.path)
+                    {
+                        bail!(
+                            "service '{sname}': scratch '{}' and '{}' are nested",
+                            s.path,
+                            other.path
+                        );
+                    }
+                }
+            }
             // depends_on must reference real services.
             for dep in &svc.depends_on {
                 if !self.services.contains_key(dep) {
@@ -617,6 +726,19 @@ impl Compose {
                             "service '{sname}': file '{}' overlaps data volume mount '{}'",
                             f.path,
                             v.path
+                        );
+                    }
+                }
+                // Nor inside a scratch path: the file is mounted read-only and
+                // the scratch directory is emptied on every restart, so which
+                // one wins is a question a catalog author should not have to
+                // ask.
+                for s in &svc.scratch {
+                    if f.path == s.path || path_is_within(&f.path, &s.path) {
+                        bail!(
+                            "service '{sname}': file '{}' overlaps scratch path '{}'",
+                            f.path,
+                            s.path
                         );
                     }
                 }
@@ -1591,6 +1713,70 @@ config:
             )
             .is_err()
         );
+    }
+
+    /// `scratch:` parses with and without an explicit size (#264).
+    #[test]
+    fn parses_scratch_paths() {
+        let c = Compose::parse(
+            "services:\n  db:\n    image: mariadb:11\n    scratch:\n      - { path: /tmp, size: 512Mi }\n      - { path: /run/mysqld }\n",
+        )
+        .unwrap();
+        let s = &c.services["db"].scratch;
+        assert_eq!(s.len(), 2);
+        assert_eq!(s[0].path, "/tmp");
+        assert_eq!(s[0].size_or_default(), "512Mi");
+        // An undeclared size falls back rather than being unbounded: an
+        // emptyDir with no sizeLimit can fill the node's disk.
+        assert_eq!(s[1].size_or_default(), DEFAULT_SCRATCH_SIZE);
+    }
+
+    /// Scratch paths are bounded, absolute, and may not overlap anything that
+    /// holds data (#264).
+    #[test]
+    fn validate_rejects_unusable_scratch() {
+        let svc = |scratch: &str| {
+            format!(
+                "services:\n  db:\n    image: mariadb:11\n    volumes:\n      - {{ name: data, path: /var/lib/mysql, size: 5Gi }}\n    scratch:\n{scratch}"
+            )
+        };
+        // Absolute, non-traversing, not '/' — the same rule volumes get.
+        assert!(Compose::parse(&svc("      - { path: tmp }\n")).is_err());
+        assert!(Compose::parse(&svc("      - { path: /var/../tmp }\n")).is_err());
+        assert!(Compose::parse(&svc("      - { path: / }\n")).is_err());
+        // Bounded: node-local disk is shared with every other tenant.
+        assert!(Compose::parse(&svc("      - { path: /tmp, size: 4Gi }\n")).is_err());
+        assert!(Compose::parse(&svc("      - { path: /tmp, size: 0 }\n")).is_err());
+        assert!(Compose::parse(&svc("      - { path: /tmp, size: enormous }\n")).is_err());
+        // Scratch inside a data volume would hide the customer's data behind an
+        // empty directory on every restart...
+        assert!(Compose::parse(&svc("      - { path: /var/lib/mysql/tmp }\n")).is_err());
+        assert!(Compose::parse(&svc("      - { path: /var/lib/mysql }\n")).is_err());
+        // ...and a data volume inside scratch would not survive one.
+        assert!(Compose::parse(&svc("      - { path: /var/lib }\n")).is_err());
+        // Duplicate and nested scratch paths render two mounts at one path,
+        // which the kubelet rejects.
+        assert!(Compose::parse(&svc("      - { path: /tmp }\n      - { path: /tmp }\n")).is_err());
+        assert!(
+            Compose::parse(&svc(
+                "      - { path: /run }\n      - { path: /run/mysqld }\n"
+            ))
+            .is_err()
+        );
+        // A config file inside a scratch path: mounted read-only into a
+        // directory that is emptied on restart.
+        assert!(
+            Compose::parse(
+                "services:\n  db:\n    image: mariadb:11\n    scratch:\n      - { path: /run/mysqld }\n    files:\n      - { path: /run/mysqld/my.cnf, content: \"x\" }\n"
+            )
+            .is_err()
+        );
+        // The shape route96's database actually needs.
+        let ok = Compose::parse(&svc(
+            "      - { path: /tmp }\n      - { path: /run/mysqld, size: 32Mi }\n",
+        ))
+        .unwrap();
+        assert_eq!(ok.services["db"].scratch.len(), 2);
     }
 
     #[test]
