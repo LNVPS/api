@@ -364,6 +364,54 @@ mod tests {
         );
     }
 
+    /// The automated refund endpoint refuses with 501 (issue #193). It used to
+    /// queue a work job whose only handler bails and answer 200 with the job
+    /// id, so an operator was told a refund had been dispatched while no money
+    /// moved and no record was written. The request is still validated first,
+    /// so a malformed one is still a 400.
+    #[tokio::test]
+    async fn test_admin_vm_refund_process_is_refused() {
+        let client = setup().await;
+        let resp = client.get_auth("/api/admin/v1/vms?limit=1").await.unwrap();
+        let data: ApiPaginatedData<Value> = parse_paginated(resp).await.unwrap();
+        if data.data.is_empty() {
+            eprintln!("Skipping: no VMs found for refund test");
+            return;
+        }
+        let vm_id = data.data[0]["id"].as_u64().unwrap();
+
+        // A well-formed request is refused, and the refusal says why.
+        let body = serde_json::json!({
+            "payment_method": "lightning",
+            "lightning_invoice": "lnbc1e2etestinvoice",
+            "reason": "e2e-test"
+        });
+        let resp = client
+            .post_auth(&format!("/api/admin/v1/vms/{vm_id}/refund"), &body)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("not implemented"), "{text}");
+        assert!(text.contains("no funds are moved"), "{text}");
+
+        // Validation still runs ahead of the refusal.
+        let bad = serde_json::json!({ "payment_method": "carrier-pigeon" });
+        let resp = client
+            .post_auth(&format!("/api/admin/v1/vms/{vm_id}/refund"), &bad)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // A lightning refund without an invoice is still a 400, not a 501.
+        let no_invoice = serde_json::json!({ "payment_method": "lightning" });
+        let resp = client
+            .post_auth(&format!("/api/admin/v1/vms/{vm_id}/refund"), &no_invoice)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn test_admin_vm_extend() {
         let client = setup().await;

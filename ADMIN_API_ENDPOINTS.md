@@ -518,39 +518,43 @@ Response:
 POST /api/admin/v1/vms/{vm_id}/refund
 ```
 
-Required Permission: `virtual_machines::delete`
+Required Permission: `virtual_machines::update`
 
-Initiates an automated refund process for a VM. This creates a work job that will be processed asynchronously by the
-worker system.
+**Not implemented — always returns `501`.** No funds are moved and no record is written.
+
+This endpoint used to queue a `ProcessVmRefund` work job and answer `200` with its job id, while the only handler for
+that job bails with "Refund processing is not yet implemented". The failure happened in a background job after the
+response, so an operator saw a real pro-rated amount from `GET /refund`, submitted it, and was told the refund had been
+dispatched — with nothing moved and nothing recorded on either side (issue #193).
+
+The request is still validated before the refusal, so the body below is checked the same way it will be once the payout
+path exists.
 
 Body:
 
 ```json
 {
   "payment_method": "lightning",
-  // Required - "lightning", "revolut", "paypal"
+  // Optional - "lightning" (default), "revolut", "paypal"
   "refund_from_date": 1705312200,
   // Optional - Unix timestamp to calculate refund from (defaults to current time)
   "reason": "Customer requested cancellation",
   // Optional - Reason for the refund
   "lightning_invoice": "lnbc..."
-  // Required when payment_method is "lightning"
+  // Required when payment_method is "lightning", rejected otherwise
 }
 ```
 
-Response:
+Response (`501 Not Implemented`):
 
 ```json
 {
-  "data": {
-    "job_dispatched": true,
-    "job_id": "stream-id-12345"
-  }
+  "error": "Automated refund processing is not implemented: no funds are moved and no record is written. Issue the refund out-of-band and record it against the VM's payment."
 }
 ```
 
-**Note:** The refund is processed asynchronously via work jobs. The admin will receive notifications about the refund
-status through their configured contact preferences.
+Errors: `400` for an invalid payment method or a lightning refund with no invoice, `403` without
+`virtual_machines::update`, `404` for an unknown VM.
 
 #### Extend VM
 
