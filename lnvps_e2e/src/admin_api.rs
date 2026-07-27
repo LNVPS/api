@@ -866,6 +866,98 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A service can declare `scratch:` paths (issue #264) — writable
+    /// `emptyDir`s a database image needs under the read-only root filesystem —
+    /// and a declaration that would cost the customer data or the node its disk
+    /// is refused at create and at update, not discovered in a crash loop.
+    #[tokio::test]
+    async fn test_admin_app_compose_scratch_paths() {
+        let client = setup().await;
+        let suffix = nostr::Keys::generate().public_key().to_hex()[..8].to_string();
+        let slug = format!("e2e-scratch-{suffix}");
+
+        let compose = |scratch: &str| {
+            format!(
+                "services:\n  db:\n    image: mariadb:11\n    user: \"999\"\n    \
+                 volumes:\n      - {{ name: data, path: /var/lib/mysql, size: 5Gi }}\n    \
+                 scratch:\n{scratch}  \
+                 app:\n    image: example/app:latest\n    user: \"1000\"\n    \
+                 depends_on: [db]\n    ports:\n      \
+                 - {{ name: http, container: 3000, protocol: http, expose: ingress }}\n"
+            )
+        };
+        let ok = || compose("      - { path: /tmp }\n      - { path: /run/mysqld, size: 32Mi }\n");
+        let body = |compose: String| {
+            serde_json::json!({
+                "name": slug,
+                "display_name": "Scratch App",
+                "category": "Media server",
+                "compose": compose,
+                "amount": 1000,
+                "currency": "usd",
+                "interval_amount": 1,
+                "interval_type": "month",
+                "setup_amount": 0
+            })
+        };
+
+        // Scratch inside a data volume would shadow the customer's data with an
+        // empty directory on every restart.
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/apps",
+                &body(compose("      - { path: /var/lib/mysql/tmp }\n")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = resp.text().await.unwrap();
+        assert!(err.contains("shadow persisted data"), "{err}");
+
+        // Node-local disk is shared with every other tenant, so it is bounded.
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/apps",
+                &body(compose("      - { path: /tmp, size: 4Gi }\n")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = resp.text().await.unwrap();
+        assert!(err.contains("scratch"), "{err}");
+
+        // Valid: accepted and stored verbatim.
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &body(ok()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let created: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let app_id = created["data"]["id"].as_u64().expect("app id");
+        assert!(
+            created["data"]["compose"]
+                .as_str()
+                .unwrap()
+                .contains("scratch:")
+        );
+
+        // The same rules apply on update.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "compose": compose("      - { path: /var/lib }\n") }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// A generated secret can declare its byte length (issue #243), and an
     /// unusable length is refused when the app is created or updated rather
     /// than becoming an app that deploys and crash-loops on its own key.
