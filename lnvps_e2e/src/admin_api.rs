@@ -2969,6 +2969,181 @@ mod tests {
         );
     }
 
+    /// Recording a refund against a paid payment (issue #193, part 2).
+    ///
+    /// Builds its own fixture the same way the complete-payment lifecycle test
+    /// does — renew a VM to create an unpaid payment, complete it as admin —
+    /// then refunds it in two halves and checks the ledger arithmetic on the
+    /// way: the running total, the ceiling, the duplicate guard, and that the
+    /// refund shows up as a refund row rather than another payment.
+    #[tokio::test]
+    async fn test_admin_record_payment_refund_lifecycle() {
+        let user = user_client();
+        let admin = setup().await;
+
+        let resp = user.get_auth("/api/v1/vm").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let vms = body["data"].as_array().unwrap();
+        if vms.is_empty() {
+            eprintln!("Skipping refund test: no VMs found for test user");
+            return;
+        }
+        let vm_id = vms[0]["id"].as_u64().unwrap();
+
+        let resp = user
+            .get_auth(&format!("/api/v1/vm/{vm_id}/renew"))
+            .await
+            .unwrap();
+        if resp.status() != StatusCode::OK {
+            eprintln!("Skipping refund test: renew failed (Lightning node likely unavailable)");
+            return;
+        }
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let payment_id = body["data"]["id"].as_str().unwrap().to_string();
+
+        let resp = admin
+            .post_auth(
+                &format!("/api/admin/v1/vms/{vm_id}/payments/{payment_id}/complete"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "complete payment");
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let amount = body["data"]["amount"].as_u64().unwrap();
+        let tax = body["data"]["tax"].as_u64().unwrap();
+        assert!(amount > 1, "need a payment big enough to halve");
+
+        // Nothing refunded yet: the whole payment is refundable.
+        let refunds_url = format!("/api/admin/v1/vms/{vm_id}/payments/{payment_id}/refund");
+        let resp = admin.get_auth(&refunds_url).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"]["refunded_total"].as_u64().unwrap(), 0);
+        assert_eq!(
+            body["data"]["refundable_remaining"].as_u64().unwrap(),
+            amount
+        );
+
+        // Refund half of it, at a fixed timestamp so the duplicate guard below
+        // is deterministic.
+        let half = amount / 2;
+        let at = 1_760_000_000i64;
+        let first = serde_json::json!({
+            "amount": half,
+            "reason": "e2e-test partial refund",
+            "external_ref": "e2e-preimage",
+            "refunded_at": at
+        });
+        let resp = admin.post_auth(&refunds_url, &first).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "record refund");
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let refund = &body["data"];
+        assert_eq!(refund["payment_type"].as_str().unwrap(), "Refund");
+        assert_eq!(
+            refund["refunded_payment_id"].as_str().unwrap(),
+            payment_id,
+            "refund links to the payment it reverses"
+        );
+        assert_eq!(refund["amount"].as_u64().unwrap(), half);
+        assert!(refund["is_paid"].as_bool().unwrap());
+        // Tax is a slice of the tax actually charged, never more than it.
+        assert!(refund["tax"].as_u64().unwrap() <= tax);
+
+        // The same refund submitted twice is a conflict, not a second refund.
+        let resp = admin.post_auth(&refunds_url, &first).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "duplicate refund");
+
+        // More than what is left is refused.
+        let too_much = serde_json::json!({ "amount": amount, "refunded_at": at + 1 });
+        let resp = admin.post_auth(&refunds_url, &too_much).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "over-refund");
+
+        // The running total moved by exactly what was refunded.
+        let resp = admin.get_auth(&refunds_url).await.unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"]["refunded_total"].as_u64().unwrap(), half);
+        assert_eq!(
+            body["data"]["refundable_remaining"].as_u64().unwrap(),
+            amount - half
+        );
+        assert_eq!(body["data"]["refunds"].as_array().unwrap().len(), 1);
+
+        // Refund the remainder (amount omitted = everything still refundable),
+        // then the payment is closed to further refunds.
+        let rest = serde_json::json!({ "refunded_at": at + 2 });
+        let resp = admin.post_auth(&refunds_url, &rest).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "refund the remainder");
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"]["amount"].as_u64().unwrap(), amount - half);
+
+        let resp = admin
+            .post_auth(&refunds_url, &serde_json::json!({ "refunded_at": at + 3 }))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "fully refunded");
+
+        // A refund cannot be refunded: it is not a sale.
+        let refund_id = refund["id"].as_str().unwrap();
+        let resp = admin
+            .post_auth(
+                &format!("/api/admin/v1/vms/{vm_id}/payments/{refund_id}/refund"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "refund of a refund");
+
+        // The refund rows are visible on the VM's payment list, typed, so a
+        // client cannot mistake them for money the customer paid.
+        let resp = admin
+            .get_auth(&format!("/api/admin/v1/vms/{vm_id}/payments"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let rows = body["data"].as_array().unwrap();
+        let refunds: Vec<&Value> = rows
+            .iter()
+            .filter(|p| p["payment_type"].as_str() == Some("Refund"))
+            .collect();
+        assert!(refunds.len() >= 2, "both refunds listed: {}", rows.len());
+    }
+
+    /// A payment id that does not belong to the VM in the path cannot be
+    /// refunded through it, and a malformed one is a 400 rather than a lookup.
+    #[tokio::test]
+    async fn test_admin_record_refund_rejects_bad_payment_ids() {
+        let client = setup().await;
+        let resp = client.get_auth("/api/admin/v1/vms?limit=1").await.unwrap();
+        let data: ApiPaginatedData<Value> = parse_paginated(resp).await.unwrap();
+        if data.data.is_empty() {
+            eprintln!("Skipping: no VMs found for refund id test");
+            return;
+        }
+        let vm_id = data.data[0]["id"].as_u64().unwrap();
+
+        let fake = "0".repeat(64);
+        let resp = client
+            .post_auth(
+                &format!("/api/admin/v1/vms/{vm_id}/payments/{fake}/refund"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK, "unknown payment");
+
+        let resp = client
+            .post_auth(
+                &format!("/api/admin/v1/vms/{vm_id}/payments/not-hex/refund"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "malformed id");
+    }
+
     #[tokio::test]
     async fn test_admin_complete_subscription_payment_not_found() {
         let client = setup().await;

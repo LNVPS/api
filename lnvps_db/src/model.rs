@@ -1700,6 +1700,10 @@ pub enum VmHistoryActionType {
     PaymentReceived = 9,
     ConfigurationChanged = 10,
     Transferred = 11,
+    /// Money returned to the customer for this VM (issue #193). Recorded when
+    /// a refund is entered against one of the VM's payments, so the audit trail
+    /// shows the reversal next to the `PaymentReceived` it undoes.
+    Refunded = 12,
 }
 
 impl Display for VmHistoryActionType {
@@ -1717,6 +1721,7 @@ impl Display for VmHistoryActionType {
             VmHistoryActionType::PaymentReceived => write!(f, "payment_received"),
             VmHistoryActionType::ConfigurationChanged => write!(f, "configuration_changed"),
             VmHistoryActionType::Transferred => write!(f, "transferred"),
+            VmHistoryActionType::Refunded => write!(f, "refunded"),
         }
     }
 }
@@ -1738,6 +1743,7 @@ impl FromStr for VmHistoryActionType {
             "payment_received" => Ok(VmHistoryActionType::PaymentReceived),
             "configuration_changed" => Ok(VmHistoryActionType::ConfigurationChanged),
             "transferred" => Ok(VmHistoryActionType::Transferred),
+            "refunded" => Ok(VmHistoryActionType::Refunded),
             _ => Err(anyhow!("unknown VM history action type: {}", s)),
         }
     }
@@ -2057,6 +2063,32 @@ pub enum SubscriptionPaymentType {
     Renewal = 1,
     /// VM upgrade payment
     Upgrade = 2,
+    /// Money returned to the customer.
+    ///
+    /// Recorded as an ordinary paid row so it keeps the frozen `rate`, `tax`
+    /// and place-of-supply of the payment it reverses (see
+    /// `refunded_payment_id`), but its `amount`/`tax` are a **magnitude to
+    /// subtract**: the columns are `BIGINT UNSIGNED`, so the sign lives in the
+    /// type rather than the value. Every aggregation over payments has to
+    /// branch on [`SubscriptionPaymentType::is_refund`] — see
+    /// [`SubscriptionPaymentType::signum`].
+    Refund = 3,
+}
+
+impl SubscriptionPaymentType {
+    /// Whether this row returns money to the customer rather than collecting it.
+    pub fn is_refund(&self) -> bool {
+        matches!(self, SubscriptionPaymentType::Refund)
+    }
+
+    /// The sign this row's `amount`/`tax` carry when summed into earnings:
+    /// `-1` for a refund, `+1` for everything else.
+    ///
+    /// Aggregating payments without this overstates revenue and VAT by the
+    /// full refunded amount, because the stored values are unsigned.
+    pub fn signum(&self) -> i64 {
+        if self.is_refund() { -1 } else { 1 }
+    }
 }
 
 impl Display for SubscriptionPaymentType {
@@ -2065,6 +2097,7 @@ impl Display for SubscriptionPaymentType {
             SubscriptionPaymentType::Purchase => write!(f, "Purchase"),
             SubscriptionPaymentType::Renewal => write!(f, "Renewal"),
             SubscriptionPaymentType::Upgrade => write!(f, "Upgrade"),
+            SubscriptionPaymentType::Refund => write!(f, "Refund"),
         }
     }
 }
@@ -2182,6 +2215,14 @@ pub struct SubscriptionPayment {
     /// time. Losslessly records payments that mix rates/treatments.
     #[sqlx(default)]
     pub tax_breakdown: Option<serde_json::Value>,
+    /// For a [`SubscriptionPaymentType::Refund`] row, the payment it reverses.
+    ///
+    /// A refund is always recorded against a specific payment so its `rate`,
+    /// `tax` and place-of-supply are the ones frozen at that sale rather than
+    /// recomputed at today's rates — VAT is owed on what was charged, not on
+    /// what the same service would cost now. `None` on every other row.
+    #[sqlx(default)]
+    pub refunded_payment_id: Option<Vec<u8>>,
 }
 
 /// Subscription payment with company info (for admin views and time-series reporting)
@@ -2223,6 +2264,9 @@ pub struct SubscriptionPaymentWithCompany {
     /// Authoritative per-line-item VAT breakdown (JSON array), frozen at sale time.
     #[sqlx(default)]
     pub tax_breakdown: Option<serde_json::Value>,
+    /// For a [`SubscriptionPaymentType::Refund`] row, the payment it reverses.
+    #[sqlx(default)]
+    pub refunded_payment_id: Option<Vec<u8>>,
     // Company information
     pub company_id: u64,
     pub company_name: String,

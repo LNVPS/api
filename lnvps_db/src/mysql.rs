@@ -2646,6 +2646,18 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_refunds_for_payment(
+        &self,
+        payment_id: &Vec<u8>,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM subscription_payment WHERE refunded_payment_id = ? ORDER BY created",
+        )
+        .bind(payment_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
     async fn get_subscription_payment_by_ext_id(
         &self,
         external_id: &str,
@@ -2699,7 +2711,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()> {
         sqlx::query(
-            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, tax, processing_fee, time_value, metadata, paid_at, tax_rate, tax_country_code, tax_treatment, tax_evidence, tax_breakdown) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, tax, processing_fee, time_value, metadata, paid_at, tax_rate, tax_country_code, tax_treatment, tax_evidence, tax_breakdown, refunded_payment_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&payment.id)
         .bind(payment.subscription_id)
@@ -2724,6 +2736,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&payment.tax_treatment)
         .bind(&payment.tax_evidence)
         .bind(&payment.tax_breakdown)
+        .bind(&payment.refunded_payment_id)
         .execute(&self.db)
         .await?;
 

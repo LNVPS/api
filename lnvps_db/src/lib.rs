@@ -784,6 +784,14 @@ pub trait LNVpsDbBase: Send + Sync {
         &self,
         id: &Vec<u8>,
     ) -> DbResult<SubscriptionPaymentWithCompany>;
+    /// Every [`SubscriptionPaymentType::Refund`] row recorded against `payment_id`.
+    ///
+    /// A payment can be refunded more than once (partial refunds), so the guard
+    /// against refunding more than was taken has to sum what already exists.
+    async fn list_refunds_for_payment(
+        &self,
+        payment_id: &Vec<u8>,
+    ) -> DbResult<Vec<SubscriptionPayment>>;
     async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()>;
     async fn update_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()>;
     async fn subscription_payment_paid(&self, payment: &SubscriptionPayment) -> DbResult<()>;

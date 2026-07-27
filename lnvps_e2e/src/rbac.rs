@@ -280,6 +280,41 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     }
 
+    /// Recording a refund is gated on `payments::update`, not on VM
+    /// permissions: a vm_manager can delete a customer's VM but cannot decide
+    /// money goes back out (issue #193).
+    #[tokio::test]
+    async fn test_vm_manager_cannot_record_refund() {
+        setup_rbac().await;
+        let client = admin_client_with_keys(vm_manager_keys().clone());
+        let fake = "0".repeat(64);
+        let resp = client
+            .post_auth(
+                &format!("/api/admin/v1/vms/1/payments/{fake}/refund"),
+                &serde_json::json!({ "amount": 100 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("Insufficient permissions"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn test_read_only_cannot_record_refund() {
+        setup_rbac().await;
+        let client = admin_client_with_keys(read_only_keys().clone());
+        let fake = "0".repeat(64);
+        let resp = client
+            .post_auth(
+                &format!("/api/admin/v1/vms/1/payments/{fake}/refund"),
+                &serde_json::json!({ "amount": 100 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
     #[tokio::test]
     async fn test_payment_manager_can_view_users() {
         setup_rbac().await;

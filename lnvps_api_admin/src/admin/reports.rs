@@ -79,6 +79,12 @@ struct TimeSeriesPayment {
     amount: u64,     // Amount in smallest currency unit
     currency: String,
     payment_method: String,
+    /// "purchase" | "renewal" | "upgrade" | "refund". A **refund** row's
+    /// `amount`/`tax` are the magnitude returned to the customer, so any total
+    /// built from these rows must subtract them (issue #193).
+    payment_type: String,
+    /// For a refund row, the hex id of the payment it reverses; null otherwise.
+    refunded_payment_id: Option<String>,
     external_id: Option<String>,
     is_paid: bool,
     rate: f32,       // Exchange rate to company's base currency
@@ -174,6 +180,8 @@ async fn admin_time_series_report(
             amount: payment.amount,
             currency: payment.currency,
             payment_method: payment.payment_method.to_string().to_lowercase(),
+            payment_type: payment.payment_type.to_string().to_lowercase(),
+            refunded_payment_id: payment.refunded_payment_id.as_ref().map(hex::encode),
             external_id: payment.external_id,
             is_paid: payment.is_paid,
             rate: payment.rate,
@@ -291,10 +299,13 @@ struct ProfitLossQuery {
 struct ProfitLossPeriod {
     /// Period identifier ("2026-01" for month grouping, "2026" for year)
     period: String,
-    /// Paid revenue net of tax, in smallest currency units
-    revenue_net: u64,
-    /// Tax collected, in smallest currency units
-    revenue_tax: u64,
+    /// Paid revenue net of tax, in smallest currency units, **net of refunds
+    /// recorded in this period**. Negative when a period refunded more than it
+    /// sold (issue #193).
+    revenue_net: i64,
+    /// Tax collected, in smallest currency units, net of refunded tax. Negative
+    /// under the same conditions as `revenue_net`.
+    revenue_tax: i64,
     /// Recurring costs attributable to this period (normalized), smallest units
     cost_recurring: u64,
     /// One-time (capital) costs booked in this period, smallest units
@@ -320,8 +331,9 @@ struct ProfitLossReport {
 
 #[derive(Default)]
 struct PlAccumulator {
-    revenue_net: u64,
-    revenue_tax: u64,
+    /// Signed: refund rows subtract (see `SubscriptionPaymentType::signum`).
+    revenue_net: i64,
+    revenue_tax: i64,
     cost_recurring_f: f64,
     cost_one_time: u64,
 }
@@ -513,9 +525,13 @@ async fn admin_profit_loss_report(
             ) else {
                 continue;
             };
+            // A refund row stores the magnitude returned, so it subtracts here
+            // rather than adding — the columns are unsigned and the sign lives
+            // in the payment type (issue #193).
+            let sign = p.payment_type.signum();
             let e = acc.entry(period_key(p.created, group_by_year)).or_default();
-            e.revenue_net = e.revenue_net.saturating_add(net_c);
-            e.revenue_tax = e.revenue_tax.saturating_add(tax_c);
+            e.revenue_net = e.revenue_net.saturating_add(sign * net_c as i64);
+            e.revenue_tax = e.revenue_tax.saturating_add(sign * tax_c as i64);
         }
     }
 
@@ -621,7 +637,7 @@ async fn admin_profit_loss_report(
                 cost_recurring,
                 cost_one_time: a.cost_one_time,
                 cost_total,
-                profit: a.revenue_net as i64 - cost_total as i64,
+                profit: a.revenue_net - cost_total as i64,
             }
         })
         .collect();
@@ -664,11 +680,14 @@ struct OssReportRow {
     country_code: String,
     /// VAT rate applied for this country/rate bucket, as a percentage.
     vat_rate: f32,
-    /// Net (pre-tax) sales to this country, in `currency` smallest units.
-    net_total: u64,
-    /// VAT collected for this country, in `currency` smallest units.
-    tax_total: u64,
-    /// Number of payments contributing to this row.
+    /// Net (pre-tax) sales to this country, in `currency` smallest units,
+    /// **net of refunds recorded in the period** — VAT is only owed on money
+    /// kept, so a refund reduces the declared base (issue #193). Negative when
+    /// refunds exceed sales for the bucket.
+    net_total: i64,
+    /// VAT for this country, in `currency` smallest units, net of refunded VAT.
+    tax_total: i64,
+    /// Number of payments contributing to this row, refunds included.
     transaction_count: u32,
 }
 
@@ -706,8 +725,9 @@ struct OssKey {
 
 #[derive(Default)]
 struct OssAcc {
-    net_total: u64,
-    tax_total: u64,
+    /// Signed: refund rows subtract (see `SubscriptionPaymentType::signum`).
+    net_total: i64,
+    tax_total: i64,
     transaction_count: u32,
     company_name: String,
     currency: String,
@@ -801,7 +821,11 @@ async fn admin_oss_report(
             // Fold this payment's OSS lines into per-bucket contributions,
             // converting to the company base currency using the frozen rate.
             let period_key = oss_period_key(p.created, bimonthly);
-            let mut per_payment: HashMap<OssKey, (u64, u64)> = HashMap::new();
+            // Refund rows carry the same frozen country/rate as the payment
+            // they reverse, so they net against exactly the bucket that
+            // declared the VAT (issue #193).
+            let sign = p.payment_type.signum();
+            let mut per_payment: HashMap<OssKey, (i64, i64)> = HashMap::new();
             for l in lines {
                 let Some(country) = l.country_code.clone() else {
                     continue;
@@ -819,8 +843,8 @@ async fn admin_oss_report(
                     rate_bits: l.rate.to_bits(),
                 };
                 let e = per_payment.entry(key).or_default();
-                e.0 = e.0.saturating_add(net_base);
-                e.1 = e.1.saturating_add(tax_base);
+                e.0 = e.0.saturating_add(sign * net_base as i64);
+                e.1 = e.1.saturating_add(sign * tax_base as i64);
             }
 
             for (key, (net, tax)) in per_payment {
