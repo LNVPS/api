@@ -3654,6 +3654,10 @@ Ordered `id DESC`. `app` has no soft-delete, so there is no `include_deleted` he
   "category": "Nostr relay",
   "seo_title": null,
   "seo_description": null,
+  "tags": [
+    { "id": 1, "slug": "nostr", "display_name": "Nostr" },
+    { "id": 2, "slug": "relay", "display_name": "Relay" }
+  ],
   "compose": "services:\n  relay:\n    image: example/relay:latest\n    ports:\n      - { name: ws, container: 7777, protocol: http, expose: ingress }\n",
   "amount": 1000,
   "currency": "USD",
@@ -3691,6 +3695,8 @@ Required Permission: `app::create`. Body:
   // Optional override for the public page <title>.
   "seo_description": "...",
   // Optional override for the public page meta description.
+  "tags": ["nostr", "relay"],
+  // Optional. Grouping-label slugs; every one must already exist.
   "compose": "services: { ... }",
   // Required. docker-compose-style YAML (image/ports/env/volumes).
   "amount": 1000,
@@ -3723,6 +3729,47 @@ PATCH /api/admin/v1/apps/{id}
 Required Permission: `app::update`. All fields optional (omitted = unchanged); `description`/`icon`/`repo_url`/`seo_title`/`seo_description` accept `null` to clear.
 
 `category` is the exception: it is `NOT NULL`, so there is no null to clear to. Omit it to leave it unchanged, or send a string to set it. An explicit `"category": null` is **refused with `400`** rather than ignored — a client asking to clear a required field must not get `200 OK` and no change — and a blank string is refused the same way as on create, leaving the stored value untouched.
+
+`tags` is a **replace-set** of slugs, not a patch: omit it to leave the set unchanged, send `[]` to clear it, send a list to make that list exact. A repeated slug is one assignment. Every slug must already exist — an unknown one is a `400` naming it, resolved *before* any write, so a rejected patch leaves the existing tags and the rest of the app untouched.
+
+#### App Tags
+
+```
+GET    /api/admin/v1/app-tags
+GET    /api/admin/v1/app-tags/{id}
+POST   /api/admin/v1/app-tags
+PATCH  /api/admin/v1/app-tags/{id}
+DELETE /api/admin/v1/app-tags/{id}
+```
+
+The **controlled vocabulary** behind the `tags` field above, and behind the public `?tag=` filter and `/apps/tag/{slug}` landing pages. Tags are the coarse, many-to-many grouping axis; `category` remains the single specific phrase used to build a page title. See `API_DOCUMENTATION.md` for the public side.
+
+These reuse the **`app`** resource — `app::view` / `app::create` / `app::update` / `app::delete`. There is deliberately no `app_tag` resource: a new enum value would mean an RBAC migration and a permission every existing app-admin role would have to be granted before the feature worked at all.
+
+`AdminAppTagInfo`:
+
+```json
+{
+  "id": 1,
+  "slug": "nip-96",
+  "display_name": "NIP-96",
+  "description": null,
+  "app_count": 1,
+  "created": "2026-07-27T09:00:00Z"
+}
+```
+
+`app_count` counts **enabled** apps only, matching what the public facet endpoint reports — an admin sees the same number a visitor does, and a disabled app carrying the tag is not counted. The list is ordered by `slug` and is not paginated; the vocabulary is small by design.
+
+`POST` body: `slug` (required, unique) and `display_name` (required); `description` optional. `slug` must be URL-safe (lowercase letters, digits, hyphens, no leading or trailing hyphen) because it is a path segment and a query value. `display_name` is **required rather than derived from the slug** — title-casing free text in a client mangles `NIP-96`, `HTTP` and `Git`, which is the whole reason the column exists.
+
+`PATCH` takes `slug`, `display_name` and `description`, all optional (omitted = unchanged). `description` accepts `null` to clear; the other two are `NOT NULL` and have no null to clear to. Renaming a `slug` is allowed but breaks any `/apps/tag/{slug}` URL already indexed — it is there so a typo is fixable, not for casual edits.
+
+`DELETE` **cascades the tag's assignments** and is not refused while the tag is in use — untagging is the point of retiring a tag, and assignment rows are not billable (unlike deleting an app, which is refused while deployments exist). The response reports what the cascade took with it:
+
+```json
+{ "data": { "assignments_removed": 4 } }
+```
 
 #### Delete App
 

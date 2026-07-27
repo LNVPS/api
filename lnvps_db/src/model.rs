@@ -3162,6 +3162,36 @@ pub struct App {
     pub created: DateTime<Utc>,
 }
 
+/// A coarse grouping label for the app catalog, from a controlled vocabulary.
+///
+/// The second axis to [`App::category`], not a replacement for it. `category`
+/// is exactly one specific human phrase used to build a page title;
+/// a tag is zero-or-more coarse slugs used for filters, facets and
+/// `/apps/tag/{slug}` landing pages. An app is legitimately several things at
+/// once — route96 is both a media server and a Nostr thing — so the grouping
+/// axis is many-to-many and a column would force a false choice.
+///
+/// The vocabulary is controlled: admins pick from existing slugs and unknown
+/// ones are rejected rather than auto-created, because auto-creation is
+/// exactly the drift (`Nostr relay` / `nostr-relay` / `nostr` as three tags)
+/// that a real table exists to prevent.
+#[derive(FromRow, Clone, Debug)]
+pub struct AppTag {
+    pub id: u64,
+    /// URL-safe slug; the path segment in `/apps/tag/{slug}` and the value of
+    /// the `?tag=` filter. Lowercase letters, digits and hyphens.
+    pub slug: String,
+    /// Label rendered on a chip or landing-page heading. Stored rather than
+    /// derived from the slug because title-casing in JS mangles `NIP-96`,
+    /// `HTTP` and `Git` — the same argument [`App::category`] makes for its
+    /// own format contract.
+    pub display_name: String,
+    /// Optional lede for a tag landing page. A tag that only ever renders as
+    /// a filter chip does not need one.
+    pub description: Option<String>,
+    pub created: DateTime<Utc>,
+}
+
 /// A Kubernetes cluster where apps can be deployed.
 ///
 /// Linked to a [`Region`] so location, company, tax and currency resolve

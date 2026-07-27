@@ -1342,7 +1342,21 @@ The catalog + read endpoints below are unauthenticated-safe views of what you ca
 #### List Catalog Apps
 - **GET** `/api/v1/apps`
 - **Auth**: None (public, like `GET /api/v1/vm/templates`)
+- **Query Params**:
+  - `tag`: Optional grouping-label slug. **Repeatable, combining with AND** —
+    `?tag=nostr&tag=relay` returns apps carrying *both*. `?tag=nostr,relay` is
+    accepted as an equivalent spelling. An unknown or retired slug returns an
+    **empty list with `200`**, not `404`: the caller is a filter UI, and a
+    stale chip should degrade to "no results" rather than an error page.
+    `?tag=` with no value means "no filter".
 - **Response**: `App[]` — all currently offered apps
+
+#### List App Tags
+- **GET** `/api/v1/app-tags`
+- **Auth**: None (public, like the catalog it describes)
+- **Response**: `AppTag[]` — the whole grouping vocabulary, ordered by `slug`,
+  each with the number of enabled apps carrying it. Use this to render a facet
+  bar or a tag index without fetching every app to derive the counts.
 
 #### Get Catalog App
 - **GET** `/api/v1/apps/{id}`
@@ -1385,6 +1399,10 @@ interface App {
   category: string;          // class of software, always present and never empty (see note below)
   seo_title?: string;        // per-app <title> override; null for almost every app
   seo_description?: string;  // per-app meta-description override; null for almost every app
+  tags: {                    // coarse grouping labels, ordered by slug; may be empty
+    slug: string;            // URL-safe; the ?tag= value and the /apps/tag/:slug segment
+    display_name: string;    // ready to render on a chip — do NOT derive this from slug
+  }[];
   compose: string;           // docker-compose-style YAML; render the config form (ports/env) from this
   amount: number;            // recurring price in smallest currency units (cents / millisats)
   currency: string;
@@ -1401,6 +1419,13 @@ interface App {
     memory_bytes: number;
     storage_bytes: number;
   }[];
+}
+
+interface AppTag {
+  slug: string;
+  display_name: string;
+  description?: string;      // lede for a tag landing page; null for filter-only tags
+  app_count: number;         // enabled apps carrying this tag
 }
 
 interface AppDeployment {
@@ -1434,6 +1459,29 @@ set, falling back to the template above. They are set per-app in admin and arriv
 over the wire, so they are never picked up by `formatjs extract` and cannot be
 translated — an English-only escape hatch, which is why `category` is the path that
 carries the localisable general case.
+
+**Tags versus `category` (issue #240).** They are two axes, not one:
+
+| | `category` | `tags` |
+|---|---|---|
+| cardinality | exactly one, never null | zero or more |
+| shape | free text, specific, a human phrase | slugged, coarse, controlled vocabulary |
+| use | the `<title>` template | filters, facets, `/apps/tag/:slug` pages, related-app links |
+| example | `Community Nostr relay` | `nostr`, `relay` |
+
+An app is legitimately several things at once — route96 is both a media server and
+a Nostr thing — so tags are a set. Do not build a title from them, and do not build
+a filter from `category`.
+
+Render `display_name` on chips; it is sent precisely because a client cannot recover
+`NIP-96` from `nip-96`, and title-casing free text in JS mangles `NIP-96`, `HTTP` and
+`Git`. `tags` may be empty and that is a normal state — nothing on the page depends
+on an app being tagged.
+
+Use `GET /api/v1/app-tags` for a facet bar rather than deriving the vocabulary from
+the catalog: it carries `app_count` so a tag with one app behind it can be rendered
+as a filter chip without generating a landing page for it — one result is thin
+content and competes with the app's own page for the same query.
 
 ### Monitoring and History
 

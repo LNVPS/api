@@ -14,7 +14,7 @@ use lnvps_api_common::{
     Nip98Auth,
 };
 use lnvps_db::{
-    App, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus, EncryptedString,
+    App, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus, AppTag, EncryptedString,
     PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionType,
 };
 use payments_rs::currency::CurrencyAmount;
@@ -25,6 +25,7 @@ use std::str::FromStr;
 pub fn router() -> Router<RouterState> {
     Router::new()
         .route("/api/v1/apps", get(v1_list_apps))
+        .route("/api/v1/app-tags", get(v1_list_app_tags))
         .route("/api/v1/apps/{id}", get(v1_get_app))
         .route("/api/v1/apps/{id}/regions", get(v1_list_app_regions))
         .route(
@@ -103,6 +104,15 @@ pub struct ApiApp {
     /// Per-service resource breakdown (sorted by name), summing to the totals
     /// above. Lets the UI show what each container in a multi-service app uses.
     pub services: Vec<ApiAppServiceResources>,
+    /// Coarse grouping labels for filtering, facets and tag landing pages,
+    /// ordered by slug so a chip row is stable across renders. Empty is a
+    /// normal state — nothing on the page depends on an app being tagged.
+    ///
+    /// Distinct from `category`, which is exactly one specific phrase used to
+    /// build the page title. An app is legitimately several things at once, so
+    /// this is a set: `nostr` + `relay`, or `nostr` + `media-server` +
+    /// `blossom` + `nip-96`.
+    pub tags: Vec<ApiAppTag>,
 }
 
 /// One service's share of an app's resource footprint.
@@ -114,8 +124,52 @@ pub struct ApiAppServiceResources {
     pub storage_bytes: u64,
 }
 
-impl From<App> for ApiApp {
-    fn from(a: App) -> Self {
+/// A grouping label as it appears on an app.
+///
+/// Both fields are sent, not the bare slug: a client cannot recover `NIP-96`
+/// from `nip-96`, and title-casing it in JS mangles exactly the protocol names
+/// that make good tags.
+#[derive(Serialize)]
+pub struct ApiAppTag {
+    /// URL-safe; the path segment in `/apps/tag/{slug}` and the value to send
+    /// back as `?tag=`.
+    pub slug: String,
+    /// Ready to render on a chip. Do not derive this from `slug`.
+    pub display_name: String,
+}
+
+impl From<AppTag> for ApiAppTag {
+    fn from(t: AppTag) -> Self {
+        Self {
+            slug: t.slug,
+            display_name: t.display_name,
+        }
+    }
+}
+
+/// The tag vocabulary with usage counts, for a facet bar.
+#[derive(Serialize)]
+pub struct ApiAppTagInfo {
+    pub slug: String,
+    pub display_name: String,
+    /// Optional lede for a tag landing page; null for a tag that only ever
+    /// renders as a filter chip.
+    pub description: Option<String>,
+    /// How many **enabled** catalog apps carry this tag. Sent so a client can
+    /// size a facet bar, and decline to generate a landing page for a tag with
+    /// one app behind it, without fetching the whole catalog first.
+    pub app_count: u64,
+}
+
+impl ApiApp {
+    /// Build the wire type from a catalog row plus its already-loaded tags.
+    ///
+    /// Deliberately not a `From<App>` impl: tags do not live on [`App`], so a
+    /// conversion that took only the row would have to fetch them itself, and
+    /// that fetch inside a per-item conversion is precisely where an N+1 comes
+    /// from. Callers load the whole result set's assignments in one query and
+    /// hand in the slice.
+    pub fn from_app(a: App, tags: Vec<ApiAppTag>) -> Self {
         // Per-service breakdown from the (already-validated) compose; best-effort.
         let services = lnvps_compose::Compose::parse(&a.compose)
             .ok()
@@ -149,6 +203,7 @@ impl From<App> for ApiApp {
             memory_bytes: a.memory_bytes,
             storage_bytes: a.storage_bytes,
             services,
+            tags,
         }
     }
 }
@@ -250,13 +305,77 @@ async fn deployment_to_api(
     })
 }
 
+/// Collect the requested tag slugs from the decoded query pairs.
+///
+/// The handler takes the pairs verbatim because `Query` deserializes with
+/// `serde_urlencoded`, which cannot fold a repeated key into a `Vec` on a
+/// named field. Both `?tag=a&tag=b` and `?tag=a,b` are accepted: a filter UI
+/// building a URL from checkbox state produces one or the other depending on
+/// how it was written, and supporting only one is a silent no-results bug for
+/// the other.
+///
+/// Empty and whitespace-only values are dropped, so a cleared filter (`?tag=`)
+/// means "no filter" rather than "apps carrying the empty-string tag", which
+/// nothing can ever match.
+fn tag_filter(params: &[(String, String)]) -> Vec<String> {
+    params
+        .iter()
+        .filter(|(k, _)| k == "tag")
+        .flat_map(|(_, v)| v.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Load every listed app's tags in one query and index them by `app_id`.
+///
+/// One query for the whole result set, not one per app — `v1_list_apps` maps
+/// the entire enabled catalog in a single pass, so a per-app lookup here would
+/// be an N+1 over the catalog size.
+async fn tags_by_app(
+    this: &RouterState,
+    apps: &[App],
+) -> Result<BTreeMap<u64, Vec<ApiAppTag>>, ApiError> {
+    let ids: Vec<u64> = apps.iter().map(|a| a.id).collect();
+    let mut out: BTreeMap<u64, Vec<ApiAppTag>> = BTreeMap::new();
+    for (app_id, tag) in this.db.list_app_tag_assignments(&ids).await? {
+        out.entry(app_id).or_default().push(tag.into());
+    }
+    Ok(out)
+}
+
 /// List all enabled catalog apps.
 ///
 /// Public (no auth) — the catalog is a shopping/marketing surface, mirroring
 /// `GET /api/v1/vm/templates`.
-async fn v1_list_apps(State(this): State<RouterState>) -> ApiResult<Vec<ApiApp>> {
+///
+/// `?tag=<slug>` is repeatable and combines with **AND**:
+/// `?tag=nostr&tag=relay` returns apps carrying both. An unknown or retired
+/// slug yields an empty list with `200`, not `404` — the caller is a filter
+/// UI, and a stale chip should degrade to "no results", not to an error page.
+async fn v1_list_apps(
+    State(this): State<RouterState>,
+    Query(params): Query<Vec<(String, String)>>,
+) -> ApiResult<Vec<ApiApp>> {
     let apps = this.db.list_apps(true).await?;
-    ApiData::ok(apps.into_iter().map(Into::into).collect())
+    let mut tags = tags_by_app(&this, &apps).await?;
+
+    // Filtering in memory rather than in SQL: the catalog listing is
+    // unpaginated and already loads every enabled app plus every assignment,
+    // so the rows are in hand and a second query shape would buy nothing.
+    let wanted = tag_filter(&params);
+    ApiData::ok(
+        apps.into_iter()
+            .filter_map(|a| {
+                let app_tags = tags.remove(&a.id).unwrap_or_default();
+                let matches = wanted
+                    .iter()
+                    .all(|slug| app_tags.iter().any(|t| &t.slug == slug));
+                matches.then(|| ApiApp::from_app(a, app_tags))
+            })
+            .collect(),
+    )
 }
 
 /// Get a single enabled catalog app. Public (no auth), like the list.
@@ -265,7 +384,33 @@ async fn v1_get_app(State(this): State<RouterState>, Path(id): Path<u64>) -> Api
     if !app.enabled {
         return Err(ApiError::not_found("App not found"));
     }
-    ApiData::ok(app.into())
+    let tags = this
+        .db
+        .list_app_tag_assignments(&[app.id])
+        .await?
+        .into_iter()
+        .map(|(_, t)| t.into())
+        .collect();
+    ApiData::ok(ApiApp::from_app(app, tags))
+}
+
+/// List the tag vocabulary with per-tag counts of enabled apps.
+///
+/// Public (no auth), like the catalog it describes. Needed as its own endpoint
+/// so a facet bar can be rendered — and a one-app tag suppressed — without
+/// fetching every app to derive the counts client-side.
+async fn v1_list_app_tags(State(this): State<RouterState>) -> ApiResult<Vec<ApiAppTagInfo>> {
+    let tags = this.db.list_app_tags_with_counts().await?;
+    ApiData::ok(
+        tags.into_iter()
+            .map(|(t, app_count)| ApiAppTagInfo {
+                slug: t.slug,
+                display_name: t.display_name,
+                description: t.description,
+                app_count,
+            })
+            .collect(),
+    )
 }
 
 /// List the regions this app can be deployed in (regions with an enabled
@@ -779,6 +924,57 @@ async fn v1_stop_app_deployment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pairs as axum's `Query` extractor hands them over: already
+    /// percent-decoded, in query order, repeats preserved. The decoding itself
+    /// is axum's job and is covered end-to-end over real HTTP in
+    /// `lnvps_e2e::apps`; this exercises the filtering.
+    fn pairs(kvs: &[(&str, &str)]) -> Vec<(String, String)> {
+        kvs.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn test_tag_filter() {
+        // Repeated key and comma-separated both work: a filter UI produces one
+        // or the other depending on how its URL builder was written, and
+        // supporting only one is a silent no-results bug for the other.
+        assert_eq!(
+            tag_filter(&pairs(&[("tag", "nostr"), ("tag", "relay")])),
+            vec!["nostr", "relay"]
+        );
+        assert_eq!(
+            tag_filter(&pairs(&[("tag", "nostr,relay")])),
+            vec!["nostr", "relay"]
+        );
+        assert_eq!(
+            tag_filter(&pairs(&[("tag", "nostr,relay"), ("tag", "blossom")])),
+            vec!["nostr", "relay", "blossom"]
+        );
+
+        // Other query keys are ignored, not mistaken for tags.
+        assert_eq!(
+            tag_filter(&pairs(&[("search", "foo"), ("tag", "nostr")])),
+            vec!["nostr"]
+        );
+        assert!(tag_filter(&[]).is_empty());
+        assert!(tag_filter(&pairs(&[("enabled", "true")])).is_empty());
+
+        // A cleared filter means "no filter". Keeping the empty string would
+        // ask for apps carrying the empty-string tag, which nothing matches —
+        // an empty catalog instead of the full one.
+        assert!(tag_filter(&pairs(&[("tag", "")])).is_empty());
+        assert!(tag_filter(&pairs(&[("tag", "  ")])).is_empty());
+        assert_eq!(
+            tag_filter(&pairs(&[("tag", " nostr "), ("tag", "")])),
+            vec!["nostr"]
+        );
+        assert_eq!(
+            tag_filter(&pairs(&[("tag", "nostr,,relay")])),
+            vec!["nostr", "relay"]
+        );
+    }
 
     #[test]
     fn test_validate_deployment_name() {

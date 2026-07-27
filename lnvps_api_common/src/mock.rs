@@ -4,7 +4,7 @@ use chrono::{Days, Months, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, App, AppCluster, AppDeployment, AppDeploymentDesiredState, AppDeploymentFilter,
-    AppDeploymentStatus, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company,
+    AppDeploymentStatus, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company,
     CpuArch, CpuMfg, DbError, DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind,
     IntervalType, IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase,
     NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
@@ -75,6 +75,11 @@ pub struct MockDb {
     pub firewall_rules: Arc<Mutex<HashMap<u64, VmFirewallRule>>>,
     pub webauthn_credentials: Arc<Mutex<HashMap<u64, WebauthnCredential>>>,
     pub apps: Arc<Mutex<HashMap<u64, App>>>,
+    pub app_tags: Arc<Mutex<HashMap<u64, AppTag>>>,
+    /// Assignments as `(app_id, tag_id)` pairs, standing in for the
+    /// `app_tag_assignment` rows. A `Vec` rather than a map because the row id
+    /// is never addressed — the unique key is the pair.
+    pub app_tag_assignments: Arc<Mutex<Vec<(u64, u64)>>>,
     pub app_clusters: Arc<Mutex<HashMap<u64, AppCluster>>>,
     pub app_deployments: Arc<Mutex<HashMap<u64, AppDeployment>>>,
 }
@@ -361,6 +366,8 @@ impl Default for MockDb {
             firewall_rules: Arc::new(Default::default()),
             webauthn_credentials: Arc::new(Default::default()),
             apps: Arc::new(Default::default()),
+            app_tags: Arc::new(Default::default()),
+            app_tag_assignments: Arc::new(Default::default()),
             app_clusters: Arc::new(Default::default()),
             app_deployments: Arc::new(Default::default()),
         }
@@ -3275,6 +3282,126 @@ impl LNVpsDbBase for MockDb {
 
     async fn delete_app(&self, id: u64) -> DbResult<()> {
         self.apps.lock().await.remove(&id);
+        // Stands in for `fk_app_tag_assignment_app ON DELETE CASCADE`.
+        self.app_tag_assignments
+            .lock()
+            .await
+            .retain(|(app_id, _)| *app_id != id);
+        Ok(())
+    }
+
+    // ----- App tags -----
+
+    async fn list_app_tags(&self) -> DbResult<Vec<AppTag>> {
+        let tags = self.app_tags.lock().await;
+        let mut out: Vec<AppTag> = tags.values().cloned().collect();
+        out.sort_by(|a, b| a.slug.cmp(&b.slug));
+        Ok(out)
+    }
+
+    async fn list_app_tags_with_counts(&self) -> DbResult<Vec<(AppTag, u64)>> {
+        let tags = self.list_app_tags().await?;
+        let assignments = self.app_tag_assignments.lock().await;
+        let apps = self.apps.lock().await;
+        Ok(tags
+            .into_iter()
+            .map(|t| {
+                let count = assignments
+                    .iter()
+                    .filter(|(app_id, tag_id)| {
+                        // Enabled apps only, matching the LEFT JOIN condition
+                        // in the MySQL implementation: a disabled app is not in
+                        // the public catalog, so counting it would advertise a
+                        // result a visitor cannot see.
+                        *tag_id == t.id && apps.get(app_id).is_some_and(|a| a.enabled)
+                    })
+                    .count() as u64;
+                (t, count)
+            })
+            .collect())
+    }
+
+    async fn get_app_tag(&self, id: u64) -> DbResult<AppTag> {
+        self.app_tags
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("app tag not found").into())
+    }
+
+    async fn get_app_tag_by_slug(&self, slug: &str) -> DbResult<AppTag> {
+        self.app_tags
+            .lock()
+            .await
+            .values()
+            .find(|t| t.slug == slug)
+            .cloned()
+            .ok_or_else(|| anyhow!("app tag not found").into())
+    }
+
+    async fn insert_app_tag(&self, tag: &AppTag) -> DbResult<u64> {
+        let mut tags = self.app_tags.lock().await;
+        // Stands in for `uq_app_tag_slug`.
+        if tags.values().any(|t| t.slug == tag.slug) {
+            return Err(DbError::Other(anyhow!("app tag slug already exists")));
+        }
+        let new_id = tags.keys().max().copied().unwrap_or(0) + 1;
+        tags.insert(
+            new_id,
+            AppTag {
+                id: new_id,
+                ..tag.clone()
+            },
+        );
+        Ok(new_id)
+    }
+
+    async fn update_app_tag(&self, tag: &AppTag) -> DbResult<()> {
+        let mut tags = self.app_tags.lock().await;
+        if tags.values().any(|t| t.slug == tag.slug && t.id != tag.id) {
+            return Err(DbError::Other(anyhow!("app tag slug already exists")));
+        }
+        if let Some(t) = tags.get_mut(&tag.id) {
+            *t = tag.clone();
+        }
+        Ok(())
+    }
+
+    async fn delete_app_tag(&self, id: u64) -> DbResult<u64> {
+        self.app_tags.lock().await.remove(&id);
+        let mut assignments = self.app_tag_assignments.lock().await;
+        let before = assignments.len();
+        // Stands in for `fk_app_tag_assignment_tag ON DELETE CASCADE`.
+        assignments.retain(|(_, tag_id)| *tag_id != id);
+        Ok((before - assignments.len()) as u64)
+    }
+
+    async fn list_app_tag_assignments(&self, app_ids: &[u64]) -> DbResult<Vec<(u64, AppTag)>> {
+        if app_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let assignments = self.app_tag_assignments.lock().await;
+        let tags = self.app_tags.lock().await;
+        let mut out: Vec<(u64, AppTag)> = assignments
+            .iter()
+            .filter(|(app_id, _)| app_ids.contains(app_id))
+            .filter_map(|(app_id, tag_id)| tags.get(tag_id).map(|t| (*app_id, t.clone())))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.slug.cmp(&b.1.slug)));
+        Ok(out)
+    }
+
+    async fn set_app_tags(&self, app_id: u64, tag_ids: &[u64]) -> DbResult<()> {
+        let mut assignments = self.app_tag_assignments.lock().await;
+        assignments.retain(|(a, _)| *a != app_id);
+        for tag_id in tag_ids {
+            // De-duplicate, standing in for `uq_app_tag_assignment`: a request
+            // listing the same slug twice is one assignment, not an error.
+            if !assignments.contains(&(app_id, *tag_id)) {
+                assignments.push((app_id, *tag_id));
+            }
+        }
         Ok(())
     }
 
@@ -6149,6 +6276,164 @@ mod tests {
         db.delete_app(id2).await.unwrap();
         assert!(db.get_app(id2).await.is_err());
         assert_eq!(db.list_apps(false).await.unwrap().len(), 1);
+    }
+
+    /// App tags (issue #240): the vocabulary, replace-set assignment, the
+    /// enabled-only counts and both cascade directions.
+    #[tokio::test]
+    async fn test_app_tag_vocabulary_and_assignment() {
+        let db = MockDb::default();
+        let tag = |slug: &str, display_name: &str| AppTag {
+            id: 0,
+            slug: slug.to_string(),
+            display_name: display_name.to_string(),
+            description: None,
+            created: Utc::now(),
+        };
+
+        let nostr = db.insert_app_tag(&tag("nostr", "Nostr")).await.unwrap();
+        let relay = db.insert_app_tag(&tag("relay", "Relay")).await.unwrap();
+        let blossom = db.insert_app_tag(&tag("blossom", "Blossom")).await.unwrap();
+
+        // Ordered by slug so a chip row / facet bar is stable across renders,
+        // not by insertion order.
+        let slugs: Vec<String> = db
+            .list_app_tags()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.slug)
+            .collect();
+        assert_eq!(slugs, vec!["blossom", "nostr", "relay"]);
+
+        // Stands in for uq_app_tag_slug: the vocabulary is controlled, so a
+        // duplicate slug is an error rather than a second tag reading the same.
+        assert!(db.insert_app_tag(&tag("nostr", "Nostr again")).await.is_err());
+        assert_eq!(db.get_app_tag_by_slug("nostr").await.unwrap().id, nostr);
+        assert!(db.get_app_tag_by_slug("no-such-tag").await.is_err());
+
+        let mut app = App {
+            id: 0,
+            name: "strfry".to_string(),
+            display_name: "strfry".to_string(),
+            description: None,
+            icon: None,
+            repo_url: None,
+            category: "Nostr relay".to_string(),
+            seo_title: None,
+            seo_description: None,
+            compose: "services: {}".to_string(),
+            amount: 1000,
+            currency: "USD".to_string(),
+            interval_amount: 1,
+            interval_type: IntervalType::Month,
+            setup_amount: 0,
+            enabled: true,
+            cpu_milli: 0,
+            memory_bytes: 0,
+            storage_bytes: 0,
+            created: Utc::now(),
+        };
+        let strfry = db.insert_app(&app).await.unwrap();
+        app.name = "route96".to_string();
+        app.display_name = "Route96".to_string();
+        app.category = "Blossom media server".to_string();
+        let route96 = db.insert_app(&app).await.unwrap();
+
+        db.set_app_tags(strfry, &[nostr, relay]).await.unwrap();
+        db.set_app_tags(route96, &[nostr, blossom]).await.unwrap();
+
+        // Bulk load is keyed by app_id and ordered by (app_id, slug) — the
+        // catalog listing indexes on it, so both halves matter.
+        let assignments = db
+            .list_app_tag_assignments(&[strfry, route96])
+            .await
+            .unwrap();
+        let pairs: Vec<(u64, String)> = assignments
+            .iter()
+            .map(|(a, t)| (*a, t.slug.clone()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (strfry, "nostr".to_string()),
+                (strfry, "relay".to_string()),
+                (route96, "blossom".to_string()),
+                (route96, "nostr".to_string()),
+            ]
+        );
+        // Empty input short-circuits rather than returning every row — the
+        // MySQL side cannot build `IN ()` at all.
+        assert!(db.list_app_tag_assignments(&[]).await.unwrap().is_empty());
+
+        // Replace-set semantics: the new list is exact, not merged.
+        db.set_app_tags(strfry, &[relay]).await.unwrap();
+        let strfry_tags: Vec<String> = db
+            .list_app_tag_assignments(&[strfry])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, t)| t.slug)
+            .collect();
+        assert_eq!(strfry_tags, vec!["relay"]);
+        // A repeated slug is one assignment, not a unique-key violation.
+        db.set_app_tags(strfry, &[nostr, relay, nostr])
+            .await
+            .unwrap();
+        assert_eq!(db.list_app_tag_assignments(&[strfry]).await.unwrap().len(), 2);
+        // An empty list clears.
+        db.set_app_tags(strfry, &[]).await.unwrap();
+        assert!(db.list_app_tag_assignments(&[strfry]).await.unwrap().is_empty());
+        db.set_app_tags(strfry, &[nostr, relay]).await.unwrap();
+
+        let counts = |v: Vec<(AppTag, u64)>| -> Vec<(String, u64)> {
+            v.into_iter().map(|(t, c)| (t.slug, c)).collect()
+        };
+        assert_eq!(
+            counts(db.list_app_tags_with_counts().await.unwrap()),
+            vec![
+                ("blossom".to_string(), 1),
+                ("nostr".to_string(), 2),
+                ("relay".to_string(), 1),
+            ]
+        );
+
+        // Disabling an app drops it from the counts: the count sizes a public
+        // facet bar, so counting a hidden app advertises a result a visitor
+        // cannot reach. The assignment itself survives, ready for re-enabling.
+        let mut r = db.get_app(route96).await.unwrap();
+        r.enabled = false;
+        db.update_app(&r).await.unwrap();
+        assert_eq!(
+            counts(db.list_app_tags_with_counts().await.unwrap()),
+            vec![
+                ("blossom".to_string(), 0),
+                ("nostr".to_string(), 1),
+                ("relay".to_string(), 1),
+            ]
+        );
+        assert_eq!(
+            db.list_app_tag_assignments(&[route96]).await.unwrap().len(),
+            2
+        );
+
+        // Deleting a tag cascades its assignments and reports how many, since
+        // the untagging is otherwise invisible to the admin who did it.
+        assert_eq!(db.delete_app_tag(nostr).await.unwrap(), 2);
+        assert!(db.get_app_tag(nostr).await.is_err());
+        let strfry_tags: Vec<String> = db
+            .list_app_tag_assignments(&[strfry])
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, t)| t.slug)
+            .collect();
+        assert_eq!(strfry_tags, vec!["relay"]);
+
+        // Deleting an app cascades the other way.
+        db.delete_app(strfry).await.unwrap();
+        assert!(db.list_app_tag_assignments(&[strfry]).await.unwrap().is_empty());
+        assert_eq!(db.delete_app_tag(relay).await.unwrap(), 0);
     }
 
     #[tokio::test]

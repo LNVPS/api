@@ -1,5 +1,5 @@
 use crate::{
-    AccessPolicy, App, AppCluster, AppDeployment, AppDeploymentFilter, AsnSubscription,
+    AccessPolicy, App, AppCluster, AppDeployment, AppDeploymentFilter, AppTag, AsnSubscription,
     AsnSubscriptionStatus, AvailableIpSpace, Company, DbError, DbResult, DnsServer, IntervalType,
     IpRange, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig,
     PaymentType, Referral, ReferralCostUsage, ReferralPayout, Region, RegionStats, Router,
@@ -3861,6 +3861,160 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(id)
             .execute(&self.db)
             .await?;
+        Ok(())
+    }
+
+    // ----- App tags -----
+
+    async fn list_app_tags(&self) -> DbResult<Vec<AppTag>> {
+        Ok(sqlx::query_as("SELECT * FROM app_tag ORDER BY slug")
+            .fetch_all(&self.db)
+            .await?)
+    }
+
+    async fn list_app_tags_with_counts(&self) -> DbResult<Vec<(AppTag, u64)>> {
+        // LEFT JOIN so a tag with no enabled apps still appears with a count of
+        // zero — a facet bar needs to know the tag exists before it can decide
+        // to hide it. The `enabled` test lives in the JOIN condition, not a
+        // WHERE clause, which would turn the outer join back into an inner one.
+        let rows = sqlx::query(
+            "SELECT t.id, t.slug, t.display_name, t.description, t.created, \
+             COUNT(a.id) AS app_count \
+             FROM app_tag t \
+             LEFT JOIN app_tag_assignment asg ON asg.tag_id = t.id \
+             LEFT JOIN app a ON a.id = asg.app_id AND a.enabled = 1 \
+             GROUP BY t.id, t.slug, t.display_name, t.description, t.created \
+             ORDER BY t.slug",
+        )
+        .fetch_all(&self.db)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok((
+                    AppTag {
+                        id: r.try_get("id")?,
+                        slug: r.try_get("slug")?,
+                        display_name: r.try_get("display_name")?,
+                        description: r.try_get("description")?,
+                        created: r.try_get("created")?,
+                    },
+                    r.try_get::<i64, _>("app_count")? as u64,
+                ))
+            })
+            .collect()
+    }
+
+    async fn get_app_tag(&self, id: u64) -> DbResult<AppTag> {
+        Ok(sqlx::query_as("SELECT * FROM app_tag WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn get_app_tag_by_slug(&self, slug: &str) -> DbResult<AppTag> {
+        Ok(sqlx::query_as("SELECT * FROM app_tag WHERE slug = ?")
+            .bind(slug)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn insert_app_tag(&self, tag: &AppTag) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO app_tag (slug, display_name, description) \
+             VALUES (?, ?, ?) returning id",
+        )
+        .bind(&tag.slug)
+        .bind(&tag.display_name)
+        .bind(&tag.description)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn update_app_tag(&self, tag: &AppTag) -> DbResult<()> {
+        sqlx::query("UPDATE app_tag SET slug = ?, display_name = ?, description = ? WHERE id = ?")
+            .bind(&tag.slug)
+            .bind(&tag.display_name)
+            .bind(&tag.description)
+            .bind(tag.id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_app_tag(&self, id: u64) -> DbResult<u64> {
+        // Count and delete in one transaction: the count is reported back to
+        // the admin as "this untagged N apps", so it has to describe the same
+        // rows the cascade actually removed.
+        let mut tx = self.db.begin().await?;
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM app_tag_assignment WHERE tag_id = ?")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        sqlx::query("DELETE FROM app_tag WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(count as u64)
+    }
+
+    async fn list_app_tag_assignments(&self, app_ids: &[u64]) -> DbResult<Vec<(u64, AppTag)>> {
+        // `IN ()` is a syntax error in MySQL, and an empty set has no rows
+        // anyway — return before building the query rather than after.
+        if app_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut query = QueryBuilder::new(
+            "SELECT asg.app_id, t.id, t.slug, t.display_name, t.description, t.created \
+             FROM app_tag_assignment asg \
+             JOIN app_tag t ON t.id = asg.tag_id \
+             WHERE asg.app_id IN (",
+        );
+        let mut sep = query.separated(", ");
+        for id in app_ids {
+            sep.push_bind(*id);
+        }
+        query.push(") ORDER BY asg.app_id, t.slug");
+
+        let rows = query.build().fetch_all(&self.db).await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok((
+                    r.try_get("app_id")?,
+                    AppTag {
+                        id: r.try_get("id")?,
+                        slug: r.try_get("slug")?,
+                        display_name: r.try_get("display_name")?,
+                        description: r.try_get("description")?,
+                        created: r.try_get("created")?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    async fn set_app_tags(&self, app_id: u64, tag_ids: &[u64]) -> DbResult<()> {
+        let mut tx = self.db.begin().await?;
+        // Delete-then-insert rather than diffing: the whole operation is one
+        // transaction, so an observer never sees the intermediate empty set,
+        // and `created` on a re-sent tag resetting is not information anyone
+        // reads. Deleting everything *not* in the new set would need the same
+        // empty-slice special case as the insert for no benefit.
+        sqlx::query("DELETE FROM app_tag_assignment WHERE app_id = ?")
+            .bind(app_id)
+            .execute(&mut *tx)
+            .await?;
+        if !tag_ids.is_empty() {
+            let mut query = QueryBuilder::new("INSERT INTO app_tag_assignment (app_id, tag_id) ");
+            query.push_values(tag_ids, |mut b, tag_id| {
+                b.push_bind(app_id).push_bind(*tag_id);
+            });
+            query.build().execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
