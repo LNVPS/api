@@ -30,6 +30,15 @@ You also need at least one **app cluster** with capacity in a region
 (`POST /api/admin/v1/app_clusters`), and the operator for that cluster must run
 with the matching `app_cluster_id`.
 
+**Validation cannot tell you the app will start.** It checks the document's own
+grammar and computes a footprint; it has no way to know what a third-party image
+requires, so an entry can validate cleanly, price correctly and still be
+incapable of booting. Before enabling one, read the image's config loader for
+values that are required *without a default* and confirm the compose supplies
+every one — HAVEN shipped enabled with 11 of its 21 required env vars absent
+(#248), and because it aborts on the first missing one it reports them a single
+variable at a time.
+
 ## Compose grammar recap
 
 Top-level keys: `services`, `secrets` (operator-generated, injected as
@@ -346,10 +355,30 @@ services:
       RELAY_BIND_ADDRESS: "0.0.0.0"
       DB_ENGINE: "badger"
       BLOSSOM_PATH: "blossom/"
+      # Every var below down to IMPORT_START_DATE is read with HAVEN's `getEnv`,
+      # which is `log.Fatalf` on unset — one at a time, so a missing one looks
+      # like an endless queue of missing ones rather than a single fault (#248).
+      PRIVATE_RELAY_NAME: "${private_relay_name}"
       PRIVATE_RELAY_NPUB: "${owner_npub}"
+      PRIVATE_RELAY_DESCRIPTION: "${private_relay_description}"
+      PRIVATE_RELAY_ICON: ""
+      CHAT_RELAY_NAME: "Chat relay"
       CHAT_RELAY_NPUB: "${owner_npub}"
+      CHAT_RELAY_DESCRIPTION: "Private chats for ${HOSTNAME}"
+      CHAT_RELAY_ICON: ""
+      OUTBOX_RELAY_NAME: "Outbox relay"
       OUTBOX_RELAY_NPUB: "${owner_npub}"
+      OUTBOX_RELAY_DESCRIPTION: "Public messages and media for ${HOSTNAME}"
+      OUTBOX_RELAY_ICON: ""
+      INBOX_RELAY_NAME: "Inbox relay"
       INBOX_RELAY_NPUB: "${owner_npub}"
+      INBOX_RELAY_DESCRIPTION: "Interactions for ${HOSTNAME}"
+      INBOX_RELAY_ICON: ""
+      # Bounds how far back the owner's history imports. Not startup-fatal if
+      # unparseable (import.go prints and returns), which is why it is a fixed
+      # default rather than an order-form field: a bad value silently imports
+      # nothing.
+      IMPORT_START_DATE: "2023-01-01"
       IMPORT_SEED_RELAYS_FILE: "relays_import.json"
       BLASTR_RELAYS_FILE: "relays_blastr.json"
       WHITELISTED_NPUBS_FILE: ""
@@ -367,6 +396,12 @@ services:
       - { name: blossom, path: /app/blossom, size: 20Gi }
 config:
   - { name: owner_npub, label: "Owner npub", type: string, required: true }
+  # The private relay's name and description are served as NIP-11 metadata, so
+  # they are customer-visible. The chat/outbox/inbox sets are functional relays
+  # rather than branding surfaces and stay fixed — eight more order-form fields
+  # would undo the one-click point of the catalog.
+  - { name: private_relay_name, label: "Relay name", type: string, default: "My private relay" }
+  - { name: private_relay_description, label: "Relay description", type: string, default: "A HAVEN relay" }
 ```
 
 ---
