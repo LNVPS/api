@@ -794,8 +794,10 @@ pub fn ensure_secrets(
 ) -> Result<BTreeMap<String, String>> {
     let mut out = existing.clone();
     for s in &compose.secrets {
+        // Only missing secrets are generated, so an existing deployment keeps
+        // its stored value even if the declaration's length changes later.
         out.entry(s.name.clone())
-            .or_insert_with(|| generate_secret_value(24));
+            .or_insert_with(|| generate_secret_value(s.byte_len()));
     }
     // Sanity: every declared secret is now present.
     for s in &compose.secrets {
@@ -1690,6 +1692,27 @@ config:
                 .iter()
                 .any(|f| f.path == "/etc/api.key" && f.sensitive)
         );
+    }
+
+    /// A secret declaring `bytes:` is generated at that width, and one that
+    /// does not keeps the historical 24 bytes.
+    #[test]
+    fn ensure_secrets_honours_declared_byte_length() {
+        let c = lnvps_compose::Compose::parse(
+            "services:\n  a:\n    image: x\n    env:\n      K: ${KEY}\n      P: ${PW}\n\
+             secrets:\n  - { name: PW, generate: password }\n  \
+             - { name: KEY, generate: token, bytes: 32 }\n",
+        )
+        .unwrap();
+        let generated = ensure_secrets(&c, &BTreeMap::new()).unwrap();
+        assert_eq!(generated["PW"].len(), 48, "default stays 24 bytes");
+        assert_eq!(generated["KEY"].len(), 64, "32 bytes hex-encoded");
+        assert!(generated["KEY"].chars().all(|c| c.is_ascii_hexdigit()));
+
+        // A stored value is preserved even if the declared length changed.
+        let existing = BTreeMap::from([("KEY".to_string(), "ff".to_string())]);
+        let kept = ensure_secrets(&c, &existing).unwrap();
+        assert_eq!(kept["KEY"], "ff");
     }
 
     #[test]

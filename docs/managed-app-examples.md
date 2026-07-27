@@ -33,7 +33,9 @@ with the matching `app_cluster_id`.
 ## Compose grammar recap
 
 Top-level keys: `services`, `secrets` (operator-generated, injected as
-`${NAME}`), `config` (customer form fields, injected as `${name}`). Per service:
+`${NAME}`; `bytes:` sets the generated length, default 24, range 16–64, always
+hex-encoded so the value is twice that many characters), `config` (customer
+form fields, injected as `${name}`). Per service:
 `image`, `resources: { cpu, memory }`, `ports` (`expose: none|ingress`, ingress
 is HTTP only), `env`, `volumes` (PVCs, read-write), `files` (ConfigMap/Secret,
 read-only, mounted via subPath), `depends_on`, `backup`, `user`. `${HOSTNAME}`
@@ -473,7 +475,7 @@ services:
       RELAY_URL: "wss://${HOSTNAME}"
       BUZZ_MEDIA_BASE_URL: "https://${HOSTNAME}"
       BUZZ_BIND_ADDR: "0.0.0.0:3000"
-      BUZZ_RELAY_PRIVATE_KEY: "${relay_private_key}"
+      BUZZ_RELAY_PRIVATE_KEY: "${BUZZ_RELAY_PRIVATE_KEY}"
       RELAY_OWNER_PUBKEY: "${owner_pubkey}"
       # --- backing services (in-namespace DNS) ---
       DATABASE_URL: "postgres://buzz:${DB_PASSWORD}@db:5432/buzz"
@@ -510,28 +512,24 @@ secrets:
   - { name: S3_ACCESS_KEY, generate: token }
   - { name: S3_SECRET_KEY, generate: password }
   - { name: GIT_HOOK_HMAC_SECRET, generate: token }
+  # 32 bytes exactly: this is the relay's Nostr secret key, and the default 24
+  # is rejected at startup as an invalid secret key.
+  - { name: BUZZ_RELAY_PRIVATE_KEY, generate: token, bytes: 32 }
 config:
   - { name: owner_pubkey, label: "Owner pubkey (64-char hex)", type: string, required: true }
-  - { name: relay_private_key, label: "Relay signing key (openssl rand -hex 32)", type: string, required: true }
 ```
 
 ### Before this one can be enabled
 
-Two things in the compose grammar are missing for this app to deploy
-end-to-end. Both are small; until they land, this entry is documentation, not
-a shippable catalog item.
+One thing in the compose grammar is still missing for this app to deploy
+end-to-end; until it lands, this entry is documentation, not a shippable
+catalog item.
 
-1. **A 32-byte generated secret.** `secrets: generate:` always produces 24
-   random bytes (48 hex chars). `BUZZ_RELAY_PRIVATE_KEY` must be a 32-byte
-   Nostr secret key, and the relay exits with `invalid
-   BUZZ_RELAY_PRIVATE_KEY: Invalid secret key` on anything else. The compose
-   above works around it by asking the customer to paste
-   `openssl rand -hex 32` into a `config:` field — which puts the relay's
-   identity key in the order form. A `bytes:` (or `length:`) option on a
-   secret declaration would let the operator generate it, and the field could
-   then be dropped.
+(The 32-byte generated secret it also needed landed in #243: `bytes:` on a
+secret declaration, used above for `BUZZ_RELAY_PRIVATE_KEY`. The customer no
+longer pastes the relay's identity key into the order form.)
 
-2. **One-shot bucket creation.** The relay never issues `CreateBucket`; it
+1. **One-shot bucket creation.** The relay never issues `CreateBucket`; it
    expects `BUZZ_S3_BUCKET` to exist and dies with `NoSuchBucket` in the A3
    probe otherwise (upstream's Helm chart runs an `mc mb` Job plus a
    wait-for-bucket init container). RustFS has no "default buckets" env var,
