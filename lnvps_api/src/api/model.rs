@@ -403,6 +403,11 @@ pub struct ApiVmPayment {
     pub is_upgrade: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upgrade_params: Option<String>,
+    /// Money returned to the customer rather than collected from them (issue
+    /// #193). `amount`/`tax` are the magnitude refunded, so a client totalling
+    /// what this VM cost must subtract these rows. `data` is empty: a refund has
+    /// no invoice to pay.
+    pub is_refund: bool,
 }
 
 #[derive(Serialize)]
@@ -488,31 +493,43 @@ impl ApiVmPayment {
             .as_ref()
             .map(|m| serde_json::to_string(m).unwrap_or_default());
         let is_upgrade = value.payment_type == lnvps_db::SubscriptionPaymentType::Upgrade;
-        let data = match &value.payment_method {
-            PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data.into()),
-            PaymentMethod::OnChain => ApiPaymentData::OnChain {
-                address: value.external_data.into(),
-                outpoint: value.external_id.clone(),
-            },
-            PaymentMethod::Revolut => {
-                #[derive(Deserialize)]
-                struct RevolutData {
-                    pub token: String,
+        let is_refund = value.payment_type.is_refund();
+        // A refund carries no payment instrument — `external_data` is empty, so
+        // the provider-specific parsing below would fail and take the whole
+        // payment list down with it (this converter is collected with `?`).
+        let data = if is_refund {
+            ApiPaymentData::Lightning(String::new())
+        } else {
+            match &value.payment_method {
+                PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data.into()),
+                PaymentMethod::OnChain => ApiPaymentData::OnChain {
+                    address: value.external_data.into(),
+                    outpoint: value.external_id.clone(),
+                },
+                PaymentMethod::Revolut => {
+                    #[derive(Deserialize)]
+                    struct RevolutData {
+                        pub token: String,
+                    }
+                    let data: RevolutData = serde_json::from_str(value.external_data.as_str())
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to parse Revolut payment data: {}", e)
+                        })?;
+                    ApiPaymentData::Revolut { token: data.token }
                 }
-                let data: RevolutData = serde_json::from_str(value.external_data.as_str())
-                    .map_err(|e| anyhow::anyhow!("Failed to parse Revolut payment data: {}", e))?;
-                ApiPaymentData::Revolut { token: data.token }
-            }
-            PaymentMethod::Paypal => anyhow::bail!("PayPal payments are not supported"),
-            PaymentMethod::Stripe => {
-                #[derive(Deserialize)]
-                struct StripeData {
-                    pub session_id: String,
-                }
-                let data: StripeData = serde_json::from_str(value.external_data.as_str())
-                    .map_err(|e| anyhow::anyhow!("Failed to parse Stripe payment data: {}", e))?;
-                ApiPaymentData::Stripe {
-                    session_id: data.session_id,
+                PaymentMethod::Paypal => anyhow::bail!("PayPal payments are not supported"),
+                PaymentMethod::Stripe => {
+                    #[derive(Deserialize)]
+                    struct StripeData {
+                        pub session_id: String,
+                    }
+                    let data: StripeData = serde_json::from_str(value.external_data.as_str())
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to parse Stripe payment data: {}", e)
+                        })?;
+                    ApiPaymentData::Stripe {
+                        session_id: data.session_id,
+                    }
                 }
             }
         };
@@ -531,6 +548,7 @@ impl ApiVmPayment {
             is_upgrade,
             upgrade_params,
             data,
+            is_refund,
         })
     }
 }
@@ -1171,6 +1189,9 @@ pub enum ApiSubscriptionPaymentType {
     Purchase,
     Renewal,
     Upgrade,
+    /// Money returned to the customer. `amount`/`tax` are the magnitude
+    /// refunded, so a client totalling what a customer paid must subtract it.
+    Refund,
 }
 
 impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
@@ -1179,6 +1200,7 @@ impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
             lnvps_db::SubscriptionPaymentType::Purchase => ApiSubscriptionPaymentType::Purchase,
             lnvps_db::SubscriptionPaymentType::Renewal => ApiSubscriptionPaymentType::Renewal,
             lnvps_db::SubscriptionPaymentType::Upgrade => ApiSubscriptionPaymentType::Upgrade,
+            lnvps_db::SubscriptionPaymentType::Refund => ApiSubscriptionPaymentType::Refund,
         }
     }
 }
@@ -1530,6 +1552,7 @@ mod tests {
             tax_treatment: None,
             tax_evidence: None,
             tax_breakdown: None,
+            refunded_payment_id: None,
         };
 
         // No deposit seen yet -> waiting for payment, no outpoint.

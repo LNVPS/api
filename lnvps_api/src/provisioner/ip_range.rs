@@ -695,6 +695,7 @@ mod tests {
             tax_treatment: None,
             tax_evidence: None,
             tax_breakdown: None,
+            refunded_payment_id: None,
         }
     }
 

@@ -351,6 +351,7 @@ impl OnChainPaymentHandler {
                 tax_treatment: payment.tax_treatment.clone(),
                 tax_evidence: payment.tax_evidence.clone(),
                 tax_breakdown: payment.tax_breakdown.clone(),
+                refunded_payment_id: None,
             };
             self.regenerate(&mut renewal, amount_msat).await?;
             self.db.insert_subscription_payment(&renewal).await?;
@@ -536,6 +537,7 @@ mod tests {
             tax_treatment: None,
             tax_evidence: None,
             tax_breakdown: None,
+            refunded_payment_id: None,
         };
         db.insert_subscription_payment(&payment).await?;
 

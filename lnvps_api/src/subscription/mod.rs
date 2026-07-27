@@ -694,6 +694,13 @@ impl SubscriptionHandler {
                     SubscriptionPaymentType::Upgrade => {
                         format!("Subscription upgrade: {}", subscription.name)
                     }
+                    // Refunds are recorded, never invoiced: nothing here creates
+                    // one, and an invoice for money we owe the customer would be
+                    // nonsense. Kept explicit so a future path that does reach
+                    // here is a compile error rather than a mislabelled invoice.
+                    SubscriptionPaymentType::Refund => {
+                        bail!("Cannot create an invoice for a refund")
+                    }
                 };
 
                 info!(
@@ -739,6 +746,7 @@ impl SubscriptionHandler {
                     tax_treatment: tax_summary.treatment.clone(),
                     tax_evidence: tax_evidence.clone(),
                     tax_breakdown: tax_breakdown.clone(),
+                    refunded_payment_id: None,
                 }
             }
             PaymentMethod::Revolut => {
@@ -761,6 +769,13 @@ impl SubscriptionHandler {
                     }
                     SubscriptionPaymentType::Upgrade => {
                         format!("Subscription upgrade: {}", subscription.name)
+                    }
+                    // Refunds are recorded, never invoiced: nothing here creates
+                    // one, and an invoice for money we owe the customer would be
+                    // nonsense. Kept explicit so a future path that does reach
+                    // here is a compile error rather than a mislabelled invoice.
+                    SubscriptionPaymentType::Refund => {
+                        bail!("Cannot create an invoice for a refund")
                     }
                 };
 
@@ -833,6 +848,7 @@ impl SubscriptionHandler {
                     tax_treatment: tax_summary.treatment.clone(),
                     tax_evidence: tax_evidence.clone(),
                     tax_breakdown: tax_breakdown.clone(),
+                    refunded_payment_id: None,
                 }
             }
             PaymentMethod::OnChain => {
@@ -853,6 +869,13 @@ impl SubscriptionHandler {
                     }
                     SubscriptionPaymentType::Upgrade => {
                         format!("Subscription upgrade: {}", subscription.name)
+                    }
+                    // Refunds are recorded, never invoiced: nothing here creates
+                    // one, and an invoice for money we owe the customer would be
+                    // nonsense. Kept explicit so a future path that does reach
+                    // here is a compile error rather than a mislabelled invoice.
+                    SubscriptionPaymentType::Refund => {
+                        bail!("Cannot create an invoice for a refund")
                     }
                 };
 
@@ -891,6 +914,7 @@ impl SubscriptionHandler {
                     tax_treatment: tax_summary.treatment.clone(),
                     tax_evidence: tax_evidence.clone(),
                     tax_breakdown: tax_breakdown.clone(),
+                    refunded_payment_id: None,
                 }
             }
             PaymentMethod::Paypal => bail!("PayPal not implemented"),
@@ -947,6 +971,11 @@ impl SubscriptionHandler {
                     }
                     SubscriptionPaymentType::Upgrade => format!("VM upgrade {vm_id}"),
                     SubscriptionPaymentType::Purchase => format!("VM purchase {vm_id}"),
+                    // A refund is recorded against an existing payment, never
+                    // priced and invoiced like a sale.
+                    SubscriptionPaymentType::Refund => {
+                        bail!("Cannot create a payment request for a refund")
+                    }
                 };
                 (line_item.subscription_id, vm.user_id, desc)
             }
@@ -1035,6 +1064,7 @@ impl SubscriptionHandler {
                             tax_treatment: tax_summary.treatment.clone(),
                             tax_evidence: tax_evidence.clone(),
                             tax_breakdown: tax_breakdown.clone(),
+                            refunded_payment_id: None,
                         }
                     }
                     PaymentMethod::Revolut => {
@@ -1116,6 +1146,7 @@ impl SubscriptionHandler {
                             tax_treatment: tax_summary.treatment.clone(),
                             tax_evidence: tax_evidence.clone(),
                             tax_breakdown: tax_breakdown.clone(),
+                            refunded_payment_id: None,
                         }
                     }
                     PaymentMethod::OnChain => {
@@ -1159,6 +1190,7 @@ impl SubscriptionHandler {
                             tax_treatment: tax_summary.treatment.clone(),
                             tax_evidence: tax_evidence.clone(),
                             tax_breakdown: tax_breakdown.clone(),
+                            refunded_payment_id: None,
                         }
                     }
                     PaymentMethod::Paypal => bail!("PayPal not implemented"),
@@ -2180,6 +2212,7 @@ mod revolut_offline_tests {
             tax_treatment: None,
             tax_evidence: None,
             tax_breakdown: None,
+            refunded_payment_id: None,
         }
     }
 

@@ -1,8 +1,8 @@
 use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
-    AdminCreateVmRequest, AdminRefundAmountInfo, AdminVmHistoryInfo, AdminVmInfo,
-    AdminVmPaymentInfo, JobResponse,
+    AdminCreateVmRequest, AdminPaymentRefundsInfo, AdminRefundAmountInfo, AdminVmHistoryInfo,
+    AdminVmInfo, AdminVmPaymentInfo, JobResponse,
 };
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post, put};
@@ -11,6 +11,7 @@ use chrono::{DateTime, Days, Utc};
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, PricingEngine,
     UpgradeConfig, VatClient, VmHistoryLogger, VmRunningState, VmStateCache, WorkJob,
+    derive_refund_payment_id, prorated_refund_tax,
 };
 use lnvps_db::{AdminAction, AdminResource, SubscriptionPaymentType};
 use log::{error, info};
@@ -53,6 +54,10 @@ pub fn router() -> Router<RouterState> {
         .route(
             "/api/admin/v1/vms/{id}/payments/{payment_id}/complete",
             post(admin_complete_vm_payment),
+        )
+        .route(
+            "/api/admin/v1/vms/{id}/payments/{payment_id}/refund",
+            get(admin_list_payment_refunds).post(admin_record_payment_refund),
         )
 }
 
@@ -981,8 +986,245 @@ async fn admin_process_vm_refund(
     );
     Err(ApiError::not_implemented(
         "Automated refund processing is not implemented: no funds are moved and no record is \
-         written. Issue the refund out-of-band and record it against the VM's payment.",
+         written. Issue the refund out-of-band and record it with \
+         POST /api/admin/v1/vms/{vm_id}/payments/{payment_id}/refund.",
     ))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct AdminRecordRefundRequest {
+    /// Gross magnitude refunded (net + tax), in the refunded payment's own
+    /// currency and smallest unit. Defaults to everything still refundable on
+    /// that payment.
+    amount: Option<u64>,
+    /// Why the money was returned. Stored on the refund row and the VM history.
+    reason: Option<String>,
+    /// Proof the money actually moved — Lightning preimage, Revolut refund id,
+    /// bank reference. Free text; stored on the refund row's metadata.
+    external_ref: Option<String>,
+    /// When the money left, unix seconds. Defaults to now. This is the date the
+    /// refund lands in reports, so backdating one into a closed VAT period is
+    /// possible and deliberate — a refund belongs to the period it happened in.
+    refunded_at: Option<i64>,
+}
+
+/// Record a refund that has already been paid out by hand, against the payment
+/// it reverses (issue #193).
+///
+/// Nothing here moves money — the payout path is part 3 of the issue. This is
+/// the accounting record for an operator who has refunded a customer through
+/// their wallet, Revolut or a bank, and until it existed there was nowhere to
+/// put such a refund at all: `SubscriptionPaymentType` had no refund variant,
+/// so P/L, the OSS VAT return and every earnings figure counted refunded money
+/// as revenue forever.
+///
+/// The row is deliberately a copy of the payment it reverses rather than a
+/// fresh calculation: same currency, same frozen exchange `rate`, same VAT
+/// rate, country and treatment, with `amount`/`tax` pro-rated. VAT is owed on
+/// what was charged, so reversing it at today's rates (which is what
+/// `GET /refund` computes, from the cost plan) would misstate the return.
+async fn admin_record_payment_refund(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path((vm_id, payment_id)): Path<(u64, String)>,
+    Json(req): Json<AdminRecordRefundRequest>,
+) -> ApiResult<AdminVmPaymentInfo> {
+    // Money leaving the business is a payments write, like completing one.
+    auth.require_permission(AdminResource::Payments, AdminAction::Update)?;
+
+    let vm = this.db.get_vm(vm_id).await?;
+    let payment = load_vm_payment(&this, &vm, &payment_id).await?;
+
+    if !payment.is_paid {
+        return Err(ApiError::conflict(
+            "Cannot refund a payment that was never paid",
+        ));
+    }
+    if payment.payment_type.is_refund() {
+        return Err(ApiError::bad_request(
+            "Cannot refund a refund — record the reversal against the original payment",
+        ));
+    }
+
+    // Partial refunds are allowed, so the ceiling is what is left after the
+    // ones already recorded. Without this, a payment could be refunded twice
+    // over and the ledger would owe the customer money we never sent.
+    let existing = this.db.list_refunds_for_payment(&payment.id).await?;
+    let already: u64 = existing.iter().map(|r| r.amount).sum();
+    let refundable = payment.amount.saturating_sub(already);
+    if refundable == 0 {
+        return Err(ApiError::conflict(format!(
+            "Payment {payment_id} is already fully refunded ({already} of {})",
+            payment.amount
+        )));
+    }
+
+    let amount = req.amount.unwrap_or(refundable);
+    if amount == 0 {
+        return Err(ApiError::bad_request(
+            "Refund amount must be greater than 0",
+        ));
+    }
+    if amount > refundable {
+        return Err(ApiError::conflict(format!(
+            "Refund of {amount} exceeds the {refundable} still refundable on payment \
+             {payment_id} ({already} of {} already refunded)",
+            payment.amount
+        )));
+    }
+
+    let refunded_at = match req.refunded_at {
+        Some(ts) => DateTime::from_timestamp(ts, 0)
+            .ok_or_else(|| ApiError::bad_request("Invalid refunded_at timestamp"))?,
+        None => Utc::now(),
+    };
+
+    // Derived, not random: a resubmitted request lands on the same id, so a
+    // double-clicked modal is a conflict rather than a second refund.
+    let refund_id = derive_refund_payment_id(&payment.id, amount, refunded_at, auth.user_id);
+    if this.db.get_subscription_payment(&refund_id).await.is_ok() {
+        return Err(ApiError::conflict(
+            "This exact refund is already recorded (same payment, amount, timestamp and admin)",
+        ));
+    }
+
+    let mut metadata = serde_json::json!({
+        "refund": {
+            "recorded_by_admin_user_id": auth.user_id,
+            "refunded_payment_id": hex::encode(&payment.id),
+        }
+    });
+    if let Some(reason) = &req.reason {
+        metadata["refund"]["reason"] = serde_json::json!(reason);
+    }
+    if let Some(ext) = &req.external_ref {
+        metadata["refund"]["external_ref"] = serde_json::json!(ext);
+    }
+
+    let refund = lnvps_db::SubscriptionPayment {
+        id: refund_id.clone(),
+        subscription_id: payment.subscription_id,
+        user_id: payment.user_id,
+        created: refunded_at,
+        // A refund buys no time; `expires` is carried from the payment it
+        // reverses so the row sits in the period it belongs to.
+        expires: payment.expires,
+        amount,
+        currency: payment.currency.clone(),
+        // The instrument the original sale used. What the money was actually
+        // returned through is free text in `metadata.refund.external_ref`: the
+        // accounting row has to stay in the currency and at the rate it
+        // reverses, whatever wallet the operator used.
+        payment_method: payment.payment_method,
+        payment_type: SubscriptionPaymentType::Refund,
+        // Nothing to store: there is no invoice for money we are giving back.
+        external_data: lnvps_db::EncryptedString::new(String::new()),
+        external_id: None,
+        is_paid: true,
+        rate: payment.rate,
+        // Must stay None. `time_value` is what extends a subscription, and a
+        // refund must not touch expiry — the VM's fate is a separate decision.
+        time_value: None,
+        metadata: Some(metadata),
+        tax: prorated_refund_tax(&payment, amount),
+        // Processor fees are not returned on a refund, so the fee stays a sunk
+        // cost on the original payment rather than being reversed here.
+        processing_fee: 0,
+        paid_at: Some(refunded_at),
+        tax_rate: payment.tax_rate,
+        tax_country_code: payment.tax_country_code.clone(),
+        tax_treatment: payment.tax_treatment.clone(),
+        tax_evidence: payment.tax_evidence.clone(),
+        // The original's per-line breakdown describes the sale, not this
+        // reversal: on a partial refund its line amounts would not add up to
+        // this row. The OSS report falls back to the summary fields above,
+        // which are the ones that must match.
+        tax_breakdown: None,
+        refunded_payment_id: Some(payment.id.clone()),
+    };
+
+    this.db.insert_subscription_payment(&refund).await?;
+
+    info!(
+        "Admin {} recorded a refund of {} {} against payment {} for VM {}",
+        auth.user_id, amount, refund.currency, payment_id, vm_id
+    );
+
+    // Audit trail next to the PaymentReceived it reverses. A failure to write
+    // history must not lose the accounting row that is already committed.
+    let history = VmHistoryLogger::new(this.db.clone());
+    if let Err(e) = history
+        .log_vm_refunded(
+            vm_id,
+            Some(auth.user_id),
+            &payment.id,
+            &refund_id,
+            amount,
+            &refund.currency,
+            req.reason.as_deref(),
+            None,
+        )
+        .await
+    {
+        error!("Refund recorded but VM history entry failed for VM {vm_id}: {e}");
+    }
+
+    let base_currency = this.db.get_vm_base_currency(vm_id).await?;
+    ApiData::ok(AdminVmPaymentInfo::from_subscription_payment(
+        &refund,
+        vm_id,
+        base_currency,
+    ))
+}
+
+/// Refunds recorded against one payment, and what is still refundable on it.
+async fn admin_list_payment_refunds(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path((vm_id, payment_id)): Path<(u64, String)>,
+) -> ApiResult<AdminPaymentRefundsInfo> {
+    auth.require_permission(AdminResource::Payments, AdminAction::View)?;
+
+    let vm = this.db.get_vm(vm_id).await?;
+    let payment = load_vm_payment(&this, &vm, &payment_id).await?;
+    let refunds = this.db.list_refunds_for_payment(&payment.id).await?;
+    let base_currency = this.db.get_vm_base_currency(vm_id).await?;
+
+    let refunded_total: u64 = refunds.iter().map(|r| r.amount).sum();
+    ApiData::ok(AdminPaymentRefundsInfo {
+        payment_id: hex::encode(&payment.id),
+        currency: payment.currency.clone(),
+        amount: payment.amount,
+        refunded_total,
+        refundable_remaining: payment.amount.saturating_sub(refunded_total),
+        refunds: refunds
+            .iter()
+            .map(|r| AdminVmPaymentInfo::from_subscription_payment(r, vm_id, base_currency.clone()))
+            .collect(),
+    })
+}
+
+/// Decode a hex payment id and confirm the payment belongs to `vm`.
+///
+/// Shared by the refund handlers so a payment id from another customer's VM is
+/// a 404 rather than something that can be refunded against the wrong VM.
+async fn load_vm_payment(
+    this: &RouterState,
+    vm: &lnvps_db::Vm,
+    payment_id: &str,
+) -> Result<lnvps_db::SubscriptionPayment, ApiError> {
+    let payment_id_bytes =
+        hex::decode(payment_id).map_err(|_| ApiError::bad_request("Invalid payment ID format"))?;
+    let payment = this.db.get_subscription_payment(&payment_id_bytes).await?;
+    let payment_vm = this
+        .db
+        .get_vm_by_subscription(payment.subscription_id)
+        .await?;
+    if payment_vm.id != vm.id {
+        return Err(ApiError::not_found("Payment does not belong to this VM"));
+    }
+    Ok(payment)
 }
 
 /// Create a VM for a specific user (admin action)

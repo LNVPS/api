@@ -2361,6 +2361,20 @@ impl LNVpsDbBase for MockDb {
             .context("Subscription payment not found")?)
     }
 
+    async fn list_refunds_for_payment(
+        &self,
+        payment_id: &Vec<u8>,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        let payments = self.subscription_payments.lock().await;
+        let mut out: Vec<SubscriptionPayment> = payments
+            .iter()
+            .filter(|p| p.refunded_payment_id.as_ref() == Some(payment_id))
+            .cloned()
+            .collect();
+        out.sort_by_key(|p| p.created);
+        Ok(out)
+    }
+
     async fn get_subscription_payment_by_ext_id(
         &self,
         ext_id: &str,
@@ -2421,6 +2435,7 @@ impl LNVpsDbBase for MockDb {
             tax_treatment: payment.tax_treatment.clone(),
             tax_evidence: payment.tax_evidence.clone(),
             tax_breakdown: payment.tax_breakdown.clone(),
+            refunded_payment_id: payment.refunded_payment_id.clone(),
             company_id: 0,
             company_name: String::new(),
             company_base_currency: "EUR".to_string(),
@@ -4182,6 +4197,7 @@ impl lnvps_db::AdminDb for MockDb {
                     tax_treatment: payment.tax_treatment.clone(),
                     tax_evidence: payment.tax_evidence.clone(),
                     tax_breakdown: payment.tax_breakdown.clone(),
+                    refunded_payment_id: payment.refunded_payment_id.clone(),
                     company_id: cid,
                     company_name: company.name.clone(),
                     company_base_currency: company.base_currency.clone(),
@@ -4926,6 +4942,7 @@ mod tests {
             tax_treatment: None,
             tax_evidence: None,
             tax_breakdown: None,
+            refunded_payment_id: None,
         }
     }
 

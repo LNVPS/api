@@ -2681,6 +2681,7 @@ pub enum AdminVmHistoryActionType {
     PaymentReceived,
     ConfigurationChanged,
     Transferred,
+    Refunded,
 }
 
 impl From<VmHistoryActionType> for AdminVmHistoryActionType {
@@ -2696,6 +2697,7 @@ impl From<VmHistoryActionType> for AdminVmHistoryActionType {
             VmHistoryActionType::Reinstalled => AdminVmHistoryActionType::Reinstalled,
             VmHistoryActionType::StateChanged => AdminVmHistoryActionType::StateChanged,
             VmHistoryActionType::PaymentReceived => AdminVmHistoryActionType::PaymentReceived,
+            VmHistoryActionType::Refunded => AdminVmHistoryActionType::Refunded,
             VmHistoryActionType::ConfigurationChanged => {
                 AdminVmHistoryActionType::ConfigurationChanged
             }
@@ -2806,7 +2808,31 @@ pub struct AdminVmPaymentInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paid_at: Option<DateTime<Utc>>,
     pub rate: f32, // Exchange rate to base currency (EUR)
-                   // Note: external_data is omitted as it may contain sensitive payment provider data
+    /// What this row is. A `refund` row's `amount`/`tax` are the magnitude
+    /// returned to the customer, so anything totalling a VM's payments must
+    /// subtract it rather than add it (issue #193).
+    pub payment_type: ApiSubscriptionPaymentType,
+    /// For a `refund` row, the hex id of the payment it reverses; null otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refunded_payment_id: Option<String>,
+    // Note: external_data is omitted as it may contain sensitive payment provider data
+}
+
+/// Refunds recorded against one payment, with what is still refundable on it.
+#[derive(Serialize)]
+pub struct AdminPaymentRefundsInfo {
+    /// Hex id of the payment these refunds reverse.
+    pub payment_id: String,
+    /// Currency of the payment and of every amount in this response.
+    pub currency: String,
+    /// Gross amount originally charged, in the smallest unit.
+    pub amount: u64,
+    /// Sum of the refunds already recorded against it.
+    pub refunded_total: u64,
+    /// `amount - refunded_total`: the ceiling on the next refund.
+    pub refundable_remaining: u64,
+    /// The refund rows themselves, oldest first.
+    pub refunds: Vec<AdminVmPaymentInfo>,
 }
 
 impl AdminVmPaymentInfo {
@@ -2830,6 +2856,8 @@ impl AdminVmPaymentInfo {
             is_paid: payment.is_paid,
             paid_at: payment.paid_at,
             rate: payment.rate,
+            payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
+            refunded_payment_id: payment.refunded_payment_id.as_ref().map(hex::encode),
         }
     }
 }
@@ -3227,11 +3255,14 @@ pub struct AdminSubscriptionPaymentInfo {
     pub processing_fee: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub enum ApiSubscriptionPaymentType {
     Purchase,
     Renewal,
     Upgrade,
+    /// Money returned to the customer: `amount`/`tax` are magnitudes to
+    /// subtract from earnings, not another sale.
+    Refund,
 }
 
 impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
@@ -3240,6 +3271,7 @@ impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
             lnvps_db::SubscriptionPaymentType::Purchase => ApiSubscriptionPaymentType::Purchase,
             lnvps_db::SubscriptionPaymentType::Renewal => ApiSubscriptionPaymentType::Renewal,
             lnvps_db::SubscriptionPaymentType::Upgrade => ApiSubscriptionPaymentType::Upgrade,
+            lnvps_db::SubscriptionPaymentType::Refund => ApiSubscriptionPaymentType::Refund,
         }
     }
 }
@@ -3250,6 +3282,7 @@ impl From<ApiSubscriptionPaymentType> for lnvps_db::SubscriptionPaymentType {
             ApiSubscriptionPaymentType::Purchase => lnvps_db::SubscriptionPaymentType::Purchase,
             ApiSubscriptionPaymentType::Renewal => lnvps_db::SubscriptionPaymentType::Renewal,
             ApiSubscriptionPaymentType::Upgrade => lnvps_db::SubscriptionPaymentType::Upgrade,
+            ApiSubscriptionPaymentType::Refund => lnvps_db::SubscriptionPaymentType::Refund,
         }
     }
 }

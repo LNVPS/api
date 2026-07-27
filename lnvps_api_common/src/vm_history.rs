@@ -303,6 +303,68 @@ impl VmHistoryLogger {
         Ok(())
     }
 
+    /// Record that money was returned to the customer for this VM (issue #193).
+    ///
+    /// Written when a refund is entered against one of the VM's payments, so
+    /// the audit trail carries the reversal next to the `PaymentReceived` it
+    /// undoes: `amount`/`currency` are the magnitude refunded, and the metadata
+    /// names the refunded payment and the refund row that records it.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn log_vm_refunded(
+        &self,
+        vm_id: u64,
+        initiated_by_user: Option<u64>,
+        refunded_payment_id: &[u8],
+        refund_payment_id: &[u8],
+        amount: u64,
+        currency: &str,
+        reason: Option<&str>,
+        metadata: Option<Value>,
+    ) -> Result<()> {
+        let mut meta = metadata.unwrap_or_else(|| json!({}));
+        meta["refunded_payment_id"] = json!(hex::encode(refunded_payment_id));
+        meta["refund_payment_id"] = json!(hex::encode(refund_payment_id));
+        meta["amount"] = json!(amount);
+        meta["currency"] = json!(currency);
+        meta["admin_action"] = json!(true);
+        if let Some(r) = reason {
+            meta["reason"] = json!(r);
+        }
+
+        let description = match reason {
+            Some(r) => format!(
+                "VM {} was refunded {} {} against payment {} - Reason: {}",
+                vm_id,
+                amount,
+                currency,
+                hex::encode(refunded_payment_id),
+                r
+            ),
+            None => format!(
+                "VM {} was refunded {} {} against payment {}",
+                vm_id,
+                amount,
+                currency,
+                hex::encode(refunded_payment_id)
+            ),
+        };
+
+        let history = VmHistory {
+            id: 0,
+            vm_id,
+            action_type: VmHistoryActionType::Refunded,
+            timestamp: Utc::now(),
+            initiated_by_user,
+            previous_state: None,
+            new_state: None,
+            metadata: serialize_json_to_bytes(Some(meta)),
+            description: Some(description),
+        };
+
+        self.db.insert_vm_history(&history).await?;
+        Ok(())
+    }
+
     pub async fn log_vm_state_changed(
         &self,
         vm_id: u64,

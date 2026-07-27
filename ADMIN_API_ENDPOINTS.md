@@ -668,6 +668,88 @@ Errors:
 - `400` if the payment does not belong to the specified VM
 - `400` if the payment ID format is invalid
 
+#### List Refunds for a Payment
+
+```
+GET /api/admin/v1/vms/{vm_id}/payments/{payment_id}/refund
+```
+
+Required Permission: `payments::view`
+
+Every refund recorded against this payment, and what is still refundable on it.
+
+```json
+{
+  "data": {
+    "payment_id": "a1b2...",
+    "currency": "EUR",
+    "amount": 1230,
+    // gross originally charged
+    "refunded_total": 615,
+    "refundable_remaining": 615,
+    "refunds": [
+      // AdminVmPaymentInfo rows, oldest first, each with payment_type "Refund"
+    ]
+  }
+}
+```
+
+#### Record a Refund
+
+```
+POST /api/admin/v1/vms/{vm_id}/payments/{payment_id}/refund
+```
+
+Required Permission: `payments::update` — **not** a VM permission. A `vm_manager`
+can delete a customer's VM but cannot decide money goes back out.
+
+Records a refund that has **already been paid out by hand** (issue #193). Nothing here
+moves money — automated payouts are part 3 of that issue and `POST /vms/{id}/refund`
+still answers `501`. This is the accounting record, and until it existed a refund could
+not be represented at all: every earnings figure counted refunded money as revenue
+forever.
+
+Body (all fields optional):
+
+```json
+{
+  "amount": 615,
+  // Gross magnitude refunded (net + tax) in the refunded payment's own currency
+  // and smallest unit. Defaults to everything still refundable on that payment.
+  "reason": "Customer requested cancellation",
+  "external_ref": "lnbc-preimage / revolut refund id / bank reference",
+  // Proof the money moved. Stored on the refund row's metadata.
+  "refunded_at": 1705312200
+  // Unix seconds; defaults to now. This is the date the refund lands in reports,
+  // so backdating one into an earlier VAT period is possible and deliberate.
+}
+```
+
+The refund is stored as a `subscription_payment` row with `payment_type = "Refund"`,
+`refunded_payment_id` pointing at the payment it reverses, and `amount`/`tax` holding
+the **magnitude** returned — the columns are unsigned, so reports subtract refund rows
+rather than reading a negative number. Currency, exchange `rate`, VAT rate, country and
+treatment are copied from the refunded payment (VAT is owed on what was charged, not on
+today's rates), `tax` is pro-rated and rounded down, `time_value` is null so nothing is
+extended, and `processing_fee` is `0` because processors do not return their fee.
+
+A VM history entry (`refunded`) is written alongside it.
+
+Returns the recorded `AdminVmPaymentInfo`.
+
+Errors:
+- `400` malformed payment id, `amount` of 0, invalid `refunded_at`, or an attempt to
+  refund a refund
+- `403` without `payments::update`
+- `404` unknown payment, or a payment belonging to a different VM
+- `409` payment never paid, already fully refunded, `amount` above what is still
+  refundable, or this exact refund already recorded (same payment, amount, timestamp
+  and admin — a resubmitted request is a conflict, not a second refund)
+
+**Not included:** recording a refund does not delete or stop the VM. Deleting a refunded
+VM stays the explicit `DELETE /api/admin/v1/vms/{id}`, so an accounting correction never
+destroys a customer's machine as a side effect.
+
 ### Subscription Management
 
 #### List Subscriptions
@@ -3438,6 +3520,10 @@ Response:
         "amount": 125000,
         "currency": "USD",
         "payment_method": "lightning",
+        "payment_type": "renewal",
+        // "purchase" | "renewal" | "upgrade" | "refund"
+        "refunded_payment_id": null,
+        // set on a "refund" row: the payment it reverses
         "external_id": "inv_12345",
         "is_paid": true,
         "rate": 1.0,
@@ -3456,6 +3542,11 @@ Response:
   }
 }
 ```
+
+**Refunds appear as ordinary rows with `payment_type: "refund"`** (issue #193). Their
+`amount`/`tax` are the magnitude returned to the customer, so any total built from this
+feed must **subtract** them — the columns are unsigned and the sign lives in the type.
+`refunded_payment_id` links back to the payment being reversed.
 
 #### Referral Usage Time Series Report
 
@@ -3555,6 +3646,10 @@ Response:
 - **Costs** have no stored rate, so they are converted into the report `currency`
   using current exchange rates (BTC-pivoted).
 - `profit = revenue_net - cost_total` and may be negative.
+- **`revenue_net` and `revenue_tax` are net of refunds** recorded in the period, and are
+  themselves signed (issue #193): a period that refunded more than it sold reports
+  negative revenue. Refunds land in the period they were paid out in, not the period of
+  the sale they reverse.
 - Amounts are in smallest currency units (cents for fiat, millisats for BTC).
 - Recurring-cost month normalization uses ~30.44 days/month for `day` intervals,
   the interval count directly for `month`, and ×12 for `year`.
@@ -3569,6 +3664,10 @@ GET /api/admin/v1/reports/oss
 Aggregates cross-border EU B2C sales (`tax_treatment = oss_b2c`) by filing
 period and destination member state, so the totals can be transcribed onto a
 quarterly (or bi-monthly) OSS VAT return. Only **paid** payments are included.
+**Refunds are netted off** (issue #193): a refund row carries the same frozen country,
+rate and treatment as the payment it reverses, so it subtracts from exactly the bucket
+that declared the VAT. `net_total` and `tax_total` are therefore signed and can be
+negative when a period refunds more than it sells.
 Each row is keyed by `(period, company, destination country, VAT rate)` because
 each seller company is a separate VAT-registered entity. Amounts are expressed
 in each company's **base currency**, converted from the payment currency using
