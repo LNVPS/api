@@ -298,6 +298,69 @@ mod tests {
         assert!(body.contains("Insufficient permissions"));
     }
 
+    /// Catalog SEO metadata is admin-only data (issue #239): writing it needs
+    /// `app::create` / `app::update`, which `read_only` does not carry. The
+    /// permission check runs before request validation, so a body that is
+    /// invalid anyway still yields 403 rather than leaking that it was.
+    #[tokio::test]
+    async fn test_read_only_cannot_write_app_category() {
+        setup_rbac().await;
+        let client = admin_client_with_keys(read_only_keys().clone());
+
+        let create = serde_json::json!({
+            "name": "e2e-rbac-seo",
+            "display_name": "RBAC SEO",
+            "category": "Nostr relay",
+            "compose": "services:\n  relay:\n    image: example/relay:latest\n",
+            "amount": 1000,
+            "currency": "usd",
+            "interval_amount": 1,
+            "interval_type": "month",
+            "setup_amount": 0
+        });
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &create)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(resp.text().await.unwrap().contains("Insufficient permissions"));
+
+        // Same for patching an existing app's category — 403 before the lookup,
+        // so a non-existent id is still 403 and not 404.
+        let resp = client
+            .patch_auth(
+                "/api/admin/v1/apps/999999999",
+                &serde_json::json!({ "category": "Personal Nostr relay" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // `App` permissions were only ever granted to super_admin
+        // (20260724150132_app_rbac_permissions.sql), so read_only cannot even
+        // view the catalog through the admin API — the customer-facing
+        // `GET /api/v1/apps` is the public read surface (#227).
+        let resp = client.get_auth("/api/admin/v1/apps").await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // super_admin does carry them, so the same create succeeds there —
+        // this is a permission boundary, not a broken route.
+        let admin = admin_client_with_keys(super_admin_keys().clone());
+        let resp = admin.post_auth("/api/admin/v1/apps", &create).await.unwrap();
+        assert!(
+            resp.status() == StatusCode::OK || resp.status() == StatusCode::BAD_REQUEST,
+            "super_admin reaches validation, not the permission gate: {}",
+            resp.status()
+        );
+        if resp.status() == StatusCode::OK {
+            let body: serde_json::Value =
+                serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            let id = body["data"]["id"].as_u64().expect("app id");
+            assert_eq!(body["data"]["category"].as_str(), Some("Nostr relay"));
+            let _ = admin.delete_auth(&format!("/api/admin/v1/apps/{id}")).await;
+        }
+    }
+
     /// `app_deployment::delete` is enough to delete a deployment but not to
     /// purge one — that stays super_admin-only. Like the VM purge, the check
     /// runs before the lookup, so a non-existent id still yields 403.

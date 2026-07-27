@@ -531,9 +531,10 @@ pub async fn seed_app_deployment(
     let slug = format!("{name}-{suffix}");
 
     let (app_id,): (u64,) = sqlx::query_as(
-        "INSERT INTO app (name, display_name, description, icon, compose, amount, currency, \
-             interval_amount, interval_type, setup_amount, enabled) \
-         VALUES (?, 'E2E App', NULL, NULL, 'services: {}', 1000, 'USD', 1, 1, 0, 1) RETURNING id",
+        "INSERT INTO app (name, display_name, description, icon, category, compose, amount, \
+             currency, interval_amount, interval_type, setup_amount, enabled) \
+         VALUES (?, 'E2E App', NULL, NULL, 'Nostr relay', 'services: {}', 1000, 'USD', 1, 1, 0, 1) \
+         RETURNING id",
     )
     .bind(&slug)
     .fetch_one(pool)
@@ -618,10 +619,10 @@ pub async fn seed_app_and_cluster(pool: &MySqlPool) -> anyhow::Result<(u64, u64,
 
     // App with a real (small) footprint and a valid single-service compose.
     let (app_id,): (u64,) = sqlx::query_as(
-        "INSERT INTO app (name, display_name, description, icon, compose, amount, currency, \
-             interval_amount, interval_type, setup_amount, enabled, cpu_milli, memory_bytes, \
-             storage_bytes) \
-         VALUES (?, 'E2E Orderable', NULL, NULL, \
+        "INSERT INTO app (name, display_name, description, icon, category, compose, amount, \
+             currency, interval_amount, interval_type, setup_amount, enabled, cpu_milli, \
+             memory_bytes, storage_bytes) \
+         VALUES (?, 'E2E Orderable', NULL, NULL, 'Nostr relay', \
              'services:\\n  web:\\n    image: example/web:latest\\n    ports:\\n      - { name: http, container: 80, protocol: http, expose: ingress }\\nconfig:\\n  - { name: title, type: string, default: \"hi\" }\\n', \
              1000, 'USD', 1, 1, 0, 1, 250, 268435456, 0) RETURNING id",
     )

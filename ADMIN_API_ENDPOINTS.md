@@ -3651,6 +3651,9 @@ Ordered `id DESC`. `app` has no soft-delete, so there is no `include_deleted` he
   "description": "A personal Nostr relay",
   "icon": null,
   "repo_url": "https://github.com/hoytech/strfry",
+  "category": "Nostr relay",
+  "seo_title": null,
+  "seo_description": null,
   "compose": "services:\n  relay:\n    image: example/relay:latest\n    ports:\n      - { name: ws, container: 7777, protocol: http, expose: ingress }\n",
   "amount": 1000,
   "currency": "USD",
@@ -3682,6 +3685,12 @@ Required Permission: `app::create`. Body:
   // Optional.
   "repo_url": "https://github.com/hoytech/strfry",
   // Optional. Canonical source repository URL.
+  "category": "Nostr relay",
+  // Required. Class of software; free text, see the format contract below.
+  "seo_title": "Managed strfry Relay Hosting",
+  // Optional override for the public page <title>.
+  "seo_description": "...",
+  // Optional override for the public page meta description.
   "compose": "services: { ... }",
   // Required. docker-compose-style YAML (image/ports/env/volumes).
   "amount": 1000,
@@ -3696,7 +3705,14 @@ Required Permission: `app::create`. Body:
 }
 ```
 
-`name` must be a DNS-safe slug and unique; `display_name`, `compose` and `currency` are required. `currency` is normalised to upper-case. The `compose` is fully parsed and validated on create/update, and the app's **resource footprint** (`cpu_milli` / `memory_bytes` / `storage_bytes` — Σ service `resources` + volume sizes) is computed from it and returned on `AdminAppInfo` (used for cluster capacity accounting).
+`name` must be a DNS-safe slug and unique; `display_name`, `compose`, `currency` and `category` are required. `currency` is normalised to upper-case. The `compose` is fully parsed and validated on create/update, and the app's **resource footprint** (`cpu_milli` / `memory_bytes` / `storage_bytes` — Σ service `resources` + volume sizes) is computed from it and returned on `AdminAppInfo` (used for cluster capacity accounting).
+
+**`category` format contract.** `category` is the shortest phrase that is true of this app and not of its neighbour — `Nostr relay` for strfry, `Community Nostr relay` for Pyramid, `Blossom media server` for route96. Free text, stored trimmed, and **never null or empty**: omitting it is `422`, and a blank or whitespace-only value is `400 category is required`. It is rendered verbatim into the public page's `<title>` and `<meta>`, where nothing downstream can repair it, so:
+
+- Sentence case with proper nouns capitalised — `Nostr relay`, not `nostr relay` or `Nostr Relay`.
+- No article, no "hosting", no "managed", no trailing punctuation — the public page templates `{display_name} Hosting — Managed {category}` around it.
+
+`seo_title` / `seo_description` are optional per-app overrides for when that template is not good enough, and are null for almost every app. They arrive over the wire and so are never extracted for translation — English-only by construction, which is why `category` carries the general case. Blank strings on either are stored as `null`.
 
 #### Update App
 
@@ -3704,7 +3720,9 @@ Required Permission: `app::create`. Body:
 PATCH /api/admin/v1/apps/{id}
 ```
 
-Required Permission: `app::update`. All fields optional (omitted = unchanged); `description`/`icon`/`repo_url` accept `null` to clear.
+Required Permission: `app::update`. All fields optional (omitted = unchanged); `description`/`icon`/`repo_url`/`seo_title`/`seo_description` accept `null` to clear.
+
+`category` is the exception: it is `NOT NULL`, so there is no null to clear to. Omit it to leave it unchanged, or send a string to set it. An explicit `"category": null` is **refused with `400`** rather than ignored — a client asking to clear a required field must not get `200 OK` and no change — and a blank string is refused the same way as on create, leaving the stored value untouched.
 
 #### Delete App
 

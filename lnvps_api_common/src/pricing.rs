@@ -4169,6 +4169,9 @@ mod tests {
                     description: None,
                     icon: None,
                     repo_url: None,
+                    category: "Nostr relay".to_string(),
+                    seo_title: None,
+                    seo_description: None,
                     compose: String::new(),
                     // EUR 10.00/month at the base size.
                     amount: 1000,

@@ -102,6 +102,22 @@ fn validate_app_fields(
     Ok(())
 }
 
+/// Trim and require a non-empty `category`.
+///
+/// Kept out of `validate_app_fields` because that helper takes what both
+/// create and patch always have; `category` is required on create but merely
+/// optional-to-send on patch, and both paths funnel through here so a blank
+/// string cannot reach the column on either. Returning the trimmed value
+/// rather than validating in place is what makes it impossible to store the
+/// untrimmed one by accident.
+fn validate_category(category: String) -> Result<String, lnvps_api_common::ApiError> {
+    let category = category.trim();
+    if category.is_empty() {
+        return Err(lnvps_api_common::ApiError::new("category is required"));
+    }
+    Ok(category.to_string())
+}
+
 /// Parse the compose and compute the app's resource footprint (already
 /// validated by `validate_app_fields`).
 fn compose_footprint(
@@ -165,6 +181,7 @@ async fn admin_create_app(
 ) -> ApiResult<AdminAppInfo> {
     auth.require_permission(AdminResource::App, AdminAction::Create)?;
     validate_app_fields(&req.name, &req.display_name, &req.compose, &req.currency)?;
+    let category = validate_category(req.category)?;
     let footprint = compose_footprint(&req.compose)?;
 
     let app = App {
@@ -174,6 +191,9 @@ async fn admin_create_app(
         description: req.description,
         icon: req.icon,
         repo_url: req.repo_url.filter(|s| !s.trim().is_empty()),
+        category,
+        seo_title: req.seo_title.filter(|s| !s.trim().is_empty()),
+        seo_description: req.seo_description.filter(|s| !s.trim().is_empty()),
         compose: req.compose,
         amount: req.amount,
         currency: req.currency.trim().to_uppercase(),
@@ -213,6 +233,19 @@ async fn admin_update_app(
     }
     if let Some(repo_url) = req.repo_url {
         app.repo_url = repo_url.filter(|s| !s.trim().is_empty());
+    }
+    if let Some(category) = req.category {
+        // `Some(None)` is an explicit null, which cannot be honoured on a
+        // NOT NULL column — refuse it rather than no-op.
+        let category = category
+            .ok_or_else(|| lnvps_api_common::ApiError::new("category cannot be null"))?;
+        app.category = validate_category(category)?;
+    }
+    if let Some(seo_title) = req.seo_title {
+        app.seo_title = seo_title.filter(|s| !s.trim().is_empty());
+    }
+    if let Some(seo_description) = req.seo_description {
+        app.seo_description = seo_description.filter(|s| !s.trim().is_empty());
     }
     if let Some(compose) = req.compose {
         app.compose = compose;
@@ -667,5 +700,26 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_validate_category() {
+        // Returns the trimmed value, so an untrimmed one cannot reach the
+        // column: the stored string is rendered verbatim into `<title>`.
+        assert_eq!(
+            validate_category("  Nostr relay  ".to_string()).ok(),
+            Some("Nostr relay".to_string())
+        );
+        assert_eq!(
+            validate_category("Blossom media server".to_string()).ok(),
+            Some("Blossom media server".to_string())
+        );
+
+        // Blank is rejected rather than stored: `category` is NOT NULL
+        // precisely so a missing one cannot degrade silently into a generic
+        // title, and "" would reintroduce exactly that.
+        assert!(validate_category(String::new()).is_err());
+        assert!(validate_category("   ".to_string()).is_err());
+        assert!(validate_category("\t\n".to_string()).is_err());
     }
 }
