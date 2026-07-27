@@ -232,6 +232,12 @@ pub struct Volume {
     pub size: String,
 }
 
+/// Default generated-secret length in bytes. Hex-encoded, so 48 characters.
+pub const DEFAULT_SECRET_BYTES: usize = 24;
+/// Accepted range for an explicitly declared secret length.
+pub const MIN_SECRET_BYTES: usize = 16;
+pub const MAX_SECRET_BYTES: usize = 64;
+
 /// An operator-generated secret.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SecretDecl {
@@ -240,6 +246,22 @@ pub struct SecretDecl {
     /// How to generate it.
     #[serde(default)]
     pub generate: Generate,
+    /// Length of the generated value in **bytes**, hex-encoded into twice as
+    /// many characters. Defaults to [`DEFAULT_SECRET_BYTES`].
+    ///
+    /// A password only needs enough entropy, but a key of an exact size — a
+    /// 32-byte Nostr secret key, an AES key, a fixed-width signing secret —
+    /// cannot be expressed by the default, and an app fed the wrong width
+    /// fails at startup rather than at deploy time.
+    #[serde(default)]
+    pub bytes: Option<usize>,
+}
+
+impl SecretDecl {
+    /// Declared length in bytes, or the default when unset.
+    pub fn byte_len(&self) -> usize {
+        self.bytes.unwrap_or(DEFAULT_SECRET_BYTES)
+    }
 }
 
 /// Secret generation strategy.
@@ -456,6 +478,21 @@ impl Compose {
                     }
                     _ => {}
                 }
+            }
+        }
+
+        // A declared secret length must be usable. Checked at authoring time
+        // because the failure mode otherwise is an app that starts, rejects its
+        // own key and crash-loops — long after whoever typed the number left.
+        for s in &self.secrets {
+            if let Some(bytes) = s.bytes
+                && !(MIN_SECRET_BYTES..=MAX_SECRET_BYTES).contains(&bytes)
+            {
+                bail!(
+                    "secret '{}': bytes must be between {MIN_SECRET_BYTES} and {MAX_SECRET_BYTES} \
+                     (got {bytes})",
+                    s.name
+                );
             }
         }
         Ok(())
@@ -854,6 +891,44 @@ config:
         let db = &c.services["mariadb"];
         assert!(db.ports.is_empty());
         assert!(db.backup.as_ref().unwrap().command.is_some());
+    }
+
+    /// A secret's length is declarable, and defaults to 24 bytes so every
+    /// compose written before the field existed is unaffected.
+    #[test]
+    fn secret_byte_length_is_declarable() {
+        let c = Compose::parse(
+            "services:\n  a:\n    image: x\n    env:\n      K: ${KEY}\n      P: ${PW}\n\
+             secrets:\n  - { name: PW, generate: password }\n  \
+             - { name: KEY, generate: token, bytes: 32 }\n",
+        )
+        .unwrap();
+        let by_name = |n: &str| c.secrets.iter().find(|s| s.name == n).unwrap().clone();
+        assert_eq!(by_name("PW").bytes, None);
+        assert_eq!(by_name("PW").byte_len(), DEFAULT_SECRET_BYTES);
+        assert_eq!(by_name("KEY").byte_len(), 32);
+        c.validate().unwrap();
+        c.validate_declarations().unwrap();
+    }
+
+    /// An unusable length is rejected at authoring time — the alternative is an
+    /// app that deploys and then crash-loops on its own key.
+    #[test]
+    fn validate_rejects_out_of_range_secret_bytes() {
+        let with_bytes = |n: usize| {
+            format!(
+                "services:\n  a:\n    image: x\nsecrets:\n  - {{ name: K, generate: token, bytes: {n} }}\n"
+            )
+        };
+        for good in [MIN_SECRET_BYTES, 32, MAX_SECRET_BYTES] {
+            Compose::parse(&with_bytes(good))
+                .unwrap_or_else(|e| panic!("{good} bytes should parse: {e}"));
+        }
+        for bad in [0, MIN_SECRET_BYTES - 1, MAX_SECRET_BYTES + 1, 4096] {
+            let err = Compose::parse(&with_bytes(bad))
+                .expect_err(&format!("{bad} bytes should be rejected"));
+            assert!(err.to_string().contains("bytes must be between"), "{err}");
+        }
     }
 
     #[test]

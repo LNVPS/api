@@ -726,6 +726,88 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A generated secret can declare its byte length (issue #243), and an
+    /// unusable length is refused when the app is created or updated rather
+    /// than becoming an app that deploys and crash-loops on its own key.
+    #[tokio::test]
+    async fn test_admin_app_compose_secret_bytes() {
+        let client = setup().await;
+        // Unique slug so the test can be re-run against the same database.
+        let suffix = nostr::Keys::generate().public_key().to_hex()[..8].to_string();
+        let slug = format!("e2e-secret-bytes-{suffix}");
+
+        let compose = |bytes: &str| {
+            format!(
+                "services:\n  relay:\n    image: example/relay:latest\n    env:\n      \
+                 KEY: ${{RELAY_KEY}}\nsecrets:\n  - {{ name: RELAY_KEY, generate: token{bytes} }}\n"
+            )
+        };
+        let body = |compose: String| {
+            serde_json::json!({
+                "name": slug,
+                "display_name": "Secret Bytes Relay",
+                "category": "Nostr relay",
+                "compose": compose,
+                "amount": 1000,
+                "currency": "usd",
+                "interval_amount": 1,
+                "interval_type": "month",
+                "setup_amount": 0
+            })
+        };
+
+        // Out of range is rejected, naming the bound.
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &body(compose(", bytes: 4")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = resp.text().await.unwrap();
+        assert!(err.contains("bytes must be between"), "{err}");
+
+        // 32 bytes is accepted and stored verbatim.
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &body(compose(", bytes: 32")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let created: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let app_id = created["data"]["id"].as_u64().expect("app id");
+        assert!(
+            created["data"]["compose"]
+                .as_str()
+                .unwrap()
+                .contains("bytes: 32")
+        );
+
+        // Omitting it still works — every compose written before this existed
+        // keeps parsing.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "compose": compose("") }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // And the same bound applies on update.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "compose": compose(", bytes: 4096") }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// Catalog SEO metadata (issue #239): `category` is required and cannot be
     /// blanked, the two overrides are nullable and clearable, and all three
     /// reach the public catalog — which is what the app page templates its
