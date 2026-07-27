@@ -15,7 +15,7 @@ use lnvps_api_common::{
 };
 use lnvps_db::{
     App, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus, AppTag, EncryptedString,
-    PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionType,
+    LNVpsDb, PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionType,
 };
 use payments_rs::currency::CurrencyAmount;
 use serde::{Deserialize, Serialize};
@@ -292,6 +292,24 @@ pub struct ApiAppDeployment {
     /// Subscription this deployment is billed under (renew via the subscription
     /// endpoints). `None` if the subscription can't be resolved.
     pub subscription_id: Option<u64>,
+    /// Where the deployment stands with billing, independent of `status`
+    /// (issue #253): `unpaid` (the first payment has never been confirmed),
+    /// `active`, or `expired` (paid, then lapsed — data retained at 0 replicas
+    /// until deletion).
+    ///
+    /// `status` cannot answer this. A never-paid deployment is written back as
+    /// `stopped` with a prose `status_message`, which makes it indistinguishable
+    /// from an app the customer stopped — so a page inferring "unpaid" from
+    /// `status == "pending"` stops asking for money after the first reconcile
+    /// and offers a Start button that the billing gate will refuse. `unpaid`
+    /// asks for a first payment and `expired` asks for a renewal; do not derive
+    /// either from `status_message`, which is untranslated prose.
+    ///
+    /// `None` only when the subscription cannot be resolved at all — the same
+    /// condition that leaves `subscription_id` null. That is an operational
+    /// fault, not a billing verdict, so it is reported as unknown rather than
+    /// as "unpaid".
+    pub billing_state: Option<String>,
     /// Size of this deployment as a multiple of the catalog app's base
     /// footprint and price. `1` = the base app. Increase it via
     /// `POST /api/v1/app-deployments/{id}/upgrade`.
@@ -310,17 +328,26 @@ pub struct ApiAppDeployment {
     pub created: DateTime<Utc>,
 }
 
+/// Map a stored deployment onto its API shape.
+///
+/// Takes the database rather than the whole `RouterState` so the mapping — in
+/// particular the `billing_state` derivation (#253) — is unit-testable against
+/// `MockDb` without standing up a provisioner.
 async fn deployment_to_api(
-    this: &RouterState,
+    db: &dyn LNVpsDb,
     d: AppDeployment,
 ) -> Result<ApiAppDeployment, ApiError> {
-    // Resolve the owning subscription from the line item (best-effort).
-    let subscription_id = this
-        .db
+    // Resolve the owning subscription from the line item (best-effort). Its
+    // billing state comes from the same row: deriving it here, rather than
+    // leaving the client to infer one from `status`, is issue #253.
+    let subscription = db
         .get_subscription_by_line_item_id(d.subscription_line_item_id)
         .await
-        .ok()
-        .map(|s| s.id);
+        .ok();
+    let subscription_id = subscription.as_ref().map(|s| s.id);
+    let billing_state = subscription
+        .as_ref()
+        .map(|s| s.billing_state(Utc::now()).to_string());
     // Decrypt and parse the stored config (customer-supplied field values only).
     let config = d
         .config
@@ -331,7 +358,7 @@ async fn deployment_to_api(
     // deployment row; propagate rather than reporting a zero footprint, which
     // the client would render as "0 CPU".
     let multiplier = d.resource_multiplier.max(1);
-    let app = this.db.get_app(d.app_id).await?;
+    let app = db.get_app(d.app_id).await?;
     let m = multiplier as u64;
     Ok(ApiAppDeployment {
         id: d.id,
@@ -343,6 +370,7 @@ async fn deployment_to_api(
         status: d.status.to_string(),
         status_message: d.status_message,
         subscription_id,
+        billing_state,
         resource_multiplier: multiplier,
         cpu_milli: app.cpu_milli * m,
         memory_bytes: app.memory_bytes * m,
@@ -503,7 +531,7 @@ async fn v1_list_app_deployments(
     let deployments = this.db.list_user_app_deployments(uid).await?;
     let mut out = Vec::with_capacity(deployments.len());
     for d in deployments {
-        out.push(deployment_to_api(&this, d).await?);
+        out.push(deployment_to_api(this.db.as_ref(), d).await?);
     }
     ApiData::ok(out)
 }
@@ -519,7 +547,7 @@ async fn v1_get_app_deployment(
     if deployment.user_id != uid || deployment.deleted {
         return Err(ApiError::not_found("Deployment not found"));
     }
-    ApiData::ok(deployment_to_api(&this, deployment).await?)
+    ApiData::ok(deployment_to_api(this.db.as_ref(), deployment).await?)
 }
 
 /// Order a new app deployment.
@@ -663,7 +691,7 @@ async fn v1_create_app_deployment(
     deployment.namespace = format!("app-{id}");
     this.db.update_app_deployment(&deployment).await?;
 
-    ApiData::ok(deployment_to_api(&this, deployment).await?)
+    ApiData::ok(deployment_to_api(this.db.as_ref(), deployment).await?)
 }
 
 /// Resolve and ownership-check a deployment for the authenticated user.
@@ -786,7 +814,7 @@ async fn v1_patch_app_deployment(
     }
 
     this.db.update_app_deployment(&deployment).await?;
-    ApiData::ok(deployment_to_api(&this, deployment).await?)
+    ApiData::ok(deployment_to_api(this.db.as_ref(), deployment).await?)
 }
 
 async fn set_desired_state(
@@ -798,7 +826,7 @@ async fn set_desired_state(
     let mut deployment = owned_deployment(this, uid, id).await?;
     deployment.desired_state = state;
     this.db.update_app_deployment(&deployment).await?;
-    ApiData::ok(deployment_to_api(this, deployment).await?)
+    ApiData::ok(deployment_to_api(this.db.as_ref(), deployment).await?)
 }
 
 async fn v1_start_app_deployment(
@@ -1154,5 +1182,138 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// `billing_state` is derived from the deployment's own subscription, not
+    /// from `status` (issue #253) — the client cannot tell "never paid" from
+    /// "customer stopped it" once the operator has written a status back.
+    #[tokio::test]
+    async fn deployment_billing_state_follows_the_subscription() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::{
+            App, AppDeployment, IntervalType, LNVpsDbBase, Subscription, SubscriptionLineItem,
+        };
+
+        // `ApiError` is not Debug, so unwrap it by hand.
+        fn ok(r: Result<ApiAppDeployment, ApiError>) -> ApiAppDeployment {
+            match r {
+                Ok(v) => v,
+                Err(_) => panic!("deployment_to_api failed"),
+            }
+        }
+
+        let db = MockDb::default();
+        {
+            let mut apps = db.apps.lock().await;
+            apps.insert(
+                1,
+                App {
+                    id: 1,
+                    name: "relay".to_string(),
+                    display_name: "Relay".to_string(),
+                    description: None,
+                    icon: None,
+                    repo_url: None,
+                    category: "Nostr relay".to_string(),
+                    seo_title: None,
+                    seo_description: None,
+                    compose: "services:\n  a:\n    image: x\n".to_string(),
+                    amount: 1000,
+                    currency: "USD".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_amount: 0,
+                    cpu_milli: 250,
+                    memory_bytes: 1024,
+                    storage_bytes: 2048,
+                    enabled: true,
+                    created: Utc::now(),
+                },
+            );
+        }
+
+        // Line item 1 has a subscription; line item 2 deliberately has none, so
+        // its lookup fails the way a broken billing back-reference does.
+        async fn seed_sub(db: &MockDb, is_setup: bool, expires: Option<DateTime<Utc>>) {
+            use lnvps_db::{IntervalType, Subscription, SubscriptionLineItem, SubscriptionType};
+            let mut items = db.subscription_line_items.lock().await;
+            items.insert(
+                1,
+                SubscriptionLineItem {
+                    id: 1,
+                    subscription_id: 1,
+                    subscription_type: SubscriptionType::App,
+                    name: "app".to_string(),
+                    description: None,
+                    amount: 1000,
+                    setup_amount: 0,
+                    configuration: None,
+                },
+            );
+            let mut subs = db.subscriptions.lock().await;
+            subs.insert(
+                1,
+                Subscription {
+                    id: 1,
+                    user_id: 1,
+                    company_id: 1,
+                    name: "sub".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires,
+                    is_active: true,
+                    is_setup,
+                    currency: "USD".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+            );
+        }
+
+        let dep = |line_item_id: u64, status: AppDeploymentStatus| AppDeployment {
+            id: 1,
+            user_id: 1,
+            app_id: 1,
+            cluster_id: 1,
+            resource_multiplier: 1,
+            subscription_line_item_id: line_item_id,
+            name: "d".to_string(),
+            namespace: "ns".to_string(),
+            hostname: None,
+            custom_domain: None,
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status,
+            status_message: None,
+            created: Utc::now(),
+            deleted: false,
+        };
+
+        // Never paid. The operator writes this deployment back as `stopped`
+        // with a prose message, which is exactly the state the old front-end
+        // inference (`status == "pending"`) got wrong.
+        seed_sub(&db, false, None).await;
+        let api = ok(deployment_to_api(&db, dep(1, AppDeploymentStatus::Stopped)).await);
+        assert_eq!(api.billing_state.as_deref(), Some("unpaid"));
+        assert_eq!(api.status, "stopped", "status alone cannot say this");
+
+        // Paid and current.
+        seed_sub(&db, true, Some(Utc::now() + chrono::Duration::days(30))).await;
+        let api = ok(deployment_to_api(&db, dep(1, AppDeploymentStatus::Running)).await);
+        assert_eq!(api.billing_state.as_deref(), Some("active"));
+
+        // Paid, then lapsed — asks for a renewal, not a first payment.
+        seed_sub(&db, true, Some(Utc::now() - chrono::Duration::days(1))).await;
+        let api = ok(deployment_to_api(&db, dep(1, AppDeploymentStatus::Stopped)).await);
+        assert_eq!(api.billing_state.as_deref(), Some("expired"));
+
+        // Subscription unresolvable: reported as unknown rather than as a
+        // billing verdict, alongside the `subscription_id` that is already null.
+        let api = ok(deployment_to_api(&db, dep(2, AppDeploymentStatus::Running)).await);
+        assert_eq!(api.billing_state, None);
+        assert_eq!(api.subscription_id, None);
     }
 }

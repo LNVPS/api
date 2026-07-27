@@ -21,9 +21,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use k8s_openapi::NamespaceResourceScope;
-use lnvps_db::{
-    AppDeployment, AppDeploymentStatus, EncryptedString, Subscription,
-};
+use lnvps_db::{AppDeployment, AppDeploymentStatus, BillingState, EncryptedString, Subscription};
 
 use crate::Context;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
@@ -1130,13 +1128,14 @@ pub fn gate_running(
         // record yet) rather than an operational fault.
         return GateReason::Unpaid;
     };
-    if !sub.is_setup {
-        return GateReason::Unpaid;
+    // The billing verdict itself comes from the shared derivation on the model,
+    // which the customer API also reports as `billing_state` (#253). One rule,
+    // so a deployment cannot be told it is unpaid while the operator runs it.
+    match sub.billing_state(now) {
+        BillingState::Unpaid => GateReason::Unpaid,
+        BillingState::Expired => GateReason::Expired,
+        BillingState::Active => GateReason::Running,
     }
-    if sub.expires.map(|e| e < now).unwrap_or(false) {
-        return GateReason::Expired;
-    }
-    GateReason::Running
 }
 
 /// Whether a deployment in this gate state gets Kubernetes objects at all

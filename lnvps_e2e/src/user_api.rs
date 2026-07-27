@@ -1160,6 +1160,85 @@ mod tests {
         );
     }
 
+    /// A deployment reports where it stands with billing, independent of
+    /// `status` (#253). Without it the client cannot tell "never paid" from
+    /// "the customer stopped it" — the operator writes both back as `stopped` —
+    /// so the page that should ask for a first payment shows a Start button the
+    /// billing gate will refuse.
+    #[tokio::test]
+    async fn test_app_deployment_reports_billing_state() {
+        let keys = nostr::Keys::generate();
+        let client = user_client_with_keys(keys.clone());
+        let pool = crate::db::connect().await.unwrap();
+        let uid = crate::db::ensure_user(&pool, &keys).await.unwrap();
+        let (_app_id, _cluster_id, dep_id) =
+            crate::db::seed_app_deployment(&pool, uid, "billing-state")
+                .await
+                .unwrap();
+
+        // The seeded subscription is paid with no expiry.
+        let state = |dep: &Value| dep["billing_state"].as_str().map(String::from);
+        let get = async |path: String| -> Value {
+            let resp = client.get_auth(&path).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            serde_json::from_str(&resp.text().await.unwrap()).unwrap()
+        };
+        let body = get(format!("/api/v1/app-deployments/{dep_id}")).await;
+        assert_eq!(state(&body["data"]).as_deref(), Some("active"));
+
+        // Never paid: `is_setup = 0`. The status stays whatever the operator
+        // last wrote — the point of the field is that it does not have to.
+        sqlx::query(
+            "UPDATE subscription s JOIN subscription_line_item li ON li.subscription_id = s.id \
+             JOIN app_deployment d ON d.subscription_line_item_id = li.id \
+             SET s.is_setup = 0 WHERE d.id = ?",
+        )
+        .bind(dep_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let body = get(format!("/api/v1/app-deployments/{dep_id}")).await;
+        assert_eq!(state(&body["data"]).as_deref(), Some("unpaid"));
+
+        // Paid, then lapsed: renewal, not a first payment.
+        sqlx::query(
+            "UPDATE subscription s JOIN subscription_line_item li ON li.subscription_id = s.id \
+             JOIN app_deployment d ON d.subscription_line_item_id = li.id \
+             SET s.is_setup = 1, s.expires = DATE_SUB(NOW(), INTERVAL 1 DAY) WHERE d.id = ?",
+        )
+        .bind(dep_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let body = get(format!("/api/v1/app-deployments/{dep_id}")).await;
+        assert_eq!(state(&body["data"]).as_deref(), Some("expired"));
+
+        // Carried on the listing too, not just the detail endpoint.
+        let body = get("/api/v1/app-deployments".to_string()).await;
+        let listed = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"].as_u64() == Some(dep_id))
+            .expect("seeded deployment listed");
+        assert_eq!(state(listed).as_deref(), Some("expired"));
+
+        // It is customer data: unauthenticated callers get nothing.
+        let resp = client
+            .get(&format!("/api/v1/app-deployments/{dep_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // ...and neither does a different customer.
+        let other = user_client_with_keys(nostr::Keys::generate());
+        let resp = other
+            .get_auth(&format!("/api/v1/app-deployments/{dep_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
     /// An unpaid order must not consume cluster capacity (#252). Nostr keys are
     /// free, so anyone can create deployments without paying; before the fix
     /// each one was counted against the cluster and could make a paying
