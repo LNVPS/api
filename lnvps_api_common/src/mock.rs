@@ -7076,13 +7076,21 @@ mod tests {
             .unwrap();
         let app_id = db.insert_app(&mk_app("relay")).await.unwrap();
 
+        // Only paid deployments consume capacity (#252), so the default mock
+        // subscription (`is_setup = false`) has to be marked as set up — its
+        // line item id 1 is what these deployments bill through.
+        {
+            let mut subs = db.subscriptions.lock().await;
+            subs.get_mut(&1).expect("mock subscription").is_setup = true;
+        }
+
         let mk_dep = |name: &str| AppDeployment {
             id: 0,
             user_id: 1,
             app_id,
             cluster_id,
             resource_multiplier: 1,
-            subscription_line_item_id: 0,
+            subscription_line_item_id: 1,
             name: name.to_string(),
             namespace: format!("app-{name}"),
             hostname: None,

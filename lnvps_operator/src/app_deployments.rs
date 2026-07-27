@@ -1045,6 +1045,26 @@ pub fn gate_running(
     GateReason::Running
 }
 
+/// Whether a deployment in this gate state gets Kubernetes objects at all
+/// (issue #252).
+///
+/// Everything except a never-paid deployment does. In particular:
+///
+/// - [`GateReason::Expired`] **must** keep its objects. It was paid for once,
+///   so its PVCs hold customer data that is deliberately retained at 0 replicas
+///   until real deletion.
+/// - [`GateReason::StoppedByUser`] likewise — the customer asked for it to
+///   stop, not to be destroyed.
+/// - [`GateReason::SubscriptionLookupFailed`] is an operational fault, not a
+///   billing verdict. Tearing down (or refusing to maintain) a deployment
+///   because the database blinked would turn a transient error into data loss.
+///
+/// Only [`GateReason::Unpaid`] — `is_setup = 0`, never paid — gets nothing.
+/// Extracted as a pure function so the rule is unit-testable without a cluster.
+pub fn provisions_cluster_objects(gate: &GateReason) -> bool {
+    !matches!(gate, GateReason::Unpaid)
+}
+
 /// Reconcile every app deployment assigned to this operator's cluster into
 /// Kubernetes. No-op when the operator isn't configured with an `app_cluster_id`.
 pub async fn reconcile_app_deployments(ctx: &Context) -> Result<()> {
@@ -1090,6 +1110,59 @@ async fn reconcile_one(
     let compose = lnvps_compose::Compose::parse(&app.compose)?;
     let hostname = deployment_hostname(&deployment.name, ingress_domain);
 
+    // Billing gate + retention, decided *before* anything is created in the
+    // cluster. The workload only runs when the subscription is set up (paid at
+    // least once) and not expired.
+    //
+    // The lookup error is NOT swallowed: a DB/decryption fault here must be
+    // surfaced (and the gate fails closed) rather than silently reading as
+    // "unpaid", which is how a paid deployment previously sat at 0 replicas
+    // with an empty status message.
+    let (sub, sub_err) = match ctx
+        .db
+        .get_subscription_by_line_item_id(deployment.subscription_line_item_id)
+        .await
+    {
+        Ok(s) => (Some(s), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    let desired_running = deployment.desired_state == lnvps_db::AppDeploymentDesiredState::Running;
+    let gate = gate_running(
+        desired_running,
+        deployment.deleted,
+        sub.as_ref(),
+        sub_err,
+        chrono::Utc::now(),
+    );
+    // Log the gate's actual inputs so a surprising conclusion (e.g. "not yet
+    // paid" on a subscription that looks paid in the DB) can be diagnosed
+    // against the exact is_setup/expires the operator decoded.
+    if gate != GateReason::Running {
+        info!(
+            "app deployment {id} gate={gate}: desired_running={desired_running} deleted={} sub={:?}",
+            deployment.deleted,
+            sub.as_ref().map(|s| (s.id, s.is_setup, s.expires))
+        );
+    }
+
+    // A deployment that has never been paid for gets *nothing* in the cluster
+    // (issue #252). Payment used to gate the replica count alone, so an unpaid
+    // order still created its namespace, its generated secrets, its PVCs at
+    // full size × multiplier, and — worst — an Ingress with a real
+    // `letsencrypt-prod` issuer. Certificates are rate-limited per registered
+    // domain, so free orders could exhaust the quota for the apps domain and
+    // deny certificates to customers who had paid.
+    //
+    // Only the never-paid case returns here. `Expired` must keep falling
+    // through: it was paid once, so its PVCs hold customer data and are
+    // deliberately retained at 0 replicas until real deletion (see the
+    // retention note further down).
+    if !provisions_cluster_objects(&gate) {
+        info!("app deployment {id} not provisioned: {gate}");
+        write_back_status(ctx, deployment, hostname, &gate).await?;
+        return Ok(());
+    }
+
     // 1. Namespace (Pod Security Standard) + isolation NetworkPolicy.
     // Default to the restricted PSS; drop to baseline only when a catalog
     // service opts into running as root (e.g. mariadb), whose entrypoint
@@ -1120,42 +1193,8 @@ async fn reconcile_one(
     let files = compose.resolve_files(&vars)?;
     let init = compose.resolve_init(&vars)?;
 
-    // Billing gate + retention. The workload only runs when the subscription is
-    // set up (paid at least once) and not expired. A freshly-ordered, unpaid
-    // deployment (not set up) stays at 0 replicas; an expired one scales to 0
-    // but keeps its PVCs (customer data) — only real deletion tears it down.
-    //
-    // The lookup error is NOT swallowed: a DB/decryption fault here must be
-    // surfaced (and the gate fails closed) rather than silently reading as
-    // "unpaid", which is how a paid deployment previously sat at 0 replicas
-    // with an empty status message.
-    let (sub, sub_err) = match ctx
-        .db
-        .get_subscription_by_line_item_id(deployment.subscription_line_item_id)
-        .await
-    {
-        Ok(s) => (Some(s), None),
-        Err(e) => (None, Some(e.to_string())),
-    };
-    let desired_running =
-        deployment.desired_state == lnvps_db::AppDeploymentDesiredState::Running;
-    let gate = gate_running(
-        desired_running,
-        deployment.deleted,
-        sub.as_ref(),
-        sub_err,
-        chrono::Utc::now(),
-    );
-    // Log the gate's actual inputs so a surprising conclusion (e.g. "not yet
-    // paid" on a subscription that looks paid in the DB) can be diagnosed
-    // against the exact is_setup/expires the operator decoded.
-    if gate != GateReason::Running {
-        info!(
-            "app deployment {id} gate={gate}: desired_running={desired_running} deleted={} sub={:?}",
-            deployment.deleted,
-            sub.as_ref().map(|s| (s.id, s.is_setup, s.expires))
-        );
-    }
+    // An expired deployment scales to 0 but keeps its PVCs (customer data);
+    // only real deletion tears it down.
     let replicas = if gate == GateReason::Running { 1 } else { 0 };
     // Size of this deployment as a multiple of the catalog app's footprint.
     // Legacy rows (pre-multiplier) decode as 0, so clamp to the base size.
@@ -1222,12 +1261,29 @@ async fn reconcile_one(
     // namespace cap.
     delete_resource_quota(client, id).await?;
 
-    // 7. Status write-back: record the hostname and running state. When the
-    // workload isn't running, surface *why* so a paid-intended deployment never
-    // sits at 0 replicas with no explanation (previously a silent `stopped`).
+    // 7. Status write-back: record the hostname and running state.
+    write_back_status(ctx, deployment, hostname, &gate).await?;
+    info!("reconciled app deployment {id}");
+    Ok(())
+}
+
+/// Record the deployment's hostname and why it is (not) running.
+///
+/// When the workload isn't running, surface *why*, so a paid-intended
+/// deployment never sits at 0 replicas with no explanation (previously a silent
+/// `stopped`). Shared by the normal end-of-reconcile path and the unpaid early
+/// return, so an unpaid order still gets its hostname and a reason the customer
+/// can act on — it just gets no cluster objects.
+async fn write_back_status(
+    ctx: &Context,
+    deployment: &AppDeployment,
+    hostname: String,
+    gate: &GateReason,
+) -> Result<()> {
+    let id = deployment.id;
     let mut updated = deployment.clone();
     updated.hostname = Some(hostname);
-    match &gate {
+    match gate {
         GateReason::Running => {
             updated.status = AppDeploymentStatus::Running;
             updated.status_message = None;
@@ -1246,7 +1302,6 @@ async fn reconcile_one(
         }
     }
     ctx.db.update_app_deployment(&updated).await?;
-    info!("reconciled app deployment {id}");
     Ok(())
 }
 
@@ -2272,6 +2327,37 @@ config:
             gate_running(true, false, Some(&s), None, chrono::Utc::now()),
             GateReason::Running
         );
+    }
+
+    /// A never-paid deployment gets nothing in the cluster (#252). Payment used
+    /// to gate the replica count alone, so an unpaid order still got its
+    /// namespace, generated secrets, PVCs at full size × multiplier and an
+    /// Ingress with a real `letsencrypt-prod` issuer — certificates are
+    /// rate-limited per registered domain, so free orders could deny
+    /// certificates to customers who had paid.
+    #[test]
+    fn unpaid_provisions_nothing() {
+        assert!(!provisions_cluster_objects(&GateReason::Unpaid));
+    }
+
+    /// Everything that was ever paid for keeps its objects. An expired
+    /// deployment's PVCs are customer data retained at 0 replicas; a stopped
+    /// one was stopped, not destroyed; and a lookup fault is an operational
+    /// error, so treating it as "unpaid" would turn a database blip into data
+    /// loss.
+    #[test]
+    fn only_never_paid_is_withheld() {
+        for gate in [
+            GateReason::Running,
+            GateReason::Expired,
+            GateReason::StoppedByUser,
+            GateReason::SubscriptionLookupFailed("db down".to_string()),
+        ] {
+            assert!(
+                provisions_cluster_objects(&gate),
+                "{gate} must keep its cluster objects"
+            );
+        }
     }
 
     /// Regression: a *lookup fault* (DB error / decryption failure) must NOT be

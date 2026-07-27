@@ -614,6 +614,18 @@ async fn seed_enabled_region(pool: &MySqlPool, name: &str) -> anyhow::Result<u64
 }
 
 pub async fn seed_app_and_cluster(pool: &MySqlPool) -> anyhow::Result<(u64, u64, u64)> {
+    seed_app_and_cluster_with_capacity(pool, 8000, 8589934592, 107374182400).await
+}
+
+/// Same as [`seed_app_and_cluster`] but with an explicit cluster capacity, so a
+/// test can size the cluster against the app's footprint (250m / 256Mi / 0) and
+/// exercise the admission path when it is full.
+pub async fn seed_app_and_cluster_with_capacity(
+    pool: &MySqlPool,
+    capacity_cpu_milli: u64,
+    capacity_memory_bytes: u64,
+    capacity_storage_bytes: u64,
+) -> anyhow::Result<(u64, u64, u64)> {
     let suffix = hex::encode(&rand_bytes32()[..4]);
     let region_id = seed_enabled_region(pool, &format!("e2e-apps-{suffix}")).await?;
 
@@ -633,10 +645,13 @@ pub async fn seed_app_and_cluster(pool: &MySqlPool) -> anyhow::Result<(u64, u64,
     let (cluster_id,): (u64,) = sqlx::query_as(
         "INSERT INTO app_cluster (name, region_id, ingress_domain, enabled, capacity_cpu_milli, \
              capacity_memory_bytes, capacity_storage_bytes) \
-         VALUES (?, ?, 'apps.e2e.example.com', 1, 8000, 8589934592, 107374182400) RETURNING id",
+         VALUES (?, ?, 'apps.e2e.example.com', 1, ?, ?, ?) RETURNING id",
     )
     .bind(format!("ordercluster-{suffix}"))
     .bind(region_id)
+    .bind(capacity_cpu_milli)
+    .bind(capacity_memory_bytes)
+    .bind(capacity_storage_bytes)
     .fetch_one(pool)
     .await?;
 

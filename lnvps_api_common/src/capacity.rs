@@ -558,8 +558,15 @@ impl AppClusterCapacityService {
     }
 
     /// Footprint currently allocated on a cluster: the summed footprint of every
-    /// non-deleted deployment on it (expired deployments still hold their PVCs
-    /// and can be revived, so they count).
+    /// non-deleted deployment on it that has been **paid for at least once**.
+    ///
+    /// Expired deployments still count — they were paid, they still hold their
+    /// PVCs and they can be revived. Never-paid ones do not (issue #252): the
+    /// operator no longer creates anything in the cluster for them, so counting
+    /// them would let free orders exhaust a cluster and fail a paying
+    /// customer's order with "No cluster with enough capacity". This mirrors
+    /// what the VM path already does in
+    /// [`HostCapacityService::get_host_capacity`].
     pub async fn used(&self, cluster_id: u64) -> Result<AppCapacity> {
         // Index app footprints by id to avoid a lookup per deployment.
         let apps: HashMap<u64, App> = self
@@ -572,6 +579,19 @@ impl AppClusterCapacityService {
         let mut used = AppCapacity::default();
         for d in self.db.list_all_app_deployments().await? {
             if d.cluster_id != cluster_id {
+                continue;
+            }
+            // Fails closed: a subscription that cannot be read counts as unpaid
+            // here, which under-reports usage rather than blocking an order.
+            // The operator surfaces the same lookup fault loudly as an Error
+            // status, so it does not go unnoticed.
+            let is_paid = self
+                .db
+                .get_subscription_by_line_item_id(d.subscription_line_item_id)
+                .await
+                .map(|s| s.is_setup)
+                .unwrap_or(false);
+            if !is_paid {
                 continue;
             }
             if let Some(a) = apps.get(&d.app_id) {
@@ -1369,6 +1389,9 @@ mod tests {
             deps.insert(2, mk(2, 3));
             deps.insert(3, mk(3, 0));
         }
+        // Only paid deployments count (#252), so each needs a subscription
+        // whose initial payment was confirmed.
+        paid_subscriptions(&db, &[1, 2, 3], true).await;
 
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let svc = AppClusterCapacityService::new(db);
@@ -1381,6 +1404,231 @@ mod tests {
 
         let avail = svc.available(1).await?;
         assert_eq!(avail.cpu_milli, 10_000 - 2500);
+        Ok(())
+    }
+
+    /// Give each line item id a subscription, `is_setup` deciding whether its
+    /// deployment reads as paid.
+    async fn paid_subscriptions(db: &MockDb, line_item_ids: &[u64], is_setup: bool) {
+        use lnvps_db::{Subscription, SubscriptionLineItem};
+
+        let mut items = db.subscription_line_items.lock().await;
+        let mut subs = db.subscriptions.lock().await;
+        for &id in line_item_ids {
+            items.insert(
+                id,
+                SubscriptionLineItem {
+                    id,
+                    subscription_id: id,
+                    subscription_type: lnvps_db::SubscriptionType::App,
+                    name: format!("app deployment {id}"),
+                    description: None,
+                    amount: 1000,
+                    setup_amount: 0,
+                    configuration: None,
+                },
+            );
+            subs.insert(
+                id,
+                Subscription {
+                    id,
+                    user_id: 1,
+                    company_id: 1,
+                    name: format!("sub {id}"),
+                    description: None,
+                    created: Utc::now(),
+                    expires: Some(Utc::now() + chrono::Duration::days(30)),
+                    is_active: true,
+                    is_setup,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: lnvps_db::IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: true,
+                    external_id: None,
+                },
+            );
+        }
+    }
+
+    /// A deployment that has never been paid for does not consume cluster
+    /// capacity (#252). The operator creates nothing for it, so counting it
+    /// would let free orders fill a cluster and fail a paying customer's order
+    /// with "No cluster with enough capacity" — and Nostr keys are free, so
+    /// there is no natural limit on how many such rows a caller can create.
+    ///
+    /// Expired deployments still count: they were paid, they still hold their
+    /// PVCs, and they can be revived.
+    #[tokio::test]
+    async fn app_capacity_excludes_never_paid_deployments() -> Result<()> {
+        use lnvps_db::{AppCluster, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus};
+
+        let db = MockDb::default();
+        {
+            let mut apps = db.apps.lock().await;
+            apps.insert(
+                1,
+                lnvps_db::App {
+                    id: 1,
+                    name: "relay".to_string(),
+                    display_name: "Relay".to_string(),
+                    description: None,
+                    icon: None,
+                    repo_url: None,
+                    category: "Nostr relay".to_string(),
+                    seo_title: None,
+                    seo_description: None,
+                    compose: String::new(),
+                    amount: 1000,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: lnvps_db::IntervalType::Month,
+                    setup_amount: 0,
+                    enabled: true,
+                    cpu_milli: 500,
+                    memory_bytes: 1024,
+                    storage_bytes: 4096,
+                    created: Utc::now(),
+                },
+            );
+            let mut clusters = db.app_clusters.lock().await;
+            clusters.insert(
+                1,
+                AppCluster {
+                    id: 1,
+                    name: "c1".to_string(),
+                    region_id: 1,
+                    ingress_domain: "apps.example.com".to_string(),
+                    enabled: true,
+                    capacity_cpu_milli: 10_000,
+                    capacity_memory_bytes: 100_000,
+                    capacity_storage_bytes: 100_000,
+                    created: Utc::now(),
+                },
+            );
+            let mut deps = db.app_deployments.lock().await;
+            let mk = |id: u64| AppDeployment {
+                id,
+                user_id: 1,
+                app_id: 1,
+                cluster_id: 1,
+                resource_multiplier: 1,
+                subscription_line_item_id: id,
+                name: format!("d{id}"),
+                namespace: format!("app-{id}"),
+                hostname: None,
+                custom_domain: None,
+                config: None,
+                desired_state: AppDeploymentDesiredState::Running,
+                status: AppDeploymentStatus::Running,
+                status_message: None,
+                created: Utc::now(),
+                deleted: false,
+            };
+            deps.insert(1, mk(1)); // paid
+            deps.insert(2, mk(2)); // never paid
+            deps.insert(3, mk(3)); // paid, then expired
+        }
+        paid_subscriptions(&db, &[1], true).await;
+        paid_subscriptions(&db, &[2], false).await;
+        paid_subscriptions(&db, &[3], true).await;
+        {
+            // Deployment 3 was paid and has since lapsed.
+            let mut subs = db.subscriptions.lock().await;
+            if let Some(s) = subs.get_mut(&3) {
+                s.expires = Some(Utc::now() - chrono::Duration::days(1));
+            }
+        }
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let svc = AppClusterCapacityService::new(db);
+        let used = svc.used(1).await?;
+
+        // The paid one and the expired one, not the never-paid one.
+        assert_eq!(used.cpu_milli, 500 * 2);
+        assert_eq!(used.memory_bytes, 1024 * 2);
+        assert_eq!(used.storage_bytes, 4096 * 2);
+        Ok(())
+    }
+
+    /// A subscription that cannot be read counts as unpaid, which under-reports
+    /// usage rather than blocking orders on a lookup fault. The operator
+    /// surfaces the same fault loudly as an `Error` status, so it is not silent.
+    #[tokio::test]
+    async fn app_capacity_fails_closed_on_subscription_lookup_error() -> Result<()> {
+        use lnvps_db::{AppCluster, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus};
+
+        let db = MockDb::default();
+        {
+            let mut apps = db.apps.lock().await;
+            apps.insert(
+                1,
+                lnvps_db::App {
+                    id: 1,
+                    name: "relay".to_string(),
+                    display_name: "Relay".to_string(),
+                    description: None,
+                    icon: None,
+                    repo_url: None,
+                    category: "Nostr relay".to_string(),
+                    seo_title: None,
+                    seo_description: None,
+                    compose: String::new(),
+                    amount: 1000,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: lnvps_db::IntervalType::Month,
+                    setup_amount: 0,
+                    enabled: true,
+                    cpu_milli: 500,
+                    memory_bytes: 1024,
+                    storage_bytes: 4096,
+                    created: Utc::now(),
+                },
+            );
+            let mut clusters = db.app_clusters.lock().await;
+            clusters.insert(
+                1,
+                AppCluster {
+                    id: 1,
+                    name: "c1".to_string(),
+                    region_id: 1,
+                    ingress_domain: "apps.example.com".to_string(),
+                    enabled: true,
+                    capacity_cpu_milli: 10_000,
+                    capacity_memory_bytes: 100_000,
+                    capacity_storage_bytes: 100_000,
+                    created: Utc::now(),
+                },
+            );
+            let mut deps = db.app_deployments.lock().await;
+            // No subscription line item exists for id 9, so the lookup errors.
+            deps.insert(
+                9,
+                AppDeployment {
+                    id: 9,
+                    user_id: 1,
+                    app_id: 1,
+                    cluster_id: 1,
+                    resource_multiplier: 1,
+                    subscription_line_item_id: 9,
+                    name: "d9".to_string(),
+                    namespace: "app-9".to_string(),
+                    hostname: None,
+                    custom_domain: None,
+                    config: None,
+                    desired_state: AppDeploymentDesiredState::Running,
+                    status: AppDeploymentStatus::Running,
+                    status_message: None,
+                    created: Utc::now(),
+                    deleted: false,
+                },
+            );
+        }
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let svc = AppClusterCapacityService::new(db);
+        assert_eq!(svc.used(1).await?.cpu_milli, 0);
         Ok(())
     }
 }
