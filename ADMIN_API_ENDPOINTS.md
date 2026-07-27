@@ -3777,7 +3777,7 @@ These reuse the **`app`** resource — `app::view` / `app::create` / `app::updat
 DELETE /api/admin/v1/apps/{id}
 ```
 
-Required Permission: `app::delete`. Rejected while the app still has deployments (disable it instead).
+Required Permission: `app::delete`. Rejected with a `400` while any `app_deployment` row still references the app — **including soft-deleted ones**, which keep their foreign key. The message reports both counts (`2 active, 3 soft-deleted`). Disable the app instead, or, if only soft-deleted deployments remain, purge them (`DELETE /api/admin/v1/app-deployments/{id}` with `purge: true`, `super_admin` only) and retry. Soft-deleted deployments are hidden from `GET /api/admin/v1/app-deployments` unless you pass `include_deleted=true`.
 
 #### App Deployments
 
@@ -3904,7 +3904,7 @@ Required Permissions: `app::view` / `app::create` / `app::update` / `app::delete
 }
 ```
 
-Delete is rejected while the cluster still has deployments.
+Delete is rejected with a `400` while any `app_deployment` row still references the cluster, soft-deleted ones included — same rule and same purge-then-retry path as [Delete App](#delete-app).
 
 ## Error Responses
 

@@ -399,6 +399,78 @@ async fn admin_update_app(
     ApiData::ok(AdminAppInfo::from_app(this.db.get_app(id).await?, tags))
 }
 
+/// The parent of a deployment — the two resources whose delete the FK guards.
+#[derive(Clone, Copy)]
+enum DeploymentParent {
+    App(u64),
+    Cluster(u64),
+}
+
+impl DeploymentParent {
+    fn filter(&self, include_deleted: bool) -> AppDeploymentFilter {
+        let mut filter = AppDeploymentFilter {
+            include_deleted,
+            ..Default::default()
+        };
+        match self {
+            DeploymentParent::App(id) => filter.app_id = Some(*id),
+            DeploymentParent::Cluster(id) => filter.cluster_id = Some(*id),
+        }
+        filter
+    }
+
+    fn noun(&self) -> &'static str {
+        match self {
+            DeploymentParent::App(_) => "app",
+            DeploymentParent::Cluster(_) => "cluster",
+        }
+    }
+}
+
+/// Refuse to delete an app or cluster while any `app_deployment` row still
+/// references it (#238).
+///
+/// The guard has to count the rows the foreign key counts.
+/// `fk_app_deployment_app` and `fk_app_deployment_cluster` do not look at
+/// `deleted`, and deployment deletion is a soft delete, so a soft-deleted row
+/// blocks the parent delete exactly as a live one does. Counting only live
+/// deployments let the delete through to MySQL, which rejected it — turning the
+/// 400 this guard exists to produce into a 500.
+///
+/// Soft-deleted deployments are hidden from the admin deployment list by
+/// default, so an admin refused on their account has nothing to look at. The
+/// message names the count and the purge that clears them.
+async fn ensure_no_deployments(
+    db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+    parent: DeploymentParent,
+) -> Result<(), lnvps_api_common::ApiError> {
+    // Only the totals are used, so ask for the narrowest page.
+    let (_, total) = db
+        .admin_list_app_deployments_filtered(1, 0, &parent.filter(true))
+        .await?;
+    if total == 0 {
+        return Ok(());
+    }
+    let (_, live) = db
+        .admin_list_app_deployments_filtered(1, 0, &parent.filter(false))
+        .await?;
+    let soft_deleted = total.saturating_sub(live);
+    let noun = parent.noun();
+
+    Err(lnvps_api_common::ApiError::new(if live > 0 {
+        format!(
+            "cannot delete this {noun} with existing deployments \
+             ({live} active, {soft_deleted} soft-deleted); disable it instead"
+        )
+    } else {
+        format!(
+            "cannot delete this {noun}: {soft_deleted} soft-deleted deployment(s) still \
+             reference it. A super admin can purge them (DELETE \
+             /api/admin/v1/app-deployments/{{id}} with `purge: true`), then retry"
+        )
+    }))
+}
+
 async fn admin_delete_app(
     auth: AdminAuth,
     State(this): State<RouterState>,
@@ -407,19 +479,7 @@ async fn admin_delete_app(
     auth.require_permission(AdminResource::App, AdminAction::Delete)?;
     this.db.get_app(id).await?;
 
-    // Refuse to delete an app that still has deployments (would orphan them /
-    // violate the FK). Operators should disable it instead.
-    let has_deployments = this
-        .db
-        .list_all_app_deployments()
-        .await?
-        .into_iter()
-        .any(|d| d.app_id == id);
-    if has_deployments {
-        return Err(lnvps_api_common::ApiError::new(
-            "cannot delete an app with existing deployments; disable it instead",
-        ));
-    }
+    ensure_no_deployments(&this.db, DeploymentParent::App(id)).await?;
 
     this.db.delete_app(id).await?;
     ApiData::ok(true)
@@ -914,17 +974,7 @@ async fn admin_delete_app_cluster(
     auth.require_permission(AdminResource::App, AdminAction::Delete)?;
     this.db.get_app_cluster(id).await?;
 
-    let has_deployments = this
-        .db
-        .list_all_app_deployments()
-        .await?
-        .into_iter()
-        .any(|d| d.cluster_id == id);
-    if has_deployments {
-        return Err(lnvps_api_common::ApiError::new(
-            "cannot delete a cluster with existing deployments; disable it instead",
-        ));
-    }
+    ensure_no_deployments(&this.db, DeploymentParent::Cluster(id)).await?;
 
     this.db.delete_app_cluster(id).await?;
     ApiData::ok(true)
@@ -1018,5 +1068,129 @@ mod tests {
         assert!(validate_category(String::new()).is_err());
         assert!(validate_category("   ".to_string()).is_err());
         assert!(validate_category("\t\n".to_string()).is_err());
+    }
+
+    // ----- Delete guard (#238) -----
+
+    fn mk_deployment(app_id: u64, cluster_id: u64, name: &str) -> lnvps_db::AppDeployment {
+        lnvps_db::AppDeployment {
+            id: 0,
+            user_id: 1,
+            app_id,
+            cluster_id,
+            resource_multiplier: 1,
+            subscription_line_item_id: 0,
+            name: name.to_string(),
+            namespace: format!("app-{name}"),
+            hostname: None,
+            custom_domain: None,
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Pending,
+            status_message: None,
+            created: chrono::Utc::now(),
+            deleted: false,
+        }
+    }
+
+    /// The guard has to count soft-deleted deployments, because the foreign key
+    /// does. A soft delete leaves the row (and its `app_id`/`cluster_id`) in
+    /// place, so letting the parent delete through produced a MySQL FK error as
+    /// a 500 instead of this 400.
+    #[tokio::test]
+    async fn test_delete_guard_counts_soft_deleted_deployments() {
+        let db: std::sync::Arc<dyn lnvps_db::LNVpsDb> =
+            std::sync::Arc::new(lnvps_api_common::MockDb::default());
+
+        // Nothing deployed: both deletes are allowed.
+        assert!(
+            ensure_no_deployments(&db, DeploymentParent::App(7))
+                .await
+                .is_ok()
+        );
+        assert!(
+            ensure_no_deployments(&db, DeploymentParent::Cluster(3))
+                .await
+                .is_ok()
+        );
+
+        let dep_id = db
+            .insert_app_deployment(&mk_deployment(7, 3, "alpha"))
+            .await
+            .unwrap();
+
+        // Live deployment: refused, and told to disable instead.
+        let err = ensure_no_deployments(&db, DeploymentParent::App(7))
+            .await
+            .expect_err("live deployment blocks the app delete");
+        assert_eq!(err.code, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.error.contains("1 active"), "{}", err.error);
+        assert!(err.error.contains("disable it instead"), "{}", err.error);
+        assert!(
+            ensure_no_deployments(&db, DeploymentParent::Cluster(3))
+                .await
+                .is_err()
+        );
+
+        // Another app/cluster is unaffected by it.
+        assert!(
+            ensure_no_deployments(&db, DeploymentParent::App(8))
+                .await
+                .is_ok()
+        );
+        assert!(
+            ensure_no_deployments(&db, DeploymentParent::Cluster(4))
+                .await
+                .is_ok()
+        );
+
+        // Soft delete: the row still holds the FK, so the delete stays refused —
+        // this is the case the old `list_all_app_deployments` guard let through.
+        db.delete_app_deployment(dep_id).await.unwrap();
+        let err = ensure_no_deployments(&db, DeploymentParent::App(7))
+            .await
+            .expect_err("soft-deleted deployment still blocks the app delete");
+        assert!(err.error.contains("1 soft-deleted"), "{}", err.error);
+        assert!(err.error.contains("purge"), "{}", err.error);
+        let err = ensure_no_deployments(&db, DeploymentParent::Cluster(3))
+            .await
+            .expect_err("soft-deleted deployment still blocks the cluster delete");
+        assert!(err.error.contains("cluster"), "{}", err.error);
+        assert!(err.error.contains("purge"), "{}", err.error);
+
+        // Purge: the row is gone, so both deletes are allowed again.
+        db.hard_delete_app_deployment(dep_id).await.unwrap();
+        assert!(
+            ensure_no_deployments(&db, DeploymentParent::App(7))
+                .await
+                .is_ok()
+        );
+        assert!(
+            ensure_no_deployments(&db, DeploymentParent::Cluster(3))
+                .await
+                .is_ok()
+        );
+    }
+
+    /// A mix of live and soft-deleted deployments reports both counts, so an
+    /// admin can tell whether purging alone would unblock the delete.
+    #[tokio::test]
+    async fn test_delete_guard_reports_both_counts() {
+        let db: std::sync::Arc<dyn lnvps_db::LNVpsDb> =
+            std::sync::Arc::new(lnvps_api_common::MockDb::default());
+        let dead = db
+            .insert_app_deployment(&mk_deployment(7, 3, "dead"))
+            .await
+            .unwrap();
+        db.insert_app_deployment(&mk_deployment(7, 3, "live"))
+            .await
+            .unwrap();
+        db.delete_app_deployment(dead).await.unwrap();
+
+        let err = ensure_no_deployments(&db, DeploymentParent::App(7))
+            .await
+            .expect_err("one live deployment still blocks the delete");
+        assert!(err.error.contains("1 active"), "{}", err.error);
+        assert!(err.error.contains("1 soft-deleted"), "{}", err.error);
     }
 }
