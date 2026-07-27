@@ -272,7 +272,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             Some(crate::email_hash(user.email.as_str()).to_vec())
         };
         sqlx::query(
-            "update users set email=?, email_hash=?, email_verified=?, email_verify_token=?, contact_nip17=?, contact_email=?, contact_telegram=?, telegram_chat_id=?, telegram_link_token=?, contact_whatsapp=?, whatsapp_number=?, whatsapp_verified=?, whatsapp_verify_code=?, country_code=?, billing_name=?, billing_address_1=?, billing_address_2=?, billing_city=?, billing_state=?, billing_postcode=?, billing_tax_id=?, geo_country_code=?, geo_ip=?, geo_updated=? where id = ?",
+            "update users set email=?, email_hash=?, email_verified=?, email_verify_token=?, contact_nip17=?, contact_email=?, contact_telegram=?, telegram_chat_id=?, telegram_link_token=?, contact_whatsapp=?, whatsapp_number=?, whatsapp_verified=?, whatsapp_verify_code=?, whatsapp_verify_attempts=?, country_code=?, billing_name=?, billing_address_1=?, billing_address_2=?, billing_city=?, billing_state=?, billing_postcode=?, billing_tax_id=?, geo_country_code=?, geo_ip=?, geo_updated=? where id = ?",
         )
             .bind(&user.email)
             .bind(hash)
@@ -287,6 +287,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(&user.whatsapp_number)
             .bind(user.whatsapp_verified)
             .bind(&user.whatsapp_verify_code)
+            .bind(user.whatsapp_verify_attempts)
             .bind(&user.country_code)
             .bind(&user.billing_name)
             .bind(&user.billing_address_1)
@@ -2060,6 +2061,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 u.whatsapp_number,
                 u.whatsapp_verified,
                 u.whatsapp_verify_code,
+                u.whatsapp_verify_attempts,
                 u.country_code,
                 u.billing_name,
                 u.billing_address_1,
@@ -4878,6 +4880,7 @@ impl AdminDb for LNVpsDbMysql {
                 u.whatsapp_number,
                 u.whatsapp_verified,
                 u.whatsapp_verify_code,
+                u.whatsapp_verify_attempts,
                 u.country_code,
                 u.billing_name,
                 u.billing_address_1,
@@ -4975,6 +4978,7 @@ impl AdminDb for LNVpsDbMysql {
                 u.whatsapp_number,
                 u.whatsapp_verified,
                 u.whatsapp_verify_code,
+                u.whatsapp_verify_attempts,
                 u.country_code,
                 u.billing_name,
                 u.billing_address_1,

@@ -28,6 +28,17 @@ This document provides comprehensive API specifications for generating TypeScrip
 `"DecodeAV1"`, `"DecodeVP9"`, `"DecodeJPEG"`, `"DecodeMPEG2"`, `"DecodeVC1"`, `"VideoScaling"`, `"VideoDeinterlace"`,
 `"VideoCSC"`, `"VideoComposition"`
 
+## Rate Limiting
+
+All endpoints are rate limited per client IP. Well-behaved clients never hit these limits; treat any `429` as a signal to back off and retry after the indicated delay.
+
+| Bucket | Limit | Endpoints |
+|---|---|---|
+| General | 600 requests / minute per IP | Everything not listed below |
+| Strict | 10 requests / minute per IP | `POST /api/v1/webauthn/register/*`, `POST /api/v1/webauthn/login/*`, `GET|POST /api/v1/oauth/{provider}/*`, `GET /api/v1/account/verify-email`, `POST /api/v1/account/whatsapp/verify`, `POST /api/v1/account/whatsapp/confirm`, `POST /api/v1/contact` |
+
+Exceeding a limit returns HTTP `429 Too Many Requests` with a `Retry-After` response header giving the number of seconds until the current window resets.
+
 ## Authentication Types
 
 Every authenticated endpoint accepts **either** of two `Authorization` schemes.
@@ -670,7 +681,7 @@ and React example. `{provider}` is one of the enabled tags (`google`, `github`,
 - **POST** `/api/v1/account/whatsapp/confirm`
 - **Auth**: Required
 - **Body**: `{ "code": string }` — the 6-digit code received via WhatsApp
-- **Notes**: On a correct code, marks the number verified and sets `contact_whatsapp` to `true`. Returns an error for an invalid or expired code.
+- **Notes**: On a correct code, marks the number verified and sets `contact_whatsapp` to `true`. Returns an error for an invalid or expired code. After **10 wrong attempts** the pending code is invalidated and a fresh one must be requested via `POST /api/v1/account/whatsapp/verify`.
 - **Response**: `null`
 
 #### Unlink WhatsApp
@@ -841,7 +852,7 @@ interface PatchPaymentMethodRequest {
   - `method`: Optional payment method ('lightning' | 'revolut' | 'paypal'). Defaults to 'lightning'
 - **Body**: `VmUpgradeRequest`
 - **Response**: `VmUpgradeQuote`
-- **Description**: Calculate the pro-rated upgrade cost for remaining VM time and the new monthly renewal cost after upgrade. Available for both standard template VMs and custom template VMs. Cost is calculated in the currency appropriate for the selected payment method. The response includes the upgrade cost (cost_difference), new renewal cost, and the discount amount representing the value of remaining time at the old pricing rate.
+- **Description**: Calculate the pro-rated upgrade cost for remaining VM time and the new monthly renewal cost after upgrade. Available for both standard template VMs and custom template VMs. Like the upgrade endpoint itself, the request must strictly increase at least one resource (no downgrades). Cost is calculated in the currency appropriate for the selected payment method. The response includes the upgrade cost (cost_difference), new renewal cost, and the discount amount representing the value of remaining time at the old pricing rate.
 
 #### Create VM Upgrade Payment
 - **POST** `/api/v1/vm/{id}/upgrade?method={payment_method}`
@@ -851,7 +862,7 @@ interface PatchPaymentMethodRequest {
   - `payment_method_id`: Optional; for `method=saved`, the specific saved card to charge (omit to use the default saved card)
 - **Body**: `VmUpgradeRequest`
 - **Response**: `VmPayment`
-- **Description**: Create a payment for upgrading VM specifications. The upgrade is applied after payment confirmation. Payment method determines the currency and payment provider used. Saved methods are collected on the spot the same way as renewals: `method=nwc` pays via the user's saved Nostr Wallet Connect wallet, and `method=saved` charges a saved Revolut card off-session (merchant-initiated). For these off-session methods the request briefly waits for settlement — the returned `VmPayment` is already `is_paid: true` if it settled within ~10s, otherwise it is returned pending and settles asynchronously. **Important: Running VMs will be automatically stopped and restarted during the upgrade process to apply hardware changes.**
+- **Description**: Create a payment for upgrading VM specifications. An upgrade must keep every resource at or above its current level and strictly increase at least one of CPU, memory or disk — requests that shrink a resource (or change nothing) are rejected; downgrades require a reinstall onto a smaller template. The upgrade is applied after payment confirmation. Payment method determines the currency and payment provider used. Saved methods are collected on the spot the same way as renewals: `method=nwc` pays via the user's saved Nostr Wallet Connect wallet, and `method=saved` charges a saved Revolut card off-session (merchant-initiated). For these off-session methods the request briefly waits for settlement — the returned `VmPayment` is already `is_paid: true` if it settled within ~10s, otherwise it is returned pending and settles asynchronously. **Important: Running VMs will be automatically stopped and restarted during the upgrade process to apply hardware changes.**
 
 ### VM Operations
 

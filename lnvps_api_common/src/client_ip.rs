@@ -9,8 +9,14 @@ use std::net::IpAddr;
 /// path), so the peer socket address is never the real client. The client IP is
 /// therefore read from forwarding headers set by the trusted front proxy:
 ///
-/// 1. `X-Forwarded-For` — the left-most (original client) entry, or
+/// 1. `X-Forwarded-For` — the **right-most** entry, i.e. the address reported
+///    by the proxy closest to us, or
 /// 2. `X-Real-IP` — a single address.
+///
+/// The left-most XFF entry is the one closest to client control (a client can
+/// prepend arbitrary entries unless the edge proxy strips them), so trusting
+/// it would let a caller spoof their geolocation. The right-most entry is the
+/// one the nearest trusted proxy observed and appended itself.
 ///
 /// This is best-effort: the value is only used as *one* non-contradictory piece
 /// of place-of-supply evidence for EU VAT and is never trusted for
@@ -22,9 +28,10 @@ pub struct ClientIp(pub Option<IpAddr>);
 impl ClientIp {
     /// Parse the client IP out of a set of request headers.
     pub fn from_headers(headers: &axum::http::HeaderMap) -> Self {
-        // X-Forwarded-For: client, proxy1, proxy2 -> take the left-most entry.
+        // X-Forwarded-For: client, proxy1, proxy2 -> take the right-most
+        // (nearest-trusted-proxy) entry.
         if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-            for part in xff.split(',') {
+            for part in xff.split(',').rev() {
                 if let Some(ip) = parse_ip(part) {
                     return ClientIp(Some(ip));
                 }
@@ -100,12 +107,25 @@ mod tests {
     }
 
     #[test]
-    fn takes_leftmost_of_chain() {
+    fn takes_rightmost_of_chain() {
+        // The right-most entry is the one appended by the nearest trusted
+        // proxy; left-most entries are client-influenced and must not win.
         let ip = ClientIp::from_headers(&headers(&[(
             "x-forwarded-for",
             "203.0.113.7, 70.41.3.18, 150.172.238.178",
         )]));
-        assert_eq!(ip.0, Some("203.0.113.7".parse().unwrap()));
+        assert_eq!(ip.0, Some("150.172.238.178".parse().unwrap()));
+    }
+
+    #[test]
+    fn skips_unparseable_rightmost_and_falls_back_inward() {
+        // A malformed right-most entry is skipped in favour of the next
+        // parseable address further in.
+        let ip = ClientIp::from_headers(&headers(&[(
+            "x-forwarded-for",
+            "203.0.113.7, 70.41.3.18, garbage",
+        )]));
+        assert_eq!(ip.0, Some("70.41.3.18".parse().unwrap()));
     }
 
     #[test]
@@ -148,6 +168,6 @@ mod tests {
             .unwrap();
         let (mut parts, _) = req.into_parts();
         let ip = ClientIp::from_request_parts(&mut parts, &()).await.unwrap();
-        assert_eq!(ip.0, Some("198.51.100.9".parse().unwrap()));
+        assert_eq!(ip.0, Some("10.0.0.1".parse().unwrap()));
     }
 }

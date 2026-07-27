@@ -28,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpSocket};
 use tower_http::cors::{AllowHeaders, Any, CorsLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
 
 /// CORS layer for the public API.
 ///
@@ -494,9 +495,37 @@ async fn main() -> Result<(), Error> {
             router = router.merge(nostr_domain_router());
         }
         tasks.push(tokio::spawn(async move {
-            if let Err(e) = axum::serve(
-                listener,
-                router.layer(cors_layer()).with_state(RouterState {
+            let app = router
+                // Per-client-IP rate limiting: a strict bucket on auth-start /
+                // verification endpoints and a general bucket on everything
+                // else. Outermost layer so cheap 429s shield the handlers.
+                .layer(axum::middleware::from_fn_with_state(
+                    lnvps_api_common::RateLimiter::default(),
+                    lnvps_api_common::rate_limit_middleware,
+                ))
+                // Defense-in-depth headers on every response (the HTML pages
+                // served here — invoices, email verification, agreements —
+                // otherwise have no framing/XSS/MIME protection).
+                .layer(SetResponseHeaderLayer::if_not_present(
+                    axum::http::header::X_CONTENT_TYPE_OPTIONS,
+                    axum::http::HeaderValue::from_static("nosniff"),
+                ))
+                .layer(SetResponseHeaderLayer::if_not_present(
+                    axum::http::header::X_FRAME_OPTIONS,
+                    axum::http::HeaderValue::from_static("DENY"),
+                ))
+                .layer(SetResponseHeaderLayer::if_not_present(
+                    axum::http::header::REFERRER_POLICY,
+                    axum::http::HeaderValue::from_static("no-referrer"),
+                ))
+                .layer(SetResponseHeaderLayer::if_not_present(
+                    axum::http::header::CONTENT_SECURITY_POLICY,
+                    axum::http::HeaderValue::from_static(
+                        "default-src 'none'; style-src 'unsafe-inline'",
+                    ),
+                ))
+                .layer(cors_layer())
+                .with_state(RouterState {
                     db,
                     state: status,
                     sub_handler,
@@ -506,10 +535,8 @@ async fn main() -> Result<(), Error> {
                     work_sender: worker.commander(),
                     feedback: api_feedback,
                     geoip: geoip.clone(),
-                }),
-            )
-            .await
-            {
+                });
+            if let Err(e) = axum::serve(listener, app).await {
                 error!("Error while running server: {}", e);
             }
         }));

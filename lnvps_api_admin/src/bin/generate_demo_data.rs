@@ -1098,6 +1098,7 @@ async fn create_users(db: &LNVpsDbMysql) -> Result<Vec<User>> {
             whatsapp_number: None,
             whatsapp_verified: false,
             whatsapp_verify_code: None,
+            whatsapp_verify_attempts: 0,
             country_code: None,
             geo_country_code: None,
             geo_ip: None,

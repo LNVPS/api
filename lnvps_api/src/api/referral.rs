@@ -324,13 +324,26 @@ fn validate_onchain_address(addr: &str) -> Result<(), ApiError> {
     Err(ApiError::new("Bitcoin address must be a mainnet address"))
 }
 
-/// Validate a lightning address by parsing its format and resolving the LNURL pay endpoint
+/// Validate a lightning address by parsing its format and resolving the LNURL pay endpoint.
+///
+/// The resolved host is user-controlled, so the fetch runs with tight connect,
+/// total and body limits: this keeps the endpoint from being abused as a
+/// slow-loris style blind-SSRF amplifier against arbitrary HTTPS hosts (the
+/// response content is never returned to the caller — only validity).
 async fn validate_lightning_address(addr: &str) -> Result<(), ApiError> {
     let ln_addr = LightningAddress::from_str(addr)
         .map_err(|_| ApiError::new("Invalid lightning address format"))?;
 
     let url = ln_addr.lnurlp_url();
-    let rsp = reqwest::get(&url)
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(3))
+        .timeout(std::time::Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::limited(2))
+        .build()
+        .map_err(|_| ApiError::new("Failed to resolve lightning address"))?;
+    let rsp = client
+        .get(&url)
+        .send()
         .await
         .map_err(|_| ApiError::new("Failed to resolve lightning address"))?;
 
@@ -338,8 +351,18 @@ async fn validate_lightning_address(addr: &str) -> Result<(), ApiError> {
         return Err(ApiError::new("Lightning address not found"));
     }
 
-    rsp.json::<PayResponse>()
+    // A LNURL pay response is small; cap the body so a hostile endpoint can't
+    // stream unbounded data into this process.
+    let body = rsp
+        .bytes()
         .await
+        .map_err(|_| ApiError::new("Failed to resolve lightning address"))?;
+    if body.len() > 64 * 1024 {
+        return Err(ApiError::new(
+            "Lightning address returned invalid LNURL pay response",
+        ));
+    }
+    serde_json::from_slice::<PayResponse>(&body)
         .map(|_| ())
         .map_err(|_| ApiError::new("Lightning address returned invalid LNURL pay response"))
 }

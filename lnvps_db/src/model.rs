@@ -78,9 +78,14 @@ pub struct User {
     pub whatsapp_number: Option<String>,
     /// Whether the WhatsApp number has been verified
     pub whatsapp_verified: bool,
-    /// Pending one-time verification code sent to the WhatsApp number.
+    /// Pending one-time verification code sent to the WhatsApp number, stored
+    /// as a SHA-256 hash (see [`crate::hash_verify_token`]).
     /// `None` once verification has completed.
     pub whatsapp_verify_code: Option<String>,
+    /// Failed confirmation attempts against the pending WhatsApp code. The
+    /// code is invalidated after a small number of failures so the 6-digit
+    /// space cannot be brute-forced online.
+    pub whatsapp_verify_attempts: u8,
     /// Users country
     pub country_code: Option<String>,
     /// Name to show on invoices

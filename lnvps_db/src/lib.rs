@@ -77,6 +77,17 @@ pub fn webauthn_pubkey(user_handle: &str) -> [u8; 32] {
     out
 }
 
+/// Hash a one-time verification secret (email-verification token, WhatsApp
+/// code) for storage, returning lowercase hex.
+///
+/// These secrets are password-reset-class: whoever holds the value can confirm
+/// the action it guards, so the DB only ever stores the SHA-256 hash. The raw
+/// value is sent to the user out-of-band and compared by hash on submission.
+pub fn hash_verify_token(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("sqlx: {0}")]
@@ -1182,5 +1193,24 @@ mod tests {
         assert_eq!(model::AccountType::Nostr.to_string(), "nostr");
         assert_eq!(model::AccountType::OAuth.to_string(), "oauth");
         assert_eq!(model::AccountType::Webauthn.to_string(), "webauthn");
+    }
+
+    #[test]
+    fn test_hash_verify_token() {
+        // Deterministic and lowercase-hex SHA-256.
+        let h = hash_verify_token("012345");
+        assert_eq!(h.len(), 64);
+        assert_eq!(h, hash_verify_token("012345"));
+        assert!(
+            h.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        );
+        // Different input -> different hash.
+        assert_ne!(h, hash_verify_token("012346"));
+        // Known vector: SHA-256("012345").
+        assert_eq!(
+            h,
+            "2224512ef44a62e580bb1c0dcb33aff688f4e7da8a488aeb4e7ca402c5cacf45".to_string()
+        );
     }
 }

@@ -507,6 +507,7 @@ impl LNVpsDbBase for MockDb {
             u.whatsapp_number = user.whatsapp_number.clone();
             u.whatsapp_verified = user.whatsapp_verified;
             u.whatsapp_verify_code = user.whatsapp_verify_code.clone();
+            u.whatsapp_verify_attempts = user.whatsapp_verify_attempts;
             u.country_code = user.country_code.clone();
             u.billing_name = user.billing_name.clone();
             u.billing_address_1 = user.billing_address_1.clone();
@@ -6325,7 +6326,11 @@ mod tests {
 
         // Stands in for uq_app_tag_slug: the vocabulary is controlled, so a
         // duplicate slug is an error rather than a second tag reading the same.
-        assert!(db.insert_app_tag(&tag("nostr", "Nostr again")).await.is_err());
+        assert!(
+            db.insert_app_tag(&tag("nostr", "Nostr again"))
+                .await
+                .is_err()
+        );
         assert_eq!(db.get_app_tag_by_slug("nostr").await.unwrap().id, nostr);
         assert!(db.get_app_tag_by_slug("no-such-tag").await.is_err());
 
@@ -6397,10 +6402,18 @@ mod tests {
         db.set_app_tags(strfry, &[nostr, relay, nostr])
             .await
             .unwrap();
-        assert_eq!(db.list_app_tag_assignments(&[strfry]).await.unwrap().len(), 2);
+        assert_eq!(
+            db.list_app_tag_assignments(&[strfry]).await.unwrap().len(),
+            2
+        );
         // An empty list clears.
         db.set_app_tags(strfry, &[]).await.unwrap();
-        assert!(db.list_app_tag_assignments(&[strfry]).await.unwrap().is_empty());
+        assert!(
+            db.list_app_tag_assignments(&[strfry])
+                .await
+                .unwrap()
+                .is_empty()
+        );
         db.set_app_tags(strfry, &[nostr, relay]).await.unwrap();
 
         let counts = |v: Vec<(AppTag, u64)>| -> Vec<(String, u64)> {
@@ -6449,7 +6462,12 @@ mod tests {
 
         // Deleting an app cascades the other way.
         db.delete_app(strfry).await.unwrap();
-        assert!(db.list_app_tag_assignments(&[strfry]).await.unwrap().is_empty());
+        assert!(
+            db.list_app_tag_assignments(&[strfry])
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(db.delete_app_tag(relay).await.unwrap(), 0);
     }
 

@@ -141,12 +141,25 @@ async fn v1_submit_contact_form(
         log::error!("Cannot send contact form: no company email configured");
         return ApiData::err("Contact form is not available");
     };
-    let reply_to = format!("{} <{}>", req.name.trim(), req.email.trim());
+
+    // Sanitize header-bound values: lettre rejects CRLF in addresses, but the
+    // display name and subject are attacker-controlled text placed into a mail
+    // that leaves our infrastructure with valid DKIM/SPF. Strip control chars
+    // so a submission can't inject extra headers or spoof the thread, and cap
+    // the subject length. The sender's address goes in the Reply-To (no user
+    // display name) so replies reach them without lending our From-domain's
+    // credibility to an attacker-chosen identity.
+    let safe_name = sanitize_header_value(&req.name);
+    let safe_subject: String = sanitize_header_value(&req.subject)
+        .chars()
+        .take(200)
+        .collect();
+    let reply_to = format!("{} <{}>", safe_name, req.email.trim());
     if let Err(e) = send_email_with_reply_to(
         smtp,
         &support_email,
         Some(&reply_to),
-        &format!("Contact Form: {}", req.subject),
+        &format!("Contact Form: {}", safe_subject),
         &support_message,
         None,
     )
@@ -157,4 +170,36 @@ async fn v1_submit_contact_form(
     }
 
     ApiData::ok(())
+}
+
+/// Strip control characters (CR/LF/NUL etc.) from a value destined for an
+/// email header, preventing header injection and collapsing odd whitespace.
+fn sanitize_header_value(v: &str) -> String {
+    v.chars()
+        .filter(|c| !c.is_control())
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_header_value_strips_crlf_and_control_chars() {
+        assert_eq!(
+            sanitize_header_value("Evil\r\nBcc: victim@example.com\0"),
+            "EvilBcc: victim@example.com"
+        );
+    }
+
+    #[test]
+    fn sanitize_header_value_trims_and_keeps_normal_text() {
+        assert_eq!(sanitize_header_value("  Alice Example  "), "Alice Example");
+        assert_eq!(
+            sanitize_header_value("Invoice #42 (urgent)"),
+            "Invoice #42 (urgent)"
+        );
+    }
 }

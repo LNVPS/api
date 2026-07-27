@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **Per-client-IP rate limiting on the public API** — all consumer endpoints now sit behind an in-process fixed-window limiter (600 req/min per IP general; 10 req/min per IP on brute-force-sensitive auth and verification endpoints: OAuth login/callback, WebAuthn register/login, email verification, WhatsApp verify/confirm, and the contact form). Exceeding a limit returns `429 Too Many Requests` with a `Retry-After` header. Clients with well-behaved retry/backoff behaviour are unaffected.
+
+- **WhatsApp verification codes are now invalidated after 10 failed confirmations** — the 6-digit code previously had unlimited online guesses. After 10 wrong attempts the pending code is cleared and a fresh one must be requested (`POST /api/v1/account/whatsapp/verify`).
+
+- **Verification secrets are stored as SHA-256 hashes, not plaintext** — `users.email_verify_token` and `users.whatsapp_verify_code` now hold only the hash of the value sent to the user, so a read-only database leak no longer exposes live verification links/codes. **Any email or WhatsApp verification pending at deploy time is invalidated** by the accompanying migration; affected users simply re-request verification.
+
+- **VM upgrades must now strictly increase at least one resource** — `POST /api/v1/vm/{id}/upgrade` and the upgrade quote endpoint previously accepted any in-plan spec, including one smaller than the current VM, producing a zero/negative prorated charge that applied a reduced VM. Requests that shrink CPU, memory or disk (or change nothing) now fail with an error. Downgrades remain available by reinstalling a smaller template.
+
+- **Client-IP geolocation now trusts the right-most `X-Forwarded-For` entry** — the left-most entry is client-controllable when an edge proxy appends rather than replaces, which let a caller spoof the IP used as EU VAT place-of-supply evidence.
+
+- **Security headers on all API responses** — `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` and a restrictive `Content-Security-Policy` are now set on every response (previously the HTML invoice/verification/agreement pages had none).
+
+- **Billing-detail mismatch warnings no longer name the mismatched fields** — `PATCH /api/v1/account` with a VAT number returns a generic "some billing details do not match the VAT registration" warning instead of listing which of name/street/postcode/city differed, closing an oracle that could probe third parties' EU VAT registration data. The warning is still surfaced (valid numbers still validate; mismatches are still non-fatal).
+
+- **Contact form hardens email header values** — `POST /api/v1/contact` strips control characters from the sender name and subject (and caps the subject) before placing them in outgoing mail headers.
+
+### Fixed
+
+- **`GET /api/v1/payment/{id}` now works for every subscription type** — it previously resolved the payer through the VM back-reference, so a payment for a managed app, IP range or other non-VPS subscription errored instead of returning. Ownership is now asserted on the subscription and the embedded `vm_id` is `0` for non-VPS payments (the endpoint remains deprecated in favour of `GET /api/v1/subscriptions/{id}/payments/{payment_id}`).
+
 ### Deprecated
 
 - **VM-specific payment endpoints** — `GET /api/v1/vm/{id}/renew`, `GET /api/v1/vm/{id}/payments` and `GET /api/v1/payment/{id}` are superseded by the subscription APIs, which cover every product type rather than just VPS. Use `GET /api/v1/subscriptions/{id}/renew` and `GET /api/v1/subscriptions/{id}/payments` with the VM's `subscription_id` (returned on `ApiVmStatus`), and `GET /api/v1/subscriptions/{id}/payments/{payment_id}` (new, below) to poll a single payment. `GET /api/v1/payment/{id}` in particular can only resolve payments that belong to a VM subscription, so it cannot poll a managed app or IP range payment at all. All three still work and are unchanged; they will be removed in a future release. `GET /api/v1/payment/{id}/invoice`, `GET /api/v1/payment/methods` and the LNURL routes (`/api/v1/vm/{id}/lnurlp`, `/api/v1/vm/{id}/renew-lnurlp`) are **not** deprecated — the invoice route is the canonical invoice surface for all subscription types and the LNURL routes serve external wallets.

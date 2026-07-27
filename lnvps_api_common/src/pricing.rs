@@ -1293,12 +1293,31 @@ impl PricingEngine {
             bail!("VM must have either a standard template or custom template to upgrade");
         };
 
+        // An upgrade must never shrink the VM: every specified dimension must be
+        // at least the current value, and at least one must strictly increase.
+        // Otherwise the prorated "upgrade cost" goes zero/negative and a payment
+        // of ~nothing would apply a reduced spec (free downgrade, or a stolen
+        // session token shrinking a victim's VM).
+        let (new_cpu, new_memory, new_disk) = (
+            cfg.new_cpu.unwrap_or(cpu),
+            cfg.new_memory.unwrap_or(memory),
+            cfg.new_disk.unwrap_or(disk),
+        );
+        ensure!(
+            new_cpu >= cpu && new_memory >= memory && new_disk >= disk,
+            "An upgrade cannot reduce the VM's resources"
+        );
+        ensure!(
+            new_cpu > cpu || new_memory > memory || new_disk > disk,
+            "An upgrade must increase at least one resource"
+        );
+
         // Build the new custom template with upgraded specs, copying resource limits from pricing
         let new_custom_template = VmCustomTemplate {
             id: 0, // Will be set when inserted
-            cpu: cfg.new_cpu.unwrap_or(cpu),
-            memory: cfg.new_memory.unwrap_or(memory),
-            disk_size: cfg.new_disk.unwrap_or(disk),
+            cpu: new_cpu,
+            memory: new_memory,
+            disk_size: new_disk,
             disk_type,
             disk_interface,
             pricing_id: pricing.id,
@@ -2421,9 +2440,9 @@ mod tests {
         let taxes = VatClient::new();
         let pe = PricingEngine::new(db_arc.clone(), rates, taxes);
 
-        // Test upgrade configuration - increase CPU from 1 to 2
+        // Test upgrade configuration - increase CPU from 2 (mock template) to 4
         let upgrade_config = UpgradeConfig {
-            new_cpu: Some(2),
+            new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
         };
@@ -2495,7 +2514,7 @@ mod tests {
         let pe = PricingEngine::new(db_arc.clone(), rates, taxes);
 
         let cfg = UpgradeConfig {
-            new_cpu: Some(2),
+            new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
         };
@@ -2573,6 +2592,102 @@ mod tests {
             .calculate_vm_upgrade_cost(1, &upgrade_config, PaymentMethod::Lightning)
             .await;
         assert!(result.is_err());
+
+        Ok(())
+    }
+
+    /// The mock VM runs 2 CPU / 2 GB / 64 GB. Any config that shrinks a
+    /// dimension (or changes nothing) must be rejected before pricing, so a
+    /// downgrade can never ride the upgrade payment path.
+    #[tokio::test]
+    async fn test_upgrade_rejects_downgrades() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+        setup_upgrade_test_data(&db).await?;
+        {
+            let mut subs = db.subscriptions.lock().await;
+            if let Some(s) = subs.get_mut(&1) {
+                s.expires = Some(Utc::now() + chrono::Duration::days(15));
+                s.is_setup = true;
+            }
+        }
+        {
+            let mut vms = db.vms.lock().await;
+            vms.insert(
+                1,
+                Vm {
+                    id: 1,
+                    user_id: 1,
+                    template_id: Some(1),
+                    custom_template_id: None,
+                    deleted: false,
+                    ..MockDb::mock_vm()
+                },
+            );
+        }
+        let db_arc: Arc<dyn LNVpsDb> = Arc::new(db);
+        let pe = PricingEngine::new(db_arc.clone(), rates, VatClient::new());
+
+        // CPU downgrade: 2 -> 1.
+        let cpu_down = UpgradeConfig {
+            new_cpu: Some(1),
+            new_memory: None,
+            new_disk: None,
+        };
+        assert!(
+            pe.calculate_vm_upgrade_cost(1, &cpu_down, PaymentMethod::Lightning)
+                .await
+                .is_err()
+        );
+
+        // Memory downgrade: 2 GB -> 1 GB.
+        let mem_down = UpgradeConfig {
+            new_cpu: None,
+            new_memory: Some(crate::GB),
+            new_disk: None,
+        };
+        assert!(
+            pe.calculate_vm_upgrade_cost(1, &mem_down, PaymentMethod::Lightning)
+                .await
+                .is_err()
+        );
+
+        // Disk downgrade: 64 GB -> 32 GB.
+        let disk_down = UpgradeConfig {
+            new_cpu: None,
+            new_memory: None,
+            new_disk: Some(32 * crate::GB),
+        };
+        assert!(
+            pe.calculate_vm_upgrade_cost(1, &disk_down, PaymentMethod::Lightning)
+                .await
+                .is_err()
+        );
+
+        // No change at all is not an upgrade.
+        let same = UpgradeConfig {
+            new_cpu: Some(2),
+            new_memory: Some(2 * crate::GB),
+            new_disk: Some(64 * crate::GB),
+        };
+        assert!(
+            pe.calculate_vm_upgrade_cost(1, &same, PaymentMethod::Lightning)
+                .await
+                .is_err()
+        );
+
+        // One dimension up, the rest unchanged: allowed.
+        let up = UpgradeConfig {
+            new_cpu: Some(4),
+            new_memory: None,
+            new_disk: None,
+        };
+        assert!(
+            pe.calculate_vm_upgrade_cost(1, &up, PaymentMethod::Lightning)
+                .await
+                .is_ok()
+        );
 
         Ok(())
     }

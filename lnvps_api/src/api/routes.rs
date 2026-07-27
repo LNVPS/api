@@ -186,16 +186,18 @@ async fn v1_patch_account(
             let email_changed = old_email != new_email.as_str();
             user.email = new_email.clone().into();
             if email_changed {
-                // Mark email as unverified and generate a verification token
+                // Mark email as unverified and generate a verification token.
+                // Only the SHA-256 hash is stored; the raw token goes to the
+                // user's inbox and is compared by hash on submission.
                 let token = hex::encode(rand::random::<[u8; 32]>());
                 user.email_verified = false;
-                user.email_verify_token = token.clone();
+                user.email_verify_token = lnvps_db::hash_verify_token(&token);
                 pending_verification = Some(token);
             } else if !user.email_verified && user.email_verify_token.is_empty() {
                 // Email is the same but was never verified and no token exists
                 // Generate a new token and send verification email
                 let token = hex::encode(rand::random::<[u8; 32]>());
-                user.email_verify_token = token.clone();
+                user.email_verify_token = lnvps_db::hash_verify_token(&token);
                 pending_verification = Some(token);
             }
         } else {
@@ -285,12 +287,15 @@ async fn v1_patch_account(
         if !result.valid {
             return ApiData::err("Invalid tax ID");
         }
+        // Deliberately a boolean-level signal: naming which fields mismatched
+        // would turn this endpoint into an oracle for probing other parties'
+        // VAT registration details (name/street/postcode/city).
         let mismatches = result.mismatched_fields();
         if !mismatches.is_empty() {
-            warnings.push(format!(
-                "The following billing details do not match the VAT registration: {}",
-                mismatches.join(", ")
-            ));
+            warnings.push(
+                "Some billing details do not match the VAT registration, please check your name and address"
+                    .to_string(),
+            );
         }
     }
 
@@ -350,7 +355,10 @@ async fn v1_verify_email(
             "#e74c3c",
         );
     }
-    let mut user = match this.db.get_user_by_email_verify_token(&params.token).await {
+    // The raw token arrives from the user's inbox; look up the account by its
+    // SHA-256 hash, which is all that is stored.
+    let token_hash = lnvps_db::hash_verify_token(params.token.trim());
+    let mut user = match this.db.get_user_by_email_verify_token(&token_hash).await {
         Ok(u) => u,
         Err(_) => {
             return make_page(
@@ -642,11 +650,14 @@ async fn v1_whatsapp_verify(
     let uid = this.db.upsert_user(&pubkey).await?;
     let mut user = this.db.get_user(uid).await?;
 
-    // 6-digit numeric code
+    // 6-digit numeric code. Only the SHA-256 hash is stored (compared by hash
+    // on confirm), and the attempt counter resets with each new code so a
+    // fresh code always gets a fresh brute-force budget.
     let code = format!("{:06}", rand::random::<u32>() % 1_000_000);
     user.whatsapp_number = Some(number.to_string());
     user.whatsapp_verified = false;
-    user.whatsapp_verify_code = Some(code.clone());
+    user.whatsapp_verify_code = Some(lnvps_db::hash_verify_token(&code));
+    user.whatsapp_verify_attempts = 0;
     this.db.update_user(&user).await?;
 
     let client = crate::notifications::WhatsAppClient::new(wa, reqwest::Client::new());
@@ -661,6 +672,43 @@ async fn v1_whatsapp_verify(
     ApiData::ok(())
 }
 
+/// Maximum failed confirmation attempts before a pending WhatsApp code is
+/// invalidated and a fresh one must be requested. A 6-digit code with no cap
+/// is brute-forceable online (~500k requests); 10 failures leaves the chance
+/// of a lucky guess negligible while never locking out a legitimate user who
+/// fat-fingers the code.
+const WHATSAPP_MAX_VERIFY_ATTEMPTS: u8 = 10;
+
+/// Outcome of one WhatsApp confirmation attempt against the pending state.
+enum WhatsappConfirmOutcome {
+    /// Code matched — mark verified and enable WhatsApp contact.
+    Verified,
+    /// Code wrong but attempts remain — persist the incremented counter.
+    WrongCode,
+    /// Code wrong and the brute-force budget is exhausted — invalidate the
+    /// pending code so a fresh one must be requested.
+    LockedOut,
+    /// No pending code at all.
+    NoPendingCode,
+}
+
+/// Evaluate a submitted WhatsApp code against the pending (hashed) code and
+/// attempt counter. Pure so the brute-force state machine is directly testable;
+/// the handler persists the resulting mutation.
+fn whatsapp_confirm_outcome(user: &lnvps_db::User, code: &str) -> WhatsappConfirmOutcome {
+    let Some(expected) = &user.whatsapp_verify_code else {
+        return WhatsappConfirmOutcome::NoPendingCode;
+    };
+    if !expected.is_empty() && *expected == lnvps_db::hash_verify_token(code) {
+        return WhatsappConfirmOutcome::Verified;
+    }
+    if user.whatsapp_verify_attempts.saturating_add(1) >= WHATSAPP_MAX_VERIFY_ATTEMPTS {
+        WhatsappConfirmOutcome::LockedOut
+    } else {
+        WhatsappConfirmOutcome::WrongCode
+    }
+}
+
 /// Confirm WhatsApp verification by matching the code; enables the number.
 async fn v1_whatsapp_confirm(
     auth: Nip98Auth,
@@ -671,16 +719,32 @@ async fn v1_whatsapp_confirm(
     let uid = this.db.upsert_user(&pubkey).await?;
     let mut user = this.db.get_user(uid).await?;
 
-    let code = req.code.trim();
-    match &user.whatsapp_verify_code {
-        Some(expected) if !expected.is_empty() && expected == code => {
+    match whatsapp_confirm_outcome(&user, req.code.trim()) {
+        WhatsappConfirmOutcome::Verified => {
             user.whatsapp_verified = true;
             user.whatsapp_verify_code = None;
+            user.whatsapp_verify_attempts = 0;
             user.contact_whatsapp = true;
             this.db.update_user(&user).await?;
             ApiData::ok(())
         }
-        _ => ApiData::err("Invalid or expired verification code"),
+        WhatsappConfirmOutcome::WrongCode => {
+            user.whatsapp_verify_attempts = user.whatsapp_verify_attempts.saturating_add(1);
+            this.db.update_user(&user).await?;
+            ApiData::err("Invalid or expired verification code")
+        }
+        WhatsappConfirmOutcome::LockedOut => {
+            // Exhausting the budget invalidates the code: the user must
+            // request a fresh one (which resets the counter) instead of
+            // getting unlimited guesses.
+            user.whatsapp_verify_code = None;
+            user.whatsapp_verify_attempts = 0;
+            this.db.update_user(&user).await?;
+            ApiData::err("Invalid or expired verification code")
+        }
+        WhatsappConfirmOutcome::NoPendingCode => {
+            ApiData::err("Invalid or expired verification code")
+        }
     }
 }
 
@@ -693,6 +757,7 @@ async fn v1_whatsapp_unlink(auth: Nip98Auth, State(this): State<RouterState>) ->
     user.whatsapp_number = None;
     user.whatsapp_verified = false;
     user.whatsapp_verify_code = None;
+    user.whatsapp_verify_attempts = 0;
     user.contact_whatsapp = false;
     this.db.update_user(&user).await?;
 
@@ -1704,15 +1769,20 @@ async fn v1_get_payment(
     };
 
     let payment = this.db.get_subscription_payment(&id).await?;
-    let vm = this
+    // Ownership is asserted on the subscription (works for every subscription
+    // type, not just VPS); the VM id embedded in the response is best-effort.
+    let subscription = this.db.get_subscription(payment.subscription_id).await?;
+    if subscription.user_id != uid {
+        return Err(ApiError::forbidden("Payment does not belong to you"));
+    }
+    let vm_id = this
         .db
         .get_vm_by_subscription(payment.subscription_id)
-        .await?;
-    if vm.user_id != uid {
-        return Err(ApiError::forbidden("VM does not belong to you"));
-    }
+        .await
+        .map(|vm| vm.id)
+        .unwrap_or_default();
 
-    ApiData::ok(ApiVmPayment::from_subscription_payment(payment, vm.id)?)
+    ApiData::ok(ApiVmPayment::from_subscription_payment(payment, vm_id)?)
 }
 
 /// Map a payment's stored tax fields to invoice display fields:
@@ -2998,5 +3068,53 @@ mod tests {
         assert!(json.get("hodl_invoice").is_none());
         // LUD-06 routes field present and empty
         assert_eq!(json["routes"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn whatsapp_confirm_outcome_matches_hashed_code() {
+        let mut user = lnvps_db::User {
+            whatsapp_verify_code: Some(lnvps_db::hash_verify_token("123456")),
+            ..Default::default()
+        };
+        // Correct code verifies, plaintext storage would fail this check.
+        assert!(matches!(
+            whatsapp_confirm_outcome(&user, "123456"),
+            WhatsappConfirmOutcome::Verified
+        ));
+        // Wrong code with budget left -> counted, not locked out.
+        assert!(matches!(
+            whatsapp_confirm_outcome(&user, "000000"),
+            WhatsappConfirmOutcome::WrongCode
+        ));
+        // At the attempt ceiling the next failure locks out.
+        user.whatsapp_verify_attempts = WHATSAPP_MAX_VERIFY_ATTEMPTS - 1;
+        assert!(matches!(
+            whatsapp_confirm_outcome(&user, "000000"),
+            WhatsappConfirmOutcome::LockedOut
+        ));
+        // A correct code at the ceiling still verifies (counter only gates
+        // failures).
+        assert!(matches!(
+            whatsapp_confirm_outcome(&user, "123456"),
+            WhatsappConfirmOutcome::Verified
+        ));
+        // No pending code at all.
+        user.whatsapp_verify_code = None;
+        assert!(matches!(
+            whatsapp_confirm_outcome(&user, "123456"),
+            WhatsappConfirmOutcome::NoPendingCode
+        ));
+    }
+
+    #[test]
+    fn email_verify_token_is_stored_hashed() {
+        // The stored value must be the SHA-256 of the token sent by email, so
+        // a DB read leak does not expose live verification links.
+        let token = hex::encode(rand::random::<[u8; 32]>());
+        let stored = lnvps_db::hash_verify_token(&token);
+        assert_ne!(stored, token);
+        assert_eq!(stored.len(), 64);
+        // And the lookup path hashes the inbound token identically.
+        assert_eq!(lnvps_db::hash_verify_token(token.trim()), stored);
     }
 }
