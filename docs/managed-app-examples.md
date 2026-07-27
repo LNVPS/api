@@ -73,10 +73,12 @@ otherwise fatal):
 services:
   s3:
     image: rustfs/rustfs:1.0.0-beta.11
+    user: "10001"                     # image sets `USER rustfs`; see `user` above
     ports:
       - { name: s3, container: 9000, protocol: http, expose: none }
   app:
     image: example/app:latest
+    user: "1000"                      # every service needs one — see `user` above
     depends_on: [s3]
     ports:
       - { name: http, container: 3000, protocol: http, expose: ingress }
@@ -153,6 +155,53 @@ for an Alpine `adduser -D nonroot` that is `1000`; for distroless `nonroot`
 it is `65532`. A `user:` that is neither `root`/`0` nor a positive integer is
 rejected when the compose is validated.
 
+**An image that declares no `USER` at all runs as root, and is refused the same
+way** (issue #256):
+
+```
+container has runAsNonRoot and image will run as root
+```
+
+Omitting `user:` is therefore not a neutral default — it is a bet that the image
+declares a numeric non-root `USER`, and most public images do not. Three of the
+five apps in this file shipped enabled and priced without one and could never
+have started. **Check the image before writing the entry, and check it again
+when the tag moves.** Nothing in validation can catch this: the compose is
+well-formed, and the operator only learns the image's `USER` when the kubelet
+refuses the pod.
+
+### Checking an image, and proving the choice works
+
+```bash
+docker pull <image>
+# What the kubelet will read. Empty means root.
+docker inspect -f 'USER={{.Config.User}}' <image>
+# A name (e.g. `appuser`) still needs its number:
+docker run --rm --entrypoint sh <image> -c 'getent passwd appuser'
+```
+
+Then run it the way the operator will — read-only root filesystem, all
+capabilities dropped, as that UID, with only the declared volume writable and
+pre-chowned (standing in for `fsGroup`) and any `files:` mounted read-only:
+
+```bash
+docker volume create smoke && docker run --rm -u 0 -v smoke:/d busybox chown -R 1000:1000 /d
+docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
+  --ulimit nofile=1048576:1048576 --user 1000:1000 \
+  -v smoke:/app/data -v "$PWD/config.yaml:/app/config.yaml:ro" <image>
+```
+
+It has to still be running after ~10s **and** have written into the volume
+(`docker run --rm -u 1000 -v smoke:/d busybox ls -la /d`) — an app that starts
+but cannot write its database only crash-loops later. Set the `nofile` limit:
+containerd's default is 1048576 and Docker's is lower, so an app that raises its
+own limit (strfry asks for 1000000) fails locally for a reason that would not
+apply on the cluster.
+
+This is not a substitute for a real reconcile — it does not exercise the
+ingress, the PVC provisioner or `depends_on` ordering — but it does exercise the
+exact check that refuses these pods.
+
 **Variable references** — every `${NAME}` in `env`, `files[].content` or a
 `content_from` must be declared, either as a `config:` field, a `secrets:` entry,
 or the built-in `HOSTNAME`. This is enforced when an app is created or updated
@@ -199,6 +248,7 @@ Exits non-zero if any document fails to parse or validate.
 services:
   strfry:
     image: dockurr/strfry:latest
+    user: "1000"    # image declares no USER, so it would run as root and be refused
     resources: { cpu: 500m, memory: 512Mi }
     ports:
       - { name: ws, container: 7777, protocol: http, expose: ingress }
@@ -248,6 +298,7 @@ services:
       artifact: route96.sql
   route96:
     image: voidic/route96:latest
+    user: "1000"    # image declares no USER, so it would run as root and be refused
     resources: { cpu: 500m, memory: 512Mi }
     depends_on: [db]
     ports:
@@ -282,6 +333,7 @@ secrets:
 services:
   blossom:
     image: ghcr.io/hzrd149/blossom-server:master
+    user: "1000"    # image declares no USER, so it would run as root and be refused
     resources: { cpu: 250m, memory: 256Mi }
     ports:
       - { name: http, container: 3000, protocol: http, expose: ingress }
@@ -321,6 +373,7 @@ services:
 services:
   relay:
     image: scsibug/nostr-rs-relay:latest
+    user: "1000"    # image sets `USER appuser` (a name); uid 1000 per its /etc/passwd
     resources: { cpu: 250m, memory: 256Mi }
     ports:
       - { name: ws, container: 8080, protocol: http, expose: ingress }
@@ -368,6 +421,7 @@ config:
 services:
   pyramid:
     image: ghcr.io/fiatjaf/pyramid:latest
+    user: "1000"    # image declares no USER, so it would run as root and be refused
     resources: { cpu: 500m, memory: 512Mi }
     ports:
       - { name: http, container: 3334, protocol: http, expose: ingress }

@@ -2187,10 +2187,37 @@ config:
                     );
                 }
                 let dep = build_deployment(id, sname, svc, &senv, &sfiles, 1, 1, &[]);
-                let image = dep.spec.unwrap().template.spec.unwrap().containers[0]
-                    .image
-                    .clone();
-                assert_eq!(image.as_deref(), Some(svc.image.as_str()));
+                let pod = dep.spec.unwrap().template.spec.unwrap();
+                let ctr = &pod.containers[0];
+                assert_eq!(ctr.image.as_deref(), Some(svc.image.as_str()));
+
+                // Every documented service must resolve to a user the kubelet
+                // will accept (#256). Under the default restricted path the pod
+                // asks for `runAsNonRoot` with no `runAsUser`, which leaves the
+                // kubelet to read the image's own `USER` — and it refuses both
+                // an image that declares none (it would run as root) and one
+                // that declares a *name* it cannot resolve to a number. Neither
+                // is visible to validation, so three of these examples shipped
+                // enabled, priced, and incapable of starting. An example must
+                // therefore either opt into root explicitly or name a numeric
+                // UID.
+                let sc = ctr.security_context.as_ref().expect("security context");
+                assert!(
+                    svc.runs_as_root() || sc.run_as_user.is_some(),
+                    "{name}/{sname}: no `user:` — the kubelet cannot verify the image's \
+                     USER, so this pod is refused. Set a numeric uid (check the image with \
+                     `docker inspect -f '{{{{.Config.User}}}}'`), or `user: root` if the \
+                     entrypoint genuinely needs it"
+                );
+                if let Some(uid) = sc.run_as_user {
+                    // fsGroup follows runAsUser, otherwise a fresh PVC stays
+                    // root-owned 0755 and the process cannot write its data.
+                    assert_eq!(
+                        pod.security_context.as_ref().and_then(|p| p.fs_group),
+                        Some(uid),
+                        "{name}/{sname}: fsGroup must match runAsUser"
+                    );
+                }
                 assert_eq!(
                     build_service(id, sname, svc).is_some(),
                     !svc.ports.is_empty(),
