@@ -40,7 +40,7 @@ use k8s_openapi::api::networking::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
-use lnvps_compose::{Compose, Expose, ResolvedFile, Service as ComposeService};
+use lnvps_compose::{Compose, Expose, ResolvedFile, ResolvedInit, Service as ComposeService};
 
 /// Label value marking objects this operator owns.
 pub const MANAGED_BY: &str = "lnvps-operator";
@@ -347,6 +347,58 @@ fn container_security_context_for(
     }
 }
 
+/// Writable scratch space every init step gets, since the root filesystem is
+/// read-only like every other container's. Tools that insist on a config or
+/// cache dir (`mc`, `psql`, `git`) work by pointing `HOME` at it.
+const INIT_TMP_DIR: &str = "/tmp";
+const INIT_TMP_VOLUME: &str = "init-tmp";
+
+/// A compose `init:` step as a Kubernetes init container (#244).
+///
+/// The kubelet runs these to completion, in declaration order, before the
+/// service's own container starts, and restarts a failed one — which is the
+/// gate: a service whose setup step has not succeeded never runs. It sees
+/// exactly what the service container sees (`mounts`: the service's volumes and
+/// config files), plus a writable [`INIT_TMP_DIR`], and is hardened the same
+/// way.
+///
+/// Resources are taken as declared, unscaled by the deployment's size
+/// multiplier: a setup step does fixed work, and a pod reserves
+/// `max(largest init container, sum of containers)`, so an unscaled step can
+/// only ever cost less than the scaled service it precedes.
+pub fn build_init_container(init: &ResolvedInit, mounts: &[VolumeMount]) -> Container {
+    let mut mounts = mounts.to_vec();
+    mounts.push(VolumeMount {
+        name: INIT_TMP_VOLUME.to_string(),
+        mount_path: INIT_TMP_DIR.to_string(),
+        ..Default::default()
+    });
+
+    Container {
+        name: init.name.clone(),
+        image: Some(init.image.clone()),
+        command: init.command.clone(),
+        args: init.args.clone(),
+        env: Some(
+            init.env
+                .iter()
+                .map(|(k, v)| EnvVar {
+                    name: k.clone(),
+                    value: Some(v.clone()),
+                    ..Default::default()
+                })
+                .collect(),
+        ),
+        volume_mounts: Some(mounts),
+        security_context: Some(container_security_context_for(
+            !init.runs_as_root(),
+            init.run_as_user(),
+        )),
+        resources: Some(build_resource_requirements(&init.resources, 1)),
+        ..Default::default()
+    }
+}
+
 /// A PVC for a compose `volume`.
 pub fn build_pvc(
     deployment_id: u64,
@@ -490,6 +542,10 @@ pub fn build_service(
 /// before a new pod starts.
 ///
 /// `multiplier` scales the container's CPU/memory limits (1 = base app size).
+// Eight positional arguments, all of them the caller's own state: bundling them
+// into a struct would only move the same list one line up, so the lint is
+// suppressed rather than worked around.
+#[allow(clippy::too_many_arguments)]
 pub fn build_deployment(
     deployment_id: u64,
     service_name: &str,
@@ -498,6 +554,7 @@ pub fn build_deployment(
     files: &[ResolvedFile],
     replicas: i32,
     multiplier: u32,
+    init: &[ResolvedInit],
 ) -> Deployment {
     let sel = service_labels(deployment_id, service_name);
 
@@ -562,6 +619,20 @@ pub fn build_deployment(
         });
     }
 
+    // Setup steps run before this service's container, seeing the same mounts
+    // plus a writable scratch dir — every root filesystem here is read-only.
+    let init_containers: Vec<Container> = init
+        .iter()
+        .map(|i| build_init_container(i, &mounts))
+        .collect();
+    if !init_containers.is_empty() {
+        volumes.push(K8sVolume {
+            name: INIT_TMP_VOLUME.to_string(),
+            empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource::default()),
+            ..Default::default()
+        });
+    }
+
     let container = Container {
         name: service_name.to_string(),
         image: Some(svc.image.clone()),
@@ -621,6 +692,11 @@ pub fn build_deployment(
                 }),
                 spec: Some(PodSpec {
                     containers: vec![container],
+                    init_containers: if init_containers.is_empty() {
+                        None
+                    } else {
+                        Some(init_containers)
+                    },
                     volumes: if volumes.is_empty() {
                         None
                     } else {
@@ -1042,6 +1118,7 @@ async fn reconcile_one(
     let vars = build_vars(&compose, &generated, &config, &hostname);
     let env = compose.resolve_env(&vars)?;
     let files = compose.resolve_files(&vars)?;
+    let init = compose.resolve_init(&vars)?;
 
     // Billing gate + retention. The workload only runs when the subscription is
     // set up (paid at least once) and not expired. A freshly-ordered, unpaid
@@ -1107,7 +1184,16 @@ async fn reconcile_one(
             .collect();
         apply(
             client,
-            &build_deployment(id, sname, svc, &svc_env, &sfiles, replicas, multiplier),
+            &build_deployment(
+                id,
+                sname,
+                svc,
+                &svc_env,
+                &sfiles,
+                replicas,
+                multiplier,
+                init.get(sname).map(Vec::as_slice).unwrap_or_default(),
+            ),
         )
         .await?;
     }
@@ -1265,9 +1351,18 @@ config:
     /// service keeps it (default-deny hardening).
     #[test]
     fn root_service_omits_run_as_non_root() {
-        let root = Compose::parse("services:\n  db:\n    image: mariadb:11\n    user: root\n")
-            .unwrap();
-        let d = build_deployment(7, "db", &root.services["db"], &BTreeMap::new(), &[], 1, 1);
+        let root =
+            Compose::parse("services:\n  db:\n    image: mariadb:11\n    user: root\n").unwrap();
+        let d = build_deployment(
+            7,
+            "db",
+            &root.services["db"],
+            &BTreeMap::new(),
+            &[],
+            1,
+            1,
+            &[],
+        );
         let ctr = &d.spec.unwrap().template.spec.unwrap().containers[0];
         let sc = ctr.security_context.as_ref().unwrap();
         assert_eq!(sc.run_as_non_root, Some(false));
@@ -1289,6 +1384,7 @@ config:
             &[],
             1,
             1,
+            &[],
         );
         let ctr = &d.spec.unwrap().template.spec.unwrap().containers[0];
         assert_eq!(
@@ -1310,7 +1406,16 @@ config:
             "services:\n  haven:\n    image: x\n    user: \"1000\"\n    volumes:\n      - { name: db, path: /app/db, size: 10Gi }\n",
         )
         .unwrap();
-        let d = build_deployment(7, "haven", &c.services["haven"], &BTreeMap::new(), &[], 1, 1);
+        let d = build_deployment(
+            7,
+            "haven",
+            &c.services["haven"],
+            &BTreeMap::new(),
+            &[],
+            1,
+            1,
+            &[],
+        );
         let pod = d.spec.unwrap().template.spec.unwrap();
 
         let ctr = &pod.containers[0];
@@ -1328,7 +1433,16 @@ config:
         // Services without a numeric user keep the previous behaviour: no
         // runAsUser, no fsGroup (their image's USER is already numeric).
         let plain = Compose::parse("services:\n  app:\n    image: x\n").unwrap();
-        let d = build_deployment(7, "app", &plain.services["app"], &BTreeMap::new(), &[], 1, 1);
+        let d = build_deployment(
+            7,
+            "app",
+            &plain.services["app"],
+            &BTreeMap::new(),
+            &[],
+            1,
+            1,
+            &[],
+        );
         let pod = d.spec.unwrap().template.spec.unwrap();
         assert_eq!(
             pod.containers[0]
@@ -1391,7 +1505,7 @@ config:
             "services:\n  a:\n    image: x\n    resources: { cpu: \"500m\", memory: 1Gi }\n",
         )
         .unwrap();
-        let d = build_deployment(7, "a", &c.services["a"], &BTreeMap::new(), &[], 1, 3);
+        let d = build_deployment(7, "a", &c.services["a"], &BTreeMap::new(), &[], 1, 3, &[]);
         let ctr = &d.spec.unwrap().template.spec.unwrap().containers[0];
         let limits = ctr.resources.as_ref().unwrap().limits.as_ref().unwrap();
         assert_eq!(limits.get("cpu").unwrap().0, "1500m");
@@ -1475,7 +1589,7 @@ config:
             },
         ];
         let env = BTreeMap::from([("PUBLIC_URL".to_string(), "https://h".to_string())]);
-        let d = build_deployment(7, "web", &c.services["web"], &env, &files, 1, 1);
+        let d = build_deployment(7, "web", &c.services["web"], &env, &files, 1, 1, &[]);
         let spec = d.spec.unwrap();
         assert_eq!(spec.replicas, Some(1));
         assert_eq!(spec.strategy.unwrap().type_.as_deref(), Some("Recreate"));
@@ -1519,7 +1633,16 @@ config:
     #[test]
     fn stopped_deployment_has_zero_replicas() {
         let c = compose();
-        let d = build_deployment(7, "web", &c.services["web"], &BTreeMap::new(), &[], 0, 1);
+        let d = build_deployment(
+            7,
+            "web",
+            &c.services["web"],
+            &BTreeMap::new(),
+            &[],
+            0,
+            1,
+            &[],
+        );
         assert_eq!(d.spec.unwrap().replicas, Some(0));
     }
 
@@ -1618,10 +1741,7 @@ config:
 
         // Two rules: default host + custom domain, same backend.
         let rules = spec.rules.unwrap();
-        let hosts: Vec<&str> = rules
-            .iter()
-            .filter_map(|r| r.host.as_deref())
-            .collect();
+        let hosts: Vec<&str> = rules.iter().filter_map(|r| r.host.as_deref()).collect();
         assert_eq!(hosts, vec!["relay.apps.example.com", "blog.example.com"]);
         let backend = rules[1].http.as_ref().unwrap().paths[0]
             .backend
@@ -1694,6 +1814,101 @@ config:
         );
     }
 
+    /// A service's `init:` steps render as init containers in its own pod, in
+    /// declaration order, seeing the same mounts as the service container plus
+    /// a writable scratch dir. A service that declares none renders none (#244).
+    #[test]
+    fn init_steps_render_as_init_containers() {
+        let c = lnvps_compose::Compose::parse(
+            "services:\n  s3:\n    image: rustfs/rustfs:latest\n    ports:\n      \
+             - { name: api, container: 9000 }\n  \
+             app:\n    image: example/app:latest\n    depends_on: [s3]\n    \
+             user: \"1000\"\n    volumes:\n      \
+             - { name: data, path: /data, size: 1Gi }\n    init:\n      \
+             - name: wait-s3\n        image: minio/mc:latest\n        \
+               command: [\"sh\", \"-c\", \"until mc --quiet ls t; do sleep 2; done\"]\n        \
+               env:\n          MC_HOST_t: http://ak:${S3_SECRET}@s3:9000\n          \
+               HOME: /tmp\n      \
+             - name: make-bucket\n        image: minio/mc:latest\n        \
+               args: [\"mb\", \"-p\", \"t/media\"]\n        user: \"65534\"\n\
+             secrets:\n  - { name: S3_SECRET, generate: password }\n",
+        )
+        .unwrap();
+        let vars =
+            std::collections::HashMap::from([("S3_SECRET".to_string(), "sk123".to_string())]);
+        let resolved = c.resolve_init(&vars).unwrap();
+
+        let render = |sname: &str| {
+            build_deployment(
+                7,
+                sname,
+                &c.services[sname],
+                &BTreeMap::new(),
+                &[],
+                1,
+                1,
+                resolved.get(sname).map(Vec::as_slice).unwrap_or_default(),
+            )
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+        };
+
+        let app = render("app");
+        let inits = app.init_containers.expect("app declares two steps");
+        assert_eq!(
+            inits.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
+            vec!["wait-s3", "make-bucket"]
+        );
+
+        let wait = &inits[0];
+        assert_eq!(wait.image.as_deref(), Some("minio/mc:latest"));
+        assert_eq!(wait.command.as_ref().unwrap()[0], "sh");
+        // `${…}` in env is substituted; nothing interpolates into argv.
+        let host = wait
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|e| e.name == "MC_HOST_t")
+            .unwrap()
+            .value
+            .clone()
+            .unwrap();
+        assert_eq!(host, "http://ak:sk123@s3:9000");
+
+        // Sees the service's own volume, plus scratch space it can write to
+        // under a read-only root filesystem.
+        let mounts = wait.volume_mounts.as_ref().unwrap();
+        assert!(mounts.iter().any(|m| m.mount_path == "/data"));
+        assert!(mounts.iter().any(|m| m.name == INIT_TMP_VOLUME));
+        assert!(
+            app.volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|v| v.name == INIT_TMP_VOLUME && v.empty_dir.is_some())
+        );
+
+        // Hardened like every other container; the step inherits the service's
+        // user unless it names its own.
+        let sc = wait.security_context.as_ref().unwrap();
+        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(sc.read_only_root_filesystem, Some(true));
+        assert_eq!(sc.run_as_user, Some(1000));
+        assert_eq!(
+            inits[1].security_context.as_ref().unwrap().run_as_user,
+            Some(65534)
+        );
+        assert_eq!(inits[1].args.as_ref().unwrap()[0], "mb");
+        assert!(inits[1].command.is_none());
+
+        // A service with no steps renders none.
+        assert!(render("s3").init_containers.is_none());
+    }
+
     /// A secret declaring `bytes:` is generated at that width, and one that
     /// does not keeps the historical 24 bytes.
     #[test]
@@ -1747,7 +1962,16 @@ config:
         // ── web service (ingress, files: ConfigMap + Secret, env with vars) ──
         let web_env = to_bt(&env["web"]);
         let web_files = files["web"].clone();
-        let web = build_deployment(id, "web", &c.services["web"], &web_env, &web_files, 1, 1);
+        let web = build_deployment(
+            id,
+            "web",
+            &c.services["web"],
+            &web_env,
+            &web_files,
+            1,
+            1,
+            &[],
+        );
         let pod = web.spec.unwrap().template.spec.unwrap();
         let ctr = &pod.containers[0];
         assert_eq!(ctr.image.as_deref(), Some("example/web:latest"));
@@ -1819,7 +2043,16 @@ config:
         // ── mariadb service (no ports, PVC, secret injected into env) ──
         let db_env = to_bt(&env["mariadb"]);
         assert_eq!(db_env["MARIADB_PASSWORD"], pw);
-        let db = build_deployment(id, "mariadb", &c.services["mariadb"], &db_env, &[], 1, 1);
+        let db = build_deployment(
+            id,
+            "mariadb",
+            &c.services["mariadb"],
+            &db_env,
+            &[],
+            1,
+            1,
+            &[],
+        );
         let db_pod = db.spec.unwrap().template.spec.unwrap();
         let vm = db_pod.containers[0]
             .volume_mounts
@@ -1840,7 +2073,16 @@ config:
         );
 
         // ── lifecycle: stopped ⇒ 0 replicas (data-preserving) ──
-        let stopped = build_deployment(id, "web", &c.services["web"], &web_env, &web_files, 0, 1);
+        let stopped = build_deployment(
+            id,
+            "web",
+            &c.services["web"],
+            &web_env,
+            &web_files,
+            0,
+            1,
+            &[],
+        );
         assert_eq!(stopped.spec.unwrap().replicas, Some(0));
     }
 
@@ -1944,7 +2186,7 @@ config:
                         f.path
                     );
                 }
-                let dep = build_deployment(id, sname, svc, &senv, &sfiles, 1, 1);
+                let dep = build_deployment(id, sname, svc, &senv, &sfiles, 1, 1, &[]);
                 let image = dep.spec.unwrap().template.spec.unwrap().containers[0]
                     .image
                     .clone();
@@ -2014,9 +2256,7 @@ config:
         let err = Some("Encryption context not initialized".to_string());
         assert_eq!(
             gate_running(true, false, None, err, now),
-            GateReason::SubscriptionLookupFailed(
-                "Encryption context not initialized".to_string()
-            )
+            GateReason::SubscriptionLookupFailed("Encryption context not initialized".to_string())
         );
         // ...and it is NOT the calm Unpaid reason.
         assert_ne!(
@@ -2074,10 +2314,7 @@ config:
             GateReason::StoppedByUser.to_string(),
             "deployment stopped by user"
         );
-        assert_eq!(
-            GateReason::Unpaid.to_string(),
-            "subscription not yet paid"
-        );
+        assert_eq!(GateReason::Unpaid.to_string(), "subscription not yet paid");
         assert_eq!(
             GateReason::Expired.to_string(),
             "subscription expired (data retained)"

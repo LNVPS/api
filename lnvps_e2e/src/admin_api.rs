@@ -726,6 +726,98 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A service can declare `init:` setup steps (issue #244), and a step whose
+    /// command interpolates a `${…}` is refused at create/update rather than
+    /// becoming a deployment that runs customer text through a shell.
+    #[tokio::test]
+    async fn test_admin_app_compose_init_steps() {
+        let client = setup().await;
+        let suffix = nostr::Keys::generate().public_key().to_hex()[..8].to_string();
+        let slug = format!("e2e-init-{suffix}");
+
+        let compose = |name: &str, cmd: &str| {
+            format!(
+                "services:\n  s3:\n    image: rustfs/rustfs:latest\n    ports:\n      \
+                 - {{ name: s3, container: 9000, protocol: http, expose: none }}\n  \
+                 app:\n    image: example/app:latest\n    depends_on: [s3]\n    ports:\n      \
+                 - {{ name: http, container: 3000, protocol: http, expose: ingress }}\n    \
+                 init:\n      - name: {name}\n        image: minio/mc:latest\n        \
+                 env:\n          MC_HOST_s3: http://k:${{S3_KEY}}@s3:9000\n        \
+                 command: [\"sh\", \"-c\", \"{cmd}\"]\n\
+                 secrets:\n  - {{ name: S3_KEY, generate: token }}\n"
+            )
+        };
+        let ok = || compose("create-bucket", "mc mb -p s3/media");
+        let body = |compose: String| {
+            serde_json::json!({
+                "name": slug,
+                "display_name": "Init App",
+                "category": "Media server",
+                "compose": compose,
+                "amount": 1000,
+                "currency": "usd",
+                "interval_amount": 1,
+                "interval_type": "month",
+                "setup_amount": 0
+            })
+        };
+
+        // A `${…}` in the command is shell injection waiting to happen: refused.
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/apps",
+                &body(compose("create-bucket", "mc mb -p s3/${S3_KEY}")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = resp.text().await.unwrap();
+        assert!(err.contains("must not contain"), "{err}");
+
+        // The step name becomes a container name, so it has to be a DNS label.
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/apps",
+                &body(compose("Create_Bucket", "mc mb -p s3/media")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = resp.text().await.unwrap();
+        assert!(err.contains("init name"), "{err}");
+
+        // Valid: accepted and stored verbatim.
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &body(ok()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let created: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let app_id = created["data"]["id"].as_u64().expect("app id");
+        assert!(
+            created["data"]["compose"]
+                .as_str()
+                .unwrap()
+                .contains("init:")
+        );
+
+        // The same rule applies on update.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "compose": compose("create-bucket", "mc mb -p s3/${S3_KEY}") }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// A generated secret can declare its byte length (issue #243), and an
     /// unusable length is refused when the app is created or updated rather
     /// than becoming an app that deploys and crash-loops on its own key.

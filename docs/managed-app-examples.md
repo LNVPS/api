@@ -47,7 +47,8 @@ hex-encoded so the value is twice that many characters), `config` (customer
 form fields, injected as `${name}`). Per service:
 `image`, `resources: { cpu, memory }`, `ports` (`expose: none|ingress`, ingress
 is HTTP only), `env`, `volumes` (PVCs, read-write), `files` (ConfigMap/Secret,
-read-only, mounted via subPath), `depends_on`, `backup`, `user`. `${HOSTNAME}`
+read-only, mounted via subPath), `depends_on`, `backup`, `user`,
+`init`. `${HOSTNAME}`
 resolves to `{deployment-name}.{cluster-ingress-domain}`; a service name
 resolves to its in-namespace DNS (e.g. `db:3306`).
 
@@ -60,6 +61,69 @@ and the deployment's namespace drops to the baseline Pod Security Standard
 all other hardening (no privilege escalation, drop ALL capabilities, read-only
 root filesystem) stays in force. Only set it where the image genuinely needs
 it.
+
+**`init`** — one-shot setup steps that must succeed before the service's own
+container starts. They render as Kubernetes init containers in that service's
+pod, run to completion in declaration order, and the kubelet restarts a failed
+one — so a service whose setup has not succeeded never runs. The canonical case
+is an S3 bucket a consumer needs to already exist (`NoSuchBucket` at startup is
+otherwise fatal):
+
+```yaml
+services:
+  s3:
+    image: rustfs/rustfs:1.0.0-beta.11
+    ports:
+      - { name: s3, container: 9000, protocol: http, expose: none }
+  app:
+    image: example/app:latest
+    depends_on: [s3]
+    ports:
+      - { name: http, container: 3000, protocol: http, expose: ingress }
+    init:
+      - name: create-bucket           # DNS label, unique within the service
+        image: minio/mc:latest
+        env:                          # ${…} is resolved here, and only here
+          MC_HOST_s3: http://${S3_ACCESS_KEY}:${S3_SECRET_KEY}@s3:9000
+          MC_CONFIG_DIR: /tmp/mc
+        command:
+          - sh
+          - -c
+          - |
+            set -e
+            until mc --quiet ls s3 >/dev/null 2>&1; do sleep 2; done
+            mc mb -p s3/media
+        # resources: { cpu: 50m, memory: 64Mi }   # the default
+        # user: "65534"                           # defaults to the service's
+secrets:
+  - { name: S3_ACCESS_KEY, generate: token }
+  - { name: S3_SECRET_KEY, generate: password }
+```
+
+Rules worth knowing:
+
+- **Put the step on the service that needs it**, not on the one it prepares. A
+  bucket cannot be created in a server that has not started, and it is the
+  consumer that must not run without it — so the wait loop above belongs in
+  `app`, whose container the kubelet holds back. `depends_on` alone is advisory.
+- **`${…}` is not substituted in `command`/`args`** and a reference there is
+  rejected at validation: a customer-supplied `config` value interpolated into a
+  shell string is an injection. Pass values through the step's `env` and read
+  them as shell variables.
+- **A step sees what the service container sees** — the same `volumes` and
+  `files` at the same paths, so it can seed a data directory — plus a writable
+  `/tmp`. Everything else is read-only, exactly as for the service.
+- **Same hardening**, and the step inherits the service's `user:` unless it
+  names its own.
+- **Resources default to `50m`/`64Mi`.** A pod reserves
+  `max(largest init container, sum of containers)`, so a small step adds nothing
+  to the app's footprint; a step asking for more than its service does raises
+  it, and the capacity accounting says so.
+- **Make it idempotent.** It re-runs on every restart and redeploy (`mc mb -p`,
+  `CREATE ... IF NOT EXISTS`).
+- Generated `secrets:` are hex, so embedding one in a URL (the `MC_HOST_s3`
+  above) is safe. A customer-supplied `config:` value is arbitrary text — don't
+  build a URL out of one.
 
 **Read-only root filesystem** — this applies to *every* service, `user: root`
 included, and only declared `volumes` are writable. An image that writes
@@ -505,6 +569,27 @@ services:
     depends_on: [db, redis, s3]
     ports:
       - { name: http, container: 3000, protocol: http, expose: ingress }
+    # The relay never issues CreateBucket — it probes the object store at
+    # startup and dies on NoSuchBucket. This runs before the relay's own
+    # container, and the kubelet retries it while RustFS is still coming up, so
+    # the relay cannot start before the bucket exists.
+    init:
+      - name: create-media-bucket
+        image: minio/mc:latest
+        user: "65534"    # only talks to the in-namespace S3 service
+        env:
+          MC_HOST_s3: "http://${S3_ACCESS_KEY}:${S3_SECRET_KEY}@s3:9000"
+          MC_CONFIG_DIR: /tmp/mc
+        command:
+          - sh
+          - -c
+          - |
+            set -e
+            until mc --quiet ls s3 >/dev/null 2>&1; do
+              echo "waiting for http://s3:9000"
+              sleep 2
+            done
+            mc mb -p s3/buzz-media
     env:
       # --- identity / public URL ---
       RELAY_URL: "wss://${HOSTNAME}"
@@ -556,24 +641,16 @@ config:
 
 ### Before this one can be enabled
 
-One thing in the compose grammar is still missing for this app to deploy
-end-to-end; until it lands, this entry is documentation, not a shippable
-catalog item.
+Both compose-grammar gaps this entry was blocked on have landed: the 32-byte
+generated secret (#243, `bytes:` on a secret declaration, used above for
+`BUZZ_RELAY_PRIVATE_KEY`) and bucket creation (#244, `init:` on the `relay`
+service). The customer no longer pastes the relay's identity key into the
+order form, and nothing in the deployment has to pre-exist.
 
-(The 32-byte generated secret it also needed landed in #243: `bytes:` on a
-secret declaration, used above for `BUZZ_RELAY_PRIVATE_KEY`. The customer no
-longer pastes the relay's identity key into the order form.)
-
-1. **One-shot bucket creation.** The relay never issues `CreateBucket`; it
-   expects `BUZZ_S3_BUCKET` to exist and dies with `NoSuchBucket` in the A3
-   probe otherwise (upstream's Helm chart runs an `mc mb` Job plus a
-   wait-for-bucket init container). RustFS has no "default buckets" env var,
-   and a compose service has no `command`, so nothing in a deployment can
-   create it. Mounting a second volume at `/data/<bucket>` makes RustFS *list*
-   the bucket but writes then fail with `Cross-device link` on its rename out
-   of the drive-root temp area, so that is not a workaround. This needs
-   either an init/`command` hook in the grammar, or an operator-side bucket
-   bootstrap for services that declare one.
+What is **not** yet done is a run of this exact compose through the operator
+against a live cluster — the composition above has never been reconciled end to
+end with the init step in place. Do that before enabling it in the catalog:
+validation checks the document, not whether the app starts.
 
 Everything else was verified end-to-end against these images (relay reaches
 `buzz-relay TCP listening`, `/_readiness` 200, NIP-11 served, A3 probe

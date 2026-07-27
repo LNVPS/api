@@ -79,12 +79,116 @@ pub struct Service {
     /// this; it is not customer-controlled at order time.
     #[serde(default)]
     pub user: Option<String>,
+    /// One-shot containers run to completion, in order, before this service's
+    /// own container starts. See [`InitContainer`].
+    #[serde(default)]
+    pub init: Vec<InitContainer>,
+}
+
+/// A setup step that must succeed before its service's container starts.
+///
+/// A compose service is otherwise `image` + `env` + `ports` + `volumes` +
+/// `files` — no `command`, no init hook — so a deployment could not perform a
+/// setup step that the image does not do on its own entrypoint (#244). Object
+/// storage is the case that breaks on it: an S3 server starts empty, and a
+/// consumer that expects its bucket to exist dies on `NoSuchBucket` rather
+/// than creating it.
+///
+/// This renders as a Kubernetes init container in the **consuming** service's
+/// pod, which is also what supplies the gate: the kubelet does not start the
+/// service's container until every init container has exited 0, and restarts a
+/// failed one. Bootstrapping a *peer* service therefore belongs on the
+/// consumer, not on the peer — a bucket cannot be created in a server that has
+/// not started, and the consumer is the pod that must not run without it.
+///
+/// The step sees exactly what the service's own container sees (its volumes,
+/// its config files) plus a writable `/tmp`, and runs under the same non-root
+/// hardening.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InitContainer {
+    /// Step name; becomes the init container name, so a DNS-style slug unique
+    /// within the service.
+    pub name: String,
+    /// Container image reference.
+    pub image: String,
+    /// Entrypoint override. Omit to use the image's own.
+    ///
+    /// Catalog text only: `${…}` is **not** substituted here, because a
+    /// customer-supplied `config` value interpolated into a shell string is an
+    /// injection. Pass values through `env` and reference them as shell
+    /// variables from a script the catalog author wrote.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// Arguments to the entrypoint. Same no-`${…}` rule as `command`.
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    /// Environment variables (values may contain `${…}` references, resolved
+    /// exactly like a service's `env`).
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Requested CPU/memory. Defaults to [`INIT_DEFAULT_CPU`] /
+    /// [`INIT_DEFAULT_MEMORY`] rather than the service defaults: a setup step
+    /// is normally tiny, and a pod is scheduled as
+    /// `max(init, sum(containers))`, so a small step never raises the app's
+    /// footprint.
+    #[serde(default)]
+    pub resources: Option<Resources>,
+    /// Run this step as a specific user, same grammar as a service's `user:`.
+    /// Defaults to the service's own `user:` — the step normally writes into
+    /// that service's volumes.
+    #[serde(default)]
+    pub user: Option<String>,
+}
+
+/// An [`InitContainer`] with its `env` `${…}` references substituted and its
+/// defaults (resources, user) filled in from the service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedInit {
+    pub name: String,
+    pub image: String,
+    pub command: Option<Vec<String>>,
+    pub args: Option<Vec<String>>,
+    /// Sorted, so a reconcile renders byte-identical env on every pass.
+    pub env: std::collections::BTreeMap<String, String>,
+    pub resources: Resources,
+    /// Effective `user:` (the step's own, else the service's).
+    pub user: Option<String>,
+}
+
+impl ResolvedInit {
+    /// Whether this step must start as root (compose `user: root` / `0`).
+    pub fn runs_as_root(&self) -> bool {
+        user_is_root(self.user.as_deref())
+    }
+
+    /// The explicit numeric UID this step runs as, if any.
+    pub fn run_as_user(&self) -> Option<i64> {
+        user_uid(self.user.as_deref())
+    }
+}
+
+/// Default CPU for an init step that declares no `resources:`.
+pub const INIT_DEFAULT_CPU: &str = "50m";
+/// Default memory for an init step that declares no `resources:`.
+pub const INIT_DEFAULT_MEMORY: &str = "64Mi";
+
+/// Whether a compose `user:` value means "start as root".
+fn user_is_root(user: Option<&str>) -> bool {
+    matches!(user, Some("root") | Some("0"))
+}
+
+/// The positive numeric UID a compose `user:` names, if it names one.
+fn user_uid(user: Option<&str>) -> Option<i64> {
+    match user?.parse::<i64>() {
+        Ok(uid) if uid > 0 => Some(uid),
+        _ => None,
+    }
 }
 
 impl Service {
     /// Whether this service must start as root (compose `user: root` / `0`).
     pub fn runs_as_root(&self) -> bool {
-        matches!(self.user.as_deref(), Some("root") | Some("0"))
+        user_is_root(self.user.as_deref())
     }
 
     /// The explicit numeric UID this service runs as, if the compose specifies
@@ -95,20 +199,22 @@ impl Service {
     /// conventionally matches its UID, and without it a fresh PVC mounts
     /// root-owned `0755` and the non-root process cannot write to it.
     pub fn run_as_user(&self) -> Option<i64> {
-        match self.user.as_deref() {
-            Some(u) => match u.parse::<i64>() {
-                Ok(uid) if uid > 0 => Some(uid),
-                _ => None,
-            },
-            None => None,
-        }
+        user_uid(self.user.as_deref())
+    }
+}
+
+/// Default `Resources` for an init step, used when it declares none.
+fn init_default_resources() -> Resources {
+    Resources {
+        cpu: INIT_DEFAULT_CPU.to_string(),
+        memory: INIT_DEFAULT_MEMORY.to_string(),
     }
 }
 
 /// A service's requested CPU and memory. Kubernetes-style quantities: CPU as
 /// cores or millicores (`"1"`, `"500m"`), memory with binary/SI suffixes
 /// (`"512Mi"`, `"2Gi"`, `"1G"`).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Resources {
     #[serde(default = "default_cpu")]
     pub cpu: String,
@@ -479,6 +585,51 @@ impl Compose {
                     _ => {}
                 }
             }
+
+            // Init steps: a name we can render, something to run, and no
+            // `${…}` in the command — an interpolated customer config value
+            // there would be shell injection, so values go through `env`.
+            for (i, init) in svc.init.iter().enumerate() {
+                validate_init_name(sname, &init.name)?;
+                if svc.init[..i].iter().any(|o| o.name == init.name) {
+                    bail!(
+                        "service '{sname}': duplicate init step '{}' — names become container \
+                         names and must be unique within the service",
+                        init.name
+                    );
+                }
+                if init.image.trim().is_empty() {
+                    bail!("service '{sname}': init '{}': image is required", init.name);
+                }
+                for (field, argv) in [("command", &init.command), ("args", &init.args)] {
+                    let Some(argv) = argv else { continue };
+                    if argv.is_empty() {
+                        bail!(
+                            "service '{sname}': init '{}': {field} is empty — omit it to use the \
+                             image's own",
+                            init.name
+                        );
+                    }
+                    if argv.iter().any(|a| !extract_refs(a).is_empty()) {
+                        bail!(
+                            "service '{sname}': init '{}': {field} must not contain '${{…}}' — a \
+                             customer-supplied value interpolated into a command is injectable; \
+                             put it in the step's `env:` and read it as a shell variable",
+                            init.name
+                        );
+                    }
+                }
+                if let Some(u) = init.user.as_deref()
+                    && !user_is_root(Some(u))
+                    && user_uid(Some(u)).is_none()
+                {
+                    bail!(
+                        "service '{sname}': init '{}': user '{u}' must be \"root\", \"0\", or a \
+                         positive numeric UID",
+                        init.name
+                    );
+                }
+            }
         }
 
         // A declared secret length must be usable. Checked at authoring time
@@ -518,8 +669,51 @@ impl Compose {
                     push(content, &mut out);
                 }
             }
+            // An init step's env is `${…}` like any other value, and an
+            // undeclared reference there fails the same way.
+            for init in &svc.init {
+                for val in init.env.values() {
+                    push(val, &mut out);
+                }
+            }
         }
         out
+    }
+
+    /// Resolve every service's init steps: substitute their `env` and fill in
+    /// the defaults each step inherits from its service. Keyed by service name,
+    /// in declaration order (which is the order the kubelet runs them in).
+    pub fn resolve_init(
+        &self,
+        vars: &HashMap<String, String>,
+    ) -> Result<HashMap<String, Vec<ResolvedInit>>> {
+        let mut out = HashMap::new();
+        for (sname, svc) in &self.services {
+            if svc.init.is_empty() {
+                continue;
+            }
+            let mut steps = Vec::with_capacity(svc.init.len());
+            for init in &svc.init {
+                let mut env = std::collections::BTreeMap::new();
+                for (k, v) in &init.env {
+                    env.insert(k.clone(), substitute(v, vars)?);
+                }
+                steps.push(ResolvedInit {
+                    name: init.name.clone(),
+                    image: init.image.clone(),
+                    command: init.command.clone(),
+                    args: init.args.clone(),
+                    env,
+                    resources: init
+                        .resources
+                        .clone()
+                        .unwrap_or_else(init_default_resources),
+                    user: init.user.clone().or_else(|| svc.user.clone()),
+                });
+            }
+            out.insert(sname.clone(), steps);
+        }
+        Ok(out)
     }
 
     /// Resolve every service's env by substituting `${NAME}` from `vars`.
@@ -592,13 +786,31 @@ impl Compose {
     /// service name for a stable order. Sums to [`Compose::footprint`]. Each
     /// service contributes its `resources` (defaulted when omitted) plus the
     /// sizes of its `volumes`.
+    ///
+    /// An `init:` step contributes only when it asks for *more* than the
+    /// service's own container: Kubernetes schedules a pod as
+    /// `max(largest init container, sum of containers)`, so a small setup step
+    /// costs nothing, and a large one is what the pod actually reserves.
     pub fn service_footprints(&self) -> Result<Vec<ServiceFootprint>> {
         let mut out = Vec::with_capacity(self.services.len());
         for (sname, svc) in &self.services {
-            let cpu_milli = parse_cpu_milli(&svc.resources.cpu)
+            let mut cpu_milli = parse_cpu_milli(&svc.resources.cpu)
                 .map_err(|e| anyhow!("service '{sname}': cpu: {e}"))?;
-            let memory_bytes = parse_bytes(&svc.resources.memory)
+            let mut memory_bytes = parse_bytes(&svc.resources.memory)
                 .map_err(|e| anyhow!("service '{sname}': memory: {e}"))?;
+            for init in &svc.init {
+                let r = init
+                    .resources
+                    .clone()
+                    .unwrap_or_else(init_default_resources);
+                cpu_milli =
+                    cpu_milli.max(parse_cpu_milli(&r.cpu).map_err(|e| {
+                        anyhow!("service '{sname}': init '{}': cpu: {e}", init.name)
+                    })?);
+                memory_bytes = memory_bytes.max(parse_bytes(&r.memory).map_err(|e| {
+                    anyhow!("service '{sname}': init '{}': memory: {e}", init.name)
+                })?);
+            }
             let mut storage_bytes = 0u64;
             for v in &svc.volumes {
                 storage_bytes += parse_bytes(&v.size)
@@ -755,6 +967,28 @@ fn path_is_within(path: &str, dir: &str) -> bool {
     path.starts_with(&format!("{dir}/"))
 }
 
+/// Validate an init step's name as a DNS label: it becomes a container name,
+/// which Kubernetes rejects outright if it is not one — and a rejected pod spec
+/// is a deployment that never becomes ready, with the reason buried in the
+/// operator's log rather than returned to whoever typed the name.
+fn validate_init_name(service: &str, name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 40 {
+        bail!("service '{service}': init name '{name}' must be 1–40 characters");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        || name.starts_with('-')
+        || name.ends_with('-')
+    {
+        bail!(
+            "service '{service}': init name '{name}' must be lowercase letters, digits and \
+             hyphens (not leading or trailing)"
+        );
+    }
+    Ok(())
+}
+
 /// Validate an in-container path: absolute, not root, no `..` traversal.
 fn check_abs_no_traversal(service: &str, label: &str, path: &str) -> Result<()> {
     if !path.starts_with('/') {
@@ -891,6 +1125,154 @@ config:
         let db = &c.services["mariadb"];
         assert!(db.ports.is_empty());
         assert!(db.backup.as_ref().unwrap().command.is_some());
+    }
+
+    /// A two-service compose — an `s3` service and an `app` that depends on it
+    /// — with `decl` spliced into the app as its init steps.
+    fn init_compose(decl: &str) -> String {
+        format!(
+            "services:\n  \
+               s3:\n    image: rustfs/rustfs:latest\n    ports:\n      \
+                 - {{ name: api, container: 9000 }}\n    env:\n      \
+                 K: ${{S3_KEY}}\n  \
+               app:\n    image: example/app:latest\n    user: \"1000\"\n    \
+                 depends_on: [s3]\n{decl}\
+             secrets:\n  - {{ name: S3_KEY, generate: token }}\n"
+        )
+    }
+
+    /// An init step resolves its `env` like any other, keeps declaration order,
+    /// and inherits the service's `user:` and a small default size.
+    #[test]
+    fn init_steps_resolve_with_service_defaults() {
+        let c = Compose::parse(&init_compose(
+            "    init:\n      \
+               - name: wait-s3\n        image: minio/mc:latest\n        \
+                 command: [\"sh\", \"-c\", \"until mc ls t; do sleep 2; done\"]\n        \
+                 env:\n          MC_HOST_t: http://k:${S3_KEY}@s3:9000\n      \
+               - name: make-bucket\n        image: minio/mc:latest\n        \
+                 resources: { cpu: 100m, memory: 128Mi }\n        user: \"65534\"\n",
+        ))
+        .unwrap();
+        c.validate_declarations().unwrap();
+
+        let vars = HashMap::from([("S3_KEY".to_string(), "abc123".to_string())]);
+        let resolved = c.resolve_init(&vars).unwrap();
+        // Only the service that declares steps appears.
+        assert_eq!(resolved.len(), 1);
+        let steps = &resolved["app"];
+        assert_eq!(
+            steps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["wait-s3", "make-bucket"]
+        );
+
+        let wait = &steps[0];
+        assert_eq!(wait.env["MC_HOST_t"], "http://k:abc123@s3:9000");
+        assert_eq!(wait.command.as_ref().unwrap()[0], "sh");
+        assert!(wait.args.is_none());
+        // No `resources:` → the init default, not the service default (250m).
+        assert_eq!(wait.resources.cpu, INIT_DEFAULT_CPU);
+        assert_eq!(wait.resources.memory, INIT_DEFAULT_MEMORY);
+        // No `user:` → the service's, so it can write that service's volumes.
+        assert_eq!(wait.run_as_user(), Some(1000));
+
+        let make = &steps[1];
+        assert_eq!(make.resources.cpu, "100m");
+        assert_eq!(make.run_as_user(), Some(65534));
+        assert!(!make.runs_as_root());
+    }
+
+    #[test]
+    fn validate_rejects_unusable_init_steps() {
+        let err = |decl: &str| {
+            Compose::parse(&init_compose(decl))
+                .expect_err("should be rejected")
+                .to_string()
+        };
+        let step = |body: &str| format!("    init:\n      - {body}\n");
+
+        // The name becomes a container name, so it must be a DNS label.
+        for bad in ["Setup", "set_up", "-setup", "setup-"] {
+            let e = err(&step(&format!("{{ name: {bad}, image: busybox }}")));
+            assert!(e.contains("init name"), "{bad}: {e}");
+        }
+        // Two steps cannot share a container name.
+        let e = err("    init:\n      - { name: setup, image: busybox }\n      \
+             - { name: setup, image: alpine }\n");
+        assert!(e.contains("duplicate init step"), "{e}");
+        // Something has to run.
+        assert!(
+            err(&step("{ name: setup, image: \"\" }")).contains("image is required"),
+            "empty image"
+        );
+        assert!(
+            err(&step("{ name: setup, image: busybox, command: [] }")).contains("command is empty"),
+            "empty command"
+        );
+        // A `user:` the kubelet cannot verify is rejected at authoring time.
+        let e = err(&step("{ name: setup, image: busybox, user: nonroot }"));
+        assert!(e.contains("positive numeric UID"), "{e}");
+    }
+
+    /// `${…}` in a command would interpolate a customer-supplied config value
+    /// into a shell string. Values go through `env` instead, where the script
+    /// reads them as shell variables.
+    #[test]
+    fn validate_rejects_substitution_in_init_commands() {
+        for decl in [
+            "    init:\n      - name: setup\n        image: busybox\n        \
+             command: [\"sh\", \"-c\", \"echo ${S3_KEY}\"]\n",
+            "    init:\n      - name: setup\n        image: busybox\n        \
+             args: [\"${S3_KEY}\"]\n",
+        ] {
+            let e = Compose::parse(&init_compose(decl))
+                .expect_err("substitution in argv")
+                .to_string();
+            assert!(e.contains("must not contain"), "{e}");
+        }
+    }
+
+    /// An init step's env is `${…}` like any other value, so an undeclared
+    /// reference is caught by the same admission rule rather than at deploy.
+    #[test]
+    fn init_env_counts_as_references() {
+        let c = Compose::parse(&init_compose(
+            "    init:\n      - name: setup\n        image: busybox\n        \
+             env:\n          A: ${NOPE}\n",
+        ))
+        .unwrap();
+        assert!(c.referenced_vars().contains(&"NOPE".to_string()));
+        let err = c
+            .validate_declarations()
+            .expect_err("undeclared")
+            .to_string();
+        assert!(err.contains("NOPE"), "{err}");
+    }
+
+    /// A pod reserves `max(largest init, sum of containers)`, so a small setup
+    /// step is free and only a larger one moves the app's footprint.
+    #[test]
+    fn init_resources_only_count_when_larger_than_the_service() {
+        let small = Compose::parse(&init_compose(
+            "    init:\n      - { name: setup, image: busybox }\n",
+        ))
+        .unwrap();
+        let bare = Compose::parse(&init_compose("")).unwrap();
+        assert_eq!(small.footprint().unwrap(), bare.footprint().unwrap());
+
+        let big = Compose::parse(&init_compose(
+            "    init:\n      - name: setup\n        image: busybox\n        \
+             resources: { cpu: \"2\", memory: 1Gi }\n",
+        ))
+        .unwrap();
+        let app = big
+            .service_footprints()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "app")
+            .unwrap();
+        assert_eq!(app.cpu_milli, 2000);
+        assert_eq!(app.memory_bytes, 1 << 30);
     }
 
     /// A secret's length is declarable, and defaults to 24 bytes so every
