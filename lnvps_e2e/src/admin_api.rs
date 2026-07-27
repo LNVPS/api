@@ -555,6 +555,7 @@ mod tests {
             "display_name": "E2E Relay",
             "description": "test relay app",
             "repo_url": "https://github.com/example/relay",
+            "category": "Nostr relay",
             "compose": "services:\n  relay:\n    image: example/relay:latest\n    ports:\n      - { name: ws, container: 7777, protocol: http, expose: ingress }\n",
             "amount": 1000,
             "currency": "usd",
@@ -578,6 +579,11 @@ mod tests {
             body["data"]["repo_url"].as_str(),
             Some("https://github.com/example/relay")
         );
+        // Category is required and echoed back; the SEO overrides default to
+        // null (issue #239).
+        assert_eq!(body["data"]["category"].as_str(), Some("Nostr relay"));
+        assert!(body["data"]["seo_title"].is_null());
+        assert!(body["data"]["seo_description"].is_null());
 
         // Duplicate name is rejected.
         let resp = client
@@ -587,9 +593,13 @@ mod tests {
         assert_ne!(resp.status(), StatusCode::OK, "duplicate app name rejected");
 
         // Invalid slug rejected.
+        // `category` is present so the request reaches slug validation: making
+        // it required (#239) means omitting it fails deserialization with 422
+        // first, which would pass an assert_ne but stop testing the slug rule.
         let bad = serde_json::json!({
             "name": "Bad Name",
             "display_name": "x",
+            "category": "Nostr relay",
             "compose": "services: {}",
             "amount": 1,
             "currency": "usd",
@@ -708,6 +718,199 @@ mod tests {
         let _ = client
             .delete_auth(&format!("/api/admin/v1/regions/{region_id}"))
             .await;
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Catalog SEO metadata (issue #239): `category` is required and cannot be
+    /// blanked, the two overrides are nullable and clearable, and all three
+    /// reach the public catalog — which is what the app page templates its
+    /// title from instead of a hardcoded per-slug map in the frontend.
+    #[tokio::test]
+    async fn test_admin_app_seo_metadata() {
+        let client = setup().await;
+        // Unique slug so the test can be re-run against the same database.
+        let suffix = nostr::Keys::generate().public_key().to_hex()[..8].to_string();
+        let slug = format!("e2e-seo-{suffix}");
+
+        let base = |category: Option<&str>| {
+            let mut v = serde_json::json!({
+                "name": slug,
+                "display_name": "SEO Relay",
+                "compose": "services:\n  relay:\n    image: example/relay:latest\n",
+                "amount": 1000,
+                "currency": "usd",
+                "interval_amount": 1,
+                "interval_type": "month",
+                "setup_amount": 0
+            });
+            if let Some(c) = category {
+                v["category"] = serde_json::json!(c);
+            }
+            v
+        };
+
+        // Omitted category is rejected: it is required precisely so that a
+        // newly-onboarded app cannot reach a crawler with a generic title.
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &base(None))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "category is required on create"
+        );
+
+        // Whitespace-only is rejected too — "" is the same silent failure as
+        // NULL, so it must not be storable through the trim.
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &base(Some("   ")))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "blank category rejected"
+        );
+        assert!(resp.text().await.unwrap().contains("category is required"));
+
+        // Create with padding: stored trimmed, since the raw string is what
+        // ends up inside <title>.
+        let create = {
+            let mut v = base(Some("  Community Nostr relay  "));
+            v["seo_description"] = serde_json::json!("  ");
+            v
+        };
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &create)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let app_id = body["data"]["id"].as_u64().expect("app id");
+        assert_eq!(
+            body["data"]["category"].as_str(),
+            Some("Community Nostr relay"),
+            "category stored trimmed"
+        );
+        // A blank optional override collapses to null rather than "".
+        assert!(body["data"]["seo_description"].is_null());
+
+        // Patch: category changes, and the overrides can be set.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({
+                    "category": "Personal Nostr relay",
+                    "seo_title": "Bespoke Relay Hosting",
+                    "seo_description": "Bespoke description for a flagship app."
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(
+            body["data"]["category"].as_str(),
+            Some("Personal Nostr relay")
+        );
+        assert_eq!(
+            body["data"]["seo_title"].as_str(),
+            Some("Bespoke Relay Hosting")
+        );
+
+        // Omitting category leaves it unchanged (it is Option<String>, not
+        // Option<Option<String>>: there is no null to clear to).
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "display_name": "SEO Relay Renamed" }),
+            )
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(
+            body["data"]["category"].as_str(),
+            Some("Personal Nostr relay"),
+            "omitted category unchanged"
+        );
+
+        // Explicit null is refused rather than silently ignored: a client
+        // asking to clear a NOT NULL column must not get 200 and no change.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "category": null }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "category cannot be nulled"
+        );
+        assert!(resp.text().await.unwrap().contains("category cannot be null"));
+
+        // Blanking it via patch is refused, and leaves the stored value alone.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "category": "  " }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(
+            body["data"]["category"].as_str(),
+            Some("Personal Nostr relay"),
+            "rejected patch left category untouched"
+        );
+
+        // The overrides clear to null (unlike category, they are nullable).
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "seo_title": null, "seo_description": null }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(body["data"]["seo_title"].is_null());
+        assert!(body["data"]["seo_description"].is_null());
+
+        // The public catalog is where this actually gets consumed, and it is
+        // unauthenticated (#227). category is a string, never null.
+        let public = user_client_no_auth();
+        let resp = public.get(&format!("/api/v1/apps/{app_id}")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(
+            body["data"]["category"].as_str(),
+            Some("Personal Nostr relay")
+        );
+        assert!(body["data"]["seo_title"].is_null());
+
+        let resp = public.get("/api/v1/apps").await.unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let listed = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"].as_u64() == Some(app_id))
+            .expect("app in public catalog");
+        assert_eq!(listed["category"].as_str(), Some("Personal Nostr relay"));
+
+        // Cleanup.
         let resp = client
             .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
             .await

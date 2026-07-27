@@ -4466,6 +4466,12 @@ pub struct AdminAppInfo {
     pub icon: Option<String>,
     /// Canonical source repository URL (e.g. the project's GitHub).
     pub repo_url: Option<String>,
+    /// Short class of software (e.g. `Nostr relay`); free text, always set.
+    pub category: String,
+    /// Per-app override for the public page `<title>` (English only).
+    pub seo_title: Option<String>,
+    /// Per-app override for the public page meta description (English only).
+    pub seo_description: Option<String>,
     /// docker-compose-style YAML defining the app.
     pub compose: String,
     /// Recurring price in the smallest currency unit (cents / millisats).
@@ -4493,6 +4499,9 @@ impl From<lnvps_db::App> for AdminAppInfo {
             description: a.description,
             icon: a.icon,
             repo_url: a.repo_url,
+            category: a.category,
+            seo_title: a.seo_title,
+            seo_description: a.seo_description,
             compose: a.compose,
             amount: a.amount,
             currency: a.currency,
@@ -4518,6 +4527,17 @@ pub struct AdminCreateAppRequest {
     pub icon: Option<String>,
     /// Canonical source repository URL (e.g. the project's GitHub).
     pub repo_url: Option<String>,
+    /// Short class of software (e.g. `Nostr relay`); free text, **required**.
+    ///
+    /// Sentence case, proper nouns capitalised, no article and no
+    /// "hosting"/"managed"/trailing punctuation — the public page templates
+    /// `{display_name} Hosting — Managed {category}` around it, and whatever
+    /// is stored is what search engines show.
+    pub category: String,
+    /// Per-app override for the public page `<title>` (English only).
+    pub seo_title: Option<String>,
+    /// Per-app override for the public page meta description (English only).
+    pub seo_description: Option<String>,
     /// docker-compose-style YAML defining the app.
     pub compose: String,
     pub amount: u64,
@@ -4551,6 +4571,29 @@ pub struct AdminUpdateAppRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub repo_url: Option<Option<String>>,
+    /// Omit to leave unchanged, send a string to set. Unlike the nullable
+    /// fields around it there is **no clear**, because `category` is `NOT
+    /// NULL` — there is no null to clear to.
+    ///
+    /// Carries the nullable-option deserializer anyway, purely so an explicit
+    /// `"category": null` can be told apart from an omitted key and rejected.
+    /// A plain `Option<String>` collapses the two, and a client asking to
+    /// clear a required field would get `200 OK` and no change.
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub category: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub seo_title: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub seo_description: Option<Option<String>>,
     pub compose: Option<String>,
     pub amount: Option<u64>,
     pub currency: Option<String>,

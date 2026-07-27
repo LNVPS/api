@@ -3099,6 +3099,44 @@ pub struct App {
     /// so the catalog UI can link to it / render its README.
     #[sqlx(default)]
     pub repo_url: Option<String>,
+    /// Shortest phrase that is true of this app and not of its neighbour, used
+    /// to build the public page's title from data instead of hardcoding one
+    /// per slug: the catalog UI renders `{display_name} Hosting — Managed
+    /// {category}`.
+    ///
+    /// Free text on purpose — an enum would need a migration per
+    /// newly-onboarded class of app, which reproduces the hardcoding one layer
+    /// down. Required, because a missing category renders a
+    /// correct-but-generic title and errors nowhere.
+    ///
+    /// **Format contract — whatever is typed here is what search engines
+    /// show, and nothing downstream can repair it:**
+    /// - Sentence case, proper nouns capitalised: `Nostr relay`, not `nostr
+    ///   relay` or `Nostr Relay`. `text-transform` does not apply to `<title>`
+    ///   or `<meta>`, and title-casing free text in JS mangles `NIP-96`,
+    ///   `HTTP`, `Git`.
+    /// - No article, no "hosting", no "managed", no trailing punctuation — the
+    ///   frontend template supplies all four.
+    /// - More specific than a taxonomy bucket: `Community Nostr relay` for
+    ///   Pyramid, `Personal Nostr relay` for HAVEN, plain `Nostr relay` for
+    ///   strfry. Bucketing gives most of the catalog an identical title suffix.
+    ///
+    /// Known trade-off: values this specific do not group, so a future
+    /// "show me all relays" catalog facet needs a second, coarser column. That
+    /// is accepted — the title is what this field exists for.
+    pub category: String,
+    /// Optional per-app override for the public page `<title>`.
+    ///
+    /// Set only when the templated title is not good enough. Overrides arrive
+    /// over the wire and so are never extracted for translation — they are an
+    /// English-only escape hatch, and [`App::category`] is what carries the
+    /// general, localisable case.
+    #[sqlx(default)]
+    pub seo_title: Option<String>,
+    /// Optional per-app override for the public page meta description. Same
+    /// English-only caveat as [`App::seo_title`].
+    #[sqlx(default)]
+    pub seo_description: Option<String>,
     /// Docker-compose-style YAML defining the app (image, ports, env, volumes).
     pub compose: String,
     /// Recurring price in the smallest currency unit (cents / millisats).

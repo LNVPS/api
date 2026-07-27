@@ -1382,6 +1382,9 @@ interface App {
   description?: string;
   icon?: string;
   repo_url?: string;         // canonical source repo (e.g. https://github.com/hoytech/strfry) for a "Source" link / README
+  category: string;          // class of software, always present and never empty (see note below)
+  seo_title?: string;        // per-app <title> override; null for almost every app
+  seo_description?: string;  // per-app meta-description override; null for almost every app
   compose: string;           // docker-compose-style YAML; render the config form (ports/env) from this
   amount: number;            // recurring price in smallest currency units (cents / millisats)
   currency: string;
@@ -1414,6 +1417,23 @@ interface AppDeployment {
   created: string;           // ISO 8601 datetime
 }
 ```
+
+**Templating page copy from `category` (issue #239).** `category` is the shortest
+phrase that is true of an app and not of its neighbour — `Nostr relay` for strfry,
+`Community Nostr relay` for Pyramid, `Blossom media server` for route96. It is free
+text so that onboarding a new class of app needs no API change, and it is **always
+present and never empty**, so a client can template on it unconditionally:
+`` `${display_name} Hosting — Managed ${category}` ``. It is stored in sentence case
+with proper nouns capitalised and deliberately carries no article, no "hosting", no
+"managed" and no trailing punctuation — the client's template supplies all four.
+Do not title-case it in JS: that mangles `NIP-96`, `HTTP` and `Git`. It also serves
+as `Product.category` in structured data.
+
+`seo_title` and `seo_description` are null for almost every app. Use them only when
+set, falling back to the template above. They are set per-app in admin and arrive
+over the wire, so they are never picked up by `formatjs extract` and cannot be
+translated — an English-only escape hatch, which is why `category` is the path that
+carries the localisable general case.
 
 ### Monitoring and History
 

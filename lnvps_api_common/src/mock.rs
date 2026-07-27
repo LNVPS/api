@@ -6078,6 +6078,9 @@ mod tests {
             description: None,
             icon: None,
             repo_url: None,
+            category: "Nostr relay".to_string(),
+            seo_title: None,
+            seo_description: None,
             compose: "services: {}".to_string(),
             amount: 1000,
             currency: "USD".to_string(),
@@ -6121,6 +6124,26 @@ mod tests {
         a1.display_name = "Relay!".to_string();
         db.update_app(&a1).await.unwrap();
         assert_eq!(db.get_app(id1).await.unwrap().display_name, "Relay!");
+
+        // Catalog SEO metadata round-trips (issue #239): `category` is always
+        // present, the two overrides default to unset and survive being set.
+        let stored = db.get_app(id1).await.unwrap();
+        assert_eq!(stored.category, "Nostr relay");
+        assert_eq!(stored.seo_title, None);
+        assert_eq!(stored.seo_description, None);
+
+        let mut a1 = stored;
+        a1.category = "Community Nostr relay".to_string();
+        a1.seo_title = Some("Bespoke title".to_string());
+        a1.seo_description = Some("Bespoke description".to_string());
+        db.update_app(&a1).await.unwrap();
+        let stored = db.get_app(id1).await.unwrap();
+        assert_eq!(stored.category, "Community Nostr relay");
+        assert_eq!(stored.seo_title.as_deref(), Some("Bespoke title"));
+        assert_eq!(
+            stored.seo_description.as_deref(),
+            Some("Bespoke description")
+        );
 
         // delete.
         db.delete_app(id2).await.unwrap();

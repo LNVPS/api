@@ -67,6 +67,23 @@ pub struct ApiApp {
     /// Canonical source repository URL (e.g. the project's GitHub), for a
     /// "Source" link / README rendering on the app-detail page.
     pub repo_url: Option<String>,
+    /// Short, human-readable class of software (e.g. `Nostr relay`, `Blossom
+    /// media server`). Free text, always present, never empty.
+    ///
+    /// Sentence case with proper nouns capitalised, carrying no article, no
+    /// "hosting", no "managed" and no trailing punctuation — the client's
+    /// template supplies those, e.g. `{display_name} Hosting — Managed
+    /// {category}`. Also suitable for `Product.category` in structured data.
+    pub category: String,
+    /// Per-app override for the page `<title>`. Null for almost every app —
+    /// clients should template from `display_name` + `category` and only use
+    /// this when it is set. Never translated (see `seo_description`).
+    pub seo_title: Option<String>,
+    /// Per-app override for the page meta description. Null for almost every
+    /// app. These strings arrive over the wire and so are never picked up by
+    /// the client's message extraction: they are English-only by construction,
+    /// which is why `category` carries the general case.
+    pub seo_description: Option<String>,
     /// docker-compose-style YAML defining the app. Clients render the
     /// configuration form (ports/env) from this spec.
     pub compose: String,
@@ -119,6 +136,9 @@ impl From<App> for ApiApp {
             description: a.description,
             icon: a.icon,
             repo_url: a.repo_url,
+            category: a.category,
+            seo_title: a.seo_title,
+            seo_description: a.seo_description,
             compose: a.compose,
             amount: a.amount,
             currency: a.currency,
