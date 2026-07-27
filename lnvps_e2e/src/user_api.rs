@@ -1096,6 +1096,79 @@ mod tests {
         pool.close().await;
     }
 
+    /// An unpaid order must not consume cluster capacity (#252). Nostr keys are
+    /// free, so anyone can create deployments without paying; before the fix
+    /// each one was counted against the cluster and could make a paying
+    /// customer's order fail with "No cluster with enough capacity".
+    ///
+    /// The cluster here holds exactly one deployment's footprint, so the second
+    /// order only succeeds if the first (unpaid) one is excluded.
+    #[tokio::test]
+    async fn test_unpaid_app_deployment_does_not_consume_capacity() {
+        let client = user_client_with_keys(nostr::Keys::generate());
+        let pool = crate::db::connect().await.unwrap();
+        // App footprint is 250m / 256Mi / 0; size the cluster to exactly one.
+        let (app_id, _cluster_id, region_id) =
+            crate::db::seed_app_and_cluster_with_capacity(&pool, 250, 268435456, 0)
+                .await
+                .unwrap();
+
+        let order = |name: &str| {
+            serde_json::json!({
+                "app_id": app_id,
+                "name": name,
+                "region_id": region_id,
+                "config": { "title": "Hello" }
+            })
+        };
+
+        let resp = client
+            .post_auth("/api/v1/app-deployments", &order("cap-first"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "first order fills the cluster"
+        );
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        // Unpaid, by construction: nothing has been paid in this test.
+        assert_eq!(body["data"]["status"].as_str().unwrap(), "pending");
+
+        // The region still reports capacity, because the unpaid order does not
+        // hold any.
+        let resp = client
+            .get_auth(&format!("/api/v1/apps/{app_id}/regions"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let region = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"].as_u64() == Some(region_id))
+            .expect("seeded region listed");
+        assert_eq!(
+            region["available"].as_bool(),
+            Some(true),
+            "unpaid order must not exhaust the region"
+        );
+
+        // And a second customer can still order into it.
+        let other = user_client_with_keys(nostr::Keys::generate());
+        let resp = other
+            .post_auth("/api/v1/app-deployments", &order("cap-second"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "an unpaid order must not block a later one: {}",
+            resp.text().await.unwrap_or_default()
+        );
+    }
+
     #[tokio::test]
     async fn test_app_deployment_ordering() {
         let keys = nostr::Keys::generate();
