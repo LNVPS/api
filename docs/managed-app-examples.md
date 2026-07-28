@@ -217,6 +217,16 @@ starts the container as whatever non-root UID the image names — so the app com
 up and fails on its first write, on a fresh volume, every time. `user: root` is
 a valid answer: a root process can write to a root-owned volume.
 
+**A volume's `size` can be raised later but never lowered, and a volume can
+never be removed or renamed** (issue #292) — app update refuses all three,
+matched on `(service, volume name)` against the stored compose. Kubernetes
+permits PVC expansion only, so a smaller size makes every existing deployment
+of the app fail to reconcile with a `422` until the size is put back; and
+because the operator cannot prune a PVC it merely stops applying, dropping or
+renaming a volume leaves the old one behind holding the customer's data,
+unmounted. Pick names and sizes on the assumption that the first deployment
+freezes both.
+
 `user` also accepts a **numeric UID** (e.g. `user: "1000"`), which is required
 when the image's Dockerfile sets `USER` to a *name* rather than a number (e.g.
 `USER nonroot`). The kubelet enforces `runAsNonRoot` by reading the image

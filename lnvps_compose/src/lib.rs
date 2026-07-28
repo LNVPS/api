@@ -751,6 +751,70 @@ impl Compose {
         Ok(())
     }
 
+    /// Check this compose against the one it would replace: a persistent
+    /// volume may grow, but it may not shrink, vanish or be renamed.
+    ///
+    /// **An authoring rule, checked at admission only**, like
+    /// [`Self::validate_declarations`] — the operator re-reads the stored
+    /// compose every pass, so a row that already violates this has to keep
+    /// reconciling rather than disappear.
+    ///
+    /// Volumes are matched on `(service, volume name)`, which is exactly the
+    /// PVC identity the operator builds (`{service}-{name}`), and compared in
+    /// bytes so `5Gi` -> `5120Mi` is the no-op it looks like. Sizes are scaled
+    /// by the deployment's multiplier at render time, so a decrease here is a
+    /// decrease for every deployment regardless of size.
+    ///
+    /// Three shapes of edit are refused, all of them irreversible from the
+    /// operator's side:
+    ///
+    /// - **Shrink** — Kubernetes permits PVC expansion only, so the next apply
+    ///   is a permanent 422 and every existing deployment sits in Error.
+    /// - **Remove** — server-side apply cannot prune an object we merely stop
+    ///   applying, so the PVC survives with the customer's data in it, unmounted
+    ///   and uncounted.
+    /// - **Rename** — indistinguishable from a remove plus an add: the pod comes
+    ///   back mounting a new, empty PVC while the old one keeps the data.
+    ///
+    /// A malformed size in either document is an error; an unparseable
+    /// *previous* document is the caller's problem, not this function's.
+    pub fn validate_volume_changes(&self, previous: &Compose) -> Result<()> {
+        for (sname, prev_svc) in &previous.services {
+            for prev in &prev_svc.volumes {
+                let prev_bytes = parse_bytes(&prev.size).map_err(|e| {
+                    anyhow!("stored service '{sname}': volume '{}': {e}", prev.name)
+                })?;
+                let current = self
+                    .services
+                    .get(sname)
+                    .and_then(|s| s.volumes.iter().find(|v| v.name == prev.name));
+                let Some(current) = current else {
+                    bail!(
+                        "service '{sname}': volume '{}' is missing — the operator cannot prune \
+                         a PVC it stops applying, so it would survive unmounted with the \
+                         customer's data in it. A rename is a remove plus an add and orphans it \
+                         the same way.",
+                        prev.name
+                    );
+                };
+                let bytes = parse_bytes(&current.size)
+                    .map_err(|e| anyhow!("service '{sname}': volume '{}': {e}", current.name))?;
+                if bytes < prev_bytes {
+                    bail!(
+                        "service '{sname}': volume '{}' shrinks from {} to {} — Kubernetes permits \
+                         PVC expansion only, so every existing deployment of this app would fail \
+                         to reconcile with a 422 until the size is put back. Equal or larger is \
+                         fine.",
+                        current.name,
+                        prev.size.trim(),
+                        current.size.trim()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Validate structural + policy rules. Enforced at parse time so the
     /// operator never tries to render an unsafe or malformed app.
     ///
@@ -2237,6 +2301,88 @@ config:
         // rows) still accepts it, so an app stored before this rule keeps
         // reconciling rather than vanishing from the cluster.
         assert!(Compose::parse(&svc("")).is_ok());
+    }
+
+    /// A stored persistent volume may grow, but it may not shrink, vanish or
+    /// be renamed (#292) — each of those is unrecoverable once a deployment
+    /// exists.
+    #[test]
+    fn volumes_may_grow_but_not_shrink_or_vanish() {
+        let app = |vols: &str| {
+            Compose::parse(&format!(
+                "services:\n  db:\n    image: x\n    user: \"1000\"\n    volumes:\n{vols}"
+            ))
+            .unwrap()
+        };
+        let stored = app("      - { name: data, path: /data, size: 5Gi }\n");
+
+        // Same size, and a larger one, both pass.
+        assert!(
+            app("      - { name: data, path: /data, size: 5Gi }\n")
+                .validate_volume_changes(&stored)
+                .is_ok()
+        );
+        assert!(
+            app("      - { name: data, path: /data, size: 20Gi }\n")
+                .validate_volume_changes(&stored)
+                .is_ok()
+        );
+        // Compared in bytes, so a change of unit alone is a no-op.
+        assert!(
+            app("      - { name: data, path: /data, size: 5120Mi }\n")
+                .validate_volume_changes(&stored)
+                .is_ok()
+        );
+        // A new volume beside the old one is fine: nothing existing moves.
+        assert!(
+            app(
+                "      - { name: data, path: /data, size: 5Gi }\n      \
+                 - { name: logs, path: /logs, size: 1Gi }\n"
+            )
+            .validate_volume_changes(&stored)
+            .is_ok()
+        );
+
+        // Shrink: the 422 loop.
+        let err = app("      - { name: data, path: /data, size: 1Gi }\n")
+            .validate_volume_changes(&stored)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("shrinks from 5Gi to 1Gi"), "{err}");
+
+        // Removal: the PVC survives unmounted, holding the customer's data.
+        let err = Compose::parse("services:\n  db:\n    image: x\n")
+            .unwrap()
+            .validate_volume_changes(&stored)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("volume 'data' is missing"), "{err}");
+
+        // Rename is a remove plus an add, and orphans the old PVC the same way.
+        let err = app("      - { name: store, path: /data, size: 5Gi }\n")
+            .validate_volume_changes(&stored)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("volume 'data' is missing"), "{err}");
+
+        // Volumes are keyed by (service, name): moving one to another service
+        // is a different PVC, so it counts as dropping the original.
+        let moved = Compose::parse(
+            "services:\n  cache:\n    image: x\n    user: \"1000\"\n    volumes:\n      \
+             - { name: data, path: /data, size: 5Gi }\n",
+        )
+        .unwrap();
+        assert!(moved.validate_volume_changes(&stored).is_err());
+
+        // Authoring-time only: `validate()` still accepts the shrunk document,
+        // so a row stored before this rule keeps reconciling.
+        assert!(
+            Compose::parse(
+                "services:\n  db:\n    image: x\n    user: \"1000\"\n    volumes:\n      \
+                 - { name: data, path: /data, size: 1Gi }\n"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
