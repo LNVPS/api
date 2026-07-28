@@ -126,16 +126,37 @@ spec:
 
 ## RBAC Permissions
 
-The operator requires these Kubernetes permissions:
+The operator requires these Kubernetes permissions, each one a verb the
+reconcile loop actually issues:
 
-- **core/namespaces**: `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`
-- **core/services, secrets, configmaps, persistentvolumeclaims, resourcequotas**: `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`
-- **core/pods**: `get`, `list`, `watch` (read-only; container statuses are the reason a deployment is not ready)
-- **apps/deployments**: `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`
-- **networking.k8s.io/ingresses, networkpolicies**: `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`
-- **core/events**: `create`, `patch` (for event logging)
+- **core/namespaces**: `list`, `create`, `patch`, `delete`
+- **core/services, configmaps, persistentvolumeclaims**: `create`, `patch`
+- **core/secrets**: `get`, `create`, `patch`
+- **core/resourcequotas**: `delete`
+- **core/pods**: `list` (container statuses are the reason a deployment is not ready)
+- **apps/deployments**: `list`, `create`, `patch`
+- **networking.k8s.io/ingresses**: `get`, `create`, `update`, `patch`, `delete`
+- **networking.k8s.io/networkpolicies**: `create`, `patch`
+
+`create` accompanies `patch` because server-side apply creates the object on
+the first pass. The operator holds no watches, so `watch` is granted nowhere.
 
 These are automatically created by the deployment manifest.
+
+### Secret access is still cluster-wide
+
+The only secret the operator reads is `generated` in each `app-N` namespace it
+created (`read_generated`), but the grant above is a ClusterRole, so a stolen
+token reads every Secret in the cluster — every tenant's generated passwords and
+every TLS private key.
+
+Moving that to a Role in each `app-N` namespace does not work on its own:
+Kubernetes refuses to let a subject grant permissions it does not already hold,
+so the operator would need those same cluster-wide secret verbs (or `escalate`)
+to create the binding. The way out is a second, static ClusterRole holding the
+namespace-scoped verbs plus `bind` on it by name, with the operator creating a
+RoleBinding per namespace at reconcile time. That is a code change and a
+two-step rollout, tracked in issue #299.
 
 ## Monitoring
 
