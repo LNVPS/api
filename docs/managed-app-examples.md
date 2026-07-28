@@ -792,7 +792,11 @@ services:
     env:
       # --- identity / public URL ---
       RELAY_URL: "wss://${HOSTNAME}"
-      BUZZ_MEDIA_BASE_URL: "https://${HOSTNAME}"
+      # The relay validates this at startup and exits 1 on anything that does
+      # not end with /media — "invalid media config: public_base_url must end
+      # with /media" (#269). It is the public prefix it hands out for blobs,
+      # not the host it binds.
+      BUZZ_MEDIA_BASE_URL: "https://${HOSTNAME}/media"
       BUZZ_BIND_ADDR: "0.0.0.0:3000"
       BUZZ_RELAY_PRIVATE_KEY: "${BUZZ_RELAY_PRIVATE_KEY}"
       RELAY_OWNER_PUBKEY: "${owner_pubkey}"
