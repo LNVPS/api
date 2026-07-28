@@ -128,7 +128,11 @@ spec:
 
 The operator requires these Kubernetes permissions:
 
-- **networking.k8s.io/ingresses**: `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`
+- **core/namespaces**: `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`
+- **core/services, secrets, configmaps, persistentvolumeclaims, resourcequotas**: `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`
+- **core/pods**: `get`, `list`, `watch` (read-only; container statuses are the reason a deployment is not ready)
+- **apps/deployments**: `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`
+- **networking.k8s.io/ingresses, networkpolicies**: `get`, `list`, `watch`, `create`, `update`, `patch`, `delete`
 - **core/events**: `create`, `patch` (for event logging)
 
 These are automatically created by the deployment manifest.
