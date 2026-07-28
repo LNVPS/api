@@ -291,7 +291,13 @@ fn apply_sent_side(
                 .to_string(),
         );
     };
-    check_rate_against_amounts(payout.amount, &payout.currency, sent_amount, &sent_currency, rate)?;
+    check_rate_against_amounts(
+        payout.amount,
+        &payout.currency,
+        sent_amount,
+        &sent_currency,
+        rate,
+    )?;
 
     payout.sent_amount = sent_amount;
     payout.sent_fee = req.sent_fee.unwrap_or(0);
