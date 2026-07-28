@@ -64,6 +64,9 @@ ENTRYPOINT ["./bin/lnvps_api_admin"]
 
 FROM runtime AS lnvps-operator
 COPY --from=build /out/lnvps_operator ./bin/
+# The operator holds a Kubernetes token, the database DSN and the field
+# encryption key, and writes nothing to its own filesystem.
+USER 65534:65534
 ENTRYPOINT ["./bin/lnvps_operator"]
 
 FROM runtime AS lnvps-nostr

@@ -95,10 +95,20 @@ spec:
         app: lnvps-operator
     spec:
       serviceAccountName: lnvps-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: lnvps-operator
         image: lnvps-operator:latest  # UPDATE THIS
         args: ["--config", "/etc/config/config.yaml"]
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
         env:
         - name: RUST_LOG
           value: "info"
