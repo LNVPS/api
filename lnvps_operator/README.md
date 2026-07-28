@@ -80,6 +80,13 @@ kubectl get ingress -n your-namespace
 | `cluster-issuer` | string | `"letsencrypt-prod"` | cert-manager ClusterIssuer name |
 | `ingress-class` | string | `"nginx"` | Ingress class name |
 | `annotations` | object | `{}` | Additional ingress annotations |
+| `prometheus.url` | string | unset | Prometheus HTTP API to read deployment CPU/memory/volume usage from. Omit to collect no usage |
+| `prometheus.timeout-seconds` | number | `10` | Per-query timeout; collection is best-effort and never blocks a reconcile |
+
+Usage collection needs a Prometheus scraping cAdvisor (`container_cpu_usage_seconds_total`,
+`container_memory_working_set_bytes`) and, for volume usage, the kubelet
+(`kubelet_volume_stats_used_bytes`). Without the kubelet series, CPU and memory are still
+reported and `storage_bytes` is null.
 
 ## Example Generated Ingress
 

@@ -128,6 +128,24 @@ pub struct ApiApp {
     pub tags: Vec<ApiAppTag>,
 }
 
+/// The last resource usage the cluster reported for a deployment.
+///
+/// Same units as the quota fields on [`ApiAppDeployment`], so the two divide
+/// directly.
+#[derive(Serialize)]
+pub struct ApiAppDeploymentUsage {
+    pub cpu_milli: u64,
+    pub memory_bytes: u64,
+    /// Volume usage. `None` for a deployment with no volumes, or when the
+    /// metrics source carries no kubelet volume statistics — CPU and memory are
+    /// still reported in that case.
+    pub storage_bytes: Option<u64>,
+    /// When the reading was taken. Usage is sampled on the operator's reconcile
+    /// interval, not on request, so it is always somewhat behind — render it
+    /// with the age rather than as a live figure.
+    pub collected: DateTime<Utc>,
+}
+
 /// One service's share of an app's resource footprint.
 #[derive(Serialize)]
 pub struct ApiAppServiceResources {
@@ -330,10 +348,18 @@ pub struct ApiAppDeployment {
     /// `POST /api/v1/app-deployments/{id}/upgrade`.
     pub resource_multiplier: u32,
     /// Effective resources after applying `resource_multiplier`, so the UI does
-    /// not have to multiply the catalog app's figures itself.
+    /// not have to multiply the catalog app's figures itself. This is the quota
+    /// `usage` is measured against.
     pub cpu_milli: u64,
     pub memory_bytes: u64,
     pub storage_bytes: u64,
+    /// What the workload is actually consuming of that quota (issue #278).
+    ///
+    /// `None` when nothing has been observed: a deployment that has never run,
+    /// or a cluster with no metrics source. Absent readings are reported as
+    /// unknown rather than as zero, which would read as "idle" for something
+    /// nobody has measured.
+    pub usage: Option<ApiAppDeploymentUsage>,
     /// Current customer-supplied `config` field values (issue #232), for
     /// prefilling the edit form so a config `PATCH` preserves untouched fields.
     /// Only the `config:` map — generated `secrets:` are never exposed. `None`
@@ -390,6 +416,18 @@ async fn deployment_to_api(
         cpu_milli: app.cpu_milli * m,
         memory_bytes: app.memory_bytes * m,
         storage_bytes: app.storage_bytes * m,
+        // Only report a reading that is complete: a timestamp with no figures,
+        // or figures with no timestamp, is a half-written row, and dating an
+        // unknown sample `now` would overstate how fresh it is.
+        usage: match (d.usage_cpu_milli, d.usage_memory_bytes, d.usage_collected) {
+            (Some(cpu_milli), Some(memory_bytes), Some(collected)) => Some(ApiAppDeploymentUsage {
+                cpu_milli: cpu_milli as u64,
+                memory_bytes,
+                storage_bytes: d.usage_storage_bytes,
+                collected,
+            }),
+            _ => None,
+        },
         config,
         created: d.created,
     })
@@ -697,6 +735,10 @@ async fn v1_create_app_deployment(
         desired_state: AppDeploymentDesiredState::Running,
         status: AppDeploymentStatus::Pending,
         status_message: None,
+        usage_cpu_milli: None,
+        usage_memory_bytes: None,
+        usage_storage_bytes: None,
+        usage_collected: None,
         created: Utc::now(),
         deleted: false,
     };
@@ -1162,6 +1204,10 @@ mod tests {
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
             status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
             created: Utc::now(),
             deleted: false,
         };
@@ -1303,6 +1349,10 @@ mod tests {
             desired_state: AppDeploymentDesiredState::Running,
             status,
             status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
             created: Utc::now(),
             deleted: false,
         };

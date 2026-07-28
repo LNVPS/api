@@ -1185,9 +1185,43 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<()> {
         }
     }
 
+    // Best-effort: a metrics outage must not fail a reconcile pass, and stale
+    // usage from the previous pass is better than none.
+    if let Err(e) = collect_usage(ctx, &active).await {
+        warn!("usage collection failed: {e}");
+    }
+
     // Garbage-collect namespaces for deployments that no longer exist (deleted
     // rows are excluded from the active set above).
     gc_namespaces(&ctx.client, &active).await?;
+    Ok(())
+}
+
+/// Record what each deployment is consuming, from Prometheus (issue #278).
+///
+/// Written separately from [`write_back_status`] rather than folded into the
+/// deployment row it writes: that row is a copy read at the top of the pass, so
+/// one path would overwrite the other's fields with values read before they
+/// were set.
+async fn collect_usage(ctx: &Context, active: &HashSet<u64>) -> Result<()> {
+    let Some(client) = &ctx.metrics else {
+        return Ok(());
+    };
+    for (id, usage) in client.deployment_usage().await? {
+        // Prometheus keeps series past a namespace's deletion, and it answers
+        // for the whole cluster, so only deployments this pass owns are written.
+        if !active.contains(&id) {
+            continue;
+        }
+        ctx.db
+            .update_app_deployment_usage(
+                id,
+                usage.cpu_milli,
+                usage.memory_bytes,
+                usage.storage_bytes,
+            )
+            .await?;
+    }
     Ok(())
 }
 
@@ -1677,7 +1711,10 @@ config:
         // The parameterized builder produces identical output for both levels.
         let r = build_namespace_with_level(7, "restricted");
         assert_eq!(
-            r.metadata.labels.as_ref().unwrap()
+            r.metadata
+                .labels
+                .as_ref()
+                .unwrap()
                 .get("pod-security.kubernetes.io/enforce")
                 .map(String::as_str),
             Some("restricted")

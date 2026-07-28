@@ -3477,6 +3477,23 @@ pub struct AppDeployment {
     pub status: AppDeploymentStatus,
     /// Optional human-readable status/error detail from the operator.
     pub status_message: Option<String>,
+    /// Last CPU usage observed in the cluster, summed across the deployment's
+    /// containers. `None` until something has been observed — a deployment that
+    /// has never run, or a cluster with no metrics source.
+    #[sqlx(default)]
+    pub usage_cpu_milli: Option<u32>,
+    /// Last memory usage observed in the cluster, summed across the
+    /// deployment's containers. `None` on the same terms as `usage_cpu_milli`.
+    #[sqlx(default)]
+    pub usage_memory_bytes: Option<u64>,
+    /// Last volume usage observed, summed across the deployment's PVCs. Also
+    /// `None` for a deployment that has no volumes, or when the metrics source
+    /// does not carry kubelet volume statistics.
+    #[sqlx(default)]
+    pub usage_storage_bytes: Option<u64>,
+    /// When the usage figures above were read. `None` while they are.
+    #[sqlx(default)]
+    pub usage_collected: Option<DateTime<Utc>>,
     pub created: DateTime<Utc>,
     /// Soft-delete flag; a deleted deployment is torn down by the operator and
     /// retained only for accounting.

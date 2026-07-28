@@ -132,9 +132,10 @@ async fn resolve_tag_slugs(
         if slug.is_empty() {
             continue;
         }
-        let tag = db.get_app_tag_by_slug(slug).await.map_err(|_| {
-            lnvps_api_common::ApiError::new(format!("unknown tag slug: {slug}"))
-        })?;
+        let tag = db
+            .get_app_tag_by_slug(slug)
+            .await
+            .map_err(|_| lnvps_api_common::ApiError::new(format!("unknown tag slug: {slug}")))?;
         if !ids.contains(&tag.id) {
             ids.push(tag.id);
         }
@@ -346,8 +347,8 @@ async fn admin_update_app(
     if let Some(category) = req.category {
         // `Some(None)` is an explicit null, which cannot be honoured on a
         // NOT NULL column — refuse it rather than no-op.
-        let category = category
-            .ok_or_else(|| lnvps_api_common::ApiError::new("category cannot be null"))?;
+        let category =
+            category.ok_or_else(|| lnvps_api_common::ApiError::new("category cannot be null"))?;
         app.category = validate_category(category)?;
     }
     if let Some(seo_title) = req.seo_title {
@@ -1021,8 +1022,14 @@ mod tests {
     fn test_validate_tag_slug() {
         // Returns trimmed: the slug is a path segment in /apps/tag/{slug} and
         // a query value, so a stray space is a broken URL, not a cosmetic slip.
-        assert_eq!(validate_tag_slug("  nostr  ").ok(), Some("nostr".to_string()));
-        assert_eq!(validate_tag_slug("media-server").ok(), Some("media-server".to_string()));
+        assert_eq!(
+            validate_tag_slug("  nostr  ").ok(),
+            Some("nostr".to_string())
+        );
+        assert_eq!(
+            validate_tag_slug("media-server").ok(),
+            Some("media-server".to_string())
+        );
         assert_eq!(validate_tag_slug("nip-96").ok(), Some("nip-96".to_string()));
 
         assert!(validate_tag_slug("").is_err());
@@ -1088,6 +1095,10 @@ mod tests {
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
             status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
             created: chrono::Utc::now(),
             deleted: false,
         }

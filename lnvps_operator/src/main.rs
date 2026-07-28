@@ -13,7 +13,10 @@ use std::time::Duration;
 use tokio::signal;
 
 mod app_deployments;
+mod metrics;
 mod nostr_domains;
+
+use crate::metrics::PrometheusClient;
 
 /// Environment variable holding the hex-encoded database encryption key. Must
 /// match the API's key (`lnvps_api::settings::ENCRYPTION_KEY_ENV`) so the
@@ -81,6 +84,11 @@ pub struct Settings {
     /// `LNVPS_ENCRYPTION_KEY` env var (hex) takes precedence over this file.
     pub encryption: Option<EncryptionConfig>,
 
+    /// Prometheus to read deployment resource usage from (optional; issue
+    /// #278). When unset, no usage is collected and the API reports usage as
+    /// unknown; everything else reconciles as before.
+    pub prometheus: Option<PrometheusConfig>,
+
     /// Redis URL carrying reconcile triggers for this operator's app cluster
     /// (optional; issue #254).
     ///
@@ -90,6 +98,18 @@ pub struct Settings {
     /// exactly as before: the periodic reconcile is the only trigger, and it
     /// remains the backstop either way.
     pub redis: Option<String>,
+}
+
+/// Prometheus the operator queries for deployment usage.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct PrometheusConfig {
+    /// Base URL of the Prometheus HTTP API, e.g. `http://prometheus.monitoring:9090`.
+    pub url: String,
+
+    /// Per-query timeout in seconds (defaults to 10). Usage collection is
+    /// best-effort, so it must not hold up a reconcile pass.
+    pub timeout_seconds: Option<u64>,
 }
 
 #[derive(Parser)]
@@ -104,6 +124,9 @@ pub struct Context {
     pub client: Client,
     pub db: Arc<dyn LNVpsDb>,
     pub settings: Settings,
+    /// Usage source, built once so its connection pool survives between
+    /// reconcile passes. `None` when no Prometheus is configured.
+    pub metrics: Option<PrometheusClient>,
 }
 
 #[tokio::main]
@@ -145,10 +168,19 @@ async fn main() -> Result<()> {
     let db = LNVpsDbMysql::new(&settings.db).await?;
     let client = Client::try_default().await?;
 
+    let metrics = match &settings.prometheus {
+        Some(cfg) => Some(PrometheusClient::new(
+            &cfg.url,
+            Duration::from_secs(cfg.timeout_seconds.unwrap_or(10)),
+        )?),
+        None => None,
+    };
+
     let context = Arc::new(Context {
         client: client.clone(),
         db: Arc::new(db) as Arc<dyn LNVpsDb>,
         settings: settings.clone(),
+        metrics,
     });
 
     info!("LNVPS Operator is running and watching for resources...");
@@ -313,6 +345,9 @@ mod tests {
         assert!(full.encryption.is_some());
         assert_eq!(full.ingress_namespace.as_deref(), Some("ingress-nginx"));
         assert_eq!(full.redis.as_deref(), Some("redis://localhost:6379"));
+        let prom = full.prometheus.clone().expect("prometheus example");
+        assert_eq!(prom.url, "http://prometheus.monitoring:9090");
+        assert_eq!(prom.timeout_seconds, Some(10));
         assert_eq!(
             full.encryption.unwrap().key_file,
             PathBuf::from("/etc/lnvps/encryption.key")
@@ -325,5 +360,7 @@ mod tests {
         // No redis: the periodic reconcile is the only trigger, which is what
         // the operator did before #254.
         assert!(minimal.redis.is_none());
+        // No prometheus: no usage is collected and the API reports it unknown.
+        assert!(minimal.prometheus.is_none());
     }
 }
