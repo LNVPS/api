@@ -4,9 +4,7 @@
 -- ?tag=nostr, not only ?tag=relay.
 --
 -- `nostr` + `relay` matches pyramid-relay, which shares its category
--- ("Community Nostr relay"). Being a workspace as well as a relay is not a
--- reason to withhold `relay`: the tag axis is many-to-many precisely so an app
--- that is two things is filed under both.
+-- ("Community Nostr relay").
 --
 -- Matched by name and inert against a database that does not hold the row,
 -- following the backfill in 20260727090000_app_tags.sql. IGNORE so a catalog
