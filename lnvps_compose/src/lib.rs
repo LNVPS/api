@@ -669,6 +669,48 @@ impl Compose {
     /// `compose-validate` CLI) so a typo or a newly added reference is caught
     /// while a human can still fix it.
     pub fn validate_declarations(&self) -> Result<()> {
+        // A service addressed as `name:port` by another service must declare a
+        // port (issue #281).
+        //
+        // `build_service` is the only thing that gives a compose service a DNS
+        // name inside the namespace, and it renders nothing for a service with
+        // no `ports:`. So `postgres://buzz:pw@db:5432/buzz` in the relay's env,
+        // with a `db` service that declares no ports, is a name that does not
+        // resolve — which is how the Buzz app reached production and failed
+        // with "Name or service not known" on its first connection.
+        //
+        // Only in-document names are checked: an external `redis.example.com`
+        // is not a compose service and is nothing to do with us.
+        for (sname, svc) in &self.services {
+            // Everywhere a service can name a peer: its own env, its inline
+            // file contents, and its init steps' env (the setup step that waits
+            // for a peer is exactly this pattern).
+            let mut texts: Vec<&str> = svc.env.values().map(String::as_str).collect();
+            for f in &svc.files {
+                if let Some(c) = &f.content {
+                    texts.push(c.as_str());
+                }
+            }
+            for init in &svc.init {
+                texts.extend(init.env.values().map(String::as_str));
+            }
+            for (target, tsvc) in &self.services {
+                if target == sname || !tsvc.ports.is_empty() {
+                    continue;
+                }
+                if !texts.iter().any(|t| addresses_host(t, target)) {
+                    continue;
+                }
+                bail!(
+                    "service '{sname}' addresses '{target}:<port>', but service '{target}' \
+                     declares no `ports:` — the operator only creates a Service (and therefore a \
+                     DNS name) for a service with declared ports, so that hostname will not \
+                     resolve. Add an internal port block to '{target}', e.g. \
+                     `ports: [{{ name: {target}, container: <port>, protocol: tcp, expose: none }}]`"
+                );
+            }
+        }
+
         // A declared `default` must satisfy its own field (#271): an `int`
         // defaulting to "abc" fails at order time for whoever leaves the box
         // blank, which is a customer paying for the author's typo. Authoring-
@@ -1328,6 +1370,38 @@ const MAX_FILE_BYTES: usize = 256 * 1024;
 fn path_is_within(path: &str, dir: &str) -> bool {
     let dir = dir.trim_end_matches('/');
     path.starts_with(&format!("{dir}/"))
+}
+
+/// Whether `text` addresses `host` as a hostname followed by a port, the way a
+/// connection string does: `postgres://u:p@db:5432/x`, `redis://redis:6379`,
+/// `http://s3:9000`, `db:3306`.
+///
+/// Deliberately narrow — the name must be preceded by a URL/host boundary and
+/// followed by `:` and a digit. `redis://redis:6379` matches once (the second
+/// `redis`), and a mention of the word in prose or in a longer token
+/// (`mydb:5432`, `db.example.com:5432`) does not match at all.
+fn addresses_host(text: &str, host: &str) -> bool {
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(host) {
+        let start = from + rel;
+        let end = start + host.len();
+        let before_ok = start == 0
+            || matches!(
+                bytes[start - 1],
+                b'/' | b'@' | b' ' | b'\t' | b'"' | b'\'' | b'=' | b',' | b'(' | b'[' | b'\n'
+            );
+        let after_ok = bytes.get(end) == Some(&b':')
+            && bytes
+                .get(end + 1)
+                .map(|c| c.is_ascii_digit())
+                .unwrap_or(false);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = end.max(start + 1);
+    }
+    false
 }
 
 /// Validate an init step's name as a DNS label: it becomes a container name,
@@ -2020,6 +2094,87 @@ config:
         .unwrap();
         assert!(bad_default.validate_declarations().is_err());
         assert!(resolve_config(&bad_default, &std::collections::BTreeMap::new()).is_err());
+    }
+
+    /// A service addressed as `name:port` must declare a port, because that is
+    /// what makes the operator render a Service — and a Service is the only
+    /// thing that gives the name a DNS record (#281).
+    #[test]
+    fn addressed_services_must_declare_a_port() {
+        // The shape that reached production: the relay points at `db:5432`,
+        // and `db` declares no ports.
+        let broken = "services:\n  db:\n    image: postgres:17\n    user: root\n  \
+             relay:\n    image: example/relay\n    user: \"1000\"\n    \
+             ports:\n      - { name: http, container: 3000, protocol: http, expose: ingress }\n    \
+             env:\n      DATABASE_URL: \"postgres://buzz:pw@db:5432/buzz\"\n";
+        let c = Compose::parse(broken).unwrap();
+        let err = c.validate_declarations().unwrap_err().to_string();
+        assert!(err.contains("addresses 'db:<port>'"), "{err}");
+        assert!(err.contains("declares no `ports:`"), "{err}");
+        // Rendering is unchanged: `validate()` (which the operator runs on
+        // stored rows) still accepts it, so an app already deployed keeps
+        // reconciling rather than disappearing.
+        assert!(Compose::parse(broken).is_ok());
+
+        // With an internal port block it passes — `expose: none` is enough,
+        // since the Service is what DNS needs, not the ingress.
+        let fixed = broken.replace(
+            "  db:\n    image: postgres:17\n    user: root\n",
+            "  db:\n    image: postgres:17\n    user: root\n    ports:\n      \
+             - { name: postgres, container: 5432, protocol: tcp, expose: none }\n",
+        );
+        Compose::parse(&fixed)
+            .unwrap()
+            .validate_declarations()
+            .unwrap();
+
+        // An init step naming a portless peer counts: the step that waits for
+        // a backing service is exactly where this bites first.
+        let init_case = "services:\n  cache:\n    image: redis:7\n    user: root\n  \
+             app:\n    image: example/app\n    user: \"1000\"\n    \
+             ports:\n      - { name: http, container: 80, protocol: http, expose: ingress }\n    \
+             init:\n      - name: wait\n        image: busybox\n        \
+             env:\n          TARGET: \"redis://cache:6379\"\n";
+        assert!(
+            Compose::parse(init_case)
+                .unwrap()
+                .validate_declarations()
+                .is_err()
+        );
+
+        // A file's content counts too — a config file is where a hostname
+        // usually lives for apps that do not read env.
+        let file_case = "services:\n  cache:\n    image: redis:7\n    user: root\n  \
+             app:\n    image: example/app\n    user: \"1000\"\n    \
+             ports:\n      - { name: http, container: 80, protocol: http, expose: ingress }\n    \
+             files:\n      - { path: /app/c.yaml, content: \"redis: cache:6379\\n\" }\n";
+        assert!(
+            Compose::parse(file_case)
+                .unwrap()
+                .validate_declarations()
+                .is_err()
+        );
+    }
+
+    /// The host match is deliberately narrow: a hostname position followed by a
+    /// port, not any mention of the name (#281).
+    #[test]
+    fn addresses_host_matches_only_host_positions() {
+        assert!(addresses_host("postgres://buzz:pw@db:5432/buzz", "db"));
+        assert!(addresses_host("redis://redis:6379", "redis"));
+        assert!(addresses_host("http://s3:9000", "s3"));
+        assert!(addresses_host("db:3306", "db"));
+        assert!(addresses_host("host = \"cache:6379\"", "cache"));
+
+        // Not a host position: part of a longer name, or a different host that
+        // merely ends with ours.
+        assert!(!addresses_host("mydb:5432", "db"));
+        assert!(!addresses_host("db.example.com:5432", "db"));
+        // Named without a port — nothing here needs a Service.
+        assert!(!addresses_host("the db is postgres", "db"));
+        assert!(!addresses_host("redis://redis", "redis"));
+        // The scheme alone must not match its own service name.
+        assert!(!addresses_host("redis://other:6379", "redis"));
     }
 
     #[test]
