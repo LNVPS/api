@@ -723,6 +723,34 @@ impl Compose {
                     .map_err(|e| anyhow!("config field '{}': default is invalid: {e}", f.name))?;
             }
         }
+        // A service with a data volume must say who writes to it (issue #277).
+        //
+        // Kubernetes chowns a freshly provisioned PVC to the pod's `fsGroup`,
+        // and the operator takes that from the numeric compose `user:`. Declare
+        // volumes without one and there is no fsGroup, so the volume mounts
+        // root-owned `0755` while the kubelet — under `runAsNonRoot` with no
+        // `runAsUser` — starts the container as whatever non-root UID the image
+        // names. The app then comes up and fails on its first write, on a fresh
+        // volume, every time.
+        //
+        // `user: root` is a valid answer here: a root process can write to a
+        // root-owned volume. The unusable combination is specifically volumes
+        // plus silence.
+        //
+        // Authoring-time only, like the rest of this function: a row stored
+        // before the rule keeps reconciling (its pod is unchanged by this), and
+        // it is caught the next time an admin edits it.
+        for (sname, svc) in &self.services {
+            if !svc.volumes.is_empty() && svc.user.is_none() {
+                bail!(
+                    "service '{sname}': declares volumes but no `user:` — a fresh PVC is chowned \
+                     to the pod's fsGroup, which comes from a numeric `user:`, so without one the \
+                     volume mounts root-owned 0755 and a non-root image cannot write to it. Set \
+                     the image's numeric UID (`docker inspect -f '{{{{.Config.User}}}}' <image>`), \
+                     or `user: root` if its entrypoint starts as root."
+                );
+            }
+        }
         for name in self.referenced_vars() {
             let declared = self.config.iter().any(|c| c.name == name)
                 || self.secrets.iter().any(|s| s.name == name)
@@ -2175,6 +2203,55 @@ config:
         assert!(!addresses_host("redis://redis", "redis"));
         // The scheme alone must not match its own service name.
         assert!(!addresses_host("redis://other:6379", "redis"));
+    }
+
+    /// A service with a data volume must declare who writes to it (#277).
+    /// Without a numeric `user:` there is no fsGroup, so the PVC mounts
+    /// root-owned and the non-root container the kubelet starts cannot write.
+    #[test]
+    fn volumes_require_a_declared_user() {
+        let svc = |user: &str| {
+            format!(
+                "services:\n  a:\n    image: x\n{user}    \
+                 volumes:\n      - {{ name: data, path: /data, size: 1Gi }}\n"
+            )
+        };
+
+        // Volumes + silence: refused, with the fix in the message.
+        let c = Compose::parse(&svc("")).unwrap();
+        let err = c.validate_declarations().unwrap_err().to_string();
+        assert!(err.contains("declares volumes but no `user:`"), "{err}");
+        assert!(err.contains("fsGroup"), "{err}");
+
+        // A numeric UID becomes the fsGroup...
+        assert!(
+            Compose::parse(&svc("    user: \"1000\"\n"))
+                .unwrap()
+                .validate_declarations()
+                .is_ok()
+        );
+        // ...and root is a valid answer too: a root process can write to a
+        // root-owned volume, so there is nothing to chown.
+        assert!(
+            Compose::parse(&svc("    user: root\n"))
+                .unwrap()
+                .validate_declarations()
+                .is_ok()
+        );
+
+        // No volumes, no requirement — the rule is about who writes to a PVC,
+        // not about declaring a user for its own sake.
+        assert!(
+            Compose::parse("services:\n  a:\n    image: x\n")
+                .unwrap()
+                .validate_declarations()
+                .is_ok()
+        );
+
+        // Authoring-time only: `validate()` (which the operator runs on stored
+        // rows) still accepts it, so an app stored before this rule keeps
+        // reconciling rather than vanishing from the cluster.
+        assert!(Compose::parse(&svc("")).is_ok());
     }
 
     #[test]
