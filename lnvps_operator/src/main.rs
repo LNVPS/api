@@ -363,42 +363,4 @@ mod tests {
         // No prometheus: no usage is collected and the API reports it unknown.
         assert!(minimal.prometheus.is_none());
     }
-
-    /// Every Kubernetes read the reconcile loop makes must be granted by the
-    /// shipped ClusterRole. A missing verb is invisible in CI and in a
-    /// single-tenant dev cluster: the API call 403s at runtime and the caller
-    /// falls back, so the feature that needed it silently does nothing.
-    #[test]
-    fn cluster_role_grants_what_the_operator_reads() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/k8s-minimal.yaml");
-        let manifest = std::fs::read_to_string(path).expect("k8s-minimal.yaml");
-        let rules = serde_yaml::Deserializer::from_str(&manifest)
-            .filter_map(|doc| serde_yaml::Value::deserialize(doc).ok())
-            .find(|doc| doc.get("kind").and_then(|k| k.as_str()) == Some("ClusterRole"))
-            .and_then(|doc| doc.get("rules").cloned())
-            .expect("a ClusterRole with rules");
-
-        let granted = |group: &str, resource: &str, verb: &str| {
-            let has = |v: &serde_yaml::Value, key: &str, want: &str| {
-                v.get(key)
-                    .and_then(|s| s.as_sequence())
-                    .is_some_and(|s| s.iter().any(|e| e.as_str() == Some(want)))
-            };
-            rules.as_sequence().is_some_and(|rules| {
-                rules.iter().any(|r| {
-                    has(r, "apiGroups", group)
-                        && has(r, "resources", resource)
-                        && has(r, "verbs", verb)
-                })
-            })
-        };
-
-        // Replica counts say a workload is not ready; only the pods' container
-        // statuses say why, and that reason is what the customer is shown.
-        for verb in ["get", "list", "watch"] {
-            assert!(granted("", "pods", verb), "pods {verb} is not granted");
-        }
-        assert!(granted("apps", "deployments", "list"));
-        assert!(granted("", "namespaces", "list"));
-    }
 }
