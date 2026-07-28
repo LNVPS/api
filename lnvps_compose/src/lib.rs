@@ -754,30 +754,14 @@ impl Compose {
     /// Check this compose against the one it would replace: a persistent
     /// volume may grow, but it may not shrink, vanish or be renamed.
     ///
-    /// **An authoring rule, checked at admission only**, like
-    /// [`Self::validate_declarations`] — the operator re-reads the stored
-    /// compose every pass, so a row that already violates this has to keep
-    /// reconciling rather than disappear.
+    /// An authoring rule, checked at admission only, like
+    /// [`Self::validate_declarations`]: a row that already violates it has to
+    /// keep reconciling rather than disappear.
     ///
-    /// Volumes are matched on `(service, volume name)`, which is exactly the
-    /// PVC identity the operator builds (`{service}-{name}`), and compared in
-    /// bytes so `5Gi` -> `5120Mi` is the no-op it looks like. Sizes are scaled
-    /// by the deployment's multiplier at render time, so a decrease here is a
-    /// decrease for every deployment regardless of size.
-    ///
-    /// Three shapes of edit are refused, all of them irreversible from the
-    /// operator's side:
-    ///
-    /// - **Shrink** — Kubernetes permits PVC expansion only, so the next apply
-    ///   is a permanent 422 and every existing deployment sits in Error.
-    /// - **Remove** — server-side apply cannot prune an object we merely stop
-    ///   applying, so the PVC survives with the customer's data in it, unmounted
-    ///   and uncounted.
-    /// - **Rename** — indistinguishable from a remove plus an add: the pod comes
-    ///   back mounting a new, empty PVC while the old one keeps the data.
-    ///
-    /// A malformed size in either document is an error; an unparseable
-    /// *previous* document is the caller's problem, not this function's.
+    /// Volumes are matched on `(service, volume name)` — the PVC identity the
+    /// operator builds — and compared in bytes, so a change of unit alone
+    /// passes. An unparseable *previous* document is the caller's problem, not
+    /// this function's.
     pub fn validate_volume_changes(&self, previous: &Compose) -> Result<()> {
         for (sname, prev_svc) in &previous.services {
             for prev in &prev_svc.volumes {
@@ -803,8 +787,10 @@ impl Compose {
                     bail!(
                         "service '{sname}': volume '{}' shrinks from {} to {} — Kubernetes permits \
                          PVC expansion only, so every existing deployment of this app would fail \
-                         to reconcile with a 422 until the size is put back. Equal or larger is \
-                         fine.",
+                         to reconcile with a 422 until the size is put back. The floor checked \
+                         here is this row's stored size; the real floor is whatever capacity the \
+                         PVCs were provisioned at, which can be larger if the row was lowered \
+                         before this rule existed.",
                         current.name,
                         prev.size.trim(),
                         current.size.trim()
