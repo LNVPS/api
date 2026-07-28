@@ -394,6 +394,15 @@ mod tests {
     use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    /// Serve `body` for a GET of `route`; anything else 404s.
+    async fn mock_get(server: &MockServer, route: impl Into<String>, body: impl Into<String>) {
+        Mock::given(method("GET"))
+            .and(path(route.into()))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.into()))
+            .mount(server)
+            .await;
+    }
+
     // ---- GNU format --------------------------------------------------------
 
     #[test]
@@ -652,8 +661,11 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
             .respond_with(ResponseTemplate::new(200).set_body_string(BSD_CHECKSUM))
             .mount(&server)
             .await;
+        // Matched only when the header is absent, so a header-less request
+        // fails the test instead of falling through to the 200.
         Mock::given(method("GET"))
             .and(path("/images/CHECKSUM"))
+            .and(|req: &wiremock::Request| !req.headers.contains_key("user-agent"))
             .respond_with(ResponseTemplate::new(403))
             .mount(&server)
             .await;
@@ -671,11 +683,7 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
     #[tokio::test]
     async fn test_fetch_checksum_gnu_sums_file() -> anyhow::Result<()> {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/images/SHA512SUMS"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(GNU_SHA512SUMS))
-            .mount(&server)
-            .await;
+        mock_get(&server, "/images/SHA512SUMS", GNU_SHA512SUMS).await;
 
         let url = format!("{}/images/SHA512SUMS", server.uri());
         let entry = fetch_checksum_for_file(&url, "debian-12-generic-amd64.qcow2").await?;
@@ -690,11 +698,7 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
     #[tokio::test]
     async fn test_fetch_checksum_bsd_checksum_file() -> anyhow::Result<()> {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/images/CHECKSUM"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(BSD_CHECKSUM))
-            .mount(&server)
-            .await;
+        mock_get(&server, "/images/CHECKSUM", BSD_CHECKSUM).await;
 
         let url = format!("{}/images/CHECKSUM", server.uri());
         let filename = "CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2";
@@ -710,11 +714,7 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
     #[tokio::test]
     async fn test_fetch_checksum_bare_digest_sidecar() -> anyhow::Result<()> {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/images/alpine.qcow2.sha512"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(BARE_DIGEST_SIDECAR))
-            .mount(&server)
-            .await;
+        mock_get(&server, "/images/alpine.qcow2.sha512", BARE_DIGEST_SIDECAR).await;
 
         let url = format!("{}/images/alpine.qcow2.sha512", server.uri());
         let entry = fetch_checksum_for_file(&url, "alpine.qcow2").await?;
@@ -727,11 +727,7 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
     #[tokio::test]
     async fn test_fetch_checksum_missing_filename_errors() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/images/SHA512SUMS"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(GNU_SHA512SUMS))
-            .mount(&server)
-            .await;
+        mock_get(&server, "/images/SHA512SUMS", GNU_SHA512SUMS).await;
 
         let url = format!("{}/images/SHA512SUMS", server.uri());
         assert!(
@@ -826,11 +822,7 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
     #[tokio::test]
     async fn test_probe_finds_shared_sums_file() -> anyhow::Result<()> {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/images/SHA512SUMS"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(GNU_SHA512SUMS))
-            .mount(&server)
-            .await;
+        mock_get(&server, "/images/SHA512SUMS", GNU_SHA512SUMS).await;
 
         let image_url = format!("{}/images/debian-12-generic-amd64.qcow2", server.uri());
         let (entry, sums_url) =
@@ -849,19 +841,16 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
     #[tokio::test]
     async fn test_probe_prefers_sha512_over_sha256() -> anyhow::Result<()> {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/images/SHA512SUMS"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(GNU_SHA512SUMS))
-            .mount(&server)
-            .await;
-        Mock::given(method("GET"))
-            .and(path("/images/SHA256SUMS"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(concat!(
+        mock_get(&server, "/images/SHA512SUMS", GNU_SHA512SUMS).await;
+        mock_get(
+            &server,
+            "/images/SHA256SUMS",
+            concat!(
                 "31b0e1c2f0b8a0e6bd0f9a1f3a2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e",
                 "  debian-12-generic-amd64.qcow2\n"
-            )))
-            .mount(&server)
-            .await;
+            ),
+        )
+        .await;
 
         let image_url = format!("{}/images/debian-12-generic-amd64.qcow2", server.uri());
         let (entry, sums_url) =
@@ -878,11 +867,7 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
     #[tokio::test]
     async fn test_probe_finds_sha256sums() -> anyhow::Result<()> {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/images/SHA256SUMS"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(GNU_SHA256SUMS))
-            .mount(&server)
-            .await;
+        mock_get(&server, "/images/SHA256SUMS", GNU_SHA256SUMS).await;
 
         let image_url = format!("{}/images/noble-server-cloudimg-amd64.img", server.uri());
         let (entry, sums_url) =
@@ -899,11 +884,7 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
     #[tokio::test]
     async fn test_probe_finds_bsd_checksum_file() -> anyhow::Result<()> {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/images/CHECKSUM"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(BSD_CHECKSUM))
-            .mount(&server)
-            .await;
+        mock_get(&server, "/images/CHECKSUM", BSD_CHECKSUM).await;
 
         let filename = "CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2";
         let image_url = format!("{}/images/{filename}", server.uri());
@@ -921,15 +902,16 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
     async fn test_probe_finds_checksum_sha512_in_directory() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         let filename = "FreeBSD-15.0-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz";
-        Mock::given(method("GET"))
-            .and(path("/images/CHECKSUM.SHA512"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+        mock_get(
+            &server,
+            "/images/CHECKSUM.SHA512",
+            format!(
                 "SHA512 ({filename}) = {}{}\n",
                 "dd86d96ba3604c05b1772c9fef74a6957402688eb9c075f212068d5a29afe6bc",
                 "a924afaa4d12b8e0e593deea18b8b200f606a94ad4a0aa5361e75ffacb12087c"
-            )))
-            .mount(&server)
-            .await;
+            ),
+        )
+        .await;
 
         let image_url = format!("{}/images/{filename}", server.uri());
         let (entry, sums_url) = probe_checksum_from_image_url(&image_url, filename)
@@ -950,11 +932,12 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
     async fn test_probe_finds_bare_digest_sidecar() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         let filename = "nocloud_alpine-3.21.0-x86_64-bios-cloudinit-r0.qcow2";
-        Mock::given(method("GET"))
-            .and(path(format!("/images/{filename}.sha512")))
-            .respond_with(ResponseTemplate::new(200).set_body_string(BARE_DIGEST_SIDECAR))
-            .mount(&server)
-            .await;
+        mock_get(
+            &server,
+            format!("/images/{filename}.sha512"),
+            BARE_DIGEST_SIDECAR,
+        )
+        .await;
 
         let image_url = format!("{}/images/{filename}", server.uri());
         let (entry, sums_url) = probe_checksum_from_image_url(&image_url, filename)
@@ -972,11 +955,7 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
     async fn test_probe_finds_bsd_sidecar() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         let filename = "Rocky-9-GenericCloud.latest.x86_64.qcow2";
-        Mock::given(method("GET"))
-            .and(path(format!("/images/{filename}.CHECKSUM")))
-            .respond_with(ResponseTemplate::new(200).set_body_string(BSD_SIDECAR))
-            .mount(&server)
-            .await;
+        mock_get(&server, format!("/images/{filename}.CHECKSUM"), BSD_SIDECAR).await;
 
         let image_url = format!("{}/images/{filename}", server.uri());
         let (entry, sums_url) = probe_checksum_from_image_url(&image_url, filename)
@@ -994,13 +973,14 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
     async fn test_probe_finds_uppercase_sha256_sidecar() -> anyhow::Result<()> {
         let server = MockServer::start().await;
         let filename = "Arch-Linux-x86_64-cloudimg.qcow2";
-        Mock::given(method("GET"))
-            .and(path(format!("/images/{filename}.SHA256")))
-            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+        mock_get(
+            &server,
+            format!("/images/{filename}.SHA256"),
+            format!(
                 "ee0e1c2f0b8a0e6bd0f9a1f3a2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6  {filename}\n"
-            )))
-            .mount(&server)
-            .await;
+            ),
+        )
+        .await;
 
         let image_url = format!("{}/images/{filename}", server.uri());
         let (entry, sums_url) = probe_checksum_from_image_url(&image_url, filename)
@@ -1029,11 +1009,7 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
     #[tokio::test]
     async fn test_probe_ignores_sums_file_without_the_filename() {
         let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/images/SHA512SUMS"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(GNU_SHA512SUMS))
-            .mount(&server)
-            .await;
+        mock_get(&server, "/images/SHA512SUMS", GNU_SHA512SUMS).await;
 
         let image_url = format!("{}/images/not-listed.qcow2", server.uri());
         assert!(
