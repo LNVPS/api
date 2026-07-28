@@ -103,15 +103,32 @@ pub struct ApiReferralEarning {
     pub amount: u64,
 }
 
-/// A single payout record
+/// A single payout record.
+///
+/// A payout has a settled side (`amount`, `fee`, `currency`) — what it takes
+/// off your earned balance — and a sent side (`sent_amount`, `sent_fee`,
+/// `sent_currency`) — what was actually transferred. They are equal, with
+/// `rate` 1 and `rate_collected` null, when no conversion happened.
 #[derive(Serialize)]
 pub struct ApiReferralPayout {
     pub id: u64,
     pub amount: u64,
-    /// Network/routing fee charged to you for this payout (smallest currency
-    /// unit), debited from your balance alongside `amount`.
+    /// Network/routing fee charged to you for this payout (smallest unit of
+    /// `currency`), debited from your balance alongside `amount`.
     pub fee: u64,
     pub currency: String,
+    /// Amount actually transferred, in the smallest unit of `sent_currency`.
+    pub sent_amount: u64,
+    /// Network/routing fee as the network charged it, in the smallest unit of
+    /// `sent_currency`.
+    pub sent_fee: u64,
+    /// Currency actually transferred.
+    pub sent_currency: String,
+    /// Settled-currency standard units per one sent-currency standard unit; 1
+    /// when the two currencies are the same.
+    pub rate: f32,
+    /// When `rate` was quoted; null when no conversion happened.
+    pub rate_collected: Option<chrono::DateTime<Utc>>,
     pub created: chrono::DateTime<Utc>,
     pub is_paid: bool,
     /// How this payout was made: `lightning_address`, `nwc`, or `on_chain`.
@@ -133,6 +150,11 @@ impl From<ReferralPayout> for ApiReferralPayout {
             amount: p.amount,
             fee: p.fee,
             currency: p.currency,
+            sent_amount: p.sent_amount,
+            sent_fee: p.sent_fee,
+            sent_currency: p.sent_currency,
+            rate: p.rate,
+            rate_collected: p.rate_collected,
             created: p.created,
             is_paid: p.is_paid,
             mode: p.mode.to_string(),

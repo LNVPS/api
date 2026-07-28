@@ -46,6 +46,20 @@ fn payable_referral_msat(earned_msat: u64, existing_msat: u64, min_msat: u64) ->
     if pay_msat == 0 { None } else { Some(pay_msat) }
 }
 
+/// Millisats already reserved or paid against a referrer's BTC balance.
+///
+/// A payout nets in the currency it settles, not the currency it sent: a EUR
+/// commission sent as BTC discharges EUR and must leave the BTC balance alone,
+/// or the referrer is charged twice for one transfer. The referrer bears the
+/// fee, so it is debited alongside the amount.
+fn settled_btc_msat(payouts: &[ReferralPayout]) -> u64 {
+    payouts
+        .iter()
+        .filter(|p| p.currency.eq_ignore_ascii_case("BTC"))
+        .map(|p| p.amount.saturating_add(p.fee))
+        .sum()
+}
+
 /// Split `total_fee` across payouts in proportion to their `amounts`, returning
 /// one fee per entry (in order). Any rounding remainder is added to the largest
 /// payout so the shares sum to exactly `total_fee`.
@@ -287,7 +301,9 @@ impl ReferralPayoutHandler {
                 mode: ReferralPayoutMode::OnChain,
                 output: None,
                 pre_image: None,
-            };
+                ..Default::default()
+            }
+            .unconverted();
             let payout_id = self.db.insert_referral_payout(&payout).await?;
             reserved.push((payout_id, referral.clone(), addr.clone(), *pay_msat));
         }
@@ -348,7 +364,9 @@ impl ReferralPayoutHandler {
                         mode: ReferralPayoutMode::OnChain,
                         output: Some(outpoint.clone()),
                         pre_image: None,
-                    };
+                        ..Default::default()
+                    }
+                    .unconverted();
                     if let Err(e) = self.db.update_referral_payout(&payout).await {
                         warn!(
                             "Broadcast payout {} but failed to mark it paid: {}",
@@ -421,15 +439,7 @@ impl ReferralPayoutHandler {
             .filter(|u| u.currency.eq_ignore_ascii_case("BTC"))
             .map(|u| u.commission())
             .sum();
-        // The referrer bears fees, so debit amount + fee from their balance.
-        let existing: u64 = self
-            .db
-            .list_referral_payouts(referral.id)
-            .await?
-            .iter()
-            .filter(|p| p.currency.eq_ignore_ascii_case("BTC"))
-            .map(|p| p.amount.saturating_add(p.fee))
-            .sum();
+        let existing = settled_btc_msat(&self.db.list_referral_payouts(referral.id).await?);
         Ok(payable_referral_msat(
             earned_msat,
             existing,
@@ -449,17 +459,8 @@ impl ReferralPayoutHandler {
             .map(|u| u.commission())
             .sum();
 
-        // Subtract every existing BTC payout record (paid AND reserved) so an
-        // in-flight reservation is never paid twice. The referrer bears fees, so
-        // debit amount + fee.
-        let existing: u64 = self
-            .db
-            .list_referral_payouts(referral.id)
-            .await?
-            .iter()
-            .filter(|p| p.currency.eq_ignore_ascii_case("BTC"))
-            .map(|p| p.amount.saturating_add(p.fee))
-            .sum();
+        // Paid AND reserved, so an in-flight reservation is never paid twice.
+        let existing = settled_btc_msat(&self.db.list_referral_payouts(referral.id).await?);
 
         let Some(pay_msat) = payable_referral_msat(
             earned_msat,
@@ -481,7 +482,9 @@ impl ReferralPayoutHandler {
             mode: referral.mode,
             output: None,
             pre_image: None,
-        };
+            ..Default::default()
+        }
+        .unconverted();
         let payout_id = self.db.insert_referral_payout(&payout).await?;
         payout.id = payout_id;
 
@@ -491,8 +494,10 @@ impl ReferralPayoutHandler {
                 // `output` is the paid BOLT11 invoice for Lightning payouts.
                 payout.output = Some(bolt11);
                 payout.pre_image = pre_image;
-                // Charge the referrer the routing fee we paid.
+                // Charge the referrer the routing fee we paid. Settled and sent
+                // are both BTC here, so the fee is the same figure on each side.
                 payout.fee = fee_msat;
+                payout.sent_fee = fee_msat;
                 self.db.update_referral_payout(&payout).await?;
                 info!(
                     "Paid referral commission {} msat (fee {} msat) to code {} (payout {})",
@@ -695,6 +700,50 @@ mod tests {
         // Zero fee / zero amounts.
         assert_eq!(split_fee_proportional(&[1, 2], 0), vec![0, 0]);
         assert_eq!(split_fee_proportional(&[0, 0], 100), vec![0, 0]);
+    }
+
+    /// Netting is by the currency a payout settles, not the one it sent. A EUR
+    /// commission settled in EUR but transferred as BTC must not also reduce the
+    /// BTC balance, and a BTC commission stays debited whatever left the wallet.
+    #[test]
+    fn test_settled_btc_msat_nets_by_the_settled_currency() {
+        let btc = ReferralPayout {
+            amount: 2_000_000,
+            fee: 1_000,
+            currency: "BTC".to_string(),
+            ..Default::default()
+        };
+        // Same commission, sent as EUR out of band: still discharges BTC.
+        let btc_sent_as_eur = ReferralPayout {
+            amount: 500_000,
+            fee: 0,
+            currency: "btc".to_string(),
+            sent_amount: 430,
+            sent_currency: "EUR".to_string(),
+            rate: 0.000_001,
+            rate_collected: Some(Utc::now()),
+            ..Default::default()
+        };
+        // EUR commission sent as BTC: discharges EUR, invisible to BTC netting.
+        let eur_sent_as_btc = ReferralPayout {
+            amount: 5_000,
+            fee: 3,
+            currency: "EUR".to_string(),
+            sent_amount: 55_000_000,
+            sent_fee: 1_200,
+            sent_currency: "BTC".to_string(),
+            rate: 90_000.0,
+            rate_collected: Some(Utc::now()),
+            ..Default::default()
+        };
+
+        assert_eq!(settled_btc_msat(&[]), 0);
+        assert_eq!(settled_btc_msat(&[eur_sent_as_btc.clone()]), 0);
+        assert_eq!(
+            settled_btc_msat(&[btc.clone(), btc_sent_as_eur.clone(), eur_sent_as_btc]),
+            2_501_000,
+            "amount + fee of the BTC-settled rows only"
+        );
     }
 
     #[test]

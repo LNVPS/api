@@ -3616,12 +3616,19 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_referral_payout(&self, payout: &ReferralPayout) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO referral_payout (referral_id, amount, fee, currency, mode, output) VALUES (?, ?, ?, ?, ?, ?) returning id",
+            "INSERT INTO referral_payout (referral_id, amount, fee, currency, sent_amount, \
+             sent_fee, sent_currency, rate, rate_collected, mode, output) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(payout.referral_id)
         .bind(payout.amount)
         .bind(payout.fee)
         .bind(&payout.currency)
+        .bind(payout.sent_amount)
+        .bind(payout.sent_fee)
+        .bind(&payout.sent_currency)
+        .bind(payout.rate)
+        .bind(payout.rate_collected)
         .bind(payout.mode)
         .bind(&payout.output)
         .fetch_one(&self.db)
@@ -3631,13 +3638,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_referral_payout(&self, payout: &ReferralPayout) -> DbResult<()> {
         sqlx::query(
-            "UPDATE referral_payout SET is_paid = ?, mode = ?, output = ?, pre_image = ?, fee = ? WHERE id = ?",
+            "UPDATE referral_payout SET is_paid = ?, mode = ?, output = ?, pre_image = ?, \
+             fee = ?, sent_fee = ? WHERE id = ?",
         )
         .bind(payout.is_paid)
         .bind(payout.mode)
         .bind(&payout.output)
         .bind(&payout.pre_image)
         .bind(payout.fee)
+        .bind(payout.sent_fee)
         .bind(payout.id)
         .execute(&self.db)
         .await?;

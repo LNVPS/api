@@ -3395,7 +3395,7 @@ Returns the referral plus per-currency earned commission, payout history and cou
     "created": "2026-07-18T10:00:00Z",
     "earned": [ { "currency": "BTC", "amount": 5000 } ],
     "payouts": [
-      { "id": 1, "amount": 5000, "fee": 0, "currency": "BTC", "created": "2026-07-18T11:00:00Z", "is_paid": true, "mode": "lightning_address", "output": "lnbc...", "pre_image": "<hex>" }
+      { "id": 1, "amount": 5000, "fee": 0, "currency": "BTC", "sent_amount": 5000, "sent_fee": 0, "sent_currency": "BTC", "rate": 1.0, "rate_collected": null, "created": "2026-07-18T11:00:00Z", "is_paid": true, "mode": "lightning_address", "output": "lnbc...", "pre_image": "<hex>" }
     ],
     "referrals_success": 3,
     "referrals_failed": 1
@@ -3439,6 +3439,8 @@ Required Permission: `referral::view`
 
 Returns an array of payout records (`AdminReferralPayoutInfo`), most recent first. Each record carries `fee` (the network/routing fee charged to the referrer, debited from their balance), `mode` (`lightning_address`/`nwc`/`on_chain`), and `output` (a BOLT11 invoice for Lightning payouts, or the on-chain outpoint `"{txid}:{vout}"` for on-chain payouts; batched rows share the txid but carry distinct vouts).
 
+A payout has two sides. The **settled** side (`amount`, `fee`, `currency`) is what it discharges against the earned balance; commission nets in the currency it was earned in. The **sent** side (`sent_amount`, `sent_fee`, `sent_currency`) is what actually left the wallet. `rate` is settled-currency standard units per one sent-currency standard unit, and `rate_collected` is when that rate was quoted. When no conversion happened the two sides are equal, `rate` is `1` and `rate_collected` is `null`.
+
 #### Create Referral Payout
 
 ```
@@ -3452,9 +3454,21 @@ Creates a manual payout record (e.g. reconciling an out-of-band payment).
 ```json
 {
   "amount": 5000,
-  // Required - smallest currency unit, > 0
+  // Required - settled amount, smallest unit of `currency`, > 0
   "currency": "BTC",
-  // Required
+  // Required - the currency the commission was earned in; this is what the payout nets against
+  "fee": 0,
+  // Optional - fee charged to the referrer, smallest unit of `currency` (default 0)
+  "sent_currency": "BTC",
+  // Optional - currency actually transferred; omit (or repeat `currency`) when nothing was converted
+  "sent_amount": 5000,
+  // Required when `sent_currency` differs from `currency` - smallest unit of `sent_currency`, > 0
+  "sent_fee": 0,
+  // Optional - fee as the network charged it, smallest unit of `sent_currency` (default 0)
+  "rate": 90000.0,
+  // Required when `sent_currency` differs from `currency` - settled-currency standard units per one sent-currency standard unit, > 0. Rejected when the currencies are the same.
+  "rate_collected": "2026-07-28T17:00:00Z",
+  // Optional - when the rate was quoted (defaults to now for a converted payout). Rejected when the currencies are the same.
   "output": "lnbc...",
   // Optional - payout output reference (BOLT11 invoice or on-chain outpoint)
   "mode": "lightning_address",

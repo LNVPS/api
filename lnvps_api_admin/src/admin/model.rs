@@ -1993,14 +1993,31 @@ pub struct AdminReferralEarning {
 }
 
 /// A payout record for a referral (admin view; includes preimage for audit).
+///
+/// A payout has a settled side (`amount`, `fee`, `currency`) — what it
+/// discharges against the earned balance — and a sent side (`sent_amount`,
+/// `sent_fee`, `sent_currency`) — what left the wallet. They are equal, with
+/// `rate` 1 and `rate_collected` null, when no conversion happened.
 #[derive(Serialize)]
 pub struct AdminReferralPayoutInfo {
     pub id: u64,
     pub amount: u64,
-    /// Network/routing fee charged to the referrer (smallest currency unit),
-    /// debited from their balance alongside `amount`.
+    /// Network/routing fee charged to the referrer (smallest unit of
+    /// `currency`), debited from their balance alongside `amount`.
     pub fee: u64,
     pub currency: String,
+    /// Amount actually transferred, in the smallest unit of `sent_currency`.
+    pub sent_amount: u64,
+    /// Network/routing fee as the network charged it, in the smallest unit of
+    /// `sent_currency`.
+    pub sent_fee: u64,
+    /// Currency actually transferred.
+    pub sent_currency: String,
+    /// Settled-currency standard units per one sent-currency standard unit; 1
+    /// when the two currencies are the same.
+    pub rate: f32,
+    /// When `rate` was quoted; null when no conversion happened.
+    pub rate_collected: Option<DateTime<Utc>>,
     pub created: DateTime<Utc>,
     pub is_paid: bool,
     /// How this payout was made: `lightning_address`, `nwc`, or `on_chain`.
@@ -2020,6 +2037,11 @@ impl From<lnvps_db::ReferralPayout> for AdminReferralPayoutInfo {
             amount: p.amount,
             fee: p.fee,
             currency: p.currency,
+            sent_amount: p.sent_amount,
+            sent_fee: p.sent_fee,
+            sent_currency: p.sent_currency,
+            rate: p.rate,
+            rate_collected: p.rate_collected,
             created: p.created,
             is_paid: p.is_paid,
             mode: p.mode.to_string(),
@@ -2070,10 +2092,31 @@ pub struct AdminUpdateReferralRequest {
 /// Create a manual payout record for a referral.
 #[derive(Deserialize)]
 pub struct AdminCreateReferralPayoutRequest {
-    /// Amount in the smallest currency unit.
+    /// Settled amount in the smallest unit of `currency`: what this payout takes
+    /// off the earned balance.
     pub amount: u64,
-    /// Currency code (e.g. `BTC`, `EUR`).
+    /// Currency this payout settles against (e.g. `BTC`, `EUR`) — the currency
+    /// the commission was earned in.
     pub currency: String,
+    /// Currency actually transferred, when it differs from `currency`. Omit (or
+    /// repeat `currency`) for a payout that sent what it settles.
+    pub sent_currency: Option<String>,
+    /// Amount actually transferred, in the smallest unit of `sent_currency`.
+    /// Required when `sent_currency` differs from `currency`.
+    pub sent_amount: Option<u64>,
+    /// Network/routing fee as the network charged it, in the smallest unit of
+    /// `sent_currency`. Defaults to 0.
+    pub sent_fee: Option<u64>,
+    /// Network/routing fee charged to the referrer, in the smallest unit of
+    /// `currency`. Defaults to 0.
+    pub fee: Option<u64>,
+    /// Settled-currency standard units per one sent-currency standard unit.
+    /// Required, and must be greater than 0, when the currencies differ;
+    /// rejected when they are the same.
+    pub rate: Option<f32>,
+    /// When the rate was quoted. Defaults to now for a converted payout;
+    /// rejected when no conversion happened.
+    pub rate_collected: Option<DateTime<Utc>>,
     /// Optional payout output reference (BOLT11 invoice or on-chain outpoint).
     pub output: Option<String>,
     /// Optional payout mode (`lightning_address`, `nwc`, `on_chain`); defaults

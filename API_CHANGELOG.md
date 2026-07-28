@@ -66,6 +66,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Referral payouts record both sides of a currency conversion** (issue #308) — a payout row now carries a **settled** side and a **sent** side. The settled side (`amount`, `fee`, `currency`) is what the payout discharges against the earned balance; commission is earned per currency and nets in the currency it was earned in. The sent side (`sent_amount`, `sent_fee`, `sent_currency`) is what actually left the wallet. `rate` is settled-currency standard units per one sent-currency standard unit, and `rate_collected` is when that rate was quoted.
+
+  Additive on `ApiReferralPayout` (`GET /api/v1/referral`) and `AdminReferralPayoutInfo` (`GET /api/admin/v1/referrals/{id}` and `/payouts`): no existing field changes meaning. A payout that sent what it settles — every payout the automated engine makes today, and every row that existed before this change — has the two sides equal, `rate` `1` and `rate_collected` `null`. Treat a `null` `rate_collected` as "no conversion happened" rather than "rate 1 was quoted".
+
+  `POST /api/admin/v1/referrals/{id}/payouts` accepts the sent side for reconciling an out-of-band payment: `sent_currency`, `sent_amount`, `sent_fee`, `rate`, `rate_collected`, plus `fee` on the settled side. When `sent_currency` differs from `currency`, `sent_amount` and a positive `rate` are required; when they are the same, a `rate` or a diverging `sent_amount`/`sent_fee` is rejected. Automatic conversion at send time is not implemented — a cross-currency payout is recorded by an admin today.
+
 - **`usage` on an app deployment — what it is actually consuming** (issue #278) — `ApiAppDeployment` (`GET /api/v1/app-deployments` and `/{id}`, and every endpoint returning a deployment) gains a nullable `usage` object. Additive: no existing field changes.
 
   ```json

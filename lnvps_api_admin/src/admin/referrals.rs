@@ -198,22 +198,33 @@ async fn admin_create_referral_payout(
         return ApiData::err("currency is required");
     }
 
-    let payout = ReferralPayout {
+    let mut payout = ReferralPayout {
         id: 0,
         referral_id: id,
         amount: req.amount,
-        currency,
+        currency: currency.clone(),
         created: chrono::Utc::now(),
-        fee: 0,
+        fee: req.fee.unwrap_or(0),
         is_paid: false,
         mode: match req.mode.as_deref() {
             Some(m) => lnvps_db::ReferralPayoutMode::from_str(m)
                 .map_err(|_| ApiError::new("Invalid payout mode"))?,
             None => lnvps_db::ReferralPayoutMode::default(),
         },
-        output: req.output.filter(|s| !s.trim().is_empty()),
+        output: req
+            .output
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         pre_image: None,
+        ..Default::default()
     };
+
+    match apply_sent_side(&mut payout, &req) {
+        Ok(()) => {}
+        Err(e) => return ApiData::err(&e),
+    }
     let payout_id = this.db.insert_referral_payout(&payout).await?;
 
     // Apply the initial paid flag if requested (insert defaults to unpaid).
@@ -234,6 +245,58 @@ async fn admin_create_referral_payout(
         .find(|p| p.id == payout_id)
         .ok_or_else(|| ApiError::new("Failed to load created payout"))?;
     ApiData::ok(created.into())
+}
+
+/// Fill a new payout's sent side from the request, validating the two sides
+/// against each other.
+///
+/// A payout that sent what it settles carries the settled figures verbatim and
+/// no rate: a quote that never happened must not be recorded as one. A payout
+/// that converted has to say what left the wallet and at what rate, otherwise
+/// the record cannot be reconciled against the transfer afterwards.
+fn apply_sent_side(
+    payout: &mut ReferralPayout,
+    req: &AdminCreateReferralPayoutRequest,
+) -> Result<(), String> {
+    let sent_currency = req
+        .sent_currency
+        .as_deref()
+        .map(|c| c.trim().to_uppercase())
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| payout.currency.clone());
+
+    if sent_currency == payout.currency {
+        if req.rate.is_some() || req.rate_collected.is_some() {
+            return Err("rate is only valid when sent_currency differs from currency".to_string());
+        }
+        if req.sent_amount.is_some_and(|a| a != payout.amount)
+            || req.sent_fee.is_some_and(|f| f != payout.fee)
+        {
+            return Err(
+                "sent_amount and sent_fee must match amount and fee when the currency is the same"
+                    .to_string(),
+            );
+        }
+        let settled = payout.clone().unconverted();
+        *payout = settled;
+        return Ok(());
+    }
+
+    let Some(sent_amount) = req.sent_amount.filter(|a| *a > 0) else {
+        return Err("sent_amount is required when sent_currency differs from currency".to_string());
+    };
+    let Some(rate) = req.rate.filter(|r| *r > 0.0 && r.is_finite()) else {
+        return Err(
+            "rate is required and must be greater than 0 when sent_currency differs from currency"
+                .to_string(),
+        );
+    };
+    payout.sent_amount = sent_amount;
+    payout.sent_fee = req.sent_fee.unwrap_or(0);
+    payout.sent_currency = sent_currency;
+    payout.rate = rate;
+    payout.rate_collected = Some(req.rate_collected.unwrap_or_else(chrono::Utc::now));
+    Ok(())
 }
 
 /// Update / reconcile a payout record (mark paid, set invoice / preimage).
@@ -283,4 +346,123 @@ async fn admin_update_referral_payout(
         .find(|p| p.id == payout_id)
         .ok_or_else(|| ApiError::new("Failed to load updated payout"))?;
     ApiData::ok(updated.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(currency: &str, amount: u64) -> AdminCreateReferralPayoutRequest {
+        AdminCreateReferralPayoutRequest {
+            amount,
+            currency: currency.to_string(),
+            sent_currency: None,
+            sent_amount: None,
+            sent_fee: None,
+            fee: None,
+            rate: None,
+            rate_collected: None,
+            output: None,
+            mode: None,
+            is_paid: false,
+        }
+    }
+
+    fn payout(currency: &str, amount: u64, fee: u64) -> ReferralPayout {
+        ReferralPayout {
+            referral_id: 1,
+            amount,
+            fee,
+            currency: currency.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// A payout that sent what it settles mirrors the settled side and records
+    /// no rate — a rate of 1 with a timestamp would claim a quote happened.
+    #[test]
+    fn same_currency_mirrors_the_settled_side() {
+        let mut p = payout("BTC", 21_000, 7);
+        apply_sent_side(&mut p, &req("BTC", 21_000)).unwrap();
+        assert_eq!(p.sent_amount, 21_000);
+        assert_eq!(p.sent_fee, 7);
+        assert_eq!(p.sent_currency, "BTC");
+        assert_eq!(p.rate, 1.0);
+        assert!(p.rate_collected.is_none());
+    }
+
+    /// The sent side is what makes a cross-currency payout reconcilable against
+    /// the transfer, so it cannot be left to a default.
+    #[test]
+    fn cross_currency_requires_the_sent_amount_and_a_usable_rate() {
+        let mut r = req("EUR", 5_000);
+        r.sent_currency = Some("BTC".to_string());
+        r.rate = Some(90_000.0);
+        let err = apply_sent_side(&mut payout("EUR", 5_000, 0), &r).unwrap_err();
+        assert!(err.contains("sent_amount is required"), "{err}");
+
+        r.sent_amount = Some(55_000_000);
+        for bad in [None, Some(0.0), Some(-1.0), Some(f32::NAN)] {
+            r.rate = bad;
+            let err = apply_sent_side(&mut payout("EUR", 5_000, 0), &r).unwrap_err();
+            assert!(err.contains("rate is required"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn cross_currency_records_both_sides_and_the_quote_time() {
+        let mut r = req("EUR", 5_000);
+        r.sent_currency = Some("btc".to_string());
+        r.sent_amount = Some(55_000_000);
+        r.sent_fee = Some(1_200);
+        r.rate = Some(90_000.0);
+
+        let mut p = payout("EUR", 5_000, 3);
+        apply_sent_side(&mut p, &r).unwrap();
+        assert_eq!(p.amount, 5_000);
+        assert_eq!(p.fee, 3);
+        assert_eq!(p.currency, "EUR");
+        assert_eq!(p.sent_amount, 55_000_000);
+        assert_eq!(p.sent_fee, 1_200);
+        assert_eq!(p.sent_currency, "BTC");
+        assert_eq!(p.rate, 90_000.0);
+        assert!(p.rate_collected.is_some());
+    }
+
+    /// A caller-supplied quote time survives, so an out-of-band payment can be
+    /// reconciled with the rate that actually applied when it was sent.
+    #[test]
+    fn cross_currency_keeps_a_supplied_quote_time() {
+        let when = chrono::Utc::now() - chrono::Duration::days(2);
+        let mut r = req("EUR", 5_000);
+        r.sent_currency = Some("BTC".to_string());
+        r.sent_amount = Some(55_000_000);
+        r.rate = Some(90_000.0);
+        r.rate_collected = Some(when);
+
+        let mut p = payout("EUR", 5_000, 0);
+        apply_sent_side(&mut p, &r).unwrap();
+        assert_eq!(p.rate_collected, Some(when));
+    }
+
+    /// Same-currency rows must stay identities: a rate or a mismatched sent
+    /// figure there is a caller error, not something to silently normalise.
+    #[test]
+    fn same_currency_rejects_a_rate_or_a_diverging_sent_side() {
+        let mut r = req("BTC", 21_000);
+        r.rate = Some(1.0);
+        let err = apply_sent_side(&mut payout("BTC", 21_000, 0), &r).unwrap_err();
+        assert!(err.contains("rate is only valid"), "{err}");
+
+        let mut r = req("BTC", 21_000);
+        r.sent_currency = Some("btc".to_string());
+        r.sent_amount = Some(20_000);
+        let err = apply_sent_side(&mut payout("BTC", 21_000, 0), &r).unwrap_err();
+        assert!(err.contains("must match amount and fee"), "{err}");
+
+        let mut r = req("BTC", 21_000);
+        r.sent_fee = Some(9);
+        let err = apply_sent_side(&mut payout("BTC", 21_000, 7), &r).unwrap_err();
+        assert!(err.contains("must match amount and fee"), "{err}");
+    }
 }
