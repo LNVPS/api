@@ -2131,6 +2131,56 @@ pub struct Subscription {
     pub external_id: Option<String>,
 }
 
+/// Where a subscription stands in its billing lifecycle (issue #253).
+///
+/// The distinction the customer-facing client needs: **unpaid** asks for a
+/// first payment, **expired** asks for a renewal, and neither is a workload the
+/// customer stopped. Without it a never-paid deployment and a stopped one are
+/// indistinguishable once the operator has written back its status, so the one
+/// screen that should ask for money offers a Start button instead.
+///
+/// Derived here, on the model, because two crates decide it from the same two
+/// columns and must not drift: `lnvps_api` reports it, and the operator gates
+/// the workload on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingState {
+    /// The initial purchase payment has never been confirmed (`is_setup = 0`).
+    Unpaid,
+    /// Paid and within its period.
+    Active,
+    /// Was paid, and `expires` has passed.
+    Expired,
+}
+
+impl Display for BillingState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BillingState::Unpaid => write!(f, "unpaid"),
+            BillingState::Active => write!(f, "active"),
+            BillingState::Expired => write!(f, "expired"),
+        }
+    }
+}
+
+impl Subscription {
+    /// This subscription's [`BillingState`] at `now`.
+    ///
+    /// `is_setup` is checked before `expires`: a subscription that was never
+    /// paid for is unpaid whatever its expiry says, and reporting it as
+    /// "expired" would ask the customer to renew something they never bought.
+    /// A `None` expiry never expires.
+    pub fn billing_state(&self, now: DateTime<Utc>) -> BillingState {
+        if !self.is_setup {
+            return BillingState::Unpaid;
+        }
+        if self.expires.map(|e| e < now).unwrap_or(false) {
+            return BillingState::Expired;
+        }
+        BillingState::Active
+    }
+}
+
 /// Subscription Type - Type of service being sold
 #[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize, PartialEq, Eq)]
 #[repr(u16)]
@@ -2338,6 +2388,66 @@ impl InternetRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A subscription's billing state is what the customer API reports and what
+    /// the operator gates on, so the three cases have to be exactly the two
+    /// columns and nothing else (issue #253).
+    #[test]
+    fn test_subscription_billing_state() {
+        let now = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+        let sub = |is_setup: bool, expires: Option<i64>| Subscription {
+            id: 1,
+            user_id: 1,
+            company_id: 1,
+            name: "s".to_string(),
+            description: None,
+            created: now,
+            expires: expires.map(|t| DateTime::<Utc>::from_timestamp(t, 0).unwrap()),
+            is_active: true,
+            is_setup,
+            currency: "USD".to_string(),
+            interval_amount: 1,
+            interval_type: IntervalType::Month,
+            setup_fee: 0,
+            auto_renewal_enabled: false,
+            external_id: None,
+        };
+
+        // Never paid for.
+        assert_eq!(
+            sub(false, None).billing_state(now),
+            BillingState::Unpaid,
+            "is_setup = 0 is unpaid"
+        );
+        // Paid, no expiry, or expiry ahead.
+        assert_eq!(sub(true, None).billing_state(now), BillingState::Active);
+        assert_eq!(
+            sub(true, Some(1_800_000_001)).billing_state(now),
+            BillingState::Active
+        );
+        // The boundary is exclusive: a subscription expiring exactly now is
+        // still active, matching the operator's gate.
+        assert_eq!(
+            sub(true, Some(1_800_000_000)).billing_state(now),
+            BillingState::Active
+        );
+        // Paid, then lapsed.
+        assert_eq!(
+            sub(true, Some(1_799_999_999)).billing_state(now),
+            BillingState::Expired
+        );
+        // Never paid *and* past its expiry is unpaid, not expired: "expired"
+        // asks the customer to renew something they never bought.
+        assert_eq!(
+            sub(false, Some(1_799_999_999)).billing_state(now),
+            BillingState::Unpaid
+        );
+
+        // The wire values the client matches on.
+        assert_eq!(BillingState::Unpaid.to_string(), "unpaid");
+        assert_eq!(BillingState::Active.to_string(), "active");
+        assert_eq!(BillingState::Expired.to_string(), "expired");
+    }
 
     #[test]
     fn test_os_distribution_from_str_and_display() {
