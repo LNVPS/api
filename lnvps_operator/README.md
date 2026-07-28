@@ -137,6 +137,20 @@ The operator requires these Kubernetes permissions:
 
 These are automatically created by the deployment manifest.
 
+## Runtime hardening
+
+The image runs as uid/gid `65534` and the Deployment enforces
+`runAsNonRoot: true`, `readOnlyRootFilesystem: true`, `allowPrivilegeEscalation:
+false` and `capabilities: drop: ["ALL"]`. The operator writes nothing to its own
+filesystem: the config is a read-only ConfigMap mount, and everything else it
+creates lives in the Kubernetes API or the database.
+
+One consequence for the field-encryption key: `encryption.auto-generate` cannot
+work on a read-only root filesystem, and a generated key would not match the
+API's in any case. Supply the key through `LNVPS_ENCRYPTION_KEY` (as the
+manifest does) or mount it as a read-only Secret volume and point
+`encryption.key-file` at it.
+
 ## Monitoring
 
 The deployment includes:
