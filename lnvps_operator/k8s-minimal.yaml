@@ -30,11 +30,17 @@ rules:
 - apiGroups: [""]
   resources: ["services", "configmaps", "persistentvolumeclaims"]
   verbs: ["create", "patch"]
-# Secrets are also read: generated values are read back so they stay stable
-# across reconciles. See the note on scope in README.md.
-- apiGroups: [""]
-  resources: ["secrets"]
-  verbs: ["get", "create", "patch"]
+# Secrets are NOT here: they are granted per deployment namespace by the
+# lnvps-operator-appns ClusterRole below, bound by the operator as it creates
+# each namespace. These two rules are what let it write that binding without
+# holding the secret verbs cluster-wide.
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["rolebindings"]
+  verbs: ["create", "patch"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles"]
+  resourceNames: ["lnvps-operator-appns"]
+  verbs: ["bind"]
 # Namespaces are no longer quota'd; the rule exists to remove objects left by
 # deployments provisioned before that change.
 - apiGroups: [""]
@@ -56,6 +62,18 @@ rules:
 - apiGroups: ["networking.k8s.io"]
   resources: ["networkpolicies"]
   verbs: ["create", "patch"]
+---
+# Namespace-scoped grant. Never bound cluster-wide: the operator creates a
+# RoleBinding to it inside each app-N namespace it provisions, so a stolen
+# token reads only the namespaces the operator itself created.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: lnvps-operator-appns
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -126,6 +144,17 @@ spec:
         env:
         - name: RUST_LOG
           value: "info"
+        # Identity the operator names as the subject of the per-namespace
+        # RoleBinding it writes. Without both, it creates no binding and falls
+        # back to whatever grant it already holds.
+        - name: LNVPS_OPERATOR_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: LNVPS_OPERATOR_SERVICE_ACCOUNT
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.serviceAccountName
         # Database field-encryption key (hex). MUST match the API's key so the
         # operator can decrypt app_deployment.config. Required for app
         # deployments; omit if running nostr-domains only.
