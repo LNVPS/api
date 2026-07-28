@@ -3203,6 +3203,135 @@ mod tests {
         crate::db::hard_delete_referral(&pool, ref_b).await.unwrap();
     }
 
+    /// A EUR commission settled by a BTC transfer has to record both sides and
+    /// the rate, and must not be recordable as a conversion with no rate or no
+    /// sent amount — those rows cannot be reconciled against the transfer later.
+    #[tokio::test]
+    async fn test_admin_create_cross_currency_referral_payout() {
+        use nostr::Keys;
+
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+
+        let keys = Keys::generate();
+        let user = crate::db::ensure_user(&pool, &keys).await.unwrap();
+        let suffix = hex::encode(keys.public_key().to_bytes());
+        let code = format!("X{}", &suffix[..7]);
+        let referral = crate::db::insert_referral(&pool, user, &code, None)
+            .await
+            .unwrap();
+        let path = format!("/api/admin/v1/referrals/{referral}/payouts");
+
+        // A conversion with no sent amount, and one with no rate, are rejected.
+        for body in [
+            serde_json::json!({ "amount": 5000, "currency": "EUR", "sent_currency": "BTC", "rate": 90000.0 }),
+            serde_json::json!({ "amount": 5000, "currency": "EUR", "sent_currency": "BTC", "sent_amount": 55000000 }),
+            serde_json::json!({ "amount": 5000, "currency": "EUR", "sent_currency": "BTC", "sent_amount": 55000000, "rate": 0.0 }),
+            // 50.00 EUR for 0.00055 BTC implies ~90909, not 9000.
+            serde_json::json!({ "amount": 5000, "currency": "EUR", "sent_currency": "BTC", "sent_amount": 55000000, "rate": 9000.0 }),
+        ] {
+            let resp = client.post_auth(&path, &body).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+
+        // A rate on a payout that converted nothing is rejected too.
+        let resp = client
+            .post_auth(
+                &path,
+                &serde_json::json!({ "amount": 5000, "currency": "BTC", "rate": 1.0 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // The full conversion is recorded on both sides.
+        let resp = client
+            .post_auth(
+                &path,
+                &serde_json::json!({
+                    "amount": 5000,
+                    "currency": "EUR",
+                    "fee": 3,
+                    "sent_currency": "btc",
+                    "sent_amount": 55_000_000u64,
+                    "sent_fee": 1200,
+                    "rate": 90000.0,
+                    "is_paid": true
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let created = &body["data"];
+        assert_eq!(created["amount"].as_u64().unwrap(), 5000);
+        assert_eq!(created["fee"].as_u64().unwrap(), 3);
+        assert_eq!(created["currency"].as_str().unwrap(), "EUR");
+        assert_eq!(created["sent_amount"].as_u64().unwrap(), 55_000_000);
+        assert_eq!(created["sent_fee"].as_u64().unwrap(), 1200);
+        assert_eq!(created["sent_currency"].as_str().unwrap(), "BTC");
+        assert_eq!(created["rate"].as_f64().unwrap(), 90000.0);
+        assert!(created["rate_collected"].is_string());
+
+        // A single-currency payout mirrors its settled side and quotes no rate.
+        let resp = client
+            .post_auth(
+                &path,
+                &serde_json::json!({ "amount": 21000, "currency": "BTC", "fee": 7 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"]["sent_amount"].as_u64().unwrap(), 21000);
+        assert_eq!(body["data"]["sent_fee"].as_u64().unwrap(), 7);
+        assert_eq!(body["data"]["sent_currency"].as_str().unwrap(), "BTC");
+        assert_eq!(body["data"]["rate"].as_f64().unwrap(), 1.0);
+        assert!(body["data"]["rate_collected"].is_null());
+
+        // Both rows read back the same way through the listing.
+        let resp = client.get_auth(&path).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let rows = body["data"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows.iter()
+                .any(|r| r["currency"] == "EUR" && r["sent_currency"] == "BTC")
+        );
+
+        crate::db::hard_delete_referral(&pool, referral).await.unwrap();
+    }
+
+    /// Payout creation is gated on `referral::create`, not merely on being
+    /// authenticated.
+    #[tokio::test]
+    async fn test_admin_create_referral_payout_requires_permission() {
+        use nostr::Keys;
+
+        let pool = crate::db::connect().await.unwrap();
+        let keys = Keys::generate();
+        let user = crate::db::ensure_user(&pool, &keys).await.unwrap();
+        let suffix = hex::encode(keys.public_key().to_bytes());
+        let code = format!("Y{}", &suffix[..7]);
+        let referral = crate::db::insert_referral(&pool, user, &code, None)
+            .await
+            .unwrap();
+
+        // The referrer themself holds no admin role.
+        let client = crate::client::admin_client_with_keys(keys.clone());
+        let resp = client
+            .post_auth(
+                &format!("/api/admin/v1/referrals/{referral}/payouts"),
+                &serde_json::json!({ "amount": 5000, "currency": "EUR" }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        crate::db::hard_delete_referral(&pool, referral).await.unwrap();
+    }
+
     // ========================================================================
     // Payment Methods (Admin)
     // ========================================================================

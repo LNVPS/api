@@ -1458,22 +1458,61 @@ pub struct Referral {
     pub payout_threshold: Option<u64>,
 }
 
-#[derive(FromRow, Clone, Debug, Default)]
+/// One payout against a referrer's accrued commission.
+///
+/// A payout has two sides. The **settled** side (`amount`, `fee`, `currency`) is
+/// what the payout discharges against the earned balance; commission is earned
+/// per currency and nets in the currency it was earned in, whatever was
+/// actually transferred. The **sent** side (`sent_amount`, `sent_fee`,
+/// `sent_currency`) is what left the wallet. `rate` ties the two together.
+///
+/// The two sides are equal, and `rate` is 1, for a payout that needed no
+/// conversion — which is every payout the automated engine makes today.
+#[derive(FromRow, Clone, Debug)]
 pub struct ReferralPayout {
     /// Unique id of this payout record
     pub id: u64,
     /// The referral this payout belongs to
     pub referral_id: u64,
-    /// Amount in smallest currency unit
+    /// Settled amount in the smallest unit of `currency`: what this payout takes
+    /// off the earned balance.
     pub amount: u64,
     /// Network/routing fee charged to the referrer, in the same smallest
     /// currency unit as `amount`. The referrer bears the fee: it is debited from
     /// their balance together with `amount` when computing what remains owed, so
     /// a fee-induced deficit is recovered from future commission.
+    ///
+    /// The fee is incurred on the sent side and recorded there verbatim as
+    /// `sent_fee`; this is the same cost carried into the currency the balance
+    /// nets in, so it can be subtracted without converting at read time.
     #[sqlx(default)]
     pub fee: u64,
-    /// Currency of this payout
+    /// Currency this payout settles against — the currency the commission was
+    /// earned in.
     pub currency: String,
+    /// Amount that actually left the wallet, in the smallest unit of
+    /// `sent_currency`.
+    #[sqlx(default)]
+    pub sent_amount: u64,
+    /// Network/routing fee as the network charged it, in the smallest unit of
+    /// `sent_currency`.
+    #[sqlx(default)]
+    pub sent_fee: u64,
+    /// Currency that actually left the wallet.
+    #[sqlx(default)]
+    pub sent_currency: String,
+    /// Settled-currency standard units per one sent-currency standard unit, so a
+    /// EUR commission sent as BTC carries the EUR/BTC price. 1 when the two
+    /// currencies are the same.
+    ///
+    /// Stored rather than re-derived so an audit does not depend on a historical
+    /// price feed still being reachable and still agreeing with itself.
+    #[sqlx(default)]
+    pub rate: f32,
+    /// When `rate` was quoted. `None` when no conversion happened: a rate of 1
+    /// with no timestamp is an identity, not a quote that came back as 1.
+    #[sqlx(default)]
+    pub rate_collected: Option<DateTime<Utc>>,
     /// When this payout record was created
     pub created: DateTime<Utc>,
     /// Whether this payout has been completed
@@ -1492,6 +1531,46 @@ pub struct ReferralPayout {
     pub output: Option<String>,
     /// Preimage revealed when a Lightning invoice was paid (32 bytes, SHA256).
     pub pre_image: Option<Vec<u8>>,
+}
+
+impl ReferralPayout {
+    /// Mirror the settled side onto the sent side, for a payout that transferred
+    /// exactly the currency it discharges.
+    ///
+    /// `rate_collected` stays `None`: no rate was quoted, so there is no moment
+    /// to record.
+    pub fn unconverted(mut self) -> Self {
+        self.sent_amount = self.amount;
+        self.sent_fee = self.fee;
+        self.sent_currency = self.currency.clone();
+        self.rate = 1.0;
+        self.rate_collected = None;
+        self
+    }
+}
+
+impl Default for ReferralPayout {
+    /// `rate` defaults to 1, not 0: an unconverted payout is the common case, and
+    /// a zero rate would make the two sides irreconcilable.
+    fn default() -> Self {
+        Self {
+            id: 0,
+            referral_id: 0,
+            amount: 0,
+            fee: 0,
+            currency: String::new(),
+            sent_amount: 0,
+            sent_fee: 0,
+            sent_currency: String::new(),
+            rate: 1.0,
+            rate_collected: None,
+            created: DateTime::<Utc>::default(),
+            is_paid: false,
+            mode: ReferralPayoutMode::default(),
+            output: None,
+            pre_image: None,
+        }
+    }
 }
 
 #[derive(FromRow, Clone, Debug)]
