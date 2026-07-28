@@ -12,16 +12,33 @@ use redis::{AsyncCommands, FromRedisValue};
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
+/// Default stream: the general worker queue the API's worker process consumes.
+pub const DEFAULT_WORK_STREAM: &str = "worker";
+
 #[derive(Clone)]
 pub struct RedisWorkCommander {
     redis: redis::Client,
     conn: MultiplexedConnection,
     group_name: String,
     consumer_name: String,
+    /// Stream this commander reads from, and writes to unless
+    /// [`WorkCommander::send_to_stream`] names another.
+    stream: String,
 }
 
 impl RedisWorkCommander {
     pub async fn new(redis_url: &str, group_name: &str, consumer_name: &str) -> Result<Self> {
+        Self::new_for_stream(redis_url, DEFAULT_WORK_STREAM, group_name, consumer_name).await
+    }
+
+    /// A commander bound to a named stream — the operator's per-cluster
+    /// reconcile queue (issue #254), where the stream name is the routing.
+    pub async fn new_for_stream(
+        redis_url: &str,
+        stream: &str,
+        group_name: &str,
+        consumer_name: &str,
+    ) -> Result<Self> {
         let redis = redis::Client::open(redis_url)?;
         let conn = redis.get_multiplexed_async_connection().await?;
         Ok(Self {
@@ -29,6 +46,7 @@ impl RedisWorkCommander {
             redis,
             group_name: group_name.to_string(),
             consumer_name: consumer_name.to_string(),
+            stream: stream.to_string(),
         })
     }
 
@@ -44,13 +62,14 @@ impl RedisWorkCommander {
             redis,
             group_name: String::new(),
             consumer_name: String::new(),
+            stream: DEFAULT_WORK_STREAM.to_string(),
         })
     }
 
     pub async fn ensure_group_exists(&self, conn: &mut MultiplexedConnection) -> Result<()> {
         // Try to create the group with MKSTREAM option, ignore error if it already exists
         let _: Result<String, _> = conn
-            .xgroup_create_mkstream("worker", &self.group_name, "$")
+            .xgroup_create_mkstream(&self.stream, &self.group_name, "$")
             .await;
         Ok(())
     }
@@ -72,7 +91,9 @@ impl RedisWorkCommander {
             .block(100)
             .group(&self.group_name, &self.consumer_name);
 
-        let results: StreamReadReply = conn.xread_options(&["worker"], &[">"], &opts).await?;
+        let results: StreamReadReply = conn
+            .xread_options(&[self.stream.as_str()], &[">"], &opts)
+            .await?;
         let mut jobs = Vec::new();
         for stream_key in results.keys {
             jobs.extend(stream_key.ids.iter().filter_map(Self::map_work_job));
@@ -89,7 +110,7 @@ impl RedisWorkCommander {
         // Parse pending messages and claim them
         let jobs: StreamAutoClaimReply = conn
             .xautoclaim_options(
-                "worker",
+                self.stream.as_str(),
                 &self.group_name,
                 &self.consumer_name,
                 10_000,
@@ -132,6 +153,16 @@ impl RedisWorkCommander {
 
 #[async_trait]
 impl WorkCommander for RedisWorkCommander {
+    async fn send_to_stream(&self, stream: &str, job: WorkJob) -> Result<String> {
+        let job_json = serde_json::to_string(&job)?;
+        let fields = &[("job", job_json.as_str())];
+        let mut conn = self.conn.clone();
+        let opts = StreamAddOptions::default()
+            .trim(StreamTrimStrategy::maxlen(StreamTrimmingMode::Approx, 1000));
+        let id: String = conn.xadd_options(stream, "*", fields, &opts).await?;
+        Ok(id)
+    }
+
     async fn send(&self, job: WorkJob) -> Result<String> {
         let job_json = serde_json::to_string(&job)?;
 
@@ -140,7 +171,9 @@ impl WorkCommander for RedisWorkCommander {
         let mut conn = self.conn.clone();
         let opts = StreamAddOptions::default()
             .trim(StreamTrimStrategy::maxlen(StreamTrimmingMode::Approx, 1000));
-        let id: String = conn.xadd_options("worker", "*", fields, &opts).await?;
+        let id: String = conn
+            .xadd_options(self.stream.as_str(), "*", fields, &opts)
+            .await?;
         Ok(id)
     }
 
@@ -150,7 +183,9 @@ impl WorkCommander for RedisWorkCommander {
 
     async fn ack(&self, id: &str) -> Result<()> {
         let mut conn = self.conn.clone();
-        let _: u64 = conn.xack("worker", &self.group_name, &[id]).await?;
+        let _: u64 = conn
+            .xack(self.stream.as_str(), &self.group_name, &[id])
+            .await?;
         Ok(())
     }
 }

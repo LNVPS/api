@@ -2051,6 +2051,16 @@ impl Worker {
                 let vm = self.db.get_vm(*vm_id).await?;
                 self.check_vm(&vm).await?;
             }
+            // Addressed to an operator, not to this worker: it is published to
+            // a per-cluster stream (#254) and only reaches here if someone
+            // sends it to the general queue by mistake. Nothing to do — the
+            // operator's own poll is the backstop either way.
+            WorkJob::ReconcileAppDeployment { deployment_id } => {
+                warn!(
+                    "Ignoring ReconcileAppDeployment({deployment_id}) on the worker queue: it \
+                     belongs on the deployment's app-cluster stream"
+                );
+            }
             WorkJob::SpawnVm { vm_id } => {
                 let vm = self.db.get_vm(*vm_id).await?;
                 if vm.mac_address == "ff:ff:ff:ff:ff:ff" {

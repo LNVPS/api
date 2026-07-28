@@ -21,6 +21,14 @@ pub struct WorkJobMessage {
 #[async_trait]
 pub trait WorkCommander: Send + Sync {
     async fn send(&self, job: WorkJob) -> Result<String>;
+    /// Send to a named stream instead of the default one.
+    ///
+    /// Defaults to [`WorkCommander::send`], which is right for the in-process
+    /// implementations (one queue, one consumer) and is overridden by the Redis
+    /// one, where the stream name is what routes a job to the right consumer.
+    async fn send_to_stream(&self, _stream: &str, job: WorkJob) -> Result<String> {
+        self.send(job).await
+    }
     async fn recv(&self) -> Result<Vec<WorkJobMessage>>;
     async fn ack(&self, id: &str) -> Result<()>;
 }
@@ -200,6 +208,24 @@ pub enum WorkJob {
         ip_range_id: u64,
         admin_user_id: Option<u64>,
     },
+    /// Reconcile one managed-app deployment now, rather than at the operator's
+    /// next poll (issue #254).
+    ///
+    /// Published to the deployment's cluster stream ([`app_cluster_stream`]) by
+    /// the payment path, and consumed by the operator serving that cluster. The
+    /// periodic reconcile stays as the backstop: a dropped trigger must be a
+    /// delay, not a deployment that never happens.
+    ReconcileAppDeployment { deployment_id: u64 },
+}
+
+/// Redis stream carrying reconcile triggers for one app cluster (issue #254).
+///
+/// Per cluster, not global: an operator serves exactly one cluster
+/// (`Settings::app_cluster_id`), so keying the stream by cluster is what routes
+/// a trigger to the operator that can act on it — without the API needing to
+/// discover N operators.
+pub fn app_cluster_stream(cluster_id: u64) -> String {
+    format!("app-cluster-{cluster_id}")
 }
 
 impl WorkJob {
@@ -218,6 +244,9 @@ impl WorkJob {
             // A reinstall is a one-shot action tied to a waiting user request;
             // don't let the worker silently retry it later.
             Self::ReinstallVm { .. } => true,
+            // The periodic reconcile is the backstop, so a failed trigger costs
+            // at most one interval — not worth retrying and blocking the stream.
+            Self::ReconcileAppDeployment { .. } => true,
             _ => false,
         }
     }
@@ -226,6 +255,7 @@ impl WorkJob {
 impl fmt::Display for WorkJob {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            WorkJob::ReconcileAppDeployment { .. } => write!(f, "ReconcileAppDeployment"),
             WorkJob::PatchHosts => write!(f, "PatchHosts"),
             WorkJob::CheckVms => write!(f, "CheckVms"),
             WorkJob::CheckVm { .. } => write!(f, "CheckVm"),

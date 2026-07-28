@@ -2,6 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use config::{Config as ConfigBuilder, File};
 use kube::Client;
+use lnvps_api_common::{RedisWorkCommander, WorkCommander, WorkJob, app_cluster_stream};
 use lnvps_db::{LNVpsDb, LNVpsDbMysql};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -79,6 +80,16 @@ pub struct Settings {
     /// columns such as `app_deployment.config`; must match the API's key. The
     /// `LNVPS_ENCRYPTION_KEY` env var (hex) takes precedence over this file.
     pub encryption: Option<EncryptionConfig>,
+
+    /// Redis URL carrying reconcile triggers for this operator's app cluster
+    /// (optional; issue #254).
+    ///
+    /// When set — and `app_cluster_id` is set — the operator consumes
+    /// `app-cluster-{id}` and reconciles a deployment as soon as its payment
+    /// settles, instead of at the next poll. When unset the operator behaves
+    /// exactly as before: the periodic reconcile is the only trigger, and it
+    /// remains the backstop either way.
+    pub redis: Option<String>,
 }
 
 #[derive(Parser)]
@@ -169,11 +180,19 @@ async fn main() -> Result<()> {
         }
     };
 
+    // Immediate reconcile on payment (#254). Optional: without a Redis URL the
+    // periodic loop above is the only trigger, which is the behaviour that
+    // shipped before this.
+    let trigger_task = trigger_listener(context.clone());
+
     // TODO: Add back the controller logic here
 
     tokio::select! {
         _ = reconciliation_task => {
             warn!("Reconciliation task stopped unexpectedly");
+        }
+        _ = trigger_task => {
+            warn!("Reconcile-trigger listener stopped unexpectedly");
         }
         _ = signal::ctrl_c() => {
             info!("Received shutdown signal");
@@ -182,6 +201,91 @@ async fn main() -> Result<()> {
 
     info!("LNVPS Operator shutting down");
     Ok(())
+}
+
+/// Consume this cluster's reconcile-trigger stream, reconciling on demand
+/// (issue #254).
+///
+/// Returns immediately (and so parks forever in the `select!`) when the
+/// operator has no Redis URL or serves no app cluster — an operator that only
+/// handles nostr domains has nothing to listen for.
+///
+/// A trigger names one deployment, but this runs the same full reconcile the
+/// timer does. That keeps one code path: the sweep is already idempotent, it
+/// re-reads the deployment's current row rather than trusting the message, and
+/// a stale or duplicated trigger therefore costs a sweep rather than producing
+/// a different outcome from the periodic one.
+async fn trigger_listener(ctx: Arc<Context>) {
+    let (Some(redis_url), Some(cluster_id)) =
+        (ctx.settings.redis.clone(), ctx.settings.app_cluster_id)
+    else {
+        info!("Reconcile triggers disabled (no redis url or app cluster); polling only");
+        std::future::pending::<()>().await;
+        return;
+    };
+    let stream = app_cluster_stream(cluster_id);
+    // One consumer group per cluster, and a consumer name that is unique per
+    // process: two operators serving the same cluster then share the work
+    // rather than each reconciling every trigger.
+    let consumer = format!("operator-{}", uuid::Uuid::new_v4());
+    let connected =
+        RedisWorkCommander::new_for_stream(&redis_url, &stream, "operator", &consumer).await;
+    let commander = match connected {
+        Ok(c) => c,
+        Err(e) => {
+            error!(
+                "Could not connect to redis at {redis_url} for {stream}: {e} — falling back to \
+                 the periodic reconcile only"
+            );
+            std::future::pending::<()>().await;
+            return;
+        }
+    };
+    info!("Listening for reconcile triggers on {stream} as {consumer}");
+
+    loop {
+        let jobs = match commander.recv().await {
+            Ok(j) => j,
+            Err(e) => {
+                // A dropped connection must not kill the listener: the periodic
+                // reconcile keeps deployments correct meanwhile, and the next
+                // read re-establishes the connection.
+                warn!("Reconcile-trigger read failed on {stream}: {e}");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        };
+        // One sweep per batch, not per message: the sweep already covers every
+        // deployment on this cluster, so five payments landing together are one
+        // reconcile rather than five identical ones.
+        let triggers: Vec<u64> = jobs
+            .iter()
+            .filter_map(|m| match m.job {
+                WorkJob::ReconcileAppDeployment { deployment_id } => Some(deployment_id),
+                _ => None,
+            })
+            .collect();
+        for m in jobs
+            .iter()
+            .filter(|m| !matches!(m.job, WorkJob::ReconcileAppDeployment { .. }))
+        {
+            warn!("Ignoring unexpected job on {stream}: {}", m.job);
+        }
+        if !triggers.is_empty() {
+            info!("Reconcile trigger for app deployment(s) {triggers:?}");
+            if let Err(e) = app_deployments::reconcile_app_deployments(&ctx).await {
+                error!("Triggered reconcile failed: {e}");
+            }
+        }
+        for msg in &jobs {
+            // Acked either way: a job this operator cannot act on must not be
+            // redelivered forever, and a failed reconcile is retried by the
+            // periodic loop rather than by the stream.
+            if let Err(e) = commander.ack(&msg.id).await {
+                warn!("Could not ack {} on {stream}: {e}", msg.id);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +312,7 @@ mod tests {
         assert!(full.app_cluster_id.is_some());
         assert!(full.encryption.is_some());
         assert_eq!(full.ingress_namespace.as_deref(), Some("ingress-nginx"));
+        assert_eq!(full.redis.as_deref(), Some("redis://localhost:6379"));
         assert_eq!(
             full.encryption.unwrap().key_file,
             PathBuf::from("/etc/lnvps/encryption.key")
@@ -217,5 +322,8 @@ mod tests {
         let minimal = load("config.minimal.yaml");
         assert!(minimal.app_cluster_id.is_none());
         assert!(minimal.encryption.is_none());
+        // No redis: the periodic reconcile is the only trigger, which is what
+        // the operator did before #254.
+        assert!(minimal.redis.is_none());
     }
 }

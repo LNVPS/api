@@ -311,9 +311,18 @@ service-name: "lnvps-nostr"
 port-name: "http"
 cluster-issuer: "letsencrypt-prod"
 ingress-class: "nginx"
+app-cluster-id: 1             # managed apps: the cluster this operator serves
+redis: "redis://localhost:6379"   # reconcile on payment instead of at the next poll
 annotations:
   nginx.ingress.kubernetes.io/ssl-redirect: "true"
 ```
+
+`redis` is optional and only meaningful alongside `app-cluster-id`: the operator
+consumes `app-cluster-{id}` and reconciles a deployment as soon as its payment
+settles, rather than up to `reconcile-interval` later. Point it at the same
+Redis the API publishes to. The periodic reconcile remains the backstop, so a
+lost trigger is a delay rather than a deployment that never happens; omit the
+key to poll only.
 
 ---
 
