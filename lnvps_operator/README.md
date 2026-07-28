@@ -137,14 +137,22 @@ creates the object on the first pass, and the operator holds no watches, so
 The operator holds no cluster-wide grant on Secrets. `lnvps-operator-appns` is a
 second ClusterRole carrying the secret verbs, and it is never bound
 cluster-wide: as the operator creates each `app-N` namespace it writes a
-RoleBinding to it in that namespace, so its token reads only namespaces it
-provisioned — not `kube-system`, not cert-manager's, not another deployment's
-TLS keys.
+RoleBinding to it in that namespace, and a RoleBinding grants only inside its
+own namespace.
 
 Writing that binding is allowed by two narrow rules rather than by holding the
 secret verbs: `rolebindings: create, patch`, and `bind` on
 `lnvps-operator-appns` by name. `bind` exists for exactly this — it permits a
 binding to a named role without holding that role's permissions.
+
+**What this does and does not buy.** Those two rules are themselves
+cluster-wide — a ClusterRole cannot scope `rolebindings` to namespaces that do
+not exist yet — so a stolen token can write the same binding into `kube-system`
+and read Secrets there. The reachable ceiling is unchanged. What changes is that
+reaching it now takes a deliberate second write that lands in the audit log,
+instead of a single `get` that looks exactly like normal operation. Narrowing
+further needs an admission policy on who may bind that role, or a controller
+that is not the thing creating namespaces.
 
 The subject comes from the downward API (`LNVPS_OPERATOR_NAMESPACE`,
 `LNVPS_OPERATOR_SERVICE_ACCOUNT`). With either missing the operator writes no

@@ -31,12 +31,12 @@ use k8s_openapi::api::core::v1::{
     ResourceRequirements, SeccompProfile, SecurityContext, Service, ServicePort, ServiceSpec,
     Volume as K8sVolume, VolumeMount, VolumeResourceRequirements,
 };
-use k8s_openapi::api::rbac::v1::{RoleBinding, RoleRef, Subject};
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
     IngressServiceBackend, IngressSpec, IngressTLS, NetworkPolicy, NetworkPolicySpec,
     ServiceBackendPort,
 };
+use k8s_openapi::api::rbac::v1::{RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use lnvps_compose::{
@@ -1369,17 +1369,18 @@ async fn reconcile_one(
         build_namespace(id)
     };
     apply_namespace(client, &namespace).await?;
+    // The binding is the operator's only grant inside this namespace, and the
+    // authorizer reads it from a cache that lags the write. Applying it first
+    // buys the rest of this pass as propagation time before a Secret is read.
+    if let Some(operator) = OperatorIdentity::from_env() {
+        apply(client, &build_role_binding(id, &operator)).await?;
+    }
     let ingress_ns = ctx
         .settings
         .ingress_namespace
         .as_deref()
         .unwrap_or("ingress-nginx");
     apply(client, &build_network_policy(id, ingress_ns)).await?;
-    // The binding has to exist before anything reads or writes a Secret here:
-    // it is the only grant the operator has in this namespace.
-    if let Some(operator) = OperatorIdentity::from_env() {
-        apply(client, &build_role_binding(id, &operator)).await?;
-    }
 
     // 2. Generated secrets: preserve existing values, generate any new ones.
     let existing = read_generated(client, id).await?;
