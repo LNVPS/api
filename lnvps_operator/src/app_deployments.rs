@@ -29,8 +29,8 @@ use lnvps_db::{
 use crate::Context;
 use crate::metrics::DeploymentUsage;
 use lnvps_api_common::k8s_names::{
-    deployment_files_configmap, deployment_namespace as namespace_name, deployment_secret,
-    deployment_volume,
+    deployment_files_configmap, deployment_id_from_namespace,
+    deployment_namespace as namespace_name, deployment_secret, deployment_volume,
 };
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
@@ -1793,9 +1793,7 @@ async fn gc_namespaces(client: &Client, active: &HashSet<u64>) -> Result<()> {
     let lp = ListParams::default().labels(&format!("managed-by={MANAGED_BY}"));
     for ns in api.list(&lp).await?.items {
         let name = ns.name_any();
-        if let Some(id) = name
-            .strip_prefix("app-")
-            .and_then(|s| s.parse::<u64>().ok())
+        if let Some(id) = deployment_id_from_namespace(&name)
             && !active.contains(&id)
         {
             info!("tearing down namespace {name} (deployment gone)");
