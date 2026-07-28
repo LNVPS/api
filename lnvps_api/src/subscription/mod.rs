@@ -232,7 +232,11 @@ impl SubscriptionHandler {
                 self.ip_range_provisioner.clone(),
                 li.id,
             ))),
-            SubscriptionType::App => Ok(Box::new(AppLineItemHandler::new(self.db.clone(), li.id))),
+            SubscriptionType::App => Ok(Box::new(AppLineItemHandler::new(
+                self.db.clone(),
+                li.id,
+                self.tx.clone(),
+            ))),
             // Exhaustive on purpose (no catch-all): adding a new SubscriptionType
             // must fail to compile until a handler is wired here, rather than
             // silently falling through. These variants have no ordering flow yet,

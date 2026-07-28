@@ -37,6 +37,14 @@ encryption:
 # operator only manages nostr domains). Requires `encryption` (above).
 app-cluster-id: 1
 
+# Redis carrying reconcile triggers for this cluster (optional). Point it at
+# the same Redis the API uses. When set (with app-cluster-id), the operator
+# consumes `app-cluster-{id}` and reconciles a deployment as soon as its
+# payment settles, instead of waiting up to reconcile-interval. The periodic
+# reconcile stays as the backstop, so a lost trigger is a delay rather than a
+# deployment that never happens. Omit to poll only.
+redis: "redis://localhost:6379"
+
 # Namespace the ingress controller runs in (optional, defaults to
 # "ingress-nginx"). The per-deployment isolation NetworkPolicy allows inbound
 # traffic from this namespace; it must match that namespace's

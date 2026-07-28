@@ -22,6 +22,10 @@ cluster-issuer: "letsencrypt-prod"
 #   key-file: "/etc/lnvps/encryption.key"
 #   auto-generate: false
 
+# Reconcile immediately on payment instead of at the next poll (optional).
+# Same Redis the API publishes to; requires app-cluster-id.
+# redis: "redis://localhost:6379"
+
 # Ingress configuration (optional - defaults shown)
 # ingress-class: "nginx"
 # ingress-namespace: "ingress-nginx"
