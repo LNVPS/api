@@ -58,6 +58,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
   **Clients that treated `running` as "provisioned successfully" will now see `pending` for the first seconds of a deployment's life and `error` for one that cannot start.** Both were previously reported as `running`. `stopped` is unchanged and still answers the billing/lifecycle question — pair it with `billing_state` (issue #253) to tell "customer stopped it" from "never paid". When the operator cannot reach the API server to read health, it leaves the stored status alone rather than guessing.
 
+- **A managed-app service that declares `volumes:` must now declare `user:`** (issue #277) — enforced when an app is created or updated through the admin API; `POST`/`PATCH /api/admin/v1/apps` returns `400` for a compose that declares a data volume on a service with no user. Kubernetes chowns a freshly provisioned PVC to the pod's `fsGroup`, which the operator takes from the numeric compose `user:`; without one the volume mounts root-owned `0755` while the kubelet starts the container as whatever non-root UID the image names, so the app deploys, starts, and fails on its first write — on a fresh volume, every time, with nothing in the deployment's status saying so. `user: root` satisfies the rule: a root process can write to a root-owned volume.
+
+  Authoring-time only. An app definition stored before this rule keeps reconciling exactly as it did (the rendered pod is unchanged); it is caught the next time an admin edits it. No documented catalog app is affected — all thirteen services with volumes already declare a user.
+
 ### Added
 
 - **`billing_state` on an app deployment — `unpaid` / `active` / `expired`** (issue #253) — `ApiAppDeployment` (`GET /api/v1/app-deployments` and `/{id}`, and every endpoint returning a deployment) gains a nullable `billing_state` string. Additive: no existing field changes.

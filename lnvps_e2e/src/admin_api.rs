@@ -1115,6 +1115,70 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A service with volumes and no `user:` is refused at app create/update
+    /// (#277): a fresh PVC is chowned to the pod's fsGroup, which comes from a
+    /// numeric `user:`, so without one the app deploys and fails on its first
+    /// write — every time, on a fresh volume.
+    #[tokio::test]
+    async fn test_admin_app_compose_volumes_require_user() {
+        let client = setup().await;
+        let suffix = nostr::Keys::generate().public_key().to_hex()[..8].to_string();
+        let slug = format!("e2e-vol-user-{suffix}");
+
+        let compose = |user: &str| {
+            format!(
+                "services:\n  web:\n    image: example/web:latest\n{user}    \
+                 ports:\n      - {{ name: http, container: 80, protocol: http, expose: ingress }}\n    \
+                 volumes:\n      - {{ name: data, path: /data, size: 1Gi }}\n"
+            )
+        };
+        let body = |compose: String| {
+            serde_json::json!({
+                "name": slug,
+                "display_name": "Volumes Need A User",
+                "category": "Nostr relay",
+                "compose": compose,
+                "amount": 1000,
+                "currency": "usd",
+                "interval_amount": 1,
+                "interval_type": "month",
+                "setup_amount": 0
+            })
+        };
+
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &body(compose("")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = resp.text().await.unwrap();
+        assert!(err.contains("declares volumes but no `user:`"), "{err}");
+
+        // With a UID it is accepted, and the rule applies on update too.
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &body(compose("    user: \"1000\"\n")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let created: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let app_id = created["data"]["id"].as_u64().expect("app id");
+
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "compose": compose("") }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// A generated secret can declare its byte length (issue #243), and an
     /// unusable length is refused when the app is created or updated rather
     /// than becoming an app that deploys and crash-loops on its own key.

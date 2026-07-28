@@ -209,6 +209,14 @@ past its limit. Something that needs more than that is storage — declare a
 An `init:` step already gets a writable `/tmp`. If the service declares
 `scratch:` at `/tmp` the step shares that one instead.
 
+**A service with `volumes:` must declare `user:`** (issue #277), and app
+create/update refuses one that does not. Kubernetes chowns a freshly
+provisioned PVC to the pod's `fsGroup`, the operator takes that from the numeric
+`user:`, and without one the volume mounts root-owned `0755` while the kubelet
+starts the container as whatever non-root UID the image names — so the app comes
+up and fails on its first write, on a fresh volume, every time. `user: root` is
+a valid answer: a root process can write to a root-owned volume.
+
 `user` also accepts a **numeric UID** (e.g. `user: "1000"`), which is required
 when the image's Dockerfile sets `USER` to a *name* rather than a number (e.g.
 `USER nonroot`). The kubelet enforces `runAsNonRoot` by reading the image
