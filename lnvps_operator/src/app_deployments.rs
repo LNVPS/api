@@ -355,6 +355,15 @@ fn build_resource_requirements(
 /// every reconcile so namespaces created before the quota was retired heal
 /// themselves; server-side apply cannot prune an object we simply stop
 /// applying.
+async fn delete_resource_quota(client: &Client, deployment_id: u64) -> Result<()> {
+    let api: Api<ResourceQuota> = Api::namespaced(client.clone(), &namespace_name(deployment_id));
+    match api.delete("quota", &DeleteParams::default()).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Delete the custom domain Ingress, if any. A `404` means it is already gone.
 async fn delete_custom_domain_ingress(client: &Client, deployment_id: u64) -> Result<()> {
     let api: Api<Ingress> = Api::namespaced(client.clone(), &namespace_name(deployment_id));
@@ -362,15 +371,6 @@ async fn delete_custom_domain_ingress(client: &Client, deployment_id: u64) -> Re
         .delete(CUSTOM_INGRESS_NAME, &DeleteParams::default())
         .await
     {
-        Ok(_) => Ok(()),
-        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
-        Err(e) => Err(e.into()),
-    }
-}
-
-async fn delete_resource_quota(client: &Client, deployment_id: u64) -> Result<()> {
-    let api: Api<ResourceQuota> = Api::namespaced(client.clone(), &namespace_name(deployment_id));
-    match api.delete("quota", &DeleteParams::default()).await {
         Ok(_) => Ok(()),
         Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
         Err(e) => Err(e.into()),
@@ -2483,10 +2483,9 @@ config:
         assert!(!ann.contains_key("kubernetes.io/ingress.class"));
         let spec = ing.spec.unwrap();
         assert_eq!(spec.ingress_class_name.as_deref(), Some("nginx"));
-        assert_eq!(
-            spec.tls.unwrap()[0].hosts.as_ref().unwrap()[0],
-            "relay.apps.example.com"
-        );
+        let tls = spec.tls.unwrap();
+        assert_eq!(tls[0].hosts.as_ref().unwrap()[0], "relay.apps.example.com");
+        assert_eq!(tls[0].secret_name.as_deref(), Some("app-tls"));
         let rule = &spec.rules.unwrap()[0];
         assert_eq!(rule.host.as_deref(), Some("relay.apps.example.com"));
         let backend = rule.http.as_ref().unwrap().paths[0]
