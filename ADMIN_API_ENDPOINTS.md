@@ -3926,7 +3926,7 @@ These use the dedicated **`app_deployment`** RBAC resource (distinct from the ca
 | `app_id` | int | Only deployments of this catalog app |
 | `cluster_id` | int | Only deployments on this cluster |
 | `region_id` | int | Only deployments on any cluster in this region |
-| `status` | string | Observed status: `pending`, `running`, `stopped`, `error`, `deleting` |
+| `status` | string | Observed status, read back from the cluster (issue #276): `running` = every replica ready, `pending` = still coming up, `error` = a container will not start (reason in `status_message`), `stopped` = billing/lifecycle (stopped, unpaid or expired), `deleting` = being torn down |
 | `desired_state` | string | Desired run state: `running`, `stopped` |
 | `search` | string | Case-insensitive substring match on `name`, `hostname`, `custom_domain` |
 | `include_deleted` | bool | Include soft-deleted deployments (default `false`) |
