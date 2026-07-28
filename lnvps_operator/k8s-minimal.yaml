@@ -78,7 +78,8 @@ metadata:
 data:
   config.yaml: |
     # CHANGE THESE VALUES FOR YOUR SETUP
-    db: "mysql://root:password@mysql-service:3306/lnvps"
+    # The database DSN is a credential and is NOT here: it comes from the
+    # lnvps-operator-db Secret through LNVPS_DATABASE_URL below.
     namespace: "default"
     service-name: "lnvps-nostr"
     port-name: "http"
@@ -133,6 +134,15 @@ spec:
             secretKeyRef:
               name: lnvps-operator-encryption
               key: key
+        # Connection string for the operator's own MySQL user: SELECT on the
+        # schema, UPDATE on app_deployment, nothing else. See README.md.
+        # Create this Secret before applying the Deployment — the reference is
+        # required, so without it the container never starts.
+        - name: LNVPS_DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: lnvps-operator-db
+              key: url
         volumeMounts:
         - name: config
           mountPath: /etc/config

@@ -28,14 +28,11 @@ docker buildx bake lnvps-operator   # shared root Dockerfile, target lnvps-opera
 
 ### 2. Update Configuration
 
-Edit the ConfigMap in `k8s-deployment.yaml`:
+Edit the ConfigMap in `k8s-minimal.yaml`:
 
 ```yaml
 data:
   config.yaml: |
-    # Update the database connection string
-    db: "mysql://username:password@your-mysql-host:3306/lnvps"
-    
     # Set the namespace where your nostr service runs
     namespace: "your-namespace"
     
@@ -46,6 +43,9 @@ data:
     # Set your cert-manager cluster issuer
     cluster-issuer: "your-cluster-issuer"
 ```
+
+The database connection string does not go in the ConfigMap. See
+[Database user](#database-user).
 
 ### 3. Deploy the Operator
 
@@ -161,6 +161,36 @@ API's in any case. Supply the key through `LNVPS_ENCRYPTION_KEY` (as the
 manifest does) or mount it as a read-only Secret volume and point
 `encryption.key-file` at it.
 
+## Database user
+
+The operator connects with its own MySQL user, not root, and reads the DSN from
+the `LNVPS_DATABASE_URL` environment variable (a Secret in the manifest). The
+config file's `db` key is still honoured as a fallback for local runs; the
+environment wins when both are set.
+
+It reads nostr domains, apps, app clusters, app deployments and the
+subscription rows that decide whether a deployment is paid for, and it writes
+to exactly one table: `app_deployment`. No inserts, no deletes, and it never
+runs migrations, so it needs no DDL:
+
+```sql
+CREATE USER 'lnvps_operator'@'%' IDENTIFIED BY '<password>';
+GRANT SELECT ON lnvps.* TO 'lnvps_operator'@'%';
+GRANT UPDATE ON lnvps.app_deployment TO 'lnvps_operator'@'%';
+```
+
+```bash
+kubectl -n lnvps-system create secret generic lnvps-operator-db \
+  --from-literal=url='mysql://lnvps_operator:<password>@mysql-service:3306/lnvps'
+```
+
+Create the Secret before applying the Deployment. The `secretKeyRef` is
+required, so a container scheduled without it sits in
+`CreateContainerConfigError` and never starts.
+
+A schema change that makes the operator write another table, insert or delete
+needs the grant widened first, or the reconcile fails at that statement.
+
 ## Monitoring
 
 The deployment includes:
@@ -238,6 +268,6 @@ annotations:
 
 - The operator runs as non-root user (UID 65534)
 - Uses read-only root filesystem
-- Database credentials should be stored in Secrets
+- The database DSN is read from a Secret, never the ConfigMap
 - Network policies can restrict operator traffic
 - Consider using Pod Security Standards/Admission Controllers
