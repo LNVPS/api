@@ -169,6 +169,16 @@ pub async fn remove_all_roles(pool: &MySqlPool, user_id: u64) -> anyhow::Result<
     Ok(())
 }
 
+/// How many times `hard_delete_vm` retries a foreign-key failure before giving up.
+const HARD_DELETE_RETRIES: u32 = 20;
+
+/// MySQL error 1451: cannot delete a parent row, a child row still references it.
+fn is_fk_violation(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .and_then(|d| d.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>())
+        .is_some_and(|e| e.number() == 1451)
+}
+
 /// Hard-delete a VM and all its dependent rows from the database.
 /// Used by E2E cleanup when the worker cannot reach a fake host.
 ///
@@ -191,14 +201,30 @@ pub async fn hard_delete_vm(pool: &MySqlPool, vm_id: u64) -> anyhow::Result<()> 
         .bind(vm_id)
         .execute(pool)
         .await?;
-    sqlx::query("DELETE FROM vm_history WHERE vm_id = ?")
-        .bind(vm_id)
-        .execute(pool)
-        .await?;
-    sqlx::query("DELETE FROM vm WHERE id = ?")
-        .bind(vm_id)
-        .execute(pool)
-        .await?;
+
+    // The worker may still be writing history for this VM while teardown runs,
+    // which re-parents a `vm_history` row between the child delete and the
+    // parent delete and fails the FK. Retry the pair; a handler that is mid
+    // flight finishes well inside this window.
+    let mut attempt = 0;
+    loop {
+        sqlx::query("DELETE FROM vm_history WHERE vm_id = ?")
+            .bind(vm_id)
+            .execute(pool)
+            .await?;
+        match sqlx::query("DELETE FROM vm WHERE id = ?")
+            .bind(vm_id)
+            .execute(pool)
+            .await
+        {
+            Ok(_) => break,
+            Err(e) if is_fk_violation(&e) && attempt < HARD_DELETE_RETRIES => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     // Delete subscription rows that were linked to this VM (if any).
     if let Some(sid) = sub_id {

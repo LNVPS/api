@@ -1644,12 +1644,11 @@ mod tests {
     //   CheckVms → worker deletes the VM → vm.deleted = true.
     //
     // Path B — check_subscriptions (expiry + stop):
-    //   Order a VM, pay for it, manually expire the subscription via DB,
-    //   publish CheckSubscriptions → worker stops the VM → a "Expired"
-    //   entry appears in vm_history (the stop call will fail on a fake
-    //   host but the history log is written first via the best-effort
-    //   stop path; if the host call happens to fail before the log we
-    //   simply verify the subscription state is consistent).
+    //   Order a VM, pay for it, expire the subscription via DB *inside* the
+    //   grace window, publish CheckSubscriptions → worker stops the VM → an
+    //   "Expired" entry appears in vm_history. Expiring past the grace window
+    //   would instead take the cancellation path, which deletes the VM and is
+    //   not what this half of the test is for.
     // ====================================================================
 
     #[tokio::test]
@@ -2036,25 +2035,27 @@ mod tests {
                 );
                 eprintln!("[cleanup] Subscription {sub2_id} active and has expiry ✓");
 
-                // Manually expire the subscription (set expires 2 days in the past).
+                // Expire the subscription one hour ago: past `expires`, well
+                // inside the grace period a day-old subscription gets, so the
+                // worker takes the expiry path and not the cancellation path.
                 {
                     let pool = crate::db::connect().await.unwrap();
-                    crate::db::expire_subscription(&pool, sub2_id, 2 * 86_400)
+                    crate::db::expire_subscription(&pool, sub2_id, 3_600)
                         .await
                         .unwrap();
                     pool.close().await;
                 }
-                eprintln!("[cleanup] Expired subscription {sub2_id} by 2 days ✓");
+                eprintln!("[cleanup] Expired subscription {sub2_id} by 1 hour ✓");
 
                 // Trigger check_subscriptions.
                 crate::worker::trigger_check_subscriptions().await.unwrap();
                 eprintln!("[cleanup] Published CheckSubscriptions job");
 
                 // Poll VM history for an "Expired" entry (up to 30 s).
-                // The worker calls on_expired → stop_vm (fails on fake host
-                // but the history entry is written best-effort).  We also
-                // accept the subscription becoming inactive as a valid signal
-                // that the grace-period path fired instead.
+                // The worker calls on_expired → stop_vm (best-effort on a fake
+                // host) → log_vm_expired. The history entry is the last thing
+                // the handler writes for this VM, so it is also the signal that
+                // teardown below may delete the VM without racing the worker.
                 let expired_signal = poll_until(30, 500, || {
                     let admin = admin.clone();
                     async move {
@@ -2063,38 +2064,26 @@ mod tests {
                             .get_auth(&format!("/api/admin/v1/vms/{paid_vm_id}/history"))
                             .await
                             .unwrap();
-                        if let Ok(h) =
+                        let Ok(h) =
                             serde_json::from_str::<serde_json::Value>(&hr.text().await.unwrap())
-                        {
-                            if h["data"].as_array().map_or(false, |arr| {
-                                arr.iter().any(|e| {
-                                    e["action_type"]
-                                        .as_str()
-                                        .map_or(false, |t| t.eq_ignore_ascii_case("expired"))
-                                })
-                            }) {
-                                return true;
-                            }
-                        }
-                        // Also accept subscription becoming inactive
-                        let sr = admin
-                            .get_auth(&format!("/api/admin/v1/subscriptions/{sub2_id}"))
-                            .await
-                            .unwrap();
-                        if let Ok(s) =
-                            serde_json::from_str::<serde_json::Value>(&sr.text().await.unwrap())
-                        {
-                            return !s["data"]["is_active"].as_bool().unwrap_or(true);
-                        }
-                        false
+                        else {
+                            return false;
+                        };
+                        h["data"].as_array().is_some_and(|arr| {
+                            arr.iter().any(|e| {
+                                e["action_type"]
+                                    .as_str()
+                                    .is_some_and(|t| t.eq_ignore_ascii_case("expired"))
+                            })
+                        })
                     }
                 })
                 .await;
 
                 assert!(
                     expired_signal,
-                    "Expired subscription {sub2_id} should have triggered stop/deactivation \
-                     within 30 s (check vm history for Expired entry or subscription is_active=false)"
+                    "Expired subscription {sub2_id} should have produced an Expired \
+                     vm_history entry for VM {paid_vm_id} within 30 s"
                 );
                 eprintln!("[cleanup] Subscription expiry handled by worker for VM {paid_vm_id} ✓");
 
