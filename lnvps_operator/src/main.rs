@@ -23,6 +23,10 @@ use crate::metrics::PrometheusClient;
 /// operator can decrypt columns the API encrypted (e.g. `app_deployment.config`).
 const ENCRYPTION_KEY_ENV: &str = "LNVPS_ENCRYPTION_KEY";
 
+/// Overrides `db` from the config file, so a deployment can keep its
+/// non-sensitive settings in a ConfigMap and read the DSN from a Secret.
+const DATABASE_URL_ENV: &str = "LNVPS_DATABASE_URL";
+
 /// Database field-encryption configuration (mirrors the API's `EncryptionConfig`
 /// so both sides use the same key).
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -38,7 +42,10 @@ pub struct EncryptionConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct Settings {
-    /// MYSQL connection string
+    /// MYSQL connection string. Optional here because the DSN carries a
+    /// password and belongs in a Secret rather than the config file; see
+    /// [`DATABASE_URL_ENV`].
+    #[serde(default)]
     pub db: String,
 
     /// Kubernetes namespace to watch (defaults to "default" if not specified)
@@ -129,6 +136,22 @@ pub struct Context {
     pub metrics: Option<PrometheusClient>,
 }
 
+/// The DSN to connect with: the environment wins over the config file, so the
+/// credential can live in a Secret while the rest of the config stays in a
+/// ConfigMap.
+fn database_url(configured: &str, from_env: Option<String>) -> Result<String> {
+    let env = from_env.unwrap_or_default();
+    let url = if env.trim().is_empty() {
+        configured.trim()
+    } else {
+        env.trim()
+    };
+    if url.is_empty() {
+        anyhow::bail!("no database connection string: set {DATABASE_URL_ENV} or `db` in the config");
+    }
+    Ok(url.to_string())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // kube (via hyper-rustls) and sqlx's TLS both use rustls, but the dependency
@@ -165,7 +188,8 @@ async fn main() -> Result<()> {
         );
     }
 
-    let db = LNVpsDbMysql::new(&settings.db).await?;
+    let db_url = database_url(&settings.db, std::env::var(DATABASE_URL_ENV).ok())?;
+    let db = LNVpsDbMysql::new(&db_url).await?;
     let client = Client::try_default().await?;
 
     let metrics = match &settings.prometheus {
@@ -323,6 +347,27 @@ async fn trigger_listener(ctx: Arc<Context>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The DSN is a credential, so a deployment can supply it from a Secret
+    /// through the environment; the config file stays the fallback.
+    #[test]
+    fn database_url_prefers_the_environment() {
+        assert_eq!(
+            database_url("mysql://from-config", Some("mysql://from-env".into())).unwrap(),
+            "mysql://from-env"
+        );
+        assert_eq!(
+            database_url("mysql://from-config", None).unwrap(),
+            "mysql://from-config"
+        );
+        // An env var set to nothing is not a connection string.
+        assert_eq!(
+            database_url("mysql://from-config", Some("  ".into())).unwrap(),
+            "mysql://from-config"
+        );
+        assert!(database_url("", None).is_err());
+        assert!(database_url("", Some(String::new())).is_err());
+    }
 
     fn load(name: &str) -> Settings {
         let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), name);

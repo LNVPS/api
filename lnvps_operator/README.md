@@ -28,14 +28,11 @@ docker buildx bake lnvps-operator   # shared root Dockerfile, target lnvps-opera
 
 ### 2. Update Configuration
 
-Edit the ConfigMap in `k8s-deployment.yaml`:
+Edit the ConfigMap in `k8s-minimal.yaml`:
 
 ```yaml
 data:
   config.yaml: |
-    # Update the database connection string
-    db: "mysql://username:password@your-mysql-host:3306/lnvps"
-    
     # Set the namespace where your nostr service runs
     namespace: "your-namespace"
     
@@ -46,6 +43,9 @@ data:
     # Set your cert-manager cluster issuer
     cluster-issuer: "your-cluster-issuer"
 ```
+
+The database connection string does not go in the ConfigMap. See
+[Database user](#database-user).
 
 ### 3. Deploy the Operator
 
@@ -137,6 +137,30 @@ The operator requires these Kubernetes permissions:
 
 These are automatically created by the deployment manifest.
 
+## Database user
+
+The operator connects with its own MySQL user, not root, and reads the DSN from
+the `LNVPS_DATABASE_URL` environment variable (a Secret in the manifest). The
+config file's `db` key is still honoured as a fallback for local runs; the
+environment wins when both are set.
+
+It touches four things in the schema: it reads domains, apps and app clusters,
+and updates `app_deployment` rows. That is `SELECT` and `UPDATE` — no inserts,
+no deletes, and it never runs migrations, so it needs no DDL:
+
+```sql
+CREATE USER 'lnvps_operator'@'%' IDENTIFIED BY '<password>';
+GRANT SELECT, UPDATE ON lnvps.* TO 'lnvps_operator'@'%';
+```
+
+```bash
+kubectl -n lnvps-system create secret generic lnvps-operator-db \
+  --from-literal=url='mysql://lnvps_operator:<password>@mysql-service:3306/lnvps'
+```
+
+A schema change that makes the operator insert or delete needs the grant
+widened first, or the reconcile fails at that statement.
+
 ## Monitoring
 
 The deployment includes:
@@ -214,6 +238,6 @@ annotations:
 
 - The operator runs as non-root user (UID 65534)
 - Uses read-only root filesystem
-- Database credentials should be stored in Secrets
+- The database DSN is read from a Secret, never the ConfigMap
 - Network policies can restrict operator traffic
 - Consider using Pod Security Standards/Admission Controllers
