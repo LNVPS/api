@@ -52,6 +52,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
   A `pattern` is compiled when the app is created or updated, so an invalid regex is the catalog author's error rather than a customer's failed order, and a declared `default` is checked against its own field at the same point. Existing app definitions are unaffected: no field declares a `pattern` yet, and the documented `owner_npub` (HAVEN) and `owner_pubkey` (Buzz) fields gain one in this release — the live catalog rows need the same edit, which no migration performs.
 
+- **An app deployment's `status` now reports the workload, not the billing gate** (issue #276) — **`status` on `ApiAppDeployment` changes meaning; no field is added or removed.** The operator wrote `running` whenever the subscription was paid, the customer had not stopped the deployment, and the reconcile completed — nothing anywhere read the workload back. A database that aborted while initialising its data directory therefore reported `running` in the admin UI and on the customer's own page, continuously, while it crash-looped.
+
+  `running` now requires every replica to be ready. A container the kubelet has given up on (`CrashLoopBackOff`, `ImagePullBackOff`, `ErrImagePull`, `CreateContainerConfigError`, `CreateContainerError`) reports `error`, with the failing service, that reason and the head of the container's last termination message in `status_message`. Anything else not yet ready reports `pending`, which is what a deployment coming up honestly is.
+
+  **Clients that treated `running` as "provisioned successfully" will now see `pending` for the first seconds of a deployment's life and `error` for one that cannot start.** Both were previously reported as `running`. `stopped` is unchanged and still answers the billing/lifecycle question — pair it with `billing_state` (issue #253) to tell "customer stopped it" from "never paid". When the operator cannot reach the API server to read health, it leaves the stored status alone rather than guessing.
+
 ### Added
 
 - **`billing_state` on an app deployment — `unpaid` / `active` / `expired`** (issue #253) — `ApiAppDeployment` (`GET /api/v1/app-deployments` and `/{id}`, and every endpoint returning a deployment) gains a nullable `billing_state` string. Additive: no existing field changes.

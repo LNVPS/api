@@ -286,8 +286,23 @@ pub struct ApiAppDeployment {
     /// Desired run state: `running` or `stopped`.
     pub desired_state: String,
     /// Observed status: `pending`, `running`, `stopped`, `error`, `deleting`.
+    ///
+    /// Read back from the cluster, not from the billing gate (issue #276):
+    /// `running` means every replica is ready, `pending` means the workload is
+    /// still coming up, and `error` means a container will not start — the
+    /// kubelet's reason and the container's last output are in
+    /// `status_message`. A crash-looping app previously reported `running`
+    /// here, because the field only ever said "the subscription is paid".
+    ///
+    /// `stopped` remains a billing/lifecycle answer (stopped by the customer,
+    /// unpaid, or expired); use `billing_state` to tell those apart.
     pub status: String,
     /// Human-readable status/error detail from the operator, when present.
+    ///
+    /// For `error` this names the failing service, the kubelet's reason
+    /// (`CrashLoopBackOff`, `ImagePullBackOff`, …) and the head of the
+    /// container's last termination message — worth rendering verbatim, since
+    /// it is usually the only thing that says *what* is wrong.
     pub status_message: Option<String>,
     /// Subscription this deployment is billed under (renew via the subscription
     /// endpoints). `None` if the subscription can't be resolved.

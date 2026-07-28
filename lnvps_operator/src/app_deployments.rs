@@ -27,7 +27,7 @@ use crate::Context;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     ConfigMap, Container, ContainerPort, EnvVar, Namespace, PersistentVolumeClaim,
-    PersistentVolumeClaimSpec, PodSecurityContext, PodSpec, PodTemplateSpec, ResourceQuota,
+    PersistentVolumeClaimSpec, Pod, PodSecurityContext, PodSpec, PodTemplateSpec, ResourceQuota,
     ResourceRequirements, SeccompProfile, SecurityContext, Service, ServicePort, ServiceSpec,
     Volume as K8sVolume, VolumeMount, VolumeResourceRequirements,
 };
@@ -1252,7 +1252,8 @@ async fn reconcile_one(
     // retention note further down).
     if !provisions_cluster_objects(&gate) {
         info!("app deployment {id} not provisioned: {gate}");
-        write_back_status(ctx, deployment, hostname, &gate).await?;
+        // Nothing was applied, so there is no workload to read.
+        write_back_status(ctx, deployment, hostname, &gate, None).await?;
         return Ok(());
     }
 
@@ -1354,10 +1355,180 @@ async fn reconcile_one(
     // namespace cap.
     delete_resource_quota(client, id).await?;
 
-    // 7. Status write-back: record the hostname and running state.
-    write_back_status(ctx, deployment, hostname, &gate).await?;
+    // 7. Status write-back: record the hostname and what the workload is
+    // actually doing (#276).
+    //
+    // A failed read is not a failed reconcile: the objects are applied and
+    // correct, and the API server being briefly unavailable must not undo that
+    // or overwrite a true status with a guess.
+    let health = match read_workload_health(client, id).await {
+        Ok(h) => Some(h),
+        Err(e) => {
+            warn!("app deployment {id}: could not read workload health: {e}");
+            None
+        }
+    };
+    write_back_status(ctx, deployment, hostname, &gate, health).await?;
     info!("reconciled app deployment {id}");
     Ok(())
+}
+
+/// What the cluster says about a deployment's workload (issue #276).
+///
+/// Collected from the Deployments and Pods in the deployment's namespace, and
+/// mapped to a status by [`workload_status`]. Kept as data so the mapping is a
+/// pure function, testable without a cluster — like [`gate_running`].
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WorkloadHealth {
+    /// Replicas asked for, summed across the deployment's services.
+    pub desired: i32,
+    /// Replicas the cluster reports as ready.
+    pub ready: i32,
+    /// Containers the kubelet says will not start.
+    pub failures: Vec<ContainerFailure>,
+}
+
+/// One container the kubelet is refusing to run, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerFailure {
+    /// Compose service the container belongs to.
+    pub service: String,
+    /// The kubelet's waiting reason, e.g. `CrashLoopBackOff`.
+    pub reason: String,
+    /// The last termination message, when the container ran and died.
+    pub detail: Option<String>,
+}
+
+/// Waiting reasons that mean "this will not start on its own".
+///
+/// `CrashLoopBackOff` only appears after the kubelet has restarted a container
+/// repeatedly, so it is a settled verdict rather than a container that is
+/// merely slow — which is why a not-yet-ready workload without one of these is
+/// reported as `Pending` and not as an error.
+const TERMINAL_WAITING_REASONS: [&str; 5] = [
+    "CrashLoopBackOff",
+    "ImagePullBackOff",
+    "ErrImagePull",
+    "CreateContainerConfigError",
+    "CreateContainerError",
+];
+
+/// Map observed workload health onto the status the customer sees (issue #276).
+///
+/// `Running` used to mean "the billing gate is open": it was written whenever
+/// the subscription was paid and the customer had not stopped the deployment,
+/// and nothing ever read the workload back. A database that aborted while
+/// initialising its data directory reported `Running` throughout, in the admin
+/// UI and on the customer's own page, for as long as it kept crashing.
+///
+/// So `Running` now requires every replica to be ready. A container the kubelet
+/// has given up on is `Error` with the reason (and its last words) in
+/// `status_message`; anything else that is not yet ready is `Pending`, which is
+/// what a deployment coming up honestly is.
+pub fn workload_status(health: &WorkloadHealth) -> (AppDeploymentStatus, Option<String>) {
+    if !health.failures.is_empty() {
+        let detail = health
+            .failures
+            .iter()
+            .map(|f| {
+                let mut line = format!("{}: {}", f.service, f.reason);
+                if let Some(d) = &f.detail {
+                    // The last termination message is the app's own output and
+                    // can be long; it is the most useful part, so keep the head
+                    // of it rather than dropping it.
+                    let d = d.trim();
+                    if !d.is_empty() {
+                        let head: String = d.chars().take(200).collect();
+                        line.push_str(&format!(" ({head})"));
+                    }
+                }
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return (AppDeploymentStatus::Error, Some(detail));
+    }
+    if health.desired > 0 && health.ready >= health.desired {
+        return (AppDeploymentStatus::Running, None);
+    }
+    (
+        AppDeploymentStatus::Pending,
+        Some(format!(
+            "waiting for the workload to become ready ({}/{} replicas)",
+            health.ready, health.desired
+        )),
+    )
+}
+
+/// Read the workload's health back out of the cluster (issue #276).
+///
+/// Deployments give the ready/desired counts; pods give the reason a container
+/// is not starting, which is the part a customer can act on ("no such image",
+/// "the database aborted") and which the replica count alone cannot say.
+async fn read_workload_health(client: &Client, deployment_id: u64) -> Result<WorkloadHealth> {
+    let ns = namespace_name(deployment_id);
+    let mut health = WorkloadHealth::default();
+
+    let deps: Api<Deployment> = Api::namespaced(client.clone(), &ns);
+    for d in deps.list(&ListParams::default()).await?.items {
+        health.desired += d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(0);
+        health.ready += d
+            .status
+            .as_ref()
+            .and_then(|s| s.ready_replicas)
+            .unwrap_or(0);
+    }
+
+    let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
+    for p in pods.list(&ListParams::default()).await?.items {
+        health.failures.extend(pod_failures(&p));
+    }
+    Ok(health)
+}
+
+/// The terminal container failures a single pod reports, if any.
+///
+/// Pure so the reason filter and the service-name fallback are testable without
+/// a cluster.
+fn pod_failures(pod: &Pod) -> Vec<ContainerFailure> {
+    // The compose service name is on the pod as the component label, which
+    // is what the customer recognises — the pod name is generated.
+    let service = pod
+        .labels()
+        .get("app.kubernetes.io/component")
+        .cloned()
+        .unwrap_or_else(|| pod.name_any());
+    let Some(status) = &pod.status else {
+        return vec![];
+    };
+    let statuses = status
+        .container_statuses
+        .iter()
+        .flatten()
+        .chain(status.init_container_statuses.iter().flatten());
+    let mut failures = vec![];
+    for cs in statuses {
+        let Some(waiting) = cs.state.as_ref().and_then(|s| s.waiting.as_ref()) else {
+            continue;
+        };
+        let Some(reason) = waiting.reason.as_deref() else {
+            continue;
+        };
+        if !TERMINAL_WAITING_REASONS.contains(&reason) {
+            continue;
+        }
+        failures.push(ContainerFailure {
+            service: service.clone(),
+            reason: reason.to_string(),
+            detail: cs
+                .last_state
+                .as_ref()
+                .and_then(|s| s.terminated.as_ref())
+                .and_then(|t| t.message.clone())
+                .or_else(|| waiting.message.clone()),
+        });
+    }
+    failures
 }
 
 /// Record the deployment's hostname and why it is (not) running.
@@ -1372,15 +1543,33 @@ async fn write_back_status(
     deployment: &AppDeployment,
     hostname: String,
     gate: &GateReason,
+    health: Option<WorkloadHealth>,
 ) -> Result<()> {
     let id = deployment.id;
     let mut updated = deployment.clone();
     updated.hostname = Some(hostname);
     match gate {
-        GateReason::Running => {
-            updated.status = AppDeploymentStatus::Running;
-            updated.status_message = None;
-        }
+        GateReason::Running => match health {
+            // The gate being open only says the customer has paid and wants it
+            // running. What it *is* doing comes from the cluster (#276).
+            Some(h) => {
+                let (status, message) = workload_status(&h);
+                if status != AppDeploymentStatus::Running {
+                    info!(
+                        "app deployment {id} is {status}: {}",
+                        message.as_deref().unwrap_or("")
+                    );
+                }
+                updated.status = status;
+                updated.status_message = message;
+            }
+            // Health could not be read (see the call site). Asserting anything
+            // here would be a guess: leave the stored status alone rather than
+            // reporting a state nobody observed.
+            None => {
+                warn!("app deployment {id}: workload health unknown, leaving status as-is");
+            }
+        },
         // A lookup fault is an operational error, not a lifecycle state — mark
         // it Error so it's visibly wrong and alerted on, not a calm `stopped`.
         GateReason::SubscriptionLookupFailed(e) => {
@@ -2638,6 +2827,147 @@ config:
             // Shared namespace objects render from the footprint.
             let _ = build_network_policy(id, "ingress-nginx");
         }
+    }
+
+    /// `Running` now means the workload is running, not that the bill is paid
+    /// (#276). A crash-looping container reads Error with the reason, a
+    /// workload still coming up reads Pending, and only a fully ready one reads
+    /// Running.
+    #[test]
+    fn workload_status_reports_what_the_cluster_says() {
+        // Every replica ready: the only case that is Running.
+        let (s, m) = workload_status(&WorkloadHealth {
+            desired: 2,
+            ready: 2,
+            failures: vec![],
+        });
+        assert_eq!(s, AppDeploymentStatus::Running);
+        assert_eq!(m, None);
+
+        // Coming up is Pending, not Running — and says how far along it is.
+        let (s, m) = workload_status(&WorkloadHealth {
+            desired: 2,
+            ready: 1,
+            failures: vec![],
+        });
+        assert_eq!(s, AppDeploymentStatus::Pending);
+        assert!(m.unwrap().contains("1/2"));
+
+        // A deployment with nothing applied yet is Pending, not Running: a
+        // zero/zero "everything I asked for is ready" would be the same lie in
+        // a different shape.
+        let (s, _) = workload_status(&WorkloadHealth::default());
+        assert_eq!(s, AppDeploymentStatus::Pending);
+
+        // The case Kieran hit: a container the kubelet has given up on. Error,
+        // naming the service, the reason, and the container's last words.
+        let (s, m) = workload_status(&WorkloadHealth {
+            desired: 2,
+            ready: 1,
+            failures: vec![ContainerFailure {
+                service: "db".to_string(),
+                reason: "CrashLoopBackOff".to_string(),
+                detail: Some("InnoDB: Unable to create temporary file\n".to_string()),
+            }],
+        });
+        assert_eq!(s, AppDeploymentStatus::Error);
+        let m = m.unwrap();
+        assert!(m.contains("db: CrashLoopBackOff"), "{m}");
+        assert!(m.contains("InnoDB"), "{m}");
+
+        // A failure outranks a ready count: a two-service app with one service
+        // up and one crash-looping is broken, not running.
+        let (s, _) = workload_status(&WorkloadHealth {
+            desired: 1,
+            ready: 1,
+            failures: vec![ContainerFailure {
+                service: "web".to_string(),
+                reason: "ImagePullBackOff".to_string(),
+                detail: None,
+            }],
+        });
+        assert_eq!(s, AppDeploymentStatus::Error);
+
+        // A long last-termination message is truncated rather than dropped —
+        // the head of it is what names the fault.
+        let (_, m) = workload_status(&WorkloadHealth {
+            desired: 1,
+            ready: 0,
+            failures: vec![ContainerFailure {
+                service: "db".to_string(),
+                reason: "CrashLoopBackOff".to_string(),
+                detail: Some("x".repeat(5000)),
+            }],
+        });
+        let m = m.unwrap();
+        assert!(m.len() < 400, "message stays renderable: {}", m.len());
+    }
+
+    /// A pod is only a failure once the kubelet has settled on one: a container
+    /// still being created is not an error the customer can act on.
+    #[test]
+    fn pod_failures_reports_only_terminal_reasons() {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus,
+            PodStatus,
+        };
+
+        let waiting = |reason: &str| ContainerState {
+            waiting: Some(ContainerStateWaiting {
+                reason: Some(reason.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let status = |name: &str, state: ContainerState| ContainerStatus {
+            name: name.to_string(),
+            state: Some(state),
+            ..Default::default()
+        };
+
+        let mut crashing = status("db", waiting("CrashLoopBackOff"));
+        crashing.last_state = Some(ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                message: Some("InnoDB: Unable to create temporary file\n".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let pod = Pod {
+            metadata: ObjectMeta {
+                name: Some("db-7f9c8-abcde".to_string()),
+                labels: Some(BTreeMap::from([(
+                    "app.kubernetes.io/component".to_string(),
+                    "db".to_string(),
+                )])),
+                ..Default::default()
+            },
+            status: Some(PodStatus {
+                container_statuses: Some(vec![
+                    status("web", waiting("ContainerCreating")),
+                    crashing,
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            pod_failures(&pod),
+            vec![ContainerFailure {
+                // The component label, not the generated pod name.
+                service: "db".to_string(),
+                reason: "CrashLoopBackOff".to_string(),
+                detail: Some("InnoDB: Unable to create temporary file\n".to_string()),
+            }]
+        );
+
+        // Without the label there is still a name to show, so a failure is
+        // never dropped for want of one.
+        let mut unlabelled = pod.clone();
+        unlabelled.metadata.labels = None;
+        assert_eq!(unlabelled.name_any(), pod_failures(&unlabelled)[0].service);
     }
 
     // ── billing gate (reconcile_one) ────────────────────────────────────────
