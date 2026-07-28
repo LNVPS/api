@@ -360,6 +360,20 @@ async fn deployment_to_api(
     db: &dyn LNVpsDb,
     d: AppDeployment,
 ) -> Result<ApiAppDeployment, ApiError> {
+    let (services, volumes) = db.list_app_deployment_usage_breakdown(&[d.id]).await?;
+    deployment_to_api_with_breakdown(db, d, services, volumes).await
+}
+
+/// As [`deployment_to_api`], with the usage breakdown already read.
+///
+/// A listing reads every row's breakdown in one query and hands each
+/// deployment its own share, rather than paying a query per row.
+async fn deployment_to_api_with_breakdown(
+    db: &dyn LNVpsDb,
+    d: AppDeployment,
+    usage_services: Vec<lnvps_db::AppDeploymentServiceUsage>,
+    usage_volumes: Vec<lnvps_db::AppDeploymentVolumeUsage>,
+) -> Result<ApiAppDeployment, ApiError> {
     // Resolve the owning subscription from the line item (best-effort). Its
     // billing state comes from the same row: deriving it here, rather than
     // leaving the client to infer one from `status`, is issue #253.
@@ -383,7 +397,6 @@ async fn deployment_to_api(
     let multiplier = d.resource_multiplier.max(1);
     let app = db.get_app(d.app_id).await?;
     let m = multiplier as u64;
-    let (usage_services, usage_volumes) = db.list_app_deployment_usage_breakdown(&[d.id]).await?;
     let usage = AppDeploymentUsage::from_parts(&d, usage_services, usage_volumes);
     Ok(ApiAppDeployment {
         id: d.id,
@@ -555,9 +568,21 @@ async fn v1_list_app_deployments(
 ) -> ApiResult<Vec<ApiAppDeployment>> {
     let uid = this.db.upsert_user(&auth.pubkey()).await?;
     let deployments = this.db.list_user_app_deployments(uid).await?;
+    let ids: Vec<u64> = deployments.iter().map(|d| d.id).collect();
+    let (services, volumes) = this.db.list_app_deployment_usage_breakdown(&ids).await?;
     let mut out = Vec::with_capacity(deployments.len());
     for d in deployments {
-        out.push(deployment_to_api(this.db.as_ref(), d).await?);
+        let mine_s = services
+            .iter()
+            .filter(|s| s.deployment_id == d.id)
+            .cloned()
+            .collect();
+        let mine_v = volumes
+            .iter()
+            .filter(|v| v.deployment_id == d.id)
+            .cloned()
+            .collect();
+        out.push(deployment_to_api_with_breakdown(this.db.as_ref(), d, mine_s, mine_v).await?);
     }
     ApiData::ok(out)
 }

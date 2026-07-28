@@ -1283,6 +1283,9 @@ async fn collect_usage(
         return Ok(());
     };
     let by_id: BTreeMap<u64, &AppDeployment> = deployments.iter().map(|d| (d.id, d)).collect();
+    // A handful of catalog apps back every customer deployment, so the compose
+    // is fetched and parsed once per app rather than once per row.
+    let mut composes: BTreeMap<u64, Option<Compose>> = BTreeMap::new();
     for (id, usage) in client.deployment_usage().await? {
         // Prometheus keeps series past a namespace's deletion, and it answers
         // for the whole cluster, so only deployments this pass owns are written.
@@ -1305,20 +1308,27 @@ async fn collect_usage(
         let Some(deployment) = by_id.get(&id) else {
             continue;
         };
-        let compose = match ctx.db.get_app(deployment.app_id).await {
-            Ok(app) => match Compose::parse(&app.compose) {
-                Ok(c) => c,
+        let app_id = deployment.app_id;
+        if let std::collections::btree_map::Entry::Vacant(slot) = composes.entry(app_id) {
+            let parsed = match ctx.db.get_app(app_id).await {
+                Ok(app) => match Compose::parse(&app.compose) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        warn!("app {app_id} usage breakdown skipped, compose invalid: {e}");
+                        None
+                    }
+                },
                 Err(e) => {
-                    warn!("app deployment {id} usage breakdown skipped, compose invalid: {e}");
-                    continue;
+                    warn!("app {app_id} usage breakdown skipped: {e}");
+                    None
                 }
-            },
-            Err(e) => {
-                warn!("app deployment {id} usage breakdown skipped: {e}");
-                continue;
-            }
+            };
+            slot.insert(parsed);
+        }
+        let Some(Some(compose)) = composes.get(&app_id) else {
+            continue;
         };
-        let (services, volumes) = breakdown_rows(id, &compose, &usage);
+        let (services, volumes) = breakdown_rows(id, compose, &usage);
         ctx.db
             .replace_app_deployment_usage_breakdown(id, &services, &volumes)
             .await?;

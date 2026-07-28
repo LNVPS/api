@@ -13,7 +13,7 @@
 //! cannot say which container is at its limit or which volume is full, and
 //! those are the failures that take an app down.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
@@ -284,18 +284,18 @@ pub fn collect_usage(
         });
     }
 
-    let cpu_seen: HashMap<u64, ()> = cpu
+    let cpu_seen: HashSet<u64> = cpu
         .iter()
-        .filter_map(|s| Some((deployment_id_from_namespace(&s.namespace)?, ())))
+        .filter_map(|s| deployment_id_from_namespace(&s.namespace))
         .collect();
-    let memory_seen: HashMap<u64, ()> = memory
+    let memory_seen: HashSet<u64> = memory
         .iter()
-        .filter_map(|s| Some((deployment_id_from_namespace(&s.namespace)?, ())))
+        .filter_map(|s| deployment_id_from_namespace(&s.namespace))
         .collect();
 
     totals
         .into_iter()
-        .filter(|(id, _)| cpu_seen.contains_key(id) && memory_seen.contains_key(id))
+        .filter(|(id, _)| cpu_seen.contains(id) && memory_seen.contains(id))
         .map(|(id, (cores, memory_bytes))| {
             let mut containers: Vec<ContainerUsage> = by_container
                 .remove(&id)
