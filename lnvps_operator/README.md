@@ -126,22 +126,11 @@ spec:
 
 ## RBAC Permissions
 
-The operator requires these Kubernetes permissions, each one a verb the
-reconcile loop actually issues:
-
-- **core/namespaces**: `list`, `create`, `patch`, `delete`
-- **core/services, configmaps, persistentvolumeclaims**: `create`, `patch`
-- **core/secrets**: `get`, `create`, `patch`
-- **core/resourcequotas**: `delete`
-- **core/pods**: `list` (container statuses are the reason a deployment is not ready)
-- **apps/deployments**: `list`, `create`, `patch`
-- **networking.k8s.io/ingresses**: `get`, `create`, `update`, `patch`, `delete`
-- **networking.k8s.io/networkpolicies**: `create`, `patch`
-
-`create` accompanies `patch` because server-side apply creates the object on
-the first pass. The operator holds no watches, so `watch` is granted nowhere.
-
-These are automatically created by the deployment manifest.
+The ClusterRole in [`k8s-minimal.yaml`](k8s-minimal.yaml) is the list, and each
+rule there is annotated with the call that needs it. Every verb is one the
+reconcile loop issues: `create` accompanies `patch` because server-side apply
+creates the object on the first pass, and the operator holds no watches, so
+`watch` is granted nowhere.
 
 ### Secret access is still cluster-wide
 
