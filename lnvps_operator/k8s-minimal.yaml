@@ -27,6 +27,11 @@ rules:
 - apiGroups: [""]
   resources: ["services", "secrets", "configmaps", "persistentvolumeclaims", "resourcequotas"]
   verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+# Pods are read-only: the replica counts say a workload is not ready, only the
+# container statuses say why, and that reason is what the customer sees.
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get", "list", "watch"]
 # Workloads.
 - apiGroups: ["apps"]
   resources: ["deployments"]
