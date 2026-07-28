@@ -28,10 +28,6 @@ use lnvps_db::{
 
 use crate::Context;
 use crate::metrics::DeploymentUsage;
-use lnvps_api_common::k8s_names::{
-    deployment_files_configmap, deployment_id_from_namespace,
-    deployment_namespace as namespace_name, deployment_secret, deployment_volume,
-};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     ConfigMap, Container, ContainerPort, EnvVar, Namespace, PersistentVolumeClaim,
@@ -47,6 +43,10 @@ use k8s_openapi::api::networking::v1::{
 use k8s_openapi::api::rbac::v1::{RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
+use lnvps_api_common::k8s_names::{
+    deployment_files_configmap, deployment_id_from_namespace,
+    deployment_namespace as namespace_name, deployment_secret, deployment_volume,
+};
 use lnvps_compose::{
     Compose, Expose, ROOT_ENTRYPOINT_CAPABILITIES, ResolvedFile, ResolvedInit,
     Service as ComposeService,
@@ -355,6 +355,19 @@ fn build_resource_requirements(
 /// every reconcile so namespaces created before the quota was retired heal
 /// themselves; server-side apply cannot prune an object we simply stop
 /// applying.
+/// Delete the custom domain Ingress, if any. A `404` means it is already gone.
+async fn delete_custom_domain_ingress(client: &Client, deployment_id: u64) -> Result<()> {
+    let api: Api<Ingress> = Api::namespaced(client.clone(), &namespace_name(deployment_id));
+    match api
+        .delete(CUSTOM_INGRESS_NAME, &DeleteParams::default())
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
 async fn delete_resource_quota(client: &Client, deployment_id: u64) -> Result<()> {
     let api: Api<ResourceQuota> = Api::namespaced(client.clone(), &namespace_name(deployment_id));
     match api.delete("quota", &DeleteParams::default()).await {
@@ -877,41 +890,37 @@ pub fn build_deployment(
     }
 }
 
-/// An Ingress routing `hostname` (and an optional customer `custom_domain`) to
-/// the first `expose: ingress` port found across the app's services, with
-/// cert-manager TLS. Returns `None` when no service exposes an ingress port.
-/// `issuer`/`class` come from operator config.
+/// Ingress name for the deployment's default host.
+pub const INGRESS_NAME: &str = "app";
+
+/// Ingress name for the customer's custom domain.
 ///
-/// Both hosts serve the same backend. Each gets its own TLS secret
-/// (`app-tls` for the default host, `app-tls-custom` for the custom domain) so
-/// cert-manager issues a separate certificate per host via HTTP-01 — the custom
-/// domain's cert is only solvable once the customer's CNAME points at us.
-pub fn build_ingress(
-    deployment_id: u64,
-    compose: &Compose,
-    hostname: &str,
-    custom_domain: Option<&str>,
-    issuer: &str,
-    class: &str,
-) -> Option<Ingress> {
-    // Find the service + port marked expose: ingress.
-    let (service_name, port) = compose.services.iter().find_map(|(name, svc)| {
+/// Separate from the default host's because cert-manager's issuer annotation is
+/// per Ingress, not per TLS entry: one object cannot both reuse a shared
+/// certificate and ask for issuance.
+pub const CUSTOM_INGRESS_NAME: &str = "app-custom";
+
+/// TLS secret for the custom domain, issued per deployment.
+const CUSTOM_TLS_SECRET: &str = "app-tls-custom";
+
+/// Per-deployment TLS secret for the default host, used when no shared
+/// certificate is configured.
+const DEFAULT_TLS_SECRET: &str = "app-tls";
+
+/// The first `expose: ingress` port across the app's services, with the service
+/// that declares it.
+fn ingress_target(compose: &Compose) -> Option<(String, lnvps_compose::Port)> {
+    compose.services.iter().find_map(|(name, svc)| {
         svc.ports
             .iter()
             .find(|p| p.expose == Expose::Ingress)
             .map(|p| (name.clone(), p.clone()))
-    })?;
+    })
+}
 
-    // cert-manager cluster-issuer drives TLS issuance. The ingress class is set
-    // via the modern `spec.ingressClassName` (below) rather than the deprecated
-    // `kubernetes.io/ingress.class` annotation, which recent ingress-nginx
-    // ignores (and warns about if both are present).
-    let annotations = BTreeMap::from([(
-        "cert-manager.io/cluster-issuer".to_string(),
-        issuer.to_string(),
-    )]);
-
-    let rule_for = |host: &str| IngressRule {
+/// One rule routing `host` to the exposed port.
+fn ingress_rule(host: &str, service_name: &str, port: &lnvps_compose::Port) -> IngressRule {
+    IngressRule {
         host: Some(host.to_string()),
         http: Some(HTTPIngressRuleValue {
             paths: vec![HTTPIngressPath {
@@ -919,7 +928,7 @@ pub fn build_ingress(
                 path_type: "Prefix".to_string(),
                 backend: IngressBackend {
                     service: Some(IngressServiceBackend {
-                        name: service_name.clone(),
+                        name: service_name.to_string(),
                         port: Some(ServiceBackendPort {
                             number: Some(port.container as i32),
                             ..Default::default()
@@ -929,27 +938,45 @@ pub fn build_ingress(
                 },
             }],
         }),
-    };
-
-    let mut rules = vec![rule_for(hostname)];
-    let mut tls = vec![IngressTLS {
-        hosts: Some(vec![hostname.to_string()]),
-        secret_name: Some("app-tls".to_string()),
-    }];
-    // Custom domain (dedup against the default host in case they're identical).
-    if let Some(cd) = custom_domain
-        && !cd.eq_ignore_ascii_case(hostname)
-    {
-        rules.push(rule_for(cd));
-        tls.push(IngressTLS {
-            hosts: Some(vec![cd.to_string()]),
-            secret_name: Some("app-tls-custom".to_string()),
-        });
     }
+}
+
+/// An Ingress routing `hostname` to the first `expose: ingress` port found
+/// across the app's services. Returns `None` when no service exposes one.
+/// `issuer`/`class` come from operator config.
+///
+/// With `shared_tls_secret` set, the host serves a certificate issued once for
+/// the whole apps domain and mirrored into the namespace, and the issuer
+/// annotation is left off so cert-manager does not also issue — and overwrite —
+/// one per deployment. Every deployment otherwise spends one of the ACME
+/// account's weekly certificates for the registered domain, which is a ceiling
+/// on how many customers can be onboarded in a week.
+///
+/// Without it, the host keeps its own per-deployment certificate.
+pub fn build_ingress(
+    deployment_id: u64,
+    compose: &Compose,
+    hostname: &str,
+    shared_tls_secret: Option<&str>,
+    issuer: &str,
+    class: &str,
+) -> Option<Ingress> {
+    let (service_name, port) = ingress_target(compose)?;
+
+    // The ingress class is set via the modern `spec.ingressClassName` (below)
+    // rather than the deprecated `kubernetes.io/ingress.class` annotation, which
+    // recent ingress-nginx ignores (and warns about if both are present).
+    let annotations = match shared_tls_secret {
+        Some(_) => BTreeMap::new(),
+        None => BTreeMap::from([(
+            "cert-manager.io/cluster-issuer".to_string(),
+            issuer.to_string(),
+        )]),
+    };
 
     Some(Ingress {
         metadata: ObjectMeta {
-            name: Some("app".to_string()),
+            name: Some(INGRESS_NAME.to_string()),
             namespace: Some(namespace_name(deployment_id)),
             labels: Some(labels(deployment_id)),
             annotations: Some(annotations),
@@ -957,8 +984,53 @@ pub fn build_ingress(
         },
         spec: Some(IngressSpec {
             ingress_class_name: Some(class.to_string()),
-            tls: Some(tls),
-            rules: Some(rules),
+            tls: Some(vec![IngressTLS {
+                hosts: Some(vec![hostname.to_string()]),
+                secret_name: Some(shared_tls_secret.unwrap_or(DEFAULT_TLS_SECRET).to_string()),
+            }]),
+            rules: Some(vec![ingress_rule(hostname, &service_name, &port)]),
+            ..Default::default()
+        }),
+        status: None,
+    })
+}
+
+/// An Ingress serving the customer's `custom_domain` from the same backend as
+/// the default host, with its own cert-manager-issued certificate.
+///
+/// `None` when there is no custom domain, when it is the default host under
+/// another spelling, or when no service exposes an ingress port. The
+/// certificate is only solvable once the customer's DNS points at us, which is
+/// why it never shares the default host's.
+pub fn build_custom_domain_ingress(
+    deployment_id: u64,
+    compose: &Compose,
+    hostname: &str,
+    custom_domain: Option<&str>,
+    issuer: &str,
+    class: &str,
+) -> Option<Ingress> {
+    let custom_domain = custom_domain.filter(|cd| !cd.eq_ignore_ascii_case(hostname))?;
+    let (service_name, port) = ingress_target(compose)?;
+
+    Some(Ingress {
+        metadata: ObjectMeta {
+            name: Some(CUSTOM_INGRESS_NAME.to_string()),
+            namespace: Some(namespace_name(deployment_id)),
+            labels: Some(labels(deployment_id)),
+            annotations: Some(BTreeMap::from([(
+                "cert-manager.io/cluster-issuer".to_string(),
+                issuer.to_string(),
+            )])),
+            ..Default::default()
+        },
+        spec: Some(IngressSpec {
+            ingress_class_name: Some(class.to_string()),
+            tls: Some(vec![IngressTLS {
+                hosts: Some(vec![custom_domain.to_string()]),
+                secret_name: Some(CUSTOM_TLS_SECRET.to_string()),
+            }]),
+            rules: Some(vec![ingress_rule(custom_domain, &service_name, &port)]),
             ..Default::default()
         }),
         status: None,
@@ -1530,18 +1602,39 @@ async fn reconcile_one(
         .await?;
     }
 
-    // 5. Ingress for the exposed port (if any), serving both the default
-    // hostname and any customer custom domain.
-    if let Some(ing) = build_ingress(
+    // 5. Ingress for the exposed port (if any): the default hostname, plus a
+    // second object for a customer custom domain because only one of the two
+    // asks cert-manager for a certificate.
+    let issuer = ctx
+        .settings
+        .cluster_issuer
+        .as_deref()
+        .unwrap_or("letsencrypt-prod");
+    let class = ctx.settings.ingress_class.as_deref().unwrap_or("nginx");
+
+    // Applied before the default host so a custom domain already being served
+    // is never momentarily unrouted while the two objects are swapped.
+    match build_custom_domain_ingress(
         id,
         &compose,
         &hostname,
         deployment.custom_domain.as_deref(),
-        ctx.settings
-            .cluster_issuer
-            .as_deref()
-            .unwrap_or("letsencrypt-prod"),
-        ctx.settings.ingress_class.as_deref().unwrap_or("nginx"),
+        issuer,
+        class,
+    ) {
+        Some(ing) => apply(client, &ing).await?,
+        // Server-side apply cannot prune an object we stop applying, so a
+        // cleared custom domain has to be deleted explicitly.
+        None => delete_custom_domain_ingress(client, id).await?,
+    }
+
+    if let Some(ing) = build_ingress(
+        id,
+        &compose,
+        &hostname,
+        ctx.settings.app_tls_secret.as_deref(),
+        issuer,
+        class,
     ) {
         apply(client, &ing).await?;
     }
@@ -2414,12 +2507,14 @@ config:
         assert!(build_ingress(7, &c, "h", None, "i", "nginx").is_none());
     }
 
-    /// A custom domain adds a second rule + a separate TLS secret
-    /// (`app-tls-custom`), while the default host keeps its own (`app-tls`).
+    /// A custom domain is served by its own Ingress with its own TLS secret,
+    /// because cert-manager's issuer annotation covers a whole Ingress: the
+    /// default host cannot reuse a shared certificate while sharing an object
+    /// with a host that needs issuance.
     #[test]
-    fn ingress_adds_custom_domain_rule_and_tls() {
+    fn custom_domain_gets_its_own_ingress_and_tls() {
         let c = compose();
-        let ing = build_ingress(
+        let ing = build_custom_domain_ingress(
             7,
             &c,
             "relay.apps.example.com",
@@ -2428,46 +2523,118 @@ config:
             "nginx",
         )
         .unwrap();
+        assert_eq!(ing.metadata.name.as_deref(), Some("app-custom"));
+        assert_eq!(
+            ing.metadata
+                .annotations
+                .as_ref()
+                .unwrap()
+                .get("cert-manager.io/cluster-issuer")
+                .map(|s| s.as_str()),
+            Some("letsencrypt-prod")
+        );
         let spec = ing.spec.unwrap();
 
-        // Two rules: default host + custom domain, same backend.
         let rules = spec.rules.unwrap();
-        let hosts: Vec<&str> = rules.iter().filter_map(|r| r.host.as_deref()).collect();
-        assert_eq!(hosts, vec!["relay.apps.example.com", "blog.example.com"]);
-        let backend = rules[1].http.as_ref().unwrap().paths[0]
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].host.as_deref(), Some("blog.example.com"));
+        let backend = rules[0].http.as_ref().unwrap().paths[0]
             .backend
             .service
             .as_ref()
             .unwrap();
-        assert_eq!(backend.name, "web");
+        assert_eq!(backend.name, "web", "same backend as the default host");
 
-        // Two TLS blocks with distinct secrets/hosts.
         let tls = spec.tls.unwrap();
-        assert_eq!(tls.len(), 2);
-        assert_eq!(tls[0].secret_name.as_deref(), Some("app-tls"));
+        assert_eq!(tls.len(), 1);
+        assert_eq!(tls[0].secret_name.as_deref(), Some("app-tls-custom"));
         assert_eq!(
             tls[0].hosts.as_ref().unwrap(),
-            &vec!["relay.apps.example.com".to_string()]
-        );
-        assert_eq!(tls[1].secret_name.as_deref(), Some("app-tls-custom"));
-        assert_eq!(
-            tls[1].hosts.as_ref().unwrap(),
             &vec!["blog.example.com".to_string()]
         );
 
-        // Custom domain identical to the default host is deduped (no dup rule).
+        // Nothing to serve separately when there is no custom domain, when it
+        // is the default host under another spelling, or with no exposed port.
+        assert!(
+            build_custom_domain_ingress(7, &c, "relay.apps.example.com", None, "i", "nginx")
+                .is_none()
+        );
+        assert!(
+            build_custom_domain_ingress(
+                7,
+                &c,
+                "relay.apps.example.com",
+                Some("RELAY.apps.example.com"),
+                "i",
+                "nginx"
+            )
+            .is_none()
+        );
+        let no_ingress = Compose::parse(
+            "services:\n  a:\n    image: x\n    ports:\n      - { name: p, container: 5, protocol: tcp }\n",
+        )
+        .unwrap();
+        assert!(
+            build_custom_domain_ingress(
+                7,
+                &no_ingress,
+                "relay.apps.example.com",
+                Some("blog.example.com"),
+                "i",
+                "nginx"
+            )
+            .is_none()
+        );
+    }
+
+    /// With a shared certificate configured the default host references it and
+    /// carries no issuer annotation — an annotated Ingress makes cert-manager
+    /// issue into every secret it names, which would overwrite the mirrored
+    /// wildcard with a per-deployment certificate.
+    #[test]
+    fn shared_tls_secret_replaces_per_deployment_issuance() {
+        let c = compose();
         let ing = build_ingress(
             7,
             &c,
             "relay.apps.example.com",
-            Some("relay.apps.example.com"),
+            Some("apps-wildcard-tls"),
             "letsencrypt-prod",
             "nginx",
         )
         .unwrap();
+        assert!(
+            ing.metadata.annotations.as_ref().unwrap().is_empty(),
+            "no issuer annotation when the certificate is shared"
+        );
         let spec = ing.spec.unwrap();
-        assert_eq!(spec.rules.unwrap().len(), 1);
-        assert_eq!(spec.tls.unwrap().len(), 1);
+        let tls = spec.tls.unwrap();
+        assert_eq!(tls.len(), 1);
+        assert_eq!(tls[0].secret_name.as_deref(), Some("apps-wildcard-tls"));
+        assert_eq!(
+            tls[0].hosts.as_ref().unwrap(),
+            &vec!["relay.apps.example.com".to_string()]
+        );
+        // The custom domain still issues its own, shared secret or not.
+        let custom = build_custom_domain_ingress(
+            7,
+            &c,
+            "relay.apps.example.com",
+            Some("blog.example.com"),
+            "letsencrypt-prod",
+            "nginx",
+        )
+        .unwrap();
+        assert_eq!(
+            custom
+                .metadata
+                .annotations
+                .as_ref()
+                .unwrap()
+                .get("cert-manager.io/cluster-issuer")
+                .map(|s| s.as_str()),
+            Some("letsencrypt-prod")
+        );
     }
 
     #[test]
