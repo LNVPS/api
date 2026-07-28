@@ -26,8 +26,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
-- **`buzz-relay` now carries the `nostr` and `relay` tags** (issue #258) — the catalog row was added after the tag backfill, so it held no tags at all and was missing from every tag filter, `?tag=nostr` as much as `?tag=relay`. A migration assigns both, matching `pyramid-relay`, which shares its category. No schema or response-shape change, but the numbers move: `?tag=relay` returns 5 apps rather than 4, `?tag=nostr` 6 rather than 5, and the `app_count` on those two tags in `GET /api/v1/app-tags` rises to match. A client that assumes a uniform price across a tag's results should note that the new relay row is €8.50/month.
-
 - **`GET /api/v1/payment/{id}` now works for every subscription type** — it previously resolved the payer through the VM back-reference, so a payment for a managed app, IP range or other non-VPS subscription errored instead of returning. Ownership is now asserted on the subscription and the embedded `vm_id` is `0` for non-VPS payments (the endpoint remains deprecated in favour of `GET /api/v1/subscriptions/{id}/payments/{payment_id}`).
 
 ### Deprecated
