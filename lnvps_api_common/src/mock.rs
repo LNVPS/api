@@ -4,10 +4,11 @@ use chrono::{Days, Months, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, App, AppCluster, AppDeployment, AppDeploymentDesiredState, AppDeploymentFilter,
-    AppDeploymentStatus, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company,
-    CpuArch, CpuMfg, DbError, DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind,
-    IntervalType, IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase,
-    NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
+    AppDeploymentServiceUsage, AppDeploymentStatus, AppDeploymentVolumeUsage, AppTag,
+    AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, CpuArch, CpuMfg, DbError,
+    DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind, IntervalType, IpRange,
+    IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain,
+    NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
     ReferralCostUsage, ReferralPayout, Region, Router, RouterBgpRoute, RouterBgpSession,
     RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
     SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan,
@@ -82,6 +83,18 @@ pub struct MockDb {
     pub app_tag_assignments: Arc<Mutex<Vec<(u64, u64)>>>,
     pub app_clusters: Arc<Mutex<HashMap<u64, AppCluster>>>,
     pub app_deployments: Arc<Mutex<HashMap<u64, AppDeployment>>>,
+    #[allow(clippy::type_complexity)]
+    pub app_deployment_usage_breakdown: Arc<
+        Mutex<
+            HashMap<
+                u64,
+                (
+                    Vec<AppDeploymentServiceUsage>,
+                    Vec<AppDeploymentVolumeUsage>,
+                ),
+            >,
+        >,
+    >,
 }
 
 impl MockDb {
@@ -370,6 +383,7 @@ impl Default for MockDb {
             app_tag_assignments: Arc::new(Default::default()),
             app_clusters: Arc::new(Default::default()),
             app_deployments: Arc::new(Default::default()),
+            app_deployment_usage_breakdown: Arc::new(Default::default()),
         }
     }
 }
@@ -3646,6 +3660,36 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn replace_app_deployment_usage_breakdown(
+        &self,
+        id: u64,
+        services: &[AppDeploymentServiceUsage],
+        volumes: &[AppDeploymentVolumeUsage],
+    ) -> DbResult<()> {
+        let mut b = self.app_deployment_usage_breakdown.lock().await;
+        b.insert(id, (services.to_vec(), volumes.to_vec()));
+        Ok(())
+    }
+
+    async fn list_app_deployment_usage_breakdown(
+        &self,
+        ids: &[u64],
+    ) -> DbResult<(
+        Vec<AppDeploymentServiceUsage>,
+        Vec<AppDeploymentVolumeUsage>,
+    )> {
+        let b = self.app_deployment_usage_breakdown.lock().await;
+        let mut services = Vec::new();
+        let mut volumes = Vec::new();
+        for id in ids {
+            if let Some((s, v)) = b.get(id) {
+                services.extend(s.iter().cloned());
+                volumes.extend(v.iter().cloned());
+            }
+        }
+        Ok((services, volumes))
+    }
+
     async fn delete_app_deployment(&self, id: u64) -> DbResult<()> {
         let mut d = self.app_deployments.lock().await;
         if let Some(x) = d.get_mut(&id) {
@@ -3658,6 +3702,8 @@ impl LNVpsDbBase for MockDb {
         let Some(deployment) = self.app_deployments.lock().await.remove(&id) else {
             return Ok(());
         };
+        // The usage tables cascade from the deployment row in MySQL.
+        self.app_deployment_usage_breakdown.lock().await.remove(&id);
 
         // Remove the billing records the deployment was attached to.
         let subscription_id = self

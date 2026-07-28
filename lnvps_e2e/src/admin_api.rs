@@ -1977,6 +1977,87 @@ mod tests {
         pool.close().await;
     }
 
+    /// Admin oversight serves the same usage object the customer sees (#304).
+    #[tokio::test]
+    async fn test_admin_app_deployment_reports_usage() {
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+        let keys = nostr::Keys::generate();
+        let uid = crate::db::ensure_user(&pool, &keys).await.unwrap();
+        let (_app_id, _cluster_id, dep_id) =
+            crate::db::seed_app_deployment(&pool, uid, "admin-usage")
+                .await
+                .unwrap();
+
+        let get = async |path: String| -> Value {
+            let resp = client.get_auth(&path).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            serde_json::from_str(&resp.text().await.unwrap()).unwrap()
+        };
+
+        // Nothing observed: null, matching the customer response rather than a
+        // zeroed reading.
+        let body = get(format!("/api/admin/v1/app-deployments/{dep_id}")).await;
+        assert!(body["data"]["usage"].is_null());
+
+        sqlx::query(
+            "UPDATE app_deployment SET usage_cpu_milli = 250, usage_memory_bytes = 2048, \
+             usage_storage_bytes = 4096, usage_collected = NOW() WHERE id = ?",
+        )
+        .bind(dep_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO app_deployment_service_usage (deployment_id, service, cpu_milli, \
+             memory_bytes, collected) VALUES (?, 'web', 250, 2048, NOW())",
+        )
+        .bind(dep_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO app_deployment_volume_usage (deployment_id, service, name, \
+             storage_bytes, collected) VALUES (?, 'web', 'data', 4096, NOW())",
+        )
+        .bind(dep_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let body = get(format!("/api/admin/v1/app-deployments/{dep_id}")).await;
+        let usage = &body["data"]["usage"];
+        assert_eq!(usage["cpu_milli"].as_u64(), Some(250));
+        assert_eq!(usage["memory_bytes"].as_u64(), Some(2048));
+        assert_eq!(usage["storage_bytes"].as_u64(), Some(4096));
+        assert_eq!(usage["services"][0]["service"].as_str(), Some("web"));
+        assert_eq!(usage["volumes"][0]["name"].as_str(), Some("data"));
+
+        // Listing carries it too, which is the surface used to spot a
+        // deployment sitting at its quota.
+        let body = get("/api/admin/v1/app-deployments".to_string()).await;
+        let listed = body["data"]
+            .as_array()
+            .expect("data array")
+            .iter()
+            .find(|d| d["id"].as_u64() == Some(dep_id))
+            .expect("seeded deployment is listed");
+        assert_eq!(listed["usage"]["cpu_milli"].as_u64(), Some(250));
+        assert_eq!(
+            listed["usage"]["services"].as_array().map(|a| a.len()),
+            Some(1)
+        );
+
+        // Same permission as the rest of the row.
+        let resp = client
+            .get(&format!("/api/admin/v1/app-deployments/{dep_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        pool.close().await;
+    }
+
     /// Filters and pagination on the admin deployment listing (#235).
     #[tokio::test]
     async fn test_admin_list_app_deployments_filters() {

@@ -21,9 +21,13 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use k8s_openapi::NamespaceResourceScope;
-use lnvps_db::{AppDeployment, AppDeploymentStatus, BillingState, EncryptedString, Subscription};
+use lnvps_db::{
+    AppDeployment, AppDeploymentServiceUsage, AppDeploymentStatus, AppDeploymentVolumeUsage,
+    BillingState, EncryptedString, Subscription,
+};
 
 use crate::Context;
+use crate::metrics::DeploymentUsage;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     ConfigMap, Container, ContainerPort, EnvVar, Namespace, PersistentVolumeClaim,
@@ -1254,7 +1258,7 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<()> {
 
     // Best-effort: a metrics outage must not fail a reconcile pass, and stale
     // usage from the previous pass is better than none.
-    if let Err(e) = collect_usage(ctx, &active).await {
+    if let Err(e) = collect_usage(ctx, &deployments, &active).await {
         warn!("usage collection failed: {e}");
     }
 
@@ -1270,10 +1274,15 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<()> {
 /// deployment row it writes: that row is a copy read at the top of the pass, so
 /// one path would overwrite the other's fields with values read before they
 /// were set.
-async fn collect_usage(ctx: &Context, active: &HashSet<u64>) -> Result<()> {
+async fn collect_usage(
+    ctx: &Context,
+    deployments: &[AppDeployment],
+    active: &HashSet<u64>,
+) -> Result<()> {
     let Some(client) = &ctx.metrics else {
         return Ok(());
     };
+    let by_id: BTreeMap<u64, &AppDeployment> = deployments.iter().map(|d| (d.id, d)).collect();
     for (id, usage) in client.deployment_usage().await? {
         // Prometheus keeps series past a namespace's deletion, and it answers
         // for the whole cluster, so only deployments this pass owns are written.
@@ -1288,8 +1297,82 @@ async fn collect_usage(ctx: &Context, active: &HashSet<u64>) -> Result<()> {
                 usage.storage_bytes,
             )
             .await?;
+
+        // The breakdown is keyed on compose names, which only the app's compose
+        // can supply: a claim name is a `"{service}-{volume}"` string that
+        // cannot be split back apart on its own, since either half may contain
+        // a dash.
+        let Some(deployment) = by_id.get(&id) else {
+            continue;
+        };
+        let compose = match ctx.db.get_app(deployment.app_id).await {
+            Ok(app) => match Compose::parse(&app.compose) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("app deployment {id} usage breakdown skipped, compose invalid: {e}");
+                    continue;
+                }
+            },
+            Err(e) => {
+                warn!("app deployment {id} usage breakdown skipped: {e}");
+                continue;
+            }
+        };
+        let (services, volumes) = breakdown_rows(id, &compose, &usage);
+        ctx.db
+            .replace_app_deployment_usage_breakdown(id, &services, &volumes)
+            .await?;
     }
     Ok(())
+}
+
+/// Map one deployment's container and claim series onto the compose names the
+/// customer sees.
+///
+/// Series that match nothing in the compose are dropped: a container from an
+/// init step, or a claim left behind by a volume that has since been removed,
+/// has no service or volume to be shown against.
+fn breakdown_rows(
+    id: u64,
+    compose: &Compose,
+    usage: &DeploymentUsage,
+) -> (
+    Vec<AppDeploymentServiceUsage>,
+    Vec<AppDeploymentVolumeUsage>,
+) {
+    let collected = chrono::Utc::now();
+    let services = usage
+        .containers
+        .iter()
+        .filter(|c| compose.services.contains_key(&c.container))
+        .map(|c| AppDeploymentServiceUsage {
+            deployment_id: id,
+            service: c.container.clone(),
+            cpu_milli: c.cpu_milli,
+            memory_bytes: c.memory_bytes,
+            collected,
+        })
+        .collect();
+
+    // Claim name is `"{service}-{volume}"`, so the compose pairs are what
+    // resolve it rather than a split on the dash.
+    let mut volumes = Vec::new();
+    for (service, svc) in &compose.services {
+        for v in &svc.volumes {
+            let claim = format!("{service}-{}", v.name);
+            if let Some(c) = usage.claims.iter().find(|c| c.claim == claim) {
+                volumes.push(AppDeploymentVolumeUsage {
+                    deployment_id: id,
+                    service: service.clone(),
+                    name: v.name.clone(),
+                    storage_bytes: c.storage_bytes,
+                    collected,
+                });
+            }
+        }
+    }
+    volumes.sort_by(|a, b| (&a.service, &a.name).cmp(&(&b.service, &b.name)));
+    (services, volumes)
 }
 
 /// Render and apply a single deployment's Kubernetes objects.
@@ -1718,6 +1801,7 @@ async fn gc_namespaces(client: &Client, active: &HashSet<u64>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::{ClaimUsage, ContainerUsage};
 
     /// The per-namespace binding is the only thing standing between the
     /// operator's token and every Secret in the cluster, so its shape is
@@ -3323,6 +3407,119 @@ config:
         assert_eq!(
             GateReason::SubscriptionLookupFailed("boom".to_string()).to_string(),
             "subscription lookup failed: boom"
+        );
+    }
+
+    /// The compose is what resolves a claim name: `"{service}-{volume}"` cannot
+    /// be split back apart when either half contains a dash.
+    #[test]
+    fn a_claim_name_resolves_through_the_compose_not_a_split_on_the_dash() {
+        let c = Compose::parse(
+            "services:\n  web-app:\n    image: x\n    volumes:\n      - name: user-data\n        path: /data\n        size: 1Gi\n",
+        )
+        .unwrap();
+        let usage = DeploymentUsage {
+            cpu_milli: 10,
+            memory_bytes: 20,
+            storage_bytes: Some(30),
+            containers: vec![ContainerUsage {
+                container: "web-app".to_string(),
+                cpu_milli: 10,
+                memory_bytes: 20,
+            }],
+            claims: vec![ClaimUsage {
+                claim: "web-app-user-data".to_string(),
+                storage_bytes: 30,
+            }],
+        };
+        let (services, volumes) = breakdown_rows(7, &c, &usage);
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].service, "web-app");
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].service, "web-app");
+        assert_eq!(volumes[0].name, "user-data");
+        assert_eq!(volumes[0].storage_bytes, 30);
+        assert_eq!(volumes[0].deployment_id, 7);
+    }
+
+    /// A series with nothing to attribute it to — an init container, or a claim
+    /// for a volume since removed from the compose — is dropped rather than
+    /// reported under a name the customer cannot find.
+    #[test]
+    fn series_that_match_no_compose_name_are_dropped() {
+        let c = Compose::parse(
+            "services:\n  app:\n    image: x\n    volumes:\n      - name: data\n        path: /data\n        size: 1Gi\n",
+        )
+        .unwrap();
+        let usage = DeploymentUsage {
+            cpu_milli: 1,
+            memory_bytes: 1,
+            storage_bytes: Some(1),
+            containers: vec![
+                ContainerUsage {
+                    container: "app".to_string(),
+                    cpu_milli: 1,
+                    memory_bytes: 1,
+                },
+                ContainerUsage {
+                    container: "setup".to_string(),
+                    cpu_milli: 5,
+                    memory_bytes: 5,
+                },
+            ],
+            claims: vec![
+                ClaimUsage {
+                    claim: "app-data".to_string(),
+                    storage_bytes: 1,
+                },
+                ClaimUsage {
+                    claim: "app-old".to_string(),
+                    storage_bytes: 9,
+                },
+            ],
+        };
+        let (services, volumes) = breakdown_rows(1, &c, &usage);
+        assert_eq!(
+            services.iter().map(|s| &s.service).collect::<Vec<_>>(),
+            vec!["app"]
+        );
+        assert_eq!(
+            volumes.iter().map(|v| &v.name).collect::<Vec<_>>(),
+            vec!["data"]
+        );
+    }
+
+    /// Two services can declare volumes of the same name, so a volume row is
+    /// only identified by the pair.
+    #[test]
+    fn the_same_volume_name_under_two_services_stays_distinct() {
+        let c = Compose::parse(
+            "services:\n  a:\n    image: x\n    volumes:\n      - name: data\n        path: /data\n        size: 1Gi\n  b:\n    image: x\n    volumes:\n      - name: data\n        path: /data\n        size: 1Gi\n",
+        )
+        .unwrap();
+        let usage = DeploymentUsage {
+            cpu_milli: 0,
+            memory_bytes: 0,
+            storage_bytes: Some(3),
+            containers: vec![],
+            claims: vec![
+                ClaimUsage {
+                    claim: "a-data".to_string(),
+                    storage_bytes: 1,
+                },
+                ClaimUsage {
+                    claim: "b-data".to_string(),
+                    storage_bytes: 2,
+                },
+            ],
+        };
+        let (_, volumes) = breakdown_rows(1, &c, &usage);
+        assert_eq!(
+            volumes
+                .iter()
+                .map(|v| (v.service.as_str(), v.storage_bytes))
+                .collect::<Vec<_>>(),
+            vec![("a", 1), ("b", 2)]
         );
     }
 }

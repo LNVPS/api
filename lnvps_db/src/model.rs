@@ -3430,6 +3430,32 @@ impl Display for AppDeploymentStatus {
     }
 }
 
+/// One compose service's last observed CPU and memory use.
+///
+/// Keyed by service rather than by pod: pods are replaced on every rollout, and
+/// the limit the customer is measured against is the container's.
+#[derive(FromRow, Clone, Debug, PartialEq)]
+pub struct AppDeploymentServiceUsage {
+    pub deployment_id: u64,
+    pub service: String,
+    pub cpu_milli: u32,
+    pub memory_bytes: u64,
+    pub collected: DateTime<Utc>,
+}
+
+/// One persistent volume's last observed use.
+///
+/// `(service, name)` is the pair the operator turns into a PVC, and the size
+/// limit is on that PVC, so a namespace total cannot say which volume is full.
+#[derive(FromRow, Clone, Debug, PartialEq)]
+pub struct AppDeploymentVolumeUsage {
+    pub deployment_id: u64,
+    pub service: String,
+    pub name: String,
+    pub storage_bytes: u64,
+    pub collected: DateTime<Utc>,
+}
+
 /// A customer's running instance of an [`App`].
 ///
 /// Billed via the subscription engine: `subscription_line_item_id` links to a

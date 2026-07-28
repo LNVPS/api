@@ -78,6 +78,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
   It is a sample, not a live figure: the operator writes it on its reconcile pass (60s by default) with CPU averaged over a 5-minute window, so `collected` can be minutes old. Show the age alongside it.
 
+- **`usage.services[]` and `usage.volumes[]` — which service and which volume** (issue #305) — the `usage` object above gains two arrays, on both the customer response (`ApiAppDeployment`) and the admin one (`GET /api/admin/v1/app-deployments`, `/{id}`, `PATCH /{id}`). Additive: no existing field changes.
+
+  ```json
+  "usage": {
+    "cpu_milli": 300, "memory_bytes": 3072, "storage_bytes": 5120,
+    "collected": "2026-07-28T11:00:00Z",
+    "services": [ { "service": "web", "cpu_milli": 100, "memory_bytes": 1024 } ],
+    "volumes":  [ { "service": "web", "name": "data", "storage_bytes": 1024 } ]
+  }
+  ```
+
+  The totals are namespace sums, and Kubernetes enforces CPU and memory per container and volume size per PVC — so a deployment at 40% of its total can have one container OOM-killing, or one full volume while the others are empty. The totals cannot express either; the breakdown names the service and the volume.
+
+  Keys are the compose names the rest of the API already uses: `service` matches `services[].name` on the catalog app, and `(service, name)` matches `volumes[]` there — a volume name is only unique within its service, so the pair is the identity. Ordering is by service, then volume name.
+
+  Both arrays are **empty, never null**, and empty is not an error: a reading taken before per-service series were collected has totals and no parts, and a series with no matching compose entry (an init container, or a volume since removed from the app) is dropped rather than reported under a name the customer cannot find. The parts are rounded individually while the totals are rounded once after summing, so a breakdown can be a millicore or two above the total it sits beside — render the total as the figure of record.
+
+- **`usage` on the admin deployment response** (issue #304) — `AdminAppDeploymentInfo` now carries the same nullable `usage` object as the customer response, on the listing, the single `GET` and the `PATCH` response. Same units, same null semantics. Support could previously not see numbers the customer could, on the endpoint whose purpose is oversight.
+
 - **`billing_state` on an app deployment — `unpaid` / `active` / `expired`** (issue #253) — `ApiAppDeployment` (`GET /api/v1/app-deployments` and `/{id}`, and every endpoint returning a deployment) gains a nullable `billing_state` string. Additive: no existing field changes.
 
   A client could not previously tell "never paid for" from "the customer stopped it". The only signals were `status` and a prose `status_message`, and the operator writes a never-paid deployment back as `stopped` with `"subscription not yet paid"` — so inferring "unpaid" from `status == "pending"` works exactly until the first reconcile, after which the page stops asking for the first payment and offers a **Start** button that the billing gate refuses. `unpaid` asks for a first payment, `expired` (paid, then lapsed; data retained at 0 replicas) asks for a renewal, and neither is a stopped app.

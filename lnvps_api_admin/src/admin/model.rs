@@ -4793,6 +4793,10 @@ pub struct AdminAppDeploymentInfo {
     /// single-deployment GET; the list endpoint leaves it `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config: Option<std::collections::BTreeMap<String, String>>,
+    /// What the workload is consuming, in the same shape and units the customer
+    /// API serves. `None` when nothing has been observed: a deployment that has
+    /// never run, or a cluster with no metrics source.
+    pub usage: Option<lnvps_api_common::AppDeploymentUsage>,
     pub created: DateTime<Utc>,
     /// Soft-deleted: the operator has torn the workload down and the row is
     /// retained only for accounting. Only ever `true` in listings requested
@@ -4817,6 +4821,7 @@ impl From<lnvps_db::AppDeployment> for AdminAppDeploymentInfo {
             status: d.status.to_string(),
             status_message: d.status_message,
             config: None, // filled in by the single-GET handler (decrypted)
+            usage: None,  // filled in by the handler, which reads the breakdown
             created: d.created,
             deleted: d.deleted,
         }

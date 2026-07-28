@@ -961,3 +961,98 @@ pub struct HostVmSpec {
     /// Whether the VM is currently running
     pub running: bool,
 }
+
+/// The last resource usage the cluster reported for an app deployment.
+///
+/// Same units as the deployment's quota fields, so the two divide directly.
+/// Shared by the customer and admin APIs so oversight sees exactly the object
+/// the customer is looking at.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppDeploymentUsage {
+    pub cpu_milli: u64,
+    pub memory_bytes: u64,
+    /// Volume usage. `None` for a deployment with no volumes, or when the
+    /// metrics source carries no kubelet volume statistics — CPU and memory are
+    /// still reported in that case.
+    pub storage_bytes: Option<u64>,
+    /// When the reading was taken. Usage is sampled on the operator's reconcile
+    /// interval, not on request, so it is always somewhat behind — render it
+    /// with the age rather than as a live figure.
+    pub collected: DateTime<Utc>,
+    /// Per-service CPU and memory behind the totals above. Empty when nothing
+    /// has been observed yet.
+    ///
+    /// Worth rendering beside the totals rather than instead of them: CPU and
+    /// memory limits are enforced per container, so a total cannot say which
+    /// service is the one at its limit.
+    pub services: Vec<AppDeploymentServiceUsage>,
+    /// Per-volume storage behind `storage_bytes`, keyed the way the app's
+    /// declared volumes are. Empty when nothing has been observed yet.
+    ///
+    /// The size limit is per volume, so a deployment well under its total can
+    /// still have one volume that is full.
+    pub volumes: Vec<AppDeploymentVolumeUsage>,
+}
+
+/// One service's share of a deployment's observed CPU and memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppDeploymentServiceUsage {
+    /// Compose service name.
+    pub service: String,
+    pub cpu_milli: u64,
+    pub memory_bytes: u64,
+}
+
+/// One volume's observed use.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppDeploymentVolumeUsage {
+    /// Compose service this volume belongs to. Sent because a volume name is
+    /// only unique within its service.
+    pub service: String,
+    /// Compose volume name.
+    pub name: String,
+    pub storage_bytes: u64,
+}
+
+impl AppDeploymentUsage {
+    /// Assemble a deployment's usage from its stored totals and breakdown.
+    ///
+    /// `None` unless the totals are complete: a timestamp with no figures, or
+    /// figures with no timestamp, is a half-written row, and dating an unknown
+    /// sample `now` would overstate how fresh it is. The breakdown is allowed
+    /// to be empty — a reading taken before per-service series were collected
+    /// has totals and no parts.
+    pub fn from_parts(
+        d: &lnvps_db::AppDeployment,
+        services: Vec<lnvps_db::AppDeploymentServiceUsage>,
+        volumes: Vec<lnvps_db::AppDeploymentVolumeUsage>,
+    ) -> Option<Self> {
+        let (cpu_milli, memory_bytes, collected) =
+            match (d.usage_cpu_milli, d.usage_memory_bytes, d.usage_collected) {
+                (Some(c), Some(m), Some(t)) => (c, m, t),
+                _ => return None,
+            };
+        Some(Self {
+            cpu_milli: cpu_milli as u64,
+            memory_bytes,
+            storage_bytes: d.usage_storage_bytes,
+            collected,
+            services: services
+                .into_iter()
+                .map(|s| AppDeploymentServiceUsage {
+                    service: s.service,
+                    cpu_milli: s.cpu_milli as u64,
+                    memory_bytes: s.memory_bytes,
+                })
+                .collect(),
+            volumes: volumes
+                .into_iter()
+                .map(|v| AppDeploymentVolumeUsage {
+                    service: v.service,
+                    name: v.name,
+                    storage_bytes: v.storage_bytes,
+                })
+                .collect(),
+        })
+    }
+}
