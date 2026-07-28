@@ -4257,6 +4257,26 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn update_app_deployment_usage(
+        &self,
+        id: u64,
+        cpu_milli: u32,
+        memory_bytes: u64,
+        storage_bytes: Option<u64>,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE app_deployment SET usage_cpu_milli = ?, usage_memory_bytes = ?, \
+             usage_storage_bytes = ?, usage_collected = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(cpu_milli)
+        .bind(memory_bytes)
+        .bind(storage_bytes)
+        .bind(id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
     async fn delete_app_deployment(&self, id: u64) -> DbResult<()> {
         sqlx::query("UPDATE app_deployment SET deleted = 1 WHERE id = ?")
             .bind(id)

@@ -45,6 +45,20 @@ app-cluster-id: 1
 # deployment that never happens. Omit to poll only.
 redis: "redis://localhost:6379"
 
+# Prometheus to read deployment resource usage from (optional). When set, every
+# reconcile pass records each deployment's CPU, memory and volume usage so the
+# customer can see consumption against the quota they are paying for. The URL
+# must be reachable from the operator. Omit to collect nothing — the API then
+# reports usage as unknown rather than as zero.
+prometheus:
+  url: "http://prometheus.monitoring:9090"
+  # Range the CPU rate is averaged over (optional, defaults to "5m"). Keep it
+  # several scrape intervals wide.
+  cpu-window: "5m"
+  # Per-query timeout in seconds (optional, defaults to 10). Collection is
+  # best-effort and must not hold up a reconcile pass.
+  timeout-seconds: 10
+
 # Namespace the ingress controller runs in (optional, defaults to
 # "ingress-nginx"). The per-deployment isolation NetworkPolicy allows inbound
 # traffic from this namespace; it must match that namespace's

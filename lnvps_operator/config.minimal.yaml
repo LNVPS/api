@@ -26,6 +26,10 @@ cluster-issuer: "letsencrypt-prod"
 # Same Redis the API publishes to; requires app-cluster-id.
 # redis: "redis://localhost:6379"
 
+# Report deployment resource usage vs quota (optional). Omit to collect none.
+# prometheus:
+#   url: "http://prometheus.monitoring:9090"
+
 # Ingress configuration (optional - defaults shown)
 # ingress-class: "nginx"
 # ingress-namespace: "ingress-nginx"

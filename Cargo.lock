@@ -3080,11 +3080,13 @@ dependencies = [
  "lnvps_db",
  "log 0.4.32",
  "rand 0.8.6",
+ "reqwest 0.13.4",
  "rustls",
  "serde",
  "serde_json",
  "tokio",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -4361,6 +4363,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

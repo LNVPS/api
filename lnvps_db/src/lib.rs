@@ -1119,6 +1119,20 @@ pub trait LNVpsDbBase: Send + Sync {
     ) -> DbResult<Option<AppDeployment>>;
     async fn insert_app_deployment(&self, deployment: &AppDeployment) -> DbResult<u64>;
     async fn update_app_deployment(&self, deployment: &AppDeployment) -> DbResult<()>;
+    /// Record the usage the cluster last reported for a deployment, stamping
+    /// the observation time.
+    ///
+    /// Separate from [`Self::update_app_deployment`] on purpose: usage is
+    /// written by the operator every reconcile while the API writes the rest of
+    /// the row from a copy it read earlier, so folding the two together would
+    /// let each overwrite the other's field with a stale value.
+    async fn update_app_deployment_usage(
+        &self,
+        id: u64,
+        cpu_milli: u32,
+        memory_bytes: u64,
+        storage_bytes: Option<u64>,
+    ) -> DbResult<()>;
     /// Soft-delete a deployment (sets `deleted = 1`); the operator tears down
     /// the Kubernetes resources on its next reconcile.
     async fn delete_app_deployment(&self, id: u64) -> DbResult<()>;

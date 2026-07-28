@@ -1239,6 +1239,86 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// A deployment reports what it is consuming against its quota (#278).
+    ///
+    /// The operator writes the usage columns from Prometheus; the API only has
+    /// to carry them, report a missing reading as unknown rather than as zero,
+    /// and keep them behind the same ownership check as the rest of the row.
+    #[tokio::test]
+    async fn test_app_deployment_reports_usage() {
+        let keys = nostr::Keys::generate();
+        let client = user_client_with_keys(keys.clone());
+        let pool = crate::db::connect().await.unwrap();
+        let uid = crate::db::ensure_user(&pool, &keys).await.unwrap();
+        let (_app_id, _cluster_id, dep_id) = crate::db::seed_app_deployment(&pool, uid, "usage")
+            .await
+            .unwrap();
+
+        let get = async |path: String| -> Value {
+            let resp = client.get_auth(&path).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            serde_json::from_str(&resp.text().await.unwrap()).unwrap()
+        };
+
+        // Nothing observed yet: null, not a zeroed reading that would render as
+        // an idle workload.
+        let body = get(format!("/api/v1/app-deployments/{dep_id}")).await;
+        assert!(body["data"]["usage"].is_null());
+
+        sqlx::query(
+            "UPDATE app_deployment SET usage_cpu_milli = 250, usage_memory_bytes = 2097152, \
+             usage_storage_bytes = 8192, usage_collected = NOW() WHERE id = ?",
+        )
+        .bind(dep_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let body = get(format!("/api/v1/app-deployments/{dep_id}")).await;
+        let usage = &body["data"]["usage"];
+        assert_eq!(usage["cpu_milli"].as_u64(), Some(250));
+        assert_eq!(usage["memory_bytes"].as_u64(), Some(2097152));
+        assert_eq!(usage["storage_bytes"].as_u64(), Some(8192));
+        assert!(usage["collected"].is_string());
+        // Reported against the quota on the same object, in the same units, so
+        // a client can divide the two without fetching the catalog app.
+        assert!(body["data"]["cpu_milli"].is_u64());
+        assert!(body["data"]["memory_bytes"].is_u64());
+        assert!(body["data"]["storage_bytes"].is_u64());
+
+        // A deployment with no volumes has no volume series to read.
+        sqlx::query("UPDATE app_deployment SET usage_storage_bytes = NULL WHERE id = ?")
+            .bind(dep_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let body = get(format!("/api/v1/app-deployments/{dep_id}")).await;
+        assert!(body["data"]["usage"]["storage_bytes"].is_null());
+        assert_eq!(body["data"]["usage"]["cpu_milli"].as_u64(), Some(250));
+
+        // Carried on the listing too.
+        let body = get("/api/v1/app-deployments".to_string()).await;
+        let listed = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"].as_u64() == Some(dep_id))
+            .expect("seeded deployment listed");
+        assert_eq!(listed["usage"]["cpu_milli"].as_u64(), Some(250));
+
+        // Usage is customer data: same ownership rules as the rest of the row.
+        let resp = client
+            .get(&format!("/api/v1/app-deployments/{dep_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let other = user_client_with_keys(nostr::Keys::generate());
+        let resp = other
+            .get_auth(&format!("/api/v1/app-deployments/{dep_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
     /// Declared config types and patterns are enforced at order time (#271).
     /// Before this, `resolve_config` read `required` and never `type`, so a
     /// value the app cannot use was accepted, charged for, and turned into a

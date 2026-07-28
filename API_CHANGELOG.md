@@ -64,6 +64,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **`usage` on an app deployment — what it is actually consuming** (issue #278) — `ApiAppDeployment` (`GET /api/v1/app-deployments` and `/{id}`, and every endpoint returning a deployment) gains a nullable `usage` object. Additive: no existing field changes.
+
+  ```json
+  "usage": { "cpu_milli": 250, "memory_bytes": 2097152, "storage_bytes": 8192, "collected": "2026-07-28T11:00:00Z" }
+  ```
+
+  Same units as the `cpu_milli` / `memory_bytes` / `storage_bytes` quota fields on the same object, which already have the `resource_multiplier` applied — so the two divide directly and the customer can see whether they are outgrowing their size.
+
+  `usage` is `null` when nothing has been observed: a deployment that has never run, or a cluster whose operator has no Prometheus configured. `storage_bytes` is independently `null` for a deployment with no volumes, or when the metrics source carries no kubelet volume statistics; `cpu_milli` and `memory_bytes` are still reported in that case. Render an absent reading as unknown, not as zero — zero reads as an idle workload, which is a different claim from an unmeasured one.
+
+  It is a sample, not a live figure: the operator writes it on its reconcile pass (60s by default) with CPU averaged over a 5-minute window, so `collected` can be minutes old. Show the age alongside it.
+
 - **`billing_state` on an app deployment — `unpaid` / `active` / `expired`** (issue #253) — `ApiAppDeployment` (`GET /api/v1/app-deployments` and `/{id}`, and every endpoint returning a deployment) gains a nullable `billing_state` string. Additive: no existing field changes.
 
   A client could not previously tell "never paid for" from "the customer stopped it". The only signals were `status` and a prose `status_message`, and the operator writes a never-paid deployment back as `stopped` with `"subscription not yet paid"` — so inferring "unpaid" from `status == "pending"` works exactly until the first reconcile, after which the page stops asking for the first payment and offers a **Start** button that the billing gate refuses. `unpaid` asks for a first payment, `expired` (paid, then lapsed; data retained at 0 replicas) asks for a renewal, and neither is a stopped app.

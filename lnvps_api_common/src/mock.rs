@@ -3629,6 +3629,23 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn update_app_deployment_usage(
+        &self,
+        id: u64,
+        cpu_milli: u32,
+        memory_bytes: u64,
+        storage_bytes: Option<u64>,
+    ) -> DbResult<()> {
+        let mut d = self.app_deployments.lock().await;
+        if let Some(x) = d.get_mut(&id) {
+            x.usage_cpu_milli = Some(cpu_milli);
+            x.usage_memory_bytes = Some(memory_bytes);
+            x.usage_storage_bytes = storage_bytes;
+            x.usage_collected = Some(Utc::now());
+        }
+        Ok(())
+    }
+
     async fn delete_app_deployment(&self, id: u64) -> DbResult<()> {
         let mut d = self.app_deployments.lock().await;
         if let Some(x) = d.get_mut(&id) {
@@ -6536,6 +6553,10 @@ mod tests {
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
             status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
             created: Utc::now(),
             deleted: false,
         };
@@ -6718,6 +6739,10 @@ mod tests {
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
             status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
             created: Utc::now(),
             deleted: false,
         };
@@ -6943,6 +6968,10 @@ mod tests {
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
                 status_message: None,
+                usage_cpu_milli: None,
+                usage_memory_bytes: None,
+                usage_storage_bytes: None,
+                usage_collected: None,
                 created: Utc::now(),
                 deleted: false,
             })
@@ -6992,6 +7021,10 @@ mod tests {
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
                 status_message: None,
+                usage_cpu_milli: None,
+                usage_memory_bytes: None,
+                usage_storage_bytes: None,
+                usage_collected: None,
                 created: Utc::now(),
                 deleted: false,
             })
@@ -7046,6 +7079,10 @@ mod tests {
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
                 status_message: None,
+                usage_cpu_milli: None,
+                usage_memory_bytes: None,
+                usage_storage_bytes: None,
+                usage_collected: None,
                 created: Utc::now(),
                 deleted: false,
             })
@@ -7117,6 +7154,10 @@ mod tests {
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
             status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
             created: Utc::now(),
             deleted: false,
         };
