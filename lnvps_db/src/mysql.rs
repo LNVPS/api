@@ -1,13 +1,14 @@
 use crate::{
-    AccessPolicy, App, AppCluster, AppDeployment, AppDeploymentFilter, AppTag, AsnSubscription,
-    AsnSubscriptionStatus, AvailableIpSpace, Company, DbError, DbResult, DnsServer, IntervalType,
-    IpRange, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig,
-    PaymentType, Referral, ReferralCostUsage, ReferralPayout, Region, RegionStats, Router,
-    RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription,
-    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User,
-    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
-    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk,
-    VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
+    AccessPolicy, App, AppCluster, AppDeployment, AppDeploymentFilter, AppDeploymentServiceUsage,
+    AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
+    Company, DbError, DbResult, DnsServer, IntervalType, IpRange, IpRangeSubscription,
+    IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig, PaymentType, Referral,
+    ReferralCostUsage, ReferralPayout, Region, RegionStats, Router, RouterBgpRoute,
+    RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm,
+    VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
+    VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
+    WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -4275,6 +4276,85 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .execute(&self.db)
         .await?;
         Ok(())
+    }
+
+    async fn replace_app_deployment_usage_breakdown(
+        &self,
+        id: u64,
+        services: &[AppDeploymentServiceUsage],
+        volumes: &[AppDeploymentVolumeUsage],
+    ) -> DbResult<()> {
+        // One transaction so a reader never sees the delete without the insert:
+        // an empty breakdown means "nothing observed", which is a different
+        // answer from the one being written.
+        let mut tx = self.db.begin().await?;
+        sqlx::query("DELETE FROM app_deployment_service_usage WHERE deployment_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM app_deployment_volume_usage WHERE deployment_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for s in services {
+            sqlx::query(
+                "INSERT INTO app_deployment_service_usage (deployment_id, service, cpu_milli, \
+                 memory_bytes, collected) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(&s.service)
+            .bind(s.cpu_milli)
+            .bind(s.memory_bytes)
+            .bind(s.collected)
+            .execute(&mut *tx)
+            .await?;
+        }
+        for v in volumes {
+            sqlx::query(
+                "INSERT INTO app_deployment_volume_usage (deployment_id, service, name, \
+                 storage_bytes, collected) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(&v.service)
+            .bind(&v.name)
+            .bind(v.storage_bytes)
+            .bind(v.collected)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_app_deployment_usage_breakdown(
+        &self,
+        ids: &[u64],
+    ) -> DbResult<(
+        Vec<AppDeploymentServiceUsage>,
+        Vec<AppDeploymentVolumeUsage>,
+    )> {
+        if ids.is_empty() {
+            return Ok((vec![], vec![]));
+        }
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let services_sql = format!(
+            "SELECT * FROM app_deployment_service_usage WHERE deployment_id IN ({placeholders}) \
+             ORDER BY deployment_id, service"
+        );
+        let volumes_sql = format!(
+            "SELECT * FROM app_deployment_volume_usage WHERE deployment_id IN ({placeholders}) \
+             ORDER BY deployment_id, service, name"
+        );
+        let mut services = sqlx::query_as(&services_sql);
+        let mut volumes = sqlx::query_as(&volumes_sql);
+        for id in ids {
+            services = services.bind(id);
+            volumes = volumes.bind(id);
+        }
+        Ok((
+            services.fetch_all(&self.db).await?,
+            volumes.fetch_all(&self.db).await?,
+        ))
     }
 
     async fn delete_app_deployment(&self, id: u64) -> DbResult<()> {

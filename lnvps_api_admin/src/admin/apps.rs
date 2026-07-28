@@ -9,7 +9,9 @@ use crate::admin::model::{
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
-use lnvps_api_common::{ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery};
+use lnvps_api_common::{
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, AppDeploymentUsage, PageQuery,
+};
 use lnvps_db::{
     AdminAction, AdminResource, App, AppCluster, AppDeploymentDesiredState, AppDeploymentFilter,
     AppDeploymentStatus,
@@ -710,12 +712,40 @@ async fn admin_list_app_deployments(
         .db
         .admin_list_app_deployments_filtered(limit, offset, &filter)
         .await?;
-    ApiPaginatedData::ok(
-        deployments.into_iter().map(Into::into).collect(),
-        total,
-        limit,
-        offset,
-    )
+    let ids: Vec<u64> = deployments.iter().map(|d| d.id).collect();
+    let (services, volumes) = this.db.list_app_deployment_usage_breakdown(&ids).await?;
+    let rows: Vec<AdminAppDeploymentInfo> = deployments
+        .into_iter()
+        .map(|d| {
+            let mut info = AdminAppDeploymentInfo::from(d.clone());
+            info.usage = AppDeploymentUsage::from_parts(
+                &d,
+                services
+                    .iter()
+                    .filter(|s| s.deployment_id == d.id)
+                    .cloned()
+                    .collect(),
+                volumes
+                    .iter()
+                    .filter(|v| v.deployment_id == d.id)
+                    .cloned()
+                    .collect(),
+            );
+            info
+        })
+        .collect();
+    ApiPaginatedData::ok(rows, total, limit, offset)
+}
+
+/// Fill in a deployment's usage from the stored totals and breakdown.
+async fn with_usage(
+    db: &dyn lnvps_db::LNVpsDb,
+    d: &lnvps_db::AppDeployment,
+    info: &mut AdminAppDeploymentInfo,
+) -> Result<(), lnvps_api_common::ApiError> {
+    let (services, volumes) = db.list_app_deployment_usage_breakdown(&[d.id]).await?;
+    info.usage = AppDeploymentUsage::from_parts(d, services, volumes);
+    Ok(())
 }
 
 /// Decrypt and parse a deployment's stored config JSON into a flat map.
@@ -738,6 +768,7 @@ async fn admin_get_app_deployment(
     let d = this.db.get_app_deployment(id).await?;
     let mut info = AdminAppDeploymentInfo::from(d.clone());
     info.config = deployment_config_map(&d);
+    with_usage(this.db.as_ref(), &d, &mut info).await?;
     ApiData::ok(info)
 }
 
@@ -799,6 +830,7 @@ async fn admin_update_app_deployment(
     this.db.update_app_deployment(&d).await?;
     let mut info = AdminAppDeploymentInfo::from(d.clone());
     info.config = deployment_config_map(&d);
+    with_usage(this.db.as_ref(), &d, &mut info).await?;
     ApiData::ok(info)
 }
 

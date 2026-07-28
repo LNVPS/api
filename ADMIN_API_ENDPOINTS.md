@@ -3909,10 +3909,20 @@ These use the dedicated **`app_deployment`** RBAC resource (distinct from the ca
   "status": "running",
   "status_message": null,
   "config": { "relay_name": "My relay" },
+  "usage": {
+    "cpu_milli": 300,
+    "memory_bytes": 3072,
+    "storage_bytes": 5120,
+    "collected": "2026-07-28T11:00:00Z",
+    "services": [ { "service": "web", "cpu_milli": 100, "memory_bytes": 1024 } ],
+    "volumes":  [ { "service": "web", "name": "data", "storage_bytes": 1024 } ]
+  },
   "created": "2026-07-25T10:00:00Z",
   "deleted": false
 }
 ```
+
+`usage` is the same object the customer API serves, in the same units as the deployment's quota. It is `null` when nothing has been observed (a deployment that has never run, or a cluster with no Prometheus); `storage_bytes` is independently `null` for a deployment with no volumes. `services[]` and `volumes[]` break the totals down by the keys the cluster enforces limits on — per container, and per PVC — and are empty rather than null when nothing has been collected. It is a sample written on the operator's reconcile pass, so `collected` can be minutes old.
 
 `resource_multiplier` is the deployment's size as a multiple of the catalog app's base footprint and price (`1` = base). The customer raises it via `POST /api/v1/app-deployments/{id}/upgrade`, which is applied only once the prorated upgrade payment settles. It is read-only here — the admin `PATCH` does not accept it, because changing it without a payment would desynchronise the billed price from the provisioned size.
 

@@ -1239,6 +1239,110 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Usage is broken down per service and per volume (#305).
+    ///
+    /// A namespace total cannot say which container is at its limit or which
+    /// volume is full, and those are the limits the cluster actually enforces.
+    #[tokio::test]
+    async fn test_app_deployment_usage_breakdown() {
+        let keys = nostr::Keys::generate();
+        let client = user_client_with_keys(keys.clone());
+        let pool = crate::db::connect().await.unwrap();
+        let uid = crate::db::ensure_user(&pool, &keys).await.unwrap();
+        let (_app_id, _cluster_id, dep_id) =
+            crate::db::seed_app_deployment(&pool, uid, "usage-parts")
+                .await
+                .unwrap();
+
+        let get = async |path: String| -> Value {
+            let resp = client.get_auth(&path).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            serde_json::from_str(&resp.text().await.unwrap()).unwrap()
+        };
+
+        sqlx::query(
+            "UPDATE app_deployment SET usage_cpu_milli = 300, usage_memory_bytes = 3072, \
+             usage_storage_bytes = 5120, usage_collected = NOW() WHERE id = ?",
+        )
+        .bind(dep_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Totals observed, no breakdown collected yet: empty lists, not a
+        // missing reading.
+        let usage = get(format!("/api/v1/app-deployments/{dep_id}")).await["data"]["usage"].clone();
+        assert_eq!(usage["cpu_milli"].as_u64(), Some(300));
+        assert_eq!(usage["services"].as_array().map(|a| a.len()), Some(0));
+        assert_eq!(usage["volumes"].as_array().map(|a| a.len()), Some(0));
+
+        for (service, cpu, mem) in [("web", 100u32, 1024u64), ("db", 200, 2048)] {
+            sqlx::query(
+                "INSERT INTO app_deployment_service_usage (deployment_id, service, cpu_milli, \
+                 memory_bytes, collected) VALUES (?, ?, ?, ?, NOW())",
+            )
+            .bind(dep_id)
+            .bind(service)
+            .bind(cpu)
+            .bind(mem)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        // Same volume name under two services: only the pair identifies it.
+        for (service, name, bytes) in [("web", "data", 1024u64), ("db", "data", 4096)] {
+            sqlx::query(
+                "INSERT INTO app_deployment_volume_usage (deployment_id, service, name, \
+                 storage_bytes, collected) VALUES (?, ?, ?, ?, NOW())",
+            )
+            .bind(dep_id)
+            .bind(service)
+            .bind(name)
+            .bind(bytes)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let usage = get(format!("/api/v1/app-deployments/{dep_id}")).await["data"]["usage"].clone();
+        let services = usage["services"].as_array().unwrap();
+        assert_eq!(services.len(), 2);
+        let db_service = services
+            .iter()
+            .find(|s| s["service"] == "db")
+            .expect("db service reported");
+        assert_eq!(db_service["cpu_milli"].as_u64(), Some(200));
+        assert_eq!(db_service["memory_bytes"].as_u64(), Some(2048));
+        let volumes = usage["volumes"].as_array().unwrap();
+        assert_eq!(volumes.len(), 2);
+        let db_volume = volumes
+            .iter()
+            .find(|v| v["service"] == "db" && v["name"] == "data")
+            .expect("volume identified by (service, name)");
+        assert_eq!(db_volume["storage_bytes"].as_u64(), Some(4096));
+
+        // Carried on the listing too, so a dashboard needs one request.
+        let body = get("/api/v1/app-deployments".to_string()).await;
+        let listed = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["id"].as_u64() == Some(dep_id))
+            .expect("seeded deployment listed");
+        assert_eq!(
+            listed["usage"]["services"].as_array().map(|a| a.len()),
+            Some(2)
+        );
+
+        // Someone else's breakdown is not readable, same as the rest of the row.
+        let other = user_client_with_keys(nostr::Keys::generate());
+        let resp = other
+            .get_auth(&format!("/api/v1/app-deployments/{dep_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
     /// A deployment reports what it is consuming against its quota (#278).
     ///
     /// The operator writes the usage columns from Prometheus; the API only has

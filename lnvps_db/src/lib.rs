@@ -1133,6 +1133,30 @@ pub trait LNVpsDbBase: Send + Sync {
         memory_bytes: u64,
         storage_bytes: Option<u64>,
     ) -> DbResult<()>;
+    /// Replace a deployment's per-service and per-volume usage with this
+    /// observation.
+    ///
+    /// Wholesale replacement, not a merge: a service or volume dropped from the
+    /// compose must stop being reported rather than sit at its last reading
+    /// forever.
+    async fn replace_app_deployment_usage_breakdown(
+        &self,
+        id: u64,
+        services: &[AppDeploymentServiceUsage],
+        volumes: &[AppDeploymentVolumeUsage],
+    ) -> DbResult<()>;
+    /// Per-service and per-volume usage for a set of deployments, empty for any
+    /// deployment nothing has been observed for.
+    ///
+    /// Takes a set rather than one id so a listing costs two queries instead of
+    /// two per row; callers group the rows by `deployment_id`.
+    async fn list_app_deployment_usage_breakdown(
+        &self,
+        ids: &[u64],
+    ) -> DbResult<(
+        Vec<AppDeploymentServiceUsage>,
+        Vec<AppDeploymentVolumeUsage>,
+    )>;
     /// Soft-delete a deployment (sets `deleted = 1`); the operator tears down
     /// the Kubernetes resources on its next reconcile.
     async fn delete_app_deployment(&self, id: u64) -> DbResult<()>;

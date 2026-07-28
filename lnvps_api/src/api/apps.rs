@@ -9,9 +9,10 @@ use axum::extract::{Path, Query, State};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use lnvps_api_common::k8s_names::{deployment_namespace, pending_deployment_namespace};
 use lnvps_api_common::{
     ApiData, ApiError, ApiIntervalType, ApiResult, AppCapacity, AppClusterCapacityService,
-    Nip98Auth,
+    AppDeploymentUsage, Nip98Auth,
 };
 use lnvps_db::{
     App, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus, AppTag, EncryptedString,
@@ -126,24 +127,6 @@ pub struct ApiApp {
     /// this is a set: `nostr` + `relay`, or `nostr` + `media-server` +
     /// `blossom` + `nip-96`.
     pub tags: Vec<ApiAppTag>,
-}
-
-/// The last resource usage the cluster reported for a deployment.
-///
-/// Same units as the quota fields on [`ApiAppDeployment`], so the two divide
-/// directly.
-#[derive(Serialize)]
-pub struct ApiAppDeploymentUsage {
-    pub cpu_milli: u64,
-    pub memory_bytes: u64,
-    /// Volume usage. `None` for a deployment with no volumes, or when the
-    /// metrics source carries no kubelet volume statistics — CPU and memory are
-    /// still reported in that case.
-    pub storage_bytes: Option<u64>,
-    /// When the reading was taken. Usage is sampled on the operator's reconcile
-    /// interval, not on request, so it is always somewhat behind — render it
-    /// with the age rather than as a live figure.
-    pub collected: DateTime<Utc>,
 }
 
 /// One service's share of an app's resource footprint.
@@ -359,7 +342,7 @@ pub struct ApiAppDeployment {
     /// or a cluster with no metrics source. Absent readings are reported as
     /// unknown rather than as zero, which would read as "idle" for something
     /// nobody has measured.
-    pub usage: Option<ApiAppDeploymentUsage>,
+    pub usage: Option<AppDeploymentUsage>,
     /// Current customer-supplied `config` field values (issue #232), for
     /// prefilling the edit form so a config `PATCH` preserves untouched fields.
     /// Only the `config:` map — generated `secrets:` are never exposed. `None`
@@ -377,6 +360,20 @@ pub struct ApiAppDeployment {
 async fn deployment_to_api(
     db: &dyn LNVpsDb,
     d: AppDeployment,
+) -> Result<ApiAppDeployment, ApiError> {
+    let (services, volumes) = db.list_app_deployment_usage_breakdown(&[d.id]).await?;
+    deployment_to_api_with_breakdown(db, d, services, volumes).await
+}
+
+/// As [`deployment_to_api`], with the usage breakdown already read.
+///
+/// A listing reads every row's breakdown in one query and hands each
+/// deployment its own share, rather than paying a query per row.
+async fn deployment_to_api_with_breakdown(
+    db: &dyn LNVpsDb,
+    d: AppDeployment,
+    usage_services: Vec<lnvps_db::AppDeploymentServiceUsage>,
+    usage_volumes: Vec<lnvps_db::AppDeploymentVolumeUsage>,
 ) -> Result<ApiAppDeployment, ApiError> {
     // Resolve the owning subscription from the line item (best-effort). Its
     // billing state comes from the same row: deriving it here, rather than
@@ -401,6 +398,7 @@ async fn deployment_to_api(
     let multiplier = d.resource_multiplier.max(1);
     let app = db.get_app(d.app_id).await?;
     let m = multiplier as u64;
+    let usage = AppDeploymentUsage::from_parts(&d, usage_services, usage_volumes);
     Ok(ApiAppDeployment {
         id: d.id,
         app_id: d.app_id,
@@ -416,18 +414,7 @@ async fn deployment_to_api(
         cpu_milli: app.cpu_milli * m,
         memory_bytes: app.memory_bytes * m,
         storage_bytes: app.storage_bytes * m,
-        // Only report a reading that is complete: a timestamp with no figures,
-        // or figures with no timestamp, is a half-written row, and dating an
-        // unknown sample `now` would overstate how fresh it is.
-        usage: match (d.usage_cpu_milli, d.usage_memory_bytes, d.usage_collected) {
-            (Some(cpu_milli), Some(memory_bytes), Some(collected)) => Some(ApiAppDeploymentUsage {
-                cpu_milli: cpu_milli as u64,
-                memory_bytes,
-                storage_bytes: d.usage_storage_bytes,
-                collected,
-            }),
-            _ => None,
-        },
+        usage,
         config,
         created: d.created,
     })
@@ -582,9 +569,21 @@ async fn v1_list_app_deployments(
 ) -> ApiResult<Vec<ApiAppDeployment>> {
     let uid = this.db.upsert_user(&auth.pubkey()).await?;
     let deployments = this.db.list_user_app_deployments(uid).await?;
+    let ids: Vec<u64> = deployments.iter().map(|d| d.id).collect();
+    let (services, volumes) = this.db.list_app_deployment_usage_breakdown(&ids).await?;
     let mut out = Vec::with_capacity(deployments.len());
     for d in deployments {
-        out.push(deployment_to_api(this.db.as_ref(), d).await?);
+        let mine_s = services
+            .iter()
+            .filter(|s| s.deployment_id == d.id)
+            .cloned()
+            .collect();
+        let mine_v = volumes
+            .iter()
+            .filter(|v| v.deployment_id == d.id)
+            .cloned()
+            .collect();
+        out.push(deployment_to_api_with_breakdown(this.db.as_ref(), d, mine_s, mine_v).await?);
     }
     ApiData::ok(out)
 }
@@ -728,7 +727,7 @@ async fn v1_create_app_deployment(
         subscription_line_item_id: line_item_id,
         name: name.to_string(),
         // Temporary unique namespace; finalized to `app-{id}` below.
-        namespace: format!("app-pending-{line_item_id}"),
+        namespace: pending_deployment_namespace(line_item_id),
         hostname: None,
         custom_domain: None,
         config: Some(EncryptedString::new(config_json)),
@@ -745,7 +744,7 @@ async fn v1_create_app_deployment(
     let id = this.db.insert_app_deployment(&deployment).await?;
     // Finalize the namespace to the operator's derived form.
     deployment.id = id;
-    deployment.namespace = format!("app-{id}");
+    deployment.namespace = deployment_namespace(id);
     this.db.update_app_deployment(&deployment).await?;
 
     ApiData::ok(deployment_to_api(this.db.as_ref(), deployment).await?)
@@ -1380,5 +1379,121 @@ mod tests {
         let api = ok(deployment_to_api(&db, dep(2, AppDeploymentStatus::Running)).await);
         assert_eq!(api.billing_state, None);
         assert_eq!(api.subscription_id, None);
+    }
+
+    /// The breakdown is served beside the totals, keyed on compose names, and a
+    /// deployment with totals but no stored breakdown reports empty lists
+    /// rather than dropping its usage.
+    #[tokio::test]
+    async fn deployment_usage_carries_the_per_service_and_per_volume_breakdown() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::{
+            App, AppDeployment, AppDeploymentServiceUsage, AppDeploymentVolumeUsage, IntervalType,
+            LNVpsDbBase,
+        };
+
+        fn ok(r: Result<ApiAppDeployment, ApiError>) -> ApiAppDeployment {
+            match r {
+                Ok(v) => v,
+                Err(_) => panic!("deployment_to_api failed"),
+            }
+        }
+
+        let db = MockDb::default();
+        {
+            let mut apps = db.apps.lock().await;
+            apps.insert(
+                1,
+                App {
+                    id: 1,
+                    name: "relay".to_string(),
+                    display_name: "Relay".to_string(),
+                    description: None,
+                    icon: None,
+                    repo_url: None,
+                    category: "Nostr relay".to_string(),
+                    seo_title: None,
+                    seo_description: None,
+                    compose: "services:\n  a:\n    image: x\n".to_string(),
+                    amount: 1000,
+                    currency: "USD".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_amount: 0,
+                    cpu_milli: 250,
+                    memory_bytes: 512 * 1024 * 1024,
+                    storage_bytes: 1024 * 1024 * 1024,
+                    enabled: true,
+                    created: Utc::now(),
+                },
+            );
+        }
+
+        let observed = Utc::now();
+        let d = AppDeployment {
+            id: 4,
+            user_id: 1,
+            app_id: 1,
+            cluster_id: 1,
+            resource_multiplier: 1,
+            subscription_line_item_id: 1,
+            name: "d".to_string(),
+            namespace: "ns".to_string(),
+            hostname: None,
+            custom_domain: None,
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Running,
+            status_message: None,
+            usage_cpu_milli: Some(300),
+            usage_memory_bytes: Some(2048),
+            usage_storage_bytes: Some(4096),
+            usage_collected: Some(observed),
+            created: Utc::now(),
+            deleted: false,
+        };
+
+        // Totals with nothing collected per service yet.
+        let api = ok(deployment_to_api(&db, d.clone()).await);
+        let usage = api.usage.expect("totals are complete");
+        assert_eq!(usage.cpu_milli, 300);
+        assert!(usage.services.is_empty());
+        assert!(usage.volumes.is_empty());
+
+        db.replace_app_deployment_usage_breakdown(
+            4,
+            &[AppDeploymentServiceUsage {
+                deployment_id: 4,
+                service: "a".to_string(),
+                cpu_milli: 300,
+                memory_bytes: 2048,
+                collected: observed,
+            }],
+            &[AppDeploymentVolumeUsage {
+                deployment_id: 4,
+                service: "a".to_string(),
+                name: "data".to_string(),
+                storage_bytes: 4096,
+                collected: observed,
+            }],
+        )
+        .await
+        .unwrap();
+
+        let api = ok(deployment_to_api(&db, d.clone()).await);
+        let usage = api.usage.expect("totals are complete");
+        assert_eq!(usage.services.len(), 1);
+        assert_eq!(usage.services[0].service, "a");
+        assert_eq!(usage.services[0].memory_bytes, 2048);
+        assert_eq!(usage.volumes.len(), 1);
+        assert_eq!(usage.volumes[0].name, "data");
+        assert_eq!(usage.volumes[0].storage_bytes, 4096);
+
+        // A breakdown alone is not a reading: without complete totals there is
+        // no timestamp to date it by.
+        let mut no_totals = d;
+        no_totals.usage_collected = None;
+        let api = ok(deployment_to_api(&db, no_totals).await);
+        assert!(api.usage.is_none());
     }
 }

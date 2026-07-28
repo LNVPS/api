@@ -4,6 +4,7 @@ mod dns;
 mod exchange;
 mod geoip;
 mod json_api;
+pub mod k8s_names;
 mod kv;
 mod mock;
 mod model;
