@@ -1,0 +1,74 @@
+# Cluster-side setup for `app-tls-secret`: one wildcard certificate for the
+# apps domain, mirrored into every deployment namespace.
+#
+# The operator only references the secret. Without this, each deployment's
+# default host gets its own certificate and onboarding is capped by the ACME
+# account's weekly certificate limit for the registered domain.
+#
+# Replace `apps.example.com` with the `ingress_domain` of the app cluster this
+# operator serves, and the DNS provider block with the one for that zone.
+#
+# Prerequisite: reflector (emberstack/kubernetes-reflector) installed in the
+# cluster. It is what copies the secret into namespaces that do not exist yet
+# when the certificate is issued:
+#
+#   helm repo add emberstack https://emberstack.github.io/helm-charts
+#   helm install reflector emberstack/reflector --namespace kube-system
+---
+# DNS-01, not HTTP-01: a wildcard cannot be validated over HTTP.
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-dns
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: admin@example.com
+    privateKeySecretRef:
+      name: letsencrypt-dns-account-key
+    solvers:
+    - dns01:
+        cloudflare:
+          apiTokenSecretRef:
+            name: cloudflare-api-token
+            key: api-token
+      selector:
+        dnsZones:
+        - "example.com"
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: apps-wildcard-tls
+  # Issued once here; the deployment namespaces receive copies.
+  namespace: cert-manager
+spec:
+  secretName: apps-wildcard-tls
+  issuerRef:
+    name: letsencrypt-dns
+    kind: ClusterIssuer
+  dnsNames:
+  - "*.apps.example.com"
+  secretTemplate:
+    annotations:
+      # Reflector mirrors this secret, and every reissue of it, into each
+      # namespace matching the regex below. `app-.*` is the operator's
+      # namespace-per-deployment naming; a namespace created later is filled in
+      # by reflector's namespace watch, so a fresh deployment does not wait for
+      # a renewal to be served.
+      reflector.v1.k8s.emberstack.com/reflection-allowed: "true"
+      reflector.v1.k8s.emberstack.com/reflection-allowed-namespaces: "app-.*"
+      reflector.v1.k8s.emberstack.com/reflection-auto-enabled: "true"
+      reflector.v1.k8s.emberstack.com/reflection-auto-namespaces: "app-.*"
+---
+# Then point the operator at the mirrored secret, by the name it has in the
+# deployment namespaces (the same name it has here):
+#
+#   app-tls-secret: "apps-wildcard-tls"
+#
+# Give it a name of its own rather than `app-tls`: namespaces provisioned before
+# this setting already hold a per-deployment secret under that name.
+#
+# Customer custom domains are unaffected and keep their own certificate — a
+# certificate for a domain we do not control is only issuable once the
+# customer's DNS points at us.

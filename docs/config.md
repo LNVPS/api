@@ -329,6 +329,10 @@ onboarded in a week. Customer custom domains always keep their own certificate:
 theirs is only solvable once their DNS points at us. Omit the key to issue one
 certificate per deployment.
 
+The cluster-side half — the wildcard `Certificate` and the reflector
+annotations that mirror its secret into the deployment namespaces — is in
+[`lnvps_operator/apps-wildcard-tls.example.yaml`](../lnvps_operator/apps-wildcard-tls.example.yaml).
+
 Give the shared secret a name of its own rather than `app-tls`: namespaces
 provisioned before this setting already hold a per-deployment secret under that
 name, and the ingress would serve whichever of the two the mirror had not
