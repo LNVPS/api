@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow};
 use serde::Deserialize;
 
-use crate::app_deployments::namespace_name;
+pub use lnvps_api_common::k8s_names::deployment_id_from_namespace;
 
 /// The namespaces this operator owns, as a PromQL matcher. Anchored so a
 /// namespace merely starting with `app-` (or one belonging to something else
@@ -208,14 +208,6 @@ pub fn parse_instant_vector(body: &str, key_label: &str) -> Result<Vec<Sample>> 
             })
         })
         .collect())
-}
-
-/// The deployment id a namespace belongs to, if it is one of ours.
-pub fn deployment_id_from_namespace(ns: &str) -> Option<u64> {
-    let id: u64 = ns.strip_prefix("app-")?.parse().ok()?;
-    // Round-trip so only the canonical spelling matches: `app-007` parses as 7
-    // but is not a namespace this operator ever created.
-    (namespace_name(id) == ns).then_some(id)
 }
 
 /// Cores to millicores, matching the quota's unit. Rounded up so a workload that

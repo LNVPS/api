@@ -28,6 +28,10 @@ use lnvps_db::{
 
 use crate::Context;
 use crate::metrics::DeploymentUsage;
+use lnvps_api_common::k8s_names::{
+    deployment_files_configmap, deployment_namespace as namespace_name, deployment_secret,
+    deployment_volume,
+};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     ConfigMap, Container, ContainerPort, EnvVar, Namespace, PersistentVolumeClaim,
@@ -55,18 +59,13 @@ pub const MANAGED_BY: &str = "lnvps-operator";
 /// deployment namespace. Bound per namespace, never cluster-wide.
 pub const APP_NAMESPACE_CLUSTER_ROLE: &str = "lnvps-operator-appns";
 
-/// The Kubernetes namespace for a deployment.
-pub fn namespace_name(deployment_id: u64) -> String {
-    format!("app-{deployment_id}")
-}
-
 /// Common labels applied to every object of a deployment.
 fn labels(deployment_id: u64) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("managed-by".to_string(), MANAGED_BY.to_string()),
         (
             "app.kubernetes.io/instance".to_string(),
-            format!("app-{deployment_id}"),
+            namespace_name(deployment_id),
         ),
     ])
 }
@@ -540,7 +539,7 @@ pub fn build_pvc(
     )]);
     PersistentVolumeClaim {
         metadata: ObjectMeta {
-            name: Some(format!("{service}-{name}")),
+            name: Some(deployment_volume(service, name)),
             namespace: Some(namespace_name(deployment_id)),
             labels: Some(service_labels(deployment_id, service)),
             ..Default::default()
@@ -579,7 +578,7 @@ pub fn build_files_configmap(
     }
     Some(ConfigMap {
         metadata: ObjectMeta {
-            name: Some(format!("{service}-files")),
+            name: Some(deployment_files_configmap(service)),
             namespace: Some(namespace_name(deployment_id)),
             labels: Some(service_labels(deployment_id, service)),
             ..Default::default()
@@ -612,7 +611,7 @@ pub fn build_secret(
     }
     Some(k8s_openapi::api::core::v1::Secret {
         metadata: ObjectMeta {
-            name: Some(format!("{service}-secret")),
+            name: Some(deployment_secret(service)),
             namespace: Some(namespace_name(deployment_id)),
             labels: Some(service_labels(deployment_id, service)),
             ..Default::default()
@@ -690,7 +689,7 @@ pub fn build_deployment(
 
     // Data volumes (PVC).
     for v in &svc.volumes {
-        let vol_name = format!("{service_name}-{}", v.name);
+        let vol_name = deployment_volume(service_name, &v.name);
         volumes.push(K8sVolume {
             name: vol_name.clone(),
             persistent_volume_claim: Some(
@@ -739,7 +738,7 @@ pub fn build_deployment(
         volumes.push(K8sVolume {
             name: "files-cm".to_string(),
             config_map: Some(k8s_openapi::api::core::v1::ConfigMapVolumeSource {
-                name: format!("{service_name}-files"),
+                name: deployment_files_configmap(service_name),
                 ..Default::default()
             }),
             ..Default::default()
@@ -749,7 +748,7 @@ pub fn build_deployment(
         volumes.push(K8sVolume {
             name: "files-secret".to_string(),
             secret: Some(k8s_openapi::api::core::v1::SecretVolumeSource {
-                secret_name: Some(format!("{service_name}-secret")),
+                secret_name: Some(deployment_secret(service_name)),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1364,12 +1363,12 @@ fn breakdown_rows(
         })
         .collect();
 
-    // Claim name is `"{service}-{volume}"`, so the compose pairs are what
-    // resolve it rather than a split on the dash.
+    // Claim name is not injective, so the compose pairs are what resolve it
+    // rather than a split on the dash.
     let mut volumes = Vec::new();
     for (service, svc) in &compose.services {
         for v in &svc.volumes {
-            let claim = format!("{service}-{}", v.name);
+            let claim = deployment_volume(service, &v.name);
             if let Some(c) = usage.claims.iter().find(|c| c.claim == claim) {
                 volumes.push(AppDeploymentVolumeUsage {
                     deployment_id: id,

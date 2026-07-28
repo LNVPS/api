@@ -9,6 +9,7 @@ use axum::extract::{Path, Query, State};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
+use lnvps_api_common::k8s_names::{deployment_namespace, pending_deployment_namespace};
 use lnvps_api_common::{
     ApiData, ApiError, ApiIntervalType, ApiResult, AppCapacity, AppClusterCapacityService,
     AppDeploymentUsage, Nip98Auth,
@@ -726,7 +727,7 @@ async fn v1_create_app_deployment(
         subscription_line_item_id: line_item_id,
         name: name.to_string(),
         // Temporary unique namespace; finalized to `app-{id}` below.
-        namespace: format!("app-pending-{line_item_id}"),
+        namespace: pending_deployment_namespace(line_item_id),
         hostname: None,
         custom_domain: None,
         config: Some(EncryptedString::new(config_json)),
@@ -743,7 +744,7 @@ async fn v1_create_app_deployment(
     let id = this.db.insert_app_deployment(&deployment).await?;
     // Finalize the namespace to the operator's derived form.
     deployment.id = id;
-    deployment.namespace = format!("app-{id}");
+    deployment.namespace = deployment_namespace(id);
     this.db.update_app_deployment(&deployment).await?;
 
     ApiData::ok(deployment_to_api(this.db.as_ref(), deployment).await?)
