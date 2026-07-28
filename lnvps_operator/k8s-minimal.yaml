@@ -98,7 +98,8 @@ spec:
       securityContext:
         runAsNonRoot: true
         runAsUser: 65534
-        fsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
       containers:
       - name: lnvps-operator
         image: lnvps-operator:latest  # UPDATE THIS
