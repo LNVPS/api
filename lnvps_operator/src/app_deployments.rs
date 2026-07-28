@@ -1393,8 +1393,6 @@ pub struct WorkloadHealth {
 pub struct ContainerFailure {
     /// Compose service the container belongs to.
     pub service: String,
-    /// Container name (a service's own container, or one of its init steps).
-    pub container: String,
     /// The kubelet's waiting reason, e.g. `CrashLoopBackOff`.
     pub reason: String,
     /// The last termination message, when the container ran and died.
@@ -1483,43 +1481,54 @@ async fn read_workload_health(client: &Client, deployment_id: u64) -> Result<Wor
 
     let pods: Api<Pod> = Api::namespaced(client.clone(), &ns);
     for p in pods.list(&ListParams::default()).await?.items {
-        // The compose service name is on the pod as the component label, which
-        // is what the customer recognises — the pod name is generated.
-        let service = p
-            .labels()
-            .get("app.kubernetes.io/component")
-            .cloned()
-            .unwrap_or_else(|| p.name_any());
-        let Some(status) = &p.status else { continue };
-        let statuses = status
-            .container_statuses
-            .iter()
-            .flatten()
-            .chain(status.init_container_statuses.iter().flatten());
-        for cs in statuses {
-            let Some(waiting) = cs.state.as_ref().and_then(|s| s.waiting.as_ref()) else {
-                continue;
-            };
-            let Some(reason) = waiting.reason.as_deref() else {
-                continue;
-            };
-            if !TERMINAL_WAITING_REASONS.contains(&reason) {
-                continue;
-            }
-            health.failures.push(ContainerFailure {
-                service: service.clone(),
-                container: cs.name.clone(),
-                reason: reason.to_string(),
-                detail: cs
-                    .last_state
-                    .as_ref()
-                    .and_then(|s| s.terminated.as_ref())
-                    .and_then(|t| t.message.clone())
-                    .or_else(|| waiting.message.clone()),
-            });
-        }
+        health.failures.extend(pod_failures(&p));
     }
     Ok(health)
+}
+
+/// The terminal container failures a single pod reports, if any.
+///
+/// Pure so the reason filter and the service-name fallback are testable without
+/// a cluster.
+fn pod_failures(pod: &Pod) -> Vec<ContainerFailure> {
+    // The compose service name is on the pod as the component label, which
+    // is what the customer recognises — the pod name is generated.
+    let service = pod
+        .labels()
+        .get("app.kubernetes.io/component")
+        .cloned()
+        .unwrap_or_else(|| pod.name_any());
+    let Some(status) = &pod.status else {
+        return vec![];
+    };
+    let statuses = status
+        .container_statuses
+        .iter()
+        .flatten()
+        .chain(status.init_container_statuses.iter().flatten());
+    let mut failures = vec![];
+    for cs in statuses {
+        let Some(waiting) = cs.state.as_ref().and_then(|s| s.waiting.as_ref()) else {
+            continue;
+        };
+        let Some(reason) = waiting.reason.as_deref() else {
+            continue;
+        };
+        if !TERMINAL_WAITING_REASONS.contains(&reason) {
+            continue;
+        }
+        failures.push(ContainerFailure {
+            service: service.clone(),
+            reason: reason.to_string(),
+            detail: cs
+                .last_state
+                .as_ref()
+                .and_then(|s| s.terminated.as_ref())
+                .and_then(|t| t.message.clone())
+                .or_else(|| waiting.message.clone()),
+        });
+    }
+    failures
 }
 
 /// Record the deployment's hostname and why it is (not) running.
@@ -2857,7 +2866,6 @@ config:
             ready: 1,
             failures: vec![ContainerFailure {
                 service: "db".to_string(),
-                container: "db".to_string(),
                 reason: "CrashLoopBackOff".to_string(),
                 detail: Some("InnoDB: Unable to create temporary file\n".to_string()),
             }],
@@ -2874,7 +2882,6 @@ config:
             ready: 1,
             failures: vec![ContainerFailure {
                 service: "web".to_string(),
-                container: "web".to_string(),
                 reason: "ImagePullBackOff".to_string(),
                 detail: None,
             }],
@@ -2888,13 +2895,79 @@ config:
             ready: 0,
             failures: vec![ContainerFailure {
                 service: "db".to_string(),
-                container: "db".to_string(),
                 reason: "CrashLoopBackOff".to_string(),
                 detail: Some("x".repeat(5000)),
             }],
         });
         let m = m.unwrap();
         assert!(m.len() < 400, "message stays renderable: {}", m.len());
+    }
+
+    /// A pod is only a failure once the kubelet has settled on one: a container
+    /// still being created is not an error the customer can act on.
+    #[test]
+    fn pod_failures_reports_only_terminal_reasons() {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateTerminated, ContainerStateWaiting, ContainerStatus,
+            PodStatus,
+        };
+
+        let waiting = |reason: &str| ContainerState {
+            waiting: Some(ContainerStateWaiting {
+                reason: Some(reason.to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let status = |name: &str, state: ContainerState| ContainerStatus {
+            name: name.to_string(),
+            state: Some(state),
+            ..Default::default()
+        };
+
+        let mut crashing = status("db", waiting("CrashLoopBackOff"));
+        crashing.last_state = Some(ContainerState {
+            terminated: Some(ContainerStateTerminated {
+                message: Some("InnoDB: Unable to create temporary file\n".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let pod = Pod {
+            metadata: ObjectMeta {
+                name: Some("db-7f9c8-abcde".to_string()),
+                labels: Some(BTreeMap::from([(
+                    "app.kubernetes.io/component".to_string(),
+                    "db".to_string(),
+                )])),
+                ..Default::default()
+            },
+            status: Some(PodStatus {
+                container_statuses: Some(vec![
+                    status("web", waiting("ContainerCreating")),
+                    crashing,
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            pod_failures(&pod),
+            vec![ContainerFailure {
+                // The component label, not the generated pod name.
+                service: "db".to_string(),
+                reason: "CrashLoopBackOff".to_string(),
+                detail: Some("InnoDB: Unable to create temporary file\n".to_string()),
+            }]
+        );
+
+        // Without the label there is still a name to show, so a failure is
+        // never dropped for want of one.
+        let mut unlabelled = pod.clone();
+        unlabelled.metadata.labels = None;
+        assert_eq!(unlabelled.name_any(), pod_failures(&unlabelled)[0].service);
     }
 
     // ── billing gate (reconcile_one) ────────────────────────────────────────
