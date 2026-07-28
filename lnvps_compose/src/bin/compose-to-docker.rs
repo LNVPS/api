@@ -620,6 +620,16 @@ fn run(args: Args) -> Result<()> {
         read_source(&args.source).with_context(|| format!("cannot read {}", args.source))?;
     let compose = Compose::parse(&source).context("parse error")?;
     compose.validate().context("validation error")?;
+    // This is an authoring tool, so it applies the admission-only rules too —
+    // as `compose-validate` does. One of them matters especially here: docker
+    // gives every service a DNS alias whether or not it declares ports, and
+    // Kubernetes only gives one to a service that renders a Service. So a
+    // compose that addresses a portless peer runs *fine locally* and fails in
+    // the cluster with "Name or service not known" (#281). Refusing it here is
+    // what keeps a green local run meaningful.
+    compose
+        .validate_declarations()
+        .context("validation error")?;
 
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("creating {}", args.out_dir.display()))?;

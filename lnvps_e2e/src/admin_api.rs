@@ -1046,6 +1046,75 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A compose that points one service at another by `name:port` is refused
+    /// at app create/update unless that peer declares ports (#281) — no ports
+    /// means no Service, which means no DNS name, which is how the Buzz app
+    /// reached production and died on "Name or service not known".
+    #[tokio::test]
+    async fn test_admin_app_compose_addressed_peer_needs_ports() {
+        let client = setup().await;
+        let suffix = nostr::Keys::generate().public_key().to_hex()[..8].to_string();
+        let slug = format!("e2e-peer-ports-{suffix}");
+
+        let compose = |db_ports: &str| {
+            format!(
+                "services:\n  db:\n    image: postgres:17-alpine\n    user: root\n{db_ports}  \
+                 relay:\n    image: example/relay:latest\n    user: \"1000\"\n    \
+                 ports:\n      - {{ name: http, container: 3000, protocol: http, expose: ingress }}\n    \
+                 env:\n      DATABASE_URL: \"postgres://buzz:pw@db:5432/buzz\"\n"
+            )
+        };
+        let body = |compose: String| {
+            serde_json::json!({
+                "name": slug,
+                "display_name": "Addressed Peer",
+                "category": "Nostr relay",
+                "compose": compose,
+                "amount": 1000,
+                "currency": "usd",
+                "interval_amount": 1,
+                "interval_type": "month",
+                "setup_amount": 0
+            })
+        };
+
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &body(compose("")))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = resp.text().await.unwrap();
+        assert!(err.contains("addresses 'db:<port>'"), "{err}");
+
+        // An internal port block satisfies it; `expose: none` is enough,
+        // because the Service is what DNS needs, not the Ingress.
+        let ok_ports = "    ports:\n      \
+             - { name: postgres, container: 5432, protocol: tcp, expose: none }\n";
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &body(compose(ok_ports)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let created: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let app_id = created["data"]["id"].as_u64().expect("app id");
+
+        // Same rule on update, so an edit cannot reintroduce it.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "compose": compose("") }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// A generated secret can declare its byte length (issue #243), and an
     /// unusable length is refused when the app is created or updated rather
     /// than becoming an app that deploys and crash-loops on its own key.

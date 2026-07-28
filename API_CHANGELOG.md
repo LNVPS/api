@@ -36,6 +36,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **A managed-app service addressed as `name:port` by another service must declare `ports:`** (issue #281) — enforced when an app is created or updated through the admin API; `POST`/`PATCH /api/admin/v1/apps` returns `400` for a compose that points at a peer with no ports. The operator creates a Kubernetes Service — the only source of an in-namespace DNS name — only for a service with declared ports, so `postgres://buzz:…@db:5432/buzz` against a `db` that declares none is a hostname that does not resolve. The Buzz catalog app reached production this way and failed on its first connection with `Name or service not known`; the same defect was latent in `route96`, whose `db` is addressed at `db:3306` and declared no ports. Both documented composes now carry internal port blocks (`expose: none`, so nothing becomes publicly reachable).
+
+  Authoring-time only, like the `${…}` rule beside it: an app definition stored before this keeps reconciling unchanged and is caught the next time an admin edits it. The live catalog rows need the same edit, which no migration performs — and because the operator re-reads the app's compose on every pass, updating the row repairs an already-deployed instance without re-ordering it.
+
+- **Managed app config fields are validated against their declared `type`### Changed
+
 - **Managed app config fields are validated against their declared `type`, and may declare a `pattern`** (issue #271) — **stricter validation on `POST /api/v1/app-deployments`, `PATCH /api/v1/app-deployments/{id}` and the admin app create/update endpoints.** An order that previously succeeded with a garbage value now returns `400`.
 
   `resolve_config` enforced `required` and unknown keys and never looked at `type`, so an `int` field accepted `abc`, a `bool` field accepted `maybe`, and a `string` field accepted anything at all. That is only a validation gap until an app is strict about the value: HAVEN panics on an `owner_npub` that is not an npub, so a single mistyped character was accepted at order time, charged for, and became a deployment that restarted forever with nothing on screen naming the field.

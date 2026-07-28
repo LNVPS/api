@@ -2605,6 +2605,24 @@ config:
                     !svc.ports.is_empty(),
                     "{name}/{sname}: service presence tracks declared ports"
                 );
+                // ...and every peer this service addresses by name must be one
+                // of the services that gets one (#281). The assertion above
+                // says the rendering is self-consistent; this one asks whether
+                // it is *sufficient*, which is the question the Buzz entry
+                // failed in production: `db:5432` in the relay's env, with a
+                // `db` that declared no ports and so had no DNS name.
+                for (peer, psvc) in &c.services {
+                    if peer == sname || !psvc.ports.is_empty() {
+                        continue;
+                    }
+                    for value in senv.values() {
+                        assert!(
+                            !value.contains(&format!("{peer}:")),
+                            "{name}/{sname}: addresses '{peer}:…' but '{peer}' declares no \
+                             ports, so no Service and no DNS name is created for it"
+                        );
+                    }
+                }
                 for v in &svc.volumes {
                     assert!(build_pvc(id, sname, &v.name, &v.size, 1).spec.is_some());
                 }

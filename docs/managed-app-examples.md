@@ -275,6 +275,37 @@ This is not a substitute for a real reconcile — it does not exercise the
 ingress, the PVC provisioner or `depends_on` ordering — but it does exercise the
 exact check that refuses these pods.
 
+**A service another service talks to must declare `ports:`** (issue #281). The
+operator creates a Kubernetes Service — the only thing that gives a compose
+service a DNS name inside the namespace — only for a service with declared
+ports. So this does not resolve, and the app fails at its first connection with
+`Name or service not known`:
+
+```yaml
+services:
+  db:
+    image: postgres:17-alpine
+    user: root
+    # Drop this block and `db:5432` below stops resolving: no ports, no
+    # Service, no DNS name. `expose: none` keeps it in-namespace — only
+    # `expose: ingress` ports reach the Ingress.
+    ports:
+      - { name: postgres, container: 5432, protocol: tcp, expose: none }
+  relay:
+    image: example/relay:latest
+    user: "1000"
+    ports:
+      - { name: http, container: 3000, protocol: http, expose: ingress }
+    env:
+      DATABASE_URL: "postgres://buzz:pw@db:5432/buzz"
+```
+
+App create/update refuses a compose that addresses a portless peer as
+`name:port`, and so do `compose-validate` and `compose-to-docker`. **A local
+`docker compose up` will not catch this on its own** — docker gives every
+service a DNS alias whether or not it declares ports, which is exactly why the
+rule is enforced at authoring time.
+
 **`config[].pattern`** — a regex a submitted value must match, checked at
 order time (issue #271):
 
@@ -458,6 +489,10 @@ services:
     image: mariadb:11
     user: root    # mariadb's entrypoint starts as root, then drops to `mysql`
     resources: { cpu: 500m, memory: 512Mi }
+    # No ports, no Service, no DNS name — `db:3306` in route96's config would
+    # not resolve (#281). `expose: none` keeps it in-namespace.
+    ports:
+      - { name: mysql, container: 3306, protocol: tcp, expose: none }
     env:
       MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
       MARIADB_DATABASE: route96
@@ -753,6 +788,11 @@ services:
     image: postgres:17-alpine
     user: root    # postgres' entrypoint starts as root, then drops to `postgres`
     resources: { cpu: 500m, memory: 1Gi }
+    # A port block is what gives the service a DNS name inside the namespace:
+    # no ports, no Service, and `db` in the relay's DATABASE_URL does not
+    # resolve (#281). `expose: none` keeps it internal.
+    ports:
+      - { name: postgres, container: 5432, protocol: tcp, expose: none }
     env:
       POSTGRES_DB: buzz
       POSTGRES_USER: buzz
@@ -772,6 +812,8 @@ services:
     image: redis:7-alpine
     user: root    # redis' entrypoint starts as root, then drops to `redis`
     resources: { cpu: 250m, memory: 512Mi }
+    ports:
+      - { name: redis, container: 6379, protocol: tcp, expose: none }
     volumes:
       # RDB snapshots; without a writable /data redis fails its bgsave and then
       # refuses writes with MISCONF
