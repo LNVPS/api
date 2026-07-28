@@ -52,9 +52,6 @@ redis: "redis://localhost:6379"
 # reports usage as unknown rather than as zero.
 prometheus:
   url: "http://prometheus.monitoring:9090"
-  # Range the CPU rate is averaged over (optional, defaults to "5m"). Keep it
-  # several scrape intervals wide.
-  cpu-window: "5m"
   # Per-query timeout in seconds (optional, defaults to 10). Collection is
   # best-effort and must not hold up a reconcile pass.
   timeout-seconds: 10

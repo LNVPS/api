@@ -16,6 +16,8 @@ mod app_deployments;
 mod metrics;
 mod nostr_domains;
 
+use crate::metrics::PrometheusClient;
+
 /// Environment variable holding the hex-encoded database encryption key. Must
 /// match the API's key (`lnvps_api::settings::ENCRYPTION_KEY_ENV`) so the
 /// operator can decrypt columns the API encrypted (e.g. `app_deployment.config`).
@@ -105,11 +107,6 @@ pub struct PrometheusConfig {
     /// Base URL of the Prometheus HTTP API, e.g. `http://prometheus.monitoring:9090`.
     pub url: String,
 
-    /// Range the CPU rate is averaged over (defaults to `5m`). Must be several
-    /// scrape intervals wide or the rate is computed from too few samples to
-    /// mean anything.
-    pub cpu_window: Option<String>,
-
     /// Per-query timeout in seconds (defaults to 10). Usage collection is
     /// best-effort, so it must not hold up a reconcile pass.
     pub timeout_seconds: Option<u64>,
@@ -127,6 +124,9 @@ pub struct Context {
     pub client: Client,
     pub db: Arc<dyn LNVpsDb>,
     pub settings: Settings,
+    /// Usage source, built once so its connection pool survives between
+    /// reconcile passes. `None` when no Prometheus is configured.
+    pub metrics: Option<PrometheusClient>,
 }
 
 #[tokio::main]
@@ -168,10 +168,19 @@ async fn main() -> Result<()> {
     let db = LNVpsDbMysql::new(&settings.db).await?;
     let client = Client::try_default().await?;
 
+    let metrics = match &settings.prometheus {
+        Some(cfg) => Some(PrometheusClient::new(
+            &cfg.url,
+            Duration::from_secs(cfg.timeout_seconds.unwrap_or(10)),
+        )?),
+        None => None,
+    };
+
     let context = Arc::new(Context {
         client: client.clone(),
         db: Arc::new(db) as Arc<dyn LNVpsDb>,
         settings: settings.clone(),
+        metrics,
     });
 
     info!("LNVPS Operator is running and watching for resources...");
@@ -338,7 +347,6 @@ mod tests {
         assert_eq!(full.redis.as_deref(), Some("redis://localhost:6379"));
         let prom = full.prometheus.clone().expect("prometheus example");
         assert_eq!(prom.url, "http://prometheus.monitoring:9090");
-        assert_eq!(prom.cpu_window.as_deref(), Some("5m"));
         assert_eq!(prom.timeout_seconds, Some(10));
         assert_eq!(
             full.encryption.unwrap().key_file,

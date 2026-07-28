@@ -81,7 +81,6 @@ kubectl get ingress -n your-namespace
 | `ingress-class` | string | `"nginx"` | Ingress class name |
 | `annotations` | object | `{}` | Additional ingress annotations |
 | `prometheus.url` | string | unset | Prometheus HTTP API to read deployment CPU/memory/volume usage from. Omit to collect no usage |
-| `prometheus.cpu-window` | string | `"5m"` | Range the CPU rate is averaged over |
 | `prometheus.timeout-seconds` | number | `10` | Per-query timeout; collection is best-effort and never blocks a reconcile |
 
 Usage collection needs a Prometheus scraping cAdvisor (`container_cpu_usage_seconds_total`,

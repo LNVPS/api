@@ -12,7 +12,6 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
-use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
@@ -25,7 +24,6 @@ use k8s_openapi::NamespaceResourceScope;
 use lnvps_db::{AppDeployment, AppDeploymentStatus, BillingState, EncryptedString, Subscription};
 
 use crate::Context;
-use crate::metrics::PrometheusClient;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     ConfigMap, Container, ContainerPort, EnvVar, Namespace, PersistentVolumeClaim,
@@ -1206,14 +1204,9 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<()> {
 /// one path would overwrite the other's fields with values read before they
 /// were set.
 async fn collect_usage(ctx: &Context, active: &HashSet<u64>) -> Result<()> {
-    let Some(cfg) = &ctx.settings.prometheus else {
+    let Some(client) = &ctx.metrics else {
         return Ok(());
     };
-    let client = PrometheusClient::new(
-        &cfg.url,
-        cfg.cpu_window.as_deref().unwrap_or("5m"),
-        Duration::from_secs(cfg.timeout_seconds.unwrap_or(10)),
-    )?;
     for (id, usage) in client.deployment_usage().await? {
         // Prometheus keeps series past a namespace's deletion, and it answers
         // for the whole cluster, so only deployments this pass owns are written.

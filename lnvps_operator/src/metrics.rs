@@ -22,9 +22,19 @@ use crate::app_deployments::namespace_name;
 /// entirely) cannot contribute another tenant's numbers to a customer's row.
 const NAMESPACE_MATCHER: &str = r#"namespace=~"app-[0-9]+""#;
 
+/// Container-level series only. Dropping the empty name excludes cAdvisor's
+/// pod-level rollup, and dropping `POD` excludes the pause container, which
+/// older cadvisor builds still label that way — either would be counted a
+/// second time into every deployment's reading.
+const CONTAINER_MATCHER: &str = r#"container!="POD", container!="""#;
+
+/// Range the CPU rate is averaged over. Wide enough that a 60s scrape gives the
+/// rate several samples to work from.
+const CPU_WINDOW: &str = "5m";
+
 /// One deployment's last observed consumption. Same units as the quota fields
 /// on the deployment row, so the two divide directly.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DeploymentUsage {
     pub cpu_milli: u32,
     pub memory_bytes: u64,
@@ -38,15 +48,13 @@ pub struct DeploymentUsage {
 /// Prometheus HTTP API client, scoped to the instant queries this needs.
 pub struct PrometheusClient {
     url: String,
-    cpu_window: String,
     client: reqwest::Client,
 }
 
 impl PrometheusClient {
-    pub fn new(url: &str, cpu_window: &str, timeout: Duration) -> Result<Self> {
+    pub fn new(url: &str, timeout: Duration) -> Result<Self> {
         Ok(Self {
             url: url.trim_end_matches('/').to_string(),
-            cpu_window: cpu_window.to_string(),
             client: reqwest::Client::builder().timeout(timeout).build()?,
         })
     }
@@ -62,14 +70,13 @@ impl PrometheusClient {
     pub async fn deployment_usage(&self) -> Result<HashMap<u64, DeploymentUsage>> {
         let cpu = self
             .query(&format!(
-                "sum by (namespace) (rate(container_cpu_usage_seconds_total{{{NAMESPACE_MATCHER}, container!=\"\"}}[{}]))",
-                self.cpu_window
+                "sum by (namespace) (rate(container_cpu_usage_seconds_total{{{NAMESPACE_MATCHER}, {CONTAINER_MATCHER}}}[{CPU_WINDOW}]))"
             ))
             .await
             .context("cpu query failed")?;
         let memory = self
             .query(&format!(
-                "sum by (namespace) (container_memory_working_set_bytes{{{NAMESPACE_MATCHER}, container!=\"\"}})"
+                "sum by (namespace) (container_memory_working_set_bytes{{{NAMESPACE_MATCHER}, {CONTAINER_MATCHER}}})"
             ))
             .await
             .context("memory query failed")?;
@@ -344,8 +351,7 @@ mod tests {
         .await;
 
         let client =
-            PrometheusClient::new(&format!("{}/", server.uri()), "5m", Duration::from_secs(5))
-                .unwrap();
+            PrometheusClient::new(&format!("{}/", server.uri()), Duration::from_secs(5)).unwrap();
         let usage = client.deployment_usage().await.unwrap();
         assert_eq!(
             usage[&3],
@@ -375,7 +381,7 @@ mod tests {
         // No mock for the volume query: wiremock answers 404, which is what a
         // Prometheus behind a proxy that blocks it looks like.
 
-        let client = PrometheusClient::new(&server.uri(), "5m", Duration::from_secs(5)).unwrap();
+        let client = PrometheusClient::new(&server.uri(), Duration::from_secs(5)).unwrap();
         let usage = client.deployment_usage().await.unwrap();
         assert_eq!(usage[&3].cpu_milli, 500);
         assert_eq!(usage[&3].storage_bytes, None);
@@ -391,23 +397,31 @@ mod tests {
         )
         .await;
 
-        let client = PrometheusClient::new(&server.uri(), "5m", Duration::from_secs(5)).unwrap();
+        let client = PrometheusClient::new(&server.uri(), Duration::from_secs(5)).unwrap();
         let e = client.deployment_usage().await.unwrap_err().to_string();
         assert!(e.contains("cpu query failed"), "{e}");
     }
 
+    /// The pause container must not be summed into a deployment's memory: some
+    /// cadvisor builds still expose it as `container="POD"`, and it is present
+    /// in every pod.
     #[tokio::test]
-    async fn the_configured_cpu_window_reaches_the_query() {
+    async fn the_pause_container_is_excluded_from_both_queries() {
         let server = wiremock::MockServer::start().await;
-        mock_query(&server, "[15m]", vector("app-3", "0.5")).await;
         mock_query(
             &server,
-            "container_memory_working_set_bytes",
+            "rate(container_cpu_usage_seconds_total{namespace=~\"app-[0-9]+\", container!=\"POD\", container!=\"\"}[5m])",
+            vector("app-3", "0.5"),
+        )
+        .await;
+        mock_query(
+            &server,
+            "container_memory_working_set_bytes{namespace=~\"app-[0-9]+\", container!=\"POD\", container!=\"\"}",
             vector("app-3", "1"),
         )
         .await;
 
-        let client = PrometheusClient::new(&server.uri(), "15m", Duration::from_secs(5)).unwrap();
+        let client = PrometheusClient::new(&server.uri(), Duration::from_secs(5)).unwrap();
         assert!(client.deployment_usage().await.unwrap().contains_key(&3));
     }
 
