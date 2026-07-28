@@ -275,6 +275,38 @@ This is not a substitute for a real reconcile — it does not exercise the
 ingress, the PVC provisioner or `depends_on` ordering — but it does exercise the
 exact check that refuses these pods.
 
+**`config[].pattern`** — a regex a submitted value must match, checked at
+order time (issue #271):
+
+```yaml
+services:
+  haven:
+    image: holgerhatgarkeinenode/haven-docker:v1.2.2
+    user: "1000"
+    ports:
+      - { name: ws, container: 3355, protocol: http, expose: ingress }
+    env:
+      OWNER_NPUB: "${owner_npub}"
+config:
+  - { name: owner_npub, label: "Owner npub", type: string, required: true,
+      pattern: "npub1[02-9ac-hj-np-z]{58}" }
+```
+
+`type:` only covers what a form input can check — a whole number, a boolean —
+and both are now enforced too: an order submitting `abc` for an `int` field is
+refused with the field's label. But most catalog fields are a `string` whose
+*shape* the app depends on, and an app that is strict about it is strict in the
+worst way: HAVEN panics on an `owner_npub` that is not an npub, so before this
+a mistyped character was accepted, charged for, and turned into a deployment
+that restarted forever with nothing on screen naming the field.
+
+The pattern is **anchored automatically** — it must match the whole value, so
+`npub1…` cannot admit a value with junk on the end. It is compiled when the app
+is created or updated, so a pattern that does not compile is the author's error
+rather than a customer's failed order, and a declared `default` is checked
+against its own field there too. Not applied to `type: file`, whose content is
+arbitrary. Keep it under 200 characters.
+
 **Variable references** — every `${NAME}` in `env`, `files[].content` or a
 `content_from` must be declared, either as a `config:` field, a `secrets:` entry,
 or the built-in `HOSTNAME`. This is enforced when an app is created or updated
@@ -658,7 +690,11 @@ services:
       - { name: db, path: /app/db, size: 10Gi, label: events }
       - { name: blossom, path: /app/blossom, size: 20Gi, label: media }
 config:
-  - { name: owner_npub, label: "Owner npub", type: string, required: true }
+  # HAVEN panics in nPubToPubkey on anything that is not an npub, so a mistyped
+  # character became a paid-for deployment that crashlooped (#271). The pattern
+  # is bech32: `npub1` + 58 characters from the bech32 alphabet (no 1/b/i/o).
+  - { name: owner_npub, label: "Owner npub", type: string, required: true,
+      pattern: "npub1[02-9ac-hj-np-z]{58}" }
   # The private relay's name and description are served as NIP-11 metadata, so
   # they are customer-visible. The chat/outbox/inbox sets are functional relays
   # rather than branding surfaces and stay fixed — eight more order-form fields
@@ -839,7 +875,8 @@ secrets:
   # is rejected at startup as an invalid secret key.
   - { name: BUZZ_RELAY_PRIVATE_KEY, generate: token, bytes: 32 }
 config:
-  - { name: owner_pubkey, label: "Owner pubkey (64-char hex)", type: string, required: true }
+  - { name: owner_pubkey, label: "Owner pubkey (64-char hex)", type: string, required: true,
+      pattern: "[0-9a-fA-F]{64}" }
 ```
 
 ### Before this one can be enabled

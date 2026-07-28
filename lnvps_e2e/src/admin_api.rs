@@ -958,6 +958,94 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A config field's `pattern` is compiled — and its `default` checked
+    /// against its own field — when the app is created or updated (#271), so a
+    /// broken constraint is the author's error rather than a customer's failed
+    /// order.
+    #[tokio::test]
+    async fn test_admin_app_compose_config_constraints() {
+        let client = setup().await;
+        let suffix = nostr::Keys::generate().public_key().to_hex()[..8].to_string();
+        let slug = format!("e2e-cfg-{suffix}");
+
+        let compose = |config: &str| {
+            format!(
+                "services:\n  web:\n    image: example/web:latest\n    user: \"1000\"\n    \
+                 ports:\n      - {{ name: http, container: 80, protocol: http, expose: ingress }}\n    \
+                 env:\n      V: ${{v}}\n\
+                 config:\n  - {config}\n"
+            )
+        };
+        let body = |compose: String| {
+            serde_json::json!({
+                "name": slug,
+                "display_name": "Config Constraints",
+                "category": "Nostr relay",
+                "compose": compose,
+                "amount": 1000,
+                "currency": "usd",
+                "interval_amount": 1,
+                "interval_type": "month",
+                "setup_amount": 0
+            })
+        };
+
+        // A pattern that does not compile.
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/apps",
+                &body(compose("{ name: v, type: string, pattern: \"[unclosed\" }")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = resp.text().await.unwrap();
+        assert!(err.contains("not a valid regex"), "{err}");
+
+        // A default its own field would reject at order time.
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/apps",
+                &body(compose("{ name: v, type: int, default: \"abc\" }")),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = resp.text().await.unwrap();
+        assert!(err.contains("default is invalid"), "{err}");
+
+        // Valid: stored, and the same rules apply on update.
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/apps",
+                &body(compose(
+                    "{ name: v, type: string, pattern: \"npub1[02-9ac-hj-np-z]{58}\" }",
+                )),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let created: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let app_id = created["data"]["id"].as_u64().expect("app id");
+
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({
+                    "compose": compose("{ name: v, type: string, pattern: \"[unclosed\" }")
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = client
+            .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// A generated secret can declare its byte length (issue #243), and an
     /// unusable length is refused when the app is created or updated rather
     /// than becoming an app that deploys and crash-loops on its own key.

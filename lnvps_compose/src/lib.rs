@@ -513,6 +513,99 @@ pub struct ConfigField {
     /// Whether the field must be supplied.
     #[serde(default)]
     pub required: bool,
+    /// Regex the submitted value must match in full (issue #271).
+    ///
+    /// `type:` covers what a form input can check — an integer, a boolean — and
+    /// nothing else. Most catalog fields are a `string` whose shape the app
+    /// depends on: HAVEN takes an `owner_npub` and *panics* on anything that is
+    /// not one, so a mistyped character was accepted at order time and became a
+    /// crashlooping deployment the customer had already paid for. A pattern is
+    /// the smallest thing that closes that, and it generalises — the next app
+    /// wants a domain, a URL or a hex key, each of which would otherwise be
+    /// another `FieldType` variant.
+    ///
+    /// Anchored automatically: the value must match end to end, so a pattern
+    /// cannot accidentally admit a value with the right prefix. Compiled at
+    /// app-create time, so a pattern that does not compile is rejected there
+    /// rather than at a customer's order. Ignored for `type: file`, whose
+    /// content is arbitrary.
+    #[serde(default)]
+    pub pattern: Option<String>,
+}
+
+/// Longest accepted `pattern`. Long enough for the character-class patterns a
+/// catalog field needs (an npub, a domain, a hex key) and short enough that the
+/// admin API is not a place to paste a program.
+pub const MAX_PATTERN_LEN: usize = 200;
+
+impl ConfigField {
+    /// The label a customer sees, falling back to the field name.
+    ///
+    /// Error messages use this: the customer typed into a box labelled "Owner
+    /// npub", and telling them `owner_npub` is wrong makes them hunt for it.
+    pub fn display_label(&self) -> &str {
+        match self.label.as_deref() {
+            Some(l) if !l.trim().is_empty() => l,
+            _ => &self.name,
+        }
+    }
+
+    /// Check one submitted value against this field's declared type and
+    /// pattern. `Ok(())` when the value is usable.
+    ///
+    /// Called for a customer's submitted value *and* for a declared `default`
+    /// at app-create time — a default that its own field would reject is a
+    /// broken app definition, and it fails at order time for whoever leaves the
+    /// field blank rather than for the person who authored it.
+    pub fn check_value(&self, value: &str) -> Result<()> {
+        let label = self.display_label();
+        match self.r#type {
+            FieldType::Int => {
+                if value.trim().parse::<i64>().is_err() {
+                    bail!("config field '{label}' must be a whole number (got '{value}')");
+                }
+            }
+            FieldType::Bool => {
+                if !matches!(value.trim(), "true" | "false") {
+                    bail!("config field '{label}' must be true or false (got '{value}')");
+                }
+            }
+            // A string is unconstrained unless the app says otherwise, and a
+            // file is arbitrary content by definition.
+            FieldType::String | FieldType::File => {}
+        }
+        if let Some(pattern) = &self.pattern
+            && self.r#type != FieldType::File
+        {
+            let re =
+                compile_pattern(pattern).map_err(|e| anyhow!("config field '{label}': {e}"))?;
+            if !re.is_match(value) {
+                bail!("config field '{label}' has the wrong format (expected: {pattern})");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Compile a `pattern` into a fully-anchored regex.
+///
+/// Anchoring is not the author's job: `npub1…` without `^…$` silently accepts a
+/// value with junk on either end, and that is exactly the mistake that produces
+/// a crashlooping deployment. The pattern is wrapped rather than rewritten, so
+/// an author's own `^`/`$` stay valid and mean the same thing.
+///
+/// The `regex` crate has no backtracking, so a catalog pattern cannot be made
+/// to hang the API on a crafted input; the length bound keeps the declaration
+/// readable, it is not a safety measure.
+fn compile_pattern(pattern: &str) -> Result<regex::Regex> {
+    if pattern.trim().is_empty() {
+        bail!("pattern is empty — omit it instead");
+    }
+    if pattern.len() > MAX_PATTERN_LEN {
+        bail!("pattern must be at most {MAX_PATTERN_LEN} characters");
+    }
+    regex::Regex::new(&format!("^(?:{pattern})$"))
+        .map_err(|e| anyhow!("pattern '{pattern}' is not a valid regex: {e}"))
 }
 
 /// Config field input type.
@@ -576,6 +669,18 @@ impl Compose {
     /// `compose-validate` CLI) so a typo or a newly added reference is caught
     /// while a human can still fix it.
     pub fn validate_declarations(&self) -> Result<()> {
+        // A declared `default` must satisfy its own field (#271): an `int`
+        // defaulting to "abc" fails at order time for whoever leaves the box
+        // blank, which is a customer paying for the author's typo. Authoring-
+        // time only, like the rest of this function — a row stored before the
+        // rule existed keeps rendering, and is caught the next time an admin
+        // edits it.
+        for f in &self.config {
+            if let Some(default) = &f.default {
+                f.check_value(default)
+                    .map_err(|e| anyhow!("config field '{}': default is invalid: {e}", f.name))?;
+            }
+        }
         for name in self.referenced_vars() {
             let declared = self.config.iter().any(|c| c.name == name)
                 || self.secrets.iter().any(|s| s.name == name)
@@ -842,6 +947,15 @@ impl Compose {
                      (got {bytes})",
                     s.name
                 );
+            }
+        }
+
+        // A declared `pattern` must compile (#271). Safe to enforce here, where
+        // the operator also runs it, because the field is new: no stored row
+        // can carry one that predates the rule.
+        for f in &self.config {
+            if let Some(pattern) = &f.pattern {
+                compile_pattern(pattern).map_err(|e| anyhow!("config field '{}': {e}", f.name))?;
             }
         }
         Ok(())
@@ -1151,9 +1265,17 @@ pub fn validate_custom_domain(d: &str) -> Result<String> {
 }
 
 /// Resolve a submitted `config` map against the app's `config` schema: required
-/// fields must be present, unknown keys rejected; returns the resolved map
-/// (submitted values ∪ declared defaults). Shared by the customer and admin
-/// APIs. `submitted` keys/values are the customer-supplied field values.
+/// fields must be present, unknown keys rejected, and every submitted value
+/// must satisfy its field's declared `type` and `pattern` (#271). Returns the
+/// resolved map (submitted values ∪ declared defaults). Shared by the customer
+/// and admin APIs. `submitted` keys/values are the customer-supplied field
+/// values.
+///
+/// The type check happens here, at order time, because here is the last moment
+/// the customer can still fix it. A value that reaches the operator is a value
+/// the customer has already paid for: HAVEN panics on an `owner_npub` that is
+/// not an npub, so before this the order was accepted and the deployment
+/// crashlooped with nothing on screen saying which character was wrong.
 pub fn resolve_config(
     compose: &Compose,
     submitted: &std::collections::BTreeMap<String, String>,
@@ -1167,12 +1289,21 @@ pub fn resolve_config(
     }
     let mut out = std::collections::BTreeMap::new();
     for field in &compose.config {
-        match submitted.get(&field.name).or(field.default.as_ref()) {
+        // An empty `int`/`bool` is "the customer left the box alone", not a
+        // value: a form that posts every field sends "" for the ones nobody
+        // touched, and failing those would reject an order over a field the
+        // app has a default for. An empty *string* is left alone — blank is a
+        // legitimate value there, and always has been.
+        let submitted_value = submitted.get(&field.name).filter(|v| {
+            !(v.trim().is_empty() && matches!(field.r#type, FieldType::Int | FieldType::Bool))
+        });
+        match submitted_value.or(field.default.as_ref()) {
             Some(v) => {
+                field.check_value(v)?;
                 out.insert(field.name.clone(), v.clone());
             }
             None if field.required => {
-                bail!("config field '{}' is required", field.name);
+                bail!("config field '{}' is required", field.display_label());
             }
             None => {}
         }
@@ -1799,6 +1930,96 @@ config:
         ))
         .unwrap();
         assert_eq!(ok.services["db"].scratch.len(), 2);
+    }
+
+    /// A declared `type` is enforced against a submitted value (#271) — before
+    /// this, `resolve_config` read `required` and never `type`.
+    #[test]
+    fn resolve_config_enforces_declared_types() {
+        let c = Compose::parse(
+            "services:\n  a:\n    image: x\n    env:\n      N: ${n}\n      B: ${b}\n      S: ${s}\n\
+             config:\n  - { name: n, label: \"Count\", type: int }\n  \
+             - { name: b, label: \"Enabled\", type: bool }\n  \
+             - { name: s, label: \"Name\", type: string }\n",
+        )
+        .unwrap();
+        let sub =
+            |k: &str, v: &str| std::collections::BTreeMap::from([(k.to_string(), v.to_string())]);
+
+        assert!(resolve_config(&c, &sub("n", "42")).is_ok());
+        assert!(resolve_config(&c, &sub("n", "-1")).is_ok());
+        assert!(resolve_config(&c, &sub("n", " 7 ")).is_ok(), "trimmed");
+        let err = resolve_config(&c, &sub("n", "abc"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Count"),
+            "names the label the customer saw: {err}"
+        );
+        assert!(err.contains("whole number"), "{err}");
+        assert!(resolve_config(&c, &sub("n", "1.5")).is_err());
+        // An empty int is an untouched form box, not a value: it falls back to
+        // the field's default (here: absent) rather than failing the order.
+        assert!(resolve_config(&c, &sub("n", "")).is_ok());
+        assert!(!resolve_config(&c, &sub("n", "")).unwrap().contains_key("n"));
+        assert!(resolve_config(&c, &sub("b", "  ")).is_ok());
+        // ...but a blank string is a legitimate value and is still stored.
+        assert_eq!(resolve_config(&c, &sub("s", "")).unwrap()["s"], "");
+
+        assert!(resolve_config(&c, &sub("b", "true")).is_ok());
+        assert!(resolve_config(&c, &sub("b", "false")).is_ok());
+        assert!(resolve_config(&c, &sub("b", "maybe")).is_err());
+        assert!(resolve_config(&c, &sub("b", "1")).is_err());
+
+        // A string is unconstrained unless the app declares a pattern.
+        assert!(resolve_config(&c, &sub("s", "anything at all")).is_ok());
+    }
+
+    /// A `pattern` is anchored, enforced at order time, and compiled at
+    /// authoring time — the npub case that produced a crashlooping, paid-for
+    /// deployment (#271).
+    #[test]
+    fn resolve_config_enforces_patterns() {
+        let npub = "npub1v0lxxxxutpvrelsksy8cdhgfux9l6a42hsj2qzquu2zk7vc9qnkszrqj49";
+        let c = Compose::parse(
+            "services:\n  a:\n    image: x\n    env:\n      O: ${owner_npub}\n\
+             config:\n  - { name: owner_npub, label: \"Owner npub\", type: string, \
+             required: true, pattern: \"npub1[02-9ac-hj-np-z]{58}\" }\n",
+        )
+        .unwrap();
+        let sub =
+            |v: &str| std::collections::BTreeMap::from([("owner_npub".to_string(), v.to_string())]);
+
+        assert!(resolve_config(&c, &sub(npub)).is_ok());
+        // One character out of the bech32 alphabet.
+        assert!(resolve_config(&c, &sub(&npub.replace("v0l", "b0l"))).is_err());
+        // Right shape, wrong length.
+        assert!(resolve_config(&c, &sub("npub1abc")).is_err());
+        // Anchored at both ends: a value that merely *contains* an npub is not
+        // an npub, and an unanchored pattern would have accepted both.
+        assert!(resolve_config(&c, &sub(&format!("{npub}junk"))).is_err());
+        assert!(resolve_config(&c, &sub(&format!("junk{npub}"))).is_err());
+        let err = resolve_config(&c, &sub("nope")).unwrap_err().to_string();
+        assert!(err.contains("Owner npub"), "{err}");
+
+        // A pattern that does not compile is the author's error, refused when
+        // the app is created rather than at a customer's order.
+        assert!(
+            Compose::parse(
+                "services:\n  a:\n    image: x\n    env:\n      O: ${o}\n\
+                 config:\n  - { name: o, type: string, pattern: \"[unclosed\" }\n"
+            )
+            .is_err()
+        );
+        // As is a default its own field would reject — authoring-time only, so
+        // a row stored before the rule still renders.
+        let bad_default = Compose::parse(
+            "services:\n  a:\n    image: x\n    env:\n      N: ${n}\n\
+             config:\n  - { name: n, type: int, default: \"abc\" }\n",
+        )
+        .unwrap();
+        assert!(bad_default.validate_declarations().is_err());
+        assert!(resolve_config(&bad_default, &std::collections::BTreeMap::new()).is_err());
     }
 
     #[test]

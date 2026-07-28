@@ -658,6 +658,44 @@ pub async fn seed_app_and_cluster_with_capacity(
     Ok((app_id, cluster_id, region_id))
 }
 
+/// Seed an orderable app whose `config:` declares a typed field and a
+/// pattern-constrained one, for the order-time validation in issue #271.
+///
+/// Returns `(app_id, region_id)`.
+pub async fn seed_app_with_typed_config(pool: &MySqlPool) -> anyhow::Result<(u64, u64)> {
+    let suffix = hex::encode(&rand_bytes32()[..4]);
+    let region_id = seed_enabled_region(pool, &format!("e2e-typed-{suffix}")).await?;
+    let compose = "services:\n  web:\n    image: example/web:latest\n    ports:\n      \
+         - { name: http, container: 80, protocol: http, expose: ingress }\n    env:\n      \
+         COUNT: ${count}\n      OWNER: ${owner_npub}\n\
+         config:\n  - { name: count, label: \"Count\", type: int, default: \"1\" }\n  \
+         - { name: owner_npub, label: \"Owner npub\", type: string, required: true, \
+         pattern: \"npub1[02-9ac-hj-np-z]{58}\" }\n";
+    let (app_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO app (name, display_name, description, icon, category, compose, amount, \
+             currency, interval_amount, interval_type, setup_amount, enabled, cpu_milli, \
+             memory_bytes, storage_bytes) \
+         VALUES (?, 'E2E Typed Config', NULL, NULL, 'Nostr relay', ?, \
+             1000, 'USD', 1, 1, 0, 1, 250, 268435456, 0) RETURNING id",
+    )
+    .bind(format!("typed-{suffix}"))
+    .bind(compose)
+    .fetch_one(pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO app_cluster (name, region_id, ingress_domain, enabled, capacity_cpu_milli, \
+             capacity_memory_bytes, capacity_storage_bytes) \
+         VALUES (?, ?, 'apps.e2e.example.com', 1, 100000, 100000000000, 100000000000)",
+    )
+    .bind(format!("typedcluster-{suffix}"))
+    .bind(region_id)
+    .execute(pool)
+    .await?;
+
+    Ok((app_id, region_id))
+}
+
 /// Seed an enabled app whose compose declares one labelled and one unlabelled
 /// volume, for the per-volume storage breakdown (issue #260). Returns its id.
 ///

@@ -2975,6 +2975,7 @@ version = "0.4.7"
 dependencies = [
  "anyhow",
  "rand 0.9.4",
+ "regex",
  "serde",
  "serde_yaml",
 ]
