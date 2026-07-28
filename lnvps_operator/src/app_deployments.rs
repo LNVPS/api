@@ -1029,18 +1029,24 @@ fn build_generated_secret(
     }
 }
 
-/// Read a deployment's existing generated secret values (empty on first run).
-async fn read_generated(client: &Client, deployment_id: u64) -> BTreeMap<String, String> {
+/// Read a deployment's existing generated secret values.
+///
+/// Only a missing Secret means "first run". Any other failure has to stop the
+/// reconcile: read as empty, it regenerates every value and the apply that
+/// follows overwrites the stored ones, while the volumes still hold data
+/// written under the old passwords.
+async fn read_generated(client: &Client, deployment_id: u64) -> Result<BTreeMap<String, String>> {
     let api: Api<k8s_openapi::api::core::v1::Secret> =
         Api::namespaced(client.clone(), &namespace_name(deployment_id));
     match api.get("generated").await {
-        Ok(s) => s
+        Ok(s) => Ok(s
             .data
             .unwrap_or_default()
             .into_iter()
             .map(|(k, v)| (k, String::from_utf8_lossy(&v.0).to_string()))
-            .collect(),
-        Err(_) => BTreeMap::new(),
+            .collect()),
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(BTreeMap::new()),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -1310,7 +1316,7 @@ async fn reconcile_one(
     apply(client, &build_network_policy(id, ingress_ns)).await?;
 
     // 2. Generated secrets: preserve existing values, generate any new ones.
-    let existing = read_generated(client, id).await;
+    let existing = read_generated(client, id).await?;
     let generated = ensure_secrets(&compose, &existing)?;
     apply(client, &build_generated_secret(id, &generated)).await?;
 
@@ -1645,6 +1651,47 @@ async fn gc_namespaces(client: &Client, active: &HashSet<u64>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A missing Secret is a first run; anything else — a 403 from a grant this
+    /// deployment's namespace does not carry — has to stop the reconcile rather
+    /// than look like "no secrets yet" and regenerate them all.
+    #[tokio::test]
+    async fn read_generated_separates_a_missing_secret_from_a_denied_one() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn client_for(server: &MockServer) -> Client {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let mut config = kube::Config::new(server.uri().parse().unwrap());
+            config.default_namespace = "default".to_string();
+            Client::try_from(config).unwrap()
+        }
+
+        let missing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/app-7/secrets/generated"))
+            .respond_with(ResponseTemplate::new(404).set_body_string(
+                r#"{"kind":"Status","status":"Failure","code":404,"reason":"NotFound"}"#,
+            ))
+            .mount(&missing)
+            .await;
+        assert!(
+            read_generated(&client_for(&missing).await, 7)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let denied = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/namespaces/app-7/secrets/generated"))
+            .respond_with(ResponseTemplate::new(403).set_body_string(
+                r#"{"kind":"Status","status":"Failure","code":403,"reason":"Forbidden"}"#,
+            ))
+            .mount(&denied)
+            .await;
+        assert!(read_generated(&client_for(&denied).await, 7).await.is_err());
+    }
 
     const APP: &str = r#"
 services:

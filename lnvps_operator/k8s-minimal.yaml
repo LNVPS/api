@@ -17,31 +17,44 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: lnvps-operator
+# Every rule below is a verb the reconcile loop issues. The operator holds no
+# watches, so `watch` is granted nowhere; server-side apply needs `create` as
+# well as `patch`, because the first pass creates the object.
 rules:
-# Namespaces: one dedicated namespace per app deployment (isolation boundary),
-# plus cluster-scoped listing for namespace garbage collection.
+# One namespace per deployment, listed cluster-wide for garbage collection and
+# deleted when its deployment is gone.
 - apiGroups: [""]
   resources: ["namespaces"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-# Core resources created inside each deployment namespace.
+  verbs: ["list", "create", "patch", "delete"]
+# Applied into each deployment namespace, never read back.
 - apiGroups: [""]
-  resources: ["services", "secrets", "configmaps", "persistentvolumeclaims", "resourcequotas"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-# Pods are read-only: the replica counts say a workload is not ready, only the
-# container statuses say why, and that reason is what the customer sees.
+  resources: ["services", "configmaps", "persistentvolumeclaims"]
+  verbs: ["create", "patch"]
+# Secrets are also read: generated values are read back so they stay stable
+# across reconciles. See the note on scope in README.md.
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "create", "patch"]
+# Namespaces are no longer quota'd; the rule exists to remove objects left by
+# deployments provisioned before that change.
+- apiGroups: [""]
+  resources: ["resourcequotas"]
+  verbs: ["delete"]
+# Read-only: the replica counts say a workload is not ready, only the container
+# statuses say why, and that reason is what the customer sees.
 - apiGroups: [""]
   resources: ["pods"]
-  verbs: ["get", "list", "watch"]
-# Workloads.
+  verbs: ["list"]
 - apiGroups: ["apps"]
   resources: ["deployments"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-# Ingress (nostr domains + app deployments) and per-deployment isolation policy.
+  verbs: ["list", "create", "patch"]
+# Nostr domain ingresses are read, replaced and deleted by name; app ingresses
+# are server-side applied.
 - apiGroups: ["networking.k8s.io"]
-  resources: ["ingresses", "networkpolicies"]
-  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-- apiGroups: [""]
-  resources: ["events"]
+  resources: ["ingresses"]
+  verbs: ["get", "create", "update", "patch", "delete"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies"]
   verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
