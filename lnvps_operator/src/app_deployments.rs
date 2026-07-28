@@ -36,6 +36,7 @@ use k8s_openapi::api::networking::v1::{
     IngressServiceBackend, IngressSpec, IngressTLS, NetworkPolicy, NetworkPolicySpec,
     ServiceBackendPort,
 };
+use k8s_openapi::api::rbac::v1::{RoleBinding, RoleRef, Subject};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
 use lnvps_compose::{
@@ -45,6 +46,10 @@ use lnvps_compose::{
 
 /// Label value marking objects this operator owns.
 pub const MANAGED_BY: &str = "lnvps-operator";
+
+/// ClusterRole carrying the namespace-scoped verbs the operator needs inside a
+/// deployment namespace. Bound per namespace, never cluster-wide.
+pub const APP_NAMESPACE_CLUSTER_ROLE: &str = "lnvps-operator-appns";
 
 /// The Kubernetes namespace for a deployment.
 pub fn namespace_name(deployment_id: u64) -> String {
@@ -110,6 +115,62 @@ pub fn build_namespace(deployment_id: u64) -> Namespace {
 /// [`ROOT_ENTRYPOINT_CAPABILITIES`]) still applies.
 pub fn build_namespace_baseline(deployment_id: u64) -> Namespace {
     build_namespace_with_level(deployment_id, "baseline")
+}
+
+/// The identity the operator runs as, when the cluster tells it.
+///
+/// Needed to bind itself permission inside each deployment namespace; without
+/// it the operator cannot write a RoleBinding naming a subject, and falls back
+/// to whatever cluster-wide grant it already has.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperatorIdentity {
+    pub service_account: String,
+    pub namespace: String,
+}
+
+impl OperatorIdentity {
+    /// Read from the downward API the Deployment injects. Absent in a local run
+    /// and in any install that predates it, which is why every caller treats
+    /// `None` as "leave the namespace unbound".
+    pub fn from_env() -> Option<Self> {
+        let service_account = std::env::var("LNVPS_OPERATOR_SERVICE_ACCOUNT").ok()?;
+        let namespace = std::env::var("LNVPS_OPERATOR_NAMESPACE").ok()?;
+        if service_account.trim().is_empty() || namespace.trim().is_empty() {
+            return None;
+        }
+        Some(Self {
+            service_account: service_account.trim().to_string(),
+            namespace: namespace.trim().to_string(),
+        })
+    }
+}
+
+/// Binds the operator to [`APP_NAMESPACE_CLUSTER_ROLE`] inside one deployment
+/// namespace, which is what lets its token read that namespace's secrets
+/// without holding a cluster-wide grant on every Secret in the cluster.
+///
+/// A RoleBinding to a ClusterRole grants only within the binding's namespace,
+/// so this is the whole isolation boundary: no binding, no access.
+pub fn build_role_binding(deployment_id: u64, operator: &OperatorIdentity) -> RoleBinding {
+    RoleBinding {
+        metadata: ObjectMeta {
+            name: Some(MANAGED_BY.to_string()),
+            namespace: Some(namespace_name(deployment_id)),
+            labels: Some(labels(deployment_id)),
+            ..Default::default()
+        },
+        role_ref: RoleRef {
+            api_group: "rbac.authorization.k8s.io".to_string(),
+            kind: "ClusterRole".to_string(),
+            name: APP_NAMESPACE_CLUSTER_ROLE.to_string(),
+        },
+        subjects: Some(vec![Subject {
+            kind: "ServiceAccount".to_string(),
+            name: operator.service_account.clone(),
+            namespace: Some(operator.namespace.clone()),
+            ..Default::default()
+        }]),
+    }
 }
 
 /// The isolation NetworkPolicy for a deployment namespace.
@@ -1308,6 +1369,12 @@ async fn reconcile_one(
         build_namespace(id)
     };
     apply_namespace(client, &namespace).await?;
+    // The binding is the operator's only grant inside this namespace, and the
+    // authorizer reads it from a cache that lags the write. Applying it first
+    // buys the rest of this pass as propagation time before a Secret is read.
+    if let Some(operator) = OperatorIdentity::from_env() {
+        apply(client, &build_role_binding(id, &operator)).await?;
+    }
     let ingress_ns = ctx
         .settings
         .ingress_namespace
@@ -1651,6 +1718,68 @@ async fn gc_namespaces(client: &Client, active: &HashSet<u64>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The per-namespace binding is the only thing standing between the
+    /// operator's token and every Secret in the cluster, so its shape is
+    /// pinned: right namespace, right ClusterRole, right subject.
+    #[test]
+    fn role_binding_grants_the_operator_only_inside_the_deployment_namespace() {
+        let operator = OperatorIdentity {
+            service_account: "lnvps-operator".to_string(),
+            namespace: "lnvps".to_string(),
+        };
+        let rb = build_role_binding(7, &operator);
+
+        assert_eq!(rb.metadata.namespace.as_deref(), Some("app-7"));
+        assert_eq!(rb.role_ref.kind, "ClusterRole");
+        assert_eq!(rb.role_ref.name, APP_NAMESPACE_CLUSTER_ROLE);
+        let subjects = rb.subjects.expect("a subject");
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].kind, "ServiceAccount");
+        assert_eq!(subjects[0].name, "lnvps-operator");
+        // The subject namespace is where the operator runs, not the namespace
+        // being granted: getting these two the wrong way round grants nothing
+        // and 403s every reconcile.
+        assert_eq!(subjects[0].namespace.as_deref(), Some("lnvps"));
+        assert_eq!(
+            rb.metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("managed-by"))
+                .map(String::as_str),
+            Some(MANAGED_BY)
+        );
+    }
+
+    /// A partially configured environment must not produce a binding with a
+    /// half-empty subject, which the API server would reject on every pass.
+    #[test]
+    fn operator_identity_needs_both_halves() {
+        // Safety: single-threaded test, no other thread reads these vars.
+        unsafe {
+            std::env::remove_var("LNVPS_OPERATOR_SERVICE_ACCOUNT");
+            std::env::set_var("LNVPS_OPERATOR_NAMESPACE", "lnvps");
+        }
+        assert!(OperatorIdentity::from_env().is_none());
+        unsafe {
+            std::env::set_var("LNVPS_OPERATOR_SERVICE_ACCOUNT", "  ");
+        }
+        assert!(OperatorIdentity::from_env().is_none());
+        unsafe {
+            std::env::set_var("LNVPS_OPERATOR_SERVICE_ACCOUNT", "lnvps-operator");
+        }
+        assert_eq!(
+            OperatorIdentity::from_env(),
+            Some(OperatorIdentity {
+                service_account: "lnvps-operator".to_string(),
+                namespace: "lnvps".to_string(),
+            })
+        );
+        unsafe {
+            std::env::remove_var("LNVPS_OPERATOR_SERVICE_ACCOUNT");
+            std::env::remove_var("LNVPS_OPERATOR_NAMESPACE");
+        }
+    }
 
     /// A missing Secret is a first run; anything else — a 403 from a grant this
     /// deployment's namespace does not carry — has to stop the reconcile rather

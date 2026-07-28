@@ -132,20 +132,45 @@ reconcile loop issues: `create` accompanies `patch` because server-side apply
 creates the object on the first pass, and the operator holds no watches, so
 `watch` is granted nowhere.
 
-### Secret access is still cluster-wide
+### Secret access is scoped per namespace
 
-The only secret the operator reads is `generated` in each `app-N` namespace it
-created (`read_generated`), but the grant above is a ClusterRole, so a stolen
-token reads every Secret in the cluster — every tenant's generated passwords and
-every TLS private key.
+The operator holds no cluster-wide grant on Secrets. `lnvps-operator-appns` is a
+second ClusterRole carrying the secret verbs, and it is never bound
+cluster-wide: as the operator creates each `app-N` namespace it writes a
+RoleBinding to it in that namespace, and a RoleBinding grants only inside its
+own namespace.
 
-Moving that to a Role in each `app-N` namespace does not work on its own:
-Kubernetes refuses to let a subject grant permissions it does not already hold,
-so the operator would need those same cluster-wide secret verbs (or `escalate`)
-to create the binding. The way out is a second, static ClusterRole holding the
-namespace-scoped verbs plus `bind` on it by name, with the operator creating a
-RoleBinding per namespace at reconcile time. That is a code change and a
-two-step rollout, tracked in issue #299.
+Writing that binding is allowed by two narrow rules rather than by holding the
+secret verbs: `rolebindings: create, patch`, and `bind` on
+`lnvps-operator-appns` by name. `bind` exists for exactly this — it permits a
+binding to a named role without holding that role's permissions.
+
+**What this does and does not buy.** Those two rules are themselves
+cluster-wide — a ClusterRole cannot scope `rolebindings` to namespaces that do
+not exist yet — so a stolen token can write the same binding into `kube-system`
+and read Secrets there. The reachable ceiling is unchanged. What changes is that
+reaching it now takes a deliberate second write that lands in the audit log,
+instead of a single `get` that looks exactly like normal operation. Narrowing
+further needs an admission policy on who may bind that role, or a controller
+that is not the thing creating namespaces.
+
+The subject comes from the downward API (`LNVPS_OPERATOR_NAMESPACE`,
+`LNVPS_OPERATOR_SERVICE_ACCOUNT`). With either missing the operator writes no
+binding at all and relies on whatever grant it already has, which is what makes
+the rollout survivable.
+
+**Rollout is three ordered steps, and the manifest is the end state:**
+
+1. Apply `lnvps-operator-appns` and add the `rolebindings` + `bind` rules to
+   `lnvps-operator`, *keeping* its existing `secrets` rule.
+2. Roll the new image with the two downward-API env vars. Each namespace gets
+   its binding on the next reconcile pass.
+3. Remove the `secrets` rule from `lnvps-operator`.
+
+Doing 3 before 2 leaves the operator unable to read `generated`, which now fails
+the reconcile loudly rather than regenerating every password. Namespaces created
+before step 2 are repaired by the pass that binds them; the binding is deleted
+with its namespace, so nothing outlives a deployment.
 
 ## Runtime hardening
 
