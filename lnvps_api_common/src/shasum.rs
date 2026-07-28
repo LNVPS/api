@@ -391,6 +391,17 @@ fn parse_bsd_line(line: &str) -> Option<ShasumEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Serve `body` for a GET of `route`; anything else 404s.
+    async fn mock_get(server: &MockServer, route: impl Into<String>, body: impl Into<String>) {
+        Mock::given(method("GET"))
+            .and(path(route.into()))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.into()))
+            .mount(server)
+            .await;
+    }
 
     // ---- GNU format --------------------------------------------------------
 
@@ -525,91 +536,216 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
         assert!(find_checksum(&entries, "file-c.img").is_some());
     }
 
+    // ---- Fixtures ----------------------------------------------------------
+    //
+    // The shapes below are copies of what real mirrors publish.  They are
+    // served from a local mock so the parsing, probing and header logic is
+    // covered without depending on anyone else's infrastructure staying up.
+
+    /// GNU coreutils format, as published by Debian's `SHA512SUMS`.
+    const GNU_SHA512SUMS: &str = concat!(
+        "4586d96ba3604c05b1772c9fef74a6957402688eb9c075f212068d5a29afe6bc",
+        "a924afaa4d12b8e0e593deea18b8b200f606a94ad4a0aa5361e75ffacb12087c",
+        "  debian-12-generic-amd64.qcow2\n",
+        "5586d96ba3604c05b1772c9fef74a6957402688eb9c075f212068d5a29afe6bc",
+        "a924afaa4d12b8e0e593deea18b8b200f606a94ad4a0aa5361e75ffacb12087c",
+        "  debian-12-nocloud-amd64.qcow2\n",
+    );
+
+    /// GNU coreutils format with SHA-256 digests, as published by Ubuntu.
+    const GNU_SHA256SUMS: &str = concat!(
+        "31b0e1c2f0b8a0e6bd0f9a1f3a2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e",
+        " *noble-server-cloudimg-amd64.img\n",
+    );
+
+    /// BSD format, as published by CentOS Stream's shared `CHECKSUM`.
+    const BSD_CHECKSUM: &str = concat!(
+        "# CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2: 1234567890 bytes\n",
+        "SHA256 (CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2) = ",
+        "aa0e1c2f0b8a0e6bd0f9a1f3a2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6\n",
+    );
+
+    /// BSD format sidecar, as published by Rocky Linux (`<image>.CHECKSUM`).
+    const BSD_SIDECAR: &str = concat!(
+        "SHA256 (Rocky-9-GenericCloud.latest.x86_64.qcow2) = ",
+        "bb0e1c2f0b8a0e6bd0f9a1f3a2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6\n",
+    );
+
+    /// Digest-only sidecar, as published by Alpine (`<image>.sha512`).
+    const BARE_DIGEST_SIDECAR: &str = concat!(
+        "cc86d96ba3604c05b1772c9fef74a6957402688eb9c075f212068d5a29afe6bc",
+        "a924afaa4d12b8e0e593deea18b8b200f606a94ad4a0aa5361e75ffacb12087c\n",
+    );
+
     // ---- resolve_redirect --------------------------------------------------
 
     #[tokio::test]
     async fn test_resolve_redirect_no_redirect() {
-        // A stable HTTPS URL that should not redirect further.
-        let url = "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS";
-        let resolved = resolve_redirect(url).await;
-        // The resolved URL must be non-empty and a valid URL.
-        assert!(!resolved.is_empty());
-        assert!(resolved.starts_with("https://"));
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/images/SHA512SUMS"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/images/SHA512SUMS", server.uri());
+        assert_eq!(resolve_redirect(&url).await, url);
     }
 
     #[tokio::test]
     async fn test_resolve_redirect_follows_redirect() {
-        // github.com redirects HTTP -> HTTPS.  Verify that resolve_redirect
-        // follows the redirect and returns the https:// URL.
-        let url = "http://github.com/";
-        let resolved = resolve_redirect(url).await;
-        assert!(
-            resolved.starts_with("https://"),
-            "expected https redirect, got: {resolved}"
-        );
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/images/image.raw"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/mirror/image.raw"))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path("/mirror/image.raw"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/images/image.raw", server.uri());
+        let resolved = resolve_redirect(&url).await;
+        assert_eq!(resolved, format!("{}/mirror/image.raw", server.uri()));
     }
 
+    /// Servers that reject HEAD must be retried with GET rather than reported
+    /// as unresolvable.
     #[tokio::test]
-    async fn test_resolve_redirect_debian_raw_image() {
-        // cloud.debian.org issues a 302 redirect to a mirror for raw images.
-        // Verify that resolve_redirect follows it and returns a different (mirror) URL.
-        let url = "https://cloud.debian.org/images/cloud/bullseye/latest/debian-11-genericcloud-amd64.raw";
-        let resolved = resolve_redirect(url).await;
-        assert_ne!(
-            resolved, url,
-            "expected a redirect to a mirror, but URL was unchanged"
-        );
-        assert!(
-            resolved.starts_with("https://"),
-            "resolved URL should still be https://, got: {resolved}"
-        );
+    async fn test_resolve_redirect_falls_back_to_get_when_head_rejected() {
+        let server = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .and(path("/images/image.raw"))
+            .respond_with(ResponseTemplate::new(405))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/images/image.raw"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/mirror/image.raw"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/mirror/image.raw"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/images/image.raw", server.uri());
+        let resolved = resolve_redirect(&url).await;
+        assert_eq!(resolved, format!("{}/mirror/image.raw", server.uri()));
     }
 
-    // ---- Network test against real Debian SHA512SUMS -----------------------
-
-    /// Regression test: cloud.centos.org sits behind CloudFront which returns
-    /// 403 for requests without a User-Agent header (reqwest's default).
+    /// An unreachable host leaves the caller with the URL it passed in.
     #[tokio::test]
-    async fn test_fetch_checksum_centos_requires_user_agent() -> anyhow::Result<()> {
-        let url = "https://cloud.centos.org/centos/9-stream/x86_64/images/CHECKSUM";
-        let filename = "CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2";
+    async fn test_resolve_redirect_unreachable_returns_input() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
 
-        let entry = fetch_checksum_for_file(url, filename).await?;
+        let url = format!("http://{addr}/images/image.raw");
+        assert_eq!(resolve_redirect(&url).await, url);
+    }
 
-        assert_eq!(entry.filename, filename);
+    // ---- fetch_checksum_for_file -------------------------------------------
+
+    /// Regression test: some CDNs return 403 for requests without a
+    /// User-Agent, which reqwest omits by default.
+    #[tokio::test]
+    async fn test_fetch_checksum_sends_user_agent() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/images/CHECKSUM"))
+            .and(header_exists("user-agent"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(BSD_CHECKSUM))
+            .mount(&server)
+            .await;
+        // Matched only when the header is absent, so a header-less request
+        // fails the test instead of falling through to the 200.
+        Mock::given(method("GET"))
+            .and(path("/images/CHECKSUM"))
+            .and(|req: &wiremock::Request| !req.headers.contains_key("user-agent"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/images/CHECKSUM", server.uri());
+        let entry =
+            fetch_checksum_for_file(&url, "CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2")
+                .await?;
+
         assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
         assert_eq!(entry.checksum.len(), 64);
         Ok(())
     }
 
-    /// Alpine publishes a digest-only `.sha512` sidecar (bare hash, no filename).
     #[tokio::test]
-    async fn test_probe_checksum_alpine_bare_sidecar() -> anyhow::Result<()> {
-        let image_url = "https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/cloud/nocloud_alpine-3.21.0-x86_64-bios-cloudinit-r0.qcow2";
-        let filename = "nocloud_alpine-3.21.0-x86_64-bios-cloudinit-r0.qcow2";
+    async fn test_fetch_checksum_gnu_sums_file() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        mock_get(&server, "/images/SHA512SUMS", GNU_SHA512SUMS).await;
 
-        let result = probe_checksum_from_image_url(image_url, filename).await;
-        let (entry, sums_url) = result.expect("should find bare-digest sidecar");
+        let url = format!("{}/images/SHA512SUMS", server.uri());
+        let entry = fetch_checksum_for_file(&url, "debian-12-generic-amd64.qcow2").await?;
 
-        assert!(
-            sums_url.ends_with(".sha512") || sums_url.ends_with(".sha256"),
-            "unexpected sums_url: {sums_url}"
-        );
-        assert_eq!(entry.filename, filename);
+        assert_eq!(entry.filename, "debian-12-generic-amd64.qcow2");
+        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha512);
+        assert_eq!(entry.checksum.len(), 128);
+        assert!(entry.checksum.chars().all(|c| c.is_ascii_hexdigit()));
         Ok(())
     }
 
-    /// Rocky Linux publishes a per-file `.CHECKSUM` sidecar (BSD format).
     #[tokio::test]
-    async fn test_fetch_checksum_rocky_checksum_sidecar() -> anyhow::Result<()> {
-        let url = "https://dl.rockylinux.org/pub/rocky/9/images/x86_64/Rocky-9-GenericCloud.latest.x86_64.qcow2.CHECKSUM";
-        let filename = "Rocky-9-GenericCloud.latest.x86_64.qcow2";
+    async fn test_fetch_checksum_bsd_checksum_file() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        mock_get(&server, "/images/CHECKSUM", BSD_CHECKSUM).await;
 
-        let entry = fetch_checksum_for_file(url, filename).await?;
+        let url = format!("{}/images/CHECKSUM", server.uri());
+        let filename = "CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2";
+        let entry = fetch_checksum_for_file(&url, filename).await?;
 
         assert_eq!(entry.filename, filename);
         assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
         Ok(())
+    }
+
+    /// A digest-only sidecar carries no filename, so the requested one is
+    /// attributed to it.
+    #[tokio::test]
+    async fn test_fetch_checksum_bare_digest_sidecar() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        mock_get(&server, "/images/alpine.qcow2.sha512", BARE_DIGEST_SIDECAR).await;
+
+        let url = format!("{}/images/alpine.qcow2.sha512", server.uri());
+        let entry = fetch_checksum_for_file(&url, "alpine.qcow2").await?;
+
+        assert_eq!(entry.filename, "alpine.qcow2");
+        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha512);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fetch_checksum_missing_filename_errors() {
+        let server = MockServer::start().await;
+        mock_get(&server, "/images/SHA512SUMS", GNU_SHA512SUMS).await;
+
+        let url = format!("{}/images/SHA512SUMS", server.uri());
+        assert!(
+            fetch_checksum_for_file(&url, "nonexistent-file.qcow2")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fetch_checksum_absent_file_errors() {
+        let server = MockServer::start().await;
+        let url = format!("{}/images/SHA512SUMS", server.uri());
+        assert!(
+            fetch_checksum_for_file(&url, "anything.qcow2")
+                .await
+                .is_err()
+        );
     }
 
     /// Spawn a local HTTP server that serves an over-sized body.
@@ -681,144 +817,206 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
         );
     }
 
-    /// CentOS 10-stream publishes a per-file `.SHA256SUM` sidecar (BSD format).
-    #[tokio::test]
-    async fn test_fetch_checksum_centos_sha256sum_sidecar() -> anyhow::Result<()> {
-        let url = "https://cloud.centos.org/centos/10-stream/x86_64/images/CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2.SHA256SUM";
-        let filename = "CentOS-Stream-GenericCloud-10-latest.x86_64.qcow2";
-
-        let entry = fetch_checksum_for_file(url, filename).await?;
-
-        assert_eq!(entry.filename, filename);
-        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
-        assert_eq!(entry.checksum.len(), 64);
-        Ok(())
-    }
-
-    /// CentOS uses a shared "CHECKSUM" file which must be probed automatically.
-    #[tokio::test]
-    async fn test_probe_checksum_centos_image_url() -> anyhow::Result<()> {
-        let image_url = "https://cloud.centos.org/centos/9-stream/x86_64/images/CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2";
-        let filename = "CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2";
-
-        let result = probe_checksum_from_image_url(image_url, filename).await;
-        let (entry, sums_url) = result.expect("should find CHECKSUM file");
-
-        assert!(
-            sums_url.ends_with("/CHECKSUM"),
-            "unexpected sums_url: {sums_url}"
-        );
-        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
-        Ok(())
-    }
-
-    /// FreeBSD publishes BSD-format `CHECKSUM.SHA512`/`CHECKSUM.SHA256` files
-    /// in the image directory, listing the compressed `.qcow2.xz` artifact.
-    #[tokio::test]
-    async fn test_probe_checksum_freebsd_checksum_sha512() -> anyhow::Result<()> {
-        let image_url = "https://download.freebsd.org/releases/VM-IMAGES/15.0-RELEASE/amd64/Latest/FreeBSD-15.0-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz";
-        let filename = "FreeBSD-15.0-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz";
-
-        let result = probe_checksum_from_image_url(image_url, filename).await;
-        let (entry, sums_url) = result.expect("should find FreeBSD CHECKSUM file");
-
-        assert!(
-            sums_url.ends_with("/CHECKSUM.SHA512") || sums_url.ends_with("/CHECKSUM.SHA256"),
-            "unexpected sums_url: {sums_url}"
-        );
-        assert_eq!(entry.filename, filename);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_fetch_checksum_debian_bookworm() -> anyhow::Result<()> {
-        let url = "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS";
-        let filename = "debian-12-generic-amd64.qcow2";
-
-        let entry = fetch_checksum_for_file(url, filename).await?;
-
-        assert_eq!(entry.filename, filename);
-        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha512);
-        assert_eq!(entry.checksum.len(), 128);
-        assert!(entry.checksum.chars().all(|c| c.is_ascii_hexdigit()));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_fetch_checksum_ubuntu_noble() -> anyhow::Result<()> {
-        let url = "https://cloud-images.ubuntu.com/noble/current/SHA256SUMS";
-        let filename = "noble-server-cloudimg-amd64.img";
-
-        let entry = fetch_checksum_for_file(url, filename).await?;
-
-        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
-        assert_eq!(entry.checksum.len(), 64);
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_fetch_checksum_missing_filename_errors() {
-        let url = "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS";
-        let result = fetch_checksum_for_file(url, "nonexistent-file.qcow2").await;
-        assert!(result.is_err());
-    }
-
     // ---- probe_checksum_from_image_url -------------------------------------
 
     #[tokio::test]
-    async fn test_probe_checksum_debian_image_url() -> anyhow::Result<()> {
-        // No sha2_url provided — should auto-discover SHA512SUMS in the same directory.
-        // Use the original URL filename (qcow2), not the host-stored .img variant.
-        let image_url =
-            "https://cloud.debian.org/images/cloud/bookworm/latest/debian-12-generic-amd64.qcow2";
-        let filename = "debian-12-generic-amd64.qcow2";
+    async fn test_probe_finds_shared_sums_file() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        mock_get(&server, "/images/SHA512SUMS", GNU_SHA512SUMS).await;
 
-        let result = probe_checksum_from_image_url(image_url, filename).await;
-        let (entry, sums_url) = result.expect("should find a SHASUMS file");
+        let image_url = format!("{}/images/debian-12-generic-amd64.qcow2", server.uri());
+        let (entry, sums_url) =
+            probe_checksum_from_image_url(&image_url, "debian-12-generic-amd64.qcow2")
+                .await
+                .expect("should find a SHASUMS file");
 
-        assert!(
-            sums_url.contains("SHA512SUMS") || sums_url.contains("SHA256SUMS"),
-            "unexpected sums_url: {sums_url}"
-        );
+        assert!(sums_url.ends_with("/SHA512SUMS"), "unexpected: {sums_url}");
         assert_eq!(entry.algorithm, ShasumAlgorithm::Sha512);
         assert_eq!(entry.checksum.len(), 128);
         Ok(())
     }
 
+    /// Both digests published: the stronger shared file wins regardless of
+    /// which response arrives first.
     #[tokio::test]
-    async fn test_probe_checksum_ubuntu_image_url() -> anyhow::Result<()> {
-        let image_url =
-            "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img";
-        let filename = "noble-server-cloudimg-amd64.img";
+    async fn test_probe_prefers_sha512_over_sha256() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        mock_get(&server, "/images/SHA512SUMS", GNU_SHA512SUMS).await;
+        mock_get(
+            &server,
+            "/images/SHA256SUMS",
+            concat!(
+                "31b0e1c2f0b8a0e6bd0f9a1f3a2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e",
+                "  debian-12-generic-amd64.qcow2\n"
+            ),
+        )
+        .await;
 
-        let result = probe_checksum_from_image_url(image_url, filename).await;
-        let (entry, sums_url) = result.expect("should find a SHASUMS file");
+        let image_url = format!("{}/images/debian-12-generic-amd64.qcow2", server.uri());
+        let (entry, sums_url) =
+            probe_checksum_from_image_url(&image_url, "debian-12-generic-amd64.qcow2")
+                .await
+                .expect("should find a SHASUMS file");
 
-        assert!(
-            sums_url.contains("SHA256SUMS") || sums_url.contains("SHA512SUMS"),
-            "unexpected sums_url: {sums_url}"
-        );
-        assert_eq!(entry.checksum.len(), 64, "Ubuntu uses SHA-256");
+        assert!(sums_url.ends_with("/SHA512SUMS"), "unexpected: {sums_url}");
+        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha512);
         Ok(())
     }
 
+    /// A `SHA256SUMS` listing a `.img` artifact, as Ubuntu publishes.
     #[tokio::test]
-    async fn test_probe_checksum_arch_sidecar() -> anyhow::Result<()> {
-        // Arch Linux uses a per-file sidecar: <image>.qcow2.SHA256
-        let image_url =
-            "https://mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2";
-        let filename = "Arch-Linux-x86_64-cloudimg.qcow2";
+    async fn test_probe_finds_sha256sums() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        mock_get(&server, "/images/SHA256SUMS", GNU_SHA256SUMS).await;
 
-        let result = probe_checksum_from_image_url(image_url, filename).await;
-        let (entry, sums_url) = result.expect("should find sidecar SHA256 file");
+        let image_url = format!("{}/images/noble-server-cloudimg-amd64.img", server.uri());
+        let (entry, sums_url) =
+            probe_checksum_from_image_url(&image_url, "noble-server-cloudimg-amd64.img")
+                .await
+                .expect("should find a SHASUMS file");
+
+        assert!(sums_url.ends_with("/SHA256SUMS"), "unexpected: {sums_url}");
+        assert_eq!(entry.checksum.len(), 64);
+        Ok(())
+    }
+
+    /// A shared BSD-format `CHECKSUM` file, as CentOS Stream publishes.
+    #[tokio::test]
+    async fn test_probe_finds_bsd_checksum_file() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        mock_get(&server, "/images/CHECKSUM", BSD_CHECKSUM).await;
+
+        let filename = "CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2";
+        let image_url = format!("{}/images/{filename}", server.uri());
+        let (entry, sums_url) = probe_checksum_from_image_url(&image_url, filename)
+            .await
+            .expect("should find CHECKSUM file");
+
+        assert!(sums_url.ends_with("/CHECKSUM"), "unexpected: {sums_url}");
+        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
+        Ok(())
+    }
+
+    /// `CHECKSUM.SHA512` in the image directory, as FreeBSD publishes.
+    #[tokio::test]
+    async fn test_probe_finds_checksum_sha512_in_directory() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let filename = "FreeBSD-15.0-RELEASE-amd64-BASIC-CLOUDINIT-ufs.qcow2.xz";
+        mock_get(
+            &server,
+            "/images/CHECKSUM.SHA512",
+            format!(
+                "SHA512 ({filename}) = {}{}\n",
+                "dd86d96ba3604c05b1772c9fef74a6957402688eb9c075f212068d5a29afe6bc",
+                "a924afaa4d12b8e0e593deea18b8b200f606a94ad4a0aa5361e75ffacb12087c"
+            ),
+        )
+        .await;
+
+        let image_url = format!("{}/images/{filename}", server.uri());
+        let (entry, sums_url) = probe_checksum_from_image_url(&image_url, filename)
+            .await
+            .expect("should find CHECKSUM.SHA512");
 
         assert!(
-            sums_url.ends_with(".SHA256"),
-            "unexpected sums_url: {sums_url}"
+            sums_url.ends_with("/CHECKSUM.SHA512"),
+            "unexpected: {sums_url}"
         );
+        assert_eq!(entry.filename, filename);
+        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha512);
+        Ok(())
+    }
+
+    /// A digest-only per-file sidecar, as Alpine publishes.
+    #[tokio::test]
+    async fn test_probe_finds_bare_digest_sidecar() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let filename = "nocloud_alpine-3.21.0-x86_64-bios-cloudinit-r0.qcow2";
+        mock_get(
+            &server,
+            format!("/images/{filename}.sha512"),
+            BARE_DIGEST_SIDECAR,
+        )
+        .await;
+
+        let image_url = format!("{}/images/{filename}", server.uri());
+        let (entry, sums_url) = probe_checksum_from_image_url(&image_url, filename)
+            .await
+            .expect("should find bare-digest sidecar");
+
+        assert!(sums_url.ends_with(".sha512"), "unexpected: {sums_url}");
+        assert_eq!(entry.filename, filename);
+        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha512);
+        Ok(())
+    }
+
+    /// A BSD-format per-file `.CHECKSUM` sidecar, as Rocky Linux publishes.
+    #[tokio::test]
+    async fn test_probe_finds_bsd_sidecar() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let filename = "Rocky-9-GenericCloud.latest.x86_64.qcow2";
+        mock_get(&server, format!("/images/{filename}.CHECKSUM"), BSD_SIDECAR).await;
+
+        let image_url = format!("{}/images/{filename}", server.uri());
+        let (entry, sums_url) = probe_checksum_from_image_url(&image_url, filename)
+            .await
+            .expect("should find .CHECKSUM sidecar");
+
+        assert!(sums_url.ends_with(".CHECKSUM"), "unexpected: {sums_url}");
+        assert_eq!(entry.filename, filename);
+        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
+        Ok(())
+    }
+
+    /// An uppercase `.SHA256` sidecar, as Arch Linux publishes.
+    #[tokio::test]
+    async fn test_probe_finds_uppercase_sha256_sidecar() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        let filename = "Arch-Linux-x86_64-cloudimg.qcow2";
+        mock_get(
+            &server,
+            format!("/images/{filename}.SHA256"),
+            format!(
+                "ee0e1c2f0b8a0e6bd0f9a1f3a2c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6  {filename}\n"
+            ),
+        )
+        .await;
+
+        let image_url = format!("{}/images/{filename}", server.uri());
+        let (entry, sums_url) = probe_checksum_from_image_url(&image_url, filename)
+            .await
+            .expect("should find sidecar SHA256 file");
+
+        assert!(sums_url.ends_with(".SHA256"), "unexpected: {sums_url}");
         assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
         assert_eq!(entry.checksum.len(), 64);
         Ok(())
+    }
+
+    /// Nothing published: probing reports no checksum rather than erroring.
+    #[tokio::test]
+    async fn test_probe_returns_none_when_no_candidate_exists() {
+        let server = MockServer::start().await;
+        let image_url = format!("{}/images/mystery.qcow2", server.uri());
+        assert!(
+            probe_checksum_from_image_url(&image_url, "mystery.qcow2")
+                .await
+                .is_none()
+        );
+    }
+
+    /// A candidate that lists other files but not this one is not a match.
+    #[tokio::test]
+    async fn test_probe_ignores_sums_file_without_the_filename() {
+        let server = MockServer::start().await;
+        mock_get(&server, "/images/SHA512SUMS", GNU_SHA512SUMS).await;
+
+        let image_url = format!("{}/images/not-listed.qcow2", server.uri());
+        assert!(
+            probe_checksum_from_image_url(&image_url, "not-listed.qcow2")
+                .await
+                .is_none()
+        );
     }
 
     #[test]
@@ -831,5 +1029,36 @@ SHA256 (file-a.iso) = 049d861863ad093da0d1e97a49e4d4f57329b86b56e66e3c0578e788c4
             trimmed[..=i].to_owned()
         };
         assert_eq!(base, "https://example.com/images/latest/");
+    }
+
+    // ---- Live mirror canaries ----------------------------------------------
+    //
+    // These hit third-party mirrors, so they are not part of the default run:
+    // a failure here means someone else changed their layout, not that this
+    // code broke.  Run deliberately with
+    // `cargo test -p lnvps_api_common -- --ignored live_mirror`.
+
+    #[tokio::test]
+    #[ignore = "hits live mirrors"]
+    async fn live_mirror_debian_sha512sums() -> anyhow::Result<()> {
+        let entry = fetch_checksum_for_file(
+            "https://cloud.debian.org/images/cloud/bookworm/latest/SHA512SUMS",
+            "debian-12-generic-amd64.qcow2",
+        )
+        .await?;
+        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha512);
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "hits live mirrors"]
+    async fn live_mirror_centos_checksum() -> anyhow::Result<()> {
+        let entry = fetch_checksum_for_file(
+            "https://cloud.centos.org/centos/9-stream/x86_64/images/CHECKSUM",
+            "CentOS-Stream-GenericCloud-9-latest.x86_64.qcow2",
+        )
+        .await?;
+        assert_eq!(entry.algorithm, ShasumAlgorithm::Sha256);
+        Ok(())
     }
 }
