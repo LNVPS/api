@@ -111,8 +111,10 @@ spec:
             secretKeyRef:
               name: lnvps-operator-encryption
               key: key
-        # Connection string for the operator's own MySQL user, which needs
-        # SELECT and UPDATE on the lnvps schema and nothing else. See README.md.
+        # Connection string for the operator's own MySQL user: SELECT on the
+        # schema, UPDATE on app_deployment, nothing else. See README.md.
+        # Create this Secret before applying the Deployment — the reference is
+        # required, so without it the container never starts.
         - name: LNVPS_DATABASE_URL
           valueFrom:
             secretKeyRef:

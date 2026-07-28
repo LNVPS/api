@@ -144,13 +144,15 @@ the `LNVPS_DATABASE_URL` environment variable (a Secret in the manifest). The
 config file's `db` key is still honoured as a fallback for local runs; the
 environment wins when both are set.
 
-It touches four things in the schema: it reads domains, apps and app clusters,
-and updates `app_deployment` rows. That is `SELECT` and `UPDATE` — no inserts,
-no deletes, and it never runs migrations, so it needs no DDL:
+It reads nostr domains, apps, app clusters, app deployments and the
+subscription rows that decide whether a deployment is paid for, and it writes
+to exactly one table: `app_deployment`. No inserts, no deletes, and it never
+runs migrations, so it needs no DDL:
 
 ```sql
 CREATE USER 'lnvps_operator'@'%' IDENTIFIED BY '<password>';
-GRANT SELECT, UPDATE ON lnvps.* TO 'lnvps_operator'@'%';
+GRANT SELECT ON lnvps.* TO 'lnvps_operator'@'%';
+GRANT UPDATE ON lnvps.app_deployment TO 'lnvps_operator'@'%';
 ```
 
 ```bash
@@ -158,8 +160,12 @@ kubectl -n lnvps-system create secret generic lnvps-operator-db \
   --from-literal=url='mysql://lnvps_operator:<password>@mysql-service:3306/lnvps'
 ```
 
-A schema change that makes the operator insert or delete needs the grant
-widened first, or the reconcile fails at that statement.
+Create the Secret before applying the Deployment. The `secretKeyRef` is
+required, so a container scheduled without it sits in
+`CreateContainerConfigError` and never starts.
+
+A schema change that makes the operator write another table, insert or delete
+needs the grant widened first, or the reconcile fails at that statement.
 
 ## Monitoring
 
