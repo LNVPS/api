@@ -723,23 +723,8 @@ impl Compose {
                     .map_err(|e| anyhow!("config field '{}': default is invalid: {e}", f.name))?;
             }
         }
-        // A service with a data volume must say who writes to it (issue #277).
-        //
-        // Kubernetes chowns a freshly provisioned PVC to the pod's `fsGroup`,
-        // and the operator takes that from the numeric compose `user:`. Declare
-        // volumes without one and there is no fsGroup, so the volume mounts
-        // root-owned `0755` while the kubelet — under `runAsNonRoot` with no
-        // `runAsUser` — starts the container as whatever non-root UID the image
-        // names. The app then comes up and fails on its first write, on a fresh
-        // volume, every time.
-        //
-        // `user: root` is a valid answer here: a root process can write to a
-        // root-owned volume. The unusable combination is specifically volumes
-        // plus silence.
-        //
-        // Authoring-time only, like the rest of this function: a row stored
-        // before the rule keeps reconciling (its pod is unchanged by this), and
-        // it is caught the next time an admin edits it.
+        // A fresh PVC is chowned to the pod's fsGroup, which comes from a
+        // numeric `user:`; volumes plus silence is the unwritable combination.
         for (sname, svc) in &self.services {
             if !svc.volumes.is_empty() && svc.user.is_none() {
                 bail!(
