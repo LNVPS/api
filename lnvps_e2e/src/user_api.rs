@@ -1239,6 +1239,85 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// Declared config types and patterns are enforced at order time (#271).
+    /// Before this, `resolve_config` read `required` and never `type`, so a
+    /// value the app cannot use was accepted, charged for, and turned into a
+    /// crashlooping deployment — HAVEN panics on an `owner_npub` that is not an
+    /// npub, and nothing on screen named the field.
+    #[tokio::test]
+    async fn test_app_order_validates_config_field_types() {
+        let client = user_client_with_keys(nostr::Keys::generate());
+        let pool = crate::db::connect().await.unwrap();
+        let (app_id, region_id) = crate::db::seed_app_with_typed_config(&pool).await.unwrap();
+        let npub = "npub1v0lxxxxutpvrelsksy8cdhgfux9l6a42hsj2qzquu2zk7vc9qnkszrqj49";
+
+        let order = |name: &str, config: Value| {
+            serde_json::json!({
+                "app_id": app_id,
+                "name": name,
+                "region_id": region_id,
+                "config": config
+            })
+        };
+        let post = async |body: Value| -> (StatusCode, String) {
+            let resp = client
+                .post_auth("/api/v1/app-deployments", &body)
+                .await
+                .unwrap();
+            let status = resp.status();
+            (status, resp.text().await.unwrap())
+        };
+
+        // A non-integer `int` is refused, naming the label the customer typed
+        // into rather than the internal field name.
+        let (status, body) = post(order(
+            "typed-bad-int",
+            serde_json::json!({ "count": "abc", "owner_npub": npub }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("Count"), "{body}");
+
+        // A value that is not an npub is refused by the declared pattern.
+        let (status, body) = post(order(
+            "typed-bad-npub",
+            serde_json::json!({ "count": "2", "owner_npub": "not-an-npub" }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("Owner npub"), "{body}");
+
+        // The pattern is anchored: an npub with junk appended is not an npub.
+        let (status, _) = post(order(
+            "typed-trailing",
+            serde_json::json!({ "count": "2", "owner_npub": format!("{npub}x") }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Valid values order normally.
+        let (status, body) = post(order(
+            "typed-ok",
+            serde_json::json!({ "count": "2", "owner_npub": npub }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // ...and the same rules apply to a config PATCH on the deployment, not
+        // just to the order.
+        let created: Value = serde_json::from_str(&body).unwrap();
+        let dep_id = created["data"]["id"].as_u64().expect("deployment id");
+        let resp = client
+            .patch_auth(
+                &format!("/api/v1/app-deployments/{dep_id}"),
+                &serde_json::json!({ "config": { "count": "nope", "owner_npub": npub } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(resp.text().await.unwrap().contains("Count"));
+    }
+
     /// An unpaid order must not consume cluster capacity (#252). Nostr keys are
     /// free, so anyone can create deployments without paying; before the fix
     /// each one was counted against the cluster and could make a paying

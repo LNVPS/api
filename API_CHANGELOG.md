@@ -34,6 +34,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **Per-response currency conversion arrays** (follows #230) — `other_price[]` on VM cost plans (`VmCostPlan`) and custom VM prices (`CustomVmPrice`), and `other_price[]` / `other_setup_fee[]` on `IpSpacePricing`, are now deprecated in favour of the single `GET /api/v1/exchange-rate` feed. They are still populated for backward compatibility but will be removed in a future release. Clients should compute conversions from the exchange-rate endpoint (`rates[B] / rates[A]`), which uses the same conversion source and precision.
 
+### Changed
+
+- **Managed app config fields are validated against their declared `type`, and may declare a `pattern`** (issue #271) — **stricter validation on `POST /api/v1/app-deployments`, `PATCH /api/v1/app-deployments/{id}` and the admin app create/update endpoints.** An order that previously succeeded with a garbage value now returns `400`.
+
+  `resolve_config` enforced `required` and unknown keys and never looked at `type`, so an `int` field accepted `abc`, a `bool` field accepted `maybe`, and a `string` field accepted anything at all. That is only a validation gap until an app is strict about the value: HAVEN panics on an `owner_npub` that is not an npub, so a single mistyped character was accepted at order time, charged for, and became a deployment that restarted forever with nothing on screen naming the field.
+
+  `int` must now parse as a whole number and `bool` must be `true` or `false`. A field may also declare `pattern`, a regex the value must match **in full** (it is anchored automatically, so `npub1…` cannot admit a value with junk on the end); `type: file` is exempt, being arbitrary content by definition. Errors name the field's **label** — what the customer sees on the form — not its internal name.
+
+  An empty submitted value for an `int` or `bool` field is treated as "not supplied" — it falls back to the field's default, or errors as required — because a form that posts every field sends `""` for the boxes nobody touched, and refusing those would fail an order over a field the app has a default for. An empty **string** is unchanged: blank is a legitimate value there.
+
+  A `pattern` is compiled when the app is created or updated, so an invalid regex is the catalog author's error rather than a customer's failed order, and a declared `default` is checked against its own field at the same point. Existing app definitions are unaffected: no field declares a `pattern` yet, and the documented `owner_npub` (HAVEN) and `owner_pubkey` (Buzz) fields gain one in this release — the live catalog rows need the same edit, which no migration performs.
+
 ### Added
 
 - **`billing_state` on an app deployment — `unpaid` / `active` / `expired`** (issue #253) — `ApiAppDeployment` (`GET /api/v1/app-deployments` and `/{id}`, and every endpoint returning a deployment) gains a nullable `billing_state` string. Additive: no existing field changes.
