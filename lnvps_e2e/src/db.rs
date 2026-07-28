@@ -174,13 +174,9 @@ const HARD_DELETE_RETRIES: u32 = 20;
 
 /// MySQL error 1451: cannot delete a parent row, a child row still references it.
 fn is_fk_violation(e: &sqlx::Error) -> bool {
-    match e {
-        sqlx::Error::Database(db) => db
-            .try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>()
-            .map(|e| e.number() == 1451)
-            .unwrap_or(false),
-        _ => false,
-    }
+    e.as_database_error()
+        .and_then(|d| d.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>())
+        .is_some_and(|e| e.number() == 1451)
 }
 
 /// Hard-delete a VM and all its dependent rows from the database.
