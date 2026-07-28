@@ -12,6 +12,7 @@ use lnvps_api_common::{
     deserialize_from_str_optional,
 };
 use lnvps_db::{AdminAction, AdminResource, Referral, ReferralPayout};
+use payments_rs::currency::{Currency, CurrencyAmount};
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -277,8 +278,7 @@ fn apply_sent_side(
                     .to_string(),
             );
         }
-        let settled = payout.clone().unconverted();
-        *payout = settled;
+        *payout = std::mem::take(payout).unconverted();
         return Ok(());
     }
 
@@ -291,11 +291,56 @@ fn apply_sent_side(
                 .to_string(),
         );
     };
+    check_rate_against_amounts(payout.amount, &payout.currency, sent_amount, &sent_currency, rate)?;
+
     payout.sent_amount = sent_amount;
     payout.sent_fee = req.sent_fee.unwrap_or(0);
     payout.sent_currency = sent_currency;
     payout.rate = rate;
     payout.rate_collected = Some(req.rate_collected.unwrap_or_else(chrono::Utc::now));
+    Ok(())
+}
+
+/// Tolerance between the supplied rate and the one the two amounts imply.
+///
+/// Wide enough for rounding, a stale quote and the spread on the transfer;
+/// narrow enough that a wrong order of magnitude cannot pass.
+const RATE_TOLERANCE: f32 = 0.10;
+
+/// Reject a rate that the two amounts contradict.
+///
+/// The rate exists so the conversion is reproducible without a price feed, so a
+/// record that disagrees with itself is worse than one carrying no rate at all.
+/// Nothing here moves money — the balance nets on the settled amount.
+///
+/// A currency neither side of the ledger knows how to scale cannot be checked;
+/// the record is still worth storing, so it passes.
+fn check_rate_against_amounts(
+    amount: u64,
+    currency: &str,
+    sent_amount: u64,
+    sent_currency: &str,
+    rate: f32,
+) -> Result<(), String> {
+    let (Ok(settled), Ok(sent)) = (
+        Currency::from_str(currency),
+        Currency::from_str(sent_currency),
+    ) else {
+        return Ok(());
+    };
+
+    let settled = CurrencyAmount::from_u64(settled, amount).value_f32();
+    let sent = CurrencyAmount::from_u64(sent, sent_amount).value_f32();
+    if settled <= 0.0 || sent <= 0.0 {
+        return Ok(());
+    }
+
+    let implied = settled / sent;
+    if (implied / rate - 1.0).abs() > RATE_TOLERANCE {
+        return Err(format!(
+            "rate {rate} disagrees with the amounts, which imply {implied}"
+        ));
+    }
     Ok(())
 }
 
@@ -443,6 +488,36 @@ mod tests {
         let mut p = payout("EUR", 5_000, 0);
         apply_sent_side(&mut p, &r).unwrap();
         assert_eq!(p.rate_collected, Some(when));
+    }
+
+    /// The rate is what makes the conversion reproducible, so a rate the two
+    /// amounts contradict is rejected rather than stored.
+    #[test]
+    fn cross_currency_rejects_a_rate_the_amounts_contradict() {
+        let mut r = req("EUR", 5_000);
+        r.sent_currency = Some("BTC".to_string());
+        r.sent_amount = Some(55_000_000);
+
+        // 50.00 EUR for 0.00055 BTC implies ~90909 EUR/BTC.
+        r.rate = Some(9_000.0);
+        let err = apply_sent_side(&mut payout("EUR", 5_000, 0), &r).unwrap_err();
+        assert!(err.contains("disagrees with the amounts"), "{err}");
+
+        // Rounding and a stale quote stay inside the tolerance.
+        r.rate = Some(90_000.0);
+        apply_sent_side(&mut payout("EUR", 5_000, 0), &r).unwrap();
+        r.rate = Some(85_000.0);
+        apply_sent_side(&mut payout("EUR", 5_000, 0), &r).unwrap();
+    }
+
+    /// A currency the ledger cannot scale cannot be cross-checked, and the
+    /// record is still worth storing.
+    #[test]
+    fn an_unknown_currency_skips_the_rate_check() {
+        assert!(check_rate_against_amounts(5_000, "XAU", 55_000_000, "BTC", 1.0).is_ok());
+        assert!(check_rate_against_amounts(5_000, "EUR", 55_000_000, "XAU", 1.0).is_ok());
+        // A zero side gives no ratio to compare against.
+        assert!(check_rate_against_amounts(0, "EUR", 55_000_000, "BTC", 90_000.0).is_ok());
     }
 
     /// Same-currency rows must stay identities: a rate or a mismatched sent

@@ -3227,6 +3227,8 @@ mod tests {
             serde_json::json!({ "amount": 5000, "currency": "EUR", "sent_currency": "BTC", "rate": 90000.0 }),
             serde_json::json!({ "amount": 5000, "currency": "EUR", "sent_currency": "BTC", "sent_amount": 55000000 }),
             serde_json::json!({ "amount": 5000, "currency": "EUR", "sent_currency": "BTC", "sent_amount": 55000000, "rate": 0.0 }),
+            // 50.00 EUR for 0.00055 BTC implies ~90909, not 9000.
+            serde_json::json!({ "amount": 5000, "currency": "EUR", "sent_currency": "BTC", "sent_amount": 55000000, "rate": 9000.0 }),
         ] {
             let resp = client.post_auth(&path, &body).await.unwrap();
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{body}");
