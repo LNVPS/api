@@ -1179,6 +1179,93 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A catalog edit may grow a persistent volume but not shrink, drop or
+    /// rename one (#292). Kubernetes permits PVC expansion only, and the
+    /// operator cannot prune a PVC it stops applying, so each of those puts
+    /// every existing deployment of the app somewhere the API cannot walk back.
+    #[tokio::test]
+    async fn test_admin_app_compose_volume_may_not_shrink() {
+        let client = setup().await;
+        let suffix = nostr::Keys::generate().public_key().to_hex()[..8].to_string();
+        let slug = format!("e2e-vol-shrink-{suffix}");
+
+        let compose = |vol: &str| {
+            format!(
+                "services:\n  db:\n    image: example/db:latest\n    user: \"1000\"\n    \
+                 volumes:\n      - {vol}\n"
+            )
+        };
+        let patch = |vol: &str| serde_json::json!({ "compose": compose(vol) });
+
+        let resp = client
+            .post_auth(
+                "/api/admin/v1/apps",
+                &serde_json::json!({
+                    "name": slug,
+                    "display_name": "Volumes Only Grow",
+                    "category": "Nostr relay",
+                    "compose": compose("{ name: data, path: /data, size: 5Gi }"),
+                    "amount": 1000,
+                    "currency": "usd",
+                    "interval_amount": 1,
+                    "interval_type": "month",
+                    "setup_amount": 0
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let created: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let app_id = created["data"]["id"].as_u64().expect("app id");
+        let path = format!("/api/admin/v1/apps/{app_id}");
+
+        let resp = client
+            .patch_auth(&path, &patch("{ name: data, path: /data, size: 1Gi }"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = resp.text().await.unwrap();
+        assert!(err.contains("shrinks from 5Gi to 1Gi"), "{err}");
+
+        // Dropping the volume, and renaming it, are refused the same way: the
+        // old PVC survives with the customer's data in it either way.
+        let resp = client
+            .patch_auth(
+                &path,
+                &serde_json::json!({
+                    "compose": "services:\n  db:\n    image: example/db:latest\n"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = resp.text().await.unwrap();
+        assert!(err.contains("volume 'data' is missing"), "{err}");
+
+        let resp = client
+            .patch_auth(&path, &patch("{ name: store, path: /data, size: 5Gi }"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Growing is the whole point of allowing the edit at all...
+        let resp = client
+            .patch_auth(&path, &patch("{ name: data, path: /data, size: 20Gi }"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // ...and the new size is the floor from then on.
+        let resp = client
+            .patch_auth(&path, &patch("{ name: data, path: /data, size: 5Gi }"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let resp = client.delete_auth(&path).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
     /// A generated secret can declare its byte length (issue #243), and an
     /// unusable length is refused when the app is created or updated rather
     /// than becoming an app that deploys and crash-loops on its own key.

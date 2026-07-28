@@ -204,6 +204,28 @@ fn validate_category(category: String) -> Result<String, lnvps_api_common::ApiEr
     Ok(category.to_string())
 }
 
+/// Refuse an edit that shrinks, drops or renames a persistent volume (#292).
+///
+/// Update only: there is no stored row to compare against on create, and an
+/// app's first compose declares whatever it likes.
+///
+/// A stored compose that no longer parses is skipped rather than fatal —
+/// nothing can be compared against it, and refusing the edit would leave an
+/// admin unable to repair the very row that is broken.
+fn validate_volume_changes(
+    stored: &str,
+    incoming: &str,
+) -> Result<(), lnvps_api_common::ApiError> {
+    let Ok(stored) = lnvps_compose::Compose::parse(stored) else {
+        return Ok(());
+    };
+    let incoming = lnvps_compose::Compose::parse(incoming)
+        .map_err(|e| lnvps_api_common::ApiError::new(format!("invalid compose: {e}")))?;
+    incoming
+        .validate_volume_changes(&stored)
+        .map_err(|e| lnvps_api_common::ApiError::new(format!("invalid compose: {e}")))
+}
+
 /// Parse the compose and compute the app's resource footprint (already
 /// validated by `validate_app_fields`).
 fn compose_footprint(
@@ -328,6 +350,7 @@ async fn admin_update_app(
 ) -> ApiResult<AdminAppInfo> {
     auth.require_permission(AdminResource::App, AdminAction::Update)?;
     let mut app = this.db.get_app(id).await?;
+    let stored_compose = app.compose.clone();
 
     if let Some(name) = req.name {
         app.name = name.trim().to_string();
@@ -380,6 +403,7 @@ async fn admin_update_app(
     }
 
     validate_app_fields(&app.name, &app.display_name, &app.compose, &app.currency)?;
+    validate_volume_changes(&stored_compose, &app.compose)?;
     // Resolve before any write, so an unknown slug leaves the app untouched
     // rather than half-applying the rest of the patch.
     let tag_ids = match &req.tags {
