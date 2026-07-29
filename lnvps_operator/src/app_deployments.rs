@@ -13,12 +13,14 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
 use std::net::IpAddr;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use hickory_resolver::TokioResolver;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::{Client, Resource, ResourceExt};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -1046,25 +1048,51 @@ pub fn build_custom_domain_ingress(
 /// the name arrives here. Any resolver failure reads as "not yet" — holding a
 /// domain is recoverable on the next pass, serving one that is not ours is not.
 async fn resolves_to_same_address(domain: &str, hostname: &str) -> bool {
-    let resolver = match TokioResolver::builder_tokio().and_then(|b| b.build()) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!("custom domain probe has no resolver: {e}");
-            return false;
+    static RESOLVER: OnceLock<Option<TokioResolver>> = OnceLock::new();
+    let resolver =
+        RESOLVER.get_or_init(
+            || match TokioResolver::builder_tokio().and_then(|b| b.build()) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    warn!("custom domain probe has no resolver: {e}");
+                    None
+                }
+            },
+        );
+    let Some(resolver) = resolver else {
+        return false;
+    };
+
+    let ours = lookup(resolver, hostname).await;
+    if ours.is_empty() {
+        warn!("custom domain probe: {hostname} resolves to nothing from here");
+        return false;
+    }
+    let theirs = lookup(resolver, domain).await;
+    let matched = shares_an_address(&ours, &theirs);
+    if !matched {
+        // Both sides logged: the usual cause of a domain that never releases is
+        // ours resolving to something the customer could never point at.
+        debug!("custom domain probe: {domain} {theirs:?} vs {hostname} {ours:?}");
+    }
+    matched
+}
+
+/// Addresses for `name`, empty on any failure.
+///
+/// Bounded rather than left to the resolver's own retries: this runs inline in
+/// a reconcile pass, once per held domain, and a pass that does not finish
+/// stops every deployment behind it.
+async fn lookup(resolver: &TokioResolver, name: &str) -> Vec<IpAddr> {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+    match tokio::time::timeout(PROBE_TIMEOUT, resolver.lookup_ip(name)).await {
+        Ok(Ok(ips)) => ips.iter().collect(),
+        Ok(Err(_)) => Vec::new(),
+        Err(_) => {
+            warn!("custom domain probe timed out resolving {name}");
+            Vec::new()
         }
-    };
-    let ours: Vec<IpAddr> = match resolver.lookup_ip(hostname).await {
-        Ok(ips) => ips.iter().collect(),
-        Err(e) => {
-            warn!("custom domain probe could not resolve {hostname}: {e}");
-            return false;
-        }
-    };
-    let theirs: Vec<IpAddr> = match resolver.lookup_ip(domain).await {
-        Ok(ips) => ips.iter().collect(),
-        Err(_) => return false,
-    };
-    shares_an_address(&ours, &theirs)
+    }
 }
 
 /// Whether the two address sets intersect. Empty on either side is no match:
