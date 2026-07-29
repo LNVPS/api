@@ -376,6 +376,17 @@ pub struct ReferralConfig {
     /// manual payout).
     #[serde(default = "default_min_onchain_payout_sats")]
     pub min_onchain_payout_sats: Option<u64>,
+    /// Minimum fiat-settled commission — valued in satoshis at the rate quoted
+    /// when the payout is sent — before an automated converted payout is
+    /// attempted. Fiat commission is transferred as sats and recorded with both
+    /// sides plus the rate used. Defaults to `null`: automated conversion is
+    /// off, and fiat commission accrues for manual payout as before.
+    ///
+    /// On-chain referrers are excluded: their payouts batch into one
+    /// transaction whose fee is split in sats, which cannot be charged against a
+    /// fiat balance without converting each share back.
+    #[serde(default)]
+    pub min_fiat_payout_sats: Option<u64>,
     /// Maximum acceptable next-block fee rate (sat/vByte) for on-chain payouts.
     /// Before broadcasting a payout batch, the current next-block fee rate is
     /// obtained from `fee_estimator`; if it exceeds this cap the batch is skipped

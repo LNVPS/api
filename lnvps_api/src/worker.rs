@@ -150,6 +150,9 @@ pub struct WorkerSettings {
     /// Maximum next-block fee rate (sat/vByte) tolerated for on-chain referral
     /// payouts; batches are deferred above this.
     pub referral_max_onchain_fee_per_vbyte: u64,
+    /// Minimum fiat-settled referral commission (satoshis at the quote) before
+    /// an automated converted payout is attempted. `None` disables them.
+    pub referral_min_fiat_payout_sats: Option<u64>,
     /// Source of the on-chain fee-rate estimate for the cap above.
     pub referral_fee_estimator: crate::settings::FeeEstimatorConfig,
 }
@@ -174,6 +177,10 @@ impl From<&Settings> for WorkerSettings {
                 .as_ref()
                 .map(|r| r.max_onchain_fee_per_vbyte)
                 .unwrap_or(50),
+            referral_min_fiat_payout_sats: val
+                .referral
+                .as_ref()
+                .and_then(|r| r.min_fiat_payout_sats),
             referral_fee_estimator: val
                 .referral
                 .as_ref()
@@ -209,6 +216,8 @@ impl Worker {
             settings.referral_min_onchain_payout_sats,
             settings.referral_max_onchain_fee_per_vbyte,
             fee_estimator,
+            subscription_handler.pricing_engine().rates(),
+            settings.referral_min_fiat_payout_sats,
         );
 
         let kv: Arc<dyn KeyValueStore> = if let Some(c) = &settings.redis {

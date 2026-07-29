@@ -20,6 +20,12 @@ referral:
   # debited from their balance), and this minimum acts as a small buffer to
   # absorb it. Defaults to 1000. Set to null to disable on-chain payouts.
   min-onchain-payout-sats: 1000
+  # Minimum fiat-settled commission, valued in satoshis at the rate quoted when
+  # the payout is sent, before it is converted and paid as sats. Omit (or null)
+  # to leave fiat commission accruing for manual payout, which is the default.
+  # On-chain referrers are excluded — their batched fee is split in sats and
+  # cannot be charged against a fiat balance.
+  min-fiat-payout-sats: null
   # Maximum next-block fee rate (sat/vByte) tolerated for on-chain payouts. The
   # current rate is obtained from fee-estimator before each batch; if it exceeds
   # this cap the batch is deferred until fees drop. Defaults to 50.
