@@ -1,6 +1,6 @@
 use crate::VmRunningState;
-use crate::ssh_host_key::{ApiVmHostKey, parse_ssh_host_keys};
 use crate::pricing::PricingEngine;
+use crate::ssh_host_key::{ApiVmHostKey, parse_ssh_host_keys};
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Days, Utc};
 use futures::future::join_all;

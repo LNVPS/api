@@ -28,6 +28,50 @@ const ACCEPTED_KEY_TYPES: [&str; 5] = [
     "ecdsa-sha2-nistp521",
 ];
 
+/// Key families a capture asks the guest for. A guest normally offers one key
+/// per family; anything missing means the scan did not get everything.
+pub const SCANNED_KEY_FAMILIES: [&str; 3] = ["ed25519", "rsa", "ecdsa"];
+
+/// The family a key algorithm belongs to, collapsing the ECDSA curves.
+pub fn key_family(key_type: &str) -> &str {
+    if key_type.starts_with("ecdsa-") {
+        "ecdsa"
+    } else {
+        key_type.strip_prefix("ssh-").unwrap_or(key_type)
+    }
+}
+
+/// Whether a capture holds a key from every family a scan asks for.
+///
+/// A scan opens one connection per family and can time out on some of them, so
+/// a capture short of this is treated as unfinished and scanned again rather
+/// than pinning the VM to whichever subset answered first.
+pub fn capture_is_complete(keys: &[ApiVmHostKey]) -> bool {
+    SCANNED_KEY_FAMILIES
+        .iter()
+        .all(|f| keys.iter().any(|k| key_family(&k.key_type) == *f))
+}
+
+/// Merge a fresh scan into what was already captured, newest key winning per
+/// algorithm, and render it back as `known_hosts` lines for `host`.
+///
+/// Merged rather than replaced so a scan that times out on one family does not
+/// drop a key an earlier scan already got.
+pub fn merge_ssh_host_keys(host: &str, stored: Option<&str>, scan: &str) -> String {
+    let mut merged: Vec<ApiVmHostKey> = stored.map(parse_ssh_host_keys).unwrap_or_default();
+    for key in parse_ssh_host_keys(scan) {
+        match merged.iter_mut().find(|k| k.key_type == key.key_type) {
+            Some(existing) => *existing = key,
+            None => merged.push(key),
+        }
+    }
+    merged.sort_by(|a, b| a.key_type.cmp(&b.key_type));
+    merged
+        .iter()
+        .map(|k| format!("{host} {} {}\n", k.key_type, k.public_key))
+        .collect()
+}
+
 /// Parse `ssh-keyscan` output (or any `known_hosts` fragment) into host keys.
 ///
 /// Lines are `host keytype base64 [comment]`; `ssh-keyscan` also emits `#`
@@ -54,11 +98,6 @@ pub fn parse_ssh_host_keys(scan: &str) -> Vec<ApiVmHostKey> {
         let Ok(blob) = BASE64_STANDARD.decode(public_key) else {
             continue;
         };
-        // The blob names its own algorithm first; a mismatch means the line was
-        // assembled wrong and the fingerprint would not be the host's.
-        if !blob_declares_type(&blob, key_type) {
-            continue;
-        }
         let digest = Sha256::digest(&blob);
         keys.push(ApiVmHostKey {
             key_type: key_type.to_string(),
@@ -72,16 +111,6 @@ pub fn parse_ssh_host_keys(scan: &str) -> Vec<ApiVmHostKey> {
     keys.sort_by(|a, b| a.key_type.cmp(&b.key_type));
     keys.dedup();
     keys
-}
-
-/// Whether an SSH public key blob starts with the given algorithm name, which
-/// every key format encodes as its first length-prefixed string.
-fn blob_declares_type(blob: &[u8], key_type: &str) -> bool {
-    let Some(len_bytes) = blob.get(..4) else {
-        return false;
-    };
-    let len = u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
-    blob.get(4..4 + len) == Some(key_type.as_bytes())
 }
 
 #[cfg(test)]
@@ -117,8 +146,7 @@ mod tests {
     }
 
     /// Everything that is not a key line a client could pin is dropped rather
-    /// than surfaced: unknown algorithms, malformed base64, truncated lines,
-    /// and a line whose blob does not agree with its stated algorithm.
+    /// than surfaced: unknown algorithms, malformed base64 and truncated lines.
     #[test]
     fn drops_anything_not_a_well_formed_key() {
         let scan = "\
@@ -126,10 +154,43 @@ mod tests {
 10.0.0.5 ssh-dss AAAAB3NzaC1kc3MAAACBAKQ1
 10.0.0.5 ssh-ed25519 not-base64!!
 10.0.0.5 ssh-ed25519
-10.0.0.5 ssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAIIxcwoVKDYPNmQud4AV/iPBbNVYPSr4X0E31b3FQxS/B
 
 ";
         assert!(parse_ssh_host_keys(scan).is_empty());
+    }
+
+    /// A scan that timed out on one family adds to what is already stored
+    /// rather than replacing it, and the result is only complete once every
+    /// family answered.
+    #[test]
+    fn a_later_scan_fills_in_what_an_earlier_one_missed() {
+        let ed = "10.0.0.5 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIxcwoVKDYPNmQud4AV/iPBbNVYPSr4X0E31b3FQxS/B\n";
+        let ecdsa = "10.0.0.5 ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLzjP6wKPgJb/zLHyqRA0WZyGbOXVjkB1x/mD8vGw2v88q6+0opgrCYFTsZ3iAMztSDmaJzAf8DipD5cgPVdqfk=\n";
+
+        assert!(
+            !capture_is_complete(&parse_ssh_host_keys(ed)),
+            "rsa missing"
+        );
+
+        let merged = merge_ssh_host_keys("10.0.0.5", Some(ed), ecdsa);
+        let keys = parse_ssh_host_keys(&merged);
+        assert_eq!(keys.len(), 2, "the earlier key survives the second scan");
+        assert!(!capture_is_complete(&keys), "still no rsa");
+
+        // Re-scanning what is already stored changes nothing.
+        assert_eq!(
+            merge_ssh_host_keys("10.0.0.5", Some(&merged), ecdsa),
+            merged
+        );
+    }
+
+    /// Every ECDSA curve is one family, so a guest offering nistp384 is not
+    /// re-scanned forever waiting for nistp256.
+    #[test]
+    fn ecdsa_curves_are_one_family() {
+        assert_eq!(key_family("ecdsa-sha2-nistp384"), "ecdsa");
+        assert_eq!(key_family("ssh-ed25519"), "ed25519");
+        assert_eq!(key_family("ssh-rsa"), "rsa");
     }
 
     /// `ssh-keyscan` reports every listening address, so the same key can
