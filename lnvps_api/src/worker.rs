@@ -64,7 +64,10 @@ fn get_host_info_path_for_arch(arch: CpuArch) -> Option<std::path::PathBuf> {
 /// (`external_id` holds the deposit outpoint `{txid}:{vout}`): confirmation
 /// can land well after the 1h quote expiry, and purging the VM in that window
 /// would lose the customer's payment (issue #194).
-fn payment_blocks_unpaid_vm_deletion(p: &SubscriptionPayment, now: DateTime<Utc>) -> bool {
+pub(crate) fn payment_blocks_unpaid_vm_deletion(
+    p: &SubscriptionPayment,
+    now: DateTime<Utc>,
+) -> bool {
     !p.is_paid
         && (p.expires > now
             || (p.payment_method == PaymentMethod::OnChain && p.external_id.is_some()))

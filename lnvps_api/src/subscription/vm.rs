@@ -281,6 +281,28 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
             return Ok(());
         }
 
+        // An on-chain renewal deposit may still be confirming (issue #194's
+        // deletion guard only covers never-paid VMs). If a payment for this
+        // VM has a mempool sighting (`external_id` holds the deposit outpoint)
+        // but is not yet settled, defer deletion so the confirmation can land.
+        let now = Utc::now();
+        if self
+            .db
+            .list_vm_subscription_payments(vm_id)
+            .await
+            .map(|ps| {
+                ps.iter()
+                    .any(|p| crate::worker::payment_blocks_unpaid_vm_deletion(p, now))
+            })
+            .unwrap_or(false)
+        {
+            info!(
+                "VM {} has an on-chain deposit still confirming, deferring deletion",
+                vm_id
+            );
+            return Ok(());
+        }
+
         if let Err(e) = self.provisioner.delete_vm(vm_id, false).await {
             warn!("Failed to delete expired VM {}: {}", vm_id, e);
         } else {

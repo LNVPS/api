@@ -2689,6 +2689,118 @@ mod tests {
         Ok(())
     }
 
+    /// Regression test for the VM 1701 bug: an already-setup VM whose on-chain
+    /// renewal deposit has been sighted in the mempool (`external_id` = the
+    /// deposit outpoint) but not yet confirmed must NOT be deleted when the
+    /// grace period ends — the confirmation can land well after the 1h quote
+    /// expiry. (The #194 guard covered only never-paid VMs.)
+    #[tokio::test]
+    async fn test_on_grace_period_exceeded_defers_deletion_for_unconfirmed_onchain_deposit()
+    -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let wrk: Arc<dyn WorkCommander> = Arc::new(ChannelWorkCommander::new());
+        let sub_handler = make_sub_handler(db.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let vm_id = vm.id;
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let sub = db.get_subscription(li.subscription_id).await?;
+
+        // On-chain renewal whose quote has expired but whose deposit was
+        // detected in the mempool (external_id set by the watcher at Detected).
+        let payment = sub_handler
+            .renew_subscription(li.id, PaymentMethod::OnChain, 1)
+            .await?;
+        {
+            let mut payments = db.subscription_payments.lock().await;
+            let p = payments
+                .iter_mut()
+                .find(|p| p.id == payment.id)
+                .expect("payment");
+            p.is_paid = false;
+            p.expires = Utc::now() - chrono::Duration::hours(1); // quote expired
+            p.external_id = Some(
+                "b64a0fb7c5e23dd3c566612aab02d806df1fc812c31a1f139f02914fa1a37b22:0".to_string(),
+            );
+        }
+
+        let handler = VmLineItemHandler::new(
+            vm_id,
+            db.clone(),
+            wrk.clone(),
+            provisioner,
+            VmStateCache::new(),
+        )
+        .await?;
+        handler.on_grace_period_exceeded(&sub, &li).await?;
+
+        assert!(
+            !db.get_vm(vm_id).await?.deleted,
+            "VM with an unconfirmed on-chain deposit must not be deleted at grace period end"
+        );
+
+        Ok(())
+    }
+
+    /// An expired on-chain renewal with NO mempool sighting (`external_id`
+    /// unset) must not block deletion — the VM is deleted as normal.
+    #[tokio::test]
+    async fn test_on_grace_period_exceeded_deletes_when_no_onchain_deposit_detected() -> Result<()>
+    {
+        let db = Arc::new(MockDb::default());
+        let wrk: Arc<dyn WorkCommander> = Arc::new(ChannelWorkCommander::new());
+        let sub_handler = make_sub_handler(db.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let vm_id = vm.id;
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let sub = db.get_subscription(li.subscription_id).await?;
+
+        // On-chain renewal, quote expired, never detected in the mempool.
+        let payment = sub_handler
+            .renew_subscription(li.id, PaymentMethod::OnChain, 1)
+            .await?;
+        {
+            let mut payments = db.subscription_payments.lock().await;
+            let p = payments
+                .iter_mut()
+                .find(|p| p.id == payment.id)
+                .expect("payment");
+            p.is_paid = false;
+            p.expires = Utc::now() - chrono::Duration::hours(1);
+            p.external_id = None;
+        }
+
+        let handler = VmLineItemHandler::new(
+            vm_id,
+            db.clone(),
+            wrk.clone(),
+            provisioner,
+            VmStateCache::new(),
+        )
+        .await?;
+        handler.on_grace_period_exceeded(&sub, &li).await?;
+
+        assert!(
+            db.get_vm(vm_id).await?.deleted,
+            "VM with an expired on-chain quote and no deposit sighting must still be deleted"
+        );
+
+        Ok(())
+    }
+
     /// Renewing an already-expired subscription extends `expires` beyond the
     /// previous expiry date and re-activates the subscription.
     #[tokio::test]
