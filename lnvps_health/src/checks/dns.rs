@@ -285,16 +285,10 @@ mod tests {
             2,
             "Should create 2 checks for dual-stack config"
         );
-
-        for check in checks {
-            match check.check().await {
-                Ok(result) => {
-                    println!("Check result: {:?}", result);
-                }
-                Err(e) => {
-                    println!("Check failed: {}", e);
-                }
-            }
-        }
+        // One check per family, and the id says which — running them would only
+        // ask a public resolver whether it is up.
+        let ids: Vec<String> = checks.iter().map(|c| c.id()).collect();
+        assert!(ids.iter().any(|i| i.ends_with(":v4")), "{ids:?}");
+        assert!(ids.iter().any(|i| i.ends_with(":v6")), "{ids:?}");
     }
 }
