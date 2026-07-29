@@ -195,13 +195,16 @@ environment wins when both are set.
 
 It reads nostr domains, apps, app clusters, app deployments and the
 subscription rows that decide whether a deployment is paid for, and it writes
-to exactly one table: `app_deployment`. No inserts, no deletes, and it never
-runs migrations, so it needs no DDL:
+to three: the status and usage totals on `app_deployment`, and the per-service
+and per-volume usage breakdown, which it rewrites each pass rather than
+accumulating. It never runs migrations, so it needs no DDL:
 
 ```sql
 CREATE USER 'lnvps_operator'@'%' IDENTIFIED BY '<password>';
 GRANT SELECT ON lnvps.* TO 'lnvps_operator'@'%';
 GRANT UPDATE ON lnvps.app_deployment TO 'lnvps_operator'@'%';
+GRANT INSERT, DELETE ON lnvps.app_deployment_service_usage TO 'lnvps_operator'@'%';
+GRANT INSERT, DELETE ON lnvps.app_deployment_volume_usage TO 'lnvps_operator'@'%';
 ```
 
 ```bash
