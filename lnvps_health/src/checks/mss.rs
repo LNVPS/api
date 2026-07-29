@@ -376,9 +376,7 @@ mod tests {
                 println!("Check result: {:?}", result);
                 assert!(result.passed, "Expected check to pass: {}", result.message);
             }
-            Err(e) => {
-                println!("Check failed (may be expected in some environments): {}", e);
-            }
+            Err(e) => panic!("{e}"),
         }
     }
 
@@ -404,9 +402,7 @@ mod tests {
                     result.message
                 );
             }
-            Err(e) => {
-                println!("Check failed (may be expected in some environments): {}", e);
-            }
+            Err(e) => panic!("{e}"),
         }
     }
 }
