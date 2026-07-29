@@ -4248,13 +4248,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_app_deployment(&self, deployment: &AppDeployment) -> DbResult<()> {
         sqlx::query(
-            "UPDATE app_deployment SET name = ?, namespace = ?, hostname = ?, custom_domain = ?, config = ?, \
-             desired_state = ?, status = ?, status_message = ?, resource_multiplier = ?, deleted = ? WHERE id = ?",
+            "UPDATE app_deployment SET name = ?, namespace = ?, hostname = ?, custom_domain = ?, \
+             custom_domain_verified = ?, config = ?, desired_state = ?, status = ?, \
+             status_message = ?, resource_multiplier = ?, deleted = ? WHERE id = ?",
         )
         .bind(&deployment.name)
         .bind(&deployment.namespace)
         .bind(&deployment.hostname)
         .bind(&deployment.custom_domain)
+        .bind(deployment.custom_domain_verified)
         .bind(&deployment.config)
         .bind(deployment.desired_state)
         .bind(deployment.status)
@@ -4264,6 +4266,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(deployment.id)
         .execute(&self.db)
         .await?;
+        Ok(())
+    }
+
+    async fn set_app_deployment_custom_domain_verified(&self, id: u64) -> DbResult<()> {
+        sqlx::query("UPDATE app_deployment SET custom_domain_verified = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
         Ok(())
     }
 

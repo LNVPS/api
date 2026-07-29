@@ -284,6 +284,13 @@ pub struct ApiAppDeployment {
     /// serves it too and cert-manager issues a TLS cert for it (HTTP-01 once
     /// DNS resolves). `None` when unset.
     pub custom_domain: Option<String>,
+    /// Whether `custom_domain` is being served yet (issue #307).
+    ///
+    /// `false` means held: the domain is stored but has never been seen
+    /// resolving to `hostname`, so nothing serves it and no certificate is
+    /// requested. Point a CNAME at `hostname` and the next reconcile releases
+    /// it. Always `false` when `custom_domain` is `None`.
+    pub custom_domain_verified: bool,
     /// Desired run state: `running` or `stopped`.
     pub desired_state: String,
     /// Observed status: `pending`, `running`, `stopped`, `error`, `deleting`.
@@ -404,6 +411,7 @@ async fn deployment_to_api_with_breakdown(
         app_id: d.app_id,
         name: d.name,
         hostname: d.hostname,
+        custom_domain_verified: d.custom_domain.is_some() && d.custom_domain_verified,
         custom_domain: d.custom_domain,
         desired_state: d.desired_state.to_string(),
         status: d.status.to_string(),
@@ -730,6 +738,7 @@ async fn v1_create_app_deployment(
         namespace: pending_deployment_namespace(line_item_id),
         hostname: None,
         custom_domain: None,
+        custom_domain_verified: false,
         config: Some(EncryptedString::new(config_json)),
         desired_state: AppDeploymentDesiredState::Running,
         status: AppDeploymentStatus::Pending,
@@ -801,9 +810,9 @@ pub struct PatchAppDeploymentRequest {
     #[serde(default)]
     pub config: Option<BTreeMap<String, String>>,
     /// Set or clear the customer-owned domain. `Some("blog.example.com")` sets
-    /// it (validated DNS-safe); `Some("")` or `Some(null)` clears it. When set,
-    /// the operator serves the domain and cert-manager issues a TLS cert once
-    /// the customer points a CNAME at the deployment's `hostname`. Absent =
+    /// it (validated DNS-safe); `Some("")` or `Some(null)` clears it. A domain
+    /// is accepted immediately but held unserved until it is seen resolving to
+    /// the deployment's `hostname` — see `custom_domain_verified`. Absent =
     /// leave unchanged.
     #[serde(default)]
     pub custom_domain: Option<Option<String>>,
@@ -859,14 +868,18 @@ async fn v1_patch_app_deployment(
         deployment.config = Some(EncryptedString::new(config_json));
     }
 
-    // Custom domain: set (validated) or clear. The operator reconciles the
-    // Ingress + cert on its next loop; TLS is issued once the customer's CNAME
-    // resolves to the deployment hostname.
+    // Custom domain: set (validated) or clear. Syntax is all the API checks —
+    // a new domain is held until the operator sees it resolve to us, so the
+    // flag only survives a no-op edit that resubmits the same domain.
     if let Some(cd) = &req.custom_domain {
-        deployment.custom_domain = match cd {
+        let new_domain = match cd {
             Some(d) if !d.trim().is_empty() => Some(validate_custom_domain(d)?),
             _ => None,
         };
+        if new_domain != deployment.custom_domain {
+            deployment.custom_domain_verified = false;
+        }
+        deployment.custom_domain = new_domain;
     }
 
     this.db.update_app_deployment(&deployment).await?;
@@ -1199,6 +1212,7 @@ mod tests {
             namespace: format!("ns-{name}"),
             hostname: None,
             custom_domain: None,
+            custom_domain_verified: false,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
@@ -1344,6 +1358,7 @@ mod tests {
             namespace: "ns".to_string(),
             hostname: None,
             custom_domain: None,
+            custom_domain_verified: false,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status,
@@ -1441,6 +1456,7 @@ mod tests {
             namespace: "ns".to_string(),
             hostname: None,
             custom_domain: None,
+            custom_domain_verified: false,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Running,
@@ -1495,5 +1511,82 @@ mod tests {
         no_totals.usage_collected = None;
         let api = ok(deployment_to_api(&db, no_totals).await);
         assert!(api.usage.is_none());
+    }
+    /// A stored `custom_domain_verified` only means anything alongside a
+    /// domain: clearing the domain leaves the column set, and reporting that as
+    /// verified would tell the UI a name it is not serving is live.
+    #[tokio::test]
+    async fn custom_domain_verified_is_never_reported_without_a_domain() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::{App, AppDeployment, IntervalType};
+
+        fn ok(r: Result<ApiAppDeployment, ApiError>) -> ApiAppDeployment {
+            match r {
+                Ok(v) => v,
+                Err(_) => panic!("deployment_to_api failed"),
+            }
+        }
+
+        let db = MockDb::default();
+        {
+            let mut apps = db.apps.lock().await;
+            apps.insert(
+                1,
+                App {
+                    id: 1,
+                    name: "relay".to_string(),
+                    display_name: "Relay".to_string(),
+                    description: None,
+                    icon: None,
+                    repo_url: None,
+                    category: "Nostr relay".to_string(),
+                    seo_title: None,
+                    seo_description: None,
+                    compose: "services:\n  a:\n    image: x\n".to_string(),
+                    amount: 1000,
+                    currency: "USD".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_amount: 0,
+                    cpu_milli: 250,
+                    memory_bytes: 512 * 1024 * 1024,
+                    storage_bytes: 1024 * 1024 * 1024,
+                    enabled: true,
+                    created: Utc::now(),
+                },
+            );
+        }
+
+        let mut d = AppDeployment {
+            id: 4,
+            user_id: 1,
+            app_id: 1,
+            cluster_id: 1,
+            resource_multiplier: 1,
+            subscription_line_item_id: 1,
+            name: "d".to_string(),
+            namespace: "ns".to_string(),
+            hostname: Some("d.apps.example.com".to_string()),
+            custom_domain: Some("blog.example.com".to_string()),
+            custom_domain_verified: true,
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Running,
+            status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
+            created: Utc::now(),
+            deleted: false,
+        };
+
+        let api = ok(deployment_to_api(&db, d.clone()).await);
+        assert_eq!(api.custom_domain.as_deref(), Some("blog.example.com"));
+        assert!(api.custom_domain_verified);
+
+        d.custom_domain = None;
+        let api = ok(deployment_to_api(&db, d).await);
+        assert!(!api.custom_domain_verified);
     }
 }

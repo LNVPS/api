@@ -66,6 +66,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **A custom domain is held until it is seen resolving to us** (issue #307) — setting `custom_domain` on a managed app deployment previously created its ingress rule and asked cert-manager for a certificate straight away, so a domain entered before its CNAME existed left an unservable rule and an HTTP-01 challenge that failed on every reconcile, spending the ACME account's failed-validation budget with nothing shown to the customer.
+
+  The domain is still accepted immediately — the CNAME is usually created afterwards — but nothing serves it and no certificate is requested until the operator observes it resolving to the same address as the deployment's `hostname`. New boolean `custom_domain_verified` on `ApiAppDeployment` (`GET`/`PATCH /api/v1/app-deployments`, `/{id}`) and `AdminAppDeploymentInfo` reports which state it is in: `false` = held, `true` = served. It is always `false` when `custom_domain` is `null`.
+
+  Additive; no existing field changes meaning. Changing the domain holds it again, on both the customer and admin `PATCH`. Verification is sticky once granted: a later resolver failure does not tear down a domain already being served. Domains set before this change are backfilled as verified, so nothing live goes dark. Surface the held state in the UI with the record to create — a `CNAME` at the deployment's `hostname`.
+
 - **Referral payouts record both sides of a currency conversion** (issue #308) — a payout row now carries a **settled** side and a **sent** side. The settled side (`amount`, `fee`, `currency`) is what the payout discharges against the earned balance; commission is earned per currency and nets in the currency it was earned in. The sent side (`sent_amount`, `sent_fee`, `sent_currency`) is what actually left the wallet. `rate` is settled-currency standard units per one sent-currency standard unit, and `rate_collected` is when that rate was quoted.
 
   Additive on `ApiReferralPayout` (`GET /api/v1/referral`) and `AdminReferralPayoutInfo` (`GET /api/admin/v1/referrals/{id}` and `/payouts`): no existing field changes meaning. A payout that sent what it settles — every payout the automated engine makes today, and every row that existed before this change — has the two sides equal, `rate` `1` and `rate_collected` `null`. Treat a `null` `rate_collected` as "no conversion happened" rather than "rate 1 was quoted".

@@ -1119,6 +1119,13 @@ pub trait LNVpsDbBase: Send + Sync {
     ) -> DbResult<Option<AppDeployment>>;
     async fn insert_app_deployment(&self, deployment: &AppDeployment) -> DbResult<u64>;
     async fn update_app_deployment(&self, deployment: &AppDeployment) -> DbResult<()>;
+    /// Mark a deployment's custom domain as observed resolving to us, which is
+    /// what releases it from being held.
+    ///
+    /// One field on its own for the same reason as the usage writers: the
+    /// operator holds a row copy read at the top of the pass, and writing the
+    /// whole row back would undo an edit the customer made in between.
+    async fn set_app_deployment_custom_domain_verified(&self, id: u64) -> DbResult<()>;
     /// Record the usage the cluster last reported for a deployment, stamping
     /// the observation time.
     ///

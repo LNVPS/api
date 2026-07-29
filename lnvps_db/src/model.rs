@@ -3572,6 +3572,16 @@ pub struct AppDeployment {
     /// When set, the operator adds it to the Ingress and cert-manager issues a
     /// TLS cert for it; the default `hostname` keeps working alongside it.
     pub custom_domain: Option<String>,
+    /// Whether `custom_domain` has been observed resolving to the same address
+    /// as `hostname`. Until it has, the domain is held: no ingress rule and no
+    /// certificate request, so a domain entered before its CNAME exists cannot
+    /// spend failed ACME validations on every reconcile.
+    ///
+    /// Cleared whenever the domain changes, set by the operator once the probe
+    /// passes, and never cleared by a later failure — a transient resolver
+    /// error must not take a live customer domain offline.
+    #[sqlx(default)]
+    pub custom_domain_verified: bool,
     /// Resolved per-deployment configuration (env values etc.), stored as an
     /// encrypted JSON blob so secret values are protected at rest. `None` until
     /// the customer supplies configuration.

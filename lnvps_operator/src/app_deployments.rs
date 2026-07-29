@@ -12,11 +12,15 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Debug;
+use std::net::IpAddr;
+use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use hickory_resolver::TokioResolver;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::{Client, Resource, ResourceExt};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
@@ -1037,6 +1041,66 @@ pub fn build_custom_domain_ingress(
     })
 }
 
+/// Whether `domain` resolves to an address `hostname` also resolves to.
+///
+/// Address overlap rather than a CNAME check: a customer may point an A record
+/// at us instead of a CNAME, and either way the question is whether traffic for
+/// the name arrives here. Any resolver failure reads as "not yet" — holding a
+/// domain is recoverable on the next pass, serving one that is not ours is not.
+async fn resolves_to_same_address(domain: &str, hostname: &str) -> bool {
+    static RESOLVER: OnceLock<Option<TokioResolver>> = OnceLock::new();
+    let resolver =
+        RESOLVER.get_or_init(
+            || match TokioResolver::builder_tokio().and_then(|b| b.build()) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    warn!("custom domain probe has no resolver: {e}");
+                    None
+                }
+            },
+        );
+    let Some(resolver) = resolver else {
+        return false;
+    };
+
+    let ours = lookup(resolver, hostname).await;
+    if ours.is_empty() {
+        warn!("custom domain probe: {hostname} resolves to nothing from here");
+        return false;
+    }
+    let theirs = lookup(resolver, domain).await;
+    let matched = shares_an_address(&ours, &theirs);
+    if !matched {
+        // Both sides logged: the usual cause of a domain that never releases is
+        // ours resolving to something the customer could never point at.
+        debug!("custom domain probe: {domain} {theirs:?} vs {hostname} {ours:?}");
+    }
+    matched
+}
+
+/// Addresses for `name`, empty on any failure.
+///
+/// Bounded rather than left to the resolver's own retries: this runs inline in
+/// a reconcile pass, once per held domain, and a pass that does not finish
+/// stops every deployment behind it.
+async fn lookup(resolver: &TokioResolver, name: &str) -> Vec<IpAddr> {
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+    match tokio::time::timeout(PROBE_TIMEOUT, resolver.lookup_ip(name)).await {
+        Ok(Ok(ips)) => ips.iter().collect(),
+        Ok(Err(_)) => Vec::new(),
+        Err(_) => {
+            warn!("custom domain probe timed out resolving {name}");
+            Vec::new()
+        }
+    }
+}
+
+/// Whether the two address sets intersect. Empty on either side is no match:
+/// a name that resolves to nothing is not pointed at us.
+fn shares_an_address(ours: &[IpAddr], theirs: &[IpAddr]) -> bool {
+    theirs.iter().any(|t| ours.contains(t))
+}
+
 /// Generate a random URL-safe secret value of `len` bytes (hex-encoded).
 pub fn generate_secret_value(len: usize) -> String {
     use rand::RngCore;
@@ -1625,16 +1689,28 @@ async fn reconcile_one(
         .unwrap_or("letsencrypt-prod");
     let class = ctx.settings.ingress_class.as_deref().unwrap_or("nginx");
 
+    // A domain nobody has pointed at us yet is held: no rule to serve it, and
+    // no annotation asking cert-manager for a certificate whose HTTP-01
+    // challenge would fail on every pass and spend the account's failed
+    // validation budget. Verified is sticky, so this probes once per domain.
+    let custom_domain = match deployment.custom_domain.as_deref() {
+        Some(cd) if !deployment.custom_domain_verified => {
+            if resolves_to_same_address(cd, &hostname).await {
+                ctx.db.set_app_deployment_custom_domain_verified(id).await?;
+                Some(cd)
+            } else {
+                info!(
+                    "app deployment {id} custom domain held: {cd} does not resolve to {hostname}"
+                );
+                None
+            }
+        }
+        other => other,
+    };
+
     // Applied before the default host so a custom domain already being served
     // is never momentarily unrouted while the two objects are swapped.
-    match build_custom_domain_ingress(
-        id,
-        &compose,
-        &hostname,
-        deployment.custom_domain.as_deref(),
-        issuer,
-        class,
-    ) {
+    match build_custom_domain_ingress(id, &compose, &hostname, custom_domain, issuer, class) {
         Some(ing) => apply(client, &ing).await?,
         // Server-side apply cannot prune an object we stop applying, so a
         // cleared custom domain has to be deleted explicitly.
@@ -3596,6 +3672,17 @@ config:
         );
     }
 
+    /// A domain is pointed at us when its addresses overlap ours, whether the
+    /// customer used a CNAME or an A record. Nothing resolving is not a match.
+    #[test]
+    fn address_overlap_is_what_counts_as_pointed_at_us() {
+        let ours: Vec<IpAddr> = vec!["185.18.221.87".parse().unwrap(), "2a01::1".parse().unwrap()];
+        assert!(shares_an_address(&ours, &["2a01::1".parse().unwrap()]));
+        assert!(!shares_an_address(&ours, &["1.2.3.4".parse().unwrap()]));
+        assert!(!shares_an_address(&ours, &[]));
+        assert!(!shares_an_address(&[], &["185.18.221.87".parse().unwrap()]));
+    }
+
     /// The compose is what resolves a claim name: `"{service}-{volume}"` cannot
     /// be split back apart when either half contains a dash.
     #[test]
@@ -3733,6 +3820,7 @@ config:
                 namespace: namespace_name(id),
                 hostname: None,
                 custom_domain: None,
+                custom_domain_verified: false,
                 config: None,
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,

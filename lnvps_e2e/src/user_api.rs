@@ -1785,6 +1785,13 @@ mod tests {
             "blog.example.com",
             "custom_domain normalized to lowercase"
         );
+        // Accepted but held: nothing serves the domain, and no certificate is
+        // requested, until the operator sees it resolve to the hostname.
+        assert_eq!(
+            body["data"]["custom_domain_verified"].as_bool(),
+            Some(false),
+            "a domain nobody has pointed at us yet is held"
+        );
         // An invalid domain (no dot / scheme / bad label) is rejected.
         for bad in ["localhost", "https://blog.example.com", "-bad.example.com"] {
             let resp = client
@@ -1815,6 +1822,11 @@ mod tests {
         );
         let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         assert!(body["data"]["custom_domain"].is_null(), "cleared -> null");
+        assert_eq!(
+            body["data"]["custom_domain_verified"].as_bool(),
+            Some(false),
+            "no domain is never verified"
+        );
         let _ = client
             .delete_auth(&format!("/api/v1/app-deployments/{dep2_id}"))
             .await;

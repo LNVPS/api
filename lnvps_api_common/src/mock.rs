@@ -3653,6 +3653,14 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn set_app_deployment_custom_domain_verified(&self, id: u64) -> DbResult<()> {
+        let mut d = self.app_deployments.lock().await;
+        if let Some(x) = d.get_mut(&id) {
+            x.custom_domain_verified = true;
+        }
+        Ok(())
+    }
+
     async fn update_app_deployment_usage(
         &self,
         id: u64,
@@ -6618,6 +6626,7 @@ mod tests {
             namespace: format!("app-{name}"),
             hostname: None,
             custom_domain: None,
+            custom_domain_verified: false,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
@@ -6804,6 +6813,7 @@ mod tests {
             namespace: format!("app-{name}"),
             hostname: Some(format!("{name}.apps.example.com")),
             custom_domain: None,
+            custom_domain_verified: false,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
@@ -7033,6 +7043,7 @@ mod tests {
                 namespace: "app-alpha".to_string(),
                 hostname: None,
                 custom_domain: None,
+                custom_domain_verified: false,
                 config: None,
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
@@ -7086,6 +7097,7 @@ mod tests {
                 namespace: "app-shared".to_string(),
                 hostname: None,
                 custom_domain: None,
+                custom_domain_verified: false,
                 config: None,
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
@@ -7144,6 +7156,7 @@ mod tests {
                 namespace: "app-alpha".to_string(),
                 hostname: None,
                 custom_domain: None,
+                custom_domain_verified: false,
                 config: None,
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
@@ -7219,6 +7232,7 @@ mod tests {
             namespace: format!("app-{name}"),
             hostname: None,
             custom_domain: None,
+            custom_domain_verified: false,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,

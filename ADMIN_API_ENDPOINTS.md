@@ -3919,6 +3919,7 @@ These use the dedicated **`app_deployment`** RBAC resource (distinct from the ca
   "namespace": "app-1",
   "hostname": "my-relay.apps.lnvps.tld",
   "custom_domain": "blog.example.com",
+  "custom_domain_verified": true,
   "desired_state": "running",
   "status": "running",
   "status_message": null,
@@ -3964,7 +3965,10 @@ Deletion is a soft delete, so `include_deleted=true` is the only way to inspect 
 ```json
 {
   "name": "new-name",               // DNS-safe; unique per cluster
-  "custom_domain": "blog.example.com", // set; "" or null clears
+  "custom_domain": "blog.example.com", // set; "" or null clears. A changed
+                                       // domain is held (custom_domain_verified
+                                       // false) until the operator sees it
+                                       // resolve to the deployment hostname
   "config": { "relay_name": "New" }  // validated against the app compose schema; replaces the stored config wholesale
 }
 ```

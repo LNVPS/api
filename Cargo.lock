@@ -3073,6 +3073,7 @@ dependencies = [
  "clap",
  "config",
  "env_logger",
+ "hickory-resolver",
  "k8s-openapi",
  "kube",
  "lnvps_api_common",
