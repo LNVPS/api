@@ -179,6 +179,15 @@ fn vout_for_address(tx: &bitcoin::Transaction, address: &str) -> Option<u32> {
         .map(|i| i as u32)
 }
 
+/// One payout in an on-chain batch: the reserved row, where it is paid, and the
+/// quote it was converted at (`None` when it settles the BTC balance directly).
+struct BatchRow {
+    referral: Referral,
+    address: String,
+    payout: ReferralPayout,
+    rate: Option<TickerRate>,
+}
+
 /// Pays referrers their accrued BTC commission over Lightning or on-chain.
 #[derive(Clone)]
 pub struct ReferralPayoutHandler {
@@ -269,7 +278,9 @@ impl ReferralPayoutHandler {
             }
         }
 
-        // Fiat-settled balances, converted at the current rate and sent as sats.
+        // Fiat-settled balances of Lightning/NWC referrers, converted at the
+        // current rate and sent as sats. On-chain referrers' fiat balances are
+        // settled by the batch below.
         if let Some(min_fiat_msat) = self.min_fiat_payout_msat {
             for referral in &referrals {
                 if let Err(e) = self.process_fiat(referral, min_fiat_msat).await {
@@ -281,7 +292,7 @@ impl ReferralPayoutHandler {
             }
         }
 
-        // On-chain payouts, batched into a single transaction.
+        // On-chain payouts (BTC and fiat balances), batched into one transaction.
         if let (Some(onchain), Some(min_onchain_msat)) =
             (self.onchain.as_ref(), self.min_onchain_payout_msat)
         {
@@ -297,7 +308,7 @@ impl ReferralPayoutHandler {
     }
 
     /// Pay every eligible [`ReferralPayoutMode::OnChain`] referrer in a **single
-    /// send-many transaction**.
+    /// send-many transaction**, settling both their BTC and their fiat balances.
     ///
     /// Each referrer's owed BTC commission is computed exactly as for Lightning
     /// (earned minus already paid/reserved, cleared against the on-chain
@@ -322,6 +333,7 @@ impl ReferralPayoutHandler {
     ) -> Result<()> {
         // 1. Select eligible on-chain referrers and their payable amount.
         let mut eligible: Vec<(Referral, String, u64)> = Vec::new();
+        let mut fiat: Vec<(Referral, String, String, u64)> = Vec::new();
         for referral in referrals {
             if referral.mode != ReferralPayoutMode::OnChain {
                 continue;
@@ -348,25 +360,80 @@ impl ReferralPayoutHandler {
                     referral.code, e
                 ),
             }
+            if self.min_fiat_payout_msat.is_some() {
+                match self.owed_fiat(referral).await {
+                    Ok(owed) => fiat.extend(owed.into_iter().map(|(currency, amount)| {
+                        (referral.clone(), address.to_string(), currency, amount)
+                    })),
+                    Err(e) => warn!(
+                        "Failed to compute fiat on-chain balance for code {}: {}",
+                        referral.code, e
+                    ),
+                }
+            }
         }
-        if eligible.is_empty() {
+        if eligible.is_empty() && fiat.is_empty() {
             return Ok(());
         }
-        self.send_batch(onchain, eligible).await
+        self.send_batch(onchain, eligible, fiat, min_onchain_msat)
+            .await
+    }
+
+    /// Current BTC quote for `currency`, rejected when the feed returns
+    /// something that cannot be a price.
+    async fn quote(&self, currency: &str) -> Result<TickerRate> {
+        let ticker = Ticker::btc_rate(currency)?;
+        let rate = self
+            .exchange
+            .get_rate(ticker)
+            .await
+            .ok_or_else(|| anyhow!("no {} rate available", ticker))?;
+        if !(rate.is_finite() && rate > 0.0) {
+            bail!("unusable {} rate {}", ticker, rate);
+        }
+        Ok(TickerRate { ticker, rate })
+    }
+
+    /// Outstanding fiat-settled commission per currency for one referrer, in
+    /// each currency's smallest unit. Balances below the threshold are kept —
+    /// the threshold applies to the converted amount, which is only known once
+    /// the batch is quoted.
+    async fn owed_fiat(&self, referral: &Referral) -> Result<Vec<(String, u64)>> {
+        let usage = self.db.list_referral_usage(&referral.code).await?;
+        let earned = earned_by_fiat_currency(&usage);
+        if earned.is_empty() {
+            return Ok(Vec::new());
+        }
+        let payouts = self.db.list_referral_payouts(referral.id).await?;
+        Ok(earned
+            .into_iter()
+            .filter_map(|(currency, earned_amount)| {
+                let owed = earned_amount.saturating_sub(settled_in(&payouts, &currency));
+                (owed > 0).then_some((currency, owed))
+            })
+            .collect())
     }
 
     /// Reserve, broadcast (single send-many) and record a batch of on-chain
-    /// payouts. Split from selection so it can be tested with a hand-built
-    /// `eligible` list. Each entry is `(referrer, address, pay_msat)`.
+    /// payouts. Split from selection so it can be tested with hand-built lists.
+    /// `eligible` entries are `(referrer, address, pay_msat)` against the BTC
+    /// balance; `fiat` entries are `(referrer, address, currency, owed)` against
+    /// a fiat-settled balance.
     ///
     /// The current next-block fee rate is obtained from the fee estimator; if it
     /// exceeds the configured cap the whole batch is **deferred** (returns `Ok`
     /// without reserving or sending) so payouts wait for cheaper fees. Otherwise
     /// the batch is broadcast at that rate.
+    ///
+    /// Fiat balances are quoted here rather than at selection time so the rate
+    /// carried on the row is the one the transaction was actually built at, and
+    /// so the fee — charged in sats — converts back at that same quote.
     async fn send_batch(
         &self,
         onchain: &dyn OnChainProvider,
         eligible: Vec<(Referral, String, u64)>,
+        fiat: Vec<(Referral, String, String, u64)>,
+        min_onchain_msat: u64,
     ) -> Result<()> {
         // Check the current next-block fee rate; defer the whole batch if fees
         // are too high so we wait for cheaper conditions.
@@ -383,38 +450,82 @@ impl ReferralPayoutHandler {
             return Ok(());
         }
 
-        // 1. Reserve every payout (unpaid) before sending, so a crash between
-        //    the broadcast and the DB update cannot double-pay next run.
-        let mut reserved: Vec<(u64, Referral, String, u64)> = Vec::new();
-        for (referral, addr, pay_msat) in &eligible {
-            let payout = ReferralPayout {
-                id: 0,
-                referral_id: referral.id,
-                amount: *pay_msat,
-                fee: 0,
-                currency: "BTC".to_string(),
-                created: Utc::now(),
-                is_paid: false,
-                mode: ReferralPayoutMode::OnChain,
-                output: None,
-                pre_image: None,
-                ..Default::default()
+        // 1. Build every row the batch will pay: BTC balances as they stand,
+        //    fiat balances converted at one quote per currency taken now.
+        let mut rows: Vec<BatchRow> = eligible
+            .into_iter()
+            .map(|(referral, address, pay_msat)| BatchRow {
+                payout: ReferralPayout {
+                    referral_id: referral.id,
+                    amount: pay_msat,
+                    currency: "BTC".to_string(),
+                    created: Utc::now(),
+                    mode: ReferralPayoutMode::OnChain,
+                    ..Default::default()
+                }
+                .unconverted(),
+                referral,
+                address,
+                rate: None,
+            })
+            .collect();
+
+        let mut quotes: BTreeMap<String, TickerRate> = BTreeMap::new();
+        for (referral, address, currency, owed) in fiat {
+            let rate = match quotes.get(&currency) {
+                Some(rate) => *rate,
+                None => match self.quote(&currency).await {
+                    Ok(rate) => *quotes.entry(currency.clone()).or_insert(rate),
+                    Err(e) => {
+                        warn!("Skipping {} on-chain payout: {}", currency, e);
+                        continue;
+                    }
+                },
+            };
+            // A fiat balance leaving on-chain has to clear both floors: the
+            // on-chain one is sized for mempool fees, the fiat one is what an
+            // operator set for converted payouts.
+            let min_msat = min_onchain_msat.max(self.min_fiat_payout_msat.unwrap_or(0));
+            match converted_payout(
+                &referral,
+                &currency,
+                owed,
+                rate,
+                effective_min_msat(&referral, min_msat),
+            ) {
+                Ok(Some(payout)) => rows.push(BatchRow {
+                    referral,
+                    address,
+                    payout,
+                    rate: Some(rate),
+                }),
+                Ok(None) => {}
+                Err(e) => warn!(
+                    "Skipping converted on-chain payout for code {}: {}",
+                    referral.code, e
+                ),
             }
-            .unconverted();
-            let payout_id = self.db.insert_referral_payout(&payout).await?;
-            reserved.push((payout_id, referral.clone(), addr.clone(), *pay_msat));
+        }
+        if rows.is_empty() {
+            return Ok(());
         }
 
-        // 2. Broadcast a single send-many transaction paying every referrer at
+        // 2. Reserve every payout (unpaid) before sending, so a crash between
+        //    the broadcast and the DB update cannot double-pay next run.
+        for row in rows.iter_mut() {
+            row.payout.id = self.db.insert_referral_payout(&row.payout).await?;
+        }
+
+        // 3. Broadcast a single send-many transaction paying every referrer at
         //    the chosen fee rate.
-        let req = Self::payout_batch_request(&eligible, sat_per_vbyte);
-        let total_msat: u64 = eligible.iter().map(|(_, _, m)| *m).sum();
+        let req = Self::payout_batch_request(&rows, sat_per_vbyte);
+        let total_msat: u64 = rows.iter().map(|r| r.payout.sent_amount).sum();
         match onchain.send_coins(req).await {
             Ok(resp) => {
                 info!(
-                    "Broadcast on-chain referral payout batch {} ({} referrers, {} sats)",
+                    "Broadcast on-chain referral payout batch {} ({} payouts, {} sats)",
                     resp.txid,
-                    reserved.len(),
+                    rows.len(),
                     total_msat / 1000
                 );
                 // Decode the raw transaction once so each payout can record its
@@ -433,54 +544,74 @@ impl ReferralPayoutHandler {
                             .map(|tx| sat_per_vbyte.saturating_mul(tx.vsize() as u64) * 1000)
                     })
                     .unwrap_or(0);
-                // Split the fee across referrers in proportion to their payout.
-                let amounts: Vec<u64> = reserved.iter().map(|(_, _, _, m)| *m).collect();
+                // Split the fee across the batch in proportion to what each row
+                // sends, which is the only side the fee is denominated in.
+                let amounts: Vec<u64> = rows.iter().map(|r| r.payout.sent_amount).collect();
                 let fee_shares = split_fee_proportional(&amounts, total_fee_msat);
 
-                // 3. Mark every reserved payout paid with its outpoint and fee.
-                for ((payout_id, referral, address, pay_msat), fee_msat) in
-                    reserved.into_iter().zip(fee_shares)
-                {
+                // 4. Mark every reserved payout paid with its outpoint and fee.
+                for (mut row, sent_fee_msat) in rows.into_iter().zip(fee_shares) {
                     let outpoint = match decoded
                         .as_ref()
-                        .and_then(|tx| vout_for_address(tx, &address))
+                        .and_then(|tx| vout_for_address(tx, &row.address))
                     {
                         Some(vout) => format!("{}:{}", resp.txid, vout),
                         // Fall back to the bare txid if the tx couldn't be
                         // decoded or the output wasn't found.
                         None => resp.txid.clone(),
                     };
-                    let payout = ReferralPayout {
-                        id: payout_id,
-                        referral_id: referral.id,
-                        amount: pay_msat,
-                        fee: fee_msat,
-                        currency: "BTC".to_string(),
-                        created: Utc::now(),
-                        is_paid: true,
-                        mode: ReferralPayoutMode::OnChain,
-                        output: Some(outpoint.clone()),
-                        pre_image: None,
-                        ..Default::default()
-                    }
-                    .unconverted();
-                    if let Err(e) = self.db.update_referral_payout(&payout).await {
+                    let sent_msat = row.payout.sent_amount;
+                    row.payout.is_paid = true;
+                    row.payout.output = Some(outpoint.clone());
+                    row.payout.sent_fee = sent_fee_msat;
+                    // The fee is incurred in sats; it is charged to the referrer
+                    // against the balance this row settles, so it is carried
+                    // over at the quote the row was built at rather than at
+                    // whatever the rate is when it is read.
+                    row.payout.fee = match row.rate {
+                        Some(rate) => match rate
+                            .convert(CurrencyAmount::millisats(sent_fee_msat))
+                            .map(|a| a.value())
+                        {
+                            Ok(fee) => fee,
+                            Err(e) => {
+                                warn!("Failed to convert fee for payout {}: {}", row.payout.id, e);
+                                0
+                            }
+                        },
+                        None => sent_fee_msat,
+                    };
+                    if let Err(e) = self.db.update_referral_payout(&row.payout).await {
                         warn!(
                             "Broadcast payout {} but failed to mark it paid: {}",
-                            payout_id, e
+                            row.payout.id, e
                         );
                     }
                     let _ = self
                         .tx
                         .send(WorkJob::SendNotification {
-                            user_id: referral.user_id,
-                            message: format!(
-                                "You've been paid {} sats in referral commission on-chain \
-                                 ({}, minus {} sats fee).",
-                                pay_msat / 1000,
-                                outpoint,
-                                fee_msat / 1000
-                            ),
+                            user_id: row.referral.user_id,
+                            message: match row.rate {
+                                // Name the balance each line settles: one
+                                // transaction can pay a referrer's BTC and fiat
+                                // balances, and two bare sat figures against one
+                                // outpoint read like a double payment.
+                                Some(rate) => format!(
+                                    "You've been paid {} in referral commission on-chain \
+                                     as {} sats ({}, minus {} sats fee).",
+                                    CurrencyAmount::from_u64(rate.ticker.1, row.payout.amount),
+                                    sent_msat / 1000,
+                                    outpoint,
+                                    sent_fee_msat / 1000
+                                ),
+                                None => format!(
+                                    "You've been paid {} sats in referral commission on-chain \
+                                     ({}, minus {} sats fee).",
+                                    sent_msat / 1000,
+                                    outpoint,
+                                    sent_fee_msat / 1000
+                                ),
+                            },
                             title: Some("Referral payout".to_string()),
                         })
                         .await;
@@ -489,11 +620,11 @@ impl ReferralPayoutHandler {
             }
             Err(e) => {
                 // Release all reservations so the balances retry next run.
-                for (payout_id, _referral, _address, _pay_msat) in reserved {
-                    if let Err(del) = self.db.delete_referral_payout(payout_id).await {
+                for row in rows {
+                    if let Err(del) = self.db.delete_referral_payout(row.payout.id).await {
                         warn!(
                             "Failed to release reserved on-chain payout {} after send error: {}",
-                            payout_id, del
+                            row.payout.id, del
                         );
                     }
                 }
@@ -502,18 +633,25 @@ impl ReferralPayoutHandler {
         }
     }
 
-    /// Build the single send-many request paying every eligible referrer at
-    /// `sat_per_vbyte`. Each entry is `(referrer, address, pay_msat)`.
-    fn payout_batch_request(
-        eligible: &[(Referral, String, u64)],
-        sat_per_vbyte: u64,
-    ) -> SendCoinsRequest {
+    /// Build the single send-many request paying every row at `sat_per_vbyte`.
+    ///
+    /// Rows are summed per address: a referrer owed both a BTC and a fiat
+    /// balance is two rows against one payout address, and paying it twice would
+    /// buy a second output and a second share of the fee for nothing.
+    fn payout_batch_request(rows: &[BatchRow], sat_per_vbyte: u64) -> SendCoinsRequest {
+        let mut outputs: Vec<(String, u64)> = Vec::new();
+        for row in rows {
+            match outputs.iter_mut().find(|(addr, _)| *addr == row.address) {
+                Some((_, msat)) => *msat = msat.saturating_add(row.payout.sent_amount),
+                None => outputs.push((row.address.clone(), row.payout.sent_amount)),
+            }
+        }
         SendCoinsRequest {
-            outputs: eligible
-                .iter()
-                .map(|(_r, address, pay_msat)| SendOutput {
-                    address: address.clone(),
-                    amount: CurrencyAmount::millisats(*pay_msat),
+            outputs: outputs
+                .into_iter()
+                .map(|(address, pay_msat)| SendOutput {
+                    address,
+                    amount: CurrencyAmount::millisats(pay_msat),
                 })
                 .collect(),
             sat_per_vbyte: Some(sat_per_vbyte),
@@ -635,26 +773,14 @@ impl ReferralPayoutHandler {
     /// wallet (`sent_amount`, always BTC) and the rate the two were quoted at.
     /// Reconciling later must not depend on a price feed still being reachable.
     ///
-    /// Lightning and NWC referrers only: an on-chain payout batches referrers
-    /// into one transaction and splits its fee across them in sats, which has no
-    /// meaning to charge against a fiat balance without converting each share
-    /// back. On-chain referrers keep accruing fiat for manual payout.
+    /// Lightning and NWC referrers only: an on-chain referrer's fiat balance is
+    /// settled by the batch instead (see [`Self::send_batch`]), so it is quoted
+    /// once for the transaction that pays it.
     async fn process_fiat(&self, referral: &Referral, min_fiat_msat: u64) -> Result<()> {
         if referral.mode == ReferralPayoutMode::OnChain {
             return Ok(());
         }
-        let usage = self.db.list_referral_usage(&referral.code).await?;
-        let earned = earned_by_fiat_currency(&usage);
-        if earned.is_empty() {
-            return Ok(());
-        }
-        let payouts = self.db.list_referral_payouts(referral.id).await?;
-
-        for (currency, earned_amount) in earned {
-            let owed = earned_amount.saturating_sub(settled_in(&payouts, &currency));
-            if owed == 0 {
-                continue;
-            }
+        for (currency, owed) in self.owed_fiat(referral).await? {
             if let Err(e) = self
                 .pay_converted(referral, &currency, owed, min_fiat_msat)
                 .await
@@ -677,19 +803,7 @@ impl ReferralPayoutHandler {
         owed: u64,
         min_fiat_msat: u64,
     ) -> Result<()> {
-        let ticker = Ticker::btc_rate(currency)?;
-        let rate_value = self
-            .exchange
-            .get_rate(ticker)
-            .await
-            .ok_or_else(|| anyhow!("no {} rate available", ticker))?;
-        if !(rate_value.is_finite() && rate_value > 0.0) {
-            bail!("unusable {} rate {}", ticker, rate_value);
-        }
-        let rate = TickerRate {
-            ticker,
-            rate: rate_value,
-        };
+        let rate = self.quote(currency).await?;
 
         let Some(mut payout) = converted_payout(
             referral,
@@ -1090,18 +1204,14 @@ mod tests {
 
     /// Seed a mock DB with one referrer whose single referred VM paid `amount`
     /// in `currency`, at a 10% commission. Returns the persisted referrer.
-    async fn fiat_referrer(db: &MockDb, currency: &str, amount: u64) -> Referral {
+    async fn fiat_referrer(db: &MockDb, currency: &str, amount: u64, base: Referral) -> Referral {
         use lnvps_db::{
             EncryptedString, LNVpsDbBase, PaymentMethod, SubscriptionLineItem, SubscriptionPayment,
             SubscriptionPaymentType, SubscriptionType,
         };
 
         db.companies.lock().await.get_mut(&1).unwrap().referral_rate = 10.0;
-        let referral = Referral {
-            mode: ReferralPayoutMode::LightningAddress,
-            address: Some("payouts@example.invalid".to_string()),
-            ..referrer(0, "FIAT")
-        };
+        let referral = base;
         let id = db.insert_referral(&referral).await.unwrap();
 
         db.vms.lock().await.insert(
@@ -1183,7 +1293,17 @@ mod tests {
     #[tokio::test]
     async fn fiat_payouts_release_on_failure_and_net_once_settled() {
         let db = Arc::new(MockDb::default());
-        let referral = fiat_referrer(&db, "EUR", 10_000).await;
+        let referral = fiat_referrer(
+            &db,
+            "EUR",
+            10_000,
+            Referral {
+                mode: ReferralPayoutMode::LightningAddress,
+                address: Some("payouts@example.invalid".to_string()),
+                ..referrer(0, "FIAT")
+            },
+        )
+        .await;
         let exchange = Arc::new(lnvps_api_common::MockExchangeRate::default());
         exchange
             .set_rate(Ticker::btc_rate("EUR").unwrap(), 100_000.0)
@@ -1226,11 +1346,218 @@ mod tests {
         );
     }
 
+    /// A row paying `pay_msat` to `address` against the BTC balance.
+    fn btc_row(referral: Referral, address: &str, pay_msat: u64) -> BatchRow {
+        BatchRow {
+            payout: ReferralPayout {
+                referral_id: referral.id,
+                amount: pay_msat,
+                currency: "BTC".to_string(),
+                mode: ReferralPayoutMode::OnChain,
+                ..Default::default()
+            }
+            .unconverted(),
+            referral,
+            address: address.to_string(),
+            rate: None,
+        }
+    }
+
+    /// A handler that pays on-chain and has fiat payouts enabled.
+    fn onchain_fiat_handler(
+        db: Arc<dyn LNVpsDb>,
+        onchain: Arc<dyn OnChainProvider>,
+        exchange: Arc<dyn ExchangeRateService>,
+        tx: Arc<ChannelWorkCommander>,
+        min_fiat_sats: u64,
+    ) -> ReferralPayoutHandler {
+        ReferralPayoutHandler::new(
+            db,
+            Arc::new(crate::mocks::MockNode::default()),
+            tx,
+            None,
+            Some(onchain),
+            Some(1),
+            50,
+            Arc::new(crate::fee_estimate::FixedFeeEstimator(10)),
+            exchange,
+            Some(min_fiat_sats),
+        )
+    }
+
+    async fn eur_exchange(rate: f32) -> Arc<lnvps_api_common::MockExchangeRate> {
+        let exchange = Arc::new(lnvps_api_common::MockExchangeRate::default());
+        exchange
+            .set_rate(Ticker::btc_rate("EUR").unwrap(), rate)
+            .await;
+        exchange
+    }
+
+    /// A fiat balance owed to an on-chain referrer is settled by the batch: the
+    /// row records what it discharges (EUR) against what left the wallet (sats)
+    /// at the quote the transaction was built at, the fee is carried over at
+    /// that same quote, and the discharged balance is not paid again.
+    #[tokio::test]
+    async fn onchain_fiat_balance_settles_in_the_batch_once() {
+        let db = Arc::new(MockDb::default());
+        let addr = regtest_addr(9);
+        let referral = fiat_referrer(
+            &db,
+            "EUR",
+            10_000,
+            Referral {
+                mode: ReferralPayoutMode::OnChain,
+                address: Some(addr.clone()),
+                ..referrer(0, "FIAT")
+            },
+        )
+        .await;
+        let exchange = eur_exchange(100_000.0).await;
+        let onchain = Arc::new(MockOnChainProvider::default());
+        let db: Arc<dyn LNVpsDb> = db;
+        let tx = Arc::new(ChannelWorkCommander::new());
+        let h = onchain_fiat_handler(db.clone(), onchain.clone(), exchange, tx.clone(), 1);
+
+        h.process_payouts().await.unwrap();
+
+        // One transaction, one output: the referrer has no BTC balance.
+        let sends = onchain.sends.lock().await;
+        assert_eq!(sends.len(), 1, "one batch transaction");
+        assert_eq!(sends[0].outputs.len(), 1);
+        assert_eq!(sends[0].outputs[0].address, addr);
+        drop(sends);
+
+        let payouts = db.list_referral_payouts(referral.id).await.unwrap();
+        assert_eq!(payouts.len(), 1, "one payout for the EUR balance");
+        let p = &payouts[0];
+        assert!(p.is_paid, "paid");
+        assert_eq!(p.mode, ReferralPayoutMode::OnChain);
+        assert_eq!(p.currency, "EUR", "settles the EUR balance");
+        assert_eq!(p.sent_currency, "BTC", "sats left the wallet");
+        // 10% of €100 is €10; at 100k EUR/BTC that is 10_000 sats.
+        assert_eq!(p.sent_amount, 10_000_000);
+        assert_eq!(p.amount, 1_000);
+        assert_eq!(p.rate, 100_000.0, "the quote is recorded on the row");
+        assert!(p.rate_collected.is_some());
+        assert!(
+            p.output.as_deref().unwrap().ends_with(":0"),
+            "records its outpoint in the batch tx"
+        );
+
+        // The fee is charged in sats and carried into EUR at the same quote.
+        assert!(p.sent_fee > 0, "the referrer bears the on-chain fee");
+        let rate = TickerRate {
+            ticker: Ticker::btc_rate("EUR").unwrap(),
+            rate: 100_000.0,
+        };
+        assert_eq!(
+            p.fee,
+            rate.convert(CurrencyAmount::millisats(p.sent_fee))
+                .unwrap()
+                .value(),
+            "fee converted at the row's own quote, not a later one"
+        );
+
+        // The notification names the balance it settles: one transaction can pay
+        // a referrer's BTC and fiat balances, and two bare sat figures against
+        // one outpoint read like a double payment.
+        let jobs = tx.recv().await.unwrap();
+        let WorkJob::SendNotification { message, .. } = &jobs[0].job else {
+            panic!("expected a notification, got {:?}", jobs[0].job);
+        };
+        assert!(
+            message.contains("EUR 10.00"),
+            "notification names the settled balance: {message}"
+        );
+
+        // The balance is discharged (amount + fee), so a second pass pays nothing.
+        h.process_payouts().await.unwrap();
+        assert_eq!(
+            db.list_referral_payouts(referral.id).await.unwrap().len(),
+            1,
+            "a settled fiat balance is not paid twice"
+        );
+        assert_eq!(
+            onchain.sends.lock().await.len(),
+            1,
+            "no second transaction broadcast"
+        );
+    }
+
+    /// `min-fiat-payout-sats` floors the on-chain rows too: it is not merely an
+    /// on/off switch for a referrer paid on-chain.
+    #[tokio::test]
+    async fn onchain_fiat_respects_the_fiat_minimum() {
+        let db = Arc::new(MockDb::default());
+        let referral = fiat_referrer(
+            &db,
+            "EUR",
+            10_000,
+            Referral {
+                mode: ReferralPayoutMode::OnChain,
+                address: Some(regtest_addr(9)),
+                ..referrer(0, "FIAT")
+            },
+        )
+        .await;
+        let onchain = Arc::new(MockOnChainProvider::default());
+        let db: Arc<dyn LNVpsDb> = db;
+        // €10 is 10_000 sats at this quote, below a 20_000 sat fiat minimum.
+        let h = onchain_fiat_handler(
+            db.clone(),
+            onchain.clone(),
+            eur_exchange(100_000.0).await,
+            Arc::new(ChannelWorkCommander::new()),
+            20_000,
+        );
+
+        h.process_payouts().await.unwrap();
+
+        assert!(
+            onchain.sends.lock().await.is_empty(),
+            "a balance below the fiat minimum is not sent"
+        );
+        assert!(
+            db.list_referral_payouts(referral.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "and nothing is reserved"
+        );
+    }
+
+    /// A referrer owed in two currencies is one output, not two: paying the same
+    /// address twice buys a second output and a second share of the fee.
+    #[test]
+    fn test_payout_batch_request_sums_rows_sharing_an_address() {
+        let rows = vec![
+            btc_row(referrer(1, "AAA"), "bcrt1qa", 2_000_000),
+            BatchRow {
+                payout: ReferralPayout {
+                    referral_id: 1,
+                    amount: 1_000,
+                    currency: "EUR".to_string(),
+                    sent_amount: 500_000,
+                    sent_currency: "BTC".to_string(),
+                    rate: 100_000.0,
+                    mode: ReferralPayoutMode::OnChain,
+                    ..Default::default()
+                },
+                referral: referrer(1, "AAA"),
+                address: "bcrt1qa".to_string(),
+                rate: None,
+            },
+        ];
+        let req = ReferralPayoutHandler::payout_batch_request(&rows, 12);
+        assert_eq!(req.outputs.len(), 1, "one output per address");
+        assert_eq!(req.outputs[0].amount.value(), 2_500_000, "amounts summed");
+    }
+
     #[test]
     fn test_payout_batch_request_one_output_per_referrer() {
         let eligible = vec![
-            (referrer(1, "AAA"), "bcrt1qa".to_string(), 2_000_000),
-            (referrer(2, "BBB"), "bcrt1qb".to_string(), 1_500_000),
+            btc_row(referrer(1, "AAA"), "bcrt1qa", 2_000_000),
+            btc_row(referrer(2, "BBB"), "bcrt1qb", 1_500_000),
         ];
         let req = ReferralPayoutHandler::payout_batch_request(&eligible, 12);
         assert_eq!(req.outputs.len(), 2, "one output per referrer");
@@ -1274,7 +1601,9 @@ mod tests {
                 1_500_000,
             ),
         ];
-        h.send_batch(onchain.as_ref(), eligible).await.unwrap();
+        h.send_batch(onchain.as_ref(), eligible, vec![], 1_000)
+            .await
+            .unwrap();
 
         // Exactly ONE on-chain transaction was broadcast for the whole batch.
         let sends = onchain.sends.lock().await;
@@ -1329,7 +1658,9 @@ mod tests {
             regtest_addr(1),
             2_000_000,
         )];
-        h.send_batch(onchain.as_ref(), eligible).await.unwrap();
+        h.send_batch(onchain.as_ref(), eligible, vec![], 1_000)
+            .await
+            .unwrap();
 
         // Nothing was broadcast and no payout was reserved/recorded.
         assert!(onchain.sends.lock().await.is_empty(), "no tx broadcast");
@@ -1374,23 +1705,28 @@ mod tests {
         let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
         let ra = db.insert_referral(&referrer(0, "AAA")).await.unwrap();
         let onchain = Arc::new(FailingOnChain);
-        let h = handler(db.clone(), onchain.clone());
+        let h = onchain_fiat_handler(
+            db.clone(),
+            onchain.clone(),
+            eur_exchange(100_000.0).await,
+            Arc::new(ChannelWorkCommander::new()),
+            1,
+        );
 
-        let eligible = vec![(
-            Referral {
-                id: ra,
-                ..referrer(ra, "AAA")
-            },
-            regtest_addr(1),
-            2_000_000,
-        )];
-        let res = h.send_batch(onchain.as_ref(), eligible).await;
+        let referral = Referral {
+            id: ra,
+            ..referrer(ra, "AAA")
+        };
+        let eligible = vec![(referral.clone(), regtest_addr(1), 2_000_000)];
+        // A fiat row rides the same batch: its reservation must be released too.
+        let fiat = vec![(referral, regtest_addr(1), "EUR".to_string(), 1_000)];
+        let res = h.send_batch(onchain.as_ref(), eligible, fiat, 1_000).await;
         assert!(res.is_err(), "send failure propagates");
-        // The reserved payout was released so the balance retries next run.
+        // The reserved payouts were released so the balances retry next run.
         let payouts = db.list_referral_payouts(ra).await.unwrap();
         assert!(
             payouts.is_empty(),
-            "reservation released on send failure, got {payouts:?}"
+            "reservations released on send failure, got {payouts:?}"
         );
     }
 
