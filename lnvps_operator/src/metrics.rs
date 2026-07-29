@@ -319,7 +319,7 @@ pub fn collect_usage(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn sample(ns: &str, key: &str, value: f64) -> Sample {
@@ -506,7 +506,7 @@ mod tests {
 
     /// Serve `body` for a query matching `needle`, so each assertion pins which
     /// PromQL the client actually sent.
-    async fn mock_query(server: &wiremock::MockServer, needle: &str, body: String) {
+    pub(crate) async fn mock_query(server: &wiremock::MockServer, needle: &str, body: String) {
         use wiremock::matchers::{method, path, query_param_contains};
         use wiremock::{Mock, ResponseTemplate};
         Mock::given(method("GET"))
@@ -520,8 +520,22 @@ mod tests {
     /// An instant vector of one series, labelled with `key_label=key` alongside
     /// the namespace.
     fn vector(ns: &str, key_label: &str, key: &str, value: &str) -> String {
+        vectors(key_label, &[(ns, key, value)])
+    }
+
+    /// An instant vector carrying one series per `(namespace, key, value)`.
+    pub(crate) fn vectors(key_label: &str, rows: &[(&str, &str, &str)]) -> String {
+        let series: Vec<String> = rows
+            .iter()
+            .map(|(ns, key, value)| {
+                format!(
+                    r#"{{"metric":{{"namespace":"{ns}","{key_label}":"{key}"}},"value":[1690000000,"{value}"]}}"#
+                )
+            })
+            .collect();
         format!(
-            r#"{{"status":"success","data":{{"resultType":"vector","result":[{{"metric":{{"namespace":"{ns}","{key_label}":"{key}"}},"value":[1690000000,"{value}"]}}]}}}}"#
+            r#"{{"status":"success","data":{{"resultType":"vector","result":[{}]}}}}"#,
+            series.join(",")
         )
     }
 

@@ -3709,15 +3709,17 @@ config:
         );
     }
     /// Usage is per deployment, so a write that fails for one must not cost
-    /// every deployment behind it in the iteration order its reading.
+    /// every deployment behind it in the iteration order its reading. The
+    /// breakdown-only failure is the one a too-narrow grant produces: the
+    /// totals land, the two breakdown tables are denied.
     #[tokio::test]
     async fn a_failed_usage_write_does_not_skip_the_other_deployments() {
+        use crate::metrics::tests::{mock_query, vectors};
         use chrono::Utc;
         use lnvps_api_common::MockDb;
         use lnvps_db::{App, AppDeploymentDesiredState, IntervalType};
         use std::time::Duration;
-        use wiremock::matchers::{method, path, query_param_contains};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use wiremock::MockServer;
 
         fn deployment(id: u64) -> AppDeployment {
             AppDeployment {
@@ -3744,38 +3746,44 @@ config:
             }
         }
 
-        async fn mock_query(server: &MockServer, needle: &str, body: String) {
-            Mock::given(method("GET"))
-                .and(path("/api/v1/query"))
-                .and(query_param_contains("query", needle))
-                .respond_with(ResponseTemplate::new(200).set_body_string(body))
-                .mount(server)
-                .await;
-        }
-
-        fn two_series(key_label: &str, key: &str, a: &str, b: &str) -> String {
-            format!(
-                r#"{{"status":"success","data":{{"resultType":"vector","result":[{{"metric":{{"namespace":"app-1","{key_label}":"{key}"}},"value":[1690000000,"{a}"]}},{{"metric":{{"namespace":"app-2","{key_label}":"{key}"}},"value":[1690000000,"{b}"]}}]}}}}"#
-            )
-        }
-
         let server = MockServer::start().await;
         mock_query(
             &server,
             "container_cpu_usage_seconds_total",
-            two_series("container", "a", "0.5", "0.25"),
+            vectors(
+                "container",
+                &[
+                    ("app-1", "a", "0.5"),
+                    ("app-2", "a", "0.25"),
+                    ("app-3", "a", "0.75"),
+                ],
+            ),
         )
         .await;
         mock_query(
             &server,
             "container_memory_working_set_bytes",
-            two_series("container", "a", "2097152", "1048576"),
+            vectors(
+                "container",
+                &[
+                    ("app-1", "a", "2097152"),
+                    ("app-2", "a", "1048576"),
+                    ("app-3", "a", "4194304"),
+                ],
+            ),
         )
         .await;
         mock_query(
             &server,
             "kubelet_volume_stats_used_bytes",
-            two_series("persistentvolumeclaim", "a-data", "8192", "4096"),
+            vectors(
+                "persistentvolumeclaim",
+                &[
+                    ("app-1", "a-data", "8192"),
+                    ("app-2", "a-data", "4096"),
+                    ("app-3", "a-data", "2048"),
+                ],
+            ),
         )
         .await;
 
@@ -3794,8 +3802,9 @@ config:
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
-                    compose: "services:\n  a:\n    image: x\n    volumes:\n      - name: data\n        path: /d\n        size: 1Gi\n"
-                        .to_string(),
+                    compose:
+                        "services:\n  a:\n    image: x\n    volumes:\n      - name: data\n        path: /d\n        size: 1Gi\n"
+                            .to_string(),
                     amount: 1000,
                     currency: "USD".to_string(),
                     interval_amount: 1,
@@ -3809,27 +3818,34 @@ config:
                 },
             );
             let mut deps = db.app_deployments.lock().await;
-            deps.insert(1, deployment(1));
-            deps.insert(2, deployment(2));
-            // Deployment 1 is written first, so before the fix its failure was
-            // enough to leave 2 with no reading at all.
+            for id in 1..=3 {
+                deps.insert(id, deployment(id));
+            }
+            // Written first, so before the fix either failure was enough to
+            // leave everything after it with no reading at all.
             db.failing_usage_writes.lock().await.insert(1);
+            db.failing_usage_breakdown_writes.lock().await.insert(3);
         }
 
         let client =
             PrometheusClient::new(&format!("{}/", server.uri()), Duration::from_secs(5)).unwrap();
-        let deployments = vec![deployment(1), deployment(2)];
-        let active: HashSet<u64> = HashSet::from([1, 2]);
+        let deployments: Vec<AppDeployment> = (1..=3).map(deployment).collect();
+        let active: HashSet<u64> = HashSet::from([1, 2, 3]);
         collect_usage(&db, Some(&client), &deployments, &active)
             .await
             .unwrap();
 
         let deps = db.app_deployments.lock().await;
-        assert_eq!(deps[&1].usage_cpu_milli, None);
-        assert_eq!(deps[&2].usage_cpu_milli, Some(250));
         let breakdown = db.app_deployment_usage_breakdown.lock().await;
+        // Totals denied: no reading, and no breakdown describing one.
+        assert_eq!(deps[&1].usage_cpu_milli, None);
         assert!(!breakdown.contains_key(&1));
+        // Untouched by either failure.
+        assert_eq!(deps[&2].usage_cpu_milli, Some(250));
         assert_eq!(breakdown[&2].0.len(), 1);
         assert_eq!(breakdown[&2].1.len(), 1);
+        // Breakdown denied: the totals still stand on their own.
+        assert_eq!(deps[&3].usage_cpu_milli, Some(750));
+        assert!(!breakdown.contains_key(&3));
     }
 }

@@ -95,9 +95,13 @@ pub struct MockDb {
             >,
         >,
     >,
-    /// Deployment ids whose usage writes fail. A failing write is otherwise
-    /// unreachable here, and the callers' job is to survive one.
+    /// Deployment ids whose usage totals write fails. A failing write is
+    /// otherwise unreachable here, and the callers' job is to survive one.
     pub failing_usage_writes: Arc<Mutex<HashSet<u64>>>,
+    /// Deployment ids whose usage breakdown write fails. Separate from the
+    /// totals: a grant can cover `app_deployment` and not the breakdown tables,
+    /// so the two fail independently.
+    pub failing_usage_breakdown_writes: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl MockDb {
@@ -388,6 +392,7 @@ impl Default for MockDb {
             app_deployments: Arc::new(Default::default()),
             app_deployment_usage_breakdown: Arc::new(Default::default()),
             failing_usage_writes: Arc::new(Default::default()),
+            failing_usage_breakdown_writes: Arc::new(Default::default()),
         }
     }
 }
@@ -3674,7 +3679,12 @@ impl LNVpsDbBase for MockDb {
         services: &[AppDeploymentServiceUsage],
         volumes: &[AppDeploymentVolumeUsage],
     ) -> DbResult<()> {
-        if self.failing_usage_writes.lock().await.contains(&id) {
+        if self
+            .failing_usage_breakdown_writes
+            .lock()
+            .await
+            .contains(&id)
+        {
             return Err(DbError::Other(anyhow!(
                 "usage breakdown write denied for {id}"
             )));
