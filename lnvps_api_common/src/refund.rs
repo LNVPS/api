@@ -10,8 +10,9 @@
 //! country and the treatment were frozen when the customer was charged, and VAT
 //! is owed on what was charged, not on what the same service would cost today.
 
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
-use lnvps_db::SubscriptionPayment;
+use lnvps_db::{SubscriptionPayment, SubscriptionPaymentType};
 use sha2::{Digest, Sha256};
 
 /// Derive the id of a refund row from what it records.
@@ -52,6 +53,149 @@ pub fn prorated_refund_tax(original: &SubscriptionPayment, amount: u64) -> u64 {
     }
     let amount = amount.min(original.amount);
     ((amount as u128 * original.tax as u128) / original.amount as u128) as u64
+}
+
+/// What is still refundable on `payment` given the refunds already recorded
+/// against it.
+///
+/// Partial refunds are allowed, so the ceiling is the payment minus everything
+/// already returned. Without it a payment could be refunded twice over and the
+/// ledger would owe the customer money that was never sent.
+pub fn refundable_remaining(
+    payment: &SubscriptionPayment,
+    existing: &[SubscriptionPayment],
+) -> u64 {
+    let already: u64 = existing.iter().map(|r| r.amount).sum();
+    payment.amount.saturating_sub(already)
+}
+
+/// Split `total` across `payments` in the order given, taking as much as each
+/// one can still absorb.
+///
+/// `payments` carries each candidate with what is still refundable on it. The
+/// caller decides the order — newest payment first, so a refund reverses the
+/// most recent period rather than one whose VAT period may be long closed.
+///
+/// Fails when the payments cannot absorb the whole amount, so an automated
+/// payout can refuse **before** any money moves: paying first and discovering
+/// there is nowhere to book it leaves money gone and the ledger silent.
+pub fn allocate_refund(
+    payments: &[(SubscriptionPayment, u64)],
+    total: u64,
+) -> Result<Vec<(SubscriptionPayment, u64)>> {
+    let capacity: u64 = payments.iter().map(|(_, r)| *r).sum();
+    if total > capacity {
+        bail!("refund of {total} exceeds the {capacity} still refundable on this VM's payments");
+    }
+
+    let mut left = total;
+    let mut out = Vec::new();
+    for (payment, remaining) in payments {
+        if left == 0 {
+            break;
+        }
+        let take = (*remaining).min(left);
+        if take == 0 {
+            continue;
+        }
+        left -= take;
+        out.push((payment.clone(), take));
+    }
+    Ok(out)
+}
+
+/// Evidence attached to a refund row.
+#[derive(Default, Clone, Copy)]
+pub struct RefundEvidence<'a> {
+    /// Why the refund was issued.
+    pub reason: Option<&'a str>,
+    /// Proof the money actually moved — a Lightning preimage, a Revolut refund
+    /// id, a bank reference.
+    pub external_ref: Option<&'a str>,
+    /// What the payout was made against: the BOLT11 invoice paid out to the
+    /// customer. `None` when the refund is only being recorded after the fact.
+    pub instrument: Option<&'a str>,
+}
+
+/// Build the accounting row that reverses `amount` of `original`.
+///
+/// The row is deliberately a copy of the payment it reverses rather than a
+/// fresh calculation: same currency, same frozen exchange `rate`, same VAT
+/// rate, country and treatment, with `amount`/`tax` pro-rated. VAT is owed on
+/// what was charged, so reversing it at today's rates would misstate the
+/// return.
+///
+/// The evidence attached to a refund row travels in `evidence`.
+pub fn build_refund_row(
+    original: &SubscriptionPayment,
+    amount: u64,
+    refunded_at: DateTime<Utc>,
+    admin_user_id: u64,
+    evidence: RefundEvidence<'_>,
+) -> SubscriptionPayment {
+    let RefundEvidence {
+        reason,
+        external_ref,
+        instrument,
+    } = evidence;
+    let mut metadata = serde_json::json!({
+        "refund": {
+            "recorded_by_admin_user_id": admin_user_id,
+            "refunded_payment_id": hex::encode(&original.id),
+        }
+    });
+    if let Some(reason) = reason {
+        metadata["refund"]["reason"] = serde_json::json!(reason);
+    }
+    if let Some(ext) = external_ref {
+        metadata["refund"]["external_ref"] = serde_json::json!(ext);
+    }
+
+    SubscriptionPayment {
+        id: derive_refund_payment_id(&original.id, amount, refunded_at, admin_user_id),
+        subscription_id: original.subscription_id,
+        user_id: original.user_id,
+        created: refunded_at,
+        // A refund buys no time; `expires` is carried from the payment it
+        // reverses so the row sits in the period it belongs to.
+        expires: original.expires,
+        amount,
+        currency: original.currency.clone(),
+        // The instrument the original sale used. What the money was actually
+        // returned through is free text in `metadata.refund.external_ref`: the
+        // accounting row has to stay in the currency and at the rate it
+        // reverses, whatever wallet paid it out.
+        payment_method: original.payment_method,
+        payment_type: SubscriptionPaymentType::Refund,
+        // The instrument the payout was made against — the customer's BOLT11
+        // for a Lightning refund, same slot the original sale's invoice uses.
+        // Empty when the money was returned out of band and only recorded.
+        external_data: lnvps_db::EncryptedString::new(
+            instrument.unwrap_or_default().to_string(),
+        ),
+        external_id: None,
+        is_paid: true,
+        rate: original.rate,
+        // Must stay None. `time_value` is what extends a subscription, and a
+        // refund must not touch expiry — the VM's fate is a separate decision.
+        time_value: None,
+        metadata: Some(metadata),
+        tax: prorated_refund_tax(original, amount),
+        // Processor fees are not returned on a refund, so the fee stays a sunk
+        // cost on the original payment rather than being reversed here.
+        processing_fee: 0,
+        paid_at: Some(refunded_at),
+        tax_rate: original.tax_rate,
+        tax_country_code: original.tax_country_code.clone(),
+        tax_treatment: original.tax_treatment.clone(),
+        tax_evidence: original.tax_evidence.clone(),
+        // The original's per-line breakdown describes the sale, not this
+        // reversal: on a partial refund its line amounts would not add up to
+        // this row. The OSS report falls back to the summary fields above,
+        // which are the ones that must match.
+        tax_breakdown: None,
+        refunded_payment_id: Some(original.id.clone()),
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +336,112 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// A refund is split over the payments it reverses, newest first, and each
+    /// one only absorbs what it has left. The order is the caller's, so the
+    /// most recent period is unwound before older ones.
+    #[test]
+    fn allocation_fills_each_payment_up_to_its_remainder() {
+        let mut newest = payment(1000, 0);
+        newest.id = vec![2u8; 32];
+        let mut older = payment(1000, 0);
+        older.id = vec![3u8; 32];
+
+        // 400 already refunded on the newest, so it can only take 600 more.
+        let plan = allocate_refund(&[(newest.clone(), 600), (older.clone(), 1000)], 900).unwrap();
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].0.id, newest.id);
+        assert_eq!(plan[0].1, 600, "newest is drained first");
+        assert_eq!(plan[1].1, 300, "the rest falls to the older payment");
+        assert_eq!(plan.iter().map(|(_, a)| a).sum::<u64>(), 900);
+
+        // A refund that fits in the first payment does not touch the second.
+        let plan = allocate_refund(&[(newest.clone(), 600), (older.clone(), 1000)], 500).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].1, 500);
+    }
+
+    /// More than the payments can absorb is refused rather than clamped: an
+    /// automated payout checks this before it pays, and a clamp would send the
+    /// full amount while booking less than went out.
+    #[test]
+    fn allocation_refuses_more_than_is_refundable() {
+        let p = payment(1000, 0);
+        let err = allocate_refund(&[(p.clone(), 400)], 500)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("400"), "{err}");
+        assert!(
+            allocate_refund(&[], 1).is_err(),
+            "nothing to refund against"
+        );
+        assert!(allocate_refund(&[], 0).unwrap().is_empty());
+    }
+
+    /// The ceiling is the payment minus every refund already recorded, so a
+    /// fully refunded payment has nothing left.
+    #[test]
+    fn remaining_is_the_payment_less_what_already_went_back() {
+        let p = payment(1000, 230);
+        assert_eq!(refundable_remaining(&p, &[]), 1000);
+        let mut part = payment(400, 0);
+        part.payment_type = SubscriptionPaymentType::Refund;
+        assert_eq!(refundable_remaining(&p, std::slice::from_ref(&part)), 600);
+        let mut rest = payment(600, 0);
+        rest.payment_type = SubscriptionPaymentType::Refund;
+        assert_eq!(refundable_remaining(&p, &[part, rest]), 0);
+    }
+
+    /// The built row reverses the original at the terms it was charged on, and
+    /// buys no time.
+    #[test]
+    fn refund_row_copies_the_terms_it_reverses() {
+        let original = payment(1230, 230);
+        let at = Utc::now();
+        let row = build_refund_row(
+            &original,
+            615,
+            at,
+            7,
+            RefundEvidence {
+                reason: Some("downgrade"),
+                external_ref: Some("preimage"),
+                instrument: Some("lnbc10u1refund"),
+            },
+        );
+
+        assert_eq!(row.payment_type, SubscriptionPaymentType::Refund);
+        assert_eq!(row.refunded_payment_id.as_ref(), Some(&original.id));
+        assert_eq!(row.amount, 615);
+        assert_eq!(row.tax, prorated_refund_tax(&original, 615));
+        assert_eq!(row.currency, original.currency);
+        assert_eq!(row.rate, original.rate, "frozen at the charged rate");
+        assert_eq!(row.tax_rate, original.tax_rate);
+        assert_eq!(row.expires, original.expires);
+        assert!(row.is_paid);
+        assert_eq!(
+            row.time_value, None,
+            "a refund must not extend a subscription"
+        );
+        assert_eq!(row.processing_fee, 0);
+        assert_eq!(row.tax_breakdown, None);
+        assert_eq!(
+            row.id,
+            derive_refund_payment_id(&original.id, 615, at, 7),
+            "id is derived, so a retry collides instead of double-recording"
+        );
+
+        assert_eq!(
+            row.external_data.as_str(),
+            "lnbc10u1refund",
+            "the invoice the payout was made against"
+        );
+
+        let meta = row.metadata.unwrap();
+        assert_eq!(meta["refund"]["external_ref"], "preimage");
+        assert_eq!(meta["refund"]["reason"], "downgrade");
+        assert_eq!(meta["refund"]["recorded_by_admin_user_id"], 7);
     }
 
     /// Refund rows subtract from earnings; everything else adds. Aggregations

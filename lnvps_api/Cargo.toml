@@ -102,7 +102,8 @@ mustache = "0.9"
 isocountry = "0.3"
 hickory-resolver = "0.26"
 humantime = "2.2"
-lightning-invoice = "0.34"
+# `std` for `Bolt11Invoice::is_expired`, which is gated on it.
+lightning-invoice = { version = "0.34", features = ["std"] }
 regex = "1"
 
 # nostr (for signing agreements)
