@@ -1,4 +1,5 @@
 use crate::VmRunningState;
+use crate::ssh_host_key::{ApiVmHostKey, parse_ssh_host_keys};
 use crate::pricing::PricingEngine;
 use anyhow::{Result, anyhow, bail};
 use chrono::{DateTime, Days, Utc};
@@ -260,6 +261,12 @@ pub struct ApiVmStatus {
     /// for a reinstall. `None`/omitted when the host arch is unknown.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_arch: Option<String>,
+    /// The VM's own SSH host keys, captured from the guest after it booted, for
+    /// verifying the host on first connect instead of trusting the key it
+    /// presents. Empty until the capture succeeds, and re-captured after a
+    /// reinstall (which regenerates them). Not to be confused with `ssh_key`,
+    /// which is the customer's authorized key.
+    pub host_ssh_keys: Vec<ApiVmHostKey>,
 }
 
 /// Grace period (days) for a subscription, tiered by how long the subscription
@@ -356,6 +363,12 @@ pub async fn vm_to_status(
             Err(_) => (None, Utc::now(), None, false, None, max_prepay_days_default),
         };
 
+    let host_ssh_keys = vm
+        .ssh_host_keys
+        .as_deref()
+        .map(parse_ssh_host_keys)
+        .unwrap_or_default();
+
     Ok(ApiVmStatus {
         id: vm.id,
         created: sub_created,
@@ -386,6 +399,7 @@ pub async fn vm_to_status(
             arch => Some(arch.to_string()),
         }),
         max_prepay_days,
+        host_ssh_keys,
     })
 }
 

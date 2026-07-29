@@ -191,6 +191,7 @@ impl VmProvisioner {
             ssh_key_id: Some(ssh_key.id),
             disk_id: pick_disk.disk.id,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
+            ssh_host_keys: None,
             deleted: false,
             ref_code,
             disabled: false,
@@ -327,6 +328,7 @@ impl VmProvisioner {
             ssh_key_id: Some(ssh_key.id),
             disk_id: pick_disk.disk.id,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
+            ssh_host_keys: None,
             deleted: false,
             ref_code,
             disabled: false,
@@ -504,6 +506,7 @@ impl VmProvisioner {
                 .mac_address
                 .clone()
                 .unwrap_or_else(|| "ff:ff:ff:ff:ff:ff".to_string()),
+            ssh_host_keys: None,
             deleted: false,
             ref_code: None,
             disabled: false,

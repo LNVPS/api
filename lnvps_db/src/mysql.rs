@@ -1217,6 +1217,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn set_vm_ssh_host_keys(&self, vm_id: u64, keys: Option<&str>) -> DbResult<()> {
+        sqlx::query("update vm set ssh_host_keys=? where id=?")
+            .bind(keys)
+            .bind(vm_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
     async fn get_vm_by_line_item(&self, line_item_id: u64) -> DbResult<Vm> {
         Ok(
             sqlx::query_as("SELECT * FROM vm WHERE subscription_line_item_id = ? AND deleted = 0")

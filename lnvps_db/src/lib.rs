@@ -420,6 +420,13 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Update a VM
     async fn update_vm(&self, vm: &Vm) -> DbResult<()>;
 
+    /// Replace a VM's captured SSH host keys (`None` clears them).
+    ///
+    /// Separate from [`update_vm`] on purpose: the keys are written by the
+    /// worker after boot, so folding them into the full-row update would let
+    /// any caller holding a VM loaded before the capture wipe them.
+    async fn set_vm_ssh_host_keys(&self, vm_id: u64, keys: Option<&str>) -> DbResult<()>;
+
     /// Get a VM by its subscription line item ID
     async fn get_vm_by_line_item(&self, line_item_id: u64) -> DbResult<Vm>;
 

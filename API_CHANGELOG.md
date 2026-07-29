@@ -24,6 +24,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **Contact form hardens email header values** — `POST /api/v1/contact` strips control characters from the sender name and subject (and caps the subject) before placing them in outgoing mail headers.
 
+### Added
+
+- **`host_ssh_keys` on VM status** (issue #154) — `GET /api/v1/vm/{id}` and `GET /api/v1/vm` now return the VM's own SSH host keys as `[{ key_type, public_key, fingerprint_sha256 }]`, so a client can verify the host on first connect instead of accepting whatever key answers. The list is empty until the keys are captured (scanned from the host once the VM is running, public keys only) and is re-captured after a reinstall, which regenerates them. Additive: no existing field changed. Not to be confused with `ssh_key`, which is the customer's authorized key.
+
 ### Fixed
 
 - **`GET /api/v1/payment/{id}` now works for every subscription type** — it previously resolved the payer through the VM back-reference, so a payment for a managed app, IP range or other non-VPS subscription errored instead of returning. Ownership is now asserted on the subscription and the embedded `vm_id` is `0` for non-VPS payments (the endpoint remains deprecated in favour of `GET /api/v1/subscriptions/{id}/payments/{payment_id}`).
