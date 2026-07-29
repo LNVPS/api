@@ -12,7 +12,7 @@ use lightning_invoice::Bolt11Invoice;
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, PricingEngine,
     UpgradeConfig, VatClient, VmHistoryLogger, VmRunningState, VmStateCache, WorkJob,
-    build_refund_row, refundable_remaining,
+    RefundEvidence, build_refund_row, refundable_remaining,
 };
 use lnvps_db::{AdminAction, AdminResource, SubscriptionPaymentType};
 use log::{error, info};
@@ -1126,8 +1126,11 @@ async fn admin_record_payment_refund(
         amount,
         refunded_at,
         auth.user_id,
-        req.reason.as_deref(),
-        req.external_ref.as_deref(),
+        RefundEvidence {
+            reason: req.reason.as_deref(),
+            external_ref: req.external_ref.as_deref(),
+            instrument: None,
+        },
     );
     let refund_id = refund.id.clone();
 

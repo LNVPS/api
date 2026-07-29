@@ -16,7 +16,8 @@ use anyhow::{Result, anyhow, bail, ensure};
 use chrono::{DateTime, Utc};
 use lightning_invoice::Bolt11Invoice;
 use lnvps_api_common::{
-    PricingEngine, VmHistoryLogger, allocate_refund, build_refund_row, refundable_remaining,
+    PricingEngine, RefundEvidence, VmHistoryLogger, allocate_refund, build_refund_row,
+    refundable_remaining,
 };
 use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment};
 use log::{error, info};
@@ -165,8 +166,11 @@ impl VmRefundHandler {
                 amount,
                 refunded_at,
                 admin_user_id,
-                reason,
-                preimage.as_deref(),
+                RefundEvidence {
+                    reason,
+                    external_ref: preimage.as_deref(),
+                    instrument: Some(invoice),
+                },
             );
             if let Err(e) = self.db.insert_subscription_payment(&row).await {
                 error!(
@@ -464,15 +468,9 @@ mod tests {
         let handler = handler(db.clone(), node.clone()).await;
 
         // €0.50 at the mock rate of 100,000 EUR/BTC is 500,000 msat.
+        let invoice = invoice_for(500_000);
         let outcome = handler
-            .process(
-                1,
-                9,
-                None,
-                Some("e2e"),
-                "lightning",
-                Some(&invoice_for(500_000)),
-            )
+            .process(1, 9, None, Some("e2e"), "lightning", Some(&invoice))
             .await
             .expect("refund");
 
@@ -494,6 +492,11 @@ mod tests {
             refund.metadata.as_ref().unwrap()["refund"]["external_ref"],
             "aa".repeat(32),
             "the preimage is the proof the money moved"
+        );
+        assert_eq!(
+            refund.external_data.as_str(),
+            invoice,
+            "the invoice that was paid out"
         );
     }
 

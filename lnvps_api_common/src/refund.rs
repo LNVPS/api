@@ -104,6 +104,19 @@ pub fn allocate_refund(
     Ok(out)
 }
 
+/// Evidence attached to a refund row.
+#[derive(Default, Clone, Copy)]
+pub struct RefundEvidence<'a> {
+    /// Why the refund was issued.
+    pub reason: Option<&'a str>,
+    /// Proof the money actually moved — a Lightning preimage, a Revolut refund
+    /// id, a bank reference.
+    pub external_ref: Option<&'a str>,
+    /// What the payout was made against: the BOLT11 invoice paid out to the
+    /// customer. `None` when the refund is only being recorded after the fact.
+    pub instrument: Option<&'a str>,
+}
+
 /// Build the accounting row that reverses `amount` of `original`.
 ///
 /// The row is deliberately a copy of the payment it reverses rather than a
@@ -112,16 +125,19 @@ pub fn allocate_refund(
 /// what was charged, so reversing it at today's rates would misstate the
 /// return.
 ///
-/// `external_ref` is proof the money actually moved — a Lightning preimage, a
-/// Revolut refund id, a bank reference.
+/// The evidence attached to a refund row travels in `evidence`.
 pub fn build_refund_row(
     original: &SubscriptionPayment,
     amount: u64,
     refunded_at: DateTime<Utc>,
     admin_user_id: u64,
-    reason: Option<&str>,
-    external_ref: Option<&str>,
+    evidence: RefundEvidence<'_>,
 ) -> SubscriptionPayment {
+    let RefundEvidence {
+        reason,
+        external_ref,
+        instrument,
+    } = evidence;
     let mut metadata = serde_json::json!({
         "refund": {
             "recorded_by_admin_user_id": admin_user_id,
@@ -151,8 +167,12 @@ pub fn build_refund_row(
         // reverses, whatever wallet paid it out.
         payment_method: original.payment_method,
         payment_type: SubscriptionPaymentType::Refund,
-        // Nothing to store: there is no invoice for money we are giving back.
-        external_data: lnvps_db::EncryptedString::new(String::new()),
+        // The instrument the payout was made against — the customer's BOLT11
+        // for a Lightning refund, same slot the original sale's invoice uses.
+        // Empty when the money was returned out of band and only recorded.
+        external_data: lnvps_db::EncryptedString::new(
+            instrument.unwrap_or_default().to_string(),
+        ),
         external_id: None,
         is_paid: true,
         rate: original.rate,
@@ -379,7 +399,17 @@ mod tests {
     fn refund_row_copies_the_terms_it_reverses() {
         let original = payment(1230, 230);
         let at = Utc::now();
-        let row = build_refund_row(&original, 615, at, 7, Some("downgrade"), Some("preimage"));
+        let row = build_refund_row(
+            &original,
+            615,
+            at,
+            7,
+            RefundEvidence {
+                reason: Some("downgrade"),
+                external_ref: Some("preimage"),
+                instrument: Some("lnbc10u1refund"),
+            },
+        );
 
         assert_eq!(row.payment_type, SubscriptionPaymentType::Refund);
         assert_eq!(row.refunded_payment_id.as_ref(), Some(&original.id));
@@ -400,6 +430,12 @@ mod tests {
             row.id,
             derive_refund_payment_id(&original.id, 615, at, 7),
             "id is derived, so a retry collides instead of double-recording"
+        );
+
+        assert_eq!(
+            row.external_data.as_str(),
+            "lnbc10u1refund",
+            "the invoice the payout was made against"
         );
 
         let meta = row.metadata.unwrap();
