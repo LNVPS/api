@@ -311,11 +311,32 @@ service-name: "lnvps-nostr"
 port-name: "http"
 cluster-issuer: "letsencrypt-prod"
 ingress-class: "nginx"
+app-tls-secret: "apps-wildcard-tls"   # managed apps: shared wildcard cert for the default host
 app-cluster-id: 1             # managed apps: the cluster this operator serves
 redis: "redis://localhost:6379"   # reconcile on payment instead of at the next poll
 annotations:
   nginx.ingress.kubernetes.io/ssl-redirect: "true"
 ```
+
+`app-tls-secret` is optional and only meaningful alongside `app-cluster-id`. It
+names a secret, mirrored into every `app-*` namespace by the cluster (e.g. with
+reflector), holding a wildcard certificate for the apps domain. When set, a
+deployment's default host serves that certificate and the operator leaves the
+cert-manager annotation off its Ingress, so no certificate is issued per
+deployment — otherwise every new app spends one of the ACME account's weekly
+certificates for the registered domain, which caps how many customers can be
+onboarded in a week. Customer custom domains always keep their own certificate:
+theirs is only solvable once their DNS points at us. Omit the key to issue one
+certificate per deployment.
+
+The cluster-side half — the wildcard `Certificate` and the reflector
+annotations that mirror its secret into the deployment namespaces — is in
+[`lnvps_operator/apps-wildcard-tls.example.yaml`](../lnvps_operator/apps-wildcard-tls.example.yaml).
+
+Give the shared secret a name of its own rather than `app-tls`: namespaces
+provisioned before this setting already hold a per-deployment secret under that
+name, and the ingress would serve whichever of the two the mirror had not
+overwritten yet.
 
 `redis` is optional and only meaningful alongside `app-cluster-id`: the operator
 consumes `app-cluster-{id}` and reconciles a deployment as soon as its payment

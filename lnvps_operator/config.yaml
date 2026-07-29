@@ -80,6 +80,15 @@ cluster-issuer: "letsencrypt-prod"
 # `spec.ingressClassName` on generated Ingress objects.
 ingress-class: "nginx"
 
+# Shared TLS secret holding a wildcard certificate for the apps domain
+# (optional). When set, a deployment's default host serves this certificate
+# instead of getting one issued for it, so onboarding is not capped by the ACME
+# account's weekly certificate limit for the registered domain. The cluster
+# issues the wildcard and mirrors the secret into each `app-*` namespace (e.g.
+# with reflector); the operator only references it. Custom domains are
+# unaffected and keep their own certificate.
+# app-tls-secret: "apps-wildcard-tls"
+
 # Additional custom annotations for the nostr-domain ingress (optional)
 # These will be merged with the default annotations
 # Custom annotations take precedence over defaults

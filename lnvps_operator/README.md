@@ -79,6 +79,7 @@ kubectl get ingress -n your-namespace
 | `port-name` | string | `"http"` | Port name on the service |
 | `cluster-issuer` | string | `"letsencrypt-prod"` | cert-manager ClusterIssuer name |
 | `ingress-class` | string | `"nginx"` | Ingress class name |
+| `app-tls-secret` | string | unset | Shared wildcard TLS secret for the apps domain, mirrored into each deployment namespace. When set, the default host of a managed app reuses it and no certificate is issued per deployment; custom domains keep their own. Cluster-side setup in [`apps-wildcard-tls.example.yaml`](apps-wildcard-tls.example.yaml) |
 | `annotations` | object | `{}` | Additional ingress annotations |
 | `prometheus.url` | string | unset | Prometheus HTTP API to read deployment CPU/memory/volume usage from. Omit to collect no usage |
 | `prometheus.timeout-seconds` | number | `10` | Per-query timeout; collection is best-effort and never blocks a reconcile |

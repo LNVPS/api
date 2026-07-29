@@ -77,6 +77,19 @@ pub struct Settings {
     /// Ingress class name (optional, defaults to "nginx")
     pub ingress_class: Option<String>,
 
+    /// Name of a shared TLS secret, mirrored into every deployment namespace,
+    /// holding a wildcard certificate for the apps domain (optional).
+    ///
+    /// When set, a deployment's default host serves that certificate and the
+    /// operator does not ask cert-manager to issue one, so onboarding is not
+    /// capped by the ACME account's weekly certificate limit for the registered
+    /// domain. The cluster is responsible for issuing the wildcard and
+    /// mirroring the secret in; the operator only references it. Custom domains
+    /// are unaffected and keep their own certificate.
+    ///
+    /// When unset, each deployment's default host gets its own certificate.
+    pub app_tls_secret: Option<String>,
+
     /// Namespace the ingress controller runs in — the app-deployment isolation
     /// NetworkPolicy allows inbound traffic from it (optional, defaults to
     /// "ingress-nginx"). Must match the `kubernetes.io/metadata.name` label of
@@ -147,7 +160,9 @@ fn database_url(configured: &str, from_env: Option<String>) -> Result<String> {
         env.trim()
     };
     if url.is_empty() {
-        anyhow::bail!("no database connection string: set {DATABASE_URL_ENV} or `db` in the config");
+        anyhow::bail!(
+            "no database connection string: set {DATABASE_URL_ENV} or `db` in the config"
+        );
     }
     Ok(url.to_string())
 }
