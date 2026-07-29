@@ -34,5 +34,6 @@ cluster-issuer: "letsencrypt-prod"
 # ingress-class: "nginx"
 # ingress-namespace: "ingress-nginx"
 # reconcile-interval: 60
+# transition-reconcile-interval: 5
 # error-retry-interval: 30
 # verbose: false

@@ -9,8 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::signal;
+use tokio::sync::Notify;
 
 mod app_deployments;
 mod metrics;
@@ -58,6 +60,12 @@ pub struct Settings {
 
     /// Reconciliation interval in seconds (defaults to 60)
     pub reconcile_interval: Option<u64>,
+
+    /// How long to wait before the next app-deployment sweep while at least one
+    /// deployment is still transitioning (defaults to 5 seconds, and is capped
+    /// at `reconcile_interval`). Steady-state deployments stay on
+    /// `reconcile_interval`.
+    pub transition_reconcile_interval: Option<u64>,
 
     /// Error retry interval in seconds (defaults to 30)
     pub error_retry_interval: Option<u64>,
@@ -149,6 +157,25 @@ pub struct Context {
     pub metrics: Option<PrometheusClient>,
 }
 
+/// Default gap between app-deployment sweeps while something is transitioning.
+const DEFAULT_TRANSITION_RECONCILE_SECS: u64 = 5;
+
+/// How long to wait before the next app-deployment sweep.
+///
+/// A deployment mid-provisioning changes state on its own, so its stored status
+/// is stale until the next sweep reads the cluster again; a settled deployment
+/// only changes when something else acts on it, and that path triggers its own
+/// reconcile. The fast interval is capped at the steady one so configuring a
+/// transition interval longer than `reconcile_interval` cannot slow the loop
+/// down below its floor.
+fn next_reconcile_delay(transitioning: bool, steady: Duration, transition: Duration) -> Duration {
+    if transitioning {
+        transition.min(steady)
+    } else {
+        steady
+    }
+}
+
 /// The DSN to connect with: the environment wins over the config file, so the
 /// credential can live in a Secret while the rest of the config stays in a
 /// ConfigMap.
@@ -229,24 +256,60 @@ async fn main() -> Result<()> {
     if let Err(e) = nostr_domains::reconcile_nostr_domains(&context).await {
         error!("Failed to reconcile nostr domains: {}", e);
     }
-    if let Err(e) = app_deployments::reconcile_app_deployments(&context).await {
-        error!("Failed to reconcile app deployments: {}", e);
+    // Shared with the trigger listener so a payment-triggered sweep that leaves
+    // a deployment provisioning also puts the timer on the fast cadence.
+    let transitioning = Arc::new(AtomicBool::new(false));
+    let wake = Arc::new(Notify::new());
+    match app_deployments::reconcile_app_deployments(&context).await {
+        Ok(t) => transitioning.store(t, Ordering::Relaxed),
+        Err(e) => error!("Failed to reconcile app deployments: {}", e),
     }
 
-    // Set up periodic reconciliation
-    let context_clone = context.clone();
     let reconcile_interval = Duration::from_secs(context.settings.reconcile_interval.unwrap_or(60));
-    let mut interval = tokio::time::interval(reconcile_interval);
+    let transition_interval = Duration::from_secs(
+        context
+            .settings
+            .transition_reconcile_interval
+            .unwrap_or(DEFAULT_TRANSITION_RECONCILE_SECS),
+    );
 
-    let reconciliation_task = async move {
+    // Nostr domains follow DNS, which nothing here can hurry, so they stay on
+    // the steady interval while app deployments run their own cadence.
+    let nostr_context = context.clone();
+    let nostr_task = async move {
+        let mut interval = tokio::time::interval(reconcile_interval);
+        interval.tick().await;
         loop {
             interval.tick().await;
-            info!("Running periodic reconciliation...");
-            if let Err(e) = nostr_domains::reconcile_nostr_domains(&context_clone).await {
+            if let Err(e) = nostr_domains::reconcile_nostr_domains(&nostr_context).await {
                 error!("Failed to reconcile nostr domains: {}", e);
             }
-            if let Err(e) = app_deployments::reconcile_app_deployments(&context_clone).await {
-                error!("Failed to reconcile app deployments: {}", e);
+        }
+    };
+
+    let app_context = context.clone();
+    let app_transitioning = transitioning.clone();
+    let app_wake = wake.clone();
+    let reconciliation_task = async move {
+        loop {
+            let delay = next_reconcile_delay(
+                app_transitioning.load(Ordering::Relaxed),
+                reconcile_interval,
+                transition_interval,
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                // Someone else swept and learned something about the cadence:
+                // start the wait again from the interval that now applies.
+                _ = app_wake.notified() => continue,
+            }
+            match app_deployments::reconcile_app_deployments(&app_context).await {
+                Ok(t) => app_transitioning.store(t, Ordering::Relaxed),
+                Err(e) => {
+                    error!("Failed to reconcile app deployments: {}", e);
+                    // An unknown outcome is not a reason to poll fast forever.
+                    app_transitioning.store(false, Ordering::Relaxed);
+                }
             }
         }
     };
@@ -254,13 +317,16 @@ async fn main() -> Result<()> {
     // Immediate reconcile on payment (#254). Optional: without a Redis URL the
     // periodic loop above is the only trigger, which is the behaviour that
     // shipped before this.
-    let trigger_task = trigger_listener(context.clone());
+    let trigger_task = trigger_listener(context.clone(), transitioning.clone(), wake.clone());
 
     // TODO: Add back the controller logic here
 
     tokio::select! {
         _ = reconciliation_task => {
             warn!("Reconciliation task stopped unexpectedly");
+        }
+        _ = nostr_task => {
+            warn!("Nostr domain reconciliation task stopped unexpectedly");
         }
         _ = trigger_task => {
             warn!("Reconcile-trigger listener stopped unexpectedly");
@@ -286,7 +352,7 @@ async fn main() -> Result<()> {
 /// re-reads the deployment's current row rather than trusting the message, and
 /// a stale or duplicated trigger therefore costs a sweep rather than producing
 /// a different outcome from the periodic one.
-async fn trigger_listener(ctx: Arc<Context>) {
+async fn trigger_listener(ctx: Arc<Context>, transitioning: Arc<AtomicBool>, wake: Arc<Notify>) {
     let (Some(redis_url), Some(cluster_id)) =
         (ctx.settings.redis.clone(), ctx.settings.app_cluster_id)
     else {
@@ -344,8 +410,12 @@ async fn trigger_listener(ctx: Arc<Context>) {
         }
         if !triggers.is_empty() {
             info!("Reconcile trigger for app deployment(s) {triggers:?}");
-            if let Err(e) = app_deployments::reconcile_app_deployments(&ctx).await {
-                error!("Triggered reconcile failed: {e}");
+            match app_deployments::reconcile_app_deployments(&ctx).await {
+                Ok(t) => {
+                    transitioning.store(t, Ordering::Relaxed);
+                    wake.notify_one();
+                }
+                Err(e) => error!("Triggered reconcile failed: {e}"),
             }
         }
         for msg in &jobs {
@@ -362,6 +432,21 @@ async fn trigger_listener(ctx: Arc<Context>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transitioning sweep comes round sooner; a settled one waits the full
+    /// interval, and a misconfigured fast interval can never be the slower of
+    /// the two.
+    #[test]
+    fn transitioning_deployments_shorten_the_next_sweep() {
+        let steady = Duration::from_secs(60);
+        let fast = Duration::from_secs(5);
+        assert_eq!(next_reconcile_delay(true, steady, fast), fast);
+        assert_eq!(next_reconcile_delay(false, steady, fast), steady);
+        assert_eq!(
+            next_reconcile_delay(true, steady, Duration::from_secs(600)),
+            steady
+        );
+    }
 
     /// The DSN is a credential, so a deployment can supply it from a Secret
     /// through the environment; the config file stays the fallback.

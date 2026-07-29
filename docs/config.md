@@ -306,6 +306,7 @@ Reconciles Kubernetes `Ingress` and cert-manager `Certificate` objects for Nostr
 db: "mysql://root:root@localhost:3376/lnvps"
 namespace: "default"
 reconcile-interval: 60        # seconds
+transition-reconcile-interval: 5   # sweep this often while a deployment is still moving
 error-retry-interval: 30
 service-name: "lnvps-nostr"
 port-name: "http"
@@ -337,6 +338,16 @@ Give the shared secret a name of its own rather than `app-tls`: namespaces
 provisioned before this setting already hold a per-deployment secret under that
 name, and the ingress would serve whichever of the two the mirror had not
 overwritten yet.
+
+`transition-reconcile-interval` is the gap between app-deployment sweeps while
+at least one deployment on the cluster is `pending` or `deleting`, so a
+customer watching a deployment come up sees its status move in seconds rather
+than once per `reconcile-interval`. Once every deployment is settled
+(`running`, `stopped` or `error`) the loop returns to `reconcile-interval` —
+a settled deployment only changes when something acts on it, and that path
+reconciles on its own. Values above `reconcile-interval` are capped to it.
+Nostr domain reconciliation is unaffected and always runs on
+`reconcile-interval`.
 
 `redis` is optional and only meaningful alongside `app-cluster-id`: the operator
 consumes `app-cluster-{id}` and reconciles a deployment as soon as its payment
