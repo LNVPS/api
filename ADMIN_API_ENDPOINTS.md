@@ -1045,14 +1045,14 @@ POST /api/admin/v1/subscription_payments/{hex_id}/complete
 
 Required Permission: `subscription_payments::update`
 
-Manually marks a subscription payment as paid. Sets `is_paid=true`, records `paid_at`, extends the subscription by 30 days, and activates it.
+Manually marks a subscription payment as paid. Sets `is_paid=true`, records `paid_at`, extends the subscription by 30 days, and activates it, then queues the same on-payment handling a Lightning settlement runs (instant app reconcile, applying a VM/app upgrade) on the worker.
 
 **No request body required.**
 
 Returns the updated `AdminSubscriptionPaymentInfo`.
 
 Errors:
-- `400` if the payment is already completed
+- `409` if the payment is already completed
 - `400` if the payment ID format is invalid
 
 ### Role Management

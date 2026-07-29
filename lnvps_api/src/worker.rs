@@ -802,6 +802,27 @@ impl Worker {
         Ok(())
     }
 
+    /// Run the line item on-payment handling for a payment another process
+    /// already marked paid.
+    ///
+    /// Re-marking it paid here would extend the subscription a second time, so
+    /// an unpaid payment is a routing bug and is refused rather than completed.
+    pub async fn apply_subscription_payment(&self, payment_id: &str) -> Result<()> {
+        let id = hex::decode(payment_id)?;
+        let payment = self.db.get_subscription_payment(&id).await?;
+        if !payment.is_paid {
+            bail!("Subscription payment {} is not paid", payment_id);
+        }
+        let result = self.subscription_handler.apply_payment(&payment).await?;
+        for p in result.expired_competing_upgrades {
+            // No Lightning node here to cancel the invoice with; it is already
+            // expired in the database, so it can no longer be settled into a
+            // second upgrade.
+            info!("Expired competing upgrade payment {}", hex::encode(&p.id));
+        }
+        Ok(())
+    }
+
     pub async fn check_subscriptions(&self) -> Result<()> {
         let last_check = self.get_last_check_subscriptions().await?;
         let time_since = Utc::now().signed_duration_since(last_check);
@@ -2060,6 +2081,9 @@ impl Worker {
                     "Ignoring ReconcileAppDeployment({deployment_id}) on the worker queue: it \
                      belongs on the deployment's app-cluster stream"
                 );
+            }
+            WorkJob::ApplySubscriptionPayment { payment_id } => {
+                self.apply_subscription_payment(payment_id).await?;
             }
             WorkJob::SpawnVm { vm_id } => {
                 let vm = self.db.get_vm(*vm_id).await?;

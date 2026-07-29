@@ -216,6 +216,17 @@ pub enum WorkJob {
     /// periodic reconcile stays as the backstop: a dropped trigger must be a
     /// delay, not a deployment that never happens.
     ReconcileAppDeployment { deployment_id: u64 },
+    /// Run the on-payment handling for a subscription payment that has already
+    /// been marked paid.
+    ///
+    /// The admin override endpoint marks a payment paid itself but lives in a
+    /// crate without the provisioner stack, so the line-item handlers (instant
+    /// app reconcile, VM/app upgrade application) run here on the worker
+    /// instead. The Lightning settlement path calls the same handling inline.
+    ApplySubscriptionPayment {
+        /// Hex-encoded `subscription_payment.id`.
+        payment_id: String,
+    },
 }
 
 /// Redis stream carrying reconcile triggers for one app cluster (issue #254).
@@ -256,6 +267,7 @@ impl fmt::Display for WorkJob {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             WorkJob::ReconcileAppDeployment { .. } => write!(f, "ReconcileAppDeployment"),
+            WorkJob::ApplySubscriptionPayment { .. } => write!(f, "ApplySubscriptionPayment"),
             WorkJob::PatchHosts => write!(f, "PatchHosts"),
             WorkJob::CheckVms => write!(f, "CheckVms"),
             WorkJob::CheckVm { .. } => write!(f, "CheckVm"),

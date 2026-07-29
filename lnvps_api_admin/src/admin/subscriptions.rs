@@ -507,7 +507,10 @@ async fn admin_get_subscription_payment(
 /// Manually mark a subscription payment as paid (admin override).
 ///
 /// This calls `subscription_payment_paid` which sets `is_paid=true`,
-/// records `paid_at`, extends the subscription by 30 days, and activates it.
+/// records `paid_at`, extends the subscription by 30 days, and activates it,
+/// then hands the line item on-payment handling (instant app reconcile,
+/// applying an upgrade) to the worker, which owns the provisioner stack this
+/// crate has no access to.
 async fn admin_complete_subscription_payment(
     auth: AdminAuth,
     State(this): State<RouterState>,
@@ -531,6 +534,22 @@ async fn admin_complete_subscription_payment(
         id,
         payment.subscription_id
     );
+
+    // Without this the payment is paid but nothing acts on it: an app never
+    // gets its instant reconcile and an upgrade is never applied.
+    if let Err(e) = this
+        .work_commander
+        .send(WorkJob::ApplySubscriptionPayment {
+            payment_id: id.clone(),
+        })
+        .await
+    {
+        log::error!(
+            "Payment completed but failed to dispatch ApplySubscriptionPayment for payment {}: {}",
+            id,
+            e
+        );
+    }
 
     // Dispatch CheckSubscriptions so the lifecycle worker picks up the new expiry
     if let Err(e) = this.work_commander.send(WorkJob::CheckSubscriptions).await {

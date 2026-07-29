@@ -26,6 +26,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Admin-completed subscription payments now run the same on-payment handling as a Lightning settlement** (issue #320) — `POST /api/admin/v1/subscription_payments/{id}/complete` marked the payment paid but skipped the subscription's line item handlers, so a managed app never got its instant reconcile (it waited for the operator's next poll) and an Upgrade payment was marked paid without the upgrade ever being applied. The endpoint now also dispatches the handling to the worker. Response shape is unchanged.
+
 - **`GET /api/v1/payment/{id}` now works for every subscription type** — it previously resolved the payer through the VM back-reference, so a payment for a managed app, IP range or other non-VPS subscription errored instead of returning. Ownership is now asserted on the subscription and the embedded `vm_id` is `0` for non-VPS payments (the endpoint remains deprecated in favour of `GET /api/v1/subscriptions/{id}/payments/{payment_id}`).
 
 ### Deprecated

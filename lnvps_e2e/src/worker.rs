@@ -43,6 +43,21 @@ pub async fn trigger_check_subscriptions() -> anyhow::Result<()> {
     publish_job("\"CheckSubscriptions\"").await
 }
 
+/// Every job payload currently held in the worker stream.
+///
+/// Entries survive being consumed (the stream is only trimmed by length), so a
+/// test can assert an endpoint dispatched a job without racing the worker.
+pub async fn stream_jobs() -> anyhow::Result<Vec<String>> {
+    let client = redis::Client::open(redis_url())?;
+    let mut conn = client.get_multiplexed_async_connection().await?;
+    let reply: redis::streams::StreamRangeReply = conn.xrange_all("worker").await?;
+    Ok(reply
+        .ids
+        .into_iter()
+        .filter_map(|id| id.get::<String>("job"))
+        .collect())
+}
+
 /// Delete a worker rate-limit key so the next job execution is not skipped.
 ///
 /// The worker stores the last-run timestamp under keys such as
