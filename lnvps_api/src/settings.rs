@@ -382,9 +382,9 @@ pub struct ReferralConfig {
     /// sides plus the rate used. Defaults to `null`: automated conversion is
     /// off, and fiat commission accrues for manual payout as before.
     ///
-    /// On-chain referrers are excluded: their payouts batch into one
-    /// transaction whose fee is split in sats, which cannot be charged against a
-    /// fiat balance without converting each share back.
+    /// On-chain referrers settle their fiat balance inside the payout batch, at
+    /// the quote the transaction is built at. The floor applied to those rows is
+    /// the higher of this and `min_onchain_payout_sats`.
     #[serde(default)]
     pub min_fiat_payout_sats: Option<u64>,
     /// Maximum acceptable next-block fee rate (sat/vByte) for on-chain payouts.

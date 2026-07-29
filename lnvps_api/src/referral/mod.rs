@@ -482,12 +482,16 @@ impl ReferralPayoutHandler {
                     }
                 },
             };
+            // A fiat balance leaving on-chain has to clear both floors: the
+            // on-chain one is sized for mempool fees, the fiat one is what an
+            // operator set for converted payouts.
+            let min_msat = min_onchain_msat.max(self.min_fiat_payout_msat.unwrap_or(0));
             match converted_payout(
                 &referral,
                 &currency,
                 owed,
                 rate,
-                effective_min_msat(&referral, min_onchain_msat),
+                effective_min_msat(&referral, min_msat),
             ) {
                 Ok(Some(payout)) => rows.push(BatchRow {
                     referral,
@@ -587,13 +591,27 @@ impl ReferralPayoutHandler {
                         .tx
                         .send(WorkJob::SendNotification {
                             user_id: row.referral.user_id,
-                            message: format!(
-                                "You've been paid {} sats in referral commission on-chain \
-                                 ({}, minus {} sats fee).",
-                                sent_msat / 1000,
-                                outpoint,
-                                sent_fee_msat / 1000
-                            ),
+                            message: match row.rate {
+                                // Name the balance each line settles: one
+                                // transaction can pay a referrer's BTC and fiat
+                                // balances, and two bare sat figures against one
+                                // outpoint read like a double payment.
+                                Some(rate) => format!(
+                                    "You've been paid {} in referral commission on-chain \
+                                     as {} sats ({}, minus {} sats fee).",
+                                    CurrencyAmount::from_u64(rate.ticker.1, row.payout.amount),
+                                    sent_msat / 1000,
+                                    outpoint,
+                                    sent_fee_msat / 1000
+                                ),
+                                None => format!(
+                                    "You've been paid {} sats in referral commission on-chain \
+                                     ({}, minus {} sats fee).",
+                                    sent_msat / 1000,
+                                    outpoint,
+                                    sent_fee_msat / 1000
+                                ),
+                            },
                             title: Some("Referral payout".to_string()),
                         })
                         .await;
@@ -762,18 +780,7 @@ impl ReferralPayoutHandler {
         if referral.mode == ReferralPayoutMode::OnChain {
             return Ok(());
         }
-        let usage = self.db.list_referral_usage(&referral.code).await?;
-        let earned = earned_by_fiat_currency(&usage);
-        if earned.is_empty() {
-            return Ok(());
-        }
-        let payouts = self.db.list_referral_payouts(referral.id).await?;
-
-        for (currency, earned_amount) in earned {
-            let owed = earned_amount.saturating_sub(settled_in(&payouts, &currency));
-            if owed == 0 {
-                continue;
-            }
+        for (currency, owed) in self.owed_fiat(referral).await? {
             if let Err(e) = self
                 .pay_converted(referral, &currency, owed, min_fiat_msat)
                 .await
@@ -1361,18 +1368,20 @@ mod tests {
         db: Arc<dyn LNVpsDb>,
         onchain: Arc<dyn OnChainProvider>,
         exchange: Arc<dyn ExchangeRateService>,
+        tx: Arc<ChannelWorkCommander>,
+        min_fiat_sats: u64,
     ) -> ReferralPayoutHandler {
         ReferralPayoutHandler::new(
             db,
             Arc::new(crate::mocks::MockNode::default()),
-            Arc::new(ChannelWorkCommander::new()),
+            tx,
             None,
             Some(onchain),
             Some(1),
             50,
             Arc::new(crate::fee_estimate::FixedFeeEstimator(10)),
             exchange,
-            Some(1),
+            Some(min_fiat_sats),
         )
     }
 
@@ -1406,7 +1415,8 @@ mod tests {
         let exchange = eur_exchange(100_000.0).await;
         let onchain = Arc::new(MockOnChainProvider::default());
         let db: Arc<dyn LNVpsDb> = db;
-        let h = onchain_fiat_handler(db.clone(), onchain.clone(), exchange);
+        let tx = Arc::new(ChannelWorkCommander::new());
+        let h = onchain_fiat_handler(db.clone(), onchain.clone(), exchange, tx.clone(), 1);
 
         h.process_payouts().await.unwrap();
 
@@ -1448,6 +1458,18 @@ mod tests {
             "fee converted at the row's own quote, not a later one"
         );
 
+        // The notification names the balance it settles: one transaction can pay
+        // a referrer's BTC and fiat balances, and two bare sat figures against
+        // one outpoint read like a double payment.
+        let jobs = tx.recv().await.unwrap();
+        let WorkJob::SendNotification { message, .. } = &jobs[0].job else {
+            panic!("expected a notification, got {:?}", jobs[0].job);
+        };
+        assert!(
+            message.contains("EUR 10.00"),
+            "notification names the settled balance: {message}"
+        );
+
         // The balance is discharged (amount + fee), so a second pass pays nothing.
         h.process_payouts().await.unwrap();
         assert_eq!(
@@ -1459,6 +1481,48 @@ mod tests {
             onchain.sends.lock().await.len(),
             1,
             "no second transaction broadcast"
+        );
+    }
+
+    /// `min-fiat-payout-sats` floors the on-chain rows too: it is not merely an
+    /// on/off switch for a referrer paid on-chain.
+    #[tokio::test]
+    async fn onchain_fiat_respects_the_fiat_minimum() {
+        let db = Arc::new(MockDb::default());
+        let referral = fiat_referrer(
+            &db,
+            "EUR",
+            10_000,
+            Referral {
+                mode: ReferralPayoutMode::OnChain,
+                address: Some(regtest_addr(9)),
+                ..referrer(0, "FIAT")
+            },
+        )
+        .await;
+        let onchain = Arc::new(MockOnChainProvider::default());
+        let db: Arc<dyn LNVpsDb> = db;
+        // €10 is 10_000 sats at this quote, below a 20_000 sat fiat minimum.
+        let h = onchain_fiat_handler(
+            db.clone(),
+            onchain.clone(),
+            eur_exchange(100_000.0).await,
+            Arc::new(ChannelWorkCommander::new()),
+            20_000,
+        );
+
+        h.process_payouts().await.unwrap();
+
+        assert!(
+            onchain.sends.lock().await.is_empty(),
+            "a balance below the fiat minimum is not sent"
+        );
+        assert!(
+            db.list_referral_payouts(referral.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "and nothing is reserved"
         );
     }
 
@@ -1641,7 +1705,13 @@ mod tests {
         let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
         let ra = db.insert_referral(&referrer(0, "AAA")).await.unwrap();
         let onchain = Arc::new(FailingOnChain);
-        let h = onchain_fiat_handler(db.clone(), onchain.clone(), eur_exchange(100_000.0).await);
+        let h = onchain_fiat_handler(
+            db.clone(),
+            onchain.clone(),
+            eur_exchange(100_000.0).await,
+            Arc::new(ChannelWorkCommander::new()),
+            1,
+        );
 
         let referral = Referral {
             id: ra,

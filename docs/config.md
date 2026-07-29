@@ -190,10 +190,14 @@ Fiat-settled commission is paid by converting the balance to sats at the rate
 quoted when the payout is sent. The payout record keeps both sides — `amount`
 in the earned currency, `sent_amount` in BTC, plus the `rate` — so it can be
 reconciled without a price feed. Omit `min-fiat-payout-sats` and fiat
-commission accrues for manual payout exactly as before. On-chain referrers are
-not converted: their payouts batch into one transaction whose fee is split in
-sats, which cannot be charged against a fiat balance without converting each
-share back.
+commission accrues for manual payout exactly as before.
+
+On-chain referrers settle their fiat balance in the same batched transaction as
+their BTC balance: one quote per currency is taken immediately before the
+transaction is broadcast, and each row's share of the network fee is converted
+back at that same quote. The floor applied to those rows is the higher of
+`min-fiat-payout-sats` and `min-onchain-payout-sats`, because an on-chain payout
+must also clear the mempool fee it pays.
 
 ### DNS — Cloudflare (optional)
 
