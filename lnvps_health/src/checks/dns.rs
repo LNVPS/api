@@ -216,7 +216,11 @@ impl HealthCheck for DnsCheck {
 mod tests {
     use super::*;
 
+    /// Canary for public DNS being reachable, not a check of this crate: it
+    /// asserts a third party answers. Ignored by default so an offline or
+    /// firewalled run is not a red suite.
     #[tokio::test]
+    #[ignore = "queries live public DNS"]
     async fn test_dns_check_google_v4() {
         let config = DnsCheckConfig {
             name: "Google DNS Test".to_string(),
@@ -240,6 +244,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "queries live public DNS over IPv6"]
     async fn test_dns_check_google_v6() {
         let config = DnsCheckConfig {
             name: "Google DNS Test".to_string(),
@@ -280,16 +285,10 @@ mod tests {
             2,
             "Should create 2 checks for dual-stack config"
         );
-
-        for check in checks {
-            match check.check().await {
-                Ok(result) => {
-                    println!("Check result: {:?}", result);
-                }
-                Err(e) => {
-                    println!("Check failed: {}", e);
-                }
-            }
-        }
+        // One check per family, and the id says which — running them would only
+        // ask a public resolver whether it is up.
+        let ids: Vec<String> = checks.iter().map(|c| c.id()).collect();
+        assert!(ids.iter().any(|i| i.ends_with(":v4")), "{ids:?}");
+        assert!(ids.iter().any(|i| i.ends_with(":v6")), "{ids:?}");
     }
 }

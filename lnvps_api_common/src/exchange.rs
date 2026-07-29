@@ -191,6 +191,18 @@ pub fn alt_prices(rates: &Vec<TickerRate>, source: CurrencyAmount) -> Vec<Curren
 /// currency), never a hardcoded value. BTC is skipped — BTC prices come from
 /// mempool.space, not an FX feed.
 pub async fn fetch_fiat_fx_rates(base: Currency, symbols: &[Currency]) -> Result<Vec<TickerRate>> {
+    fetch_fiat_fx_rates_from(FRANKFURTER_API, base, symbols).await
+}
+
+/// Base URL of the FX feed. Split out so tests can serve the response locally
+/// instead of asserting that a third party is up and unchanged.
+const FRANKFURTER_API: &str = "https://api.frankfurter.app";
+
+async fn fetch_fiat_fx_rates_from(
+    api_url: &str,
+    base: Currency,
+    symbols: &[Currency],
+) -> Result<Vec<TickerRate>> {
     let symbol_list = symbols
         .iter()
         .filter(|c| **c != base && **c != Currency::BTC)
@@ -200,7 +212,10 @@ pub async fn fetch_fiat_fx_rates(base: Currency, symbols: &[Currency]) -> Result
     if base == Currency::BTC || symbol_list.is_empty() {
         return Ok(vec![]);
     }
-    let url = format!("https://api.frankfurter.app/latest?base={base}&symbols={symbol_list}");
+    let url = format!(
+        "{}/latest?base={base}&symbols={symbol_list}",
+        api_url.trim_end_matches('/')
+    );
     let rsp = reqwest::get(&url).await?.text().await?;
     let parsed: FrankfurterRates = serde_json::from_str(&rsp)?;
     let mut ret = Vec::new();
@@ -561,9 +576,65 @@ mod tests {
         assert!(fetch_fx_for_currencies(&[Currency::EUR]).await.is_empty());
     }
 
+    /// The requested base must reach the feed as `base=`, and the parsed rate
+    /// must come back keyed `Ticker(base, symbol)` — swapping those silently
+    /// inverts every conversion built on the result.
     #[tokio::test]
     async fn fx_fetch_real_pair_uses_requested_base() -> Result<()> {
-        // Hits frankfurter.app (ECB). base=EUR must yield a Ticker(EUR, USD).
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/latest"))
+            .and(query_param("base", "EUR"))
+            .and(query_param("symbols", "USD"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"amount":1.0,"base":"EUR","date":"2026-07-27","rates":{"USD":1.0842}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let rates =
+            fetch_fiat_fx_rates_from(&server.uri(), Currency::EUR, &[Currency::USD]).await?;
+        assert_eq!(rates.len(), 1);
+        assert_eq!(rates[0].ticker, Ticker(Currency::EUR, Currency::USD));
+        assert_eq!(rates[0].rate, 1.0842);
+        Ok(())
+    }
+
+    /// A symbol the feed does not answer for is dropped, not defaulted to zero:
+    /// a zero rate would price everything at nothing.
+    #[tokio::test]
+    async fn fx_fetch_skips_a_symbol_the_feed_omits() -> Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"amount":1.0,"base":"EUR","date":"2026-07-27","rates":{"USD":1.0842}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let rates = fetch_fiat_fx_rates_from(
+            &server.uri(),
+            Currency::EUR,
+            &[Currency::USD, Currency::AUD],
+        )
+        .await?;
+        assert_eq!(rates.len(), 1);
+        assert_eq!(rates[0].ticker, Ticker(Currency::EUR, Currency::USD));
+        Ok(())
+    }
+
+    /// Canary for the live feed's shape. Ignored by default: a third party being
+    /// down is not this repository failing.
+    #[tokio::test]
+    #[ignore = "hits the live FX feed"]
+    async fn fx_live_feed_still_answers() -> Result<()> {
         let rates = fetch_fiat_fx_rates(Currency::EUR, &[Currency::USD]).await?;
         assert_eq!(rates.len(), 1);
         assert_eq!(rates[0].ticker, Ticker(Currency::EUR, Currency::USD));
@@ -621,10 +692,7 @@ mod tests {
         assert_eq!(currencies, vec![Currency::BTC, Currency::USD]);
 
         // USD came from the direct FX rate (1.20), not the BTC round-trip (~1.10).
-        let usd = out
-            .iter()
-            .find(|c| c.currency() == Currency::USD)
-            .unwrap();
+        let usd = out.iter().find(|c| c.currency() == Currency::USD).unwrap();
         assert_eq!(*usd, CurrencyAmount::from_u64(Currency::USD, 120));
     }
 }

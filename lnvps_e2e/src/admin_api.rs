@@ -1476,7 +1476,12 @@ mod tests {
             StatusCode::BAD_REQUEST,
             "category cannot be nulled"
         );
-        assert!(resp.text().await.unwrap().contains("category cannot be null"));
+        assert!(
+            resp.text()
+                .await
+                .unwrap()
+                .contains("category cannot be null")
+        );
 
         // Blanking it via patch is refused, and leaves the stored value alone.
         let resp = client
@@ -1599,7 +1604,14 @@ mod tests {
         assert_ne!(resp.status(), StatusCode::OK, "duplicate slug refused");
 
         // Slug must be URL-safe: it is a path segment and a query value.
-        for bad in ["Alpha", "with space", "under_score", "-lead", "trail-", "  "] {
+        for bad in [
+            "Alpha",
+            "with space",
+            "under_score",
+            "-lead",
+            "trail-",
+            "  ",
+        ] {
             let resp = client
                 .post_auth(
                     "/api/admin/v1/app-tags",
@@ -1733,7 +1745,11 @@ mod tests {
             .await
             .unwrap();
         let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
-        assert_eq!(slugs(&body["data"]), vec![tag_b.clone()], "omitted = unchanged");
+        assert_eq!(
+            slugs(&body["data"]),
+            vec![tag_b.clone()],
+            "omitted = unchanged"
+        );
 
         // An unknown slug on PATCH leaves the existing set untouched rather
         // than half-applying.
@@ -3300,7 +3316,9 @@ mod tests {
                 .any(|r| r["currency"] == "EUR" && r["sent_currency"] == "BTC")
         );
 
-        crate::db::hard_delete_referral(&pool, referral).await.unwrap();
+        crate::db::hard_delete_referral(&pool, referral)
+            .await
+            .unwrap();
     }
 
     /// Payout creation is gated on `referral::create`, not merely on being
@@ -3329,7 +3347,9 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
-        crate::db::hard_delete_referral(&pool, referral).await.unwrap();
+        crate::db::hard_delete_referral(&pool, referral)
+            .await
+            .unwrap();
     }
 
     // ========================================================================

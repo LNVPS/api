@@ -489,27 +489,144 @@ mod tests {
         assert_eq!(cleaned, "NL123456789B01");
     }
 
+    /// Serve one canned body for a method+path, so a test asserts on this
+    /// crate's parsing rather than on a third party being up and unchanged.
+    async fn mock_json(server: &wiremock::MockServer, method_name: &str, route: &str, body: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method(method_name))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body.to_string()))
+            .mount(server)
+            .await;
+    }
+
+    const RATES_BODY: &str = r#"{"rates":{
+        "DE":{"country":"Germany","standard_rate":19.0},
+        "IE":{"country":"Ireland","standard_rate":23.0},
+        "EL":{"country":"Greece","standard_rate":24.0},
+        "XX":{"country":"Nowhere","standard_rate":5.0}
+    }}"#;
+
     #[tokio::test]
     async fn test_fetch_vat_rates() {
-        let client = VatClient::new();
-        let rates = client.fetch_rates().await.unwrap();
+        let server = wiremock::MockServer::start().await;
+        mock_json(&server, "GET", "/rates.json", RATES_BODY).await;
+        let client = VatClient::with_urls(format!("{}/rates.json", server.uri()), "unused");
 
-        // Should have rates for EU member states
-        assert!(!rates.is_empty(), "Should fetch at least some VAT rates");
+        let rates = client.fetch_rates().await.unwrap();
+        let de = rates
+            .iter()
+            .find(|r| r.country_code_str() == "DE")
+            .expect("DE rate");
+        assert_eq!(de.rate, 19.0);
+
+        // Greece is published under the VAT code EL, not the ISO GR, and must
+        // survive the mapping into the keyed table; a code with no country is
+        // dropped rather than failing the whole fetch.
+        let map = client.fetch_rates_map().await.unwrap();
+        assert_eq!(map.get(&CountryCode::GRC), Some(&24.0));
+        assert_eq!(map.get(&CountryCode::DEU), Some(&19.0));
+        assert_eq!(map.len(), 3);
     }
 
     #[tokio::test]
     async fn test_validate_vat_number() {
-        let client = VatClient::new();
+        let server = wiremock::MockServer::start().await;
+        mock_json(
+            &server,
+            "POST",
+            "/check-vat-number",
+            r#"{"valid":false,"countryCode":"DE","vatNumber":"123456789","name":"---","address":"---"}"#,
+        )
+        .await;
+        let client = VatClient::with_urls("unused", format!("{}/check-vat-number", server.uri()));
 
-        // Test with an invalid VAT number - should return valid=false
         let result = client
             .validate_vat_number("DE123456789", None)
             .await
             .unwrap();
-        assert!(!result.valid, "Random VAT number should be invalid");
+        assert!(!result.valid);
         assert_eq!(result.country_code, "DE");
         assert_eq!(result.vat_number, "123456789");
+        // VIES fills the blanks with `---`; that is not a company name.
+        assert_eq!(result.name, None);
+        assert_eq!(result.address, None);
+    }
+
+    /// A valid number carries the registered details and the trader match
+    /// indicators through unchanged.
+    #[tokio::test]
+    async fn test_validate_vat_number_valid_with_trader_matches() {
+        let server = wiremock::MockServer::start().await;
+        mock_json(
+            &server,
+            "POST",
+            "/check-vat-number",
+            r#"{"valid":true,"name":"Example GmbH","address":"Musterstr. 1",
+                "requestIdentifier":"WAPIAAAAX","traderNameMatch":"VALID",
+                "traderStreetMatch":"INVALID","traderCityMatch":"NOT_PROCESSED"}"#,
+        )
+        .await;
+        let client = VatClient::with_urls("unused", format!("{}/check-vat-number", server.uri()));
+
+        let trader = TraderDetails {
+            name: Some("Example GmbH".to_string()),
+            street: Some("Elsewhere 2".to_string()),
+            ..Default::default()
+        };
+        let result = client
+            .validate_vat_number_with_trader("DE123456789", None, Some(&trader))
+            .await
+            .unwrap();
+        assert!(result.valid);
+        assert_eq!(result.name.as_deref(), Some("Example GmbH"));
+        assert_eq!(result.request_identifier.as_deref(), Some("WAPIAAAAX"));
+        assert_eq!(result.name_match, Some(TraderMatch::Valid));
+        assert_eq!(result.street_match, Some(TraderMatch::Invalid));
+        assert_eq!(result.city_match, Some(TraderMatch::NotProcessed));
+        assert_eq!(result.postal_code_match, None);
+    }
+
+    /// VIES reports its own input errors in the body with HTTP 200; that must
+    /// surface as an error, not as "this number is invalid".
+    #[tokio::test]
+    async fn test_validate_vat_number_user_error_is_an_error() {
+        let server = wiremock::MockServer::start().await;
+        mock_json(
+            &server,
+            "POST",
+            "/check-vat-number",
+            r#"{"valid":false,"userError":"INVALID_INPUT"}"#,
+        )
+        .await;
+        let client = VatClient::with_urls("unused", format!("{}/check-vat-number", server.uri()));
+
+        let err = client
+            .validate_vat_number("DE123456789", None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("INVALID_INPUT"), "{err}");
+    }
+
+    /// Canaries for the live services' shapes. Ignored by default: a third party
+    /// being down is not this repository failing.
+    #[tokio::test]
+    #[ignore = "hits the live VAT rates feed"]
+    async fn live_vat_rates_feed_still_answers() {
+        let rates = VatClient::new().fetch_rates().await.unwrap();
+        assert!(!rates.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "hits the live VIES service"]
+    async fn live_vies_still_answers() {
+        let result = VatClient::new()
+            .validate_vat_number("DE123456789", None)
+            .await
+            .unwrap();
+        assert_eq!(result.country_code, "DE");
     }
 
     /// Regression: a VAT number starting with a multi-byte character (byte

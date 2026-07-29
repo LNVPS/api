@@ -396,7 +396,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert!(resp.text().await.unwrap().contains("Insufficient permissions"));
+        assert!(
+            resp.text()
+                .await
+                .unwrap()
+                .contains("Insufficient permissions")
+        );
 
         // Same for patching an existing app's category — 403 before the lookup,
         // so a non-existent id is still 403 and not 404.
@@ -419,7 +424,10 @@ mod tests {
         // super_admin does carry them, so the same create succeeds there —
         // this is a permission boundary, not a broken route.
         let admin = admin_client_with_keys(super_admin_keys().clone());
-        let resp = admin.post_auth("/api/admin/v1/apps", &create).await.unwrap();
+        let resp = admin
+            .post_auth("/api/admin/v1/apps", &create)
+            .await
+            .unwrap();
         assert!(
             resp.status() == StatusCode::OK || resp.status() == StatusCode::BAD_REQUEST,
             "super_admin reaches validation, not the permission gate: {}",
@@ -458,7 +466,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        assert!(resp.text().await.unwrap().contains("Insufficient permissions"));
+        assert!(
+            resp.text()
+                .await
+                .unwrap()
+                .contains("Insufficient permissions")
+        );
 
         // Patch and delete are checked before the lookup, so a non-existent id
         // is still 403 and not 404 — the permission gate must not double as an
