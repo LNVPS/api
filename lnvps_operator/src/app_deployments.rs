@@ -10,7 +10,7 @@
 //! The object **builders** are pure functions (unit-tested without a cluster);
 //! [`reconcile_app_deployments`] resolves config/secrets and applies them.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Debug;
 use std::net::IpAddr;
 use std::sync::OnceLock;
@@ -1379,11 +1379,11 @@ pub fn is_transitioning(status: AppDeploymentStatus) -> bool {
 /// Reconcile every app deployment assigned to this operator's cluster into
 /// Kubernetes. No-op when the operator isn't configured with an `app_cluster_id`.
 ///
-/// Returns true when at least one deployment came back mid-transition, so the
-/// caller can come round again sooner than the steady-state interval.
-pub async fn reconcile_app_deployments(ctx: &Context) -> Result<bool> {
+/// Returns the deployments that came back mid-transition, so the caller can
+/// come round again sooner than the steady-state interval while they last.
+pub async fn reconcile_app_deployments(ctx: &Context) -> Result<BTreeSet<u64>> {
     let Some(cluster_id) = ctx.settings.app_cluster_id else {
-        return Ok(false);
+        return Ok(BTreeSet::new());
     };
     let cluster = ctx.db.get_app_cluster(cluster_id).await?;
     let deployments: Vec<AppDeployment> = ctx
@@ -1395,11 +1395,15 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<bool> {
         .collect();
 
     let mut active: HashSet<u64> = HashSet::new();
-    let mut transitioning = false;
+    let mut transitioning: BTreeSet<u64> = BTreeSet::new();
     for d in &deployments {
         active.insert(d.id);
         match reconcile_one(ctx, d, &cluster.ingress_domain).await {
-            Ok(status) => transitioning |= is_transitioning(status),
+            Ok(status) => {
+                if is_transitioning(status) {
+                    transitioning.insert(d.id);
+                }
+            }
             Err(e) => {
                 error!("app deployment {} reconcile failed: {}", d.id, e);
                 let mut errd = d.clone();

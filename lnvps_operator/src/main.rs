@@ -6,10 +6,10 @@ use lnvps_api_common::{RedisWorkCommander, WorkCommander, WorkJob, app_cluster_s
 use lnvps_db::{LNVpsDb, LNVpsDbMysql};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::signal;
 use tokio::sync::Notify;
@@ -250,10 +250,10 @@ async fn main() -> Result<()> {
     }
     // Shared with the trigger listener so a payment-triggered sweep that leaves
     // a deployment provisioning also puts the timer on the fast cadence.
-    let transitioning = Arc::new(AtomicBool::new(false));
+    let transitioning: Arc<Mutex<BTreeSet<u64>>> = Arc::new(Mutex::new(BTreeSet::new()));
     let wake = Arc::new(Notify::new());
     match app_deployments::reconcile_app_deployments(&context).await {
-        Ok(t) => transitioning.store(t, Ordering::Relaxed),
+        Ok(t) => *transitioning.lock().unwrap() = t,
         Err(e) => error!("Failed to reconcile app deployments: {}", e),
     }
 
@@ -291,34 +291,32 @@ async fn main() -> Result<()> {
     let app_wake = wake.clone();
     let reconciliation_task = async move {
         let mut fast_sweeps = 0;
+        let mut watched: BTreeSet<u64> = BTreeSet::new();
         loop {
-            let fast = app_transitioning.load(Ordering::Relaxed) && fast_sweeps < max_fast_sweeps;
+            let current = app_transitioning.lock().unwrap().clone();
+            // A deployment we were not already watching is fresh work and gets
+            // its own fast window; a deployment wedged mid-transition burns its
+            // budget once and cannot spend the next one's.
+            if current.iter().any(|id| !watched.contains(id)) {
+                fast_sweeps = 0;
+            }
+            watched = current;
+            let fast = !watched.is_empty() && fast_sweeps < max_fast_sweeps;
             tokio::select! {
                 _ = tokio::time::sleep(if fast { transition_interval } else { reconcile_interval }) => {}
-                // A trigger is a fresh reason to watch closely: start the wait
-                // again, and give it a full fast window.
-                _ = app_wake.notified() => {
-                    fast_sweeps = 0;
-                    continue;
-                }
+                // Someone else swept: re-read what is transitioning now rather
+                // than waiting out a delay chosen before that was known.
+                _ = app_wake.notified() => continue,
             }
             if fast {
                 fast_sweeps += 1;
             }
             match app_deployments::reconcile_app_deployments(&app_context).await {
-                Ok(t) => {
-                    // Only a settled cluster re-arms the fast window, so a
-                    // deployment stuck mid-transition cannot hold the cadence.
-                    if !t {
-                        fast_sweeps = 0;
-                    }
-                    app_transitioning.store(t, Ordering::Relaxed);
-                }
+                Ok(t) => *app_transitioning.lock().unwrap() = t,
                 Err(e) => {
                     error!("Failed to reconcile app deployments: {}", e);
                     // An unknown outcome is not a reason to poll fast forever.
-                    app_transitioning.store(false, Ordering::Relaxed);
-                    fast_sweeps = 0;
+                    app_transitioning.lock().unwrap().clear();
                 }
             }
         }
@@ -362,7 +360,11 @@ async fn main() -> Result<()> {
 /// re-reads the deployment's current row rather than trusting the message, and
 /// a stale or duplicated trigger therefore costs a sweep rather than producing
 /// a different outcome from the periodic one.
-async fn trigger_listener(ctx: Arc<Context>, transitioning: Arc<AtomicBool>, wake: Arc<Notify>) {
+async fn trigger_listener(
+    ctx: Arc<Context>,
+    transitioning: Arc<Mutex<BTreeSet<u64>>>,
+    wake: Arc<Notify>,
+) {
     let (Some(redis_url), Some(cluster_id)) =
         (ctx.settings.redis.clone(), ctx.settings.app_cluster_id)
     else {
@@ -422,7 +424,7 @@ async fn trigger_listener(ctx: Arc<Context>, transitioning: Arc<AtomicBool>, wak
             info!("Reconcile trigger for app deployment(s) {triggers:?}");
             match app_deployments::reconcile_app_deployments(&ctx).await {
                 Ok(t) => {
-                    transitioning.store(t, Ordering::Relaxed);
+                    *transitioning.lock().unwrap() = t;
                     wake.notify_one();
                 }
                 Err(e) => error!("Triggered reconcile failed: {e}"),
