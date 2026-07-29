@@ -182,8 +182,18 @@ whatsapp:
 # commission still accrues for manual admin payout, but nothing is paid out
 # automatically.
 referral:
-  min-payout-sats: 1000        # minimum accrued commission before an auto-payout
+  min-payout-sats: 1000        # minimum accrued BTC commission before an auto-payout
+  min-fiat-payout-sats: 1000   # same for fiat-settled commission, valued at the quote; omit to disable
 ```
+
+Fiat-settled commission is paid by converting the balance to sats at the rate
+quoted when the payout is sent. The payout record keeps both sides — `amount`
+in the earned currency, `sent_amount` in BTC, plus the `rate` — so it can be
+reconciled without a price feed. Omit `min-fiat-payout-sats` and fiat
+commission accrues for manual payout exactly as before. On-chain referrers are
+not converted: their payouts batch into one transaction whose fee is split in
+sats, which cannot be charged against a fiat balance without converting each
+share back.
 
 ### DNS — Cloudflare (optional)
 

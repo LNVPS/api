@@ -735,6 +735,7 @@ mod tests {
     fn test_validate_payout_threshold() {
         use crate::settings::{FeeEstimatorConfig, ReferralConfig};
         let cfg = ReferralConfig {
+            min_fiat_payout_sats: None,
             min_payout_sats: 1_000,
             min_onchain_payout_sats: Some(5_000),
             max_onchain_fee_per_vbyte: 50,

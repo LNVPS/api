@@ -1227,6 +1227,8 @@ interface ReferralSignupRequest {
 
 > **On-chain payouts** are paid by an automated worker that **batches every eligible on-chain referrer into a single send-many transaction**, gated by a minimum threshold (`min-onchain-payout-sats`, default 1000 sats). The **network fee is charged to you**: the transaction fee is split across the batch in proportion to each payout and debited from your balance (along with the amount), so `ReferralPayout.fee` records your share and the running balance may go negative — recovered from future referrals. Before broadcasting, the current next-block fee rate is fetched from mempool.space and the batch is **deferred if it exceeds the operator's cap** (`max-onchain-fee-per-vbyte`, default 50), so payouts wait for cheaper fees. Balances below the threshold accrue until a later run. You can also raise your own **`payout_threshold`** (satoshis) to batch up to a larger amount and avoid many tiny payouts — the effective threshold is `max(system minimum, your payout_threshold)`. Commission always accrues and can also be paid manually by admins.
 
+> **Fiat-earned commission** (a referral whose first payment settled in EUR/USD/…) accrues in that currency. When the operator enables it, it is paid automatically by converting the balance to sats at the rate quoted at send time and paying it over Lightning; the payout record then shows `amount`/`currency` as the fiat discharged, `sent_amount`/`sent_currency` as the sats that left, and the `rate` used. Only the value of the whole sats actually sent is discharged, so a sub-sat remainder stays owed. On-chain referrers are not converted automatically and keep accruing for manual payout.
+
 #### Get Referral State
 - **GET** `/api/v1/referral`
 - **Auth**: Required

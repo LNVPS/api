@@ -5,19 +5,21 @@
 //! commission into outgoing Lightning payments, independently of the
 //! subscription/billing machinery.
 //!
-//! Non-BTC (fiat) commission is never auto-paid here — Lightning settles in
-//! sats — and is left to accrue for manual admin payout. Automated payouts are
-//! opt-in: when no minimum threshold is configured they are disabled entirely.
+//! Fiat-settled commission can also be paid automatically: the balance is
+//! quoted against BTC at send time and transferred as sats, recorded with both
+//! sides and the rate used. Automated payouts are opt-in — each kind is
+//! disabled entirely when its minimum threshold is not configured.
 
 use crate::fee_estimate::FeeEstimator;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use lnvps_api_common::{WorkCommander, WorkJob};
+use lnvps_api_common::{ExchangeRateService, Ticker, TickerRate, WorkCommander, WorkJob};
 use lnvps_db::{LNVpsDb, Referral, ReferralPayout, ReferralPayoutMode};
 use log::{debug, info, warn};
-use payments_rs::currency::CurrencyAmount;
+use payments_rs::currency::{Currency, CurrencyAmount};
 use payments_rs::lightning::{LightningNode, PayInvoiceRequest};
 use payments_rs::onchain::{OnChainProvider, SendCoinsRequest, SendOutput};
+use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -46,6 +48,50 @@ fn payable_referral_msat(earned_msat: u64, existing_msat: u64, min_msat: u64) ->
     if pay_msat == 0 { None } else { Some(pay_msat) }
 }
 
+/// Build the payout row for a fiat-settled balance paid as sats, or `None` when
+/// the converted balance is below the threshold.
+///
+/// The row is reserved unpaid: `amount`/`currency` are what it discharges,
+/// `sent_amount` is what leaves the wallet, and `rate` is the quote both were
+/// taken at. The settled amount is derived **back** from the rounded-to-sats
+/// transfer, so the sub-sat remainder Lightning cannot send stays owed instead
+/// of being written off.
+fn converted_payout(
+    referral: &Referral,
+    currency: &str,
+    owed: u64,
+    rate: TickerRate,
+    min_msat: u64,
+) -> Result<Option<ReferralPayout>> {
+    let settled_currency = Currency::from_str(currency)
+        .map_err(|_| anyhow!("unsupported payout currency {}", currency))?;
+    let quoted = rate.convert(CurrencyAmount::from_u64(settled_currency, owed))?;
+    let Some(pay_msat) = payable_referral_msat(quoted.value(), 0, min_msat) else {
+        return Ok(None);
+    };
+    let settled_amount = rate.convert(CurrencyAmount::millisats(pay_msat))?.value();
+    if settled_amount == 0 {
+        return Ok(None);
+    }
+    Ok(Some(ReferralPayout {
+        id: 0,
+        referral_id: referral.id,
+        amount: settled_amount,
+        fee: 0,
+        currency: currency.to_uppercase(),
+        sent_amount: pay_msat,
+        sent_fee: 0,
+        sent_currency: Currency::BTC.to_string(),
+        rate: rate.rate,
+        rate_collected: Some(Utc::now()),
+        created: Utc::now(),
+        is_paid: false,
+        mode: referral.mode,
+        output: None,
+        pre_image: None,
+    }))
+}
+
 /// Millisats already reserved or paid against a referrer's BTC balance.
 ///
 /// A payout nets in the currency it settles, not the currency it sent: a EUR
@@ -53,11 +99,31 @@ fn payable_referral_msat(earned_msat: u64, existing_msat: u64, min_msat: u64) ->
 /// or the referrer is charged twice for one transfer. The referrer bears the
 /// fee, so it is debited alongside the amount.
 fn settled_btc_msat(payouts: &[ReferralPayout]) -> u64 {
+    settled_in(payouts, "BTC")
+}
+
+/// Amount already reserved or paid against a referrer's balance in `currency`,
+/// in that currency's smallest unit. See [`settled_btc_msat`] for why netting
+/// follows the settled currency rather than the sent one.
+fn settled_in(payouts: &[ReferralPayout], currency: &str) -> u64 {
     payouts
         .iter()
-        .filter(|p| p.currency.eq_ignore_ascii_case("BTC"))
+        .filter(|p| p.currency.eq_ignore_ascii_case(currency))
         .map(|p| p.amount.saturating_add(p.fee))
         .sum()
+}
+
+/// Commission earned per settled currency, excluding BTC (which the BTC passes
+/// own). Keys are upper-cased so `eur` and `EUR` are one balance.
+fn earned_by_fiat_currency(usage: &[lnvps_db::ReferralCostUsage]) -> BTreeMap<String, u64> {
+    let mut earned: BTreeMap<String, u64> = BTreeMap::new();
+    for u in usage
+        .iter()
+        .filter(|u| !u.currency.eq_ignore_ascii_case("BTC"))
+    {
+        *earned.entry(u.currency.to_uppercase()).or_default() += u.commission();
+    }
+    earned
 }
 
 /// Split `total_fee` across payouts in proportion to their `amounts`, returning
@@ -126,6 +192,13 @@ pub struct ReferralPayoutHandler {
     max_onchain_fee_per_vbyte: u64,
     /// Source of the current on-chain fee-rate estimate (mockable).
     fee_estimator: Arc<dyn FeeEstimator>,
+    /// Rate source used to quote a fiat-settled balance against BTC at send
+    /// time.
+    exchange: Arc<dyn ExchangeRateService>,
+    /// Minimum fiat-settled commission, valued in millisats at the quote, before
+    /// an automated converted payout is attempted. `None` disables automated
+    /// fiat payouts; the balance still accrues for manual payout.
+    min_fiat_payout_msat: Option<u64>,
 }
 
 impl ReferralPayoutHandler {
@@ -143,6 +216,8 @@ impl ReferralPayoutHandler {
         min_onchain_payout_sats: Option<u64>,
         max_onchain_fee_per_vbyte: u64,
         fee_estimator: Arc<dyn FeeEstimator>,
+        exchange: Arc<dyn ExchangeRateService>,
+        min_fiat_payout_sats: Option<u64>,
     ) -> Self {
         Self {
             db,
@@ -153,6 +228,8 @@ impl ReferralPayoutHandler {
             min_onchain_payout_msat: min_onchain_payout_sats.map(|s| s.saturating_mul(1000)),
             max_onchain_fee_per_vbyte,
             fee_estimator,
+            exchange,
+            min_fiat_payout_msat: min_fiat_payout_sats.map(|s| s.saturating_mul(1000)),
         }
     }
 
@@ -180,6 +257,18 @@ impl ReferralPayoutHandler {
                 }
                 if let Err(e) = self.process_one(referral, min_msat).await {
                     warn!("Referral payout failed for code {}: {}", referral.code, e);
+                }
+            }
+        }
+
+        // Fiat-settled balances, converted at the current rate and sent as sats.
+        if let Some(min_fiat_msat) = self.min_fiat_payout_msat {
+            for referral in &referrals {
+                if let Err(e) = self.process_fiat(referral, min_fiat_msat).await {
+                    warn!(
+                        "Converted referral payout failed for code {}: {}",
+                        referral.code, e
+                    );
                 }
             }
         }
@@ -530,6 +619,127 @@ impl ReferralPayoutHandler {
         }
     }
 
+    /// Pay a referrer's fiat-settled commission by converting it to sats at the
+    /// current rate.
+    ///
+    /// The balance nets in the currency it was earned in, so the payout row
+    /// settles that currency (`amount`) while recording what actually left the
+    /// wallet (`sent_amount`, always BTC) and the rate the two were quoted at.
+    /// Reconciling later must not depend on a price feed still being reachable.
+    ///
+    /// Lightning and NWC referrers only: an on-chain payout batches referrers
+    /// into one transaction and splits its fee across them in sats, which has no
+    /// meaning to charge against a fiat balance without converting each share
+    /// back. On-chain referrers keep accruing fiat for manual payout.
+    async fn process_fiat(&self, referral: &Referral, min_fiat_msat: u64) -> Result<()> {
+        if referral.mode == ReferralPayoutMode::OnChain {
+            return Ok(());
+        }
+        let usage = self.db.list_referral_usage(&referral.code).await?;
+        let earned = earned_by_fiat_currency(&usage);
+        if earned.is_empty() {
+            return Ok(());
+        }
+        let payouts = self.db.list_referral_payouts(referral.id).await?;
+
+        for (currency, earned_amount) in earned {
+            let owed = earned_amount.saturating_sub(settled_in(&payouts, &currency));
+            if owed == 0 {
+                continue;
+            }
+            if let Err(e) = self
+                .pay_converted(referral, &currency, owed, min_fiat_msat)
+                .await
+            {
+                warn!(
+                    "Converted {} payout failed for code {}: {}",
+                    currency, referral.code, e
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Quote `owed` in `currency` against BTC and, if the result clears the
+    /// threshold, pay it as sats and record both sides.
+    async fn pay_converted(
+        &self,
+        referral: &Referral,
+        currency: &str,
+        owed: u64,
+        min_fiat_msat: u64,
+    ) -> Result<()> {
+        let ticker = Ticker::btc_rate(currency)?;
+        let rate_value = self
+            .exchange
+            .get_rate(ticker)
+            .await
+            .ok_or_else(|| anyhow!("no {} rate available", ticker))?;
+        if !(rate_value.is_finite() && rate_value > 0.0) {
+            bail!("unusable {} rate {}", ticker, rate_value);
+        }
+        let rate = TickerRate {
+            ticker,
+            rate: rate_value,
+        };
+
+        let Some(mut payout) = converted_payout(
+            referral,
+            currency,
+            owed,
+            rate,
+            effective_min_msat(referral, min_fiat_msat),
+        )?
+        else {
+            return Ok(());
+        };
+        let pay_msat = payout.sent_amount;
+        let settled_amount = payout.amount;
+
+        let payout_id = self.db.insert_referral_payout(&payout).await?;
+        payout.id = payout_id;
+
+        match self.pay_commission(referral, pay_msat).await {
+            Ok((bolt11, pre_image, fee_msat)) => {
+                payout.is_paid = true;
+                payout.output = Some(bolt11);
+                payout.pre_image = pre_image;
+                // The fee is incurred in sats; it is charged to the referrer
+                // against a fiat balance, so it is carried over at the same
+                // quote rather than at whatever the rate is when it is read.
+                payout.sent_fee = fee_msat;
+                payout.fee = rate.convert(CurrencyAmount::millisats(fee_msat))?.value();
+                self.db.update_referral_payout(&payout).await?;
+                info!(
+                    "Paid referral commission {} {} as {} msat (fee {} msat) to code {} (payout {})",
+                    settled_amount, currency, pay_msat, fee_msat, referral.code, payout_id
+                );
+                let _ = self
+                    .tx
+                    .send(WorkJob::SendNotification {
+                        user_id: referral.user_id,
+                        message: format!(
+                            "You've been paid {} sats in referral commission (minus {} sats fee).",
+                            pay_msat / 1000,
+                            fee_msat / 1000
+                        ),
+                        title: Some("Referral payout".to_string()),
+                    })
+                    .await;
+                Ok(())
+            }
+            Err(e) => {
+                if let Err(del) = self.db.delete_referral_payout(payout_id).await {
+                    warn!(
+                        "Failed to release reserved payout {} after payment error: {}",
+                        payout_id, del
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// Resolve a BOLT11 invoice for `amount_msat` from the referrer's chosen
     /// payout method and pay it from our node. Returns `(bolt11, preimage,
     /// routing_fee_msat)`.
@@ -680,6 +890,8 @@ mod tests {
             Some(1000),
             50,
             Arc::new(crate::fee_estimate::FixedFeeEstimator(feerate)),
+            Arc::new(lnvps_api_common::MockExchangeRate::default()),
+            None,
         )
     }
 
@@ -744,6 +956,137 @@ mod tests {
             2_501_000,
             "amount + fee of the BTC-settled rows only"
         );
+    }
+
+    fn eur_rate(rate: f32) -> TickerRate {
+        TickerRate {
+            ticker: Ticker::btc_rate("EUR").unwrap(),
+            rate,
+        }
+    }
+
+    /// A converted payout settles the currency it was earned in and sends BTC,
+    /// carrying the quote both sides were taken at. The settled amount comes
+    /// back from the rounded-to-sats transfer, so the sub-sat remainder stays
+    /// owed rather than being discharged for free.
+    #[test]
+    fn converted_payout_records_both_sides_at_one_quote() {
+        // €12.34 owed at 100,000 EUR/BTC = 12_340_000 msat exactly.
+        let p = converted_payout(
+            &referrer(1, "AAA"),
+            "eur",
+            1_234,
+            eur_rate(100_000.0),
+            1_000,
+        )
+        .unwrap()
+        .expect("above threshold");
+        assert_eq!(
+            p.currency, "EUR",
+            "settles the earned currency, upper-cased"
+        );
+        assert_eq!(p.amount, 1_234);
+        assert_eq!(p.sent_currency, "BTC");
+        assert_eq!(p.sent_amount, 12_340_000);
+        assert_eq!(p.rate, 100_000.0);
+        assert!(p.rate_collected.is_some(), "a quote happened");
+        assert!(!p.is_paid, "reserved, not paid");
+        assert_eq!((p.fee, p.sent_fee), (0, 0), "fee is known only once paid");
+
+        // A balance whose value does not land on a whole sat discharges only
+        // what the rounded transfer is worth.
+        let p = converted_payout(&referrer(1, "AAA"), "EUR", 1_001, eur_rate(90_000.0), 1_000)
+            .unwrap()
+            .expect("above threshold");
+        assert_eq!(p.sent_amount % 1_000, 0, "whole sats only");
+        assert!(
+            p.amount <= 1_001,
+            "settled {} must not exceed the owed 1001",
+            p.amount
+        );
+    }
+
+    /// The threshold is judged on the converted value, and a referrer's own
+    /// higher threshold still applies.
+    #[test]
+    fn converted_payout_respects_the_threshold() {
+        // €0.10 at 100,000 EUR/BTC = 100_000 msat, below a 1_000_000 msat floor.
+        assert!(
+            converted_payout(
+                &referrer(1, "AAA"),
+                "EUR",
+                10,
+                eur_rate(100_000.0),
+                1_000_000
+            )
+            .unwrap()
+            .is_none()
+        );
+        // The same balance clears a floor it is above.
+        assert!(
+            converted_payout(&referrer(1, "AAA"), "EUR", 10, eur_rate(100_000.0), 1_000)
+                .unwrap()
+                .is_some()
+        );
+        // A currency with no scale on either side is refused rather than paid
+        // at a guessed rate.
+        assert!(
+            converted_payout(
+                &referrer(1, "AAA"),
+                "XYZ",
+                1_000,
+                eur_rate(100_000.0),
+                1_000
+            )
+            .is_err()
+        );
+    }
+
+    /// Commission is grouped per settled currency, case-insensitively, and BTC
+    /// is left to the BTC passes.
+    #[test]
+    fn fiat_balances_group_per_currency() {
+        let usage = |currency: &str, amount: u64| lnvps_db::ReferralCostUsage {
+            vm_id: 1,
+            ref_code: "AAA".to_string(),
+            created: Utc::now(),
+            amount,
+            currency: currency.to_string(),
+            rate: 1.0,
+            base_currency: "EUR".to_string(),
+            effective_rate: 10.0,
+        };
+        let earned = earned_by_fiat_currency(&[
+            usage("EUR", 1_000),
+            usage("eur", 500),
+            usage("USD", 2_000),
+            usage("BTC", 1_000_000),
+        ]);
+        assert_eq!(earned.get("EUR"), Some(&150), "10% of 1500, one balance");
+        assert_eq!(earned.get("USD"), Some(&200));
+        assert!(!earned.contains_key("BTC"), "BTC is not a fiat balance");
+    }
+
+    /// Netting per currency: a EUR payout discharges EUR only, and the fee is
+    /// debited with it.
+    #[test]
+    fn settled_in_nets_per_currency() {
+        let eur = ReferralPayout {
+            amount: 1_000,
+            fee: 7,
+            currency: "EUR".to_string(),
+            sent_amount: 12_000_000,
+            sent_currency: "BTC".to_string(),
+            ..Default::default()
+        };
+        let usd = ReferralPayout {
+            amount: 500,
+            currency: "usd".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(settled_in(&[eur.clone(), usd.clone()], "EUR"), 1_007);
+        assert_eq!(settled_in(&[eur.clone(), usd], "USD"), 500);
+        assert_eq!(settled_in(&[eur], "BTC"), 0);
     }
 
     #[test]

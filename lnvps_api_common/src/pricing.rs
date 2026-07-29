@@ -282,6 +282,12 @@ impl PricingEngine {
         Self { db, rates, vat }
     }
 
+    /// The shared exchange-rate service backing this engine, for callers that
+    /// need a quote outside pricing (e.g. converting a payout).
+    pub fn rates(&self) -> Arc<dyn ExchangeRateService> {
+        self.rates.clone()
+    }
+
     /// The shared VAT client backing this engine (for rate refreshes).
     pub fn vat_client(&self) -> VatClient {
         self.vat.clone()
