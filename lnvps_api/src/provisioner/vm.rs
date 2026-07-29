@@ -2748,6 +2748,104 @@ mod tests {
         Ok(())
     }
 
+    /// The admin override marks a payment paid itself and then asks the worker
+    /// to run the handlers; `apply_payment` must do that side of the work
+    /// without extending the subscription a second time.
+    #[tokio::test]
+    async fn test_apply_payment_runs_handlers_without_repaying() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let wrk = Arc::new(ChannelWorkCommander::new());
+        let sub_handler = make_sub_handler_with_commander(db.clone(), wrk.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let payment = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+
+        // What the admin endpoint does before dispatching the work job.
+        db.subscription_payment_paid(&payment).await?;
+        let expiry_after_paid = db
+            .get_subscription(li.subscription_id)
+            .await?
+            .expires
+            .expect("expires must be set once the payment is paid");
+
+        sub_handler.apply_payment(&payment).await?;
+
+        assert_eq!(
+            db.get_subscription(li.subscription_id).await?.expires,
+            Some(expiry_after_paid),
+            "apply_payment must not extend the subscription again"
+        );
+
+        let msgs = tokio::time::timeout(std::time::Duration::from_millis(100), wrk.recv())
+            .await
+            .expect("timed out waiting for WorkJob::SpawnVm")?;
+        assert!(
+            msgs.iter()
+                .any(|m| matches!(&m.job, WorkJob::SpawnVm { vm_id } if *vm_id == vm.id)),
+            "expected WorkJob::SpawnVm {{ vm_id: {} }} in queued jobs: {:?}",
+            vm.id,
+            msgs.iter()
+                .map(|m| format!("{:?}", m.job))
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// Re-running the handlers for one payment (an admin re-dispatch, or a
+    /// redelivered work job) must not make the audit trail claim the customer
+    /// paid twice.
+    #[tokio::test]
+    async fn test_apply_payment_twice_records_one_payment() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let sub_handler = make_sub_handler(db.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let payment = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+
+        sub_handler.complete_payment(&payment).await?;
+        sub_handler.apply_payment(&payment).await?;
+
+        let payment_hex = hex::encode(&payment.id);
+        let received = db
+            .list_vm_history(vm.id)
+            .await?
+            .into_iter()
+            .filter(|h| {
+                matches!(
+                    h.action_type,
+                    lnvps_db::VmHistoryActionType::PaymentReceived
+                ) && h
+                    .metadata
+                    .as_ref()
+                    .and_then(|m| serde_json::from_slice::<serde_json::Value>(m).ok())
+                    .and_then(|v| v["payment_id"].as_str().map(|p| p == payment_hex))
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(received, 1, "one payment must be recorded once");
+
+        Ok(())
+    }
+
     /// Helper: build a SubscriptionHandler wired to a specific WorkCommander.
     async fn make_sub_handler_with_commander(
         db: Arc<MockDb>,

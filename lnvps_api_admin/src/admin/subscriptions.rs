@@ -507,7 +507,16 @@ async fn admin_get_subscription_payment(
 /// Manually mark a subscription payment as paid (admin override).
 ///
 /// This calls `subscription_payment_paid` which sets `is_paid=true`,
-/// records `paid_at`, extends the subscription by 30 days, and activates it.
+/// records `paid_at`, extends the subscription by 30 days, and activates it,
+/// then hands the line item on-payment handling (instant app reconcile,
+/// applying an upgrade) to the worker, which owns the provisioner stack this
+/// crate has no access to.
+///
+/// An already-paid payment is re-dispatched rather than refused: the two steps
+/// cannot be made atomic, so refusing would leave a payment that is paid with
+/// its handlers never run and no way to ask for them again. Re-running them is
+/// safe — the subscription is not extended a second time, and the handlers
+/// carry absolute target state.
 async fn admin_complete_subscription_payment(
     auth: AdminAuth,
     State(this): State<RouterState>,
@@ -519,18 +528,30 @@ async fn admin_complete_subscription_payment(
 
     let payment = this.db.get_subscription_payment(&payment_id).await?;
 
-    if payment.is_paid {
-        return Err(ApiError::conflict("Payment is already completed"));
+    if !payment.is_paid {
+        this.db.subscription_payment_paid(&payment).await?;
+        log::info!(
+            "Admin {} manually completed subscription payment {} for subscription {}",
+            auth.user_id,
+            id,
+            payment.subscription_id
+        );
+    } else {
+        log::info!(
+            "Admin {} re-queued on-payment work for subscription payment {}",
+            auth.user_id,
+            id
+        );
     }
 
-    this.db.subscription_payment_paid(&payment).await?;
-
-    log::info!(
-        "Admin {} manually completed subscription payment {} for subscription {}",
-        auth.user_id,
-        id,
-        payment.subscription_id
-    );
+    // Fail the request if this cannot be queued: the payment is paid either
+    // way, so a silent success would leave an app without its reconcile and an
+    // upgrade never applied, with nothing left to retry it.
+    this.work_commander
+        .send(WorkJob::ApplySubscriptionPayment {
+            payment_id: id.clone(),
+        })
+        .await?;
 
     // Dispatch CheckSubscriptions so the lifecycle worker picks up the new expiry
     if let Err(e) = this.work_commander.send(WorkJob::CheckSubscriptions).await {

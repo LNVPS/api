@@ -745,6 +745,52 @@ mod tests {
         }
 
         // ----------------------------------------------------------------
+        // 14c-2. Admin override completion must run the same on-payment
+        //        handling as a Lightning settlement, by handing the line
+        //        item handlers to the worker.
+        // ----------------------------------------------------------------
+        let resp = user
+            .get_auth(&format!("/api/v1/subscriptions/{sub_id}/renew"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "subscription renew");
+        let renew = serde_json::from_str::<Value>(&resp.text().await.unwrap()).unwrap();
+        let manual_payment_id = renew["data"]["id"].as_str().unwrap().to_string();
+        admin_complete(
+            &admin,
+            &format!("/api/admin/v1/subscription_payments/{manual_payment_id}"),
+        )
+        .await;
+
+        let jobs = crate::worker::stream_jobs().await.unwrap();
+        assert!(
+            jobs.iter()
+                .any(|j| j.contains("ApplySubscriptionPayment") && j.contains(&manual_payment_id)),
+            "admin complete should dispatch ApplySubscriptionPayment for {manual_payment_id}"
+        );
+        eprintln!("Admin-completed payment {manual_payment_id} dispatched on-payment work \u{2713}");
+
+        // Completing an already-paid payment re-dispatches the handlers (the
+        // only way to recover a failed dispatch) without paying it again.
+        let sub_path = format!("/api/admin/v1/subscriptions/{sub_id}");
+        let expires_before =
+            json_ok(admin.get_auth(&sub_path).await.unwrap()).await["data"]["expires"].clone();
+        let resp = admin
+            .post_auth(
+                &format!("/api/admin/v1/subscription_payments/{manual_payment_id}/complete"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "re-dispatch is allowed");
+        let expires_after =
+            json_ok(admin.get_auth(&sub_path).await.unwrap()).await["data"]["expires"].clone();
+        assert_eq!(
+            expires_before, expires_after,
+            "re-completing a paid payment must not extend the subscription again"
+        );
+
+        // ----------------------------------------------------------------
         // 14d. On-chain renewal: request an on-chain payment, send real
         //      coins from lnd-payer, mine a block and wait for the API's
         //      chain watcher to settle it.

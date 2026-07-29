@@ -254,7 +254,18 @@ impl SubscriptionHandler {
         payment: &SubscriptionPayment,
     ) -> Result<CompletePaymentResult> {
         self.db.subscription_payment_paid(payment).await?;
+        self.apply_payment(payment).await
+    }
 
+    /// Everything that must happen once a payment is paid, separated from the
+    /// act of marking it paid: settlement paths that mark the payment paid
+    /// themselves (the admin override, which runs in a crate without the
+    /// provisioner stack) reach this through `WorkJob::ApplySubscriptionPayment`
+    /// so no path can settle a payment without running the line item handlers.
+    pub async fn apply_payment(
+        &self,
+        payment: &SubscriptionPayment,
+    ) -> Result<CompletePaymentResult> {
         let line_items = self
             .db
             .list_subscription_line_items(payment.subscription_id)

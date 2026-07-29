@@ -135,6 +135,23 @@ mod tests {
         assert!(text.contains("Insufficient permissions"));
     }
 
+    /// Permission is checked before the payment is looked up, so a viewer
+    /// cannot settle a payment (or probe which ids exist) this way.
+    #[tokio::test]
+    async fn test_read_only_cannot_complete_subscription_payment() {
+        setup_rbac().await;
+        let client = admin_client_with_keys(read_only_keys().clone());
+        let fake_id = "bb".repeat(32);
+        let resp = client
+            .post_auth(
+                &format!("/api/admin/v1/subscription_payments/{fake_id}/complete"),
+                &serde_json::json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
     #[tokio::test]
     async fn test_read_only_cannot_create_role() {
         setup_rbac().await;
