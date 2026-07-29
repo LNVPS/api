@@ -106,14 +106,13 @@ fn converted_payout(
     }))
 }
 
-/// Millisats already reserved or paid against a referrer's BTC balance.
+/// Amount already reserved or paid against a referrer's balance in `currency`,
+/// in that currency's smallest unit.
 ///
 /// A payout nets in the currency it settles, not the currency it sent: a EUR
 /// commission sent as BTC discharges EUR and must leave the BTC balance alone,
 /// or the referrer is charged twice for one transfer. The referrer bears the
 /// fee, so it is debited alongside the amount.
-/// Amount already reserved or paid against a referrer's balance in `currency`,
-/// in that currency's smallest unit.
 fn settled_in(payouts: &[ReferralPayout], currency: &str) -> u64 {
     payouts
         .iter()
@@ -1004,6 +1003,20 @@ mod tests {
                 1_000
             )
             .is_err()
+        );
+        // Above the per-payout ceiling — €2000 at 100k is 0.02 BTC — the payout
+        // is refused rather than sent: a rate that far out is the likelier
+        // explanation, and a Lightning payment does not come back.
+        assert!(
+            converted_payout(
+                &referrer(1, "AAA"),
+                "EUR",
+                200_000,
+                eur_rate(100_000.0),
+                1_000
+            )
+            .is_err(),
+            "a payout above the ceiling is refused, not sent"
         );
     }
 
