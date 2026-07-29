@@ -511,6 +511,12 @@ async fn admin_get_subscription_payment(
 /// then hands the line item on-payment handling (instant app reconcile,
 /// applying an upgrade) to the worker, which owns the provisioner stack this
 /// crate has no access to.
+///
+/// An already-paid payment is re-dispatched rather than refused: the two steps
+/// cannot be made atomic, so refusing would leave a payment that is paid with
+/// its handlers never run and no way to ask for them again. Re-running them is
+/// safe — the subscription is not extended a second time, and the handlers
+/// carry absolute target state.
 async fn admin_complete_subscription_payment(
     auth: AdminAuth,
     State(this): State<RouterState>,
@@ -522,11 +528,9 @@ async fn admin_complete_subscription_payment(
 
     let payment = this.db.get_subscription_payment(&payment_id).await?;
 
-    if payment.is_paid {
-        return Err(ApiError::conflict("Payment is already completed"));
+    if !payment.is_paid {
+        this.db.subscription_payment_paid(&payment).await?;
     }
-
-    this.db.subscription_payment_paid(&payment).await?;
 
     log::info!(
         "Admin {} manually completed subscription payment {} for subscription {}",
@@ -535,21 +539,14 @@ async fn admin_complete_subscription_payment(
         payment.subscription_id
     );
 
-    // Without this the payment is paid but nothing acts on it: an app never
-    // gets its instant reconcile and an upgrade is never applied.
-    if let Err(e) = this
-        .work_commander
+    // Fail the request if this cannot be queued: the payment is paid either
+    // way, so a silent success would leave an app without its reconcile and an
+    // upgrade never applied, with nothing left to retry it.
+    this.work_commander
         .send(WorkJob::ApplySubscriptionPayment {
             payment_id: id.clone(),
         })
-        .await
-    {
-        log::error!(
-            "Payment completed but failed to dispatch ApplySubscriptionPayment for payment {}: {}",
-            id,
-            e
-        );
-    }
+        .await?;
 
     // Dispatch CheckSubscriptions so the lifecycle worker picks up the new expiry
     if let Err(e) = this.work_commander.send(WorkJob::CheckSubscriptions).await {

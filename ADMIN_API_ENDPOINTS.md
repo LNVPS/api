@@ -1047,12 +1047,14 @@ Required Permission: `subscription_payments::update`
 
 Manually marks a subscription payment as paid. Sets `is_paid=true`, records `paid_at`, extends the subscription by 30 days, and activates it, then queues the same on-payment handling a Lightning settlement runs (instant app reconcile, applying a VM/app upgrade) on the worker.
 
+Calling it again on an already-paid payment only re-queues that handling (the subscription is not extended twice), so a failed queue dispatch can be retried.
+
 **No request body required.**
 
 Returns the updated `AdminSubscriptionPaymentInfo`.
 
 Errors:
-- `409` if the payment is already completed
+- `500` if the on-payment work could not be queued — retry the call
 - `400` if the payment ID format is invalid
 
 ### Role Management

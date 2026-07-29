@@ -814,12 +814,12 @@ impl Worker {
             bail!("Subscription payment {} is not paid", payment_id);
         }
         let result = self.subscription_handler.apply_payment(&payment).await?;
-        for p in result.expired_competing_upgrades {
-            // No Lightning node here to cancel the invoice with; it is already
-            // expired in the database, so it can no longer be settled into a
-            // second upgrade.
-            info!("Expired competing upgrade payment {}", hex::encode(&p.id));
-        }
+        // No Lightning node here to cancel the invoices with; they are already
+        // expired in the database, so they can no longer settle.
+        info!(
+            "Expired {} competing upgrade payments",
+            result.expired_competing_upgrades.len()
+        );
         Ok(())
     }
 
