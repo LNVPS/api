@@ -10,7 +10,7 @@
 //! The object **builders** are pure functions (unit-tested without a cluster);
 //! [`reconcile_app_deployments`] resolves config/secrets and applies them.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Debug;
 use std::net::IpAddr;
 use std::sync::OnceLock;
@@ -1364,11 +1364,26 @@ pub fn provisions_cluster_objects(gate: &GateReason) -> bool {
     !matches!(gate, GateReason::Unpaid)
 }
 
+/// True while a deployment is still moving towards its desired state, so its
+/// status is expected to change without anything else happening.
+///
+/// `Stopped` counts as settled: a deployment scaled to zero stays there until
+/// the customer or a payment changes the row, which triggers its own reconcile.
+pub fn is_transitioning(status: AppDeploymentStatus) -> bool {
+    matches!(
+        status,
+        AppDeploymentStatus::Pending | AppDeploymentStatus::Deleting
+    )
+}
+
 /// Reconcile every app deployment assigned to this operator's cluster into
 /// Kubernetes. No-op when the operator isn't configured with an `app_cluster_id`.
-pub async fn reconcile_app_deployments(ctx: &Context) -> Result<()> {
+///
+/// Returns the deployments that came back mid-transition, so the caller can
+/// come round again sooner than the steady-state interval while they last.
+pub async fn reconcile_app_deployments(ctx: &Context) -> Result<BTreeSet<u64>> {
     let Some(cluster_id) = ctx.settings.app_cluster_id else {
-        return Ok(());
+        return Ok(BTreeSet::new());
     };
     let cluster = ctx.db.get_app_cluster(cluster_id).await?;
     let deployments: Vec<AppDeployment> = ctx
@@ -1380,14 +1395,22 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<()> {
         .collect();
 
     let mut active: HashSet<u64> = HashSet::new();
+    let mut transitioning: BTreeSet<u64> = BTreeSet::new();
     for d in &deployments {
         active.insert(d.id);
-        if let Err(e) = reconcile_one(ctx, d, &cluster.ingress_domain).await {
-            error!("app deployment {} reconcile failed: {}", d.id, e);
-            let mut errd = d.clone();
-            errd.status = AppDeploymentStatus::Error;
-            errd.status_message = Some(e.to_string());
-            let _ = ctx.db.update_app_deployment(&errd).await;
+        match reconcile_one(ctx, d, &cluster.ingress_domain).await {
+            Ok(status) => {
+                if is_transitioning(status) {
+                    transitioning.insert(d.id);
+                }
+            }
+            Err(e) => {
+                error!("app deployment {} reconcile failed: {}", d.id, e);
+                let mut errd = d.clone();
+                errd.status = AppDeploymentStatus::Error;
+                errd.status_message = Some(e.to_string());
+                let _ = ctx.db.update_app_deployment(&errd).await;
+            }
         }
     }
 
@@ -1402,7 +1425,7 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<()> {
     // Garbage-collect namespaces for deployments that no longer exist (deleted
     // rows are excluded from the active set above).
     gc_namespaces(&ctx.client, &active).await?;
-    Ok(())
+    Ok(transitioning)
 }
 
 /// Record what each deployment is consuming, from Prometheus (issue #278).
@@ -1538,7 +1561,7 @@ async fn reconcile_one(
     ctx: &Context,
     deployment: &AppDeployment,
     ingress_domain: &str,
-) -> Result<()> {
+) -> Result<AppDeploymentStatus> {
     let client = &ctx.client;
     let id = deployment.id;
     let app = ctx.db.get_app(deployment.app_id).await?;
@@ -1595,8 +1618,7 @@ async fn reconcile_one(
     if !provisions_cluster_objects(&gate) {
         info!("app deployment {id} not provisioned: {gate}");
         // Nothing was applied, so there is no workload to read.
-        write_back_status(ctx, deployment, hostname, &gate, None).await?;
-        return Ok(());
+        return write_back_status(ctx, deployment, hostname, &gate, None).await;
     }
 
     // 1. Namespace (Pod Security Standard) + isolation NetworkPolicy.
@@ -1749,9 +1771,9 @@ async fn reconcile_one(
             None
         }
     };
-    write_back_status(ctx, deployment, hostname, &gate, health).await?;
+    let status = write_back_status(ctx, deployment, hostname, &gate, health).await?;
     info!("reconciled app deployment {id}");
-    Ok(())
+    Ok(status)
 }
 
 /// What the cluster says about a deployment's workload (issue #276).
@@ -1925,7 +1947,7 @@ async fn write_back_status(
     hostname: String,
     gate: &GateReason,
     health: Option<WorkloadHealth>,
-) -> Result<()> {
+) -> Result<AppDeploymentStatus> {
     let id = deployment.id;
     let mut updated = deployment.clone();
     updated.hostname = Some(hostname);
@@ -1965,7 +1987,7 @@ async fn write_back_status(
         }
     }
     ctx.db.update_app_deployment(&updated).await?;
-    Ok(())
+    Ok(updated.status)
 }
 
 /// Delete namespaces owned by this operator whose deployment id is not in
@@ -1991,6 +2013,18 @@ async fn gc_namespaces(client: &Client, active: &HashSet<u64>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::metrics::{ClaimUsage, ContainerUsage};
+
+    /// Which statuses keep the operator sweeping quickly. A deployment the
+    /// customer stopped is settled — the row only changes when someone acts on
+    /// it, and that path triggers its own reconcile.
+    #[test]
+    fn only_pending_and_deleting_count_as_transitioning() {
+        assert!(is_transitioning(AppDeploymentStatus::Pending));
+        assert!(is_transitioning(AppDeploymentStatus::Deleting));
+        assert!(!is_transitioning(AppDeploymentStatus::Running));
+        assert!(!is_transitioning(AppDeploymentStatus::Error));
+        assert!(!is_transitioning(AppDeploymentStatus::Stopped));
+    }
 
     /// The per-namespace binding is the only thing standing between the
     /// operator's token and every Secret in the cluster, so its shape is

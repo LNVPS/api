@@ -12,6 +12,11 @@ namespace: "lnvps"
 # Reconciliation interval in seconds (optional, defaults to 60)
 reconcile-interval: 60
 
+# How long to wait before the next app-deployment sweep while a deployment is
+# still provisioning or deleting (optional, defaults to 5, capped at
+# reconcile-interval). Settled deployments stay on reconcile-interval.
+transition-reconcile-interval: 5
+
 # Error retry interval in seconds (optional, defaults to 30)  
 error-retry-interval: 30
 
