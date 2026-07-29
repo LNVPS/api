@@ -950,8 +950,8 @@ impl Worker {
             && v.len() == 8
         {
             let last = u64::from_le_bytes(v.as_slice().try_into().unwrap_or_default());
-            // Saturating: a clock stepped backwards leaves a stamp in the
-            // future, and the wait is over either way.
+            // A clock stepped backwards leaves a stamp in the future; wait it
+            // out rather than panic.
             let waited = (Utc::now().timestamp() as u64).saturating_sub(last);
             if waited < HOST_KEY_SCAN_RETRY_SECS {
                 return;
