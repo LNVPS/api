@@ -23,11 +23,11 @@ use serde::de::DeserializeOwned;
 use k8s_openapi::NamespaceResourceScope;
 use lnvps_db::{
     AppDeployment, AppDeploymentServiceUsage, AppDeploymentStatus, AppDeploymentVolumeUsage,
-    BillingState, EncryptedString, Subscription,
+    BillingState, EncryptedString, LNVpsDb, Subscription,
 };
 
 use crate::Context;
-use crate::metrics::DeploymentUsage;
+use crate::metrics::{DeploymentUsage, PrometheusClient};
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     ConfigMap, Container, ContainerPort, EnvVar, Namespace, PersistentVolumeClaim,
@@ -1329,7 +1329,9 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<()> {
 
     // Best-effort: a metrics outage must not fail a reconcile pass, and stale
     // usage from the previous pass is better than none.
-    if let Err(e) = collect_usage(ctx, &deployments, &active).await {
+    if let Err(e) =
+        collect_usage(ctx.db.as_ref(), ctx.metrics.as_ref(), &deployments, &active).await
+    {
         warn!("usage collection failed: {e}");
     }
 
@@ -1345,12 +1347,16 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<()> {
 /// deployment row it writes: that row is a copy read at the top of the pass, so
 /// one path would overwrite the other's fields with values read before they
 /// were set.
+/// A deployment whose write fails is logged and skipped rather than ending the
+/// pass: usage is per deployment, so one bad row must not blank every row
+/// behind it in the iteration order.
 async fn collect_usage(
-    ctx: &Context,
+    db: &dyn LNVpsDb,
+    metrics: Option<&PrometheusClient>,
     deployments: &[AppDeployment],
     active: &HashSet<u64>,
 ) -> Result<()> {
-    let Some(client) = &ctx.metrics else {
+    let Some(client) = metrics else {
         return Ok(());
     };
     let by_id: BTreeMap<u64, &AppDeployment> = deployments.iter().map(|d| (d.id, d)).collect();
@@ -1363,14 +1369,18 @@ async fn collect_usage(
         if !active.contains(&id) {
             continue;
         }
-        ctx.db
+        if let Err(e) = db
             .update_app_deployment_usage(
                 id,
                 usage.cpu_milli,
                 usage.memory_bytes,
                 usage.storage_bytes,
             )
-            .await?;
+            .await
+        {
+            warn!("app deployment {id} usage write failed: {e}");
+            continue;
+        }
 
         // The breakdown is keyed on compose names, which only the app's compose
         // can supply: a claim name is a `"{service}-{volume}"` string that
@@ -1381,7 +1391,7 @@ async fn collect_usage(
         };
         let app_id = deployment.app_id;
         if let std::collections::btree_map::Entry::Vacant(slot) = composes.entry(app_id) {
-            let parsed = match ctx.db.get_app(app_id).await {
+            let parsed = match db.get_app(app_id).await {
                 Ok(app) => match Compose::parse(&app.compose) {
                     Ok(c) => Some(c),
                     Err(e) => {
@@ -1400,9 +1410,12 @@ async fn collect_usage(
             continue;
         };
         let (services, volumes) = breakdown_rows(id, compose, &usage);
-        ctx.db
+        if let Err(e) = db
             .replace_app_deployment_usage_breakdown(id, &services, &volumes)
-            .await?;
+            .await
+        {
+            warn!("app deployment {id} usage breakdown write failed: {e}");
+        }
     }
     Ok(())
 }
@@ -3694,5 +3707,129 @@ config:
                 .collect::<Vec<_>>(),
             vec![("a", 1), ("b", 2)]
         );
+    }
+    /// Usage is per deployment, so a write that fails for one must not cost
+    /// every deployment behind it in the iteration order its reading.
+    #[tokio::test]
+    async fn a_failed_usage_write_does_not_skip_the_other_deployments() {
+        use chrono::Utc;
+        use lnvps_api_common::MockDb;
+        use lnvps_db::{App, AppDeploymentDesiredState, IntervalType};
+        use std::time::Duration;
+        use wiremock::matchers::{method, path, query_param_contains};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        fn deployment(id: u64) -> AppDeployment {
+            AppDeployment {
+                id,
+                user_id: 1,
+                app_id: 1,
+                cluster_id: 1,
+                resource_multiplier: 1,
+                subscription_line_item_id: id,
+                name: format!("d{id}"),
+                namespace: namespace_name(id),
+                hostname: None,
+                custom_domain: None,
+                config: None,
+                desired_state: AppDeploymentDesiredState::Running,
+                status: AppDeploymentStatus::Running,
+                status_message: None,
+                usage_cpu_milli: None,
+                usage_memory_bytes: None,
+                usage_storage_bytes: None,
+                usage_collected: None,
+                created: Utc::now(),
+                deleted: false,
+            }
+        }
+
+        async fn mock_query(server: &MockServer, needle: &str, body: String) {
+            Mock::given(method("GET"))
+                .and(path("/api/v1/query"))
+                .and(query_param_contains("query", needle))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(server)
+                .await;
+        }
+
+        fn two_series(key_label: &str, key: &str, a: &str, b: &str) -> String {
+            format!(
+                r#"{{"status":"success","data":{{"resultType":"vector","result":[{{"metric":{{"namespace":"app-1","{key_label}":"{key}"}},"value":[1690000000,"{a}"]}},{{"metric":{{"namespace":"app-2","{key_label}":"{key}"}},"value":[1690000000,"{b}"]}}]}}}}"#
+            )
+        }
+
+        let server = MockServer::start().await;
+        mock_query(
+            &server,
+            "container_cpu_usage_seconds_total",
+            two_series("container", "a", "0.5", "0.25"),
+        )
+        .await;
+        mock_query(
+            &server,
+            "container_memory_working_set_bytes",
+            two_series("container", "a", "2097152", "1048576"),
+        )
+        .await;
+        mock_query(
+            &server,
+            "kubelet_volume_stats_used_bytes",
+            two_series("persistentvolumeclaim", "a-data", "8192", "4096"),
+        )
+        .await;
+
+        let db = MockDb::empty();
+        {
+            let mut apps = db.apps.lock().await;
+            apps.insert(
+                1,
+                App {
+                    id: 1,
+                    name: "relay".to_string(),
+                    display_name: "Relay".to_string(),
+                    description: None,
+                    icon: None,
+                    repo_url: None,
+                    category: "Nostr relay".to_string(),
+                    seo_title: None,
+                    seo_description: None,
+                    compose: "services:\n  a:\n    image: x\n    volumes:\n      - name: data\n        path: /d\n        size: 1Gi\n"
+                        .to_string(),
+                    amount: 1000,
+                    currency: "USD".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_amount: 0,
+                    cpu_milli: 250,
+                    memory_bytes: 512 * 1024 * 1024,
+                    storage_bytes: 1024 * 1024 * 1024,
+                    enabled: true,
+                    created: Utc::now(),
+                },
+            );
+            let mut deps = db.app_deployments.lock().await;
+            deps.insert(1, deployment(1));
+            deps.insert(2, deployment(2));
+            // Deployment 1 is written first, so before the fix its failure was
+            // enough to leave 2 with no reading at all.
+            db.failing_usage_writes.lock().await.insert(1);
+        }
+
+        let client =
+            PrometheusClient::new(&format!("{}/", server.uri()), Duration::from_secs(5)).unwrap();
+        let deployments = vec![deployment(1), deployment(2)];
+        let active: HashSet<u64> = HashSet::from([1, 2]);
+        collect_usage(&db, Some(&client), &deployments, &active)
+            .await
+            .unwrap();
+
+        let deps = db.app_deployments.lock().await;
+        assert_eq!(deps[&1].usage_cpu_milli, None);
+        assert_eq!(deps[&2].usage_cpu_milli, Some(250));
+        let breakdown = db.app_deployment_usage_breakdown.lock().await;
+        assert!(!breakdown.contains_key(&1));
+        assert_eq!(breakdown[&2].0.len(), 1);
+        assert_eq!(breakdown[&2].1.len(), 1);
     }
 }
