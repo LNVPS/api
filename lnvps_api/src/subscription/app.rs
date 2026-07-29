@@ -303,6 +303,7 @@ mod tests {
             namespace: "app-1".to_string(),
             hostname: None,
             custom_domain: None,
+            custom_domain_verified: false,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Running,

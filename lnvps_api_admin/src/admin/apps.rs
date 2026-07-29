@@ -214,10 +214,7 @@ fn validate_category(category: String) -> Result<String, lnvps_api_common::ApiEr
 /// A stored compose that no longer parses is skipped rather than fatal —
 /// nothing can be compared against it, and refusing the edit would leave an
 /// admin unable to repair the very row that is broken.
-fn validate_volume_changes(
-    stored: &str,
-    incoming: &str,
-) -> Result<(), lnvps_api_common::ApiError> {
+fn validate_volume_changes(stored: &str, incoming: &str) -> Result<(), lnvps_api_common::ApiError> {
     let Ok(stored) = lnvps_compose::Compose::parse(stored) else {
         return Ok(());
     };
@@ -816,15 +813,21 @@ async fn admin_update_app_deployment(
         d.config = Some(lnvps_db::EncryptedString::new(config_json));
     }
 
-    // Custom domain: set (validated) or clear.
+    // Custom domain: set (validated) or clear. A changed domain is held until
+    // the operator sees it resolve to us, the same as on the customer endpoint
+    // — an admin edit cannot vouch for someone else's DNS either.
     if let Some(cd) = &req.custom_domain {
-        d.custom_domain = match cd {
+        let new_domain = match cd {
             Some(v) if !v.trim().is_empty() => Some(
                 lnvps_compose::validate_custom_domain(v)
                     .map_err(|e| lnvps_api_common::ApiError::new(e.to_string()))?,
             ),
             _ => None,
         };
+        if new_domain != d.custom_domain {
+            d.custom_domain_verified = false;
+        }
+        d.custom_domain = new_domain;
     }
 
     this.db.update_app_deployment(&d).await?;
@@ -1147,6 +1150,7 @@ mod tests {
             namespace: format!("app-{name}"),
             hostname: None,
             custom_domain: None,
+            custom_domain_verified: false,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
