@@ -528,8 +528,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let with_keys =
-            json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap()).await;
+        let with_keys = json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap()).await;
         let keys = with_keys["data"]["host_ssh_keys"].as_array().unwrap();
         assert_eq!(keys.len(), 1, "{keys:?}");
         assert_eq!(keys[0]["key_type"].as_str(), Some("ssh-ed25519"));
@@ -537,7 +536,9 @@ mod tests {
             keys[0]["fingerprint_sha256"].as_str(),
             Some("SHA256:XXJM8fNyKu1oxISUmJkU3eTS4F4FcyW69THWriTri6M")
         );
-        crate::db::set_vm_ssh_host_keys(&pool, vm_id, "").await.unwrap();
+        crate::db::set_vm_ssh_host_keys(&pool, vm_id, "")
+            .await
+            .unwrap();
 
         // ----------------------------------------------------------------
         // 14b. Verify subscription state after first payment
@@ -796,7 +797,9 @@ mod tests {
                 .any(|j| j.contains("ApplySubscriptionPayment") && j.contains(&manual_payment_id)),
             "admin complete should dispatch ApplySubscriptionPayment for {manual_payment_id}"
         );
-        eprintln!("Admin-completed payment {manual_payment_id} dispatched on-payment work \u{2713}");
+        eprintln!(
+            "Admin-completed payment {manual_payment_id} dispatched on-payment work \u{2713}"
+        );
 
         // Completing an already-paid payment re-dispatches the handlers (the
         // only way to recover a failed dispatch) without paying it again.

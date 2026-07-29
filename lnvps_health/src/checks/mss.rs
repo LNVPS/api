@@ -356,7 +356,11 @@ fn get_ip_mtu(fd: i32, is_v6: bool) -> Result<Option<u16>> {
 mod tests {
     use super::*;
 
+    /// Canary for a public host being reachable, not a check of this crate: it
+    /// opens a real TCP connection. Ignored by default so an offline or
+    /// firewalled run is not a red suite.
     #[tokio::test]
+    #[ignore = "connects to a live public host"]
     async fn test_mss_check_google_v4() {
         let config = MssCheckConfig {
             name: "Google DNS".to_string(),
@@ -379,6 +383,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "connects to a live public host over IPv6"]
     async fn test_mss_check_google_v6() {
         let config = MssCheckConfig {
             name: "Google".to_string(),

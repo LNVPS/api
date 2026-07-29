@@ -491,12 +491,7 @@ mod tests {
 
     /// Serve one canned body for a method+path, so a test asserts on this
     /// crate's parsing rather than on a third party being up and unchanged.
-    async fn mock_json(
-        server: &wiremock::MockServer,
-        method_name: &str,
-        route: &str,
-        body: &str,
-    ) {
+    async fn mock_json(server: &wiremock::MockServer, method_name: &str, route: &str, body: &str) {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
         Mock::given(method(method_name))

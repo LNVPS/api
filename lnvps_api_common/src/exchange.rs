@@ -692,10 +692,7 @@ mod tests {
         assert_eq!(currencies, vec![Currency::BTC, Currency::USD]);
 
         // USD came from the direct FX rate (1.20), not the BTC round-trip (~1.10).
-        let usd = out
-            .iter()
-            .find(|c| c.currency() == Currency::USD)
-            .unwrap();
+        let usd = out.iter().find(|c| c.currency() == Currency::USD).unwrap();
         assert_eq!(*usd, CurrencyAmount::from_u64(Currency::USD, 120));
     }
 }

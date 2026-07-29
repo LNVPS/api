@@ -344,11 +344,7 @@ pub async fn hard_delete_company(pool: &MySqlPool, company_id: u64) -> anyhow::R
 
 /// Write a VM's captured SSH host keys directly, standing in for the worker's
 /// scan of the guest (which needs a real booted VM).
-pub async fn set_vm_ssh_host_keys(
-    pool: &MySqlPool,
-    vm_id: u64,
-    keys: &str,
-) -> anyhow::Result<()> {
+pub async fn set_vm_ssh_host_keys(pool: &MySqlPool, vm_id: u64, keys: &str) -> anyhow::Result<()> {
     sqlx::query("UPDATE vm SET ssh_host_keys = ? WHERE id = ?")
         .bind(keys)
         .bind(vm_id)

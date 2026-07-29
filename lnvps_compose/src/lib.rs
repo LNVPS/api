@@ -2321,10 +2321,8 @@ config:
         );
         // A new volume beside the old one is fine: nothing existing moves.
         assert!(
-            app(
-                "      - { name: data, path: /data, size: 5Gi }\n      \
-                 - { name: logs, path: /logs, size: 1Gi }\n"
-            )
+            app("      - { name: data, path: /data, size: 5Gi }\n      \
+                 - { name: logs, path: /logs, size: 1Gi }\n")
             .validate_volume_changes(&stored)
             .is_ok()
         );
