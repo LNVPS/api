@@ -8,14 +8,16 @@ use axum::extract::{Path, Query, State};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Days, Utc};
+use lightning_invoice::Bolt11Invoice;
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, PricingEngine,
     UpgradeConfig, VatClient, VmHistoryLogger, VmRunningState, VmStateCache, WorkJob,
-    derive_refund_payment_id, prorated_refund_tax,
+    build_refund_row, refundable_remaining,
 };
 use lnvps_db::{AdminAction, AdminResource, SubscriptionPaymentType};
 use log::{error, info};
 use serde::Deserialize;
+use std::str::FromStr;
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -924,21 +926,19 @@ async fn admin_calculate_vm_refund(
     ApiData::ok(refund_info)
 }
 
-/// Process a refund for a VM automatically.
+/// Process a refund for a VM: pay the customer over Lightning and record it.
 ///
-/// **Refuses with 501 — automated refunds do not exist yet (issue #193).**
+/// The payout runs in `WorkJob::ProcessVmRefund` because the Lightning node
+/// lives in the worker, so the response is a job id and the outcome arrives as
+/// job feedback. Everything that can be judged from the request is judged here
+/// first — the invoice has to parse, carry an amount and still be live — so a
+/// caller learns about a bad request synchronously rather than from a job that
+/// failed after the fact.
 ///
-/// This used to queue a `WorkJob::ProcessVmRefund` and answer `200` with the
-/// job id, while the only handler for that job is
-/// `bail!("Refund processing is not yet implemented")` (`lnvps_api/src/worker.rs`).
-/// The failure happened in a background job after the response, so an operator
-/// saw a real pro-rated amount from `GET /refund`, submitted it, and was told
-/// it had been dispatched — while no money moved and no record was written.
-/// Neither side of the transaction could tell a refund from a no-op.
-///
-/// A refused request is the honest answer until the payout path exists: the
-/// request is still validated, so the shape a caller sends is checked the same
-/// way it will be when this is implemented, and the refusal names the state.
+/// Only Lightning is automated. Revolut and PayPal refunds are issued in the
+/// provider's own dashboard and recorded with
+/// `POST /vms/{id}/payments/{payment_id}/refund`; queueing a job for them
+/// would report success for something nothing here can do.
 async fn admin_process_vm_refund(
     auth: AdminAuth,
     State(this): State<RouterState>,
@@ -977,18 +977,57 @@ async fn admin_process_vm_refund(
         );
     }
 
-    // Deliberately no work job: the handler for it bails, so queueing one would
-    // report success for something that cannot happen.
-    info!(
-        "Admin {} attempted an automated {} refund for VM {} (from_date={:?}, reason={:?}) — \
-         refused, not implemented",
-        auth.user_id, payment_method, vm_id, req.refund_from_date, req.reason
-    );
-    Err(ApiError::not_implemented(
-        "Automated refund processing is not implemented: no funds are moved and no record is \
-         written. Issue the refund out-of-band and record it with \
-         POST /api/admin/v1/vms/{vm_id}/payments/{payment_id}/refund.",
-    ))
+    if payment_method != "lightning" {
+        info!(
+            "Admin {} attempted an automated {} refund for VM {} — refused, not automated",
+            auth.user_id, payment_method, vm_id
+        );
+        return Err(ApiError::not_implemented(format!(
+            "Automated {payment_method} refunds are not implemented: no funds are moved and no \
+             record is written. Issue the refund in the provider's dashboard and record it with \
+             POST /api/admin/v1/vms/{{vm_id}}/payments/{{payment_id}}/refund."
+        )));
+    }
+
+    // Validated here rather than in the worker: a bad invoice is a bad request,
+    // and the caller can only be told so while it is still holding the
+    // connection. The worker re-checks the amount against what is owed, which
+    // it cannot know without the pricing engine and the ledger.
+    let invoice = req.lightning_invoice.as_deref().unwrap_or_default().trim();
+    let parsed = Bolt11Invoice::from_str(invoice)
+        .map_err(|e| ApiError::bad_request(format!("Invalid lightning invoice: {e}")))?;
+    if parsed.amount_milli_satoshis().is_none() {
+        return Err(ApiError::bad_request(
+            "Lightning invoice must specify an amount — an amountless invoice leaves the sum \
+             refunded up to the payer",
+        ));
+    }
+    if parsed.is_expired() {
+        return Err(ApiError::bad_request("Lightning invoice has expired"));
+    }
+
+    let refund_job = WorkJob::ProcessVmRefund {
+        vm_id,
+        admin_user_id: auth.user_id,
+        refund_from_date: req.refund_from_date,
+        reason: req.reason.clone(),
+        payment_method,
+        lightning_invoice: Some(invoice.to_string()),
+    };
+
+    match this.work_commander.send(refund_job).await {
+        Ok(stream_id) => {
+            info!(
+                "Admin {} queued a lightning refund for VM {} as job {}",
+                auth.user_id, vm_id, stream_id
+            );
+            ApiData::ok(JobResponse { job_id: stream_id })
+        }
+        Err(e) => {
+            error!("Failed to queue VM refund job: {}", e);
+            ApiData::err("Failed to queue VM refund job")
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -1052,7 +1091,7 @@ async fn admin_record_payment_refund(
     // over and the ledger would owe the customer money we never sent.
     let existing = this.db.list_refunds_for_payment(&payment.id).await?;
     let already: u64 = existing.iter().map(|r| r.amount).sum();
-    let refundable = payment.amount.saturating_sub(already);
+    let refundable = refundable_remaining(&payment, &existing);
     if refundable == 0 {
         return Err(ApiError::conflict(format!(
             "Payment {payment_id} is already fully refunded ({already} of {})",
@@ -1080,69 +1119,24 @@ async fn admin_record_payment_refund(
         None => Utc::now(),
     };
 
-    // Derived, not random: a resubmitted request lands on the same id, so a
-    // double-clicked modal is a conflict rather than a second refund.
-    let refund_id = derive_refund_payment_id(&payment.id, amount, refunded_at, auth.user_id);
+    let refund = build_refund_row(
+        &payment,
+        amount,
+        refunded_at,
+        auth.user_id,
+        req.reason.as_deref(),
+        req.external_ref.as_deref(),
+    );
+    let refund_id = refund.id.clone();
+
+    // The id is derived from what is being recorded, so a resubmitted request
+    // lands on the same id: a double-clicked modal is a conflict rather than a
+    // second refund.
     if this.db.get_subscription_payment(&refund_id).await.is_ok() {
         return Err(ApiError::conflict(
             "This exact refund is already recorded (same payment, amount, timestamp and admin)",
         ));
     }
-
-    let mut metadata = serde_json::json!({
-        "refund": {
-            "recorded_by_admin_user_id": auth.user_id,
-            "refunded_payment_id": hex::encode(&payment.id),
-        }
-    });
-    if let Some(reason) = &req.reason {
-        metadata["refund"]["reason"] = serde_json::json!(reason);
-    }
-    if let Some(ext) = &req.external_ref {
-        metadata["refund"]["external_ref"] = serde_json::json!(ext);
-    }
-
-    let refund = lnvps_db::SubscriptionPayment {
-        id: refund_id.clone(),
-        subscription_id: payment.subscription_id,
-        user_id: payment.user_id,
-        created: refunded_at,
-        // A refund buys no time; `expires` is carried from the payment it
-        // reverses so the row sits in the period it belongs to.
-        expires: payment.expires,
-        amount,
-        currency: payment.currency.clone(),
-        // The instrument the original sale used. What the money was actually
-        // returned through is free text in `metadata.refund.external_ref`: the
-        // accounting row has to stay in the currency and at the rate it
-        // reverses, whatever wallet the operator used.
-        payment_method: payment.payment_method,
-        payment_type: SubscriptionPaymentType::Refund,
-        // Nothing to store: there is no invoice for money we are giving back.
-        external_data: lnvps_db::EncryptedString::new(String::new()),
-        external_id: None,
-        is_paid: true,
-        rate: payment.rate,
-        // Must stay None. `time_value` is what extends a subscription, and a
-        // refund must not touch expiry — the VM's fate is a separate decision.
-        time_value: None,
-        metadata: Some(metadata),
-        tax: prorated_refund_tax(&payment, amount),
-        // Processor fees are not returned on a refund, so the fee stays a sunk
-        // cost on the original payment rather than being reversed here.
-        processing_fee: 0,
-        paid_at: Some(refunded_at),
-        tax_rate: payment.tax_rate,
-        tax_country_code: payment.tax_country_code.clone(),
-        tax_treatment: payment.tax_treatment.clone(),
-        tax_evidence: payment.tax_evidence.clone(),
-        // The original's per-line breakdown describes the sale, not this
-        // reversal: on a partial refund its line amounts would not add up to
-        // this row. The OSS report falls back to the summary fields above,
-        // which are the ones that must match.
-        tax_breakdown: None,
-        refunded_payment_id: Some(payment.id.clone()),
-    };
 
     this.db.insert_subscription_payment(&refund).await?;
 

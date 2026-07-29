@@ -128,6 +128,7 @@ pub struct Worker {
     kv: Arc<dyn KeyValueStore>,
     http_client: reqwest::Client,
     referral_payouts: crate::referral::ReferralPayoutHandler,
+    refunds: crate::refund::VmRefundHandler,
 }
 
 #[derive(Clone)]
@@ -209,7 +210,7 @@ impl Worker {
             crate::fee_estimate::build_fee_estimator(&settings.referral_fee_estimator);
         let referral_payouts = crate::referral::ReferralPayoutHandler::new(
             db.clone(),
-            node,
+            node.clone(),
             work_commander.clone(),
             settings.referral_min_payout_sats,
             onchain,
@@ -218,6 +219,12 @@ impl Worker {
             fee_estimator,
             subscription_handler.pricing_engine().rates(),
             settings.referral_min_fiat_payout_sats,
+        );
+
+        let refunds = crate::refund::VmRefundHandler::new(
+            db.clone(),
+            node,
+            subscription_handler.pricing_engine(),
         );
 
         let kv: Arc<dyn KeyValueStore> = if let Some(c) = &settings.redis {
@@ -249,6 +256,7 @@ impl Worker {
             work_commander,
             http_client,
             referral_payouts,
+            refunds,
         })
     }
 
@@ -2647,15 +2655,70 @@ impl Worker {
                 return Ok(Some("IP configuration updated successfully".to_string()));
             }
             WorkJob::ProcessVmRefund {
-                vm_id: _,
-                admin_user_id: _,
-                refund_from_date: _,
-                reason: _,
-                payment_method: _,
-                lightning_invoice: _,
+                vm_id,
+                admin_user_id,
+                refund_from_date,
+                reason,
+                payment_method,
+                lightning_invoice,
             } => {
-                // TODO: Implement the actual refund processing logic
-                bail!("Refund processing is not yet implemented");
+                let vm = self.db.get_vm(*vm_id).await?;
+                let outcome = self
+                    .refunds
+                    .process(
+                        *vm_id,
+                        *admin_user_id,
+                        *refund_from_date,
+                        reason.as_deref(),
+                        payment_method,
+                        lightning_invoice.as_deref(),
+                    )
+                    .await?;
+
+                // A refunded VM is deleted — the customer has been paid for the
+                // time it would have run. Queued rather than done here so the
+                // one deletion path (provisioner, history, notifications) stays
+                // the only one; the refund itself is already committed, so a
+                // deletion that fails is a VM to clean up, not money to chase.
+                if let Err(e) = self
+                    .work_commander
+                    .send(WorkJob::DeleteVm {
+                        vm_id: *vm_id,
+                        reason: Some(format!(
+                            "Refunded {} {}",
+                            outcome.booked_amount, outcome.currency
+                        )),
+                        admin_user_id: Some(*admin_user_id),
+                        purge: false,
+                    })
+                    .await
+                {
+                    error!(
+                        "VM {} was refunded but the deletion job could not be queued: {}",
+                        vm_id, e
+                    );
+                }
+
+                self.queue_notification(
+                    vm.user_id,
+                    format!(
+                        "Your VM #{} has been refunded {} sats and will be deleted.",
+                        vm_id,
+                        outcome.amount_msat / 1000
+                    ),
+                    Some(format!("[VM{}] Refunded", vm_id)),
+                )
+                .await;
+
+                return Ok(Some(format!(
+                    "VM {} refunded {} msat (fee {} msat), booked {} {} across {} payment(s)",
+                    vm_id,
+                    outcome.amount_msat,
+                    outcome.fee_msat,
+                    outcome.booked_amount,
+                    outcome.currency,
+                    outcome.refund_payment_ids.len()
+                )));
             }
             WorkJob::CreateVm {
                 user_id,

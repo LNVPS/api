@@ -520,15 +520,18 @@ POST /api/admin/v1/vms/{vm_id}/refund
 
 Required Permission: `virtual_machines::update`
 
-**Not implemented — always returns `501`.** No funds are moved and no record is written.
+Pays the customer's Lightning invoice from the LNVPS node, records the refund against the payments it reverses, and
+queues the VM for deletion (issue #193). The payout runs in a `ProcessVmRefund` work job, because the Lightning node
+lives in the worker — the response carries the job id and the outcome arrives as job feedback.
 
-This endpoint used to queue a `ProcessVmRefund` work job and answer `200` with its job id, while the only handler for
-that job bails with "Refund processing is not yet implemented". The failure happened in a background job after the
-response, so an operator saw a real pro-rated amount from `GET /refund`, submitted it, and was told the refund had been
-dispatched — with nothing moved and nothing recorded on either side (issue #193).
+The invoice must carry an amount, and that amount may not exceed the pro-rated refund `GET /refund` quotes; a smaller
+amount is allowed and is what gets recorded. The worker refuses before paying anything if the VM's paid payments cannot
+absorb the refund (already fully refunded, wrong currency), so money never leaves with nowhere to book it. The refund is
+booked in the currency each payment was charged in, at that payment's own frozen exchange and VAT rates, newest payment
+first.
 
-The request is still validated before the refusal, so the body below is checked the same way it will be once the payout
-path exists.
+Only `lightning` is automated. `revolut` and `paypal` return `501` — issue those in the provider's own dashboard and
+record them with `POST /api/admin/v1/vms/{vm_id}/payments/{payment_id}/refund`.
 
 Body:
 
@@ -545,16 +548,19 @@ Body:
 }
 ```
 
-Response (`501 Not Implemented`):
+Response:
 
 ```json
 {
-  "error": "Automated refund processing is not implemented: no funds are moved and no record is written. Issue the refund out-of-band and record it against the VM's payment."
+  "data": {
+    "job_id": "1705312200000-0"
+  }
 }
 ```
 
-Errors: `400` for an invalid payment method or a lightning refund with no invoice, `403` without
-`virtual_machines::update`, `404` for an unknown VM.
+Errors: `400` for an invalid payment method, a lightning refund with no invoice, or an invoice that does not parse, has
+no amount or has expired; `501` for `revolut`/`paypal`; `403` without `virtual_machines::update`; `404` for an unknown
+VM.
 
 #### Extend VM
 

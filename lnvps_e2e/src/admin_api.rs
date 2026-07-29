@@ -364,13 +364,13 @@ mod tests {
         );
     }
 
-    /// The automated refund endpoint refuses with 501 (issue #193). It used to
-    /// queue a work job whose only handler bails and answer 200 with the job
-    /// id, so an operator was told a refund had been dispatched while no money
-    /// moved and no record was written. The request is still validated first,
-    /// so a malformed one is still a 400.
+    /// What the automated refund endpoint accepts and what it turns away
+    /// (issue #193). The payout itself runs in the worker, so a well-formed
+    /// request answers with a job id; everything judgeable from the request is
+    /// judged synchronously, because an operator refunding a customer should
+    /// not learn about a malformed invoice from a job that failed later.
     #[tokio::test]
-    async fn test_admin_vm_refund_process_is_refused() {
+    async fn test_admin_vm_refund_process_validates_then_queues() {
         let client = setup().await;
         let resp = client.get_auth("/api/admin/v1/vms?limit=1").await.unwrap();
         let data: ApiPaginatedData<Value> = parse_paginated(resp).await.unwrap();
@@ -379,37 +379,74 @@ mod tests {
             return;
         }
         let vm_id = data.data[0]["id"].as_u64().unwrap();
+        let url = format!("/api/admin/v1/vms/{vm_id}/refund");
 
-        // A well-formed request is refused, and the refusal says why.
-        let body = serde_json::json!({
-            "payment_method": "lightning",
-            "lightning_invoice": "lnbc1e2etestinvoice",
-            "reason": "e2e-test"
-        });
-        let resp = client
-            .post_auth(&format!("/api/admin/v1/vms/{vm_id}/refund"), &body)
-            .await
-            .unwrap();
+        // An unknown payment method is rejected before anything else.
+        let bad = serde_json::json!({ "payment_method": "carrier-pigeon" });
+        let resp = client.post_auth(&url, &bad).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // A lightning refund without an invoice has nothing to pay.
+        let no_invoice = serde_json::json!({ "payment_method": "lightning" });
+        let resp = client.post_auth(&url, &no_invoice).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Only lightning is automated; the rest name where to record them.
+        let revolut = serde_json::json!({ "payment_method": "revolut" });
+        let resp = client.post_auth(&url, &revolut).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_IMPLEMENTED);
         let text = resp.text().await.unwrap();
         assert!(text.contains("not implemented"), "{text}");
-        assert!(text.contains("no funds are moved"), "{text}");
+        assert!(
+            text.contains("payments/"),
+            "names the manual endpoint: {text}"
+        );
 
-        // Validation still runs ahead of the refusal.
-        let bad = serde_json::json!({ "payment_method": "carrier-pigeon" });
-        let resp = client
-            .post_auth(&format!("/api/admin/v1/vms/{vm_id}/refund"), &bad)
-            .await
-            .unwrap();
+        // A string that is not a BOLT11 at all.
+        let garbage = serde_json::json!({
+            "payment_method": "lightning",
+            "lightning_invoice": "lnbc1e2etestinvoice"
+        });
+        let resp = client.post_auth(&url, &garbage).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        // A lightning refund without an invoice is still a 400, not a 501.
-        let no_invoice = serde_json::json!({ "payment_method": "lightning" });
-        let resp = client
-            .post_auth(&format!("/api/admin/v1/vms/{vm_id}/refund"), &no_invoice)
+        let amountless = match crate::lightning::create_invoice(None, "e2e-refund-amountless").await
+        {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("Skipping the rest: no payer lightning node ({e})");
+                return;
+            }
+        };
+        let body = serde_json::json!({
+            "payment_method": "lightning",
+            "lightning_invoice": amountless
+        });
+        let resp = client.post_auth(&url, &body).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "an amountless invoice leaves the refunded sum up to the payer"
+        );
+
+        // A valid invoice is accepted and the payout is queued as a job.
+        let invoice = crate::lightning::create_invoice(Some(1_000), "e2e-refund")
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = serde_json::json!({
+            "payment_method": "lightning",
+            "lightning_invoice": invoice,
+            "reason": "e2e-test"
+        });
+        let resp = client.post_auth(&url, &body).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "queued");
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(
+            body["data"]["job_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "the response carries the job to follow: {body}"
+        );
     }
 
     #[tokio::test]

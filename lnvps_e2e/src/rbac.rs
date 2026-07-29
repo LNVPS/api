@@ -264,10 +264,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// The refund endpoint refuses everyone with 501, but the permission check
-    /// runs first — a read_only admin is still refused with 403, so the
-    /// not-implemented answer never leaks to a caller who could not have used
-    /// it anyway. Checked ahead of the VM lookup, so a bogus VM id still 403s.
+    /// Paying a refund out is gated on `virtual_machines::update`, and the
+    /// permission is checked ahead of the VM lookup and the invoice — a
+    /// read_only admin gets 403 for a bogus VM id and a bogus invoice alike,
+    /// so nothing about the VM or the request leaks to a caller who could not
+    /// have refunded it anyway.
     #[tokio::test]
     async fn test_read_only_cannot_process_vm_refund() {
         setup_rbac().await;

@@ -2923,6 +2923,7 @@ dependencies = [
  "hex",
  "ipnetwork",
  "isocountry",
+ "lightning-invoice",
  "lnvps_api_common",
  "lnvps_compose",
  "lnvps_db",
