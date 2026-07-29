@@ -160,21 +160,13 @@ pub struct Context {
 /// Default gap between app-deployment sweeps while something is transitioning.
 const DEFAULT_TRANSITION_RECONCILE_SECS: u64 = 5;
 
-/// How long to wait before the next app-deployment sweep.
+/// How long the fast cadence may last before dropping back to the steady one.
 ///
-/// A deployment mid-provisioning changes state on its own, so its stored status
-/// is stale until the next sweep reads the cluster again; a settled deployment
-/// only changes when something else acts on it, and that path triggers its own
-/// reconcile. The fast interval is capped at the steady one so configuring a
-/// transition interval longer than `reconcile_interval` cannot slow the loop
-/// down below its floor.
-fn next_reconcile_delay(transitioning: bool, steady: Duration, transition: Duration) -> Duration {
-    if transitioning {
-        transition.min(steady)
-    } else {
-        steady
-    }
-}
+/// A workload that is merely not ready reads as transitioning, so an app whose
+/// readiness probe never passes would otherwise hold the whole cluster at the
+/// fast cadence forever. Provisioning that has not finished within this window
+/// is stuck, not slow, and is not worth sweeping for.
+const FAST_CADENCE_WINDOW: Duration = Duration::from_secs(300);
 
 /// The DSN to connect with: the environment wins over the config file, so the
 /// credential can live in a Secret while the rest of the config stays in a
@@ -265,13 +257,20 @@ async fn main() -> Result<()> {
         Err(e) => error!("Failed to reconcile app deployments: {}", e),
     }
 
-    let reconcile_interval = Duration::from_secs(context.settings.reconcile_interval.unwrap_or(60));
+    // Neither interval may be zero: that is a tight sweep loop against the API
+    // server, not a fast poll.
+    let reconcile_interval = Duration::from_secs(context.settings.reconcile_interval.unwrap_or(60))
+        .max(Duration::from_secs(1));
+    // Never below a second, and never above the steady interval it exists to
+    // beat.
     let transition_interval = Duration::from_secs(
         context
             .settings
             .transition_reconcile_interval
             .unwrap_or(DEFAULT_TRANSITION_RECONCILE_SECS),
-    );
+    )
+    .clamp(Duration::from_secs(1), reconcile_interval);
+    let max_fast_sweeps = (FAST_CADENCE_WINDOW.as_secs() / transition_interval.as_secs()).max(1);
 
     // Nostr domains follow DNS, which nothing here can hurry, so they stay on
     // the steady interval while app deployments run their own cadence.
@@ -291,24 +290,35 @@ async fn main() -> Result<()> {
     let app_transitioning = transitioning.clone();
     let app_wake = wake.clone();
     let reconciliation_task = async move {
+        let mut fast_sweeps = 0;
         loop {
-            let delay = next_reconcile_delay(
-                app_transitioning.load(Ordering::Relaxed),
-                reconcile_interval,
-                transition_interval,
-            );
+            let fast = app_transitioning.load(Ordering::Relaxed) && fast_sweeps < max_fast_sweeps;
             tokio::select! {
-                _ = tokio::time::sleep(delay) => {}
-                // Someone else swept and learned something about the cadence:
-                // start the wait again from the interval that now applies.
-                _ = app_wake.notified() => continue,
+                _ = tokio::time::sleep(if fast { transition_interval } else { reconcile_interval }) => {}
+                // A trigger is a fresh reason to watch closely: start the wait
+                // again, and give it a full fast window.
+                _ = app_wake.notified() => {
+                    fast_sweeps = 0;
+                    continue;
+                }
+            }
+            if fast {
+                fast_sweeps += 1;
             }
             match app_deployments::reconcile_app_deployments(&app_context).await {
-                Ok(t) => app_transitioning.store(t, Ordering::Relaxed),
+                Ok(t) => {
+                    // Only a settled cluster re-arms the fast window, so a
+                    // deployment stuck mid-transition cannot hold the cadence.
+                    if !t {
+                        fast_sweeps = 0;
+                    }
+                    app_transitioning.store(t, Ordering::Relaxed);
+                }
                 Err(e) => {
                     error!("Failed to reconcile app deployments: {}", e);
                     // An unknown outcome is not a reason to poll fast forever.
                     app_transitioning.store(false, Ordering::Relaxed);
+                    fast_sweeps = 0;
                 }
             }
         }
@@ -432,21 +442,6 @@ async fn trigger_listener(ctx: Arc<Context>, transitioning: Arc<AtomicBool>, wak
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A transitioning sweep comes round sooner; a settled one waits the full
-    /// interval, and a misconfigured fast interval can never be the slower of
-    /// the two.
-    #[test]
-    fn transitioning_deployments_shorten_the_next_sweep() {
-        let steady = Duration::from_secs(60);
-        let fast = Duration::from_secs(5);
-        assert_eq!(next_reconcile_delay(true, steady, fast), fast);
-        assert_eq!(next_reconcile_delay(false, steady, fast), steady);
-        assert_eq!(
-            next_reconcile_delay(true, steady, Duration::from_secs(600)),
-            steady
-        );
-    }
 
     /// The DSN is a credential, so a deployment can supply it from a Secret
     /// through the environment; the config file stays the fallback.

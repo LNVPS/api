@@ -345,7 +345,11 @@ customer watching a deployment come up sees its status move in seconds rather
 than once per `reconcile-interval`. Once every deployment is settled
 (`running`, `stopped` or `error`) the loop returns to `reconcile-interval` —
 a settled deployment only changes when something acts on it, and that path
-reconciles on its own. Values above `reconcile-interval` are capped to it.
+reconciles on its own. Values above `reconcile-interval` are capped to it, and values below one second
+are raised to it. The fast cadence lasts at most five minutes at a time: a
+workload that never becomes ready reads as `pending` forever, and sweeping the
+whole cluster every few seconds for it is load with no end — it returns to the
+fast cadence once the cluster settles, or when a payment triggers a reconcile.
 Nostr domain reconciliation is unaffected and always runs on
 `reconcile-interval`.
 
