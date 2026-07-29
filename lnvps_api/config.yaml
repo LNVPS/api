@@ -25,7 +25,7 @@ referral:
   # to leave fiat commission accruing for manual payout, which is the default.
   # On-chain referrers are excluded — their batched fee is split in sats and
   # cannot be charged against a fiat balance.
-  min-fiat-payout-sats: 1000
+  min-fiat-payout-sats: null
   # Maximum next-block fee rate (sat/vByte) tolerated for on-chain payouts. The
   # current rate is obtained from fee-estimator before each batch; if it exceeds
   # this cap the batch is deferred until fees drop. Defaults to 50.
