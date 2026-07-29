@@ -216,7 +216,11 @@ impl HealthCheck for DnsCheck {
 mod tests {
     use super::*;
 
+    /// Canary for public DNS being reachable, not a check of this crate: it
+    /// asserts a third party answers. Ignored by default so an offline or
+    /// firewalled run is not a red suite.
     #[tokio::test]
+    #[ignore = "queries live public DNS"]
     async fn test_dns_check_google_v4() {
         let config = DnsCheckConfig {
             name: "Google DNS Test".to_string(),
@@ -240,6 +244,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "queries live public DNS over IPv6"]
     async fn test_dns_check_google_v6() {
         let config = DnsCheckConfig {
             name: "Google DNS Test".to_string(),

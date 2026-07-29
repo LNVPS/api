@@ -41,7 +41,17 @@ cargo test -p lnvps_api_common test_name
 
 # Run tests with output visible
 cargo test -- --nocapture
+
+# Run the live-service canaries (VAT rates, VIES, public DNS). Ignored by
+# default: a third party being down is not this repository failing.
+cargo test --workspace --exclude lnvps_e2e -- --ignored --test-threads=1
 ```
+
+Unit tests need no network. Every client that talks to a third party (FX feed,
+VAT rates, VIES, image checksum sidecars, DNS/registry APIs) is served locally
+by `wiremock` in its tests, and the handful of tests that do reach a live
+service are `#[ignore]`d with the reason. A red run therefore means this
+codebase changed, not that a feed moved.
 
 ## Coverage
 
