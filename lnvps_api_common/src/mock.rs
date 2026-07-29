@@ -20,7 +20,7 @@ use lnvps_db::{
 use async_trait::async_trait;
 #[cfg(feature = "admin")]
 use lnvps_db::{AdminRole, AdminRoleAssignment, AdminUserInfo, AdminVmHost, RegionStats};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Add;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -95,6 +95,13 @@ pub struct MockDb {
             >,
         >,
     >,
+    /// Deployment ids whose usage totals write fails. A failing write is
+    /// otherwise unreachable here, and the callers' job is to survive one.
+    pub failing_usage_writes: Arc<Mutex<HashSet<u64>>>,
+    /// Deployment ids whose usage breakdown write fails. Separate from the
+    /// totals: a grant can cover `app_deployment` and not the breakdown tables,
+    /// so the two fail independently.
+    pub failing_usage_breakdown_writes: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl MockDb {
@@ -384,6 +391,8 @@ impl Default for MockDb {
             app_clusters: Arc::new(Default::default()),
             app_deployments: Arc::new(Default::default()),
             app_deployment_usage_breakdown: Arc::new(Default::default()),
+            failing_usage_writes: Arc::new(Default::default()),
+            failing_usage_breakdown_writes: Arc::new(Default::default()),
         }
     }
 }
@@ -3651,6 +3660,9 @@ impl LNVpsDbBase for MockDb {
         memory_bytes: u64,
         storage_bytes: Option<u64>,
     ) -> DbResult<()> {
+        if self.failing_usage_writes.lock().await.contains(&id) {
+            return Err(DbError::Other(anyhow!("usage write denied for {id}")));
+        }
         let mut d = self.app_deployments.lock().await;
         if let Some(x) = d.get_mut(&id) {
             x.usage_cpu_milli = Some(cpu_milli);
@@ -3667,6 +3679,16 @@ impl LNVpsDbBase for MockDb {
         services: &[AppDeploymentServiceUsage],
         volumes: &[AppDeploymentVolumeUsage],
     ) -> DbResult<()> {
+        if self
+            .failing_usage_breakdown_writes
+            .lock()
+            .await
+            .contains(&id)
+        {
+            return Err(DbError::Other(anyhow!(
+                "usage breakdown write denied for {id}"
+            )));
+        }
         let mut b = self.app_deployment_usage_breakdown.lock().await;
         b.insert(id, (services.to_vec(), volumes.to_vec()));
         Ok(())
