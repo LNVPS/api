@@ -9,7 +9,7 @@ use lnvps_api_common::{
 };
 use lnvps_db::{
     LNVpsDb, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
-    SubscriptionType, Vm,
+    SubscriptionType, Vm, VmHistoryActionType,
 };
 use log::{error, info, warn};
 use std::sync::Arc;
@@ -65,6 +65,33 @@ impl VmLineItemHandler {
         }
     }
 
+    /// Whether a `PaymentReceived` row for this payment already exists.
+    ///
+    /// The on-payment handling can run more than once for a single payment (an
+    /// admin re-dispatch, or a redelivered work job), but one payment must
+    /// appear in the audit trail once. On a read failure this reports false:
+    /// a duplicated row is a smaller loss than a missing one.
+    async fn payment_already_recorded(&self, vm_id: u64, payment_id: &str) -> bool {
+        match self.db.list_vm_history(vm_id).await {
+            Ok(history) => history.iter().any(|h| {
+                matches!(h.action_type, VmHistoryActionType::PaymentReceived)
+                    && h.metadata
+                        .as_ref()
+                        .and_then(|m| serde_json::from_slice::<serde_json::Value>(m).ok())
+                        .and_then(|v| {
+                            v.get("payment_id")
+                                .and_then(|p| p.as_str())
+                                .map(|p| p == payment_id)
+                        })
+                        .unwrap_or(false)
+            }),
+            Err(e) => {
+                warn!("Failed to read history for VM {}: {}", vm_id, e);
+                false
+            }
+        }
+    }
+
     async fn queue_admin_notification(&self, message: String, title: Option<String>) {
         if let Err(e) = self
             .tx
@@ -90,27 +117,32 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
             .and_then(|s| s.expires)
             .unwrap_or_else(chrono::Utc::now);
 
+        let payment_hex = hex::encode(&payment.id);
+        let already_recorded = self.payment_already_recorded(vm_id, &payment_hex).await;
+
         let payment_metadata = serde_json::json!({
-            "payment_id": hex::encode(&payment.id),
+            "payment_id": payment_hex,
             "payment_method": payment.payment_method.to_string()
         });
 
-        if let Err(e) = self
-            .vm_history_logger
-            .log_vm_payment_received(
-                vm_id,
-                payment.amount + payment.tax + payment.processing_fee,
-                &payment.currency,
-                payment.time_value.unwrap_or(0),
-                Some(payment_metadata),
-            )
-            .await
-        {
-            warn!("Failed to log payment for VM {}: {}", vm_id, e);
+        if !already_recorded {
+            if let Err(e) = self
+                .vm_history_logger
+                .log_vm_payment_received(
+                    vm_id,
+                    payment.amount + payment.tax + payment.processing_fee,
+                    &payment.currency,
+                    payment.time_value.unwrap_or(0),
+                    Some(payment_metadata),
+                )
+                .await
+            {
+                warn!("Failed to log payment for VM {}: {}", vm_id, e);
+            }
         }
 
         let time_value = payment.time_value.unwrap_or(0);
-        if time_value > 0 {
+        if time_value > 0 && !already_recorded {
             if let Err(e) = self
                 .vm_history_logger
                 .log_vm_renewed(
@@ -122,7 +154,7 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
                     Some(&payment.currency),
                     Some(serde_json::json!({
                         "time_added_seconds": time_value,
-                        "payment_id": hex::encode(&payment.id)
+                        "payment_id": payment_hex
                     })),
                 )
                 .await

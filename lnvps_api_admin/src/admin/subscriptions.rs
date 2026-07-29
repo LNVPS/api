@@ -530,14 +530,19 @@ async fn admin_complete_subscription_payment(
 
     if !payment.is_paid {
         this.db.subscription_payment_paid(&payment).await?;
+        log::info!(
+            "Admin {} manually completed subscription payment {} for subscription {}",
+            auth.user_id,
+            id,
+            payment.subscription_id
+        );
+    } else {
+        log::info!(
+            "Admin {} re-queued on-payment work for subscription payment {}",
+            auth.user_id,
+            id
+        );
     }
-
-    log::info!(
-        "Admin {} manually completed subscription payment {} for subscription {}",
-        auth.user_id,
-        id,
-        payment.subscription_id
-    );
 
     // Fail the request if this cannot be queued: the payment is paid either
     // way, so a silent success would leave an app without its reconcile and an
