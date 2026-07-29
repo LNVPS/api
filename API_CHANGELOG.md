@@ -24,6 +24,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **Contact form hardens email header values** — `POST /api/v1/contact` strips control characters from the sender name and subject (and caps the subject) before placing them in outgoing mail headers.
 
+### Added
+
+- **`host_ssh_keys` on VM status** (issue #154) — `GET /api/v1/vm/{id}` and `GET /api/v1/vm` now return the VM's own SSH host keys as `[{ key_type, public_key, fingerprint_sha256 }]`, so a client can verify the host on first connect instead of accepting whatever key answers. The list is empty until the keys are captured (scanned from the host once the VM is running, public keys only) and is re-captured after a reinstall, which regenerates them. Additive: no existing field changed. Not to be confused with `ssh_key`, which is the customer's authorized key.
+
 ### Fixed
 
 - **Admin-completed subscription payments now run the same on-payment handling as a Lightning settlement** (issue #320) — `POST /api/admin/v1/subscription_payments/{id}/complete` marked the payment paid but skipped the subscription's line item handlers, so a managed app never got its instant reconcile (it waited for the operator's next poll) and an Upgrade payment was marked paid without the upgrade ever being applied. The endpoint now also dispatches the handling to the worker, and fails (rather than returning `200`) if that dispatch cannot be queued. Repeating the call on an already-paid payment re-queues the handling instead of returning `409`, so a failed dispatch is recoverable; it never extends the subscription twice. Response shape is unchanged.

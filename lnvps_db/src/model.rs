@@ -1304,6 +1304,9 @@ pub struct Vm {
     pub disk_id: u64,
     /// Network MAC address
     pub mac_address: String,
+    /// SSH host keys captured from the guest after boot, as `ssh-keyscan`
+    /// lines. `None` until a capture succeeds.
+    pub ssh_host_keys: Option<String>,
     /// Is the VM deleted
     pub deleted: bool,
     /// Referral code (recorded during ordering)

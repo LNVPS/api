@@ -684,6 +684,7 @@ mod tests {
             subscription_line_item_id: 0,
             disk_id: 1,
             mac_address: "02:00:00:00:00:01".to_string(), // A valid MAC
+            ssh_host_keys: None,
             ref_code: None,
             deleted: false,
             disabled: false,

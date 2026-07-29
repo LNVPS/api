@@ -163,6 +163,7 @@ impl MockDb {
             ssh_key_id: Some(1),
             disk_id: 1,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
+            ssh_host_keys: None,
             deleted: false,
             ref_code: None,
             disabled: false,
@@ -1271,6 +1272,14 @@ impl LNVpsDbBase for MockDb {
             v.disk_id = vm.disk_id;
             v.mac_address = vm.mac_address.clone();
             v.disabled = vm.disabled;
+        }
+        Ok(())
+    }
+
+    async fn set_vm_ssh_host_keys(&self, vm_id: u64, keys: Option<&str>) -> DbResult<()> {
+        let mut vms = self.vms.lock().await;
+        if let Some(v) = vms.get_mut(&vm_id) {
+            v.ssh_host_keys = keys.map(|k| k.to_string());
         }
         Ok(())
     }
@@ -5482,6 +5491,50 @@ mod tests {
         let host = db.get_host(vm.host_id).await.ok();
         let res = vm_to_status(&db, vm, host, None, 0, 365).await;
         assert!(res.is_err(), "expected error, not a panic");
+    }
+
+    /// A VM's captured host keys reach the customer parsed, and a VM with none
+    /// captured reports an empty list rather than a missing field.
+    #[tokio::test]
+    async fn test_vm_to_status_exposes_captured_host_keys() {
+        use crate::model::vm_to_status;
+        use lnvps_db::{LNVpsDb, UserSshKey};
+
+        let db = MockDb::default();
+        db.vms.lock().await.insert(1, MockDb::mock_vm());
+        db.insert_user_ssh_key(&UserSshKey {
+            id: 0,
+            name: "k".to_string(),
+            user_id: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let db: std::sync::Arc<dyn LNVpsDb> = std::sync::Arc::new(db);
+        let vm = db.get_vm(1).await.unwrap();
+        let host = db.get_host(vm.host_id).await.ok();
+        let status = vm_to_status(&db, vm, host.clone(), None, 0, 365)
+            .await
+            .unwrap();
+        assert!(status.host_ssh_keys.is_empty(), "nothing captured yet");
+
+        db.set_vm_ssh_host_keys(
+            1,
+            Some(
+                "10.0.0.5 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIxcwoVKDYPNmQud4AV/iPBbNVYPSr4X0E31b3FQxS/B\n",
+            ),
+        )
+        .await
+        .unwrap();
+        let vm = db.get_vm(1).await.unwrap();
+        let status = vm_to_status(&db, vm, host, None, 0, 365).await.unwrap();
+        assert_eq!(status.host_ssh_keys.len(), 1);
+        assert_eq!(status.host_ssh_keys[0].key_type, "ssh-ed25519");
+        assert_eq!(
+            status.host_ssh_keys[0].fingerprint_sha256,
+            "SHA256:XXJM8fNyKu1oxISUmJkU3eTS4F4FcyW69THWriTri6M"
+        );
     }
 
     /// vm_to_status surfaces the host's sunset date on VMs whose host is being

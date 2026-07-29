@@ -10,8 +10,9 @@ use hickory_resolver::TokioResolver;
 use lnvps_api_common::{
     BlackholeWorkFeedback, ChannelWorkCommander, InMemoryKeyValueStore, JobFeedback, KeyValueStore,
     NetworkProvisioner, RedisConfig, RedisKeyValueStore, RedisWorkCommander, RedisWorkFeedback,
-    UpgradeConfig, VmHistoryLogger, VmRunningState, VmStateCache, WorkCommander, WorkFeedback,
-    WorkJob, WorkJobMessage, op_fatal,
+    SCANNED_KEY_FAMILIES, UpgradeConfig, VmHistoryLogger, VmRunningState, VmRunningStates,
+    VmStateCache, WorkCommander, WorkFeedback, WorkJob, WorkJobMessage, capture_is_complete,
+    merge_ssh_host_keys, op_fatal, parse_ssh_host_keys,
     retry::{OpError, Pipeline, RetryPolicy},
 };
 use lnvps_db::{
@@ -67,6 +68,15 @@ fn payment_blocks_unpaid_vm_deletion(p: &SubscriptionPayment, now: DateTime<Utc>
     !p.is_paid
         && (p.expires > now
             || (p.payment_method == PaymentMethod::OnChain && p.external_id.is_some()))
+}
+
+/// How long to wait before scanning a VM's host keys again while the capture is
+/// still missing keys.
+const HOST_KEY_SCAN_RETRY_SECS: u64 = 3600;
+
+/// Key holding when a VM's host keys were last scanned.
+fn host_key_attempt_key(vm_id: u64) -> String {
+    format!("worker-host-keys-attempt-{vm_id}")
 }
 
 /// Extract hostname/IP from a URL or return the input if it's already a plain host
@@ -915,7 +925,144 @@ impl Worker {
         )
         .await?;
         self.reconcile_vm_dns(vm).await;
+        self.capture_vm_ssh_host_keys(vm).await;
         Ok(())
+    }
+
+    /// Best-effort capture of a VM's SSH host keys, so a customer can verify
+    /// the host on first connect instead of trusting whatever key answers.
+    ///
+    /// Scanned from the Proxmox node rather than from here: the VM's address is
+    /// often not routable from the API, and the node is already trusted with
+    /// the VM. Only public keys are read — nothing runs inside the guest.
+    ///
+    /// Runs on the periodic VM check rather than at spawn: the keys do not
+    /// exist until cloud-init has generated them and sshd is up, and a VM whose
+    /// keys were never captured (or were cleared by a reinstall) self-heals on
+    /// the next pass. A VM whose capture already covers every algorithm is
+    /// skipped, so this costs nothing for a healthy VM.
+    async fn capture_vm_ssh_host_keys(&self, vm: &Vm) {
+        if vm.deleted {
+            return;
+        }
+        let captured = vm
+            .ssh_host_keys
+            .as_deref()
+            .map(parse_ssh_host_keys)
+            .unwrap_or_default();
+        if capture_is_complete(&captured) {
+            return;
+        }
+        if !matches!(
+            self.vm_state_cache.get_state(vm.id).await.map(|s| s.state),
+            Some(VmRunningStates::Running)
+        ) {
+            return;
+        }
+        let Some(ip) = self.vm_scan_address(vm).await else {
+            return;
+        };
+        // A guest that blocks port 22, never runs sshd, or offers fewer
+        // algorithms than a scan asks for would otherwise be scanned on every
+        // check for the life of the VM. One attempt per hour still captures
+        // the keys within an hour of the guest becoming reachable.
+        let attempt_key = host_key_attempt_key(vm.id);
+        if let Ok(Some(v)) = self.kv.get(&attempt_key).await
+            && v.len() == 8
+        {
+            let last = u64::from_le_bytes(v.as_slice().try_into().unwrap_or_default());
+            // A clock stepped backwards leaves a stamp in the future; wait it
+            // out rather than panic.
+            let waited = (Utc::now().timestamp() as u64).saturating_sub(last);
+            if waited < HOST_KEY_SCAN_RETRY_SECS {
+                return;
+            }
+        }
+        let now = Utc::now().timestamp() as u64;
+        if let Err(e) = self.kv.store(&attempt_key, &now.to_le_bytes()).await {
+            warn!("[host-keys] vm {}: failed to record attempt: {}", vm.id, e);
+        }
+        let host = match self.db.get_host(vm.host_id).await {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("[host-keys] vm {}: host lookup failed: {}", vm.id, e);
+                return;
+            }
+        };
+        let Some(ssh_key) = host.ssh_key.as_ref() else {
+            return;
+        };
+        let ssh_user = host.ssh_user.as_deref().unwrap_or("root");
+
+        let mut ssh = match SshClient::new() {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("[host-keys] vm {}: ssh client failed: {}", vm.id, e);
+                return;
+            }
+        };
+        let ssh_host = extract_host_from_url(&host.ip);
+        if let Err(e) = ssh
+            .connect_with_key((ssh_host.as_str(), 22), ssh_user, ssh_key.as_str())
+            .await
+        {
+            warn!(
+                "[host-keys] vm {}: connect to {} failed: {}",
+                vm.id, host.name, e
+            );
+            return;
+        }
+        // Bounded so an unreachable or half-open guest cannot hold the check.
+        let scan = match ssh
+            .execute(&format!(
+                "ssh-keyscan -T 5 -t {} {ip}",
+                SCANNED_KEY_FAMILIES.join(",")
+            ))
+            .await
+        {
+            Ok((_, out)) => out,
+            Err(e) => {
+                warn!("[host-keys] vm {}: keyscan failed: {}", vm.id, e);
+                return;
+            }
+        };
+        // A non-zero exit still prints the keys it did get, so the output is
+        // what decides. A scan opens one connection per algorithm and can time
+        // out on some of them, so what came back is merged into what is stored
+        // rather than replacing it, and a short capture is scanned again later.
+        if parse_ssh_host_keys(&scan).is_empty() {
+            debug!("[host-keys] vm {}: no keys in scan of {}", vm.id, ip);
+            return;
+        }
+        let merged = merge_ssh_host_keys(&ip, vm.ssh_host_keys.as_deref(), &scan);
+        if Some(merged.as_str()) == vm.ssh_host_keys.as_deref() {
+            return;
+        }
+        if let Err(e) = self.db.set_vm_ssh_host_keys(vm.id, Some(&merged)).await {
+            warn!("[host-keys] vm {}: failed to store keys: {}", vm.id, e);
+        }
+    }
+
+    /// The address to scan a VM's host keys on: its first assigned IP, v4
+    /// preferred because a node without IPv6 egress cannot reach the other.
+    async fn vm_scan_address(&self, vm: &Vm) -> Option<String> {
+        // Assignments are stored as CIDR; ssh-keyscan wants the bare address.
+        // Parsed rather than trimmed: the result is interpolated into a command
+        // on the host, so only something that is definitely an address goes in.
+        let addrs: Vec<std::net::IpAddr> = self
+            .db
+            .list_vm_ip_assignments(vm.id)
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|i| !i.deleted)
+            .filter_map(|i| i.ip.split('/').next()?.parse().ok())
+            .collect();
+        addrs
+            .iter()
+            .find(|a| a.is_ipv4())
+            .or_else(|| addrs.first())
+            .map(|a| a.to_string())
     }
 
     /// Best-effort reconciliation of missing DNS records for a VM's IPs.
@@ -2388,6 +2535,28 @@ impl Worker {
 
                 let feedback = match &result {
                     Ok(()) => {
+                        // The guest generates fresh host keys on reinstall, so
+                        // the stored ones now belong to an image that is gone;
+                        // clearing them makes the next check re-capture. The
+                        // scan-attempt stamp goes with them, or the customer
+                        // would be shown no keys until the retry window passed
+                        // — exactly when they are looking for the fingerprint.
+                        if let Err(e) = self.db.set_vm_ssh_host_keys(*vm_id, None).await {
+                            warn!(
+                                "Failed to clear ssh host keys after reinstall of VM {}: {}",
+                                vm_id, e
+                            );
+                        }
+                        if let Err(e) = self
+                            .kv
+                            .store(&host_key_attempt_key(*vm_id), &0u64.to_le_bytes())
+                            .await
+                        {
+                            warn!(
+                                "Failed to reset ssh host key scan stamp for VM {}: {}",
+                                vm_id, e
+                            );
+                        }
                         // Record history + refresh cached state only on success.
                         self.vm_history_logger
                             .log_vm_reinstalled(

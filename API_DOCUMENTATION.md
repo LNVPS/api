@@ -256,6 +256,13 @@ interface VmStatus {
   host_sunset_date?: string; // ISO 8601 datetime — set when the VM's host is being decommissioned; migrate before this date. Renewals are blocked once expires reaches it. Omitted when the host is not being sunset
   max_prepay_days: number; // Max days this VM may be prepaid/renewed in advance. A renewal is rejected once it would push `expires` beyond now + max_prepay_days; cap the renewal interval selector accordingly
   cpu_arch?: string; // CPU architecture of the host this VM runs on ("x86_64" | "arm64"), from the host record. Unlike template.cpu_arch (an optional constraint) this is present whenever the host arch is known; use it to always pass ?arch= when listing OS images for a reinstall. Omitted when unknown
+  host_ssh_keys: VmHostKey[]; // The VM's own SSH host keys, for verifying the host on first connect. Empty until captured after first boot; re-captured after a reinstall. Not the customer's authorized key (that is ssh_key)
+}
+
+interface VmHostKey {
+  key_type: string;           // "ssh-ed25519" | "ssh-rsa" | "ecdsa-sha2-nistp256" | "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521"
+  public_key: string;         // base64 key blob, as in the third field of a known_hosts line
+  fingerprint_sha256: string; // "SHA256:…", matching `ssh-keygen -lf` and the banner ssh prints for an unknown host
 }
 
 interface VmRunningState {

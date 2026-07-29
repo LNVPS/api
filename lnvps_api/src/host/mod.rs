@@ -384,6 +384,7 @@ mod tests {
                 ssh_key_id: Some(1),
                 disk_id: 1,
                 mac_address: "ff:ff:ff:ff:ff:fe".to_string(),
+                ssh_host_keys: None,
                 deleted: false,
                 ref_code: None,
                 disabled: false,

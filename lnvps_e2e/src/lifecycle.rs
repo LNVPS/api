@@ -512,6 +512,34 @@ mod tests {
         eprintln!("VM {vm_id} expires: {expires_str}");
 
         // ----------------------------------------------------------------
+        // 14a-2. SSH host keys: empty until the worker captures them, and
+        //        surfaced parsed once a capture exists.
+        // ----------------------------------------------------------------
+        assert_eq!(
+            vm_after_pay["data"]["host_ssh_keys"].as_array(),
+            Some(&vec![]),
+            "host keys are empty, not absent, before capture"
+        );
+        let pool = crate::db::connect().await.unwrap();
+        crate::db::set_vm_ssh_host_keys(
+            &pool,
+            vm_id,
+            "10.0.0.5 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIIxcwoVKDYPNmQud4AV/iPBbNVYPSr4X0E31b3FQxS/B\n",
+        )
+        .await
+        .unwrap();
+        let with_keys =
+            json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap()).await;
+        let keys = with_keys["data"]["host_ssh_keys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1, "{keys:?}");
+        assert_eq!(keys[0]["key_type"].as_str(), Some("ssh-ed25519"));
+        assert_eq!(
+            keys[0]["fingerprint_sha256"].as_str(),
+            Some("SHA256:XXJM8fNyKu1oxISUmJkU3eTS4F4FcyW69THWriTri6M")
+        );
+        crate::db::set_vm_ssh_host_keys(&pool, vm_id, "").await.unwrap();
+
+        // ----------------------------------------------------------------
         // 14b. Verify subscription state after first payment
         //      is_setup should now be true; expires should be set.
         // ----------------------------------------------------------------
