@@ -10,9 +10,9 @@ use hickory_resolver::TokioResolver;
 use lnvps_api_common::{
     BlackholeWorkFeedback, ChannelWorkCommander, InMemoryKeyValueStore, JobFeedback, KeyValueStore,
     NetworkProvisioner, RedisConfig, RedisKeyValueStore, RedisWorkCommander, RedisWorkFeedback,
-    UpgradeConfig, VmHistoryLogger, VmRunningState, VmRunningStates, VmStateCache, WorkCommander,
-    WorkFeedback, WorkJob, WorkJobMessage, capture_is_complete, merge_ssh_host_keys, op_fatal,
-    parse_ssh_host_keys,
+    SCANNED_KEY_FAMILIES, UpgradeConfig, VmHistoryLogger, VmRunningState, VmRunningStates,
+    VmStateCache, WorkCommander, WorkFeedback, WorkJob, WorkJobMessage, capture_is_complete,
+    merge_ssh_host_keys, op_fatal, parse_ssh_host_keys,
     retry::{OpError, Pipeline, RetryPolicy},
 };
 use lnvps_db::{
@@ -950,7 +950,10 @@ impl Worker {
             && v.len() == 8
         {
             let last = u64::from_le_bytes(v.as_slice().try_into().unwrap_or_default());
-            if Utc::now().timestamp() as u64 - last < HOST_KEY_SCAN_RETRY_SECS {
+            // Saturating: a clock stepped backwards leaves a stamp in the
+            // future, and the wait is over either way.
+            let waited = (Utc::now().timestamp() as u64).saturating_sub(last);
+            if waited < HOST_KEY_SCAN_RETRY_SECS {
                 return;
             }
         }
@@ -990,7 +993,10 @@ impl Worker {
         }
         // Bounded so an unreachable or half-open guest cannot hold the check.
         let scan = match ssh
-            .execute(&format!("ssh-keyscan -T 5 -t rsa,ecdsa,ed25519 {ip}"))
+            .execute(&format!(
+                "ssh-keyscan -T 5 -t {} {ip}",
+                SCANNED_KEY_FAMILIES.join(",")
+            ))
             .await
         {
             Ok((_, out)) => out,
