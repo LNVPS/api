@@ -518,7 +518,7 @@ Response:
 POST /api/admin/v1/vms/{vm_id}/refund
 ```
 
-Required Permission: `virtual_machines::update`
+Required Permissions: `virtual_machines::update` **and** `payments::update`
 
 Pays the customer's Lightning invoice from the LNVPS node, records the refund against the payments it reverses, and
 queues the VM for deletion (issue #193). The payout runs in a `ProcessVmRefund` work job, because the Lightning node
@@ -526,7 +526,8 @@ lives in the worker — the response carries the job id and the outcome arrives 
 
 The invoice must carry an amount, and that amount may not exceed the pro-rated refund `GET /refund` quotes; a smaller
 amount is allowed and is what gets recorded. The worker refuses before paying anything if the VM's paid payments cannot
-absorb the refund (already fully refunded, wrong currency), so money never leaves with nowhere to book it. The refund is
+absorb the refund (already fully refunded, wrong currency), or if the invoice is worth less than one minor unit of the
+charged currency, so money never leaves with nowhere to book it. The refund is
 booked in the currency each payment was charged in, at that payment's own frozen exchange and VAT rates, newest payment
 first.
 
@@ -559,8 +560,8 @@ Response:
 ```
 
 Errors: `400` for an invalid payment method, a lightning refund with no invoice, or an invoice that does not parse, has
-no amount or has expired; `501` for `revolut`/`paypal`; `403` without `virtual_machines::update`; `404` for an unknown
-VM.
+no amount or has expired; `501` for `revolut`/`paypal`; `403` without both `virtual_machines::update` and
+`payments::update`; `404` for an unknown VM.
 
 #### Extend VM
 

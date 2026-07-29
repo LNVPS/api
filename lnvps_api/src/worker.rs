@@ -2711,13 +2711,15 @@ impl Worker {
                 .await;
 
                 return Ok(Some(format!(
-                    "VM {} refunded {} msat (fee {} msat), booked {} {} across {} payment(s)",
+                    "VM {} refunded {} msat (fee {} msat, preimage {}), booked {} {} across {} \
+                     payment(s)",
                     vm_id,
                     outcome.amount_msat,
                     outcome.fee_msat,
+                    outcome.preimage.as_deref().unwrap_or("none"),
                     outcome.booked_amount,
                     outcome.currency,
-                    outcome.refund_payment_ids.len()
+                    outcome.refund_rows
                 )));
             }
             WorkJob::CreateVm {

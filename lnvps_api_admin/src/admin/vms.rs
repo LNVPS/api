@@ -945,8 +945,10 @@ async fn admin_process_vm_refund(
     Path(vm_id): Path<u64>,
     Json(req): Json<AdminProcessRefundRequest>,
 ) -> ApiResult<JobResponse> {
-    // Check permission
+    // Money leaving the business is a payments write, like recording one; the
+    // VM permission alone would let whoever can delete a VM send funds out.
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
+    auth.require_permission(AdminResource::Payments, AdminAction::Update)?;
 
     // Verify VM exists
     let _vm = this.db.get_vm(vm_id).await?;

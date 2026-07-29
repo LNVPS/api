@@ -41,8 +41,8 @@ pub struct RefundOutcome {
     pub booked_amount: u64,
     /// The currency the VM was charged in.
     pub currency: String,
-    /// Ids of the refund rows written.
-    pub refund_payment_ids: Vec<Vec<u8>>,
+    /// How many refund rows were written.
+    pub refund_rows: u64,
 }
 
 #[derive(Clone)]
@@ -123,6 +123,15 @@ impl VmRefundHandler {
         // that left the node describe one event.
         let booked = quote.rate.convert(CurrencyAmount::millisats(pay_msat))?;
         let currency = booked.currency().to_string();
+        // Conversion rounds to the nearest minor unit, so a small enough
+        // invoice is worth nothing in the charged currency. Paying it would
+        // move money that no refund row could account for.
+        ensure!(
+            booked.value() > 0,
+            "invoice of {} msat rounds to zero {}, too small to refund",
+            pay_msat,
+            currency
+        );
 
         let plan = self
             .allocation(vm_id, &currency, booked.value())
@@ -147,7 +156,7 @@ impl VmRefundHandler {
         // has to be recorded — by hand through the manual endpoint if these
         // writes cannot do it.
         let refunded_at = Utc::now();
-        let mut refund_payment_ids = Vec::new();
+        let mut refund_rows = 0;
         let mut booked_amount = 0;
         let mut failures = Vec::new();
         for (original, amount) in plan {
@@ -174,7 +183,7 @@ impl VmRefundHandler {
                 continue;
             }
             booked_amount += amount;
-            refund_payment_ids.push(row.id.clone());
+            refund_rows += 1;
 
             if let Err(e) = self
                 .history
@@ -214,7 +223,7 @@ impl VmRefundHandler {
             preimage,
             booked_amount,
             currency,
-            refund_payment_ids,
+            refund_rows,
         })
     }
 
@@ -471,7 +480,7 @@ mod tests {
         assert_eq!(outcome.amount_msat, 500_000);
         assert_eq!(outcome.currency, "EUR");
         assert_eq!(outcome.booked_amount, 50, "€0.50 booked in cents");
-        assert_eq!(outcome.refund_payment_ids.len(), 1);
+        assert_eq!(outcome.refund_rows, 1);
 
         let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
         assert_eq!(refunds.len(), 1);
@@ -542,6 +551,36 @@ mod tests {
         assert!(node.paid.lock().unwrap().is_empty(), "nothing was paid");
     }
 
+    /// An invoice worth less than one minor unit of the charged currency is
+    /// refused before paying: it would send money that rounds to nothing on
+    /// the ledger, leaving a paid-out refund with no row behind it.
+    #[tokio::test]
+    async fn refuses_an_invoice_that_rounds_to_zero_in_the_charged_currency() {
+        let mock = MockDb::default();
+        vm_with_payment(&mock, 1230, 230).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let node = Arc::new(PayNode::default());
+        let handler = handler(db, node.clone()).await;
+
+        // At 100,000 EUR/BTC one cent is 10,000 msat, so 4,000 msat is worth
+        // less than the smallest amount that can be booked.
+        let err = handler
+            .process(1, 9, None, None, "lightning", Some(&invoice_for(4_000)))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rounds to zero"), "{err}");
+        assert!(node.paid.lock().unwrap().is_empty(), "nothing was paid");
+
+        // One cent exactly is still refundable.
+        let outcome = handler
+            .process(1, 9, None, None, "lightning", Some(&invoice_for(10_000)))
+            .await
+            .expect("one cent refund");
+        assert_eq!(outcome.booked_amount, 1);
+        assert_eq!(outcome.refund_rows, 1);
+    }
+
     /// Non-Lightning methods are not automated, and say where to record them.
     #[tokio::test]
     async fn refuses_methods_it_cannot_pay() {
@@ -596,7 +635,7 @@ mod tests {
             .await
             .expect("refund");
         assert_eq!(outcome.booked_amount, 50);
-        assert_eq!(outcome.refund_payment_ids.len(), 2);
+        assert_eq!(outcome.refund_rows, 2);
         assert_eq!(
             db.list_refunds_for_payment(&newest.id)
                 .await

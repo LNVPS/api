@@ -264,6 +264,26 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// Paying a refund out needs `payments::update` as well as VM update: a
+    /// vm_manager can delete a customer's VM but cannot decide money goes back
+    /// out over the node.
+    #[tokio::test]
+    async fn test_vm_manager_cannot_process_vm_refund() {
+        setup_rbac().await;
+        let client = admin_client_with_keys(vm_manager_keys().clone());
+        let body = serde_json::json!({
+            "payment_method": "lightning",
+            "lightning_invoice": "lnbc1rbactestinvoice"
+        });
+        let resp = client
+            .post_auth("/api/admin/v1/vms/999999999/refund", &body)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("Insufficient permissions"), "{text}");
+    }
+
     /// Paying a refund out is gated on `virtual_machines::update`, and the
     /// permission is checked ahead of the VM lookup and the invoice — a
     /// read_only admin gets 403 for a bogus VM id and a bogus invoice alike,
