@@ -1769,11 +1769,10 @@ Body:
   // optional - if not provided, cost plan will be auto-created
   "region_id": number,
   "ip4_count": number,
-  // optional - IPv4 addresses included in this offer, default 1. Capped at 1
-  // until the guest network config can carry more than one address per family
+  // optional - IPv4 addresses included in this offer, default 1
   "ip6_count": number,
-  // optional - IPv6 addresses included in this offer, default 1, capped at 1.
-  // Assignment is best-effort: a region with no IPv6 range still provisions
+  // optional - IPv6 addresses included in this offer, default 1. Assignment is
+  // best-effort: a region with no IPv6 range still provisions
 
   // Cost plan auto-creation fields (used when cost_plan_id not provided)
   "cost_plan_name": "string",
@@ -2042,12 +2041,11 @@ Body:
   "min_ip4": number,
   // optional - Minimum IPv4 addresses selectable, default 1
   "max_ip4": number,
-  // optional - Maximum IPv4 addresses selectable, default 1. Capped at 1 until
-  // the guest network config can carry more than one address per family
+  // optional - Maximum IPv4 addresses selectable, default 1
   "min_ip6": number,
   // optional - Minimum IPv6 addresses selectable, default 1
   "max_ip6": number,
-  // optional - Maximum IPv6 addresses selectable, default 1, capped at 1
+  // optional - Maximum IPv6 addresses selectable, default 1
   "disk_iops_read": number,
   // optional - Maximum disk read IOPS (omit or null = uncapped)
   "disk_iops_write": number,
@@ -2120,12 +2118,11 @@ Body (all optional):
   "min_ip4": number,
   // optional - Minimum IPv4 addresses selectable, default 1
   "max_ip4": number,
-  // optional - Maximum IPv4 addresses selectable, default 1. Capped at 1 until
-  // the guest network config can carry more than one address per family
+  // optional - Maximum IPv4 addresses selectable, default 1
   "min_ip6": number,
   // optional - Minimum IPv6 addresses selectable, default 1
   "max_ip6": number,
-  // optional - Maximum IPv6 addresses selectable, default 1, capped at 1
+  // optional - Maximum IPv6 addresses selectable, default 1
   "disk_iops_read": "number | null",
   // Maximum disk read IOPS - send null to clear
   "disk_iops_write": "number | null",
@@ -4852,12 +4849,11 @@ The RBAC system uses the following permission format: `resource::action`
   "min_ip4": number,
   // optional - Minimum IPv4 addresses selectable, default 1
   "max_ip4": number,
-  // optional - Maximum IPv4 addresses selectable, default 1. Capped at 1 until
-  // the guest network config can carry more than one address per family
+  // optional - Maximum IPv4 addresses selectable, default 1
   "min_ip6": number,
   // optional - Minimum IPv6 addresses selectable, default 1
   "max_ip6": number,
-  // optional - Maximum IPv6 addresses selectable, default 1, capped at 1
+  // optional - Maximum IPv6 addresses selectable, default 1
   "disk_iops_read": number,
   // Maximum disk read IOPS - omitted when uncapped
   "disk_iops_write": number,

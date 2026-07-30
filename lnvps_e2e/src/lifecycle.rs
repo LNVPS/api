@@ -221,7 +221,7 @@ mod tests {
             "min_memory": 1073741824_u64,
             "max_memory": 17179869184_u64,
             "min_ip4": 1,
-            "max_ip4": 1,
+            "max_ip4": 2,
             "min_ip6": 0,
             "max_ip6": 1,
             "disk_pricing": [{
@@ -1743,7 +1743,7 @@ mod tests {
             "disk": 10737418240_u64,
             "disk_type": "ssd",
             "disk_interface": "pcie",
-            "ip4_count": 1,
+            "ip4_count": 2,
             "ip6_count": 0,
             "image_id": image_id,
             "ssh_key_id": ssh_key_id
@@ -1758,15 +1758,21 @@ mod tests {
             let id = vm["data"]["id"].as_u64().unwrap();
             multi_ip_vm_id = Some(id);
             assert_eq!(
-                1,
+                2,
                 vm["data"]["template"]["ip4_count"].as_u64().unwrap(),
                 "ordered IPv4 count must be reflected on the VM's template"
             );
             assert_eq!(0, vm["data"]["template"]["ip6_count"].as_u64().unwrap());
-            eprintln!("Ordered custom VM {id} with an explicit IPv4 count");
+            // Two addresses at 200 cents each, so the IPv4 share alone exceeds
+            // the single-address price this plan used to imply.
+            let amount = vm["data"]["template"]["cost_plan"]["amount"]
+                .as_u64()
+                .unwrap();
+            assert!(amount >= 400, "2x IPv4 must be billed, got {amount}");
+            eprintln!("Ordered custom VM {id} with 2x IPv4 (amount {amount})");
         } else {
             eprintln!(
-                "Explicit-IP custom VM order returned {} (expected if provisioner unavailable)",
+                "Multi-IP custom VM order returned {} (expected if provisioner unavailable)",
                 resp.status()
             );
         }
@@ -1782,21 +1788,6 @@ mod tests {
             resp.status(),
             StatusCode::OK,
             "an out-of-range IPv4 count must not be orderable"
-        );
-
-        // A plan cannot offer more addresses than the guest can be configured
-        // with, so widening it is refused.
-        let resp = admin
-            .patch_auth(
-                &format!("/api/admin/v1/custom_pricing/{custom_pricing_id}"),
-                &serde_json::json!({ "max_ip4": 2 }),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "max_ip4 above the configurable limit must be refused"
         );
 
         // ----------------------------------------------------------------

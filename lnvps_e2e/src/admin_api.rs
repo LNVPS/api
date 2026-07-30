@@ -3025,13 +3025,13 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// The guest can only be configured with one address per family, so an offer
-    /// above that would allocate and bill for addresses the VM never receives.
+    /// A plan may offer more than one address per family; the guest network
+    /// config carries them all on one NIC.
     #[tokio::test]
-    async fn test_admin_create_custom_pricing_rejects_unconfigurable_ip_count() {
+    async fn test_admin_create_custom_pricing_accepts_multi_ip_range() {
         let client = setup().await;
         let body = serde_json::json!({
-            "name": "e2e-too-many-ips",
+            "name": "e2e-multi-ip",
             "enabled": true,
             "region_id": 1,
             "currency": "EUR",
@@ -3051,32 +3051,7 @@ mod tests {
             .post_auth("/api/admin/v1/custom_pricing", &body)
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_admin_create_vm_template_rejects_unconfigurable_ip_count() {
-        let client = setup().await;
-        let body = serde_json::json!({
-            "name": "e2e-too-many-ips-template",
-            "enabled": true,
-            "region_id": 1,
-            "cpu": 1,
-            "memory": 1073741824_u64,
-            "disk_size": 10737418240_u64,
-            "disk_type": "ssd",
-            "disk_interface": "pcie",
-            "ip4_count": 2,
-            "cost_plan_amount": 500,
-            "cost_plan_currency": "EUR",
-            "cost_plan_interval_amount": 1,
-            "cost_plan_interval_type": "month"
-        });
-        let resp = client
-            .post_auth("/api/admin/v1/vm_templates", &body)
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
