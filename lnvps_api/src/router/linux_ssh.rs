@@ -63,10 +63,10 @@ impl LinuxSshRouter {
     /// Open a fresh SSH connection for a single operation.
     ///
     /// Connecting per-operation keeps the router `Send + Sync` without holding a
-    /// live (non-`Sync`) ssh2 session, and is naturally resilient to dropped
+    /// live SSH session, and is naturally resilient to dropped
     /// connections.
     async fn connect(&self) -> Result<SshClient> {
-        let mut client = SshClient::new()?;
+        let mut client = SshClient::new();
         client
             .connect_with_key(&self.host, &self.username, &self.key)
             .await?;

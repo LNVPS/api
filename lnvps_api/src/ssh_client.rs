@@ -1,18 +1,45 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use log::info;
-use ssh2::Channel;
-use std::io::Read;
+use russh::client::{self, Handle, Msg};
+use russh::keys::{PrivateKeyWithHashAlg, decode_secret_key, load_secret_key};
+use russh::{Channel, ChannelMsg};
+use russh_sftp::client::SftpSession;
+use russh_sftp::protocol::FileAttributes;
 use std::path::{Path, PathBuf};
-use tokio::net::{TcpStream, ToSocketAddrs};
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::net::ToSocketAddrs;
 
+/// How long a connect/auth attempt may take before it is abandoned.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Session event handler.
+///
+/// Host keys are accepted unconditionally: hosts are addressed by IP from the
+/// database and there is no key store to pin them against, so verifying here
+/// would reject every connection rather than add security.
+struct Handler;
+
+impl client::Handler for Handler {
+    type Error = russh::Error;
+
+    async fn check_server_key(
+        &mut self,
+        _server_public_key: &russh::keys::ssh_key::PublicKey,
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
+    }
+}
+
+#[derive(Default)]
 pub struct SshClient {
-    session: ssh2::Session,
+    session: Option<Handle<Handler>>,
 }
 
 impl SshClient {
-    pub fn new() -> Result<SshClient> {
-        let session = ssh2::Session::new()?;
-        Ok(SshClient { session })
+    pub fn new() -> SshClient {
+        SshClient { session: None }
     }
 
     pub async fn connect(
@@ -21,12 +48,8 @@ impl SshClient {
         username: &str,
         key: &PathBuf,
     ) -> Result<()> {
-        let tcp = TcpStream::connect(host).await?;
-        self.session.set_tcp_stream(tcp);
-        self.session.handshake()?;
-        self.session
-            .userauth_pubkey_file(username, None, key, None)?;
-        Ok(())
+        let key = load_secret_key(key, None)?;
+        self.authenticate(host, username, key).await
     }
 
     /// Connect using a private key from memory (PEM format)
@@ -36,42 +59,68 @@ impl SshClient {
         username: &str,
         private_key_pem: &str,
     ) -> Result<()> {
-        let tcp = TcpStream::connect(host).await?;
-        self.session.set_tcp_stream(tcp);
-        self.session.handshake()?;
-        self.session
-            .userauth_pubkey_memory(username, None, private_key_pem, None)?;
+        let key = decode_secret_key(private_key_pem, None)?;
+        self.authenticate(host, username, key).await
+    }
+
+    async fn authenticate(
+        &mut self,
+        host: impl ToSocketAddrs,
+        username: &str,
+        key: russh::keys::PrivateKey,
+    ) -> Result<()> {
+        let config = Arc::new(client::Config {
+            inactivity_timeout: None,
+            ..Default::default()
+        });
+        // A host can finish key exchange and then stall in auth, so the timeout
+        // has to cover the whole handshake and not just the connect.
+        let session = tokio::time::timeout(CONNECT_TIMEOUT, async move {
+            let mut session = client::connect(config, host, Handler).await?;
+            let hash_alg = session.best_supported_rsa_hash().await?.flatten();
+            let res = session
+                .authenticate_publickey(
+                    username,
+                    PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
+                )
+                .await?;
+            if !res.success() {
+                bail!("SSH public key authentication failed for user {username}");
+            }
+            Ok::<_, anyhow::Error>(session)
+        })
+        .await??;
+
+        self.session = Some(session);
         Ok(())
     }
 
-    pub async fn open_channel(&mut self) -> Result<Channel> {
-        let channel = self.session.channel_session()?;
-        Ok(channel)
-    }
-
-    pub fn tunnel_unix_socket(&mut self, remote_path: &Path) -> Result<Channel> {
+    fn session(&self) -> Result<&Handle<Handler>> {
         self.session
-            .channel_direct_streamlocal(remote_path.to_str().unwrap(), None)
-            .map_err(|e| anyhow!(e))
+            .as_ref()
+            .ok_or_else(|| anyhow!("SSH session is not connected"))
     }
 
-    /// Toggle blocking mode on the underlying SSH session.
-    ///
-    /// Set to `false` before calling [`tunnel_unix_socket`] when you need
-    /// non-blocking I/O (e.g. for the terminal proxy bridge thread).
-    pub fn set_blocking(&self, blocking: bool) {
-        self.session.set_blocking(blocking);
+    pub async fn open_channel(&mut self) -> Result<Channel<Msg>> {
+        Ok(self.session()?.channel_open_session().await?)
     }
 
-    /// Connect and run a single command entirely on a blocking thread.
+    /// Open a direct-streamlocal channel to a unix socket on the remote host.
     ///
-    /// libssh2 I/O is synchronous and blocking; running it directly inside an
-    /// async task (as [`connect`](Self::connect) + [`execute`](Self::execute)
-    /// do) stalls the tokio worker thread for the whole duration of the command.
-    /// For long-running commands — image downloads, decompression — that freezes
-    /// the entire runtime. This helper performs the connect + exec on a dedicated
-    /// blocking thread (via `spawn_blocking`) using a synchronous
-    /// [`std::net::TcpStream`], so the async runtime keeps making progress.
+    /// The returned channel borrows nothing from this client, but the session it
+    /// belongs to lives on the client: keep the [`SshClient`] alive for as long
+    /// as the channel is in use.
+    pub async fn tunnel_unix_socket(&mut self, remote_path: &Path) -> Result<Channel<Msg>> {
+        let path = remote_path
+            .to_str()
+            .ok_or_else(|| anyhow!("Remote socket path is not valid UTF-8"))?;
+        Ok(self
+            .session()?
+            .channel_open_direct_streamlocal(path)
+            .await?)
+    }
+
+    /// Connect and run a single command.
     pub async fn run_command(
         host: String,
         port: u16,
@@ -79,50 +128,41 @@ impl SshClient {
         key: PathBuf,
         command: String,
     ) -> Result<(i32, String)> {
-        tokio::task::spawn_blocking(move || -> Result<(i32, String)> {
-            let tcp = std::net::TcpStream::connect((host.as_str(), port))?;
-            let mut session = ssh2::Session::new()?;
-            session.set_tcp_stream(tcp);
-            session.handshake()?;
-            session.userauth_pubkey_file(&username, None, &key, None)?;
-
-            let mut channel = session.channel_session()?;
-            channel.exec(&command)?;
-            let mut s = String::new();
-            channel.read_to_string(&mut s)?;
-            // Drain stderr and fold it into the output on failure (see `execute`).
-            let mut err = String::new();
-            channel.stderr().read_to_string(&mut err)?;
-            channel.wait_close()?;
-            let code = channel.exit_status()?;
-            if code != 0 && !err.trim().is_empty() {
-                if !s.is_empty() && !s.ends_with('\n') {
-                    s.push('\n');
-                }
-                s.push_str("stderr: ");
-                s.push_str(err.trim_end());
-            }
-            Ok((code, s))
-        })
-        .await?
+        let mut client = SshClient::new();
+        client.connect((host, port), &username, &key).await?;
+        client.execute(&command).await
     }
 
     pub async fn execute(&mut self, command: &str) -> Result<(i32, String)> {
         info!("Executing command: {}", command);
-        let mut channel = self.session.channel_session()?;
-        channel.exec(command)?;
-        let mut s = String::new();
-        channel.read_to_string(&mut s)?;
-        // Also drain stderr. Tools like `qm`/`qemu-img` print the actual failure
-        // reason here (stdout only carries the terse "update VM ..." echo and
-        // syslog only logs "creating disks failed"), so without this the real
-        // cause of a non-zero exit is invisible. Fold it into the returned
-        // output on failure so callers that log the string surface it; on
-        // success stderr is left out to avoid disturbing output parsers.
-        let mut err = String::new();
-        channel.stderr().read_to_string(&mut err)?;
-        channel.wait_close()?;
-        let code = channel.exit_status()?;
+        let mut channel = self.session()?.channel_open_session().await?;
+        channel.exec(true, command).await?;
+
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let mut code = None;
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { ref data } => out.extend_from_slice(data),
+                // Also collect stderr. Tools like `qm`/`qemu-img` print the
+                // actual failure reason there (stdout only carries the terse
+                // "update VM ..." echo and syslog only logs "creating disks
+                // failed"), so without this the real cause of a non-zero exit is
+                // invisible.
+                ChannelMsg::ExtendedData { ref data, ext: 1 } => err.extend_from_slice(data),
+                ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status as i32),
+                _ => {}
+            }
+        }
+
+        let mut s = String::from_utf8_lossy(&out).into_owned();
+        let err = String::from_utf8_lossy(&err).into_owned();
+        // A server that closes the channel without an exit-status is treated as
+        // a failure so callers cannot mistake it for a clean run.
+        let code = code.ok_or_else(|| anyhow!("Command did not report an exit status"))?;
+        // Fold stderr into the returned output on failure so callers that log
+        // the string surface it; on success it is left out to avoid disturbing
+        // output parsers.
         if code != 0 && !err.trim().is_empty() {
             if !s.is_empty() && !s.ends_with('\n') {
                 s.push('\n');
@@ -134,8 +174,16 @@ impl SshClient {
     }
 
     /// Upload a file to the remote host via SFTP
-    pub fn scp_upload(&self, local_data: &[u8], remote_path: &Path, mode: i32) -> Result<()> {
-        use std::io::Write;
+    pub async fn scp_upload(
+        &mut self,
+        local_data: &[u8],
+        remote_path: &Path,
+        mode: i32,
+    ) -> Result<()> {
+        let path = remote_path
+            .to_str()
+            .ok_or_else(|| anyhow!("Remote path is not valid UTF-8"))?
+            .to_string();
 
         info!(
             "SFTP upload to {:?} ({} bytes, mode {:o})",
@@ -144,14 +192,26 @@ impl SshClient {
             mode
         );
 
-        let sftp = self.session.sftp()?;
-        let mut file = sftp.create(remote_path)?;
-        file.write_all(local_data)?;
+        let channel = self.session()?.channel_open_session().await?;
+        channel.request_subsystem(true, "sftp").await?;
+        let sftp = SftpSession::new(channel.into_stream()).await?;
 
-        // Set file permissions
-        let mut stat = sftp.stat(remote_path)?;
-        stat.perm = Some(mode as u32);
-        sftp.setstat(remote_path, stat)?;
+        let mut file = sftp.create(path.clone()).await?;
+        file.write_all(local_data).await?;
+        file.shutdown().await?;
+
+        // Only the permission bits are sent. `FileAttributes::default()` is not
+        // an empty attribute set — it carries `size: Some(0)`, which the server
+        // applies and truncates the file we just wrote.
+        sftp.set_metadata(
+            path,
+            FileAttributes {
+                permissions: Some(mode as u32),
+                ..FileAttributes::empty()
+            },
+        )
+        .await?;
+        sftp.close().await?;
 
         info!("SFTP upload complete");
         Ok(())

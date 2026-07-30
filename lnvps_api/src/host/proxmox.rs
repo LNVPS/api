@@ -372,7 +372,7 @@ impl ProxmoxClient {
         let ssh_user = ssh_config.user.clone();
         let ssh_key = ssh_config.key.clone();
 
-        let mut ssh = SshClient::new().map_err(OpError::Transient)?;
+        let mut ssh = SshClient::new();
         ssh.connect((host.clone(), 22), &ssh_user, &ssh_key)
             .await
             .map_err(OpError::Transient)?;
@@ -480,7 +480,7 @@ impl ProxmoxClient {
             );
 
             // SSH connection and execution with retry
-            let mut s = SshClient::new().map_err(OpError::Transient)?;
+            let mut s = SshClient::new();
             s.connect((host.clone(), 22), &ssh_user, &ssh_key)
                 .await
                 .map_err(OpError::Transient)?;
@@ -1210,7 +1210,7 @@ impl ProxmoxClient {
         self.stop_vm(&self.node, vm_id).await.ok();
 
         {
-            let mut ses = SshClient::new().map_err(OpError::Transient)?;
+            let mut ses = SshClient::new();
             ses.connect(
                 (self.api.base().host().unwrap().to_string(), 22),
                 &ssh.user,
@@ -1998,7 +1998,7 @@ impl VmHostClient for ProxmoxClient {
         let ssh_user = ssh.user.clone();
         let ssh_key = ssh.key.clone();
 
-        let mut client = SshClient::new().map_err(OpError::Transient)?;
+        let mut client = SshClient::new();
         client
             .connect((host, 22), &ssh_user, &ssh_key)
             .await
@@ -2006,12 +2006,8 @@ impl VmHostClient for ProxmoxClient {
 
         let ssh_channel = client
             .tunnel_unix_socket(std::path::Path::new(&socket_path))
+            .await
             .map_err(OpError::Transient)?;
-
-        // Enable non-blocking mode *after* the channel is fully established.
-        // Setting it before causes the channel_direct_streamlocal handshake to
-        // fail with WouldBlock.
-        client.set_blocking(false);
 
         // mpsc channels: the TerminalStream returned to the caller exposes
         // client_rx (bytes from VM) and server_tx (bytes to VM).
@@ -2019,10 +2015,11 @@ impl VmHostClient for ProxmoxClient {
         let (client_tx, client_rx) = mpsc_channel::<Vec<u8>>(256);
         let (server_tx, server_rx) = mpsc_channel::<Vec<u8>>(256);
 
-        // Run the blocking I/O bridge in a dedicated thread so the non-Send
-        // ssh2::Channel does not cross async task boundaries.
-        tokio::task::spawn_blocking(move || {
-            ssh_terminal_bridge(ssh_channel, client_tx, server_rx);
+        // The client owns the SSH session the tunnel channel belongs to, so it
+        // has to outlive the bridge.
+        tokio::spawn(async move {
+            ssh_terminal_bridge(ssh_channel, client_tx, server_rx).await;
+            drop(client);
         });
 
         info!("Terminal proxy opened for VM {}", vm_id);
@@ -2043,11 +2040,7 @@ impl ProxmoxClient {
 
     /// Run a shell command on the Proxmox node over SSH.
     ///
-    /// Delegates to [`SshClient::run_command`], which performs the blocking
-    /// libssh2 connect + exec on a dedicated blocking thread. This is important
-    /// for long-running commands (image downloads, decompression): doing the
-    /// blocking SSH I/O directly on an async worker thread would stall the entire
-    /// tokio runtime for the command's full duration.
+    /// Delegates to [`SshClient::run_command`], which opens a session per call.
     async fn ssh_run(&self, command: String) -> Result<(i32, String)> {
         let ssh_cfg = match &self.ssh {
             Some(s) => s,
@@ -2795,63 +2788,46 @@ pub struct VmFirewallRule {
     pub rule_type: VmFirewallRuleType,
 }
 
-/// Blocking I/O bridge between an SSH channel (QEMU serial socket) and the
-/// async mpsc channels exposed as a [`TerminalStream`].
-///
-/// This function is intended to be executed via [`tokio::task::spawn_blocking`]
-/// so that the non-`Send` [`ssh2::Channel`] never crosses async task boundaries.
-fn ssh_terminal_bridge(
-    mut channel: ssh2::Channel,
+/// I/O bridge between an SSH channel (QEMU serial socket) and the async mpsc
+/// channels exposed as a [`TerminalStream`].
+async fn ssh_terminal_bridge(
+    mut channel: russh::Channel<russh::client::Msg>,
     client_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     mut server_rx: tokio::sync::mpsc::Receiver<Vec<u8>>,
 ) {
-    use std::io::{Read, Write};
-
-    // Non-blocking mode is already set on the session by the caller.
-    let mut buf = [0u8; 4096];
     loop {
-        // --- upstream: serial socket → WebSocket client ---
-        match channel.stream(0).read(&mut buf) {
-            Ok(0) => {
-                // EOF: the channel was closed by the remote side.
-                break;
-            }
-            Ok(n) => {
-                if client_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                    // Receiver dropped (WebSocket closed).
-                    break;
+        tokio::select! {
+            // --- upstream: serial socket → WebSocket client ---
+            msg = channel.wait() => {
+                match msg {
+                    Some(russh::ChannelMsg::Data { data }) => {
+                        if client_tx.send(data.to_vec()).await.is_err() {
+                            // Receiver dropped (WebSocket closed).
+                            break;
+                        }
+                    }
+                    // EOF or channel closed by the remote side.
+                    Some(russh::ChannelMsg::Eof) | Some(russh::ChannelMsg::Close) | None => break,
+                    Some(_) => {}
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                // No data available right now — fall through to check
-                // downstream direction, then sleep briefly.
-            }
-            Err(e) => {
-                log::warn!("Terminal read error: {}", e);
-                break;
-            }
-        }
-
-        // --- downstream: WebSocket client → serial socket ---
-        match server_rx.try_recv() {
-            Ok(data) => {
-                if let Err(e) = channel.stream(0).write_all(&data) {
-                    log::warn!("Terminal write error: {}", e);
-                    break;
+            // --- downstream: WebSocket client → serial socket ---
+            data = server_rx.recv() => {
+                match data {
+                    Some(data) => {
+                        if let Err(e) = channel.data(data.as_slice()).await {
+                            log::warn!("Terminal write error: {}", e);
+                            break;
+                        }
+                    }
+                    // Sender dropped (WebSocket closed).
+                    None => break,
                 }
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                // Nothing to write right now.
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                // Sender dropped (WebSocket closed).
-                break;
             }
         }
     }
 
-    let _ = channel.close();
+    let _ = channel.close().await;
     info!("Terminal proxy connection closed");
 }
 

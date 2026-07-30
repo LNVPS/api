@@ -295,3 +295,23 @@ if [[ -n "$FILTER" ]]; then
     TEST_CMD="$TEST_CMD $FILTER"
 fi
 eval "$TEST_CMD"
+
+# ---------------------------------------------------------------------------
+# 10. SshClient integration tests against the compose sshd
+#
+# These live in lnvps_api (they use the library directly, not HTTP) and skip
+# themselves unless these two variables are set.
+# ---------------------------------------------------------------------------
+SSH_KEY="$REPO_ROOT/volumes/e2e-sshd/id_ed25519"
+if [[ ! -f "$SSH_KEY" ]]; then
+    # The tests skip themselves without these variables, so a missing key would
+    # otherwise pass the run without ever touching SSH.
+    echo "ERROR: $SSH_KEY missing — the sshd service did not start" >&2
+    docker compose -f "$COMPOSE_FILE" logs --tail=40 sshd >&2 || true
+    exit 1
+fi
+
+echo "=== Running SshClient integration tests ==="
+LNVPS_TEST_SSH_ADDR="${LNVPS_TEST_SSH_ADDR:-localhost:2222}" \
+LNVPS_TEST_SSH_KEY="$SSH_KEY" \
+    cargo test -p lnvps_api --test ssh_client
