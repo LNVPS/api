@@ -376,20 +376,10 @@ impl ProxmoxClient {
             .await
             .map_err(OpError::Transient)?;
 
-        // Mirror the Proxmox host's resolvers into the snippet so cloud-init
-        // force-writes /etc/resolv.conf on every guest. Without this, minimal
-        // images (Alpine, NixOS) silently drop the DNS servers Proxmox provides.
-        let (_, resolv_conf) = ssh
-            .execute("cat /etc/resolv.conf 2>/dev/null || true")
-            .await
-            .map_err(OpError::Transient)?;
-        let nameservers = parse_resolv_conf_nameservers(&resolv_conf);
-        if nameservers.is_empty() {
-            warn!(
-                "No nameservers found in host /etc/resolv.conf; vendor snippet will not manage guest DNS"
-            );
-        }
-        let snippet_content = build_vendor_snippet(&nameservers);
+        // Force a fixed set of public resolvers into every guest's
+        // /etc/resolv.conf via cloud-init. Without this, minimal images
+        // (Alpine, NixOS) silently drop the DNS servers Proxmox provides.
+        let snippet_content = build_vendor_snippet(GUEST_DNS_SERVERS);
 
         let vol_ref = format!("{storage_name}:snippets/{snippet_filename}");
 
@@ -2243,29 +2233,17 @@ fn parse_storage_from_disk(disk: &str) -> Option<String> {
     }
 }
 
-/// Extract the `nameserver` entries from an `/etc/resolv.conf`, preserving order
-/// and dropping duplicates/comments.
-///
-/// Used to mirror the Proxmox host's resolvers into the cloud-init vendor
-/// snippet (see [`build_vendor_snippet`]).
-fn parse_resolv_conf_nameservers(resolv_conf: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    for line in resolv_conf.lines() {
-        let line = line.trim();
-        if line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        if parts.next() == Some("nameserver")
-            && let Some(ip) = parts.next()
-            && ip.parse::<IpAddr>().is_ok()
-            && !out.iter().any(|e| e == ip)
-        {
-            out.push(ip.to_string());
-        }
-    }
-    out
-}
+/// DNS resolvers forced into every guest's `/etc/resolv.conf` via the cloud-init
+/// vendor snippet (see [`build_vendor_snippet`]).
+const GUEST_DNS_SERVERS: &[&str] = &[
+    "1.1.1.1",
+    "8.8.8.8",
+    "9.9.9.9",
+    // IPv6 variants of the same providers (Cloudflare, Google, Quad9).
+    "2606:4700:4700::1111",
+    "2001:4860:4860::8888",
+    "2620:fe::fe",
+];
 
 /// Build the cloud-init vendor-data snippet applied to every VM on the host.
 ///
@@ -2274,9 +2252,8 @@ fn parse_resolv_conf_nameservers(resolv_conf: &str) -> Vec<String> {
 /// `/etc/resolv.conf` directly (`manage_resolv_conf: true`), which is required
 /// for minimal images (e.g. Alpine, NixOS) whose native network renderer does
 /// not apply the DNS servers Proxmox hands them (Alpine's busybox ifupdown
-/// needs `openresolv`, which the stock cloud image lacks). Mirroring the host's
-/// resolvers here matches Proxmox's own host-`resolv.conf` fallback behaviour.
-fn build_vendor_snippet(nameservers: &[String]) -> String {
+/// needs `openresolv`, which the stock cloud image lacks).
+fn build_vendor_snippet(nameservers: &[&str]) -> String {
     let mut s = String::from("#cloud-config\nssh_deletekeys: false\n");
     if !nameservers.is_empty() {
         s.push_str("manage_resolv_conf: true\nresolv_conf:\n  nameservers:\n");
@@ -2901,32 +2878,23 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
-    fn test_parse_resolv_conf_nameservers() {
-        let rc = "# generated\nsearch example.com\nnameserver 1.1.1.1\nnameserver 9.9.9.9\n;comment\nnameserver 1.1.1.1\nnameserver not-an-ip\nnameserver 2606:4700:4700::1111\n";
-        assert_eq!(
-            parse_resolv_conf_nameservers(rc),
-            vec![
-                "1.1.1.1".to_string(),
-                "9.9.9.9".to_string(),
-                "2606:4700:4700::1111".to_string(),
-            ]
-        );
-        assert!(parse_resolv_conf_nameservers("# nothing here\nsearch foo\n").is_empty());
-    }
-
-    #[test]
     fn test_build_vendor_snippet() {
         // No nameservers -> only ssh_deletekeys, no resolv_conf block.
         let empty = build_vendor_snippet(&[]);
         assert_eq!(empty, "#cloud-config\nssh_deletekeys: false\n");
         assert!(!empty.contains("manage_resolv_conf"));
 
-        // With nameservers -> manage_resolv_conf block appended.
-        let s = build_vendor_snippet(&["1.1.1.1".to_string(), "9.9.9.9".to_string()]);
+        // With nameservers (incl. IPv6) -> manage_resolv_conf block appended.
+        let s = build_vendor_snippet(&["1.1.1.1", "2606:4700:4700::1111"]);
         assert_eq!(
             s,
-            "#cloud-config\nssh_deletekeys: false\nmanage_resolv_conf: true\nresolv_conf:\n  nameservers:\n    - 1.1.1.1\n    - 9.9.9.9\n"
+            "#cloud-config\nssh_deletekeys: false\nmanage_resolv_conf: true\nresolv_conf:\n  nameservers:\n    - 1.1.1.1\n    - 2606:4700:4700::1111\n"
         );
+
+        // The production constant covers both IPv4 and IPv6 resolvers.
+        let prod = build_vendor_snippet(GUEST_DNS_SERVERS);
+        assert!(prod.contains("    - 8.8.8.8\n"));
+        assert!(prod.contains("    - 2620:fe::fe\n"));
     }
 
     #[test]
