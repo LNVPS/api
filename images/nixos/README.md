@@ -20,7 +20,7 @@ to be **baked into the image at build time**, which is exactly what
 
 | File | Purpose |
 |---|---|
-| `flake.nix` | Pins nixpkgs + `nixos-generators`; exposes a `qcow` image per arch |
+| `flake.nix` | Pins nixpkgs + `nixos-generators`; exposes a `qcow-efi` (UEFI) image per arch |
 | `configuration.nix` | The NixOS profile: cloud-init, OpenSSH, serial console |
 | `build.sh` | Builds the qcow2, xz-compresses it, writes `SHA256SUMS` |
 | `../../.github/workflows/nixos-image.yml` | CI that builds + publishes on `nixos-image-v*` tags |
@@ -88,6 +88,10 @@ uses it like any other cloud image. Set `enabled: true` to make it selectable.
 2. **You maintain this image.** There is no upstream mirror to track — bump the
    `nixpkgs` channel in `flake.nix` and `system.stateVersion` in
    `configuration.nix` together each NixOS release, then re-tag.
+3. **UEFI only.** LNVPS boots every VM with OVMF (UEFI) firmware, so the flake
+   uses the `qcow-efi` format (ESP + `efiInstallAsRemovable`). The plain `qcow`
+   format is legacy-BIOS only and will **not boot** under LNVPS — do not switch
+   back to it.
 
 ## First-boot smoke test (recommended before enabling)
 

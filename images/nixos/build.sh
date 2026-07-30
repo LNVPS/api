@@ -27,9 +27,9 @@ OUT_DIR="out"
 BASENAME="nixos-${VERSION}-cloudinit-${ARCH}"
 mkdir -p "$OUT_DIR"
 
-echo ">> Building qcow2 for ${NIX_SYSTEM} (this can take a while)…"
+echo ">> Building qcow2 (UEFI) for ${NIX_SYSTEM} (this can take a while)…"
 # result/ is a symlink to a store path containing nixos.qcow2
-nix build ".#packages.${NIX_SYSTEM}.qcow" --out-link result
+nix build ".#packages.${NIX_SYSTEM}.qcow-efi" --out-link result
 
 QCOW_SRC="$(find -L result -maxdepth 1 -name '*.qcow2' | head -1)"
 if [[ -z "$QCOW_SRC" ]]; then

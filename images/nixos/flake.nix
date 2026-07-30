@@ -26,20 +26,25 @@
         system:
         nixos-generators.nixosGenerate {
           inherit system;
-          # `qcow` produces a cloud-ready qcow2 with a growable root partition,
-          # a serial console and a GRUB/systemd-boot loader already configured.
-          format = "qcow";
+          # `qcow-efi` (NOT `qcow`) is required: LNVPS boots every VM with OVMF
+          # (UEFI) firmware and hands it a fresh, empty efidisk0. The plain
+          # `qcow` format installs GRUB to the MBR for legacy BIOS boot and has
+          # no EFI system partition, so it will not boot under OVMF. `qcow-efi`
+          # creates an ESP and sets efiInstallAsRemovable, installing GRUB to the
+          # UEFI fallback path (EFI/BOOT/BOOTX64.EFI) that OVMF finds without a
+          # pre-existing NVRAM boot entry.
+          format = "qcow-efi";
           modules = [ ./configuration.nix ];
         };
     in
     {
       packages = {
         "x86_64-linux" = {
-          qcow = mkImage "x86_64-linux";
+          qcow-efi = mkImage "x86_64-linux";
           default = mkImage "x86_64-linux";
         };
         "aarch64-linux" = {
-          qcow = mkImage "aarch64-linux";
+          qcow-efi = mkImage "aarch64-linux";
           default = mkImage "aarch64-linux";
         };
       };
