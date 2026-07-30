@@ -295,6 +295,13 @@ mod tests {
                     "Custom template price calc should return 200, 400, or 500, got: {}",
                     resp.status()
                 );
+                if resp.status() == StatusCode::OK {
+                    // A recurring price with no period reads as a total, so the
+                    // interval has to be on the wire.
+                    let price: ApiData<Value> = parse_data(resp).await.unwrap();
+                    assert_eq!(price.data["interval_amount"], 1);
+                    assert_eq!(price.data["interval_type"], "month");
+                }
             }
         }
     }

@@ -60,6 +60,15 @@ pub struct RemainingTimeInfo {
     pub prorated_cost: CurrencyAmount,
 }
 
+/// Billing period a custom VM price buys. Custom builds have no cost plan row,
+/// so the interval is fixed here and is what both the renewal and the quoted
+/// price report.
+pub const CUSTOM_VM_INTERVAL_AMOUNT: u64 = 1;
+pub const CUSTOM_VM_INTERVAL_TYPE: IntervalType = IntervalType::Month;
+// The renewal below advances by months, so a change of unit here has to be made
+// there too.
+const _: () = assert!(matches!(CUSTOM_VM_INTERVAL_TYPE, IntervalType::Month));
+
 /// ISO 3166-1 alpha-3 codes treated as inside the EU VAT area (27 member states).
 const EU_VAT_COUNTRIES: [&str; 27] = [
     "AUT", "BEL", "BGR", "HRV", "CYP", "CZE", "DNK", "EST", "FIN", "FRA", "DEU", "GRC", "HUN",
@@ -885,13 +894,14 @@ impl PricingEngine {
         let template = self.db.get_custom_vm_template(template_id).await?;
         let price = Self::get_custom_vm_cost_amount(&self.db, &template).await?;
 
-        // custom templates are always 1-month intervals; clamp base to now for expired VMs
+        // clamp base to now for expired VMs
         let base = self
             .vm_subscription_expires(vm)
             .await
             .unwrap_or_else(Utc::now)
             .max(Utc::now());
-        let time_value = (base.add(Months::new(1)) - base).num_seconds() as u64;
+        let time_value =
+            (base.add(Months::new(CUSTOM_VM_INTERVAL_AMOUNT as u32)) - base).num_seconds() as u64;
         let converted_amount = self
             .get_amount_and_rate(
                 CurrencyAmount::from_u64(price.currency, price.total()),
@@ -1396,7 +1406,10 @@ impl PricingEngine {
         } else if let Some(cid) = vm.custom_template_id {
             let template = self.db.get_custom_vm_template(cid).await?;
             let price = Self::get_custom_vm_cost_amount(&self.db, &template).await?;
-            let time_value = Self::cost_plan_interval_to_seconds(IntervalType::Month, 1);
+            let time_value = Self::cost_plan_interval_to_seconds(
+                CUSTOM_VM_INTERVAL_TYPE,
+                CUSTOM_VM_INTERVAL_AMOUNT,
+            );
             (
                 CurrencyAmount::from_u64(price.currency, price.total()),
                 time_value,
@@ -1557,7 +1570,8 @@ impl PricingEngine {
         let new_price = CurrencyAmount::from_u64(new_price.currency, new_price.total());
 
         // Get the time value for the custom template
-        let custom_plan_seconds = Self::cost_plan_interval_to_seconds(IntervalType::Month, 1);
+        let custom_plan_seconds =
+            Self::cost_plan_interval_to_seconds(CUSTOM_VM_INTERVAL_TYPE, CUSTOM_VM_INTERVAL_AMOUNT);
         let new_cost_per_second = new_price.value() as f64 / custom_plan_seconds as f64;
 
         // calculate the cost based on the time until the vm expires
