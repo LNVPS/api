@@ -1,0 +1,72 @@
+name: Build NixOS cloud image
+
+# Builds the LNVPS NixOS cloud-init qcow2 (images/nixos), compresses it and
+# publishes it with a SHA256SUMS file. NixOS ships no official cloud-init
+# image, so we build and host our own.
+#
+# Triggers on a dedicated tag prefix (nixos-image-v*) so it does NOT run on the
+# main `v*` release tags (those drive the lnvps_fw .deb build). Also available
+# on demand via workflow_dispatch.
+on:
+  push:
+    tags:
+      - "nixos-image-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image version label (used in filenames), e.g. 24.11"
+        required: true
+        default: "24.11"
+
+permissions:
+  contents: write
+
+jobs:
+  build-image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Derive version label
+        id: ver
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            # tag form: nixos-image-v24.11  ->  24.11
+            echo "version=${GITHUB_REF_NAME#nixos-image-v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Nix (flakes enabled)
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Enable Nix build cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Build qcow2 (x86_64)
+        working-directory: images/nixos
+        run: ./build.sh "${{ steps.ver.outputs.version }}" x86_64
+
+      - name: Show artifacts
+        working-directory: images/nixos/out
+        run: |
+          ls -lh
+          cat SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: nixos-cloud-image
+          path: |
+            images/nixos/out/*.qcow2.xz
+            images/nixos/out/SHA256SUMS
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/nixos-image-v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            images/nixos/out/*.qcow2.xz
+            images/nixos/out/SHA256SUMS
