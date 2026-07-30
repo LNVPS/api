@@ -1,8 +1,8 @@
-use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminCreateVmTemplateRequest, AdminUpdateVmTemplateRequest, AdminVmTemplateInfo,
 };
+use crate::admin::{RouterState, validate_offered_ip_count};
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -138,6 +138,11 @@ async fn admin_create_vm_template(
     // Validate that region exists
     let _region = this.db.get_host_region(req.region_id).await?;
 
+    let ip4_count = req.ip4_count.unwrap_or(1);
+    let ip6_count = req.ip6_count.unwrap_or(1);
+    validate_offered_ip_count("ip4_count", ip4_count)?;
+    validate_offered_ip_count("ip6_count", ip6_count)?;
+
     // Handle cost plan creation or validation
     let cost_plan_id = if let Some(existing_cost_plan_id) = req.cost_plan_id {
         // Validate that the provided cost plan exists
@@ -201,8 +206,8 @@ async fn admin_create_vm_template(
         disk_interface: req.disk_interface.into(),
         cost_plan_id,
         region_id: req.region_id,
-        ip4_count: req.ip4_count.unwrap_or(1),
-        ip6_count: req.ip6_count.unwrap_or(1),
+        ip4_count,
+        ip6_count,
         disk_iops_read: req.disk_iops_read,
         disk_iops_write: req.disk_iops_write,
         disk_mbps_read: req.disk_mbps_read,
@@ -324,9 +329,11 @@ async fn admin_update_vm_template(
         template.region_id = region_id;
     }
     if let Some(v) = req.ip4_count {
+        validate_offered_ip_count("ip4_count", v)?;
         template.ip4_count = v;
     }
     if let Some(v) = req.ip6_count {
+        validate_offered_ip_count("ip6_count", v)?;
         template.ip6_count = v;
     }
     if let Some(v) = req.disk_iops_read {

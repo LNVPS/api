@@ -790,6 +790,17 @@ pub struct CustomVmSpec {
     pub cpu_arch: Option<String>,
     #[serde(default)]
     pub cpu_feature: Vec<String>,
+    /// IPv4 addresses to assign; defaults to 1, the count every order implied
+    /// before this was selectable.
+    #[serde(default = "default_ip_count")]
+    pub ip4_count: u16,
+    /// IPv6 addresses to assign; defaults to 1.
+    #[serde(default = "default_ip_count")]
+    pub ip6_count: u16,
+}
+
+fn default_ip_count() -> u16 {
+    1
 }
 
 impl CustomVmSpec {
@@ -824,6 +835,8 @@ impl CustomVmSpec {
                 None => CpuArch::default(),
             },
             cpu_features: cpu_features.into(),
+            ip4_count: self.ip4_count,
+            ip6_count: self.ip6_count,
             ..Default::default()
         })
     }
@@ -1043,7 +1056,38 @@ mod tests {
             cpu_mfg: None,
             cpu_arch: None,
             cpu_feature: vec![],
+            ip4_count: 1,
+            ip6_count: 1,
         }
+    }
+
+    /// An omitted count means the single address every order implied before the
+    /// counts were selectable, not zero.
+    #[test]
+    fn test_custom_vm_spec_defaults_ip_counts_to_one() {
+        let spec: CustomVmSpec = serde_json::from_str(
+            r#"{"pricing_id":7,"cpu":4,"memory":1073741824,"disk":10737418240,
+                "disk_type":"ssd","disk_interface":"pcie"}"#,
+        )
+        .unwrap();
+        assert_eq!(1, spec.ip4_count);
+        assert_eq!(1, spec.ip6_count);
+
+        let t = spec.to_template().unwrap();
+        assert_eq!(1, t.ip4_count);
+        assert_eq!(1, t.ip6_count);
+    }
+
+    #[test]
+    fn test_custom_vm_spec_carries_ip_counts() {
+        let spec = CustomVmSpec {
+            ip4_count: 2,
+            ip6_count: 0,
+            ..custom_spec()
+        };
+        let t = spec.to_template().unwrap();
+        assert_eq!(2, t.ip4_count);
+        assert_eq!(0, t.ip6_count);
     }
 
     #[test]

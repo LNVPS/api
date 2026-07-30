@@ -1,6 +1,8 @@
 use axum::Router;
 use axum::extract::FromRef;
-use lnvps_api_common::{ExchangeRateService, RedisWorkFeedback, VmStateCache, WorkCommander};
+use lnvps_api_common::{
+    ApiError, ExchangeRateService, RedisWorkFeedback, VmStateCache, WorkCommander,
+};
 use lnvps_db::LNVpsDb;
 use std::sync::Arc;
 
@@ -33,6 +35,22 @@ mod vm_os_images;
 mod vm_templates;
 mod vms;
 mod websocket;
+
+/// Largest address count an offer may carry, per family.
+///
+/// A guest gets one cloud-init `ipconfig` entry, which holds a single IPv4 and a
+/// single IPv6, so an offer above this would allocate and bill for addresses that
+/// never reach the VM. Raise once the guest-side config can carry more.
+pub(crate) const MAX_OFFERED_IPS: u16 = 1;
+
+pub(crate) fn validate_offered_ip_count(field: &str, count: u16) -> Result<(), ApiError> {
+    if count > MAX_OFFERED_IPS {
+        return Err(ApiError::bad_request(format!(
+            "{field} cannot exceed {MAX_OFFERED_IPS}: the guest can only be configured with one address per family"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Clone, FromRef)]
 pub(crate) struct RouterState {
