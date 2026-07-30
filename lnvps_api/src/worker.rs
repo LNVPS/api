@@ -321,10 +321,19 @@ impl Worker {
         sub: &Subscription,
         last_check: DateTime<Utc>,
     ) -> Result<()> {
-        const BEFORE_EXPIRE_NOTIFICATION_DAYS: u64 = 1;
         let Some(expires) = sub.expires else {
             return Ok(());
         };
+
+        // How far ahead of expiry the "expiring soon" auto-renewal / warning
+        // window opens. Capped at half the billing interval so a subscription
+        // that was just renewed (new expiry = now + interval) is NOT immediately
+        // "expiring soon" again. Without the cap, a short interval (e.g. 1-day
+        // billing) with a fixed 1-day lead re-enters the window the moment it is
+        // paid, and the next worker tick auto-renews it seconds later — a
+        // double charge (VM 1828).
+        let lead = expiry_lead_window(sub);
+        let lead_descr = format_lead_window(lead);
 
         let line_items = self.db.list_subscription_line_items(sub.id).await?;
         let sub_notification_subject = self.sub_notification_subject(sub, &line_items).await;
@@ -337,11 +346,8 @@ impl Worker {
         // stale (e.g. a freshly-started worker whose last check defaults to the
         // unix epoch), starving the expired/grace branches below.
         let now = Utc::now();
-        let expiry_window = now.add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS));
-        if expires > now
-            && expires < expiry_window
-            && expires > last_check.add(Days::new(BEFORE_EXPIRE_NOTIFICATION_DAYS))
-        {
+        let expiry_window = now.add(lead);
+        if expires > now && expires < expiry_window && expires > last_check.add(lead) {
             // Attempt auto-renewal using the user's default saved payment method
             // (NWC Lightning wallet or Revolut card), dispatched by provider.
             let mut auto_renewed = false;
@@ -370,8 +376,8 @@ impl Worker {
                             self.queue_notification(
                                 sub.user_id,
                                 format!(
-                                    "Your subscription will expire soon.\nAutomatic renewal failed: '{}'\nPlease renew manually in the next {} day(s).\n{}",
-                                    e, BEFORE_EXPIRE_NOTIFICATION_DAYS, sub_notification_descr
+                                    "Your subscription will expire soon.\nAutomatic renewal failed: '{}'\nPlease renew manually in the next {}.\n{}",
+                                    e, lead_descr, sub_notification_descr
                                 ),
                                 Some(format!("[{}] Expiring Soon", sub_notification_subject)),
                             )
@@ -388,8 +394,8 @@ impl Worker {
                 self.queue_notification(
                     sub.user_id,
                     format!(
-                        "Your subscription will expire soon. Please renew manually in the next {} day(s).\n{}",
-                        BEFORE_EXPIRE_NOTIFICATION_DAYS, sub_notification_descr
+                        "Your subscription will expire soon. Please renew manually in the next {}.\n{}",
+                        lead_descr, sub_notification_descr
                     ),
                     Some(format!("[{}] Expiring Soon", sub_notification_subject)),
                 )
@@ -465,6 +471,45 @@ impl Worker {
 /// `lnvps_api_common` so the API layer can surface the resulting deletion date;
 /// re-exported here for the worker/subscription callers.
 pub use lnvps_api_common::grace_period_days_for_sub;
+
+/// Approximate duration of one billing interval for a subscription.
+///
+/// Calendar months/years are approximated (30/365 days) — this is only used to
+/// cap the auto-renewal lead window, where day-level precision is irrelevant.
+fn subscription_interval(sub: &Subscription) -> TimeDelta {
+    let amount = sub.interval_amount.max(1) as i64;
+    match sub.interval_type {
+        IntervalType::Day => TimeDelta::days(amount),
+        IntervalType::Month => TimeDelta::days(30 * amount),
+        IntervalType::Year => TimeDelta::days(365 * amount),
+    }
+}
+
+/// How far ahead of expiry the "expiring soon" auto-renewal / warning window
+/// opens.
+///
+/// Defaults to one day, but is capped at **half the billing interval** so that
+/// a freshly-renewed subscription (new expiry = `now + interval`) does not fall
+/// straight back inside the window. Without the cap, any interval ≤ the fixed
+/// 1-day lead (e.g. 1-day billing) re-enters the window the instant it is paid,
+/// and the next worker tick auto-renews it seconds after purchase — a double
+/// charge (VM 1828).
+fn expiry_lead_window(sub: &Subscription) -> TimeDelta {
+    const MAX_LEAD: TimeDelta = TimeDelta::days(1);
+    MAX_LEAD.min(subscription_interval(sub) / 2)
+}
+
+/// Human-readable description of a lead window for renewal notifications,
+/// e.g. `"1 day"` or `"12 hours"`.
+fn format_lead_window(lead: TimeDelta) -> String {
+    let hours = lead.num_hours().max(1);
+    if hours % 24 == 0 {
+        let days = hours / 24;
+        format!("{} day{}", days, if days == 1 { "" } else { "s" })
+    } else {
+        format!("{} hour{}", hours, if hours == 1 { "" } else { "s" })
+    }
+}
 
 impl Worker {
     /// Grace period (in days) for a subscription, tiered by subscription age.
@@ -4185,6 +4230,124 @@ mod tests {
         assert_eq!(
             second, 0,
             "expired notification must NOT repeat on subsequent cycles within grace"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_expiry_lead_window_capped_by_interval() {
+        let mut sub = Subscription {
+            id: 0,
+            user_id: 0,
+            company_id: 1,
+            name: "s".to_string(),
+            description: None,
+            created: Utc::now(),
+            expires: None,
+            is_active: true,
+            is_setup: true,
+            currency: "EUR".to_string(),
+            interval_amount: 1,
+            interval_type: IntervalType::Month,
+            setup_fee: 0,
+            auto_renewal_enabled: true,
+            external_id: None,
+        };
+
+        // Monthly billing: the fixed 1-day lead is well under half a month, so
+        // the window is unchanged at 1 day.
+        assert_eq!(expiry_lead_window(&sub), TimeDelta::days(1));
+        assert_eq!(subscription_interval(&sub), TimeDelta::days(30));
+
+        // Daily billing: the lead is capped at half the interval (12h), so a
+        // freshly-renewed VM (expiry = now + 1 day) is not immediately "expiring
+        // soon" again — the double-charge bug (VM 1828).
+        sub.interval_type = IntervalType::Day;
+        assert_eq!(subscription_interval(&sub), TimeDelta::days(1));
+        assert_eq!(expiry_lead_window(&sub), TimeDelta::hours(12));
+
+        // A 2-day interval caps at 1 day (== the max), not more.
+        sub.interval_amount = 2;
+        assert_eq!(expiry_lead_window(&sub), TimeDelta::days(1));
+
+        // Yearly billing stays at the 1-day max.
+        sub.interval_amount = 1;
+        sub.interval_type = IntervalType::Year;
+        assert_eq!(expiry_lead_window(&sub), TimeDelta::days(1));
+    }
+
+    #[test]
+    fn test_format_lead_window() {
+        assert_eq!(format_lead_window(TimeDelta::days(1)), "1 day");
+        assert_eq!(format_lead_window(TimeDelta::days(2)), "2 days");
+        assert_eq!(format_lead_window(TimeDelta::hours(12)), "12 hours");
+        assert_eq!(format_lead_window(TimeDelta::hours(1)), "1 hour");
+        // Sub-hour windows clamp to a minimum of one hour.
+        assert_eq!(format_lead_window(TimeDelta::minutes(30)), "1 hour");
+    }
+
+    /// Regression for the VM 1828 double charge: a subscription billed on a
+    /// 1-day interval that was just renewed (expiry = now + 1 day) must NOT be
+    /// treated as "expiring soon", so auto-renewal does not fire seconds after
+    /// the customer paid.
+    #[tokio::test]
+    async fn test_freshly_renewed_daily_sub_not_expiring_soon() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let created = Utc::now();
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, created, true).await?;
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let s = subs.get_mut(&subscription_id).unwrap();
+            s.interval_type = IntervalType::Day;
+            s.interval_amount = 1;
+            s.auto_renewal_enabled = true;
+            // Just renewed: new expiry is one full interval out.
+            s.expires = Some(Utc::now().add(TimeDelta::days(1)));
+        }
+        let sub = db.get_subscription(subscription_id).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        // last_check just before now (a normal worker cadence).
+        worker
+            .handle_subscription_state(&sub, Utc::now().sub(TimeDelta::minutes(1)))
+            .await?;
+
+        let notes = count_notifications(&worker, "Expiring Soon").await
+            + count_notifications(&worker, "Auto-Renewed").await;
+        assert_eq!(
+            notes, 0,
+            "a freshly-renewed 1-day sub must not be 'expiring soon' (double-charge bug)"
+        );
+        Ok(())
+    }
+
+    /// A 1-day-interval subscription genuinely near expiry (within the capped
+    /// 12h lead window) still fires the expiring-soon handling.
+    #[tokio::test]
+    async fn test_daily_sub_within_lead_window_is_expiring_soon() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let created = Utc::now().sub(TimeDelta::days(1));
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, created, true).await?;
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let s = subs.get_mut(&subscription_id).unwrap();
+            s.interval_type = IntervalType::Day;
+            s.interval_amount = 1;
+            s.auto_renewal_enabled = false; // exercise the plain warning path
+            // 6h from expiry: inside the 12h capped lead window.
+            s.expires = Some(Utc::now().add(TimeDelta::hours(6)));
+        }
+        let sub = db.get_subscription(subscription_id).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .handle_subscription_state(&sub, Utc::now().sub(TimeDelta::days(1)))
+            .await?;
+
+        let notes = count_notifications(&worker, "Expiring Soon").await;
+        assert!(
+            notes >= 1,
+            "a daily sub within the 12h lead window must warn/auto-renew (got {notes})"
         );
         Ok(())
     }
