@@ -39,6 +39,13 @@ pub struct AvailableIps {
     pub ip6: Option<AvailableIp>,
 }
 
+/// Addresses picked for one VM, in the counts its offer specifies.
+#[derive(Debug, Clone, Default)]
+pub struct PickedIps {
+    pub ip4: Vec<AvailableIp>,
+    pub ip6: Vec<AvailableIp>,
+}
+
 #[derive(Debug, Clone)]
 pub struct AvailableIp {
     pub ip: IpNetwork,
@@ -69,6 +76,78 @@ impl NetworkProvisioner {
     /// This method MUST return a free IP which can be used
     pub async fn pick_ip_for_region(&self, region_id: u64) -> Result<AvailableIps> {
         self.pick_ip_kind_for_region(region_id, None).await
+    }
+
+    /// Pick `ip4_count` IPv4 addresses and up to `ip6_count` IPv6 addresses in one
+    /// region, spanning ranges as needed.
+    ///
+    /// IPv4 is all-or-nothing: an order that asks for addresses the region cannot
+    /// supply is unsatisfiable, never quietly under-provisioned. IPv6 stays
+    /// best-effort, as it always has been, so a region with no IPv6 range still
+    /// provisions.
+    ///
+    /// A SLAAC/EUI-64 range yields at most one address per VM, because the address
+    /// is derived from the VM's single MAC.
+    pub async fn pick_ips_for_region(
+        &self,
+        region_id: u64,
+        ip4_count: u16,
+        ip6_count: u16,
+    ) -> Result<PickedIps> {
+        let mut ip_ranges = self.db.list_ip_range_in_region(region_id).await?;
+        if ip_ranges.is_empty() {
+            bail!("No ip range found in this region");
+        }
+        ip_ranges.shuffle(&mut rand::rng());
+
+        let mut picked = PickedIps::default();
+        let mut taken: HashSet<IpAddr> = HashSet::new();
+
+        for range in &ip_ranges {
+            let range_cidr: IpNetwork = match range.cidr.parse() {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Skipping unparseable ip range {}: {}", range.cidr, e);
+                    continue;
+                }
+            };
+            let want = if range_cidr.is_ipv4() {
+                (ip4_count as usize).saturating_sub(picked.ip4.len())
+            } else if matches!(range.allocation_mode, IpRangeAllocationMode::SlaacEui64) {
+                // One MAC, one derived address.
+                usize::from(picked.ip6.is_empty() && ip6_count > 0)
+            } else {
+                (ip6_count as usize).saturating_sub(picked.ip6.len())
+            };
+
+            for _ in 0..want {
+                match self.pick_ip_from_range_excluding(range, &taken).await {
+                    Ok(ip) => {
+                        taken.insert(ip.ip.ip());
+                        if range_cidr.is_ipv4() {
+                            picked.ip4.push(ip);
+                        } else {
+                            picked.ip6.push(ip);
+                        }
+                    }
+                    Err(e) => {
+                        // A full or broken range is not fatal on its own; another
+                        // range in the region may still have space.
+                        warn!("Failed to pick ip in range {}: {}", range.cidr, e);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if picked.ip4.len() < ip4_count as usize {
+            bail!(
+                "Only {} of {} IPv4 addresses available in this region",
+                picked.ip4.len(),
+                ip4_count
+            );
+        }
+        Ok(picked)
     }
 
     pub async fn pick_ip_kind_for_region(
@@ -133,10 +212,25 @@ impl NetworkProvisioner {
     }
 
     pub async fn pick_ip_from_range(&self, range: &IpRange) -> Result<AvailableIp> {
+        self.pick_ip_from_range_excluding(range, &HashSet::new())
+            .await
+    }
+
+    /// Pick a free IP, additionally avoiding `exclude`.
+    ///
+    /// Callers picking several addresses for one VM need this: nothing is
+    /// persisted until the whole assignment succeeds, so without it the second
+    /// pick can hand back the address the first one just took.
+    pub async fn pick_ip_from_range_excluding(
+        &self,
+        range: &IpRange,
+        exclude: &HashSet<IpAddr>,
+    ) -> Result<AvailableIp> {
         let range_cidr: IpNetwork = range.cidr.parse()?;
         let ips = self.db.list_vm_ip_assignments_in_range(range.id).await?;
         // Parse stored IPs (stored as plain IP addresses)
         let mut ips: HashSet<IpAddr> = ips.iter().filter_map(|i| i.ip.parse().ok()).collect();
+        ips.extend(exclude.iter().copied());
 
         let gateway: IpNetwork = parse_gateway(&range.gateway)?;
 
@@ -860,5 +954,58 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("IPv4 ranges"));
+    }
+
+    #[tokio::test]
+    async fn pick_ips_for_region_allocates_distinct_v4() {
+        env_logger::try_init().ok();
+        let db = MockDb::default();
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let mgr = NetworkProvisioner::new(db.clone());
+
+        let picked = mgr.pick_ips_for_region(1, 3, 1).await.expect("picked");
+        assert_eq!(3, picked.ip4.len());
+        let unique: HashSet<IpAddr> = picked.ip4.iter().map(|i| i.ip.ip()).collect();
+        assert_eq!(3, unique.len(), "every picked address must be distinct");
+        // The mock region's only IPv6 range is SLAAC, which yields one address.
+        assert_eq!(1, picked.ip6.len());
+    }
+
+    #[tokio::test]
+    async fn pick_ips_for_region_fails_when_v4_short() {
+        env_logger::try_init().ok();
+        let db = MockDb::default();
+        // A /30 with reserved network/broadcast and gateway leaves one usable address.
+        if let Some(r) = db.ip_range.lock().await.get_mut(&1) {
+            r.cidr = "10.0.0.0/30".to_string();
+            r.gateway = "10.0.0.1/30".to_string();
+            r.allocation_mode = IpRangeAllocationMode::Sequential;
+        }
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let mgr = NetworkProvisioner::new(db.clone());
+
+        assert!(mgr.pick_ips_for_region(1, 1, 0).await.is_ok());
+        let err = mgr
+            .pick_ips_for_region(1, 2, 0)
+            .await
+            .expect_err("must not under-provision IPv4");
+        assert!(err.to_string().contains("IPv4"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn pick_ips_for_region_v6_is_best_effort() {
+        env_logger::try_init().ok();
+        let db = MockDb::default();
+        // Region with no IPv6 range at all.
+        db.ip_range.lock().await.remove(&2);
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let mgr = NetworkProvisioner::new(db.clone());
+
+        let picked = mgr.pick_ips_for_region(1, 1, 2).await.expect("picked");
+        assert_eq!(1, picked.ip4.len());
+        assert!(
+            picked.ip6.is_empty(),
+            "missing IPv6 must not fail provisioning"
+        );
     }
 }

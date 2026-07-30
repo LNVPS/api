@@ -352,8 +352,7 @@ impl VmProvisioner {
         li.name = format!("VM{} - {}", new_vm.id, pricing.name);
         // Record the base monthly amount now that the VM id is known. With no IP
         // assignments yet this prices the base config plus the minimum 1x IPv4/IPv6.
-        let price =
-            PricingEngine::get_custom_vm_cost_amount(&self.db, new_vm.id, &template).await?;
+        let price = PricingEngine::get_custom_vm_cost_amount(&self.db, &template).await?;
         li.amount = price.total();
         self.db.update_subscription_line_item(&li).await?;
 
@@ -444,6 +443,10 @@ impl VmProvisioner {
             disk_type: disk.kind,
             disk_interface: disk.interface,
             pricing_id: pricing.id,
+            // An imported VM's addresses are attached separately; record the
+            // single-IPv4 offer every VM had before counts were sellable.
+            ip4_count: 1,
+            ip6_count: 1,
             cpu_mfg: pricing.cpu_mfg,
             cpu_arch: pricing.cpu_arch,
             cpu_features: pricing.cpu_features.clone(),
@@ -528,8 +531,7 @@ impl VmProvisioner {
             .get_subscription_line_item(subscription_line_item_id)
             .await?;
         li.name = format!("VM{} - {}", new_vm.id, pricing.name);
-        let price =
-            PricingEngine::get_custom_vm_cost_amount(&self.db, new_vm.id, &template).await?;
+        let price = PricingEngine::get_custom_vm_cost_amount(&self.db, &template).await?;
         li.amount = price.total();
         self.db.update_subscription_line_item(&li).await?;
 
@@ -846,7 +848,7 @@ impl VmProvisioner {
         // Calculate the new base-currency cost for the new custom template and update the line
         // item's amount so the displayed subscription cost reflects the upgraded specs.
         let new_price =
-            PricingEngine::get_custom_vm_cost_amount(&self.db, vm_id, &new_custom_template).await?;
+            PricingEngine::get_custom_vm_cost_amount(&self.db, &new_custom_template).await?;
 
         // Update the line item: mark as VmRenewal (no longer VmUpgrade), store the new config,
         // and update the renewal amount to the new template's base-currency cost.
@@ -871,8 +873,7 @@ impl VmProvisioner {
             .ok_or_else(|| anyhow::anyhow!("VM does not have a custom template"))?;
         let template = self.db.get_custom_vm_template(custom_template_id).await?;
 
-        let new_price =
-            PricingEngine::get_custom_vm_cost_amount(&self.db, vm_id, &template).await?;
+        let new_price = PricingEngine::get_custom_vm_cost_amount(&self.db, &template).await?;
 
         let mut line_item = self
             .db
@@ -939,6 +940,10 @@ impl VmProvisioner {
             disk_type: current_template.disk_type,
             disk_interface: current_template.disk_interface,
             pricing_id: custom_pricing.id,
+            // An upgrade changes cpu/memory/disk only; the VM keeps the address
+            // counts it was sold, so its price must not move on that dimension.
+            ip4_count: current_template.ip4_count,
+            ip6_count: current_template.ip6_count,
             cpu_mfg: current_template.cpu_mfg.clone(),
             cpu_arch: current_template.cpu_arch.clone(),
             cpu_features: current_template.cpu_features.clone(),
@@ -1064,24 +1069,38 @@ impl SpawnVmContext {
             return Ok(());
         }
 
+        let (ip4_count, ip6_count) = self.info.ip_counts();
         let network = NetworkProvisioner::new(self.db.clone());
-        let ip = network.pick_ip_for_region(self.info.host.region_id).await?;
-        match ip.ip4 {
-            Some(v4) => {
-                let mut assignment = VmIpAssignment {
-                    vm_id: self.info.vm.id,
-                    ip_range_id: v4.range_id,
-                    ip: v4.ip.ip().to_string(),
-                    ..Default::default()
-                };
+        // Asking for zero IPv4 is a valid offer; asking for some and not getting
+        // them is unsatisfiable, so the picker failing here is fatal.
+        let picked = match network
+            .pick_ips_for_region(self.info.host.region_id, ip4_count, ip6_count)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => op_fatal!("Cannot provision VM: {}", e),
+        };
 
-                //generate mac address from ip assignment
-                self.assign_mac(&mut assignment).await?;
-                self.info.ips.push(assignment);
+        for v4 in picked.ip4 {
+            let mut assignment = VmIpAssignment {
+                vm_id: self.info.vm.id,
+                ip_range_id: v4.range_id,
+                ip: v4.ip.ip().to_string(),
+                ..Default::default()
+            };
+
+            // The router-generated vMAC is per-VM, not per-address, so it is only
+            // generated for the first assignment; later ones reuse the VM's MAC.
+            self.assign_mac(&mut assignment).await?;
+            self.info.ips.push(assignment);
+            if !self.info.ranges.iter().any(|r| r.id == v4.range_id) {
+                self.info
+                    .ranges
+                    .push(self.db.get_ip_range(v4.range_id).await?);
             }
-            None => op_fatal!("Cannot provision VM without an IPv4 address"),
         }
-        if let Some(mut v6) = ip.ip6 {
+
+        for mut v6 in picked.ip6 {
             let assignment = VmProvisioner::v6_to_allocation(
                 &mut v6,
                 self.info.vm.id,
@@ -1984,7 +2003,7 @@ mod tests {
         // Directly insert VM (bypassing provision_custom) to simulate an existing VM
         // that was created before the pricing was disabled
         let subscription_line_item_id = make_test_subscription(&db, user.id).await?;
-        let vm_id = db
+        let _vm_id = db
             .insert_vm(&Vm {
                 id: 0,
                 host_id: 1,
@@ -2380,6 +2399,138 @@ mod tests {
             new_line_item.amount > 0,
             "new line_item.amount must be positive"
         );
+        Ok(())
+    }
+
+    /// A custom order for several IPv4 addresses gets exactly that many, all
+    /// distinct, and the best-effort IPv6 alongside them.
+    #[tokio::test]
+    async fn test_assign_ips_allocates_requested_ip4_count() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_custom_pricing(&db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let template_id = db
+            .insert_custom_vm_template(&VmCustomTemplate {
+                id: 0,
+                cpu: 2,
+                memory: 2 * GB,
+                disk_size: 64 * GB,
+                disk_type: DiskType::SSD,
+                disk_interface: DiskInterface::PCIe,
+                pricing_id,
+                ip4_count: 3,
+                ip6_count: 1,
+                ..Default::default()
+            })
+            .await?;
+
+        let subscription_line_item_id = make_test_subscription(&db, user.id).await?;
+        let vm_id = db
+            .insert_vm(&Vm {
+                id: 0,
+                host_id: 1,
+                user_id: user.id,
+                image_id: 1,
+                template_id: None,
+                custom_template_id: Some(template_id),
+                subscription_line_item_id,
+                ssh_key_id: Some(ssh_key.id),
+                disk_id: 1,
+                ..Default::default()
+            })
+            .await?;
+
+        let db_dyn: Arc<dyn LNVpsDb> = db.clone();
+        let info = FullVmInfo::load(vm_id, db_dyn.clone()).await?;
+        let mut ctx = SpawnVmContext {
+            db: db_dyn.clone(),
+            network: VmNetworkProvisioner::new(db_dyn.clone(), VmProvisioner::retry_policy()),
+            host_client: Arc::new(crate::mocks::MockVmHost::new()),
+            generated_mac: None,
+            info,
+        };
+
+        ctx.assign_ips().await?;
+
+        let v4: Vec<&lnvps_db::VmIpAssignment> = ctx
+            .info
+            .ips
+            .iter()
+            .filter(|i| i.ip.parse::<std::net::IpAddr>().map(|a| a.is_ipv4()) == Ok(true))
+            .collect();
+        assert_eq!(3, v4.len(), "must assign the ordered IPv4 count");
+        let unique: std::collections::HashSet<&String> = v4.iter().map(|i| &i.ip).collect();
+        assert_eq!(3, unique.len(), "assigned addresses must be distinct");
+        assert!(
+            !ctx.info.vm.mac_address.is_empty(),
+            "the VM still gets one MAC for the whole set"
+        );
+
+        Ok(())
+    }
+
+    /// An order the region cannot satisfy fails rather than under-provisioning.
+    #[tokio::test]
+    async fn test_assign_ips_fails_when_ip4_short() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_custom_pricing(&db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let (user, ssh_key) = add_user(&db).await?;
+
+        // /30 leaves a single usable address once network, broadcast and gateway
+        // are reserved.
+        if let Some(r) = db.ip_range.lock().await.get_mut(&1) {
+            r.cidr = "10.0.0.0/30".to_string();
+            r.gateway = "10.0.0.1/30".to_string();
+            r.allocation_mode = lnvps_db::IpRangeAllocationMode::Sequential;
+        }
+
+        let template_id = db
+            .insert_custom_vm_template(&VmCustomTemplate {
+                id: 0,
+                cpu: 2,
+                memory: 2 * GB,
+                disk_size: 64 * GB,
+                disk_type: DiskType::SSD,
+                disk_interface: DiskInterface::PCIe,
+                pricing_id,
+                ip4_count: 2,
+                ip6_count: 0,
+                ..Default::default()
+            })
+            .await?;
+
+        let subscription_line_item_id = make_test_subscription(&db, user.id).await?;
+        let vm_id = db
+            .insert_vm(&Vm {
+                id: 0,
+                host_id: 1,
+                user_id: user.id,
+                image_id: 1,
+                template_id: None,
+                custom_template_id: Some(template_id),
+                subscription_line_item_id,
+                ssh_key_id: Some(ssh_key.id),
+                disk_id: 1,
+                ..Default::default()
+            })
+            .await?;
+
+        let db_dyn: Arc<dyn LNVpsDb> = db.clone();
+        let info = FullVmInfo::load(vm_id, db_dyn.clone()).await?;
+        let mut ctx = SpawnVmContext {
+            db: db_dyn.clone(),
+            network: VmNetworkProvisioner::new(db_dyn.clone(), VmProvisioner::retry_policy()),
+            host_client: Arc::new(crate::mocks::MockVmHost::new()),
+            generated_mac: None,
+            info,
+        };
+
+        assert!(
+            ctx.assign_ips().await.is_err(),
+            "an unsatisfiable IPv4 count must not silently under-provision"
+        );
+
         Ok(())
     }
 

@@ -1506,6 +1506,8 @@ pub struct AdminVmTemplateInfo {
     pub disk_interface: ApiDiskInterface,
     pub cost_plan_id: u64,
     pub region_id: u64,
+    pub ip4_count: u16,
+    pub ip6_count: u16,
     pub region_name: Option<String>,
     pub cost_plan_name: Option<String>,
     pub active_vm_count: i64, // Number of active (non-deleted) VMs using this template
@@ -1548,6 +1550,10 @@ pub struct AdminCreateVmTemplateRequest {
     pub disk_interface: ApiDiskInterface,
     pub cost_plan_id: Option<u64>, // Optional - if not provided, will auto-create cost plan
     pub region_id: u64,
+    /// IPv4 addresses included in this offer (defaults to 1)
+    pub ip4_count: Option<u16>,
+    /// IPv6 addresses included in this offer (defaults to 1)
+    pub ip6_count: Option<u16>,
     // Cost plan creation fields - used when cost_plan_id is not provided
     pub cost_plan_name: Option<String>, // Defaults to "{template_name} Cost Plan"
     /// Cost amount in smallest currency units (cents for fiat, millisats for BTC) - required if cost_plan_id not provided
@@ -1606,6 +1612,8 @@ pub struct AdminUpdateVmTemplateRequest {
     pub disk_interface: Option<ApiDiskInterface>,
     pub cost_plan_id: Option<u64>,
     pub region_id: Option<u64>,
+    pub ip4_count: Option<u16>,
+    pub ip6_count: Option<u16>,
     // Cost plan update fields - will update the associated cost plan for this template
     pub cost_plan_name: Option<String>,
     /// Cost amount in smallest currency units (cents for fiat, millisats for BTC)
@@ -1697,6 +1705,10 @@ pub struct AdminCustomPricingInfo {
     pub max_cpu: u16,
     pub min_memory: u64,
     pub max_memory: u64,
+    pub min_ip4: u16,
+    pub max_ip4: u16,
+    pub min_ip6: u16,
+    pub max_ip6: u16,
     pub disk_pricing: Vec<AdminCustomPricingDisk>,
     pub template_count: u64,
     /// Maximum disk read IOPS (None = uncapped)
@@ -1774,6 +1786,10 @@ pub struct UpdateCustomPricingRequest {
     pub max_cpu: Option<u16>,
     pub min_memory: Option<u64>,
     pub max_memory: Option<u64>,
+    pub min_ip4: Option<u16>,
+    pub max_ip4: Option<u16>,
+    pub min_ip6: Option<u16>,
+    pub max_ip6: Option<u16>,
     pub disk_pricing: Option<Vec<CreateCustomPricingDisk>>,
     /// Maximum disk read IOPS — use `null` to clear
     #[serde(
@@ -1839,6 +1855,14 @@ pub struct CreateCustomPricingRequest {
     pub max_cpu: u16,
     pub min_memory: u64,
     pub max_memory: u64,
+    /// Minimum IPv4 addresses selectable (defaults to 1)
+    pub min_ip4: Option<u16>,
+    /// Maximum IPv4 addresses selectable (defaults to 1)
+    pub max_ip4: Option<u16>,
+    /// Minimum IPv6 addresses selectable (defaults to 1)
+    pub min_ip6: Option<u16>,
+    /// Maximum IPv6 addresses selectable (defaults to 1)
+    pub max_ip6: Option<u16>,
     pub disk_pricing: Vec<CreateCustomPricingDisk>,
     /// Maximum disk read IOPS (None = uncapped)
     pub disk_iops_read: Option<u32>,

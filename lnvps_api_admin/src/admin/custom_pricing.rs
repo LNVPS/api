@@ -1,15 +1,16 @@
-use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminCustomPricingDisk, AdminCustomPricingInfo, CopyCustomPricingRequest,
     CreateCustomPricingRequest, UpdateCustomPricingRequest,
 };
+use crate::admin::{RouterState, validate_offered_ip_count};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use lnvps_api_common::{
-    ApiData, ApiDiskInterface, ApiDiskType, ApiPaginatedData, ApiPaginatedResult, ApiResult,
+    ApiData, ApiDiskInterface, ApiDiskType, ApiError, ApiPaginatedData, ApiPaginatedResult,
+    ApiResult,
 };
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb, VmCustomPricing, VmCustomPricingDisk};
 use serde::Deserialize;
@@ -100,6 +101,10 @@ impl AdminCustomPricingInfo {
             max_cpu: pricing.max_cpu,
             min_memory: pricing.min_memory,
             max_memory: pricing.max_memory,
+            min_ip4: pricing.min_ip4,
+            max_ip4: pricing.max_ip4,
+            min_ip6: pricing.min_ip6,
+            max_ip6: pricing.max_ip6,
             disk_pricing: disk_pricing_info,
             template_count,
             disk_iops_read: pricing.disk_iops_read,
@@ -198,6 +203,10 @@ async fn admin_create_custom_pricing(
         max_cpu: req.max_cpu,
         min_memory: req.min_memory,
         max_memory: req.max_memory,
+        min_ip4: req.min_ip4.unwrap_or(1),
+        max_ip4: req.max_ip4.unwrap_or(1),
+        min_ip6: req.min_ip6.unwrap_or(1),
+        max_ip6: req.max_ip6.unwrap_or(1),
         disk_iops_read: req.disk_iops_read,
         disk_iops_write: req.disk_iops_write,
         disk_mbps_read: req.disk_mbps_read,
@@ -205,6 +214,8 @@ async fn admin_create_custom_pricing(
         network_mbps: req.network_mbps,
         cpu_limit: req.cpu_limit,
     };
+
+    validate_ip_ranges(&pricing)?;
 
     let pricing_id = this.db.insert_custom_pricing(&pricing).await?;
 
@@ -300,6 +311,18 @@ async fn admin_update_custom_pricing(
     if let Some(max_memory) = req.max_memory {
         pricing.max_memory = max_memory;
     }
+    if let Some(v) = req.min_ip4 {
+        pricing.min_ip4 = v;
+    }
+    if let Some(v) = req.max_ip4 {
+        pricing.max_ip4 = v;
+    }
+    if let Some(v) = req.min_ip6 {
+        pricing.min_ip6 = v;
+    }
+    if let Some(v) = req.max_ip6 {
+        pricing.max_ip6 = v;
+    }
     if let Some(v) = req.disk_iops_read {
         pricing.disk_iops_read = v;
     }
@@ -318,6 +341,8 @@ async fn admin_update_custom_pricing(
     if let Some(v) = req.cpu_limit {
         pricing.cpu_limit = v;
     }
+
+    validate_ip_ranges(&pricing)?;
 
     this.db.update_custom_pricing(&pricing).await?;
 
@@ -425,6 +450,10 @@ async fn admin_copy_custom_pricing(
         max_cpu: source_pricing.max_cpu,
         min_memory: source_pricing.min_memory,
         max_memory: source_pricing.max_memory,
+        min_ip4: source_pricing.min_ip4,
+        max_ip4: source_pricing.max_ip4,
+        min_ip6: source_pricing.min_ip6,
+        max_ip6: source_pricing.max_ip6,
         disk_iops_read: source_pricing.disk_iops_read,
         disk_iops_write: source_pricing.disk_iops_write,
         disk_mbps_read: source_pricing.disk_mbps_read,
@@ -455,4 +484,18 @@ async fn admin_copy_custom_pricing(
     let created_pricing = this.db.get_custom_pricing(new_pricing_id).await?;
     let info = AdminCustomPricingInfo::from_custom_pricing(&this.db, &created_pricing).await?;
     ApiData::ok(info)
+}
+
+/// A plan whose minimum exceeds its maximum can never be ordered, so it is
+/// rejected rather than stored as a silently unsellable offer.
+fn validate_ip_ranges(pricing: &VmCustomPricing) -> Result<(), ApiError> {
+    if pricing.min_ip4 > pricing.max_ip4 {
+        return Err(ApiError::bad_request("min_ip4 cannot exceed max_ip4"));
+    }
+    if pricing.min_ip6 > pricing.max_ip6 {
+        return Err(ApiError::bad_request("min_ip6 cannot exceed max_ip6"));
+    }
+    validate_offered_ip_count("max_ip4", pricing.max_ip4)?;
+    validate_offered_ip_count("max_ip6", pricing.max_ip6)?;
+    Ok(())
 }

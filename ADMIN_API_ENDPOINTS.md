@@ -389,6 +389,10 @@ Body:
   // Optional - e.g. "x86_64", "arm64"; omitted means any
   "cpu_feature": ["string"],
   // Optional - required CPU features, e.g. ["AVX2"]; empty means any
+  "ip4_count": number,
+  // Optional - IPv4 addresses to assign, default 1; must be within the plan's range
+  "ip6_count": number,
+  // Optional - IPv6 addresses to assign, default 1; must be within the plan's range
   "image_id": number,
   // Required - OS image ID
   "ssh_key_id": number,
@@ -1764,6 +1768,13 @@ Body:
   "cost_plan_id": number,
   // optional - if not provided, cost plan will be auto-created
   "region_id": number,
+  "ip4_count": number,
+  // optional - IPv4 addresses included in this offer, default 1. Capped at 1
+  // until the guest network config can carry more than one address per family
+  "ip6_count": number,
+  // optional - IPv6 addresses included in this offer, default 1, capped at 1.
+  // Assignment is best-effort: a region with no IPv6 range still provisions
+
   // Cost plan auto-creation fields (used when cost_plan_id not provided)
   "cost_plan_name": "string",
   // optional, defaults to "{template_name} Cost Plan"
@@ -1822,6 +1833,8 @@ Body (all optional):
   "disk_interface": "string",
   "cost_plan_id": number,
   "region_id": number,
+  "ip4_count": number,
+  "ip6_count": number,
   "cost_plan_name": "string",
   // Update associated cost plan name
   "cost_plan_amount": number,
@@ -2026,6 +2039,15 @@ Body:
   // Minimum memory in bytes
   "max_memory": number,
   // Maximum memory in bytes
+  "min_ip4": number,
+  // optional - Minimum IPv4 addresses selectable, default 1
+  "max_ip4": number,
+  // optional - Maximum IPv4 addresses selectable, default 1. Capped at 1 until
+  // the guest network config can carry more than one address per family
+  "min_ip6": number,
+  // optional - Minimum IPv6 addresses selectable, default 1
+  "max_ip6": number,
+  // optional - Maximum IPv6 addresses selectable, default 1, capped at 1
   "disk_iops_read": number,
   // optional - Maximum disk read IOPS (omit or null = uncapped)
   "disk_iops_write": number,
@@ -2095,6 +2117,15 @@ Body (all optional):
   // Minimum memory in bytes
   "max_memory": number,
   // Maximum memory in bytes
+  "min_ip4": number,
+  // optional - Minimum IPv4 addresses selectable, default 1
+  "max_ip4": number,
+  // optional - Maximum IPv4 addresses selectable, default 1. Capped at 1 until
+  // the guest network config can carry more than one address per family
+  "min_ip6": number,
+  // optional - Minimum IPv6 addresses selectable, default 1
+  "max_ip6": number,
+  // optional - Maximum IPv6 addresses selectable, default 1, capped at 1
   "disk_iops_read": "number | null",
   // Maximum disk read IOPS - send null to clear
   "disk_iops_write": "number | null",
@@ -4759,6 +4790,8 @@ The RBAC system uses the following permission format: `resource::action`
   // DiskInterface enum: "sata", "scsi", or "pcie"
   "cost_plan_id": number,
   "region_id": number,
+  "ip4_count": number,
+  "ip6_count": number,
   "region_name": "string | null",
   // Populated with region name
   "cost_plan_name": "string | null",
@@ -4816,6 +4849,15 @@ The RBAC system uses the following permission format: `resource::action`
   // Minimum memory in bytes
   "max_memory": number,
   // Maximum memory in bytes
+  "min_ip4": number,
+  // optional - Minimum IPv4 addresses selectable, default 1
+  "max_ip4": number,
+  // optional - Maximum IPv4 addresses selectable, default 1. Capped at 1 until
+  // the guest network config can carry more than one address per family
+  "min_ip6": number,
+  // optional - Minimum IPv6 addresses selectable, default 1
+  "max_ip6": number,
+  // optional - Maximum IPv6 addresses selectable, default 1, capped at 1
   "disk_iops_read": number,
   // Maximum disk read IOPS - omitted when uncapped
   "disk_iops_write": number,

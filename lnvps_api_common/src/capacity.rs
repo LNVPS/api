@@ -156,12 +156,11 @@ impl HostCapacityService {
             let min_cpu = template.min_cpu;
             let min_memory = template.min_memory;
 
-            // Whether a host has a free IPv4 slot (required for every order).
-            let host_has_ipv4 = |h: &&HostCapacity| {
-                h.ranges
-                    .iter()
-                    .any(|r| r.is_ipv4() && r.available_capacity() >= 1)
-            };
+            // Whether a host's region can still supply the smallest IPv4 count
+            // this plan sells. A plan whose minimum cannot be met is not
+            // orderable at all.
+            let min_ip4 = template.min_ip4;
+            let host_has_ipv4 = move |h: &&HostCapacity| h.available_ip4() >= min_ip4 as u128;
 
             // Limit disk maximums based on actual host capacity.
             //
@@ -224,12 +223,25 @@ impl HostCapacityService {
             let max_memory = servable_max(&|h| h.available_memory());
             template.max_cpu = template.max_cpu.min(max_cpu);
             template.max_memory = template.max_memory.min(max_memory);
+
+            // Never offer more addresses than the region can hand out. Capped
+            // against the whole region rather than one host: addresses are a
+            // region resource, unlike cpu/memory/disk.
+            let max_ip4 = hosts_in_region
+                .clone()
+                .map(|h| h.available_ip4())
+                .max()
+                .unwrap_or(0);
+            template.max_ip4 = template.max_ip4.min(max_ip4.min(u16::MAX as u128) as u16);
         }
 
-        // remove templates with 0 max cpu/ram/disk
+        // remove templates with 0 max cpu/ram/disk, or that cannot supply the
+        // addresses they require
         Ok(templates
             .into_iter()
-            .filter(|t| t.max_cpu > 0 && t.max_memory > 0 && !t.disks.is_empty())
+            .filter(|t| {
+                t.max_cpu > 0 && t.max_memory > 0 && !t.disks.is_empty() && t.max_ip4 >= t.min_ip4
+            })
             .collect())
     }
 
@@ -458,10 +470,22 @@ impl HostCapacity {
                 .disks
                 .iter()
                 .any(|d| d.available_capacity() >= template.disk_size())
-            && self
-                .ranges
-                .iter()
-                .any(|r| r.is_ipv4() && r.available_capacity() >= 1)
+            && self.available_ip4() >= template.ip4_count() as u128
+    }
+
+    /// Free IPv4 addresses across every range in the host's region.
+    ///
+    /// Summed rather than per-range: a VM's addresses may come from any range in
+    /// the region, so several partly-full ranges can still satisfy one order.
+    ///
+    /// IPv6 has no equivalent gate — IPv6 assignment stays best-effort, so a
+    /// region without a v6 range must not become unsellable.
+    pub fn available_ip4(&self) -> u128 {
+        self.ranges
+            .iter()
+            .filter(|r| r.is_ipv4())
+            .map(|r| r.available_capacity())
+            .sum()
     }
 }
 
@@ -833,6 +857,8 @@ mod tests {
             disk_type: DiskType::SSD,
             disk_interface: DiskInterface::PCIe,
             region_id: 1,
+            ip4_count: 1,
+            ip6_count: 1,
             ..Default::default()
         }
     }
@@ -1132,6 +1158,60 @@ mod tests {
         );
     }
 
+    /// A template asking for more IPv4 addresses than the region has free must
+    /// not be accommodated, even though a single address is available.
+    #[test]
+    fn can_accommodate_respects_ip4_count() {
+        let mut cap = make_host_capacity(CpuMfg::Unknown, CpuArch::Unknown, vec![]);
+        cap.ranges = vec![IPRangeCapacity {
+            range: IpRange {
+                id: 1,
+                cidr: "10.0.0.0/29".to_string(),
+                gateway: "192.168.1.1".to_string(),
+                enabled: true,
+                region_id: 1,
+                use_full_range: false,
+                ..Default::default()
+            },
+            // 8 total - 2 boundary = 6 usable, 4 already taken
+            usage: 4,
+        }];
+        assert_eq!(2, cap.available_ip4());
+
+        let mut template = make_template(CpuMfg::Unknown, CpuArch::Unknown, vec![]);
+        template.ip4_count = 2;
+        assert!(cap.can_accommodate(&template));
+
+        template.ip4_count = 3;
+        assert!(
+            !cap.can_accommodate(&template),
+            "must not sell more addresses than the region can supply"
+        );
+    }
+
+    /// An IPv6-only offer is sellable in a region with no IPv4 capacity left.
+    #[test]
+    fn can_accommodate_ip4_count_zero_needs_no_v4() {
+        let mut cap = make_host_capacity(CpuMfg::Unknown, CpuArch::Unknown, vec![]);
+        cap.ranges = vec![IPRangeCapacity {
+            range: IpRange {
+                id: 1,
+                cidr: "10.0.0.0/30".to_string(),
+                gateway: "192.168.1.1".to_string(),
+                enabled: true,
+                region_id: 1,
+                use_full_range: false,
+                ..Default::default()
+            },
+            usage: 2,
+        }];
+        assert_eq!(0, cap.available_ip4());
+
+        let mut template = make_template(CpuMfg::Unknown, CpuArch::Unknown, vec![]);
+        template.ip4_count = 0;
+        assert!(cap.can_accommodate(&template));
+    }
+
     // ── apply_host_capacity_limits tests ────────────────────────────────────
 
     /// Helper to build a minimal ApiCustomTemplateParams for region 1
@@ -1157,6 +1237,10 @@ mod tests {
             min_cpu: 1,
             min_memory: GB,
             max_memory,
+            min_ip4: 1,
+            max_ip4: 1,
+            min_ip6: 1,
+            max_ip6: 1,
             disks: vec![ApiCustomTemplateDiskParam {
                 min_disk: GB,
                 max_disk: 100 * GB,

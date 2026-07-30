@@ -1,6 +1,9 @@
 use axum::Router;
 use axum::extract::FromRef;
-use lnvps_api_common::{ExchangeRateService, RedisWorkFeedback, VmStateCache, WorkCommander};
+use lnvps_api_common::{
+    ApiError, ExchangeRateService, MAX_CONFIGURABLE_IPS, RedisWorkFeedback, VmStateCache,
+    WorkCommander,
+};
 use lnvps_db::LNVpsDb;
 use std::sync::Arc;
 
@@ -33,6 +36,18 @@ mod vm_os_images;
 mod vm_templates;
 mod vms;
 mod websocket;
+
+/// Refuse an offer wider than what a guest can actually be configured with, so an
+/// operator cannot create a plan whose orders would allocate and bill addresses
+/// the VM never receives. The order path enforces the same bound.
+pub(crate) fn validate_offered_ip_count(field: &str, count: u16) -> Result<(), ApiError> {
+    if count > MAX_CONFIGURABLE_IPS {
+        return Err(ApiError::bad_request(format!(
+            "{field} cannot exceed {MAX_CONFIGURABLE_IPS}: a VM can only be configured with that many addresses per family"
+        )));
+    }
+    Ok(())
+}
 
 #[derive(Clone, FromRef)]
 pub(crate) struct RouterState {

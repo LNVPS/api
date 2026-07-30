@@ -1065,7 +1065,7 @@ async fn v1_custom_template_calc(
     // Reject out-of-range specs so the order form surfaces the error early.
     PricingEngine::validate_custom_vm_spec(&this.db, &template).await?;
 
-    let price = PricingEngine::get_custom_vm_cost_amount(&this.db, 0, &template).await?;
+    let price = PricingEngine::get_custom_vm_cost_amount(&this.db, &template).await?;
     let amount = CurrencyAmount::from_u64(price.currency, price.total());
     // Include conversions to the other supported currencies, like the template
     // listing's `other_price`.

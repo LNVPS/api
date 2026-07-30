@@ -1,9 +1,9 @@
 use crate::{
-    ConvertedCurrencyAmount, ExchangeRateService, Ticker, TickerRate, UpgradeConfig, VatClient,
+    ConvertedCurrencyAmount, ExchangeRateService, MAX_CONFIGURABLE_IPS, Ticker, TickerRate,
+    UpgradeConfig, VatClient,
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use chrono::{DateTime, Days, Months, TimeDelta, Utc};
-use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
 use lnvps_db::{
     CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, IntervalType, LNVpsDb, PaymentMethod,
@@ -753,30 +753,15 @@ impl PricingEngine {
     /// Get the cost amount as (Currency,amount)
     pub async fn get_custom_vm_cost_amount(
         db: &Arc<dyn LNVpsDb>,
-        vm_id: u64,
         template: &VmCustomTemplate,
     ) -> Result<PricingData> {
         let pricing = db.get_custom_pricing(template.pricing_id).await?;
         let pricing_disk = db.list_custom_pricing_disk(pricing.id).await?;
-        let ips = db.list_vm_ip_assignments(vm_id).await?;
-        let v4s = ips
-            .iter()
-            .filter(|i| {
-                IpNetwork::from_str(&i.ip)
-                    .map(|i| i.is_ipv4())
-                    .unwrap_or(false)
-            })
-            .count()
-            .max(1); // must have at least 1
-        let v6s = ips
-            .iter()
-            .filter(|i| {
-                IpNetwork::from_str(&i.ip)
-                    .map(|i| i.is_ipv6())
-                    .unwrap_or(false)
-            })
-            .count()
-            .max(1); // must have at least 1
+        // Counts come from the ordered spec, not from what is currently assigned:
+        // the price must be quotable before any address exists, and must not move
+        // when provisioning temporarily holds fewer addresses than were sold.
+        let v4s = template.ip4_count as u64;
+        let v6s = template.ip6_count as u64;
         // Match disk pricing on BOTH kind and interface — pricing rows are keyed
         // by (kind, interface), so matching on kind alone can bill the wrong rate
         // (or a rate for an interface the user never requested).
@@ -803,8 +788,8 @@ impl PricingEngine {
         let disk_cost = disk_size_gb * disk_pricing.cost;
         let cpu_cost = pricing.cpu_cost * template.cpu as u64;
         let memory_cost = pricing.memory_cost * memory_gb;
-        let ip4_cost = pricing.ip4_cost * v4s as u64;
-        let ip6_cost = pricing.ip6_cost * v6s as u64;
+        let ip4_cost = pricing.ip4_cost * v4s;
+        let ip6_cost = pricing.ip6_cost * v6s;
 
         let currency: Currency = if let Ok(p) = pricing.currency.parse() {
             p
@@ -866,6 +851,39 @@ impl PricingEngine {
                 disk_pricing.max_disk_size
             );
         }
+        if template.ip4_count < pricing.min_ip4 || template.ip4_count > pricing.max_ip4 {
+            bail!(
+                "IPv4 count {} out of range ({}-{})",
+                template.ip4_count,
+                pricing.min_ip4,
+                pricing.max_ip4
+            );
+        }
+        if template.ip6_count < pricing.min_ip6 || template.ip6_count > pricing.max_ip6 {
+            bail!(
+                "IPv6 count {} out of range ({}-{})",
+                template.ip6_count,
+                pricing.min_ip6,
+                pricing.max_ip6
+            );
+        }
+        // The plan's own bounds are not enough: a stored plan can exceed what a
+        // guest can be configured with, and an order against it would allocate
+        // and bill addresses the VM never receives.
+        if template.ip4_count > MAX_CONFIGURABLE_IPS {
+            bail!(
+                "IPv4 count {} exceeds the {} address(es) a VM can be configured with",
+                template.ip4_count,
+                MAX_CONFIGURABLE_IPS
+            );
+        }
+        if template.ip6_count > MAX_CONFIGURABLE_IPS {
+            bail!(
+                "IPv6 count {} exceeds the {} address(es) a VM can be configured with",
+                template.ip6_count,
+                MAX_CONFIGURABLE_IPS
+            );
+        }
         Ok(())
     }
 
@@ -883,7 +901,7 @@ impl PricingEngine {
         };
 
         let template = self.db.get_custom_vm_template(template_id).await?;
-        let price = Self::get_custom_vm_cost_amount(&self.db, vm.id, &template).await?;
+        let price = Self::get_custom_vm_cost_amount(&self.db, &template).await?;
 
         // custom templates are always 1-month intervals; clamp base to now for expired VMs
         let base = self
@@ -1259,6 +1277,8 @@ impl PricingEngine {
             cpu_mfg,
             cpu_arch,
             cpu_features,
+            ip4_count,
+            ip6_count,
         ) = if let Some(template_id) = vm.template_id {
             let template = self.db.get_vm_template(template_id).await?;
             (
@@ -1279,6 +1299,8 @@ impl PricingEngine {
                 template.cpu_mfg,
                 template.cpu_arch,
                 template.cpu_features,
+                template.ip4_count,
+                template.ip6_count,
             )
         } else if let Some(custom_template_id) = vm.custom_template_id {
             let custom_template = self.db.get_custom_vm_template(custom_template_id).await?;
@@ -1294,6 +1316,8 @@ impl PricingEngine {
                 custom_template.cpu_mfg,
                 custom_template.cpu_arch,
                 custom_template.cpu_features,
+                custom_template.ip4_count,
+                custom_template.ip6_count,
             )
         } else {
             bail!("VM must have either a standard template or custom template to upgrade");
@@ -1327,6 +1351,10 @@ impl PricingEngine {
             disk_type,
             disk_interface,
             pricing_id: pricing.id,
+            // An upgrade changes cpu/memory/disk only; the address counts the VM
+            // was sold carry over untouched.
+            ip4_count,
+            ip6_count,
             cpu_mfg,
             cpu_arch,
             cpu_features,
@@ -1385,7 +1413,7 @@ impl PricingEngine {
             )
         } else if let Some(cid) = vm.custom_template_id {
             let template = self.db.get_custom_vm_template(cid).await?;
-            let price = Self::get_custom_vm_cost_amount(&self.db, vm.id, &template).await?;
+            let price = Self::get_custom_vm_cost_amount(&self.db, &template).await?;
             let time_value = Self::cost_plan_interval_to_seconds(IntervalType::Month, 1);
             (
                 CurrencyAmount::from_u64(price.currency, price.total()),
@@ -1543,8 +1571,7 @@ impl PricingEngine {
         Self::validate_custom_vm_spec(&self.db, &new_custom_template).await?;
 
         // Get the cost of renewal
-        let new_price =
-            Self::get_custom_vm_cost_amount(&self.db, vm_id, &new_custom_template).await?;
+        let new_price = Self::get_custom_vm_cost_amount(&self.db, &new_custom_template).await?;
         let new_price = CurrencyAmount::from_u64(new_price.currency, new_price.total());
 
         // Get the time value for the custom template
@@ -1757,6 +1784,10 @@ mod tests {
                 max_cpu: 16,
                 min_memory: 1 * crate::GB,
                 max_memory: 64 * crate::GB,
+                min_ip4: 1,
+                max_ip4: 4,
+                min_ip6: 1,
+                max_ip6: 4,
                 ..Default::default()
             },
         );
@@ -1771,6 +1802,8 @@ mod tests {
                 disk_type: DiskType::SSD,
                 disk_interface: Default::default(),
                 pricing_id: 1,
+                ip4_count: 1,
+                ip6_count: 1,
                 ..Default::default()
             },
         );
@@ -1919,7 +1952,7 @@ mod tests {
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
 
         let template = db.get_custom_vm_template(1).await?;
-        let price = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await?;
+        let price = PricingEngine::get_custom_vm_cost_amount(&db, &template).await?;
         // All costs now in cents:
         // cpu_cost = 150 cents/CPU * 2 CPUs = 300 cents
         // memory_cost = 50 cents/GB * 2 GB = 100 cents
@@ -1933,6 +1966,101 @@ mod tests {
         assert_eq!(5, price.ip6_cost);
         assert_eq!(400, price.disk_cost);
         assert_eq!(855, price.total());
+
+        Ok(())
+    }
+
+    /// Address counts come from the ordered spec and multiply the per-address
+    /// price, so an order for extra addresses costs more.
+    #[tokio::test]
+    async fn custom_pricing_scales_with_ip_counts() -> Result<()> {
+        let db = MockDb::default();
+        add_custom_pricing(&db).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+
+        let mut template = db.get_custom_vm_template(1).await?;
+        template.ip4_count = 3;
+        template.ip6_count = 2;
+
+        let price = PricingEngine::get_custom_vm_cost_amount(&db, &template).await?;
+        assert_eq!(150, price.ip4_cost);
+        assert_eq!(10, price.ip6_cost);
+        assert_eq!(960, price.total());
+
+        Ok(())
+    }
+
+    /// An IPv6-only order pays nothing for IPv4.
+    #[tokio::test]
+    async fn custom_pricing_ip4_count_zero_is_free() -> Result<()> {
+        let db = MockDb::default();
+        add_custom_pricing(&db).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+
+        let mut template = db.get_custom_vm_template(1).await?;
+        template.ip4_count = 0;
+        let price = PricingEngine::get_custom_vm_cost_amount(&db, &template).await?;
+        assert_eq!(0, price.ip4_cost);
+
+        Ok(())
+    }
+
+    /// Counts outside the plan's range are refused at order/upgrade time.
+    #[tokio::test]
+    async fn validate_custom_vm_spec_checks_ip_counts() -> Result<()> {
+        let db = MockDb::default();
+        add_custom_pricing(&db).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+
+        let base = db.get_custom_vm_template(1).await?;
+        PricingEngine::validate_custom_vm_spec(&db, &base).await?;
+
+        let mut too_many_v4 = base.clone();
+        too_many_v4.ip4_count = 5;
+        let err = PricingEngine::validate_custom_vm_spec(&db, &too_many_v4)
+            .await
+            .expect_err("above max_ip4");
+        assert!(err.to_string().contains("IPv4 count"), "{err}");
+
+        let mut too_few_v6 = base.clone();
+        too_few_v6.ip6_count = 0;
+        let err = PricingEngine::validate_custom_vm_spec(&db, &too_few_v6)
+            .await
+            .expect_err("below min_ip6");
+        assert!(err.to_string().contains("IPv6 count"), "{err}");
+
+        Ok(())
+    }
+
+    /// A stored plan can be wider than what a guest can be configured with — the
+    /// migration adopts counts from existing VMs — so the order path must bound
+    /// the count itself and not trust the plan's range.
+    #[tokio::test]
+    async fn validate_custom_vm_spec_refuses_unconfigurable_ip_counts() -> Result<()> {
+        let db = MockDb::default();
+        add_custom_pricing(&db).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+
+        let base = db.get_custom_vm_template(1).await?;
+        let pricing = db.get_custom_pricing(base.pricing_id).await?;
+        assert!(
+            pricing.max_ip4 > MAX_CONFIGURABLE_IPS && pricing.max_ip6 > MAX_CONFIGURABLE_IPS,
+            "plan must be wider than the cap for this to test anything"
+        );
+
+        let mut within_plan_v4 = base.clone();
+        within_plan_v4.ip4_count = MAX_CONFIGURABLE_IPS + 1;
+        let err = PricingEngine::validate_custom_vm_spec(&db, &within_plan_v4)
+            .await
+            .expect_err("within the plan but above what a guest can hold");
+        assert!(err.to_string().contains("can be configured with"), "{err}");
+
+        let mut within_plan_v6 = base.clone();
+        within_plan_v6.ip6_count = MAX_CONFIGURABLE_IPS + 1;
+        let err = PricingEngine::validate_custom_vm_spec(&db, &within_plan_v6)
+            .await
+            .expect_err("within the plan but above what a guest can hold");
+        assert!(err.to_string().contains("can be configured with"), "{err}");
 
         Ok(())
     }
@@ -1953,7 +2081,7 @@ mod tests {
         }
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let template = db.get_custom_vm_template(1).await?;
-        let price = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await?;
+        let price = PricingEngine::get_custom_vm_cost_amount(&db, &template).await?;
         // memory rounds up to 2 GB * 50 = 100 cents
         assert_eq!(100, price.memory_cost);
         // disk rounds up to 6 GB * 5 = 30 cents
@@ -1978,7 +2106,7 @@ mod tests {
         assert!(res.is_err(), "cpu=0 must be rejected (below min_cpu)");
         // But pricing itself must still succeed — grandfathered/out-of-range VMs
         // must remain renewable and migratable.
-        let priced = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await;
+        let priced = PricingEngine::get_custom_vm_cost_amount(&db, &template).await;
         assert!(
             priced.is_ok(),
             "pricing must succeed for out-of-range specs (renewal/backfill)"
@@ -2002,7 +2130,7 @@ mod tests {
         }
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let template = db.get_custom_vm_template(1).await?;
-        let res = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await;
+        let res = PricingEngine::get_custom_vm_cost_amount(&db, &template).await;
         assert!(
             res.is_err(),
             "an interface with no pricing row must be rejected"
@@ -2383,6 +2511,10 @@ mod tests {
                     max_cpu: 16,
                     min_memory: 1 * crate::GB,
                     max_memory: 64 * crate::GB,
+                    min_ip4: 1,
+                    max_ip4: 4,
+                    min_ip6: 1,
+                    max_ip6: 4,
                     ..Default::default()
                 },
             );
@@ -3322,6 +3454,10 @@ mod tests {
                 max_cpu: 16,
                 min_memory: crate::GB,
                 max_memory: 64 * crate::GB,
+                min_ip4: 1,
+                max_ip4: 4,
+                min_ip6: 1,
+                max_ip6: 4,
                 ..Default::default()
             },
         );

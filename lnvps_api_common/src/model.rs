@@ -28,6 +28,10 @@ pub trait Template {
     fn cpu_arch(&self) -> CpuArch;
     /// Required CPU feature flags. An empty list means "any".
     fn cpu_features(&self) -> &[CpuFeature];
+    /// Number of IPv4 addresses the offer includes.
+    fn ip4_count(&self) -> u16;
+    /// Number of IPv6 addresses the offer includes.
+    fn ip6_count(&self) -> u16;
 }
 
 impl Template for VmTemplate {
@@ -61,6 +65,14 @@ impl Template for VmTemplate {
 
     fn cpu_features(&self) -> &[CpuFeature] {
         &self.cpu_features
+    }
+
+    fn ip4_count(&self) -> u16 {
+        self.ip4_count
+    }
+
+    fn ip6_count(&self) -> u16 {
+        self.ip6_count
     }
 }
 
@@ -96,6 +108,14 @@ impl Template for VmCustomTemplate {
     fn cpu_features(&self) -> &[CpuFeature] {
         &self.cpu_features
     }
+
+    fn ip4_count(&self) -> u16 {
+        self.ip4_count
+    }
+
+    fn ip6_count(&self) -> u16 {
+        self.ip6_count
+    }
 }
 
 impl ApiVmTemplate {
@@ -106,11 +126,11 @@ impl ApiVmTemplate {
         Self::from_standard_data(&template, &cost_plan, &region)
     }
 
-    pub async fn from_custom(db: &Arc<dyn LNVpsDb>, vm_id: u64, template_id: u64) -> Result<Self> {
+    pub async fn from_custom(db: &Arc<dyn LNVpsDb>, template_id: u64) -> Result<Self> {
         let template = db.get_custom_vm_template(template_id).await?;
         let pricing = db.get_custom_pricing(template.pricing_id).await?;
         let region = db.get_host_region(pricing.region_id).await?;
-        let price = PricingEngine::get_custom_vm_cost_amount(db, vm_id, &template).await?;
+        let price = PricingEngine::get_custom_vm_cost_amount(db, &template).await?;
         Ok(Self {
             id: template.id,
             name: "Custom".to_string(),
@@ -150,6 +170,8 @@ impl ApiVmTemplate {
                 name: region.name,
                 company_id: region.company_id,
             },
+            ip4_count: template.ip4_count,
+            ip6_count: template.ip6_count,
         })
     }
 
@@ -158,7 +180,7 @@ impl ApiVmTemplate {
             return Self::from_standard(db, t).await;
         }
         if let Some(t) = vm.custom_template_id {
-            return Self::from_custom(db, vm.id, t).await;
+            return Self::from_custom(db, t).await;
         }
         bail!("Invalid VM config, no template or custom template")
     }
@@ -209,6 +231,8 @@ impl ApiVmTemplate {
                 name: region.name.clone(),
                 company_id: region.company_id,
             },
+            ip4_count: template.ip4_count,
+            ip6_count: template.ip6_count,
         })
     }
 }
@@ -502,6 +526,11 @@ pub struct ApiVmTemplate {
     pub cpu_mfg: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_arch: Option<String>,
+    /// IPv4 addresses included
+    pub ip4_count: u16,
+    /// IPv6 addresses included. Assignment is best-effort: a region without an
+    /// IPv6 range still provisions, so a VM may hold fewer than this.
+    pub ip6_count: u16,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
@@ -761,7 +790,25 @@ pub struct CustomVmSpec {
     pub cpu_arch: Option<String>,
     #[serde(default)]
     pub cpu_feature: Vec<String>,
+    /// IPv4 addresses to assign; defaults to 1, the count every order implied
+    /// before this was selectable.
+    #[serde(default = "default_ip_count")]
+    pub ip4_count: u16,
+    /// IPv6 addresses to assign; defaults to 1.
+    #[serde(default = "default_ip_count")]
+    pub ip6_count: u16,
 }
+
+fn default_ip_count() -> u16 {
+    1
+}
+
+/// Largest address count a VM can actually be given, per family.
+///
+/// A guest gets one cloud-init `ipconfig` entry, which holds a single IPv4 and a
+/// single IPv6, so anything above this would be allocated and billed without ever
+/// reaching the VM. Raise once the guest-side config can carry more.
+pub const MAX_CONFIGURABLE_IPS: u16 = 1;
 
 impl CustomVmSpec {
     /// Build the template this spec describes.
@@ -795,6 +842,8 @@ impl CustomVmSpec {
                 None => CpuArch::default(),
             },
             cpu_features: cpu_features.into(),
+            ip4_count: self.ip4_count,
+            ip6_count: self.ip6_count,
             ..Default::default()
         })
     }
@@ -832,6 +881,14 @@ pub struct ApiCustomTemplateParams {
     pub min_cpu: u16,
     pub min_memory: u64,
     pub max_memory: u64,
+    /// Minimum IPv4 addresses selectable on this plan
+    pub min_ip4: u16,
+    /// Maximum IPv4 addresses selectable, already capped by region capacity
+    pub max_ip4: u16,
+    /// Minimum IPv6 addresses selectable on this plan
+    pub min_ip6: u16,
+    /// Maximum IPv6 addresses selectable on this plan
+    pub max_ip6: u16,
     pub disks: Vec<ApiCustomTemplateDiskParam>,
 }
 
@@ -868,6 +925,10 @@ impl ApiCustomTemplateParams {
             min_cpu: pricing.min_cpu,
             min_memory: pricing.min_memory,
             max_memory: pricing.max_memory,
+            min_ip4: pricing.min_ip4,
+            max_ip4: pricing.max_ip4,
+            min_ip6: pricing.min_ip6,
+            max_ip6: pricing.max_ip6,
             disks: disks
                 .iter()
                 .filter(|d| d.pricing_id == pricing.id)
@@ -1002,7 +1063,38 @@ mod tests {
             cpu_mfg: None,
             cpu_arch: None,
             cpu_feature: vec![],
+            ip4_count: 1,
+            ip6_count: 1,
         }
+    }
+
+    /// An omitted count means the single address every order implied before the
+    /// counts were selectable, not zero.
+    #[test]
+    fn test_custom_vm_spec_defaults_ip_counts_to_one() {
+        let spec: CustomVmSpec = serde_json::from_str(
+            r#"{"pricing_id":7,"cpu":4,"memory":1073741824,"disk":10737418240,
+                "disk_type":"ssd","disk_interface":"pcie"}"#,
+        )
+        .unwrap();
+        assert_eq!(1, spec.ip4_count);
+        assert_eq!(1, spec.ip6_count);
+
+        let t = spec.to_template().unwrap();
+        assert_eq!(1, t.ip4_count);
+        assert_eq!(1, t.ip6_count);
+    }
+
+    #[test]
+    fn test_custom_vm_spec_carries_ip_counts() {
+        let spec = CustomVmSpec {
+            ip4_count: 2,
+            ip6_count: 0,
+            ..custom_spec()
+        };
+        let t = spec.to_template().unwrap();
+        assert_eq!(2, t.ip4_count);
+        assert_eq!(0, t.ip6_count);
     }
 
     #[test]
