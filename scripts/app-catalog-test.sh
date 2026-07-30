@@ -109,11 +109,10 @@ sleep "$SETTLE"
 # on — so only a non-zero exit or a restart counts against it.
 failed=0
 states="$(docker compose -f "$COMPOSE_FILE" ps -a --format '{{.Name}} {{.State}} {{.ExitCode}}')"
-while read -r name state status || [ -n "${name:-}" ]; do
-    # `read` leaves the fields unset when it stops at EOF without a newline.
-    name="${name:-}"; state="${state:-}"; status="${status:-}"
+while read -r name state status; do
     [ -n "$name" ] || continue
-    restarts="$(docker inspect -f '{{.RestartCount}}' "$name" 2>/dev/null || echo 0)"
+    # Without a stdin of its own, docker would eat the rest of the loop's input.
+    restarts="$(docker inspect -f '{{.RestartCount}}' "$name" </dev/null 2>/dev/null || echo 0)"
     case "$state" in
         running) [ "$restarts" -eq 0 ] || { echo "FAIL $name restarted $restarts time(s)"; failed=1; } ;;
         exited)  [ "$status" = "0" ] || { echo "FAIL $name exited with status $status"; failed=1; } ;;
@@ -129,7 +128,16 @@ EOF
 # it back off `docker compose ps` would leave the probe silently skipped if that
 # output format ever changes.
 ports="$(grep -oE '127\.0\.0\.1:[0-9]+:' "$COMPOSE_FILE" | cut -d: -f2 | sort -un)"
-if grep -q 'expose: ingress' "$APP_FILE" && [ -z "$ports" ]; then
+# An expose value written in a form this does not recognise would drop the
+# guard silently, so anything but the two known values fails the run instead.
+doc_body="$(sed 's/^[[:space:]]*#.*$//; s/[[:space:]]#.*$//' "$APP_FILE")"
+unknown="$(printf '%s\n' "$doc_body" | grep -oE 'expose:[[:space:]]*[^,}[:space:]]+' \
+    | grep -vE 'expose:[[:space:]]*"?(none|ingress)"?$' || true)"
+if [ -n "$unknown" ]; then
+    echo "FAIL $APP: unrecognised expose value: $unknown"
+    failed=1
+fi
+if printf '%s\n' "$doc_body" | grep -qE 'expose:[[:space:]]*"?ingress"?' && [ -z "$ports" ]; then
     echo "FAIL $APP: declares an ingress port but nothing was published"
     failed=1
 fi
