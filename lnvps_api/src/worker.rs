@@ -82,6 +82,44 @@ fn host_key_attempt_key(vm_id: u64) -> String {
     format!("worker-host-keys-attempt-{vm_id}")
 }
 
+/// One SSH session to a node, shared by every host key scan aimed at it.
+///
+/// A fleet check walks every VM on a node in turn; connecting per VM would pay
+/// a handshake per guest, and a node that is down would be dialled once per VM
+/// it carries. A failed connect is remembered so the rest of that node's VMs
+/// are skipped rather than retried.
+#[derive(Default)]
+enum HostSshSession {
+    #[default]
+    Idle,
+    Connected(Box<SshClient>),
+    Failed,
+}
+
+impl HostSshSession {
+    async fn get_or_connect(&mut self, host: &VmHost) -> Option<&mut SshClient> {
+        if let Self::Idle = self {
+            let ssh_key = host.ssh_key.as_ref()?;
+            let ssh_user = host.ssh_user.as_deref().unwrap_or("root");
+            let mut ssh = SshClient::new();
+            let ssh_host = extract_host_from_url(&host.ip);
+            if let Err(e) = ssh
+                .connect_with_key((ssh_host.as_str(), 22), ssh_user, ssh_key.as_str())
+                .await
+            {
+                warn!("[host-keys] connect to {} failed: {}", host.name, e);
+                *self = Self::Failed;
+                return None;
+            }
+            *self = Self::Connected(Box::new(ssh));
+        }
+        match self {
+            Self::Connected(ssh) => Some(ssh),
+            _ => None,
+        }
+    }
+}
+
 /// Extract hostname/IP from a URL or return the input if it's already a plain host
 /// e.g. "https://192.168.1.1:8006/" -> "192.168.1.1"
 ///      "192.168.1.1" -> "192.168.1.1"
@@ -991,7 +1029,8 @@ impl Worker {
         )
         .await?;
         self.reconcile_vm_dns(vm).await;
-        self.capture_vm_ssh_host_keys(vm).await;
+        self.capture_vm_ssh_host_keys(vm, &host, &mut HostSshSession::default())
+            .await;
         Ok(())
     }
 
@@ -1007,8 +1046,13 @@ impl Worker {
     /// keys were never captured (or were cleared by a reinstall) self-heals on
     /// the next pass. A VM whose capture already covers every algorithm is
     /// skipped, so this costs nothing for a healthy VM.
-    async fn capture_vm_ssh_host_keys(&self, vm: &Vm) {
-        if vm.deleted {
+    async fn capture_vm_ssh_host_keys(
+        &self,
+        vm: &Vm,
+        host: &VmHost,
+        ssh: &mut HostSshSession,
+    ) {
+        if vm.deleted || host.ssh_key.is_none() {
             return;
         }
         let captured = vm
@@ -1048,30 +1092,9 @@ impl Worker {
         if let Err(e) = self.kv.store(&attempt_key, &now.to_le_bytes()).await {
             warn!("[host-keys] vm {}: failed to record attempt: {}", vm.id, e);
         }
-        let host = match self.db.get_host(vm.host_id).await {
-            Ok(h) => h,
-            Err(e) => {
-                warn!("[host-keys] vm {}: host lookup failed: {}", vm.id, e);
-                return;
-            }
-        };
-        let Some(ssh_key) = host.ssh_key.as_ref() else {
+        let Some(ssh) = ssh.get_or_connect(host).await else {
             return;
         };
-        let ssh_user = host.ssh_user.as_deref().unwrap_or("root");
-
-        let mut ssh = SshClient::new();
-        let ssh_host = extract_host_from_url(&host.ip);
-        if let Err(e) = ssh
-            .connect_with_key((ssh_host.as_str(), 22), ssh_user, ssh_key.as_str())
-            .await
-        {
-            warn!(
-                "[host-keys] vm {}: connect to {} failed: {}",
-                vm.id, host.name, e
-            );
-            return;
-        }
         // Bounded so an unreachable or half-open guest cannot hold the check.
         let scan = match ssh
             .execute(&format!(
@@ -1185,6 +1208,10 @@ impl Worker {
         let states = client.get_all_vm_states().await?;
         let state_map: HashMap<u64, VmRunningState> = states.into_iter().collect();
 
+        // Every VM here lives on the same node, so the host key scans share one
+        // session instead of paying a handshake per guest.
+        let mut host_ssh = HostSshSession::default();
+
         for vm in vms {
             self.handle_vm_state(
                 state_map
@@ -1198,7 +1225,7 @@ impl Worker {
             self.reconcile_vm_dns(vm).await;
             // This sweep is the only pass that visits every VM, so capture has
             // to hang off it; the single-VM check only runs on customer action.
-            self.capture_vm_ssh_host_keys(vm).await;
+            self.capture_vm_ssh_host_keys(vm, &host, &mut host_ssh).await;
         }
         Ok(())
     }
@@ -3973,6 +4000,13 @@ mod tests {
     #[tokio::test]
     async fn test_check_vms_on_host_attempts_host_key_capture() -> Result<()> {
         let db = Arc::new(MockDb::default());
+        // A host with no SSH key is skipped outright, so the scan path needs one.
+        db.hosts
+            .lock()
+            .await
+            .get_mut(&1)
+            .expect("mock host")
+            .ssh_key = Some(lnvps_db::EncryptedString::from("not-a-usable-key"));
         let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
         db.insert_vm_ip_assignment(&VmIpAssignment {
             vm_id,
@@ -3998,8 +4032,8 @@ mod tests {
         let vm = db.get_vm(vm_id).await?;
         worker.check_vms_on_host(vm.host_id, &[&vm]).await?;
 
-        // The scan itself needs SSH to the host, which the mock host has none
-        // of; the recorded attempt is what proves the sweep reached capture.
+        // The scan itself needs a real SSH session to the host; the recorded
+        // attempt is what proves the sweep reached capture.
         assert!(
             worker
                 .kv
