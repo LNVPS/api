@@ -59,6 +59,10 @@ pub struct ApiCustomVmPrice {
     /// currencies. Use `GET /api/v1/exchange-rate` instead. Still populated for
     /// backward compatibility; will be removed in a future release.
     pub other_price: Vec<ApiPrice>,
+    /// Billing period the amount buys, same shape as a standard template's cost
+    /// plan. Custom builds renew monthly, so this is always 1 month.
+    pub interval_amount: u64,
+    pub interval_type: ApiIntervalType,
 }
 
 impl ApiCustomVmPrice {
@@ -80,6 +84,8 @@ impl ApiCustomVmPrice {
             currency: amount.currency().into(),
             amount: amount.value(),
             other_price,
+            interval_amount: CUSTOM_VM_INTERVAL_AMOUNT,
+            interval_type: CUSTOM_VM_INTERVAL_TYPE.into(),
         })
     }
 }
