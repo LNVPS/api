@@ -352,8 +352,7 @@ impl VmProvisioner {
         li.name = format!("VM{} - {}", new_vm.id, pricing.name);
         // Record the base monthly amount now that the VM id is known. With no IP
         // assignments yet this prices the base config plus the minimum 1x IPv4/IPv6.
-        let price =
-            PricingEngine::get_custom_vm_cost_amount(&self.db, new_vm.id, &template).await?;
+        let price = PricingEngine::get_custom_vm_cost_amount(&self.db, &template).await?;
         li.amount = price.total();
         self.db.update_subscription_line_item(&li).await?;
 
@@ -532,8 +531,7 @@ impl VmProvisioner {
             .get_subscription_line_item(subscription_line_item_id)
             .await?;
         li.name = format!("VM{} - {}", new_vm.id, pricing.name);
-        let price =
-            PricingEngine::get_custom_vm_cost_amount(&self.db, new_vm.id, &template).await?;
+        let price = PricingEngine::get_custom_vm_cost_amount(&self.db, &template).await?;
         li.amount = price.total();
         self.db.update_subscription_line_item(&li).await?;
 
@@ -850,7 +848,7 @@ impl VmProvisioner {
         // Calculate the new base-currency cost for the new custom template and update the line
         // item's amount so the displayed subscription cost reflects the upgraded specs.
         let new_price =
-            PricingEngine::get_custom_vm_cost_amount(&self.db, vm_id, &new_custom_template).await?;
+            PricingEngine::get_custom_vm_cost_amount(&self.db, &new_custom_template).await?;
 
         // Update the line item: mark as VmRenewal (no longer VmUpgrade), store the new config,
         // and update the renewal amount to the new template's base-currency cost.
@@ -875,8 +873,7 @@ impl VmProvisioner {
             .ok_or_else(|| anyhow::anyhow!("VM does not have a custom template"))?;
         let template = self.db.get_custom_vm_template(custom_template_id).await?;
 
-        let new_price =
-            PricingEngine::get_custom_vm_cost_amount(&self.db, vm_id, &template).await?;
+        let new_price = PricingEngine::get_custom_vm_cost_amount(&self.db, &template).await?;
 
         let mut line_item = self
             .db
@@ -2006,7 +2003,7 @@ mod tests {
         // Directly insert VM (bypassing provision_custom) to simulate an existing VM
         // that was created before the pricing was disabled
         let subscription_line_item_id = make_test_subscription(&db, user.id).await?;
-        let vm_id = db
+        let _vm_id = db
             .insert_vm(&Vm {
                 id: 0,
                 host_id: 1,

@@ -126,11 +126,11 @@ impl ApiVmTemplate {
         Self::from_standard_data(&template, &cost_plan, &region)
     }
 
-    pub async fn from_custom(db: &Arc<dyn LNVpsDb>, vm_id: u64, template_id: u64) -> Result<Self> {
+    pub async fn from_custom(db: &Arc<dyn LNVpsDb>, template_id: u64) -> Result<Self> {
         let template = db.get_custom_vm_template(template_id).await?;
         let pricing = db.get_custom_pricing(template.pricing_id).await?;
         let region = db.get_host_region(pricing.region_id).await?;
-        let price = PricingEngine::get_custom_vm_cost_amount(db, vm_id, &template).await?;
+        let price = PricingEngine::get_custom_vm_cost_amount(db, &template).await?;
         Ok(Self {
             id: template.id,
             name: "Custom".to_string(),
@@ -180,7 +180,7 @@ impl ApiVmTemplate {
             return Self::from_standard(db, t).await;
         }
         if let Some(t) = vm.custom_template_id {
-            return Self::from_custom(db, vm.id, t).await;
+            return Self::from_custom(db, t).await;
         }
         bail!("Invalid VM config, no template or custom template")
     }

@@ -9,7 +9,8 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
 use lnvps_api_common::{
-    ApiData, ApiDiskInterface, ApiDiskType, ApiPaginatedData, ApiPaginatedResult, ApiResult,
+    ApiData, ApiDiskInterface, ApiDiskType, ApiError, ApiPaginatedData, ApiPaginatedResult,
+    ApiResult,
 };
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb, VmCustomPricing, VmCustomPricingDisk};
 use serde::Deserialize;
@@ -214,6 +215,8 @@ async fn admin_create_custom_pricing(
         cpu_limit: req.cpu_limit,
     };
 
+    validate_ip_ranges(&pricing)?;
+
     let pricing_id = this.db.insert_custom_pricing(&pricing).await?;
 
     // Insert disk pricing configurations
@@ -338,6 +341,8 @@ async fn admin_update_custom_pricing(
     if let Some(v) = req.cpu_limit {
         pricing.cpu_limit = v;
     }
+
+    validate_ip_ranges(&pricing)?;
 
     this.db.update_custom_pricing(&pricing).await?;
 
@@ -479,4 +484,16 @@ async fn admin_copy_custom_pricing(
     let created_pricing = this.db.get_custom_pricing(new_pricing_id).await?;
     let info = AdminCustomPricingInfo::from_custom_pricing(&this.db, &created_pricing).await?;
     ApiData::ok(info)
+}
+
+/// A plan whose minimum exceeds its maximum can never be ordered, so it is
+/// rejected rather than stored as a silently unsellable offer.
+fn validate_ip_ranges(pricing: &VmCustomPricing) -> Result<(), ApiError> {
+    if pricing.min_ip4 > pricing.max_ip4 {
+        return Err(ApiError::bad_request("min_ip4 cannot exceed max_ip4"));
+    }
+    if pricing.min_ip6 > pricing.max_ip6 {
+        return Err(ApiError::bad_request("min_ip6 cannot exceed max_ip6"));
+    }
+    Ok(())
 }

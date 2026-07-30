@@ -3,7 +3,6 @@ use crate::{
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use chrono::{DateTime, Days, Months, TimeDelta, Utc};
-use ipnetwork::IpNetwork;
 use isocountry::CountryCode;
 use lnvps_db::{
     CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, IntervalType, LNVpsDb, PaymentMethod,
@@ -753,7 +752,6 @@ impl PricingEngine {
     /// Get the cost amount as (Currency,amount)
     pub async fn get_custom_vm_cost_amount(
         db: &Arc<dyn LNVpsDb>,
-        vm_id: u64,
         template: &VmCustomTemplate,
     ) -> Result<PricingData> {
         let pricing = db.get_custom_pricing(template.pricing_id).await?;
@@ -885,7 +883,7 @@ impl PricingEngine {
         };
 
         let template = self.db.get_custom_vm_template(template_id).await?;
-        let price = Self::get_custom_vm_cost_amount(&self.db, vm.id, &template).await?;
+        let price = Self::get_custom_vm_cost_amount(&self.db, &template).await?;
 
         // custom templates are always 1-month intervals; clamp base to now for expired VMs
         let base = self
@@ -1397,7 +1395,7 @@ impl PricingEngine {
             )
         } else if let Some(cid) = vm.custom_template_id {
             let template = self.db.get_custom_vm_template(cid).await?;
-            let price = Self::get_custom_vm_cost_amount(&self.db, vm.id, &template).await?;
+            let price = Self::get_custom_vm_cost_amount(&self.db, &template).await?;
             let time_value = Self::cost_plan_interval_to_seconds(IntervalType::Month, 1);
             (
                 CurrencyAmount::from_u64(price.currency, price.total()),
@@ -1555,8 +1553,7 @@ impl PricingEngine {
         Self::validate_custom_vm_spec(&self.db, &new_custom_template).await?;
 
         // Get the cost of renewal
-        let new_price =
-            Self::get_custom_vm_cost_amount(&self.db, vm_id, &new_custom_template).await?;
+        let new_price = Self::get_custom_vm_cost_amount(&self.db, &new_custom_template).await?;
         let new_price = CurrencyAmount::from_u64(new_price.currency, new_price.total());
 
         // Get the time value for the custom template
@@ -1937,7 +1934,7 @@ mod tests {
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
 
         let template = db.get_custom_vm_template(1).await?;
-        let price = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await?;
+        let price = PricingEngine::get_custom_vm_cost_amount(&db, &template).await?;
         // All costs now in cents:
         // cpu_cost = 150 cents/CPU * 2 CPUs = 300 cents
         // memory_cost = 50 cents/GB * 2 GB = 100 cents
@@ -1967,14 +1964,10 @@ mod tests {
         template.ip4_count = 3;
         template.ip6_count = 2;
 
-        let price = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await?;
+        let price = PricingEngine::get_custom_vm_cost_amount(&db, &template).await?;
         assert_eq!(150, price.ip4_cost);
         assert_eq!(10, price.ip6_cost);
         assert_eq!(960, price.total());
-
-        // Priced the same before the VM exists (no assignments to count).
-        let quote = PricingEngine::get_custom_vm_cost_amount(&db, 0, &template).await?;
-        assert_eq!(price.total(), quote.total());
 
         Ok(())
     }
@@ -1988,7 +1981,7 @@ mod tests {
 
         let mut template = db.get_custom_vm_template(1).await?;
         template.ip4_count = 0;
-        let price = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await?;
+        let price = PricingEngine::get_custom_vm_cost_amount(&db, &template).await?;
         assert_eq!(0, price.ip4_cost);
 
         Ok(())
@@ -2037,7 +2030,7 @@ mod tests {
         }
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let template = db.get_custom_vm_template(1).await?;
-        let price = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await?;
+        let price = PricingEngine::get_custom_vm_cost_amount(&db, &template).await?;
         // memory rounds up to 2 GB * 50 = 100 cents
         assert_eq!(100, price.memory_cost);
         // disk rounds up to 6 GB * 5 = 30 cents
@@ -2062,7 +2055,7 @@ mod tests {
         assert!(res.is_err(), "cpu=0 must be rejected (below min_cpu)");
         // But pricing itself must still succeed — grandfathered/out-of-range VMs
         // must remain renewable and migratable.
-        let priced = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await;
+        let priced = PricingEngine::get_custom_vm_cost_amount(&db, &template).await;
         assert!(
             priced.is_ok(),
             "pricing must succeed for out-of-range specs (renewal/backfill)"
@@ -2086,7 +2079,7 @@ mod tests {
         }
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
         let template = db.get_custom_vm_template(1).await?;
-        let res = PricingEngine::get_custom_vm_cost_amount(&db, 1, &template).await;
+        let res = PricingEngine::get_custom_vm_cost_amount(&db, &template).await;
         assert!(
             res.is_err(),
             "an interface with no pricing row must be rejected"

@@ -112,12 +112,12 @@ impl NetworkProvisioner {
                 }
             };
             let want = if range_cidr.is_ipv4() {
-                ip4_count as usize - picked.ip4.len().min(ip4_count as usize)
+                (ip4_count as usize).saturating_sub(picked.ip4.len())
             } else if matches!(range.allocation_mode, IpRangeAllocationMode::SlaacEui64) {
                 // One MAC, one derived address.
                 usize::from(picked.ip6.is_empty() && ip6_count > 0)
             } else {
-                ip6_count as usize - picked.ip6.len().min(ip6_count as usize)
+                (ip6_count as usize).saturating_sub(picked.ip6.len())
             };
 
             for _ in 0..want {

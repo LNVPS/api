@@ -2996,6 +2996,35 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// A plan whose minimum address count exceeds its maximum could never be
+    /// ordered, so creating one is refused.
+    #[tokio::test]
+    async fn test_admin_create_custom_pricing_rejects_inverted_ip_range() {
+        let client = setup().await;
+        let body = serde_json::json!({
+            "name": "e2e-inverted-ip-range",
+            "enabled": true,
+            "region_id": 1,
+            "currency": "EUR",
+            "cpu_cost": 100,
+            "memory_cost": 50,
+            "ip4_cost": 200,
+            "ip6_cost": 0,
+            "min_cpu": 1,
+            "max_cpu": 4,
+            "min_memory": 1073741824_u64,
+            "max_memory": 8589934592_u64,
+            "min_ip4": 3,
+            "max_ip4": 1,
+            "disk_pricing": []
+        });
+        let resp = client
+            .post_auth("/api/admin/v1/custom_pricing", &body)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn test_admin_get_custom_pricing() {
         let client = setup().await;
