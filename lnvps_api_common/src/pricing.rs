@@ -900,8 +900,8 @@ impl PricingEngine {
             .await
             .unwrap_or_else(Utc::now)
             .max(Utc::now());
-        let time_value = (base.add(Months::new(CUSTOM_VM_INTERVAL_AMOUNT as u32)) - base)
-            .num_seconds() as u64;
+        let time_value =
+            (base.add(Months::new(CUSTOM_VM_INTERVAL_AMOUNT as u32)) - base).num_seconds() as u64;
         let converted_amount = self
             .get_amount_and_rate(
                 CurrencyAmount::from_u64(price.currency, price.total()),
@@ -1406,7 +1406,10 @@ impl PricingEngine {
         } else if let Some(cid) = vm.custom_template_id {
             let template = self.db.get_custom_vm_template(cid).await?;
             let price = Self::get_custom_vm_cost_amount(&self.db, &template).await?;
-            let time_value = Self::cost_plan_interval_to_seconds(IntervalType::Month, 1);
+            let time_value = Self::cost_plan_interval_to_seconds(
+                CUSTOM_VM_INTERVAL_TYPE,
+                CUSTOM_VM_INTERVAL_AMOUNT,
+            );
             (
                 CurrencyAmount::from_u64(price.currency, price.total()),
                 time_value,
@@ -1567,7 +1570,8 @@ impl PricingEngine {
         let new_price = CurrencyAmount::from_u64(new_price.currency, new_price.total());
 
         // Get the time value for the custom template
-        let custom_plan_seconds = Self::cost_plan_interval_to_seconds(IntervalType::Month, 1);
+        let custom_plan_seconds =
+            Self::cost_plan_interval_to_seconds(CUSTOM_VM_INTERVAL_TYPE, CUSTOM_VM_INTERVAL_AMOUNT);
         let new_cost_per_second = new_price.value() as f64 / custom_plan_seconds as f64;
 
         // calculate the cost based on the time until the vm expires
