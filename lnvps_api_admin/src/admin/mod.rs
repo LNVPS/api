@@ -1,7 +1,8 @@
 use axum::Router;
 use axum::extract::FromRef;
 use lnvps_api_common::{
-    ApiError, ExchangeRateService, RedisWorkFeedback, VmStateCache, WorkCommander,
+    ApiError, ExchangeRateService, MAX_CONFIGURABLE_IPS, RedisWorkFeedback, VmStateCache,
+    WorkCommander,
 };
 use lnvps_db::LNVpsDb;
 use std::sync::Arc;
@@ -36,17 +37,13 @@ mod vm_templates;
 mod vms;
 mod websocket;
 
-/// Largest address count an offer may carry, per family.
-///
-/// A guest gets one cloud-init `ipconfig` entry, which holds a single IPv4 and a
-/// single IPv6, so an offer above this would allocate and bill for addresses that
-/// never reach the VM. Raise once the guest-side config can carry more.
-pub(crate) const MAX_OFFERED_IPS: u16 = 1;
-
+/// Refuse an offer wider than what a guest can actually be configured with, so an
+/// operator cannot create a plan whose orders would allocate and bill addresses
+/// the VM never receives. The order path enforces the same bound.
 pub(crate) fn validate_offered_ip_count(field: &str, count: u16) -> Result<(), ApiError> {
-    if count > MAX_OFFERED_IPS {
+    if count > MAX_CONFIGURABLE_IPS {
         return Err(ApiError::bad_request(format!(
-            "{field} cannot exceed {MAX_OFFERED_IPS}: the guest can only be configured with one address per family"
+            "{field} cannot exceed {MAX_CONFIGURABLE_IPS}: a VM can only be configured with that many addresses per family"
         )));
     }
     Ok(())

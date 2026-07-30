@@ -1,5 +1,6 @@
 use crate::{
-    ConvertedCurrencyAmount, ExchangeRateService, Ticker, TickerRate, UpgradeConfig, VatClient,
+    ConvertedCurrencyAmount, ExchangeRateService, MAX_CONFIGURABLE_IPS, Ticker, TickerRate,
+    UpgradeConfig, VatClient,
 };
 use anyhow::{Result, anyhow, bail, ensure};
 use chrono::{DateTime, Days, Months, TimeDelta, Utc};
@@ -864,6 +865,23 @@ impl PricingEngine {
                 template.ip6_count,
                 pricing.min_ip6,
                 pricing.max_ip6
+            );
+        }
+        // The plan's own bounds are not enough: a stored plan can exceed what a
+        // guest can be configured with, and an order against it would allocate
+        // and bill addresses the VM never receives.
+        if template.ip4_count > MAX_CONFIGURABLE_IPS {
+            bail!(
+                "IPv4 count {} exceeds the {} address(es) a VM can be configured with",
+                template.ip4_count,
+                MAX_CONFIGURABLE_IPS
+            );
+        }
+        if template.ip6_count > MAX_CONFIGURABLE_IPS {
+            bail!(
+                "IPv6 count {} exceeds the {} address(es) a VM can be configured with",
+                template.ip6_count,
+                MAX_CONFIGURABLE_IPS
             );
         }
         Ok(())
@@ -2010,6 +2028,39 @@ mod tests {
             .await
             .expect_err("below min_ip6");
         assert!(err.to_string().contains("IPv6 count"), "{err}");
+
+        Ok(())
+    }
+
+    /// A stored plan can be wider than what a guest can be configured with — the
+    /// migration adopts counts from existing VMs — so the order path must bound
+    /// the count itself and not trust the plan's range.
+    #[tokio::test]
+    async fn validate_custom_vm_spec_refuses_unconfigurable_ip_counts() -> Result<()> {
+        let db = MockDb::default();
+        add_custom_pricing(&db).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+
+        let base = db.get_custom_vm_template(1).await?;
+        let pricing = db.get_custom_pricing(base.pricing_id).await?;
+        assert!(
+            pricing.max_ip4 > MAX_CONFIGURABLE_IPS && pricing.max_ip6 > MAX_CONFIGURABLE_IPS,
+            "plan must be wider than the cap for this to test anything"
+        );
+
+        let mut within_plan_v4 = base.clone();
+        within_plan_v4.ip4_count = MAX_CONFIGURABLE_IPS + 1;
+        let err = PricingEngine::validate_custom_vm_spec(&db, &within_plan_v4)
+            .await
+            .expect_err("within the plan but above what a guest can hold");
+        assert!(err.to_string().contains("can be configured with"), "{err}");
+
+        let mut within_plan_v6 = base.clone();
+        within_plan_v6.ip6_count = MAX_CONFIGURABLE_IPS + 1;
+        let err = PricingEngine::validate_custom_vm_spec(&db, &within_plan_v6)
+            .await
+            .expect_err("within the plan but above what a guest can hold");
+        assert!(err.to_string().contains("can be configured with"), "{err}");
 
         Ok(())
     }
