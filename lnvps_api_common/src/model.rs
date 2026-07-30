@@ -803,13 +803,6 @@ fn default_ip_count() -> u16 {
     1
 }
 
-/// Largest address count a VM can actually be given, per family.
-///
-/// A guest gets one cloud-init `ipconfig` entry, which holds a single IPv4 and a
-/// single IPv6, so anything above this would be allocated and billed without ever
-/// reaching the VM. Raise once the guest-side config can carry more.
-pub const MAX_CONFIGURABLE_IPS: u16 = 1;
-
 impl CustomVmSpec {
     /// Build the template this spec describes.
     ///

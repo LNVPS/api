@@ -346,49 +346,42 @@ impl ProxmoxClient {
     ///
     /// This snippet disables SSH host key regeneration so that cloud-init
     /// reconfiguration (IP changes, SSH key updates, etc.) does not cause
-    /// host-key warnings for users connecting via SSH.
+    /// host-key warnings for users connecting via SSH, and pins the guest
+    /// resolvers, which minimal images otherwise drop.
     ///
-    /// The snippet is written once via SSH to the storage's snippet directory.
     /// Returns the Proxmox volume reference (e.g. `local:snippets/lnvps-vendor.yaml`)
     /// or `None` if SSH is not configured or no snippet storage is available.
     async fn ensure_vendor_snippet(&self) -> OpResult<Option<String>> {
+        self.write_snippet("lnvps-vendor.yaml", &build_vendor_snippet(GUEST_DNS_SERVERS))
+            .await
+    }
+
+    /// Resolve the on-disk path of a snippet volume, writing it only when the
+    /// content differs. Returns the volume reference to put in `cicustom`.
+    async fn write_snippet(&self, filename: &str, content: &str) -> OpResult<Option<String>> {
         let ssh_config = match &self.ssh {
             Some(s) => s,
             None => return Ok(None),
         };
-
         let storage_name = match self.get_snippet_storage(&self.node).await? {
             Some(s) => s,
             None => return Ok(None),
         };
 
-        let snippet_filename = "lnvps-vendor.yaml";
-
         // Snippet storage path depends on the storage type; for the default
-        // `local` storage this is `/var/lib/vz/snippets/`.  For other directory-
-        // based storages it varies.  We use `pvesm path` to resolve it.
+        // `local` storage this is `/var/lib/vz/snippets/`. For other directory-
+        // based storages it varies, so `pvesm path` resolves it.
         let host = self.api.base().host().unwrap().to_string();
-        let ssh_user = ssh_config.user.clone();
-        let ssh_key = ssh_config.key.clone();
-
         let mut ssh = SshClient::new();
-        ssh.connect((host.clone(), 22), &ssh_user, &ssh_key)
+        ssh.connect((host, 22), &ssh_config.user, &ssh_config.key)
             .await
             .map_err(OpError::Transient)?;
 
-        // Force a fixed set of public resolvers into every guest's
-        // /etc/resolv.conf via cloud-init. Without this, minimal images
-        // (Alpine, NixOS) silently drop the DNS servers Proxmox provides.
-        let snippet_content = build_vendor_snippet(GUEST_DNS_SERVERS);
-
-        let vol_ref = format!("{storage_name}:snippets/{snippet_filename}");
-
-        // Resolve the on-disk path for the snippet volume reference
+        let vol_ref = format!("{storage_name}:snippets/{filename}");
         let (exit_code, path_output) = ssh
             .execute(&format!("pvesm path '{vol_ref}'"))
             .await
             .map_err(OpError::Transient)?;
-
         if exit_code != 0 {
             info!(
                 "Cannot resolve snippet path for {}: {}",
@@ -397,43 +390,99 @@ impl ProxmoxClient {
             );
             return Ok(None);
         }
-        let snippet_path = path_output.trim();
+        let snippet_path = path_output.trim().to_string();
 
-        // Ensure parent directory exists and write only if missing or changed
         let (_, existing) = ssh
             .execute(&format!("cat '{snippet_path}' 2>/dev/null || true"))
             .await
             .map_err(OpError::Transient)?;
-
-        if existing.trim() != snippet_content.trim() {
+        if existing.trim() != content.trim() {
             let parent = snippet_path
                 .rsplit_once('/')
                 .map(|(p, _)| p)
-                .unwrap_or("/tmp");
+                .unwrap_or("/tmp")
+                .to_string();
             ssh.execute(&format!("mkdir -p '{parent}'"))
                 .await
                 .map_err(OpError::Transient)?;
-
-            let (code, output) = ssh
-                .execute(&format!(
-                    "printf '%s' '{}' > '{}'",
-                    snippet_content, snippet_path
-                ))
-                .await
-                .map_err(OpError::Transient)?;
-
-            if code != 0 {
-                info!(
-                    "Failed to write vendor snippet to {}: {}",
-                    snippet_path,
-                    output.trim()
-                );
-                return Ok(None);
-            }
-            info!("Wrote cloud-init vendor snippet to {}", snippet_path);
+            // Uploaded rather than echoed through a shell: the content is
+            // multi-line YAML and quoting it into a command is a foot-gun.
+            ssh.scp_upload(
+                content.as_bytes(),
+                std::path::Path::new(&snippet_path),
+                0o644,
+            )
+            .await
+            .map_err(OpError::Transient)?;
+            info!("Wrote cloud-init snippet to {}", snippet_path);
         }
-
         Ok(Some(vol_ref))
+    }
+
+    /// Snippet filename holding a VM's network config, if it needs one.
+    fn network_snippet_filename(vm_id: u64) -> String {
+        format!("lnvps-net-{vm_id}.yaml")
+    }
+
+    /// Write the VM's network snippet, if it needs one.
+    ///
+    /// Failing to write one the VM needs is fatal rather than a downgrade: every
+    /// address is already allocated, routed and billed, and carrying on would
+    /// hand the customer a VM holding one of them.
+    async fn ensure_network_snippet(&self, cfg: &FullVmInfo) -> OpResult<Option<String>> {
+        let content = match Self::make_network_config(cfg).map_err(OpError::Fatal)? {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+        match self
+            .write_snippet(&Self::network_snippet_filename(cfg.vm.id), &content)
+            .await?
+        {
+            Some(vol_ref) => Ok(Some(vol_ref)),
+            None => op_fatal!(
+                "VM {} needs a cloud-init network snippet but none could be written; \
+                 snippet storage and SSH access are required to configure more than \
+                 one address per family",
+                cfg.vm.id
+            ),
+        }
+    }
+
+    /// Remove a VM's network snippet, if one was ever written.
+    ///
+    /// A VM cannot start when a `cicustom` volume it references is missing, so
+    /// this only ever runs after the VM itself is gone.
+    async fn remove_network_snippet(&self, vm_id: u64) -> OpResult<()> {
+        let ssh_config = match &self.ssh {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let storage_name = match self.get_snippet_storage(&self.node).await? {
+            Some(s) => s,
+            None => return Ok(()),
+        };
+        let host = self.api.base().host().unwrap().to_string();
+        let mut ssh = SshClient::new();
+        ssh.connect((host, 22), &ssh_config.user, &ssh_config.key)
+            .await
+            .map_err(OpError::Transient)?;
+
+        let vol_ref = format!(
+            "{storage_name}:snippets/{}",
+            Self::network_snippet_filename(vm_id)
+        );
+        let (exit_code, path_output) = ssh
+            .execute(&format!("pvesm path '{vol_ref}'"))
+            .await
+            .map_err(OpError::Transient)?;
+        if exit_code != 0 {
+            return Ok(());
+        }
+        let snippet_path = path_output.trim();
+        ssh.execute(&format!("rm -f '{snippet_path}'"))
+            .await
+            .map_err(OpError::Transient)?;
+        Ok(())
     }
 
     pub async fn import_disk_image(&self, req: ImportDiskImageRequest) -> OpResult<()> {
@@ -980,7 +1029,96 @@ impl ProxmoxClient {
             .collect()
     }
 
-    fn make_config(&self, value: &FullVmInfo, vendor_snippet: Option<&str>) -> Result<VmConfig> {
+    /// Build a cloud-init network-config (v2) putting every assignment on the
+    /// VM's single NIC.
+    ///
+    /// Returns `None` when the VM holds at most one address per family: a single
+    /// `ipconfig0` expresses that exactly, and leaving those VMs on the built-in
+    /// path keeps their config untouched. Above that, `ipconfig[n]` cannot help —
+    /// it carries one `ip=` and one `ip6=` per interface — and a second NIC is not
+    /// an option either, because the addresses share one router-issued vMAC and
+    /// must therefore share the interface carrying it.
+    ///
+    /// The interface is matched by MAC rather than by name so the config does not
+    /// depend on how the guest enumerates devices.
+    fn make_network_config(value: &FullVmInfo) -> Result<Option<String>> {
+        let mut v4 = Vec::new();
+        let mut v6 = Vec::new();
+        let mut gw4 = None;
+        let mut gw6 = None;
+        let mut accept_ra = false;
+
+        for ip in &value.ips {
+            let addr: IpAddr = match ip.ip.parse() {
+                Ok(a) => a,
+                Err(_) => continue,
+            };
+            let ip_range = match value.ranges.iter().find(|r| r.id == ip.ip_range_id) {
+                Some(r) => r,
+                None => continue,
+            };
+            if addr.is_ipv6()
+                && matches!(ip_range.allocation_mode, IpRangeAllocationMode::SlaacEui64)
+            {
+                // The host hands out the address; what the database holds is
+                // informational only.
+                accept_ra = true;
+                continue;
+            }
+            let range: IpNetwork = ip_range.cidr.parse()?;
+            let range_gw: IpNetwork = parse_gateway(&ip_range.gateway)?;
+            // Same widening as the ipconfig path: take the shorter prefix so an
+            // off-subnet gateway stays directly reachable without an on-link route.
+            let prefix = range.prefix().min(range_gw.prefix());
+            let cidr = IpNetwork::new(addr, prefix)?.to_string();
+            if addr.is_ipv4() {
+                // Only one default route per family is meaningful; addresses from
+                // a second range stay reachable on-link through the widened
+                // prefix. First assignment wins, as it does via `ipconfig`.
+                gw4.get_or_insert_with(|| range_gw.ip());
+                v4.push(cidr);
+            } else {
+                gw6.get_or_insert_with(|| range_gw.ip());
+                v6.push(cidr);
+            }
+        }
+
+        if v4.len() <= 1 && v6.len() <= 1 {
+            return Ok(None);
+        }
+
+        let mut cfg =
+            String::from("version: 2\nethernets:\n  nic0:\n    match:\n      macaddress: ");
+        cfg.push_str(&value.vm.mac_address.to_lowercase());
+        cfg.push_str("\n    dhcp4: false\n    dhcp6: false\n");
+        if accept_ra {
+            cfg.push_str("    accept-ra: true\n");
+        }
+        cfg.push_str("    addresses:\n");
+        for a in v4.iter().chain(v6.iter()) {
+            cfg.push_str(&format!("      - {a}\n"));
+        }
+        let routes: Vec<String> = gw4
+            .into_iter()
+            .chain(gw6)
+            .map(|gw| format!("      - to: default\n        via: {gw}"))
+            .collect();
+        if !routes.is_empty() {
+            cfg.push_str("    routes:\n");
+            for r in &routes {
+                cfg.push_str(r);
+                cfg.push('\n');
+            }
+        }
+        Ok(Some(cfg))
+    }
+
+    fn make_config(
+        &self,
+        value: &FullVmInfo,
+        vendor_snippet: Option<&str>,
+        network_snippet: Option<&str>,
+    ) -> Result<VmConfig> {
         let ip_config = value
             .ips
             .iter()
@@ -1023,6 +1161,23 @@ impl ProxmoxClient {
             })
             .collect::<Vec<_>>();
 
+        // `ipconfig[n]` is a property string holding at most one `ip=` and one
+        // `ip6=`; repeating a key produces something the guest cannot act on. Any
+        // address beyond the first of each family is carried by the network
+        // snippet instead, so keep only the first of each here.
+        let ip_config: Vec<String> = {
+            let mut first_v4 = None;
+            let mut first_v6 = None;
+            for entry in ip_config {
+                if entry.starts_with("ip6=") {
+                    first_v6.get_or_insert(entry);
+                } else {
+                    first_v4.get_or_insert(entry);
+                }
+            }
+            first_v4.into_iter().chain(first_v6).collect()
+        };
+
         let mut net = vec![
             format!("virtio={}", value.vm.mac_address),
             format!("bridge={}", self.config.bridge),
@@ -1043,7 +1198,16 @@ impl ProxmoxClient {
             net.push(format!("rate={}", mbps as f32 / 8.0));
         }
 
-        let cicustom = vendor_snippet.map(|vol_ref| format!("vendor={vol_ref}"));
+        let cicustom_parts: Vec<String> = vendor_snippet
+            .map(|v| format!("vendor={v}"))
+            .into_iter()
+            .chain(network_snippet.map(|n| format!("network={n}")))
+            .collect();
+        let cicustom = if cicustom_parts.is_empty() {
+            None
+        } else {
+            Some(cicustom_parts.join(","))
+        };
 
         let vm_resources = value.resources()?;
         Ok(VmConfig {
@@ -1612,7 +1776,9 @@ impl VmHostClient for ProxmoxClient {
 
     async fn create_vm(&self, req: &FullVmInfo) -> OpResult<()> {
         let vendor_snippet = self.ensure_vendor_snippet().await?;
-        let config = self.make_config(req, vendor_snippet.as_deref())?;
+        let network_snippet = self.ensure_network_snippet(req).await?;
+        let config =
+            self.make_config(req, vendor_snippet.as_deref(), network_snippet.as_deref())?;
         let vm_id: ProxmoxVmId = req.vm.id.into();
 
         let ctx = CreateVmContext {
@@ -1678,7 +1844,13 @@ impl VmHostClient for ProxmoxClient {
     }
 
     async fn delete_vm(&self, vm: &Vm) -> OpResult<()> {
-        self.destroy_vm(vm.id.into()).await
+        self.destroy_vm(vm.id.into()).await?;
+        // Best-effort: a leaked snippet wastes a few hundred bytes, while failing
+        // here would leave the caller believing a destroyed VM still exists.
+        if let Err(e) = self.remove_network_snippet(vm.id).await {
+            warn!("Failed to remove network snippet for VM {}: {}", vm.id, e);
+        }
+        Ok(())
     }
 
     async fn unlink_primary_disk(&self, vm: &Vm) -> OpResult<()> {
@@ -1734,7 +1906,11 @@ impl VmHostClient for ProxmoxClient {
         let current_config = self.get_vm_config(&self.node, cfg.vm.id.into()).await?;
 
         let vendor_snippet = self.ensure_vendor_snippet().await?;
-        let mut config = self.make_config(cfg, vendor_snippet.as_deref())?;
+        // Rewrites the file when the assignments changed, so the volume ref can
+        // compare equal while the config behind it is new.
+        let network_snippet = self.ensure_network_snippet(cfg).await?;
+        let mut config =
+            self.make_config(cfg, vendor_snippet.as_deref(), network_snippet.as_deref())?;
 
         // dont re-create the disks
         config.scsi_0 = None;
@@ -1768,7 +1944,8 @@ impl VmHostClient for ProxmoxClient {
 
         // Check and fix cloud-init IP config if it doesn't match expected
         let current_config = self.get_vm_config(&self.node, vm_id).await?;
-        let expected_config = self.make_config(cfg, None)?;
+        let network_snippet = self.ensure_network_snippet(cfg).await?;
+        let expected_config = self.make_config(cfg, None, network_snippet.as_deref())?;
         if current_config.config.ip_config != expected_config.ip_config {
             info!(
                 "IP config mismatch for VM {}: current={:?}, expected={:?}",
@@ -2973,7 +3150,7 @@ mod tests {
             None,
         );
 
-        let vm = p.make_config(&cfg, None)?;
+        let vm = p.make_config(&cfg, None, None)?;
         assert_eq!(vm.cpu, Some(q_cfg.cpu));
         assert_eq!(vm.cores, Some(template.cpu as i32));
         assert_eq!(vm.memory, Some((template.memory / MB).to_string()));
@@ -2982,12 +3159,11 @@ mod tests {
         assert_eq!(vm.on_boot, Some(true));
         assert!(vm.net.as_ref().unwrap().contains("tag=100"));
         assert!(vm.net.as_ref().unwrap().contains("firewall=1"));
+        // One address per family: the fixture holds two IPv4s, and repeating
+        // `ip=` in the property string is not something the guest can act on.
         assert_eq!(
             vm.ip_config,
-            Some(
-                "ip=192.168.1.2/16,gw=192.168.1.1,ip=192.168.2.2/24,gw=10.10.10.10,ip6=auto"
-                    .to_string()
-            )
+            Some("ip=192.168.1.2/16,gw=192.168.1.1,ip6=auto".to_string())
         );
         Ok(())
     }
@@ -3010,7 +3186,7 @@ mod tests {
         };
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
-        let vm = p.make_config(&cfg, None)?;
+        let vm = p.make_config(&cfg, None, None)?;
         // Full memory is still the sold amount; balloon is the 90% floor.
         assert_eq!(vm.memory, Some(memory_mb.to_string()));
         assert_eq!(vm.balloon, Some((memory_mb * 90 / 100) as i32));
@@ -3047,7 +3223,7 @@ mod tests {
         };
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
-        let vm = p.make_config(&cfg, None)?;
+        let vm = p.make_config(&cfg, None, None)?;
         let ip_config = vm.ip_config.unwrap();
         // The IP should use /24 (gateway prefix), not /26 (range prefix),
         // so the gateway 185.18.221.1 is inside the VM's subnet.
@@ -3116,7 +3292,7 @@ mod tests {
 
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
-        let vm = p.make_config(&cfg, None)?;
+        let vm = p.make_config(&cfg, None, None)?;
         let net = vm.net.unwrap();
         // 800 Mbit/s ÷ 8 = 100 MB/s
         assert!(
@@ -3145,7 +3321,7 @@ mod tests {
 
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
-        let vm = p.make_config(&cfg, None)?;
+        let vm = p.make_config(&cfg, None, None)?;
         assert_eq!(vm.cpu_limit, Some(0.5));
         Ok(())
     }
@@ -3364,7 +3540,7 @@ mod tests {
 
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
-        let vm = p.make_config(&cfg, None)?;
+        let vm = p.make_config(&cfg, None, None)?;
         assert!(
             !vm.net.as_deref().unwrap_or("").contains("rate="),
             "rate= must not appear when network_mbps is None"
@@ -3407,16 +3583,205 @@ mod tests {
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
         // With vendor snippet
-        let vm = p.make_config(&cfg, Some("local:snippets/lnvps-vendor.yaml"))?;
+        let vm = p.make_config(&cfg, Some("local:snippets/lnvps-vendor.yaml"), None)?;
         assert_eq!(
             vm.cicustom,
             Some("vendor=local:snippets/lnvps-vendor.yaml".to_string())
         );
 
         // Without vendor snippet
-        let vm = p.make_config(&cfg, None)?;
+        let vm = p.make_config(&cfg, None, None)?;
         assert_eq!(vm.cicustom, None);
 
+        // Both snippets
+        let vm = p.make_config(
+            &cfg,
+            Some("local:snippets/lnvps-vendor.yaml"),
+            Some("local:snippets/lnvps-net-1.yaml"),
+        )?;
+        assert_eq!(
+            vm.cicustom,
+            Some(
+                "vendor=local:snippets/lnvps-vendor.yaml,network=local:snippets/lnvps-net-1.yaml"
+                    .to_string()
+            )
+        );
+
+        Ok(())
+    }
+
+    /// A VM with one address per family stays on the built-in `ipconfig` path, so
+    /// nothing already deployed is reconfigured by the snippet feature.
+    /// One IPv4 plus one IPv6 on a single range each, which is what every VM
+    /// holds today.
+    fn single_address_vm() -> FullVmInfo {
+        let mut cfg = mock_full_vm();
+        cfg.ranges = vec![IpRange {
+            id: 1,
+            cidr: "185.18.221.64/26".to_string(),
+            gateway: "185.18.221.1/24".to_string(),
+            enabled: true,
+            region_id: 1,
+            ..Default::default()
+        }];
+        cfg.ips = vec![lnvps_db::VmIpAssignment {
+            id: 1,
+            vm_id: cfg.vm.id,
+            ip_range_id: 1,
+            ip: "185.18.221.65".to_string(),
+            ..Default::default()
+        }];
+        cfg
+    }
+
+    /// A VM with one address per family stays on the built-in `ipconfig` path, so
+    /// nothing already deployed is reconfigured by the snippet feature.
+    #[test]
+    fn test_no_network_snippet_for_single_address() -> Result<()> {
+        assert!(ProxmoxClient::make_network_config(&single_address_vm())?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_network_snippet_carries_every_ipv4() -> Result<()> {
+        let mut cfg = single_address_vm();
+        cfg.ips.push(lnvps_db::VmIpAssignment {
+            id: 2,
+            ip: "185.18.221.66".to_string(),
+            ip_range_id: 1,
+            vm_id: cfg.vm.id,
+            ..Default::default()
+        });
+
+        let net = ProxmoxClient::make_network_config(&cfg)?.expect("two v4 needs a snippet");
+
+        // Both addresses, widened to the gateway prefix so the gateway is on-link.
+        assert!(net.contains("- 185.18.221.65/24"), "{net}");
+        assert!(net.contains("- 185.18.221.66/24"), "{net}");
+        // Matched by MAC, not by guest interface name.
+        assert!(net.contains("macaddress: ff:ff:ff:ff:ff:fe"), "{net}");
+        // One default route, not one per address.
+        assert_eq!(1, net.matches("to: default").count(), "{net}");
+        assert!(net.contains("via: 185.18.221.1"), "{net}");
+        Ok(())
+    }
+
+    /// `ipconfig[n]` holds one address per family, so a VM carrying more must not
+    /// have the extras repeated into that property string — they live in the
+    /// snippet. A repeated key is either rejected by PVE or silently contradicts
+    /// the snippet, and nothing in CI reaches a real host to find out.
+    #[test]
+    fn test_ipconfig_holds_one_address_per_family() -> Result<()> {
+        let mut cfg = single_address_vm();
+        cfg.ips.push(lnvps_db::VmIpAssignment {
+            id: 2,
+            ip: "185.18.221.66".to_string(),
+            ip_range_id: 1,
+            vm_id: cfg.vm.id,
+            ..Default::default()
+        });
+        cfg.ranges.push(IpRange {
+            id: 3,
+            cidr: "fd00::/64".to_string(),
+            gateway: "fd00::1".to_string(),
+            enabled: true,
+            region_id: 1,
+            ..Default::default()
+        });
+        for (id, ip) in [(3u64, "fd00::2"), (4, "fd00::3")] {
+            cfg.ips.push(lnvps_db::VmIpAssignment {
+                id,
+                ip: ip.to_string(),
+                ip_range_id: 3,
+                vm_id: cfg.vm.id,
+                ..Default::default()
+            });
+        }
+
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "host".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
+        let vm = p.make_config(&cfg, None, Some("local:snippets/lnvps-net-1.yaml"))?;
+        let ip_config = vm.ip_config.unwrap();
+
+        assert_eq!(1, ip_config.matches("ip=").count(), "{ip_config}");
+        assert_eq!(1, ip_config.matches("ip6=").count(), "{ip_config}");
+        // The first assignment of each family, matching what the snippet routes.
+        assert!(ip_config.contains("ip=185.18.221.65/24"), "{ip_config}");
+        assert!(ip_config.contains("ip6=fd00::2/64"), "{ip_config}");
+        Ok(())
+    }
+
+    /// Addresses from a second range must not add a second default route.
+    #[test]
+    fn test_network_snippet_has_one_default_route_per_family() -> Result<()> {
+        let mut cfg = single_address_vm();
+        cfg.ranges.push(IpRange {
+            id: 2,
+            cidr: "185.18.221.128/25".to_string(),
+            gateway: "185.18.221.2/24".to_string(),
+            enabled: true,
+            region_id: 1,
+            ..Default::default()
+        });
+        cfg.ips.push(lnvps_db::VmIpAssignment {
+            id: 2,
+            ip: "185.18.221.130".to_string(),
+            ip_range_id: 2,
+            vm_id: cfg.vm.id,
+            ..Default::default()
+        });
+
+        let net = ProxmoxClient::make_network_config(&cfg)?.expect("two v4 needs a snippet");
+        assert_eq!(1, net.matches("to: default").count(), "{net}");
+        // The first assignment's gateway wins, as it does via `ipconfig`.
+        assert!(net.contains("via: 185.18.221.1"), "{net}");
+        assert!(net.contains("- 185.18.221.130/24"), "{net}");
+        Ok(())
+    }
+
+    /// A SLAAC range contributes autoconfiguration rather than a static address.
+    #[test]
+    fn test_network_snippet_uses_accept_ra_for_slaac() -> Result<()> {
+        let mut cfg = single_address_vm();
+        cfg.ips.push(lnvps_db::VmIpAssignment {
+            id: 2,
+            ip: "185.18.221.66".to_string(),
+            ip_range_id: 1,
+            vm_id: cfg.vm.id,
+            ..Default::default()
+        });
+        cfg.ranges.push(IpRange {
+            id: 3,
+            cidr: "fd00::/64".to_string(),
+            gateway: "fd00::1".to_string(),
+            enabled: true,
+            region_id: 1,
+            allocation_mode: IpRangeAllocationMode::SlaacEui64,
+            ..Default::default()
+        });
+        cfg.ips.push(lnvps_db::VmIpAssignment {
+            id: 3,
+            ip: "fd00::ffff:ffff:ffff:fffe".to_string(),
+            ip_range_id: 3,
+            vm_id: cfg.vm.id,
+            ..Default::default()
+        });
+
+        let net = ProxmoxClient::make_network_config(&cfg)?.expect("two v4 needs a snippet");
+        assert!(net.contains("accept-ra: true"), "{net}");
+        assert!(
+            !net.contains("fd00::"),
+            "SLAAC address must not be pinned: {net}"
+        );
         Ok(())
     }
 

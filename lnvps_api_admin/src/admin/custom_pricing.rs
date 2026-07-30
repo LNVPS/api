@@ -1,9 +1,9 @@
+use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminCustomPricingDisk, AdminCustomPricingInfo, CopyCustomPricingRequest,
     CreateCustomPricingRequest, UpdateCustomPricingRequest,
 };
-use crate::admin::{RouterState, validate_offered_ip_count};
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -495,7 +495,5 @@ fn validate_ip_ranges(pricing: &VmCustomPricing) -> Result<(), ApiError> {
     if pricing.min_ip6 > pricing.max_ip6 {
         return Err(ApiError::bad_request("min_ip6 cannot exceed max_ip6"));
     }
-    validate_offered_ip_count("max_ip4", pricing.max_ip4)?;
-    validate_offered_ip_count("max_ip6", pricing.max_ip6)?;
     Ok(())
 }

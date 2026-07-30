@@ -1,8 +1,8 @@
+use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminCreateVmTemplateRequest, AdminUpdateVmTemplateRequest, AdminVmTemplateInfo,
 };
-use crate::admin::{RouterState, validate_offered_ip_count};
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -140,8 +140,6 @@ async fn admin_create_vm_template(
 
     let ip4_count = req.ip4_count.unwrap_or(1);
     let ip6_count = req.ip6_count.unwrap_or(1);
-    validate_offered_ip_count("ip4_count", ip4_count)?;
-    validate_offered_ip_count("ip6_count", ip6_count)?;
 
     // Handle cost plan creation or validation
     let cost_plan_id = if let Some(existing_cost_plan_id) = req.cost_plan_id {
@@ -329,11 +327,9 @@ async fn admin_update_vm_template(
         template.region_id = region_id;
     }
     if let Some(v) = req.ip4_count {
-        validate_offered_ip_count("ip4_count", v)?;
         template.ip4_count = v;
     }
     if let Some(v) = req.ip6_count {
-        validate_offered_ip_count("ip6_count", v)?;
         template.ip6_count = v;
     }
     if let Some(v) = req.disk_iops_read {
