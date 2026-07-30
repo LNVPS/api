@@ -270,6 +270,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_admin_create_custom_vm_requires_auth() {
+        let client = admin_client_no_auth();
+        let body = serde_json::json!({
+            "user_id": 1,
+            "pricing_id": 1,
+            "cpu": 2,
+            "memory": 2147483648_u64,
+            "disk": 21474836480_u64,
+            "disk_type": "ssd",
+            "disk_interface": "pcie",
+            "image_id": 1,
+            "ssh_key_id": 1
+        });
+        let resp = client
+            .post("/api/admin/v1/vms/custom", &body)
+            .await
+            .unwrap();
+        assert!(
+            resp.status() == StatusCode::FORBIDDEN || resp.status() == StatusCode::UNAUTHORIZED,
+            "unauthenticated custom VM creation must not be accepted, got {}",
+            resp.status()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_admin_create_custom_vm_rejects_unknown_spec_values() {
+        let client = setup().await;
+        for (field, value) in [
+            ("disk_type", "nvme"),
+            ("disk_interface", "ide"),
+            ("cpu_arch", "sparc"),
+        ] {
+            let mut body = serde_json::json!({
+                "user_id": 1,
+                "pricing_id": 1,
+                "cpu": 2,
+                "memory": 2147483648_u64,
+                "disk": 21474836480_u64,
+                "disk_type": "ssd",
+                "disk_interface": "pcie",
+                "image_id": 1,
+                "ssh_key_id": 1
+            });
+            body[field] = serde_json::json!(value);
+            let resp = client
+                .post_auth("/api/admin/v1/vms/custom", &body)
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{field}={value} must be rejected before any lookup"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_admin_list_vms_with_pagination() {
         let client = setup().await;
         let resp = client

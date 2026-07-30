@@ -1,4 +1,4 @@
-use crate::model::UpgradeConfig;
+use crate::model::{CustomVmSpec, UpgradeConfig};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -169,6 +169,16 @@ pub enum WorkJob {
         admin_user_id: u64,
         reason: Option<String>,
     },
+    /// Create a VM from a custom spec for a specific user (admin action).
+    CreateCustomVm {
+        user_id: u64,
+        spec: CustomVmSpec,
+        image_id: u64,
+        ssh_key_id: u64,
+        ref_code: Option<String>,
+        admin_user_id: u64,
+        reason: Option<String>,
+    },
     /// Send an email verification link to the user
     SendEmailVerification { user_id: u64, verify_url: String },
     /// Download OS images to all hosts, verifying checksums and re-downloading if stale.
@@ -289,6 +299,7 @@ impl fmt::Display for WorkJob {
             WorkJob::ReinstallVm { .. } => write!(f, "ReinstallVm"),
             WorkJob::ImportVm { .. } => write!(f, "ImportVm"),
             WorkJob::CreateVm { .. } => write!(f, "CreateVm"),
+            WorkJob::CreateCustomVm { .. } => write!(f, "CreateCustomVm"),
             WorkJob::SendEmailVerification { .. } => write!(f, "SendEmailVerification"),
             WorkJob::DownloadOsImages { .. } => write!(f, "DownloadOsImages"),
             WorkJob::CheckSubscriptions => write!(f, "CheckSubscriptions"),

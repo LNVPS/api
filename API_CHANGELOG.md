@@ -26,6 +26,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Admin can create a custom-spec VM** (issue #335) — `POST /api/admin/v1/vms/custom` creates a VM from an arbitrary spec for any user, billed against a custom pricing plan, instead of only from the fixed template catalog. Body is the customer custom-order shape plus `user_id`/`reason`: `pricing_id` (also decides the region), `cpu`, `memory` and `disk` in bytes, `disk_type`, `disk_interface`, optional `cpu_mfg`/`cpu_arch`/`cpu_feature`, `image_id`, `ssh_key_id` (must belong to the target user), optional `ref_code`. Returns `{ "job_id": string }`; the VM is created unpaid like a customer order. Unknown enum spellings are `400` and are never defaulted. Additive: `POST /api/admin/v1/vms` (template path) is unchanged.
+
 - **`host_ssh_keys` on VM status** (issue #154) — `GET /api/v1/vm/{id}` and `GET /api/v1/vm` now return the VM's own SSH host keys as `[{ key_type, public_key, fingerprint_sha256 }]`, so a client can verify the host on first connect instead of accepting whatever key answers. The list is empty until the keys are captured (scanned from the host once the VM is running, public keys only) and is re-captured after a reinstall, which regenerates them. Additive: no existing field changed. Not to be confused with `ssh_key`, which is the customer's authorized key.
 
 ### Added

@@ -2817,6 +2817,50 @@ impl Worker {
                     vm.id, user_id
                 )));
             }
+            WorkJob::CreateCustomVm {
+                user_id,
+                spec,
+                image_id,
+                ssh_key_id,
+                ref_code,
+                admin_user_id,
+                reason,
+            } => {
+                info!(
+                    "Admin {} creating custom VM for user {}",
+                    admin_user_id, user_id
+                );
+                let template = spec.to_template()?;
+
+                let provisioner = self.subscription_handler.vm_provisioner();
+                let vm = provisioner
+                    .provision_custom(*user_id, template, *image_id, *ssh_key_id, ref_code.clone())
+                    .await?;
+
+                let metadata = Some(serde_json::json!({
+                    "admin_user_id": admin_user_id,
+                    "admin_action": true,
+                    "reason": reason
+                }));
+
+                if let Err(e) = self
+                    .vm_history_logger
+                    .log_vm_created(&vm, Some(*user_id), metadata)
+                    .await
+                {
+                    error!("Failed to log VM {} creation: {}", vm.id, e);
+                }
+
+                info!(
+                    "Admin {} successfully created custom VM {} for user {}",
+                    admin_user_id, vm.id, user_id
+                );
+
+                return Ok(Some(format!(
+                    "Custom VM {} created successfully for user {}",
+                    vm.id, user_id
+                )));
+            }
             WorkJob::ListUnmanagedVms {
                 host_id,
                 reply_channel,
