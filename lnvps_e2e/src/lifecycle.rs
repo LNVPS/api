@@ -220,6 +220,10 @@ mod tests {
             "max_cpu": 8,
             "min_memory": 1073741824_u64,
             "max_memory": 17179869184_u64,
+            "min_ip4": 1,
+            "max_ip4": 2,
+            "min_ip6": 0,
+            "max_ip6": 1,
             "disk_pricing": [{
                 "kind": "ssd",
                 "interface": "pcie",
@@ -1677,6 +1681,7 @@ mod tests {
             "disk": 10737418240_u64,
             "disk_type": "ssd",
             "disk_interface": "pcie",
+
             "image_id": image_id,
             "ssh_key_id": ssh_key_id,
             "reason": "e2e admin custom create"
@@ -1729,6 +1734,63 @@ mod tests {
         );
 
         // ----------------------------------------------------------------
+        // 19c. Custom VM order with an explicit IPv4 count
+        // ----------------------------------------------------------------
+        let ip_body = serde_json::json!({
+            "pricing_id": custom_pricing_id,
+            "cpu": 1,
+            "memory": 1073741824_u64,
+            "disk": 10737418240_u64,
+            "disk_type": "ssd",
+            "disk_interface": "pcie",
+            "ip4_count": 2,
+            "ip6_count": 0,
+            "image_id": image_id,
+            "ssh_key_id": ssh_key_id
+        });
+        let mut multi_ip_vm_id: Option<u64> = None;
+        let resp = user
+            .post_auth("/api/v1/vm/custom-template", &ip_body)
+            .await
+            .unwrap();
+        if resp.status() == StatusCode::OK {
+            let vm = serde_json::from_str::<Value>(&resp.text().await.unwrap()).unwrap();
+            let id = vm["data"]["id"].as_u64().unwrap();
+            multi_ip_vm_id = Some(id);
+            assert_eq!(
+                2,
+                vm["data"]["template"]["ip4_count"].as_u64().unwrap(),
+                "ordered IPv4 count must be reflected on the VM's template"
+            );
+            assert_eq!(0, vm["data"]["template"]["ip6_count"].as_u64().unwrap());
+            // Two addresses at 200 cents each, so the IPv4 share alone exceeds
+            // the single-address price this plan used to imply.
+            let amount = vm["data"]["template"]["cost_plan"]["amount"]
+                .as_u64()
+                .unwrap();
+            assert!(amount >= 400, "2x IPv4 must be billed, got {amount}");
+            eprintln!("Ordered custom VM {id} with 2x IPv4 (amount {amount})");
+        } else {
+            eprintln!(
+                "Multi-IP custom VM order returned {} (expected if provisioner unavailable)",
+                resp.status()
+            );
+        }
+
+        // A count outside the plan's range is refused.
+        let mut bad = ip_body.clone();
+        bad["ip4_count"] = serde_json::json!(9);
+        let resp = user
+            .post_auth("/api/v1/vm/custom-template", &bad)
+            .await
+            .unwrap();
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "an out-of-range IPv4 count must not be orderable"
+        );
+
+        // ----------------------------------------------------------------
         // 20. Cleanup: hard-delete VMs and all infrastructure via DB
         //     The worker cannot reach fake hosts, so API-level VM deletion
         //     only dispatches an async job that will never complete.
@@ -1746,10 +1808,15 @@ mod tests {
             crate::db::hard_delete_vm(&pool, cvm_id).await.unwrap();
             eprintln!("Hard-deleted custom VM {cvm_id}");
         }
+
         crate::db::hard_delete_vm(&pool, admin_custom_vm_id)
             .await
             .unwrap();
         eprintln!("Hard-deleted admin custom VM {admin_custom_vm_id}");
+        if let Some(cvm_id) = multi_ip_vm_id {
+            crate::db::hard_delete_vm(&pool, cvm_id).await.unwrap();
+            eprintln!("Hard-deleted multi-IP custom VM {cvm_id}");
+        }
         crate::db::hard_delete_referral(&pool, referral_id)
             .await
             .unwrap();

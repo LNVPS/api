@@ -236,6 +236,20 @@ impl FullVmInfo {
         }
     }
 
+    /// IPv4 and IPv6 address counts this VM's offer specifies.
+    ///
+    /// A VM with neither template falls back to one IPv4, which is what every
+    /// offer implied before counts existed.
+    pub fn ip_counts(&self) -> (u16, u16) {
+        if let Some(t) = &self.template {
+            (t.ip4_count, t.ip6_count)
+        } else if let Some(t) = &self.custom_template {
+            (t.ip4_count, t.ip6_count)
+        } else {
+            (1, 1)
+        }
+    }
+
     pub async fn vm_resources(vm_id: u64, db: Arc<dyn LNVpsDb>) -> Result<VmResources> {
         let vm = db.get_vm(vm_id).await?;
         if let Some(t) = vm.template_id {

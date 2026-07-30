@@ -758,6 +758,17 @@ pub struct ApiCustomVmRequest {
     /// CPU features as strings (e.g. "AVX2", "AES", "VMX")
     #[serde(default)]
     pub cpu_feature: Vec<String>,
+    /// IPv4 addresses to assign; defaults to 1, the count every order implied
+    /// before this was selectable.
+    #[serde(default = "default_ip_count")]
+    pub ip4_count: u16,
+    /// IPv6 addresses to assign; defaults to 1.
+    #[serde(default = "default_ip_count")]
+    pub ip6_count: u16,
+}
+
+fn default_ip_count() -> u16 {
+    1
 }
 
 impl From<ApiCustomVmRequest> for VmCustomTemplate {
@@ -777,6 +788,8 @@ impl From<ApiCustomVmRequest> for VmCustomTemplate {
             disk_type: value.disk_type.into(),
             disk_interface: value.disk_interface.into(),
             pricing_id: value.pricing_id,
+            ip4_count: value.ip4_count,
+            ip6_count: value.ip6_count,
             cpu_mfg: value
                 .cpu_mfg
                 .and_then(|s| s.parse().ok())
@@ -1495,6 +1508,36 @@ pub enum ApiCreateSubscriptionLineItemRequest {
 
 #[cfg(test)]
 mod tests {
+
+    /// Omitted counts mean the single-IPv4/single-IPv6 offer that predates them
+    /// being selectable, so an older client keeps ordering exactly what it did.
+    #[test]
+    fn custom_vm_request_ip_counts_default_to_one() {
+        let req: ApiCustomVmRequest = serde_json::from_str(
+            r#"{"pricing_id": 1, "cpu": 2, "memory": 2147483648, "disk": 21474836480,
+                "disk_type": "ssd", "disk_interface": "pcie"}"#,
+        )
+        .unwrap();
+        assert_eq!(1, req.ip4_count);
+        assert_eq!(1, req.ip6_count);
+
+        let t: lnvps_db::VmCustomTemplate = req.into();
+        assert_eq!(1, t.ip4_count);
+        assert_eq!(1, t.ip6_count);
+    }
+
+    /// Requested counts reach the stored spec, including an IPv6-only order.
+    #[test]
+    fn custom_vm_request_carries_ip_counts() {
+        let req: ApiCustomVmRequest = serde_json::from_str(
+            r#"{"pricing_id": 1, "cpu": 2, "memory": 2147483648, "disk": 21474836480,
+                "disk_type": "ssd", "disk_interface": "pcie", "ip4_count": 0, "ip6_count": 3}"#,
+        )
+        .unwrap();
+        let t: lnvps_db::VmCustomTemplate = req.into();
+        assert_eq!(0, t.ip4_count);
+        assert_eq!(3, t.ip6_count);
+    }
     use super::*;
 
     /// Exchange-rate feed (#230): a BTC base quotes fiat directly, a fiat base

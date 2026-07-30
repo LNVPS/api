@@ -100,6 +100,10 @@ impl AdminCustomPricingInfo {
             max_cpu: pricing.max_cpu,
             min_memory: pricing.min_memory,
             max_memory: pricing.max_memory,
+            min_ip4: pricing.min_ip4,
+            max_ip4: pricing.max_ip4,
+            min_ip6: pricing.min_ip6,
+            max_ip6: pricing.max_ip6,
             disk_pricing: disk_pricing_info,
             template_count,
             disk_iops_read: pricing.disk_iops_read,
@@ -198,6 +202,10 @@ async fn admin_create_custom_pricing(
         max_cpu: req.max_cpu,
         min_memory: req.min_memory,
         max_memory: req.max_memory,
+        min_ip4: req.min_ip4.unwrap_or(1),
+        max_ip4: req.max_ip4.unwrap_or(1),
+        min_ip6: req.min_ip6.unwrap_or(1),
+        max_ip6: req.max_ip6.unwrap_or(1),
         disk_iops_read: req.disk_iops_read,
         disk_iops_write: req.disk_iops_write,
         disk_mbps_read: req.disk_mbps_read,
@@ -299,6 +307,18 @@ async fn admin_update_custom_pricing(
     }
     if let Some(max_memory) = req.max_memory {
         pricing.max_memory = max_memory;
+    }
+    if let Some(v) = req.min_ip4 {
+        pricing.min_ip4 = v;
+    }
+    if let Some(v) = req.max_ip4 {
+        pricing.max_ip4 = v;
+    }
+    if let Some(v) = req.min_ip6 {
+        pricing.min_ip6 = v;
+    }
+    if let Some(v) = req.max_ip6 {
+        pricing.max_ip6 = v;
     }
     if let Some(v) = req.disk_iops_read {
         pricing.disk_iops_read = v;
@@ -425,6 +445,10 @@ async fn admin_copy_custom_pricing(
         max_cpu: source_pricing.max_cpu,
         min_memory: source_pricing.min_memory,
         max_memory: source_pricing.max_memory,
+        min_ip4: source_pricing.min_ip4,
+        max_ip4: source_pricing.max_ip4,
+        min_ip6: source_pricing.min_ip6,
+        max_ip6: source_pricing.max_ip6,
         disk_iops_read: source_pricing.disk_iops_read,
         disk_iops_write: source_pricing.disk_iops_write,
         disk_mbps_read: source_pricing.disk_mbps_read,

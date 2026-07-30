@@ -70,6 +70,8 @@ impl AdminVmTemplateInfo {
             disk_interface: template.disk_interface.into(),
             cost_plan_id: template.cost_plan_id,
             region_id: template.region_id,
+            ip4_count: template.ip4_count,
+            ip6_count: template.ip6_count,
             region_name: region.map(|r| r.name),
             cost_plan_name: cost_plan.map(|cp| cp.name),
             active_vm_count,
@@ -199,6 +201,8 @@ async fn admin_create_vm_template(
         disk_interface: req.disk_interface.into(),
         cost_plan_id,
         region_id: req.region_id,
+        ip4_count: req.ip4_count.unwrap_or(1),
+        ip6_count: req.ip6_count.unwrap_or(1),
         disk_iops_read: req.disk_iops_read,
         disk_iops_write: req.disk_iops_write,
         disk_mbps_read: req.disk_mbps_read,
@@ -318,6 +322,12 @@ async fn admin_update_vm_template(
         // Validate that region exists
         let _region = this.db.get_host_region(region_id).await?;
         template.region_id = region_id;
+    }
+    if let Some(v) = req.ip4_count {
+        template.ip4_count = v;
+    }
+    if let Some(v) = req.ip6_count {
+        template.ip6_count = v;
     }
     if let Some(v) = req.disk_iops_read {
         template.disk_iops_read = v;

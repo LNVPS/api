@@ -1178,6 +1178,10 @@ pub struct VmTemplate {
     pub disk_interface: DiskInterface,
     pub cost_plan_id: u64,
     pub region_id: u64,
+    /// Number of IPv4 addresses this offer includes
+    pub ip4_count: u16,
+    /// Number of IPv6 addresses this offer includes
+    pub ip6_count: u16,
     /// Maximum disk read IOPS (None = uncapped)
     pub disk_iops_read: Option<u32>,
     /// Maximum disk write IOPS (None = uncapped)
@@ -1205,6 +1209,10 @@ pub struct VmCustomTemplate {
     pub disk_type: DiskType,
     pub disk_interface: DiskInterface,
     pub pricing_id: u64,
+    /// Number of IPv4 addresses ordered
+    pub ip4_count: u16,
+    /// Number of IPv6 addresses ordered
+    pub ip6_count: u16,
     pub cpu_mfg: CpuMfg,
     pub cpu_arch: CpuArch,
     pub cpu_features: CommaSeparated<CpuFeature>,
@@ -1253,6 +1261,14 @@ pub struct VmCustomPricing {
     pub min_memory: u64,
     /// Maximum memory in bytes
     pub max_memory: u64,
+    /// Minimum IPv4 addresses allowed
+    pub min_ip4: u16,
+    /// Maximum IPv4 addresses allowed
+    pub max_ip4: u16,
+    /// Minimum IPv6 addresses allowed
+    pub min_ip6: u16,
+    /// Maximum IPv6 addresses allowed
+    pub max_ip6: u16,
     /// Maximum disk read IOPS (None = uncapped)
     pub disk_iops_read: Option<u32>,
     /// Maximum disk write IOPS (None = uncapped)

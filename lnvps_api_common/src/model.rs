@@ -28,6 +28,10 @@ pub trait Template {
     fn cpu_arch(&self) -> CpuArch;
     /// Required CPU feature flags. An empty list means "any".
     fn cpu_features(&self) -> &[CpuFeature];
+    /// Number of IPv4 addresses the offer includes.
+    fn ip4_count(&self) -> u16;
+    /// Number of IPv6 addresses the offer includes.
+    fn ip6_count(&self) -> u16;
 }
 
 impl Template for VmTemplate {
@@ -62,6 +66,14 @@ impl Template for VmTemplate {
     fn cpu_features(&self) -> &[CpuFeature] {
         &self.cpu_features
     }
+
+    fn ip4_count(&self) -> u16 {
+        self.ip4_count
+    }
+
+    fn ip6_count(&self) -> u16 {
+        self.ip6_count
+    }
 }
 
 impl Template for VmCustomTemplate {
@@ -95,6 +107,14 @@ impl Template for VmCustomTemplate {
 
     fn cpu_features(&self) -> &[CpuFeature] {
         &self.cpu_features
+    }
+
+    fn ip4_count(&self) -> u16 {
+        self.ip4_count
+    }
+
+    fn ip6_count(&self) -> u16 {
+        self.ip6_count
     }
 }
 
@@ -150,6 +170,8 @@ impl ApiVmTemplate {
                 name: region.name,
                 company_id: region.company_id,
             },
+            ip4_count: template.ip4_count,
+            ip6_count: template.ip6_count,
         })
     }
 
@@ -209,6 +231,8 @@ impl ApiVmTemplate {
                 name: region.name.clone(),
                 company_id: region.company_id,
             },
+            ip4_count: template.ip4_count,
+            ip6_count: template.ip6_count,
         })
     }
 }
@@ -502,6 +526,11 @@ pub struct ApiVmTemplate {
     pub cpu_mfg: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_arch: Option<String>,
+    /// IPv4 addresses included
+    pub ip4_count: u16,
+    /// IPv6 addresses included. Assignment is best-effort: a region without an
+    /// IPv6 range still provisions, so a VM may hold fewer than this.
+    pub ip6_count: u16,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
@@ -832,6 +861,14 @@ pub struct ApiCustomTemplateParams {
     pub min_cpu: u16,
     pub min_memory: u64,
     pub max_memory: u64,
+    /// Minimum IPv4 addresses selectable on this plan
+    pub min_ip4: u16,
+    /// Maximum IPv4 addresses selectable, already capped by region capacity
+    pub max_ip4: u16,
+    /// Minimum IPv6 addresses selectable on this plan
+    pub min_ip6: u16,
+    /// Maximum IPv6 addresses selectable on this plan
+    pub max_ip6: u16,
     pub disks: Vec<ApiCustomTemplateDiskParam>,
 }
 
@@ -868,6 +905,10 @@ impl ApiCustomTemplateParams {
             min_cpu: pricing.min_cpu,
             min_memory: pricing.min_memory,
             max_memory: pricing.max_memory,
+            min_ip4: pricing.min_ip4,
+            max_ip4: pricing.max_ip4,
+            min_ip6: pricing.min_ip6,
+            max_ip6: pricing.max_ip6,
             disks: disks
                 .iter()
                 .filter(|d| d.pricing_id == pricing.id)
