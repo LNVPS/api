@@ -1196,6 +1196,9 @@ impl Worker {
             .await?;
             // Self-heal any DNS records that failed to create during spawn.
             self.reconcile_vm_dns(vm).await;
+            // This sweep is the only pass that visits every VM, so capture has
+            // to hang off it; the single-VM check only runs on customer action.
+            self.capture_vm_ssh_host_keys(vm).await;
         }
         Ok(())
     }
@@ -3962,6 +3965,50 @@ mod tests {
             tax_breakdown: None,
             refunded_payment_id: None,
         }
+    }
+
+    /// The periodic fleet sweep — not just the per-VM check dispatched on
+    /// customer action — has to attempt host key capture, otherwise a VM nobody
+    /// touches never gets any keys.
+    #[tokio::test]
+    async fn test_check_vms_on_host_attempts_host_key_capture() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        db.insert_vm_ip_assignment(&VmIpAssignment {
+            vm_id,
+            ip_range_id: 1,
+            ip: "10.0.0.5".to_string(),
+            ..Default::default()
+        })
+        .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        // Capture only runs for a VM the cache believes is up.
+        worker
+            .vm_state_cache
+            .set_state(
+                vm_id,
+                VmRunningState {
+                    state: VmRunningStates::Running,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let vm = db.get_vm(vm_id).await?;
+        worker.check_vms_on_host(vm.host_id, &[&vm]).await?;
+
+        // The scan itself needs SSH to the host, which the mock host has none
+        // of; the recorded attempt is what proves the sweep reached capture.
+        assert!(
+            worker
+                .kv
+                .get(&host_key_attempt_key(vm_id))
+                .await?
+                .is_some(),
+            "periodic sweep did not attempt host key capture"
+        );
+        Ok(())
     }
 
     /// An unpaid VM (subscription not set up) older than 1 hour must be deleted by check_vms.
