@@ -1,8 +1,8 @@
 use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
-    AdminCreateVmRequest, AdminPaymentRefundsInfo, AdminRefundAmountInfo, AdminVmHistoryInfo,
-    AdminVmInfo, AdminVmPaymentInfo, JobResponse,
+    AdminCreateCustomVmRequest, AdminCreateVmRequest, AdminPaymentRefundsInfo,
+    AdminRefundAmountInfo, AdminVmHistoryInfo, AdminVmInfo, AdminVmPaymentInfo, JobResponse,
 };
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post, put};
@@ -11,8 +11,8 @@ use chrono::{DateTime, Days, Utc};
 use lightning_invoice::Bolt11Invoice;
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, PricingEngine,
-    UpgradeConfig, VatClient, VmHistoryLogger, VmRunningState, VmStateCache, WorkJob,
-    RefundEvidence, build_refund_row, refundable_remaining,
+    RefundEvidence, UpgradeConfig, VatClient, VmHistoryLogger, VmRunningState, VmStateCache,
+    WorkJob, build_refund_row, refundable_remaining,
 };
 use lnvps_db::{AdminAction, AdminResource, SubscriptionPaymentType};
 use log::{error, info};
@@ -25,6 +25,7 @@ pub fn router() -> Router<RouterState> {
             "/api/admin/v1/vms",
             get(admin_list_vms).post(admin_create_vm),
         )
+        .route("/api/admin/v1/vms/custom", post(admin_create_custom_vm))
         .route("/api/admin/v1/vms/extend-all", post(admin_extend_all_vms))
         .route(
             "/api/admin/v1/vms/{id}",
@@ -1271,6 +1272,58 @@ async fn admin_create_vm(
     }
 }
 
+/// Create a VM from a custom spec for a specific user (admin action).
+///
+/// The spec, pricing and capacity checks all live in `provision_custom`, which
+/// the worker calls; what is validated here is only what makes an obviously bad
+/// request a 4xx instead of a failed job.
+async fn admin_create_custom_vm(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Json(req): Json<AdminCreateCustomVmRequest>,
+) -> ApiResult<JobResponse> {
+    auth.require_permission(AdminResource::VirtualMachines, AdminAction::Create)?;
+
+    // Reject unknown enum spellings before any lookup, so a typo is a 400
+    // rather than a job that fails out of band.
+    req.spec
+        .to_template()
+        .map_err(|e| ApiError::bad_request(format!("Invalid VM spec: {e}")))?;
+
+    let _user = this.db.get_user(req.user_id).await?;
+    let _pricing = this.db.get_custom_pricing(req.spec.pricing_id).await?;
+    let _image = this.db.get_os_image(req.image_id).await?;
+
+    let ssh_key = this.db.get_user_ssh_key(req.ssh_key_id).await?;
+    if ssh_key.user_id != req.user_id {
+        return ApiData::err("SSH key does not belong to the specified user");
+    }
+
+    let create_job = WorkJob::CreateCustomVm {
+        user_id: req.user_id,
+        spec: req.spec,
+        image_id: req.image_id,
+        ssh_key_id: req.ssh_key_id,
+        ref_code: req.ref_code,
+        admin_user_id: auth.user_id,
+        reason: req.reason,
+    };
+
+    match this.work_commander.send(create_job).await {
+        Ok(stream_id) => {
+            info!(
+                "Custom VM creation job queued with stream ID: {}",
+                stream_id
+            );
+            ApiData::ok(JobResponse { job_id: stream_id })
+        }
+        Err(e) => {
+            error!("Failed to queue custom VM creation job: {}", e);
+            ApiData::err("Failed to queue custom VM creation job")
+        }
+    }
+}
+
 /// Manually mark a VM payment as paid (admin override).
 ///
 /// This calls `subscription_payment_paid` which atomically sets `is_paid=true`,
@@ -1365,5 +1418,30 @@ mod tests {
             serde_json::from_str(r#"{"disabled": true, "admin_notes": "x"}"#).unwrap();
         assert_eq!(req.disabled, Some(true));
         assert_eq!(req.admin_notes, Some(Some("x".to_string())));
+    }
+
+    /// The spec is flattened, so the body stays the same shape the customer
+    /// custom-order endpoint accepts.
+    #[test]
+    fn admin_create_custom_vm_request_spec_is_flat() {
+        let req: AdminCreateCustomVmRequest = serde_json::from_str(
+            r#"{"user_id": 1, "pricing_id": 2, "cpu": 4, "memory": 8589934592,
+                "disk": 107374182400, "disk_type": "ssd", "disk_interface": "pcie",
+                "cpu_arch": "x86_64", "image_id": 3, "ssh_key_id": 4}"#,
+        )
+        .unwrap();
+        assert_eq!(req.user_id, 1);
+        assert_eq!(req.spec.pricing_id, 2);
+        assert_eq!(req.spec.cpu, 4);
+        assert_eq!(req.spec.disk_type, "ssd");
+        assert_eq!(req.spec.cpu_arch.as_deref(), Some("x86_64"));
+        assert!(req.spec.cpu_feature.is_empty());
+        assert_eq!(req.image_id, 3);
+        assert_eq!(req.ssh_key_id, 4);
+        assert!(req.ref_code.is_none());
+
+        let t = req.spec.to_template().unwrap();
+        assert_eq!(t.pricing_id, 2);
+        assert_eq!(t.disk_type, lnvps_db::DiskType::SSD);
     }
 }

@@ -353,6 +353,75 @@ Response:
 returns immediately with a job ID. The VM creation is handled by the provisioner and includes full audit logging with
 admin action metadata.
 
+#### Create Custom-Spec VM for User
+
+```
+POST /api/admin/v1/vms/custom
+```
+
+Required Permission: `virtual_machines::create`
+
+Creates a VM from an arbitrary spec (rather than a fixed template) for a specific user, billed against a custom pricing
+plan. Same spec fields as the customer endpoint `POST /api/v1/vm/custom-template`; the region comes from `pricing_id`.
+Processed asynchronously via the work job system.
+
+Body:
+
+```json
+{
+  "user_id": number,
+  // Required - Target user ID
+  "pricing_id": number,
+  // Required - Custom pricing plan ID (decides region and currency)
+  "cpu": number,
+  // Required - vCPU cores
+  "memory": number,
+  // Required - Memory in bytes
+  "disk": number,
+  // Required - Disk size in bytes
+  "disk_type": "hdd" | "ssd",
+  // Required
+  "disk_interface": "sata" | "scsi" | "pcie",
+  // Required
+  "cpu_mfg": "string",
+  // Optional - e.g. "intel", "amd"; omitted means any
+  "cpu_arch": "string",
+  // Optional - e.g. "x86_64", "arm64"; omitted means any
+  "cpu_feature": ["string"],
+  // Optional - required CPU features, e.g. ["AVX2"]; empty means any
+  "image_id": number,
+  // Required - OS image ID
+  "ssh_key_id": number,
+  // Required - SSH key ID (must belong to user)
+  "ref_code": "string",
+  // Optional - Referral code
+  "reason": "string"
+  // Optional - Admin reason for audit trail
+}
+```
+
+Response:
+
+```json
+{
+  "data": {
+    "job_id": "stream-id-12345"
+  }
+}
+```
+
+**Validation:**
+
+- Unknown `disk_type`, `disk_interface`, `cpu_mfg`, `cpu_arch` or `cpu_feature` values are rejected with `400` before any
+  lookup — they are never defaulted
+- User, custom pricing plan and image must exist
+- SSH key must exist and belong to the specified user
+- Spec range limits, pricing enabled/expiry, image architecture compatibility and host capacity are enforced when the job
+  runs (same checks as a customer custom order), so those failures surface on the job, not the request
+
+**Asynchronous Processing:** dispatches a `CreateCustomVm` work job. Like the template path, the VM is created unpaid
+(expired) and logged with admin action metadata.
+
 #### Transfer VM
 
 ```

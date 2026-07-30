@@ -1646,6 +1646,89 @@ mod tests {
         }
 
         // ----------------------------------------------------------------
+        // 19b. Admin custom-spec VM creation
+        // ----------------------------------------------------------------
+        let owner_id = json_ok(
+            admin
+                .get_auth(&format!("/api/admin/v1/vms/{vm_id}"))
+                .await
+                .unwrap(),
+        )
+        .await["data"]["user_id"]
+            .as_u64()
+            .unwrap();
+
+        // Every VM this user already has, so the assertion below cannot be
+        // satisfied by the customer's own order from step 19.
+        let list_path = format!("/api/admin/v1/vms?user_id={owner_id}&limit=50");
+        let known_vm_ids: std::collections::HashSet<u64> =
+            json_ok(admin.get_auth(&list_path).await.unwrap()).await["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|vm| vm["id"].as_u64())
+                .collect();
+
+        let body = serde_json::json!({
+            "user_id": owner_id,
+            "pricing_id": custom_pricing_id,
+            "cpu": 1,
+            "memory": 1073741824_u64,
+            "disk": 10737418240_u64,
+            "disk_type": "ssd",
+            "disk_interface": "pcie",
+            "image_id": image_id,
+            "ssh_key_id": ssh_key_id,
+            "reason": "e2e admin custom create"
+        });
+        let admin_custom = json_ok(
+            admin
+                .post_auth("/api/admin/v1/vms/custom", &body)
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            !admin_custom["data"]["job_id"].as_str().unwrap().is_empty(),
+            "admin custom VM creation should return a job id"
+        );
+
+        // The job is async: wait for a custom-template VM that did not exist
+        // before the admin call.
+        let appeared = poll_until(30, 500, || {
+            let admin = admin.clone();
+            let list_path = list_path.clone();
+            let known = known_vm_ids.clone();
+            async move {
+                admin_custom_vm_ids(&admin, &list_path, &known)
+                    .await
+                    .is_some()
+            }
+        })
+        .await;
+        assert!(
+            appeared,
+            "admin-created custom VM did not appear for user {owner_id}"
+        );
+        let admin_custom_vm_id = admin_custom_vm_ids(&admin, &list_path, &known_vm_ids)
+            .await
+            .unwrap();
+        eprintln!("Admin created custom VM {admin_custom_vm_id} for user {owner_id}");
+
+        // A bad spec value is refused outright, not queued.
+        let mut bad = body.clone();
+        bad["disk_type"] = serde_json::json!("nvme");
+        let resp = admin
+            .post_auth("/api/admin/v1/vms/custom", &bad)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "unknown disk_type must be rejected"
+        );
+
+        // ----------------------------------------------------------------
         // 20. Cleanup: hard-delete VMs and all infrastructure via DB
         //     The worker cannot reach fake hosts, so API-level VM deletion
         //     only dispatches an async job that will never complete.
@@ -1663,6 +1746,10 @@ mod tests {
             crate::db::hard_delete_vm(&pool, cvm_id).await.unwrap();
             eprintln!("Hard-deleted custom VM {cvm_id}");
         }
+        crate::db::hard_delete_vm(&pool, admin_custom_vm_id)
+            .await
+            .unwrap();
+        eprintln!("Hard-deleted admin custom VM {admin_custom_vm_id}");
         crate::db::hard_delete_referral(&pool, referral_id)
             .await
             .unwrap();
@@ -2248,6 +2335,26 @@ mod tests {
             .await
             .unwrap();
         eprintln!("[cleanup] Infrastructure hard-deleted ✓");
+    }
+
+    // ----------------------------------------------------------------
+    // Find a custom-template VM in the admin VM list that isn't the one the
+    // customer ordered themselves, i.e. the admin-created one.
+    // ----------------------------------------------------------------
+    async fn admin_custom_vm_ids(
+        admin: &crate::client::TestClient,
+        list_path: &str,
+        known: &std::collections::HashSet<u64>,
+    ) -> Option<u64> {
+        let resp = admin.get_auth(list_path).await.ok()?;
+        let body = serde_json::from_str::<Value>(&resp.text().await.ok()?).ok()?;
+        body["data"].as_array()?.iter().find_map(|vm| {
+            let id = vm["id"].as_u64()?;
+            if known.contains(&id) || vm["custom_template_id"].as_u64().is_none() {
+                return None;
+            }
+            Some(id)
+        })
     }
 
     // ----------------------------------------------------------------

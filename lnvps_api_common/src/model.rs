@@ -738,6 +738,68 @@ impl From<CurrencyAmount> for ApiPrice {
     }
 }
 
+/// A custom VM spec as it travels over the wire: enum fields are the same
+/// strings the customer order API accepts, because neither the work queue nor a
+/// JSON body can carry the database enums directly.
+///
+/// The region is not part of the spec — it comes from `pricing_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomVmSpec {
+    pub pricing_id: u64,
+    pub cpu: u16,
+    /// Memory in bytes
+    pub memory: u64,
+    /// Disk size in bytes
+    pub disk: u64,
+    /// "hdd" or "ssd"
+    pub disk_type: String,
+    /// "sata", "scsi" or "pcie"
+    pub disk_interface: String,
+    /// CPU manufacturer (e.g. "intel", "amd"); `None` means any
+    pub cpu_mfg: Option<String>,
+    /// CPU architecture (e.g. "x86_64", "arm64"); `None` means any
+    pub cpu_arch: Option<String>,
+    #[serde(default)]
+    pub cpu_feature: Vec<String>,
+}
+
+impl CustomVmSpec {
+    /// Build the template this spec describes.
+    ///
+    /// An unknown enum spelling is an error rather than a default: a silently
+    /// downgraded disk or architecture is worse than a rejected request.
+    pub fn to_template(&self) -> Result<VmCustomTemplate> {
+        let mut cpu_features = Vec::with_capacity(self.cpu_feature.len());
+        for f in &self.cpu_feature {
+            cpu_features
+                .push(CpuFeature::from_str(f).map_err(|_| anyhow!("unknown cpu feature {}", f))?);
+        }
+        Ok(VmCustomTemplate {
+            id: 0,
+            cpu: self.cpu,
+            memory: self.memory,
+            disk_size: self.disk,
+            disk_type: lnvps_db::DiskType::from_str(&self.disk_type)?,
+            disk_interface: lnvps_db::DiskInterface::from_str(&self.disk_interface)?,
+            pricing_id: self.pricing_id,
+            cpu_mfg: match &self.cpu_mfg {
+                Some(v) => {
+                    CpuMfg::from_str(v).map_err(|_| anyhow!("unknown cpu manufacturer {}", v))?
+                }
+                None => CpuMfg::default(),
+            },
+            cpu_arch: match &self.cpu_arch {
+                Some(v) => {
+                    CpuArch::from_str(v).map_err(|_| anyhow!("unknown cpu architecture {}", v))?
+                }
+                None => CpuArch::default(),
+            },
+            cpu_features: cpu_features.into(),
+            ..Default::default()
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpgradeConfig {
     pub new_cpu: Option<u16>,
@@ -926,6 +988,78 @@ mod tests {
             let json = serde_json::to_string(&api).unwrap();
             let name = json.trim_matches('"');
             assert_eq!(name.parse::<lnvps_db::OsDistribution>().unwrap(), d);
+        }
+    }
+
+    fn custom_spec() -> CustomVmSpec {
+        CustomVmSpec {
+            pricing_id: 7,
+            cpu: 4,
+            memory: 8 * 1024 * 1024 * 1024,
+            disk: 100 * 1024 * 1024 * 1024,
+            disk_type: "ssd".to_string(),
+            disk_interface: "pcie".to_string(),
+            cpu_mfg: None,
+            cpu_arch: None,
+            cpu_feature: vec![],
+        }
+    }
+
+    #[test]
+    fn test_custom_vm_spec_to_template() {
+        let spec = CustomVmSpec {
+            cpu_mfg: Some("amd".to_string()),
+            cpu_arch: Some("x86_64".to_string()),
+            cpu_feature: vec!["AVX2".to_string()],
+            ..custom_spec()
+        };
+        let t = spec.to_template().unwrap();
+        assert_eq!(t.id, 0);
+        assert_eq!(t.pricing_id, 7);
+        assert_eq!(t.cpu, 4);
+        assert_eq!(t.memory, 8 * 1024 * 1024 * 1024);
+        assert_eq!(t.disk_size, 100 * 1024 * 1024 * 1024);
+        assert_eq!(t.disk_type, lnvps_db::DiskType::SSD);
+        assert_eq!(t.disk_interface, lnvps_db::DiskInterface::PCIe);
+        assert_eq!(t.cpu_mfg, CpuMfg::Amd);
+        assert_eq!(t.cpu_arch, CpuArch::X86_64);
+        assert_eq!(t.cpu_features.0, vec![CpuFeature::AVX2]);
+    }
+
+    #[test]
+    fn test_custom_vm_spec_omitted_cpu_fields_mean_any() {
+        let t = custom_spec().to_template().unwrap();
+        assert_eq!(t.cpu_mfg, CpuMfg::default());
+        assert_eq!(t.cpu_arch, CpuArch::default());
+        assert!(t.cpu_features.0.is_empty());
+    }
+
+    #[test]
+    fn test_custom_vm_spec_rejects_unknown_enum_values() {
+        // Never silently default: a typo must not become a different machine.
+        for spec in [
+            CustomVmSpec {
+                disk_type: "nvme".to_string(),
+                ..custom_spec()
+            },
+            CustomVmSpec {
+                disk_interface: "ide".to_string(),
+                ..custom_spec()
+            },
+            CustomVmSpec {
+                cpu_mfg: Some("acme".to_string()),
+                ..custom_spec()
+            },
+            CustomVmSpec {
+                cpu_arch: Some("sparc".to_string()),
+                ..custom_spec()
+            },
+            CustomVmSpec {
+                cpu_feature: vec!["TELEPATHY".to_string()],
+                ..custom_spec()
+            },
+        ] {
+            assert!(spec.to_template().is_err());
         }
     }
 

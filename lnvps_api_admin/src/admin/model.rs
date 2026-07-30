@@ -3019,6 +3019,22 @@ pub struct AdminCreateVmRequest {
     pub reason: Option<String>,
 }
 
+/// Create a VM from a custom spec, priced against a custom pricing plan.
+///
+/// Mirrors the customer custom-order body: the region comes from `pricing_id`,
+/// and `ssh_key_id` must be one of the target user's own keys.
+#[derive(Deserialize)]
+pub struct AdminCreateCustomVmRequest {
+    pub user_id: u64,
+    /// Spec fields are flattened into this body, matching the customer order shape.
+    #[serde(flatten)]
+    pub spec: lnvps_api_common::CustomVmSpec,
+    pub image_id: u64,
+    pub ssh_key_id: u64,
+    pub ref_code: Option<String>,
+    pub reason: Option<String>,
+}
+
 /// Request to import an existing host VM into the database (issue #166)
 #[derive(Deserialize)]
 pub struct AdminImportVmRequest {
