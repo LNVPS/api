@@ -325,6 +325,17 @@ fn scratch_mounts(svc: &Service) -> Result<Vec<Value>> {
     Ok(out)
 }
 
+/// `KEY=value` list form. A mapping would re-emit an env value as whatever
+/// YAML type it looks like — a bare date becomes a timestamp and compose
+/// rejects the file — and every env value here is a string.
+fn env_sequence<'a>(env: impl IntoIterator<Item = (&'a String, &'a String)>) -> Value {
+    Value::Sequence(
+        env.into_iter()
+            .map(|(k, v)| Value::from(format!("{k}={v}")))
+            .collect(),
+    )
+}
+
 /// Turn one compose service into its docker-compose service mapping.
 fn service_mapping(name: &str, svc: &Service, r: &Rendered) -> Result<Mapping> {
     let mut m = Mapping::new();
@@ -332,11 +343,7 @@ fn service_mapping(name: &str, svc: &Service, r: &Rendered) -> Result<Mapping> {
 
     if let Some(env) = r.env.get(name).filter(|e| !e.is_empty()) {
         let sorted: BTreeMap<_, _> = env.iter().collect();
-        let mut em = Mapping::new();
-        for (k, v) in sorted {
-            em.insert(k.as_str().into(), v.as_str().into());
-        }
-        m.insert("environment".into(), Value::Mapping(em));
+        m.insert("environment".into(), env_sequence(sorted));
     }
 
     // Data volumes (PVC equivalent) followed by read-only file bind mounts.
@@ -430,11 +437,8 @@ fn init_mapping(
     let mut m = Mapping::new();
     m.insert("image".into(), step.image.as_str().into());
     if !step.env.is_empty() {
-        let mut em = Mapping::new();
-        for (k, v) in &step.env {
-            em.insert(k.as_str().into(), v.as_str().into());
-        }
-        m.insert("environment".into(), Value::Mapping(em));
+        let sorted: BTreeMap<_, _> = step.env.iter().collect();
+        m.insert("environment".into(), env_sequence(sorted));
     }
     if let Some(cmd) = &step.command {
         m.insert(
@@ -748,6 +752,27 @@ mod tests {
         doc["services"][name].as_mapping().expect("service")
     }
 
+    /// Env values are strings whatever they look like: serialised as a mapping,
+    /// a date- or number-shaped value comes back as a typed scalar and compose
+    /// refuses the file.
+    #[test]
+    fn env_values_stay_strings_when_serialised() {
+        let doc = render(
+            "services:\n  app:\n    image: example/app:latest\n    user: \"1000\"\n    \
+             env:\n      SINCE: \"2023-01-01\"\n      REPLICAS: \"3\"\n      DEBUG: \"true\"\n",
+        );
+        let text = serde_yaml::to_string(&Value::Mapping(doc)).expect("serialise");
+        let back: Value = serde_yaml::from_str(&text).expect("reparse");
+        assert_eq!(
+            back["services"]["app"]["environment"],
+            Value::Sequence(vec![
+                "DEBUG=true".into(),
+                "REPLICAS=3".into(),
+                "SINCE=2023-01-01".into(),
+            ])
+        );
+    }
+
     const DB_APP: &str = "services:\n  db:\n    image: mariadb:11\n    user: root\n    \
          resources: { cpu: 500m, memory: 512Mi }\n    \
          env:\n      MARIADB_ROOT_PASSWORD: ${DB_PASSWORD}\n    \
@@ -828,8 +853,8 @@ mod tests {
         assert_eq!(db["cpus"], Value::from(0.5));
         assert_eq!(db["mem_limit"], Value::from(536870912u64));
         assert_eq!(
-            db["environment"]["MARIADB_ROOT_PASSWORD"],
-            Value::from("sekret")
+            db["environment"],
+            Value::Sequence(vec!["MARIADB_ROOT_PASSWORD=sekret".into()])
         );
         // The named volume is declared, so `docker compose up` creates it.
         assert!(doc["volumes"].as_mapping().unwrap().contains_key("db-data"));
@@ -887,8 +912,8 @@ mod tests {
             Value::Sequence(vec!["mb".into(), "-p".into(), "s3/media".into()])
         );
         assert_eq!(
-            step["environment"]["MC_HOST_s3"],
-            Value::from("http://k:sekret@s3:9000")
+            step["environment"],
+            Value::Sequence(vec!["MC_HOST_s3=http://k:sekret@s3:9000".into()])
         );
         // Sees the service's volume, plus scratch it can write to.
         assert_eq!(
