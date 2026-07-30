@@ -363,7 +363,6 @@ impl ProxmoxClient {
         };
 
         let snippet_filename = "lnvps-vendor.yaml";
-        let snippet_content = "#cloud-config\nssh_deletekeys: false\n";
 
         // Snippet storage path depends on the storage type; for the default
         // `local` storage this is `/var/lib/vz/snippets/`.  For other directory-
@@ -376,6 +375,21 @@ impl ProxmoxClient {
         ssh.connect((host.clone(), 22), &ssh_user, &ssh_key)
             .await
             .map_err(OpError::Transient)?;
+
+        // Mirror the Proxmox host's resolvers into the snippet so cloud-init
+        // force-writes /etc/resolv.conf on every guest. Without this, minimal
+        // images (Alpine, NixOS) silently drop the DNS servers Proxmox provides.
+        let (_, resolv_conf) = ssh
+            .execute("cat /etc/resolv.conf 2>/dev/null || true")
+            .await
+            .map_err(OpError::Transient)?;
+        let nameservers = parse_resolv_conf_nameservers(&resolv_conf);
+        if nameservers.is_empty() {
+            warn!(
+                "No nameservers found in host /etc/resolv.conf; vendor snippet will not manage guest DNS"
+            );
+        }
+        let snippet_content = build_vendor_snippet(&nameservers);
 
         let vol_ref = format!("{storage_name}:snippets/{snippet_filename}");
 
@@ -2229,6 +2243,52 @@ fn parse_storage_from_disk(disk: &str) -> Option<String> {
     }
 }
 
+/// Extract the `nameserver` entries from an `/etc/resolv.conf`, preserving order
+/// and dropping duplicates/comments.
+///
+/// Used to mirror the Proxmox host's resolvers into the cloud-init vendor
+/// snippet (see [`build_vendor_snippet`]).
+fn parse_resolv_conf_nameservers(resolv_conf: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in resolv_conf.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        if parts.next() == Some("nameserver")
+            && let Some(ip) = parts.next()
+            && ip.parse::<IpAddr>().is_ok()
+            && !out.iter().any(|e| e == ip)
+        {
+            out.push(ip.to_string());
+        }
+    }
+    out
+}
+
+/// Build the cloud-init vendor-data snippet applied to every VM on the host.
+///
+/// Always disables SSH host-key regeneration (`ssh_deletekeys: false`). When
+/// `nameservers` is non-empty it also forces cloud-init to write
+/// `/etc/resolv.conf` directly (`manage_resolv_conf: true`), which is required
+/// for minimal images (e.g. Alpine, NixOS) whose native network renderer does
+/// not apply the DNS servers Proxmox hands them (Alpine's busybox ifupdown
+/// needs `openresolv`, which the stock cloud image lacks). Mirroring the host's
+/// resolvers here matches Proxmox's own host-`resolv.conf` fallback behaviour.
+fn build_vendor_snippet(nameservers: &[String]) -> String {
+    let mut s = String::from("#cloud-config\nssh_deletekeys: false\n");
+    if !nameservers.is_empty() {
+        s.push_str("manage_resolv_conf: true\nresolv_conf:\n  nameservers:\n");
+        for ns in nameservers {
+            s.push_str("    - ");
+            s.push_str(ns);
+            s.push('\n');
+        }
+    }
+    s
+}
+
 impl From<ProxmoxVmId> for i32 {
     fn from(val: ProxmoxVmId) -> Self {
         val.0 as i32 + 100
@@ -2839,6 +2899,35 @@ mod tests {
     use lnvps_db::IpRange;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn test_parse_resolv_conf_nameservers() {
+        let rc = "# generated\nsearch example.com\nnameserver 1.1.1.1\nnameserver 9.9.9.9\n;comment\nnameserver 1.1.1.1\nnameserver not-an-ip\nnameserver 2606:4700:4700::1111\n";
+        assert_eq!(
+            parse_resolv_conf_nameservers(rc),
+            vec![
+                "1.1.1.1".to_string(),
+                "9.9.9.9".to_string(),
+                "2606:4700:4700::1111".to_string(),
+            ]
+        );
+        assert!(parse_resolv_conf_nameservers("# nothing here\nsearch foo\n").is_empty());
+    }
+
+    #[test]
+    fn test_build_vendor_snippet() {
+        // No nameservers -> only ssh_deletekeys, no resolv_conf block.
+        let empty = build_vendor_snippet(&[]);
+        assert_eq!(empty, "#cloud-config\nssh_deletekeys: false\n");
+        assert!(!empty.contains("manage_resolv_conf"));
+
+        // With nameservers -> manage_resolv_conf block appended.
+        let s = build_vendor_snippet(&["1.1.1.1".to_string(), "9.9.9.9".to_string()]);
+        assert_eq!(
+            s,
+            "#cloud-config\nssh_deletekeys: false\nmanage_resolv_conf: true\nresolv_conf:\n  nameservers:\n    - 1.1.1.1\n    - 9.9.9.9\n"
+        );
+    }
 
     #[test]
     fn test_image_source_checksum_path() {
