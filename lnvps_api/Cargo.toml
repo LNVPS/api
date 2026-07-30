@@ -36,13 +36,13 @@ default = [
 ]
 openapi = ["dep:openapi-build-gen"]
 mikrotik = []
-# Linux router managed over SSH (shares the ssh2-based SshClient with proxmox)
-linux-ssh = ["dep:ssh2"]
+# Linux router managed over SSH (shares the SshClient with proxmox)
+linux-ssh = ["dep:russh", "dep:russh-sftp"]
 nostr-dm = ["dep:nostr-sdk", "nostr-sdk/nip44", "nostr-sdk/nip59"]
 nostr-dvm = ["dep:nostr-sdk"]
 nostr-domain = ["lnvps_db/nostr-domain", "dep:uuid"]
 nostr-nwc = ["dep:nostr-sdk", "dep:nwc", "nostr-sdk/nip47"]
-proxmox = ["dep:ssh2", "dep:tokio-tungstenite"]
+proxmox = ["dep:russh", "dep:russh-sftp", "dep:tokio-tungstenite"]
 libvirt = ["dep:virt", "dep:uuid", "dep:quick-xml"]
 lnd = ["payments-rs/method-lnd"]
 # On-chain Bitcoin payments (LND wallet backend)
@@ -117,7 +117,6 @@ nwc = { rev = "c69c4ae2bf1a5f340aba70c20d09323f5309a4e2", git = "https://github.
 
 #proxmox
 tokio-tungstenite = { version = "0.28", features = ["native-tls"], optional = true }
-ssh2 = { version = "0.9", optional = true }
 reqwest = { workspace = true }
 
 #libvirt
@@ -125,6 +124,8 @@ virt = { git = "https://gitlab.com/libvirt/libvirt-rust.git", optional = true }
 #virtxml = {git = "https://gitlab.com/libvirt/libvirt-rust-xml.git", optional = true}/
 uuid = { version = "1.16", features = ["v4", "serde"], optional = true }
 quick-xml = { version = "0.39", features = ["serde", "serialize"], optional = true }
+russh = { version = "0.62", optional = true }
+russh-sftp = { version = "2", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11"

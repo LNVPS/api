@@ -295,3 +295,19 @@ if [[ -n "$FILTER" ]]; then
     TEST_CMD="$TEST_CMD $FILTER"
 fi
 eval "$TEST_CMD"
+
+# ---------------------------------------------------------------------------
+# 10. SshClient integration tests against the compose sshd
+#
+# These live in lnvps_api (they use the library directly, not HTTP) and skip
+# themselves unless these two variables are set.
+# ---------------------------------------------------------------------------
+SSH_KEY="$REPO_ROOT/volumes/e2e-sshd/id_ed25519"
+if [[ -f "$SSH_KEY" ]]; then
+    echo "=== Running SshClient integration tests ==="
+    LNVPS_TEST_SSH_ADDR="${LNVPS_TEST_SSH_ADDR:-localhost:2222}" \
+    LNVPS_TEST_SSH_KEY="$SSH_KEY" \
+        cargo test -p lnvps_api --test ssh_client
+else
+    echo "WARNING: $SSH_KEY missing, skipping SshClient integration tests" >&2
+fi

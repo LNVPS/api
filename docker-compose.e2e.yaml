@@ -127,6 +127,21 @@ services:
       retries: 30
       start_period: 10s
 
+  # Real sshd for the SshClient integration tests (exec, SFTP upload, unix
+  # socket tunnel). Without it nothing exercises the SSH plumbing outside of
+  # live Proxmox hosts.
+  sshd:
+    build: .github/e2e/sshd
+    ports:
+      - "2222:22"
+    volumes:
+      - "./volumes/e2e-sshd:/keys"
+    healthcheck:
+      test: ["CMD", "sh", "-c", "test -f /keys/id_ed25519 && nc -z localhost 22"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
   nostr-relay:
     image: dockurr/strfry
     ports:

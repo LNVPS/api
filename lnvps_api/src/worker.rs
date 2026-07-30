@@ -1727,6 +1727,7 @@ impl Worker {
 
         // Upload the binary
         ssh.scp_upload(&binary_data, Path::new(HOST_INFO_REMOTE_PATH), 0o755)
+            .await
             .with_context(|| format!("Failed to upload host-info to {}", host.name))?;
 
         info!("Uploaded host-info to {}", host.name);
@@ -3574,14 +3575,10 @@ pub(crate) async fn download_images_on_hosts(
     clients: Vec<(String, Arc<dyn VmHostClient>)>,
     images: &[VmOsImage],
 ) {
-    // Spawn each host on its own task rather than combining them with
-    // `join_all`. Host image downloads run over SSH (wget/decompress/checksum),
-    // and `SshClient::execute` performs *blocking* socket I/O for the full
-    // duration of each command. Under `join_all` all host futures share a single
-    // task, so one host's blocking download stalls every other host (serialising
-    // them). Independent tasks let the multi-threaded runtime run the blocking
-    // downloads concurrently across worker threads. Images on a single host are
-    // still processed sequentially to avoid saturating that host's storage.
+    // One task per host rather than one shared `join_all` future, so a single
+    // host's long download (wget/decompress/checksum over SSH) cannot delay the
+    // others. Images on a single host are still processed sequentially to avoid
+    // saturating that host's storage.
     let tasks: Vec<_> = clients
         .into_iter()
         .map(|(host_name, client)| {

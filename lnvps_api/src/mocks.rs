@@ -39,7 +39,6 @@ use payments_rs::onchain::{
     ChainPaymentUpdate, NewAddressRequest, NewAddressResponse, OnChainProvider, PaymentCursor,
     SendCoinsRequest, SendCoinsResponse,
 };
-use ssh2::HashType::Sha256;
 use std::collections::HashMap;
 use std::ops::Add;
 use std::pin::Pin;

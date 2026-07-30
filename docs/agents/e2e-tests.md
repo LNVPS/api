@@ -43,6 +43,8 @@ docker compose up -d
 cargo test --workspace --exclude lnvps_e2e -- --test-threads=1
 ```
 
+After the `lnvps_e2e` suite, `run-e2e.sh` also runs `cargo test -p lnvps_api --test ssh_client`: `SshClient` talks SSH rather than HTTP, so it is covered against the `sshd` service in `docker-compose.e2e.yaml` (command exec, SFTP upload, unix-socket tunnel, auth failure) instead of through the API. Those tests skip themselves when `LNVPS_TEST_SSH_ADDR` / `LNVPS_TEST_SSH_KEY` are unset, so a plain `cargo test --workspace` does not need the stack.
+
 The `run-e2e.sh` script sets `LNVPS_NO_DEV_SETUP=1` when starting the API servers so that `dev_setup.sql` is not executed. The lifecycle test creates and cleans up all its own infrastructure; the dev setup data would conflict with it.
 
 ## Per-run Database Isolation
@@ -66,6 +68,8 @@ The API servers must be configured to connect to the same per-run database. In C
 | `LNVPS_DB_URL` | `mysql://root:root@localhost:3376/lnvps` | Full DB URL — only used to derive `LNVPS_DB_BASE_URL` when the latter is not set. |
 | `LNVPS_E2E_RUN_ID` | *(current timestamp ms)* | Unique ID for this test run; determines the per-run DB name `lnvps_e2e_{run_id}`. |
 | `LNVPS_NO_DEV_SETUP` | *(unset)* | Set to any value to suppress `dev_setup.sql` on startup (debug builds only). Always set by `run-e2e.sh`. |
+| `LNVPS_TEST_SSH_ADDR` | *(unset)* | `host:port` of the compose `sshd` service; set by `run-e2e.sh` to `localhost:2222`. |
+| `LNVPS_TEST_SSH_KEY` | *(unset)* | Client private key for that sshd, generated into `volumes/e2e-sshd/` on first start. |
 | `NOSTR_SECRET_KEY` | *(random)* | Hex Nostr secret key for user identity |
 | `ADMIN_NOSTR_SECRET_KEY` | *(random)* | Hex Nostr secret key for admin identity |
 

@@ -26,3 +26,6 @@ node_modules/
 lnvps_api/Cargo.lock
 lnvps_db/Cargo.lock
 lnvps_nostr/Cargo.lock
+
+# Docker bind mounts for the e2e stack (includes a generated test ssh key)
+/volumes/
