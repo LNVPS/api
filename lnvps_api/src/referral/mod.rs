@@ -283,6 +283,9 @@ impl ReferralPayoutHandler {
 
     /// Key holding whether one referrer's balance in `currency` is currently
     /// refused over the ceiling.
+    ///
+    /// Without redis configured this state lives in memory, so a restart
+    /// re-alerts on a standing refusal.
     fn refusal_key(referral_id: u64, currency: &str) -> String {
         format!(
             "referral:payout-refused:{}:{}",
@@ -299,13 +302,12 @@ impl ReferralPayoutHandler {
         match self.kv.get(&key).await {
             Ok(Some(v)) if v == b"1" => return,
             Ok(_) => {}
-            Err(e) => {
-                warn!(
-                    "Failed to read refusal state for code {}: {}",
-                    referral.code, e
-                );
-                return;
-            }
+            // Notify anyway when the state is unknown: a duplicate alert is
+            // cheaper than a refusal nobody hears about.
+            Err(e) => warn!(
+                "Failed to read refusal state for code {}: {}",
+                referral.code, e
+            ),
         }
         let _ = self
             .tx
@@ -331,10 +333,7 @@ impl ReferralPayoutHandler {
     /// Forget a refusal once the balance pays, so a later one is reported again.
     async fn clear_refusal(&self, referral_id: u64, currency: &str) {
         let key = Self::refusal_key(referral_id, currency);
-        if let Ok(Some(v)) = self.kv.get(&key).await
-            && v == b"1"
-            && let Err(e) = self.kv.store(&key, b"0").await
-        {
+        if let Err(e) = self.kv.store(&key, b"0").await {
             warn!(
                 "Failed to clear refusal state for referral {}: {}",
                 referral_id, e
@@ -342,19 +341,11 @@ impl ReferralPayoutHandler {
         }
     }
 
-    /// Pass a `converted_payout` result through, telling admins when it was
-    /// refused over the ceiling.
-    async fn checked_conversion(
-        &self,
-        referral: &Referral,
-        result: Result<Option<ReferralPayout>>,
-    ) -> Result<Option<ReferralPayout>> {
-        if let Err(e) = &result
-            && let Some(refusal) = e.downcast_ref::<RefusedOverCeiling>()
-        {
+    /// Tell admins when a conversion was refused over the ceiling.
+    async fn note_refusal_over_ceiling(&self, referral: &Referral, e: &anyhow::Error) {
+        if let Some(refusal) = e.downcast_ref::<RefusedOverCeiling>() {
             self.note_refusal(referral, refusal).await;
         }
-        result
     }
 
     /// Process automated payouts for every enrolled referrer. Per-referrer
@@ -593,18 +584,16 @@ impl ReferralPayoutHandler {
             // on-chain one is sized for mempool fees, the fiat one is what an
             // operator set for converted payouts.
             let min_msat = min_onchain_msat.max(self.min_fiat_payout_msat.unwrap_or(0));
-            let converted = self
-                .checked_conversion(
-                    &referral,
-                    converted_payout(
-                        &referral,
-                        &currency,
-                        owed,
-                        rate,
-                        effective_min_msat(&referral, min_msat),
-                    ),
-                )
-                .await;
+            let converted = converted_payout(
+                &referral,
+                &currency,
+                owed,
+                rate,
+                effective_min_msat(&referral, min_msat),
+            );
+            if let Err(e) = &converted {
+                self.note_refusal_over_ceiling(&referral, e).await;
+            }
             match converted {
                 Ok(Some(payout)) => rows.push(BatchRow {
                     referral,
@@ -922,19 +911,18 @@ impl ReferralPayoutHandler {
     ) -> Result<()> {
         let rate = self.quote(currency).await?;
 
-        let Some(mut payout) = self
-            .checked_conversion(
-                referral,
-                converted_payout(
-                    referral,
-                    currency,
-                    owed,
-                    rate,
-                    effective_min_msat(referral, min_fiat_msat),
-                ),
-            )
-            .await?
-        else {
+        let converted = converted_payout(
+            referral,
+            currency,
+            owed,
+            rate,
+            effective_min_msat(referral, min_fiat_msat),
+        );
+        if let Err(e) = &converted {
+            self.note_refusal_over_ceiling(referral, e).await;
+        }
+
+        let Some(mut payout) = converted? else {
             return Ok(());
         };
         let pay_msat = payout.sent_amount;
