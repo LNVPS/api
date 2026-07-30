@@ -2274,9 +2274,9 @@ struct CloudInitResolvConf {
 /// not apply the DNS servers Proxmox hands them (Alpine's busybox ifupdown
 /// needs `openresolv`, which the stock cloud image lacks).
 ///
-/// Serialised from a typed struct via `serde_json`: JSON is a strict subset of
-/// YAML, so the output — prefixed with the `#cloud-config` header line — is
-/// valid cloud-config while avoiding fragile hand-built YAML.
+/// Serialised to YAML from a typed struct via `serde_yml`, prefixed with the
+/// `#cloud-config` header line, so the on-disk snippet is real cloud-config
+/// YAML without any fragile hand-built indentation/escaping.
 fn build_vendor_snippet(nameservers: &[&str]) -> String {
     let has_dns = !nameservers.is_empty();
     let data = CloudInitVendorData {
@@ -2287,9 +2287,9 @@ fn build_vendor_snippet(nameservers: &[&str]) -> String {
         }),
     };
     format!(
-        "#cloud-config\n{}\n",
+        "#cloud-config\n{}",
         // This struct is always serialisable, so this cannot fail.
-        serde_json::to_string(&data).expect("serialize cloud-init vendor data")
+        serde_yml::to_string(&data).expect("serialize cloud-init vendor data")
     )
 }
 
@@ -2906,27 +2906,33 @@ mod tests {
 
     #[test]
     fn test_build_vendor_snippet() {
-        // No nameservers -> only ssh_deletekeys, no resolv_conf block.
+        // Every snippet must carry the cloud-config header and parse as YAML.
+        let header = "#cloud-config\n";
+
+        // No nameservers -> ssh_deletekeys only, no resolv_conf keys.
         let empty = build_vendor_snippet(&[]);
-        assert_eq!(empty, "#cloud-config\n{\"ssh_deletekeys\":false}\n");
+        assert!(empty.starts_with(header));
         assert!(!empty.contains("manage_resolv_conf"));
+        assert!(!empty.contains("resolv_conf"));
+        let v: serde_yml::Value = serde_yml::from_str(&empty).unwrap();
+        assert_eq!(v["ssh_deletekeys"], serde_yml::Value::Bool(false));
 
         // With nameservers (incl. IPv6) -> manage_resolv_conf + resolv_conf set.
         let s = build_vendor_snippet(&["1.1.1.1", "2606:4700:4700::1111"]);
-        assert_eq!(
-            s,
-            "#cloud-config\n{\"ssh_deletekeys\":false,\"manage_resolv_conf\":true,\"resolv_conf\":{\"nameservers\":[\"1.1.1.1\",\"2606:4700:4700::1111\"]}}\n"
-        );
-        // Must carry the cloud-config header and be valid YAML (JSON subset).
-        assert!(s.starts_with("#cloud-config\n"));
-        let body = s.strip_prefix("#cloud-config\n").unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
-        assert_eq!(parsed["resolv_conf"]["nameservers"][0], "1.1.1.1");
+        assert!(s.starts_with(header));
+        let v: serde_yml::Value = serde_yml::from_str(&s).unwrap();
+        assert_eq!(v["ssh_deletekeys"], serde_yml::Value::Bool(false));
+        assert_eq!(v["manage_resolv_conf"], serde_yml::Value::Bool(true));
+        assert_eq!(v["resolv_conf"]["nameservers"][0], "1.1.1.1");
+        assert_eq!(v["resolv_conf"]["nameservers"][1], "2606:4700:4700::1111");
 
-        // The production constant covers both IPv4 and IPv6 resolvers.
+        // The production constant covers both IPv4 and IPv6 resolvers, and the
+        // body must be valid cloud-config YAML.
         let prod = build_vendor_snippet(GUEST_DNS_SERVERS);
-        assert!(prod.contains("\"8.8.8.8\""));
-        assert!(prod.contains("\"2620:fe::fe\""));
+        let v: serde_yml::Value = serde_yml::from_str(&prod).unwrap();
+        let ns = v["resolv_conf"]["nameservers"].as_sequence().unwrap();
+        assert!(ns.iter().any(|n| n.as_str() == Some("8.8.8.8")));
+        assert!(ns.iter().any(|n| n.as_str() == Some("2620:fe::fe")));
     }
 
     #[test]
