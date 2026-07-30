@@ -2245,6 +2245,26 @@ const GUEST_DNS_SERVERS: &[&str] = &[
     "2620:fe::fe",
 ];
 
+/// Structured `#cloud-config` vendor-data document written to the host snippet
+/// and referenced by every VM's `cicustom` (see [`build_vendor_snippet`]).
+#[derive(Debug, Serialize)]
+struct CloudInitVendorData {
+    /// Keep SSH host keys across cloud-init reconfiguration so users don't hit
+    /// host-key-changed warnings on IP/key updates.
+    ssh_deletekeys: bool,
+    /// Force cloud-init to write `/etc/resolv.conf` directly. Only emitted when
+    /// there are nameservers to set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manage_resolv_conf: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolv_conf: Option<CloudInitResolvConf>,
+}
+
+#[derive(Debug, Serialize)]
+struct CloudInitResolvConf {
+    nameservers: Vec<String>,
+}
+
 /// Build the cloud-init vendor-data snippet applied to every VM on the host.
 ///
 /// Always disables SSH host-key regeneration (`ssh_deletekeys: false`). When
@@ -2253,17 +2273,24 @@ const GUEST_DNS_SERVERS: &[&str] = &[
 /// for minimal images (e.g. Alpine, NixOS) whose native network renderer does
 /// not apply the DNS servers Proxmox hands them (Alpine's busybox ifupdown
 /// needs `openresolv`, which the stock cloud image lacks).
+///
+/// Serialised from a typed struct via `serde_json`: JSON is a strict subset of
+/// YAML, so the output — prefixed with the `#cloud-config` header line — is
+/// valid cloud-config while avoiding fragile hand-built YAML.
 fn build_vendor_snippet(nameservers: &[&str]) -> String {
-    let mut s = String::from("#cloud-config\nssh_deletekeys: false\n");
-    if !nameservers.is_empty() {
-        s.push_str("manage_resolv_conf: true\nresolv_conf:\n  nameservers:\n");
-        for ns in nameservers {
-            s.push_str("    - ");
-            s.push_str(ns);
-            s.push('\n');
-        }
-    }
-    s
+    let has_dns = !nameservers.is_empty();
+    let data = CloudInitVendorData {
+        ssh_deletekeys: false,
+        manage_resolv_conf: has_dns.then_some(true),
+        resolv_conf: has_dns.then(|| CloudInitResolvConf {
+            nameservers: nameservers.iter().map(|s| s.to_string()).collect(),
+        }),
+    };
+    format!(
+        "#cloud-config\n{}\n",
+        // This struct is always serialisable, so this cannot fail.
+        serde_json::to_string(&data).expect("serialize cloud-init vendor data")
+    )
 }
 
 impl From<ProxmoxVmId> for i32 {
@@ -2881,20 +2908,25 @@ mod tests {
     fn test_build_vendor_snippet() {
         // No nameservers -> only ssh_deletekeys, no resolv_conf block.
         let empty = build_vendor_snippet(&[]);
-        assert_eq!(empty, "#cloud-config\nssh_deletekeys: false\n");
+        assert_eq!(empty, "#cloud-config\n{\"ssh_deletekeys\":false}\n");
         assert!(!empty.contains("manage_resolv_conf"));
 
-        // With nameservers (incl. IPv6) -> manage_resolv_conf block appended.
+        // With nameservers (incl. IPv6) -> manage_resolv_conf + resolv_conf set.
         let s = build_vendor_snippet(&["1.1.1.1", "2606:4700:4700::1111"]);
         assert_eq!(
             s,
-            "#cloud-config\nssh_deletekeys: false\nmanage_resolv_conf: true\nresolv_conf:\n  nameservers:\n    - 1.1.1.1\n    - 2606:4700:4700::1111\n"
+            "#cloud-config\n{\"ssh_deletekeys\":false,\"manage_resolv_conf\":true,\"resolv_conf\":{\"nameservers\":[\"1.1.1.1\",\"2606:4700:4700::1111\"]}}\n"
         );
+        // Must carry the cloud-config header and be valid YAML (JSON subset).
+        assert!(s.starts_with("#cloud-config\n"));
+        let body = s.strip_prefix("#cloud-config\n").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed["resolv_conf"]["nameservers"][0], "1.1.1.1");
 
         // The production constant covers both IPv4 and IPv6 resolvers.
         let prod = build_vendor_snippet(GUEST_DNS_SERVERS);
-        assert!(prod.contains("    - 8.8.8.8\n"));
-        assert!(prod.contains("    - 2620:fe::fe\n"));
+        assert!(prod.contains("\"8.8.8.8\""));
+        assert!(prod.contains("\"2620:fe::fe\""));
     }
 
     #[test]
