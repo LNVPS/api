@@ -1382,43 +1382,81 @@ impl VmHostClient for ProxmoxClient {
             .any(|v| v.vol_id.ends_with(&format!("iso/{storage_name}")));
 
         if already_present {
-            // For compressed images the stored file is the *decompressed* `.img`,
-            // whose checksum differs from the SHASUMS entry (which covers the
-            // compressed artifact). We therefore cannot re-verify it here, so we
-            // trust its presence and skip the re-download.
-            if compression.is_some() {
-                info!(
-                    "Compressed image already decompressed on host as {}, skipping download",
-                    storage_name
-                );
-                return Ok(());
-            }
-
-            // If we have an expected checksum, verify the stored file via SSH
+            // Decide whether the stored image is stale (its source changed) and
+            // must be re-downloaded. We always do a hash check when a checksum is
+            // available:
+            //
+            // - Uncompressed images: hash the stored file directly and compare to
+            //   the expected SHASUMS checksum.
+            // - Compressed images: the stored file is the *decompressed* `.img`,
+            //   whose hash does not match the SHASUMS entry (which covers the
+            //   compressed artifact). We instead record the source checksum in a
+            //   sidecar (`<img>.sha2src`) when decompressing, and compare the
+            //   current expected checksum against that here. This still detects a
+            //   changed source image (e.g. an updated OS image record) without
+            //   re-hashing the large decompressed file, and — crucially — no
+            //   longer blindly trusts a stale decompressed image.
             let stale = if let (Some(expected), Some(algo)) = (&expected_sha2, &checksum_algorithm)
             {
-                match self
-                    .verify_image_checksum(&storage_name, &iso_storage, expected, algo)
-                    .await
-                {
-                    Ok(matches) => {
-                        if matches {
-                            info!("Checksum verified for {}, skipping download", storage_name);
+                if compression.is_some() {
+                    let sidecar = Self::image_source_checksum_path(&storage_name);
+                    match self
+                        .ssh_run(format!("cat '{sidecar}' 2>/dev/null || true"))
+                        .await
+                    {
+                        Ok((_, out)) if out.trim().eq_ignore_ascii_case(expected) => {
+                            info!(
+                                "Source checksum matches for {}, skipping download",
+                                storage_name
+                            );
                             false
-                        } else {
-                            info!("Checksum mismatch for {}, will re-download", storage_name);
+                        }
+                        Ok((_, out)) if out.trim().is_empty() => {
+                            info!(
+                                "No recorded source checksum for {}, will re-download to record it",
+                                storage_name
+                            );
+                            true
+                        }
+                        Ok(_) => {
+                            info!(
+                                "Source checksum changed for {}, will re-download",
+                                storage_name
+                            );
+                            true
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to read source checksum for {}: {}, will re-download",
+                                storage_name, e
+                            );
                             true
                         }
                     }
-                    Err(e) => {
-                        warn!(
-                            "Failed to verify checksum for {}: {}, will re-download",
-                            storage_name, e
-                        );
-                        true
+                } else {
+                    match self
+                        .verify_image_checksum(&storage_name, &iso_storage, expected, algo)
+                        .await
+                    {
+                        Ok(true) => {
+                            info!("Checksum verified for {}, skipping download", storage_name);
+                            false
+                        }
+                        Ok(false) => {
+                            info!("Checksum mismatch for {}, will re-download", storage_name);
+                            true
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to verify checksum for {}: {}, will re-download",
+                                storage_name, e
+                            );
+                            true
+                        }
                     }
                 }
             } else {
+                // No checksum available: cannot verify, trust presence.
                 info!(
                     "No checksum available for {}, skipping re-download check",
                     storage_name
@@ -1430,13 +1468,20 @@ impl VmHostClient for ProxmoxClient {
                 return Ok(());
             }
 
-            // Delete the stale image before re-downloading
+            // Delete the stale image (and any source-checksum sidecar) first.
             info!("Deleting stale image {} from {}", storage_name, &self.node);
             if let Err(e) = self
                 .delete_storage_file(&self.node, &iso_storage, &storage_name)
                 .await
             {
                 warn!("Failed to delete stale image {}: {}", storage_name, e);
+            }
+            let sidecar = Self::image_source_checksum_path(&storage_name);
+            if let Err(e) = self.ssh_run(format!("rm -f '{sidecar}'")).await {
+                warn!(
+                    "Failed to delete source checksum sidecar for {}: {}",
+                    storage_name, e
+                );
             }
         }
 
@@ -1499,6 +1544,26 @@ impl VmHostClient for ProxmoxClient {
                 .await
                 .map_err(OpError::Fatal)?;
             info!("Decompressed image available as {}", storage_name);
+
+            // Record the source (compressed) checksum next to the decompressed
+            // image so future runs can detect a changed source via a hash check
+            // without re-hashing the large decompressed file. Best-effort: a
+            // failure here only means the next run re-downloads to record it.
+            if let (Some(expected), Some(_)) = (&expected_sha2, &checksum_algorithm)
+                && expected.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                let sidecar = Self::image_source_checksum_path(&storage_name);
+                let expected = expected.to_lowercase();
+                if let Err(e) = self
+                    .ssh_run(format!("printf '%s' '{expected}' > '{sidecar}'"))
+                    .await
+                {
+                    warn!(
+                        "Failed to record source checksum for {}: {}",
+                        storage_name, e
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -1990,6 +2055,16 @@ impl ProxmoxClient {
         };
         let host = crate::worker::extract_host_from_url(&self.api.base().to_string());
         SshClient::run_command(host, 22, ssh_cfg.user.clone(), ssh_cfg.key.clone(), command).await
+    }
+
+    /// Path to the sidecar file that records the *source* (compressed) checksum
+    /// used to produce a decompressed image (`<img>.sha2src`).
+    ///
+    /// The decompressed `.img` cannot be hashed against the SHASUMS entry (which
+    /// covers the compressed artifact), so we persist the source checksum here to
+    /// still detect a changed source on later runs.
+    fn image_source_checksum_path(filename: &str) -> String {
+        format!("/var/lib/vz/template/iso/{filename}.sha2src")
     }
 
     /// Verify an already-downloaded image's checksum via SSH by running the appropriate
@@ -2788,6 +2863,19 @@ mod tests {
     use lnvps_db::IpRange;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn test_image_source_checksum_path() {
+        assert_eq!(
+            ProxmoxClient::image_source_checksum_path("nixos-24.11-cloudinit-x86_64.img"),
+            "/var/lib/vz/template/iso/nixos-24.11-cloudinit-x86_64.img.sha2src"
+        );
+        // Distinct images produce distinct sidecar paths.
+        assert_ne!(
+            ProxmoxClient::image_source_checksum_path("a.img"),
+            ProxmoxClient::image_source_checksum_path("b.img")
+        );
+    }
 
     #[test]
     fn test_config() -> Result<()> {
