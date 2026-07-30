@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use log::info;
 use russh::client::{self, Handle, Msg};
 use russh::keys::{PrivateKeyWithHashAlg, decode_secret_key, load_secret_key};
-use russh::{Channel, ChannelMsg, Disconnect};
+use russh::{Channel, ChannelMsg};
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::FileAttributes;
 use std::path::{Path, PathBuf};
@@ -32,13 +32,14 @@ impl client::Handler for Handler {
     }
 }
 
+#[derive(Default)]
 pub struct SshClient {
     session: Option<Handle<Handler>>,
 }
 
 impl SshClient {
-    pub fn new() -> Result<SshClient> {
-        Ok(SshClient { session: None })
+    pub fn new() -> SshClient {
+        SshClient { session: None }
     }
 
     pub async fn connect(
@@ -72,19 +73,24 @@ impl SshClient {
             inactivity_timeout: None,
             ..Default::default()
         });
-        let mut session =
-            tokio::time::timeout(CONNECT_TIMEOUT, client::connect(config, host, Handler)).await??;
+        // A host can finish key exchange and then stall in auth, so the timeout
+        // has to cover the whole handshake and not just the connect.
+        let session = tokio::time::timeout(CONNECT_TIMEOUT, async move {
+            let mut session = client::connect(config, host, Handler).await?;
+            let hash_alg = session.best_supported_rsa_hash().await?.flatten();
+            let res = session
+                .authenticate_publickey(
+                    username,
+                    PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
+                )
+                .await?;
+            if !res.success() {
+                bail!("SSH public key authentication failed for user {username}");
+            }
+            Ok::<_, anyhow::Error>(session)
+        })
+        .await??;
 
-        let hash_alg = session.best_supported_rsa_hash().await?.flatten();
-        let res = session
-            .authenticate_publickey(
-                username,
-                PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
-            )
-            .await?;
-        if !res.success() {
-            bail!("SSH public key authentication failed for user {username}");
-        }
         self.session = Some(session);
         Ok(())
     }
@@ -122,7 +128,7 @@ impl SshClient {
         key: PathBuf,
         command: String,
     ) -> Result<(i32, String)> {
-        let mut client = SshClient::new()?;
+        let mut client = SshClient::new();
         client.connect((host, port), &username, &key).await?;
         client.execute(&command).await
     }
@@ -208,16 +214,6 @@ impl SshClient {
         sftp.close().await?;
 
         info!("SFTP upload complete");
-        Ok(())
-    }
-
-    /// Close the session cleanly, if one is open.
-    pub async fn disconnect(&mut self) -> Result<()> {
-        if let Some(session) = self.session.take() {
-            session
-                .disconnect(Disconnect::ByApplication, "", "en")
-                .await?;
-        }
         Ok(())
     }
 }

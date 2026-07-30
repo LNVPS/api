@@ -1060,13 +1060,7 @@ impl Worker {
         };
         let ssh_user = host.ssh_user.as_deref().unwrap_or("root");
 
-        let mut ssh = match SshClient::new() {
-            Ok(c) => c,
-            Err(e) => {
-                warn!("[host-keys] vm {}: ssh client failed: {}", vm.id, e);
-                return;
-            }
-        };
+        let mut ssh = SshClient::new();
         let ssh_host = extract_host_from_url(&host.ip);
         if let Err(e) = ssh
             .connect_with_key((ssh_host.as_str(), 22), ssh_user, ssh_key.as_str())
@@ -1672,7 +1666,7 @@ impl Worker {
         let ssh_host = extract_host_from_url(&host.ip);
 
         // Connect to host via SSH
-        let mut ssh = SshClient::new()?;
+        let mut ssh = SshClient::new();
         ssh.connect_with_key((ssh_host.as_str(), 22), ssh_user, &ssh_key)
             .await
             .with_context(|| {

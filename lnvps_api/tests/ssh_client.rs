@@ -44,7 +44,7 @@ macro_rules! target_or_skip {
 }
 
 async fn connected(t: &Target) -> Result<SshClient> {
-    let mut client = SshClient::new()?;
+    let mut client = SshClient::new();
     client.connect(t.addr.as_str(), "root", &t.key).await?;
     Ok(client)
 }
@@ -149,7 +149,7 @@ async fn tunnel_unix_socket_round_trips() -> Result<()> {
 async fn connect_rejects_unauthorised_user() -> Result<()> {
     let t = target_or_skip!();
 
-    let mut client = SshClient::new()?;
+    let mut client = SshClient::new();
     let err = client
         .connect(t.addr.as_str(), "nobody", &t.key)
         .await

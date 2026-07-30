@@ -372,7 +372,7 @@ impl ProxmoxClient {
         let ssh_user = ssh_config.user.clone();
         let ssh_key = ssh_config.key.clone();
 
-        let mut ssh = SshClient::new().map_err(OpError::Transient)?;
+        let mut ssh = SshClient::new();
         ssh.connect((host.clone(), 22), &ssh_user, &ssh_key)
             .await
             .map_err(OpError::Transient)?;
@@ -480,7 +480,7 @@ impl ProxmoxClient {
             );
 
             // SSH connection and execution with retry
-            let mut s = SshClient::new().map_err(OpError::Transient)?;
+            let mut s = SshClient::new();
             s.connect((host.clone(), 22), &ssh_user, &ssh_key)
                 .await
                 .map_err(OpError::Transient)?;
@@ -1210,7 +1210,7 @@ impl ProxmoxClient {
         self.stop_vm(&self.node, vm_id).await.ok();
 
         {
-            let mut ses = SshClient::new().map_err(OpError::Transient)?;
+            let mut ses = SshClient::new();
             ses.connect(
                 (self.api.base().host().unwrap().to_string(), 22),
                 &ssh.user,
@@ -1998,7 +1998,7 @@ impl VmHostClient for ProxmoxClient {
         let ssh_user = ssh.user.clone();
         let ssh_key = ssh.key.clone();
 
-        let mut client = SshClient::new().map_err(OpError::Transient)?;
+        let mut client = SshClient::new();
         client
             .connect((host, 22), &ssh_user, &ssh_key)
             .await

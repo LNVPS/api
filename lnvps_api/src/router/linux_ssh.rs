@@ -66,7 +66,7 @@ impl LinuxSshRouter {
     /// live SSH session, and is naturally resilient to dropped
     /// connections.
     async fn connect(&self) -> Result<SshClient> {
-        let mut client = SshClient::new()?;
+        let mut client = SshClient::new();
         client
             .connect_with_key(&self.host, &self.username, &self.key)
             .await?;
