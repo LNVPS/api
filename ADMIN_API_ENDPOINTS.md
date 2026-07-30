@@ -414,6 +414,8 @@ Response:
 
 - Unknown `disk_type`, `disk_interface`, `cpu_mfg`, `cpu_arch` or `cpu_feature` values are rejected with `400` before any
   lookup — they are never defaulted
+- Unknown *keys* are ignored, not rejected: a misspelled optional field (e.g. `cpu_ar` instead of `cpu_arch`) is dropped
+  and that field falls back to "any". Check spelling of optional fields
 - User, custom pricing plan and image must exist
 - SSH key must exist and belong to the specified user
 - Spec range limits, pricing enabled/expiry, image architecture compatibility and host capacity are enforced when the job
