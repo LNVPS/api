@@ -1,8 +1,14 @@
 # Managed App — catalog examples
 
 Reference `compose` documents for adding **managed apps** to the catalog via the
-admin API. These are **not** auto-seeded; create them manually and set your own
-pricing / enable them when ready.
+admin API. Each one lives as a standalone document in [`catalog/`](../catalog),
+so it can be validated, started and shipped without being pasted out of a
+Markdown fence. They are **not** auto-seeded; create them manually and set your
+own pricing / enable them when ready.
+
+CI starts every `catalog/*.yaml` one at a time on each change to the directory,
+the grammar or the renderer (`.github/workflows/app-catalog.yml`), so an entry
+that can no longer start fails the build rather than a customer's order.
 
 ## How to add one
 
@@ -16,7 +22,7 @@ the created app (create it disabled, then `PATCH .../apps/{id}` with
   "name": "strfry",                 // DNS-safe slug, unique
   "display_name": "strfry Relay",
   "description": "A high-performance personal Nostr relay.",
-  "compose": "<the YAML below, as a string>",
+  "compose": "<the document from catalog/strfry.yaml, as a string>",
   "amount": 500,                    // price in the smallest currency unit (e.g. cents)
   "currency": "USD",
   "interval_amount": 1,
@@ -428,6 +434,23 @@ broken apps cleanly.
 A green `docker compose up` means the image starts and the app's own startup
 checks pass under our security context. **It is not a deployment test.**
 
+### One command, and the same one CI runs
+
+`scripts/app-catalog-test.sh catalog/<app>.yaml` does the whole loop: render,
+create and chown the volumes, `up --wait`, then re-read the state after a settle
+period and check every ingress port is listening. It fails if a service exits
+non-zero, restarts, or never binds — the three shapes a broken image takes.
+
+```sh
+scripts/app-catalog-test.sh catalog/strfry.yaml
+```
+
+Ingress ports are published on loopback at the container number, so the script
+stops early if one is already taken on your machine rather than reporting it as
+the app's fault. Config fields the customer supplies at order time come from
+`app_config()` in that script; an entry with a required field and no value there
+fails the render loudly.
+
 ### Known non-equivalences
 
 - **Volume ownership.** Kubernetes sets `fsGroup` from `user:` so a fresh PVC is
@@ -463,32 +486,8 @@ checks pass under our security context. **It is not a deployment test.**
   to `127.0.0.1` (must be `0.0.0.0` in a container), port `7777`, data in
   `./strfry-db/`. The `dockurr/strfry` image reads `/etc/strfry.conf`.
 
-```yaml
-services:
-  strfry:
-    image: dockurr/strfry:latest
-    user: "1000"    # image declares no USER, so it would run as root and be refused
-    resources: { cpu: 500m, memory: 512Mi }
-    ports:
-      - { name: ws, container: 7777, protocol: http, expose: ingress }
-    files:
-      - path: /etc/strfry.conf
-        content: |
-          db = "/app/strfry-db/"
-          relay {
-              bind = "0.0.0.0"
-              port = 7777
-              info {
-                  name = "${relay_name}"
-                  description = "${relay_description}"
-              }
-          }
-    volumes:
-      - { name: db, path: /app/strfry-db, size: 5Gi, label: events }
-config:
-  - { name: relay_name, label: "Relay name", type: string, default: "My strfry relay" }
-  - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay" }
-```
+**Document:** [`catalog/strfry.yaml`](../catalog/strfry.yaml) —
+`scripts/app-catalog-test.sh catalog/strfry.yaml` starts it locally.
 
 ---
 
@@ -501,51 +500,8 @@ config:
   `8000`. Mirrors route96's `config.prod.yaml` + `docker-compose.prod.yml`
   (app reaches the DB via the service name `db`).
 
-```yaml
-services:
-  db:
-    image: mariadb:11
-    user: root    # mariadb's entrypoint starts as root, then drops to `mysql`
-    resources: { cpu: 500m, memory: 512Mi }
-    # No ports, no Service, no DNS name — `db:3306` in route96's config would
-    # not resolve (#281). `expose: none` keeps it in-namespace.
-    ports:
-      - { name: mysql, container: 3306, protocol: tcp, expose: none }
-    env:
-      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
-      MARIADB_DATABASE: route96
-    volumes:
-      - { name: data, path: /var/lib/mysql, size: 5Gi, label: database }
-    scratch:
-      # readOnlyRootFilesystem: InnoDB's temporary files, and the pid file +
-      # unix socket mariadbd writes before it accepts a connection
-      - { path: /tmp }
-      - { path: /run/mysqld, size: 32Mi }
-    backup:
-      command: ["sh", "-c", "exec mariadb-dump --all-databases -uroot -p\"$MARIADB_ROOT_PASSWORD\""]
-      artifact: route96.sql
-  route96:
-    image: voidic/route96:latest
-    user: "1000"    # image declares no USER, so it would run as root and be refused
-    resources: { cpu: 500m, memory: 512Mi }
-    depends_on: [db]
-    ports:
-      - { name: http, container: 8000, protocol: http, expose: ingress }
-    files:
-      - path: /app/config.yaml
-        content: |
-          listen: "0.0.0.0:8000"
-          database: "mysql://root:${DB_ROOT_PASSWORD}@db:3306/route96"
-          storage_dir: "/app/data"
-          max_upload_bytes: 104857600
-          public_url: "https://${HOSTNAME}"
-    volumes:
-      - { name: blobs, path: /app/data, size: 20Gi, label: files }
-    backup:
-      volume: blobs
-secrets:
-  - { name: DB_ROOT_PASSWORD, generate: password }
-```
+**Document:** [`catalog/route96.yaml`](../catalog/route96.yaml) —
+`scripts/app-catalog-test.sh catalog/route96.yaml` starts it locally.
 
 ---
 
@@ -557,34 +513,8 @@ secrets:
   `/app/config.yml`; listens on `3000`; SQLite + blobs under `/app/data`.
   `publicDomain` is a **bare** hostname (no scheme).
 
-```yaml
-services:
-  blossom:
-    image: ghcr.io/hzrd149/blossom-server:master
-    user: "1000"    # image declares no USER, so it would run as root and be refused
-    resources: { cpu: 250m, memory: 256Mi }
-    ports:
-      - { name: http, container: 3000, protocol: http, expose: ingress }
-    files:
-      - path: /app/config.yml
-        content: |
-          port: 3000
-          host: 0.0.0.0
-          publicDomain: "${HOSTNAME}"
-          database:
-            path: /app/data/sqlite.db
-          storage:
-            backend: local
-            local:
-              dir: /app/data/blobs
-            rules:
-              - { type: "*", expiration: "1 month" }
-          upload:
-            enabled: true
-            requireAuth: true
-    volumes:
-      - { name: data, path: /app/data, size: 20Gi, label: files }
-```
+**Document:** [`catalog/blossom-server.yaml`](../catalog/blossom-server.yaml) —
+`scripts/app-catalog-test.sh catalog/blossom-server.yaml` starts it locally.
 
 ---
 
@@ -597,32 +527,8 @@ services:
   `/usr/src/app/db`. Set `network.address = "0.0.0.0"` so it's reachable in the
   pod.
 
-```yaml
-services:
-  relay:
-    image: scsibug/nostr-rs-relay:latest
-    user: "1000"    # image sets `USER appuser` (a name); uid 1000 per its /etc/passwd
-    resources: { cpu: 250m, memory: 256Mi }
-    ports:
-      - { name: ws, container: 8080, protocol: http, expose: ingress }
-    files:
-      - path: /usr/src/app/config.toml
-        content: |
-          [info]
-          relay_url = "wss://${HOSTNAME}/"
-          name = "${relay_name}"
-          description = "${relay_description}"
-          [database]
-          data_directory = "/usr/src/app/db"
-          [network]
-          address = "0.0.0.0"
-          port = 8080
-    volumes:
-      - { name: db, path: /usr/src/app/db, size: 10Gi, label: events }
-config:
-  - { name: relay_name, label: "Relay name", type: string, default: "My nostr-rs-relay" }
-  - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay" }
-```
+**Document:** [`catalog/nostr-rs-relay.yaml`](../catalog/nostr-rs-relay.yaml) —
+`scripts/app-catalog-test.sh catalog/nostr-rs-relay.yaml` starts it locally.
 
 ---
 
@@ -645,22 +551,8 @@ config:
   manager (`2222`) and audio/video via embedded LiveKit — aren't reachable
   until the `expose: tcp/udp` path exists.
 
-```yaml
-services:
-  pyramid:
-    image: ghcr.io/fiatjaf/pyramid:latest
-    user: "1000"    # image declares no USER, so it would run as root and be refused
-    resources: { cpu: 500m, memory: 512Mi }
-    ports:
-      - { name: http, container: 3334, protocol: http, expose: ingress }
-    env:
-      HOST: "0.0.0.0"
-      PORT: "3334"
-      DATA_PATH: "/app/data"
-      NO_AUTO_UPDATES: "true"
-    volumes:
-      - { name: data, path: /app/data, size: 20Gi, label: events }
-```
+**Document:** [`catalog/pyramid.yaml`](../catalog/pyramid.yaml) —
+`scripts/app-catalog-test.sh catalog/pyramid.yaml` starts it locally.
 
 ---
 
@@ -674,7 +566,7 @@ services:
   vars; listens on `RELAY_PORT` (default `3355`), `RELAY_BIND_ADDRESS` must be
   `0.0.0.0`. Databases (badger) live under `/app/db`, Blossom media under
   `/app/blossom`. It **fatally requires** the two relay-list files
-  `relays_import.json` and `relays_blastr.json` at startup (provided below via
+  `relays_import.json` and `relays_blastr.json` at startup (provided via
   `files:`); the whitelist/blacklist files are optional and disabled by setting
   their env vars to `""` (owner-only).
 - **Caveat:** current published community images do **not** bundle HAVEN's
@@ -684,77 +576,8 @@ services:
   (<https://github.com/HolgerHatGarKeineNode/haven-docker/pull/8>); once merged
   and released the dashboard works out of the box.
 
-```yaml
-services:
-  haven:
-    image: holgerhatgarkeinenode/haven-docker:v1.2.2
-    # The image sets `USER nonroot` (a name), which the kubelet cannot verify
-    # under runAsNonRoot. `nonroot` is uid 1000 in this image (Alpine
-    # `adduser -D nonroot`), and 1000 also becomes the fsGroup so the db and
-    # blossom volumes are writable.
-    user: "1000"
-    resources: { cpu: 500m, memory: 512Mi }
-    ports:
-      - { name: ws, container: 3355, protocol: http, expose: ingress }
-    env:
-      OWNER_NPUB: "${owner_npub}"
-      RELAY_URL: "${HOSTNAME}"
-      RELAY_PORT: "3355"
-      RELAY_BIND_ADDRESS: "0.0.0.0"
-      DB_ENGINE: "badger"
-      BLOSSOM_PATH: "blossom/"
-      # Every var below down to IMPORT_START_DATE is read with HAVEN's `getEnv`,
-      # which is `log.Fatalf` on unset — one at a time, so a missing one looks
-      # like an endless queue of missing ones rather than a single fault (#248).
-      PRIVATE_RELAY_NAME: "${private_relay_name}"
-      PRIVATE_RELAY_NPUB: "${owner_npub}"
-      PRIVATE_RELAY_DESCRIPTION: "${private_relay_description}"
-      PRIVATE_RELAY_ICON: ""
-      CHAT_RELAY_NAME: "Chat relay"
-      CHAT_RELAY_NPUB: "${owner_npub}"
-      CHAT_RELAY_DESCRIPTION: "Private chats for ${HOSTNAME}"
-      CHAT_RELAY_ICON: ""
-      OUTBOX_RELAY_NAME: "Outbox relay"
-      OUTBOX_RELAY_NPUB: "${owner_npub}"
-      OUTBOX_RELAY_DESCRIPTION: "Public messages and media for ${HOSTNAME}"
-      OUTBOX_RELAY_ICON: ""
-      INBOX_RELAY_NAME: "Inbox relay"
-      INBOX_RELAY_NPUB: "${owner_npub}"
-      INBOX_RELAY_DESCRIPTION: "Interactions for ${HOSTNAME}"
-      INBOX_RELAY_ICON: ""
-      # Bounds how far back the owner's history imports. Not startup-fatal if
-      # unparseable (import.go prints and returns), which is why it is a fixed
-      # default rather than an order-form field: a bad value silently imports
-      # nothing.
-      IMPORT_START_DATE: "2023-01-01"
-      IMPORT_SEED_RELAYS_FILE: "relays_import.json"
-      BLASTR_RELAYS_FILE: "relays_blastr.json"
-      WHITELISTED_NPUBS_FILE: ""
-      BLACKLISTED_NPUBS_FILE: ""
-      BACKUP_PROVIDER: "none"
-    files:
-      - path: /app/relays_import.json
-        content: |
-          ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
-      - path: /app/relays_blastr.json
-        content: |
-          ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
-    volumes:
-      - { name: db, path: /app/db, size: 10Gi, label: events }
-      - { name: blossom, path: /app/blossom, size: 20Gi, label: media }
-config:
-  # HAVEN panics in nPubToPubkey on anything that is not an npub, so a mistyped
-  # character became a paid-for deployment that crashlooped (#271). The pattern
-  # is bech32: `npub1` + 58 characters from the bech32 alphabet (no 1/b/i/o).
-  - { name: owner_npub, label: "Owner npub", type: string, required: true,
-      pattern: "npub1[02-9ac-hj-np-z]{58}" }
-  # The private relay's name and description are served as NIP-11 metadata, so
-  # they are customer-visible. The chat/outbox/inbox sets are functional relays
-  # rather than branding surfaces and stay fixed — eight more order-form fields
-  # would undo the one-click point of the catalog.
-  - { name: private_relay_name, label: "Relay name", type: string, default: "My private relay" }
-  - { name: private_relay_description, label: "Relay description", type: string, default: "A HAVEN relay" }
-```
+**Document:** [`catalog/haven.yaml`](../catalog/haven.yaml) —
+`scripts/app-catalog-test.sh catalog/haven.yaml` starts it locally.
 
 ---
 
@@ -785,7 +608,7 @@ config:
     (a linearizable conditional-write race backing git pointer CAS) and
     *exits* if it fails. RustFS answers the default 32-way race with HTTP 503;
     a 4-way single-round race passes. Hence `BUZZ_GIT_PROBE_WRITERS=4` /
-    `BUZZ_GIT_PROBE_ROUNDS=1` above — do not remove them, and do not paper
+    `BUZZ_GIT_PROBE_ROUNDS=1` in the document — do not remove them, and do not paper
     over a failure with `BUZZ_GIT_CONFORMANCE_PROBE=false` (that disables the
     gate, not the requirement).
   - Every container runs with `readOnlyRootFilesystem`, which is why `db`
@@ -800,155 +623,19 @@ config:
     this deployment — it runs wherever the customer's agent runs and connects
     over `wss://` with its own key.
 
-```yaml
-services:
-  db:
-    image: postgres:17-alpine
-    user: root    # postgres' entrypoint starts as root, then drops to `postgres`
-    resources: { cpu: 500m, memory: 1Gi }
-    # A port block is what gives the service a DNS name inside the namespace:
-    # no ports, no Service, and `db` in the relay's DATABASE_URL does not
-    # resolve (#281). `expose: none` keeps it internal.
-    ports:
-      - { name: postgres, container: 5432, protocol: tcp, expose: none }
-    env:
-      POSTGRES_DB: buzz
-      POSTGRES_USER: buzz
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
-      # initdb refuses a non-empty directory, and a fresh ext4 PVC has lost+found
-      PGDATA: /var/lib/postgresql/data/pgdata
-    volumes:
-      - { name: data, path: /var/lib/postgresql/data, size: 20Gi, label: database }
-    scratch:
-      # readOnlyRootFilesystem: the postmaster lock + unix socket need a
-      # writable dir, but not a persistent one
-      - { path: /var/run/postgresql, size: 32Mi }
-    backup:
-      command: ["sh", "-c", "exec pg_dumpall -U buzz"]
-      artifact: buzz.sql
-  redis:
-    image: redis:7-alpine
-    user: root    # redis' entrypoint starts as root, then drops to `redis`
-    resources: { cpu: 250m, memory: 512Mi }
-    ports:
-      - { name: redis, container: 6379, protocol: tcp, expose: none }
-    volumes:
-      # RDB snapshots; without a writable /data redis fails its bgsave and then
-      # refuses writes with MISCONF
-      - { name: data, path: /data, size: 2Gi }
-  s3:
-    image: rustfs/rustfs:1.0.0-beta.11
-    user: "10001"    # image sets `USER rustfs` (a name); uid 10001 per its Dockerfile
-    resources: { cpu: 500m, memory: 1Gi }
-    ports:
-      - { name: s3, container: 9000, protocol: http, expose: none }
-    env:
-      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY}
-      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY}
-      RUSTFS_VOLUMES: /data
-      RUSTFS_ADDRESS: ":9000"
-      RUSTFS_CONSOLE_ENABLE: "false"
-      # image default is RUSTFS_OBS_LOG_DIRECTORY=/logs, which is unwritable
-      # under readOnlyRootFilesystem — log to stdout instead
-      RUSTFS_OBS_LOG_DIRECTORY: ""
-      RUSTFS_OBS_USE_STDOUT: "true"
-      RUSTFS_OBS_LOGGER_LEVEL: warn
-    volumes:
-      - { name: blobs, path: /data, size: 50Gi, label: media }
-    backup:
-      volume: blobs
-  relay:
-    image: ghcr.io/block/buzz:latest
-    user: "1000"    # image sets `USER buzz:buzz` (a name); uid 1000 per its Dockerfile
-    resources: { cpu: 1, memory: 2Gi }
-    depends_on: [db, redis, s3]
-    ports:
-      - { name: http, container: 3000, protocol: http, expose: ingress }
-    # The relay never issues CreateBucket — it probes the object store at
-    # startup and dies on NoSuchBucket. This runs before the relay's own
-    # container, and the kubelet retries it while RustFS is still coming up, so
-    # the relay cannot start before the bucket exists.
-    init:
-      - name: create-media-bucket
-        image: minio/mc:latest
-        user: "65534"    # only talks to the in-namespace S3 service
-        env:
-          MC_HOST_s3: "http://${S3_ACCESS_KEY}:${S3_SECRET_KEY}@s3:9000"
-          MC_CONFIG_DIR: /tmp/mc
-        command:
-          - sh
-          - -c
-          - |
-            set -e
-            until mc --quiet ls s3 >/dev/null 2>&1; do
-              echo "waiting for http://s3:9000"
-              sleep 2
-            done
-            mc mb -p s3/buzz-media
-    env:
-      # --- identity / public URL ---
-      RELAY_URL: "wss://${HOSTNAME}"
-      # The relay validates this at startup and exits 1 on anything that does
-      # not end with /media — "invalid media config: public_base_url must end
-      # with /media" (#269). It is the public prefix it hands out for blobs,
-      # not the host it binds.
-      BUZZ_MEDIA_BASE_URL: "https://${HOSTNAME}/media"
-      BUZZ_BIND_ADDR: "0.0.0.0:3000"
-      BUZZ_RELAY_PRIVATE_KEY: "${BUZZ_RELAY_PRIVATE_KEY}"
-      RELAY_OWNER_PUBKEY: "${owner_pubkey}"
-      # --- backing services (in-namespace DNS) ---
-      DATABASE_URL: "postgres://buzz:${DB_PASSWORD}@db:5432/buzz"
-      REDIS_URL: "redis://redis:6379"
-      BUZZ_AUTO_MIGRATE: "true"
-      # --- object storage ---
-      BUZZ_S3_ENDPOINT: "http://s3:9000"
-      BUZZ_S3_BUCKET: "buzz-media"
-      BUZZ_S3_REGION: "us-east-1"
-      BUZZ_S3_ACCESS_KEY: "${S3_ACCESS_KEY}"
-      BUZZ_S3_SECRET_KEY: "${S3_SECRET_KEY}"
-      # --- access control ---
-      BUZZ_REQUIRE_AUTH_TOKEN: "true"
-      BUZZ_REQUIRE_RELAY_MEMBERSHIP: "true"
-      BUZZ_ALLOW_NIP_OA_AUTH: "true"
-      BUZZ_PUBKEY_ALLOWLIST: "false"
-      BUZZ_REQUIRE_MEDIA_GET_AUTH: "false"
-      # --- git on object storage ---
-      BUZZ_GIT_REPO_PATH: "/var/lib/buzz/git"
-      BUZZ_GIT_PACK_CACHE_PATH: "/var/cache/buzz/git-packs"
-      BUZZ_GIT_HOOK_HMAC_SECRET: "${GIT_HOOK_HMAC_SECRET}"
-      # RustFS serves 503 under the default 32-way conditional-PUT race; the A3
-      # probe is startup-fatal, so keep the race narrow (verified: 4x1 passes)
-      BUZZ_GIT_PROBE_WRITERS: "4"
-      BUZZ_GIT_PROBE_ROUNDS: "1"
-      # --- capacity / logging ---
-      BUZZ_MAX_CONNECTIONS: "2000"
-      RUST_LOG: "info"
-    volumes:
-      - { name: git, path: /var/lib/buzz/git, size: 20Gi, label: git repositories }
-      - { name: packs, path: /var/cache/buzz/git-packs, size: 5Gi }
-secrets:
-  - { name: DB_PASSWORD, generate: password }
-  - { name: S3_ACCESS_KEY, generate: token }
-  - { name: S3_SECRET_KEY, generate: password }
-  - { name: GIT_HOOK_HMAC_SECRET, generate: token }
-  # 32 bytes exactly: this is the relay's Nostr secret key, and the default 24
-  # is rejected at startup as an invalid secret key.
-  - { name: BUZZ_RELAY_PRIVATE_KEY, generate: token, bytes: 32 }
-config:
-  - { name: owner_pubkey, label: "Owner pubkey (64-char hex)", type: string, required: true,
-      pattern: "[0-9a-fA-F]{64}" }
-```
+**Document:** [`catalog/buzz.yaml`](../catalog/buzz.yaml) —
+`scripts/app-catalog-test.sh catalog/buzz.yaml` starts it locally.
 
 ### Before this one can be enabled
 
 Both compose-grammar gaps this entry was blocked on have landed: the 32-byte
-generated secret (#243, `bytes:` on a secret declaration, used above for
+generated secret (#243, `bytes:` on a secret declaration, used in the document for
 `BUZZ_RELAY_PRIVATE_KEY`) and bucket creation (#244, `init:` on the `relay`
 service). The customer no longer pastes the relay's identity key into the
 order form, and nothing in the deployment has to pre-exist.
 
 What is **not** yet done is a run of this exact compose through the operator
-against a live cluster — the composition above has never been reconciled end to
+against a live cluster — the composition has never been reconciled end to
 end with the init step in place. Do that before enabling it in the catalog:
 validation checks the document, not whether the app starts.
 

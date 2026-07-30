@@ -3188,31 +3188,26 @@ config:
         assert_eq!(stopped.spec.unwrap().replicas, Some(0));
     }
 
-    /// Extract every ```yaml fenced block from a markdown doc, tagged with the
-    /// nearest preceding `## ` heading (used to name the fixture in failures).
-    fn extract_yaml_blocks(md: &str) -> Vec<(String, String)> {
-        let mut out = Vec::new();
-        let mut heading = String::new();
-        let mut lines = md.lines();
-        while let Some(line) = lines.next() {
-            if let Some(h) = line.strip_prefix("## ") {
-                heading = h.trim().to_string();
-            } else if line.trim_start() == "```yaml" {
-                let mut body = String::new();
-                for l in lines.by_ref() {
-                    if l.trim_start() == "```" {
-                        break;
-                    }
-                    body.push_str(l);
-                    body.push('\n');
-                }
-                out.push((heading.clone(), body));
-            }
-        }
+    /// Every catalog document, named by its file stem so a failure points at
+    /// the file to fix.
+    fn catalog_documents() -> Vec<(String, String)> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../catalog");
+        let mut out: Vec<(String, String)> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("read {dir}: {e}"))
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().is_some_and(|e| e == "yaml"))
+            .map(|p| {
+                let name = p.file_stem().unwrap().to_string_lossy().into_owned();
+                let body = std::fs::read_to_string(&p)
+                    .unwrap_or_else(|e| panic!("read {}: {e}", p.display()));
+                (name, body)
+            })
+            .collect();
+        out.sort();
         out
     }
 
-    /// Every app compose published in `docs/managed-app-examples.md` must run
+    /// Every app compose in `catalog/` must run
     /// through the full compose → Kubernetes pipeline: parse, validate, compute
     /// a footprint, resolve secrets/config/files, and render each service's
     /// Deployment / Service / PVC / ConfigMap / Secret plus the shared Ingress /
@@ -3220,17 +3215,11 @@ config:
     /// invariants intact. This keeps the documented fixtures from drifting out
     /// of the grammar the operator actually implements.
     #[test]
-    fn documented_examples_map_to_k8s() {
-        let doc = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../docs/managed-app-examples.md"
-        ))
-        .expect("read docs/managed-app-examples.md");
-
-        let examples = extract_yaml_blocks(&doc);
+    fn catalog_documents_map_to_k8s() {
+        let examples = catalog_documents();
         assert!(
             examples.len() >= 6,
-            "expected at least the 6 documented app composes, found {}",
+            "expected at least the 6 catalog composes, found {}",
             examples.len()
         );
 

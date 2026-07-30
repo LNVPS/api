@@ -1,0 +1,136 @@
+services:
+  db:
+    image: postgres:17-alpine
+    user: root    # postgres' entrypoint starts as root, then drops to `postgres`
+    resources: { cpu: 500m, memory: 1Gi }
+    # A port block is what gives the service a DNS name inside the namespace:
+    # no ports, no Service, and `db` in the relay's DATABASE_URL does not
+    # resolve. `expose: none` keeps it internal.
+    ports:
+      - { name: postgres, container: 5432, protocol: tcp, expose: none }
+    env:
+      POSTGRES_DB: buzz
+      POSTGRES_USER: buzz
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      # initdb refuses a non-empty directory, and a fresh ext4 PVC has lost+found
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - { name: data, path: /var/lib/postgresql/data, size: 20Gi, label: database }
+    scratch:
+      # readOnlyRootFilesystem: the postmaster lock + unix socket need a
+      # writable dir, but not a persistent one
+      - { path: /var/run/postgresql, size: 32Mi }
+    backup:
+      command: ["sh", "-c", "exec pg_dumpall -U buzz"]
+      artifact: buzz.sql
+  redis:
+    image: redis:7-alpine
+    user: root    # redis' entrypoint starts as root, then drops to `redis`
+    resources: { cpu: 250m, memory: 512Mi }
+    ports:
+      - { name: redis, container: 6379, protocol: tcp, expose: none }
+    volumes:
+      # RDB snapshots; without a writable /data redis fails its bgsave and then
+      # refuses writes with MISCONF
+      - { name: data, path: /data, size: 2Gi }
+  s3:
+    image: rustfs/rustfs:1.0.0-beta.11
+    user: "10001"    # image sets `USER rustfs` (a name); uid 10001 per its Dockerfile
+    resources: { cpu: 500m, memory: 1Gi }
+    ports:
+      - { name: s3, container: 9000, protocol: http, expose: none }
+    env:
+      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY}
+      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY}
+      RUSTFS_VOLUMES: /data
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ENABLE: "false"
+      # image default is RUSTFS_OBS_LOG_DIRECTORY=/logs, which is unwritable
+      # under readOnlyRootFilesystem — log to stdout instead
+      RUSTFS_OBS_LOG_DIRECTORY: ""
+      RUSTFS_OBS_USE_STDOUT: "true"
+      RUSTFS_OBS_LOGGER_LEVEL: warn
+    volumes:
+      - { name: blobs, path: /data, size: 50Gi, label: media }
+    backup:
+      volume: blobs
+  relay:
+    image: ghcr.io/block/buzz:latest
+    user: "1000"    # image sets `USER buzz:buzz` (a name); uid 1000 per its Dockerfile
+    resources: { cpu: 1, memory: 2Gi }
+    depends_on: [db, redis, s3]
+    ports:
+      - { name: http, container: 3000, protocol: http, expose: ingress }
+    # The relay never issues CreateBucket — it probes the object store at
+    # startup and dies on NoSuchBucket. This runs before the relay's own
+    # container, and the kubelet retries it while RustFS is still coming up, so
+    # the relay cannot start before the bucket exists.
+    init:
+      - name: create-media-bucket
+        image: minio/mc:latest
+        user: "65534"    # only talks to the in-namespace S3 service
+        env:
+          MC_HOST_s3: "http://${S3_ACCESS_KEY}:${S3_SECRET_KEY}@s3:9000"
+          MC_CONFIG_DIR: /tmp/mc
+        command:
+          - sh
+          - -c
+          - |
+            set -e
+            until mc --quiet ls s3 >/dev/null 2>&1; do
+              echo "waiting for http://s3:9000"
+              sleep 2
+            done
+            mc mb -p s3/buzz-media
+    env:
+      # --- identity / public URL ---
+      RELAY_URL: "wss://${HOSTNAME}"
+      # The relay validates this at startup and exits 1 on anything that does
+      # not end with /media — "invalid media config: public_base_url must end
+      # with /media". It is the public prefix it hands out for blobs,
+      # not the host it binds.
+      BUZZ_MEDIA_BASE_URL: "https://${HOSTNAME}/media"
+      BUZZ_BIND_ADDR: "0.0.0.0:3000"
+      BUZZ_RELAY_PRIVATE_KEY: "${BUZZ_RELAY_PRIVATE_KEY}"
+      RELAY_OWNER_PUBKEY: "${owner_pubkey}"
+      # --- backing services (in-namespace DNS) ---
+      DATABASE_URL: "postgres://buzz:${DB_PASSWORD}@db:5432/buzz"
+      REDIS_URL: "redis://redis:6379"
+      BUZZ_AUTO_MIGRATE: "true"
+      # --- object storage ---
+      BUZZ_S3_ENDPOINT: "http://s3:9000"
+      BUZZ_S3_BUCKET: "buzz-media"
+      BUZZ_S3_REGION: "us-east-1"
+      BUZZ_S3_ACCESS_KEY: "${S3_ACCESS_KEY}"
+      BUZZ_S3_SECRET_KEY: "${S3_SECRET_KEY}"
+      # --- access control ---
+      BUZZ_REQUIRE_AUTH_TOKEN: "true"
+      BUZZ_REQUIRE_RELAY_MEMBERSHIP: "true"
+      BUZZ_ALLOW_NIP_OA_AUTH: "true"
+      BUZZ_PUBKEY_ALLOWLIST: "false"
+      BUZZ_REQUIRE_MEDIA_GET_AUTH: "false"
+      # --- git on object storage ---
+      BUZZ_GIT_REPO_PATH: "/var/lib/buzz/git"
+      BUZZ_GIT_PACK_CACHE_PATH: "/var/cache/buzz/git-packs"
+      BUZZ_GIT_HOOK_HMAC_SECRET: "${GIT_HOOK_HMAC_SECRET}"
+      # RustFS serves 503 under the default 32-way conditional-PUT race; the A3
+      # probe is startup-fatal, so keep the race narrow (verified: 4x1 passes)
+      BUZZ_GIT_PROBE_WRITERS: "4"
+      BUZZ_GIT_PROBE_ROUNDS: "1"
+      # --- capacity / logging ---
+      BUZZ_MAX_CONNECTIONS: "2000"
+      RUST_LOG: "info"
+    volumes:
+      - { name: git, path: /var/lib/buzz/git, size: 20Gi, label: git repositories }
+      - { name: packs, path: /var/cache/buzz/git-packs, size: 5Gi }
+secrets:
+  - { name: DB_PASSWORD, generate: password }
+  - { name: S3_ACCESS_KEY, generate: token }
+  - { name: S3_SECRET_KEY, generate: password }
+  - { name: GIT_HOOK_HMAC_SECRET, generate: token }
+  # 32 bytes exactly: this is the relay's Nostr secret key, and the default 24
+  # is rejected at startup as an invalid secret key.
+  - { name: BUZZ_RELAY_PRIVATE_KEY, generate: token, bytes: 32 }
+config:
+  - { name: owner_pubkey, label: "Owner pubkey (64-char hex)", type: string, required: true,
+      pattern: "[0-9a-fA-F]{64}" }

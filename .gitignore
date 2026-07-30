@@ -29,3 +29,6 @@ lnvps_nostr/Cargo.lock
 
 # Docker bind mounts for the e2e stack (includes a generated test ssh key)
 /volumes/
+
+# Local catalog test renders
+/.local/

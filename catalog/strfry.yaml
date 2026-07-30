@@ -1,0 +1,24 @@
+services:
+  strfry:
+    image: dockurr/strfry:latest
+    user: "1000"    # image declares no USER, so it would run as root and be refused
+    resources: { cpu: 500m, memory: 512Mi }
+    ports:
+      - { name: ws, container: 7777, protocol: http, expose: ingress }
+    files:
+      - path: /etc/strfry.conf
+        content: |
+          db = "/app/strfry-db/"
+          relay {
+              bind = "0.0.0.0"
+              port = 7777
+              info {
+                  name = "${relay_name}"
+                  description = "${relay_description}"
+              }
+          }
+    volumes:
+      - { name: db, path: /app/strfry-db, size: 5Gi, label: events }
+config:
+  - { name: relay_name, label: "Relay name", type: string, default: "My strfry relay" }
+  - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay" }
