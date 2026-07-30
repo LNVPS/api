@@ -13,7 +13,9 @@
 use crate::fee_estimate::FeeEstimator;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::Utc;
-use lnvps_api_common::{ExchangeRateService, Ticker, TickerRate, WorkCommander, WorkJob};
+use lnvps_api_common::{
+    ExchangeRateService, KeyValueStore, Ticker, TickerRate, WorkCommander, WorkJob,
+};
 use lnvps_db::{LNVpsDb, Referral, ReferralPayout, ReferralPayoutMode};
 use log::{debug, info, warn};
 use payments_rs::currency::{Currency, CurrencyAmount};
@@ -57,6 +59,31 @@ fn payable_referral_msat(earned_msat: u64, existing_msat: u64, min_msat: u64) ->
 /// human to look at rather than sent.
 const MAX_CONVERTED_PAYOUT_MSAT: u64 = 1_000_000_000;
 
+/// A converted payout refused because the quote values it above
+/// [`MAX_CONVERTED_PAYOUT_MSAT`].
+///
+/// Typed rather than a bare message so a caller can tell "the rate is not to be
+/// trusted" apart from every other reason a payout did not happen, and tell an
+/// operator about it once.
+#[derive(Debug)]
+struct RefusedOverCeiling {
+    currency: String,
+    owed: u64,
+    pay_msat: u64,
+}
+
+impl std::fmt::Display for RefusedOverCeiling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "converted payout of {} msat for {} {} exceeds the {} msat ceiling; check the rate",
+            self.pay_msat, self.owed, self.currency, MAX_CONVERTED_PAYOUT_MSAT
+        )
+    }
+}
+
+impl std::error::Error for RefusedOverCeiling {}
+
 /// Build the payout row for a fiat-settled balance paid as sats, or `None` when
 /// the converted balance is below the threshold. Errors when it is above the
 /// per-payout ceiling.
@@ -80,13 +107,12 @@ fn converted_payout(
         return Ok(None);
     };
     if pay_msat > MAX_CONVERTED_PAYOUT_MSAT {
-        bail!(
-            "converted payout of {} msat for {} {} exceeds the {} msat ceiling; check the rate",
-            pay_msat,
+        return Err(RefusedOverCeiling {
+            currency: currency.to_uppercase(),
             owed,
-            currency,
-            MAX_CONVERTED_PAYOUT_MSAT
-        );
+            pay_msat,
+        }
+        .into());
     }
     let settled_amount = rate.convert(CurrencyAmount::millisats(pay_msat))?.value();
     if settled_amount == 0 {
@@ -216,6 +242,9 @@ pub struct ReferralPayoutHandler {
     /// an automated converted payout is attempted. `None` disables automated
     /// fiat payouts; the balance still accrues for manual payout.
     min_fiat_payout_msat: Option<u64>,
+    /// Remembers which balances are currently refused over the ceiling, so an
+    /// operator hears about a refusal once instead of on every pass.
+    kv: Arc<dyn KeyValueStore>,
 }
 
 impl ReferralPayoutHandler {
@@ -235,6 +264,7 @@ impl ReferralPayoutHandler {
         fee_estimator: Arc<dyn FeeEstimator>,
         exchange: Arc<dyn ExchangeRateService>,
         min_fiat_payout_sats: Option<u64>,
+        kv: Arc<dyn KeyValueStore>,
     ) -> Self {
         Self {
             db,
@@ -247,7 +277,84 @@ impl ReferralPayoutHandler {
             fee_estimator,
             exchange,
             min_fiat_payout_msat: min_fiat_payout_sats.map(|s| s.saturating_mul(1000)),
+            kv,
         }
+    }
+
+    /// Key holding whether one referrer's balance in `currency` is currently
+    /// refused over the ceiling.
+    fn refusal_key(referral_id: u64, currency: &str) -> String {
+        format!(
+            "referral:payout-refused:{}:{}",
+            referral_id,
+            currency.to_uppercase()
+        )
+    }
+
+    /// Tell admins a payout was refused, but only on the transition into the
+    /// refused state: the balance is re-evaluated every pass, so notifying on
+    /// the state itself would notify forever.
+    async fn note_refusal(&self, referral: &Referral, refusal: &RefusedOverCeiling) {
+        let key = Self::refusal_key(referral.id, &refusal.currency);
+        match self.kv.get(&key).await {
+            Ok(Some(v)) if v == b"1" => return,
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    "Failed to read refusal state for code {}: {}",
+                    referral.code, e
+                );
+                return;
+            }
+        }
+        let _ = self
+            .tx
+            .send(WorkJob::SendAdminNotification {
+                title: Some("Referral payout refused".to_string()),
+                message: format!(
+                    "A referral payout for code {} was refused: {}.\n\
+                     Either the {} rate is wrong, or the referrer is legitimately owed \
+                     more than the ceiling and needs paying by hand. The balance keeps \
+                     accruing and nothing left the wallet.",
+                    referral.code, refusal, refusal.currency
+                ),
+            })
+            .await;
+        if let Err(e) = self.kv.store(&key, b"1").await {
+            warn!(
+                "Failed to record refusal state for code {}: {}",
+                referral.code, e
+            );
+        }
+    }
+
+    /// Forget a refusal once the balance pays, so a later one is reported again.
+    async fn clear_refusal(&self, referral_id: u64, currency: &str) {
+        let key = Self::refusal_key(referral_id, currency);
+        if let Ok(Some(v)) = self.kv.get(&key).await
+            && v == b"1"
+            && let Err(e) = self.kv.store(&key, b"0").await
+        {
+            warn!(
+                "Failed to clear refusal state for referral {}: {}",
+                referral_id, e
+            );
+        }
+    }
+
+    /// Pass a `converted_payout` result through, telling admins when it was
+    /// refused over the ceiling.
+    async fn checked_conversion(
+        &self,
+        referral: &Referral,
+        result: Result<Option<ReferralPayout>>,
+    ) -> Result<Option<ReferralPayout>> {
+        if let Err(e) = &result
+            && let Some(refusal) = e.downcast_ref::<RefusedOverCeiling>()
+        {
+            self.note_refusal(referral, refusal).await;
+        }
+        result
     }
 
     /// Process automated payouts for every enrolled referrer. Per-referrer
@@ -486,13 +593,19 @@ impl ReferralPayoutHandler {
             // on-chain one is sized for mempool fees, the fiat one is what an
             // operator set for converted payouts.
             let min_msat = min_onchain_msat.max(self.min_fiat_payout_msat.unwrap_or(0));
-            match converted_payout(
-                &referral,
-                &currency,
-                owed,
-                rate,
-                effective_min_msat(&referral, min_msat),
-            ) {
+            let converted = self
+                .checked_conversion(
+                    &referral,
+                    converted_payout(
+                        &referral,
+                        &currency,
+                        owed,
+                        rate,
+                        effective_min_msat(&referral, min_msat),
+                    ),
+                )
+                .await;
+            match converted {
                 Ok(Some(payout)) => rows.push(BatchRow {
                     referral,
                     address,
@@ -586,6 +699,10 @@ impl ReferralPayoutHandler {
                             "Broadcast payout {} but failed to mark it paid: {}",
                             row.payout.id, e
                         );
+                    }
+                    if row.rate.is_some() {
+                        self.clear_refusal(row.referral.id, &row.payout.currency)
+                            .await;
                     }
                     let _ = self
                         .tx
@@ -805,13 +922,18 @@ impl ReferralPayoutHandler {
     ) -> Result<()> {
         let rate = self.quote(currency).await?;
 
-        let Some(mut payout) = converted_payout(
-            referral,
-            currency,
-            owed,
-            rate,
-            effective_min_msat(referral, min_fiat_msat),
-        )?
+        let Some(mut payout) = self
+            .checked_conversion(
+                referral,
+                converted_payout(
+                    referral,
+                    currency,
+                    owed,
+                    rate,
+                    effective_min_msat(referral, min_fiat_msat),
+                ),
+            )
+            .await?
         else {
             return Ok(());
         };
@@ -836,6 +958,7 @@ impl ReferralPayoutHandler {
                     "Paid referral commission {} {} as {} msat (fee {} msat) to code {} (payout {})",
                     settled_amount, currency, pay_msat, fee_msat, referral.code, payout_id
                 );
+                self.clear_refusal(referral.id, currency).await;
                 let _ = self
                     .tx
                     .send(WorkJob::SendNotification {
@@ -972,7 +1095,7 @@ impl ReferralPayoutHandler {
 mod tests {
     use super::*;
     use crate::mocks::MockOnChainProvider;
-    use lnvps_api_common::{ChannelWorkCommander, MockDb};
+    use lnvps_api_common::{ChannelWorkCommander, InMemoryKeyValueStore, MockDb};
     use lnvps_db::Referral;
 
     /// A deterministic, checksum-valid regtest P2WPKH address for tests.
@@ -1014,6 +1137,7 @@ mod tests {
             Arc::new(crate::fee_estimate::FixedFeeEstimator(feerate)),
             Arc::new(lnvps_api_common::MockExchangeRate::default()),
             None,
+            Arc::new(InMemoryKeyValueStore::new()),
         )
     }
 
@@ -1273,10 +1397,26 @@ mod tests {
         db: Arc<dyn LNVpsDb>,
         exchange: Arc<dyn ExchangeRateService>,
     ) -> ReferralPayoutHandler {
+        fiat_handler_with(
+            db,
+            exchange,
+            Arc::new(ChannelWorkCommander::new()),
+            Arc::new(InMemoryKeyValueStore::new()),
+        )
+    }
+
+    /// A Lightning fiat handler whose work queue and refusal state the test
+    /// can inspect.
+    fn fiat_handler_with(
+        db: Arc<dyn LNVpsDb>,
+        exchange: Arc<dyn ExchangeRateService>,
+        tx: Arc<ChannelWorkCommander>,
+        kv: Arc<dyn KeyValueStore>,
+    ) -> ReferralPayoutHandler {
         ReferralPayoutHandler::new(
             db,
             Arc::new(crate::mocks::MockNode::default()),
-            Arc::new(ChannelWorkCommander::new()),
+            tx,
             None,
             None,
             None,
@@ -1284,6 +1424,7 @@ mod tests {
             Arc::new(crate::fee_estimate::FixedFeeEstimator(10)),
             exchange,
             Some(1),
+            kv,
         )
     }
 
@@ -1346,6 +1487,104 @@ mod tests {
         );
     }
 
+    /// A refusal over the ceiling reaches an operator once, not once a pass:
+    /// the balance is re-evaluated on every run, so notifying on the state
+    /// rather than the transition into it would notify forever.
+    #[tokio::test]
+    async fn a_refused_payout_notifies_admins_once() {
+        let db = Arc::new(MockDb::default());
+        let referral = fiat_referrer(
+            &db,
+            "EUR",
+            10_000,
+            Referral {
+                mode: ReferralPayoutMode::LightningAddress,
+                address: Some("payouts@example.invalid".to_string()),
+                ..referrer(0, "FIAT")
+            },
+        )
+        .await;
+        // €10 owed at 100 EUR/BTC is 0.1 BTC — ten times the ceiling, which is
+        // what a broken rate feed looks like.
+        let exchange = eur_exchange(100.0).await;
+        let db: Arc<dyn LNVpsDb> = db;
+        let tx = Arc::new(ChannelWorkCommander::new());
+        let kv: Arc<dyn KeyValueStore> = Arc::new(InMemoryKeyValueStore::new());
+        let h = fiat_handler_with(db.clone(), exchange, tx.clone(), kv.clone());
+
+        h.process_fiat(&referral, 1_000).await.unwrap();
+
+        let jobs = tx.recv().await.unwrap();
+        assert_eq!(jobs.len(), 1, "one job: {:?}", jobs);
+        let WorkJob::SendAdminNotification { message, title } = &jobs[0].job else {
+            panic!("expected an admin notification, got {:?}", jobs[0].job);
+        };
+        assert_eq!(title.as_deref(), Some("Referral payout refused"));
+        assert!(
+            message.contains(&referral.code),
+            "names the code: {message}"
+        );
+        assert!(message.contains("ceiling"), "{message}");
+        assert!(
+            db.list_referral_payouts(referral.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a refused payout reserves nothing"
+        );
+
+        // Same balance, same refusal: the operator has already been told.
+        h.process_fiat(&referral, 1_000).await.unwrap();
+        // `recv` waits for a job rather than reporting an empty queue, so the
+        // absence of a second notification can only be observed as a timeout.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), tx.recv())
+                .await
+                .is_err(),
+            "a standing refusal must not notify every pass"
+        );
+    }
+
+    /// Once the balance pays, the refusal is forgotten, so the next one is
+    /// reported instead of being swallowed as a repeat.
+    #[tokio::test]
+    async fn a_paid_balance_clears_the_refusal() {
+        let db = Arc::new(MockDb::default());
+        let referral = fiat_referrer(
+            &db,
+            "EUR",
+            10_000,
+            Referral {
+                mode: ReferralPayoutMode::LightningAddress,
+                address: Some("payouts@example.invalid".to_string()),
+                ..referrer(0, "FIAT")
+            },
+        )
+        .await;
+        let db: Arc<dyn LNVpsDb> = db;
+        let kv: Arc<dyn KeyValueStore> = Arc::new(InMemoryKeyValueStore::new());
+        let key = ReferralPayoutHandler::refusal_key(referral.id, "EUR");
+        kv.store(&key, b"1").await.unwrap();
+
+        let tx = Arc::new(ChannelWorkCommander::new());
+        let h = fiat_handler_with(
+            db.clone(),
+            eur_exchange(100.0).await,
+            tx.clone(),
+            kv.clone(),
+        );
+        h.clear_refusal(referral.id, "EUR").await;
+
+        h.process_fiat(&referral, 1_000).await.unwrap();
+        let jobs = tx.recv().await.unwrap();
+        assert_eq!(
+            jobs.len(),
+            1,
+            "a refusal after the state was cleared is reported again: {:?}",
+            jobs
+        );
+    }
+
     /// A row paying `pay_msat` to `address` against the BTC balance.
     fn btc_row(referral: Referral, address: &str, pay_msat: u64) -> BatchRow {
         BatchRow {
@@ -1382,6 +1621,7 @@ mod tests {
             Arc::new(crate::fee_estimate::FixedFeeEstimator(10)),
             exchange,
             Some(min_fiat_sats),
+            Arc::new(InMemoryKeyValueStore::new()),
         )
     }
 

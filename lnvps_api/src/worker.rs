@@ -211,6 +211,12 @@ impl Worker {
         let settings = settings.into();
         let fee_estimator =
             crate::fee_estimate::build_fee_estimator(&settings.referral_fee_estimator);
+        let kv: Arc<dyn KeyValueStore> = if let Some(c) = &settings.redis {
+            Arc::new(RedisKeyValueStore::new(&c.url).await?)
+        } else {
+            Arc::new(InMemoryKeyValueStore::new())
+        };
+
         let referral_payouts = crate::referral::ReferralPayoutHandler::new(
             db.clone(),
             node.clone(),
@@ -222,6 +228,7 @@ impl Worker {
             fee_estimator,
             subscription_handler.pricing_engine().rates(),
             settings.referral_min_fiat_payout_sats,
+            kv.clone(),
         );
 
         let refunds = crate::refund::VmRefundHandler::new(
@@ -229,12 +236,6 @@ impl Worker {
             node,
             subscription_handler.pricing_engine(),
         );
-
-        let kv: Arc<dyn KeyValueStore> = if let Some(c) = &settings.redis {
-            Arc::new(RedisKeyValueStore::new(&c.url).await?)
-        } else {
-            Arc::new(InMemoryKeyValueStore::new())
-        };
 
         let feedback: Arc<dyn WorkFeedback> = if let Some(c) = &settings.redis {
             Arc::new(RedisWorkFeedback::new(&c.url).await?)
