@@ -363,7 +363,6 @@ impl ProxmoxClient {
         };
 
         let snippet_filename = "lnvps-vendor.yaml";
-        let snippet_content = "#cloud-config\nssh_deletekeys: false\n";
 
         // Snippet storage path depends on the storage type; for the default
         // `local` storage this is `/var/lib/vz/snippets/`.  For other directory-
@@ -376,6 +375,11 @@ impl ProxmoxClient {
         ssh.connect((host.clone(), 22), &ssh_user, &ssh_key)
             .await
             .map_err(OpError::Transient)?;
+
+        // Force a fixed set of public resolvers into every guest's
+        // /etc/resolv.conf via cloud-init. Without this, minimal images
+        // (Alpine, NixOS) silently drop the DNS servers Proxmox provides.
+        let snippet_content = build_vendor_snippet(GUEST_DNS_SERVERS);
 
         let vol_ref = format!("{storage_name}:snippets/{snippet_filename}");
 
@@ -2229,6 +2233,66 @@ fn parse_storage_from_disk(disk: &str) -> Option<String> {
     }
 }
 
+/// DNS resolvers forced into every guest's `/etc/resolv.conf` via the cloud-init
+/// vendor snippet (see [`build_vendor_snippet`]).
+const GUEST_DNS_SERVERS: &[&str] = &[
+    "1.1.1.1",
+    "8.8.8.8",
+    "9.9.9.9",
+    // IPv6 variants of the same providers (Cloudflare, Google, Quad9).
+    "2606:4700:4700::1111",
+    "2001:4860:4860::8888",
+    "2620:fe::fe",
+];
+
+/// Structured `#cloud-config` vendor-data document written to the host snippet
+/// and referenced by every VM's `cicustom` (see [`build_vendor_snippet`]).
+#[derive(Debug, Serialize)]
+struct CloudInitVendorData {
+    /// Keep SSH host keys across cloud-init reconfiguration so users don't hit
+    /// host-key-changed warnings on IP/key updates.
+    ssh_deletekeys: bool,
+    /// Force cloud-init to write `/etc/resolv.conf` directly. Only emitted when
+    /// there are nameservers to set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manage_resolv_conf: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolv_conf: Option<CloudInitResolvConf>,
+}
+
+#[derive(Debug, Serialize)]
+struct CloudInitResolvConf {
+    nameservers: Vec<String>,
+}
+
+/// Build the cloud-init vendor-data snippet applied to every VM on the host.
+///
+/// Always disables SSH host-key regeneration (`ssh_deletekeys: false`). When
+/// `nameservers` is non-empty it also forces cloud-init to write
+/// `/etc/resolv.conf` directly (`manage_resolv_conf: true`), which is required
+/// for minimal images (e.g. Alpine, NixOS) whose native network renderer does
+/// not apply the DNS servers Proxmox hands them (Alpine's busybox ifupdown
+/// needs `openresolv`, which the stock cloud image lacks).
+///
+/// Serialised to YAML from a typed struct via `serde_yml`, prefixed with the
+/// `#cloud-config` header line, so the on-disk snippet is real cloud-config
+/// YAML without any fragile hand-built indentation/escaping.
+fn build_vendor_snippet(nameservers: &[&str]) -> String {
+    let has_dns = !nameservers.is_empty();
+    let data = CloudInitVendorData {
+        ssh_deletekeys: false,
+        manage_resolv_conf: has_dns.then_some(true),
+        resolv_conf: has_dns.then(|| CloudInitResolvConf {
+            nameservers: nameservers.iter().map(|s| s.to_string()).collect(),
+        }),
+    };
+    format!(
+        "#cloud-config\n{}",
+        // This struct is always serialisable, so this cannot fail.
+        serde_yml::to_string(&data).expect("serialize cloud-init vendor data")
+    )
+}
+
 impl From<ProxmoxVmId> for i32 {
     fn from(val: ProxmoxVmId) -> Self {
         val.0 as i32 + 100
@@ -2839,6 +2903,37 @@ mod tests {
     use lnvps_db::IpRange;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn test_build_vendor_snippet() {
+        // Every snippet must carry the cloud-config header and parse as YAML.
+        let header = "#cloud-config\n";
+
+        // No nameservers -> ssh_deletekeys only, no resolv_conf keys.
+        let empty = build_vendor_snippet(&[]);
+        assert!(empty.starts_with(header));
+        assert!(!empty.contains("manage_resolv_conf"));
+        assert!(!empty.contains("resolv_conf"));
+        let v: serde_yml::Value = serde_yml::from_str(&empty).unwrap();
+        assert_eq!(v["ssh_deletekeys"], serde_yml::Value::Bool(false));
+
+        // With nameservers (incl. IPv6) -> manage_resolv_conf + resolv_conf set.
+        let s = build_vendor_snippet(&["1.1.1.1", "2606:4700:4700::1111"]);
+        assert!(s.starts_with(header));
+        let v: serde_yml::Value = serde_yml::from_str(&s).unwrap();
+        assert_eq!(v["ssh_deletekeys"], serde_yml::Value::Bool(false));
+        assert_eq!(v["manage_resolv_conf"], serde_yml::Value::Bool(true));
+        assert_eq!(v["resolv_conf"]["nameservers"][0], "1.1.1.1");
+        assert_eq!(v["resolv_conf"]["nameservers"][1], "2606:4700:4700::1111");
+
+        // The production constant covers both IPv4 and IPv6 resolvers, and the
+        // body must be valid cloud-config YAML.
+        let prod = build_vendor_snippet(GUEST_DNS_SERVERS);
+        let v: serde_yml::Value = serde_yml::from_str(&prod).unwrap();
+        let ns = v["resolv_conf"]["nameservers"].as_sequence().unwrap();
+        assert!(ns.iter().any(|n| n.as_str() == Some("8.8.8.8")));
+        assert!(ns.iter().any(|n| n.as_str() == Some("2620:fe::fe")));
+    }
 
     #[test]
     fn test_image_source_checksum_path() {
