@@ -1,0 +1,14 @@
+services:
+  pyramid:
+    image: ghcr.io/fiatjaf/pyramid:latest
+    user: "1000"    # image declares no USER, so it would run as root and be refused
+    resources: { cpu: 500m, memory: 512Mi }
+    ports:
+      - { name: http, container: 3334, protocol: http, expose: ingress }
+    env:
+      HOST: "0.0.0.0"
+      PORT: "3334"
+      DATA_PATH: "/app/data"
+      NO_AUTO_UPDATES: "true"
+    volumes:
+      - { name: data, path: /app/data, size: 20Gi, label: events }

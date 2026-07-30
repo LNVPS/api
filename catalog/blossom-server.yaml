@@ -1,0 +1,26 @@
+services:
+  blossom:
+    image: ghcr.io/hzrd149/blossom-server:master
+    user: "1000"    # image declares no USER, so it would run as root and be refused
+    resources: { cpu: 250m, memory: 256Mi }
+    ports:
+      - { name: http, container: 3000, protocol: http, expose: ingress }
+    files:
+      - path: /app/config.yml
+        content: |
+          port: 3000
+          host: 0.0.0.0
+          publicDomain: "${HOSTNAME}"
+          database:
+            path: /app/data/sqlite.db
+          storage:
+            backend: local
+            local:
+              dir: /app/data/blobs
+            rules:
+              - { type: "*", expiration: "1 month" }
+          upload:
+            enabled: true
+            requireAuth: true
+    volumes:
+      - { name: data, path: /app/data, size: 20Gi, label: files }

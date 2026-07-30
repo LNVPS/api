@@ -1,0 +1,69 @@
+services:
+  haven:
+    image: holgerhatgarkeinenode/haven-docker:v1.2.2
+    # The image sets `USER nonroot` (a name), which the kubelet cannot verify
+    # under runAsNonRoot. `nonroot` is uid 1000 in this image (Alpine
+    # `adduser -D nonroot`), and 1000 also becomes the fsGroup so the db and
+    # blossom volumes are writable.
+    user: "1000"
+    resources: { cpu: 500m, memory: 512Mi }
+    ports:
+      - { name: ws, container: 3355, protocol: http, expose: ingress }
+    env:
+      OWNER_NPUB: "${owner_npub}"
+      RELAY_URL: "${HOSTNAME}"
+      RELAY_PORT: "3355"
+      RELAY_BIND_ADDRESS: "0.0.0.0"
+      DB_ENGINE: "badger"
+      BLOSSOM_PATH: "blossom/"
+      # Every var below down to IMPORT_START_DATE is read with HAVEN's `getEnv`,
+      # which is `log.Fatalf` on unset — one at a time, so a missing one looks
+      # like an endless queue of missing ones rather than a single fault.
+      PRIVATE_RELAY_NAME: "${private_relay_name}"
+      PRIVATE_RELAY_NPUB: "${owner_npub}"
+      PRIVATE_RELAY_DESCRIPTION: "${private_relay_description}"
+      PRIVATE_RELAY_ICON: ""
+      CHAT_RELAY_NAME: "Chat relay"
+      CHAT_RELAY_NPUB: "${owner_npub}"
+      CHAT_RELAY_DESCRIPTION: "Private chats for ${HOSTNAME}"
+      CHAT_RELAY_ICON: ""
+      OUTBOX_RELAY_NAME: "Outbox relay"
+      OUTBOX_RELAY_NPUB: "${owner_npub}"
+      OUTBOX_RELAY_DESCRIPTION: "Public messages and media for ${HOSTNAME}"
+      OUTBOX_RELAY_ICON: ""
+      INBOX_RELAY_NAME: "Inbox relay"
+      INBOX_RELAY_NPUB: "${owner_npub}"
+      INBOX_RELAY_DESCRIPTION: "Interactions for ${HOSTNAME}"
+      INBOX_RELAY_ICON: ""
+      # Bounds how far back the owner's history imports. Not startup-fatal if
+      # unparseable (import.go prints and returns), which is why it is a fixed
+      # default rather than an order-form field: a bad value silently imports
+      # nothing.
+      IMPORT_START_DATE: "2023-01-01"
+      IMPORT_SEED_RELAYS_FILE: "relays_import.json"
+      BLASTR_RELAYS_FILE: "relays_blastr.json"
+      WHITELISTED_NPUBS_FILE: ""
+      BLACKLISTED_NPUBS_FILE: ""
+      BACKUP_PROVIDER: "none"
+    files:
+      - path: /app/relays_import.json
+        content: |
+          ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
+      - path: /app/relays_blastr.json
+        content: |
+          ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
+    volumes:
+      - { name: db, path: /app/db, size: 10Gi, label: events }
+      - { name: blossom, path: /app/blossom, size: 20Gi, label: media }
+config:
+  # HAVEN panics in nPubToPubkey on anything that is not an npub, so a mistyped
+  # character is a paid-for deployment that crashloops. The pattern
+  # is bech32: `npub1` + 58 characters from the bech32 alphabet (no 1/b/i/o).
+  - { name: owner_npub, label: "Owner npub", type: string, required: true,
+      pattern: "npub1[02-9ac-hj-np-z]{58}" }
+  # The private relay's name and description are served as NIP-11 metadata, so
+  # they are customer-visible. The chat/outbox/inbox sets are functional relays
+  # rather than branding surfaces and stay fixed — eight more order-form fields
+  # would undo the one-click point of the catalog.
+  - { name: private_relay_name, label: "Relay name", type: string, default: "My private relay" }
+  - { name: private_relay_description, label: "Relay description", type: string, default: "A HAVEN relay" }

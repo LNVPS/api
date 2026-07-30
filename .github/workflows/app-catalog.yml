@@ -1,0 +1,89 @@
+name: App Catalog
+
+# Start every catalog app under the hardening the operator applies. Validation
+# checks the document; only a container that runs proves the image can start.
+on:
+  pull_request:
+    paths:
+      - catalog/**
+      - lnvps_compose/**
+      - scripts/app-catalog-test.sh
+      - .github/workflows/app-catalog.yml
+  workflow_dispatch:
+  # Most entries pin a mutable tag, so a green catalog goes stale on its own.
+  schedule:
+    - cron: "0 4 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      apps: ${{ steps.discover.outputs.apps }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: app-catalog-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            app-catalog-${{ runner.os }}-cargo-
+
+      - name: Build compose-to-docker
+        run: cargo build --release -p lnvps_compose --bin compose-to-docker
+
+      - name: Validate every catalog document
+        run: cargo run -q --release -p lnvps_compose --bin compose-validate -- catalog/*.yaml
+
+      # The matrix comes from the directory, so adding a .yaml is enough to get
+      # it tested — a hand-kept list would let a new app ship untested.
+      - name: Discover catalog apps
+        id: discover
+        run: |
+          apps=$(ls catalog/*.yaml | xargs -n1 basename | sed 's/\.yaml$//' | jq -R . | jq -sc .)
+          [ "$apps" != "[]" ] || { echo "no catalog documents found"; exit 1; }
+          echo "apps=$apps" >> "$GITHUB_OUTPUT"
+          echo "$apps"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compose-to-docker
+          path: target/release/compose-to-docker
+          retention-days: 1
+
+  app:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      # One app's image being broken says nothing about the others, so let them
+      # all report.
+      fail-fast: false
+      matrix:
+        app: ${{ fromJson(needs.build.outputs.apps) }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: compose-to-docker
+          path: .bin
+
+      - name: Start ${{ matrix.app }}
+        run: |
+          chmod +x .bin/compose-to-docker
+          ./scripts/app-catalog-test.sh "catalog/${{ matrix.app }}.yaml" --bin .bin/compose-to-docker

@@ -1,0 +1,43 @@
+services:
+  db:
+    image: mariadb:11
+    user: root    # mariadb's entrypoint starts as root, then drops to `mysql`
+    resources: { cpu: 500m, memory: 512Mi }
+    # No ports, no Service, no DNS name — `db:3306` in route96's config would
+    # not resolve. `expose: none` keeps it in-namespace.
+    ports:
+      - { name: mysql, container: 3306, protocol: tcp, expose: none }
+    env:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}
+      MARIADB_DATABASE: route96
+    volumes:
+      - { name: data, path: /var/lib/mysql, size: 5Gi, label: database }
+    scratch:
+      # readOnlyRootFilesystem: InnoDB's temporary files, and the pid file +
+      # unix socket mariadbd writes before it accepts a connection
+      - { path: /tmp }
+      - { path: /run/mysqld, size: 32Mi }
+    backup:
+      command: ["sh", "-c", "exec mariadb-dump --all-databases -uroot -p\"$MARIADB_ROOT_PASSWORD\""]
+      artifact: route96.sql
+  route96:
+    image: voidic/route96:latest
+    user: "1000"    # image declares no USER, so it would run as root and be refused
+    resources: { cpu: 500m, memory: 512Mi }
+    depends_on: [db]
+    ports:
+      - { name: http, container: 8000, protocol: http, expose: ingress }
+    files:
+      - path: /app/config.yaml
+        content: |
+          listen: "0.0.0.0:8000"
+          database: "mysql://root:${DB_ROOT_PASSWORD}@db:3306/route96"
+          storage_dir: "/app/data"
+          max_upload_bytes: 104857600
+          public_url: "https://${HOSTNAME}"
+    volumes:
+      - { name: blobs, path: /app/data, size: 20Gi, label: files }
+    backup:
+      volume: blobs
+secrets:
+  - { name: DB_ROOT_PASSWORD, generate: password }

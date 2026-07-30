@@ -1,0 +1,24 @@
+services:
+  relay:
+    image: scsibug/nostr-rs-relay:latest
+    user: "1000"    # image sets `USER appuser` (a name); uid 1000 per its /etc/passwd
+    resources: { cpu: 250m, memory: 256Mi }
+    ports:
+      - { name: ws, container: 8080, protocol: http, expose: ingress }
+    files:
+      - path: /usr/src/app/config.toml
+        content: |
+          [info]
+          relay_url = "wss://${HOSTNAME}/"
+          name = "${relay_name}"
+          description = "${relay_description}"
+          [database]
+          data_directory = "/usr/src/app/db"
+          [network]
+          address = "0.0.0.0"
+          port = 8080
+    volumes:
+      - { name: db, path: /usr/src/app/db, size: 10Gi, label: events }
+config:
+  - { name: relay_name, label: "Relay name", type: string, default: "My nostr-rs-relay" }
+  - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay" }
