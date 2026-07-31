@@ -7,7 +7,7 @@ use nostr_sdk::prelude::*;
 use tokio::sync::mpsc;
 
 use crate::channel::{IncomingSupportRequest, SupportChannel, SupportReply};
-use crate::identity::SenderIdentity;
+use crate::identity::{SenderIdentity, SupportChannelKind};
 use crate::settings::Kind1Config;
 
 /// Kind 1 Nostr support channel.
@@ -161,6 +161,10 @@ impl Kind1SupportChannel {
 
 #[async_trait]
 impl SupportChannel for Kind1SupportChannel {
+    fn kind(&self) -> SupportChannelKind {
+        SupportChannelKind::Nostr
+    }
+
     fn channel_prompt(&self) -> &str {
         r#"Format your responses for a Nostr kind 1 post:
 - Keep it SHORT — Nostr kind 1 events should be concise (under ~500 chars is ideal, max ~2000)

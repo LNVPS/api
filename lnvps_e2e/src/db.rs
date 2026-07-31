@@ -784,3 +784,158 @@ pub async fn hard_delete_referral(pool: &MySqlPool, referral_id: u64) -> anyhow:
         .await?;
     Ok(())
 }
+
+/// Identifiers for a fully-seeded standalone VM, for cleanup.
+pub struct SeededVm {
+    pub vm_id: u64,
+    pub subscription_id: u64,
+    pub host_id: u64,
+    pub disk_id: u64,
+    pub template_id: u64,
+    pub cost_plan_id: u64,
+    pub image_id: u64,
+    pub region_id: u64,
+    pub company_id: u64,
+}
+
+/// Seed a complete VM owned by `user_id`, building the whole infrastructure
+/// chain from scratch (company → region → cost plan → image → host → disk →
+/// template → subscription → line item → vm).
+///
+/// Unlike [`seed_referrer_with_commission`] this borrows no foreign keys from an
+/// existing VM, so a test using it does not depend on the lifecycle test having
+/// run. `ssh_host_keys` is stored on the VM verbatim, which lets a test plant a
+/// recognisable sentinel and assert it never leaks.
+pub async fn seed_standalone_vm(
+    pool: &MySqlPool,
+    user_id: u64,
+    label: &str,
+    ssh_host_keys: &str,
+) -> anyhow::Result<SeededVm> {
+    let (company_id,): (u64,) =
+        sqlx::query_as("INSERT INTO company (name, email) VALUES (?, ?) RETURNING id")
+            .bind(format!("{label}-co"))
+            .bind(format!("{label}@example.com"))
+            .fetch_one(pool)
+            .await?;
+
+    let (region_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO region (name, enabled, company_id) VALUES (?, 1, ?) RETURNING id",
+    )
+    .bind(format!("{label}-region"))
+    .bind(company_id)
+    .fetch_one(pool)
+    .await?;
+
+    let (cost_plan_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO vm_cost_plan (name, amount, currency, interval_amount, interval_type) \
+         VALUES (?, 1000, 'BTC', 1, 0) RETURNING id",
+    )
+    .bind(format!("{label}-plan"))
+    .fetch_one(pool)
+    .await?;
+
+    let (image_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO vm_os_image (distribution, flavour, version, enabled, release_date, url) \
+         VALUES (0, 'server', ?, 1, NOW(), 'https://example.com/img.qcow2') RETURNING id",
+    )
+    .bind(format!("{label}-1.0"))
+    .fetch_one(pool)
+    .await?;
+
+    let (host_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO vm_host (kind, region_id, name, ip, cpu, memory, enabled, api_token) \
+         VALUES (0, ?, ?, 'https://127.0.0.1:8006', 8, 68719476736, 1, ?) RETURNING id",
+    )
+    .bind(region_id)
+    .bind(format!("{label}-host"))
+    .bind(format!("{label}-HOST-API-TOKEN"))
+    .fetch_one(pool)
+    .await?;
+
+    let (disk_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO vm_host_disk (host_id, name, size, kind, interface, enabled) \
+         VALUES (?, 'local', 1099511627776, 0, 0, 1) RETURNING id",
+    )
+    .bind(host_id)
+    .fetch_one(pool)
+    .await?;
+
+    let (template_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO vm_template (name, enabled, cpu, memory, disk_size, disk_type, \
+             disk_interface, cost_plan_id, region_id) \
+         VALUES (?, 1, 2, 2147483648, 21474836480, 0, 0, ?, ?) RETURNING id",
+    )
+    .bind(format!("{label}-template"))
+    .bind(cost_plan_id)
+    .bind(region_id)
+    .fetch_one(pool)
+    .await?;
+
+    let (subscription_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO subscription (user_id, company_id, name, description, created, expires, \
+             is_active, is_setup, currency, interval_amount, interval_type, setup_fee, \
+             auto_renewal_enabled, external_id) \
+         VALUES (?, ?, ?, NULL, NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY), 1, 1, 'BTC', 1, 0, 0, 0, NULL) \
+         RETURNING id",
+    )
+    .bind(user_id)
+    .bind(company_id)
+    .bind(format!("{label}-sub"))
+    .fetch_one(pool)
+    .await?;
+
+    let (li_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, \
+             description, amount, setup_amount, configuration) \
+         VALUES (?, 3, 'vm', NULL, 1000, 0, NULL) RETURNING id",
+    )
+    .bind(subscription_id)
+    .fetch_one(pool)
+    .await?;
+
+    let (vm_id,): (u64,) = sqlx::query_as(
+        "INSERT INTO vm(host_id,user_id,image_id,template_id,custom_template_id,\
+             subscription_line_item_id,ssh_key_id,disk_id,mac_address,ssh_host_keys,ref_code) \
+         VALUES (?, ?, ?, ?, NULL, ?, NULL, ?, ?, ?, NULL) RETURNING id",
+    )
+    .bind(host_id)
+    .bind(user_id)
+    .bind(image_id)
+    .bind(template_id)
+    .bind(li_id)
+    .bind(disk_id)
+    .bind(random_mac())
+    .bind(ssh_host_keys)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(SeededVm {
+        vm_id,
+        subscription_id,
+        host_id,
+        disk_id,
+        template_id,
+        cost_plan_id,
+        image_id,
+        region_id,
+        company_id,
+    })
+}
+
+/// Tear down everything [`seed_standalone_vm`] created, innermost first.
+pub async fn hard_delete_seeded_vm(pool: &MySqlPool, seeded: &SeededVm) -> anyhow::Result<()> {
+    hard_delete_vm(pool, seeded.vm_id).await?;
+    hard_delete_subscription(pool, seeded.subscription_id).await?;
+    hard_delete_vm_template(pool, seeded.template_id).await?;
+    sqlx::query("DELETE FROM vm_host_disk WHERE id = ?")
+        .bind(seeded.disk_id)
+        .execute(pool)
+        .await?;
+    hard_delete_host(pool, seeded.host_id).await?;
+    hard_delete_os_image(pool, seeded.image_id).await?;
+    hard_delete_cost_plan(pool, seeded.cost_plan_id).await?;
+    hard_delete_region(pool, seeded.region_id).await?;
+    hard_delete_company(pool, seeded.company_id).await?;
+    Ok(())
+}

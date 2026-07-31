@@ -3653,3 +3653,117 @@ pub struct AppDeploymentFilter {
     /// admin needs this to inspect or confirm a teardown.
     pub include_deleted: bool,
 }
+
+// ── Support agent conversation history ──────────────────────────────
+
+/// Who produced a message in a support-agent conversation.
+///
+/// Mirrors the OpenAI chat roles the agent replays, so a stored transcript can
+/// be turned back into a request message list without further interpretation.
+#[derive(Clone, Copy, Debug, sqlx::Type, Default, PartialEq, Eq)]
+#[repr(u16)]
+pub enum AgentMessageRole {
+    /// A message from the customer.
+    #[default]
+    User = 0,
+    /// A message from the agent. May carry tool calls instead of prose.
+    Assistant = 1,
+    /// The result of executing a tool call.
+    Tool = 2,
+}
+
+impl Display for AgentMessageRole {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentMessageRole::User => write!(f, "user"),
+            AgentMessageRole::Assistant => write!(f, "assistant"),
+            AgentMessageRole::Tool => write!(f, "tool"),
+        }
+    }
+}
+
+/// The channel a support message travelled over.
+///
+/// Recorded per message rather than per conversation because a single private
+/// thread legitimately mixes email and live chat for the same customer.
+#[derive(Clone, Copy, Debug, sqlx::Type, Default, PartialEq, Eq)]
+#[repr(u16)]
+pub enum AgentChannel {
+    /// IMAP/SMTP support mailbox.
+    #[default]
+    Email = 0,
+    /// Public Nostr kind-1 mention.
+    Nostr = 1,
+    /// Live-chat WebSocket served by the API.
+    WebChat = 2,
+}
+
+impl Display for AgentChannel {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentChannel::Email => write!(f, "email"),
+            AgentChannel::Nostr => write!(f, "nostr"),
+            AgentChannel::WebChat => write!(f, "webchat"),
+        }
+    }
+}
+
+/// A support-agent conversation thread.
+///
+/// See the `agent_conversation` migration for the `conversation_key`
+/// namespacing rules — in particular, public Nostr threads are deliberately
+/// kept separate from the shared private thread.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct AgentConversation {
+    pub id: u64,
+    /// Namespaced sender identity (`user:<id>`, `email:<addr>`, `pubkey:<hex>`,
+    /// `nostr:<hex>`).
+    pub conversation_key: String,
+    /// Resolved LNVPS user, when the sender matched an account.
+    pub user_id: Option<u64>,
+    /// Running LLM summary of everything at or below `compacted_upto`.
+    pub summary: Option<String>,
+    /// Highest [`AgentMessage::id`] folded into `summary`; `0` when nothing has
+    /// been compacted. Only messages above this are replayed as LLM context.
+    pub compacted_upto: u64,
+    pub created: DateTime<Utc>,
+    pub updated: DateTime<Utc>,
+}
+
+/// A single message in a support-agent conversation.
+///
+/// Append-only: rows are never updated or deleted in normal operation, so the
+/// table doubles as the training corpus.
+#[derive(FromRow, Clone, Debug)]
+pub struct AgentMessage {
+    pub id: u64,
+    pub conversation_id: u64,
+    pub role: AgentMessageRole,
+    pub channel: AgentChannel,
+    /// Message text, encrypted at rest — transcripts contain customer PII.
+    /// `None` for an assistant turn that only requested tool calls.
+    pub content: Option<EncryptedString>,
+    /// JSON array of `{id, name, arguments}` when the assistant requested tools.
+    ///
+    /// Bytes rather than `String` because MariaDB implements `JSON` as
+    /// `LONGTEXT` with the binary `utf8mb4_bin` collation, which sqlx surfaces
+    /// as a BLOB — decoding it straight into `String` fails at runtime. Same
+    /// treatment as [`VmHistory::metadata`].
+    pub tool_calls: Option<Vec<u8>>,
+    /// For [`AgentMessageRole::Tool`], the tool call this row answers.
+    pub tool_call_id: Option<String>,
+    pub created: DateTime<Utc>,
+}
+
+/// A message queued for insertion into a conversation.
+///
+/// Separate from [`AgentMessage`] because the id, conversation and timestamp are
+/// assigned by the database on append.
+#[derive(Clone, Debug)]
+pub struct NewAgentMessage {
+    pub role: AgentMessageRole,
+    pub channel: AgentChannel,
+    pub content: Option<String>,
+    pub tool_calls: Option<String>,
+    pub tool_call_id: Option<String>,
+}

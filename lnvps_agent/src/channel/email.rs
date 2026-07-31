@@ -15,7 +15,7 @@ use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 
 use crate::channel::{IncomingSupportRequest, SupportChannel, SupportReply};
-use crate::identity::SenderIdentity;
+use crate::identity::{SenderIdentity, SupportChannelKind};
 use crate::settings::EmailConfig;
 
 /// Email support channel that uses IMAP IDLE for push-based email notifications.
@@ -114,6 +114,10 @@ impl EmailSupportChannel {
 
 #[async_trait]
 impl SupportChannel for EmailSupportChannel {
+    fn kind(&self) -> SupportChannelKind {
+        SupportChannelKind::Email
+    }
+
     fn channel_prompt(&self) -> &str {
         r#"Format your responses like a professional email reply:
 - Use a polite greeting (e.g. "Hello", "Hi")

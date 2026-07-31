@@ -44,98 +44,125 @@ use crate::api::{AmountQuery, AuthQuery, PaymentMethodQuery, RouterState};
 use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
 use crate::provisioner::{HostCapacityService, PricingEngine};
 
+/// Attach the live-chat support agent websocket.
+///
+/// A no-op unless the `agent` feature is compiled in; even then the handler
+/// refuses connections until `agent` is present in the config.
+#[cfg(feature = "agent")]
+fn with_support_chat(router: Router<RouterState>) -> Router<RouterState> {
+    router.route(
+        crate::api::support::CHAT_PATH,
+        any(
+            async move |ws: WebSocketUpgrade,
+                        Query(q): Query<AuthQuery>,
+                        State(this): State<RouterState>| {
+                ws.on_upgrade(async move |s| {
+                    crate::api::support::v1_support_chat(q.auth, this, s).await
+                })
+            },
+        ),
+    )
+}
+
+#[cfg(not(feature = "agent"))]
+fn with_support_chat(router: Router<RouterState>) -> Router<RouterState> {
+    router
+}
+
 pub fn routes() -> Router<RouterState> {
-    Router::new()
-        .route(
-            "/api/v1/account",
-            get(v1_get_account).patch(v1_patch_account),
-        )
-        .route("/api/v1/account/verify-email", get(v1_verify_email))
-        .route(
-            "/api/v1/payment-methods",
-            get(v1_list_payment_methods).post(v1_add_nwc_payment_method),
-        )
-        .route(
-            "/api/v1/payment-methods/{id}",
-            patch(v1_patch_payment_method).delete(v1_delete_payment_method),
-        )
-        .route(
-            "/api/v1/account/telegram/link",
-            post(v1_telegram_link).delete(v1_telegram_unlink),
-        )
-        .route(
-            "/api/v1/account/whatsapp/verify",
-            post(v1_whatsapp_verify).delete(v1_whatsapp_unlink),
-        )
-        .route(
-            "/api/v1/account/whatsapp/confirm",
-            post(v1_whatsapp_confirm),
-        )
-        .route(
-            "/api/v1/notification/channels",
-            get(v1_notification_channels),
-        )
-        .route("/api/v1/vm", get(v1_list_vms))
-        .route("/api/v1/vm/{id}", get(v1_get_vm).patch(v1_patch_vm))
-        .route("/api/v1/image", get(v1_list_vm_images))
-        .route("/api/v1/vm/templates", get(v1_list_vm_templates))
-        .route("/api/v1/exchange-rate", get(v1_exchange_rate))
-        .route(
-            "/api/v1/vm/custom-template/price",
-            post(v1_custom_template_calc),
-        )
-        .route(
-            "/api/v1/vm/custom-template",
-            post(v1_create_custom_vm_order),
-        )
-        .route(
-            "/api/v1/ssh-key",
-            get(v1_list_ssh_keys).post(v1_add_ssh_key),
-        )
-        .route("/api/v1/ssh-key/{id}", delete(v1_delete_ssh_key))
-        .route("/api/v1/vm", post(v1_create_vm_order))
-        .route("/api/v1/vm/{id}/renew", get(v1_renew_vm))
-        .route("/api/v1/vm/{id}/renew-lnurlp", get(v1_renew_vm_lnurlp))
-        .route("/.well-known/lnurlp/{id}", get(v1_lnurlp))
-        .route("/api/v1/vm/{id}/start", patch(v1_start_vm))
-        .route("/api/v1/vm/{id}/stop", patch(v1_stop_vm))
-        .route("/api/v1/vm/{id}/restart", patch(v1_restart_vm))
-        .route("/api/v1/vm/{id}/re-install", patch(v1_reinstall_vm))
-        .route("/api/v1/vm/{id}/time-series", get(v1_time_series))
-        .route(
-            "/api/v1/vm/{id}/console",
-            any(
-                async move |ws: WebSocketUpgrade,
-                            Path(id): Path<u64>,
-                            Query(q): Query<AuthQuery>,
-                            State(this): State<RouterState>| {
-                    ws.on_upgrade(async move |s| {
-                        if let Err(e) = v1_terminal_proxy(id, q.auth, this, s).await {
-                            error!("Failed to proxy terminal proxy: {}", e);
-                        }
-                    })
-                },
+    with_support_chat(
+        Router::new()
+            .route(
+                "/api/v1/account",
+                get(v1_get_account).patch(v1_patch_account),
+            )
+            .route("/api/v1/account/verify-email", get(v1_verify_email))
+            .route(
+                "/api/v1/payment-methods",
+                get(v1_list_payment_methods).post(v1_add_nwc_payment_method),
+            )
+            .route(
+                "/api/v1/payment-methods/{id}",
+                patch(v1_patch_payment_method).delete(v1_delete_payment_method),
+            )
+            .route(
+                "/api/v1/account/telegram/link",
+                post(v1_telegram_link).delete(v1_telegram_unlink),
+            )
+            .route(
+                "/api/v1/account/whatsapp/verify",
+                post(v1_whatsapp_verify).delete(v1_whatsapp_unlink),
+            )
+            .route(
+                "/api/v1/account/whatsapp/confirm",
+                post(v1_whatsapp_confirm),
+            )
+            .route(
+                "/api/v1/notification/channels",
+                get(v1_notification_channels),
+            )
+            .route("/api/v1/vm", get(v1_list_vms))
+            .route("/api/v1/vm/{id}", get(v1_get_vm).patch(v1_patch_vm))
+            .route("/api/v1/image", get(v1_list_vm_images))
+            .route("/api/v1/vm/templates", get(v1_list_vm_templates))
+            .route("/api/v1/exchange-rate", get(v1_exchange_rate))
+            .route(
+                "/api/v1/vm/custom-template/price",
+                post(v1_custom_template_calc),
+            )
+            .route(
+                "/api/v1/vm/custom-template",
+                post(v1_create_custom_vm_order),
+            )
+            .route(
+                "/api/v1/ssh-key",
+                get(v1_list_ssh_keys).post(v1_add_ssh_key),
+            )
+            .route("/api/v1/ssh-key/{id}", delete(v1_delete_ssh_key))
+            .route("/api/v1/vm", post(v1_create_vm_order))
+            .route("/api/v1/vm/{id}/renew", get(v1_renew_vm))
+            .route("/api/v1/vm/{id}/renew-lnurlp", get(v1_renew_vm_lnurlp))
+            .route("/.well-known/lnurlp/{id}", get(v1_lnurlp))
+            .route("/api/v1/vm/{id}/start", patch(v1_start_vm))
+            .route("/api/v1/vm/{id}/stop", patch(v1_stop_vm))
+            .route("/api/v1/vm/{id}/restart", patch(v1_restart_vm))
+            .route("/api/v1/vm/{id}/re-install", patch(v1_reinstall_vm))
+            .route("/api/v1/vm/{id}/time-series", get(v1_time_series))
+            .route(
+                "/api/v1/vm/{id}/console",
+                any(
+                    async move |ws: WebSocketUpgrade,
+                                Path(id): Path<u64>,
+                                Query(q): Query<AuthQuery>,
+                                State(this): State<RouterState>| {
+                        ws.on_upgrade(async move |s| {
+                            if let Err(e) = v1_terminal_proxy(id, q.auth, this, s).await {
+                                error!("Failed to proxy terminal proxy: {}", e);
+                            }
+                        })
+                    },
+                ),
+            )
+            .route("/api/v1/payment/methods", get(v1_get_payment_methods))
+            .route("/api/v1/payment/{id}", get(v1_get_payment))
+            .route("/api/v1/payment/{id}/invoice", get(v1_get_payment_invoice))
+            .route("/api/v1/vm/{id}/payments", get(v1_payment_history))
+            .route("/api/v1/vm/{id}/history", get(v1_get_vm_history))
+            .route("/api/v1/vm/{id}/upgrade/quote", post(v1_vm_upgrade_quote))
+            .route("/api/v1/vm/{id}/upgrade", post(v1_vm_upgrade))
+            .route(
+                "/api/v1/vm/{id}/firewall",
+                get(v1_list_firewall_rules).post(v1_create_firewall_rule),
+            )
+            .route(
+                "/api/v1/vm/{id}/firewall/policy",
+                get(v1_get_firewall_policy).patch(v1_patch_firewall_policy),
+            )
+            .route(
+                "/api/v1/vm/{id}/firewall/{rule_id}",
+                patch(v1_patch_firewall_rule).delete(v1_delete_firewall_rule),
             ),
-        )
-        .route("/api/v1/payment/methods", get(v1_get_payment_methods))
-        .route("/api/v1/payment/{id}", get(v1_get_payment))
-        .route("/api/v1/payment/{id}/invoice", get(v1_get_payment_invoice))
-        .route("/api/v1/vm/{id}/payments", get(v1_payment_history))
-        .route("/api/v1/vm/{id}/history", get(v1_get_vm_history))
-        .route("/api/v1/vm/{id}/upgrade/quote", post(v1_vm_upgrade_quote))
-        .route("/api/v1/vm/{id}/upgrade", post(v1_vm_upgrade))
-        .route(
-            "/api/v1/vm/{id}/firewall",
-            get(v1_list_firewall_rules).post(v1_create_firewall_rule),
-        )
-        .route(
-            "/api/v1/vm/{id}/firewall/policy",
-            get(v1_get_firewall_policy).patch(v1_patch_firewall_policy),
-        )
-        .route(
-            "/api/v1/vm/{id}/firewall/{rule_id}",
-            patch(v1_patch_firewall_rule).delete(v1_delete_firewall_rule),
-        )
+    )
 }
 
 /// Capture IP-derived geolocation for a user as an independent place-of-supply

@@ -102,7 +102,7 @@ impl HostSshSession {
             let ssh_key = host.ssh_key.as_ref()?;
             let ssh_user = host.ssh_user.as_deref().unwrap_or("root");
             let mut ssh = SshClient::new();
-            let ssh_host = extract_host_from_url(&host.ip);
+            let ssh_host = lnvps_api_common::host::extract_host_from_url(&host.ip);
             if let Err(e) = ssh
                 .connect_with_key((ssh_host.as_str(), 22), ssh_user, ssh_key.as_str())
                 .await
@@ -118,24 +118,6 @@ impl HostSshSession {
             _ => None,
         }
     }
-}
-
-/// Extract hostname/IP from a URL or return the input if it's already a plain host
-/// e.g. "https://192.168.1.1:8006/" -> "192.168.1.1"
-///      "192.168.1.1" -> "192.168.1.1"
-pub(crate) fn extract_host_from_url(input: &str) -> String {
-    // Strip protocol prefix if present
-    let without_protocol = input
-        .strip_prefix("https://")
-        .or_else(|| input.strip_prefix("http://"))
-        .unwrap_or(input);
-
-    // Take everything before the first ':' or '/' (to strip port and path)
-    without_protocol
-        .split(|c| c == ':' || c == '/')
-        .next()
-        .unwrap_or(input)
-        .to_string()
 }
 
 /// Host info output from lnvps-host-info utility
@@ -1046,12 +1028,7 @@ impl Worker {
     /// keys were never captured (or were cleared by a reinstall) self-heals on
     /// the next pass. A VM whose capture already covers every algorithm is
     /// skipped, so this costs nothing for a healthy VM.
-    async fn capture_vm_ssh_host_keys(
-        &self,
-        vm: &Vm,
-        host: &VmHost,
-        ssh: &mut HostSshSession,
-    ) {
+    async fn capture_vm_ssh_host_keys(&self, vm: &Vm, host: &VmHost, ssh: &mut HostSshSession) {
         if vm.deleted || host.ssh_key.is_none() {
             return;
         }
@@ -1225,7 +1202,8 @@ impl Worker {
             self.reconcile_vm_dns(vm).await;
             // This sweep is the only pass that visits every VM, so capture has
             // to hang off it; the single-VM check only runs on customer action.
-            self.capture_vm_ssh_host_keys(vm, &host, &mut host_ssh).await;
+            self.capture_vm_ssh_host_keys(vm, &host, &mut host_ssh)
+                .await;
         }
         Ok(())
     }
@@ -1693,7 +1671,7 @@ impl Worker {
         let ssh_user = host.ssh_user.as_deref().unwrap_or("root");
 
         // Extract hostname/IP from the host.ip field (may be a URL like https://1.2.3.4:8006/)
-        let ssh_host = extract_host_from_url(&host.ip);
+        let ssh_host = lnvps_api_common::host::extract_host_from_url(&host.ip);
 
         // Connect to host via SSH
         let mut ssh = SshClient::new();
@@ -4035,11 +4013,7 @@ mod tests {
         // The scan itself needs a real SSH session to the host; the recorded
         // attempt is what proves the sweep reached capture.
         assert!(
-            worker
-                .kv
-                .get(&host_key_attempt_key(vm_id))
-                .await?
-                .is_some(),
+            worker.kv.get(&host_key_attempt_key(vm_id)).await?.is_some(),
             "periodic sweep did not attempt host key capture"
         );
         Ok(())

@@ -2,10 +2,10 @@ use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostDiskInfo,
     VmHostInfo,
 };
+use crate::retry::OpResult;
+use crate::{GB, HostVmSpec, PB, TB, VmRunningState, VmRunningStates, op_fatal};
 use async_trait::async_trait;
 use chrono::Utc;
-use lnvps_api_common::retry::OpResult;
-use lnvps_api_common::{GB, HostVmSpec, PB, TB, VmRunningState, VmRunningStates, op_fatal};
 use lnvps_db::{Vm, VmOsImage};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;

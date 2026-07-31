@@ -1,8 +1,9 @@
 use crate::{
-    AccessPolicy, App, AppCluster, AppDeployment, AppDeploymentFilter, AppDeploymentServiceUsage,
-    AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
-    Company, DbError, DbResult, DnsServer, IntervalType, IpRange, IpRangeSubscription,
-    IpSpacePricing, LNVpsDbBase, PaymentMethod, PaymentMethodConfig, PaymentType, Referral,
+    AccessPolicy, AgentConversation, AgentMessage, App, AppCluster, AppDeployment,
+    AppDeploymentFilter, AppDeploymentServiceUsage, AppDeploymentVolumeUsage, AppTag,
+    AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, DbError, DbResult,
+    DnsServer, EncryptedString, IntervalType, IpRange, IpRangeSubscription, IpSpacePricing,
+    LNVpsDbBase, NewAgentMessage, PaymentMethod, PaymentMethodConfig, PaymentType, Referral,
     ReferralCostUsage, ReferralPayout, Region, RegionStats, Router, RouterBgpRoute,
     RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm,
@@ -2026,6 +2027,145 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(id)
             .fetch_one(&self.db)
             .await?)
+    }
+
+    // ── Support agent conversations ──────────────────────────────
+
+    async fn upsert_agent_conversation(
+        &self,
+        conversation_key: &str,
+        user_id: Option<u64>,
+    ) -> DbResult<AgentConversation> {
+        // `insert ignore` + fallback select is the same idiom as upsert_user:
+        // the unique key on conversation_key makes the insert a no-op when the
+        // thread already exists.
+        sqlx::query("insert ignore into agent_conversation(conversation_key,user_id) values(?,?)")
+            .bind(conversation_key)
+            .bind(user_id)
+            .execute(&self.db)
+            .await?;
+
+        // Link a thread that started anonymous once the sender resolves to an
+        // account. Never clear an existing link on an unresolved lookup.
+        if user_id.is_some() {
+            sqlx::query(
+                "update agent_conversation set user_id=? where conversation_key=? and user_id is null",
+            )
+            .bind(user_id)
+            .bind(conversation_key)
+            .execute(&self.db)
+            .await?;
+        }
+
+        Ok(
+            sqlx::query_as("select * from agent_conversation where conversation_key=?")
+                .bind(conversation_key)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_agent_conversation(&self, id: u64) -> DbResult<AgentConversation> {
+        Ok(
+            sqlx::query_as("select * from agent_conversation where id=?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn append_agent_messages(
+        &self,
+        conversation_id: u64,
+        messages: &[NewAgentMessage],
+    ) -> DbResult<Vec<u64>> {
+        if messages.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // One transaction so a turn lands whole: a persisted assistant tool-call
+        // row without its matching tool-result rows would replay as a malformed
+        // message list on the next turn.
+        let mut tx = self.db.begin().await?;
+        let mut ids = Vec::with_capacity(messages.len());
+        for message in messages {
+            let id: u64 = sqlx::query(
+                r#"insert into agent_message
+                     (conversation_id, role, channel, content, tool_calls, tool_call_id)
+                   values (?, ?, ?, ?, ?, ?) returning id"#,
+            )
+            .bind(conversation_id)
+            .bind(message.role)
+            .bind(message.channel)
+            .bind(message.content.clone().map(EncryptedString::new))
+            .bind(&message.tool_calls)
+            .bind(&message.tool_call_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get(0)?;
+            ids.push(id);
+        }
+
+        // Touch the parent so `updated` tracks activity, not just compaction.
+        sqlx::query("update agent_conversation set updated=current_timestamp where id=?")
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(ids)
+    }
+
+    async fn list_agent_messages_after_watermark(
+        &self,
+        conversation_id: u64,
+    ) -> DbResult<Vec<AgentMessage>> {
+        Ok(sqlx::query_as(
+            r#"select m.* from agent_message m
+                 join agent_conversation c on c.id = m.conversation_id
+                where m.conversation_id = ? and m.id > c.compacted_upto
+                order by m.id asc"#,
+        )
+        .bind(conversation_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_agent_messages_paginated(
+        &self,
+        conversation_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<Vec<AgentMessage>> {
+        Ok(sqlx::query_as(
+            "select * from agent_message where conversation_id=? order by id asc limit ? offset ?",
+        )
+        .bind(conversation_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn compact_agent_conversation(
+        &self,
+        conversation_id: u64,
+        summary: &str,
+        compacted_upto: u64,
+    ) -> DbResult<()> {
+        // `greatest` keeps the watermark monotonic: a compaction racing with a
+        // later one must never re-expose messages already folded into a summary.
+        sqlx::query(
+            r#"update agent_conversation
+                  set summary=?, compacted_upto=greatest(compacted_upto, ?)
+                where id=?"#,
+        )
+        .bind(summary)
+        .bind(compacted_upto)
+        .bind(conversation_id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
     }
 
     async fn execute_query(&self, query: &str) -> DbResult<u64> {

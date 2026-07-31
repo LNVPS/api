@@ -1,17 +1,17 @@
+use crate::HostVmSpec;
+use crate::JsonApi;
+use crate::host::config::{QemuConfig, SshConfig};
 use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostDiskInfo,
     VmHostInfo,
 };
-use crate::settings::{QemuConfig, SshConfig};
+use crate::retry::{OpError, OpResult, Pipeline, RetryPolicy};
 use crate::ssh_client::SshClient;
+use crate::{VmRunningState, VmRunningStates, op_fatal, parse_gateway};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use ipnetwork::IpNetwork;
-use lnvps_api_common::HostVmSpec;
-use lnvps_api_common::JsonApi;
-use lnvps_api_common::retry::{OpError, OpResult, Pipeline, RetryPolicy};
-use lnvps_api_common::{VmRunningState, VmRunningStates, op_fatal, parse_gateway};
 use lnvps_db::{DiskType, IpRangeAllocationMode, Vm, VmOsImage};
 use log::{info, warn};
 use rand::random;
@@ -352,8 +352,11 @@ impl ProxmoxClient {
     /// Returns the Proxmox volume reference (e.g. `local:snippets/lnvps-vendor.yaml`)
     /// or `None` if SSH is not configured or no snippet storage is available.
     async fn ensure_vendor_snippet(&self) -> OpResult<Option<String>> {
-        self.write_snippet("lnvps-vendor.yaml", &build_vendor_snippet(GUEST_DNS_SERVERS))
-            .await
+        self.write_snippet(
+            "lnvps-vendor.yaml",
+            &build_vendor_snippet(GUEST_DNS_SERVERS),
+        )
+        .await
     }
 
     /// Resolve the on-disk path of a snippet volume, writing it only when the
@@ -948,11 +951,11 @@ impl ProxmoxClient {
 }
 
 impl ProxmoxClient {
-    fn convert_firewall_policy(policy: &crate::settings::FirewallPolicy) -> VmFirewallPolicy {
+    fn convert_firewall_policy(policy: &crate::host::config::FirewallPolicy) -> VmFirewallPolicy {
         match policy {
-            crate::settings::FirewallPolicy::Accept => VmFirewallPolicy::ACCEPT,
-            crate::settings::FirewallPolicy::Reject => VmFirewallPolicy::REJECT,
-            crate::settings::FirewallPolicy::Drop => VmFirewallPolicy::DROP,
+            crate::host::config::FirewallPolicy::Accept => VmFirewallPolicy::ACCEPT,
+            crate::host::config::FirewallPolicy::Reject => VmFirewallPolicy::REJECT,
+            crate::host::config::FirewallPolicy::Drop => VmFirewallPolicy::DROP,
         }
     }
 
@@ -1542,7 +1545,7 @@ impl VmHostClient for ProxmoxClient {
         // Determine the checksum algorithm from the digest length
         let checksum_algorithm = expected_sha2
             .as_deref()
-            .and_then(|s| lnvps_api_common::shasum::ShasumAlgorithm::from_hex_len(s.len()))
+            .and_then(|s| crate::shasum::ShasumAlgorithm::from_hex_len(s.len()))
             .map(|a| a.as_str().to_owned());
 
         let already_present = files
@@ -2213,9 +2216,9 @@ impl VmHostClient for ProxmoxClient {
 
 impl ProxmoxClient {
     /// Fetch a SHA2SUMS file and extract the checksum for the given filename.
-    /// Delegates to the common [`lnvps_api_common::shasum`] parser.
+    /// Delegates to the common [`crate::shasum`] parser.
     pub async fn fetch_sha2_from_url(sha2_url: &str, filename: &str) -> Result<String> {
-        let entry = lnvps_api_common::shasum::fetch_checksum_for_file(sha2_url, filename).await?;
+        let entry = crate::shasum::fetch_checksum_for_file(sha2_url, filename).await?;
         Ok(entry.checksum)
     }
 
@@ -2227,7 +2230,7 @@ impl ProxmoxClient {
             Some(s) => s,
             None => anyhow::bail!("SSH not configured"),
         };
-        let host = crate::worker::extract_host_from_url(&self.api.base().to_string());
+        let host = crate::host::extract_host_from_url(&self.api.base().to_string());
         SshClient::run_command(host, 22, ssh_cfg.user.clone(), ssh_cfg.key.clone(), command).await
     }
 
@@ -2808,10 +2811,7 @@ pub struct HashedVmConfig {
 pub struct VmConfig {
     #[serde(rename = "onboot")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(
-        default,
-        deserialize_with = "lnvps_api_common::deserialize_int_to_bool"
-    )]
+    #[serde(default, deserialize_with = "crate::deserialize_int_to_bool")]
     pub on_boot: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balloon: Option<i32>,
@@ -2856,10 +2856,7 @@ pub struct VmConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub efi_disk_0: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(
-        default,
-        deserialize_with = "lnvps_api_common::deserialize_int_to_bool"
-    )]
+    #[serde(default, deserialize_with = "crate::deserialize_int_to_bool")]
     pub kvm: Option<bool>,
     #[serde(rename = "serial0")]
     #[serde(skip_serializing_if = "Option::is_none")]

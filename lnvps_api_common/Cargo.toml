@@ -7,6 +7,13 @@ edition.workspace = true
 default = ["nostr-domain"]
 nostr-domain = ["lnvps_db/nostr-domain"]
 admin = ["lnvps_db/admin"]
+# Proxmox hypervisor host client (shares SshClient with linux-ssh)
+proxmox = ["dep:russh", "dep:russh-sftp", "dep:tokio-tungstenite"]
+# LibVirt hypervisor host client. Pulls in native libvirt C bindings, so it is
+# off by default and must be opted into explicitly.
+libvirt = ["dep:virt", "dep:uuid", "dep:quick-xml"]
+# Linux router managed over SSH (shares the SshClient with proxmox)
+linux-ssh = ["dep:russh", "dep:russh-sftp"]
 
 [dependencies]
 lnvps_db = { path = "../lnvps_db" }
@@ -15,6 +22,7 @@ anyhow.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yml.workspace = true
 axum.workspace = true
 tokio.workspace = true
 hex.workspace = true
@@ -32,8 +40,19 @@ sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"
 isocountry = "0.3"
+urlencoding = "2.1"
 redis = { version = "1", features = ["tokio-comp", "cluster"] }
 maxminddb = "0.29"
+
+#proxmox / linux-ssh
+tokio-tungstenite = { version = "0.28", features = ["native-tls"], optional = true }
+russh = { version = "0.62", optional = true }
+russh-sftp = { version = "2", optional = true }
+
+#libvirt
+virt = { git = "https://gitlab.com/libvirt/libvirt-rust.git", optional = true }
+uuid = { version = "1.16", features = ["v4", "serde"], optional = true }
+quick-xml = { version = "0.39", features = ["serde", "serialize"], optional = true }
 
 [dev-dependencies]
 env_logger = "0.11"

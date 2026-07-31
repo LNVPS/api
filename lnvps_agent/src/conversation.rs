@@ -5,6 +5,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use tokio::sync::RwLock;
 
+use crate::identity::SupportChannelKind;
+
+#[cfg(feature = "db")]
+pub mod db;
+#[cfg(feature = "db")]
+pub use db::DbConversationStore;
+
 /// A tool call requested by the assistant within a chat turn.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StoredToolCall {
@@ -106,32 +113,128 @@ fn now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-/// Full conversation state for a single sender.
+/// The conversation context to replay for a sender: the accumulated summary
+/// plus every message not yet folded into it.
 ///
-/// When history is compacted, `summary` contains a condensed narrative
-/// of all prior messages and `messages` is reset to empty. New messages
-/// after compaction accumulate in `messages` until the next compaction.
+/// This is a *snapshot*, not the whole history. Compaction summarises the
+/// messages in a snapshot and advances a high-water mark so they stop being
+/// replayed; depending on the store, the underlying messages may be retained
+/// (the database store keeps them as a training corpus).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SenderConversation {
     /// LLM-generated summary of all compacted messages.
     #[serde(default)]
     pub summary: Option<String>,
-    /// Raw chat log that hasn't been compacted yet.
+    /// Chat log that hasn't been compacted yet.
     #[serde(default, alias = "entries")]
     pub messages: Vec<ChatMessage>,
+    /// Opaque high-water mark identifying the last message in this snapshot.
+    ///
+    /// Passed back to [`ConversationStore::compact`] so that only what was
+    /// actually summarised is marked compacted — messages that arrive while the
+    /// summary is being generated must not be silently dropped from context.
+    /// Never persisted; each store defines its own meaning (a row id, a count).
+    #[serde(skip)]
+    pub cursor: u64,
 }
 
-/// Trait for persistent conversation storage.
+/// Trait for conversation storage.
 #[async_trait]
 pub trait ConversationStore: Send + Sync {
-    /// Load full conversation state for a sender.
+    /// Load the context to replay for a sender: summary + uncompacted messages.
     async fn load(&self, sender_id: &str) -> SenderConversation;
 
     /// Append one or more chat messages for a sender.
-    async fn append(&self, sender_id: &str, messages: Vec<ChatMessage>) -> Result<()>;
+    ///
+    /// `channel` records how the message travelled, so a single private thread
+    /// can distinguish an email exchange from a live-chat one.
+    async fn append(
+        &self,
+        sender_id: &str,
+        channel: SupportChannelKind,
+        messages: Vec<ChatMessage>,
+    ) -> Result<()>;
 
-    /// Replace the entire conversation state for a sender (used after compaction).
-    async fn save(&self, sender_id: &str, conversation: SenderConversation) -> Result<()>;
+    /// Record a compaction: store `summary` and stop replaying every message up
+    /// to `cursor` (the value from the [`SenderConversation`] that was
+    /// summarised).
+    ///
+    /// Implementations must treat the high-water mark as monotonic — a late or
+    /// duplicated compaction must never re-expose messages already summarised.
+    async fn compact(&self, sender_id: &str, summary: String, cursor: u64) -> Result<()>;
+}
+
+/// Ephemeral, process-local conversation store.
+///
+/// Used by the live-chat websocket, where history is scoped to the lifetime of
+/// a single connection: one store is created per socket and dropped when the
+/// socket closes, so nothing is persisted and nothing leaks between sessions.
+#[derive(Default)]
+pub struct MemoryStore {
+    conversations: RwLock<HashMap<String, SenderConversation>>,
+}
+
+impl MemoryStore {
+    /// Create an empty in-memory store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl ConversationStore for MemoryStore {
+    async fn load(&self, sender_id: &str) -> SenderConversation {
+        let key = normalize_key(sender_id);
+        let mut conv = self
+            .conversations
+            .read()
+            .await
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
+        conv.cursor = conv.messages.len() as u64;
+        conv
+    }
+
+    async fn append(
+        &self,
+        sender_id: &str,
+        _channel: SupportChannelKind,
+        messages: Vec<ChatMessage>,
+    ) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let key = normalize_key(sender_id);
+        self.conversations
+            .write()
+            .await
+            .entry(key)
+            .or_default()
+            .messages
+            .extend(messages);
+        Ok(())
+    }
+
+    async fn compact(&self, sender_id: &str, summary: String, cursor: u64) -> Result<()> {
+        let key = normalize_key(sender_id);
+        let mut conversations = self.conversations.write().await;
+        let conv = conversations.entry(key).or_default();
+        conv.summary = Some(summary);
+        // Drop only what was summarised; anything appended during summarisation
+        // stays in the replay window.
+        drain_compacted(&mut conv.messages, cursor);
+        Ok(())
+    }
+}
+
+/// Drop the first `cursor` messages, saturating at the current length.
+///
+/// Shared by the in-memory and file stores, which both represent the high-water
+/// mark as "number of messages summarised so far".
+fn drain_compacted(messages: &mut Vec<ChatMessage>, cursor: u64) {
+    let take = (cursor as usize).min(messages.len());
+    messages.drain(..take);
 }
 
 /// Normalize a sender_id into a cache key / filename.
@@ -205,6 +308,7 @@ fn parse_conversation(data: &str) -> Option<SenderConversation> {
             return Some(SenderConversation {
                 summary: legacy.summary,
                 messages,
+                cursor: 0,
             });
         }
     }
@@ -217,6 +321,7 @@ fn parse_conversation(data: &str) -> Option<SenderConversation> {
                 .into_iter()
                 .flat_map(LegacyEntry::into_messages)
                 .collect(),
+            cursor: 0,
         });
     }
 
@@ -286,10 +391,17 @@ impl ConversationStore for JsonFileStore {
     async fn load(&self, sender_id: &str) -> SenderConversation {
         let key = normalize_key(sender_id);
         let cache = self.cache.read().await;
-        cache.get(&key).cloned().unwrap_or_default()
+        let mut conv = cache.get(&key).cloned().unwrap_or_default();
+        conv.cursor = conv.messages.len() as u64;
+        conv
     }
 
-    async fn append(&self, sender_id: &str, messages: Vec<ChatMessage>) -> Result<()> {
+    async fn append(
+        &self,
+        sender_id: &str,
+        _channel: SupportChannelKind,
+        messages: Vec<ChatMessage>,
+    ) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
@@ -303,20 +415,27 @@ impl ConversationStore for JsonFileStore {
         self.flush(&key, &snapshot).await
     }
 
-    async fn save(&self, sender_id: &str, conversation: SenderConversation) -> Result<()> {
+    async fn compact(&self, sender_id: &str, summary: String, cursor: u64) -> Result<()> {
         let key = normalize_key(sender_id);
         let mut cache = self.cache.write().await;
-        cache.insert(key.clone(), conversation.clone());
+        let conv = cache.entry(key.clone()).or_default();
+        conv.summary = Some(summary);
+        drain_compacted(&mut conv.messages, cursor);
+        let snapshot = conv.clone();
         drop(cache);
 
-        self.flush(&key, &conversation).await
+        self.flush(&key, &snapshot).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::SupportChannelKind;
     use tempfile::TempDir;
+
+    /// Channel used by store tests; the file/memory stores ignore it.
+    const CH: SupportChannelKind = SupportChannelKind::Email;
 
     fn exchange(user: &str, agent: &str) -> Vec<ChatMessage> {
         vec![
@@ -331,11 +450,11 @@ mod tests {
         let store = JsonFileStore::new(dir.path().to_path_buf()).await.unwrap();
 
         store
-            .append("alice@example.com", exchange("hello", "hi there"))
+            .append("alice@example.com", CH, exchange("hello", "hi there"))
             .await
             .unwrap();
         store
-            .append("alice@example.com", exchange("vm status?", "running"))
+            .append("alice@example.com", CH, exchange("vm status?", "running"))
             .await
             .unwrap();
 
@@ -352,7 +471,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = JsonFileStore::new(dir.path().to_path_buf()).await.unwrap();
 
-        store.append("nobody", vec![]).await.unwrap();
+        store.append("nobody", CH, vec![]).await.unwrap();
         assert!(store.load("nobody").await.messages.is_empty());
     }
 
@@ -374,7 +493,7 @@ mod tests {
             ChatMessage::tool("call_1", "[vm 5]"),
             ChatMessage::assistant(Some("You have one VM.".to_string()), vec![]),
         ];
-        store.append("bob", turn).await.unwrap();
+        store.append("bob", CH, turn).await.unwrap();
 
         // Reload from a fresh store to exercise disk roundtrip.
         let store2 = JsonFileStore::new(dir.path().to_path_buf()).await.unwrap();
@@ -399,23 +518,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_and_load_with_summary() {
+    async fn compact_and_load_with_summary() {
         let dir = TempDir::new().unwrap();
         let store = JsonFileStore::new(dir.path().to_path_buf()).await.unwrap();
 
         store
-            .append("carol", exchange("msg1", "resp1"))
+            .append("carol", CH, exchange("msg1", "resp1"))
             .await
             .unwrap();
 
-        // Compact: save summary, clear messages
-        let conv = SenderConversation {
-            summary: Some(
+        let snapshot = store.load("carol").await;
+        assert_eq!(snapshot.cursor, 2);
+        store
+            .compact(
+                "carol",
                 "Carol asked about VM status. She has a running VM on Proxmox.".to_string(),
-            ),
-            messages: vec![],
-        };
-        store.save("carol", conv).await.unwrap();
+                snapshot.cursor,
+            )
+            .await
+            .unwrap();
 
         let loaded = store.load("carol").await;
         assert_eq!(
@@ -426,11 +547,53 @@ mod tests {
 
         // New message after compaction
         store
-            .append("carol", exchange("how do I extend?", "call extend_vm"))
+            .append("carol", CH, exchange("how do I extend?", "call extend_vm"))
             .await
             .unwrap();
         let loaded = store.load("carol").await;
         assert_eq!(loaded.messages.len(), 2);
+    }
+
+    /// A message that lands while the summary is being generated must stay in
+    /// the replay window — the cursor bounds what compaction consumes.
+    #[tokio::test]
+    async fn compact_only_drops_up_to_the_cursor() {
+        let dir = TempDir::new().unwrap();
+        let store = JsonFileStore::new(dir.path().to_path_buf()).await.unwrap();
+
+        store
+            .append("frank", CH, vec![ChatMessage::user("first")])
+            .await
+            .unwrap();
+        let snapshot = store.load("frank").await;
+
+        store
+            .append("frank", CH, vec![ChatMessage::user("late")])
+            .await
+            .unwrap();
+
+        store
+            .compact("frank", "sum".to_string(), snapshot.cursor)
+            .await
+            .unwrap();
+
+        let loaded = store.load("frank").await;
+        assert_eq!(loaded.messages.len(), 1);
+        assert!(
+            matches!(&loaded.messages[0], ChatMessage::User { content, .. } if content == "late")
+        );
+    }
+
+    /// A cursor beyond the current length must clamp rather than panic.
+    #[test]
+    fn drain_compacted_saturates() {
+        let mut messages = vec![ChatMessage::user("a"), ChatMessage::user("b")];
+        drain_compacted(&mut messages, 99);
+        assert!(messages.is_empty());
+
+        let mut messages = vec![ChatMessage::user("a"), ChatMessage::user("b")];
+        drain_compacted(&mut messages, 0);
+        assert_eq!(messages.len(), 2);
     }
 
     #[tokio::test]
@@ -440,7 +603,7 @@ mod tests {
 
         let store1 = JsonFileStore::new(path.clone()).await.unwrap();
         store1
-            .append("dave", exchange("hello", "hi"))
+            .append("dave", CH, exchange("hello", "hi"))
             .await
             .unwrap();
 
@@ -498,7 +661,7 @@ mod tests {
         let store = JsonFileStore::new(dir.path().to_path_buf()).await.unwrap();
 
         store
-            .append("Kieran@Harkin.me", exchange("msg1", "resp1"))
+            .append("Kieran@Harkin.me", CH, exchange("msg1", "resp1"))
             .await
             .unwrap();
 
@@ -508,13 +671,42 @@ mod tests {
 
         // Append under lowercase key
         store
-            .append("kieran@harkin.me", exchange("msg2", "resp2"))
+            .append("kieran@harkin.me", CH, exchange("msg2", "resp2"))
             .await
             .unwrap();
 
         // Check under original case — should see both exchanges
         let conv = store.load("Kieran@Harkin.me").await;
         assert_eq!(conv.messages.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn memory_store_roundtrips_and_isolates() {
+        let store = MemoryStore::new();
+        assert!(store.load("nobody").await.messages.is_empty());
+
+        store
+            .append("eve", CH, exchange("hi", "hello"))
+            .await
+            .unwrap();
+        store.append("eve", CH, vec![]).await.unwrap();
+        assert_eq!(store.load("eve").await.messages.len(), 2);
+
+        // Case-insensitive keying matches the file store.
+        assert_eq!(store.load("EVE").await.messages.len(), 2);
+
+        // Compaction folds the snapshot into a summary.
+        let snapshot = store.load("eve").await;
+        store
+            .compact("eve", "summarised".to_string(), snapshot.cursor)
+            .await
+            .unwrap();
+        let conv = store.load("eve").await;
+        assert_eq!(conv.summary.as_deref(), Some("summarised"));
+        assert!(conv.messages.is_empty());
+
+        // A second store shares no state — one per websocket connection.
+        assert!(MemoryStore::new().load("eve").await.messages.is_empty());
     }
 
     #[test]

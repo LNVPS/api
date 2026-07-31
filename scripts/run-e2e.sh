@@ -209,7 +209,10 @@ echo "API configs written with DB: ${DB_URL}"
 # ---------------------------------------------------------------------------
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
     echo "=== Building API servers ==="
-    cargo build -p lnvps_api -p lnvps_api_admin
+    # `agent` enables the live-chat support websocket exercised by
+    # lnvps_e2e::agent_chat; it is not a default feature.
+    cargo build -p lnvps_api --features agent
+    cargo build -p lnvps_api_admin
 fi
 
 # ---------------------------------------------------------------------------
@@ -268,7 +271,7 @@ fi
 # 8. Start user API
 # ---------------------------------------------------------------------------
 echo "=== Starting user API ==="
-LNVPS_NO_DEV_SETUP=1 cargo run -p lnvps_api -- --config "$TMP_API_CONFIG" \
+LNVPS_NO_DEV_SETUP=1 cargo run -p lnvps_api --features agent -- --config "$TMP_API_CONFIG" \
     > /tmp/lnvps-e2e-api.log 2>&1 &
 echo $! > "$API_PID_FILE"
 
@@ -290,7 +293,9 @@ done
 # 9. Run E2E tests
 # ---------------------------------------------------------------------------
 echo "=== Running E2E tests ==="
-TEST_CMD="cargo test -p lnvps_e2e -- --test-threads=1"
+# --nocapture so a test that skips itself (no data, or a third-party endpoint
+# down) says so in the CI log instead of passing silently.
+TEST_CMD="cargo test -p lnvps_e2e -- --test-threads=1 --nocapture"
 if [[ -n "$FILTER" ]]; then
     TEST_CMD="$TEST_CMD $FILTER"
 fi
@@ -299,8 +304,9 @@ eval "$TEST_CMD"
 # ---------------------------------------------------------------------------
 # 10. SshClient integration tests against the compose sshd
 #
-# These live in lnvps_api (they use the library directly, not HTTP) and skip
-# themselves unless these two variables are set.
+# These live in lnvps_api_common (they use the library directly, not HTTP) and
+# skip themselves unless these two variables are set. The `linux-ssh` feature
+# is what compiles SshClient in.
 # ---------------------------------------------------------------------------
 SSH_KEY="$REPO_ROOT/volumes/e2e-sshd/id_ed25519"
 if [[ ! -f "$SSH_KEY" ]]; then
@@ -314,4 +320,4 @@ fi
 echo "=== Running SshClient integration tests ==="
 LNVPS_TEST_SSH_ADDR="${LNVPS_TEST_SSH_ADDR:-localhost:2222}" \
 LNVPS_TEST_SSH_KEY="$SSH_KEY" \
-    cargo test -p lnvps_api --test ssh_client
+    cargo test -p lnvps_api_common --features linux-ssh --test ssh_client

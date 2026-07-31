@@ -9,7 +9,7 @@
 #![cfg(any(feature = "proxmox", feature = "linux-ssh"))]
 
 use anyhow::Result;
-use lnvps_api::ssh_client::SshClient;
+use lnvps_api_common::ssh_client::SshClient;
 use std::path::{Path, PathBuf};
 
 /// Socket the test sshd's echo server listens on.

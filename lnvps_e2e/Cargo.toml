@@ -8,7 +8,7 @@ name = "lnvps_e2e"
 path = "src/lib.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "process", "time", "sync"] }
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -27,6 +27,9 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
 base64urlsafedata = "0.5"
+# Live-chat support agent websocket (lnvps_e2e::agent_chat)
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
 
 [dev-dependencies]
 # Used only to validate the software authenticator offline: register via

@@ -4,5 +4,6 @@ pub mod channel;
 pub mod conversation;
 pub mod identity;
 pub mod nip98;
+pub mod session;
 pub mod settings;
 pub mod tools;

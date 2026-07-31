@@ -1,14 +1,14 @@
 use crate::KB;
+use crate::VmRunningStates;
+use crate::host::config::QemuConfig;
 use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostDiskInfo,
     VmHostInfo,
 };
-use crate::settings::QemuConfig;
+use crate::retry::{OpError, OpResult};
+use crate::{VmRunningState, op_fatal};
 use anyhow::{Context, Result, bail, ensure};
 use chrono::Utc;
-use lnvps_api_common::VmRunningStates;
-use lnvps_api_common::retry::{OpError, OpResult};
-use lnvps_api_common::{VmRunningState, op_fatal};
 use lnvps_db::{LNVpsDb, Vm, VmOsImage};
 use log::info;
 use rand::random;

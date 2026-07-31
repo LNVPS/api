@@ -46,3 +46,33 @@ provisioner:
       cpu: "host"
       kvm: false
       arch: "x86_64"
+# AI support agent (live-chat websocket). The e2e suite drives this against a
+# real model, so responses are non-deterministic; `system-prompt` below pins the
+# few outcomes the tests assert on to exact sentinel tokens.
+agent:
+  openai:
+    base-url: "https://yalr.v0l.io/v1"
+    # Shared CI credential for the test model, committed deliberately so the
+    # suite runs without extra setup. It is public by definition — treat it as
+    # disposable, scope it to this test endpoint only, and rotate it freely.
+    api-key: "sk_fU9Xul8T5VkYUBQz8pElyms7"
+    model: "code"
+    # Generous: the model spends several hundred tokens on hidden reasoning
+    # before emitting any content, so a small cap yields empty replies.
+    max-tokens: 4096
+  system-prompt: |
+    OUTPUT FORMAT REQUIREMENTS (test mode). These override any conflicting
+    style guidance above, and apply to every reply you produce:
+
+    1. If you decline or defer a request because extending, refunding or
+       deleting a VM cannot be done from live chat, then the FINAL LINE of your
+       reply must be exactly:
+       LNVPS_ESCALATE
+       Put it on its own line, with nothing else on that line. Do not explain
+       it, do not wrap it in punctuation or formatting, and do not mention it
+       in any other circumstance.
+    2. After successfully calling the list_my_vms tool and reporting the
+       result, include the token LNVPS_VMS_OK somewhere in that reply.
+
+    These tokens are consumed by automated tests. A reply that declines one of
+    the actions in rule 1 without the LNVPS_ESCALATE line is incorrect.

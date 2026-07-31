@@ -3,18 +3,18 @@ use anyhow::{Context, anyhow};
 use chrono::{Days, Months, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
-    AccessPolicy, App, AppCluster, AppDeployment, AppDeploymentDesiredState, AppDeploymentFilter,
-    AppDeploymentServiceUsage, AppDeploymentStatus, AppDeploymentVolumeUsage, AppTag,
-    AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, CpuArch, CpuMfg, DbError,
-    DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind, IntervalType, IpRange,
-    IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, NostrDomain,
-    NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
-    ReferralCostUsage, ReferralPayout, Region, Router, RouterBgpRoute, RouterBgpSession,
-    RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
-    VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment, VmOsImage, VmTemplate,
-    WebauthnCredential,
+    AccessPolicy, AgentConversation, AgentMessage, App, AppCluster, AppDeployment,
+    AppDeploymentDesiredState, AppDeploymentFilter, AppDeploymentServiceUsage, AppDeploymentStatus,
+    AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
+    Company, CpuArch, CpuMfg, DbError, DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind,
+    EncryptedString, IntervalType, IpRange, IpRangeAllocationMode, IpRangeSubscription,
+    IpSpacePricing, LNVpsDbBase, NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution,
+    PaymentMethod, PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region,
+    Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription,
+    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User,
+    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
+    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind,
+    VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
 };
 
 use async_trait::async_trait;
@@ -60,6 +60,11 @@ pub struct MockDb {
     pub access_policy: Arc<Mutex<HashMap<u64, AccessPolicy>>>,
     pub companies: Arc<Mutex<HashMap<u64, Company>>>,
     pub vm_history: Arc<Mutex<HashMap<u64, VmHistory>>>,
+    /// Support-agent conversation threads, keyed by id.
+    pub agent_conversations: Arc<Mutex<HashMap<u64, AgentConversation>>>,
+    /// Support-agent messages. A `Vec` rather than a map because the log is
+    /// append-only and always read in insertion order.
+    pub agent_messages: Arc<Mutex<Vec<AgentMessage>>>,
     pub subscriptions: Arc<Mutex<HashMap<u64, Subscription>>>,
     pub subscription_line_items: Arc<Mutex<HashMap<u64, SubscriptionLineItem>>>,
     pub subscription_payments: Arc<Mutex<Vec<SubscriptionPayment>>>,
@@ -291,6 +296,8 @@ impl Default for MockDb {
             },
         );
         Self {
+            agent_conversations: Arc::new(Mutex::new(HashMap::new())),
+            agent_messages: Arc::new(Mutex::new(Vec::new())),
             regions: Arc::new(Mutex::new(regions)),
             ip_range: Arc::new(Mutex::new(ip_ranges)),
             hosts: Arc::new(Mutex::new(hosts)),
@@ -1911,6 +1918,145 @@ impl LNVpsDbBase for MockDb {
             .ok_or_else(|| anyhow!("Region not found"))?;
 
         Ok(region.company_id)
+    }
+
+    // ── Support agent conversations ──────────────────────────────
+
+    async fn upsert_agent_conversation(
+        &self,
+        conversation_key: &str,
+        user_id: Option<u64>,
+    ) -> DbResult<AgentConversation> {
+        let mut conversations = self.agent_conversations.lock().await;
+
+        if let Some(existing) = conversations
+            .values_mut()
+            .find(|c| c.conversation_key == conversation_key)
+        {
+            // Link a thread that started anonymous, but never clear the link.
+            if existing.user_id.is_none() && user_id.is_some() {
+                existing.user_id = user_id;
+            }
+            return Ok(existing.clone());
+        }
+
+        let id = (conversations.len() + 1) as u64;
+        let now = chrono::Utc::now();
+        let conversation = AgentConversation {
+            id,
+            conversation_key: conversation_key.to_string(),
+            user_id,
+            summary: None,
+            compacted_upto: 0,
+            created: now,
+            updated: now,
+        };
+        conversations.insert(id, conversation.clone());
+        Ok(conversation)
+    }
+
+    async fn get_agent_conversation(&self, id: u64) -> DbResult<AgentConversation> {
+        self.agent_conversations
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| DbError::from(anyhow!("agent conversation {} not found", id)))
+    }
+
+    async fn append_agent_messages(
+        &self,
+        conversation_id: u64,
+        messages: &[NewAgentMessage],
+    ) -> DbResult<Vec<u64>> {
+        if messages.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut log = self.agent_messages.lock().await;
+        let mut ids = Vec::with_capacity(messages.len());
+        for message in messages {
+            let id = (log.len() + 1) as u64;
+            log.push(AgentMessage {
+                id,
+                conversation_id,
+                role: message.role,
+                channel: message.channel,
+                content: message.content.clone().map(EncryptedString::new),
+                // Bytes, mirroring how MariaDB returns a JSON column.
+                tool_calls: message.tool_calls.clone().map(String::into_bytes),
+                tool_call_id: message.tool_call_id.clone(),
+                created: chrono::Utc::now(),
+            });
+            ids.push(id);
+        }
+        drop(log);
+
+        if let Some(conversation) = self
+            .agent_conversations
+            .lock()
+            .await
+            .get_mut(&conversation_id)
+        {
+            conversation.updated = chrono::Utc::now();
+        }
+        Ok(ids)
+    }
+
+    async fn list_agent_messages_after_watermark(
+        &self,
+        conversation_id: u64,
+    ) -> DbResult<Vec<AgentMessage>> {
+        let watermark = self
+            .agent_conversations
+            .lock()
+            .await
+            .get(&conversation_id)
+            .map(|c| c.compacted_upto)
+            .unwrap_or(0);
+
+        Ok(self
+            .agent_messages
+            .lock()
+            .await
+            .iter()
+            .filter(|m| m.conversation_id == conversation_id && m.id > watermark)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_agent_messages_paginated(
+        &self,
+        conversation_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<Vec<AgentMessage>> {
+        Ok(self
+            .agent_messages
+            .lock()
+            .await
+            .iter()
+            .filter(|m| m.conversation_id == conversation_id)
+            .skip(offset as usize)
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    async fn compact_agent_conversation(
+        &self,
+        conversation_id: u64,
+        summary: &str,
+        compacted_upto: u64,
+    ) -> DbResult<()> {
+        let mut conversations = self.agent_conversations.lock().await;
+        let conversation = conversations.get_mut(&conversation_id).ok_or_else(|| {
+            DbError::from(anyhow!("agent conversation {} not found", conversation_id))
+        })?;
+        conversation.summary = Some(summary.to_string());
+        // Monotonic, matching the `greatest(...)` in the SQL implementation.
+        conversation.compacted_upto = conversation.compacted_upto.max(compacted_upto);
+        conversation.updated = chrono::Utc::now();
+        Ok(())
     }
 
     async fn insert_vm_history(&self, history: &VmHistory) -> DbResult<u64> {
@@ -4710,7 +4856,267 @@ impl LNVPSNostrDb for MockDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lnvps_db::{IntervalType, LNVpsDbBase, SubscriptionPaymentType};
+    use lnvps_db::{
+        AgentChannel, AgentMessageRole, IntervalType, LNVpsDbBase, SubscriptionPaymentType,
+    };
+
+    fn user_msg(text: &str, channel: AgentChannel) -> NewAgentMessage {
+        NewAgentMessage {
+            role: AgentMessageRole::User,
+            channel,
+            content: Some(text.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_conversation_is_created_once_per_key() {
+        let db = MockDb::default();
+
+        let a = db
+            .upsert_agent_conversation("user:7", Some(7))
+            .await
+            .unwrap();
+        let b = db
+            .upsert_agent_conversation("user:7", Some(7))
+            .await
+            .unwrap();
+        assert_eq!(a.id, b.id, "same key must reuse the thread");
+        assert_eq!(a.compacted_upto, 0);
+        assert!(a.summary.is_none());
+
+        // A different key is a different thread.
+        let other = db
+            .upsert_agent_conversation("nostr:abc", Some(7))
+            .await
+            .unwrap();
+        assert_ne!(a.id, other.id);
+    }
+
+    /// A thread that starts anonymous gets linked once the sender resolves,
+    /// but an unresolved later lookup must never clear the link.
+    #[tokio::test]
+    async fn agent_conversation_links_user_without_clearing() {
+        let db = MockDb::default();
+
+        let anon = db
+            .upsert_agent_conversation("email:bob@example.com", None)
+            .await
+            .unwrap();
+        assert!(anon.user_id.is_none());
+
+        let linked = db
+            .upsert_agent_conversation("email:bob@example.com", Some(42))
+            .await
+            .unwrap();
+        assert_eq!(linked.id, anon.id);
+        assert_eq!(linked.user_id, Some(42));
+
+        let relookup = db
+            .upsert_agent_conversation("email:bob@example.com", None)
+            .await
+            .unwrap();
+        assert_eq!(relookup.user_id, Some(42), "link must not be cleared");
+    }
+
+    #[tokio::test]
+    async fn agent_messages_append_in_order_and_roundtrip_tool_calls() {
+        let db = MockDb::default();
+        let conv = db
+            .upsert_agent_conversation("user:1", Some(1))
+            .await
+            .unwrap();
+
+        let turn = vec![
+            user_msg("my vm is down", AgentChannel::WebChat),
+            NewAgentMessage {
+                role: AgentMessageRole::Assistant,
+                channel: AgentChannel::WebChat,
+                content: None,
+                tool_calls: Some(r#"[{"id":"c1","name":"start_vm","arguments":"{}"}]"#.to_string()),
+                tool_call_id: None,
+            },
+            NewAgentMessage {
+                role: AgentMessageRole::Tool,
+                channel: AgentChannel::WebChat,
+                content: Some("ok".to_string()),
+                tool_calls: None,
+                tool_call_id: Some("c1".to_string()),
+            },
+        ];
+        let ids = db.append_agent_messages(conv.id, &turn).await.unwrap();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.windows(2).all(|w| w[0] < w[1]), "ids must ascend");
+
+        let stored = db
+            .list_agent_messages_after_watermark(conv.id)
+            .await
+            .unwrap();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[0].role, AgentMessageRole::User);
+        assert_eq!(
+            stored[0].content.as_ref().map(|c| c.as_str()),
+            Some("my vm is down")
+        );
+        // An assistant turn that only called a tool stores no prose.
+        assert!(stored[1].content.is_none());
+        assert!(stored[1].tool_calls.is_some());
+        assert_eq!(stored[2].tool_call_id.as_deref(), Some("c1"));
+
+        // Appending nothing is a no-op, not an error.
+        assert!(
+            db.append_agent_messages(conv.id, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The core of the training-corpus decision: compaction bounds what is
+    /// replayed but must never destroy the transcript.
+    #[tokio::test]
+    async fn compaction_advances_watermark_without_deleting() {
+        let db = MockDb::default();
+        let conv = db
+            .upsert_agent_conversation("user:2", Some(2))
+            .await
+            .unwrap();
+
+        let first = db
+            .append_agent_messages(
+                conv.id,
+                &[
+                    user_msg("one", AgentChannel::Email),
+                    user_msg("two", AgentChannel::Email),
+                ],
+            )
+            .await
+            .unwrap();
+        let watermark = *first.last().unwrap();
+
+        db.compact_agent_conversation(conv.id, "summary so far", watermark)
+            .await
+            .unwrap();
+
+        // Context is now empty — everything is folded into the summary.
+        assert!(
+            db.list_agent_messages_after_watermark(conv.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let reloaded = db.get_agent_conversation(conv.id).await.unwrap();
+        assert_eq!(reloaded.summary.as_deref(), Some("summary so far"));
+        assert_eq!(reloaded.compacted_upto, watermark);
+
+        // ...but the full transcript is still there for training.
+        let all = db
+            .list_agent_messages_paginated(conv.id, 100, 0)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2, "compaction must not delete messages");
+
+        // New messages replay again.
+        db.append_agent_messages(conv.id, &[user_msg("three", AgentChannel::WebChat)])
+            .await
+            .unwrap();
+        let context = db
+            .list_agent_messages_after_watermark(conv.id)
+            .await
+            .unwrap();
+        assert_eq!(context.len(), 1);
+        assert_eq!(
+            context[0].content.as_ref().map(|c| c.as_str()),
+            Some("three")
+        );
+    }
+
+    /// A stale compaction must not drag the watermark backwards and re-expose
+    /// messages already summarised.
+    #[tokio::test]
+    async fn compaction_watermark_is_monotonic() {
+        let db = MockDb::default();
+        let conv = db
+            .upsert_agent_conversation("user:3", Some(3))
+            .await
+            .unwrap();
+        let ids = db
+            .append_agent_messages(
+                conv.id,
+                &[
+                    user_msg("a", AgentChannel::Email),
+                    user_msg("b", AgentChannel::Email),
+                ],
+            )
+            .await
+            .unwrap();
+
+        db.compact_agent_conversation(conv.id, "newer", ids[1])
+            .await
+            .unwrap();
+        db.compact_agent_conversation(conv.id, "stale", ids[0])
+            .await
+            .unwrap();
+
+        let reloaded = db.get_agent_conversation(conv.id).await.unwrap();
+        assert_eq!(
+            reloaded.compacted_upto, ids[1],
+            "watermark must not regress"
+        );
+    }
+
+    /// Threads are isolated: the public Nostr thread must not leak into the
+    /// private email/web-chat thread for the same customer.
+    #[tokio::test]
+    async fn agent_threads_are_isolated_by_key() {
+        let db = MockDb::default();
+        let private = db
+            .upsert_agent_conversation("user:9", Some(9))
+            .await
+            .unwrap();
+        let public = db
+            .upsert_agent_conversation("nostr:deadbeef", Some(9))
+            .await
+            .unwrap();
+
+        db.append_agent_messages(
+            private.id,
+            &[user_msg("my card ending 4242 failed", AgentChannel::Email)],
+        )
+        .await
+        .unwrap();
+
+        let public_context = db
+            .list_agent_messages_after_watermark(public.id)
+            .await
+            .unwrap();
+        assert!(
+            public_context.is_empty(),
+            "private message must not appear in the public nostr thread"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_messages_paginate() {
+        let db = MockDb::default();
+        let conv = db
+            .upsert_agent_conversation("user:4", Some(4))
+            .await
+            .unwrap();
+        let msgs: Vec<_> = (0..5)
+            .map(|i| user_msg(&format!("m{i}"), AgentChannel::WebChat))
+            .collect();
+        db.append_agent_messages(conv.id, &msgs).await.unwrap();
+
+        let page = db
+            .list_agent_messages_paginated(conv.id, 2, 1)
+            .await
+            .unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].content.as_ref().map(|c| c.as_str()), Some("m1"));
+        assert_eq!(page[1].content.as_ref().map(|c| c.as_str()), Some("m2"));
+    }
 
     #[tokio::test]
     async fn test_count_vms_by_os_image() {

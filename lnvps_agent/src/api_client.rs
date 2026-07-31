@@ -116,7 +116,7 @@ impl ApiClient {
             SenderIdentity::Pubkey(pubkey) => self.admin_find_user_by_pubkey(pubkey).await?,
         };
 
-        let key = sender.conversation_key();
+        let key = sender.as_str();
         let Some(user) = user else {
             log::info!("{} is not an LNVPS customer — general", key);
             return Ok(Requester::Anonymous);

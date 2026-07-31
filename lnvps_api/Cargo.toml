@@ -35,15 +35,22 @@ default = [
     "payments-rs/tls-ring"
 ]
 openapi = ["dep:openapi-build-gen"]
+# AI support agent served over a live-chat websocket. Off by default: it pulls
+# an OpenAI client and is inert unless `agent` is set in the config.
+# `lnvps_api_common/admin` brings in the RBAC tables so the chat handler can
+# check `users:view` before exposing tool activity.
+agent = ["dep:lnvps_agent", "lnvps_api_common/admin"]
 mikrotik = []
-# Linux router managed over SSH (shares the SshClient with proxmox)
-linux-ssh = ["dep:russh", "dep:russh-sftp"]
+# Linux router managed over SSH (shares the SshClient with proxmox).
+# The client itself lives in lnvps_api_common; this just forwards the feature.
+linux-ssh = ["lnvps_api_common/linux-ssh"]
 nostr-dm = ["dep:nostr-sdk", "nostr-sdk/nip44", "nostr-sdk/nip59"]
 nostr-dvm = ["dep:nostr-sdk"]
 nostr-domain = ["lnvps_db/nostr-domain", "dep:uuid"]
 nostr-nwc = ["dep:nostr-sdk", "dep:nwc", "nostr-sdk/nip47"]
-proxmox = ["dep:russh", "dep:russh-sftp", "dep:tokio-tungstenite"]
-libvirt = ["dep:virt", "dep:uuid", "dep:quick-xml"]
+# Hypervisor host clients now live in lnvps_api_common; forward the features.
+proxmox = ["lnvps_api_common/proxmox"]
+libvirt = ["lnvps_api_common/libvirt", "dep:uuid", "dep:quick-xml"]
 lnd = ["payments-rs/method-lnd"]
 # On-chain Bitcoin payments (LND wallet backend)
 onchain = ["payments-rs/method-lnd-onchain"]
@@ -59,6 +66,7 @@ stripe = ["payments-rs/method-stripe"]
 lnvps_db = { path = "../lnvps_db" }
 lnvps_compose = { path = "../lnvps_compose" }
 lnvps_api_common = { path = "../lnvps_api_common" }
+lnvps_agent = { path = "../lnvps_agent", features = ["db"], optional = true }
 try-procedure = { path = "../try-procedure" }
 
 anyhow.workspace = true
@@ -116,17 +124,11 @@ nostr-sdk = { rev = "c69c4ae2bf1a5f340aba70c20d09323f5309a4e2", git = "https://g
 #nostr-nwc
 nwc = { rev = "c69c4ae2bf1a5f340aba70c20d09323f5309a4e2", git = "https://github.com/rust-nostr/nostr", optional = true }
 
-#proxmox
-tokio-tungstenite = { version = "0.28", features = ["native-tls"], optional = true }
 reqwest = { workspace = true }
 
-#libvirt
-virt = { git = "https://gitlab.com/libvirt/libvirt-rust.git", optional = true }
-#virtxml = {git = "https://gitlab.com/libvirt/libvirt-rust-xml.git", optional = true}/
+#libvirt (host client lives in lnvps_api_common; these remain for local XML/uuid use)
 uuid = { version = "1.16", features = ["v4", "serde"], optional = true }
 quick-xml = { version = "0.39", features = ["serde", "serialize"], optional = true }
-russh = { version = "0.62", optional = true }
-russh-sftp = { version = "2", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11"

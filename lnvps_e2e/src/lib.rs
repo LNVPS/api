@@ -13,6 +13,7 @@
 //! - `ADMIN_NOSTR_SECRET_KEY` — Hex-encoded Nostr secret key for admin API auth (random key generated if unset)
 
 mod admin_api;
+mod agent_chat;
 pub mod client;
 pub mod db;
 mod lifecycle;
