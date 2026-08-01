@@ -6,12 +6,13 @@ use crate::admin::model::{
     AdminUpdateSubscriptionLineItemRequest, AdminUpdateSubscriptionRequest,
 };
 use axum::extract::{Path, Query, State};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use chrono::{DateTime, Days, Utc};
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, WorkJob,
 };
-use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
+use lnvps_db::{AdminAction, AdminResource, LNVpsDb, Subscription};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -26,6 +27,10 @@ pub fn router() -> Router<RouterState> {
             get(admin_get_subscription)
                 .patch(admin_update_subscription)
                 .delete(admin_delete_subscription),
+        )
+        .route(
+            "/api/admin/v1/subscriptions/{id}/extend",
+            put(admin_extend_subscription),
         )
         .route(
             "/api/admin/v1/subscriptions/{subscription_id}/line_items",
@@ -271,6 +276,82 @@ async fn admin_update_subscription(
     }
 
     this.db.update_subscription(&subscription).await?;
+    let info = AdminSubscriptionInfo::from_subscription(&this.db, &subscription).await?;
+    ApiData::ok(info)
+}
+
+#[derive(Deserialize)]
+struct AdminExtendSubscriptionRequest {
+    /// Number of days to add to the current expiry (1–365)
+    days: u32,
+    /// Free-text justification, recorded in the server log
+    reason: Option<String>,
+}
+
+/// Validate `days` and apply the extension to `subscription` in memory,
+/// returning the new expiry.
+///
+/// Mirrors the VM extension rules (`PUT /api/admin/v1/vms/{id}/extend`): time
+/// is added to the existing expiry (or to now when the subscription has never
+/// had one), and granting paid time marks the subscription set up and active —
+/// otherwise the lifecycle worker, which keys off those flags, would tear the
+/// resource down despite the admin having extended it.
+fn apply_subscription_extension(
+    subscription: &mut Subscription,
+    days: u32,
+) -> Result<DateTime<Utc>, ApiError> {
+    if days == 0 {
+        return Err(ApiError::bad_request("Must extend by at least 1 day"));
+    }
+    if days > 365 {
+        return Err(ApiError::bad_request("Cannot extend by more than 365 days"));
+    }
+
+    let new_expires = subscription.expires.unwrap_or_else(Utc::now) + Days::new(days as u64);
+    subscription.expires = Some(new_expires);
+    subscription.is_setup = true;
+    subscription.is_active = true;
+    Ok(new_expires)
+}
+
+/// Extend a subscription's expiry by a number of days (admin grant).
+///
+/// The subscription-level counterpart of `PUT /api/admin/v1/vms/{id}/extend`,
+/// so non-VPS products (apps, IP ranges, ASN sponsoring, DNS hosting) can be
+/// credited the same way. No payment row is written: this is granted time, not
+/// a settlement.
+async fn admin_extend_subscription(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(request): Json<AdminExtendSubscriptionRequest>,
+) -> ApiResult<AdminSubscriptionInfo> {
+    auth.require_permission(AdminResource::Subscriptions, AdminAction::Update)?;
+
+    let mut subscription = this.db.get_subscription(id).await?;
+    let new_expires = apply_subscription_extension(&mut subscription, request.days)?;
+
+    this.db.update_subscription(&subscription).await?;
+
+    log::info!(
+        "Admin {} extended subscription {} by {} days until {} (reason: {})",
+        auth.user_id,
+        id,
+        request.days,
+        new_expires,
+        request.reason.as_deref().unwrap_or("none")
+    );
+
+    // Dispatch CheckSubscriptions so the lifecycle worker picks up the new
+    // expiry (e.g. restarts a workload that was stopped for non-payment).
+    if let Err(e) = this.work_commander.send(WorkJob::CheckSubscriptions).await {
+        log::error!(
+            "Subscription {} extended but failed to dispatch CheckSubscriptions: {}",
+            id,
+            e
+        );
+    }
+
     let info = AdminSubscriptionInfo::from_subscription(&this.db, &subscription).await?;
     ApiData::ok(info)
 }
@@ -568,4 +649,83 @@ async fn admin_complete_subscription_payment(
         .get_subscription_payment_with_company(&payment_id)
         .await?;
     ApiData::ok(AdminSubscriptionPaymentInfo::from_with_company(updated))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lnvps_db::IntervalType;
+
+    fn mk_subscription(expires: Option<DateTime<Utc>>) -> Subscription {
+        Subscription {
+            id: 1,
+            user_id: 1,
+            company_id: 1,
+            name: "test".to_string(),
+            description: None,
+            created: DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap(),
+            expires,
+            is_active: false,
+            is_setup: false,
+            currency: "USD".to_string(),
+            interval_amount: 1,
+            interval_type: IntervalType::Month,
+            setup_fee: 0,
+            auto_renewal_enabled: false,
+            external_id: None,
+        }
+    }
+
+    #[test]
+    fn extension_adds_days_to_existing_expiry() {
+        let expires = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+        let mut sub = mk_subscription(Some(expires));
+
+        let Ok(new_expires) = apply_subscription_extension(&mut sub, 30) else {
+            panic!("30 days is within bounds");
+        };
+
+        // Added to the existing expiry, not to "now": an admin crediting a
+        // customer must not silently shorten unused paid time.
+        assert_eq!(new_expires, expires + Days::new(30));
+        assert_eq!(sub.expires, Some(new_expires));
+        // Granting paid time also marks the subscription live, otherwise the
+        // lifecycle worker would tear the resource down anyway.
+        assert!(sub.is_setup);
+        assert!(sub.is_active);
+    }
+
+    #[test]
+    fn extension_without_expiry_starts_from_now() {
+        let mut sub = mk_subscription(None);
+
+        let before = Utc::now();
+        let Ok(new_expires) = apply_subscription_extension(&mut sub, 1) else {
+            panic!("1 day is within bounds");
+        };
+        let after = Utc::now();
+
+        assert!(new_expires >= before + Days::new(1));
+        assert!(new_expires <= after + Days::new(1));
+    }
+
+    #[test]
+    fn extension_days_are_bounded() {
+        let expires = DateTime::<Utc>::from_timestamp(1_800_000_000, 0).unwrap();
+
+        // Zero is a no-op that would still flip is_setup/is_active, so it is
+        // refused rather than accepted.
+        let mut sub = mk_subscription(Some(expires));
+        assert!(apply_subscription_extension(&mut sub, 0).is_err());
+        assert_eq!(sub.expires, Some(expires));
+        assert!(!sub.is_active);
+
+        // Upper bound matches the VM endpoint (365 days).
+        let mut sub = mk_subscription(Some(expires));
+        assert!(apply_subscription_extension(&mut sub, 366).is_err());
+        assert_eq!(sub.expires, Some(expires));
+
+        let mut sub = mk_subscription(Some(expires));
+        assert!(apply_subscription_extension(&mut sub, 365).is_ok());
+    }
 }

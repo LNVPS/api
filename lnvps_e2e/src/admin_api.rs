@@ -3250,6 +3250,68 @@ mod tests {
         }
     }
 
+    /// Admins can grant time on any subscription, not just VPS ones
+    /// (`PUT /api/admin/v1/subscriptions/{id}/extend`). Verifies the happy
+    /// path moves `expires` forward, and that the day bounds are enforced.
+    #[tokio::test]
+    async fn test_admin_subscription_extend() {
+        let client = setup().await;
+        let resp = client
+            .get_auth("/api/admin/v1/subscriptions?limit=1")
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let Some(sub) = body["data"].as_array().and_then(|s| s.first().cloned()) else {
+            eprintln!("Skipping: no subscriptions found for extend test");
+            return;
+        };
+        let sub_id = sub["id"].as_u64().unwrap();
+        let before = sub["expires"].as_str().map(|s| s.to_string());
+
+        let resp = client
+            .put_auth(
+                &format!("/api/admin/v1/subscriptions/{sub_id}/extend"),
+                &serde_json::json!({"days": 1, "reason": "e2e-test"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let after = body["data"]["expires"].as_str().map(|s| s.to_string());
+        assert!(after.is_some(), "extend always sets an expiry: {body}");
+        assert_ne!(after, before, "expiry must move forward");
+        assert_eq!(body["data"]["is_active"], serde_json::json!(true));
+
+        // Bounds: 0 and >365 days are refused.
+        for days in [0u32, 366] {
+            let resp = client
+                .put_auth(
+                    &format!("/api/admin/v1/subscriptions/{sub_id}/extend"),
+                    &serde_json::json!({"days": days}),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::OK,
+                "extend with days={days} must not succeed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_admin_subscription_extend_not_found() {
+        let client = setup().await;
+        let resp = client
+            .put_auth(
+                "/api/admin/v1/subscriptions/999999999/extend",
+                &serde_json::json!({"days": 1}),
+            )
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn test_admin_subscription_line_item_not_found() {
         let client = setup().await;

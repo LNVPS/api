@@ -941,6 +941,32 @@ Request body (all fields optional):
 
 Response: Updated subscription with line items
 
+#### Extend Subscription
+
+```
+PUT /api/admin/v1/subscriptions/{id}/extend
+```
+
+Required Permission: `subscriptions::update`
+
+Grants free time on any subscription (apps, IP ranges, ASN sponsoring, DNS hosting, VPS) — the subscription-level counterpart of `PUT /api/admin/v1/vms/{id}/extend`. No payment row is written: this is granted time, not a settlement.
+
+Request body:
+
+```json
+{
+  "days": number,
+  // Required, 1-365. Added to the current expiry (or to now if the
+  // subscription has no expiry yet).
+  "reason": string
+  // Optional, recorded in the server log.
+}
+```
+
+**Note:** Time is added to the existing `expires`, so unused paid time is never lost, and an already-expired subscription is extended from where it lapsed. Granting time also sets `is_setup` and `is_active` to `true`, otherwise the lifecycle worker (which keys off those flags) would tear the resource down despite the extension. A `CheckSubscriptions` job is dispatched so the worker picks up the new expiry.
+
+Response: Updated subscription with line items
+
 #### Delete Subscription
 
 ```
