@@ -660,6 +660,60 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Get VM history entry by id
     async fn get_vm_history(&self, id: u64) -> DbResult<VmHistory>;
 
+    // ── Support agent conversations ──────────────────────────────
+
+    /// Fetch the conversation for `conversation_key`, creating it if absent.
+    ///
+    /// `user_id` is the resolved LNVPS user, or `None` for an unrecognised
+    /// sender. On an existing row it refreshes `user_id`, so a sender who was
+    /// anonymous when the thread started becomes linked once they register.
+    ///
+    /// See the `agent_conversation` migration for the key namespacing rules.
+    async fn upsert_agent_conversation(
+        &self,
+        conversation_key: &str,
+        user_id: Option<u64>,
+    ) -> DbResult<AgentConversation>;
+
+    /// Get a conversation by id.
+    async fn get_agent_conversation(&self, id: u64) -> DbResult<AgentConversation>;
+
+    /// Append messages to a conversation, in order. Returns the new message ids.
+    ///
+    /// The log is append-only; there is deliberately no update or delete.
+    async fn append_agent_messages(
+        &self,
+        conversation_id: u64,
+        messages: &[NewAgentMessage],
+    ) -> DbResult<Vec<u64>>;
+
+    /// List the messages a conversation should replay as LLM context: those
+    /// above the `compacted_upto` watermark, oldest first.
+    async fn list_agent_messages_after_watermark(
+        &self,
+        conversation_id: u64,
+    ) -> DbResult<Vec<AgentMessage>>;
+
+    /// List every message in a conversation, oldest first, ignoring the
+    /// watermark. This is the training/audit export path.
+    async fn list_agent_messages_paginated(
+        &self,
+        conversation_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<Vec<AgentMessage>>;
+
+    /// Record a compaction: store the new summary and advance the watermark.
+    ///
+    /// No messages are removed — `compacted_upto` simply bounds what is
+    /// replayed, leaving the transcript intact for training.
+    async fn compact_agent_conversation(
+        &self,
+        conversation_id: u64,
+        summary: &str,
+        compacted_upto: u64,
+    ) -> DbResult<()>;
+
     /// Execute a raw SQL query that doesn't return data
     async fn execute_query(&self, query: &str) -> DbResult<u64>;
 

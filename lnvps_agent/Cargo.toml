@@ -8,7 +8,17 @@ description = "AI support agent for LNVPS — processes support requests using a
 name = "lnvps_agent"
 path = "src/main.rs"
 
+[features]
+default = []
+# Database-backed conversation storage and tool execution, for when the agent is
+# hosted inside `lnvps_api` rather than run as a standalone binary. Lets the
+# in-process agent read customer data directly instead of calling the admin API
+# over loopback with an admin nsec.
+db = ["dep:lnvps_db", "dep:lnvps_api_common", "dep:hex"]
+
 [dependencies]
+lnvps_db = { path = "../lnvps_db", optional = true }
+lnvps_api_common = { path = "../lnvps_api_common", optional = true }
 tokio = { workspace = true, features = ["signal", "time"] }
 anyhow.workspace = true
 log.workspace = true
@@ -26,6 +36,7 @@ chrono = { version = "0.4", features = ["serde"] }
 nostr = { version = "0.44", default-features = false, features = ["std"] }
 nostr-sdk = { rev = "c69c4ae2bf1a5f340aba70c20d09323f5309a4e2", git = "https://github.com/rust-nostr/nostr", default-features = false }
 base64 = "0.22"
+hex = { workspace = true, optional = true }
 
 # Email support channel (IMAP poll + SMTP reply)
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
@@ -35,3 +46,6 @@ webpki-roots = "0.26"
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+futures.workspace = true

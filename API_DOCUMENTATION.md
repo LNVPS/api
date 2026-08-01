@@ -901,6 +901,41 @@ interface PatchPaymentMethodRequest {
 - **Protocol**: WebSocket upgrade — bidirectional relay between the client and the VM's serial console
 - **Description**: Opens a WebSocket connection to the VM's serial terminal. Raw bytes in either direction are forwarded to/from the VM's serial port on the host. The connection is closed when either side disconnects or an error occurs.
 
+### Support Chat
+
+#### Live Chat with the Support Agent (WebSocket)
+- **WebSocket** `/api/v1/support/chat`
+- **Auth**: Query parameter `?auth=<base64_nip98_event>` (same base64-encoded NIP-98 event as the `Authorization` header, signed over `/api/v1/support/chat` with method `GET`)
+- **Description**: Opens a live chat with the AI support agent. The agent has read access to your account, VMs, payment history and VM activity log, and can start, stop and restart your VMs.
+
+**Sending**: send each message as a single WebSocket **text frame** containing the plain message text. Binary frames are rejected.
+
+**Receiving**: the server replies with newline-free JSON text frames. Each frame is one event:
+
+```typescript
+{ type: "token";      text: string }    // fragment of the reply — append as it arrives
+{ type: "final";      text: string }    // complete reply; equals all tokens concatenated
+{ type: "error";      message: string } // the turn failed
+
+// Only sent to callers holding the `users:view` admin permission:
+{ type: "tool_start"; name: string }    // agent began running a tool
+{ type: "tool_done";  name: string }    // agent finished running a tool
+```
+
+Ordinary customers receive only `token`, `final` and `error`. The `tool_start` / `tool_done` frames describe the agent's internal lookups and are restricted to callers with the `users:view` permission; the agent still runs those tools either way, the progress notifications are simply not sent. Clients must therefore treat any frame type they do not recognise as ignorable.
+
+Every message you send produces exactly one terminal frame — `final` or `error` — so a client can treat either as "this turn is done".
+
+**Limits**
+- Messages longer than **4000 characters** are rejected with an `error` frame; the connection stays open.
+- A single connection accepts at most **50 messages**, after which the server sends an `error` frame and closes. Reconnect to continue; conversation history is preserved.
+
+**What the agent will not do**: the agent cannot extend, refund or delete a VM. Those actions move money or destroy data, so they are not exposed to an interactive chat session; the agent will refer you to email support instead. Stopping or restarting a VM interrupts running services, so the agent will confirm before doing either.
+
+**Conversation history** is stored per account and is shared with the email support channel, so the agent remembers earlier exchanges regardless of how you contacted support. Public Nostr mentions are kept in a separate thread and are never mixed into it.
+
+**Availability**: this endpoint is only present when the server is built with the `agent` feature and an agent is configured; otherwise it returns an `error` frame and closes.
+
 ### VM Firewall
 
 Basic per-VM firewall rules. User-defined ACCEPT/DROP/REJECT rules are evaluated

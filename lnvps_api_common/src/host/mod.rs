@@ -1,29 +1,50 @@
-use crate::settings::ProvisionerConfig;
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use futures::future::join_all;
-use lnvps_api_common::HostVmSpec;
-use lnvps_api_common::VmRunningState;
-use lnvps_api_common::retry::OpResult;
-use lnvps_db::{
-    IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmFirewallRule, VmHost, VmHostDisk,
-    VmHostKind, VmIpAssignment, VmOsImage, VmTemplate,
-};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc::{Receiver, Sender};
 
+use lnvps_db::{
+    IpRange, LNVpsDb, UserSshKey, Vm, VmCustomTemplate, VmFirewallRule, VmHost, VmHostDisk,
+    VmHostKind, VmIpAssignment, VmOsImage, VmTemplate,
+};
+
+use crate::HostVmSpec;
+use crate::VmRunningState;
+use crate::host::config::ProvisionerConfig;
+use crate::retry::OpResult;
+
+pub mod config;
 #[cfg(feature = "libvirt")]
 mod libvirt;
 #[cfg(feature = "proxmox")]
 mod proxmox;
 
-pub(crate) mod dummy_host;
+pub mod dummy_host;
 
 pub struct TerminalStream {
     pub rx: Receiver<Vec<u8>>,
     pub tx: Sender<Vec<u8>>,
+}
+
+/// Extract hostname/IP from a URL or return the input if it's already a plain host
+/// e.g. "https://192.168.1.1:8006/" -> "192.168.1.1"
+///      "192.168.1.1" -> "192.168.1.1"
+pub fn extract_host_from_url(input: &str) -> String {
+    // Strip protocol prefix if present
+    let without_protocol = input
+        .strip_prefix("https://")
+        .or_else(|| input.strip_prefix("http://"))
+        .unwrap_or(input);
+
+    // Take everything before the first ':' or '/' (to strip port and path)
+    without_protocol
+        .split(|c| c == ':' || c == '/')
+        .next()
+        .unwrap_or(input)
+        .to_string()
 }
 
 /// Generic type for creating VM's
@@ -37,7 +58,7 @@ pub trait VmHostClient: Send + Sync {
     /// tracked in the database. Defaults to unsupported for hosts that don't
     /// implement discovery.
     async fn list_host_vms(&self) -> OpResult<Vec<HostVmSpec>> {
-        use lnvps_api_common::retry::OpError;
+        use crate::retry::OpError;
         Err(OpError::Fatal(anyhow!(
             "VM discovery is not supported on this host type"
         )))
@@ -117,7 +138,16 @@ pub async fn get_vm_host_client(
     Ok(client)
 }
 
-pub fn get_host_client(host: &VmHost, cfg: &ProvisionerConfig) -> Result<Arc<dyn VmHostClient>> {
+pub fn get_host_client(
+    host: &VmHost,
+    // Only read by the hypervisor-specific arms below, so it is unused when the
+    // crate is built with neither `proxmox` nor `libvirt` enabled.
+    #[cfg_attr(
+        not(any(feature = "proxmox", feature = "libvirt")),
+        allow(unused_variables)
+    )]
+    cfg: &ProvisionerConfig,
+) -> Result<Arc<dyn VmHostClient>> {
     Ok(match host.kind.clone() {
         #[cfg(feature = "proxmox")]
         VmHostKind::Proxmox if cfg.proxmox.is_some() => {

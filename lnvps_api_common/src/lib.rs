@@ -3,6 +3,7 @@ mod client_ip;
 mod dns;
 mod exchange;
 mod geoip;
+pub mod host;
 mod json_api;
 pub mod k8s_names;
 mod kv;
@@ -19,6 +20,8 @@ pub mod retry;
 mod routes;
 mod session;
 pub mod shasum;
+#[cfg(any(feature = "proxmox", feature = "linux-ssh"))]
+pub mod ssh_client;
 mod ssh_host_key;
 mod status;
 mod vat;

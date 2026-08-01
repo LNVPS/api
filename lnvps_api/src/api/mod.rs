@@ -10,6 +10,8 @@ mod oauth;
 mod referral;
 mod routes;
 mod subscriptions;
+#[cfg(feature = "agent")]
+mod support;
 mod webauthn;
 mod webhook;
 

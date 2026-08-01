@@ -170,9 +170,7 @@ pub fn build_refund_row(
         // The instrument the payout was made against — the customer's BOLT11
         // for a Lightning refund, same slot the original sale's invoice uses.
         // Empty when the money was returned out of band and only recorded.
-        external_data: lnvps_db::EncryptedString::new(
-            instrument.unwrap_or_default().to_string(),
-        ),
+        external_data: lnvps_db::EncryptedString::new(instrument.unwrap_or_default().to_string()),
         external_id: None,
         is_paid: true,
         rate: original.rate,

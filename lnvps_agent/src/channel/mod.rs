@@ -4,7 +4,7 @@ pub mod kind1;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::identity::SenderIdentity;
+use crate::identity::{SenderIdentity, SupportChannelKind};
 
 /// An incoming support request from a customer.
 #[derive(Clone, Debug)]
@@ -35,6 +35,14 @@ pub struct SupportReply {
 /// read from a message queue, or monitor an IMAP inbox.
 #[async_trait]
 pub trait SupportChannel: Send + Sync {
+    /// Which kind of channel this is.
+    ///
+    /// Determines how conversations are keyed — in particular, a public channel
+    /// is kept in its own thread so the agent cannot quote privately-shared
+    /// details into a world-readable reply. See
+    /// [`crate::identity::conversation_key`].
+    fn kind(&self) -> SupportChannelKind;
+
     /// Wait for the next inbound support request.
     /// Blocks until a request is available, or returns `None` if the channel
     /// has been shut down.
