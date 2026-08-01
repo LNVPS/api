@@ -301,6 +301,39 @@ captcha:
 
 ---
 
+### Live-chat support agent (optional)
+
+AI support agent served in-process by `lnvps_api` over the
+`/api/v1/support/chat` websocket. Requires building with the `agent` feature
+(`cargo build -p lnvps_api --features agent`); it is off by default. When the
+`agent` section is omitted the endpoint still exists but refuses connections.
+
+This is distinct from the standalone [`lnvps_agent`](#lnvps_agent-config)
+service, which serves the email and Nostr channels and has its own
+`settings.yaml`.
+
+```yaml
+agent:
+  openai:                                    # OpenAI-compatible LLM (required)
+    base-url: "http://localhost:11434/v1"   # Ollama, vLLM, https://api.openai.com/v1, ...
+    api-key: "sk-..."                       # optional (not needed for Ollama)
+    model: "gpt-4o"
+    max-tokens: 2048
+  system-prompt: |                           # optional EXTRA instructions (see below)
+    Billing questions go to billing@example.com.
+  max-message-chars: 4000                    # reject longer single messages (default 4000)
+  max-turns-per-connection: 50               # messages allowed per websocket (default 50)
+```
+
+**`system-prompt` is optional and additive — not an override.** The agent's
+system prompt is compiled into the binary
+(`lnvps_agent/src/agent/prompts.rs`, plus the live-chat channel prompt in
+`lnvps_agent/src/session.rs`) and is always used. Anything set here is appended
+after it, for deployment-specific guidance (tone, escalation wording, house
+rules). Leave it unset to run the default agent prompt as-is.
+
+---
+
 ### `lnvps_nostr` config
 
 Standalone NIP-05 identity server. Reads domain/handle records from the shared database.
@@ -423,7 +456,7 @@ listen: "0.0.0.0:8080"                       # agent HTTP server (default)
 admin-api-url: "https://api.example.com"     # LNVPS admin API base URL (required)
 user-api-url: "https://api.example.com"      # LNVPS user API base URL (required)
 nsec: "nsec1234xxx"                           # signs NIP-98 auth events / Nostr ops (required)
-system-prompt: "You are LNVPS support..."    # optional system prompt override
+system-prompt: "Billing goes to billing@..." # optional EXTRA instructions, appended to the built-in prompt
 conversation-history-path: "/var/lib/lnvps-agent"  # optional history store dir
 
 openai:                                       # OpenAI-compatible LLM (required)

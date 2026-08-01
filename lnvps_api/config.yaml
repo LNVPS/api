@@ -71,6 +71,28 @@ captcha:
   # Turnstile is a Cloudflare captcha product
   turnstile:
     secret-key: "1x0000000000000000000000000000000AA"
+# AI live-chat support agent (optional, requires building with `--features agent`).
+# Serves the support websocket at `/api/v1/support/chat` in-process against the
+# database. When this section is omitted the endpoint exists but refuses every
+# connection, so the feature can be compiled in and left switched off.
+#agent:
+#  # OpenAI-compatible endpoint (Ollama, vLLM, OpenAI, ...). Required.
+#  openai:
+#    base-url: "http://localhost:11434/v1"
+#    # Not needed for Ollama, required by most hosted providers.
+#    #api-key: "sk-..."
+#    model: "llama3.2"
+#    max-tokens: 2048
+#  # OPTIONAL and ADDITIVE — do not put the whole support prompt here. The
+#  # built-in prompts (lnvps_agent/src/agent/prompts.rs plus the live-chat
+#  # channel prompt) are always used; this text is appended after them for
+#  # deployment-specific guidance (tone, escalation wording, house rules).
+#  #system-prompt: |
+#  #  Always mention that billing questions go to billing@example.com.
+#  # Reject a single chat message longer than this many characters (default 4000).
+#  #max-message-chars: 4000
+#  # Cap on messages accepted per websocket connection (default 50).
+#  #max-turns-per-connection: 50
 # Telegram notification channel (optional). Create a bot via @BotFather.
 # When set, users can link their chat from account settings and receive
 # notifications via Telegram.

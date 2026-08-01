@@ -21,9 +21,12 @@ openai:
   # Max completion tokens
   max-tokens: 2048
 
-# Optional: custom system prompt override
+# Optional EXTRA instructions, appended to the built-in prompts
+# (src/agent/prompts.rs plus the channel prompt). This is additive — the default
+# agent prompt is always used, so only put deployment-specific guidance here
+# (tone, escalation wording, house rules).
 # system-prompt: |
-#   You are the LNVPS support agent...
+#   Billing questions go to billing@lnvps.io.
 
 # Email support channel (optional)
 # Uses IMAP IDLE for push-based email notifications

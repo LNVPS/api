@@ -210,6 +210,22 @@ pub(crate) fn tool_specs(
         .collect()
 }
 
+/// Append operator-supplied instructions to a channel prompt.
+///
+/// Kept separate from the built-in prompts so config can only ever add to them.
+fn channel_prompt_with_extra(channel_prompt: &str, extra: Option<&str>) -> String {
+    match extra {
+        Some(extra) if !extra.trim().is_empty() => {
+            if channel_prompt.is_empty() {
+                extra.trim().to_string()
+            } else {
+                format!("{}\n\n{}", channel_prompt, extra.trim())
+            }
+        }
+        _ => channel_prompt.to_string(),
+    }
+}
+
 /// The AI support agent that handles a support conversation.
 #[derive(Clone)]
 pub struct SupportAgent {
@@ -225,15 +241,26 @@ pub struct SupportAgent {
     store: Arc<dyn ConversationStore>,
     /// Maximum stored messages to retain per sender before compaction.
     compaction_threshold: usize,
+    /// Operator-supplied instructions appended after the built-in prompts.
+    ///
+    /// Additive, never a replacement: the compiled prompts in [`prompts`] are
+    /// always used, so a deployment can adjust tone or house rules without
+    /// having to restate the whole support prompt.
+    extra_prompt: Option<String>,
 }
 
 impl SupportAgent {
     pub fn new(api: Arc<ApiClient>, settings: Settings, store: Arc<dyn ConversationStore>) -> Self {
+        let extra_prompt = settings
+            .system_prompt
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| p.trim().to_string());
         Self {
             api: Some(api),
             openai: settings.openai,
             store,
             compaction_threshold: COMPACTION_THRESHOLD,
+            extra_prompt,
         }
     }
 
@@ -248,6 +275,7 @@ impl SupportAgent {
             openai,
             store,
             compaction_threshold: COMPACTION_THRESHOLD,
+            extra_prompt: None,
         }
     }
 
@@ -789,7 +817,8 @@ impl SupportAgent {
     pub async fn run_loop(&self, channel: Box<dyn crate::channel::SupportChannel>) {
         use crate::channel::SupportReply;
 
-        let channel_prompt = channel.channel_prompt().to_string();
+        let channel_prompt =
+            channel_prompt_with_extra(channel.channel_prompt(), self.extra_prompt.as_deref());
         let kind = channel.kind();
 
         while let Some(req) = channel.next_request().await {
@@ -831,6 +860,19 @@ impl SupportAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Config may only add to the built-in prompts, never replace them.
+    #[test]
+    fn channel_prompt_with_extra_is_additive() {
+        assert_eq!(channel_prompt_with_extra("BASE", None), "BASE");
+        assert_eq!(channel_prompt_with_extra("BASE", Some("   ")), "BASE");
+        assert_eq!(
+            channel_prompt_with_extra("BASE", Some("be brief\n")),
+            "BASE\n\nbe brief"
+        );
+        // A channel with no prompt of its own still gets the extra text.
+        assert_eq!(channel_prompt_with_extra("", Some("be brief")), "be brief");
+    }
 
     /// Regression: truncating for logging must not panic on multi-byte UTF-8
     /// input (byte-index slicing previously panicked mid-character).
