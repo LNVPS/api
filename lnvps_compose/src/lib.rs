@@ -639,7 +639,7 @@ impl Compose {
     /// Parse an app compose document from YAML.
     pub fn parse(yaml: &str) -> Result<Self> {
         let c: Compose =
-            serde_yaml::from_str(yaml).map_err(|e| anyhow!("invalid compose YAML: {e}"))?;
+            serde_yaml_ng::from_str(yaml).map_err(|e| anyhow!("invalid compose YAML: {e}"))?;
         c.validate()?;
         Ok(c)
     }

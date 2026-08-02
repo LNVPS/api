@@ -32,7 +32,7 @@ use lnvps_compose::{
     Compose, DEFAULT_SCRATCH_SIZE, Expose, ROOT_ENTRYPOINT_CAPABILITIES, ResolvedFile,
     ResolvedInit, Service, parse_bytes, parse_cpu_milli, resolve_config,
 };
-use serde_yaml::{Mapping, Value};
+use serde_yaml_ng::{Mapping, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -668,7 +668,7 @@ fn run(args: Args) -> Result<()> {
          # dropped, no privilege escalation. See docs/managed-app-examples.md\n\
          # for what a local run does and does not prove.\n{}",
         args.source,
-        serde_yaml::to_string(&Value::Mapping(doc))?
+        serde_yaml_ng::to_string(&Value::Mapping(doc))?
     );
     std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
 
@@ -761,8 +761,8 @@ mod tests {
             "services:\n  app:\n    image: example/app:latest\n    user: \"1000\"\n    \
              env:\n      SINCE: \"2023-01-01\"\n      REPLICAS: \"3\"\n      DEBUG: \"true\"\n",
         );
-        let text = serde_yaml::to_string(&Value::Mapping(doc)).expect("serialise");
-        let back: Value = serde_yaml::from_str(&text).expect("reparse");
+        let text = serde_yaml_ng::to_string(&Value::Mapping(doc)).expect("serialise");
+        let back: Value = serde_yaml_ng::from_str(&text).expect("reparse");
         assert_eq!(
             back["services"]["app"]["environment"],
             Value::Sequence(vec![

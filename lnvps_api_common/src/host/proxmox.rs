@@ -2454,7 +2454,7 @@ struct CloudInitResolvConf {
 /// not apply the DNS servers Proxmox hands them (Alpine's busybox ifupdown
 /// needs `openresolv`, which the stock cloud image lacks).
 ///
-/// Serialised to YAML from a typed struct via `serde_yml`, prefixed with the
+/// Serialised to YAML from a typed struct via `serde_yaml_ng`, prefixed with the
 /// `#cloud-config` header line, so the on-disk snippet is real cloud-config
 /// YAML without any fragile hand-built indentation/escaping.
 fn build_vendor_snippet(nameservers: &[&str]) -> String {
@@ -2469,7 +2469,7 @@ fn build_vendor_snippet(nameservers: &[&str]) -> String {
     format!(
         "#cloud-config\n{}",
         // This struct is always serialisable, so this cannot fail.
-        serde_yml::to_string(&data).expect("serialize cloud-init vendor data")
+        serde_yaml_ng::to_string(&data).expect("serialize cloud-init vendor data")
     )
 }
 
@@ -3088,22 +3088,22 @@ mod tests {
         assert!(empty.starts_with(header));
         assert!(!empty.contains("manage_resolv_conf"));
         assert!(!empty.contains("resolv_conf"));
-        let v: serde_yml::Value = serde_yml::from_str(&empty).unwrap();
-        assert_eq!(v["ssh_deletekeys"], serde_yml::Value::Bool(false));
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&empty).unwrap();
+        assert_eq!(v["ssh_deletekeys"], serde_yaml_ng::Value::Bool(false));
 
         // With nameservers (incl. IPv6) -> manage_resolv_conf + resolv_conf set.
         let s = build_vendor_snippet(&["1.1.1.1", "2606:4700:4700::1111"]);
         assert!(s.starts_with(header));
-        let v: serde_yml::Value = serde_yml::from_str(&s).unwrap();
-        assert_eq!(v["ssh_deletekeys"], serde_yml::Value::Bool(false));
-        assert_eq!(v["manage_resolv_conf"], serde_yml::Value::Bool(true));
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&s).unwrap();
+        assert_eq!(v["ssh_deletekeys"], serde_yaml_ng::Value::Bool(false));
+        assert_eq!(v["manage_resolv_conf"], serde_yaml_ng::Value::Bool(true));
         assert_eq!(v["resolv_conf"]["nameservers"][0], "1.1.1.1");
         assert_eq!(v["resolv_conf"]["nameservers"][1], "2606:4700:4700::1111");
 
         // The production constant covers both IPv4 and IPv6 resolvers, and the
         // body must be valid cloud-config YAML.
         let prod = build_vendor_snippet(GUEST_DNS_SERVERS);
-        let v: serde_yml::Value = serde_yml::from_str(&prod).unwrap();
+        let v: serde_yaml_ng::Value = serde_yaml_ng::from_str(&prod).unwrap();
         let ns = v["resolv_conf"]["nameservers"].as_sequence().unwrap();
         assert!(ns.iter().any(|n| n.as_str() == Some("8.8.8.8")));
         assert!(ns.iter().any(|n| n.as_str() == Some("2620:fe::fe")));

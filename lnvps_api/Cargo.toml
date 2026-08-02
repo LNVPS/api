@@ -76,7 +76,6 @@ tokio.workspace = true
 config.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yml.workspace = true
 axum.workspace = true
 tower-http.workspace = true
 hex.workspace = true
