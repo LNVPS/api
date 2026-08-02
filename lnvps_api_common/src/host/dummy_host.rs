@@ -1,6 +1,6 @@
 use crate::host::{
-    FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostDiskInfo,
-    VmHostInfo,
+    FullVmInfo, MigrateVmRequest, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient,
+    VmHostDiskInfo, VmHostInfo,
 };
 use crate::retry::OpResult;
 use crate::{GB, HostVmSpec, PB, TB, VmRunningState, VmRunningStates, op_fatal};
@@ -101,6 +101,12 @@ pub struct DummyVmHost {
     vms: Arc<Mutex<HashMap<u64, MockVm>>>,
     /// When `true`, mutations are flushed to [`STATE_FILE`].
     persist: bool,
+    /// Database id of the host this client stands in for, when known.
+    ///
+    /// Only used to answer [`VmHostClient::list_host_vms`] per host, so a test
+    /// can place different VMs on different hosts (which is the whole subject
+    /// of placement-drift detection).
+    host_id: Option<u64>,
 }
 
 impl Default for DummyVmHost {
@@ -119,7 +125,14 @@ impl DummyVmHost {
         Self {
             vms: Arc::new(Mutex::new(HashMap::new())),
             persist: false,
+            host_id: None,
         }
+    }
+
+    /// Tag this client with the database host id it represents.
+    pub fn with_host_id(mut self, host_id: u64) -> Self {
+        self.host_id = Some(host_id);
+        self
     }
 
     /// Create (or reuse) the process-wide persistent host.  State is loaded
@@ -133,6 +146,7 @@ impl DummyVmHost {
         Self {
             vms: LAZY_VMS.clone(),
             persist: true,
+            host_id: None,
         }
     }
 
@@ -153,6 +167,20 @@ impl DummyVmHost {
         }
     }
 
+    /// Migrations recorded by [`VmHostClient::migrate_vm`], oldest first.
+    ///
+    /// Lets a test assert what the provisioner asked the hypervisor to do
+    /// (target node, online or not, whether the disk was copied) without a real
+    /// host.
+    pub async fn migrations() -> Vec<(u64, MigrateVmRequest)> {
+        DUMMY_MIGRATIONS.lock().await.clone()
+    }
+
+    /// Forget all recorded migrations.
+    pub async fn clear_migrations() {
+        DUMMY_MIGRATIONS.lock().await.clear();
+    }
+
     /// Set the list of host VMs reported by [`list_host_vms`].
     ///
     /// Backed by a process-wide registry so the value survives the fresh
@@ -161,15 +189,42 @@ impl DummyVmHost {
     pub async fn set_host_vms(vms: Vec<HostVmSpec>) {
         *DUMMY_HOST_VMS.lock().await = vms;
     }
+
+    /// Set the VM list reported by the client for one specific host.
+    ///
+    /// Takes precedence over [`set_host_vms`] for that host, so a test can give
+    /// two hosts different VM lists.
+    pub async fn set_host_vms_for(host_id: u64, vms: Vec<HostVmSpec>) {
+        DUMMY_HOST_VMS_BY_HOST.lock().await.insert(host_id, vms);
+    }
+
+    /// Forget all per-host VM lists.
+    pub async fn clear_host_vms() {
+        DUMMY_HOST_VMS_BY_HOST.lock().await.clear();
+        DUMMY_HOST_VMS.lock().await.clear();
+    }
 }
 
 /// Process-wide registry of "host" VMs reported by [`DummyVmHost::list_host_vms`].
 static DUMMY_HOST_VMS: LazyLock<Arc<Mutex<Vec<HostVmSpec>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
 
+/// Per-host VM lists, keyed by database host id.
+static DUMMY_HOST_VMS_BY_HOST: LazyLock<Arc<Mutex<HashMap<u64, Vec<HostVmSpec>>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+/// Process-wide log of migrations requested through [`DummyVmHost::migrate_vm`].
+static DUMMY_MIGRATIONS: LazyLock<Arc<Mutex<Vec<(u64, MigrateVmRequest)>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
+
 #[async_trait]
 impl VmHostClient for DummyVmHost {
     async fn list_host_vms(&self) -> OpResult<Vec<HostVmSpec>> {
+        if let Some(host_id) = self.host_id
+            && let Some(vms) = DUMMY_HOST_VMS_BY_HOST.lock().await.get(&host_id)
+        {
+            return Ok(vms.clone());
+        }
         Ok(DUMMY_HOST_VMS.lock().await.clone())
     }
 
@@ -219,6 +274,11 @@ impl VmHostClient for DummyVmHost {
         }
         self.save().await;
 
+        Ok(())
+    }
+
+    async fn migrate_vm(&self, vm: &Vm, req: &MigrateVmRequest) -> OpResult<()> {
+        DUMMY_MIGRATIONS.lock().await.push((vm.id, req.clone()));
         Ok(())
     }
 

@@ -1807,6 +1807,10 @@ pub enum VmHistoryActionType {
     /// a refund is entered against one of the VM's payments, so the audit trail
     /// shows the reversal next to the `PaymentReceived` it undoes.
     Refunded = 12,
+    /// The VM changed host (issue #66). Written both for an admin-requested
+    /// migration and for a placement change discovered on the hosts, so the
+    /// audit trail shows where a VM has physically lived.
+    Migrated = 13,
 }
 
 impl Display for VmHistoryActionType {
@@ -1825,6 +1829,7 @@ impl Display for VmHistoryActionType {
             VmHistoryActionType::ConfigurationChanged => write!(f, "configuration_changed"),
             VmHistoryActionType::Transferred => write!(f, "transferred"),
             VmHistoryActionType::Refunded => write!(f, "refunded"),
+            VmHistoryActionType::Migrated => write!(f, "migrated"),
         }
     }
 }
@@ -1847,6 +1852,7 @@ impl FromStr for VmHistoryActionType {
             "configuration_changed" => Ok(VmHistoryActionType::ConfigurationChanged),
             "transferred" => Ok(VmHistoryActionType::Transferred),
             "refunded" => Ok(VmHistoryActionType::Refunded),
+            "migrated" => Ok(VmHistoryActionType::Migrated),
             _ => Err(anyhow!("unknown VM history action type: {}", s)),
         }
     }

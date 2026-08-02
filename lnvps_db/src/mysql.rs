@@ -1220,6 +1220,16 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn update_vm_host(&self, vm_id: u64, host_id: u64, disk_id: u64) -> DbResult<()> {
+        sqlx::query("update vm set host_id=?,disk_id=? where id=?")
+            .bind(host_id)
+            .bind(disk_id)
+            .bind(vm_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
     async fn set_vm_ssh_host_keys(&self, vm_id: u64, keys: Option<&str>) -> DbResult<()> {
         sqlx::query("update vm set ssh_host_keys=? where id=?")
             .bind(keys)

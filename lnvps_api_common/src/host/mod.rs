@@ -24,6 +24,25 @@ mod proxmox;
 
 pub mod dummy_host;
 
+/// A request to move a VM from the host this client talks to onto another host.
+///
+/// Expressed in host-native terms (a Proxmox node name, a storage pool name)
+/// because the target host record means nothing to the hypervisor; the caller
+/// resolves the database host/disk into these fields.
+#[derive(Debug, Clone)]
+pub struct MigrateVmRequest {
+    /// Host-native name of the destination (Proxmox node name).
+    pub target_node: String,
+    /// Attempt a live (online) migration instead of stopping the VM first.
+    pub online: bool,
+    /// Destination storage pool, when the disk has to be copied.
+    ///
+    /// `None` means the same pool exists on the destination (shared or
+    /// identically named storage) and the hypervisor can keep the disk where it
+    /// is.
+    pub target_storage: Option<String>,
+}
+
 pub struct TerminalStream {
     pub rx: Receiver<Vec<u8>>,
     pub tx: Sender<Vec<u8>>,
@@ -61,6 +80,19 @@ pub trait VmHostClient: Send + Sync {
         use crate::retry::OpError;
         Err(OpError::Fatal(anyhow!(
             "VM discovery is not supported on this host type"
+        )))
+    }
+
+    /// Move a VM from this host to another host of the same kind.
+    ///
+    /// The VM keeps its id, MAC and IP assignments — only its placement
+    /// changes. Implementations must leave the VM on the source host when the
+    /// migration fails, so the caller can keep the database pointing at a host
+    /// that actually has the VM.
+    async fn migrate_vm(&self, _vm: &Vm, _req: &MigrateVmRequest) -> OpResult<()> {
+        use crate::retry::OpError;
+        Err(OpError::Fatal(anyhow!(
+            "VM migration is not supported on this host type"
         )))
     }
 
@@ -168,9 +200,9 @@ pub fn get_host_client(
         }
         VmHostKind::Dummy => {
             if cfg!(test) {
-                Arc::new(dummy_host::DummyVmHost::new())
+                Arc::new(dummy_host::DummyVmHost::new().with_host_id(host.id))
             } else {
-                Arc::new(dummy_host::DummyVmHost::new_persistent())
+                Arc::new(dummy_host::DummyVmHost::new_persistent().with_host_id(host.id))
             }
         }
         _ => bail!("Unknown host config: {}", host.kind),

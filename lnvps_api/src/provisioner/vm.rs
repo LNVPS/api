@@ -1,4 +1,4 @@
-use crate::host::{FullVmInfo, VmHostClient, get_host_client};
+use crate::host::{FullVmInfo, VmHostClient, VmResources, get_host_client};
 use crate::provisioner::VmNetworkProvisioner;
 use crate::router::{ArpEntry, Router, get_router};
 use crate::settings::{ProvisionerConfig, Settings};
@@ -92,6 +92,35 @@ impl VmProvisioner {
     /// Get database handle
     pub fn get_db(&self) -> Arc<dyn LNVpsDb> {
         self.db.clone()
+    }
+
+    /// Whether this provisioner refuses operations that change host state
+    pub fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Resolve a VM's CPU/memory/disk from whichever template it uses.
+    ///
+    /// Unlike `FullVmInfo::load` this needs no SSH key, image or IP records, so
+    /// it also works for a VM that was imported rather than provisioned.
+    pub(crate) async fn vm_resources(db: &Arc<dyn LNVpsDb>, vm: &Vm) -> Result<VmResources> {
+        if let Some(t) = vm.template_id {
+            let t = db.get_vm_template(t).await?;
+            Ok(VmResources {
+                cpu: t.cpu,
+                memory: t.memory,
+                disk_size: t.disk_size,
+            })
+        } else if let Some(t) = vm.custom_template_id {
+            let t = db.get_custom_vm_template(t).await?;
+            Ok(VmResources {
+                cpu: t.cpu,
+                memory: t.memory,
+                disk_size: t.disk_size,
+            })
+        } else {
+            bail!("VM {} has no template", vm.id)
+        }
     }
 
     /// Provision a new VM for a user on the database

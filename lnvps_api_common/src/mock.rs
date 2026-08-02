@@ -1285,6 +1285,15 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn update_vm_host(&self, vm_id: u64, host_id: u64, disk_id: u64) -> DbResult<()> {
+        let mut vms = self.vms.lock().await;
+        if let Some(v) = vms.get_mut(&vm_id) {
+            v.host_id = host_id;
+            v.disk_id = disk_id;
+        }
+        Ok(())
+    }
+
     async fn set_vm_ssh_host_keys(&self, vm_id: u64, keys: Option<&str>) -> DbResult<()> {
         let mut vms = self.vms.lock().await;
         if let Some(v) = vms.get_mut(&vm_id) {

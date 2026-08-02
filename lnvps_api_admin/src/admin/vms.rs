@@ -34,6 +34,7 @@ pub fn router() -> Router<RouterState> {
                 .delete(admin_delete_vm),
         )
         .route("/api/admin/v1/vms/{id}/transfer", post(admin_transfer_vm))
+        .route("/api/admin/v1/vms/{id}/migrate", post(admin_migrate_vm))
         .route("/api/admin/v1/vms/{id}/start", post(admin_start_vm))
         .route("/api/admin/v1/vms/{id}/stop", post(admin_stop_vm))
         .route("/api/admin/v1/vms/{id}/extend", put(admin_extend_vm))
@@ -408,6 +409,68 @@ async fn admin_transfer_vm(
     );
 
     ApiData::ok(())
+}
+
+#[derive(Deserialize)]
+struct AdminMigrateVmRequest {
+    /// Host to move the VM onto
+    target_host_id: u64,
+    /// Attempt an online (live) migration instead of stopping the VM first.
+    #[serde(default)]
+    live: bool,
+    reason: Option<String>,
+}
+
+/// Migrate a VM to another host (issue #66)
+///
+/// Queued rather than performed inline: a migration copies disk state and can
+/// run for minutes, and it must be serialised with the other lifecycle
+/// operations for that VM. Capacity, region and storage pre-flight checks run
+/// on the worker; only the cheap, definitely-wrong cases are rejected here.
+async fn admin_migrate_vm(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<AdminMigrateVmRequest>,
+) -> ApiResult<JobResponse> {
+    auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
+
+    let vm = this.db.get_vm(id).await?;
+    if vm.deleted {
+        return Err(ApiError::conflict("Cannot migrate a deleted VM"));
+    }
+    if vm.host_id == req.target_host_id {
+        return Err(ApiError::conflict("VM is already on this host"));
+    }
+
+    // Fail an unknown/disabled host here rather than in a background job the
+    // caller has to go looking for.
+    let target = this.db.get_host(req.target_host_id).await?;
+    if !target.enabled {
+        return Err(ApiError::conflict("Target host is disabled"));
+    }
+
+    let job = WorkJob::MigrateVm {
+        vm_id: id,
+        target_host_id: req.target_host_id,
+        live: req.live,
+        admin_user_id: Some(auth.user_id),
+        reason: req.reason,
+    };
+
+    match this.work_commander.send(job).await {
+        Ok(stream_id) => {
+            info!(
+                "Admin {} queued migration of VM {} to host {} (stream {})",
+                auth.user_id, id, req.target_host_id, stream_id
+            );
+            ApiData::ok(JobResponse { job_id: stream_id })
+        }
+        Err(e) => {
+            error!("Failed to queue VM migration job: {}", e);
+            ApiData::err("Failed to queue VM migration job")
+        }
+    }
 }
 
 /// Start a VM

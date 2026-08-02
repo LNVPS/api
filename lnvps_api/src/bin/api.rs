@@ -319,6 +319,10 @@ async fn main() -> Result<(), Error> {
         tasks.push(worker.spawn_job_interval(WorkJob::CheckSubscriptions, Duration::from_secs(30)));
         // Refresh cached router tunnel/BGP session/route state + traffic every 60s
         tasks.push(worker.spawn_job_interval(WorkJob::SyncRouterState, Duration::from_secs(60)));
+        // Catch VMs that changed host without going through this API (issue
+        // #66). Every 10 minutes: it lists the VMs on every host, and a stale
+        // host_id breaks that VM's lifecycle operations until it is corrected.
+        tasks.push(worker.spawn_job_interval(WorkJob::ReconcileVmHosts, Duration::from_secs(600)));
         // Automated referral payouts are opt-in (config-gated); run hourly.
         if settings.referral.is_some() {
             tasks.push(

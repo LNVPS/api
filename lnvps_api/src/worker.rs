@@ -2934,6 +2934,83 @@ impl Worker {
                     vm.id, user_id
                 )));
             }
+            WorkJob::MigrateVm {
+                vm_id,
+                target_host_id,
+                live,
+                admin_user_id,
+                reason,
+            } => {
+                info!(
+                    "Migrating VM {} to host {} ({})",
+                    vm_id,
+                    target_host_id,
+                    if *live { "online" } else { "offline" }
+                );
+                let provisioner = self.subscription_handler.vm_provisioner();
+                match provisioner
+                    .migrate_vm(*vm_id, *target_host_id, *live, *admin_user_id)
+                    .await
+                {
+                    Ok(vm) => {
+                        // The destination enforces its own firewall/ipset state,
+                        // so re-apply the ruleset rather than assuming it came
+                        // across with the VM.
+                        if let Err(e) = self
+                            .work_commander
+                            .send(WorkJob::ApplyVmFirewall { vm_id: vm.id })
+                            .await
+                        {
+                            warn!("Failed to queue firewall re-apply for VM {}: {}", vm.id, e);
+                        }
+                        return Ok(Some(format!(
+                            "VM {} migrated to host {}{}",
+                            vm.id,
+                            target_host_id,
+                            reason
+                                .as_ref()
+                                .map(|r| format!(" ({})", r))
+                                .unwrap_or_default()
+                        )));
+                    }
+                    Err(e) => {
+                        error!("Failed to migrate VM {}: {}", vm_id, e);
+                        self.queue_admin_notification(
+                            format!(
+                                "Failed to migrate VM {} to host {}:\n{}",
+                                vm_id, target_host_id, e
+                            ),
+                            Some(format!("VM {} Migration Failed", vm_id)),
+                        )
+                        .await;
+                        return Err(e);
+                    }
+                }
+            }
+            WorkJob::ReconcileVmHosts => {
+                let provisioner = self.subscription_handler.vm_provisioner();
+                let drifts = provisioner.reconcile_vm_hosts().await?;
+                for drift in &drifts {
+                    // Nobody asked this API for the move, so surface it: either
+                    // an operator migrated by hand, or a VM moved on its own
+                    // (HA fail-over) and capacity planning needs to know.
+                    self.queue_admin_notification(
+                        format!(
+                            "VM {} was found on host {} but was recorded on host {}. \
+                             The database has been updated to match the host.",
+                            drift.vm_id, drift.to_host_id, drift.from_host_id
+                        ),
+                        Some(format!("VM {} Moved Host", drift.vm_id)),
+                    )
+                    .await;
+                }
+                if !drifts.is_empty() {
+                    return Ok(Some(format!(
+                        "Reconciled placement of {} VM(s)",
+                        drifts.len()
+                    )));
+                }
+            }
             WorkJob::SendEmailVerification {
                 user_id,
                 verify_url,
