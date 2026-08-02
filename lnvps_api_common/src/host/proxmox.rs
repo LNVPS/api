@@ -1293,9 +1293,10 @@ impl ProxmoxClient {
     /// Compare the config currently on the host against the config we expect
     /// from the database, returning the names of the fields that differ.
     ///
-    /// Only fields the expected config actually sets are considered, and
-    /// disk/EFI fields are ignored (those are managed by create/resize, not by
-    /// re-configuration).
+    /// Only fields the expected config actually sets are considered. The disk
+    /// *volumes* themselves are ignored (they are managed by create/resize),
+    /// but the disk *options* we own (`iothread`, `ssd`/`discard`, throttle
+    /// limits) are compared by the caller via [`Self::make_scsi0`].
     fn config_drift(current: &VmConfig, expected: &VmConfig) -> Vec<String> {
         let mut drift = Vec::new();
 
@@ -1361,8 +1362,6 @@ impl ProxmoxClient {
     /// config. Runs unconditionally so that VMs without throttle limits still converge
     /// onto `iothread=1`.
     async fn apply_disk_options(&self, req: &FullVmInfo) -> OpResult<()> {
-        let limits = req.limits();
-
         // Fetch the current config to get the live scsi0 disk path
         let current = self.get_vm_config(&self.node, req.vm.id.into()).await?;
         let scsi0_base = match current.config.scsi_0 {
@@ -1370,11 +1369,33 @@ impl ProxmoxClient {
             None => op_fatal!("scsi0 not found in VM config"),
         };
 
+        self.configure_vm(ConfigureVm {
+            node: self.node.clone(),
+            vm_id: req.vm.id.into(),
+            current: None,
+            snapshot: None,
+            digest: None,
+            config: VmConfig {
+                scsi_0: Some(Self::make_scsi0(&scsi0_base, req)),
+                ..Default::default()
+            },
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// Build the `scsi0` device string we expect for a VM, from the live device
+    /// string (only its bare volume reference is kept — every option after it is
+    /// owned by us and rebuilt here).
+    fn make_scsi0(current_scsi0: &str, req: &FullVmInfo) -> String {
+        let limits = req.limits();
+
         // Strip any pre-existing throttle/ssd params so we get the bare volume ref
-        let volume_part = scsi0_base
+        let volume_part = current_scsi0
             .split(',')
             .next()
-            .unwrap_or(&scsi0_base)
+            .unwrap_or(current_scsi0)
             .to_string();
 
         let mut parts = vec![volume_part];
@@ -1398,20 +1419,7 @@ impl ProxmoxClient {
             parts.push(format!("iops_wr={}", v));
         }
 
-        self.configure_vm(ConfigureVm {
-            node: self.node.clone(),
-            vm_id: req.vm.id.into(),
-            current: None,
-            snapshot: None,
-            digest: None,
-            config: VmConfig {
-                scsi_0: Some(parts.join(",")),
-                ..Default::default()
-            },
-        })
-        .await?;
-
-        Ok(())
+        parts.join(",")
     }
 
     /// Import main disk image from the template (without resizing)
@@ -2080,7 +2088,19 @@ impl VmHostClient for ProxmoxClient {
         let expected =
             self.make_config(cfg, vendor_snippet.as_deref(), network_snippet.as_deref())?;
 
-        let drift = Self::config_drift(&current.config, &expected);
+        let mut drift = Self::config_drift(&current.config, &expected);
+
+        // Disk options (iothread, ssd/discard, throttle limits) live on the
+        // scsi0 device string, which is rebuilt from the live volume reference
+        // rather than from `make_config` — compare it separately so that VMs
+        // created before these options existed converge onto them.
+        if let Some(scsi_0) = current.config.scsi_0.as_deref() {
+            let want = Self::make_scsi0(scsi_0, cfg);
+            if Self::normalize_prop_string(scsi_0) != Self::normalize_prop_string(&want) {
+                drift.push("scsi_0".to_string());
+            }
+        }
+
         if drift.is_empty() {
             return Ok(vec![]);
         }
@@ -3270,6 +3290,28 @@ mod tests {
         assert_ne!(
             ProxmoxClient::normalize_prop_string("bridge=vmbr0"),
             ProxmoxClient::normalize_prop_string("bridge=vmbr1")
+        );
+    }
+
+    #[test]
+    fn test_make_scsi0() {
+        let cfg = mock_full_vm();
+
+        // Only the bare volume ref is kept; our options are rebuilt.
+        let built = ProxmoxClient::make_scsi0("ssd:vm-100-disk-0,size=100G,iops_rd=99", &cfg);
+        assert_eq!(
+            built, "ssd:vm-100-disk-0,discard=on,ssd=1,iothread=1",
+            "ssd disks get discard/ssd and always iothread=1"
+        );
+
+        // Rebuilding an already-correct device string is a no-op, so a VM that
+        // is up to date never reports scsi0 drift.
+        assert_eq!(ProxmoxClient::make_scsi0(&built, &cfg), built);
+
+        // A VM created before iothread existed drifts.
+        assert_ne!(
+            ProxmoxClient::normalize_prop_string("ssd:vm-100-disk-0,discard=on,ssd=1"),
+            ProxmoxClient::normalize_prop_string(&built)
         );
     }
 
