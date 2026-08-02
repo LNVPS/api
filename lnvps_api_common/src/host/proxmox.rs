@@ -509,6 +509,13 @@ impl ProxmoxClient {
                 disk_args.insert("ssd", "1".to_string());
             }
 
+            // Dedicated IO thread for this disk. Without it every guest's block IO is
+            // serialised through the main QEMU event loop alongside device emulation and
+            // networking, capping a guest at roughly one thread of throughput.
+            // Only honoured with the `virtio-scsi-single` controller (see `make_config`);
+            // qemu-server warns and ignores it otherwise, so it is safe on legacy VMs.
+            disk_args.insert("iothread", "1".to_string());
+
             // Disk I/O throttle limits — set at import time alongside discard/ssd
             if let Some(v) = req.mbps_rd {
                 disk_args.insert("mbps_rd", v.to_string());
@@ -1254,7 +1261,10 @@ impl ProxmoxClient {
             cores: Some(vm_resources.cpu as i32),
             memory: Some((vm_resources.memory / crate::MB).to_string()),
             balloon: self.config.balloon_mb(vm_resources.memory / crate::MB),
-            scsi_hw: Some("virtio-scsi-pci".to_string()),
+            // `virtio-scsi-single` gives each disk its own controller, which is the only
+            // scsi controller type that supports `iothread=1` (set on scsi0 at import /
+            // in `apply_disk_options`). Takes effect on next VM start.
+            scsi_hw: Some("virtio-scsi-single".to_string()),
             serial_0: Some("socket".to_string()),
             scsi_1: Some(format!("{}:cloudinit", &value.disk.name)),
             ssh_keys: Some(urlencoding::encode(value.ssh_key.key_data.as_str()).to_string()),
@@ -1265,20 +1275,14 @@ impl ProxmoxClient {
         })
     }
 
-    /// Apply disk I/O throttle limits to the primary disk of a VM.
+    /// Apply disk options (iothread, SSD hints, I/O throttle limits) to the primary disk.
     ///
-    /// Fetches the current scsi0 device string from Proxmox, appends the
-    /// throttle parameters, and sends a PATCH to update the VM config.
-    async fn apply_disk_limits(&self, req: &FullVmInfo) -> OpResult<()> {
+    /// Fetches the current scsi0 device string from Proxmox, rebuilds it from the bare
+    /// volume reference plus the options we own, and sends a PATCH to update the VM
+    /// config. Runs unconditionally so that VMs without throttle limits still converge
+    /// onto `iothread=1`.
+    async fn apply_disk_options(&self, req: &FullVmInfo) -> OpResult<()> {
         let limits = req.limits();
-        let has_disk_limits = limits.disk_iops_read.is_some()
-            || limits.disk_iops_write.is_some()
-            || limits.disk_mbps_read.is_some()
-            || limits.disk_mbps_write.is_some();
-
-        if !has_disk_limits {
-            return Ok(());
-        }
 
         // Fetch the current config to get the live scsi0 disk path
         let current = self.get_vm_config(&self.node, req.vm.id.into()).await?;
@@ -1300,6 +1304,8 @@ impl ProxmoxClient {
             parts.push("discard=on".to_string());
             parts.push("ssd=1".to_string());
         }
+        // Keep in sync with `import_disk_image`; requires scsihw=virtio-scsi-single.
+        parts.push("iothread=1".to_string());
         if let Some(v) = limits.disk_mbps_read {
             parts.push(format!("mbps_rd={}", v));
         }
@@ -1981,8 +1987,8 @@ impl VmHostClient for ProxmoxClient {
         })
         .await?;
 
-        // Apply disk I/O throttle limits (requires reading live scsi0 path)
-        self.apply_disk_limits(cfg).await?;
+        // Apply disk options / throttle limits (requires reading live scsi0 path)
+        self.apply_disk_options(cfg).await?;
 
         Ok(())
     }
@@ -4075,13 +4081,13 @@ mod tests {
         Ok(())
     }
 
-    /// Regression test: `apply_disk_limits` must preserve `discard=on,ssd=1` for SSD disks.
+    /// Regression test: `apply_disk_options` must preserve `discard=on,ssd=1` for SSD disks.
     ///
-    /// Before the fix, `apply_disk_limits` stripped all existing disk params (including
+    /// Before the fix, it stripped all existing disk params (including
     /// `discard=on,ssd=1`) when applying I/O throttle limits, taking only the bare volume
     /// path and adding back only the throttle params.
     #[tokio::test]
-    async fn test_apply_disk_limits_preserves_ssd_params() -> Result<()> {
+    async fn test_apply_disk_options_preserves_ssd_params() -> Result<()> {
         let server = MockServer::start().await;
 
         // The existing scsi0 config as Proxmox would return it
@@ -4129,9 +4135,9 @@ mod tests {
         info.template.as_mut().unwrap().disk_mbps_write = Some(100);
 
         client
-            .apply_disk_limits(&info)
+            .apply_disk_options(&info)
             .await
-            .expect("apply_disk_limits should succeed");
+            .expect("apply_disk_options should succeed");
 
         // Inspect the POST request body to verify ssd params are present
         let received = server.received_requests().await.unwrap();
@@ -4164,6 +4170,102 @@ mod tests {
             "expected mbps_wr=100 in scsi0, got: {}",
             scsi0
         );
+        assert!(
+            scsi0.contains("iothread=1"),
+            "expected iothread=1 in scsi0, got: {}",
+            scsi0
+        );
+
+        Ok(())
+    }
+
+    /// `apply_disk_options` must still run when the template carries no throttle limits,
+    /// otherwise existing VMs would never converge onto `iothread=1`.
+    #[tokio::test]
+    async fn test_apply_disk_options_sets_iothread_without_limits() -> Result<()> {
+        let server = MockServer::start().await;
+
+        let config_body = serde_json::json!({
+            "data": {
+                "digest": "abc123",
+                "scsi0": "local-zfs:vm-1-disk-0,discard=on,size=100G,ssd=1"
+            }
+        });
+
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/qemu/\d+/config$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&config_body))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/qemu/\d+/config$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": "UPID:node:0:0:task"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = ProxmoxClient::new(
+            server.uri().parse()?,
+            "pve",
+            "",
+            None,
+            test_qemu_config(),
+            None,
+        );
+
+        // No disk_mbps_*/disk_iops_* set on the template
+        let info = mock_full_vm();
+
+        client
+            .apply_disk_options(&info)
+            .await
+            .expect("apply_disk_options should succeed without limits");
+
+        let received = server.received_requests().await.unwrap();
+        let post_req = received
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::POST)
+            .expect("expected a POST to /config even with no throttle limits");
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&post_req.body).expect("POST body should be JSON");
+        let scsi0 = body["scsi0"].as_str().expect("scsi0 field must be present");
+
+        assert!(
+            scsi0.contains("iothread=1"),
+            "expected iothread=1 in scsi0, got: {}",
+            scsi0
+        );
+        assert!(
+            scsi0.starts_with("local-zfs:vm-1-disk-0"),
+            "expected the bare volume ref to be preserved, got: {}",
+            scsi0
+        );
+
+        Ok(())
+    }
+
+    /// `iothread=1` is only honoured by qemu-server with the `virtio-scsi-single`
+    /// controller, so the two settings must not drift apart.
+    #[test]
+    fn test_make_config_uses_virtio_scsi_single() -> Result<()> {
+        let cfg = mock_full_vm();
+        let p = ProxmoxClient::new(
+            "http://localhost:8006".parse()?,
+            "",
+            "",
+            None,
+            test_qemu_config(),
+            None,
+        );
+
+        let vm = p.make_config(&cfg, None, None)?;
+        assert_eq!(vm.scsi_hw.as_deref(), Some("virtio-scsi-single"));
 
         Ok(())
     }
