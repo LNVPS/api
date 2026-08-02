@@ -588,6 +588,43 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_admin_vm_migrate_rejects_same_host_and_unknown_host() {
+        let client = setup().await;
+        let resp = client.get_auth("/api/admin/v1/vms?limit=1").await.unwrap();
+        let data: ApiPaginatedData<Value> = parse_paginated(resp).await.unwrap();
+        if data.data.is_empty() {
+            eprintln!("Skipping: no VMs found for migrate test");
+            return;
+        }
+        let vm_id = data.data[0]["id"].as_u64().unwrap();
+        let host_id = data.data[0]["host_id"].as_u64().unwrap_or(0);
+
+        // Migrating to the host the VM is already on is refused before any job
+        // is queued — a queued no-op migration would stop and start the VM.
+        let body = serde_json::json!({"target_host_id": host_id, "live": false});
+        let resp = client
+            .post_auth(&format!("/api/admin/v1/vms/{vm_id}/migrate"), &body)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT, "same host must be 409");
+
+        // Unknown target host is rejected here rather than in a background job
+        // the caller would have to go looking for.
+        let body = serde_json::json!({"target_host_id": 999_999u64});
+        let resp = client
+            .post_auth(&format!("/api/admin/v1/vms/{vm_id}/migrate"), &body)
+            .await
+            .unwrap();
+        assert!(
+            resp.status() == StatusCode::NOT_FOUND
+                || resp.status() == StatusCode::BAD_REQUEST
+                || resp.status() == StatusCode::INTERNAL_SERVER_ERROR,
+            "unknown host should not be accepted, got: {}",
+            resp.status()
+        );
+    }
+
     // ========================================================================
     // Host Management
     // ========================================================================

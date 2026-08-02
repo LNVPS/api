@@ -420,6 +420,14 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Update a VM
     async fn update_vm(&self, vm: &Vm) -> DbResult<()>;
 
+    /// Move a VM to another host and storage pool (issue #66).
+    ///
+    /// Deliberately not part of [`update_vm`], which never writes `host_id`:
+    /// placement is owned by the hypervisor, so it may only change after a
+    /// migration has actually happened (or been observed on the hosts), never
+    /// as a side effect of saving an unrelated edit to a `Vm` struct.
+    async fn update_vm_host(&self, vm_id: u64, host_id: u64, disk_id: u64) -> DbResult<()>;
+
     /// Replace a VM's captured SSH host keys (`None` clears them).
     ///
     /// Separate from [`update_vm`] on purpose: the keys are written by the

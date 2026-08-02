@@ -143,6 +143,22 @@ pub enum WorkJob {
         admin_user_id: u64,
         reason: Option<String>,
     },
+    /// Migrate a VM to another host (issue #66). Runs on the worker so it is
+    /// serialised with the other lifecycle operations for that VM.
+    MigrateVm {
+        vm_id: u64,
+        target_host_id: u64,
+        /// Attempt an online migration; otherwise the VM is stopped, moved and
+        /// started again on the destination.
+        live: bool,
+        admin_user_id: Option<u64>,
+        reason: Option<String>,
+    },
+    /// Poll every host for the VMs it is running and re-point `vm.host_id` at
+    /// whichever host actually has each VM, so a migration performed outside
+    /// this API (e.g. by hand in the Proxmox UI) does not leave the database
+    /// aiming every lifecycle operation at the wrong host.
+    ReconcileVmHosts,
     /// Re-install a VM: stop it, wipe & re-import the primary disk from its
     /// current image template, then start it again. Runs on the worker so it is
     /// serialised with spawn (avoiding a reinstall racing an in-flight spawn).
@@ -268,6 +284,9 @@ impl WorkJob {
             // The periodic reconcile is the backstop, so a failed trigger costs
             // at most one interval — not worth retrying and blocking the stream.
             Self::ReconcileAppDeployment { .. } => true,
+            // Placement drift is re-detected on the next pass, so a failed run
+            // (usually an unreachable host) costs one interval, not a fix.
+            Self::ReconcileVmHosts => true,
             _ => false,
         }
     }
@@ -298,6 +317,8 @@ impl fmt::Display for WorkJob {
             WorkJob::ListUnmanagedVms { .. } => write!(f, "ListUnmanagedVms"),
             WorkJob::ReinstallVm { .. } => write!(f, "ReinstallVm"),
             WorkJob::ImportVm { .. } => write!(f, "ImportVm"),
+            WorkJob::MigrateVm { .. } => write!(f, "MigrateVm"),
+            WorkJob::ReconcileVmHosts => write!(f, "ReconcileVmHosts"),
             WorkJob::CreateVm { .. } => write!(f, "CreateVm"),
             WorkJob::CreateCustomVm { .. } => write!(f, "CreateCustomVm"),
             WorkJob::SendEmailVerification { .. } => write!(f, "SendEmailVerification"),

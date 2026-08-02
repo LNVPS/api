@@ -2,8 +2,8 @@ use crate::HostVmSpec;
 use crate::JsonApi;
 use crate::host::config::{QemuConfig, SshConfig};
 use crate::host::{
-    FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostDiskInfo,
-    VmHostInfo,
+    FullVmInfo, MigrateVmRequest, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient,
+    VmHostDiskInfo, VmHostInfo,
 };
 use crate::retry::{OpError, OpResult, Pipeline, RetryPolicy};
 use crate::ssh_client::SshClient;
@@ -582,6 +582,33 @@ impl ProxmoxClient {
             .post(
                 &format!("/api2/json/nodes/{}/qemu/{}/status/start", node_str, vm),
                 (),
+            )
+            .await?;
+
+        Ok(TaskId {
+            id: rsp.data,
+            node: node_str,
+        })
+    }
+
+    /// Migrate a VM to another node in the same Proxmox cluster.
+    ///
+    /// The task runs on the **source** node, which is also where the returned
+    /// task id must be polled: the destination has no record of the job until
+    /// it completes.
+    pub async fn migrate_vm(
+        &self,
+        node: &str,
+        vm: ProxmoxVmId,
+        req: &MigrateVmParams,
+    ) -> OpResult<TaskId> {
+        let api = &self.api;
+        let node_str = node.to_string();
+
+        let rsp: ResponseBase<String> = api
+            .post(
+                &format!("/api2/json/nodes/{}/qemu/{}/migrate", node_str, vm),
+                req,
             )
             .await?;
 
@@ -1760,6 +1787,24 @@ impl VmHostClient for ProxmoxClient {
         Ok(())
     }
 
+    async fn migrate_vm(&self, vm: &Vm, req: &MigrateVmRequest) -> OpResult<()> {
+        if req.target_node == self.node {
+            op_fatal!("VM {} is already on node {}", vm.id, req.target_node);
+        }
+        let params = MigrateVmParams {
+            target: req.target_node.clone(),
+            online: Some(req.online as u8),
+            // Only set when the disk cannot stay where it is: passing
+            // `with-local-disks` for a VM on shared storage makes Proxmox copy a
+            // disk that both nodes can already see.
+            with_local_disks: req.target_storage.as_ref().map(|_| 1),
+            targetstorage: req.target_storage.clone(),
+        };
+        let task = self.migrate_vm(&self.node, vm.id.into(), &params).await?;
+        self.wait_for_task(&task).await?;
+        Ok(())
+    }
+
     async fn stop_vm(&self, vm: &Vm) -> OpResult<()> {
         let task = self.stop_vm(&self.node, vm.id.into()).await?;
         self.wait_for_task(&task).await?;
@@ -2730,6 +2775,26 @@ pub struct StorageContentEntry {
     pub vol_id: String,
     #[serde(rename = "vmid")]
     pub vm_id: Option<u32>,
+}
+
+/// Body of `POST /nodes/{node}/qemu/{vmid}/migrate`.
+///
+/// Flags are sent as `1`/`0` rather than JSON booleans: that is what every
+/// other Proxmox client sends and what the API documents, and an omitted flag
+/// (`None`) keeps the node's own default.
+#[derive(Debug, Serialize, Default)]
+pub struct MigrateVmParams {
+    /// Destination node name.
+    pub target: String,
+    /// Migrate the VM while it keeps running.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub online: Option<u8>,
+    /// Copy disks that live on node-local storage as part of the migration.
+    #[serde(rename = "with-local-disks", skip_serializing_if = "Option::is_none")]
+    pub with_local_disks: Option<u8>,
+    /// Storage pool to place the disks in on the destination node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub targetstorage: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default)]
@@ -3838,6 +3903,175 @@ mod tests {
             .expect("wait_for_vm_stopped should succeed once status is stopped");
 
         // wiremock verifies the expected call counts on drop
+        Ok(())
+    }
+
+    /// The migrate call must reach the source node with the destination node,
+    /// and must only ask for a disk copy when the disk actually has to move
+    /// (issue #66). Sending `with-local-disks` for a VM on shared storage turns
+    /// a seconds-long migration into a full disk transfer.
+    #[tokio::test]
+    async fn test_migrate_vm_request_body() -> Result<()> {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/qemu/\d+/migrate$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": "UPID:node:0:0:task"})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        let client = ProxmoxClient::new(server.uri().parse()?, "pve1", "", None, q_cfg, None);
+
+        // Shared/identically-named storage: no copy.
+        client
+            .migrate_vm(
+                "pve1",
+                ProxmoxVmId(100),
+                &MigrateVmParams {
+                    target: "pve2".to_string(),
+                    online: Some(1),
+                    with_local_disks: None,
+                    targetstorage: None,
+                },
+            )
+            .await?;
+
+        // Local storage: the disk has to be copied to a named pool.
+        client
+            .migrate_vm(
+                "pve1",
+                ProxmoxVmId(100),
+                &MigrateVmParams {
+                    target: "pve2".to_string(),
+                    online: Some(0),
+                    with_local_disks: Some(1),
+                    targetstorage: Some("nvme-b".to_string()),
+                },
+            )
+            .await?;
+
+        let received = server.received_requests().await.unwrap();
+        let bodies: Vec<serde_json::Value> = received
+            .iter()
+            .map(|r| serde_json::from_slice(&r.body).expect("JSON body"))
+            .collect();
+
+        assert_eq!(bodies[0]["target"], "pve2");
+        assert_eq!(bodies[0]["online"], 1);
+        assert!(
+            bodies[0].get("with-local-disks").is_none(),
+            "{:?}",
+            bodies[0]
+        );
+        assert!(bodies[0].get("targetstorage").is_none(), "{:?}", bodies[0]);
+
+        assert_eq!(bodies[1]["online"], 0);
+        assert_eq!(bodies[1]["with-local-disks"], 1);
+        assert_eq!(bodies[1]["targetstorage"], "nvme-b");
+
+        // Migration is driven from the node that currently holds the VM.
+        assert!(received[0].url.path().starts_with("/api2/json/nodes/pve1/"));
+        Ok(())
+    }
+
+    /// The `VmHostClient` wrapper maps the host-agnostic request onto the
+    /// Proxmox parameters, and refuses a migration that would target the node
+    /// the VM is already on.
+    #[tokio::test]
+    async fn test_migrate_vm_trait_maps_request() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/qemu/\d+/migrate$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": "UPID:node:0:0:task"})),
+            )
+            .mount(&server)
+            .await;
+        // Task polling for the migration task.
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/tasks/.*/status$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "id": "100",
+                    "node": "pve1",
+                    "pid": 1,
+                    "pstart": 1,
+                    "starttime": 1,
+                    "status": "stopped",
+                    "type": "qmigrate",
+                    "upid": "UPID:node:0:0:task",
+                    "user": "root@pam",
+                    "exitstatus": "OK"
+                }
+            })))
+            .mount(&server)
+            .await;
+
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        let client = ProxmoxClient::new(server.uri().parse()?, "pve1", "", None, q_cfg, None);
+        let vm = mock_full_vm().vm;
+
+        // Same node is a caller mistake, not a hypervisor round-trip.
+        assert!(
+            VmHostClient::migrate_vm(
+                &client,
+                &vm,
+                &MigrateVmRequest {
+                    target_node: "pve1".to_string(),
+                    online: true,
+                    target_storage: None,
+                },
+            )
+            .await
+            .is_err()
+        );
+
+        VmHostClient::migrate_vm(
+            &client,
+            &vm,
+            &MigrateVmRequest {
+                target_node: "pve2".to_string(),
+                online: true,
+                target_storage: Some("nvme-b".to_string()),
+            },
+        )
+        .await?;
+
+        let received = server.received_requests().await.unwrap();
+        let post = received
+            .iter()
+            .find(|r| r.method == wiremock::http::Method::POST)
+            .expect("expected a migrate POST");
+        let body: serde_json::Value = serde_json::from_slice(&post.body)?;
+        assert_eq!(body["target"], "pve2");
+        assert_eq!(body["online"], 1);
+        // A named target storage implies the disk is copied.
+        assert_eq!(body["with-local-disks"], 1);
+        assert_eq!(body["targetstorage"], "nvme-b");
         Ok(())
     }
 

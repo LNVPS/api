@@ -456,6 +456,43 @@ Request body:
 Returns `409` if the VM is deleted or already belongs to the target user, and
 `404` if the target user does not exist.
 
+#### Migrate VM
+
+```
+POST /api/admin/v1/vms/{id}/migrate
+```
+
+Required Permission: `virtual_machines::update`
+
+Moves a VM to another host. Request body:
+
+```json
+{
+  "target_host_id": 3,
+  "live": true,
+  "reason": "Draining host 2 for maintenance"
+}
+```
+
+- `target_host_id` (required) — host to move the VM onto.
+- `live` (optional, default `false`) — attempt an online migration. When
+  `false`, a running VM is stopped, migrated and started again on the
+  destination.
+- `reason` (optional) — free-text reason recorded in the audit log.
+
+**Asynchronous Processing:** dispatches a `MigrateVm` work job and returns a
+`job_id`. The worker runs the pre-flight checks and refuses the migration if the
+target host is disabled, in a different region (the VM's IPs would not exist on
+the destination's VLANs), of a different CPU architecture or hypervisor kind, or
+lacks free CPU/memory/disk for the VM. `vm.host_id` and `vm.disk_id` are only
+updated after the hypervisor reports the migration succeeded, and the firewall
+ruleset is re-applied on the destination. The move is recorded in VM history as
+a `migrated` action.
+
+The endpoint itself returns `409` when the VM is deleted, already on the target
+host, or the target host is disabled, and `404` when the host does not exist.
+Migration is currently implemented for Proxmox hosts only.
+
 #### Start VM
 
 ```

@@ -303,6 +303,52 @@ impl VmHistoryLogger {
         Ok(())
     }
 
+    /// Record that a VM moved from one host to another (issue #66).
+    ///
+    /// `detected` distinguishes the two ways a VM changes host: an admin asked
+    /// for the migration, or the placement poller found the VM running
+    /// somewhere other than where the database said it was (e.g. someone
+    /// migrated it by hand in the Proxmox UI) and reconciled the record. The
+    /// second case has no initiating user, so without the flag the two are
+    /// indistinguishable after the fact.
+    pub async fn log_vm_migrated(
+        &self,
+        vm_id: u64,
+        initiated_by_user: Option<u64>,
+        old_host_id: u64,
+        new_host_id: u64,
+        detected: bool,
+        metadata: Option<Value>,
+    ) -> Result<()> {
+        let mut meta = metadata.unwrap_or_else(|| json!({}));
+        meta["detected"] = json!(detected);
+
+        let history = VmHistory {
+            id: 0,
+            vm_id,
+            action_type: VmHistoryActionType::Migrated,
+            timestamp: Utc::now(),
+            initiated_by_user,
+            previous_state: serialize_json_to_bytes(Some(json!({"host_id": old_host_id}))),
+            new_state: serialize_json_to_bytes(Some(json!({"host_id": new_host_id}))),
+            metadata: serialize_json_to_bytes(Some(meta)),
+            description: Some(if detected {
+                format!(
+                    "VM {} was found on host {} instead of host {}, database updated to match",
+                    vm_id, new_host_id, old_host_id
+                )
+            } else {
+                format!(
+                    "VM {} was migrated from host {} to host {}",
+                    vm_id, old_host_id, new_host_id
+                )
+            }),
+        };
+
+        self.db.insert_vm_history(&history).await?;
+        Ok(())
+    }
+
     /// Record that money was returned to the customer for this VM (issue #193).
     ///
     /// Written when a refund is entered against one of the VM's payments, so
