@@ -1618,7 +1618,7 @@ impl Worker {
             }
         }
 
-        // Patch firewall configuration for all VMs on this host
+        // Patch config + firewall configuration for all VMs on this host
         let vms = self.db.list_vms_on_host(host.id).await?;
         for vm in &vms {
             // Sweep up orphaned/unused disks for every live VM. Repeated
@@ -1638,9 +1638,26 @@ impl Worker {
                     .map(|e| e > Utc::now())
                     .unwrap_or(false)
             {
-                info!("Patching firewall for VM {} on host {}", vm.id, host.name);
+                info!("Patching VM {} on host {}", vm.id, host.name);
                 match FullVmInfo::load(vm.id, self.db.clone()).await {
                     Ok(vm_config) => {
+                        // Re-apply the VM config when what's on the host no
+                        // longer matches the database (e.g. template upgrades
+                        // or manual edits on the hypervisor).
+                        match client.patch_config(&vm_config).await {
+                            Ok(drift) if !drift.is_empty() => {
+                                info!(
+                                    "Re-configured VM {} on host {} (drift: {})",
+                                    vm.id,
+                                    host.name,
+                                    drift.join(", ")
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                warn!("Failed to patch config for VM {}: {}", vm.id, e);
+                            }
+                        }
                         if let Err(e) = client.patch_firewall(&vm_config).await {
                             warn!("Failed to patch firewall for VM {}: {}", vm.id, e);
                         }
