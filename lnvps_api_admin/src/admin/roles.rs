@@ -11,6 +11,84 @@ use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery,
 };
 use lnvps_db::{AdminAction, AdminResource};
+use std::collections::HashSet;
+
+/// Name of the built-in role that grants every permission in the system.
+const SUPER_ADMIN_ROLE: &str = "super_admin";
+
+/// Authorization rules for granting a role to a user.
+///
+/// Role assignment is an escalation primitive: without these checks any admin
+/// holding the assignment permission could grant themselves `super_admin`,
+/// which collapses the whole RBAC model into a single permission.
+fn check_role_assignment(
+    caller_user_id: u64,
+    target_user_id: u64,
+    caller_is_super_admin: bool,
+    role_name: &str,
+    caller_permissions: &HashSet<Permission>,
+    role_permissions: &HashSet<Permission>,
+) -> Result<(), ApiError> {
+    // An admin must never be able to widen their own grants.
+    if caller_user_id == target_user_id {
+        return Err(ApiError::forbidden(
+            "Admins cannot assign roles to themselves",
+        ));
+    }
+
+    if role_name == SUPER_ADMIN_ROLE && !caller_is_super_admin {
+        return Err(ApiError::forbidden(format!(
+            "Only a {} can grant the {} role",
+            SUPER_ADMIN_ROLE, SUPER_ADMIN_ROLE
+        )));
+    }
+
+    // No granting permissions you don't hold yourself.
+    if !caller_is_super_admin {
+        let mut missing: Vec<String> = role_permissions
+            .difference(caller_permissions)
+            .map(|p| format!("{}::{}", p.resource, p.action))
+            .collect();
+        if !missing.is_empty() {
+            missing.sort();
+            return Err(ApiError::forbidden(format!(
+                "Cannot grant a role holding permissions you do not have: {}",
+                missing.join(", ")
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Authorization rules for revoking a role from a user.
+///
+/// Self-revocation of `super_admin` is only blocked when the caller is the last
+/// super admin, otherwise an unwanted grant could never be handed back.
+fn check_role_revocation(
+    caller_user_id: u64,
+    target_user_id: u64,
+    caller_is_super_admin: bool,
+    role_name: &str,
+    role_user_count: u64,
+) -> Result<(), ApiError> {
+    if role_name == SUPER_ADMIN_ROLE {
+        if !caller_is_super_admin {
+            return Err(ApiError::forbidden(format!(
+                "Only a {} can revoke the {} role",
+                SUPER_ADMIN_ROLE, SUPER_ADMIN_ROLE
+            )));
+        }
+        if caller_user_id == target_user_id && role_user_count <= 1 {
+            return Err(ApiError::forbidden(format!(
+                "Cannot revoke your own {} role, you are the last {}",
+                SUPER_ADMIN_ROLE, SUPER_ADMIN_ROLE
+            )));
+        }
+    }
+
+    Ok(())
+}
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -317,14 +395,36 @@ async fn admin_assign_user_role(
     Path(user_id): Path<u64>,
     Json(req): Json<AssignRoleRequest>,
 ) -> ApiResult<()> {
-    // Check permission
-    auth.require_permission(AdminResource::Users, AdminAction::Update)?;
+    // Role assignment is role management, not user management
+    auth.require_permission(AdminResource::Roles, AdminAction::Update)?;
 
     // Check that user exists
     let _user = this.db.get_user(user_id).await?;
 
     // Check that role exists
-    let _role = this.db.get_role(req.role_id).await?;
+    let role = this.db.get_role(req.role_id).await?;
+
+    let role_permissions: HashSet<Permission> = this
+        .db
+        .get_role_permissions(role.id)
+        .await?
+        .into_iter()
+        .filter_map(|(resource, action)| {
+            Some(Permission {
+                resource: AdminResource::try_from(resource).ok()?,
+                action: AdminAction::try_from(action).ok()?,
+            })
+        })
+        .collect();
+
+    check_role_assignment(
+        auth.user_id,
+        user_id,
+        auth.is_super_admin(&this.db).await?,
+        &role.name,
+        &auth.permissions,
+        &role_permissions,
+    )?;
 
     // Assign the role
     this.db
@@ -340,8 +440,8 @@ async fn admin_revoke_user_role(
     State(this): State<RouterState>,
     Path((user_id, role_id)): Path<(u64, u64)>,
 ) -> ApiResult<()> {
-    // Check permission
-    auth.require_permission(AdminResource::Users, AdminAction::Update)?;
+    // Role assignment is role management, not user management
+    auth.require_permission(AdminResource::Roles, AdminAction::Update)?;
 
     // Check that user exists
     let _user = this.db.get_user(user_id).await?;
@@ -349,20 +449,13 @@ async fn admin_revoke_user_role(
     // Check that role exists
     let role = this.db.get_role(role_id).await?;
 
-    // Only prevent super_admin users from revoking their own super_admin role
-    // (to avoid locking themselves out of the system)
-    if auth.user_id == user_id && role.name == "super_admin" {
-        // Check if the current user has super_admin role
-        let user_roles = this.db.get_user_roles(auth.user_id).await?;
-        for user_role_id in user_roles {
-            let user_role = this.db.get_role(user_role_id).await?;
-            if user_role.name == "super_admin" {
-                return Err(ApiError::forbidden(
-                    "Super admins cannot revoke their own super_admin role",
-                ));
-            }
-        }
-    }
+    check_role_revocation(
+        auth.user_id,
+        user_id,
+        auth.is_super_admin(&this.db).await?,
+        &role.name,
+        this.db.count_role_users(role.id).await?,
+    )?;
 
     // Revoke the role
     this.db.revoke_user_role(user_id, role_id).await?;
@@ -447,4 +540,94 @@ async fn admin_get_my_roles(
     }
 
     ApiData::ok(user_roles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn perm(resource: AdminResource, action: AdminAction) -> Permission {
+        Permission { resource, action }
+    }
+
+    fn perms(items: &[(AdminResource, AdminAction)]) -> HashSet<Permission> {
+        items.iter().map(|(r, a)| perm(*r, *a)).collect()
+    }
+
+    /// Regression: a `user_manager` (users::update, no role permissions) could
+    /// POST /users/{self}/roles with role_id=super_admin and take over.
+    #[test]
+    fn test_cannot_self_assign_super_admin() {
+        let caller = perms(&[
+            (AdminResource::Users, AdminAction::Update),
+            (AdminResource::Roles, AdminAction::Update),
+        ]);
+        let super_admin = perms(&[(AdminResource::Roles, AdminAction::Update)]);
+
+        // Self-assignment is refused outright, even for a super admin.
+        assert!(
+            check_role_assignment(7, 7, false, SUPER_ADMIN_ROLE, &caller, &super_admin).is_err()
+        );
+        assert!(
+            check_role_assignment(7, 7, true, SUPER_ADMIN_ROLE, &caller, &super_admin).is_err()
+        );
+        assert!(check_role_assignment(7, 7, false, "read_only", &caller, &HashSet::new()).is_err());
+    }
+
+    #[test]
+    fn test_only_super_admin_can_grant_super_admin() {
+        let caller = perms(&[(AdminResource::Roles, AdminAction::Update)]);
+
+        assert!(
+            check_role_assignment(1, 2, false, SUPER_ADMIN_ROLE, &caller, &caller).is_err(),
+            "non super admin must not hand out super_admin"
+        );
+        assert!(check_role_assignment(1, 2, true, SUPER_ADMIN_ROLE, &caller, &caller).is_ok());
+    }
+
+    #[test]
+    fn test_cannot_grant_permissions_caller_does_not_hold() {
+        let caller = perms(&[
+            (AdminResource::Roles, AdminAction::Update),
+            (AdminResource::Users, AdminAction::View),
+        ]);
+
+        // Role holds vm::delete which the caller does not have.
+        let escalating = perms(&[
+            (AdminResource::Users, AdminAction::View),
+            (AdminResource::VirtualMachines, AdminAction::Delete),
+        ]);
+        let err = check_role_assignment(1, 2, false, "vm_manager", &caller, &escalating)
+            .expect_err("escalating grant must be refused");
+        assert!(
+            err.error.contains("virtual_machines::delete"),
+            "{}",
+            err.error
+        );
+
+        // Subset of the caller's own permissions is fine.
+        let subset = perms(&[(AdminResource::Users, AdminAction::View)]);
+        assert!(check_role_assignment(1, 2, false, "read_only", &caller, &subset).is_ok());
+
+        // A super admin holds everything implicitly.
+        assert!(
+            check_role_assignment(1, 2, true, "vm_manager", &HashSet::new(), &escalating).is_ok()
+        );
+    }
+
+    /// Regression: the old guard made an accidental grant permanent, since the
+    /// account that escalated itself could never hand the role back.
+    #[test]
+    fn test_super_admin_can_self_revoke_unless_last() {
+        // Two super admins: self-revoke is allowed.
+        assert!(check_role_revocation(1, 1, true, SUPER_ADMIN_ROLE, 2).is_ok());
+        // Last super admin: blocked to avoid locking everyone out.
+        assert!(check_role_revocation(1, 1, true, SUPER_ADMIN_ROLE, 1).is_err());
+        // Revoking someone else's super_admin is fine even at count 1.
+        assert!(check_role_revocation(1, 2, true, SUPER_ADMIN_ROLE, 1).is_ok());
+        // Non super admins cannot strip super_admin at all.
+        assert!(check_role_revocation(1, 2, false, SUPER_ADMIN_ROLE, 5).is_err());
+        // Ordinary roles are unaffected.
+        assert!(check_role_revocation(1, 1, false, "read_only", 1).is_ok());
+    }
 }

@@ -1252,7 +1252,13 @@ Required Permission: `users::view`
 POST /api/admin/v1/users/{user_id}/roles
 ```
 
-Required Permission: `users::update`
+Required Permission: `roles::update`
+
+Additional restrictions (403 on violation):
+
+- An admin cannot assign a role to themselves.
+- Only a `super_admin` may grant the `super_admin` role.
+- The granted role's permissions must be a subset of the caller's own permissions (super admins are exempt).
 
 Body:
 
@@ -1268,7 +1274,12 @@ Body:
 DELETE /api/admin/v1/users/{user_id}/roles/{role_id}
 ```
 
-Required Permission: `users::update`
+Required Permission: `roles::update`
+
+Additional restrictions (403 on violation):
+
+- Only a `super_admin` may revoke the `super_admin` role.
+- A super admin may revoke their own `super_admin` role unless they are the last one holding it.
 
 #### Get Current User's Admin Roles
 

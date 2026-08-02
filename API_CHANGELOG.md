@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- **Role assignment no longer allows privilege escalation** — `POST /api/admin/v1/users/{id}/roles` and `DELETE /api/admin/v1/users/{id}/roles/{role_id}` previously required only `users::update` and placed no constraint on which role was granted, so any admin who could edit users (e.g. the built-in `user_manager` role) could grant themselves `super_admin` and gain every permission in the system. Both endpoints now require `roles::update` instead, refuse self-assignment, require `super_admin` to grant or revoke `super_admin`, and refuse to grant a role whose permissions are not a subset of the caller's own. The self-revoke lockout guard now only applies to the **last** super admin, so an unwanted `super_admin` grant can be handed back instead of being permanent. By default only `super_admin` holds `roles::update`, so role assignment is now a super-admin-only operation unless a custom role grants it.
+
 - **Per-client-IP rate limiting on the public API** — all consumer endpoints now sit behind an in-process fixed-window limiter (600 req/min per IP general; 10 req/min per IP on brute-force-sensitive auth and verification endpoints: OAuth login/callback, WebAuthn register/login, email verification, WhatsApp verify/confirm, and the contact form). Exceeding a limit returns `429 Too Many Requests` with a `Retry-After` header. Clients with well-behaved retry/backoff behaviour are unaffected.
 
 - **WhatsApp verification codes are now invalidated after 10 failed confirmations** — the 6-digit code previously had unlimited online guesses. After 10 wrong attempts the pending code is cleared and a fresh one must be requested (`POST /api/v1/account/whatsapp/verify`).
