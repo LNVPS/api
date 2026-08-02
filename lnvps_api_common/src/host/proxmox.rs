@@ -1,6 +1,10 @@
 use crate::HostVmSpec;
 use crate::JsonApi;
 use crate::host::config::{QemuConfig, SshConfig};
+use crate::host::proxmox_config::{
+    CiCustom, DiskDevice, IpConfig, Ipv4Setting, Ipv6Setting, MacAddress, NetDevice, NetModel,
+    SshKeys, opt_prop_string,
+};
 use crate::host::{
     FullVmInfo, MigrateVmRequest, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient,
     VmHostDiskInfo, VmHostInfo,
@@ -1156,94 +1160,71 @@ impl ProxmoxClient {
         vendor_snippet: Option<&str>,
         network_snippet: Option<&str>,
     ) -> Result<VmConfig> {
-        let ip_config = value
-            .ips
-            .iter()
-            .filter_map(|ip| {
-                if let Ok(addr) = ip.ip.parse::<IpAddr>() {
-                    Some(match addr {
-                        IpAddr::V4(_) => {
-                            let ip_range = value.ranges.iter().find(|r| r.id == ip.ip_range_id)?;
-                            let range: IpNetwork = ip_range.cidr.parse().ok()?;
-                            let range_gw: IpNetwork = parse_gateway(&ip_range.gateway).ok()?;
-                            let prefix = range.prefix().min(range_gw.prefix());
-                            format!(
-                                "ip={},gw={}",
-                                IpNetwork::new(addr, prefix).ok()?,
-                                range_gw.ip()
-                            )
-                        }
-                        IpAddr::V6(_) => {
-                            let ip_range = value.ranges.iter().find(|r| r.id == ip.ip_range_id)?;
-                            if matches!(ip_range.allocation_mode, IpRangeAllocationMode::SlaacEui64)
-                            {
-                                // just ignore what's in the db and use whatever the host wants
-                                // what's in the db is purely informational
-                                "ip6=auto".to_string()
-                            } else {
-                                let range: IpNetwork = ip_range.cidr.parse().ok()?;
-                                let range_gw: IpNetwork = parse_gateway(&ip_range.gateway).ok()?;
-                                let prefix = range.prefix().min(range_gw.prefix());
-                                format!(
-                                    "ip6={},gw6={}",
-                                    IpNetwork::new(addr, prefix).ok()?,
-                                    range_gw.ip(),
-                                )
-                            }
-                        }
-                    })
-                } else {
-                    None
+        // `ipconfig[n]` holds at most one address per family; repeating a key
+        // produces something the guest cannot act on. Any address beyond the
+        // first of each family is carried by the network snippet instead.
+        let mut ip_config = IpConfig::default();
+        for ip in &value.ips {
+            let Ok(addr) = ip.ip.parse::<IpAddr>() else {
+                continue;
+            };
+            let Some(ip_range) = value.ranges.iter().find(|r| r.id == ip.ip_range_id) else {
+                continue;
+            };
+            match addr {
+                IpAddr::V4(_) if ip_config.ip.is_none() => {
+                    let (Ok(range), Ok(range_gw)) = (
+                        ip_range.cidr.parse::<IpNetwork>(),
+                        parse_gateway(&ip_range.gateway),
+                    ) else {
+                        continue;
+                    };
+                    let prefix = range.prefix().min(range_gw.prefix());
+                    if let Ok(net) = IpNetwork::new(addr, prefix) {
+                        ip_config.ip = Some(Ipv4Setting::Static(net));
+                        ip_config.gateway = Some(range_gw.ip());
+                    }
                 }
-            })
-            .collect::<Vec<_>>();
-
-        // `ipconfig[n]` is a property string holding at most one `ip=` and one
-        // `ip6=`; repeating a key produces something the guest cannot act on. Any
-        // address beyond the first of each family is carried by the network
-        // snippet instead, so keep only the first of each here.
-        let ip_config: Vec<String> = {
-            let mut first_v4 = None;
-            let mut first_v6 = None;
-            for entry in ip_config {
-                if entry.starts_with("ip6=") {
-                    first_v6.get_or_insert(entry);
-                } else {
-                    first_v4.get_or_insert(entry);
+                IpAddr::V6(_) if ip_config.ip6.is_none() => {
+                    if matches!(ip_range.allocation_mode, IpRangeAllocationMode::SlaacEui64) {
+                        // just ignore what's in the db and use whatever the host wants
+                        // what's in the db is purely informational
+                        ip_config.ip6 = Some(Ipv6Setting::Auto);
+                        continue;
+                    }
+                    let (Ok(range), Ok(range_gw)) = (
+                        ip_range.cidr.parse::<IpNetwork>(),
+                        parse_gateway(&ip_range.gateway),
+                    ) else {
+                        continue;
+                    };
+                    let prefix = range.prefix().min(range_gw.prefix());
+                    if let Ok(net) = IpNetwork::new(addr, prefix) {
+                        ip_config.ip6 = Some(Ipv6Setting::Static(net));
+                        ip_config.gateway6 = Some(range_gw.ip());
+                    }
                 }
+                _ => {}
             }
-            first_v4.into_iter().chain(first_v6).collect()
+        }
+
+        let limits = value.limits();
+        let net = NetDevice {
+            model: NetModel::VirtIo,
+            mac: MacAddress::parse(&value.vm.mac_address),
+            bridge: Some(self.config.bridge.clone()),
+            firewall: true, //always enable on interface
+            tag: value.host.vlan_id.map(|t| t as u16),
+            mtu: value.host.mtu.map(|m| m as u32),
+            link_down: value.vm.disabled,
+            // Proxmox rate= is in MB/s; our field is stored in Mbit/s
+            rate: limits.network_mbps.map(|mbps| mbps as f32 / 8.0),
         };
 
-        let mut net = vec![
-            format!("virtio={}", value.vm.mac_address),
-            format!("bridge={}", self.config.bridge),
-            "firewall=1".to_string(), //always enable on interface
-        ];
-        if let Some(t) = value.host.vlan_id {
-            net.push(format!("tag={}", t));
-        }
-        if let Some(mtu) = value.host.mtu {
-            net.push(format!("mtu={}", mtu));
-        }
-        if value.vm.disabled {
-            net.push("link_down=1".to_string());
-        }
-        let limits = value.limits();
-        if let Some(mbps) = limits.network_mbps {
-            // Proxmox rate= is in MB/s; our field is stored in Mbit/s
-            net.push(format!("rate={}", mbps as f32 / 8.0));
-        }
-
-        let cicustom_parts: Vec<String> = vendor_snippet
-            .map(|v| format!("vendor={v}"))
-            .into_iter()
-            .chain(network_snippet.map(|n| format!("network={n}")))
-            .collect();
-        let cicustom = if cicustom_parts.is_empty() {
-            None
-        } else {
-            Some(cicustom_parts.join(","))
+        let cicustom = CiCustom {
+            vendor: vendor_snippet.and_then(|v| v.parse().ok()),
+            network: network_snippet.and_then(|n| n.parse().ok()),
+            ..Default::default()
         };
 
         let vm_resources = value.resources()?;
@@ -1251,9 +1232,9 @@ impl ProxmoxClient {
             name: Some(format!("VM{}", value.vm.id)), // set name to DB name
             cpu: Some(self.config.cpu.clone()),
             kvm: Some(self.config.kvm),
-            ip_config: Some(ip_config.join(",")),
+            ip_config: Some(ip_config),
             machine: Some(self.config.machine.clone()),
-            net: Some(net.join(",")),
+            net: Some(net),
             os_type: Some(self.config.os_type.clone()),
             on_boot: Some(true),
             bios: Some(VmBios::OVMF),
@@ -1266,28 +1247,16 @@ impl ProxmoxClient {
             // in `apply_disk_options`). Takes effect on next VM start.
             scsi_hw: Some("virtio-scsi-single".to_string()),
             serial_0: Some("socket".to_string()),
-            scsi_1: Some(format!("{}:cloudinit", &value.disk.name)),
-            ssh_keys: Some(urlencoding::encode(value.ssh_key.key_data.as_str()).to_string()),
-            efi_disk_0: Some(format!("{}:0,efitype=4m", &value.disk.name)),
+            scsi_1: Some(DiskDevice::volume(&value.disk.name, "cloudinit")),
+            ssh_keys: Some(SshKeys::one(value.ssh_key.key_data.as_str())),
+            efi_disk_0: Some(DiskDevice {
+                efi_type: Some("4m".to_string()),
+                ..DiskDevice::volume(&value.disk.name, "0")
+            }),
             cpu_limit: limits.cpu_limit,
-            cicustom,
+            cicustom: (!cicustom.is_empty()).then_some(cicustom),
             ..Default::default()
         })
-    }
-
-    /// Normalise a Proxmox property string (e.g. `net0`, `ipconfig0`) so it can
-    /// be compared for equality regardless of key ordering or letter case.
-    /// Proxmox rewrites these strings when it stores them (re-ordering keys and
-    /// upper-casing MAC addresses), so a naive string compare would report
-    /// permanent drift.
-    fn normalize_prop_string(value: &str) -> Vec<String> {
-        let mut parts: Vec<String> = value
-            .split(',')
-            .map(|p| p.trim().to_lowercase())
-            .filter(|p| !p.is_empty())
-            .collect();
-        parts.sort();
-        parts
     }
 
     /// Compare the config currently on the host against the config we expect
@@ -1309,16 +1278,6 @@ impl ProxmoxClient {
                 }
             };
         }
-        macro_rules! cmp_props {
-            ($field:ident) => {
-                if let Some(want) = expected.$field.as_ref() {
-                    let have = current.$field.as_deref().unwrap_or_default();
-                    if Self::normalize_prop_string(have) != Self::normalize_prop_string(want) {
-                        drift.push(stringify!($field).to_string());
-                    }
-                }
-            };
-        }
 
         cmp!(name);
         cmp!(cores);
@@ -1335,22 +1294,9 @@ impl ProxmoxClient {
         cmp!(scsi_hw);
         cmp!(serial_0);
         cmp!(cicustom);
-        cmp_props!(net);
-        cmp_props!(ip_config);
-
-        // ssh keys are url-encoded by both sides but Proxmox may use a
-        // different escaping/case, so compare the decoded values
-        if let Some(want) = expected.ssh_keys.as_ref() {
-            let decode = |v: &str| {
-                urlencoding::decode(v)
-                    .map(|d| d.trim().to_string())
-                    .unwrap_or_else(|_| v.trim().to_string())
-            };
-            let have = current.ssh_keys.as_deref().unwrap_or_default();
-            if decode(have) != decode(want) {
-                drift.push("ssh_keys".to_string());
-            }
-        }
+        cmp!(net);
+        cmp!(ip_config);
+        cmp!(ssh_keys);
 
         drift
     }
@@ -1362,9 +1308,9 @@ impl ProxmoxClient {
     /// config. Runs unconditionally so that VMs without throttle limits still converge
     /// onto `iothread=1`.
     async fn apply_disk_options(&self, req: &FullVmInfo) -> OpResult<()> {
-        // Fetch the current config to get the live scsi0 disk path
+        // Fetch the current config to get the live scsi0 disk
         let current = self.get_vm_config(&self.node, req.vm.id.into()).await?;
-        let scsi0_base = match current.config.scsi_0 {
+        let scsi_0 = match current.config.scsi_0 {
             Some(v) => v,
             None => op_fatal!("scsi0 not found in VM config"),
         };
@@ -1376,7 +1322,7 @@ impl ProxmoxClient {
             snapshot: None,
             digest: None,
             config: VmConfig {
-                scsi_0: Some(Self::make_scsi0(&scsi0_base, req)),
+                scsi_0: Some(Self::make_scsi0(&scsi_0, req)),
                 ..Default::default()
             },
         })
@@ -1385,41 +1331,24 @@ impl ProxmoxClient {
         Ok(())
     }
 
-    /// Build the `scsi0` device string we expect for a VM, from the live device
-    /// string (only its bare volume reference is kept — every option after it is
-    /// owned by us and rebuilt here).
-    fn make_scsi0(current_scsi0: &str, req: &FullVmInfo) -> String {
+    /// The `scsi0` device we expect for a VM: the live volume (owned by
+    /// create/resize) carrying the options we own.
+    fn make_scsi0(current: &DiskDevice, req: &FullVmInfo) -> DiskDevice {
         let limits = req.limits();
-
-        // Strip any pre-existing throttle/ssd params so we get the bare volume ref
-        let volume_part = current_scsi0
-            .split(',')
-            .next()
-            .unwrap_or(current_scsi0)
-            .to_string();
-
-        let mut parts = vec![volume_part];
-        // Re-apply SSD params if the disk type is SSD
-        if matches!(req.disk.kind, DiskType::SSD) {
-            parts.push("discard=on".to_string());
-            parts.push("ssd=1".to_string());
+        let is_ssd = matches!(req.disk.kind, DiskType::SSD);
+        DiskDevice {
+            volume: current.volume.clone(),
+            size: current.size.clone(),
+            discard: is_ssd,
+            ssd: is_ssd,
+            // Keep in sync with `import_disk_image`; requires scsihw=virtio-scsi-single.
+            iothread: true,
+            efi_type: None,
+            mbps_rd: limits.disk_mbps_read.map(|v| v as f32),
+            mbps_wr: limits.disk_mbps_write.map(|v| v as f32),
+            iops_rd: limits.disk_iops_read,
+            iops_wr: limits.disk_iops_write,
         }
-        // Keep in sync with `import_disk_image`; requires scsihw=virtio-scsi-single.
-        parts.push("iothread=1".to_string());
-        if let Some(v) = limits.disk_mbps_read {
-            parts.push(format!("mbps_rd={}", v));
-        }
-        if let Some(v) = limits.disk_mbps_write {
-            parts.push(format!("mbps_wr={}", v));
-        }
-        if let Some(v) = limits.disk_iops_read {
-            parts.push(format!("iops_rd={}", v));
-        }
-        if let Some(v) = limits.disk_iops_write {
-            parts.push(format!("iops_wr={}", v));
-        }
-
-        parts.join(",")
     }
 
     /// Import main disk image from the template (without resizing)
@@ -1588,11 +1517,11 @@ impl VmHostClient for ProxmoxClient {
             let (mac_address, disk_storage) =
                 match self.get_vm_config(&self.node, vm.vm_id.into()).await {
                     Ok(cfg) => (
-                        cfg.config.net.as_deref().and_then(parse_mac_from_net),
+                        cfg.config.net.and_then(|n| n.mac).map(|m| m.to_string()),
                         cfg.config
                             .scsi_0
-                            .as_deref()
-                            .and_then(parse_storage_from_disk),
+                            .map(|d| d.volume.storage)
+                            .filter(|s| !s.is_empty()),
                     ),
                     Err(e) => {
                         warn!("Failed to read config for vm {}: {}", vm.vm_id, e);
@@ -2094,9 +2023,8 @@ impl VmHostClient for ProxmoxClient {
         // scsi0 device string, which is rebuilt from the live volume reference
         // rather than from `make_config` — compare it separately so that VMs
         // created before these options existed converge onto them.
-        if let Some(scsi_0) = current.config.scsi_0.as_deref() {
-            let want = Self::make_scsi0(scsi_0, cfg);
-            if Self::normalize_prop_string(scsi_0) != Self::normalize_prop_string(&want) {
+        if let Some(scsi_0) = current.config.scsi_0.as_ref() {
+            if *scsi_0 != Self::make_scsi0(scsi_0, cfg) {
                 drift.push("scsi_0".to_string());
             }
         }
@@ -2559,32 +2487,6 @@ impl ProxmoxVmId {
     }
 }
 
-/// Extract the MAC address from a Proxmox `netN` config string, e.g.
-/// `virtio=BC:24:11:00:11:22,bridge=vmbr0,firewall=1` -> `BC:24:11:00:11:22`.
-fn parse_mac_from_net(net: &str) -> Option<String> {
-    net.split(',').find_map(|kv| {
-        let (k, v) = kv.split_once('=')?;
-        // The NIC model key (virtio/e1000/...) holds the MAC as its value.
-        if v.split(':').count() == 6 && k != "bridge" {
-            Some(v.to_string())
-        } else {
-            None
-        }
-    })
-}
-
-/// Extract the storage pool from a Proxmox disk config string, e.g.
-/// `local-lvm:vm-1566-disk-0,size=32G` -> `local-lvm`.
-fn parse_storage_from_disk(disk: &str) -> Option<String> {
-    let first = disk.split(',').next()?;
-    let (storage, _) = first.split_once(':')?;
-    if storage.is_empty() {
-        None
-    } else {
-        Some(storage.to_string())
-    }
-}
-
 /// DNS resolvers forced into every guest's `/etc/resolv.conf` via the cloud-init
 /// vendor snippet (see [`build_vendor_snippet`]).
 const GUEST_DNS_SERVERS: &[&str] = &[
@@ -2999,7 +2901,13 @@ pub struct HashedVmConfig {
     pub config: VmConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+/// A Proxmox VM config.
+///
+/// Compound values (`netN`, `ipconfigN`, disks, `cicustom`, `sshkeys`) are
+/// Proxmox "property strings"; they are typed here (see
+/// [`crate::host::proxmox_config`]) so they can be read field-wise and compared
+/// with `==` instead of by string matching.
+#[derive(Debug, Clone, Deserialize, Serialize, Default, PartialEq)]
 pub struct VmConfig {
     #[serde(rename = "onboot")]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3017,7 +2925,8 @@ pub struct VmConfig {
     pub cpu: Option<String>,
     #[serde(rename = "ipconfig0")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ip_config: Option<String>,
+    #[serde(default, with = "opt_prop_string")]
+    pub ip_config: Option<IpConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3026,27 +2935,32 @@ pub struct VmConfig {
     pub name: Option<String>,
     #[serde(rename = "net0")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub net: Option<String>,
+    #[serde(default, with = "opt_prop_string")]
+    pub net: Option<NetDevice>,
     #[serde(rename = "ostype")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub os_type: Option<String>,
     #[serde(rename = "scsi0")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub scsi_0: Option<String>,
+    #[serde(default, with = "opt_prop_string")]
+    pub scsi_0: Option<DiskDevice>,
     #[serde(rename = "scsi1")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub scsi_1: Option<String>,
+    #[serde(default, with = "opt_prop_string")]
+    pub scsi_1: Option<DiskDevice>,
     #[serde(rename = "scsihw")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scsi_hw: Option<String>,
     #[serde(rename = "sshkeys")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ssh_keys: Option<String>,
+    #[serde(default, with = "opt_prop_string")]
+    pub ssh_keys: Option<SshKeys>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<String>,
     #[serde(rename = "efidisk0")]
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub efi_disk_0: Option<String>,
+    #[serde(default, with = "opt_prop_string")]
+    pub efi_disk_0: Option<DiskDevice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default, deserialize_with = "crate::deserialize_int_to_bool")]
     pub kvm: Option<bool>,
@@ -3059,7 +2973,8 @@ pub struct VmConfig {
     pub cpu_limit: Option<f32>,
     /// Custom cloud-init config files (e.g. "vendor=local:snippets/lnvps-vendor.yaml")
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub cicustom: Option<String>,
+    #[serde(default, with = "opt_prop_string")]
+    pub cicustom: Option<CiCustom>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3265,54 +3180,37 @@ async fn ssh_terminal_bridge(
 mod tests {
     use super::*;
     use crate::MB;
+    use crate::host::proxmox_config::{Ipv4Setting, Ipv6Setting, VolumeRef};
     use crate::host::tests::mock_full_vm;
     use lnvps_db::IpRange;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
-    fn test_normalize_prop_string() {
-        // Key order and case must not matter
-        assert_eq!(
-            ProxmoxClient::normalize_prop_string(
-                "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1"
-            ),
-            ProxmoxClient::normalize_prop_string(
-                "firewall=1,bridge=vmbr0,virtio=aa:bb:cc:dd:ee:ff"
-            )
-        );
-        // Empty segments are dropped
-        assert_eq!(
-            ProxmoxClient::normalize_prop_string("ip=1.2.3.4/24,"),
-            vec!["ip=1.2.3.4/24".to_string()]
-        );
-        // Different values still differ
-        assert_ne!(
-            ProxmoxClient::normalize_prop_string("bridge=vmbr0"),
-            ProxmoxClient::normalize_prop_string("bridge=vmbr1")
-        );
-    }
-
-    #[test]
     fn test_make_scsi0() {
         let cfg = mock_full_vm();
 
-        // Only the bare volume ref is kept; our options are rebuilt.
-        let built = ProxmoxClient::make_scsi0("ssd:vm-100-disk-0,size=100G,iops_rd=99", &cfg);
-        assert_eq!(
-            built, "ssd:vm-100-disk-0,discard=on,ssd=1,iothread=1",
-            "ssd disks get discard/ssd and always iothread=1"
+        // The live volume and size are kept; every option is rebuilt from the DB.
+        let live: DiskDevice = "ssd:vm-100-disk-0,size=100G,iops_rd=99".parse().unwrap();
+        let built = ProxmoxClient::make_scsi0(&live, &cfg);
+        assert_eq!(built.volume, VolumeRef::new("ssd", "vm-100-disk-0"));
+        assert_eq!(built.size.as_deref(), Some("100G"));
+        assert!(
+            built.discard && built.ssd,
+            "ssd disks get discard/ssd hints"
         );
+        assert!(built.iothread, "iothread is always on");
+        assert_eq!(built.iops_rd, None, "stale throttle values are dropped");
 
-        // Rebuilding an already-correct device string is a no-op, so a VM that
-        // is up to date never reports scsi0 drift.
+        // Rebuilding an already-correct device is a no-op, so a VM that is up to
+        // date never reports scsi0 drift.
         assert_eq!(ProxmoxClient::make_scsi0(&built, &cfg), built);
 
         // A VM created before iothread existed drifts.
-        assert_ne!(
-            ProxmoxClient::normalize_prop_string("ssd:vm-100-disk-0,discard=on,ssd=1"),
-            ProxmoxClient::normalize_prop_string(&built)
-        );
+        let old: DiskDevice = "ssd:vm-100-disk-0,size=100G,discard=on,ssd=1"
+            .parse()
+            .unwrap();
+        assert_ne!(old, ProxmoxClient::make_scsi0(&old, &cfg));
     }
 
     #[test]
@@ -3321,9 +3219,13 @@ mod tests {
             name: Some("VM100".to_string()),
             cores: Some(4),
             memory: Some("2048".to_string()),
-            net: Some("virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0,firewall=1".to_string()),
-            ip_config: Some("ip=1.2.3.4/24,gw=1.2.3.1".to_string()),
-            ssh_keys: Some(urlencoding::encode("ssh-ed25519 AAAA test").to_string()),
+            net: Some(
+                "virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0,firewall=1"
+                    .parse()
+                    .unwrap(),
+            ),
+            ip_config: Some("ip=1.2.3.4/24,gw=1.2.3.1".parse().unwrap()),
+            ssh_keys: Some(SshKeys::one("ssh-ed25519 AAAA test")),
             ..Default::default()
         };
 
@@ -3332,11 +3234,19 @@ mod tests {
             name: Some("VM100".to_string()),
             cores: Some(4),
             memory: Some("2048".to_string()),
-            net: Some("bridge=vmbr0,firewall=1,virtio=AA:BB:CC:DD:EE:FF".to_string()),
-            ip_config: Some("gw=1.2.3.1,ip=1.2.3.4/24".to_string()),
-            ssh_keys: Some(urlencoding::encode("ssh-ed25519 AAAA test").to_string()),
+            net: Some(
+                "bridge=vmbr0,firewall=1,virtio=AA:BB:CC:DD:EE:FF"
+                    .parse()
+                    .unwrap(),
+            ),
+            ip_config: Some("gw=1.2.3.1,ip=1.2.3.4/24".parse().unwrap()),
+            ssh_keys: Some(
+                urlencoding::encode("ssh-ed25519 AAAA test\n")
+                    .parse()
+                    .unwrap(),
+            ),
             // Fields not present in the expected config are ignored
-            scsi_0: Some("local-lvm:vm-100-disk-0".to_string()),
+            scsi_0: Some("local-lvm:vm-100-disk-0".parse().unwrap()),
             ..Default::default()
         };
         assert!(ProxmoxClient::config_drift(&current, &expected).is_empty());
@@ -3353,7 +3263,7 @@ mod tests {
 
         // A different ssh key is detected
         let drifted = VmConfig {
-            ssh_keys: Some(urlencoding::encode("ssh-ed25519 BBBB other").to_string()),
+            ssh_keys: Some(SshKeys::one("ssh-ed25519 BBBB other")),
             ..current.clone()
         };
         assert_eq!(
@@ -3438,13 +3348,14 @@ mod tests {
         // No balloon floor configured => no balloon key
         assert_eq!(vm.balloon, None);
         assert_eq!(vm.on_boot, Some(true));
-        assert!(vm.net.as_ref().unwrap().contains("tag=100"));
-        assert!(vm.net.as_ref().unwrap().contains("firewall=1"));
+        let net = vm.net.as_ref().unwrap();
+        assert_eq!(net.tag, Some(100));
+        assert!(net.firewall);
         // One address per family: the fixture holds two IPv4s, and repeating
         // `ip=` in the property string is not something the guest can act on.
         assert_eq!(
             vm.ip_config,
-            Some("ip=192.168.1.2/16,gw=192.168.1.1,ip6=auto".to_string())
+            Some("ip=192.168.1.2/16,gw=192.168.1.1,ip6=auto".parse().unwrap())
         );
         Ok(())
     }
@@ -3508,16 +3419,12 @@ mod tests {
         let ip_config = vm.ip_config.unwrap();
         // The IP should use /24 (gateway prefix), not /26 (range prefix),
         // so the gateway 185.18.221.1 is inside the VM's subnet.
-        assert!(
-            ip_config.contains("185.18.221.65/24"),
-            "expected /24 (gateway prefix) but got: {}",
-            ip_config
+        assert_eq!(
+            ip_config.ip,
+            Some(Ipv4Setting::Static("185.18.221.65/24".parse()?)),
+            "expected /24 (gateway prefix)"
         );
-        assert!(
-            ip_config.contains("gw=185.18.221.1"),
-            "expected gateway 185.18.221.1 but got: {}",
-            ip_config
-        );
+        assert_eq!(ip_config.gateway, Some("185.18.221.1".parse()?));
         Ok(())
     }
 
@@ -3574,13 +3481,8 @@ mod tests {
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
         let vm = p.make_config(&cfg, None, None)?;
-        let net = vm.net.unwrap();
         // 800 Mbit/s ÷ 8 = 100 MB/s
-        assert!(
-            net.contains("rate=100"),
-            "expected rate=100 in net string, got: {}",
-            net
-        );
+        assert_eq!(vm.net.unwrap().rate, Some(100.0));
         Ok(())
     }
 
@@ -3727,36 +3629,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_mac_from_net() {
-        assert_eq!(
-            parse_mac_from_net("virtio=BC:24:11:00:11:22,bridge=vmbr0,firewall=1").as_deref(),
-            Some("BC:24:11:00:11:22")
-        );
-        assert_eq!(
-            parse_mac_from_net("e1000=00:15:5D:01:02:03,bridge=vmbr1").as_deref(),
-            Some("00:15:5D:01:02:03")
-        );
-        // No MAC present
-        assert_eq!(parse_mac_from_net("bridge=vmbr0,firewall=1"), None);
-        assert_eq!(parse_mac_from_net(""), None);
-    }
-
-    #[test]
-    fn test_parse_storage_from_disk() {
-        assert_eq!(
-            parse_storage_from_disk("local-lvm:vm-1566-disk-0,size=32G").as_deref(),
-            Some("local-lvm")
-        );
-        assert_eq!(
-            parse_storage_from_disk("ceph:vm-100-disk-0").as_deref(),
-            Some("ceph")
-        );
-        // No storage separator
-        assert_eq!(parse_storage_from_disk("none"), None);
-        assert_eq!(parse_storage_from_disk(""), None);
-    }
-
-    #[test]
     fn test_proxmox_vm_id_inner_maps_to_db_id() {
         // Host vmid 1566 -> db id 1466
         let id: ProxmoxVmId = 1566i32.into();
@@ -3822,8 +3694,9 @@ mod tests {
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
         let vm = p.make_config(&cfg, None, None)?;
-        assert!(
-            !vm.net.as_deref().unwrap_or("").contains("rate="),
+        assert_eq!(
+            vm.net.unwrap().rate,
+            None,
             "rate= must not appear when network_mbps is None"
         );
         assert_eq!(vm.cpu_limit, None);
@@ -3867,7 +3740,7 @@ mod tests {
         let vm = p.make_config(&cfg, Some("local:snippets/lnvps-vendor.yaml"), None)?;
         assert_eq!(
             vm.cicustom,
-            Some("vendor=local:snippets/lnvps-vendor.yaml".to_string())
+            Some("vendor=local:snippets/lnvps-vendor.yaml".parse().unwrap())
         );
 
         // Without vendor snippet
@@ -3884,7 +3757,8 @@ mod tests {
             vm.cicustom,
             Some(
                 "vendor=local:snippets/lnvps-vendor.yaml,network=local:snippets/lnvps-net-1.yaml"
-                    .to_string()
+                    .parse()
+                    .unwrap()
             )
         );
 
@@ -3993,11 +3867,16 @@ mod tests {
         let vm = p.make_config(&cfg, None, Some("local:snippets/lnvps-net-1.yaml"))?;
         let ip_config = vm.ip_config.unwrap();
 
-        assert_eq!(1, ip_config.matches("ip=").count(), "{ip_config}");
-        assert_eq!(1, ip_config.matches("ip6=").count(), "{ip_config}");
-        // The first assignment of each family, matching what the snippet routes.
-        assert!(ip_config.contains("ip=185.18.221.65/24"), "{ip_config}");
-        assert!(ip_config.contains("ip6=fd00::2/64"), "{ip_config}");
+        // One address per family — the first assignment of each, matching what
+        // the snippet routes.
+        assert_eq!(
+            ip_config.ip,
+            Some(Ipv4Setting::Static("185.18.221.65/24".parse()?))
+        );
+        assert_eq!(
+            ip_config.ip6,
+            Some(Ipv6Setting::Static("fd00::2/64".parse()?))
+        );
         Ok(())
     }
 

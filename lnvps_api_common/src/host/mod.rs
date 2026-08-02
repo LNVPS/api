@@ -21,6 +21,8 @@ pub mod config;
 mod libvirt;
 #[cfg(feature = "proxmox")]
 mod proxmox;
+#[cfg(feature = "proxmox")]
+pub mod proxmox_config;
 
 pub mod dummy_host;
 
