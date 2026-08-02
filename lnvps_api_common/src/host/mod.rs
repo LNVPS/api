@@ -145,6 +145,15 @@ pub trait VmHostClient: Send + Sync {
     /// Apply vm configuration (patch)
     async fn configure_vm(&self, cfg: &FullVmInfo) -> OpResult<()>;
 
+    /// Re-apply the VM configuration **only if** the config on the host has
+    /// drifted from the config we expect from the database.
+    ///
+    /// Returns the list of drifted field names (empty when nothing changed).
+    /// Defaults to a no-op for hosts that cannot read back their config.
+    async fn patch_config(&self, _cfg: &FullVmInfo) -> OpResult<Vec<String>> {
+        Ok(vec![])
+    }
+
     /// Update VM firewall configuration and IPsets
     async fn patch_firewall(&self, cfg: &FullVmInfo) -> OpResult<()>;
 

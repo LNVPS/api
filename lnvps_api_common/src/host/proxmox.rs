@@ -1275,6 +1275,85 @@ impl ProxmoxClient {
         })
     }
 
+    /// Normalise a Proxmox property string (e.g. `net0`, `ipconfig0`) so it can
+    /// be compared for equality regardless of key ordering or letter case.
+    /// Proxmox rewrites these strings when it stores them (re-ordering keys and
+    /// upper-casing MAC addresses), so a naive string compare would report
+    /// permanent drift.
+    fn normalize_prop_string(value: &str) -> Vec<String> {
+        let mut parts: Vec<String> = value
+            .split(',')
+            .map(|p| p.trim().to_lowercase())
+            .filter(|p| !p.is_empty())
+            .collect();
+        parts.sort();
+        parts
+    }
+
+    /// Compare the config currently on the host against the config we expect
+    /// from the database, returning the names of the fields that differ.
+    ///
+    /// Only fields the expected config actually sets are considered, and
+    /// disk/EFI fields are ignored (those are managed by create/resize, not by
+    /// re-configuration).
+    fn config_drift(current: &VmConfig, expected: &VmConfig) -> Vec<String> {
+        let mut drift = Vec::new();
+
+        macro_rules! cmp {
+            ($field:ident) => {
+                if let Some(want) = expected.$field.as_ref() {
+                    if current.$field.as_ref() != Some(want) {
+                        drift.push(stringify!($field).to_string());
+                    }
+                }
+            };
+        }
+        macro_rules! cmp_props {
+            ($field:ident) => {
+                if let Some(want) = expected.$field.as_ref() {
+                    let have = current.$field.as_deref().unwrap_or_default();
+                    if Self::normalize_prop_string(have) != Self::normalize_prop_string(want) {
+                        drift.push(stringify!($field).to_string());
+                    }
+                }
+            };
+        }
+
+        cmp!(name);
+        cmp!(cores);
+        cmp!(memory);
+        cmp!(balloon);
+        cmp!(cpu);
+        cmp!(cpu_limit);
+        cmp!(on_boot);
+        cmp!(machine);
+        cmp!(os_type);
+        cmp!(bios);
+        cmp!(boot);
+        cmp!(kvm);
+        cmp!(scsi_hw);
+        cmp!(serial_0);
+        cmp!(cicustom);
+        cmp_props!(net);
+        cmp_props!(ip_config);
+
+        // ssh keys are url-encoded by both sides but Proxmox may use a
+        // different escaping/case, so compare the decoded values
+        if let Some(want) = expected.ssh_keys.as_ref() {
+            let decode = |v: &str| {
+                urlencoding::decode(v)
+                    .map(|d| d.trim().to_string())
+                    .unwrap_or_else(|_| v.trim().to_string())
+            };
+            let have = current.ssh_keys.as_deref().unwrap_or_default();
+            if decode(have) != decode(want) {
+                drift.push("ssh_keys".to_string());
+            }
+        }
+
+        drift
+    }
+
     /// Apply disk options (iothread, SSD hints, I/O throttle limits) to the primary disk.
     ///
     /// Fetches the current scsi0 device string from Proxmox, rebuilds it from the bare
@@ -1991,6 +2070,28 @@ impl VmHostClient for ProxmoxClient {
         self.apply_disk_options(cfg).await?;
 
         Ok(())
+    }
+
+    async fn patch_config(&self, cfg: &FullVmInfo) -> OpResult<Vec<String>> {
+        let current = self.get_vm_config(&self.node, cfg.vm.id.into()).await?;
+
+        let vendor_snippet = self.ensure_vendor_snippet().await?;
+        let network_snippet = self.ensure_network_snippet(cfg).await?;
+        let expected =
+            self.make_config(cfg, vendor_snippet.as_deref(), network_snippet.as_deref())?;
+
+        let drift = Self::config_drift(&current.config, &expected);
+        if drift.is_empty() {
+            return Ok(vec![]);
+        }
+
+        info!(
+            "Config drift detected for VM {} ({}), re-configuring",
+            cfg.vm.id,
+            drift.join(", ")
+        );
+        VmHostClient::configure_vm(self, cfg).await?;
+        Ok(drift)
     }
 
     async fn patch_firewall(&self, cfg: &FullVmInfo) -> OpResult<()> {
@@ -2840,7 +2941,7 @@ pub struct ImportDiskImageRequest {
     pub mbps_wr: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VmBios {
     SeaBios,
@@ -3148,6 +3249,76 @@ mod tests {
     use lnvps_db::IpRange;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn test_normalize_prop_string() {
+        // Key order and case must not matter
+        assert_eq!(
+            ProxmoxClient::normalize_prop_string(
+                "virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1"
+            ),
+            ProxmoxClient::normalize_prop_string(
+                "firewall=1,bridge=vmbr0,virtio=aa:bb:cc:dd:ee:ff"
+            )
+        );
+        // Empty segments are dropped
+        assert_eq!(
+            ProxmoxClient::normalize_prop_string("ip=1.2.3.4/24,"),
+            vec!["ip=1.2.3.4/24".to_string()]
+        );
+        // Different values still differ
+        assert_ne!(
+            ProxmoxClient::normalize_prop_string("bridge=vmbr0"),
+            ProxmoxClient::normalize_prop_string("bridge=vmbr1")
+        );
+    }
+
+    #[test]
+    fn test_config_drift() {
+        let expected = VmConfig {
+            name: Some("VM100".to_string()),
+            cores: Some(4),
+            memory: Some("2048".to_string()),
+            net: Some("virtio=aa:bb:cc:dd:ee:ff,bridge=vmbr0,firewall=1".to_string()),
+            ip_config: Some("ip=1.2.3.4/24,gw=1.2.3.1".to_string()),
+            ssh_keys: Some(urlencoding::encode("ssh-ed25519 AAAA test").to_string()),
+            ..Default::default()
+        };
+
+        // Same config (with Proxmox-style re-ordering/casing) => no drift
+        let current = VmConfig {
+            name: Some("VM100".to_string()),
+            cores: Some(4),
+            memory: Some("2048".to_string()),
+            net: Some("bridge=vmbr0,firewall=1,virtio=AA:BB:CC:DD:EE:FF".to_string()),
+            ip_config: Some("gw=1.2.3.1,ip=1.2.3.4/24".to_string()),
+            ssh_keys: Some(urlencoding::encode("ssh-ed25519 AAAA test").to_string()),
+            // Fields not present in the expected config are ignored
+            scsi_0: Some("local-lvm:vm-100-disk-0".to_string()),
+            ..Default::default()
+        };
+        assert!(ProxmoxClient::config_drift(&current, &expected).is_empty());
+
+        // Changed resources + missing ip config => drift on those fields only
+        let drifted = VmConfig {
+            cores: Some(2),
+            memory: Some("1024".to_string()),
+            ip_config: None,
+            ..current.clone()
+        };
+        let drift = ProxmoxClient::config_drift(&drifted, &expected);
+        assert_eq!(drift, vec!["cores", "memory", "ip_config"]);
+
+        // A different ssh key is detected
+        let drifted = VmConfig {
+            ssh_keys: Some(urlencoding::encode("ssh-ed25519 BBBB other").to_string()),
+            ..current.clone()
+        };
+        assert_eq!(
+            ProxmoxClient::config_drift(&drifted, &expected),
+            vec!["ssh_keys"]
+        );
+    }
 
     #[test]
     fn test_build_vendor_snippet() {
