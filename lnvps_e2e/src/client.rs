@@ -322,10 +322,24 @@ pub fn admin_client_with_keys(keys: Keys) -> TestClient {
 }
 
 /// Bootstrap the admin user: ensure the user exists in the DB with `super_admin` role.
-/// Should be called once before admin tests run.
+///
+/// Every admin test's `setup()` calls this, but the work is idempotent and the
+/// admin identity is a per-process `OnceLock`, so the result cannot change
+/// within a run. It is therefore done once and memoised: previously each of the
+/// ~90 admin tests stood up and tore down its own `MySqlPool` just to re-assert
+/// a role that was already there.
+///
+/// `OnceCell` rather than `OnceLock` because the initialiser is async; a
+/// failure is not cached, so a genuine bootstrap error still surfaces on the
+/// next call rather than being silently remembered.
 pub async fn bootstrap_admin() -> anyhow::Result<()> {
-    let pool = crate::db::connect().await?;
-    crate::db::ensure_user_with_role(&pool, admin_keys(), "super_admin").await?;
-    pool.close().await;
-    Ok(())
+    static DONE: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+    DONE.get_or_try_init(|| async {
+        let pool = crate::db::connect().await?;
+        crate::db::ensure_user_with_role(&pool, admin_keys(), "super_admin").await?;
+        pool.close().await;
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map(|_| ())
 }

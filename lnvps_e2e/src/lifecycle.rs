@@ -1202,10 +1202,27 @@ mod tests {
                 );
 
                 // Idempotency: re-running the job pays nothing new.
-                crate::worker::publish_job("\"ProcessReferralPayouts\"")
+                //
+                // This asserts on an absence, so there is no state change to
+                // poll for. Rather than guess at worker latency with a blind
+                // sleep, wait for the consumer group to actually take the job
+                // off the stream, then allow a short settle for it to run. That
+                // is both faster and stronger: if the worker never picked the
+                // job up, the assertion below would previously have passed
+                // vacuously.
+                let job_id = crate::worker::publish_job_id("\"ProcessReferralPayouts\"")
                     .await
                     .unwrap();
-                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                assert!(
+                    crate::worker::wait_for_job_consumed(
+                        &job_id,
+                        std::time::Duration::from_secs(10)
+                    )
+                    .await
+                    .unwrap(),
+                    "worker never consumed the re-run job, so idempotency was never exercised"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                 assert_eq!(
                     crate::db::list_referral_payouts(&pool, oc1_ref_id)
                         .await
@@ -2425,23 +2442,40 @@ mod tests {
     }
 
     // ----------------------------------------------------------------
-    // Poll helper: retry a condition up to `max_secs` seconds,
-    // checking every `interval_ms` milliseconds.
-    // ----------------------------------------------------------------
+    // Poll helper: retry a condition up to `max_secs` seconds, backing off
+    // from `POLL_MIN_INTERVAL_MS` up to `interval_ms` between checks.
+    //
+    // The wait we are almost always in is "the worker will pick this up on its
+    // next ~100ms cycle", which a fixed 500ms cadence turns into a flat 500ms
+    // bill per call: every poll in the lifecycle test was succeeding on its
+    // first retry, so the suite spent ~4.6s asleep in nine of these. Starting
+    // small and doubling detects the flip roughly an order of magnitude sooner
+    // while still settling to the caller's cadence for genuinely long waits, so
+    // a slow condition does not hammer the API.
+    //
+    // `max_secs` and the early exit are unchanged, so the failure semantics and
+    // worst-case runtime of every call site are exactly as before.
+    const POLL_MIN_INTERVAL_MS: u64 = 25;
+
     async fn poll_until<F, Fut>(max_secs: u64, interval_ms: u64, f: F) -> bool
     where
         F: Fn() -> Fut,
         Fut: std::future::Future<Output = bool>,
     {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(max_secs);
+        let mut backoff = POLL_MIN_INTERVAL_MS.min(interval_ms);
         loop {
             if f().await {
                 return true;
             }
-            if std::time::Instant::now() >= deadline {
+            let now = std::time::Instant::now();
+            if now >= deadline {
                 return false;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+            // Never sleep past the deadline, so `max_secs` stays honest.
+            let remaining = deadline.saturating_duration_since(now);
+            tokio::time::sleep(std::time::Duration::from_millis(backoff).min(remaining)).await;
+            backoff = (backoff * 2).min(interval_ms);
         }
     }
 
