@@ -2003,7 +2003,8 @@ pub struct AdminReferralInfo {
     pub referral_rate: Option<f32>,
     /// User-chosen minimum accrued commission (satoshis) before an automated
     /// payout; `null` = use the system minimum. Effective threshold is
-    /// `max(system minimum, this value)`.
+    /// `max(system minimum, this value)`, judged against the referrer's total
+    /// outstanding commission across every currency.
     pub payout_threshold: Option<u64>,
     pub created: DateTime<Utc>,
 }
@@ -2014,6 +2015,26 @@ pub struct AdminReferralEarning {
     pub currency: String,
     /// Commission earned = sum of (first payment * effective_rate%) in this currency.
     pub amount: u64,
+}
+
+/// What a referral is still owed in one settled currency, and what that is
+/// worth in millisats — the unit the payout threshold is expressed in.
+#[derive(Serialize)]
+pub struct AdminReferralBalance {
+    pub currency: String,
+    /// Commission earned in this currency (smallest unit).
+    pub earned: u64,
+    /// Already paid **or reserved** against this currency (amount + fee), in
+    /// its smallest unit. A payout nets the currency it settles, not the one it
+    /// sent.
+    pub settled: u64,
+    /// Still owed = `earned - settled`, in the currency's smallest unit.
+    pub outstanding: u64,
+    /// `outstanding` valued in millisats at the current rate (identical to
+    /// `outstanding` for BTC). `null` when no rate is available for the
+    /// currency, in which case it is also excluded from
+    /// `outstanding_total_msat`.
+    pub outstanding_msat: Option<u64>,
 }
 
 /// A payout record for a referral (admin view; includes preimage for audit).
@@ -2081,6 +2102,13 @@ pub struct AdminReferralDetail {
     #[serde(flatten)]
     pub referral: AdminReferralInfo,
     pub earned: Vec<AdminReferralEarning>,
+    /// Outstanding (unpaid, unreserved) commission per settled currency.
+    pub balances: Vec<AdminReferralBalance>,
+    /// Everything still owed, valued in millisats at current rates — the figure
+    /// the payout threshold is judged against, so it can be compared directly
+    /// with `payout_threshold` (satoshis × 1000) and the system minimum.
+    /// Currencies with no available rate are excluded.
+    pub outstanding_total_msat: u64,
     pub payouts: Vec<AdminReferralPayoutInfo>,
     /// Referred VMs that made at least one payment.
     pub referrals_success: u64,

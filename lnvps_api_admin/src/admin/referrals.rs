@@ -1,15 +1,16 @@
 use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
-    AdminCreateReferralPayoutRequest, AdminReferralDetail, AdminReferralEarning, AdminReferralInfo,
-    AdminReferralPayoutInfo, AdminUpdateReferralPayoutRequest, AdminUpdateReferralRequest,
+    AdminCreateReferralPayoutRequest, AdminReferralBalance, AdminReferralDetail,
+    AdminReferralEarning, AdminReferralInfo, AdminReferralPayoutInfo,
+    AdminUpdateReferralPayoutRequest, AdminUpdateReferralRequest,
 };
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use lnvps_api_common::{
-    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult,
-    deserialize_from_str_optional,
+    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, ExchangeRateService,
+    Ticker, TickerRate, deserialize_from_str_optional,
 };
 use lnvps_db::{AdminAction, AdminResource, Referral, ReferralPayout};
 use payments_rs::currency::{Currency, CurrencyAmount};
@@ -98,10 +99,11 @@ async fn admin_get_referral(
         this.db.count_failed_referrals(&code),
     )?;
 
-    // Aggregate commission earned per currency.
+    // Aggregate commission earned per currency. Keys are upper-cased so `eur`
+    // and `EUR` are one balance rather than two half-netted ones.
     let mut by_currency: HashMap<String, u64> = HashMap::new();
     for u in &usage {
-        *by_currency.entry(u.currency.clone()).or_insert(0) += u.commission();
+        *by_currency.entry(u.currency.to_uppercase()).or_insert(0) += u.commission();
     }
     let mut earned: Vec<AdminReferralEarning> = by_currency
         .into_iter()
@@ -109,16 +111,83 @@ async fn admin_get_referral(
         .collect();
     earned.sort_by(|a, b| a.currency.cmp(&b.currency));
 
+    // What is still owed, and what the whole lot is worth in millisats: that is
+    // the figure the payout threshold is judged against, so an admin can see at
+    // a glance why a referrer is or is not being paid.
+    let balances = outstanding_balances(&earned, &payouts, this.exchange.as_ref()).await;
+    let outstanding_total_msat = balances
+        .iter()
+        .filter_map(|b| b.outstanding_msat)
+        .fold(0u64, |acc, msat| acc.saturating_add(msat));
+
     let referrals_success = usage.len() as u64;
     let info = build_info(&this, referral).await?;
 
     ApiData::ok(AdminReferralDetail {
         referral: info,
         earned,
+        balances,
+        outstanding_total_msat,
         payouts: payouts.into_iter().map(Into::into).collect(),
         referrals_success,
         referrals_failed,
     })
+}
+
+/// Amount already paid **or reserved** against `currency`, in that currency's
+/// smallest unit. A payout nets the currency it settles, never the one it sent,
+/// and the referrer bears the fee, so it is debited alongside the amount.
+fn settled_in(payouts: &[ReferralPayout], currency: &str) -> u64 {
+    payouts
+        .iter()
+        .filter(|p| p.currency.eq_ignore_ascii_case(currency))
+        .map(|p| p.amount.saturating_add(p.fee))
+        .sum()
+}
+
+/// Value `amount` units of `currency` in millisats at the current rate. `None`
+/// when the currency is unknown or no rate is available — a balance whose worth
+/// cannot be established is reported as unknown rather than guessed at.
+async fn outstanding_msat(
+    exchange: &dyn ExchangeRateService,
+    currency: &str,
+    amount: u64,
+) -> Option<u64> {
+    let currency = Currency::from_str(currency).ok()?;
+    if currency == Currency::BTC {
+        return Some(amount);
+    }
+    let ticker = Ticker(Currency::BTC, currency);
+    let rate = exchange.get_rate(ticker).await?;
+    if !(rate.is_finite() && rate > 0.0) {
+        return None;
+    }
+    TickerRate { ticker, rate }
+        .convert(CurrencyAmount::from_u64(currency, amount))
+        .ok()
+        .map(|c| c.value())
+}
+
+/// Net each earned currency against what has been paid or reserved in it, and
+/// value the remainder in millisats.
+async fn outstanding_balances(
+    earned: &[AdminReferralEarning],
+    payouts: &[ReferralPayout],
+    exchange: &dyn ExchangeRateService,
+) -> Vec<AdminReferralBalance> {
+    let mut out = Vec::with_capacity(earned.len());
+    for e in earned {
+        let settled = settled_in(payouts, &e.currency);
+        let outstanding = e.amount.saturating_sub(settled);
+        out.push(AdminReferralBalance {
+            outstanding_msat: outstanding_msat(exchange, &e.currency, outstanding).await,
+            currency: e.currency.clone(),
+            earned: e.amount,
+            settled,
+            outstanding,
+        });
+    }
+    out
 }
 
 /// Set or clear a referral's per-referrer commission override.
@@ -402,6 +471,102 @@ async fn admin_update_referral_payout(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Outstanding is earned net of what is paid **and** reserved (amount plus
+    /// the fee the referrer bears), per settled currency, and the millisat
+    /// value is the total the payout threshold is compared against.
+    #[tokio::test]
+    async fn outstanding_balances_net_per_currency_and_value_in_msat() {
+        let earned = vec![
+            AdminReferralEarning {
+                currency: "BTC".to_string(),
+                amount: 20_000_000,
+            },
+            AdminReferralEarning {
+                currency: "EUR".to_string(),
+                amount: 2_000,
+            },
+            AdminReferralEarning {
+                currency: "XAU".to_string(),
+                amount: 5,
+            },
+        ];
+        // A paid BTC payout, and a EUR balance settled by a payout that sent
+        // sats: it discharges EUR, and must leave the BTC balance alone.
+        let payouts = vec![
+            ReferralPayout {
+                amount: 5_000_000,
+                fee: 1_000,
+                currency: "BTC".to_string(),
+                ..Default::default()
+            },
+            ReferralPayout {
+                amount: 1_000,
+                fee: 0,
+                currency: "eur".to_string(),
+                sent_amount: 1_000_000,
+                sent_currency: "BTC".to_string(),
+                ..Default::default()
+            },
+        ];
+        let exchange = lnvps_api_common::MockExchangeRate::default();
+        exchange
+            .set_rate(Ticker::btc_rate("EUR").unwrap(), 100_000.0)
+            .await;
+
+        let balances = outstanding_balances(&earned, &payouts, &exchange).await;
+        assert_eq!(balances.len(), 3);
+
+        let btc = &balances[0];
+        assert_eq!((btc.earned, btc.settled), (20_000_000, 5_001_000));
+        assert_eq!(btc.outstanding, 14_999_000, "amount and fee both debited");
+        assert_eq!(
+            btc.outstanding_msat,
+            Some(14_999_000),
+            "BTC needs no conversion"
+        );
+
+        let eur = &balances[1];
+        assert_eq!(eur.settled, 1_000, "netted case-insensitively");
+        assert_eq!(eur.outstanding, 1_000, "€10 still owed");
+        assert_eq!(
+            eur.outstanding_msat,
+            Some(10_000_000),
+            "€10 at 100,000 EUR/BTC is 10,000 sats"
+        );
+
+        let unknown = &balances[2];
+        assert_eq!(unknown.outstanding, 5);
+        assert_eq!(
+            unknown.outstanding_msat, None,
+            "a balance with no rate is reported unknown, not guessed"
+        );
+
+        // The detail endpoint sums exactly the balances that could be valued.
+        let total: u64 = balances.iter().filter_map(|b| b.outstanding_msat).sum();
+        assert_eq!(total, 24_999_000);
+    }
+
+    /// A missing or nonsensical rate leaves the balance unvalued rather than
+    /// reporting a number an admin might act on.
+    #[tokio::test]
+    async fn an_unusable_rate_leaves_the_balance_unvalued() {
+        let exchange = lnvps_api_common::MockExchangeRate::default();
+        assert_eq!(
+            outstanding_msat(&exchange, "EUR", 1_000).await,
+            None,
+            "no rate configured"
+        );
+        exchange
+            .set_rate(Ticker::btc_rate("EUR").unwrap(), 0.0)
+            .await;
+        assert_eq!(
+            outstanding_msat(&exchange, "EUR", 1_000).await,
+            None,
+            "a zero rate is not a price"
+        );
+        assert_eq!(outstanding_msat(&exchange, "BTC", 0).await, Some(0));
+    }
 
     fn req(currency: &str, amount: u64) -> AdminCreateReferralPayoutRequest {
         AdminCreateReferralPayoutRequest {

@@ -3561,7 +3561,7 @@ GET /api/admin/v1/referrals/{id}
 
 Required Permission: `referral::view`
 
-Returns the referral plus per-currency earned commission, payout history and counts:
+Returns the referral plus per-currency earned commission, the outstanding balance, payout history and counts:
 
 ```json
 {
@@ -3576,6 +3576,11 @@ Returns the referral plus per-currency earned commission, payout history and cou
     "payout_threshold": null,
     "created": "2026-07-18T10:00:00Z",
     "earned": [ { "currency": "BTC", "amount": 5000 } ],
+    "balances": [
+      { "currency": "BTC", "earned": 5000, "settled": 0, "outstanding": 5000, "outstanding_msat": 5000 },
+      { "currency": "EUR", "earned": 2000, "settled": 1000, "outstanding": 1000, "outstanding_msat": 10000000 }
+    ],
+    "outstanding_total_msat": 10005000,
     "payouts": [
       { "id": 1, "amount": 5000, "fee": 0, "currency": "BTC", "sent_amount": 5000, "sent_fee": 0, "sent_currency": "BTC", "rate": 1.0, "rate_collected": null, "created": "2026-07-18T11:00:00Z", "is_paid": true, "mode": "lightning_address", "output": "lnbc...", "pre_image": "<hex>" }
     ],
@@ -3585,7 +3590,11 @@ Returns the referral plus per-currency earned commission, payout history and cou
 }
 ```
 
-`earned` is commission (`first payment * effective_rate%`) aggregated per currency.
+`earned` is commission (`first payment * effective_rate%`) aggregated per currency (keys upper-cased).
+
+`balances` nets each earned currency against what has already been paid **or reserved** in it (`settled` = payout `amount + fee`, matched on the currency a payout *settles*, not the one it sent) and values the remainder in millisats at current rates. `outstanding_msat` is `null` when no rate is available for that currency, and such balances are excluded from the total.
+
+`outstanding_total_msat` is what the referrer is owed across every currency, in millisats — the exact figure the payout threshold is judged against. Compare it directly with `payout_threshold * 1000` (and the system minimum, `min-payout-sats` / `min-onchain-payout-sats` / `min-fiat-payout-sats` × 1000) to see whether the next payout run will pay this referrer.
 
 #### Update Referral (code / commission override)
 
