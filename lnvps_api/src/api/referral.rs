@@ -52,7 +52,9 @@ pub struct ApiReferral {
     /// Your chosen minimum accrued commission (in **satoshis**) before an
     /// automated payout is made — raise this to avoid many tiny payouts
     /// (useful for on-chain). `null` uses the system minimum. The effective
-    /// threshold is `max(system minimum, this value)`.
+    /// threshold is `max(system minimum, this value)`, and it is judged on your
+    /// **total** outstanding commission across every currency (fiat balances
+    /// valued in sats at the current rate), not on each currency separately.
     pub payout_threshold: Option<u64>,
     /// When the referral was created
     pub created: chrono::DateTime<Utc>,
@@ -259,8 +261,9 @@ pub struct ApiReferralPatchRequest {
     /// `on_chain`.
     pub mode: Option<String>,
     /// Set (`Some(sats)`) or clear (`null`) your minimum-payout threshold in
-    /// **satoshis**. When set it must be at least the system minimum. Omit the
-    /// field to leave it unchanged.
+    /// **satoshis**. When set it must be at least the system minimum. The
+    /// threshold applies to your total outstanding commission across every
+    /// currency, not per currency. Omit the field to leave it unchanged.
     #[serde(
         default,
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"

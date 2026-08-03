@@ -1472,7 +1472,9 @@ pub struct Referral {
     /// ones in particular — avoid many tiny payouts by batching up to a larger
     /// amount. When set it must be at least the system minimum; the effective
     /// threshold used at payout time is `max(system_minimum, payout_threshold)`.
-    /// `None` uses the system minimum.
+    /// `None` uses the system minimum. The threshold is judged on the
+    /// referrer's whole outstanding commission valued in millisats — BTC plus
+    /// every fiat balance at the current rate — not on each currency alone.
     #[sqlx(default)]
     pub payout_threshold: Option<u64>,
 }
