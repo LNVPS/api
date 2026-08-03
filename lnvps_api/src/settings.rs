@@ -147,6 +147,14 @@ pub struct OAuthConfig {
     #[serde(default)]
     pub allowed_redirects: Vec<String>,
 
+    /// Permit *any* `localhost` URL as a post-login redirect target.
+    ///
+    /// Convenient when developing a frontend locally, but it is a standing
+    /// exemption from the allowlist, so it defaults to **off** and must be
+    /// enabled explicitly. Never enable it in production.
+    #[serde(default)]
+    pub allow_localhost_redirect: bool,
+
     /// Configured identity providers, keyed by a short provider tag (e.g.
     /// `google`, `github`). The tag is part of the synthetic identity
     /// (`sha256("{tag}:{subject}")`) so it must remain stable.

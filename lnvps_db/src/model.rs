@@ -61,6 +61,16 @@ pub struct User {
     pub email_verified: bool,
     /// Token used for email address verification (empty string means no pending verification)
     pub email_verify_token: String,
+    /// When the pending `email_verify_token` was issued. `None` when there is
+    /// no pending verification (or for tokens issued before this was tracked,
+    /// which are treated as expired).
+    #[sqlx(default)]
+    pub email_verify_sent: Option<DateTime<Utc>>,
+    /// Monotonic counter embedded in issued session (Bearer) tokens. Bumping it
+    /// invalidates every outstanding session for this user, which is the only
+    /// way to revoke a stateless JWT before it expires.
+    #[sqlx(default)]
+    pub session_version: u32,
     /// If user should be contacted via NIP-17 for notifications
     pub contact_nip17: bool,
     /// If user should be contacted via email for notifications

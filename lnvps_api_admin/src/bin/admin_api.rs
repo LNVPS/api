@@ -5,17 +5,20 @@ use config::{Config, File};
 use lnvps_api_admin::admin::admin_router;
 use lnvps_api_admin::settings::Settings;
 use lnvps_api_common::{
-    RedisWorkCommander, RedisWorkFeedback, VmStateCache, WorkCommander, WorkJob, WorkJobMessage,
-    make_exchange_service,
+    RateLimiter, RedisWorkCommander, RedisWorkFeedback, VmStateCache, WorkCommander, WorkJob,
+    WorkJobMessage, handle_panic, init_auth_origin, make_exchange_service,
+    nip98_payload_middleware, rate_limit_middleware,
 };
 use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbBase, LNVpsDbMysql};
-use log::info;
+use log::{info, warn};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::net::TcpSocket;
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowHeaders, Any, CorsLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
 
 /// CORS layer for the admin API.
 ///
@@ -70,6 +73,16 @@ async fn main() -> Result<(), Error> {
         info!("Database encryption initialized from key file");
     }
 
+    // Bind NIP-98 `u` tags to this host so an event signed for another origin
+    // cannot be replayed against the admin API.
+    match settings.public_url.as_deref() {
+        Some(url) if init_auth_origin(url) => info!("NIP-98 auth origin bound to {url}"),
+        Some(url) => warn!("Could not bind a NIP-98 auth origin from public-url {url:?}"),
+        None => warn!(
+            "No public-url configured; NIP-98 `u` tag host binding is disabled on the admin API"
+        ),
+    }
+
     // Connect database and migrate
     let db = LNVpsDbMysql::new(&settings.db).await?;
     db.migrate().await?;
@@ -110,7 +123,43 @@ async fn main() -> Result<(), Error> {
         exchange,
         feedback,
     );
-    axum::serve(listener, router.layer(cors_layer())).await?;
+
+    // Same cross-cutting stack as the public API. The admin surface previously
+    // had none of it: no rate limiting in front of NIP-98 verification, and no
+    // framing/MIME/referrer protection on the HTML it serves. Remember that the
+    // LAST layer added is the OUTERMOST, so requests flow bottom-to-top.
+    let app = router
+        .layer(axum::middleware::from_fn(nip98_payload_middleware))
+        .layer(axum::middleware::from_fn_with_state(
+            RateLimiter::default(),
+            rate_limit_middleware,
+        ))
+        .layer(CatchPanicLayer::custom(handle_panic))
+        .layer(cors_layer())
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+            axum::http::HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::X_FRAME_OPTIONS,
+            axum::http::HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::REFERRER_POLICY,
+            axum::http::HeaderValue::from_static("no-referrer"),
+        ))
+        .layer(SetResponseHeaderLayer::if_not_present(
+            axum::http::header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'"),
+        ));
+
+    // `into_make_service_with_connect_info` gives the rate limiter a peer-address
+    // fallback when a request arrives without forwarding headers.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
 
     Ok(())
 }

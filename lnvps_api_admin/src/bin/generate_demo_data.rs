@@ -1093,6 +1093,8 @@ async fn create_users(db: &LNVpsDbMysql) -> Result<Vec<User>> {
             email: EncryptedString::new(email.to_string()),
             email_verified: true,
             email_verify_token: String::new(),
+            email_verify_sent: None,
+            session_version: 0,
             contact_nip17: true,
             contact_email: true,
             contact_telegram: false,

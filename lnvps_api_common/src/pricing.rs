@@ -1,8 +1,9 @@
 use crate::{
-    ConvertedCurrencyAmount, ExchangeRateService, Ticker, TickerRate, UpgradeConfig, VatClient,
+    ConvertedCurrencyAmount, ExchangeRateService, MAX_RENEWAL_INTERVALS, Ticker, TickerRate,
+    UpgradeConfig, VatClient, saturating_add_seconds,
 };
 use anyhow::{Result, anyhow, bail, ensure};
-use chrono::{DateTime, Days, Months, TimeDelta, Utc};
+use chrono::{DateTime, Days, Months, Utc};
 use isocountry::CountryCode;
 use lnvps_db::{
     CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, IntervalType, LNVpsDb, PaymentMethod,
@@ -575,7 +576,7 @@ impl PricingEngine {
             amount: net,
             currency: cost.currency,
             time_value: new_time,
-            new_expiry: vm_expires.add(TimeDelta::seconds(new_time as i64)),
+            new_expiry: saturating_add_seconds(vm_expires, new_time),
             rate: cost.rate,
             tax: tax_details.amount,
             tax_details,
@@ -675,7 +676,7 @@ impl PricingEngine {
             amount: net,
             currency: converted.amount.currency(),
             time_value: new_time,
-            new_expiry: base.add(TimeDelta::seconds(new_time as i64)),
+            new_expiry: saturating_add_seconds(base, new_time),
             rate: converted.rate,
             tax: tax_details.amount,
             tax_details,
@@ -695,7 +696,11 @@ impl PricingEngine {
         method: PaymentMethod,
         intervals: u32,
     ) -> Result<CostResult> {
-        let intervals = intervals.max(1); // Ensure at least 1 interval
+        // Bound the request before any arithmetic. `intervals` is caller
+        // supplied; unbounded values used to overflow the expiry calculation
+        // and panic (F-02). The API layer rejects out-of-range values with a
+        // 400, so reaching here with one means an internal caller — clamp.
+        let intervals = intervals.clamp(1, MAX_RENEWAL_INTERVALS);
         let vm = self.db.get_vm(vm_id).await?;
         let company_id = self.db.get_vm_company_id(vm_id).await?;
 
@@ -707,7 +712,7 @@ impl PricingEngine {
         };
 
         // Total time this request would add (one interval's worth * intervals).
-        let requested_time = base_cost.time_value * intervals as u64;
+        let requested_time = base_cost.time_value.saturating_mul(intervals as u64);
 
         // Check for an existing pending (unpaid, non-expired) renewal payment.
         // Match on payment_method + payment_type AND the time value it covers, so
@@ -731,8 +736,8 @@ impl PricingEngine {
         if intervals == 1 {
             Ok(CostResult::New(base_cost))
         } else {
-            let scaled_amount = base_cost.amount * intervals as u64;
-            let scaled_time = base_cost.time_value * intervals as u64;
+            let scaled_amount = base_cost.amount.saturating_mul(intervals as u64);
+            let scaled_time = base_cost.time_value.saturating_mul(intervals as u64);
             let tax_details = self
                 .determine_tax(vm.user_id, scaled_amount, company_id)
                 .await?;
@@ -742,7 +747,7 @@ impl PricingEngine {
                     company_id,
                     method,
                     base_cost.currency,
-                    scaled_amount + tax_details.amount,
+                    scaled_amount.saturating_add(tax_details.amount),
                 )
                 .await;
             Ok(CostResult::New(NewPaymentInfo {
@@ -753,7 +758,7 @@ impl PricingEngine {
                 currency: base_cost.currency,
                 rate: base_cost.rate,
                 time_value: scaled_time,
-                new_expiry: base.add(TimeDelta::seconds(scaled_time as i64)),
+                new_expiry: saturating_add_seconds(base, scaled_time),
             }))
         }
     }
@@ -928,7 +933,7 @@ impl PricingEngine {
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
-            new_expiry: base.add(TimeDelta::seconds(time_value as i64)),
+            new_expiry: saturating_add_seconds(base, time_value),
         })
     }
 
@@ -1129,13 +1134,25 @@ impl PricingEngine {
     pub fn next_template_expire(base_expiry: DateTime<Utc>, cost_plan: &VmCostPlan) -> u64 {
         // Clamp the base to now so expired VMs get a sensible time_value
         let base = base_expiry.max(Utc::now());
+        // `Days`/`Months` addition panics on overflow, and the `as u32` casts
+        // below silently truncate. A cost plan is admin-authored, but a typo
+        // must not be able to abort the process, so every step is checked and
+        // falls back to leaving the expiry untouched (yielding a zero interval,
+        // which the callers already treat as "nothing to bill").
         let next_expire = match cost_plan.interval_type {
-            IntervalType::Day => base.add(Days::new(cost_plan.interval_amount)),
-            IntervalType::Month => base.add(Months::new(cost_plan.interval_amount as u32)),
-            IntervalType::Year => base.add(Months::new((12 * cost_plan.interval_amount) as u32)),
-        };
+            IntervalType::Day => base.checked_add_days(Days::new(cost_plan.interval_amount)),
+            IntervalType::Month => u32::try_from(cost_plan.interval_amount)
+                .ok()
+                .and_then(|m| base.checked_add_months(Months::new(m))),
+            IntervalType::Year => cost_plan
+                .interval_amount
+                .checked_mul(12)
+                .and_then(|m| u32::try_from(m).ok())
+                .and_then(|m| base.checked_add_months(Months::new(m))),
+        }
+        .unwrap_or(base);
 
-        (next_expire - base).num_seconds() as u64
+        (next_expire - base).num_seconds().max(0) as u64
     }
 
     /// Gets the renewal cost of a standard VM
@@ -1183,7 +1200,7 @@ impl PricingEngine {
             currency: converted_amount.amount.currency(),
             rate: converted_amount.rate,
             time_value,
-            new_expiry: base.add(TimeDelta::seconds(time_value as i64)),
+            new_expiry: saturating_add_seconds(base, time_value),
         })
     }
 
@@ -3491,7 +3508,7 @@ mod tests {
         // Set subscription expiry to 30 days
         let mut subs = db.subscriptions.lock().await;
         if let Some(s) = subs.get_mut(&1) {
-            s.expires = Some(Utc::now() + TimeDelta::days(30));
+            s.expires = Some(Utc::now() + chrono::TimeDelta::days(30));
             s.is_setup = true;
         }
         vm_id
@@ -3811,6 +3828,59 @@ mod tests {
                 bail!("12-interval request must not reuse a 1-interval pending payment")
             }
         }
+        Ok(())
+    }
+
+    /// Regression (F-02): an unbounded `intervals` used to overflow the
+    /// projected-expiry arithmetic. `base.add(TimeDelta::seconds(n))` panics
+    /// with "`DateTime + TimeDelta` overflowed" (and, larger still,
+    /// "TimeDelta::seconds out of bounds"), which under the release profile's
+    /// `panic = "abort"` killed the whole API process. A caller passing an
+    /// absurd interval count must get a bounded quote, never a panic.
+    #[tokio::test]
+    async fn test_extreme_intervals_do_not_panic() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        db.vms.lock().await.insert(1, MockDb::mock_vm());
+        db.users.lock().await.insert(
+            1,
+            User {
+                id: 1,
+                pubkey: vec![],
+                ..Default::default()
+            },
+        );
+
+        let db_arc: Arc<dyn LNVpsDb> = db.clone();
+        let pe = make_pe(db_arc).await;
+
+        // Each of these used to panic before the clamp + saturating arithmetic.
+        for intervals in [u32::MAX, 1_000_000_000, MAX_RENEWAL_INTERVALS + 1] {
+            let result = pe
+                .get_vm_cost_for_intervals(1, PaymentMethod::Lightning, intervals)
+                .await?;
+
+            let CostResult::New(info) = result else {
+                bail!("expected a fresh quote for {intervals} intervals")
+            };
+
+            // Clamped to the cap, so the quote matches the maximum request
+            // rather than the absurd one that was asked for.
+            let capped = pe
+                .get_vm_cost_for_intervals(1, PaymentMethod::Lightning, MAX_RENEWAL_INTERVALS)
+                .await?;
+            let CostResult::New(capped) = capped else {
+                bail!("expected a fresh quote at the cap")
+            };
+            assert_eq!(
+                info.time_value, capped.time_value,
+                "{intervals} intervals should be clamped to {MAX_RENEWAL_INTERVALS}"
+            );
+            assert!(
+                info.new_expiry < DateTime::<Utc>::MAX_UTC,
+                "a clamped quote must stay well inside the representable range"
+            );
+        }
+
         Ok(())
     }
 

@@ -85,24 +85,26 @@ async fn send_error(ws: &mut WebSocket, message: &str) {
 }
 
 /// Handle one live-chat websocket connection.
-pub(crate) async fn v1_support_chat(auth: String, this: RouterState, mut ws: WebSocket) {
+pub(crate) async fn v1_support_chat(
+    auth: crate::api::AuthQuery,
+    this: RouterState,
+    mut ws: WebSocket,
+) {
     let Some(config) = this.settings.agent.clone() else {
         send_error(&mut ws, "The support agent is not enabled on this server").await;
         return;
     };
 
-    // Authenticate exactly like the console endpoint: a NIP-98 event signed
-    // over this path, passed as a query parameter because browsers cannot set
-    // headers on a WebSocket handshake.
-    let auth = match Nip98Auth::from_base64(&auth) {
-        Ok(auth) if auth.check(CHAT_PATH, "GET").is_ok() => auth,
-        _ => {
-            send_error(&mut ws, "Missing or invalid auth event").await;
+    // Authenticate exactly like the console endpoint: a single-use ticket (or,
+    // for older clients, a NIP-98 event signed over this path) passed as a query
+    // parameter, because browsers cannot set headers on a WebSocket handshake.
+    let pubkey = match auth.resolve(CHAT_PATH) {
+        Ok(pubkey) => pubkey,
+        Err(e) => {
+            send_error(&mut ws, e).await;
             return;
         }
     };
-
-    let pubkey = auth.pubkey();
     let uid = match this.db.upsert_user(&pubkey).await {
         Ok(uid) => uid,
         Err(e) => {

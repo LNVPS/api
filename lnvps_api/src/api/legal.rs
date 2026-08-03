@@ -129,7 +129,15 @@ fn render_lir_agreement(data: &AgreementData) -> Result<Html<String>, &'static s
 }
 
 /// Generate unsigned Sponsoring LIR Agreement from base64-encoded data
+///
+/// **Requires authentication.** Every field of the rendered document comes from
+/// the caller, so an unauthenticated version of this endpoint is a phishing
+/// primitive: a URL on the LNVPS origin serving an official-looking contract
+/// with attacker-chosen company names, fees and addresses. The template escapes
+/// its values (no triple-mustache) and the global CSP blocks script, so this is
+/// not XSS — but the document's apparent provenance is the whole point of it.
 async fn v1_get_sponsoring_lir_agreement(
+    _auth: Nip98Auth,
     Query(q): Query<SponsoringLirAgreementQuery>,
 ) -> Result<Html<String>, &'static str> {
     // Decode base64-encoded JSON

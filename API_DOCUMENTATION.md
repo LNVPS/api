@@ -59,6 +59,79 @@ interface AuthHeaders {
   OAuth login flow below. The token is opaque to the frontend: store it and
   echo it back on every request.
 
+### NIP-98 requirements
+
+A NIP-98 auth event must satisfy all of the following. These are stricter than
+they once were — check them if previously-working requests start failing.
+
+- **Sign a fresh event per request.** Each event id may be used **once**;
+  presenting the same event twice is rejected. Do not cache or reuse an event.
+- **`created_at` must be within 60 seconds** of server time (previously 600).
+  A client with a badly-skewed clock will be rejected.
+- **The `u` tag must be an absolute URL whose host matches the API's own host**,
+  not just a matching path. An event signed for another origin is rejected.
+- **The `method` tag must match the request method.**
+- **The `payload` tag is optional, but verified when present.** If you include
+  it, it must be the lowercase hex SHA-256 of the exact request body. Omitting
+  it is still accepted; including it binds the body to the signature and is
+  recommended for `POST`/`PATCH`.
+
+### Issue an Auth Ticket
+
+- **POST** `/api/v1/auth/ticket`
+- **Auth**: normal `Authorization` header (either scheme)
+
+Some endpoints cannot receive an `Authorization` header — a browser cannot set
+one on a WebSocket handshake, nor on a plain navigation to an HTML page. Those
+endpoints take their credential from the query string instead, and a **ticket**
+is the safe thing to put there: it is valid for one use, for one path, for 30
+seconds, so a copy captured from an access log, a proxy log or browser history
+is inert.
+
+```typescript
+interface TicketRequest {
+  // Exact path the ticket will be used on.
+  path: string;
+}
+
+interface TicketResponse {
+  ticket: string;
+  expires_in: number; // seconds
+}
+```
+
+Tickets may only be issued for:
+
+- `/api/v1/vm/{id}/console`
+- `/api/v1/payment/{id}/invoice`
+- `/api/v1/support/chat`
+
+A ticket does **not** grant access — the target endpoint still checks that the
+resource belongs to you. Mint the ticket immediately before use:
+
+```typescript
+const { data } = await api.post('/api/v1/auth/ticket', {
+  path: `/api/v1/vm/${vmId}/console`,
+});
+const ws = new WebSocket(`${WS_API}/api/v1/vm/${vmId}/console?ticket=${data.ticket}`);
+```
+
+The older `?auth=<base64_nip98_event>` form still works on these endpoints and
+is unchanged, but is **deprecated** — it puts a signature made by the user's
+identity key into a URL. Please migrate to tickets.
+
+### Revoke All Sessions
+
+- **DELETE** `/api/v1/account/sessions`
+- **Auth**: either scheme
+- **Response**: `null`
+
+Invalidates every outstanding `Bearer` session token for the account — "log out
+everywhere". Use after a password/credential change at the OAuth provider, or if
+a token may have leaked. The caller's own token is invalidated too, so the user
+must log in again. Nostr (NIP-98) authentication is unaffected: it has no
+server-issued token to revoke.
+
 ### OAuth login flow (Google / GitHub / Facebook / Apple)
 
 External login is a full-page browser redirect through the provider, ending back
@@ -897,7 +970,7 @@ interface PatchPaymentMethodRequest {
 
 #### VM Serial Console (WebSocket)
 - **WebSocket** `/api/v1/vm/{id}/console`
-- **Auth**: Query parameter `?auth=<base64_nip98_event>` (same base64-encoded NIP-98 event as the `Authorization` header)
+- **Auth**: Query parameter `?ticket=<ticket>` from [Issue an Auth Ticket](#issue-an-auth-ticket). The legacy `?auth=<base64_nip98_event>` form still works but is **deprecated**.
 - **Protocol**: WebSocket upgrade — bidirectional relay between the client and the VM's serial console
 - **Description**: Opens a WebSocket connection to the VM's serial terminal. Raw bytes in either direction are forwarded to/from the VM's serial port on the host. The connection is closed when either side disconnects or an error occurs.
 
@@ -905,7 +978,7 @@ interface PatchPaymentMethodRequest {
 
 #### Live Chat with the Support Agent (WebSocket)
 - **WebSocket** `/api/v1/support/chat`
-- **Auth**: Query parameter `?auth=<base64_nip98_event>` (same base64-encoded NIP-98 event as the `Authorization` header, signed over `/api/v1/support/chat` with method `GET`)
+- **Auth**: Query parameter `?ticket=<ticket>` from [Issue an Auth Ticket](#issue-an-auth-ticket). The legacy `?auth=<base64_nip98_event>` form (signed over `/api/v1/support/chat` with method `GET`) still works but is **deprecated**.
 - **Description**: Opens a live chat with the AI support agent. The agent has read access to your account, VMs, payment history and VM activity log, and can start, stop and restart your VMs.
 
 **Sending**: send each message as a single WebSocket **text frame** containing the plain message text. Binary frames are rejected.
@@ -1081,8 +1154,8 @@ interface ExchangeRates {
 ```
 
 #### Get Payment Invoice (PDF)
-- **GET** `/api/v1/payment/{payment_id}/invoice?auth={base64_auth}`
-- **Auth**: Query parameter
+- **GET** `/api/v1/payment/{payment_id}/invoice?ticket={ticket}`
+- **Auth**: Query parameter `?ticket=<ticket>` from [Issue an Auth Ticket](#issue-an-auth-ticket). The legacy `?auth=<base64_nip98_event>` form still works but is **deprecated**.
 - **Response**: PDF file (Content-Type: text/html)
 
 ### Subscription Management
@@ -1631,11 +1704,11 @@ interface NostrDomainHandle {
 
 #### Generate Unsigned Sponsoring LIR Agreement
 - **GET** `/api/v1/legal/sponsoring-lir-agreement?data={base64url_json}`
-- **Auth**: None
+- **Auth**: NIP-98 or Bearer (**changed** — this endpoint was previously unauthenticated)
 - **Query Params**:
   - `data`: base64url-encoded JSON of the agreement data
 - **Response**: Rendered HTML agreement document
-- **Notes**: Rejects data that includes a cryptographic proof (use the signed endpoint for that)
+- **Notes**: Rejects data that includes a cryptographic proof (use the signed endpoint for that). Authentication is required because the document is rendered entirely from caller-supplied data, which made the unauthenticated version a convincing phishing page hosted on the API's own origin.
 
 #### Generate Signed Sponsoring LIR Agreement from Subscription
 - **GET** `/api/v1/legal/sponsoring-lir-agreement/from-subscription/{subscription_id}`

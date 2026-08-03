@@ -531,6 +531,8 @@ impl LNVpsDbBase for MockDb {
             u.email_hash = user.email_hash.clone();
             u.email_verified = user.email_verified;
             u.email_verify_token = user.email_verify_token.clone();
+            u.email_verify_sent = user.email_verify_sent;
+            u.session_version = user.session_version;
             u.contact_email = user.contact_email;
             u.contact_nip17 = user.contact_nip17;
             u.contact_telegram = user.contact_telegram;

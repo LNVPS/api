@@ -59,4 +59,5 @@ env_logger = "0.11"
 sqlx = { version = "0.8", default-features = false }
 wiremock = "0.6"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tower = { version = "0.5.3", features = ["util"] }
 

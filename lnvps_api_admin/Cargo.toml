@@ -43,3 +43,6 @@ lightning-invoice = { version = "0.34", features = ["std"] }
 
 #demo
 rand = { version = "0.9.2", optional = true }
+
+[dev-dependencies]
+serde_urlencoded = "0.7.1"

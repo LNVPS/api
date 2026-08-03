@@ -355,7 +355,7 @@ async fn v1_renew_subscription(
 
     // Resolve interactive / saved NWC / saved Revolut identically to VM renewals
     // and upgrades; saved methods are collected on the spot.
-    let intervals = q.intervals.unwrap_or(1);
+    let intervals = q.validated_intervals()?;
     let (method, mode) = crate::api::resolve_payment_mode(&this, uid, &q).await?;
     let payment = this
         .sub_handler

@@ -117,6 +117,14 @@ captcha:
 #  # Optional: after login, redirect the browser here with `#token=<jwt>`.
 #  # When omitted, the callback returns the token as JSON.
 #  success-redirect: "https://app.example.com/oauth/complete"
+#  # Allowlist of additional post-login redirect targets requestable via
+#  # `?redirect=<url>` on the login endpoint.
+#  #allowed-redirects:
+#  #  - "https://staging.example.com"
+#  # Permit ANY localhost URL as a post-login redirect. For local frontend
+#  # development only — this is a standing exemption from the allowlist above.
+#  # NEVER enable in production. Defaults to false.
+#  #allow-localhost-redirect: false
 #  # Providers are keyed by a stable tag (part of the account identity). Each
 #  # has a `type` selecting the flavor; built-in flavors supply default
 #  # endpoints/scopes so usually only credentials are needed.

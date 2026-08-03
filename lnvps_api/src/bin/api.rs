@@ -11,7 +11,7 @@ use lnvps_api_common::{
     ChannelWorkCommander, CountryResolver, MaxmindCountryResolver, RedisWorkCommander,
     VmHistoryLogger, WorkCommander,
 };
-use lnvps_api_common::{VatClient, VmStateCache, WorkJob, make_exchange_service};
+use lnvps_api_common::{VatClient, VmStateCache, WorkJob, handle_panic, make_exchange_service};
 use std::fmt::{Display, Formatter};
 
 use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbBase, LNVpsDbMysql};
@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpSocket};
+use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::cors::{AllowHeaders, Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 
@@ -153,6 +154,18 @@ async fn main() -> Result<(), Error> {
     } else if settings.oauth.is_some() || settings.webauthn.is_some() {
         warn!(
             "oauth/webauthn configured but no [session] secret is set — Bearer login is disabled"
+        );
+    }
+
+    // Bind NIP-98 `u` tags to this deployment's host. Without it the auth check
+    // compares only the path, so an event a user was tricked into signing for
+    // another origin replays here.
+    if lnvps_api_common::init_auth_origin(&settings.public_url) {
+        info!("NIP-98 auth origin bound to {}", settings.public_url);
+    } else {
+        warn!(
+            "Could not bind a NIP-98 auth origin from public_url {:?}",
+            settings.public_url
         );
     }
 
@@ -499,17 +512,37 @@ async fn main() -> Result<(), Error> {
             router = router.merge(nostr_domain_router());
         }
         tasks.push(tokio::spawn(async move {
+            // Layer order note: with `Router::layer` the LAST layer added is the
+            // OUTERMOST, so requests travel bottom-to-top through this list.
+            // Reading upwards, a request hits the security headers, then CORS,
+            // then the panic guard, then rate limiting, then the handler.
             let app = router
                 // Per-client-IP rate limiting: a strict bucket on auth-start /
                 // verification endpoints and a general bucket on everything
-                // else. Outermost layer so cheap 429s shield the handlers.
+                // else. Innermost of the cross-cutting layers so that a 429
+                // still carries CORS and security headers.
+                // Hash the body of NIP-98-authenticated requests so the auth
+                // extractor can verify a `payload` tag and bind the body to the
+                // signature. Innermost: it must run after rate limiting so a
+                // flood is rejected before anything is buffered.
+                .layer(axum::middleware::from_fn(
+                    lnvps_api_common::nip98_payload_middleware,
+                ))
                 .layer(axum::middleware::from_fn_with_state(
                     lnvps_api_common::RateLimiter::default(),
                     lnvps_api_common::rate_limit_middleware,
                 ))
+                // Turn a panic in any handler into a 500 for that one request.
+                // Without this a panic unwinds out of the connection task and,
+                // when the profile aborted on panic, took the whole process
+                // down — several such panics were reachable from unauthenticated
+                // input.
+                .layer(CatchPanicLayer::custom(handle_panic))
+                .layer(cors_layer())
                 // Defense-in-depth headers on every response (the HTML pages
                 // served here — invoices, email verification, agreements —
-                // otherwise have no framing/XSS/MIME protection).
+                // otherwise have no framing/XSS/MIME protection). Outermost so
+                // error and rate-limit responses are covered too.
                 .layer(SetResponseHeaderLayer::if_not_present(
                     axum::http::header::X_CONTENT_TYPE_OPTIONS,
                     axum::http::HeaderValue::from_static("nosniff"),
@@ -528,7 +561,6 @@ async fn main() -> Result<(), Error> {
                         "default-src 'none'; style-src 'unsafe-inline'",
                     ),
                 ))
-                .layer(cors_layer())
                 .with_state(RouterState {
                     db,
                     state: status,
@@ -540,7 +572,14 @@ async fn main() -> Result<(), Error> {
                     feedback: api_feedback,
                     geoip: geoip.clone(),
                 });
-            if let Err(e) = axum::serve(listener, app).await {
+            // `into_make_service_with_connect_info` (rather than a bare
+            // `Router`) is what puts the peer address in the request
+            // extensions. Without it the rate limiter has no fallback when a
+            // request carries no forwarding headers, and simply let those
+            // requests through unlimited — which is exactly what an attacker
+            // reaching the API directly rather than via the proxy would send.
+            let service = app.into_make_service_with_connect_info::<SocketAddr>();
+            if let Err(e) = axum::serve(listener, service).await {
                 error!("Error while running server: {}", e);
             }
         }));

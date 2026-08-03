@@ -102,6 +102,7 @@ impl RateLimiter {
     /// Whether `path` falls into the strict (brute-force-sensitive) bucket.
     fn is_strict(&self, path: &str) -> bool {
         self.strict_prefixes.iter().any(|p| path.starts_with(p))
+            || STRICT_SUFFIXES.iter().any(|s| path.ends_with(s))
     }
 
     /// Check and record one request from `ip` for `path`. Returns the number
@@ -136,6 +137,60 @@ impl RateLimiter {
     }
 }
 
+/// Fixed-window rate limiter keyed by user id rather than client IP.
+///
+/// Some actions cost real money or send a message to a third party, and must be
+/// bounded per *account* — an attacker with many source addresses trivially
+/// defeats a per-IP bucket for those.
+pub struct UserRateLimiter {
+    buckets: Mutex<HashMap<u64, Bucket>>,
+    max: u32,
+    window: Duration,
+}
+
+impl UserRateLimiter {
+    /// Allow `max` actions per `window` per user.
+    pub fn new(max: u32, window: Duration) -> Self {
+        Self {
+            buckets: Mutex::new(HashMap::new()),
+            max,
+            window,
+        }
+    }
+
+    /// Record one action for `user_id`, returning seconds until the window
+    /// resets when the limit is exceeded.
+    pub fn check(&self, user_id: u64) -> Result<(), u64> {
+        let mut guard = self
+            .buckets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let now = Instant::now();
+        // Bound memory: drop entries whose window has fully elapsed.
+        guard.retain(|_, b| now.duration_since(b.window_start) < self.window);
+
+        let bucket = guard.entry(user_id).or_insert(Bucket {
+            count: 0,
+            window_start: now,
+            last_seen: now,
+        });
+        bucket.last_seen = now;
+        if now.duration_since(bucket.window_start) >= self.window {
+            bucket.count = 0;
+            bucket.window_start = now;
+        }
+        bucket.count = bucket.count.saturating_add(1);
+        if bucket.count > self.max {
+            let reset = self
+                .window
+                .saturating_sub(now.duration_since(bucket.window_start));
+            return Err(reset.as_secs().max(1));
+        }
+        Ok(())
+    }
+}
+
 /// Drop the stalest entries once the map is at capacity.
 fn evict_if_full(map: &mut HashMap<(IpAddr, &'static str), Bucket>) {
     if map.len() < MAX_TRACKED_KEYS {
@@ -151,7 +206,8 @@ fn evict_if_full(map: &mut HashMap<(IpAddr, &'static str), Bucket>) {
 }
 
 /// Path prefixes guarded by the strict bucket: anything that starts an auth
-/// ceremony or confirms a brute-forceable code/token.
+/// ceremony, confirms a brute-forceable code/token, or lets an unauthenticated
+/// caller make us do expensive work.
 const STRICT_PREFIXES: &[&str] = &[
     "/api/v1/oauth/",
     "/api/v1/webauthn/login",
@@ -160,7 +216,19 @@ const STRICT_PREFIXES: &[&str] = &[
     "/api/v1/account/whatsapp/verify",
     "/api/v1/account/whatsapp/confirm",
     "/api/v1/contact",
+    // Unauthenticated LNURL-pay surface. `/.well-known/lnurlp/{id}` is a VM-id
+    // enumeration oracle and the renew callback mints a real Lightning invoice
+    // (a DB row plus node state) per request.
+    "/.well-known/lnurlp/",
+    // Unauthenticated ticket minting for websocket/HTML auth (see `session`).
+    "/api/v1/auth/ticket",
 ];
+
+/// Suffixes guarded by the strict bucket, matched against the whole path.
+///
+/// Used where the abuse-prone segment is not a prefix, e.g. the LNURL renew
+/// callback sits under the per-VM path `/api/v1/vm/{id}/renew-lnurlp`.
+const STRICT_SUFFIXES: &[&str] = &["/renew-lnurlp"];
 
 /// Resolve the client IP the same way handlers do (forwarding headers first),
 /// falling back to the peer socket address when no headers are present.
@@ -174,26 +242,42 @@ fn request_ip(req: &Request<Body>) -> Option<IpAddr> {
 }
 
 /// Axum middleware enforcing the per-IP fixed-window limits. Exceeding the
-/// limit yields `429 Too Many Requests` with a `Retry-After` hint. Requests
-/// without a resolvable IP (no headers and no `ConnectInfo`) are allowed
-/// through rather than being blanket-blocked.
+/// limit yields `429 Too Many Requests` with a `Retry-After` hint.
+///
+/// A request whose IP cannot be resolved is counted against a shared
+/// `UNRESOLVED_IP` bucket rather than being waved through. Previously such
+/// requests skipped rate limiting entirely, so anything reaching the socket
+/// without forwarding headers (a misconfigured LB, in-cluster access, a leaked
+/// origin address) was unlimited. The server now supplies `ConnectInfo`, so in
+/// practice this bucket should stay empty; it is the fail-closed backstop.
 pub async fn rate_limit_middleware(
     axum::extract::State(limiter): axum::extract::State<RateLimiter>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
     let path = req.uri().path().to_string();
-    if let Some(ip) = request_ip(&req) {
-        if let Err(retry_after) = limiter.check(ip, &path) {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [("retry-after", retry_after.to_string())],
-                "Rate limit exceeded",
-            )
-                .into_response();
-        }
+    let ip = bucket_ip(&req);
+    if let Err(retry_after) = limiter.check(ip, &path) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", retry_after.to_string())],
+            "Rate limit exceeded",
+        )
+            .into_response();
     }
     next.run(req).await
+}
+
+/// Bucket key for requests with no resolvable client address.
+///
+/// `100::` is the IPv6 discard prefix (RFC 6666) — never a real client, so it
+/// cannot collide with a genuine peer's bucket.
+const UNRESOLVED_IP: IpAddr = IpAddr::V6(std::net::Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, 0));
+
+/// The address a request is billed to, falling back to [`UNRESOLVED_IP`] so a
+/// request can never escape the limiter entirely.
+fn bucket_ip(req: &Request<Body>) -> IpAddr {
+    request_ip(req).unwrap_or(UNRESOLVED_IP)
 }
 
 #[cfg(test)]
@@ -285,6 +369,97 @@ mod tests {
         }
         evict_if_full(&mut map);
         assert!(map.len() <= MAX_TRACKED_KEYS - MAX_TRACKED_KEYS / 10);
+    }
+
+    /// Regression (F-13): the unauthenticated LNURL-pay surface must land in
+    /// the strict bucket. `/.well-known/lnurlp/{id}` is an enumeration oracle
+    /// and the renew callback mints a real Lightning invoice per request.
+    #[test]
+    fn lnurlp_paths_are_strict() {
+        let l = limiter(1, 100);
+        let ip: IpAddr = "203.0.113.6".parse().unwrap();
+
+        assert!(l.check(ip, "/.well-known/lnurlp/42").is_ok());
+        // Second request exhausts the strict budget, proving it is not using
+        // the general bucket (which allows 100 here).
+        assert!(l.check(ip, "/.well-known/lnurlp/42").is_err());
+
+        // The renew callback is matched by suffix, not prefix.
+        let l = limiter(1, 100);
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(l.check(ip, "/api/v1/vm/1/renew-lnurlp").is_ok());
+        assert!(l.check(ip, "/api/v1/vm/1/renew-lnurlp").is_err());
+    }
+
+    /// The ordinary per-VM renew endpoint is authenticated and must stay in the
+    /// general bucket — the suffix match must not catch it.
+    #[test]
+    fn authenticated_renew_stays_general() {
+        let l = limiter(1, 100);
+        let ip: IpAddr = "203.0.113.8".parse().unwrap();
+
+        assert!(l.check(ip, "/api/v1/vm/1/renew").is_ok());
+        assert!(l.check(ip, "/api/v1/vm/1/renew").is_ok());
+    }
+
+    /// Regression (F-08): a request with no resolvable IP used to skip the
+    /// limiter entirely (the middleware only counted it `if let Some(ip)`).
+    /// It must now be billed to the shared fallback bucket, so anything
+    /// reaching the socket without forwarding headers is still limited.
+    #[test]
+    fn unresolvable_ip_falls_back_to_shared_bucket() {
+        let req = Request::builder().body(Body::empty()).unwrap();
+        assert_eq!(request_ip(&req), None, "precondition: no resolvable IP");
+        assert_eq!(bucket_ip(&req), UNRESOLVED_IP);
+
+        // And that bucket is enforced like any other.
+        let l = limiter(1, 1);
+        assert!(l.check(UNRESOLVED_IP, "/api/v1/vm").is_ok());
+        assert!(
+            l.check(UNRESOLVED_IP, "/api/v1/vm").is_err(),
+            "requests without a resolvable IP must not bypass the limiter"
+        );
+    }
+
+    /// A resolvable request is billed to its own address, not the fallback.
+    #[test]
+    fn resolvable_ip_is_used_as_the_bucket_key() {
+        let req = Request::builder()
+            .header("x-real-ip", "198.51.100.7")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(bucket_ip(&req), "198.51.100.7".parse::<IpAddr>().unwrap());
+    }
+
+    /// Regression (F-15): WhatsApp verification sends were bounded only by the
+    /// per-IP bucket, so an attacker spreading across addresses could pump
+    /// messages at arbitrary numbers on our bill from a single account. Costly
+    /// actions need a per-*account* cap.
+    #[test]
+    fn user_limiter_bounds_per_account() {
+        let l = UserRateLimiter::new(2, Duration::from_secs(3600));
+
+        assert!(l.check(1).is_ok());
+        assert!(l.check(1).is_ok());
+        let retry = l.check(1).expect_err("third send must be refused");
+        assert!(retry > 0, "a refusal must carry a retry hint");
+
+        // A different account has its own budget — the cap is per user, not
+        // global.
+        assert!(l.check(2).is_ok());
+    }
+
+    /// The per-user window resets, so a legitimate user is never locked out
+    /// permanently.
+    #[test]
+    fn user_limiter_window_resets() {
+        let l = UserRateLimiter::new(1, Duration::from_millis(20));
+
+        assert!(l.check(1).is_ok());
+        assert!(l.check(1).is_err());
+
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(l.check(1).is_ok());
     }
 
     #[test]

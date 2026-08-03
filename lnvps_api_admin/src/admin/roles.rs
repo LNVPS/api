@@ -61,6 +61,50 @@ fn check_role_assignment(
     Ok(())
 }
 
+/// Authorization rules for defining a role's permission set.
+///
+/// Assignment is guarded by [`check_role_assignment`], but *defining* a role was
+/// not: anyone holding `roles::create` / `roles::update` could mint or edit a
+/// role carrying permissions they do not themselves have. Because an admin can
+/// edit a role they already hold, that was a direct self-escalation to every
+/// permission in the system — the assignment guard never runs, since no new
+/// assignment happens.
+///
+/// A super admin implicitly holds everything and is unrestricted.
+fn check_role_definition(
+    caller_is_super_admin: bool,
+    caller_permissions: &HashSet<Permission>,
+    role_permissions: &HashSet<Permission>,
+) -> Result<(), ApiError> {
+    if caller_is_super_admin {
+        return Ok(());
+    }
+
+    let mut missing: Vec<String> = role_permissions
+        .difference(caller_permissions)
+        .map(|p| format!("{}::{}", p.resource, p.action))
+        .collect();
+    if !missing.is_empty() {
+        missing.sort();
+        return Err(ApiError::forbidden(format!(
+            "Cannot define a role holding permissions you do not have: {}",
+            missing.join(", ")
+        )));
+    }
+
+    Ok(())
+}
+
+/// Parse the wire representation of a permission set, rejecting unknown values.
+fn parse_permissions(raw: &[String]) -> Result<HashSet<Permission>, ApiError> {
+    raw.iter()
+        .map(|p| {
+            p.parse::<Permission>()
+                .map_err(|_| ApiError::new(format!("Invalid permission format: {}", p)))
+        })
+        .collect()
+}
+
 /// Authorization rules for revoking a role from a user.
 ///
 /// Self-revocation of `super_admin` is only blocked when the caller is the last
@@ -212,6 +256,15 @@ async fn admin_create_role(
     // Check permission
     auth.require_permission(AdminResource::Roles, AdminAction::Create)?;
 
+    // Validate the whole permission set *before* creating anything, so an
+    // invalid or escalating request cannot leave a half-populated role behind.
+    let permissions = parse_permissions(&req.permissions)?;
+    check_role_definition(
+        auth.is_super_admin(&this.db).await?,
+        &auth.permissions,
+        &permissions,
+    )?;
+
     // Create the role
     let role_id = this
         .db
@@ -219,16 +272,14 @@ async fn admin_create_role(
         .await?;
 
     // Add permissions to the role
-    for perm_str in &req.permissions {
-        if let Ok(permission) = perm_str.parse::<Permission>() {
-            let resource_val = permission.resource as u16;
-            let action_val = permission.action as u16;
-            this.db
-                .add_role_permission(role_id, resource_val, action_val)
-                .await?;
-        } else {
-            return ApiData::err(&format!("Invalid permission format: {}", perm_str));
-        }
+    for permission in &permissions {
+        this.db
+            .add_role_permission(
+                role_id,
+                permission.resource as u16,
+                permission.action as u16,
+            )
+            .await?;
     }
 
     // Return the created role
@@ -257,6 +308,22 @@ async fn admin_update_role(
         return Err(ApiError::forbidden("Cannot modify system roles"));
     }
 
+    // An admin may hold the role they are editing, so widening its permissions
+    // is a self-escalation path that never touches the assignment guard.
+    // Validate up front, before any mutation.
+    let new_permissions = req
+        .permissions
+        .as_deref()
+        .map(parse_permissions)
+        .transpose()?;
+    if let Some(new_permissions) = &new_permissions {
+        check_role_definition(
+            auth.is_super_admin(&this.db).await?,
+            &auth.permissions,
+            new_permissions,
+        )?;
+    }
+
     // Update role fields
     if let Some(name) = &req.name {
         role.name = name.clone();
@@ -268,7 +335,7 @@ async fn admin_update_role(
     this.db.update_role(&role).await?;
 
     // Update permissions if provided
-    if let Some(permissions) = &req.permissions {
+    if let Some(permissions) = new_permissions {
         // Get current permissions
         let current_permissions = this.db.get_role_permissions(id).await?;
 
@@ -278,16 +345,10 @@ async fn admin_update_role(
         }
 
         // Add new permissions
-        for perm_str in permissions {
-            if let Ok(permission) = perm_str.parse::<Permission>() {
-                let resource_val = permission.resource as u16;
-                let action_val = permission.action as u16;
-                this.db
-                    .add_role_permission(id, resource_val, action_val)
-                    .await?;
-            } else {
-                return ApiData::err(&format!("Invalid permission format: {}", perm_str));
-            }
+        for permission in &permissions {
+            this.db
+                .add_role_permission(id, permission.resource as u16, permission.action as u16)
+                .await?;
         }
     }
 
@@ -613,6 +674,79 @@ mod tests {
         assert!(
             check_role_assignment(1, 2, true, "vm_manager", &HashSet::new(), &escalating).is_ok()
         );
+    }
+
+    /// Regression (F-05): `check_role_assignment` stopped an admin *granting*
+    /// a role stronger than their own, but nothing stopped them *editing* a
+    /// role they already hold. An admin with only `roles::update` could add
+    /// every permission in the system to their own role and never trip the
+    /// assignment guard, because no new assignment happens.
+    #[test]
+    fn test_cannot_define_role_with_permissions_caller_lacks() {
+        let caller = perms(&[
+            (AdminResource::Roles, AdminAction::Update),
+            (AdminResource::Users, AdminAction::View),
+        ]);
+
+        // The escalation: hand my own role vm::delete and users::update.
+        let escalating = perms(&[
+            (AdminResource::Roles, AdminAction::Update),
+            (AdminResource::VirtualMachines, AdminAction::Delete),
+            (AdminResource::Users, AdminAction::Update),
+        ]);
+
+        let err = check_role_definition(false, &caller, &escalating)
+            .expect_err("defining an escalating role must be refused");
+        assert!(
+            err.error.contains("virtual_machines::delete"),
+            "{}",
+            err.error
+        );
+        assert!(err.error.contains("users::update"), "{}", err.error);
+    }
+
+    /// Defining a role within your own permissions stays allowed — that is the
+    /// ordinary delegation case.
+    #[test]
+    fn test_can_define_role_within_own_permissions() {
+        let caller = perms(&[
+            (AdminResource::Roles, AdminAction::Create),
+            (AdminResource::Users, AdminAction::View),
+            (AdminResource::VirtualMachines, AdminAction::View),
+        ]);
+
+        let delegated = perms(&[
+            (AdminResource::Users, AdminAction::View),
+            (AdminResource::VirtualMachines, AdminAction::View),
+        ]);
+
+        assert!(check_role_definition(false, &caller, &delegated).is_ok());
+        // An empty role is trivially fine.
+        assert!(check_role_definition(false, &caller, &HashSet::new()).is_ok());
+    }
+
+    /// A super admin implicitly holds everything, so may define any role.
+    #[test]
+    fn test_super_admin_can_define_any_role() {
+        let everything = perms(&[
+            (AdminResource::VirtualMachines, AdminAction::Delete),
+            (AdminResource::Roles, AdminAction::Update),
+            (AdminResource::Users, AdminAction::Update),
+        ]);
+
+        assert!(check_role_definition(true, &HashSet::new(), &everything).is_ok());
+    }
+
+    /// An unparseable permission string must be a clean 400, and must be caught
+    /// before any mutation happens (the handler validates the whole set first,
+    /// so a bad entry cannot leave a half-populated role behind).
+    #[test]
+    fn test_parse_permissions_rejects_unknown_values() {
+        assert!(parse_permissions(&["users::view".to_string()]).is_ok());
+
+        let err = parse_permissions(&["users::view".to_string(), "not_a_permission".to_string()])
+            .expect_err("unknown permission must be rejected");
+        assert!(err.error.contains("not_a_permission"), "{}", err.error);
     }
 
     /// Regression: the old guard made an accidental grant permanent, since the

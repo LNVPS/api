@@ -87,7 +87,13 @@ impl HostCapacityService {
             .filter(|v| v.can_accommodate(template))
             .collect();
 
-        host_cap.sort_by(|a, b| a.load().partial_cmp(&b.load()).unwrap());
+        // `total_cmp` rather than `partial_cmp().unwrap()`: a host whose
+        // capacity denominators are zero yields a NaN load, and `partial_cmp`
+        // returns `None` for NaN. The unwrap panicked, which under the release
+        // profile's `panic = "abort"` took the whole process down on any VM
+        // order. NaN sorts last with `total_cmp`, so a degenerate host is
+        // simply never the least-loaded pick.
+        host_cap.sort_by(|a, b| a.load().total_cmp(&b.load()));
 
         if let Some(f) = host_cap.into_iter().next() {
             Ok(f)
@@ -360,7 +366,8 @@ impl HostCapacityService {
             })
             .collect();
 
-        storage_disks.sort_by(|a, b| a.load_factor.partial_cmp(&b.load_factor).unwrap());
+        // See the note in `pick_best_host`: NaN-safe ordering, never a panic.
+        storage_disks.sort_by(|a, b| a.load_factor.total_cmp(&b.load_factor));
 
         let cpu_consumed = vm_resources.values().fold(0, |acc, vm| acc + vm.cpu);
         let memory_consumed = vm_resources.values().fold(0, |acc, vm| acc + vm.memory);
@@ -523,7 +530,12 @@ pub struct IPRangeCapacity {
 impl IPRangeCapacity {
     /// Total number of IPs free
     pub fn available_capacity(&self) -> u128 {
-        let net: IpNetwork = self.range.cidr.parse().unwrap();
+        // A malformed CIDR is bad stored data, not a reason to abort the
+        // process (the release profile unwinds nowhere — `panic = "abort"`).
+        // Report the range as having no capacity so the scheduler skips it.
+        let Ok(net) = self.range.cidr.parse::<IpNetwork>() else {
+            return 0;
+        };
 
         let total = match net.size() {
             NetworkSize::V4(s) => s as u128,
@@ -781,6 +793,113 @@ mod tests {
             assert_eq!(r.usage, 69);
             assert_eq!(r.available_capacity(), 256 - 3 - 69);
         }
+    }
+
+    /// Regression (F-09): a host with zero configured capacity produces a NaN
+    /// load. Sorting such hosts used to go through `partial_cmp().unwrap()`,
+    /// which panics on NaN and — under `panic = "abort"` — killed the process
+    /// on any VM order. Sorting must be total and NaN must not win the pick.
+    #[test]
+    fn nan_load_does_not_panic_when_sorting_hosts() {
+        let degenerate = HostCapacity {
+            load_factor: LoadFactors {
+                cpu: 1.0,
+                memory: 1.0,
+                disk: 1.0,
+            },
+            // Zero capacity everywhere => 0/0 => NaN load.
+            host: VmHost {
+                cpu: 0,
+                memory: 0,
+                ..Default::default()
+            },
+            cpu: 0,
+            memory: 0,
+            disks: vec![],
+            ranges: vec![],
+        };
+        assert!(degenerate.load().is_nan(), "expected a NaN load to sort");
+
+        let healthy = HostCapacity {
+            load_factor: LoadFactors {
+                cpu: 1.0,
+                memory: 1.0,
+                disk: 1.0,
+            },
+            host: VmHost {
+                cpu: 100,
+                memory: 100,
+                ..Default::default()
+            },
+            cpu: 10,
+            memory: 10,
+            disks: vec![DiskCapacity {
+                load_factor: 1.0,
+                disk: VmHostDisk {
+                    size: 100,
+                    ..Default::default()
+                },
+                usage: 10,
+            }],
+            ranges: vec![],
+        };
+
+        let mut hosts = [degenerate, healthy];
+        // Must not panic.
+        hosts.sort_by(|a, b| a.load().total_cmp(&b.load()));
+
+        // NaN sorts last, so the healthy host is picked first.
+        assert!(
+            !hosts[0].load().is_nan(),
+            "a NaN-load host must not be selected as least loaded"
+        );
+    }
+
+    /// Regression (F-09): a NaN disk load factor must not panic the disk sort.
+    #[test]
+    fn nan_load_does_not_panic_when_sorting_disks() {
+        let mut disks = [
+            DiskCapacity {
+                load_factor: 1.0,
+                disk: VmHostDisk {
+                    size: 0,
+                    ..Default::default()
+                },
+                usage: 0,
+            },
+            DiskCapacity {
+                load_factor: 1.0,
+                disk: VmHostDisk {
+                    size: 100,
+                    ..Default::default()
+                },
+                usage: 10,
+            },
+        ];
+        assert!(disks[0].load().is_nan());
+
+        disks.sort_by(|a, b| a.load().total_cmp(&b.load()));
+
+        assert!(!disks[0].load().is_nan());
+    }
+
+    /// Regression (F-09): a malformed stored CIDR must report zero capacity
+    /// rather than panicking (and aborting) inside the scheduler.
+    #[test]
+    fn malformed_cidr_reports_no_capacity() {
+        let range = IPRangeCapacity {
+            range: IpRange {
+                id: 1,
+                cidr: "not-a-cidr".to_string(),
+                gateway: "10.0.0.1".to_string(),
+                enabled: true,
+                region_id: 1,
+                ..Default::default()
+            },
+            usage: 0,
+        };
+
+        assert_eq!(range.available_capacity(), 0);
     }
 
     #[tokio::test]

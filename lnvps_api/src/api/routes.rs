@@ -18,13 +18,13 @@ use ssh_key::PublicKey;
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use lnvps_api_common::{
     ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate,
     ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, TraderDetails, UpgradeConfig,
-    VatClient, WorkJob,
+    UserRateLimiter, VatClient, WorkJob,
 };
 use lnvps_db::{
     CpuArch, LNVpsDb, PaymentMethod, Region, Vm, VmCustomPricing, VmCustomPricingDisk,
@@ -40,7 +40,9 @@ use crate::api::model::{
     PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule, PaymentMethodResponse,
     VMPatchRequest, validate_firewall_cidr, validate_firewall_ports, vm_to_status,
 };
-use crate::api::{AmountQuery, AuthQuery, PaymentMethodQuery, RouterState};
+use crate::api::{
+    AmountQuery, AuthQuery, PaymentMethodQuery, RouterState, TicketRequest, TicketResponse,
+};
 use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
 use crate::provisioner::{HostCapacityService, PricingEngine};
 
@@ -56,9 +58,7 @@ fn with_support_chat(router: Router<RouterState>) -> Router<RouterState> {
             async move |ws: WebSocketUpgrade,
                         Query(q): Query<AuthQuery>,
                         State(this): State<RouterState>| {
-                ws.on_upgrade(async move |s| {
-                    crate::api::support::v1_support_chat(q.auth, this, s).await
-                })
+                ws.on_upgrade(async move |s| crate::api::support::v1_support_chat(q, this, s).await)
             },
         ),
     )
@@ -89,6 +89,8 @@ pub fn routes() -> Router<RouterState> {
                 "/api/v1/account/telegram/link",
                 post(v1_telegram_link).delete(v1_telegram_unlink),
             )
+            .route("/api/v1/account/sessions", delete(v1_revoke_all_sessions))
+            .route("/api/v1/auth/ticket", post(v1_issue_auth_ticket))
             .route(
                 "/api/v1/account/whatsapp/verify",
                 post(v1_whatsapp_verify).delete(v1_whatsapp_unlink),
@@ -136,7 +138,7 @@ pub fn routes() -> Router<RouterState> {
                                 Query(q): Query<AuthQuery>,
                                 State(this): State<RouterState>| {
                         ws.on_upgrade(async move |s| {
-                            if let Err(e) = v1_terminal_proxy(id, q.auth, this, s).await {
+                            if let Err(e) = v1_terminal_proxy(id, q, this, s).await {
                                 error!("Failed to proxy terminal proxy: {}", e);
                             }
                         })
@@ -219,12 +221,15 @@ async fn v1_patch_account(
                 let token = hex::encode(rand::random::<[u8; 32]>());
                 user.email_verified = false;
                 user.email_verify_token = lnvps_db::hash_verify_token(&token);
+                // Stamped so the link can be aged out; see `is_verify_token_expired`.
+                user.email_verify_sent = Some(Utc::now());
                 pending_verification = Some(token);
             } else if !user.email_verified && user.email_verify_token.is_empty() {
                 // Email is the same but was never verified and no token exists
                 // Generate a new token and send verification email
                 let token = hex::encode(rand::random::<[u8; 32]>());
                 user.email_verify_token = lnvps_db::hash_verify_token(&token);
+                user.email_verify_sent = Some(Utc::now());
                 pending_verification = Some(token);
             }
         } else {
@@ -395,8 +400,26 @@ async fn v1_verify_email(
             );
         }
     };
+
+    // A verification link used to be valid forever, so one sitting in an old or
+    // compromised inbox stayed usable indefinitely.
+    if is_verify_token_expired(user.email_verify_sent, Utc::now()) {
+        // Clear the stale token so the link is dead rather than merely refused.
+        user.email_verify_token = String::new();
+        user.email_verify_sent = None;
+        if let Err(e) = this.db.update_user(&user).await {
+            error!("Failed to clear expired email verify token: {}", e);
+        }
+        return make_page(
+            "Link Expired",
+            "This verification link has expired. Please request a new one from your account settings.",
+            "#e74c3c",
+        );
+    }
+
     user.email_verified = true;
     user.email_verify_token = String::new();
+    user.email_verify_sent = None;
     if let Err(e) = this.db.update_user(&user).await {
         error!("Failed to mark email verified: {}", e);
         return make_page(
@@ -415,6 +438,106 @@ async fn v1_verify_email(
 #[derive(serde::Deserialize)]
 struct VerifyEmailQuery {
     token: String,
+}
+
+/// How long an email verification link stays usable.
+const EMAIL_VERIFY_TTL: chrono::Duration = chrono::Duration::hours(24);
+
+/// Whether a pending verification token issued at `sent` is too old to accept.
+///
+/// A `None` issue time means either a token minted before issue times were
+/// recorded or a corrupted row; both are treated as expired rather than
+/// valid-forever, which is the safe direction — the user can always request a
+/// fresh link.
+fn is_verify_token_expired(sent: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
+    match sent {
+        Some(sent) => now.signed_duration_since(sent) > EMAIL_VERIFY_TTL,
+        None => true,
+    }
+}
+
+/// Paths a ticket may be minted for, as (prefix, suffix) pairs around the
+/// resource id. Anything not listed is refused, so a ticket can never be
+/// retargeted at an endpoint that was not designed for query-string auth.
+const TICKETABLE_PATHS: &[(&str, &str)] = &[
+    ("/api/v1/vm/", "/console"),
+    ("/api/v1/payment/", "/invoice"),
+];
+
+/// Whether `path` is one this API will mint a ticket for.
+fn is_ticketable_path(path: &str) -> bool {
+    // The support chat websocket has no id segment.
+    if path == "/api/v1/support/chat" {
+        return true;
+    }
+    TICKETABLE_PATHS.iter().any(|(prefix, suffix)| {
+        path.starts_with(prefix)
+            && path.ends_with(suffix)
+            && path.len() > prefix.len() + suffix.len()
+            // The id segment must not contain further path separators, so
+            // `/api/v1/vm/1/foo/../console` style inputs cannot slip through.
+            && !path[prefix.len()..path.len() - suffix.len()].contains('/')
+    })
+}
+
+/// Mint a short-lived, single-use, path-scoped ticket for an endpoint that
+/// cannot take an `Authorization` header (WebSocket handshake, HTML page).
+///
+/// The caller authenticates normally (header-borne NIP-98 or Bearer) and names
+/// the exact path they intend to open. The returned ticket is good for one use
+/// within 30 seconds, so a copy of it captured from an access log, a proxy log
+/// or browser history is inert.
+///
+/// This does **not** authorize the target: the endpoint still performs its own
+/// ownership check against the identity the ticket resolves to.
+async fn v1_issue_auth_ticket(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Json(req): Json<TicketRequest>,
+) -> ApiResult<TicketResponse> {
+    if !is_ticketable_path(&req.path) {
+        return Err(ApiError::new("Tickets cannot be issued for that path"));
+    }
+
+    let pubkey = auth.pubkey();
+    // Resolve the account so a ticket is never minted for an identity that has
+    // no account (and so the usual upsert-on-first-action behaviour holds).
+    let _uid = this.db.upsert_user(&pubkey).await?;
+
+    let ticket = lnvps_api_common::issue_ticket(
+        &pubkey,
+        &req.path,
+        lnvps_api_common::DEFAULT_TICKET_TTL_SECS,
+    )
+    .map_err(|e| ApiError::internal(format!("Failed to issue ticket: {}", e)))?;
+
+    ApiData::ok(TicketResponse {
+        ticket,
+        expires_in: lnvps_api_common::DEFAULT_TICKET_TTL_SECS,
+    })
+}
+
+/// Revoke every outstanding session (Bearer) token for the account.
+///
+/// Session tokens are stateless JWTs, so the only way to invalidate one before
+/// it expires is to bump the account's `session_version`; the auth extractor
+/// compares the token's stamped version against the stored one on every
+/// request. This is the "log out everywhere" / "I think I've been compromised"
+/// control.
+///
+/// Nostr (NIP-98) authentication is unaffected — it carries no server-issued
+/// token to revoke.
+async fn v1_revoke_all_sessions(auth: Nip98Auth, State(this): State<RouterState>) -> ApiResult<()> {
+    let pubkey = auth.pubkey();
+    let uid = this.db.upsert_user(&pubkey).await?;
+    let mut user = this.db.get_user(uid).await?;
+
+    // Saturating: a wrap would resurrect old tokens that happen to carry the
+    // wrapped-to value.
+    user.session_version = user.session_version.saturating_add(1);
+    this.db.update_user(&user).await?;
+
+    ApiData::ok(())
 }
 
 /// Get user account detail
@@ -677,6 +800,19 @@ async fn v1_whatsapp_verify(
     let uid = this.db.upsert_user(&pubkey).await?;
     let mut user = this.db.get_user(uid).await?;
 
+    // Cap sends per account, not just per IP. The IP bucket alone does not stop
+    // an attacker spreading across addresses to pump WhatsApp messages at
+    // arbitrary numbers on our bill.
+    if let Err(retry_after) = WHATSAPP_SEND_LIMITER.check(uid) {
+        return Err(ApiError::with_status(
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            format!(
+                "Too many verification codes requested. Try again in {} seconds.",
+                retry_after
+            ),
+        ));
+    }
+
     // 6-digit numeric code. Only the SHA-256 hash is stored (compared by hash
     // on confirm), and the attempt counter resets with each new code so a
     // fresh code always gets a fresh brute-force budget.
@@ -698,6 +834,15 @@ async fn v1_whatsapp_verify(
 
     ApiData::ok(())
 }
+
+/// Per-account cap on WhatsApp verification sends.
+///
+/// Each send costs money and lands a message on a number the caller chose, so
+/// this is both a spend control and an anti-harassment control. The per-IP
+/// strict bucket does not cover it: an attacker with many addresses would
+/// otherwise get unlimited sends from one account.
+static WHATSAPP_SEND_LIMITER: LazyLock<UserRateLimiter> =
+    LazyLock::new(|| UserRateLimiter::new(5, Duration::from_secs(60 * 60)));
 
 /// Maximum failed confirmation attempts before a pending WhatsApp code is
 /// invalidated and a fresh one must be requested. A 6-digit code with no cap
@@ -1314,7 +1459,7 @@ async fn v1_renew_vm(
     Query(q): Query<PaymentMethodQuery>,
 ) -> ApiResult<ApiVmPayment> {
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
-    let intervals = q.intervals.unwrap_or(1);
+    let intervals = q.validated_intervals()?;
     let vm_line = this
         .db
         .get_subscription_line_item(vm.subscription_line_item_id)
@@ -1614,18 +1759,11 @@ async fn v1_time_series(
 #[allow(unused)]
 async fn v1_terminal_proxy(
     id: u64,
-    auth: String,
+    auth: AuthQuery,
     this: RouterState,
     mut ws: WebSocket,
 ) -> Result<(), &'static str> {
-    let auth = Nip98Auth::from_base64(&auth).map_err(|_| "Missing or invalid auth param")?;
-    if auth
-        .check(&format!("/api/v1/vm/{id}/console"), "GET")
-        .is_err()
-    {
-        return Err("Invalid auth event");
-    }
-    let pubkey = auth.pubkey();
+    let pubkey = auth.resolve(&format!("/api/v1/vm/{id}/console"))?;
     let uid = this
         .db
         .upsert_user(&pubkey)
@@ -1955,14 +2093,7 @@ async fn v1_get_payment_invoice(
     Path(id): Path<String>,
     Query(q): Query<AuthQuery>,
 ) -> Result<Html<String>, &'static str> {
-    let auth = Nip98Auth::from_base64(&q.auth).map_err(|_e| "Missing or invalid auth param")?;
-    if auth
-        .check(&format!("/api/v1/payment/{id}/invoice"), "GET")
-        .is_err()
-    {
-        return Err("Invalid auth event");
-    }
-    let pubkey = auth.pubkey();
+    let pubkey = q.resolve(&format!("/api/v1/payment/{id}/invoice"))?;
     let uid = this
         .db
         .upsert_user(&pubkey)
@@ -3096,6 +3227,72 @@ mod tests {
         assert!(json.get("hodl_invoice").is_none());
         // LUD-06 routes field present and empty
         assert_eq!(json["routes"], serde_json::json!([]));
+    }
+
+    /// Regression (F-12): tickets exist so a credential in a query string is
+    /// inert once used. They must only be mintable for the handful of endpoints
+    /// that genuinely cannot take an `Authorization` header — otherwise a
+    /// ticket becomes a general-purpose bearer credential in the URL.
+    #[test]
+    fn only_websocket_and_html_paths_are_ticketable() {
+        assert!(is_ticketable_path("/api/v1/vm/7/console"));
+        assert!(is_ticketable_path("/api/v1/payment/abc123/invoice"));
+        assert!(is_ticketable_path("/api/v1/support/chat"));
+
+        // Ordinary API endpoints are not ticketable.
+        assert!(!is_ticketable_path("/api/v1/account"));
+        assert!(!is_ticketable_path("/api/v1/vm"));
+        assert!(!is_ticketable_path("/api/v1/vm/7"));
+        assert!(!is_ticketable_path("/api/v1/vm/7/renew"));
+        assert!(!is_ticketable_path("/api/admin/v1/users"));
+
+        // A missing id segment is not a valid target.
+        assert!(!is_ticketable_path("/api/v1/vm//console"));
+        assert!(!is_ticketable_path("/api/v1/vm/console"));
+    }
+
+    /// The id segment must be a single path component, so a crafted path cannot
+    /// smuggle extra segments past the prefix/suffix match.
+    #[test]
+    fn ticketable_path_rejects_extra_segments() {
+        assert!(!is_ticketable_path("/api/v1/vm/1/../../admin/console"));
+        assert!(!is_ticketable_path("/api/v1/vm/1/foo/console"));
+        assert!(!is_ticketable_path("/api/v1/payment/a/b/invoice"));
+    }
+
+    /// Regression (F-18): email verification tokens had no expiry, so a link
+    /// sitting in an old (or compromised) inbox stayed usable forever.
+    #[test]
+    fn email_verify_token_expires() {
+        let now = Utc::now();
+
+        // Fresh link is accepted.
+        assert!(!is_verify_token_expired(
+            Some(now - chrono::Duration::minutes(5)),
+            now
+        ));
+        // Just inside the window.
+        assert!(!is_verify_token_expired(
+            Some(now - chrono::Duration::hours(23)),
+            now
+        ));
+        // Past the window.
+        assert!(is_verify_token_expired(
+            Some(now - chrono::Duration::hours(25)),
+            now
+        ));
+        assert!(is_verify_token_expired(
+            Some(now - chrono::Duration::days(365)),
+            now
+        ));
+    }
+
+    /// A token with no recorded issue time (minted before issue times were
+    /// tracked, or a corrupt row) must fail closed rather than being treated as
+    /// valid forever.
+    #[test]
+    fn email_verify_token_without_issue_time_is_expired() {
+        assert!(is_verify_token_expired(None, Utc::now()));
     }
 
     #[test]

@@ -274,12 +274,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
             Some(crate::email_hash(user.email.as_str()).to_vec())
         };
         sqlx::query(
-            "update users set email=?, email_hash=?, email_verified=?, email_verify_token=?, contact_nip17=?, contact_email=?, contact_telegram=?, telegram_chat_id=?, telegram_link_token=?, contact_whatsapp=?, whatsapp_number=?, whatsapp_verified=?, whatsapp_verify_code=?, whatsapp_verify_attempts=?, country_code=?, billing_name=?, billing_address_1=?, billing_address_2=?, billing_city=?, billing_state=?, billing_postcode=?, billing_tax_id=?, geo_country_code=?, geo_ip=?, geo_updated=? where id = ?",
+            "update users set email=?, email_hash=?, email_verified=?, email_verify_token=?, email_verify_sent=?, session_version=?, contact_nip17=?, contact_email=?, contact_telegram=?, telegram_chat_id=?, telegram_link_token=?, contact_whatsapp=?, whatsapp_number=?, whatsapp_verified=?, whatsapp_verify_code=?, whatsapp_verify_attempts=?, country_code=?, billing_name=?, billing_address_1=?, billing_address_2=?, billing_city=?, billing_state=?, billing_postcode=?, billing_tax_id=?, geo_country_code=?, geo_ip=?, geo_updated=? where id = ?",
         )
             .bind(&user.email)
             .bind(hash)
             .bind(user.email_verified)
             .bind(&user.email_verify_token)
+            .bind(user.email_verify_sent)
+            .bind(user.session_version)
             .bind(user.contact_nip17)
             .bind(user.contact_email)
             .bind(user.contact_telegram)

@@ -24,8 +24,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use lnvps_api_common::{
-    ApiData, ApiError, ApiResult, DEFAULT_CHALLENGE_TTL_SECS, Nip98Auth, issue_challenge_token,
-    issue_session_token, verify_challenge_token,
+    ApiData, ApiError, ApiResult, DEFAULT_CHALLENGE_TTL_SECS, Nip98Auth, consume_challenge_token,
+    issue_challenge_token, issue_session_token,
 };
 use lnvps_db::{WebauthnCredential, webauthn_pubkey};
 
@@ -322,7 +322,7 @@ async fn register_finish(
     let cfg = webauthn_cfg(&this)?;
     let core = build_webauthn_core(&cfg)?;
 
-    let state_json = verify_challenge_token(PURPOSE_REG, &req.state)
+    let state_json = consume_challenge_token(PURPOSE_REG, &req.state)
         .map_err(|e| ApiError::from(anyhow::anyhow!("Invalid registration state: {}", e)))?;
     let state: RegState = serde_json::from_str(&state_json).map_err(ApiError::internal)?;
 
@@ -352,7 +352,8 @@ async fn register_finish(
         })
         .await?;
 
-    issue_token(&pubkey, uid, session_ttl(&this))
+    let session_version = this.db.get_user(uid).await?.session_version;
+    issue_token(&pubkey, uid, session_version, session_ttl(&this))
 }
 
 /// Begin a usernameless (discoverable) login.
@@ -386,7 +387,7 @@ async fn login_finish(
     let cfg = webauthn_cfg(&this)?;
     let webauthn = build_webauthn(&cfg)?;
 
-    let state_json = verify_challenge_token(PURPOSE_AUTH, &req.state)
+    let state_json = consume_challenge_token(PURPOSE_AUTH, &req.state)
         .map_err(|e| ApiError::from(anyhow::anyhow!("Invalid authentication state: {}", e)))?;
     let auth: DiscoverableAuthentication =
         serde_json::from_str(&state_json).map_err(ApiError::internal)?;
@@ -433,7 +434,12 @@ async fn login_finish(
         .try_into()
         .map_err(|_| ApiError::internal("Invalid stored pubkey"))?;
 
-    issue_token(&pubkey, used.user_id, session_ttl(&this))
+    issue_token(
+        &pubkey,
+        used.user_id,
+        user.session_version,
+        session_ttl(&this),
+    )
 }
 
 /// List the passkeys registered to the authenticated account.
@@ -503,7 +509,7 @@ async fn add_credential_finish(
     let cfg = webauthn_cfg(&this)?;
     let core = build_webauthn_core(&cfg)?;
 
-    let state_json = verify_challenge_token(PURPOSE_CRED_REG, &req.state)
+    let state_json = consume_challenge_token(PURPOSE_CRED_REG, &req.state)
         .map_err(|e| ApiError::from(anyhow::anyhow!("Invalid registration state: {}", e)))?;
     let reg: RegistrationState = serde_json::from_str(&state_json).map_err(ApiError::internal)?;
 
@@ -564,8 +570,16 @@ async fn delete_credential(
 }
 
 /// Issue the session JWT response.
-fn issue_token(pubkey: &[u8; 32], uid: u64, ttl: u64) -> ApiResult<WebauthnTokenResponse> {
-    let token = issue_session_token(pubkey, uid, ttl)
+///
+/// `session_version` is the account's current value, stamped into the token so
+/// bumping the column revokes it.
+fn issue_token(
+    pubkey: &[u8; 32],
+    uid: u64,
+    session_version: u32,
+    ttl: u64,
+) -> ApiResult<WebauthnTokenResponse> {
+    let token = issue_session_token(pubkey, uid, session_version, ttl)
         .map_err(|e| ApiError::internal(format!("Failed to issue session: {}", e)))?;
     ApiData::ok(WebauthnTokenResponse {
         token,

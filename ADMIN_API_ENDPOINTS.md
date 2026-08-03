@@ -3432,15 +3432,55 @@ For real-time job monitoring via WebSocket connections:
 ##### Job Feedback WebSocket
 
 ```
-GET /api/admin/v1/jobs/feedback?auth={auth_token}&job_id={job_id} (WebSocket)
+GET /api/admin/v1/jobs/feedback?ticket={ticket}&job_id={job_id} (WebSocket)
 ```
 
-Required Permission: Any admin role
+Required Permission: `virtual_machines::view`
 
 **Query Parameters:**
 
-- `auth`: Base64-encoded NIP-98 authentication token (required, since WebSocket headers aren't supported in browsers)
+- `ticket`: Single-use ticket from `POST /api/admin/v1/auth/ticket` (preferred; WebSocket handshakes cannot carry an `Authorization` header)
+- `auth`: Base64-encoded NIP-98 authentication token (**deprecated**, kept for existing clients — prefer `ticket`)
 - `job_id`: Specific job ID to monitor (optional, omit for global monitoring)
+
+Exactly one of `ticket` or `auth` must be supplied. A NIP-98 event passed as
+`auth` must be signed over this exact path with method `GET`; its signature is
+verified (this was previously **not** the case) and, like all NIP-98 auth, it is
+single-use and valid for 60 seconds.
+
+##### Issue a WebSocket Ticket
+
+```
+POST /api/admin/v1/auth/ticket
+```
+
+Required Permission: `virtual_machines::view`
+
+Authenticates normally (via the `Authorization` header) and returns a
+short-lived credential for a WebSocket handshake.
+
+**Request Body:**
+
+```json
+{
+  "path": "/api/admin/v1/jobs/feedback"
+}
+```
+
+**Response:**
+
+```json
+{
+  "data": {
+    "ticket": "eyJzdWIiOi...",
+    "expires_in": 30
+  }
+}
+```
+
+The ticket is valid for one use, for that exact path, for 30 seconds. It is not
+a general bearer credential: `path` must be `/api/admin/v1/jobs/feedback`, and
+the caller must already hold the permission the target endpoint requires.
 
 Establishes a WebSocket connection that streams job feedback messages. When `job_id` is provided, only feedback for that
 specific job is sent. When omitted, all job feedback is streamed.

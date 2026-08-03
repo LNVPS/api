@@ -183,7 +183,10 @@ async fn handle_callback(
         warn!("Failed to sync OAuth email for user {}: {}", uid, e);
     }
 
-    let token = issue_session_token(&pubkey, uid, session_ttl(this))
+    // Stamp the account's current session version into the token so it can be
+    // revoked later by bumping that column.
+    let session_version = this.db.get_user(uid).await?.session_version;
+    let token = issue_session_token(&pubkey, uid, session_version, session_ttl(this))
         .map_err(|e| ApiError::internal(format!("Failed to issue session: {}", e)))?;
 
     // Redirect to the frontend with the token in the fragment, or return JSON.
@@ -260,16 +263,20 @@ fn url_host(url: &str) -> Option<&str> {
 
 /// Whether `requested` is a permitted post-login redirect target.
 ///
-/// Any `localhost` URL is always permitted (for local frontend development).
-/// Otherwise accepted when it exactly equals, or extends at a path boundary,
-/// either the configured `success_redirect` (always implicitly allowed) or any
-/// entry in `allowed_redirects`. The boundary check (next char must be `/`, `?`,
-/// `#`, or end-of-string) stops `http://localhost:3000` from also matching
+/// Accepted when it exactly equals, or extends at a path boundary, either the
+/// configured `success_redirect` (always implicitly allowed) or any entry in
+/// `allowed_redirects`. The boundary check (next char must be `/`, `?`, `#`, or
+/// end-of-string) stops `http://localhost:3000` from also matching
 /// `http://localhost:30000.evil` — which would be an open-redirect / token-theft
 /// hole.
+///
+/// A blanket `localhost` exemption is available for local frontend development
+/// but must be turned on explicitly via `allow_localhost_redirect`; it is off by
+/// default so it cannot be left enabled in production by accident.
 fn is_allowed_redirect(cfg: &crate::settings::OAuthConfig, requested: &str) -> bool {
-    // Always allow the localhost hostname for local dev.
-    if url_host(requested).is_some_and(|h| h.eq_ignore_ascii_case("localhost")) {
+    if cfg.allow_localhost_redirect
+        && url_host(requested).is_some_and(|h| h.eq_ignore_ascii_case("localhost"))
+    {
         return true;
     }
 
@@ -589,11 +596,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn redirect_localhost_always_allowed() {
-        // No configured redirects at all.
+    fn redirect_localhost_allowed_only_when_enabled() {
+        // No configured redirects, localhost exemption ON (local dev).
         let cfg = crate::settings::OAuthConfig {
             success_redirect: None,
             allowed_redirects: vec![],
+            allow_localhost_redirect: true,
             providers: std::collections::HashMap::new(),
         };
         assert!(is_allowed_redirect(
@@ -608,11 +616,31 @@ mod tests {
         assert!(!is_allowed_redirect(&cfg, "http://notlocalhost/x"));
     }
 
+    /// Regression (F-17): the localhost exemption used to apply unconditionally,
+    /// including in production. It must be off unless explicitly enabled.
+    #[test]
+    fn redirect_localhost_rejected_by_default() {
+        let cfg = crate::settings::OAuthConfig {
+            success_redirect: None,
+            allowed_redirects: vec![],
+            allow_localhost_redirect: false,
+            providers: std::collections::HashMap::new(),
+        };
+
+        assert!(!is_allowed_redirect(
+            &cfg,
+            "http://localhost:3000/oauth/complete"
+        ));
+        assert!(!is_allowed_redirect(&cfg, "http://localhost"));
+        assert!(!is_allowed_redirect(&cfg, "https://localhost:8080/x"));
+    }
+
     #[test]
     fn redirect_allowlist_matches_at_boundaries_only() {
         let cfg = crate::settings::OAuthConfig {
             success_redirect: Some("https://app.lnvps.com/oauth".to_string()),
             allowed_redirects: vec!["https://staging.lnvps.com".to_string()],
+            allow_localhost_redirect: false,
             providers: std::collections::HashMap::new(),
         };
 

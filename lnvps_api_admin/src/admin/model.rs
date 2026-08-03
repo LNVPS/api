@@ -882,7 +882,7 @@ pub struct VmActionRequest {
     pub action: AdminVmAction,
 }
 
-#[derive(Eq, PartialEq, Clone, Hash)]
+#[derive(Eq, PartialEq, Clone, Hash, Debug)]
 pub struct Permission {
     pub resource: AdminResource,
     pub action: AdminAction,

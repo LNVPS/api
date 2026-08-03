@@ -1,4 +1,7 @@
 db: "mysql://root:root@localhost:3376/lnvps"
+# Binds NIP-98 `u` tags to this host so an auth event signed for another origin
+# cannot be replayed against the admin API. Set this in every deployment.
+public-url: "http://localhost:8001"
 redis:
   url: "redis://localhost:6398"
   ttl: 30

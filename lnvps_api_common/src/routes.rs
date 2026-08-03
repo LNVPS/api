@@ -45,7 +45,7 @@ impl<T: Serialize> ApiPaginatedData<T> {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct ApiError {
     pub error: String,
     /// HTTP status code to return for this error. Skipped during serialization
