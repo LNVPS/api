@@ -17,6 +17,12 @@ pub struct Settings {
     /// Database encryption configuration (fallback when the
     /// `LNVPS_ENCRYPTION_KEY` environment variable is not set)
     pub encryption: Option<EncryptionConfig>,
+
+    /// Per-IP API rate limiting. Enabled unless explicitly turned off, which
+    /// is only intended for the E2E suite (hundreds of requests a minute from
+    /// one address).
+    #[serde(default)]
+    pub rate_limit: lnvps_api_common::RateLimitConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

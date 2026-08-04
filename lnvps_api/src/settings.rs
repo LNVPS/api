@@ -30,6 +30,12 @@ pub struct Settings {
     #[serde(default = "default_max_prepay_days")]
     pub max_prepay_days: u16,
 
+    /// Per-IP API rate limiting. Enabled unless explicitly turned off, which
+    /// is only intended for the E2E suite (hundreds of requests a minute from
+    /// one address).
+    #[serde(default)]
+    pub rate_limit: lnvps_api_common::RateLimitConfig,
+
     /// SMTP settings for sending emails
     pub smtp: Option<SmtpConfig>,
 
@@ -606,6 +612,7 @@ pub fn mock_settings() -> Settings {
         listen: None,
         #[cfg(feature = "agent")]
         agent: None,
+        rate_limit: Default::default(),
         db: "".to_string(),
         encryption: None,
         public_url: "http://localhost:8000".to_string(),

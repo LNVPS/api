@@ -517,7 +517,7 @@ async fn main() -> Result<(), Error> {
                     lnvps_api_common::nip98_payload_middleware,
                 ))
                 .layer(axum::middleware::from_fn_with_state(
-                    lnvps_api_common::RateLimiter::default(),
+                    lnvps_api_common::RateLimiter::default().with_config(&settings.rate_limit),
                     lnvps_api_common::rate_limit_middleware,
                 ))
                 // Turn a panic in any handler into a 500 for that one request.

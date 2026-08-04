@@ -71,20 +71,35 @@ echo "Funded lnd ($LND_ADDR) and lnd-payer ($PAYER_ADDR) with 101 blocks each"
 LND_PUBKEY=$(LND_CLI getinfo | jq -r .identity_pubkey)
 echo "Connecting lnd-payer to lnd (pubkey: ${LND_PUBKEY})..."
 for i in $(seq 1 30); do
-    if PAYER_CLI connect "${LND_PUBKEY}@lnd:9735" 2>/dev/null; then
+    # `connect` exits non-zero when the peer is *already* connected, which is
+    # success as far as this script is concerned. Without this the whole run
+    # aborts against an already-running stack (e.g. --no-cleanup, or a retry).
+    CONNECT_OUT=$(PAYER_CLI connect "${LND_PUBKEY}@lnd:9735" 2>&1) && {
         echo "lnd-payer connected to lnd after ${i}s"
+        break
+    }
+    if grep -qi "already connected" <<<"$CONNECT_OUT"; then
+        echo "lnd-payer was already connected to lnd"
         break
     fi
     if [[ "$i" -eq 30 ]]; then
         echo "ERROR: could not connect lnd-payer to lnd within 30s"
+        echo "$CONNECT_OUT" >&2
         exit 1
     fi
     sleep 1
 done
 
-# Open a 10M sat channel from lnd-payer → lnd
-PAYER_CLI openchannel --node_key "$LND_PUBKEY" --local_amt 10000000
-echo "Channel open request submitted (10M sats)"
+# Open a 10M sat channel from lnd-payer → lnd, unless one already exists.
+# Opening a second channel would drain the payer's wallet on every re-run.
+EXISTING=$(PAYER_CLI listchannels | jq --arg k "$LND_PUBKEY" \
+    '[.channels[] | select(.remote_pubkey == $k)] | length')
+if [[ "$EXISTING" -ge 1 ]]; then
+    echo "Channel to lnd already exists (${EXISTING}), skipping openchannel"
+else
+    PAYER_CLI openchannel --node_key "$LND_PUBKEY" --local_amt 10000000
+    echo "Channel open request submitted (10M sats)"
+fi
 
 # Mine 6 blocks so the channel is confirmed and active
 BTC_CLI generatetoaddress 6 "$LND_ADDR" >/dev/null
