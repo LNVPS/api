@@ -157,18 +157,6 @@ async fn main() -> Result<(), Error> {
         );
     }
 
-    // Bind NIP-98 `u` tags to this deployment's host. Without it the auth check
-    // compares only the path, so an event a user was tricked into signing for
-    // another origin replays here.
-    if lnvps_api_common::init_auth_origin(&settings.public_url) {
-        info!("NIP-98 auth origin bound to {}", settings.public_url);
-    } else {
-        warn!(
-            "Could not bind a NIP-98 auth origin from public_url {:?}",
-            settings.public_url
-        );
-    }
-
     let nostr_client = if let Some(ref c) = settings.nostr {
         let cx = Client::builder().signer(Keys::parse(&c.nsec)?).build();
         for r in &c.relays {

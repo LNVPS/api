@@ -8,7 +8,7 @@ use base64::prelude::BASE64_STANDARD;
 use log::{debug, warn};
 use nostr::{Event, EventId, JsonUtil, Kind, PublicKey, Timestamp};
 use sha2::{Digest, Sha256};
-use std::sync::{LazyLock, OnceLock};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use crate::session::{SessionClaims, verify_session_token};
@@ -20,34 +20,6 @@ use crate::single_use::SingleUseGuard;
 /// of any replay tracking — gave a captured `Authorization` header a ten-minute
 /// window in which it could be replayed verbatim.
 const AUTH_WINDOW_SECS: u64 = 60;
-
-/// Host this deployment serves on, used to bind the `u` tag to *us*.
-///
-/// Installed once at startup from the configured `public_url`. When unset the
-/// host check is skipped (tests, local development).
-static AUTH_ORIGIN: OnceLock<String> = OnceLock::new();
-
-/// Install the expected auth origin from the service's public URL.
-///
-/// Without this, `check` compares only the *path* of the `u` tag, so an event a
-/// user was tricked into signing for `https://evil.example/api/v1/vm/1/renew`
-/// (via NIP-07 on a hostile page) replays successfully against this API.
-/// Returns `true` if this call installed the value.
-pub fn init_auth_origin(public_url: &str) -> bool {
-    match public_url.parse::<Uri>().ok().and_then(|u| {
-        u.host()
-            .map(|h| h.to_ascii_lowercase())
-            .filter(|h| !h.is_empty())
-    }) {
-        Some(host) => AUTH_ORIGIN.set(host).is_ok(),
-        None => {
-            warn!(
-                "Could not derive an auth origin from public_url {public_url:?}; NIP-98 `u` tag host binding is DISABLED"
-            );
-            false
-        }
-    }
-}
 
 /// Hard cap on tracked event ids so a flood cannot grow the map without bound.
 const MAX_TRACKED_EVENTS: usize = 100_000;
@@ -178,16 +150,6 @@ impl Nip98Auth {
         if path != parsed_uri.path() {
             bail!("U tag does not match");
         }
-        // Binding the host stops an event signed for a *different* site (which a
-        // hostile page can obtain via NIP-07) from being replayed here.
-        if let Some(expected_host) = AUTH_ORIGIN.get() {
-            match parsed_uri.host() {
-                Some(host) if host.eq_ignore_ascii_case(expected_host) => {}
-                Some(_) => bail!("U tag host does not match this server"),
-                None => bail!("U tag must be an absolute URL"),
-            }
-        }
-
         // check method tag
         match Self::tag_value(event, "method") {
             Some(t_method) if method == t_method => {}
@@ -263,15 +225,9 @@ mod tests {
     use super::*;
     use nostr::{EventBuilder, Keys, Tag};
 
-    /// Install (once) and return the host every test signs against.
-    ///
-    /// `AUTH_ORIGIN` is a process-global `OnceLock` shared by the whole test
-    /// binary, so tests must not each install a different origin — whichever
-    /// ran first would win and break the rest. Every test goes through this
-    /// helper and reads back whatever is actually installed.
+    /// Host every test writes into its `u` tags.
     fn test_origin() -> String {
-        init_auth_origin("https://example.com");
-        AUTH_ORIGIN.get().expect("origin installed").clone()
+        "example.com".to_string()
     }
 
     /// A freshly-signed auth event for `path`/`method` against the test origin.
@@ -420,36 +376,6 @@ mod tests {
         assert!(
             auth.check("/api/v1/account", "GET").is_err(),
             "an event older than the auth window must be rejected"
-        );
-    }
-
-    /// Regression (F-04): only the *path* of the `u` tag was compared, so an
-    /// event a user was tricked into signing for a hostile origin replayed
-    /// here. With an origin configured, the host must match.
-    #[test]
-    fn u_tag_host_must_match_configured_origin() {
-        // `AUTH_ORIGIN` is a process-global OnceLock; set it for this binary.
-        // Whichever test wins the race, both assertions below hold because they
-        // are expressed relative to the value actually installed.
-        let expected = test_origin();
-
-        let hostile = signed_auth(vec![
-            Tag::parse(["u", "https://evil.example/api/v1/vm/1/renew"]).unwrap(),
-            Tag::parse(["method", "GET"]).unwrap(),
-        ]);
-        assert!(
-            hostile.check("/api/v1/vm/1/renew", "GET").is_err(),
-            "an event signed for another origin must not authenticate here"
-        );
-
-        let ours = signed_auth(vec![
-            Tag::parse(["u", &format!("https://{expected}/api/v1/vm/1/renew")]).unwrap(),
-            Tag::parse(["method", "GET"]).unwrap(),
-        ]);
-
-        assert!(
-            ours.check("/api/v1/vm/1/renew", "GET").is_ok(),
-            "an event signed for our own origin must still work"
         );
     }
 

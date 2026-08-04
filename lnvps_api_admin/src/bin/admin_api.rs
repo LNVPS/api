@@ -6,11 +6,11 @@ use lnvps_api_admin::admin::admin_router;
 use lnvps_api_admin::settings::Settings;
 use lnvps_api_common::{
     RateLimiter, RedisWorkCommander, RedisWorkFeedback, VmStateCache, WorkCommander, WorkJob,
-    WorkJobMessage, handle_panic, init_auth_origin, make_exchange_service,
-    nip98_payload_middleware, rate_limit_middleware,
+    WorkJobMessage, handle_panic, make_exchange_service, nip98_payload_middleware,
+    rate_limit_middleware,
 };
 use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbBase, LNVpsDbMysql};
-use log::{info, warn};
+use log::info;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -71,16 +71,6 @@ async fn main() -> Result<(), Error> {
             encryption_config.auto_generate,
         )?;
         info!("Database encryption initialized from key file");
-    }
-
-    // Bind NIP-98 `u` tags to this host so an event signed for another origin
-    // cannot be replayed against the admin API.
-    match settings.public_url.as_deref() {
-        Some(url) if init_auth_origin(url) => info!("NIP-98 auth origin bound to {url}"),
-        Some(url) => warn!("Could not bind a NIP-98 auth origin from public-url {url:?}"),
-        None => warn!(
-            "No public-url configured; NIP-98 `u` tag host binding is disabled on the admin API"
-        ),
     }
 
     // Connect database and migrate

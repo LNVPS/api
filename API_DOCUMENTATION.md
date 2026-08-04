@@ -68,8 +68,6 @@ they once were — check them if previously-working requests start failing.
   presenting the same event twice is rejected. Do not cache or reuse an event.
 - **`created_at` must be within 60 seconds** of server time (previously 600).
   A client with a badly-skewed clock will be rejected.
-- **The `u` tag must be an absolute URL whose host matches the API's own host**,
-  not just a matching path. An event signed for another origin is rejected.
 - **The `method` tag must match the request method.**
 - **The `payload` tag is optional, but verified when present.** If you include
   it, it must be the lowercase hex SHA-256 of the exact request body. Omitting

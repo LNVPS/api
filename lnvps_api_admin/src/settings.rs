@@ -8,13 +8,6 @@ pub struct Settings {
     /// Listen address for http server
     pub listen: Option<String>,
 
-    /// Public URL this admin API is served on, e.g. `https://admin.lnvps.net`.
-    ///
-    /// Used to bind NIP-98 `u` tags to this host so an auth event signed for
-    /// another origin cannot be replayed here. When unset the host portion of
-    /// the `u` tag is not checked (path and method still are).
-    pub public_url: Option<String>,
-
     /// MYSQL connection string
     pub db: String,
 
