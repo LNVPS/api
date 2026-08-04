@@ -267,19 +267,32 @@ in the local image cache afterwards).
 Three of the seven bugs were invisible until a real guest image was booted and
 its serial console read.
 
+## CI
+
+`.github/workflows/libvirt-tests.yml` runs the whole suite, ignored tests included, on a
+GitHub-hosted runner:
+
+- `/dev/kvm` is present on GitHub's Linux runners but only readable by the `kvm` group, so the
+  job installs the standard udev rule first. If KVM is ever unavailable the job **degrades to TCG
+  emulation** rather than failing — `LNVPS_LIBVIRT_KVM=0` switches the domain type to `qemu`.
+  Measured locally: 5.4s to userspace with KVM, 36s under TCG, with identical assertions.
+- The ~400 MB Debian cloud image is cached between runs via `LNVPS_LIBVIRT_IMAGE_CACHE`.
+- The job is scoped to `host::libvirt` + `host::cloud_init` rather than the whole crate, because
+  `lnvps_api_common` has two unrelated failing tests on master (`capacity::tests::nan_load_*`)
+  and a permanently-red job gets ignored.
+
 ## Remaining before this can be merged
 
 - [ ] **Document the new config keys** in `docs/config.md`: the `provisioner.libvirt` section
       there still shows only `qemu:`. Missing: `image-pool`, `image-cache-dir`, `secure-boot`,
       `vlan-aware-bridge`, `shutdown-timeout-secs`.
-- [ ] **Function coverage** (`docs/agents-common/coverage.md` requires 100% on new/modified
-      functions). Everything reachable through the libvirt *test driver* is covered by ordinary
-      tests, but a set of functions can only run against a real hypervisor and is therefore only
-      exercised by the `#[ignore]`d suite — which CI does not run: `console.rs` (all of it),
+- [x] **Function coverage** — closed by `.github/workflows/libvirt-tests.yml`, which installs
+      libvirt + QEMU on a GitHub-hosted runner and runs the suite with `--include-ignored`. The
+      functions that can only run against a real hypervisor (`console.rs`,
       `storage.rs::{upload_volume, upload_bytes, upload_stream, clone_volume}`,
       `image.rs::{download_to_cache, download, expected_checksum}`, and the `list_host_vms` /
-      `write_seed` / `primary_disk_path` paths in `mod.rs`. Either accept this as a documented
-      deviation, or stand up a libvirt-capable CI job and run `-- --include-ignored`.
+      `write_seed` / `primary_disk_path` paths) are therefore covered on every PR touching
+      `lnvps_api_common/src/host/**`.
 - [ ] **Commit / PR.** Nothing is committed yet. Note `docker-compose.e2e.yaml` was already
       modified before this work started and is unrelated — keep it out of the commit.
 

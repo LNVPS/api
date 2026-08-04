@@ -1,0 +1,167 @@
+name: LibVirt Host Backend Tests
+
+# The libvirt backend's integration tests are `#[ignore]`d because they need a
+# real hypervisor: the `test:///default` mock driver accepts almost any XML and
+# never launches QEMU, so it has historically passed while no VM could actually
+# be defined or booted. This job is the only place they run.
+on:
+  pull_request:
+    paths:
+      - "lnvps_api_common/src/host/**"
+      - "lnvps_api_common/Cargo.toml"
+      - ".github/workflows/libvirt-tests.yml"
+  push:
+    branches:
+      - master
+    paths:
+      - "lnvps_api_common/src/host/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: info
+  # Storage pool the tests use. Must live under a path AppArmor lets QEMU read
+  # (virt-aa-helper only whitelists the standard image locations), or guests
+  # fail to start with a confusing "Permission denied".
+  POOL_NAME: lnvps-test
+  POOL_PATH: /var/lib/libvirt/images/lnvps-test
+  LNVPS_LIBVIRT_IMAGE_CACHE: /tmp/lnvps-os-images
+
+jobs:
+  libvirt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: libvirt-${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            libvirt-${{ runner.os }}-cargo-
+
+      # GitHub-hosted Linux runners expose /dev/kvm, but only to the `kvm`
+      # group; the runner user is not in it.
+      - name: Enable KVM group permissions
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Install libvirt and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libvirt-daemon-system libvirt-clients libvirt-dev \
+            qemu-system-x86 qemu-utils ovmf
+
+      # Without hardware virtualisation the guests still run, just under TCG
+      # emulation. Reported explicitly so a silent fallback to a 10x slower
+      # boot doesn't look like a hang.
+      - name: Detect hardware virtualisation
+        run: |
+          if [ -c /dev/kvm ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "LNVPS_LIBVIRT_KVM=1" >> "$GITHUB_ENV"
+            echo "KVM available: tests will use hardware virtualisation"
+          else
+            echo "LNVPS_LIBVIRT_KVM=0" >> "$GITHUB_ENV"
+            echo "::warning::/dev/kvm unavailable - falling back to TCG emulation (slower)"
+          fi
+
+      - name: Start libvirt and provision the test host
+        run: |
+          set -euxo pipefail
+          sudo systemctl start libvirtd
+          # `virsh` needs a moment before the socket accepts connections.
+          for _ in $(seq 1 30); do
+            sudo virsh version >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+          # The default network provides virbr0, the bridge the tests attach
+          # guests to.
+          sudo virsh net-start default || true
+          sudo virsh net-autostart default || true
+
+          sudo mkdir -p "$POOL_PATH"
+          sudo virsh pool-define-as "$POOL_NAME" dir --target "$POOL_PATH"
+          sudo virsh pool-build "$POOL_NAME"
+          sudo virsh pool-start "$POOL_NAME"
+
+          sudo virsh net-list --all
+          sudo virsh pool-list --all
+
+      - name: Grant the runner access to libvirt
+        run: sudo usermod -aG libvirt,kvm "$USER"
+
+      # The Debian cloud image is ~400 MB; caching it keeps the job off the
+      # mirror on every run.
+      - name: Cache OS images
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.LNVPS_LIBVIRT_IMAGE_CACHE }}
+          key: libvirt-os-images-debian-13-genericcloud
+          restore-keys: |
+            libvirt-os-images-
+
+      - name: Build tests
+        run: cargo test -p lnvps_api_common --features libvirt --no-run
+
+      # Scoped to the hypervisor surface this job owns rather than the whole
+      # crate: `lnvps_api_common` currently has unrelated failing tests on
+      # master (capacity NaN sorting), and inheriting them would make this job
+      # permanently red and therefore ignored.
+      #
+      # `sg` picks up the libvirt group membership without a new login, which
+      # `usermod` alone does not provide within a job.
+      - name: Run libvirt integration tests
+        run: |
+          sg libvirt -c "cargo test -p lnvps_api_common --features libvirt host::libvirt -- \
+            --include-ignored --test-threads=1"
+
+      - name: Run cloud-init unit tests
+        run: |
+          cargo test -p lnvps_api_common --features libvirt host::cloud_init -- --test-threads=1
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== domains ==="
+          sudo virsh list --all || true
+          echo "=== storage ==="
+          sudo virsh vol-list "$POOL_NAME" || true
+          echo "=== nwfilters ==="
+          sudo virsh nwfilter-list || true
+          echo "=== guest serial console logs ==="
+          for f in /tmp/lnvps-console-*.log; do
+            [ -e "$f" ] || continue
+            echo "--- $f (last 100 lines) ---"
+            tail -n 100 "$f"
+          done
+          echo "=== qemu domain logs ==="
+          sudo tail -n 50 /var/log/libvirt/qemu/*.log 2>/dev/null || true
+          echo "=== libvirtd ==="
+          sudo journalctl -u libvirtd --no-pager -n 100 || true
+
+      - name: Clean up guests
+        if: always()
+        run: |
+          for d in $(sudo virsh list --all --name | grep '^VM' || true); do
+            sudo virsh destroy "$d" >/dev/null 2>&1 || true
+            sudo virsh undefine --nvram "$d" >/dev/null 2>&1 || true
+          done

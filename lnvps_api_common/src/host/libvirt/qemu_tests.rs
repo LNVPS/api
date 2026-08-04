@@ -76,13 +76,26 @@ fn next_vm_id() -> u64 {
     900_000 + (std::process::id() as u64 % 1000) * 100 + n
 }
 
+/// Hardware virtualisation, unless the environment says otherwise.
+///
+/// Set `LNVPS_LIBVIRT_KVM=0` to fall back to TCG emulation (`<domain
+/// type='qemu'>`), which lets the suite run where `/dev/kvm` is unavailable at
+/// the cost of a much slower boot.
+fn use_kvm() -> bool {
+    !matches!(
+        std::env::var("LNVPS_LIBVIRT_KVM").as_deref(),
+        Ok("0") | Ok("false")
+    )
+}
+
 fn qemu_cfg() -> QemuConfig {
     QemuConfig {
         machine: "q35".to_string(),
         os_type: "l26".to_string(),
         bridge: bridge(),
-        cpu: "host".to_string(),
-        kvm: true,
+        // A custom model cannot be used without KVM on an emulated CPU.
+        cpu: if use_kvm() { "host" } else { "qemu64" }.to_string(),
+        kvm: use_kvm(),
         arch: "x86_64".to_string(),
         balloon_min_pct: None,
         firewall_config: None,
@@ -97,7 +110,9 @@ fn host_config() -> LibVirtConfig {
     LibVirtConfig {
         qemu: qemu_cfg(),
         image_pool: Some(pool()),
-        image_cache_dir: None,
+        // Pointing this at a stable path lets CI cache the (large) OS image
+        // between runs instead of re-downloading it every time.
+        image_cache_dir: std::env::var("LNVPS_LIBVIRT_IMAGE_CACHE").ok().map(Into::into),
         secure_boot: false,
         vlan_aware_bridge: std::env::var("LNVPS_LIBVIRT_VLAN_AWARE").is_ok(),
         // The fake image has no OS to answer ACPI, so don't wait a minute
