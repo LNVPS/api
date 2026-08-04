@@ -427,7 +427,7 @@ impl HostCapacity {
 
     /// CPU usage as a percentage
     pub fn cpu_load(&self) -> f32 {
-        self.cpu as f32 / (self.host.cpu as f32 * self.load_factor.cpu)
+        saturating_load(self.cpu as f32, self.host.cpu as f32 * self.load_factor.cpu)
     }
 
     /// Total number of available CPUs
@@ -438,7 +438,10 @@ impl HostCapacity {
 
     /// Memory usage as a percentage
     pub fn memory_load(&self) -> f32 {
-        self.memory as f32 / (self.host.memory as f32 * self.load_factor.memory)
+        saturating_load(
+            self.memory as f32,
+            self.host.memory as f32 * self.load_factor.memory,
+        )
     }
 
     /// Total available bytes of memory
@@ -450,7 +453,10 @@ impl HostCapacity {
 
     /// Disk usage as a percentage (average over all disks)
     pub fn disk_load(&self) -> f32 {
-        self.disks.iter().fold(0.0, |acc, disk| acc + disk.load()) / self.disks.len() as f32
+        saturating_load(
+            self.disks.iter().fold(0.0, |acc, disk| acc + disk.load()),
+            self.disks.len() as f32,
+        )
     }
 
     /// Can this host and its available capacity accommodate the given template
@@ -506,6 +512,23 @@ pub struct DiskCapacity {
     pub usage: u64,
 }
 
+/// `used / total`, with anything undefined reported as **fully loaded**.
+///
+/// A host or disk with no usable capacity (size 0, or a load factor of 0)
+/// otherwise yields `0.0 / 0.0` = NaN. That is not merely cosmetic: `total_cmp`
+/// orders a *negative* NaN before every real number, and `0.0 / 0.0` produces a
+/// negative NaN on some targets/optimisation levels, so the emptiest-first sort
+/// used to pick a placement would rank a zero-capacity host or disk **first**.
+/// Reporting 1.0 sorts it last, which is the safe direction: never schedule
+/// onto something whose capacity we cannot reason about.
+fn saturating_load(used: f32, total: f32) -> f32 {
+    if !total.is_finite() || total <= 0.0 {
+        return 1.0;
+    }
+    let load = used / total;
+    if load.is_finite() { load } else { 1.0 }
+}
+
 impl DiskCapacity {
     /// Total available bytes of disk space
     pub fn available_capacity(&self) -> u64 {
@@ -515,7 +538,7 @@ impl DiskCapacity {
 
     /// Disk usage as percentage
     pub fn load(&self) -> f32 {
-        (self.usage as f32 / self.disk.size as f32) * (1.0 / self.load_factor)
+        saturating_load(self.usage as f32, self.disk.size as f32 * self.load_factor)
     }
 }
 
@@ -818,7 +841,11 @@ mod tests {
             disks: vec![],
             ranges: vec![],
         };
-        assert!(degenerate.load().is_nan(), "expected a NaN load to sort");
+        // A host with no capacity must report as fully loaded, never NaN:
+        // `total_cmp` sorts a negative NaN *first*, which would make the
+        // emptiest-first placement search pick this host.
+        assert!(!degenerate.load().is_nan(), "load must never be NaN");
+        assert_eq!(degenerate.load(), 1.0, "no capacity means fully loaded");
 
         let healthy = HostCapacity {
             load_factor: LoadFactors {
@@ -876,11 +903,19 @@ mod tests {
                 usage: 10,
             },
         ];
-        assert!(disks[0].load().is_nan());
+        // A zero-size disk must report as fully loaded, never NaN: `total_cmp`
+        // sorts a negative NaN *first*, so the emptiest-first sort used to pick
+        // a disk would otherwise choose the one with no capacity at all.
+        assert!(!disks[0].load().is_nan(), "load must never be NaN");
+        assert_eq!(disks[0].load(), 1.0, "no capacity means fully loaded");
 
         disks.sort_by(|a, b| a.load().total_cmp(&b.load()));
 
         assert!(!disks[0].load().is_nan());
+        assert_eq!(
+            disks[0].disk.size, 100,
+            "the usable disk must sort ahead of the zero-capacity one"
+        );
     }
 
     /// Regression (F-09): a malformed stored CIDR must report zero capacity
