@@ -34,7 +34,8 @@ payments-rs = { workspace = true, features = ["fiat"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = { version = "0.22", features = ["alloc"] }
 nostr = { version = "0.44", default-features = false, features = ["std"] }
-reqwest = { version = "0.13", features = ["json"] }
+# `stream` is needed to download OS images without buffering them in memory
+reqwest = { version = "0.13", features = ["json", "stream"] }
 rand = "0.9"
 sha1 = "0.10"
 sha2 = "0.10"
@@ -51,7 +52,8 @@ russh-sftp = { version = "2", optional = true }
 
 #libvirt
 virt = { git = "https://gitlab.com/libvirt/libvirt-rust.git", optional = true }
-uuid = { version = "1.16", features = ["v4", "serde"], optional = true }
+# v5 provides the deterministic per-VM libvirt domain UUIDs
+uuid = { version = "1.16", features = ["v4", "v5", "serde"], optional = true }
 quick-xml = { version = "0.39", features = ["serde", "serialize"], optional = true }
 
 [dev-dependencies]

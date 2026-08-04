@@ -60,14 +60,41 @@ provisioner:
     # MAC prefix for generated NICs (default: bc:24:11)
     mac-prefix: "bc:24:11"
 
-  # LibVirt (WIP)
+  # LibVirt / QEMU-KVM
   libvirt:
     qemu:
       machine: "q35"
       os-type: "l26"
+      # Guests are attached to this bridge. See vlan-aware-bridge below if the
+      # host record carries a vlan_id.
       bridge: "vmbr0"
-      cpu: "kvm64"
-      kvm: false
+      # "host" / "host-passthrough" exposes the physical CPU; anything else is
+      # used as an exact custom model.
+      cpu: "host"
+      kvm: true
+      arch: "x86_64"
+    # Storage pool caching OS images on the host (default: "default").
+    # VM disks are cloned from images in this pool; it may be the same pool the
+    # disks live in. The pool's target path must be one AppArmor allows QEMU to
+    # read (e.g. under /var/lib/libvirt/images), or guests fail to start with a
+    # confusing "Permission denied".
+    image-pool: "default"
+    # Where the API caches downloaded OS images before uploading them to a host
+    # (default: a lnvps-os-images dir under the system temp dir).
+    image-cache-dir: "/var/cache/lnvps/os-images"
+    # Declares that `bridge` has VLAN filtering enabled (vlan_filtering=1).
+    # libvirt accepts a <vlan> tag on any bridge, but a plain Linux bridge
+    # silently ignores it and puts the VM on the untagged network, so VM
+    # creation fails when a host has a vlan_id and this is not set.
+    vlan-aware-bridge: false
+    # UEFI secure boot. Requires an OVMF secure-boot firmware on the host and a
+    # signed bootloader in the guest image; ordinary cloud images will not boot
+    # with it on (default: false).
+    secure-boot: false
+    # Seconds a graceful ACPI shutdown is given before the VM is powered off by
+    # force (default: 60). Without the forced stop, a guest that ignores ACPI
+    # would leave `stop_vm` reporting success while it keeps running.
+    shutdown-timeout-secs: 60
 ```
 
 ### Session tokens (required for OAuth / passkey login)

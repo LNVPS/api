@@ -1082,76 +1082,18 @@ impl ProxmoxClient {
     ///
     /// The interface is matched by MAC rather than by name so the config does not
     /// depend on how the guest enumerates devices.
+    /// Cloud-init network snippet, or `None` when the simpler `ipconfig` path
+    /// can express the layout on its own (at most one address per family).
+    ///
+    /// The document itself is built by [`crate::host::cloud_init::network_config`],
+    /// shared with the libvirt backend so the address/gateway handling cannot
+    /// drift between hypervisors.
     fn make_network_config(value: &FullVmInfo) -> Result<Option<String>> {
-        let mut v4 = Vec::new();
-        let mut v6 = Vec::new();
-        let mut gw4 = None;
-        let mut gw6 = None;
-        let mut accept_ra = false;
-
-        for ip in &value.ips {
-            let addr: IpAddr = match ip.ip.parse() {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            let ip_range = match value.ranges.iter().find(|r| r.id == ip.ip_range_id) {
-                Some(r) => r,
-                None => continue,
-            };
-            if addr.is_ipv6()
-                && matches!(ip_range.allocation_mode, IpRangeAllocationMode::SlaacEui64)
-            {
-                // The host hands out the address; what the database holds is
-                // informational only.
-                accept_ra = true;
-                continue;
-            }
-            let range: IpNetwork = ip_range.cidr.parse()?;
-            let range_gw: IpNetwork = parse_gateway(&ip_range.gateway)?;
-            // Same widening as the ipconfig path: take the shorter prefix so an
-            // off-subnet gateway stays directly reachable without an on-link route.
-            let prefix = range.prefix().min(range_gw.prefix());
-            let cidr = IpNetwork::new(addr, prefix)?.to_string();
-            if addr.is_ipv4() {
-                // Only one default route per family is meaningful; addresses from
-                // a second range stay reachable on-link through the widened
-                // prefix. First assignment wins, as it does via `ipconfig`.
-                gw4.get_or_insert_with(|| range_gw.ip());
-                v4.push(cidr);
-            } else {
-                gw6.get_or_insert_with(|| range_gw.ip());
-                v6.push(cidr);
-            }
-        }
-
-        if v4.len() <= 1 && v6.len() <= 1 {
+        let net = crate::host::cloud_init::network_config(value)?;
+        if net.v4_count <= 1 && net.v6_count <= 1 {
             return Ok(None);
         }
-
-        let mut cfg =
-            String::from("version: 2\nethernets:\n  nic0:\n    match:\n      macaddress: ");
-        cfg.push_str(&value.vm.mac_address.to_lowercase());
-        cfg.push_str("\n    dhcp4: false\n    dhcp6: false\n");
-        if accept_ra {
-            cfg.push_str("    accept-ra: true\n");
-        }
-        cfg.push_str("    addresses:\n");
-        for a in v4.iter().chain(v6.iter()) {
-            cfg.push_str(&format!("      - {a}\n"));
-        }
-        let routes: Vec<String> = gw4
-            .into_iter()
-            .chain(gw6)
-            .map(|gw| format!("      - to: default\n        via: {gw}"))
-            .collect();
-        if !routes.is_empty() {
-            cfg.push_str("    routes:\n");
-            for r in &routes {
-                cfg.push_str(r);
-                cfg.push('\n');
-            }
-        }
-        Ok(Some(cfg))
+        Ok(Some(net.yaml))
     }
 
     fn make_config(
