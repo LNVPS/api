@@ -220,9 +220,13 @@ const STRICT_PREFIXES: &[&str] = &[
     // enumeration oracle and the renew callback mints a real Lightning invoice
     // (a DB row plus node state) per request.
     "/.well-known/lnurlp/",
-    // Unauthenticated ticket minting for websocket/HTML auth (see `session`).
-    "/api/v1/auth/ticket",
 ];
+
+// NOTE: ticket minting (`/api/v1/auth/ticket`) is deliberately NOT strict. It
+// requires full authentication and guards no brute-forceable secret, so the
+// strict bucket buys nothing — while a user opening several invoices, or a
+// console that reconnects, would hit 10/min immediately and start seeing 429s.
+// The general bucket is the right home for it.
 
 /// Suffixes guarded by the strict bucket, matched against the whole path.
 ///
@@ -400,6 +404,23 @@ mod tests {
 
         assert!(l.check(ip, "/api/v1/vm/1/renew").is_ok());
         assert!(l.check(ip, "/api/v1/vm/1/renew").is_ok());
+    }
+
+    /// Ticket minting must stay in the general bucket. It is authenticated and
+    /// guards no brute-forceable secret, and a client legitimately mints one
+    /// per invoice opened or console reconnect — the strict bucket's 10/min
+    /// would start returning 429 during ordinary use.
+    #[test]
+    fn ticket_minting_stays_general() {
+        let l = limiter(1, 100);
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+
+        for _ in 0..20 {
+            assert!(
+                l.check(ip, "/api/v1/auth/ticket").is_ok(),
+                "ticket minting must not hit the strict bucket"
+            );
+        }
     }
 
     /// Regression (F-08): a request with no resolvable IP used to skip the
