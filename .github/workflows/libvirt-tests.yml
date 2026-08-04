@@ -30,6 +30,11 @@ env:
   POOL_NAME: lnvps-test
   POOL_PATH: /var/lib/libvirt/images/lnvps-test
   LNVPS_LIBVIRT_IMAGE_CACHE: /tmp/lnvps-os-images
+  # Guests attach to a plain Linux bridge rather than libvirt's default NAT
+  # network: they never need DHCP or outbound access (cloud-init configures
+  # them statically and the assertions read the serial console), so this drops
+  # a dependency on dnsmasq and iptables.
+  LNVPS_LIBVIRT_BRIDGE: lnvps-br0
 
 jobs:
   libvirt:
@@ -93,18 +98,19 @@ jobs:
             sleep 1
           done
 
-          # The default network provides virbr0, the bridge the tests attach
-          # guests to.
-          sudo virsh net-start default || true
-          sudo virsh net-autostart default || true
+          sudo ip link add "$LNVPS_LIBVIRT_BRIDGE" type bridge
+          sudo ip link set "$LNVPS_LIBVIRT_BRIDGE" up
 
           sudo mkdir -p "$POOL_PATH"
           sudo virsh pool-define-as "$POOL_NAME" dir --target "$POOL_PATH"
           sudo virsh pool-build "$POOL_NAME"
           sudo virsh pool-start "$POOL_NAME"
 
-          sudo virsh net-list --all
-          sudo virsh pool-list --all
+          # Assert the environment is actually usable. A missing bridge or pool
+          # otherwise surfaces much later as a confusing per-test failure
+          # ("Cannot get interface MTU on ...: No such device").
+          ip -br link show "$LNVPS_LIBVIRT_BRIDGE"
+          sudo virsh pool-info "$POOL_NAME"
 
       - name: Grant the runner access to libvirt
         run: sudo usermod -aG libvirt,kvm "$USER"
@@ -147,6 +153,8 @@ jobs:
           sudo virsh vol-list "$POOL_NAME" || true
           echo "=== nwfilters ==="
           sudo virsh nwfilter-list || true
+          echo "=== bridge ==="
+          ip -br link show || true
           echo "=== guest serial console logs ==="
           for f in /tmp/lnvps-console-*.log; do
             [ -e "$f" ] || continue
