@@ -16,6 +16,7 @@ use crate::VmRunningState;
 use crate::host::config::ProvisionerConfig;
 use crate::retry::OpResult;
 
+pub mod cloud_init;
 pub mod config;
 #[cfg(feature = "libvirt")]
 mod libvirt;
@@ -207,7 +208,7 @@ pub fn get_host_client(
         #[cfg(feature = "libvirt")]
         VmHostKind::LibVirt if cfg.libvirt.is_some() => {
             let cfg = cfg.libvirt.clone().unwrap();
-            Arc::new(libvirt::LibVirtHost::new(&host.ip, cfg.qemu)?)
+            Arc::new(libvirt::LibVirtHost::new(&host.ip, cfg)?)
         }
         VmHostKind::Dummy => {
             if cfg!(test) {

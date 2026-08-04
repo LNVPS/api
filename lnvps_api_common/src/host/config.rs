@@ -32,6 +32,40 @@ pub struct ProxmoxConfig {
 pub struct LibVirtConfig {
     /// Generic VM configuration
     pub qemu: QemuConfig,
+    /// Storage pool used to cache OS images on the host (default: `default`).
+    ///
+    /// VM disks are cloned from images in this pool; it may be the same pool
+    /// the VM disks live in.
+    #[serde(default)]
+    pub image_pool: Option<String>,
+    /// Local directory used to cache downloaded OS images before they are
+    /// uploaded to a host (default: a `lnvps-os-images` dir under the system
+    /// temp dir).
+    #[serde(default)]
+    pub image_cache_dir: Option<PathBuf>,
+    /// Declares that [`QemuConfig::bridge`] has VLAN filtering enabled
+    /// (`vlan_filtering=1`, e.g. a Proxmox-style VLAN-aware bridge).
+    ///
+    /// libvirt accepts a `<vlan>` tag on any bridge interface, but a plain
+    /// Linux bridge silently ignores it and puts the VM on the untagged
+    /// network. VM creation therefore fails when the host has a `vlan_id` and
+    /// this is not set, rather than quietly breaking tenant isolation.
+    #[serde(default)]
+    pub vlan_aware_bridge: bool,
+    /// Enable UEFI secure boot for guests.
+    ///
+    /// Requires an OVMF secure-boot firmware on the host and a signed
+    /// bootloader in the guest image, so it defaults to `false` — enabling it
+    /// for an unsigned image makes the VM fail to boot.
+    #[serde(default)]
+    pub secure_boot: bool,
+    /// How long a graceful (ACPI) shutdown is given before the VM is powered
+    /// off by force. Default 60s.
+    ///
+    /// Without a forced stop, a guest that ignores ACPI would leave `stop_vm`
+    /// reporting success while the VM keeps running.
+    #[serde(default)]
+    pub shutdown_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
