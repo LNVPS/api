@@ -18,12 +18,15 @@
 --   * plain WireGuard VPNs sold to users,
 --   * infrastructure peerings, including tunnels carrying BGP.
 --
--- There is no `purpose` column. A tunnel sold to a user has a `user_id`; every
--- other tunnel is ours, and a marketplace node's is found through
--- `marketplace_node.tunnel_id`. A node link and a BGP transport differ in what
--- is routed over them, not in anything this table stores — and a column that
--- merely restates which reference points at the row is one more thing free to
--- disagree with it.
+-- There is no `purpose` column, and `user_id` is not one either. What a tunnel
+-- is *for* is decided by whichever table links to it —
+-- `marketplace_node.tunnel_id` today, a VPN or BGP table later. A node link and
+-- a BGP transport differ in what is routed over them, not in anything this
+-- table stores, so a column restating which reference points at the row would
+-- be one more thing free to disagree with it.
+--
+-- This table answers only: who owns this allocation, what key terminates it,
+-- and which addresses and route server it was given.
 
 CREATE TABLE tunnel (
     id INTEGER UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -33,11 +36,18 @@ CREATE TABLE tunnel (
     -- compared without a translation table.
     kind SMALLINT UNSIGNED NOT NULL DEFAULT 2,
 
-    -- The customer this tunnel was sold to, when it is a VPN. NULL means the
-    -- tunnel is LNVPS's own — a marketplace node's data plane, or an
-    -- infrastructure peering. A real FK rather than an (owner_type, owner_id)
-    -- pair, so the database still enforces that the owner exists.
-    user_id INTEGER UNSIGNED NULL DEFAULT NULL,
+    -- Who owns this allocation. Always set: every tunnel belongs to somebody,
+    -- including LNVPS's own infrastructure, which is owned by the account that
+    -- represents us. NOT NULL so "unowned" is not a state that has to be
+    -- handled — an allocation nobody owns is one nobody can be billed for,
+    -- audited against, or have revoked with their account.
+    --
+    -- Ownership says nothing about what the tunnel is for; that is the
+    -- referencing table's job.
+    --
+    -- A real FK rather than an (owner_type, owner_id) pair, so the database
+    -- still enforces that the owner exists.
+    user_id INTEGER UNSIGNED NOT NULL,
 
     -- The route server terminating this tunnel. NULL until one is chosen, so a
     -- tunnel can be allocated before it is placed.

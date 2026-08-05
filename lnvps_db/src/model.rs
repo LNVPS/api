@@ -1804,10 +1804,11 @@ pub struct MarketplaceOperator {
 /// is drift to be reported rather than an allocation that quietly vanished.
 ///
 /// One shape serves marketplace node data planes, user VPNs and infrastructure
-/// peerings. There is no `purpose`: a tunnel sold to a customer has a
-/// [`user_id`](Self::user_id), every other tunnel is ours, and a node's is
-/// found through [`MarketplaceNode::tunnel_id`]. What a tunnel is for is
-/// already recorded by whichever reference points at it.
+/// peerings. There is no `purpose`, and [`user_id`](Self::user_id) is not one:
+/// what a tunnel is *for* is decided by whichever table links to it —
+/// [`MarketplaceNode::tunnel_id`] today, a VPN or BGP table later. This record
+/// answers only who owns the allocation, what key terminates it, and which
+/// addresses and route server it was given.
 #[derive(FromRow, Clone, Debug, Default)]
 pub struct Tunnel {
     /// Unique id of this tunnel
@@ -1815,9 +1816,10 @@ pub struct Tunnel {
     /// Encapsulation. Values match [`RouterTunnelKind`] so desired and observed
     /// state compare directly.
     pub kind: RouterTunnelKind,
-    /// The customer this tunnel was sold to, when it is a VPN. `None` means it
-    /// is LNVPS's own — a node data plane or an infrastructure peering.
-    pub user_id: Option<u64>,
+    /// Who owns this allocation. Always set: every tunnel belongs to somebody,
+    /// including LNVPS's own infrastructure, which is owned by the account
+    /// representing us. Says nothing about what the tunnel is for.
+    pub user_id: u64,
     /// Route server terminating this tunnel. `None` until one is chosen.
     pub router_id: Option<u64>,
     /// Interface/peer name to configure on the router; correlates with

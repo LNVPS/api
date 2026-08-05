@@ -1154,7 +1154,8 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List every tunnel
     async fn list_tunnels(&self) -> DbResult<Vec<Tunnel>>;
 
-    /// List the VPN tunnels sold to one user
+    /// List the tunnels owned by one user. Ownership is not a type: this
+    /// returns whatever that account owns, whichever table links to it.
     async fn list_tunnels_for_user(&self, user_id: u64) -> DbResult<Vec<Tunnel>>;
 
     /// Allocate a tunnel, returning the new id

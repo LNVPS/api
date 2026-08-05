@@ -478,12 +478,11 @@ Migration `20260805120000_marketplace_node_registry.sql`:
   created), unique key so it identifies exactly one node. **No region** — that lives on the
   backing `vm_host`, and a second copy would be free to drift. **No WireGuard fields** — the
   data-plane identity lives in `tunnel`.
-- `tunnel`: the source of truth for what LNVPS has *assigned* (peer key, inner addresses,
-  route server), generic across marketplace nodes, user VPNs and infrastructure tunnels.
-  `marketplace_node.tunnel_id` points at it (unique — a tunnel terminates one peer), a
-  `user_id` marks a tunnel sold to a customer, and there is **no `purpose` column**: what a
-  tunnel is for is already recorded by whichever reference points at it. `router_tunnel`
-  remains the observed state.
+- `tunnel`: the source of truth for what LNVPS has *assigned* — owner, peer key, inner
+  addresses, route server — and nothing else. **What a tunnel is for is decided by whichever
+  table links to it**: `marketplace_node.tunnel_id` today, a VPN or BGP table later. There is
+  no `purpose` column, and `user_id` (NOT NULL) is ownership, not type: every allocation has
+  an owner, including LNVPS's own infrastructure. `router_tunnel` remains the observed state.
 - `vm_host.marketplace_node_id` NULLABLE UNIQUE FK, `company.marketplace_rate` default 0.
 - `VmHostKind::MarketplaceNode = 2`, `MarketplaceNodeStatus`, `MarketplaceTrustTier`,
   `PayoutMode` (shared with referrals), `lnvps_db` CRUD, mock impl, tests.

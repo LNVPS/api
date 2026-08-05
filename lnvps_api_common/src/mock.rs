@@ -3681,7 +3681,7 @@ impl LNVpsDbBase for MockDb {
         let tunnels = self.tunnels.lock().await;
         let mut out: Vec<_> = tunnels
             .values()
-            .filter(|t| t.user_id == Some(user_id))
+            .filter(|t| t.user_id == user_id)
             .cloned()
             .collect();
         out.sort_by_key(|t| t.id);
@@ -3689,11 +3689,9 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn insert_tunnel(&self, tunnel: &Tunnel) -> DbResult<u64> {
-        // FK tunnel.user_id
-        if let Some(user_id) = tunnel.user_id
-            && !self.users.lock().await.contains_key(&user_id)
-        {
-            return Err(anyhow!("User {} not found", user_id).into());
+        // FK tunnel.user_id (NOT NULL — every tunnel has an owner)
+        if !self.users.lock().await.contains_key(&tunnel.user_id) {
+            return Err(anyhow!("User {} not found", tunnel.user_id).into());
         }
         let mut tunnels = self.tunnels.lock().await;
         Self::check_tunnel_uniqueness(&tunnels, tunnel, None)?;
@@ -8566,9 +8564,11 @@ mod marketplace_tests {
 
     // ----- Tunnels -----
 
-    /// An unassigned tunnel: ours (no `user_id`) until a node points at it.
-    fn tunnel(name: &str) -> Tunnel {
+    /// An allocation owned by `user_id`. What it is *for* is decided by
+    /// whatever links to it, not by anything here.
+    fn tunnel(user_id: u64, name: &str) -> Tunnel {
         Tunnel {
+            user_id,
             name: name.to_string(),
             enabled: true,
             ..Default::default()
@@ -8582,7 +8582,7 @@ mod marketplace_tests {
         let op = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
         let node_id = db.insert_marketplace_node(&node(op, "a")).await.unwrap();
 
-        let mut t = tunnel("wg-node-1");
+        let mut t = tunnel(u1, "wg-node-1");
         t.peer_pubkey = Some(vec![3u8; 32]);
         t.address4 = Some("10.66.0.1/31".to_string());
         t.address6 = Some("2001:db8::1/127".to_string());
@@ -8592,8 +8592,8 @@ mod marketplace_tests {
         let loaded = db.get_tunnel(id).await.unwrap();
         // WireGuard is the default kind, matching the column default.
         assert_eq!(loaded.kind, RouterTunnelKind::Wireguard);
-        // Not sold to a customer, so it is ours.
-        assert_eq!(loaded.user_id, None);
+        // Every allocation has an owner; it says nothing about what it is for.
+        assert_eq!(loaded.user_id, u1);
         assert_eq!(loaded.address4.as_deref(), Some("10.66.0.1/31"));
         // Not yet placed on a route server.
         assert_eq!(loaded.router_id, None);
@@ -8628,24 +8628,25 @@ mod marketplace_tests {
     #[tokio::test]
     async fn an_inner_address_belongs_to_one_tunnel() {
         let db = MockDb::default();
+        let u1 = user(&db, 1).await;
 
-        let mut first = tunnel("wg-1");
+        let mut first = tunnel(u1, "wg-1");
         first.address4 = Some("10.66.0.1/31".to_string());
         first.peer_pubkey = Some(vec![1u8; 32]);
         db.insert_tunnel(&first).await.unwrap();
 
         // Reusing an inner address routes one tenant's traffic to another.
-        let mut clash = tunnel("wg-2");
+        let mut clash = tunnel(u1, "wg-2");
         clash.address4 = Some("10.66.0.1/31".to_string());
         assert!(db.insert_tunnel(&clash).await.is_err());
 
         // Same for the peer key: the route server could not tell them apart.
-        let mut key_clash = tunnel("wg-3");
+        let mut key_clash = tunnel(u1, "wg-3");
         key_clash.peer_pubkey = Some(vec![1u8; 32]);
         assert!(db.insert_tunnel(&key_clash).await.is_err());
 
         // ...and neither may be stolen by an update.
-        let mut ok = tunnel("wg-4");
+        let mut ok = tunnel(u1, "wg-4");
         ok.address6 = Some("2001:db8::1/127".to_string());
         let ok_id = db.insert_tunnel(&ok).await.unwrap();
         let mut steal = db.get_tunnel(ok_id).await.unwrap();
@@ -8653,8 +8654,8 @@ mod marketplace_tests {
         assert!(db.update_tunnel(&steal).await.is_err());
 
         // Unassigned tunnels do not collide with each other (SQL NULLs never do).
-        db.insert_tunnel(&tunnel("wg-5")).await.unwrap();
-        db.insert_tunnel(&tunnel("wg-6")).await.unwrap();
+        db.insert_tunnel(&tunnel(u1, "wg-5")).await.unwrap();
+        db.insert_tunnel(&tunnel(u1, "wg-6")).await.unwrap();
     }
 
     #[tokio::test]
@@ -8664,7 +8665,7 @@ mod marketplace_tests {
         let op = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
         let first = db.insert_marketplace_node(&node(op, "a")).await.unwrap();
         let second = db.insert_marketplace_node(&node(op, "b")).await.unwrap();
-        let t = db.insert_tunnel(&tunnel("wg-1")).await.unwrap();
+        let t = db.insert_tunnel(&tunnel(u1, "wg-1")).await.unwrap();
 
         let mut a = db.get_marketplace_node(first).await.unwrap();
         a.tunnel_id = Some(t);
@@ -8697,7 +8698,7 @@ mod marketplace_tests {
         let u1 = user(&db, 1).await;
         let op = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
         let node_id = db.insert_marketplace_node(&node(op, "a")).await.unwrap();
-        let t = db.insert_tunnel(&tunnel("wg-1")).await.unwrap();
+        let t = db.insert_tunnel(&tunnel(u1, "wg-1")).await.unwrap();
 
         let mut n = db.get_marketplace_node(node_id).await.unwrap();
         n.tunnel_id = Some(t);
@@ -8717,18 +8718,11 @@ mod marketplace_tests {
     #[tokio::test]
     async fn a_tunnel_cannot_change_owner() {
         let db = MockDb::default();
-        let u1 = user(&db, 1).await;
-        let id = db
-            .insert_tunnel(&Tunnel {
-                user_id: Some(u1),
-                name: "wg-vpn".to_string(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        let (u1, u2) = (user(&db, 1).await, user(&db, 2).await);
+        let id = db.insert_tunnel(&tunnel(u1, "wg-vpn")).await.unwrap();
 
         let mut hijack = db.get_tunnel(id).await.unwrap();
-        hijack.user_id = Some(u1 + 1);
+        hijack.user_id = u2;
         hijack.name = "renamed".to_string();
         db.update_tunnel(&hijack).await.unwrap();
 
@@ -8736,47 +8730,41 @@ mod marketplace_tests {
         // allocation would hand one tenant's addresses and key to another.
         let reloaded = db.get_tunnel(id).await.unwrap();
         assert_eq!(reloaded.name, "renamed");
-        assert_eq!(reloaded.user_id, Some(u1));
+        assert_eq!(reloaded.user_id, u1);
     }
 
     #[tokio::test]
     async fn tunnels_list_by_owner() {
         let db = MockDb::default();
-        let u1 = user(&db, 1).await;
+        let (u1, lnvps) = (user(&db, 1).await, user(&db, 9).await);
         let op = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
         let node_id = db.insert_marketplace_node(&node(op, "a")).await.unwrap();
 
-        let node_tunnel = db.insert_tunnel(&tunnel("wg-node")).await.unwrap();
+        // A node's data plane: owned by the operator, and marked as a node
+        // tunnel only by the node pointing at it.
+        let node_tunnel = db.insert_tunnel(&tunnel(u1, "wg-node")).await.unwrap();
         let mut n = db.get_marketplace_node(node_id).await.unwrap();
         n.tunnel_id = Some(node_tunnel);
         db.update_marketplace_node(&n).await.unwrap();
 
-        db.insert_tunnel(&Tunnel {
-            user_id: Some(u1),
-            name: "wg-vpn".to_string(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-        db.insert_tunnel(&tunnel("wg-bgp")).await.unwrap();
+        // A VPN sold to the same user, linked by nothing yet.
+        db.insert_tunnel(&tunnel(u1, "wg-vpn")).await.unwrap();
+        // LNVPS infrastructure is owned too — by the account representing us.
+        db.insert_tunnel(&tunnel(lnvps, "wg-bgp")).await.unwrap();
 
         assert_eq!(db.list_tunnels().await.unwrap().len(), 3);
-        // A customer sees their VPN and nothing else — not the node data plane
-        // and not the infrastructure tunnel, both of which are ours.
-        let mine = db.list_tunnels_for_user(u1).await.unwrap();
-        assert_eq!(mine.len(), 1);
-        assert_eq!(mine[0].name, "wg-vpn");
-        assert_eq!(db.list_tunnels_for_user(u1 + 1).await.unwrap().len(), 0);
 
-        // A VPN tunnel cannot be sold to a user who does not exist.
-        assert!(
-            db.insert_tunnel(&Tunnel {
-                user_id: Some(999),
-                name: "wg-ghost".to_string(),
-                ..Default::default()
-            })
-            .await
-            .is_err()
-        );
+        // Ownership is not a type: this user owns both a node data plane and a
+        // VPN, and the query returns what they own rather than what it is for.
+        let mine = db.list_tunnels_for_user(u1).await.unwrap();
+        assert_eq!(mine.len(), 2);
+        assert_eq!(db.list_tunnels_for_user(lnvps).await.unwrap().len(), 1);
+
+        // Which of them is the node's is answered by the node, not the tunnel.
+        let attached = db.get_marketplace_node(node_id).await.unwrap().tunnel_id;
+        assert_eq!(attached, Some(node_tunnel));
+
+        // A tunnel cannot be allocated to a user who does not exist.
+        assert!(db.insert_tunnel(&tunnel(999, "wg-ghost")).await.is_err());
     }
 }
