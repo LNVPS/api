@@ -1,6 +1,6 @@
 use crate::{ExchangeRateService, Ticker, TickerRate};
 use anyhow::{Context, anyhow};
-use chrono::{Days, Months, TimeDelta, Utc};
+use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, AgentConversation, AgentMessage, App, AppCluster, AppDeployment,
@@ -8,10 +8,11 @@ use lnvps_db::{
     AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
     Company, CpuArch, CpuMfg, DbError, DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind,
     EncryptedString, IntervalType, IpRange, IpRangeAllocationMode, IpRangeSubscription,
-    IpSpacePricing, LNVpsDbBase, NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution,
-    PaymentMethod, PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region,
-    Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription,
-    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, User,
+    IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator,
+    NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod,
+    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region, Router,
+    RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription,
+    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, Tunnel, User,
     UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
     VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind,
     VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
@@ -73,6 +74,9 @@ pub struct MockDb {
     pub asn_subscriptions: Arc<Mutex<HashMap<u64, AsnSubscription>>>,
     pub payment_method_configs: Arc<Mutex<HashMap<u64, PaymentMethodConfig>>>,
     pub referrals: Arc<Mutex<HashMap<u64, Referral>>>,
+    pub marketplace_operators: Arc<Mutex<HashMap<u64, MarketplaceOperator>>>,
+    pub marketplace_nodes: Arc<Mutex<HashMap<u64, MarketplaceNode>>>,
+    pub tunnels: Arc<Mutex<HashMap<u64, Tunnel>>>,
     pub referral_payouts: Arc<Mutex<Vec<ReferralPayout>>>,
     pub router_tunnels: Arc<Mutex<HashMap<u64, RouterTunnel>>>,
     pub router_tunnel_traffic: Arc<Mutex<Vec<RouterTunnelTraffic>>>,
@@ -110,6 +114,32 @@ pub struct MockDb {
 }
 
 impl MockDb {
+    /// The `uk_tunnel_*` unique keys: a peer key or an inner address may belong
+    /// to at most one tunnel. Two tunnels sharing an inner address is a routing
+    /// collision that delivers one tenant's traffic to another, so the mock
+    /// enforces it exactly as the schema does.
+    fn check_tunnel_uniqueness(
+        tunnels: &HashMap<u64, Tunnel>,
+        candidate: &Tunnel,
+        skip_id: Option<u64>,
+    ) -> DbResult<()> {
+        for other in tunnels.values() {
+            if Some(other.id) == skip_id {
+                continue;
+            }
+            if candidate.peer_pubkey.is_some() && other.peer_pubkey == candidate.peer_pubkey {
+                return Err(anyhow!("A tunnel with that peer key already exists").into());
+            }
+            if candidate.address4.is_some() && other.address4 == candidate.address4 {
+                return Err(anyhow!("Address {:?} is already assigned", candidate.address4).into());
+            }
+            if candidate.address6.is_some() && other.address6 == candidate.address6 {
+                return Err(anyhow!("Address {:?} is already assigned", candidate.address6).into());
+            }
+        }
+        Ok(())
+    }
+
     pub fn empty() -> MockDb {
         Self {
             ..Default::default()
@@ -259,6 +289,7 @@ impl Default for MockDb {
                 ssh_user: None,
                 ssh_key: None,
                 sunset_date: None,
+                marketplace_node_id: None,
             },
         );
         let mut host_disks = HashMap::new();
@@ -336,6 +367,7 @@ impl Default for MockDb {
                         base_currency: "EUR".to_string(),
                         referral_rate: 0.0,
                         max_prepay_days: 0,
+                        marketplace_rate: 0.0,
                     },
                 );
                 companies
@@ -388,6 +420,9 @@ impl Default for MockDb {
             asn_subscriptions: Arc::new(Default::default()),
             payment_method_configs: Arc::new(Default::default()),
             referrals: Arc::new(Default::default()),
+            marketplace_operators: Arc::new(Default::default()),
+            marketplace_nodes: Arc::new(Default::default()),
+            tunnels: Arc::new(Default::default()),
             referral_payouts: Arc::new(Default::default()),
             router_tunnels: Arc::new(Default::default()),
             router_tunnel_traffic: Arc::new(Default::default()),
@@ -3400,6 +3435,311 @@ impl LNVpsDbBase for MockDb {
                 .unwrap_or(false)
             })
             .count() as u64)
+    }
+
+    // ----- Marketplace (operator-run compute nodes) -----
+
+    async fn get_marketplace_operator(&self, id: u64) -> DbResult<MarketplaceOperator> {
+        let operators = self.marketplace_operators.lock().await;
+        operators
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Marketplace operator {} not found", id).into())
+    }
+
+    async fn get_marketplace_operator_by_user(
+        &self,
+        user_id: u64,
+    ) -> DbResult<MarketplaceOperator> {
+        let operators = self.marketplace_operators.lock().await;
+        operators
+            .values()
+            .find(|o| o.user_id == user_id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Marketplace operator not found for user {}", user_id).into())
+    }
+
+    async fn list_marketplace_operators(&self) -> DbResult<Vec<MarketplaceOperator>> {
+        let operators = self.marketplace_operators.lock().await;
+        let mut out: Vec<_> = operators.values().cloned().collect();
+        out.sort_by_key(|o| o.id);
+        Ok(out)
+    }
+
+    async fn insert_marketplace_operator(&self, operator: &MarketplaceOperator) -> DbResult<u64> {
+        // FK marketplace_operator.user_id
+        if !self.users.lock().await.contains_key(&operator.user_id) {
+            return Err(anyhow!("User {} not found", operator.user_id).into());
+        }
+        let mut operators = self.marketplace_operators.lock().await;
+        // uk_marketplace_operator_user
+        if operators.values().any(|o| o.user_id == operator.user_id) {
+            return Err(anyhow!("User {} is already an operator", operator.user_id).into());
+        }
+        let new_id = operators.keys().max().copied().unwrap_or(0) + 1;
+        operators.insert(
+            new_id,
+            MarketplaceOperator {
+                id: new_id,
+                created: Utc::now(),
+                ..operator.clone()
+            },
+        );
+        Ok(new_id)
+    }
+
+    async fn update_marketplace_operator(&self, operator: &MarketplaceOperator) -> DbResult<()> {
+        let mut operators = self.marketplace_operators.lock().await;
+        let existing = operators.get_mut(&operator.id).ok_or_else(|| {
+            DbError::Other(anyhow!("Marketplace operator {} not found", operator.id))
+        })?;
+        // user_id and created are immutable, matching the UPDATE statement.
+        existing.address = operator.address.clone();
+        existing.mode = operator.mode;
+        existing.payout_threshold = operator.payout_threshold;
+        existing.rate = operator.rate;
+        existing.enabled = operator.enabled;
+        Ok(())
+    }
+
+    async fn delete_marketplace_operator(&self, id: u64) -> DbResult<()> {
+        let nodes = self.marketplace_nodes.lock().await;
+        // FK marketplace_node.operator_id
+        if nodes.values().any(|n| n.operator_id == id) {
+            return Err(anyhow!("Operator {} still has nodes", id).into());
+        }
+        self.marketplace_operators.lock().await.remove(&id);
+        Ok(())
+    }
+
+    async fn get_marketplace_node(&self, id: u64) -> DbResult<MarketplaceNode> {
+        let nodes = self.marketplace_nodes.lock().await;
+        nodes
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Marketplace node {} not found", id).into())
+    }
+
+    async fn get_marketplace_node_by_nostr_pubkey(
+        &self,
+        pubkey: &[u8],
+    ) -> DbResult<MarketplaceNode> {
+        let nodes = self.marketplace_nodes.lock().await;
+        nodes
+            .values()
+            .find(|n| n.nostr_pubkey.as_deref() == Some(pubkey))
+            .cloned()
+            .ok_or_else(|| anyhow!("No marketplace node with that pubkey").into())
+    }
+
+    async fn list_marketplace_nodes(&self, operator_id: u64) -> DbResult<Vec<MarketplaceNode>> {
+        let nodes = self.marketplace_nodes.lock().await;
+        let mut out: Vec<_> = nodes
+            .values()
+            .filter(|n| n.operator_id == operator_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|n| n.id);
+        Ok(out)
+    }
+
+    async fn list_all_marketplace_nodes(
+        &self,
+        status: Option<MarketplaceNodeStatus>,
+    ) -> DbResult<Vec<MarketplaceNode>> {
+        let nodes = self.marketplace_nodes.lock().await;
+        let mut out: Vec<_> = nodes
+            .values()
+            .filter(|n| status.is_none_or(|s| n.status == s))
+            .cloned()
+            .collect();
+        out.sort_by_key(|n| n.id);
+        Ok(out)
+    }
+
+    async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64> {
+        let operators = self.marketplace_operators.lock().await;
+        // FK marketplace_node.operator_id
+        if !operators.contains_key(&node.operator_id) {
+            return Err(anyhow!("Operator {} not found", node.operator_id).into());
+        }
+        drop(operators);
+        if let Some(tunnel_id) = node.tunnel_id
+            && !self.tunnels.lock().await.contains_key(&tunnel_id)
+        {
+            return Err(anyhow!("Tunnel {} not found", tunnel_id).into());
+        }
+        let mut nodes = self.marketplace_nodes.lock().await;
+        // uk_marketplace_node_nostr_pubkey (NULLs do not collide in MySQL either)
+        if let Some(pubkey) = node.nostr_pubkey.as_deref()
+            && nodes
+                .values()
+                .any(|n| n.nostr_pubkey.as_deref() == Some(pubkey))
+        {
+            return Err(anyhow!("A node with that pubkey already exists").into());
+        }
+        // uk_marketplace_node_tunnel
+        if let Some(tunnel_id) = node.tunnel_id
+            && nodes.values().any(|n| n.tunnel_id == Some(tunnel_id))
+        {
+            return Err(anyhow!("Tunnel {} already backs another node", tunnel_id).into());
+        }
+        let new_id = nodes.keys().max().copied().unwrap_or(0) + 1;
+        nodes.insert(
+            new_id,
+            MarketplaceNode {
+                id: new_id,
+                created: Utc::now(),
+                ..node.clone()
+            },
+        );
+        Ok(new_id)
+    }
+
+    async fn update_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<()> {
+        if let Some(tunnel_id) = node.tunnel_id
+            && !self.tunnels.lock().await.contains_key(&tunnel_id)
+        {
+            return Err(anyhow!("Tunnel {} not found", tunnel_id).into());
+        }
+        let mut nodes = self.marketplace_nodes.lock().await;
+        if let Some(tunnel_id) = node.tunnel_id
+            && nodes
+                .values()
+                .any(|n| n.id != node.id && n.tunnel_id == Some(tunnel_id))
+        {
+            return Err(anyhow!("Tunnel {} already backs another node", tunnel_id).into());
+        }
+        if let Some(pubkey) = node.nostr_pubkey.as_deref()
+            && nodes
+                .values()
+                .any(|n| n.id != node.id && n.nostr_pubkey.as_deref() == Some(pubkey))
+        {
+            return Err(anyhow!("A node with that pubkey already exists").into());
+        }
+        let existing = nodes
+            .get_mut(&node.id)
+            .ok_or_else(|| DbError::Other(anyhow!("Marketplace node {} not found", node.id)))?;
+        // operator_id, created and last_seen are not written by the UPDATE:
+        // a node cannot change hands, and heartbeats go through
+        // `touch_marketplace_node`.
+        existing.name = node.name.clone();
+        existing.nostr_pubkey = node.nostr_pubkey.clone();
+        existing.status = node.status;
+        existing.trust_tier = node.trust_tier;
+        existing.tunnel_id = node.tunnel_id;
+        Ok(())
+    }
+
+    async fn touch_marketplace_node(&self, id: u64, seen: DateTime<Utc>) -> DbResult<()> {
+        let mut nodes = self.marketplace_nodes.lock().await;
+        let node = nodes
+            .get_mut(&id)
+            .ok_or_else(|| DbError::Other(anyhow!("Marketplace node {} not found", id)))?;
+        node.last_seen = Some(seen);
+        Ok(())
+    }
+
+    async fn delete_marketplace_node(&self, id: u64) -> DbResult<()> {
+        let hosts = self.hosts.lock().await;
+        // FK vm_host.marketplace_node_id
+        if hosts.values().any(|h| h.marketplace_node_id == Some(id)) {
+            return Err(anyhow!("Node {} still backs a vm_host", id).into());
+        }
+        drop(hosts);
+        self.marketplace_nodes.lock().await.remove(&id);
+        Ok(())
+    }
+
+    // ----- Tunnels -----
+
+    async fn get_tunnel(&self, id: u64) -> DbResult<Tunnel> {
+        let tunnels = self.tunnels.lock().await;
+        tunnels
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Tunnel {} not found", id).into())
+    }
+
+    async fn get_tunnel_by_peer_pubkey(&self, peer_pubkey: &[u8]) -> DbResult<Tunnel> {
+        let tunnels = self.tunnels.lock().await;
+        tunnels
+            .values()
+            .find(|t| t.peer_pubkey.as_deref() == Some(peer_pubkey))
+            .cloned()
+            .ok_or_else(|| anyhow!("No tunnel with that peer key").into())
+    }
+
+    async fn list_tunnels(&self) -> DbResult<Vec<Tunnel>> {
+        let tunnels = self.tunnels.lock().await;
+        let mut out: Vec<_> = tunnels.values().cloned().collect();
+        out.sort_by_key(|t| t.id);
+        Ok(out)
+    }
+
+    async fn list_tunnels_for_user(&self, user_id: u64) -> DbResult<Vec<Tunnel>> {
+        let tunnels = self.tunnels.lock().await;
+        let mut out: Vec<_> = tunnels
+            .values()
+            .filter(|t| t.user_id == user_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|t| t.id);
+        Ok(out)
+    }
+
+    async fn insert_tunnel(&self, tunnel: &Tunnel) -> DbResult<u64> {
+        // FK tunnel.user_id (NOT NULL — every tunnel has an owner)
+        if !self.users.lock().await.contains_key(&tunnel.user_id) {
+            return Err(anyhow!("User {} not found", tunnel.user_id).into());
+        }
+        let mut tunnels = self.tunnels.lock().await;
+        Self::check_tunnel_uniqueness(&tunnels, tunnel, None)?;
+        let new_id = tunnels.keys().max().copied().unwrap_or(0) + 1;
+        tunnels.insert(
+            new_id,
+            Tunnel {
+                id: new_id,
+                created: Utc::now(),
+                ..tunnel.clone()
+            },
+        );
+        Ok(new_id)
+    }
+
+    async fn update_tunnel(&self, tunnel: &Tunnel) -> DbResult<()> {
+        let mut tunnels = self.tunnels.lock().await;
+        Self::check_tunnel_uniqueness(&tunnels, tunnel, Some(tunnel.id))?;
+        let existing = tunnels
+            .get_mut(&tunnel.id)
+            .ok_or_else(|| DbError::Other(anyhow!("Tunnel {} not found", tunnel.id)))?;
+        // user_id and created are not written: moving an allocation to another
+        // owner would hand one tenant's addresses and key to another.
+        existing.kind = tunnel.kind;
+        existing.router_id = tunnel.router_id;
+        existing.name = tunnel.name.clone();
+        existing.peer_pubkey = tunnel.peer_pubkey.clone();
+        existing.peer_endpoint = tunnel.peer_endpoint.clone();
+        existing.address4 = tunnel.address4.clone();
+        existing.address6 = tunnel.address6.clone();
+        existing.keepalive = tunnel.keepalive;
+        existing.enabled = tunnel.enabled;
+        Ok(())
+    }
+
+    async fn delete_tunnel(&self, id: u64) -> DbResult<()> {
+        // FK marketplace_node.tunnel_id
+        if self
+            .marketplace_nodes
+            .lock()
+            .await
+            .values()
+            .any(|n| n.tunnel_id == Some(id))
+        {
+            return Err(anyhow!("Tunnel {} still backs a marketplace node", id).into());
+        }
+        self.tunnels.lock().await.remove(&id);
+        Ok(())
     }
 
     // ----- App catalog -----
@@ -7922,5 +8262,509 @@ impl crate::dns::DnsServer for MockDnsServer {
             id: "mock-zone-id".to_string(),
             name: "mock.example.com".to_string(),
         }])
+    }
+}
+
+#[cfg(test)]
+mod marketplace_tests {
+    use super::*;
+    use lnvps_db::{LNVpsDbBase, MarketplaceTrustTier, PayoutMode, RouterTunnelKind};
+
+    /// Create a user, returning its id. The marketplace tables carry real FKs
+    /// to `users`, so tests cannot invent owners.
+    async fn user(db: &MockDb, n: u8) -> u64 {
+        db.upsert_user(&[n; 32]).await.unwrap()
+    }
+
+    /// An operator enrolment for `user_id`, with the defaults a fresh signup has.
+    fn operator(user_id: u64) -> MarketplaceOperator {
+        MarketplaceOperator {
+            user_id,
+            address: Some("operator@example.com".to_string()),
+            mode: PayoutMode::LightningAddress,
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    fn node(operator_id: u64, name: &str) -> MarketplaceNode {
+        MarketplaceNode {
+            operator_id,
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_crud_roundtrip() {
+        let db = MockDb::default();
+        let u1 = user(&db, 1).await;
+
+        let id = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
+        let loaded = db.get_marketplace_operator(id).await.unwrap();
+        assert_eq!(loaded.user_id, 1);
+        assert_eq!(loaded.mode, PayoutMode::LightningAddress);
+        // No override by default: the company rate applies.
+        assert_eq!(loaded.rate, None);
+        assert_eq!(loaded.payout_threshold, None);
+        assert!(loaded.enabled);
+
+        // Lookup by user is how the operator's own API calls will resolve.
+        let by_user = db.get_marketplace_operator_by_user(1).await.unwrap();
+        assert_eq!(by_user.id, id);
+
+        let mut update = loaded.clone();
+        update.rate = Some(70.0);
+        update.payout_threshold = Some(10_000);
+        update.mode = PayoutMode::Nwc;
+        update.address = None;
+        update.enabled = false;
+        db.update_marketplace_operator(&update).await.unwrap();
+
+        let reloaded = db.get_marketplace_operator(id).await.unwrap();
+        assert_eq!(reloaded.rate, Some(70.0));
+        assert_eq!(reloaded.payout_threshold, Some(10_000));
+        assert_eq!(reloaded.mode, PayoutMode::Nwc);
+        assert_eq!(reloaded.address, None);
+        assert!(!reloaded.enabled);
+
+        assert_eq!(db.list_marketplace_operators().await.unwrap().len(), 1);
+        db.delete_marketplace_operator(id).await.unwrap();
+        assert!(db.get_marketplace_operator(id).await.is_err());
+        assert!(db.list_marketplace_operators().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn operator_enrolment_is_one_per_user() {
+        let db = MockDb::default();
+        let (u1, u2) = (user(&db, 1).await, user(&db, 2).await);
+        db.insert_marketplace_operator(&operator(u1)).await.unwrap();
+        // uk_marketplace_operator_user: a second enrolment would split one
+        // user's earnings across two balances.
+        assert!(db.insert_marketplace_operator(&operator(u1)).await.is_err());
+        db.insert_marketplace_operator(&operator(u2)).await.unwrap();
+        // FK marketplace_operator.user_id
+        assert!(
+            db.insert_marketplace_operator(&operator(999))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_update_cannot_move_the_enrolment_to_another_user() {
+        let db = MockDb::default();
+        let u1 = user(&db, 1).await;
+        let id = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
+
+        let mut hijack = db.get_marketplace_operator(id).await.unwrap();
+        hijack.user_id = 2;
+        hijack.rate = Some(50.0);
+        db.update_marketplace_operator(&hijack).await.unwrap();
+
+        // The mutable field changed; the owner did not. Otherwise an update
+        // endpoint would be a way to redirect somebody else's payouts.
+        let reloaded = db.get_marketplace_operator(id).await.unwrap();
+        assert_eq!(reloaded.rate, Some(50.0));
+        assert_eq!(reloaded.user_id, 1);
+    }
+
+    #[tokio::test]
+    async fn node_crud_roundtrip() {
+        let db = MockDb::default();
+        let u1 = user(&db, 1).await;
+        let op = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
+
+        let id = db
+            .insert_marketplace_node(&node(op, "rack-1"))
+            .await
+            .unwrap();
+        let loaded = db.get_marketplace_node(id).await.unwrap();
+        assert_eq!(loaded.name, "rack-1");
+        // A new node is pending and untrusted: it must not be placeable purely
+        // by being registered.
+        assert_eq!(loaded.status, MarketplaceNodeStatus::Pending);
+        assert_eq!(loaded.trust_tier, MarketplaceTrustTier::Untrusted);
+        assert!(!loaded.status.accepts_placement());
+        assert_eq!(loaded.last_seen, None);
+        assert_eq!(loaded.nostr_pubkey, None);
+
+        let mut update = loaded.clone();
+        update.name = "rack-1a".to_string();
+        update.status = MarketplaceNodeStatus::Approved;
+        update.trust_tier = MarketplaceTrustTier::Verified;
+        update.nostr_pubkey = Some(vec![7u8; 32]);
+        db.update_marketplace_node(&update).await.unwrap();
+
+        let reloaded = db.get_marketplace_node(id).await.unwrap();
+        assert_eq!(reloaded.name, "rack-1a");
+        assert!(reloaded.status.accepts_placement());
+        assert_eq!(reloaded.trust_tier, MarketplaceTrustTier::Verified);
+        assert_eq!(reloaded.nostr_pubkey, Some(vec![7u8; 32]));
+
+        // The control channel resolves a connection by key.
+        let by_key = db
+            .get_marketplace_node_by_nostr_pubkey(&[7u8; 32])
+            .await
+            .unwrap();
+        assert_eq!(by_key.id, id);
+        assert!(
+            db.get_marketplace_node_by_nostr_pubkey(&[9u8; 32])
+                .await
+                .is_err()
+        );
+
+        db.delete_marketplace_node(id).await.unwrap();
+        assert!(db.get_marketplace_node(id).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn node_listing_filters_by_operator_and_status() {
+        let db = MockDb::default();
+        let (u1, u2) = (user(&db, 1).await, user(&db, 2).await);
+        let op1 = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
+        let op2 = db.insert_marketplace_operator(&operator(u2)).await.unwrap();
+
+        let a = db.insert_marketplace_node(&node(op1, "a")).await.unwrap();
+        db.insert_marketplace_node(&node(op1, "b")).await.unwrap();
+        db.insert_marketplace_node(&node(op2, "c")).await.unwrap();
+
+        let mut approved = db.get_marketplace_node(a).await.unwrap();
+        approved.status = MarketplaceNodeStatus::Approved;
+        db.update_marketplace_node(&approved).await.unwrap();
+
+        // An operator sees only their own hardware.
+        let mine = db.list_marketplace_nodes(op1).await.unwrap();
+        assert_eq!(mine.len(), 2);
+        assert!(mine.iter().all(|n| n.operator_id == op1));
+        assert_eq!(db.list_marketplace_nodes(op2).await.unwrap().len(), 1);
+
+        assert_eq!(db.list_all_marketplace_nodes(None).await.unwrap().len(), 3);
+        let pending = db
+            .list_all_marketplace_nodes(Some(MarketplaceNodeStatus::Pending))
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+        let live = db
+            .list_all_marketplace_nodes(Some(MarketplaceNodeStatus::Approved))
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, a);
+    }
+
+    #[tokio::test]
+    async fn a_node_key_identifies_exactly_one_node() {
+        let db = MockDb::default();
+        let u1 = user(&db, 1).await;
+        let op = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
+
+        let mut first = node(op, "a");
+        first.nostr_pubkey = Some(vec![1u8; 32]);
+        db.insert_marketplace_node(&first).await.unwrap();
+
+        // uk_marketplace_node_pubkey. Without this a second node could claim an
+        // approved node's identity on the control channel.
+        let mut clash = node(op, "b");
+        clash.nostr_pubkey = Some(vec![1u8; 32]);
+        assert!(db.insert_marketplace_node(&clash).await.is_err());
+
+        // ...and the same must hold on update, not just insert.
+        clash.nostr_pubkey = None;
+        let other_id = db.insert_marketplace_node(&clash).await.unwrap();
+        let mut steal = db.get_marketplace_node(other_id).await.unwrap();
+        steal.nostr_pubkey = Some(vec![1u8; 32]);
+        assert!(db.update_marketplace_node(&steal).await.is_err());
+
+        // Keyless nodes do not collide with each other (SQL NULLs never do).
+        db.insert_marketplace_node(&node(op, "c")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn node_cannot_be_registered_to_a_missing_operator() {
+        let db = MockDb::default();
+        assert!(
+            db.insert_marketplace_node(&node(999, "orphan"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn node_update_cannot_move_hardware_between_operators() {
+        let db = MockDb::default();
+        let (u1, u2) = (user(&db, 1).await, user(&db, 2).await);
+        let op1 = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
+        let op2 = db.insert_marketplace_operator(&operator(u2)).await.unwrap();
+        let id = db.insert_marketplace_node(&node(op1, "a")).await.unwrap();
+
+        let mut hijack = db.get_marketplace_node(id).await.unwrap();
+        hijack.operator_id = op2;
+        db.update_marketplace_node(&hijack).await.unwrap();
+
+        // Reassigning a node would move its earnings history to someone else.
+        assert_eq!(db.get_marketplace_node(id).await.unwrap().operator_id, op1);
+        assert_eq!(db.list_marketplace_nodes(op2).await.unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_updates_only_last_seen() {
+        let db = MockDb::default();
+        let u1 = user(&db, 1).await;
+        let op = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
+        let id = db.insert_marketplace_node(&node(op, "a")).await.unwrap();
+
+        let seen = Utc::now();
+        db.touch_marketplace_node(id, seen).await.unwrap();
+        let loaded = db.get_marketplace_node(id).await.unwrap();
+        assert_eq!(loaded.last_seen, Some(seen));
+        // A heartbeat must never resurrect a suspended node.
+        assert_eq!(loaded.status, MarketplaceNodeStatus::Pending);
+
+        assert!(db.touch_marketplace_node(999, seen).await.is_err());
+
+        // Conversely, an admin edit must not clobber liveness with a stale
+        // value read before the last heartbeat.
+        let mut edit = loaded.clone();
+        edit.last_seen = None;
+        edit.status = MarketplaceNodeStatus::Approved;
+        db.update_marketplace_node(&edit).await.unwrap();
+        assert_eq!(
+            db.get_marketplace_node(id).await.unwrap().last_seen,
+            Some(seen)
+        );
+    }
+
+    #[tokio::test]
+    async fn live_hardware_cannot_be_deleted_out_from_under_customers() {
+        let db = MockDb::default();
+        let u1 = user(&db, 1).await;
+        let op = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
+        let node_id = db.insert_marketplace_node(&node(op, "a")).await.unwrap();
+
+        // An operator enrolment with nodes cannot be dropped...
+        assert!(db.delete_marketplace_operator(op).await.is_err());
+
+        // ...and a node backing a host cannot be dropped either.
+        {
+            let mut hosts = db.hosts.lock().await;
+            let host = hosts.get_mut(&1).expect("seeded host");
+            host.marketplace_node_id = Some(node_id);
+        }
+        assert!(db.delete_marketplace_node(node_id).await.is_err());
+
+        // Detaching the host is what makes removal safe, in that order.
+        {
+            let mut hosts = db.hosts.lock().await;
+            hosts.get_mut(&1).unwrap().marketplace_node_id = None;
+        }
+        db.delete_marketplace_node(node_id).await.unwrap();
+        db.delete_marketplace_operator(op).await.unwrap();
+    }
+
+    // ----- Tunnels -----
+
+    /// An allocation owned by `user_id`. What it is *for* is decided by
+    /// whatever links to it, not by anything here.
+    fn tunnel(user_id: u64, name: &str) -> Tunnel {
+        Tunnel {
+            user_id,
+            name: name.to_string(),
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn tunnel_crud_roundtrip() {
+        let db = MockDb::default();
+        let u1 = user(&db, 1).await;
+        let op = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
+        let node_id = db.insert_marketplace_node(&node(op, "a")).await.unwrap();
+
+        let mut t = tunnel(u1, "wg-node-1");
+        t.peer_pubkey = Some(vec![3u8; 32]);
+        t.address4 = Some("10.66.0.1/31".to_string());
+        t.address6 = Some("2001:db8::1/127".to_string());
+        t.keepalive = Some(25);
+        let id = db.insert_tunnel(&t).await.unwrap();
+
+        let loaded = db.get_tunnel(id).await.unwrap();
+        // WireGuard is the default kind, matching the column default.
+        assert_eq!(loaded.kind, RouterTunnelKind::Wireguard);
+        // Every allocation has an owner; it says nothing about what it is for.
+        assert_eq!(loaded.user_id, u1);
+        assert_eq!(loaded.address4.as_deref(), Some("10.66.0.1/31"));
+        // Not yet placed on a route server.
+        assert_eq!(loaded.router_id, None);
+
+        // A route server resolves an incoming handshake to its allocation.
+        let by_key = db.get_tunnel_by_peer_pubkey(&[3u8; 32]).await.unwrap();
+        assert_eq!(by_key.id, id);
+        assert!(db.get_tunnel_by_peer_pubkey(&[4u8; 32]).await.is_err());
+
+        // The node points at its tunnel, not the other way round.
+        let mut with_tunnel = db.get_marketplace_node(node_id).await.unwrap();
+        assert_eq!(with_tunnel.tunnel_id, None);
+        with_tunnel.tunnel_id = Some(id);
+        db.update_marketplace_node(&with_tunnel).await.unwrap();
+        assert_eq!(
+            db.get_marketplace_node(node_id).await.unwrap().tunnel_id,
+            Some(id)
+        );
+
+        let mut update = loaded.clone();
+        update.enabled = false;
+        update.peer_endpoint = Some("198.51.100.7:51820".to_string());
+        db.update_tunnel(&update).await.unwrap();
+        let reloaded = db.get_tunnel(id).await.unwrap();
+        assert!(!reloaded.enabled);
+        assert_eq!(
+            reloaded.peer_endpoint.as_deref(),
+            Some("198.51.100.7:51820")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_inner_address_belongs_to_one_tunnel() {
+        let db = MockDb::default();
+        let u1 = user(&db, 1).await;
+
+        let mut first = tunnel(u1, "wg-1");
+        first.address4 = Some("10.66.0.1/31".to_string());
+        first.peer_pubkey = Some(vec![1u8; 32]);
+        db.insert_tunnel(&first).await.unwrap();
+
+        // Reusing an inner address routes one tenant's traffic to another.
+        let mut clash = tunnel(u1, "wg-2");
+        clash.address4 = Some("10.66.0.1/31".to_string());
+        assert!(db.insert_tunnel(&clash).await.is_err());
+
+        // Same for the peer key: the route server could not tell them apart.
+        let mut key_clash = tunnel(u1, "wg-3");
+        key_clash.peer_pubkey = Some(vec![1u8; 32]);
+        assert!(db.insert_tunnel(&key_clash).await.is_err());
+
+        // ...and neither may be stolen by an update.
+        let mut ok = tunnel(u1, "wg-4");
+        ok.address6 = Some("2001:db8::1/127".to_string());
+        let ok_id = db.insert_tunnel(&ok).await.unwrap();
+        let mut steal = db.get_tunnel(ok_id).await.unwrap();
+        steal.address4 = Some("10.66.0.1/31".to_string());
+        assert!(db.update_tunnel(&steal).await.is_err());
+
+        // Unassigned tunnels do not collide with each other (SQL NULLs never do).
+        db.insert_tunnel(&tunnel(u1, "wg-5")).await.unwrap();
+        db.insert_tunnel(&tunnel(u1, "wg-6")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_backs_exactly_one_node() {
+        let db = MockDb::default();
+        let u1 = user(&db, 1).await;
+        let op = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
+        let first = db.insert_marketplace_node(&node(op, "a")).await.unwrap();
+        let second = db.insert_marketplace_node(&node(op, "b")).await.unwrap();
+        let t = db.insert_tunnel(&tunnel(u1, "wg-1")).await.unwrap();
+
+        let mut a = db.get_marketplace_node(first).await.unwrap();
+        a.tunnel_id = Some(t);
+        db.update_marketplace_node(&a).await.unwrap();
+
+        // uk_marketplace_node_tunnel: two machines answering to one key and
+        // address is exactly the collision the unique index exists to stop.
+        let mut b = db.get_marketplace_node(second).await.unwrap();
+        b.tunnel_id = Some(t);
+        assert!(db.update_marketplace_node(&b).await.is_err());
+        assert_eq!(
+            db.get_marketplace_node(second).await.unwrap().tunnel_id,
+            None
+        );
+
+        // ...including at registration time.
+        let mut fresh = node(op, "c");
+        fresh.tunnel_id = Some(t);
+        assert!(db.insert_marketplace_node(&fresh).await.is_err());
+
+        // A node cannot point at a tunnel that does not exist.
+        let mut ghost = db.get_marketplace_node(second).await.unwrap();
+        ghost.tunnel_id = Some(999);
+        assert!(db.update_marketplace_node(&ghost).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_carrying_guest_traffic_cannot_be_deleted() {
+        let db = MockDb::default();
+        let u1 = user(&db, 1).await;
+        let op = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
+        let node_id = db.insert_marketplace_node(&node(op, "a")).await.unwrap();
+        let t = db.insert_tunnel(&tunnel(u1, "wg-1")).await.unwrap();
+
+        let mut n = db.get_marketplace_node(node_id).await.unwrap();
+        n.tunnel_id = Some(t);
+        db.update_marketplace_node(&n).await.unwrap();
+
+        // FK marketplace_node.tunnel_id — deleting it would cut a live data
+        // plane and orphan the allocation.
+        assert!(db.delete_tunnel(t).await.is_err());
+
+        // Detaching first is what makes removal safe, in that order.
+        n.tunnel_id = None;
+        db.update_marketplace_node(&n).await.unwrap();
+        db.delete_tunnel(t).await.unwrap();
+        assert!(db.get_tunnel(t).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_cannot_change_owner() {
+        let db = MockDb::default();
+        let (u1, u2) = (user(&db, 1).await, user(&db, 2).await);
+        let id = db.insert_tunnel(&tunnel(u1, "wg-vpn")).await.unwrap();
+
+        let mut hijack = db.get_tunnel(id).await.unwrap();
+        hijack.user_id = u2;
+        hijack.name = "renamed".to_string();
+        db.update_tunnel(&hijack).await.unwrap();
+
+        // The mutable field changed; ownership did not. Re-pointing an
+        // allocation would hand one tenant's addresses and key to another.
+        let reloaded = db.get_tunnel(id).await.unwrap();
+        assert_eq!(reloaded.name, "renamed");
+        assert_eq!(reloaded.user_id, u1);
+    }
+
+    #[tokio::test]
+    async fn tunnels_list_by_owner() {
+        let db = MockDb::default();
+        let (u1, lnvps) = (user(&db, 1).await, user(&db, 9).await);
+        let op = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
+        let node_id = db.insert_marketplace_node(&node(op, "a")).await.unwrap();
+
+        // A node's data plane: owned by the operator, and marked as a node
+        // tunnel only by the node pointing at it.
+        let node_tunnel = db.insert_tunnel(&tunnel(u1, "wg-node")).await.unwrap();
+        let mut n = db.get_marketplace_node(node_id).await.unwrap();
+        n.tunnel_id = Some(node_tunnel);
+        db.update_marketplace_node(&n).await.unwrap();
+
+        // A VPN sold to the same user, linked by nothing yet.
+        db.insert_tunnel(&tunnel(u1, "wg-vpn")).await.unwrap();
+        // LNVPS infrastructure is owned too — by the account representing us.
+        db.insert_tunnel(&tunnel(lnvps, "wg-bgp")).await.unwrap();
+
+        assert_eq!(db.list_tunnels().await.unwrap().len(), 3);
+
+        // Ownership is not a type: this user owns both a node data plane and a
+        // VPN, and the query returns what they own rather than what it is for.
+        let mine = db.list_tunnels_for_user(u1).await.unwrap();
+        assert_eq!(mine.len(), 2);
+        assert_eq!(db.list_tunnels_for_user(lnvps).await.unwrap().len(), 1);
+
+        // Which of them is the node's is answered by the node, not the tunnel.
+        let attached = db.get_marketplace_node(node_id).await.unwrap().tunnel_id;
+        assert_eq!(attached, Some(node_tunnel));
+
+        // A tunnel cannot be allocated to a user who does not exist.
+        assert!(db.insert_tunnel(&tunnel(999, "wg-ghost")).await.is_err());
     }
 }

@@ -22,6 +22,12 @@ use lnvps_db::{
 pub enum AdminVmHostKind {
     Proxmox,
     Libvirt,
+    /// Operator-owned hardware, controlled over the marketplace node daemon's
+    /// outbound channel. Reported for existing hosts, but a host of this kind
+    /// cannot be *created* through the admin host API: the backing row is
+    /// created by node approval, which is what supplies its
+    /// `marketplace_node_id`.
+    MarketplaceNode,
     Mock,
 }
 
@@ -30,6 +36,7 @@ impl From<VmHostKind> for AdminVmHostKind {
         match host_kind {
             VmHostKind::Proxmox => AdminVmHostKind::Proxmox,
             VmHostKind::LibVirt => AdminVmHostKind::Libvirt,
+            VmHostKind::MarketplaceNode => AdminVmHostKind::MarketplaceNode,
             VmHostKind::Dummy => AdminVmHostKind::Mock,
         }
     }
@@ -40,6 +47,7 @@ impl From<AdminVmHostKind> for VmHostKind {
         match admin_host_kind {
             AdminVmHostKind::Proxmox => VmHostKind::Proxmox,
             AdminVmHostKind::Libvirt => VmHostKind::LibVirt,
+            AdminVmHostKind::MarketplaceNode => VmHostKind::MarketplaceNode,
             AdminVmHostKind::Mock => VmHostKind::Dummy,
         }
     }

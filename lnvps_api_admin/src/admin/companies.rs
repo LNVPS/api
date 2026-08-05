@@ -158,6 +158,10 @@ async fn admin_create_company(
         base_currency,
         referral_rate: req.referral_rate.unwrap_or(0.0).max(0.0),
         max_prepay_days: req.max_prepay_days.unwrap_or(0),
+        // Marketplace revenue share is not settable through the admin API yet
+        // (no marketplace exists to pay out); the column defaults to 0, which
+        // means "no revenue share", and is left untouched by company updates.
+        marketplace_rate: 0.0,
     };
 
     let company_id = this.db.admin_create_company(&company).await?;
