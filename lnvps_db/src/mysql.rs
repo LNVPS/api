@@ -2970,7 +2970,35 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .execute(tx.as_mut())
         .await?;
 
-        if let Some(time_value) = payment.time_value {
+        // A subscription that bills nothing recurring has nothing to renew, so
+        // it must never acquire an expiry. Without this branch a one-off
+        // purchase (a marketplace node listing fee) would be given an expiry by
+        // the code below, and `check_subscriptions` would then mail the customer
+        // "your subscription will expire soon" for something they bought
+        // outright.
+        //
+        // Deliberately narrow: it requires a setup fee *and* no recurring
+        // amount, so it describes a one-off purchase and nothing else. A free or
+        // fully-discounted recurring subscription has neither, and keeps today's
+        // behaviour of expiring on schedule — a zero-amount VM must still lapse.
+        let recurring: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT COALESCE(SUM(amount), 0), COALESCE(SUM(setup_amount), 0) \
+             FROM subscription_line_item WHERE subscription_id = ?",
+        )
+        .bind(payment.subscription_id)
+        .fetch_optional(tx.as_mut())
+        .await?;
+        let one_off = matches!(recurring, Some((0, setup)) if setup > 0);
+
+        if one_off {
+            // Still activate it: the expiry UPDATE below is also what sets
+            // `is_active` and `is_setup`, so skipping it wholesale would leave a
+            // paid fee looking unpaid.
+            sqlx::query("UPDATE subscription SET is_active = 1, is_setup = 1 WHERE id = ?")
+                .bind(payment.subscription_id)
+                .execute(tx.as_mut())
+                .await?;
+        } else if let Some(time_value) = payment.time_value {
             // Extend subscription.expires by explicit time_value seconds
             sqlx::query(
                 "UPDATE subscription SET expires = DATE_ADD(GREATEST(COALESCE(expires, NOW()), NOW()), INTERVAL ? SECOND), is_active = 1, is_setup = 1 WHERE id = ?",
@@ -4065,10 +4093,22 @@ impl LNVpsDbBase for LNVpsDbMysql {
         })
     }
 
+    async fn get_marketplace_node_by_line_item(
+        &self,
+        line_item_id: u64,
+    ) -> DbResult<MarketplaceNode> {
+        Ok(
+            sqlx::query_as("SELECT * FROM marketplace_node WHERE subscription_line_item_id = ?")
+                .bind(line_item_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
     async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO marketplace_node (operator_id, name, tls_fingerprint, token_version, status, trust_tier, tunnel_id, last_seen) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?) returning id",
+            "INSERT INTO marketplace_node (operator_id, name, tls_fingerprint, token_version, status, trust_tier, tunnel_id, last_seen, subscription_line_item_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(node.operator_id)
         .bind(&node.name)
@@ -4078,6 +4118,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(node.trust_tier)
         .bind(node.tunnel_id)
         .bind(node.last_seen)
+        .bind(node.subscription_line_item_id)
         .fetch_one(&self.db)
         .await?;
         Ok(res.try_get(0)?)
@@ -4086,7 +4127,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn update_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<()> {
         sqlx::query(
             "UPDATE marketplace_node \
-             SET name = ?, tls_fingerprint = ?, token_version = ?, status = ?, trust_tier = ?, tunnel_id = ? \
+             SET name = ?, tls_fingerprint = ?, token_version = ?, status = ?, trust_tier = ?, tunnel_id = ?, subscription_line_item_id = ? \
              WHERE id = ?",
         )
         .bind(&node.name)
@@ -4095,6 +4136,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(node.status)
         .bind(node.trust_tier)
         .bind(node.tunnel_id)
+        .bind(node.subscription_line_item_id)
         .bind(node.id)
         .execute(&self.db)
         .await?;
@@ -6227,8 +6269,8 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn admin_create_company(&self, company: &Company) -> DbResult<u64> {
         let result = sqlx::query(
-            r#"INSERT INTO company (name, address_1, address_2, city, state, country_code, tax_id, postcode, phone, email, created, base_currency, referral_rate, max_prepay_days)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?)"#,
+            r#"INSERT INTO company (name, address_1, address_2, city, state, country_code, tax_id, postcode, phone, email, created, base_currency, referral_rate, max_prepay_days, marketplace_rate, marketplace_node_fee)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?)"#,
         )
         .bind(&company.name)
         .bind(&company.address_1)
@@ -6243,6 +6285,8 @@ impl AdminDb for LNVpsDbMysql {
             .bind(&company.base_currency)
         .bind(company.referral_rate)
         .bind(company.max_prepay_days)
+        .bind(company.marketplace_rate)
+        .bind(company.marketplace_node_fee)
         .execute(&self.db)
         .await?;
 
@@ -6253,7 +6297,8 @@ impl AdminDb for LNVpsDbMysql {
         sqlx::query(
             r#"UPDATE company SET 
                name = ?, address_1 = ?, address_2 = ?, city = ?, state = ?, 
-               country_code = ?, tax_id = ?, postcode = ?, phone = ?, email = ?, base_currency = ?, referral_rate = ?, max_prepay_days = ?
+               country_code = ?, tax_id = ?, postcode = ?, phone = ?, email = ?, base_currency = ?, referral_rate = ?, max_prepay_days = ?,
+               marketplace_rate = ?, marketplace_node_fee = ?
                WHERE id = ?"#,
         )
         .bind(&company.name)
@@ -6269,6 +6314,8 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&company.base_currency)
         .bind(company.referral_rate)
         .bind(company.max_prepay_days)
+        .bind(company.marketplace_rate)
+        .bind(company.marketplace_node_fee)
         .bind(company.id)
         .execute(&self.db)
         .await?;

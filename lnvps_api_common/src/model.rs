@@ -965,6 +965,9 @@ pub enum ApiSubscriptionLineItemResource {
     /// A managed app deployment.
     #[serde(rename = "app")]
     App { app_deployment_id: u64 },
+    /// A marketplace node's one-off listing fee.
+    #[serde(rename = "marketplace_node")]
+    MarketplaceNode { marketplace_node_id: u64 },
 }
 
 impl ApiSubscriptionLineItemResource {
@@ -1004,6 +1007,13 @@ impl ApiSubscriptionLineItemResource {
                 .ok()
                 .map(|d| Self::App {
                     app_deployment_id: d.id,
+                }),
+            SubscriptionType::MarketplaceNodeFee => db
+                .get_marketplace_node_by_line_item(line_item.id)
+                .await
+                .ok()
+                .map(|n| Self::MarketplaceNode {
+                    marketplace_node_id: n.id,
                 }),
             SubscriptionType::DnsHosting => None,
         }

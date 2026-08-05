@@ -1877,6 +1877,10 @@ pub struct MarketplaceNode {
     pub tunnel_id: Option<u64>,
     /// Last control-channel contact. `None` until the node first connects.
     pub last_seen: Option<DateTime<Utc>>,
+    /// The line item whose payment covers this node's one-off listing fee.
+    /// `None` until the operator starts the purchase. A node cannot be approved
+    /// until the subscription behind this line item is paid.
+    pub subscription_line_item_id: Option<u64>,
     /// When this node was registered
     pub created: DateTime<Utc>,
 }
@@ -2029,6 +2033,11 @@ pub struct Company {
     /// share for this company.
     #[sqlx(default)]
     pub marketplace_rate: f32,
+    /// One-off fee charged per marketplace node before it can be approved, in
+    /// this company's `base_currency`. `0` requires no fee, which makes the
+    /// approval gate a no-op.
+    #[sqlx(default)]
+    pub marketplace_node_fee: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2547,6 +2556,13 @@ pub enum SubscriptionType {
     DnsHosting = 2,    // DNS hosting services
     Vps = 3,           // VM (links to vm table via vm.subscription_line_item_id)
     App = 4, // Managed app deployment (links via app_deployment.subscription_line_item_id)
+    /// One-off marketplace node listing fee (links via
+    /// `marketplace_node.subscription_line_item_id`).
+    ///
+    /// Unlike every other variant this bills nothing recurring: the line item
+    /// carries a `setup_amount` and an `amount` of zero, so the subscription
+    /// never renews and never expires. See `subscription_payment_paid`.
+    MarketplaceNodeFee = 5,
 }
 
 impl Display for SubscriptionType {
@@ -2557,6 +2573,7 @@ impl Display for SubscriptionType {
             SubscriptionType::DnsHosting => write!(f, "DNS Hosting"),
             SubscriptionType::Vps => write!(f, "VPS"),
             SubscriptionType::App => write!(f, "App"),
+            SubscriptionType::MarketplaceNodeFee => write!(f, "Marketplace Node Fee"),
         }
     }
 }
