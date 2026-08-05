@@ -2,7 +2,7 @@
 
 **Status:** planning
 **Started:** 2026-07-05
-**Last updated:** 2026-08-05 (increment 1 landed; decisions locked: no operator KYC in v1, payout rails shared with referrals)
+**Last updated:** 2026-08-05 (increment 1 landed; GPU capacity scoped — two-tier offers, fractional in v1; increments 11a/11b)
 
 ## Goal
 
@@ -26,6 +26,8 @@ place VMs on — with automatic sat payouts, uptime accounting, and full traffic
   see Trust model.
 - Decentralised settlement or escrow contracts. Payouts are custodial from LNVPS.
 - Nested marketplace resale (an operator node cannot itself be a marketplace client).
+- GPU support on any hypervisor but libvirt/KVM, and any GPU the node has not explicitly
+  enrolled into the marketplace pool.
 
 ## Findings (current codebase)
 
@@ -210,6 +212,147 @@ staged upgrade rings), but they are no longer the confidentiality control: `Untr
 `Verified` (identity-checked operator) → `Partner`. Attestation state is surfaced to customers
 as a badge on the offer.
 
+### GPU capacity (passthrough and vGPU)
+
+Marketplace nodes should be able to sell GPU-backed VMs, not just CPU. This is where the
+operator's hardware is most differentiated (and most expensive), so it is a large part of why
+an operator would join. It also collides with the locked decision on memory encryption in a
+way that has to be resolved deliberately rather than discovered later.
+
+**What already exists:** `lnvps_host_util/src/gpu.rs` detects the *first* GPU via NVML/AMD
+sysfs and reports **video-encode features** (NVENC/NVDEC), feeding `GpuMfg` and the host
+feature list. That is a capability probe, not an inventory: there is no per-device record, no
+PCI address, no IOMMU group, no VRAM figure, and nothing that allocates a GPU to a VM. All of
+that is new work.
+
+#### The confidentiality problem
+
+The plan's whole trust model is that the operator is hostile and cannot read guest memory
+(decision 4). A GPU breaks that assumption unless specific hardware is used, because the
+device DMAs into guest memory:
+
+- **SEV-SNP/TDX + ordinary passthrough:** guest memory is encrypted, but device DMA cannot
+  target encrypted pages. The guest marks buffers **shared** and traffic crosses via SWIOTLB
+  bounce buffers, which are plaintext to the host. Everything moving between CPU and GPU —
+  model weights, frames, inputs — is visible to the operator, as is everything resident in
+  VRAM, which is outside the CPU's encryption domain entirely. **Memory encryption without
+  trusted I/O does not protect a GPU workload.**
+- **NVIDIA Confidential Computing mode (Hopper/Blackwell — H100/H200/B200):** the GPU has its
+  own root of trust, the CPU↔GPU link is encrypted, VRAM is protected from the host, and the
+  GPU emits **its own attestation report** which must be verified *alongside* the CPU's.
+  Needs a specific stack (recent OVMF, QEMU ≥ 9.2 — 9.1 has a VFIO/SEV-SNP regression —
+  kernel ≥ 6.11, guest driver 580.x+). This is the only configuration where a GPU VM keeps
+  the promise the rest of the plan makes.
+- **SEV-TIO / TDX Connect / PCIe TDISP:** removes the bounce-buffer tax and extends the TEE
+  over the link properly. Early/RFC status. **Not a v1 foundation**; revisit later.
+
+Consequence: **"GPU" and "confidential" are the same decision.** Either GPUs are restricted to
+CC-capable datacenter parts, or GPU VMs are a product tier that explicitly does *not* carry
+the confidentiality guarantee — which must be stated to the customer at order time, never
+silently degraded. See open decision 10.
+
+#### The three virtualisation paths
+
+There is no single GPU virtualisation stack: consumer and datacenter cards differ, NVIDIA and
+AMD differ, and NVIDIA's own stack has several overlapping paths. A marketplace taking
+whatever hardware operators own will have to implement and maintain all three. (Field report
+from CloudRift, who run exactly this in production:
+<https://kernelspace.substack.com/p/gpu-virtualization-with-vfio-nvai>.)
+
+| Path | Hardware | Fractional? | Licence | Notes |
+|---|---|---|---|---|
+| **VFIO passthrough** | Any GPU, any vendor | No — whole card | None | Simplest and cheapest. What consumer rigs (RTX 4090/5090/PRO 6000) and whole-card datacenter rentals use. |
+| **NVIDIA MIG + AI Enterprise vGPU** | A100/H100/H200/B200 | Yes, hardware-partitioned | **~$4,500 per GPU per year** | ~$36k/yr for an 8-GPU server; roughly +50% TCO over a 4-year life. Host driver stays loaded and manages partitions. |
+| **AMD SR-IOV (GIM)** | Instinct MI300X/MI350X | Yes, natively (SPX/DPX/QPX/CPX) | **None** | Plain PCIe SR-IOV; VFs are ordinary PCI devices, `managed="yes"`, no vendor CLI. Reported as by far the easiest of the three. |
+
+**The licensing asymmetry is the headline.** Fractional NVIDIA costs $4.5k/GPU/yr; fractional
+AMD costs nothing. In a marketplace the hardware belongs to the *operator*, so somebody has to
+answer who holds that licence — see open decision 12. Whole-card passthrough sidesteps it
+entirely, which is why the sensible default is: **passthrough unless the customer is buying a
+fraction.**
+
+**MIG is not a simple integer count.** Profiles must tile across the GPU's GPC slices without
+overlap, and only specific combinations are valid per model (an H100 80GB has 7 GPCs and 19
+valid placement configurations). Scheduling fractional NVIDIA capacity is a constrained
+bin-packing problem against a per-model placement table, not "seven slots free". AMD's
+partition modes are set at driver level and are much simpler to reason about, at the cost of
+granularity (no mixed partition sizes on one card).
+
+#### Domain XML and host prerequisites
+
+The libvirt backend already emits `q35` and `host-passthrough`, and already pins the
+non-secure-boot OVMF build — all prerequisites. What GPU support adds:
+
+- `<pcihole64 unit="G">…</pcihole64>` on `pcie-root`, **computed from actual BAR sizes**.
+  H100/B200 BARs can exceed 128 GB and QEMU's built-in estimate is not always enough; getting
+  it wrong gives `BAR X: can't assign mem` inside the guest.
+- `<rom bar="off"/>` on every passthrough device — newer GPU firmware makes OVMF hang or crawl
+  when it tries to load the option ROM, and cloud VMs use serial/VNC anyway.
+- PCIe topology: **flat** (all GPUs on bus 0, differing slots) for consumer cards, which also
+  need `multifunction="on"` to carry the companion HDA audio function at `0x1`; **deep** (one
+  `pcie-root-port` per GPU) for datacenter cards, which have no audio function and are more
+  reliable behind dedicated ports.
+- `managed="no"` plus an explicit `<driver name="vfio"/>` for NVIDIA, because the teardown
+  sequence needs more control than libvirt's managed mode; `managed="yes"` for AMD VFs.
+- Version floors: QEMU ≥ 9.2 (9.0 for GPUs generally, but 9.1 has a VFIO/SEV-SNP regression),
+  OVMF 2024.02+, libvirt 10.6+, and a 6.11+ kernel. Node eligibility must check these, not
+  assume them.
+
+#### The NVIDIA driver lifecycle is the operational hazard
+
+Claiming an NVIDIA GPU for VFIO is a stateful, host-wide, failure-prone sequence: stop
+whatever holds the device (DCGM exporter, `nvidia-persistenced`, stray `nvidia-smi`), unload
+`nvidia-uvm`/`nvidia-drm`/`nvidia-modeset`/`nvidia`, unbind the GPU and its audio function,
+bind to `vfio-pci`, wait for `/dev/vfio` nodes. Returning it reverses all of that and then
+needs a CUDA init to "warm up" the device, or containers report *no CUDA-capable device*.
+
+**This is dangerous on hardware we do not own.** The trust model says the operator's own
+workloads are private and coexist with ours — but unloading the NVIDIA kernel modules is
+host-wide and would kill the operator's own inference jobs. Two hard rules for the node
+daemon:
+
+1. **Never touch a GPU that is not explicitly enrolled** in the marketplace pool, and never
+   perform host-wide module unloads on a node whose other GPUs are in use. Mixed
+   host-use + passthrough is only supported on the **open-source** NVIDIA driver; NVIDIA AI
+   Enterprise does not support that mixed mode.
+2. **Enrolment is an operator decision, per device**, made once at setup — not something the
+   scheduler infers from what it can see.
+
+#### Multi-tenancy hazards specific to GPUs
+
+- **VRAM residue between tenants.** Frame-buffer memory is not reliably zeroed when a device
+  is reassigned. NVIDIA's vGPU stack scrubs via copy engines on device open/close; raw
+  passthrough depends on reset behaviour, which varies by card and firmware. A GPU handed
+  from one customer to the next without a verified scrub leaks the previous tenant's data.
+  **Requirement: an explicit scrub-and-verify step between allocations, and a card is not
+  returned to the pool until it passes.**
+- **Reset reliability.** Not every GPU survives FLR/bus reset cleanly; some need a host
+  reboot. A card that fails reset must be cordoned, not silently reissued.
+- **A GPU VM is pinned to its node.** The device is local and cannot be tunnelled, so drain,
+  migration and offboarding (increments 7 and 10) cannot relocate it. GPU VMs need their own
+  drain policy: expire-and-refund rather than move.
+- **Power, heat and abuse.** GPUs draw far more power than the rest of the plan assumes, on
+  hardware LNVPS does not own, and are the obvious target for mining abuse. Per-node power
+  and thermal telemetry, and a mining stance in the operator ToS.
+- **Attestation gains a second half.** Node eligibility must verify the GPU's attestation
+  report as well as the CPU's, and bind them: a valid CPU report plus an unattested GPU is
+  not a confidential VM.
+
+#### What this adds to the increments
+
+- **Increment 1 (done):** no GPU columns were added, correctly — GPU inventory is per-device
+  and belongs with the code that allocates it.
+- **Increment 2 (node daemon):** telemetry must enumerate *every* GPU — PCI address, IOMMU
+  group, model, VRAM, driver, CC capability, vGPU/MIG capability — not just probe the first
+  card for video features. Extend `lnvps_host_util`'s detection into a real inventory.
+- **Increment 5 (attestation):** verify and bind the GPU attestation report alongside the
+  CPU's; refuse CC placement when the GPU cannot attest.
+- **Increment 7 (placement):** a GPU is a **countable, non-oversubscribable** resource, unlike
+  CPU and memory which use load factors. Templates need GPU requirements (count, model class,
+  minimum VRAM, CC required yes/no) and placement needs exact matching plus exclusive
+  allocation with no overcommit.
+- **Increment 11 (new, below):** the GPU work itself.
+
 ### Economics
 
 - LNVPS keeps pricing/billing. Operator earns a **revenue share** of the invoice value of VMs
@@ -232,36 +375,57 @@ as a badge on the offer.
 **Locked:**
 
 1. **Hypervisor** — libvirt/KVM only in v1.
-2. **Revenue share** — per-account rate with company-wide default, identical mechanism to
-   referrals (`Option<f32>` override → `company.*_rate`).
+2. **VMM** — libvirt/QEMU/KVM (decided on merit; the backend was greenfield). Node VM control
+   goes behind a `VmBackend` trait to keep Cloud Hypervisor viable later.
 3. **Node auth** — normal consumer-API auth: operator's nostr key (NIP-98) or a long-lived
    session token. No separate node credential system.
-4. **Encryption** — disk encryption *and* memory encryption (SEV-SNP/TDX) are mandatory
-   eligibility requirements, with remote attestation gating both placement and LUKS key release.
-5. **VMM** — libvirt/QEMU/KVM for v1 (decided on merit; the existing backend is a stub, so this
-   is greenfield). Node VM control still goes behind a `VmBackend` trait to keep Cloud
-   Hypervisor viable later.
-6. **Stubbed libvirt backend** — superseded: the backend was fully implemented instead
-   (`work/libvirt-backend.md`, merged), so nothing needs disabling.
-7. **Operator KYC** — none in v1. Operators are not identity-checked; confidentiality is
+4. **Revenue share** — per-account rate with company-wide default, identical mechanism to
+   referrals (`Option<f32>` override → `company.*_rate`).
+5. **Payout rail** — shared with referrals. `marketplace_operator` mirrors `referral` column
+   for column (`address` + `mode` + `payout_threshold`), and the payout-mode enum is one
+   shared `PayoutMode` type (`ReferralPayoutMode` remains an alias). Operators get Lightning
+   address, NWC and on-chain, and both ledgers reconcile the same way.
+6. **Operator KYC** — none in v1. Operators are not identity-checked; confidentiality is
    enforced by attestation and guest encryption, not by knowing who the operator is. The
-   `marketplace_operator` table deliberately carries no identity columns, so there is no
-   store of documents to protect. Trust tiers still exist for placement policy, and a
-   future tier can add checks without a schema change to what v1 stores.
-8. **Payout rail** — shared with referrals. `marketplace_operator` mirrors `referral`
-   column for column (`address` + `mode` + `payout_threshold`), and the payout-mode enum is
-   now one shared `PayoutMode` type (`ReferralPayoutMode` remains as an alias). Operators
-   get Lightning address, NWC and on-chain, and both ledgers reconcile the same way.
+   `marketplace_operator` table deliberately carries no identity columns, so there is no store
+   of documents to protect. Trust tiers still gate placement policy, and a future tier can add
+   checks without changing what v1 stores.
+7. **Encryption** — disk encryption *and* memory encryption (SEV-SNP/TDX) are mandatory
+   eligibility requirements, with remote attestation gating both placement and LUKS key
+   release. **One deliberate exception: GPU VMs, per decision 8.**
+8. **GPU offers are two-tiered.** A GPU cannot keep the confidentiality promise on ordinary
+   hardware: device DMA crosses plaintext bounce buffers and VRAM sits outside the CPU's
+   encryption domain. So there are two distinct products:
+   - **Confidential GPU VM** — CC-capable parts only (H100/H200/B200-class, NVIDIA CC mode),
+     with CPU *and* GPU attestation verified and bound together.
+   - **GPU VM (non-confidential)** — any card, including consumer RTX. The customer is told at
+     order time, in plain words, that the node operator can read GPU memory and CPU↔GPU
+     traffic. An explicit, visible product choice: **never a silent downgrade**, and never
+     shown with the same badge as a confidential VM.
+   This opens the marketplace to the large pool of consumer-GPU operators without quietly
+   weakening the guarantee made everywhere else.
+9. **Fractional GPUs are in scope for v1** (MIG on NVIDIA, SR-IOV partitions on AMD), not
+   passthrough-only — sharing is what makes GPU capacity sellable in small units. Passthrough
+   still lands first: it is a prerequisite for both, and whole-card rentals should always use
+   it to avoid NVIDIA licensing entirely.
+10. **Stubbed libvirt backend** — superseded: the backend was fully implemented instead
+   (`work/libvirt-backend.md`, merged), so nothing needs disabling.
 
 **Still open:**
 
-4b. **Cloud Hypervisor as a second `VmBackend`** — worth doing once measurement pinning is
-   in place (smaller TCB, smaller measurement), or stay on QEMU indefinitely?
-7. **Attestation strictness**: pin exact guest measurements (strongest, but every image/kernel
-   update needs a re-measure + allow-list bump) vs. pin platform + signer only.
-8. **Backups**: operator-local storage only, or optional LNVPS-side backup egress (costly over
-   WG, and must stay encrypted end-to-end).
-9. **Migration**: is offline migration off a misbehaving node required in v1?
+a. **Who holds the NVIDIA AI Enterprise licence** for fractional NVIDIA capacity — the
+   operator (a ~$4,500/GPU/yr barrier to onboarding, though they may already hold one), LNVPS
+   centrally, or is fractional NVIDIA deferred until demand justifies it? AMD SR-IOV gives
+   fractional capacity with no licence at all, so "fractional" and "expensive" are only linked
+   on NVIDIA.
+b. **Cloud Hypervisor as a second `VmBackend`** — worth doing once measurement pinning is in
+   place (smaller TCB, smaller measurement), or stay on QEMU indefinitely?
+c. **Attestation strictness** — pin exact guest measurements (strongest, but every image or
+   kernel update needs a re-measure and allow-list bump) vs. pin platform + signer only.
+d. **Backups** — operator-local storage only, or optional LNVPS-side backup egress (costly
+   over WG, and must stay encrypted end to end)?
+e. **Migration** — is offline migration off a misbehaving node required in v1? Note GPU VMs
+   cannot be migrated at all.
 
 ## Increments
 
@@ -377,6 +541,41 @@ node job protocol:
 - Docs: `docs/agents/marketplace.md`, operator install guide, `API_CHANGELOG.md` entries,
   E2E tests in `lnvps_e2e` with a mock node.
 
+### Increment 11a — GPU inventory + whole-card passthrough (L, depends on 5 + 7)
+- `marketplace_node_gpu` inventory (node, PCI address, IOMMU group, vendor, model, VRAM,
+  driver/QEMU/OVMF versions, CC-capable, MIG/SR-IOV-capable, **enrolled** flag, allocation
+  state) and `vm_gpu_assignment` — mirroring IP assignment: a countable resource with an
+  explicit assignment row, never a load factor.
+- **Enrolment is per device and operator-initiated.** The node never claims a GPU the operator
+  has not offered, and never performs host-wide NVIDIA module unloads while the operator's own
+  GPUs are in use (only the open-source driver supports mixed host/passthrough use at all).
+- Domain XML: `<hostdev>` with `<rom bar="off"/>`, computed `<pcihole64>`, flat topology plus
+  `multifunction="on"` for consumer cards, deep topology (one `pcie-root-port` per GPU) for
+  datacenter cards. `managed="no"` + explicit `<driver name="vfio"/>` for NVIDIA.
+- Host driver lifecycle on the node: full teardown/rebind sequence with a hard failure when
+  something still holds the device, and the post-return CUDA warm-up.
+- Eligibility checks for QEMU ≥ 9.2 / OVMF 2024.02+ / libvirt 10.6+ / kernel 6.11+ and a clean
+  IOMMU group; refuse rather than produce a VM that fails to map BARs.
+- Scrub-and-verify between allocations; cordon any card that fails reset instead of reissuing.
+- Two-tier product plumbing (decision 8): `confidential` vs `non-confidential` GPU offers, the
+  order-time disclosure, and a hard rule that a non-CC GPU can never satisfy a confidential
+  template.
+- Pricing: GPU line items in cost plans and rev-share accounting for them.
+- Drain policy for GPU VMs — they cannot move, so expire-and-refund rather than relocate.
+
+### Increment 11b — Fractional GPUs (L, depends on 11a)
+- **AMD SR-IOV first**: partition modes (SPX/DPX/QPX/CPX) via the GIM driver, VFs passed with
+  `managed="yes"`. No licensing, standard PCIe semantics, simplest of the three paths.
+- **NVIDIA MIG + vGPU** behind the licensing decision (open item a): GI/CI creation, mapping
+  instances onto SR-IOV VFs, `current_vgpu_type`, NVAI guest driver and `nvidia-gridd` licence
+  checkout, and teardown of GI/CI on VM delete (ids tracked in both our DB and libvirt domain
+  metadata).
+- Scheduler: fractional NVIDIA is **constrained bin-packing against a per-model MIG placement
+  table**, not an integer slot count — only specific profile combinations tile validly. AMD
+  partition modes are a much simpler fixed split.
+- Guest images with the right stack baked in (NVAI proprietary driver for vGPU; ROCm + HWE
+  kernel for AMD).
+
 ## Risks
 
 | Risk | Mitigation |
@@ -388,6 +587,13 @@ node job protocol:
 | libvirt TDX support immature/distro-dependent | SEV-SNP is the v1 target; TDX best-effort, gated on reported node capability. |
 | Executor work underestimated because the libvirt backend looked complete | Recognised: it is a stub. Split into increments 6a/6b and sized as greenfield. |
 | `virt` crate is a git dependency with C bindings shipped to operator hardware | Pin the revision, vendor if needed, or prefer a pure-Rust VMM (decision 4a). |
+| GPU DMA leaks guest data past memory encryption | Only CC-capable GPUs (NVIDIA CC mode) may back a confidential VM; anything else is a labelled non-confidential tier, never a silent downgrade. |
+| VRAM residue leaks between GPU tenants | Mandatory scrub-and-verify between allocations; a card that fails reset is cordoned, not reissued. |
+| GPU VMs cannot be drained or migrated off a failing node | Separate drain policy: expire and refund rather than relocate; price and advertise accordingly. |
+| GPU mining abuse / power draw on operator hardware | Power and thermal telemetry per node, ToS stance, per-node reputation. |
+| Node daemon breaks the operator's own GPU workloads by unloading NVIDIA modules host-wide | Only enrolled devices are ever touched; refuse host-wide teardown while unenrolled GPUs are in use; mixed use requires the open-source driver. |
+| NVIDIA vGPU licensing (~$4.5k/GPU/yr) blocks operator onboarding | Passthrough needs no licence and lands first; AMD SR-IOV gives fractional capacity licence-free; fractional NVIDIA gated on decision (a). |
+| Customer misreads a non-confidential GPU VM as confidential | Separate product tier with order-time disclosure in plain words; a non-CC GPU can never satisfy a confidential template. |
 | Operator abuses LNVPS IPs (spam/DDoS from a rogue node) | Route-server-side egress filtering + rate limits per node, existing `lnvps_fw`, instant peer teardown. |
 | Guest abuse damages `185.18.221.0/24` reputation | Same abuse workflow as owned hosts; per-node reputation score gating capacity. |
 | WG throughput/latency ceiling on cheap operator links | Advertise link speed in offers, measure per-node, cap bandwidth in `VmTemplate`. |
