@@ -4025,18 +4025,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
-    async fn get_marketplace_node_by_nostr_pubkey(
-        &self,
-        pubkey: &[u8],
-    ) -> DbResult<MarketplaceNode> {
-        Ok(
-            sqlx::query_as("SELECT * FROM marketplace_node WHERE nostr_pubkey = ?")
-                .bind(pubkey)
-                .fetch_one(&self.db)
-                .await?,
-        )
-    }
-
     async fn get_marketplace_node_by_tls_fingerprint(
         &self,
         fingerprint: &[u8],
@@ -4079,13 +4067,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO marketplace_node (operator_id, name, nostr_pubkey, tls_fingerprint, status, trust_tier, tunnel_id, last_seen) \
+            "INSERT INTO marketplace_node (operator_id, name, tls_fingerprint, token_version, status, trust_tier, tunnel_id, last_seen) \
              VALUES (?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(node.operator_id)
         .bind(&node.name)
-        .bind(&node.nostr_pubkey)
         .bind(&node.tls_fingerprint)
+        .bind(node.token_version)
         .bind(node.status)
         .bind(node.trust_tier)
         .bind(node.tunnel_id)
@@ -4098,12 +4086,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn update_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<()> {
         sqlx::query(
             "UPDATE marketplace_node \
-             SET name = ?, nostr_pubkey = ?, tls_fingerprint = ?, status = ?, trust_tier = ?, tunnel_id = ? \
+             SET name = ?, tls_fingerprint = ?, token_version = ?, status = ?, trust_tier = ?, tunnel_id = ? \
              WHERE id = ?",
         )
         .bind(&node.name)
-        .bind(&node.nostr_pubkey)
         .bind(&node.tls_fingerprint)
+        .bind(node.token_version)
         .bind(node.status)
         .bind(node.trust_tier)
         .bind(node.tunnel_id)

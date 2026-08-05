@@ -11,12 +11,14 @@ api-url: "https://api.lnvps.net"
 # re-registered before it can be reached again.
 state-dir: "/var/lib/lnvps-node"
 
-# The node's own credential, used to sign outbound calls to LNVPS.
+# The node's token, as issued when the node was registered. It authenticates
+# this node and nothing else: it is not an account credential, and it cannot be
+# used to reach the operator's account or their other nodes.
 credential:
-  # nostr-key (nsec1... or 64 hex characters) or session-token.
-  kind: nostr-key
   # Must not be readable by other users; the daemon refuses to start otherwise.
-  file: "/etc/lnvps-node/node.key"
+  # The token is shown once at registration — if it is lost, take a new one from
+  # POST /api/v1/marketplace/nodes/{id}/token, which revokes the old one.
+  file: "/etc/lnvps-node/token"
 
 # Seconds between heartbeats.
 heartbeat-secs: 60

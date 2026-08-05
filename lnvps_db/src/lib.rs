@@ -1108,13 +1108,6 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Get a marketplace node by id
     async fn get_marketplace_node(&self, id: u64) -> DbResult<MarketplaceNode>;
 
-    /// Get a marketplace node by the nostr key its daemon authenticates with.
-    /// This is the lookup the control channel performs on every connection.
-    async fn get_marketplace_node_by_nostr_pubkey(
-        &self,
-        pubkey: &[u8],
-    ) -> DbResult<MarketplaceNode>;
-
     /// Get a marketplace node by the TLS certificate fingerprint it registered.
     ///
     /// Used to tell an operator that some other node already serves this

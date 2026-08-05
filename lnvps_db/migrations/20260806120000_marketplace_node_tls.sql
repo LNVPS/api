@@ -1,10 +1,12 @@
--- The TLS certificate fingerprint LNVPS pins when calling a node's control API.
+-- The node's TLS identity and its authentication token.
 --
--- NIP-98 authenticates requests *to* a node; nothing authenticates the node's
--- replies. Without a pin, anything able to answer on the node's tunnel address
--- — a guest on that machine that grabbed the IP, a route-server
--- misconfiguration — could report that a VM started when it did not. The node
--- self-signs and registers this value; LNVPS checks it on every later call.
+-- `tls_fingerprint` is the SHA-256 of the DER certificate LNVPS pins when
+-- calling a node's control API. NIP-98 authenticates requests *to* a node;
+-- nothing authenticates the node's replies. Without a pin, anything able to
+-- answer on the node's tunnel address — a guest on that machine that grabbed
+-- the IP, a route-server misconfiguration — could report that a VM started when
+-- it did not. The node self-signs and registers this value; LNVPS checks it on
+-- every later call.
 --
 -- Binary rather than a hex CHAR column, for the same reason as
 -- `tunnel.peer_pubkey`: the default collation is case-insensitive, so a hex
@@ -30,3 +32,22 @@ ALTER TABLE marketplace_node
     ADD CONSTRAINT ck_marketplace_node_tls_fingerprint
         CHECK (tls_fingerprint IS NULL OR OCTET_LENGTH(tls_fingerprint) = 32),
     ADD UNIQUE KEY uk_marketplace_node_tls_fingerprint (tls_fingerprint);
+
+-- Revocation counter for this node's token, compared against the `ver` claim on
+-- every authenticated call the node makes. Bumping it invalidates every token
+-- issued for this node and nothing else.
+--
+-- Deliberately per-node rather than reusing the operator's `users.session_version`:
+-- that column revokes the operator's web sessions and every other node they own
+-- at the same time, which turns "one node was compromised" into "the operator is
+-- locked out of everything".
+ALTER TABLE marketplace_node
+    ADD COLUMN token_version INTEGER UNSIGNED NOT NULL DEFAULT 0;
+
+-- A node authenticates with a token carrying its own id, not with a nostr key,
+-- so the key column now states a fact nothing sets. Dropped rather than left
+-- nullable-and-empty, where the next reader would reasonably assume nodes still
+-- have keys and write code against a column that is never populated.
+ALTER TABLE marketplace_node
+    DROP KEY uk_marketplace_node_nostr_pubkey,
+    DROP COLUMN nostr_pubkey;

@@ -463,13 +463,23 @@ v1.
    Consequences: the release workflow **must** inject `LNVPS_CONTROL_PUBKEY` at build time;
    a binary built without it refuses to serve the control API rather than serving it to
    everyone. Self-hosted deployments rebuild with their own key.
-15. **A node has its own nostr key, and registration is signed by the operator's account,
-   not by the node.** `marketplace_node.nostr_pubkey` is unique per node with a by-pubkey
-   lookup, so the two cannot be the same key: an operator running two nodes would collide.
-   Registration therefore carries the node's identity (its pubkey and TLS fingerprint) in the
-   body, authenticated as the operator. The operator's account key — which controls billing,
-   payouts and every other node they own — never has to be present on third-party hardware,
-   and a node's own key can be revoked on its own.
+15. **A node authenticates with a node-scoped token, not a nostr key, and registration is
+   signed by the operator's account.** Registration returns a token (shown once) carrying the
+   node's id and its own `token_version`; the node presents it as a Bearer credential.
+   Consequences that had to be built rather than assumed:
+   - **Revocation is per node.** Bumping `marketplace_node.token_version` invalidates that
+     node's tokens and nothing else. Reusing the operator's `users.session_version` would turn
+     "one node was compromised" into "the operator is locked out of everything".
+   - **Node tokens and user sessions are the same HS256 construction over the same secret**,
+     so they are separated by an explicit `typ` claim, checked in both directions. Without it
+     the only thing keeping them apart is which fields serde happens to require — an accident,
+     not a decision, and one that disappears the day someone gives those fields defaults.
+   - **Expiry is not the revocation mechanism.** Node tokens are long-lived on purpose:
+     expiry buys little against an attacker who has the token now, while a short lifetime
+     guarantees an eventual fleet-wide outage on unattended hardware.
+   - **`nostr_pubkey` was dropped from `marketplace_node`**, since nothing would set it.
+   - **Registration refuses when no session secret is configured**, rather than registering a
+     node whose token could never be issued.
 14. **Control calls run over HTTPS with a certificate pinned at registration.** NIP-98
    authenticates requests *to* the node, but nothing authenticated the node's *replies*:
    anything able to answer on the tunnel address — a guest on the same machine that grabbed
@@ -588,12 +598,14 @@ Two guards worth remembering:
 ### Increment 3 — Pairing + admin approval flow (M)  ⬅ IN PROGRESS
 
 **3a — registration (done):** `POST /api/v1/marketplace/nodes` registers hardware under the
-operator's account, carrying the node's pubkey and TLS fingerprint (decision 15). Enrolment as
-an operator is implicit. Nodes land in `pending`; re-registering the same node updates the
-pinned fingerprint, which is the certificate-rotation path. Taking over another operator's node
-is refused, and a duplicate certificate — the signature of a cloned machine image — is reported
-as such rather than as a unique-index violation. `GET /api/v1/marketplace/nodes` and
-`GET /api/v1/marketplace/operator` for the operator's own view.
+operator's account and returns the node's token, shown once (decision 15). Enrolment as an
+operator is implicit. Nodes land in `pending`. `PATCH /api/v1/marketplace/nodes/{id}` re-pins a
+rotated certificate — without it a node that regenerates one is unreachable for good — and
+`POST /api/v1/marketplace/nodes/{id}/token` issues a replacement token, revoking the previous.
+A duplicate certificate — the signature of a cloned machine image — is reported as such rather
+than as a unique-index violation. Another operator's node answers "not found" rather than
+"forbidden", so ids cannot be probed. `GET /api/v1/node/self` is the node-authenticated
+endpoint that proves the token works end to end.
 
 **3b — admin approval (next):** approve/reject/suspend/drain, trust tier, capacity caps, the
 per-operator rate override, and creating the backing `VmHost` row on approval.

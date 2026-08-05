@@ -63,6 +63,85 @@ pub struct SessionClaims {
     pub iat: u64,
     /// Expiry (unix seconds).
     pub exp: u64,
+    /// Token type. Absent on user tokens (including every one issued before
+    /// node tokens existed); [`NODE_TOKEN_TYP`] on a node token.
+    ///
+    /// Both types are HS256 over the same secret, so without this the only
+    /// thing stopping a node token being presented as a user session is that
+    /// `sub` and `uid` happen to be required fields. That is an accident of
+    /// serde, not a decision, and it would evaporate the day someone gives
+    /// them defaults. This makes the separation explicit and testable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub typ: Option<String>,
+}
+
+/// The `typ` claim marking a token as a node token rather than a user session.
+pub const NODE_TOKEN_TYP: &str = "node";
+
+/// Claims carried by a node token.
+///
+/// A node is not a user: it has no account, cannot be billed, and must not
+/// reach any endpoint that authenticates a person. It carries its own numeric
+/// id and its own revocation counter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeClaims {
+    /// Always [`NODE_TOKEN_TYP`].
+    pub typ: String,
+    /// The marketplace node this token authenticates.
+    pub nid: u64,
+    /// The node's `token_version` at issue time. Bumping that column revokes
+    /// every token issued for **this node** and nothing else — unlike a user's
+    /// `session_version`, which would take out their other nodes and their web
+    /// sessions with it.
+    pub ver: u32,
+    /// Issued-at (unix seconds).
+    pub iat: u64,
+    /// Expiry (unix seconds).
+    pub exp: u64,
+}
+
+/// Node token lifetime.
+///
+/// Long by design. A node is unattended hardware in somebody else's building:
+/// expiry buys almost nothing against an attacker who has the token and will
+/// use it immediately, while a short one guarantees an eventual fleet-wide
+/// outage as tokens lapse with nobody watching. Revocation is the real control
+/// here, and it is immediate and per-node via `token_version`.
+pub const NODE_TOKEN_TTL_SECS: u64 = 60 * 60 * 24 * 365 * 10;
+
+/// Issue a token authenticating one marketplace node.
+pub fn issue_node_token(node_id: u64, token_version: u32, ttl_secs: u64) -> Result<String> {
+    let secret = SESSION_SECRET
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Session auth not configured"))?;
+
+    let iat = now_secs();
+    let claims = NodeClaims {
+        typ: NODE_TOKEN_TYP.to_string(),
+        nid: node_id,
+        ver: token_version,
+        iat,
+        exp: iat + ttl_secs,
+    };
+    let header = BASE64_URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+    let payload = BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?);
+    let signing_input = format!("{header}.{payload}");
+    let sig = sign(signing_input.as_bytes(), secret);
+    Ok(format!("{signing_input}.{sig}"))
+}
+
+/// Verify a node token. The caller must still check `ver` against the node's
+/// current `token_version`, which is what makes revocation work.
+pub fn verify_node_token(token: &str) -> Result<NodeClaims> {
+    let claims: NodeClaims = verify_jwt(token)?;
+    // A user session must not be usable as a node.
+    if claims.typ != NODE_TOKEN_TYP {
+        bail!("Not a node token");
+    }
+    if now_secs() >= claims.exp {
+        bail!("Node token expired");
+    }
+    Ok(claims)
 }
 
 impl SessionClaims {
@@ -111,6 +190,7 @@ pub fn issue_session_token(
         ver: session_version,
         iat,
         exp: iat + ttl_secs,
+        typ: None,
     };
 
     // Fixed HS256 header.
@@ -152,10 +232,46 @@ pub fn verify_session_token(token: &str) -> Result<SessionClaims> {
     let claims: SessionClaims =
         serde_json::from_slice(&BASE64_URL_SAFE_NO_PAD.decode(payload_b64.as_bytes())?)?;
 
+    // A node token must not authenticate as a person.
+    if claims.typ.as_deref() == Some(NODE_TOKEN_TYP) {
+        bail!("Node tokens cannot be used as a session");
+    }
+
     if now_secs() >= claims.exp {
         bail!("Session token expired");
     }
     Ok(claims)
+}
+
+/// Signature and structural verification shared by every token type, so the
+/// two verifiers cannot drift apart on how a token is checked.
+fn verify_jwt<T: serde::de::DeserializeOwned>(token: &str) -> Result<T> {
+    let secret = SESSION_SECRET
+        .get()
+        .ok_or_else(|| anyhow::anyhow!("Session auth not configured"))?;
+
+    let mut parts = token.split('.');
+    let header_b64 = parts.next().unwrap_or_default();
+    let payload_b64 = parts.next().unwrap_or_default();
+    let sig_b64 = parts.next().unwrap_or_default();
+    if header_b64.is_empty()
+        || payload_b64.is_empty()
+        || sig_b64.is_empty()
+        || parts.next().is_some()
+    {
+        bail!("Malformed token");
+    }
+
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let expected_sig = BASE64_URL_SAFE_NO_PAD.decode(sig_b64.as_bytes())?;
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC accepts any key length");
+    mac.update(signing_input.as_bytes());
+    mac.verify_slice(&expected_sig)
+        .map_err(|_| anyhow::anyhow!("Invalid token signature"))?;
+
+    Ok(serde_json::from_slice(
+        &BASE64_URL_SAFE_NO_PAD.decode(payload_b64.as_bytes())?,
+    )?)
 }
 
 /// Claims for a short-lived OAuth CSRF `state` value.
@@ -643,5 +759,161 @@ mod tests {
         // ttl 0 => exp == iat == now, and verify checks `now >= exp`.
         let token = issue_session_token(&[2u8; 32], 5, 0, 0).unwrap();
         assert!(verify_session_token(&token).is_err());
+    }
+}
+
+#[cfg(test)]
+mod node_token_tests {
+    use super::*;
+
+    /// The session secret is process-wide and set once, so these tests share
+    /// whatever the rest of the suite installed.
+    fn secret() {
+        init_session_secret(b"test-secret-for-node-tokens".to_vec());
+    }
+
+    #[test]
+    fn a_node_token_authenticates_its_node() {
+        secret();
+        let token = issue_node_token(7, 3, 3600).unwrap();
+        let claims = verify_node_token(&token).unwrap();
+
+        assert_eq!(claims.nid, 7);
+        assert_eq!(claims.ver, 3);
+        assert_eq!(claims.typ, NODE_TOKEN_TYP);
+    }
+
+    /// Both token types are HS256 over the same secret. Nothing but the `typ`
+    /// claim stops one being presented as the other, so both directions are
+    /// checked explicitly rather than left to serde's field requirements.
+    #[test]
+    fn a_node_token_cannot_be_used_as_a_user_session() {
+        secret();
+        let node_token = issue_node_token(7, 0, 3600).unwrap();
+
+        verify_session_token(&node_token)
+            .expect_err("a node token authenticated as a user account");
+    }
+
+    /// The test above passes today only because `SessionClaims` happens to
+    /// require `sub` — serde rejects the node token before the `typ` check runs.
+    /// That is an accident of field requirements, and it disappears the moment
+    /// anyone gives those fields defaults or a node token grows a `sub`. This
+    /// exercises the guard itself, with a properly signed token that carries
+    /// both the user fields and `typ: node`.
+    #[test]
+    fn the_type_claim_is_what_separates_the_two_token_kinds() {
+        secret();
+        let secret_bytes = SESSION_SECRET.get().unwrap();
+
+        let claims = serde_json::json!({
+            "sub": hex::encode([4u8; 32]),
+            "uid": 42,
+            "ver": 0,
+            "iat": now_secs(),
+            "exp": now_secs() + 3600,
+            "typ": NODE_TOKEN_TYP,
+        });
+        let header = BASE64_URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let signing_input = format!("{header}.{payload}");
+        let token = format!(
+            "{signing_input}.{}",
+            sign(signing_input.as_bytes(), secret_bytes)
+        );
+
+        // It deserialises cleanly as a user session, so only the typ check can
+        // stop it.
+        let err = verify_session_token(&token)
+            .expect_err("a node token carrying user fields authenticated as that user");
+        assert!(
+            format!("{err}").contains("Node tokens cannot be used as a session"),
+            "rejected for the wrong reason: {err}"
+        );
+    }
+
+    #[test]
+    fn a_user_session_cannot_be_used_as_a_node() {
+        secret();
+        let user_token = issue_session_token(&[4u8; 32], 42, 0, 3600).unwrap();
+
+        let err =
+            verify_node_token(&user_token).expect_err("a user session authenticated as a node");
+        // Missing `typ` fails to deserialise as NodeClaims, which is also a
+        // rejection — assert only that it did not succeed with a node identity.
+        assert!(!format!("{err}").is_empty());
+    }
+
+    /// Mirror of the check above, for the other direction. A user session is
+    /// rejected today only because it has no `nid` for `NodeClaims` to
+    /// deserialise — serde, not a decision. This signs a token that parses
+    /// cleanly as node claims but is marked as a user token, so the `typ` check
+    /// is the only thing that can refuse it.
+    #[test]
+    fn a_token_marked_as_a_user_cannot_authenticate_as_a_node() {
+        secret();
+        let secret_bytes = SESSION_SECRET.get().unwrap();
+
+        let claims = serde_json::json!({
+            "typ": "user",
+            "nid": 7,
+            "ver": 0,
+            "iat": now_secs(),
+            "exp": now_secs() + 3600,
+        });
+        let header = BASE64_URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload = BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
+        let signing_input = format!("{header}.{payload}");
+        let token = format!(
+            "{signing_input}.{}",
+            sign(signing_input.as_bytes(), secret_bytes)
+        );
+
+        let err = verify_node_token(&token)
+            .expect_err("a token marked as a user session authenticated as a node");
+        assert!(
+            format!("{err}").contains("Not a node token"),
+            "rejected for the wrong reason: {err}"
+        );
+    }
+
+    #[test]
+    fn a_tampered_node_token_is_rejected() {
+        secret();
+        let token = issue_node_token(7, 0, 3600).unwrap();
+
+        // Swap the node id in the payload and re-encode, leaving the signature.
+        let parts: Vec<&str> = token.split('.').collect();
+        let payload = BASE64_URL_SAFE_NO_PAD.decode(parts[1]).unwrap();
+        let mut claims: NodeClaims = serde_json::from_slice(&payload).unwrap();
+        claims.nid = 8;
+        let forged = format!(
+            "{}.{}.{}",
+            parts[0],
+            BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap()),
+            parts[2]
+        );
+
+        let err = verify_node_token(&forged).expect_err("a node claimed to be a different node");
+        assert!(format!("{err}").contains("signature"), "{err}");
+    }
+
+    #[test]
+    fn an_expired_node_token_is_rejected() {
+        secret();
+        let token = issue_node_token(7, 0, 0).unwrap();
+        let err = verify_node_token(&token).expect_err("an expired token was accepted");
+        assert!(format!("{err}").contains("expired"), "{err}");
+    }
+
+    /// Expiry is not the revocation mechanism — `token_version` is — so the
+    /// default lifetime is deliberately long. A short one would guarantee an
+    /// eventual fleet-wide outage as tokens lapse on unattended hardware.
+    #[test]
+    fn the_default_node_token_lifetime_is_long() {
+        assert!(
+            NODE_TOKEN_TTL_SECS >= 60 * 60 * 24 * 365,
+            "a node token that lapses within a year takes the node offline with nobody watching"
+        );
     }
 }

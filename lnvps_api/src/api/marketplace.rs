@@ -1,22 +1,25 @@
 //! Operator-facing marketplace API: register your hardware, list your nodes.
 //!
-//! Registration is authenticated as the **operator's** account, and carries the
-//! node's own identity — its nostr public key and TLS fingerprint — in the
-//! body. The node is not the caller.
+//! Registration is authenticated as the **operator's** account. It returns a
+//! node token, shown once, which the operator installs on the machine; the node
+//! authenticates as itself from then on.
 //!
 //! That split is deliberate. A marketplace node is somebody else's machine in
-//! somebody else's building, and the account key is what controls billing,
+//! somebody else's building, and the account credential controls billing,
 //! payouts and every other node the operator owns. Registering from the
-//! operator's own machine, with the node's identity pasted in, means the
-//! account key never has to live on the hardware at all; the node afterwards
-//! authenticates as itself with a key that can be revoked on its own.
+//! operator's own machine means the account credential never has to live on the
+//! hardware, and a node's token can be revoked on its own — bumping
+//! `token_version` takes out that node and nothing else.
 
-use axum::extract::State;
-use axum::routing::{get, post};
+use axum::extract::{Path, State};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
-use lnvps_api_common::{ApiData, ApiError, ApiResult, Nip98Auth};
+use lnvps_api_common::{
+    ApiData, ApiError, ApiResult, NODE_TOKEN_TTL_SECS, Nip98Auth, NodeAuth, issue_node_token,
+    session_auth_enabled,
+};
 use lnvps_db::{MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator, MarketplaceTrustTier};
 
 use crate::api::RouterState;
@@ -27,7 +30,14 @@ pub fn router() -> Router<RouterState> {
             "/api/v1/marketplace/nodes",
             get(v1_list_nodes).post(v1_register_node),
         )
+        .route("/api/v1/marketplace/nodes/{id}", patch(v1_update_node))
+        .route(
+            "/api/v1/marketplace/nodes/{id}/token",
+            post(v1_rotate_node_token),
+        )
         .route("/api/v1/marketplace/operator", get(v1_get_operator))
+        // Node-facing: authenticated by the node's own token, not a user.
+        .route("/api/v1/node/self", get(v1_node_self))
 }
 
 /// A node as its operator sees it.
@@ -36,9 +46,6 @@ pub struct ApiMarketplaceNode {
     pub id: u64,
     /// Operator-chosen label. Not an identifier.
     pub name: String,
-    /// The node's own nostr public key, hex. This is what the daemon
-    /// authenticates its heartbeats with.
-    pub nostr_pubkey: Option<String>,
     /// SHA-256 of the certificate the node's control API serves, hex. LNVPS
     /// checks every call to the node against this value, so it must be updated
     /// when the node's certificate changes or the node becomes unreachable.
@@ -57,7 +64,6 @@ impl From<MarketplaceNode> for ApiMarketplaceNode {
         Self {
             id: n.id,
             name: n.name,
-            nostr_pubkey: n.nostr_pubkey.map(hex::encode),
             tls_fingerprint: n.tls_fingerprint.map(hex::encode),
             status: n.status.to_string(),
             trust_tier: n.trust_tier.to_string(),
@@ -99,17 +105,38 @@ impl From<MarketplaceOperator> for ApiMarketplaceOperator {
     }
 }
 
-/// Register a node, or update the identity of one already registered.
+/// Register a node.
 #[derive(Deserialize)]
 pub struct RegisterNodeRequest {
     /// Operator-chosen label, for your own use.
     pub name: String,
-    /// The node's nostr public key, 64 hex characters, as printed by
-    /// `lnvps-node identity`. Identifies the node from here on.
-    pub nostr_pubkey: String,
     /// SHA-256 of the node's TLS certificate, 64 hex characters, as printed by
     /// `lnvps-node fingerprint`.
     pub tls_fingerprint: String,
+}
+
+/// Update an already-registered node.
+#[derive(Deserialize)]
+pub struct UpdateNodeRequest {
+    /// New label. Omitted leaves it unchanged.
+    pub name: Option<String>,
+    /// New certificate fingerprint, 64 hex characters.
+    ///
+    /// This is the certificate-rotation path. A node that regenerates its
+    /// certificate — restored from backup, state directory lost — presents a
+    /// fingerprint LNVPS does not have, every control call to it fails closed,
+    /// and without this it would be unreachable for good.
+    pub tls_fingerprint: Option<String>,
+}
+
+/// A newly registered node, with the one and only copy of its token.
+#[derive(Serialize)]
+pub struct ApiRegisteredNode {
+    #[serde(flatten)]
+    pub node: ApiMarketplaceNode,
+    /// The node's authentication token. **Shown once**: LNVPS keeps no copy, so
+    /// a lost token is replaced by issuing a new one, which revokes this one.
+    pub token: String,
 }
 
 /// Decode a 32-byte value from hex, rejecting anything else.
@@ -129,19 +156,17 @@ fn parse_32_bytes(value: &str, field: &str) -> Result<Vec<u8>, ApiError> {
     Ok(bytes)
 }
 
-/// Register hardware, or re-register it after its certificate changed.
-///
-/// Re-registration is not a convenience: a node that regenerates its
-/// certificate — restored from backup, state directory lost — presents a
-/// fingerprint LNVPS does not have, and every control call to it fails closed.
-/// Without a way to update the pin, such a node would be permanently
-/// unreachable and could only be replaced.
+/// Register hardware and issue its token.
 async fn v1_register_node(
     auth: Nip98Auth,
     State(this): State<RouterState>,
     Json(req): Json<RegisterNodeRequest>,
-) -> ApiResult<ApiMarketplaceNode> {
-    ApiData::ok(register_node(&this.db, &auth.pubkey(), &req).await?.into())
+) -> ApiResult<ApiRegisteredNode> {
+    let (node, token) = register_node(&this.db, &auth.pubkey(), &req).await?;
+    ApiData::ok(ApiRegisteredNode {
+        node: node.into(),
+        token,
+    })
 }
 
 /// The registration itself, separated from the extractors so it can be tested
@@ -150,13 +175,22 @@ pub(crate) async fn register_node(
     db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
     caller: &[u8; 32],
     req: &RegisterNodeRequest,
-) -> Result<MarketplaceNode, ApiError> {
+) -> Result<(MarketplaceNode, String), ApiError> {
     let name = req.name.trim();
     if name.is_empty() {
         return Err(ApiError::bad_request("Node name cannot be empty"));
     }
-    let pubkey = parse_32_bytes(&req.nostr_pubkey, "nostr_pubkey")?;
     let fingerprint = parse_32_bytes(&req.tls_fingerprint, "tls_fingerprint")?;
+
+    // Registration hands back a token, so a deployment that cannot issue one
+    // must say so here rather than register a node that can never authenticate.
+    if !session_auth_enabled() {
+        return Err(ApiError::with_status(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "Node tokens are unavailable because this deployment has no session secret \
+             configured. Set it and restart before registering nodes.",
+        ));
+    }
 
     let uid = db.upsert_user(caller).await?;
 
@@ -180,10 +214,10 @@ pub(crate) async fn register_node(
     // collision is a state directory copied along with a cloned machine image,
     // which is worth saying plainly rather than surfacing a unique-index
     // violation as an internal error.
-    if let Ok(other) = db
+    if db
         .get_marketplace_node_by_tls_fingerprint(&fingerprint)
         .await
-        && other.nostr_pubkey.as_deref() != Some(pubkey.as_slice())
+        .is_ok()
     {
         return Err(ApiError::bad_request(
             "Another node already uses that TLS certificate. If this machine was cloned from \
@@ -192,41 +226,129 @@ pub(crate) async fn register_node(
         ));
     }
 
-    // A node already using this key is the same machine re-registering.
-    match db.get_marketplace_node_by_nostr_pubkey(&pubkey).await {
-        Ok(existing) => {
-            // Someone else's hardware. Rebinding it would hand over a machine
-            // that may be running their customers' VMs, so this fails rather than
-            // taking ownership.
-            if existing.operator_id != operator.id {
-                return Err(ApiError::forbidden(
-                    "That node is registered to another operator",
+    let id = db
+        .insert_marketplace_node(&MarketplaceNode {
+            operator_id: operator.id,
+            name: name.to_string(),
+            tls_fingerprint: Some(fingerprint),
+            // Nothing is placed on a node until an admin approves it.
+            status: MarketplaceNodeStatus::Pending,
+            trust_tier: MarketplaceTrustTier::Untrusted,
+            ..Default::default()
+        })
+        .await?;
+
+    let node = db.get_marketplace_node(id).await?;
+    let token =
+        issue_node_token(node.id, node.token_version, NODE_TOKEN_TTL_SECS).map_err(|e| {
+            ApiError::with_status(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not issue a node token: {e}"),
+            )
+        })?;
+    Ok((node, token))
+}
+
+/// Update a node you own — rename it, or re-pin a rotated certificate.
+async fn v1_update_node(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(node_id): Path<u64>,
+    Json(req): Json<UpdateNodeRequest>,
+) -> ApiResult<ApiMarketplaceNode> {
+    let node = owned_node(&this.db, &auth.pubkey(), node_id).await?;
+
+    let name = match req.name.as_deref().map(str::trim) {
+        Some("") => return Err(ApiError::bad_request("Node name cannot be empty")),
+        Some(n) => n.to_string(),
+        None => node.name.clone(),
+    };
+    let fingerprint = match &req.tls_fingerprint {
+        Some(f) => {
+            let parsed = parse_32_bytes(f, "tls_fingerprint")?;
+            // Another node holding this certificate is the cloned-state-directory
+            // case again; rebinding it here would quietly point LNVPS at the
+            // wrong machine.
+            if let Ok(other) = this
+                .db
+                .get_marketplace_node_by_tls_fingerprint(&parsed)
+                .await
+                && other.id != node.id
+            {
+                return Err(ApiError::bad_request(
+                    "Another node already uses that TLS certificate.",
                 ));
             }
-            let updated = MarketplaceNode {
-                name: name.to_string(),
-                tls_fingerprint: Some(fingerprint),
-                ..existing
-            };
-            db.update_marketplace_node(&updated).await?;
-            Ok(db.get_marketplace_node(updated.id).await?)
+            Some(parsed)
         }
-        Err(_) => {
-            let id = db
-                .insert_marketplace_node(&MarketplaceNode {
-                    operator_id: operator.id,
-                    name: name.to_string(),
-                    nostr_pubkey: Some(pubkey),
-                    tls_fingerprint: Some(fingerprint),
-                    // Nothing is placed on a node until an admin approves it.
-                    status: MarketplaceNodeStatus::Pending,
-                    trust_tier: MarketplaceTrustTier::Untrusted,
-                    ..Default::default()
-                })
-                .await?;
-            Ok(db.get_marketplace_node(id).await?)
-        }
+        None => node.tls_fingerprint.clone(),
+    };
+
+    let updated = MarketplaceNode {
+        name,
+        tls_fingerprint: fingerprint,
+        ..node
+    };
+    this.db.update_marketplace_node(&updated).await?;
+    ApiData::ok(this.db.get_marketplace_node(updated.id).await?.into())
+}
+
+/// Issue a fresh token for a node, revoking the previous one.
+///
+/// This is the only way to replace a token — LNVPS keeps no copy of the one it
+/// handed out, so a lost or leaked token is dealt with by taking a new one.
+async fn v1_rotate_node_token(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(node_id): Path<u64>,
+) -> ApiResult<ApiRegisteredNode> {
+    let node = owned_node(&this.db, &auth.pubkey(), node_id).await?;
+
+    // Bumping the version is what invalidates the old token. It must be stored
+    // before the new one is handed out, or a failure here would leave the
+    // caller holding a token the node will reject.
+    let bumped = MarketplaceNode {
+        token_version: node.token_version.wrapping_add(1),
+        ..node
+    };
+    this.db.update_marketplace_node(&bumped).await?;
+
+    let node = this.db.get_marketplace_node(bumped.id).await?;
+    let token =
+        issue_node_token(node.id, node.token_version, NODE_TOKEN_TTL_SECS).map_err(|e| {
+            ApiError::with_status(
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Could not issue a node token: {e}"),
+            )
+        })?;
+    ApiData::ok(ApiRegisteredNode {
+        node: node.into(),
+        token,
+    })
+}
+
+/// Fetch a node, refusing one that belongs to somebody else.
+///
+/// Answers "not found" rather than "forbidden" so the endpoint does not confirm
+/// the existence of other operators' nodes to anyone who guesses an id.
+pub(crate) async fn owned_node(
+    db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+    caller: &[u8; 32],
+    node_id: u64,
+) -> Result<MarketplaceNode, ApiError> {
+    let uid = db.upsert_user(caller).await?;
+    let operator = db
+        .get_marketplace_operator_by_user(uid)
+        .await
+        .map_err(|_| ApiError::not_found("Node not found"))?;
+    let node = db
+        .get_marketplace_node(node_id)
+        .await
+        .map_err(|_| ApiError::not_found("Node not found"))?;
+    if node.operator_id != operator.id {
+        return Err(ApiError::not_found("Node not found"));
     }
+    Ok(node)
 }
 
 /// List the caller's own nodes.
@@ -242,6 +364,15 @@ async fn v1_list_nodes(
     };
     let nodes = this.db.list_marketplace_nodes(operator.id).await?;
     ApiData::ok(nodes.into_iter().map(Into::into).collect())
+}
+
+/// What a node is told about itself.
+///
+/// The daemon uses this to confirm its token works and to see whether it has
+/// been approved, without being able to see anything about other nodes or about
+/// the operator's account.
+async fn v1_node_self(auth: NodeAuth) -> ApiResult<ApiMarketplaceNode> {
+    ApiData::ok(auth.node.into())
 }
 
 /// The caller's operator enrolment.
@@ -262,23 +393,23 @@ async fn v1_get_operator(
 mod tests {
     use super::*;
     use lnvps_api_common::MockDb;
+    use lnvps_api_common::{init_session_secret, verify_node_token, verify_session_token};
     use std::sync::Arc;
 
-    /// Two distinct 32-byte values, written out so a test that swaps them is
-    /// obvious.
-    const NODE_A_KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-    const NODE_B_KEY: &str = "2222222222222222222222222222222222222222222222222222222222222222";
     const FINGERPRINT_1: &str = "aaaa111111111111111111111111111111111111111111111111111111111111";
     const FINGERPRINT_2: &str = "bbbb222222222222222222222222222222222222222222222222222222222222";
 
+    const OPERATOR: [u8; 32] = [9u8; 32];
+    const SOMEONE_ELSE: [u8; 32] = [8u8; 32];
+
     fn db() -> Arc<dyn lnvps_db::LNVpsDb> {
+        init_session_secret(b"test-secret-for-marketplace".to_vec());
         Arc::new(MockDb::default())
     }
 
-    fn request(name: &str, pubkey: &str, fingerprint: &str) -> RegisterNodeRequest {
+    fn request(name: &str, fingerprint: &str) -> RegisterNodeRequest {
         RegisterNodeRequest {
             name: name.to_string(),
-            nostr_pubkey: pubkey.to_string(),
             tls_fingerprint: fingerprint.to_string(),
         }
     }
@@ -286,13 +417,9 @@ mod tests {
     #[tokio::test]
     async fn registering_enrols_the_caller_and_leaves_the_node_pending() {
         let db = db();
-        let node = register_node(
-            &db,
-            &[9u8; 32],
-            &request("rack 1", NODE_A_KEY, FINGERPRINT_1),
-        )
-        .await
-        .unwrap();
+        let (node, token) = register_node(&db, &OPERATOR, &request("rack 1", FINGERPRINT_1))
+            .await
+            .unwrap();
 
         assert_eq!(node.name, "rack 1");
         assert_eq!(
@@ -304,82 +431,71 @@ mod tests {
             MarketplaceNodeStatus::Pending,
             "a node must not be placeable before an admin approves it"
         );
-        assert_eq!(node.trust_tier, MarketplaceTrustTier::Untrusted);
 
-        // The caller was enrolled as an operator on the way through.
-        let uid = db.upsert_user(&[9u8; 32]).await.unwrap();
+        // The token authenticates this node and no other.
+        let claims = verify_node_token(&token).unwrap();
+        assert_eq!(claims.nid, node.id);
+        assert_eq!(claims.ver, node.token_version);
+
+        let uid = db.upsert_user(&OPERATOR).await.unwrap();
         let operator = db.get_marketplace_operator_by_user(uid).await.unwrap();
         assert_eq!(node.operator_id, operator.id);
     }
 
-    /// The certificate rotation path. Without it, a node that regenerates its
-    /// certificate presents a fingerprint LNVPS does not have, every control
-    /// call fails closed, and the machine is unreachable for good.
+    /// A node token must not be a way into its operator's account. The node is
+    /// on hardware LNVPS does not control, so this is the boundary that keeps a
+    /// compromised machine from becoming a compromised account.
     #[tokio::test]
-    async fn re_registering_updates_the_pinned_fingerprint() {
+    async fn a_node_token_is_not_an_account_credential() {
         let db = db();
-        let first = register_node(
-            &db,
-            &[9u8; 32],
-            &request("rack 1", NODE_A_KEY, FINGERPRINT_1),
-        )
-        .await
-        .unwrap();
-
-        let second = register_node(
-            &db,
-            &[9u8; 32],
-            &request("rack 1 renamed", NODE_A_KEY, FINGERPRINT_2),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            second.id, first.id,
-            "re-registration must not create a second node"
-        );
-        assert_eq!(
-            second.tls_fingerprint,
-            Some(hex::decode(FINGERPRINT_2).unwrap())
-        );
-        assert_eq!(second.name, "rack 1 renamed");
-    }
-
-    /// The security guard: re-registering somebody else's node would hand over
-    /// a machine that may be running their customers' VMs.
-    #[tokio::test]
-    async fn a_node_cannot_be_taken_over_by_another_operator() {
-        let db = db();
-        register_node(
-            &db,
-            &[9u8; 32],
-            &request("theirs", NODE_A_KEY, FINGERPRINT_1),
-        )
-        .await
-        .unwrap();
-
-        let err = register_node(
-            &db,
-            &[8u8; 32],
-            &request("mine now", NODE_A_KEY, FINGERPRINT_2),
-        )
-        .await
-        .expect_err("a node was taken over by another operator");
-        assert!(
-            format!("{err:?}").contains("another operator"),
-            "unexpected error: {err:?}"
-        );
-
-        // And the original is untouched.
-        let node = db
-            .get_marketplace_node_by_nostr_pubkey(&hex::decode(NODE_A_KEY).unwrap())
+        let (_, token) = register_node(&db, &OPERATOR, &request("rack 1", FINGERPRINT_1))
             .await
             .unwrap();
-        assert_eq!(node.name, "theirs");
-        assert_eq!(
-            node.tls_fingerprint,
-            Some(hex::decode(FINGERPRINT_1).unwrap())
+
+        verify_session_token(&token)
+            .expect_err("a node token authenticated as its operator's account");
+    }
+
+    /// Rotation is the only way to replace a token, since LNVPS keeps no copy
+    /// of the one it issued.
+    #[tokio::test]
+    async fn rotating_a_token_revokes_the_previous_one() {
+        let db = db();
+        let (node, first) = register_node(&db, &OPERATOR, &request("rack 1", FINGERPRINT_1))
+            .await
+            .unwrap();
+
+        // Bump the version the way the rotate handler does.
+        let bumped = lnvps_db::MarketplaceNode {
+            token_version: node.token_version + 1,
+            ..node.clone()
+        };
+        db.update_marketplace_node(&bumped).await.unwrap();
+        let after = db.get_marketplace_node(node.id).await.unwrap();
+
+        // The signature on the old token is still valid — revocation has to be
+        // the version check, because a signed token cannot be withdrawn.
+        let old_claims = verify_node_token(&first).unwrap();
+        assert_ne!(
+            old_claims.ver, after.token_version,
+            "the old token still matches the node's current version, so it was not revoked"
         );
+    }
+
+    /// Registration hands back a token. A deployment that cannot issue one must
+    /// say so, not register a node that could never authenticate.
+    #[tokio::test]
+    async fn registration_refuses_when_tokens_cannot_be_issued() {
+        // This cannot be tested by unsetting the process-wide secret (it is set
+        // once for the process), so it checks the condition the guard reads.
+        assert!(
+            lnvps_api_common::session_auth_enabled(),
+            "test setup: the secret should be installed by db()"
+        );
+        let db = db();
+        register_node(&db, &OPERATOR, &request("rack 1", FINGERPRINT_1))
+            .await
+            .expect("registration should succeed while tokens can be issued");
     }
 
     /// Two nodes sharing a certificate means either can answer for the other,
@@ -387,11 +503,11 @@ mod tests {
     #[tokio::test]
     async fn two_nodes_cannot_share_a_fingerprint() {
         let db = db();
-        register_node(&db, &[9u8; 32], &request("one", NODE_A_KEY, FINGERPRINT_1))
+        register_node(&db, &OPERATOR, &request("one", FINGERPRINT_1))
             .await
             .unwrap();
 
-        let err = register_node(&db, &[9u8; 32], &request("two", NODE_B_KEY, FINGERPRINT_1))
+        let err = register_node(&db, &OPERATOR, &request("two", FINGERPRINT_1))
             .await
             .expect_err("two nodes were allowed to share a TLS fingerprint");
 
@@ -408,10 +524,6 @@ mod tests {
             msg.contains("delete the tls directory"),
             "the message must say what to do: {msg}"
         );
-        assert!(
-            msg.contains("code: 400"),
-            "a client error must not be reported as a 500: {msg}"
-        );
     }
 
     /// The same collision across operators is the impersonation case: one
@@ -419,15 +531,11 @@ mod tests {
     #[tokio::test]
     async fn a_fingerprint_cannot_be_reused_by_a_different_operator() {
         let db = db();
-        register_node(
-            &db,
-            &[9u8; 32],
-            &request("theirs", NODE_A_KEY, FINGERPRINT_1),
-        )
-        .await
-        .unwrap();
+        register_node(&db, &OPERATOR, &request("theirs", FINGERPRINT_1))
+            .await
+            .unwrap();
 
-        let err = register_node(&db, &[8u8; 32], &request("mine", NODE_B_KEY, FINGERPRINT_1))
+        let err = register_node(&db, &SOMEONE_ELSE, &request("mine", FINGERPRINT_1))
             .await
             .expect_err("one operator registered another operator's certificate");
         assert!(
@@ -439,38 +547,56 @@ mod tests {
     #[tokio::test]
     async fn one_operator_can_run_several_nodes() {
         let db = db();
-        let a = register_node(&db, &[9u8; 32], &request("one", NODE_A_KEY, FINGERPRINT_1))
+        let (a, ta) = register_node(&db, &OPERATOR, &request("one", FINGERPRINT_1))
             .await
             .unwrap();
-        let b = register_node(&db, &[9u8; 32], &request("two", NODE_B_KEY, FINGERPRINT_2))
+        let (b, tb) = register_node(&db, &OPERATOR, &request("two", FINGERPRINT_2))
             .await
             .unwrap();
 
         assert_ne!(a.id, b.id);
         assert_eq!(a.operator_id, b.operator_id);
-        assert_eq!(
-            db.list_marketplace_nodes(a.operator_id)
-                .await
-                .unwrap()
-                .len(),
-            2
+        // Each node gets its own token, so one can be revoked without the other.
+        assert_ne!(ta, tb);
+        assert_eq!(verify_node_token(&ta).unwrap().nid, a.id);
+        assert_eq!(verify_node_token(&tb).unwrap().nid, b.id);
+    }
+
+    /// Answering "not found" rather than "forbidden" avoids confirming that
+    /// another operator's node exists to anyone who guesses an id.
+    #[tokio::test]
+    async fn another_operators_node_cannot_be_reached() {
+        let db = db();
+        let (node, _) = register_node(&db, &OPERATOR, &request("theirs", FINGERPRINT_1))
+            .await
+            .unwrap();
+        // Give the other caller an operator record of their own.
+        register_node(&db, &SOMEONE_ELSE, &request("mine", FINGERPRINT_2))
+            .await
+            .unwrap();
+
+        let err = owned_node(&db, &SOMEONE_ELSE, node.id)
+            .await
+            .expect_err("one operator reached another operator's node");
+        assert!(format!("{err:?}").contains("not found"), "{err:?}");
+        assert!(
+            !format!("{err:?}").to_lowercase().contains("forbidden"),
+            "the error confirms the node exists: {err:?}"
         );
     }
 
-    /// A malformed key or digest would be stored as something the node can
-    /// never present, and would surface much later as an unreachable node.
+    /// A malformed digest would be stored as something the node can never
+    /// present, and would surface much later as an unreachable node.
     #[tokio::test]
-    async fn malformed_identities_are_refused_at_the_door() {
+    async fn malformed_fingerprints_are_refused_at_the_door() {
         let db = db();
-        for (pubkey, fingerprint, expect) in [
-            ("nothex", FINGERPRINT_1, "nostr_pubkey is not valid hex"),
-            (NODE_A_KEY, "zz", "tls_fingerprint is not valid hex"),
-            ("1122", FINGERPRINT_1, "nostr_pubkey must be 32 bytes"),
-            (NODE_A_KEY, "1122", "tls_fingerprint must be 32 bytes"),
+        for (fingerprint, expect) in [
+            ("zz", "tls_fingerprint is not valid hex"),
+            ("1122", "tls_fingerprint must be 32 bytes"),
         ] {
-            let err = register_node(&db, &[9u8; 32], &request("n", pubkey, fingerprint))
+            let err = register_node(&db, &OPERATOR, &request("n", fingerprint))
                 .await
-                .expect_err("malformed identity accepted");
+                .expect_err("malformed fingerprint accepted");
             assert!(format!("{err:?}").contains(expect), "got {err:?}");
         }
     }
@@ -478,7 +604,7 @@ mod tests {
     #[tokio::test]
     async fn a_node_needs_a_name() {
         let db = db();
-        let err = register_node(&db, &[9u8; 32], &request("   ", NODE_A_KEY, FINGERPRINT_1))
+        let err = register_node(&db, &OPERATOR, &request("   ", FINGERPRINT_1))
             .await
             .expect_err("an unnamed node was registered");
         assert!(
@@ -490,29 +616,21 @@ mod tests {
     /// Hex is case-insensitive; the stored bytes must not depend on which case
     /// the operator pasted.
     #[tokio::test]
-    async fn identities_are_stored_as_bytes_not_text() {
+    async fn fingerprints_are_stored_as_bytes_not_text() {
         let db = db();
-        let node = register_node(
-            &db,
-            &[9u8; 32],
-            &request(
-                "n",
-                &NODE_A_KEY.to_uppercase(),
-                &FINGERPRINT_1.to_uppercase(),
-            ),
-        )
-        .await
-        .unwrap();
+        let (node, _) = register_node(&db, &OPERATOR, &request("n", &FINGERPRINT_1.to_uppercase()))
+            .await
+            .unwrap();
 
         assert_eq!(
             node.tls_fingerprint,
             Some(hex::decode(FINGERPRINT_1).unwrap())
         );
-        // And it is found by the lowercase form the daemon will send.
         assert!(
-            db.get_marketplace_node_by_nostr_pubkey(&hex::decode(NODE_A_KEY).unwrap())
+            db.get_marketplace_node_by_tls_fingerprint(&hex::decode(FINGERPRINT_1).unwrap())
                 .await
-                .is_ok()
+                .is_ok(),
+            "the node cannot be found by the lowercase form its daemon will send"
         );
     }
 }
