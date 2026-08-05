@@ -15,9 +15,10 @@ pub struct GpuInfo {
 }
 
 /// Detect NVIDIA GPUs with NVENC/NVDEC support using NVML
+#[cfg(feature = "nvml")]
 pub fn detect_nvidia() -> DetectionResult {
-    use nvml_wrapper::enum_wrappers::device::EncoderType;
     use nvml_wrapper::Nvml;
+    use nvml_wrapper::enum_wrappers::device::EncoderType;
 
     let mut features = Vec::new();
 
@@ -109,6 +110,14 @@ pub fn detect_nvidia() -> DetectionResult {
         Some(name) => DetectionResult::ok_with_name(name, features),
         None => DetectionResult::ok(features),
     }
+}
+
+/// Without the `nvml` feature there is no NVML library to load, so the result
+/// is `Unsupported` rather than an empty feature list — "we did not look" and
+/// "we looked and found nothing" are different answers.
+#[cfg(not(feature = "nvml"))]
+pub fn detect_nvidia() -> DetectionResult {
+    DetectionResult::Unsupported
 }
 
 /// Detect AMD discrete GPUs with VCN/AMF support
