@@ -4025,13 +4025,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
-    async fn get_marketplace_node_by_nostr_pubkey(
+    async fn get_marketplace_node_by_tls_fingerprint(
         &self,
-        pubkey: &[u8],
+        fingerprint: &[u8],
     ) -> DbResult<MarketplaceNode> {
         Ok(
-            sqlx::query_as("SELECT * FROM marketplace_node WHERE nostr_pubkey = ?")
-                .bind(pubkey)
+            sqlx::query_as("SELECT * FROM marketplace_node WHERE tls_fingerprint = ?")
+                .bind(fingerprint)
                 .fetch_one(&self.db)
                 .await?,
         )
@@ -4067,12 +4067,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO marketplace_node (operator_id, name, nostr_pubkey, status, trust_tier, tunnel_id, last_seen) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) returning id",
+            "INSERT INTO marketplace_node (operator_id, name, tls_fingerprint, token_version, status, trust_tier, tunnel_id, last_seen) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(node.operator_id)
         .bind(&node.name)
-        .bind(&node.nostr_pubkey)
+        .bind(&node.tls_fingerprint)
+        .bind(node.token_version)
         .bind(node.status)
         .bind(node.trust_tier)
         .bind(node.tunnel_id)
@@ -4085,11 +4086,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn update_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<()> {
         sqlx::query(
             "UPDATE marketplace_node \
-             SET name = ?, nostr_pubkey = ?, status = ?, trust_tier = ?, tunnel_id = ? \
+             SET name = ?, tls_fingerprint = ?, token_version = ?, status = ?, trust_tier = ?, tunnel_id = ? \
              WHERE id = ?",
         )
         .bind(&node.name)
-        .bind(&node.nostr_pubkey)
+        .bind(&node.tls_fingerprint)
+        .bind(node.token_version)
         .bind(node.status)
         .bind(node.trust_tier)
         .bind(node.tunnel_id)

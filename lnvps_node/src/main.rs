@@ -57,10 +57,14 @@ async fn main() -> Result<()> {
             let credential = Credential::load_checked(&config.credential)?;
             println!("config:     {}", cli.config.display());
             println!("api url:    {}", config.api_url);
-            match credential.public_key() {
-                Some(pubkey) => println!("identity:   {pubkey}"),
-                None => println!("identity:   session token (no public key)"),
-            }
+            // The token is a secret, so only its presence is reported. The
+            // node's identity as LNVPS sees it comes from `lnvps-node self`
+            // once the control API is reachable.
+            let _ = &credential;
+            println!(
+                "credential: loaded from {}",
+                config.credential.file.display()
+            );
             match &config.control {
                 Some(control) => println!(
                     "control:    {}:{} on {}",

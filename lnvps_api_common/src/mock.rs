@@ -3520,16 +3520,16 @@ impl LNVpsDbBase for MockDb {
             .ok_or_else(|| anyhow!("Marketplace node {} not found", id).into())
     }
 
-    async fn get_marketplace_node_by_nostr_pubkey(
+    async fn get_marketplace_node_by_tls_fingerprint(
         &self,
-        pubkey: &[u8],
+        fingerprint: &[u8],
     ) -> DbResult<MarketplaceNode> {
         let nodes = self.marketplace_nodes.lock().await;
         nodes
             .values()
-            .find(|n| n.nostr_pubkey.as_deref() == Some(pubkey))
+            .find(|n| n.tls_fingerprint.as_deref() == Some(fingerprint))
             .cloned()
-            .ok_or_else(|| anyhow!("No marketplace node with that pubkey").into())
+            .ok_or_else(|| DbError::Other(anyhow!("Marketplace node not found")))
     }
 
     async fn list_marketplace_nodes(&self, operator_id: u64) -> DbResult<Vec<MarketplaceNode>> {
@@ -3570,13 +3570,25 @@ impl LNVpsDbBase for MockDb {
             return Err(anyhow!("Tunnel {} not found", tunnel_id).into());
         }
         let mut nodes = self.marketplace_nodes.lock().await;
-        // uk_marketplace_node_nostr_pubkey (NULLs do not collide in MySQL either)
-        if let Some(pubkey) = node.nostr_pubkey.as_deref()
+        // ck_marketplace_node_tls_fingerprint: a short value would be padded
+        // by the real column and could then never match what the node serves.
+        if let Some(fp) = node.tls_fingerprint.as_deref()
+            && fp.len() != 32
+        {
+            return Err(anyhow!(
+                "TLS fingerprint must be 32 bytes, got {} (ck_marketplace_node_tls_fingerprint)",
+                fp.len()
+            )
+            .into());
+        }
+        // uk_marketplace_node_tls_fingerprint: two nodes serving the same
+        // certificate would each be able to answer for the other.
+        if let Some(fp) = node.tls_fingerprint.as_deref()
             && nodes
                 .values()
-                .any(|n| n.nostr_pubkey.as_deref() == Some(pubkey))
+                .any(|n| n.tls_fingerprint.as_deref() == Some(fp))
         {
-            return Err(anyhow!("A node with that pubkey already exists").into());
+            return Err(anyhow!("A node with that TLS fingerprint already exists").into());
         }
         // uk_marketplace_node_tunnel
         if let Some(tunnel_id) = node.tunnel_id
@@ -3610,12 +3622,21 @@ impl LNVpsDbBase for MockDb {
         {
             return Err(anyhow!("Tunnel {} already backs another node", tunnel_id).into());
         }
-        if let Some(pubkey) = node.nostr_pubkey.as_deref()
+        if let Some(fp) = node.tls_fingerprint.as_deref()
+            && fp.len() != 32
+        {
+            return Err(anyhow!(
+                "TLS fingerprint must be 32 bytes, got {} (ck_marketplace_node_tls_fingerprint)",
+                fp.len()
+            )
+            .into());
+        }
+        if let Some(fp) = node.tls_fingerprint.as_deref()
             && nodes
                 .values()
-                .any(|n| n.id != node.id && n.nostr_pubkey.as_deref() == Some(pubkey))
+                .any(|n| n.id != node.id && n.tls_fingerprint.as_deref() == Some(fp))
         {
-            return Err(anyhow!("A node with that pubkey already exists").into());
+            return Err(anyhow!("A node with that TLS fingerprint already exists").into());
         }
         let existing = nodes
             .get_mut(&node.id)
@@ -3624,7 +3645,8 @@ impl LNVpsDbBase for MockDb {
         // a node cannot change hands, and heartbeats go through
         // `touch_marketplace_node`.
         existing.name = node.name.clone();
-        existing.nostr_pubkey = node.nostr_pubkey.clone();
+        existing.tls_fingerprint = node.tls_fingerprint.clone();
+        existing.token_version = node.token_version;
         existing.status = node.status;
         existing.trust_tier = node.trust_tier;
         existing.tunnel_id = node.tunnel_id;
@@ -8295,6 +8317,64 @@ mod marketplace_tests {
         }
     }
 
+    /// Mirrors `uk_marketplace_node_tls_fingerprint`: two nodes serving the
+    /// same certificate would each be able to answer for the other.
+    #[tokio::test]
+    async fn a_tls_fingerprint_belongs_to_one_node() {
+        let db = MockDb::default();
+        let u1 = user(&db, 1).await;
+        let op = db
+            .insert_marketplace_operator(&MarketplaceOperator {
+                user_id: u1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        db.insert_marketplace_node(&MarketplaceNode {
+            tls_fingerprint: Some(vec![7u8; 32]),
+            ..node(op, "one")
+        })
+        .await
+        .unwrap();
+
+        let err = db
+            .insert_marketplace_node(&MarketplaceNode {
+                tls_fingerprint: Some(vec![7u8; 32]),
+                ..node(op, "two")
+            })
+            .await
+            .expect_err("two nodes shared a TLS fingerprint");
+        assert!(err.to_string().contains("fingerprint"), "{err}");
+    }
+
+    /// Mirrors `ck_marketplace_node_tls_fingerprint`. The real column pads a
+    /// short value with zero bytes and accepts it, which stores a pin that can
+    /// never match; the constraint turns that into an error at write time.
+    #[tokio::test]
+    async fn a_tls_fingerprint_must_be_a_full_sha256() {
+        let db = MockDb::default();
+        let u1 = user(&db, 1).await;
+        let op = db
+            .insert_marketplace_operator(&MarketplaceOperator {
+                user_id: u1,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        for len in [16usize, 31, 33] {
+            let err = db
+                .insert_marketplace_node(&MarketplaceNode {
+                    tls_fingerprint: Some(vec![1u8; len]),
+                    ..node(op, "short")
+                })
+                .await
+                .expect_err("a {len}-byte fingerprint was accepted");
+            assert!(err.to_string().contains("32 bytes"), "{len}: {err}");
+        }
+    }
+
     #[tokio::test]
     async fn operator_crud_roundtrip() {
         let db = MockDb::default();
@@ -8387,29 +8467,34 @@ mod marketplace_tests {
         assert_eq!(loaded.trust_tier, MarketplaceTrustTier::Untrusted);
         assert!(!loaded.status.accepts_placement());
         assert_eq!(loaded.last_seen, None);
-        assert_eq!(loaded.nostr_pubkey, None);
+        assert_eq!(loaded.tls_fingerprint, None);
+        assert_eq!(loaded.token_version, 0);
 
         let mut update = loaded.clone();
         update.name = "rack-1a".to_string();
         update.status = MarketplaceNodeStatus::Approved;
         update.trust_tier = MarketplaceTrustTier::Verified;
-        update.nostr_pubkey = Some(vec![7u8; 32]);
+        update.tls_fingerprint = Some(vec![7u8; 32]);
+        // Bumping the version is how a node's token is revoked, and it must
+        // survive a write or revocation would silently not take.
+        update.token_version = 1;
         db.update_marketplace_node(&update).await.unwrap();
 
         let reloaded = db.get_marketplace_node(id).await.unwrap();
         assert_eq!(reloaded.name, "rack-1a");
         assert!(reloaded.status.accepts_placement());
         assert_eq!(reloaded.trust_tier, MarketplaceTrustTier::Verified);
-        assert_eq!(reloaded.nostr_pubkey, Some(vec![7u8; 32]));
+        assert_eq!(reloaded.tls_fingerprint, Some(vec![7u8; 32]));
+        assert_eq!(reloaded.token_version, 1);
 
-        // The control channel resolves a connection by key.
-        let by_key = db
-            .get_marketplace_node_by_nostr_pubkey(&[7u8; 32])
+        // LNVPS resolves a node by the certificate it pinned.
+        let by_cert = db
+            .get_marketplace_node_by_tls_fingerprint(&[7u8; 32])
             .await
             .unwrap();
-        assert_eq!(by_key.id, id);
+        assert_eq!(by_cert.id, id);
         assert!(
-            db.get_marketplace_node_by_nostr_pubkey(&[9u8; 32])
+            db.get_marketplace_node_by_tls_fingerprint(&[9u8; 32])
                 .await
                 .is_err()
         );
@@ -8454,29 +8539,30 @@ mod marketplace_tests {
     }
 
     #[tokio::test]
-    async fn a_node_key_identifies_exactly_one_node() {
+    async fn a_certificate_identifies_exactly_one_node() {
         let db = MockDb::default();
         let u1 = user(&db, 1).await;
         let op = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
 
         let mut first = node(op, "a");
-        first.nostr_pubkey = Some(vec![1u8; 32]);
+        first.tls_fingerprint = Some(vec![1u8; 32]);
         db.insert_marketplace_node(&first).await.unwrap();
 
-        // uk_marketplace_node_pubkey. Without this a second node could claim an
-        // approved node's identity on the control channel.
+        // uk_marketplace_node_tls_fingerprint. Without this a second node could
+        // present the certificate LNVPS pinned for an approved node, and answer
+        // for it.
         let mut clash = node(op, "b");
-        clash.nostr_pubkey = Some(vec![1u8; 32]);
+        clash.tls_fingerprint = Some(vec![1u8; 32]);
         assert!(db.insert_marketplace_node(&clash).await.is_err());
 
         // ...and the same must hold on update, not just insert.
-        clash.nostr_pubkey = None;
+        clash.tls_fingerprint = None;
         let other_id = db.insert_marketplace_node(&clash).await.unwrap();
         let mut steal = db.get_marketplace_node(other_id).await.unwrap();
-        steal.nostr_pubkey = Some(vec![1u8; 32]);
+        steal.tls_fingerprint = Some(vec![1u8; 32]);
         assert!(db.update_marketplace_node(&steal).await.is_err());
 
-        // Keyless nodes do not collide with each other (SQL NULLs never do).
+        // Unregistered nodes do not collide with each other (SQL NULLs never do).
         db.insert_marketplace_node(&node(op, "c")).await.unwrap();
     }
 

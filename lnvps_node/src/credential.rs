@@ -1,80 +1,54 @@
-//! How a node proves who it is to the LNVPS API.
+//! The node's credential: the token LNVPS issued for this machine.
 //!
-//! A node authenticates as a **normal consumer account** — the operator's own
-//! account — using the two schemes the API already accepts, so there is no
-//! node-specific auth path to keep secure separately:
+//! A node authenticates as itself, never as its operator. The token carries the
+//! node's own id and its own revocation counter, so a compromised machine costs
+//! the operator that node and nothing else — not their account, not their other
+//! nodes.
 //!
-//! - `Authorization: Nostr <base64 event>` — a NIP-98 event signed per request.
-//! - `Authorization: Bearer <jwt>` — a long-lived session token, for installs
-//!   where holding a nostr key on the machine is not wanted.
+//! There is deliberately no nostr-key option. The node signs nothing: inbound
+//! control requests are verified against LNVPS's key (see
+//! [`crate::control_auth`]), and outbound calls carry this token. A second
+//! credential kind that authenticates nothing would just be a way to
+//! misconfigure a node.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use nostr::prelude::*;
 use serde::{Deserialize, Serialize};
 
-/// Which authentication scheme a node's secret is for.
+/// Where the node's token lives.
 ///
-/// Named explicitly in config rather than sniffed from the file's contents: a
-/// token that happened to start with `nsec1` would otherwise be parsed as a
-/// key, and the failure would surface as a confusing signature error rather
-/// than "you configured the wrong kind".
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CredentialKind {
-    /// A nostr secret key (`nsec1...` bech32, or 64 hex characters).
-    NostrKey,
-    /// A long-lived session token issued by the API.
-    SessionToken,
-}
-
-/// Where a node's secret lives.
-///
-/// The secret is always a file path, never an inline value: a config file gets
-/// copied into issue reports and configuration management, and a key pasted
-/// into it leaks with the first person who asks for the config.
+/// Always a file path, never an inline value: a config file gets copied into
+/// issue reports and configuration management, and a token pasted into it leaks
+/// with the first person who asks for the config.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CredentialConfig {
-    /// Which scheme the file's contents are for.
-    pub kind: CredentialKind,
-    /// Path to the file holding the secret.
+    /// Path to the file holding the token, as issued at registration.
     pub file: PathBuf,
 }
 
-/// A loaded secret, ready to authenticate requests.
-pub enum Credential {
-    /// Signs a fresh NIP-98 event per request.
-    NostrKey(Box<Keys>),
-    /// Presented unchanged on every request.
-    SessionToken(String),
+/// The node's token, ready to authenticate requests to LNVPS.
+pub struct Credential {
+    token: String,
 }
 
 impl std::fmt::Debug for Credential {
-    /// Deliberately hand-written: the derived form would print the secret key
-    /// and the session token, and this type ends up inside anyhow errors and
-    /// log lines.
+    /// Hand-written: the derived form would print the token, and this type ends
+    /// up inside anyhow errors and log lines.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Credential::NostrKey(keys) => f
-                .debug_struct("NostrKey")
-                .field("pubkey", &keys.public_key().to_hex())
-                .finish(),
-            Credential::SessionToken(_) => f.write_str("SessionToken(<redacted>)"),
-        }
+        f.write_str("Credential(<redacted>)")
     }
 }
 
 impl Credential {
-    /// Load the secret named by `config`.
+    /// Load the token named by `config`.
     pub fn load(config: &CredentialConfig) -> Result<Self> {
         let contents = fs::read_to_string(&config.file)
             .with_context(|| format!("Cannot read credential file {}", config.file.display()))?;
-        Self::parse(config.kind, &contents, &config.file)
+        Self::parse(&contents, &config.file)
     }
 
     /// Load and check that the file is not readable by other users.
@@ -87,66 +61,34 @@ impl Credential {
         Self::load(config)
     }
 
-    /// Parse file contents as `kind`.
+    /// Parse file contents as a node token.
     ///
     /// Surrounding whitespace is trimmed: every editor and `echo` leaves a
-    /// trailing newline, and a key that fails to parse for that reason is a
-    /// miserable first-run experience.
-    pub fn parse(kind: CredentialKind, contents: &str, path: &Path) -> Result<Self> {
-        let secret = contents.trim();
-        if secret.is_empty() {
+    /// trailing newline, and a token that fails for that reason is a miserable
+    /// first-run experience.
+    pub fn parse(contents: &str, path: &Path) -> Result<Self> {
+        let token = contents.trim();
+        if token.is_empty() {
             bail!("Credential file {} is empty", path.display());
         }
-
-        match kind {
-            CredentialKind::NostrKey => {
-                let key = SecretKey::from_bech32(secret)
-                    .or_else(|_| SecretKey::from_hex(secret))
-                    .with_context(|| {
-                        format!(
-                            "Credential file {} is not a nostr secret key (expected nsec1... or 64 hex characters)",
-                            path.display()
-                        )
-                    })?;
-                Ok(Credential::NostrKey(Box::new(Keys::new(key))))
-            }
-            CredentialKind::SessionToken => Ok(Credential::SessionToken(secret.to_string())),
+        // A JWT has three dot-separated parts. Checking the shape here turns a
+        // pasted-wrong-thing into a clear message at startup, rather than a 401
+        // from the API that looks like a revoked node.
+        if token.split('.').count() != 3 {
+            bail!(
+                "Credential file {} does not contain a node token (expected three dot-separated \
+                 parts, as issued when the node was registered)",
+                path.display()
+            );
         }
+        Ok(Credential {
+            token: token.to_string(),
+        })
     }
 
-    /// The node's public identity, when it has one.
-    ///
-    /// A session token identifies an account to the server, but the node cannot
-    /// derive a public key from it, so there is nothing to show the operator.
-    pub fn public_key(&self) -> Option<String> {
-        match self {
-            Credential::NostrKey(keys) => Some(keys.public_key().to_hex()),
-            Credential::SessionToken(_) => None,
-        }
-    }
-
-    /// Build the `Authorization` header value for one request.
-    ///
-    /// NIP-98 events are signed per call and bound to the URL and method, so
-    /// this takes both rather than being cached.
-    pub fn authorization_header(&self, url: &str, method: &str) -> Result<String> {
-        match self {
-            Credential::NostrKey(keys) => {
-                let event = EventBuilder::new(Kind::HttpAuth, "")
-                    .tag(Tag::custom(
-                        TagKind::Custom(std::borrow::Cow::Borrowed("u")),
-                        vec![url.to_string()],
-                    ))
-                    .tag(Tag::custom(
-                        TagKind::Custom(std::borrow::Cow::Borrowed("method")),
-                        vec![method.to_uppercase()],
-                    ))
-                    .sign_with_keys(keys)
-                    .context("Failed to sign NIP-98 event")?;
-                Ok(format!("Nostr {}", BASE64.encode(event.as_json())))
-            }
-            Credential::SessionToken(token) => Ok(format!("Bearer {token}")),
-        }
+    /// The `Authorization` header value for a call to LNVPS.
+    pub fn authorization_header(&self) -> String {
+        format!("Bearer {}", self.token)
     }
 }
 
@@ -188,151 +130,92 @@ pub fn check_permissions(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// A key whose bech32 and hex forms are both known, so the test can prove
-    /// the two encodings load to the same identity.
-    const NSEC: &str = "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5";
-    const HEX: &str = "67dea2ed018072d675f5415ecfaed7d2597555e202d85b3d65ea4e58d2d92ffa";
+    /// The shape of what registration hands back.
+    const TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJuaWQiOjd9.c2ln";
 
     fn path() -> PathBuf {
-        PathBuf::from("/etc/lnvps-node/credential")
+        PathBuf::from("/etc/lnvps-node/token")
     }
 
     #[test]
-    fn a_key_loads_from_either_encoding() {
-        let from_bech32 = Credential::parse(CredentialKind::NostrKey, NSEC, &path()).unwrap();
-        let from_hex = Credential::parse(CredentialKind::NostrKey, HEX, &path()).unwrap();
-        assert_eq!(from_bech32.public_key(), from_hex.public_key());
-        assert!(from_bech32.public_key().is_some());
+    fn a_token_becomes_a_bearer_header() {
+        let cred = Credential::parse(TOKEN, &path()).unwrap();
+        assert_eq!(cred.authorization_header(), format!("Bearer {TOKEN}"));
     }
 
     /// Every editor and `echo` leaves a trailing newline; a first run that
     /// fails on one is a bad first run.
     #[test]
     fn surrounding_whitespace_is_ignored() {
-        let padded = format!("  {NSEC}\n\n");
-        let trimmed = Credential::parse(CredentialKind::NostrKey, &padded, &path()).unwrap();
-        let plain = Credential::parse(CredentialKind::NostrKey, NSEC, &path()).unwrap();
-        assert_eq!(trimmed.public_key(), plain.public_key());
-
-        let token = Credential::parse(CredentialKind::SessionToken, " abc.def\n", &path()).unwrap();
+        let padded = format!("  {TOKEN}\n\n");
         assert_eq!(
-            token.authorization_header("u", "GET").unwrap(),
-            "Bearer abc.def"
+            Credential::parse(&padded, &path())
+                .unwrap()
+                .authorization_header(),
+            format!("Bearer {TOKEN}")
         );
     }
 
     #[test]
     fn an_empty_file_is_rejected() {
-        for kind in [CredentialKind::NostrKey, CredentialKind::SessionToken] {
-            let err = Credential::parse(kind, "  \n ", &path()).unwrap_err();
-            assert!(err.to_string().contains("empty"), "got: {err}");
+        let err = Credential::parse("  \n ", &path()).unwrap_err();
+        assert!(err.to_string().contains("empty"), "got: {err}");
+    }
+
+    /// Pasting the wrong thing into the token file is the likeliest
+    /// misconfiguration. Caught at startup with a message that names what was
+    /// expected, rather than surfacing later as a 401 that looks exactly like a
+    /// revoked node.
+    #[test]
+    fn something_that_is_not_a_token_is_rejected() {
+        for wrong in [
+            "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laq",
+            "just-a-string",
+            "two.parts",
+            "four.parts.here.now",
+        ] {
+            let err = Credential::parse(wrong, &path()).unwrap_err().to_string();
+            assert!(
+                err.contains("does not contain a node token"),
+                "{wrong}: {err}"
+            );
         }
     }
 
-    /// The wrong file in the key slot must say so, rather than failing later
-    /// with an opaque signature error.
+    /// The token must never reach a log line or an error report.
     #[test]
-    fn a_session_token_in_the_key_slot_is_rejected() {
-        let err =
-            Credential::parse(CredentialKind::NostrKey, "eyJhbGciOi.token", &path()).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("not a nostr secret key"), "got: {msg}");
-    }
-
-    #[test]
-    fn nip98_headers_are_bound_to_url_and_method() {
-        let cred = Credential::parse(CredentialKind::NostrKey, NSEC, &path()).unwrap();
-        let header = cred
-            .authorization_header("https://api.lnvps.net/api/v1/node", "post")
-            .unwrap();
-
-        let encoded = header.strip_prefix("Nostr ").expect("Nostr scheme");
-        let json = String::from_utf8(BASE64.decode(encoded).unwrap()).unwrap();
-        let event: Event = serde_json::from_str(&json).unwrap();
-
-        // A server that trusts the signature is trusting these two tags to
-        // stop the event being replayed against a different endpoint.
-        event.verify().expect("signature must verify");
-        assert_eq!(event.kind, Kind::HttpAuth);
-        let tag = |name: &str| {
-            event
-                .tags
-                .iter()
-                .find(|t| t.as_slice().first().map(String::as_str) == Some(name))
-                .map(|t| t.as_slice()[1].clone())
-        };
-        assert_eq!(
-            tag("u").as_deref(),
-            Some("https://api.lnvps.net/api/v1/node")
+    fn debug_output_never_contains_the_token() {
+        let cred = Credential::parse(TOKEN, &path()).unwrap();
+        let rendered = format!("{cred:?}");
+        assert!(
+            !rendered.contains(TOKEN),
+            "token leaked into Debug: {rendered}"
         );
-        // Lowercased in the call above: the tag must still be canonical.
-        assert_eq!(tag("method").as_deref(), Some("POST"));
-    }
-
-    /// Two requests must not reuse one event, or a captured header could be
-    /// replayed. Freshness comes from `created_at` plus a new event id.
-    #[test]
-    fn every_request_signs_a_fresh_event() {
-        let cred = Credential::parse(CredentialKind::NostrKey, NSEC, &path()).unwrap();
-        let one = cred
-            .authorization_header("https://api.lnvps.net/x", "GET")
-            .unwrap();
-        let two = cred
-            .authorization_header("https://api.lnvps.net/x", "GET")
-            .unwrap();
-        assert_ne!(one, two, "each request must sign its own event");
-    }
-
-    #[test]
-    fn session_tokens_are_presented_as_bearer() {
-        let cred = Credential::parse(CredentialKind::SessionToken, "abc.def.ghi", &path()).unwrap();
-        assert_eq!(
-            cred.authorization_header("https://api.lnvps.net/x", "GET")
-                .unwrap(),
-            "Bearer abc.def.ghi"
-        );
-        // Nothing to show an operator: the node cannot derive one from a token.
-        assert_eq!(cred.public_key(), None);
-    }
-
-    /// The secret must not reach a log line or an error report.
-    #[test]
-    fn debug_output_never_contains_the_secret() {
-        let key = Credential::parse(CredentialKind::NostrKey, NSEC, &path()).unwrap();
-        let rendered = format!("{key:?}");
-        assert!(!rendered.contains(NSEC));
-        assert!(!rendered.contains(HEX));
-        assert!(rendered.contains(&key.public_key().unwrap()));
-
-        let token = Credential::parse(CredentialKind::SessionToken, "s3cret.jwt", &path()).unwrap();
-        let rendered = format!("{token:?}");
-        assert!(!rendered.contains("s3cret"), "got: {rendered}");
+        assert!(rendered.contains("redacted"));
     }
 
     #[cfg(unix)]
-    mod permissions {
+    mod unix_permissions {
         use super::*;
         use std::os::unix::fs::PermissionsExt;
 
         fn file_with_mode(mode: u32) -> (tempfile::TempDir, PathBuf) {
             let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("credential");
-            fs::write(&path, NSEC).unwrap();
+            let path = dir.path().join("token");
+            fs::write(&path, TOKEN).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
             (dir, path)
         }
 
         #[test]
         fn an_owner_only_file_is_accepted() {
-            for mode in [0o600, 0o400] {
-                let (_dir, path) = file_with_mode(mode);
-                check_permissions(&path).unwrap();
-            }
+            let (_dir, path) = file_with_mode(0o600);
+            check_permissions(&path).unwrap();
         }
 
         /// A node runs on somebody else's hardware, often with other logins on
-        /// it. Each of these modes hands the operator's identity to another
-        /// account on the box.
+        /// it. Each of these modes hands the node's token to another account on
+        /// the box, and with it the ability to act as this node.
         #[test]
         fn a_file_others_can_reach_is_rejected() {
             for mode in [0o640, 0o604, 0o644, 0o660, 0o606, 0o666, 0o601, 0o610] {
@@ -350,18 +233,15 @@ mod tests {
         #[test]
         fn load_checked_refuses_before_reading_the_secret() {
             let (_dir, path) = file_with_mode(0o644);
-            let config = CredentialConfig {
-                kind: CredentialKind::NostrKey,
-                file: path,
-            };
+            let config = CredentialConfig { file: path };
             assert!(Credential::load_checked(&config).is_err());
             // ...but the same file with sane permissions loads.
             fs::set_permissions(&config.file, fs::Permissions::from_mode(0o600)).unwrap();
-            assert!(
+            assert_eq!(
                 Credential::load_checked(&config)
                     .unwrap()
-                    .public_key()
-                    .is_some()
+                    .authorization_header(),
+                format!("Bearer {TOKEN}")
             );
         }
 

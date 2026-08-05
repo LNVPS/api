@@ -1857,15 +1857,21 @@ pub struct MarketplaceNode {
     pub operator_id: u64,
     /// Operator-chosen display label. Not an identifier — not unique.
     pub name: String,
-    /// The nostr public key the daemon authenticates its *control channel*
-    /// with, unique across the fleet. `None` until the node first presents a
-    /// key. Its data-plane identity — WireGuard key and assigned addresses —
-    /// lives in [`Tunnel`], not here.
-    pub nostr_pubkey: Option<Vec<u8>>,
+    /// Revocation counter for this node's token, compared against the `ver`
+    /// claim on every call the node makes. Bumping it invalidates every token
+    /// issued for this node — and, unlike the operator's `session_version`,
+    /// nothing else.
+    pub token_version: u32,
     /// Approval lifecycle state
     pub status: MarketplaceNodeStatus,
     /// Placement-policy trust tier
     pub trust_tier: MarketplaceTrustTier,
+    /// SHA-256 of the DER certificate the node's control API serves, pinned by
+    /// LNVPS on every call to it. `None` until the node first registers.
+    ///
+    /// Unique across the fleet: two nodes presenting the same certificate would
+    /// mean either can answer for the other, which is what the pin prevents.
+    pub tls_fingerprint: Option<Vec<u8>>,
     /// The node's data plane, once assigned. `None` until then; a tunnel backs
     /// exactly one node.
     pub tunnel_id: Option<u64>,
