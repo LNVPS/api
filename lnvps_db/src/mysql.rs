@@ -2981,14 +2981,20 @@ impl LNVpsDbBase for LNVpsDbMysql {
         // amount, so it describes a one-off purchase and nothing else. A free or
         // fully-discounted recurring subscription has neither, and keeps today's
         // behaviour of expiring on schedule — a zero-amount VM must still lapse.
-        let recurring: Option<(i64, i64)> = sqlx::query_as(
-            "SELECT COALESCE(SUM(amount), 0), COALESCE(SUM(setup_amount), 0) \
-             FROM subscription_line_item WHERE subscription_id = ?",
+        // EXISTS rather than SUM: MySQL types SUM() as DECIMAL, which sqlx will
+        // not decode into an integer, and the error would surface here — in the
+        // statement that marks money as received — as every payment silently
+        // failing to settle.
+        let (has_recurring, has_setup): (i64, i64) = sqlx::query_as(
+            "SELECT \
+               EXISTS(SELECT 1 FROM subscription_line_item WHERE subscription_id = ? AND amount > 0), \
+               EXISTS(SELECT 1 FROM subscription_line_item WHERE subscription_id = ? AND setup_amount > 0)",
         )
         .bind(payment.subscription_id)
-        .fetch_optional(tx.as_mut())
+        .bind(payment.subscription_id)
+        .fetch_one(tx.as_mut())
         .await?;
-        let one_off = matches!(recurring, Some((0, setup)) if setup > 0);
+        let one_off = has_recurring == 0 && has_setup == 1;
 
         if one_off {
             // Still activate it: the expiry UPDATE below is also what sets
