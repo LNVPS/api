@@ -4,6 +4,7 @@ volumes:
   e2e-lnd-payer:
   e2e-bitcoind:
   e2e-nostr-relay:
+  e2e-rustfs:
 
 services:
   db:
@@ -153,3 +154,40 @@ services:
       interval: 3s
       timeout: 5s
       retries: 10
+
+  # S3-compatible object storage for the web-hosting product (static sites) and
+  # for app-deployment backups. RustFS runs as uid 10001 and refuses to start on
+  # a root-owned volume, so a one-shot init container fixes ownership first --
+  # Docker creates named volumes root-owned.
+  rustfs-perms:
+    image: alpine
+    user: root
+    volumes:
+      - "e2e-rustfs:/fix"
+    command: chown -R 10001:10001 /fix
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    depends_on:
+      rustfs-perms:
+        condition: service_completed_successfully
+    environment:
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_OBS_LOGGER_LEVEL: error
+      # Never the well-known `rustfsadmin` default -- the server starts with a
+      # warning on those and they must not leak into a config template.
+      RUSTFS_ACCESS_KEY: e2eaccesskey
+      RUSTFS_SECRET_KEY: e2esecretkey
+    command: ["/data"]
+    ports:
+      - "9400:9000"
+      - "9401:9001"
+    volumes:
+      - "e2e-rustfs:/data"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "9000"]
+      interval: 3s
+      timeout: 5s
+      retries: 20

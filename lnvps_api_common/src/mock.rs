@@ -8736,7 +8736,7 @@ mod marketplace_tests {
     #[tokio::test]
     async fn tunnels_list_by_owner() {
         let db = MockDb::default();
-        let (u1, lnvps) = (user(&db, 1).await, user(&db, 9).await);
+        let (u1, bgp_customer) = (user(&db, 1).await, user(&db, 9).await);
         let op = db.insert_marketplace_operator(&operator(u1)).await.unwrap();
         let node_id = db.insert_marketplace_node(&node(op, "a")).await.unwrap();
 
@@ -8749,8 +8749,10 @@ mod marketplace_tests {
 
         // A VPN sold to the same user, linked by nothing yet.
         db.insert_tunnel(&tunnel(u1, "wg-vpn")).await.unwrap();
-        // LNVPS infrastructure is owned too — by the account representing us.
-        db.insert_tunnel(&tunnel(lnvps, "wg-bgp")).await.unwrap();
+        // A BGP tunnel requested by a different customer.
+        db.insert_tunnel(&tunnel(bgp_customer, "wg-bgp"))
+            .await
+            .unwrap();
 
         assert_eq!(db.list_tunnels().await.unwrap().len(), 3);
 
@@ -8758,7 +8760,10 @@ mod marketplace_tests {
         // VPN, and the query returns what they own rather than what it is for.
         let mine = db.list_tunnels_for_user(u1).await.unwrap();
         assert_eq!(mine.len(), 2);
-        assert_eq!(db.list_tunnels_for_user(lnvps).await.unwrap().len(), 1);
+        assert_eq!(
+            db.list_tunnels_for_user(bgp_customer).await.unwrap().len(),
+            1
+        );
 
         // Which of them is the node's is answered by the node, not the tunnel.
         let attached = db.get_marketplace_node(node_id).await.unwrap().tunnel_id;

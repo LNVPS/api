@@ -481,8 +481,9 @@ Migration `20260805120000_marketplace_node_registry.sql`:
 - `tunnel`: the source of truth for what LNVPS has *assigned* — owner, peer key, inner
   addresses, route server — and nothing else. **What a tunnel is for is decided by whichever
   table links to it**: `marketplace_node.tunnel_id` today, a VPN or BGP table later. There is
-  no `purpose` column, and `user_id` (NOT NULL) is ownership, not type: every allocation has
-  an owner, including LNVPS's own infrastructure. `router_tunnel` remains the observed state.
+  no `purpose` column, and `user_id` (NOT NULL) is ownership, not type: every allocation
+  belongs to a real customer account — the operator's merchant account for a node, the
+  requesting user for a BGP tunnel or VPN. `router_tunnel` remains the observed state.
 - `vm_host.marketplace_node_id` NULLABLE UNIQUE FK, `company.marketplace_rate` default 0.
 - `VmHostKind::MarketplaceNode = 2`, `MarketplaceNodeStatus`, `MarketplaceTrustTier`,
   `PayoutMode` (shared with referrals), `lnvps_db` CRUD, mock impl, tests.
