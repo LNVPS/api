@@ -473,7 +473,10 @@ v1.
    Consequences: the identity is **persisted**, because a certificate minted on each restart
    would break the pin and make the node unreachable; a corrupt certificate is a hard failure
    rather than a silent regeneration, for the same reason; and registration (increment 3)
-   must carry the fingerprint, with a re-registration path for rotation.
+   must carry the fingerprint, with a re-registration path for rotation. Note the node does
+   not currently verify that a persisted certificate still covers its tunnel address as a SAN:
+   under a fingerprint-pinning verifier that does not matter, but it is a loose end for the
+   rotation path to close.
 13. **The tunnel is not by itself a trust boundary.** Guests run on the node, so a guest that
    can route to the node's tunnel address could otherwise stop its neighbours. Two independent
    defences, both required: the listener binds **only** the tunnel interface address (enforced
@@ -549,9 +552,24 @@ Two guards worth remembering:
   flags were fixed in passing: `--no-default-features` did not compile, which is exactly the
   configuration the daemon needs (a node has neither libva nor NVML installed).
 
-**2b — control listener + heartbeat (next, with increments 3 and 4):**
-- Axum listener bound to the tunnel address, NIP-98 middleware, start/stop/status handlers
-  over the existing `VmBackend`.
+**2b — control listener (done):**
+- Axum listener over HTTPS bound to the tunnel address, with `GET /api/v1/status`.
+- NIP-98 authentication layered over the *whole* router rather than per route, so a route
+  added later cannot forget it — proven by an unauthenticated request to a path that does not
+  exist returning 401 rather than 404.
+- The `u` tag is checked against the node's **own** address, never the `Host` header;
+  otherwise a request captured from one node could be replayed against another by setting
+  `Host` to the first node's address.
+- Startup refuses, with a specific message, when: the binary has no `LNVPS_CONTROL_PUBKEY`,
+  the tunnel interface has no addresses, the listen address is a wildcard, or the listen
+  address belongs to some other interface. All four verified against a real machine.
+- Integration tests speak real TLS to a real socket: the certificate presented on the wire is
+  the one whose fingerprint is registered, a client pinned to a different certificate fails
+  the handshake, plain HTTP is refused, and reaching the node over TLS still authorises
+  nothing.
+
+**2c — VM lifecycle + heartbeat (next, with increments 3 and 4):**
+- start/stop/status handlers over the existing `VmBackend`.
 - Outbound registration and heartbeat frames (telemetry: cpu/mem/disk/net, libvirt version,
   firmware version).
 - `.deb` packaging + GitHub release workflow + self-upgrade, copied from `lnvps_fw`

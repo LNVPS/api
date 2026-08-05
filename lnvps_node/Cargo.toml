@@ -21,7 +21,17 @@ rcgen = "0.13"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "fs"] }
+# Control API: axum over rustls. HTTPS is not optional — LNVPS pins the
+# certificate (decision 14), which is what authenticates the node's replies.
+axum = { workspace = true }
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# Reads the tunnel interface's real addresses, so the bind check (decision 13)
+# is made against the machine rather than against the config file restating
+# itself.
+if-addrs = "0.13"
+
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "fs", "net", "signal"] }
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
@@ -31,3 +41,10 @@ config.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Drives the router directly in tests, so authentication is exercised without
+# binding a socket or terminating TLS.
+tower = { version = "0.5", features = ["util"] }
+# Integration tests speak real TLS to the daemon: reqwest as the pinned client
+# LNVPS will be, tokio-rustls to observe the certificate actually presented.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
