@@ -1108,9 +1108,12 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Get a marketplace node by id
     async fn get_marketplace_node(&self, id: u64) -> DbResult<MarketplaceNode>;
 
-    /// Get a marketplace node by the public key its daemon authenticates with.
+    /// Get a marketplace node by the nostr key its daemon authenticates with.
     /// This is the lookup the control channel performs on every connection.
-    async fn get_marketplace_node_by_pubkey(&self, pubkey: &[u8]) -> DbResult<MarketplaceNode>;
+    async fn get_marketplace_node_by_nostr_pubkey(
+        &self,
+        pubkey: &[u8],
+    ) -> DbResult<MarketplaceNode>;
 
     /// List the nodes belonging to one operator
     async fn list_marketplace_nodes(&self, operator_id: u64) -> DbResult<Vec<MarketplaceNode>>;
@@ -1125,9 +1128,9 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Register a new node, returning the new id
     async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64>;
 
-    /// Update a node's name, key, status, trust tier or region. `operator_id`
-    /// and `created` are immutable and are not written: a node cannot change
-    /// hands, because its earnings history and its hardware would diverge.
+    /// Update a node's name, key, status or trust tier. `operator_id` and
+    /// `created` are immutable and are not written: a node cannot change hands,
+    /// because its earnings history and its hardware would diverge.
     async fn update_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<()>;
 
     /// Record control-channel contact from a node. Separate from
@@ -1137,6 +1140,38 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Delete a node. Fails while a `vm_host` still references it.
     async fn delete_marketplace_node(&self, id: u64) -> DbResult<()>;
+
+    // ----- Tunnels -----
+
+    /// Get an assigned tunnel by id
+    async fn get_tunnel(&self, id: u64) -> DbResult<Tunnel>;
+
+    /// Get a tunnel by the peer's public key. This is how a route server
+    /// resolves an incoming handshake to an allocation.
+    async fn get_tunnel_by_peer_pubkey(&self, peer_pubkey: &[u8]) -> DbResult<Tunnel>;
+
+    /// List tunnels, optionally filtered to one purpose
+    async fn list_tunnels(&self, purpose: Option<TunnelPurpose>) -> DbResult<Vec<Tunnel>>;
+
+    /// List the tunnels belonging to one marketplace node (more than one when a
+    /// node is multi-homed across route servers)
+    async fn list_tunnels_for_marketplace_node(&self, node_id: u64) -> DbResult<Vec<Tunnel>>;
+
+    /// List the VPN tunnels belonging to one user
+    async fn list_tunnels_for_user(&self, user_id: u64) -> DbResult<Vec<Tunnel>>;
+
+    /// Allocate a tunnel, returning the new id. Rejects an owner that does not
+    /// match the purpose.
+    async fn insert_tunnel(&self, tunnel: &Tunnel) -> DbResult<u64>;
+
+    /// Update a tunnel's routing and peer details. `purpose`, its owner and
+    /// `created` are immutable and are not written: re-purposing an allocation
+    /// or moving it to another owner would silently hand one tenant's addresses
+    /// to another.
+    async fn update_tunnel(&self, tunnel: &Tunnel) -> DbResult<()>;
+
+    /// Delete a tunnel, releasing its addresses and key back to the pool
+    async fn delete_tunnel(&self, id: u64) -> DbResult<()>;
 
     // ----- App catalog -----
 

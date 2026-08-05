@@ -45,18 +45,25 @@ CREATE TABLE marketplace_operator (
 );
 
 -- A single machine offered by an operator.
+--
+-- Deliberately carries no region: an approved node's region lives on its backing
+-- `vm_host` row, which is what capacity and placement actually read. Storing it
+-- here too would be a second copy of the same fact, free to drift the moment an
+-- admin edits the host — and the copy nothing reads is the one that would be
+-- wrong. The region is chosen when the host row is created, at approval.
 CREATE TABLE marketplace_node (
     id INTEGER UNSIGNED NOT NULL AUTO_INCREMENT,
     operator_id INTEGER UNSIGNED NOT NULL,
     -- Operator-chosen label, shown to the operator and to admins. Not unique:
     -- it is a display name, not an identifier.
     name VARCHAR(100) NOT NULL,
-    region_id INTEGER UNSIGNED NOT NULL,
-    -- The nostr public key the daemon authenticates its control channel with.
+    -- The nostr public key the daemon authenticates its *control channel* with.
+    -- Its data-plane identity (WireGuard key, assigned tunnel addresses) lives
+    -- in `tunnel`, not here.
     -- Unique across the fleet so a key identifies exactly one node. NULL while
     -- the node is registered but has not yet presented a key (or authenticates
     -- with a session token issued to the operator's account instead).
-    pubkey BINARY(32) NULL DEFAULT NULL,
+    nostr_pubkey BINARY(32) NULL DEFAULT NULL,
     -- MarketplaceNodeStatus: pending / approved / suspended / draining.
     status SMALLINT UNSIGNED NOT NULL DEFAULT 0,
     -- MarketplaceTrustTier: untrusted / verified / partner. Gates placement
@@ -68,10 +75,9 @@ CREATE TABLE marketplace_node (
     last_seen DATETIME NULL DEFAULT NULL,
     created DATETIME NOT NULL DEFAULT NOW(),
     PRIMARY KEY (id),
-    UNIQUE KEY uk_marketplace_node_pubkey (pubkey),
+    UNIQUE KEY uk_marketplace_node_nostr_pubkey (nostr_pubkey),
     KEY ix_marketplace_node_operator (operator_id),
-    FOREIGN KEY (operator_id) REFERENCES marketplace_operator(id),
-    FOREIGN KEY (region_id) REFERENCES region (id)
+    FOREIGN KEY (operator_id) REFERENCES marketplace_operator(id)
 );
 
 -- The backing host row for an approved node. NULL for every LNVPS-owned host,

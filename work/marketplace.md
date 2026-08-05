@@ -40,9 +40,15 @@ place VMs on — with automatic sat payouts, uptime accounting, and full traffic
 - Networking: `IpRange` is region-scoped with gateway + DNS zone wiring
   (`lnvps_db/src/model.rs:991`). VLAN per host (`VmHost.vlan_id`), MTU field already present —
   needed for WG overhead.
-- WireGuard is already modelled: `TunnelRouter` trait, `WireguardConfig`, `WireguardPeer`,
+- WireGuard is partly modelled: `TunnelRouter` trait, `WireguardConfig`, `WireguardPeer`,
   `TunnelKind`, plus Linux-SSH and Mikrotik backends — `lnvps_api/src/router/mod.rs`,
   `router/linux_ssh.rs`, `router/mikrotik.rs`. Route-server work: `work/route-server-management.md`.
+  **But there was no source of truth for assignments.** `router_tunnel` is a *discovery cache*
+  of what was last observed on a router (keyed by `router_id, name`, with `last_seen` and no
+  key material); nothing recorded that a peer key and inner address belong to a given node or
+  customer. Increment 1 adds a `tunnel` table for the desired state — deliberately generic, so
+  it also carries plain WireGuard VPNs sold to users and infrastructure/BGP tunnels, rather
+  than bolting WireGuard columns onto each consumer.
 - Daemon precedent: `lnvps_fw` (separate workspace, eBPF/XDP, bearer-token HTTPS API,
   `.deb` via `lnvps_fw-deb.yml`, self-upgrade against `vX.Y.Z` GitHub releases) —
   `docs/agents/fw-api.md`. Reuse the packaging + self-upgrade design wholesale.
@@ -468,8 +474,13 @@ there is the node-side job protocol and the `VmBackend` trait, not the hyperviso
 Migration `20260805120000_marketplace_node_registry.sql`:
 - `marketplace_operator` (user_id, `address`/`mode`/`payout_threshold` mirroring `referral`,
   `rate` override, `enabled`, created). No KYC columns — see decision 7.
-- `marketplace_node` (operator_id, name, region_id, pubkey, status, trust_tier, last_seen,
-  created), unique pubkey so a key identifies exactly one node.
+- `marketplace_node` (operator_id, name, nostr_pubkey, status, trust_tier, last_seen,
+  created), unique key so it identifies exactly one node. **No region** — that lives on the
+  backing `vm_host`, and a second copy would be free to drift. **No WireGuard fields** — the
+  data-plane identity lives in `tunnel`.
+- `tunnel`: the source of truth for what LNVPS has *assigned* (owner, peer key, inner
+  addresses, route server), generic across marketplace nodes, user VPNs and infrastructure
+  tunnels. `router_tunnel` remains the observed state.
 - `vm_host.marketplace_node_id` NULLABLE UNIQUE FK, `company.marketplace_rate` default 0.
 - `VmHostKind::MarketplaceNode = 2`, `MarketplaceNodeStatus`, `MarketplaceTrustTier`,
   `PayoutMode` (shared with referrals), `lnvps_db` CRUD, mock impl, tests.
@@ -503,8 +514,13 @@ Two guards worth remembering:
 - On approval, create the backing `VmHost` row (disabled until networking is up).
 
 ### Increment 4 — WireGuard data plane (L)
-- Route-server side: allocate tunnel subnet + WG peer via the existing `TunnelRouter` trait
-  (`router/mod.rs`), push routes for the guest IPs assigned to that node.
+- Allocator on top of the `tunnel` table from increment 1: pick a route server, assign the
+  inner /31 (and/or /127), record the node-generated peer key. The schema already enforces
+  that an inner address or peer key belongs to exactly one tunnel.
+- Reconcile desired state (`tunnel`) against observed state (`router_tunnel`); a peer that has
+  vanished from a router is drift to report, not an allocation to forget.
+- Route-server side: push the peer and routes for the guest IPs assigned to that node via the
+  existing `TunnelRouter` trait (`router/mod.rs`).
 - Node side: create `wg0` + `br-lnvps`, default route into the tunnel, anti-spoof and
   anti-LAN-access rules, MTU/MSS clamp.
 - Health gate: node is only marked `online` after an end-to-end reachability probe from the
