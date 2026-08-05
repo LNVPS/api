@@ -6,6 +6,10 @@ description = "Host CPU detection utility for LNVPS"
 
 [workspace]
 
+[lib]
+name = "lnvps_host_util"
+path = "src/lib.rs"
+
 [[bin]]
 name = "lnvps-host-info"
 path = "src/main.rs"

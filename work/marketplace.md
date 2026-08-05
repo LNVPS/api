@@ -445,6 +445,28 @@ v1.
    for operators who already hold NVAI.
 10. **Stubbed libvirt backend** — superseded: the backend was fully implemented instead
    (`work/libvirt-backend.md`, merged), so nothing needs disabling.
+11. **Control plane: LNVPS dials the node over the tunnel, using HTTP.** Commands are
+   request/response with a result to report (start a VM, stop a VM), which is what HTTP
+   already is; a persistent websocket would mean rebuilding correlation ids, in-flight replay
+   and reconnect semantics to arrive back at the same thing. The usual reason to prefer an
+   outbound socket — NAT traversal — does not apply, because the WireGuard tunnel gives
+   direct reachability and a node without a working tunnel cannot serve guests anyway. This
+   also matches `lnvps_fw`, so there is one daemon operational model rather than two.
+   Outbound calls remain for the two things that precede or outlive the tunnel: registration
+   and heartbeat.
+12. **Control auth is NIP-98 against a pubkey compiled into the node binary** — not a bearer
+   token. A shared token must be generated, delivered, stored on the operator's disk, rotated
+   and revoked: five chances to leak a secret that grants control of every guest on the
+   machine. A public key is not a secret, so none of those steps exist, and forging a command
+   needs LNVPS's private key. Verification binds URL, method, body hash and timestamp, and
+   keeps a replay cache — replaying a captured stop is a second outage.
+   Consequences: the release workflow **must** inject `LNVPS_CONTROL_PUBKEY` at build time;
+   a binary built without it refuses to serve the control API rather than serving it to
+   everyone. Self-hosted deployments rebuild with their own key.
+13. **The tunnel is not by itself a trust boundary.** Guests run on the node, so a guest that
+   can route to the node's tunnel address could otherwise stop its neighbours. Two independent
+   defences, both required: the listener binds **only** the tunnel interface address (enforced
+   at startup, not documented), and every request is authenticated per decision 12.
 
 **Still open:**
 
@@ -498,13 +520,31 @@ Two guards worth remembering:
   node approval, which is what supplies `marketplace_node_id`. A host of that kind with no
   node would accept placements and then fail every operation.
 
-### Increment 2 — Node daemon skeleton (`lnvps_node`) (M/L)
-- New crate (own workspace if it needs a special toolchain; otherwise workspace member).
-- Config, credential loading (nostr key **or** session token), NIP-98 signing, outbound WSS
-  client with reconnect/backoff, `telemetry` frames (cpu/mem/disk/net, libvirt version, kernel,
-  uptime, **CPU model + SEV-SNP/TDX capability + firmware version**).
+### Increment 2 — Node daemon skeleton (`lnvps_node`)
+
+**2a — crate, config, credentials, inventory (done):**
+- `lnvps_node` workspace member with `lnvps-node inventory` / `check`.
+- Credential loading (nostr key **or** session token) with owner-only file permissions
+  enforced, NIP-98 signing for outbound calls, secrets kept out of `Debug` output.
+- `control_auth`: NIP-98 verification of inbound commands against the pinned LNVPS key
+  (decision 12) — signature, pubkey, URL, method, body hash, clock window, replay cache.
+- `config`: control listener address validated against the tunnel interface (decision 13).
+- Inventory (memory, kernel, os, uptime, disks, SEV-SNP/TDX/nested-virt) built on
+  `lnvps_host_util`, which became a lib + bin so the daemon and the operator's
+  `lnvps-host-info` pre-flight check cannot disagree about the same machine. Its feature
+  flags were fixed in passing: `--no-default-features` did not compile, which is exactly the
+  configuration the daemon needs (a node has neither libva nor NVML installed).
+
+**2b — control listener + heartbeat (next, with increments 3 and 4):**
+- Axum listener bound to the tunnel address, NIP-98 middleware, start/stop/status handlers
+  over the existing `VmBackend`.
+- Outbound registration and heartbeat frames (telemetry: cpu/mem/disk/net, libvirt version,
+  firmware version).
 - `.deb` packaging + GitHub release workflow + self-upgrade, copied from `lnvps_fw`
-  (`upgrade.rs`, `lnvps_fw-deb.yml`). Version must move in lockstep with `vX.Y.Z`.
+  (`upgrade.rs`, `lnvps_fw-deb.yml`). Version must move in lockstep with `vX.Y.Z`, and the
+  workflow must inject `LNVPS_CONTROL_PUBKEY`.
+- GPU inventory lands with increment 11a's eligibility probe, so PCI address, IOMMU group
+  cleanliness, BAR sizes and CC capability are collected once, against real hardware.
 
 ### Increment 3 — Pairing + admin approval flow (M)  ⬅ NEXT (with increment 2)
 - `POST /api/v1/node/register` under standard consumer auth → node bound to the calling user,

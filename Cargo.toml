@@ -12,9 +12,14 @@ members = [
     "try-procedure",
     "lnvps_e2e",
     "lnvps_agent",
+    "lnvps_node",
 ]
-# lnvps_fw is a separate workspace (eBPF build needs its own target/toolchain)
-exclude = ["lnvps_fw"]
+# Both are separate workspaces with their own lockfile and are built in their
+# own Docker context: lnvps_fw because the eBPF datapath needs its own
+# toolchain and target dir, lnvps_host_util because it is released per-arch as
+# a standalone operator tool. lnvps_node depends on lnvps_host_util by path,
+# which is only legal while it stays excluded from this workspace.
+exclude = ["lnvps_fw", "lnvps_host_util"]
 
 [workspace.package]
 version = "0.4.7"

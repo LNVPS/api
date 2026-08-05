@@ -3539,6 +3539,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "lnvps_host_util"
+version = "0.2.0"
+dependencies = [
+ "raw-cpuid",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "lnvps_node"
+version = "0.4.7"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "config",
+ "env_logger",
+ "lnvps_host_util",
+ "log 0.4.32",
+ "nostr 0.44.3",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "lnvps_nostr"
 version = "0.4.7"
 dependencies = [
@@ -4945,6 +4972,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
 dependencies = [
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "raw-cpuid"
+version = "11.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "498cd0dc59d73224351ee52a95fee0f1a617a2eae0e7d9d720cc622c73a54186"
+dependencies = [
+ "bitflags",
 ]
 
 [[package]]

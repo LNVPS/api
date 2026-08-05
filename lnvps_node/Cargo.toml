@@ -1,0 +1,30 @@
+[package]
+name = "lnvps_node"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "lnvps-node"
+path = "src/main.rs"
+
+[dependencies]
+# Detection is shared with the `lnvps-host-info` binary so an operator's
+# pre-flight check and the daemon's report cannot disagree about the machine.
+# Built without the vendor libraries: a node must start on a host that has
+# neither libva nor NVML installed.
+lnvps_host_util = { path = "../lnvps_host_util", default-features = false }
+
+nostr = { version = "0.44", default-features = false, features = ["std"] }
+base64 = "0.22"
+clap = { version = "4.5", features = ["derive"] }
+
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "fs"] }
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+config.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
