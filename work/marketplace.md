@@ -463,6 +463,13 @@ v1.
    Consequences: the release workflow **must** inject `LNVPS_CONTROL_PUBKEY` at build time;
    a binary built without it refuses to serve the control API rather than serving it to
    everyone. Self-hosted deployments rebuild with their own key.
+15. **A node has its own nostr key, and registration is signed by the operator's account,
+   not by the node.** `marketplace_node.nostr_pubkey` is unique per node with a by-pubkey
+   lookup, so the two cannot be the same key: an operator running two nodes would collide.
+   Registration therefore carries the node's identity (its pubkey and TLS fingerprint) in the
+   body, authenticated as the operator. The operator's account key — which controls billing,
+   payouts and every other node they own — never has to be present on third-party hardware,
+   and a node's own key can be revoked on its own.
 14. **Control calls run over HTTPS with a certificate pinned at registration.** NIP-98
    authenticates requests *to* the node, but nothing authenticated the node's *replies*:
    anything able to answer on the tunnel address — a guest on the same machine that grabbed
@@ -578,7 +585,20 @@ Two guards worth remembering:
 - GPU inventory lands with increment 11a's eligibility probe, so PCI address, IOMMU group
   cleanliness, BAR sizes and CC capability are collected once, against real hardware.
 
-### Increment 3 — Pairing + admin approval flow (M)  ⬅ NEXT (with increment 2)
+### Increment 3 — Pairing + admin approval flow (M)  ⬅ IN PROGRESS
+
+**3a — registration (done):** `POST /api/v1/marketplace/nodes` registers hardware under the
+operator's account, carrying the node's pubkey and TLS fingerprint (decision 15). Enrolment as
+an operator is implicit. Nodes land in `pending`; re-registering the same node updates the
+pinned fingerprint, which is the certificate-rotation path. Taking over another operator's node
+is refused, and a duplicate certificate — the signature of a cloned machine image — is reported
+as such rather than as a unique-index violation. `GET /api/v1/marketplace/nodes` and
+`GET /api/v1/marketplace/operator` for the operator's own view.
+
+**3b — admin approval (next):** approve/reject/suspend/drain, trust tier, capacity caps, the
+per-operator rate override, and creating the backing `VmHost` row on approval.
+
+**Original scope:**
 - `POST /api/v1/node/register` under standard consumer auth → node bound to the calling user,
   lands in `pending`. Carries the node's TLS fingerprint (decision 14), stored on
   `marketplace_node`; plus a re-registration path for when the certificate is rotated, or a

@@ -3,6 +3,7 @@ mod contact;
 mod docs;
 mod ip_space;
 mod legal;
+mod marketplace;
 mod model;
 #[cfg(feature = "nostr-domain")]
 mod nostr_domain;
@@ -27,6 +28,7 @@ use lnvps_api_common::{
     WorkFeedback,
 };
 use lnvps_db::LNVpsDb;
+pub use marketplace::router as marketplace_router;
 #[cfg(feature = "nostr-domain")]
 pub use nostr_domain::router as nostr_domain_router;
 pub use oauth::router as oauth_router;

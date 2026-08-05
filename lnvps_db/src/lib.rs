@@ -1115,6 +1115,16 @@ pub trait LNVpsDbBase: Send + Sync {
         pubkey: &[u8],
     ) -> DbResult<MarketplaceNode>;
 
+    /// Get a marketplace node by the TLS certificate fingerprint it registered.
+    ///
+    /// Used to tell an operator that some other node already serves this
+    /// certificate — most often because a node's state directory was copied
+    /// when its machine was cloned — instead of failing on a unique index.
+    async fn get_marketplace_node_by_tls_fingerprint(
+        &self,
+        fingerprint: &[u8],
+    ) -> DbResult<MarketplaceNode>;
+
     /// List the nodes belonging to one operator
     async fn list_marketplace_nodes(&self, operator_id: u64) -> DbResult<Vec<MarketplaceNode>>;
 

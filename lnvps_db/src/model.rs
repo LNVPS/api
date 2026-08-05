@@ -1866,6 +1866,12 @@ pub struct MarketplaceNode {
     pub status: MarketplaceNodeStatus,
     /// Placement-policy trust tier
     pub trust_tier: MarketplaceTrustTier,
+    /// SHA-256 of the DER certificate the node's control API serves, pinned by
+    /// LNVPS on every call to it. `None` until the node first registers.
+    ///
+    /// Unique across the fleet: two nodes presenting the same certificate would
+    /// mean either can answer for the other, which is what the pin prevents.
+    pub tls_fingerprint: Option<Vec<u8>>,
     /// The node's data plane, once assigned. `None` until then; a tunnel backs
     /// exactly one node.
     pub tunnel_id: Option<u64>,
