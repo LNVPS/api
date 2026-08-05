@@ -114,6 +114,29 @@ jobs:
           cache-from: type=gha,scope=host-info-${{ matrix.arch }}
           cache-to: type=gha,mode=max,scope=host-info-${{ matrix.arch }}
 
+      # A green build only proves the binary compiled. This image shipped for
+      # months unable to start, because the runtime stage was missing the libva
+      # the binary links against — invisible until someone ran it. Load the
+      # image for this runner's own architecture and run it.
+      - name: Smoke test lnvps-host-info (${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: lnvps_host_util
+          file: lnvps_host_util/Dockerfile
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: lnvps-host-info:smoke-${{ matrix.arch }}
+          cache-from: type=gha,scope=host-info-${{ matrix.arch }}
+
+      - name: Run lnvps-host-info (${{ matrix.arch }})
+        run: |
+          set -euo pipefail
+          out=$(docker run --rm lnvps-host-info:smoke-${{ matrix.arch }})
+          echo "$out"
+          # Must be JSON with the fields host registration consumes, not just
+          # a process that exited 0.
+          echo "$out" | jq -e '.cpu_arch and .cpu_mfg and (.cpu_features | type == "array")' > /dev/null
+
       - name: Export digest
         if: needs.setup.outputs.push == 'true'
         run: |

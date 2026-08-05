@@ -21,6 +21,11 @@ RUN cargo build --release --locked --bin lnvps-host-info \
     && cp target/release/lnvps-host-info /lnvps-host-info
 
 FROM debian:trixie-slim AS runner
+# The binary links libva at build time for VA-API detection, so the runtime
+# image needs the shared library too. Without it the image builds fine and then
+# fails on every run with "libva.so.2: cannot open shared object file".
+RUN apt update && apt -y install --no-install-recommends libva2 libva-drm2 \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /lnvps-host-info .
 ENTRYPOINT ["./lnvps-host-info"]
