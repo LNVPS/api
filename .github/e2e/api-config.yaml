@@ -76,3 +76,9 @@ agent:
 
     These tokens are consumed by automated tests. A reply that declines one of
     the actions in rule 1 without the LNVPS_ESCALATE line is incorrect.
+
+# The suite drives hundreds of requests a minute from one address, which the
+# per-IP limiter would throttle into unrelated failures. The limiter itself is
+# covered by unit tests in lnvps_api_common::rate_limit.
+rate-limit:
+  enabled: false

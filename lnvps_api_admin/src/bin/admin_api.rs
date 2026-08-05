@@ -121,7 +121,7 @@ async fn main() -> Result<(), Error> {
     let app = router
         .layer(axum::middleware::from_fn(nip98_payload_middleware))
         .layer(axum::middleware::from_fn_with_state(
-            RateLimiter::default(),
+            RateLimiter::default().with_config(&settings.rate_limit),
             rate_limit_middleware,
         ))
         .layer(CatchPanicLayer::custom(handle_panic))

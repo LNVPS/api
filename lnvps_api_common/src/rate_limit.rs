@@ -29,6 +29,30 @@ use crate::ClientIp;
 /// their oldest counters reset — they can never exceed the limit *per* IP.
 const MAX_TRACKED_KEYS: usize = 100_000;
 
+/// Runtime configuration for the per-IP limiter.
+///
+/// Exists so a deployment can turn limiting off. The only intended use is the
+/// E2E suite, which drives hundreds of requests per minute from a single source
+/// address and would otherwise be throttled into unrelated failures. It is
+/// **on** by default: a config file that omits the section keeps production
+/// protected.
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct RateLimitConfig {
+    #[serde(default = "default_rate_limit_enabled")]
+    pub enabled: bool,
+}
+
+fn default_rate_limit_enabled() -> bool {
+    true
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// A named rate-limit bucket: `max` requests per `window` per client IP.
 #[derive(Debug, Clone, Copy)]
 pub struct RateLimit {
@@ -71,6 +95,8 @@ pub struct RateLimiter {
     general: Arc<Mutex<HashMap<(IpAddr, &'static str), Bucket>>>,
     strict_limit: RateLimit,
     general_limit: RateLimit,
+    /// When false every request is allowed through; see [`RateLimitConfig`].
+    enabled: bool,
     /// Path prefixes subject to the strict bucket (e.g. auth ceremony starts,
     /// verification confirms). Matched case-sensitively against
     /// `request.uri().path()`.
@@ -96,7 +122,25 @@ impl RateLimiter {
             strict_limit,
             general_limit,
             strict_prefixes,
+            enabled: true,
         }
+    }
+
+    /// Apply a configuration, returning the limiter for chaining.
+    pub fn with_config(mut self, config: &RateLimitConfig) -> Self {
+        self.enabled = config.enabled;
+        if !self.enabled {
+            log::warn!(
+                "API rate limiting is DISABLED by configuration - this must only \
+                 be used for testing"
+            );
+        }
+        self
+    }
+
+    /// Whether limiting is currently enforced.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     /// Whether `path` falls into the strict (brute-force-sensitive) bucket.
@@ -108,6 +152,9 @@ impl RateLimiter {
     /// Check and record one request from `ip` for `path`. Returns the number
     /// of seconds until the current window resets when the limit is exceeded.
     pub fn check(&self, ip: IpAddr, path: &str) -> Result<(), u64> {
+        if !self.enabled {
+            return Ok(());
+        }
         let (map, limit) = if self.is_strict(path) {
             (&self.strict, self.strict_limit)
         } else {
@@ -300,6 +347,36 @@ mod tests {
             },
             STRICT_PREFIXES,
         )
+    }
+
+    #[test]
+    fn config_defaults_to_enabled() {
+        // A config file that omits the section must leave production protected.
+        let cfg: RateLimitConfig = serde_yaml_ng::from_str("{}").expect("parse");
+        assert!(cfg.enabled);
+        assert!(RateLimitConfig::default().enabled);
+        assert!(limiter(2, 3).is_enabled());
+    }
+
+    #[test]
+    fn disabled_config_lets_everything_through() {
+        let l = limiter(1, 1).with_config(&RateLimitConfig { enabled: false });
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        assert!(!l.is_enabled());
+        // Far beyond both buckets' limits, on a strict path and a general one.
+        for _ in 0..50 {
+            assert!(l.check(ip, "/api/v1/vm").is_ok());
+            assert!(l.check(ip, "/api/v1/oauth/login").is_ok());
+        }
+    }
+
+    #[test]
+    fn explicitly_enabled_config_still_limits() {
+        let l = limiter(1, 2).with_config(&RateLimitConfig { enabled: true });
+        let ip: IpAddr = "203.0.113.10".parse().unwrap();
+        assert!(l.check(ip, "/api/v1/vm").is_ok());
+        assert!(l.check(ip, "/api/v1/vm").is_ok());
+        assert!(l.check(ip, "/api/v1/vm").is_err());
     }
 
     #[test]

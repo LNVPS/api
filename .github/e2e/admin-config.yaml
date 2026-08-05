@@ -5,3 +5,9 @@ redis:
 encryption:
   key-file: "/tmp/e2e-encryption.key"
   auto-generate: true
+
+# The suite drives hundreds of requests a minute from one address, which the
+# per-IP limiter would throttle into unrelated failures. The limiter itself is
+# covered by unit tests in lnvps_api_common::rate_limit.
+rate-limit:
+  enabled: false

@@ -383,19 +383,32 @@ mod tests {
         );
     }
 
+    /// The endpoint renders an official-looking contract entirely from
+    /// caller-supplied fields, so it must not serve anonymous callers (it would
+    /// be a phishing primitive on the LNVPS origin) and must reject a request
+    /// with no `data`.
     #[tokio::test]
     async fn test_legal_sponsoring_lir_agreement() {
-        let client = user_client_no_auth();
-        let resp = client
+        let anon = user_client_no_auth();
+        let resp = anon
             .get("/api/v1/legal/sponsoring-lir-agreement")
             .await
             .unwrap();
         assert!(
-            resp.status() == StatusCode::OK
-                || resp.status() == StatusCode::BAD_REQUEST
-                || resp.status() == StatusCode::INTERNAL_SERVER_ERROR
-                || resp.status() == StatusCode::UNPROCESSABLE_ENTITY,
-            "LIR agreement without params should return error, got: {}",
+            resp.status() == StatusCode::UNAUTHORIZED || resp.status() == StatusCode::FORBIDDEN,
+            "unauthenticated LIR agreement must be rejected, got: {}",
+            resp.status()
+        );
+
+        // Authenticated, but no agreement data to render.
+        let client = user_client();
+        let resp = client
+            .get_auth("/api/v1/legal/sponsoring-lir-agreement")
+            .await
+            .unwrap();
+        assert!(
+            resp.status().is_client_error() || resp.status().is_server_error(),
+            "LIR agreement without params should return an error, got: {}",
             resp.status()
         );
     }

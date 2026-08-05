@@ -112,7 +112,9 @@ fn host_config() -> LibVirtConfig {
         image_pool: Some(pool()),
         // Pointing this at a stable path lets CI cache the (large) OS image
         // between runs instead of re-downloading it every time.
-        image_cache_dir: std::env::var("LNVPS_LIBVIRT_IMAGE_CACHE").ok().map(Into::into),
+        image_cache_dir: std::env::var("LNVPS_LIBVIRT_IMAGE_CACHE")
+            .ok()
+            .map(Into::into),
         secure_boot: false,
         vlan_aware_bridge: std::env::var("LNVPS_LIBVIRT_VLAN_AWARE").is_ok(),
         // The fake image has no OS to answer ACPI, so don't wait a minute

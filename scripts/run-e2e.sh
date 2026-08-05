@@ -8,6 +8,7 @@
 #   --no-build       Skip cargo build step
 #   --no-cleanup     Leave API servers and DB running after the run
 #   --filter FILTER  Pass a test-name filter to cargo test (e.g. lifecycle)
+#   --ignored        Run only #[ignore]d tests (the model-dependent agent suite)
 #   --run-id ID      Override the run ID (default: timestamp)
 #
 # Environment variables (all optional):
@@ -32,12 +33,14 @@ set -euo pipefail
 SKIP_BUILD=0
 SKIP_CLEANUP=0
 FILTER=""
+RUN_IGNORED=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-build)    SKIP_BUILD=1;   shift ;;
         --no-cleanup)  SKIP_CLEANUP=1; shift ;;
         --filter)      FILTER="$2";    shift 2 ;;
+        --ignored)     RUN_IGNORED=1;  shift ;;
         --run-id)
             export LNVPS_E2E_RUN_ID="$2"
             shift 2
@@ -79,9 +82,18 @@ DB_PASS=$(echo "$DB_BASE" | sed -E 's|mysql://[^:]+:([^@]+)@.*|\1|')
 mysql_exec() {
     local sql="$1"
     # Preferred: execute inside the db service container.
-    if docker compose -f "$COMPOSE_FILE" exec -T db \
-        mariadb -u "$DB_USER" "-p${DB_PASS}" -e "$sql" 2>/dev/null; then
+    #
+    # stderr is captured rather than discarded: a swallowed SQL error turns
+    # into a bare "failed to seed" with no cause, which is what made the
+    # payment_method_config seeding failure so hard to diagnose. The password
+    # warning mariadb always prints is filtered out instead.
+    local err
+    if err=$(docker compose -f "$COMPOSE_FILE" exec -T db \
+        mariadb -u "$DB_USER" "-p${DB_PASS}" -e "$sql" 2>&1); then
         return 0
+    fi
+    if [[ -n "$err" ]]; then
+        grep -v "Using a password on the command line" <<<"$err" >&2 || true
     fi
     # Fallbacks: host clients (used for local dev where the client is installed).
     if command -v mariadb >/dev/null 2>&1; then
@@ -106,6 +118,42 @@ mysql_exec() {
 # ---------------------------------------------------------------------------
 API_PID_FILE="/tmp/lnvps-e2e-api.pid"
 ADMIN_PID_FILE="/tmp/lnvps-e2e-admin-api.pid"
+
+# ---------------------------------------------------------------------------
+# Stop an API left running by a previous --no-cleanup invocation.
+#
+# Each run provisions a *fresh* database, but a surviving API is still bound to
+# the old one. Because the new process then fails to bind the port while the old
+# one keeps answering the health check, the run would proceed against a stale
+# server and fail later with a baffling "Table ... doesn't exist".
+# ---------------------------------------------------------------------------
+reap_stale_api() {
+    local pid_file="$1" name="$2"
+    [[ -f "$pid_file" ]] || return 0
+    local pid
+    pid=$(cat "$pid_file")
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+        echo "Stopping stale ${name} from a previous run (pid ${pid})"
+        kill "$pid" 2>/dev/null || true
+        for _ in $(seq 1 20); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+        done
+        kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pid_file"
+}
+
+# Fail fast when a port is held by something we do not manage, instead of
+# silently testing against whatever is listening.
+require_free_port() {
+    local url="$1" name="$2"
+    if curl -sf "$url" >/dev/null 2>&1; then
+        echo "ERROR: ${name} is already serving on ${url} and is not ours." >&2
+        echo "       Stop it (or set ${3}) before running the suite." >&2
+        exit 1
+    fi
+}
 
 cleanup() {
     local exit_code=$?
@@ -202,6 +250,23 @@ sed "s|db: \"mysql://.*\"|db: \"${DB_URL}\"|g" \
 sed "s|db: \"mysql://.*\"|db: \"${DB_URL}\"|g" \
     .github/e2e/admin-config.yaml > "$TMP_ADMIN_CONFIG"
 
+# Keep the servers' listen addresses in step with the URLs the tests use.
+# Overriding only the client URL used to leave the server binding the default
+# port, which failed with a bare "Address already in use" 90 seconds later.
+set_listen() {
+    local config="$1" url="$2"
+    [[ -n "$url" ]] || return 0
+    local hostport="${url#*://}"
+    hostport="${hostport%%/*}"
+    local port="${hostport##*:}"
+    [[ "$port" != "$hostport" ]] || return 0
+    sed -i "/^listen:/d" "$config"
+    echo "listen: \"0.0.0.0:${port}\"" >> "$config"
+    echo "Pinned $(basename "$config") to port ${port}"
+}
+set_listen "$TMP_API_CONFIG" "${LNVPS_API_URL:-}"
+set_listen "$TMP_ADMIN_CONFIG" "${LNVPS_ADMIN_API_URL:-}"
+
 echo "API configs written with DB: ${DB_URL}"
 
 # ---------------------------------------------------------------------------
@@ -224,6 +289,8 @@ fi
 # needs.
 # ---------------------------------------------------------------------------
 echo "=== Starting admin API ==="
+reap_stale_api "$ADMIN_PID_FILE" "admin API"
+require_free_port "${LNVPS_ADMIN_API_URL:-http://localhost:8001}/" "Admin API" "LNVPS_ADMIN_API_URL"
 LNVPS_NO_DEV_SETUP=1 cargo run -p lnvps_api_admin --bin lnvps_api_admin -- --config "$TMP_ADMIN_CONFIG" \
     > /tmp/lnvps-e2e-admin-api.log 2>&1 &
 echo $! > "$ADMIN_PID_FILE"
@@ -232,6 +299,11 @@ for i in $(seq 1 90); do
     if curl -sf "${LNVPS_ADMIN_API_URL:-http://localhost:8001}/" >/dev/null 2>&1; then
         echo "Admin API ready after ${i}s"
         break
+    fi
+    if ! kill -0 "$(cat "$ADMIN_PID_FILE")" 2>/dev/null; then
+        echo "ERROR: Admin API exited during startup" >&2
+        tail -20 /tmp/lnvps-e2e-admin-api.log >&2
+        exit 1
     fi
     if [[ "$i" -eq 90 ]]; then
         echo "ERROR: Admin API failed to start within 90s" >&2
@@ -271,6 +343,8 @@ fi
 # 8. Start user API
 # ---------------------------------------------------------------------------
 echo "=== Starting user API ==="
+reap_stale_api "$API_PID_FILE" "user API"
+require_free_port "${LNVPS_API_URL:-http://localhost:8000}/" "User API" "LNVPS_API_URL"
 LNVPS_NO_DEV_SETUP=1 cargo run -p lnvps_api --features agent -- --config "$TMP_API_CONFIG" \
     > /tmp/lnvps-e2e-api.log 2>&1 &
 echo $! > "$API_PID_FILE"
@@ -279,6 +353,11 @@ for i in $(seq 1 90); do
     if curl -sf "${LNVPS_API_URL:-http://localhost:8000}/" >/dev/null 2>&1; then
         echo "User API ready after ${i}s"
         break
+    fi
+    if ! kill -0 "$(cat "$API_PID_FILE")" 2>/dev/null; then
+        echo "ERROR: User API exited during startup" >&2
+        tail -20 /tmp/lnvps-e2e-api.log >&2
+        exit 1
     fi
     if [[ "$i" -eq 90 ]]; then
         echo "ERROR: User API failed to start within 90s" >&2
@@ -295,7 +374,11 @@ done
 echo "=== Running E2E tests ==="
 # --nocapture so a test that skips itself (no data, or a third-party endpoint
 # down) says so in the CI log instead of passing silently.
-TEST_CMD="cargo test -p lnvps_e2e -- --test-threads=1 --nocapture"
+TEST_CMD="cargo test -p lnvps_e2e --"
+if [[ "$RUN_IGNORED" -eq 1 ]]; then
+    TEST_CMD="$TEST_CMD --ignored"
+fi
+TEST_CMD="$TEST_CMD --test-threads=1 --nocapture"
 if [[ -n "$FILTER" ]]; then
     TEST_CMD="$TEST_CMD $FILTER"
 fi
