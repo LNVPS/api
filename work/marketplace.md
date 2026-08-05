@@ -262,21 +262,21 @@ from CloudRift, who run exactly this in production:
 | Path | Hardware | Fractional? | Licence | Notes |
 |---|---|---|---|---|
 | **VFIO passthrough** | Any GPU, any vendor | No — whole card | None | Simplest and cheapest. What consumer rigs (RTX 4090/5090/PRO 6000) and whole-card datacenter rentals use. |
-| **NVIDIA MIG + AI Enterprise vGPU** | A100/H100/H200/B200 | Yes, hardware-partitioned | **~$4,500 per GPU per year** | ~$36k/yr for an 8-GPU server; roughly +50% TCO over a 4-year life. Host driver stays loaded and manages partitions. |
+| **NVIDIA MIG + AI Enterprise vGPU** | A100/H100/H200/B200 | Yes, hardware-partitioned | **~$4,500 per GPU per year** | ~$36k/yr for an 8-GPU server; roughly +50% TCO over a 4-year life. **Ruled out — see decision 9.** |
 | **AMD SR-IOV (GIM)** | Instinct MI300X/MI350X | Yes, natively (SPX/DPX/QPX/CPX) | **None** | Plain PCIe SR-IOV; VFs are ordinary PCI devices, `managed="yes"`, no vendor CLI. Reported as by far the easiest of the three. |
 
-**The licensing asymmetry is the headline.** Fractional NVIDIA costs $4.5k/GPU/yr; fractional
-AMD costs nothing. In a marketplace the hardware belongs to the *operator*, so somebody has to
-answer who holds that licence — see open decision 12. Whole-card passthrough sidesteps it
-entirely, which is why the sensible default is: **passthrough unless the customer is buying a
-fraction.**
+**The licensing asymmetry decided the design.** Fractional NVIDIA costs ~$4.5k/GPU/yr;
+fractional AMD costs nothing. In a marketplace the hardware belongs to the *operator*, so that
+licence would be a per-GPU annual toll on joining — which is not a viable onboarding story.
+Decision 9 therefore rules NVIDIA vGPU out: **NVIDIA is whole-card passthrough only, and
+fractional capacity comes from AMD.**
 
-**MIG is not a simple integer count.** Profiles must tile across the GPU's GPC slices without
-overlap, and only specific combinations are valid per model (an H100 80GB has 7 GPCs and 19
-valid placement configurations). Scheduling fractional NVIDIA capacity is a constrained
-bin-packing problem against a per-model placement table, not "seven slots free". AMD's
-partition modes are set at driver level and are much simpler to reason about, at the cost of
-granularity (no mixed partition sizes on one card).
+**A side benefit of dropping MIG: the scheduler stays simple.** MIG profiles must tile across
+the GPU's GPC slices without overlap, and only specific combinations are valid per model (an
+H100 80GB has 7 GPCs and 19 valid placement configurations), so scheduling it would have been
+constrained bin-packing against a per-model placement table rather than "seven slots free".
+AMD's partition mode is set once at driver/firmware level, so free capacity is a plain count
+of unused VFs — at the cost of granularity (no mixed partition sizes on one card).
 
 #### Domain XML and host prerequisites
 
@@ -317,6 +317,28 @@ daemon:
    Enterprise does not support that mixed mode.
 2. **Enrolment is an operator decision, per device**, made once at setup — not something the
    scheduler infers from what it can see.
+
+#### What is actually sellable (consequence of decisions 8 and 9)
+
+Ruling out NVIDIA vGPU licensing and requiring CC hardware for confidentiality leaves two of
+four cells filled:
+
+| | **Whole card** | **Fractional** |
+|---|---|---|
+| **Confidential** | ✅ NVIDIA CC mode (H100/H200/B200), passthrough — no vGPU licence needed | ❌ empty in v1: fractional is AMD-only, and AMD has no confidential-computing story |
+| **Non-confidential** | ✅ any card, any vendor — consumer RTX included | ✅ AMD Instinct SR-IOV partitions (MI300X/MI350X) |
+
+Two things follow, and both are product facts rather than implementation details:
+
+- **The cheapest GPU offers will be AMD and non-confidential.** Small, affordable slices come
+  only from AMD partitioning, which cannot carry the confidential badge.
+- **Confidential GPU capacity is whole-card and therefore expensive.** There is no small
+  confidential GPU offer in v1, and pretending otherwise by slicing a CC card is not
+  available — the licensing path that would allow it is ruled out.
+
+If a small *confidential* GPU offer turns out to be the thing customers want, the options are
+BYO-licence operators, or waiting for SEV-TIO/TDISP to make non-CC hardware viable. Neither is
+v1.
 
 #### Multi-tenancy hazards specific to GPUs
 
@@ -404,27 +426,29 @@ daemon:
      shown with the same badge as a confidential VM.
    This opens the marketplace to the large pool of consumer-GPU operators without quietly
    weakening the guarantee made everywhere else.
-9. **Fractional GPUs are in scope for v1** (MIG on NVIDIA, SR-IOV partitions on AMD), not
-   passthrough-only — sharing is what makes GPU capacity sellable in small units. Passthrough
-   still lands first: it is a prerequisite for both, and whole-card rentals should always use
-   it to avoid NVIDIA licensing entirely.
+9. **Fractional GPUs are in scope for v1, but only on AMD.** Sharing is what makes GPU
+   capacity sellable in small units, and AMD SR-IOV provides it with no licence, standard
+   PCIe semantics and driver-level partition modes. **NVIDIA AI Enterprise licensing
+   (~$4,500/GPU/yr) is ruled out**, and without it there is no supported path to hand a
+   MIG/vGPU instance to a VM — the guest needs the NVAI driver and a `nvidia-gridd` licence
+   checkout. So:
+   - **NVIDIA → whole-card VFIO passthrough only.** No licence required, and it is the mode
+     the confidential tier needs anyway.
+   - **AMD → whole-card or fractional** (SPX/DPX/QPX/CPX) via SR-IOV.
+   Revisit only if NVIDIA's licensing changes, or later as a bring-your-own-licence option
+   for operators who already hold NVAI.
 10. **Stubbed libvirt backend** — superseded: the backend was fully implemented instead
    (`work/libvirt-backend.md`, merged), so nothing needs disabling.
 
 **Still open:**
 
-a. **Who holds the NVIDIA AI Enterprise licence** for fractional NVIDIA capacity — the
-   operator (a ~$4,500/GPU/yr barrier to onboarding, though they may already hold one), LNVPS
-   centrally, or is fractional NVIDIA deferred until demand justifies it? AMD SR-IOV gives
-   fractional capacity with no licence at all, so "fractional" and "expensive" are only linked
-   on NVIDIA.
-b. **Cloud Hypervisor as a second `VmBackend`** — worth doing once measurement pinning is in
+a. **Cloud Hypervisor as a second `VmBackend`** — worth doing once measurement pinning is in
    place (smaller TCB, smaller measurement), or stay on QEMU indefinitely?
-c. **Attestation strictness** — pin exact guest measurements (strongest, but every image or
+b. **Attestation strictness** — pin exact guest measurements (strongest, but every image or
    kernel update needs a re-measure and allow-list bump) vs. pin platform + signer only.
-d. **Backups** — operator-local storage only, or optional LNVPS-side backup egress (costly
+c. **Backups** — operator-local storage only, or optional LNVPS-side backup egress (costly
    over WG, and must stay encrypted end to end)?
-e. **Migration** — is offline migration off a misbehaving node required in v1? Note GPU VMs
+d. **Migration** — is offline migration off a misbehaving node required in v1? Note GPU VMs
    cannot be migrated at all.
 
 ## Increments
@@ -563,18 +587,20 @@ node job protocol:
 - Pricing: GPU line items in cost plans and rev-share accounting for them.
 - Drain policy for GPU VMs — they cannot move, so expire-and-refund rather than relocate.
 
-### Increment 11b — Fractional GPUs (L, depends on 11a)
-- **AMD SR-IOV first**: partition modes (SPX/DPX/QPX/CPX) via the GIM driver, VFs passed with
-  `managed="yes"`. No licensing, standard PCIe semantics, simplest of the three paths.
-- **NVIDIA MIG + vGPU** behind the licensing decision (open item a): GI/CI creation, mapping
-  instances onto SR-IOV VFs, `current_vgpu_type`, NVAI guest driver and `nvidia-gridd` licence
-  checkout, and teardown of GI/CI on VM delete (ids tracked in both our DB and libvirt domain
-  metadata).
-- Scheduler: fractional NVIDIA is **constrained bin-packing against a per-model MIG placement
-  table**, not an integer slot count — only specific profile combinations tile validly. AMD
-  partition modes are a much simpler fixed split.
-- Guest images with the right stack baked in (NVAI proprietary driver for vGPU; ROCm + HWE
-  kernel for AMD).
+### Increment 11b — Fractional GPUs, AMD SR-IOV (M/L, depends on 11a)
+- GIM driver partition modes (SPX/DPX/QPX/CPX) on Instinct MI300X/MI350X; VFs are ordinary
+  PCI devices passed with `managed="yes"`, so libvirt handles the VFIO binding — none of
+  NVIDIA's teardown sequence applies.
+- The PF stays bound to `amdgpu` at all times; no runtime driver switching, which also means
+  no risk of disturbing the operator's other workloads.
+- Partition mode is a **node-level, operator-set** property (it is driver/firmware level and
+  cannot be mixed per card), so it belongs in node enrolment, not in per-VM scheduling.
+  Scheduling is then a simple count of free VFs per mode.
+- Guest images with ROCm + an HWE kernel (Ubuntu 24.04's 6.8 is too old for the ROCm DKMS
+  module) baked in.
+- **Explicitly not included: NVIDIA MIG/vGPU.** Decision 9 rules out AI Enterprise licensing,
+  and there is no supported way to hand a MIG instance to a VM without it. NVIDIA remains
+  whole-card passthrough from 11a.
 
 ## Risks
 
@@ -592,7 +618,8 @@ node job protocol:
 | GPU VMs cannot be drained or migrated off a failing node | Separate drain policy: expire and refund rather than relocate; price and advertise accordingly. |
 | GPU mining abuse / power draw on operator hardware | Power and thermal telemetry per node, ToS stance, per-node reputation. |
 | Node daemon breaks the operator's own GPU workloads by unloading NVIDIA modules host-wide | Only enrolled devices are ever touched; refuse host-wide teardown while unenrolled GPUs are in use; mixed use requires the open-source driver. |
-| NVIDIA vGPU licensing (~$4.5k/GPU/yr) blocks operator onboarding | Passthrough needs no licence and lands first; AMD SR-IOV gives fractional capacity licence-free; fractional NVIDIA gated on decision (a). |
+| NVIDIA vGPU licensing (~$4.5k/GPU/yr) blocks operator onboarding | Ruled out entirely (decision 9): NVIDIA is whole-card passthrough only, which needs no licence; fractional capacity comes from AMD SR-IOV. |
+| No small confidential GPU offer exists (fractional is AMD, confidential is NVIDIA) | Accepted and documented as a product fact, not hidden; revisit via BYO-licence operators or SEV-TIO/TDISP. |
 | Customer misreads a non-confidential GPU VM as confidential | Separate product tier with order-time disclosure in plain words; a non-CC GPU can never satisfy a confidential template. |
 | Operator abuses LNVPS IPs (spam/DDoS from a rogue node) | Route-server-side egress filtering + rate limits per node, existing `lnvps_fw`, instant peer teardown. |
 | Guest abuse damages `185.18.221.0/24` reputation | Same abuse workflow as owned hosts; per-node reputation score gating capacity. |
