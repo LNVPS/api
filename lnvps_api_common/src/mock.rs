@@ -114,6 +114,18 @@ pub struct MockDb {
 }
 
 impl MockDb {
+    /// Set a company's one-off marketplace node listing fee.
+    ///
+    /// Test support: the fee is normally set through the admin API, which is
+    /// behind a feature the consumer API crate does not enable, so its tests
+    /// cannot reach `admin_update_company`.
+    pub async fn set_marketplace_node_fee(&self, company_id: u64, fee: u64) {
+        let mut companies = self.companies.lock().await;
+        if let Some(company) = companies.get_mut(&company_id) {
+            company.marketplace_node_fee = fee;
+        }
+    }
+
     /// The `uk_tunnel_*` unique keys: a peer key or an inner address may belong
     /// to at most one tunnel. Two tunnels sharing an inner address is a routing
     /// collision that delivers one tenant's traffic to another, so the mock
