@@ -1,0 +1,33 @@
+# Example configuration for lnvps-node.
+#
+# Keys are kebab-case, and unknown keys are rejected rather than ignored — a
+# typo fails at startup instead of quietly leaving a default in place.
+
+# LNVPS API, used for registration, heartbeat and telemetry (outbound only).
+api-url: "https://api.lnvps.net"
+
+# Where the node keeps state it must not lose. Holds the TLS identity whose
+# fingerprint LNVPS pins at registration: delete it and the node must be
+# re-registered before it can be reached again.
+state-dir: "/var/lib/lnvps-node"
+
+# The node's own credential, used to sign outbound calls to LNVPS.
+credential:
+  # nostr-key (nsec1... or 64 hex characters) or session-token.
+  kind: nostr-key
+  # Must not be readable by other users; the daemon refuses to start otherwise.
+  file: "/etc/lnvps-node/node.key"
+
+# Seconds between heartbeats.
+heartbeat-secs: 60
+
+# Inbound control API. Omit this section until the node is paired — without it
+# the daemon has nothing to serve and will say so.
+control:
+  # Must be an address of tunnel-interface below, and never a wildcard. The
+  # control API can start and stop other people's virtual machines, so it is
+  # reachable over the tunnel and nowhere else. Checked against the interface's
+  # real addresses at startup.
+  listen: "10.66.0.2"
+  port: 8890
+  tunnel-interface: "wg0"

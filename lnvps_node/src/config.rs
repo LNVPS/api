@@ -133,6 +133,29 @@ pub fn validate_listen_address(listen: IpAddr, interface_addrs: &[IpAddr]) -> Re
     Ok(())
 }
 
+/// Addresses currently assigned to `interface`.
+///
+/// Split out from [`validate_listen_address`] so the rule is testable without a
+/// tunnel: this function is the only part that touches the machine.
+pub fn interface_addresses(interface: &str) -> Result<Vec<IpAddr>> {
+    let addrs = if_addrs::get_if_addrs()
+        .with_context(|| format!("Cannot read network interfaces to find {interface}"))?;
+
+    let found: Vec<IpAddr> = addrs
+        .iter()
+        .filter(|i| i.name == interface)
+        .map(|i| i.addr.ip())
+        .collect();
+
+    if found.is_empty() {
+        bail!(
+            "Tunnel interface {interface} has no addresses (is it up?); the control API cannot \
+             be bound to the tunnel, so it will not be started"
+        );
+    }
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

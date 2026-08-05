@@ -17,11 +17,11 @@ use cros_libva::Display;
 // Used only by the VA-API probe, so it is gated the same way; without this the
 // default build (which is what CI builds) fails while a no-default-features
 // build succeeds.
-#[cfg(all(target_os = "linux", feature = "vaapi"))]
-use std::path::Path;
 #[cfg(target_arch = "x86_64")]
 use raw_cpuid::CpuId;
 use serde::Serialize;
+#[cfg(all(target_os = "linux", feature = "vaapi"))]
+use std::path::Path;
 
 /// CPU manufacturer
 #[derive(Debug, Clone, Serialize)]
