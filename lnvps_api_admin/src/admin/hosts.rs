@@ -211,6 +211,16 @@ async fn admin_create_host(
     // Validate region exists
     let _region = this.db.get_host_region(req.region_id).await?;
 
+    // A marketplace host is created by approving a node, which is what fills in
+    // its `marketplace_node_id`. Allowing one here would produce a host that no
+    // control channel is bound to: it would accept placements and then fail
+    // every operation against it.
+    if matches!(req.kind, AdminVmHostKind::MarketplaceNode) {
+        return Err(ApiError::bad_request(
+            "Marketplace hosts are created by approving a marketplace node, not directly",
+        ));
+    }
+
     // Create new host object
     let new_host = lnvps_db::VmHost {
         id: 0, // Will be set by database
@@ -252,6 +262,8 @@ async fn admin_create_host(
         ssh_user: req.ssh_user.clone(),
         ssh_key: req.ssh_key.clone().map(|k| k.into()),
         sunset_date: req.sunset_date,
+        // Only node approval creates a marketplace-backed host (guarded above).
+        marketplace_node_id: None,
     };
 
     // Create host in database

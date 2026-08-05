@@ -1464,6 +1464,7 @@ mod tests {
                     ssh_user: None,
                     ssh_key: None,
                     sunset_date: None,
+                    marketplace_node_id: None,
                 },
             );
             let mut disks = db.host_disks.lock().await;

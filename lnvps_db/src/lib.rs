@@ -1081,6 +1081,63 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Count VMs that used this referral code but have never made a paid subscription payment.
     async fn count_failed_referrals(&self, code: &str) -> DbResult<u64>;
 
+    // ----- Marketplace (operator-run compute nodes) -----
+
+    /// Get a marketplace operator enrolment by id
+    async fn get_marketplace_operator(&self, id: u64) -> DbResult<MarketplaceOperator>;
+
+    /// Get a user's marketplace operator enrolment (one per user)
+    async fn get_marketplace_operator_by_user(&self, user_id: u64)
+    -> DbResult<MarketplaceOperator>;
+
+    /// List every operator enrolment (used by the payout accrual job)
+    async fn list_marketplace_operators(&self) -> DbResult<Vec<MarketplaceOperator>>;
+
+    /// Enrol a user as a marketplace operator, returning the new id
+    async fn insert_marketplace_operator(&self, operator: &MarketplaceOperator) -> DbResult<u64>;
+
+    /// Update an operator's payout configuration, rate override or enabled flag.
+    /// `user_id` and `created` are immutable and are not written.
+    async fn update_marketplace_operator(&self, operator: &MarketplaceOperator) -> DbResult<()>;
+
+    /// Delete an operator enrolment. Fails while the operator still has nodes:
+    /// nodes must be drained and removed first, so an enrolment cannot be
+    /// deleted out from under running customer VMs.
+    async fn delete_marketplace_operator(&self, id: u64) -> DbResult<()>;
+
+    /// Get a marketplace node by id
+    async fn get_marketplace_node(&self, id: u64) -> DbResult<MarketplaceNode>;
+
+    /// Get a marketplace node by the public key its daemon authenticates with.
+    /// This is the lookup the control channel performs on every connection.
+    async fn get_marketplace_node_by_pubkey(&self, pubkey: &[u8]) -> DbResult<MarketplaceNode>;
+
+    /// List the nodes belonging to one operator
+    async fn list_marketplace_nodes(&self, operator_id: u64) -> DbResult<Vec<MarketplaceNode>>;
+
+    /// List every node, optionally filtered to a single status (admin review
+    /// queues, placement scans and the SLA sweep all want one status at a time)
+    async fn list_all_marketplace_nodes(
+        &self,
+        status: Option<MarketplaceNodeStatus>,
+    ) -> DbResult<Vec<MarketplaceNode>>;
+
+    /// Register a new node, returning the new id
+    async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64>;
+
+    /// Update a node's name, key, status, trust tier or region. `operator_id`
+    /// and `created` are immutable and are not written: a node cannot change
+    /// hands, because its earnings history and its hardware would diverge.
+    async fn update_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<()>;
+
+    /// Record control-channel contact from a node. Separate from
+    /// [`update_marketplace_node`] because it runs on every heartbeat and must
+    /// not race with an admin editing the same row.
+    async fn touch_marketplace_node(&self, id: u64, seen: DateTime<Utc>) -> DbResult<()>;
+
+    /// Delete a node. Fails while a `vm_host` still references it.
+    async fn delete_marketplace_node(&self, id: u64) -> DbResult<()>;
+
     // ----- App catalog -----
 
     /// List catalog apps. When `enabled_only` is set, only apps offered in the

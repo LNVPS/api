@@ -214,6 +214,10 @@ pub enum VmHostKind {
     #[default]
     Proxmox = 0,
     LibVirt = 1,
+    /// A libvirt host owned by a third-party marketplace operator, controlled
+    /// over the node daemon's outbound control channel rather than dialled into
+    /// directly. See `vm_host.marketplace_node_id`.
+    MarketplaceNode = 2,
 
     Dummy = u16::MAX,
 }
@@ -223,6 +227,7 @@ impl Display for VmHostKind {
         match self {
             VmHostKind::Proxmox => write!(f, "proxmox"),
             VmHostKind::LibVirt => write!(f, "libvirt"),
+            VmHostKind::MarketplaceNode => write!(f, "marketplace_node"),
             VmHostKind::Dummy => write!(f, "dummy"),
         }
     }
@@ -615,6 +620,10 @@ pub struct VmHost {
     /// host `enabled = false` (so it takes no new VMs), and renewals are blocked
     /// once a VM's expiry reaches this date.
     pub sunset_date: Option<DateTime<Utc>>,
+    /// The marketplace node this host is backed by, when it is operator-owned
+    /// hardware rather than LNVPS's. `None` for every LNVPS-owned host.
+    #[sqlx(default)]
+    pub marketplace_node_id: Option<u64>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
@@ -1628,46 +1637,207 @@ impl ReferralCostUsage {
     }
 }
 
-/// How a referrer receives their commission payouts. Stored as a small integer;
-/// new methods are added as new variants (append-only to preserve values).
+/// How an outbound payout reaches its recipient. Stored as a small integer; new
+/// methods are added as new variants (append-only to preserve values).
+///
+/// Shared by referral commission and marketplace operator revenue share: both
+/// pay a user out of an accrued balance, so they use one set of rails and stay
+/// reconcilable by the same reporting.
 #[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(u16)]
-pub enum ReferralPayoutMode {
-    /// Pay to the referrer's Lightning address (LNURL-pay).
+pub enum PayoutMode {
+    /// Pay to the recipient's Lightning address (LNURL-pay).
     #[default]
     LightningAddress = 0,
-    /// Pay via the referrer's Nostr Wallet Connect (NWC) connection.
+    /// Pay via the recipient's Nostr Wallet Connect (NWC) connection.
     Nwc = 1,
-    /// Credit the referrer's account balance (not yet implemented).
+    /// Credit the recipient's account balance (not yet implemented).
     AccountCredit = 2,
-    /// Pay to the referrer's on-chain Bitcoin address. Eligible referrers are
+    /// Pay to the recipient's on-chain Bitcoin address. Eligible recipients are
     /// batched into a single send-many transaction.
     OnChain = 3,
 }
 
-impl Display for ReferralPayoutMode {
+/// The payout rails, under their original referral-specific name.
+pub type ReferralPayoutMode = PayoutMode;
+
+/// Where a marketplace node sits in its approval lifecycle.
+///
+/// Stored as a small integer; append-only to preserve values.
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u16)]
+pub enum MarketplaceNodeStatus {
+    /// Registered by its operator, awaiting admin review. Takes no VMs.
+    #[default]
+    Pending = 0,
+    /// Approved and eligible for placement, subject to the usual health,
+    /// attestation and capacity checks.
+    Approved = 1,
+    /// Blocked by an admin. Takes no new VMs; existing VMs are left alone so
+    /// suspension is not itself a customer outage.
+    Suspended = 2,
+    /// Being offboarded: takes no new VMs and its existing VMs are being
+    /// expired or moved, after which the node can be removed.
+    Draining = 3,
+}
+
+impl Display for MarketplaceNodeStatus {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            ReferralPayoutMode::LightningAddress => "lightning_address",
-            ReferralPayoutMode::Nwc => "nwc",
-            ReferralPayoutMode::AccountCredit => "account_credit",
-            ReferralPayoutMode::OnChain => "on_chain",
+            MarketplaceNodeStatus::Pending => "pending",
+            MarketplaceNodeStatus::Approved => "approved",
+            MarketplaceNodeStatus::Suspended => "suspended",
+            MarketplaceNodeStatus::Draining => "draining",
         })
     }
 }
 
-impl FromStr for ReferralPayoutMode {
+impl FromStr for MarketplaceNodeStatus {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_lowercase().as_str() {
-            "lightning_address" | "lightning" | "lnaddress" => {
-                Ok(ReferralPayoutMode::LightningAddress)
-            }
-            "nwc" => Ok(ReferralPayoutMode::Nwc),
-            "account_credit" | "credit" => Ok(ReferralPayoutMode::AccountCredit),
-            "on_chain" | "onchain" => Ok(ReferralPayoutMode::OnChain),
-            other => anyhow::bail!("Invalid referral payout mode: {}", other),
+            "pending" => Ok(MarketplaceNodeStatus::Pending),
+            "approved" => Ok(MarketplaceNodeStatus::Approved),
+            "suspended" => Ok(MarketplaceNodeStatus::Suspended),
+            "draining" => Ok(MarketplaceNodeStatus::Draining),
+            other => anyhow::bail!("Invalid marketplace node status: {}", other),
+        }
+    }
+}
+
+impl MarketplaceNodeStatus {
+    /// Whether a node in this state may receive new VMs.
+    ///
+    /// This is the only state check placement should make, so that adding a
+    /// state cannot accidentally become "eligible" by default.
+    pub fn accepts_placement(&self) -> bool {
+        matches!(self, MarketplaceNodeStatus::Approved)
+    }
+}
+
+/// How much LNVPS trusts an operator's node.
+///
+/// This gates *placement policy* — which workloads may land there, capacity
+/// caps, and which upgrade ring the node is in. It is **not** the
+/// confidentiality control: guest confidentiality is enforced by memory
+/// encryption and attestation-gated disk keys, which apply identically at every
+/// tier. Stored as a small integer; append-only.
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u16)]
+pub enum MarketplaceTrustTier {
+    /// Anonymous operator. Tightest caps, last upgrade ring.
+    #[default]
+    Untrusted = 0,
+    /// Operator has been through whatever identity checks are in force.
+    Verified = 1,
+    /// Commercial partner with a contractual relationship.
+    Partner = 2,
+}
+
+impl Display for MarketplaceTrustTier {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            MarketplaceTrustTier::Untrusted => "untrusted",
+            MarketplaceTrustTier::Verified => "verified",
+            MarketplaceTrustTier::Partner => "partner",
+        })
+    }
+}
+
+impl FromStr for MarketplaceTrustTier {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "untrusted" => Ok(MarketplaceTrustTier::Untrusted),
+            "verified" => Ok(MarketplaceTrustTier::Verified),
+            "partner" => Ok(MarketplaceTrustTier::Partner),
+            other => anyhow::bail!("Invalid marketplace trust tier: {}", other),
+        }
+    }
+}
+
+/// A user who has enrolled to sell compute on the marketplace.
+///
+/// Payout configuration mirrors [`Referral`] field for field, because both are
+/// an accrued balance paid out to a user over the same rails.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct MarketplaceOperator {
+    /// Unique id of this operator enrolment
+    pub id: u64,
+    /// The user that owns this enrolment (one per user)
+    pub user_id: u64,
+    /// Payout target address. Its type is determined by `mode`: a Lightning
+    /// address for `LightningAddress`, an on-chain Bitcoin address for
+    /// `OnChain`. `None` for modes that need no address (e.g. `Nwc`).
+    pub address: Option<String>,
+    /// How the operator is paid their revenue share.
+    pub mode: PayoutMode,
+    /// Optional operator-chosen minimum accrued earnings (in **satoshis**)
+    /// before an automated payout is made, so many tiny payments can be batched
+    /// into one. `None` uses the system minimum; when set, the effective
+    /// threshold is `max(system_minimum, payout_threshold)`.
+    #[sqlx(default)]
+    pub payout_threshold: Option<u64>,
+    /// Optional per-operator revenue share override, as a whole percentage of
+    /// the invoice value of VMs running on this operator's nodes. `None` falls
+    /// back to `company.marketplace_rate`.
+    #[sqlx(default)]
+    pub rate: Option<f32>,
+    /// Whether this operator's nodes may take new VMs at all. Set to `false` by
+    /// an admin to stop placement across every node they own without deleting
+    /// anything or withholding already-accrued earnings.
+    pub enabled: bool,
+    /// When this enrolment was created
+    pub created: DateTime<Utc>,
+}
+
+/// A single machine offered by an operator.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct MarketplaceNode {
+    /// Unique id of this node
+    pub id: u64,
+    /// The operator that owns the hardware
+    pub operator_id: u64,
+    /// Operator-chosen display label. Not an identifier — not unique.
+    pub name: String,
+    /// Which region this node's capacity is offered in
+    pub region_id: u64,
+    /// The nostr public key the daemon authenticates its control channel with,
+    /// unique across the fleet. `None` until the node first presents a key.
+    pub pubkey: Option<Vec<u8>>,
+    /// Approval lifecycle state
+    pub status: MarketplaceNodeStatus,
+    /// Placement-policy trust tier
+    pub trust_tier: MarketplaceTrustTier,
+    /// Last control-channel contact. `None` until the node first connects.
+    pub last_seen: Option<DateTime<Utc>>,
+    /// When this node was registered
+    pub created: DateTime<Utc>,
+}
+
+impl Display for PayoutMode {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PayoutMode::LightningAddress => "lightning_address",
+            PayoutMode::Nwc => "nwc",
+            PayoutMode::AccountCredit => "account_credit",
+            PayoutMode::OnChain => "on_chain",
+        })
+    }
+}
+
+impl FromStr for PayoutMode {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "lightning_address" | "lightning" | "lnaddress" => Ok(PayoutMode::LightningAddress),
+            "nwc" => Ok(PayoutMode::Nwc),
+            "account_credit" | "credit" => Ok(PayoutMode::AccountCredit),
+            "on_chain" | "onchain" => Ok(PayoutMode::OnChain),
+            other => anyhow::bail!("Invalid payout mode: {}", other),
         }
     }
 }
@@ -1789,6 +1959,12 @@ pub struct Company {
     /// `now + max_prepay_days`. `0` means "inherit the global default".
     #[sqlx(default)]
     pub max_prepay_days: u16,
+    /// Default marketplace revenue share, as a whole percentage of the invoice
+    /// value of VMs running on an operator's nodes (e.g. `70.0` = 70%). Applies
+    /// when the operator has no per-operator override. `0` disables revenue
+    /// share for this company.
+    #[sqlx(default)]
+    pub marketplace_rate: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -2643,6 +2819,99 @@ mod tests {
         let img = os_image("https://example.com/images/foo.raw");
         assert_eq!(img.compression(), None);
         assert_eq!(img.filename().unwrap(), "foo.img");
+    }
+
+    #[test]
+    fn test_marketplace_node_status_roundtrip() {
+        for (text, status) in [
+            ("pending", MarketplaceNodeStatus::Pending),
+            ("approved", MarketplaceNodeStatus::Approved),
+            ("suspended", MarketplaceNodeStatus::Suspended),
+            ("draining", MarketplaceNodeStatus::Draining),
+        ] {
+            assert_eq!(MarketplaceNodeStatus::from_str(text).unwrap(), status);
+            assert_eq!(status.to_string(), text);
+        }
+        assert_eq!(
+            MarketplaceNodeStatus::from_str(" APPROVED ").unwrap(),
+            MarketplaceNodeStatus::Approved
+        );
+        assert!(MarketplaceNodeStatus::from_str("online").is_err());
+        // The stored discriminants are an on-disk format: changing one
+        // silently reinterprets every existing row.
+        assert_eq!(MarketplaceNodeStatus::Pending as u16, 0);
+        assert_eq!(MarketplaceNodeStatus::Approved as u16, 1);
+        assert_eq!(MarketplaceNodeStatus::Suspended as u16, 2);
+        assert_eq!(MarketplaceNodeStatus::Draining as u16, 3);
+        // A node is pending until somebody approves it.
+        assert_eq!(
+            MarketplaceNodeStatus::default(),
+            MarketplaceNodeStatus::Pending
+        );
+    }
+
+    #[test]
+    fn test_only_approved_nodes_accept_placement() {
+        assert!(MarketplaceNodeStatus::Approved.accepts_placement());
+        // Everything else must be ineligible — including any status added
+        // later, which is why this is a match on the whole set rather than
+        // three hand-written negatives.
+        for status in [
+            MarketplaceNodeStatus::Pending,
+            MarketplaceNodeStatus::Suspended,
+            MarketplaceNodeStatus::Draining,
+        ] {
+            assert!(
+                !status.accepts_placement(),
+                "{status} must not accept new VMs"
+            );
+        }
+    }
+
+    #[test]
+    fn test_marketplace_trust_tier_roundtrip() {
+        for (text, tier) in [
+            ("untrusted", MarketplaceTrustTier::Untrusted),
+            ("verified", MarketplaceTrustTier::Verified),
+            ("partner", MarketplaceTrustTier::Partner),
+        ] {
+            assert_eq!(MarketplaceTrustTier::from_str(text).unwrap(), tier);
+            assert_eq!(tier.to_string(), text);
+        }
+        assert!(MarketplaceTrustTier::from_str("trusted").is_err());
+        assert_eq!(MarketplaceTrustTier::Untrusted as u16, 0);
+        assert_eq!(MarketplaceTrustTier::Verified as u16, 1);
+        assert_eq!(MarketplaceTrustTier::Partner as u16, 2);
+        // An unspecified operator gets the least trust, not the most.
+        assert_eq!(
+            MarketplaceTrustTier::default(),
+            MarketplaceTrustTier::Untrusted
+        );
+        // Ordering is meaningful: policy is written as "at least tier X".
+        assert!(MarketplaceTrustTier::Partner > MarketplaceTrustTier::Verified);
+        assert!(MarketplaceTrustTier::Verified > MarketplaceTrustTier::Untrusted);
+    }
+
+    #[test]
+    fn test_vm_host_kind_marketplace_node() {
+        assert_eq!(VmHostKind::MarketplaceNode.to_string(), "marketplace_node");
+        // Appended after LibVirt so existing rows keep their meaning.
+        assert_eq!(VmHostKind::Proxmox as u16, 0);
+        assert_eq!(VmHostKind::LibVirt as u16, 1);
+        assert_eq!(VmHostKind::MarketplaceNode as u16, 2);
+    }
+
+    #[test]
+    fn test_referral_payout_mode_alias_is_the_shared_type() {
+        // Marketplace payouts reuse the referral rails. The alias exists so the
+        // rename did not churn 85 call sites; it must stay the *same* type, or
+        // the two payout ledgers would drift apart.
+        let mode: PayoutMode = ReferralPayoutMode::OnChain;
+        assert_eq!(mode, PayoutMode::OnChain);
+        assert_eq!(
+            PayoutMode::from_str("nwc").unwrap(),
+            ReferralPayoutMode::Nwc
+        );
     }
 
     #[test]

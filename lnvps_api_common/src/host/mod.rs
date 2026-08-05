@@ -501,6 +501,7 @@ mod tests {
                 ssh_user: None,
                 ssh_key: None,
                 sunset_date: None,
+                marketplace_node_id: None,
             },
             disk: VmHostDisk {
                 id: 1,

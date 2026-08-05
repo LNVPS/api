@@ -3,13 +3,13 @@ use crate::{
     AppDeploymentFilter, AppDeploymentServiceUsage, AppDeploymentVolumeUsage, AppTag,
     AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, DbError, DbResult,
     DnsServer, EncryptedString, IntervalType, IpRange, IpRangeSubscription, IpSpacePricing,
-    LNVpsDbBase, NewAgentMessage, PaymentMethod, PaymentMethodConfig, PaymentType, Referral,
-    ReferralCostUsage, ReferralPayout, Region, RegionStats, Router, RouterBgpRoute,
-    RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm,
-    VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
-    VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
-    WebauthnCredential,
+    LNVpsDbBase, MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage,
+    PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
+    Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
+    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentWithCompany, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
+    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -727,6 +727,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 ssh_user: row.get("ssh_user"),
                 ssh_key: row.get("ssh_key"),
                 sunset_date: row.get("sunset_date"),
+                marketplace_node_id: row.get("marketplace_node_id"),
             };
 
             let region = Region {
@@ -3941,6 +3942,175 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .fetch_one(&self.db)
         .await?;
         Ok(count as u64)
+    }
+
+    // ----- Marketplace (operator-run compute nodes) -----
+
+    async fn get_marketplace_operator(&self, id: u64) -> DbResult<MarketplaceOperator> {
+        Ok(
+            sqlx::query_as("SELECT * FROM marketplace_operator WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_marketplace_operator_by_user(
+        &self,
+        user_id: u64,
+    ) -> DbResult<MarketplaceOperator> {
+        Ok(
+            sqlx::query_as("SELECT * FROM marketplace_operator WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn list_marketplace_operators(&self) -> DbResult<Vec<MarketplaceOperator>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM marketplace_operator ORDER BY id")
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn insert_marketplace_operator(&self, operator: &MarketplaceOperator) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO marketplace_operator (user_id, address, mode, payout_threshold, rate, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?) returning id",
+        )
+        .bind(operator.user_id)
+        .bind(&operator.address)
+        .bind(operator.mode)
+        .bind(operator.payout_threshold)
+        .bind(operator.rate)
+        .bind(operator.enabled)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn update_marketplace_operator(&self, operator: &MarketplaceOperator) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE marketplace_operator \
+             SET address = ?, mode = ?, payout_threshold = ?, rate = ?, enabled = ? \
+             WHERE id = ?",
+        )
+        .bind(&operator.address)
+        .bind(operator.mode)
+        .bind(operator.payout_threshold)
+        .bind(operator.rate)
+        .bind(operator.enabled)
+        .bind(operator.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_marketplace_operator(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM marketplace_operator WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_marketplace_node(&self, id: u64) -> DbResult<MarketplaceNode> {
+        Ok(
+            sqlx::query_as("SELECT * FROM marketplace_node WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_marketplace_node_by_pubkey(&self, pubkey: &[u8]) -> DbResult<MarketplaceNode> {
+        Ok(
+            sqlx::query_as("SELECT * FROM marketplace_node WHERE pubkey = ?")
+                .bind(pubkey)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn list_marketplace_nodes(&self, operator_id: u64) -> DbResult<Vec<MarketplaceNode>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM marketplace_node WHERE operator_id = ? ORDER BY id")
+                .bind(operator_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn list_all_marketplace_nodes(
+        &self,
+        status: Option<MarketplaceNodeStatus>,
+    ) -> DbResult<Vec<MarketplaceNode>> {
+        Ok(match status {
+            Some(status) => {
+                sqlx::query_as("SELECT * FROM marketplace_node WHERE status = ? ORDER BY id")
+                    .bind(status)
+                    .fetch_all(&self.db)
+                    .await?
+            }
+            None => {
+                sqlx::query_as("SELECT * FROM marketplace_node ORDER BY id")
+                    .fetch_all(&self.db)
+                    .await?
+            }
+        })
+    }
+
+    async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO marketplace_node (operator_id, name, region_id, pubkey, status, trust_tier, last_seen) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) returning id",
+        )
+        .bind(node.operator_id)
+        .bind(&node.name)
+        .bind(node.region_id)
+        .bind(&node.pubkey)
+        .bind(node.status)
+        .bind(node.trust_tier)
+        .bind(node.last_seen)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn update_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE marketplace_node \
+             SET name = ?, region_id = ?, pubkey = ?, status = ?, trust_tier = ? \
+             WHERE id = ?",
+        )
+        .bind(&node.name)
+        .bind(node.region_id)
+        .bind(&node.pubkey)
+        .bind(node.status)
+        .bind(node.trust_tier)
+        .bind(node.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn touch_marketplace_node(&self, id: u64, seen: DateTime<Utc>) -> DbResult<()> {
+        sqlx::query("UPDATE marketplace_node SET last_seen = ? WHERE id = ?")
+            .bind(seen)
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_marketplace_node(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM marketplace_node WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
     }
 
     // ----- App catalog -----

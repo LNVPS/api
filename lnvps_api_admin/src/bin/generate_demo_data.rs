@@ -159,6 +159,7 @@ async fn create_companies(db: &LNVpsDbMysql) -> Result<Vec<Company>> {
             base_currency: "USD".to_string(),
             referral_rate: 0.0,
             max_prepay_days: 0,
+            marketplace_rate: 0.0,
             address_2: None,
         },
         Company {
@@ -176,6 +177,7 @@ async fn create_companies(db: &LNVpsDbMysql) -> Result<Vec<Company>> {
             base_currency: "GBP".to_string(),
             referral_rate: 0.0,
             max_prepay_days: 0,
+            marketplace_rate: 0.0,
             address_2: None,
         },
         Company {
@@ -193,6 +195,7 @@ async fn create_companies(db: &LNVpsDbMysql) -> Result<Vec<Company>> {
             base_currency: "EUR".to_string(),
             referral_rate: 0.0,
             max_prepay_days: 0,
+            marketplace_rate: 0.0,
             address_2: None,
         },
     ];
@@ -380,6 +383,7 @@ async fn create_hosts(db: &LNVpsDbMysql, regions: &[Region]) -> Result<Vec<VmHos
             ssh_user: None,
             ssh_key: None,
             sunset_date: None,
+            marketplace_node_id: None,
         };
 
         let id = db.create_host(&host).await?;
