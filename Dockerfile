@@ -19,6 +19,14 @@ RUN cargo chef prepare --recipe-path recipe.json
 # --- build: cook workspace deps once (cached layer), compile ALL bins once ---
 FROM chef AS build
 COPY --from=planner /app/src/recipe.json recipe.json
+# lnvps_node depends on lnvps_host_util by path, and that crate is deliberately
+# outside this workspace (it ships as a standalone per-arch operator tool with
+# its own lockfile and Docker context). cargo-chef builds its skeleton from
+# workspace members only, so the path dependency is absent when cooking and
+# resolution fails before a single crate compiles. Copying it in first is
+# enough; it is small and changes rarely, so the cost to layer caching is
+# negligible.
+COPY lnvps_host_util lnvps_host_util
 RUN cargo chef cook --release --recipe-path recipe.json
 COPY . .
 RUN cargo build --release --locked --bins \
