@@ -17,7 +17,13 @@
 --   * marketplace node data planes (guest traffic back to a route server),
 --   * plain WireGuard VPNs sold to users,
 --   * infrastructure peerings, including tunnels carrying BGP.
--- They differ only in who owns them and what is routed over them.
+--
+-- There is no `purpose` column. A tunnel sold to a user has a `user_id`; every
+-- other tunnel is ours, and a marketplace node's is found through
+-- `marketplace_node.tunnel_id`. A node link and a BGP transport differ in what
+-- is routed over them, not in anything this table stores — and a column that
+-- merely restates which reference points at the row is one more thing free to
+-- disagree with it.
 
 CREATE TABLE tunnel (
     id INTEGER UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -27,15 +33,11 @@ CREATE TABLE tunnel (
     -- compared without a translation table.
     kind SMALLINT UNSIGNED NOT NULL DEFAULT 2,
 
-    -- What this tunnel is for. Determines which owner column is set; see the
-    -- CHECK below. 0 = marketplace node, 1 = user VPN, 2 = infrastructure.
-    purpose SMALLINT UNSIGNED NOT NULL,
-
-    -- Exactly one owner, or none for infrastructure. Nullable FKs rather than
-    -- an (owner_type, owner_id) pair, so the database still enforces that the
-    -- owner exists.
+    -- The customer this tunnel was sold to, when it is a VPN. NULL means the
+    -- tunnel is LNVPS's own — a marketplace node's data plane, or an
+    -- infrastructure peering. A real FK rather than an (owner_type, owner_id)
+    -- pair, so the database still enforces that the owner exists.
     user_id INTEGER UNSIGNED NULL DEFAULT NULL,
-    marketplace_node_id INTEGER UNSIGNED NULL DEFAULT NULL,
 
     -- The route server terminating this tunnel. NULL until one is chosen, so a
     -- tunnel can be allocated before it is placed.
@@ -89,20 +91,19 @@ CREATE TABLE tunnel (
     UNIQUE KEY uk_tunnel_address4 (address4),
     UNIQUE KEY uk_tunnel_address6 (address6),
     KEY ix_tunnel_user (user_id),
-    KEY ix_tunnel_marketplace_node (marketplace_node_id),
     KEY ix_tunnel_router (router_id),
 
     FOREIGN KEY (user_id) REFERENCES users (id),
-    FOREIGN KEY (marketplace_node_id) REFERENCES marketplace_node (id),
-    FOREIGN KEY (router_id) REFERENCES router (id),
-
-    -- The owner column must match the purpose. Without this, a "user VPN" row
-    -- with no user, or a node tunnel that also claims a user, is representable
-    -- — and every consumer would have to re-check what the schema could have
-    -- guaranteed.
-    CONSTRAINT ck_tunnel_owner CHECK (
-        (purpose = 0 AND marketplace_node_id IS NOT NULL AND user_id IS NULL)
-        OR (purpose = 1 AND user_id IS NOT NULL AND marketplace_node_id IS NULL)
-        OR (purpose = 2 AND user_id IS NULL AND marketplace_node_id IS NULL)
-    )
+    FOREIGN KEY (router_id) REFERENCES router (id)
 );
+
+-- A node's data plane. Nullable because a node is registered before it is
+-- given one, and unique because a tunnel terminates exactly one peer: two
+-- nodes sharing it would be two machines answering to one key and address.
+--
+-- ON DELETE RESTRICT (the default) so a tunnel still carrying a node's guest
+-- traffic cannot be deleted out from under it.
+ALTER TABLE marketplace_node
+    ADD COLUMN tunnel_id INTEGER UNSIGNED NULL DEFAULT NULL,
+    ADD UNIQUE KEY uk_marketplace_node_tunnel (tunnel_id),
+    ADD FOREIGN KEY (tunnel_id) REFERENCES tunnel (id);

@@ -1128,7 +1128,8 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Register a new node, returning the new id
     async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64>;
 
-    /// Update a node's name, key, status or trust tier. `operator_id` and
+    /// Update a node's name, key, status, trust tier or assigned tunnel.
+    /// `operator_id` and
     /// `created` are immutable and are not written: a node cannot change hands,
     /// because its earnings history and its hardware would diverge.
     async fn update_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<()>;
@@ -1150,27 +1151,22 @@ pub trait LNVpsDbBase: Send + Sync {
     /// resolves an incoming handshake to an allocation.
     async fn get_tunnel_by_peer_pubkey(&self, peer_pubkey: &[u8]) -> DbResult<Tunnel>;
 
-    /// List tunnels, optionally filtered to one purpose
-    async fn list_tunnels(&self, purpose: Option<TunnelPurpose>) -> DbResult<Vec<Tunnel>>;
+    /// List every tunnel
+    async fn list_tunnels(&self) -> DbResult<Vec<Tunnel>>;
 
-    /// List the tunnels belonging to one marketplace node (more than one when a
-    /// node is multi-homed across route servers)
-    async fn list_tunnels_for_marketplace_node(&self, node_id: u64) -> DbResult<Vec<Tunnel>>;
-
-    /// List the VPN tunnels belonging to one user
+    /// List the VPN tunnels sold to one user
     async fn list_tunnels_for_user(&self, user_id: u64) -> DbResult<Vec<Tunnel>>;
 
-    /// Allocate a tunnel, returning the new id. Rejects an owner that does not
-    /// match the purpose.
+    /// Allocate a tunnel, returning the new id
     async fn insert_tunnel(&self, tunnel: &Tunnel) -> DbResult<u64>;
 
-    /// Update a tunnel's routing and peer details. `purpose`, its owner and
-    /// `created` are immutable and are not written: re-purposing an allocation
-    /// or moving it to another owner would silently hand one tenant's addresses
-    /// to another.
+    /// Update a tunnel's routing and peer details. `user_id` and `created` are
+    /// immutable and are not written: moving an allocation to another owner
+    /// would hand one tenant's addresses and key to another.
     async fn update_tunnel(&self, tunnel: &Tunnel) -> DbResult<()>;
 
-    /// Delete a tunnel, releasing its addresses and key back to the pool
+    /// Delete a tunnel, releasing its addresses and key back to the pool. Fails
+    /// while a marketplace node still references it.
     async fn delete_tunnel(&self, id: u64) -> DbResult<()>;
 
     // ----- App catalog -----

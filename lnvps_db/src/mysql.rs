@@ -7,10 +7,9 @@ use crate::{
     PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
     Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
     RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, Tunnel, TunnelPurpose, User, UserPaymentMethod, UserSshKey, Vm,
-    VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
-    VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
-    WebauthnCredential,
+    SubscriptionPaymentWithCompany, Tunnel, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
+    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -4068,14 +4067,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO marketplace_node (operator_id, name, nostr_pubkey, status, trust_tier, last_seen) \
-             VALUES (?, ?, ?, ?, ?, ?) returning id",
+            "INSERT INTO marketplace_node (operator_id, name, nostr_pubkey, status, trust_tier, tunnel_id, last_seen) \
+             VALUES (?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(node.operator_id)
         .bind(&node.name)
         .bind(&node.nostr_pubkey)
         .bind(node.status)
         .bind(node.trust_tier)
+        .bind(node.tunnel_id)
         .bind(node.last_seen)
         .fetch_one(&self.db)
         .await?;
@@ -4085,13 +4085,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn update_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<()> {
         sqlx::query(
             "UPDATE marketplace_node \
-             SET name = ?, nostr_pubkey = ?, status = ?, trust_tier = ? \
+             SET name = ?, nostr_pubkey = ?, status = ?, trust_tier = ?, tunnel_id = ? \
              WHERE id = ?",
         )
         .bind(&node.name)
         .bind(&node.nostr_pubkey)
         .bind(node.status)
         .bind(node.trust_tier)
+        .bind(node.tunnel_id)
         .bind(node.id)
         .execute(&self.db)
         .await?;
@@ -4131,29 +4132,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?)
     }
 
-    async fn list_tunnels(&self, purpose: Option<TunnelPurpose>) -> DbResult<Vec<Tunnel>> {
-        Ok(match purpose {
-            Some(purpose) => {
-                sqlx::query_as("SELECT * FROM tunnel WHERE purpose = ? ORDER BY id")
-                    .bind(purpose)
-                    .fetch_all(&self.db)
-                    .await?
-            }
-            None => {
-                sqlx::query_as("SELECT * FROM tunnel ORDER BY id")
-                    .fetch_all(&self.db)
-                    .await?
-            }
-        })
-    }
-
-    async fn list_tunnels_for_marketplace_node(&self, node_id: u64) -> DbResult<Vec<Tunnel>> {
-        Ok(
-            sqlx::query_as("SELECT * FROM tunnel WHERE marketplace_node_id = ? ORDER BY id")
-                .bind(node_id)
-                .fetch_all(&self.db)
-                .await?,
-        )
+    async fn list_tunnels(&self) -> DbResult<Vec<Tunnel>> {
+        Ok(sqlx::query_as("SELECT * FROM tunnel ORDER BY id")
+            .fetch_all(&self.db)
+            .await?)
     }
 
     async fn list_tunnels_for_user(&self, user_id: u64) -> DbResult<Vec<Tunnel>> {
@@ -4166,23 +4148,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_tunnel(&self, tunnel: &Tunnel) -> DbResult<u64> {
-        // Fail here rather than let MariaDB reject it with a CHECK violation,
-        // so the error names the actual problem.
-        if !tunnel.owner_is_valid() {
-            return Err(DbError::Other(anyhow!(
-                "Tunnel owner does not match purpose {}",
-                tunnel.purpose
-            )));
-        }
         let res = sqlx::query(
-            "INSERT INTO tunnel (kind, purpose, user_id, marketplace_node_id, router_id, name, \
+            "INSERT INTO tunnel (kind, user_id, router_id, name, \
              peer_pubkey, peer_endpoint, address4, address6, keepalive, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(tunnel.kind)
-        .bind(tunnel.purpose)
         .bind(tunnel.user_id)
-        .bind(tunnel.marketplace_node_id)
         .bind(tunnel.router_id)
         .bind(&tunnel.name)
         .bind(&tunnel.peer_pubkey)

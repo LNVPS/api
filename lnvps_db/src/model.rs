@@ -1796,45 +1796,6 @@ pub struct MarketplaceOperator {
     pub created: DateTime<Utc>,
 }
 
-/// What a [`Tunnel`] is for. Determines which owner field is set.
-///
-/// Stored as a small integer; append-only to preserve values.
-#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(u16)]
-pub enum TunnelPurpose {
-    /// Carries a marketplace node's guest traffic to a route server.
-    #[default]
-    MarketplaceNode = 0,
-    /// A plain WireGuard VPN sold to a user.
-    UserVpn = 1,
-    /// LNVPS infrastructure, including tunnels carrying BGP sessions. Owned by
-    /// no customer.
-    Infrastructure = 2,
-}
-
-impl Display for TunnelPurpose {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            TunnelPurpose::MarketplaceNode => "marketplace_node",
-            TunnelPurpose::UserVpn => "user_vpn",
-            TunnelPurpose::Infrastructure => "infrastructure",
-        })
-    }
-}
-
-impl FromStr for TunnelPurpose {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_lowercase().as_str() {
-            "marketplace_node" => Ok(TunnelPurpose::MarketplaceNode),
-            "user_vpn" | "vpn" => Ok(TunnelPurpose::UserVpn),
-            "infrastructure" | "infra" => Ok(TunnelPurpose::Infrastructure),
-            other => anyhow::bail!("Invalid tunnel purpose: {}", other),
-        }
-    }
-}
-
 /// A tunnel LNVPS has **assigned**: who owns it, what key terminates it, and
 /// which inner addresses it was given.
 ///
@@ -1843,7 +1804,10 @@ impl FromStr for TunnelPurpose {
 /// is drift to be reported rather than an allocation that quietly vanished.
 ///
 /// One shape serves marketplace node data planes, user VPNs and infrastructure
-/// peerings — they differ only in ownership and in what is routed over them.
+/// peerings. There is no `purpose`: a tunnel sold to a customer has a
+/// [`user_id`](Self::user_id), every other tunnel is ours, and a node's is
+/// found through [`MarketplaceNode::tunnel_id`]. What a tunnel is for is
+/// already recorded by whichever reference points at it.
 #[derive(FromRow, Clone, Debug, Default)]
 pub struct Tunnel {
     /// Unique id of this tunnel
@@ -1851,12 +1815,9 @@ pub struct Tunnel {
     /// Encapsulation. Values match [`RouterTunnelKind`] so desired and observed
     /// state compare directly.
     pub kind: RouterTunnelKind,
-    /// What this tunnel is for; fixes which owner field is set
-    pub purpose: TunnelPurpose,
-    /// Owning user, for [`TunnelPurpose::UserVpn`]
+    /// The customer this tunnel was sold to, when it is a VPN. `None` means it
+    /// is LNVPS's own — a node data plane or an infrastructure peering.
     pub user_id: Option<u64>,
-    /// Owning node, for [`TunnelPurpose::MarketplaceNode`]
-    pub marketplace_node_id: Option<u64>,
     /// Route server terminating this tunnel. `None` until one is chosen.
     pub router_id: Option<u64>,
     /// Interface/peer name to configure on the router; correlates with
@@ -1878,25 +1839,6 @@ pub struct Tunnel {
     pub enabled: bool,
     /// When this tunnel was allocated
     pub created: DateTime<Utc>,
-}
-
-impl Tunnel {
-    /// The owner column that must be set for this tunnel's purpose, mirroring
-    /// the `ck_tunnel_owner` database constraint.
-    ///
-    /// Kept next to the schema rule so callers building a tunnel cannot invent
-    /// a combination the database will reject.
-    pub fn owner_is_valid(&self) -> bool {
-        match self.purpose {
-            TunnelPurpose::MarketplaceNode => {
-                self.marketplace_node_id.is_some() && self.user_id.is_none()
-            }
-            TunnelPurpose::UserVpn => self.user_id.is_some() && self.marketplace_node_id.is_none(),
-            TunnelPurpose::Infrastructure => {
-                self.user_id.is_none() && self.marketplace_node_id.is_none()
-            }
-        }
-    }
 }
 
 /// A single machine offered by an operator.
@@ -1922,6 +1864,9 @@ pub struct MarketplaceNode {
     pub status: MarketplaceNodeStatus,
     /// Placement-policy trust tier
     pub trust_tier: MarketplaceTrustTier,
+    /// The node's data plane, once assigned. `None` until then; a tunnel backs
+    /// exactly one node.
+    pub tunnel_id: Option<u64>,
     /// Last control-channel contact. `None` until the node first connects.
     pub last_seen: Option<DateTime<Utc>>,
     /// When this node was registered
