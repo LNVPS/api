@@ -44,17 +44,6 @@ jobs:
           LNVPS_E2E_RUN_ID: ${{ github.run_id }}_${{ github.run_attempt }}
         run: ./scripts/run-e2e.sh
 
-      # The agent tests depend on a live LLM choosing to call a tool or emit a
-      # sentinel token, which the small test model does not do reliably: each
-      # run fails a different subset. They are `#[ignore]`d out of the blocking
-      # suite but still run here, non-blocking, so a real regression in
-      # prompt-injection resistance or cross-user isolation stays visible.
-      - name: Run model-dependent agent tests (non-blocking)
-        continue-on-error: true
-        env:
-          LNVPS_E2E_RUN_ID: ${{ github.run_id }}_${{ github.run_attempt }}_agent
-        run: ./scripts/run-e2e.sh --no-build --filter agent_chat --ignored
-
       - name: Dump server logs on failure
         if: failure()
         run: |

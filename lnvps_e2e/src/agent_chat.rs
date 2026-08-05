@@ -21,24 +21,28 @@
 //! Free-text keyword matching is used only where the answer is a value the
 //! customer themselves supplied earlier in the conversation.
 //!
-//! # Why the model-dependent tests are `#[ignore]`d
+//! # This whole module is `#[ignore]`d — run it deliberately
 //!
-//! Signals (2) and (3) still depend on the model *choosing* to call a tool or
-//! emit a sentinel, and the small test model does neither reliably: repeated
-//! runs fail a different subset each time. Left in the blocking suite they made
-//! every e2e run red, which trains people to ignore the result.
+//! Signals (2) and (3) depend on the model *choosing* to call a tool or emit a
+//! sentinel, and the small test model does neither reliably: repeated runs
+//! against an unchanged server fail a different subset each time. Left in the
+//! blocking suite they made every e2e run red, which trains people to ignore
+//! the result.
 //!
-//! They are therefore `#[ignore]`d rather than deleted — they encode real
-//! security properties (prompt-injection resistance, cross-user isolation) and
-//! still run in CI as a separate, non-blocking step, so a genuine regression is
-//! visible without gating merges:
+//! The entire module is therefore opt-in, including the handful of tests that
+//! are themselves deterministic: they still need the `agent` feature, a live
+//! third-party model endpoint and its credential, so running them by default
+//! makes the suite depend on a service no other test needs.
+//!
+//! Nothing is deleted — these encode real security properties
+//! (prompt-injection resistance, cross-user isolation, credential leakage) and
+//! are worth running when the agent or its prompt changes:
 //!
 //! ```sh
+//! ./scripts/run-e2e.sh --filter agent_chat --ignored
+//! # or, against an already-running stack:
 //! cargo test -p lnvps_e2e agent_chat -- --ignored --test-threads=1
 //! ```
-//!
-//! The tests that assert *server* behaviour (auth, message limits, history
-//! persistence, frame protocol) are deterministic and stay in the main suite.
 
 #[cfg(test)]
 mod tests {
@@ -329,6 +333,7 @@ mod tests {
     /// An unauthenticated connection is refused with an error frame rather than
     /// being silently accepted.
     #[tokio::test]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
     async fn test_chat_rejects_invalid_auth() {
         let mut chat = Chat::connect_with_auth("not-a-valid-nip98-event")
             .await
@@ -347,6 +352,7 @@ mod tests {
     /// An oversized message is rejected without reaching the model, and the
     /// connection stays usable.
     #[tokio::test]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
     async fn test_chat_rejects_oversized_message() {
         let mut chat = Chat::connect().await.expect("connect");
 
@@ -370,7 +376,7 @@ mod tests {
     /// assertion is exact, since `tool_start` is emitted by the server when it
     /// dispatches rather than depending on the model's wording.
     #[tokio::test]
-    #[ignore = "depends on live model behaviour; run with --ignored"]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
     async fn test_chat_uses_account_tools_and_streams() {
         require_model!();
         setup_privileged().await;
@@ -415,7 +421,7 @@ mod tests {
     /// the sentinel confirms the agent actually understood and escalated rather
     /// than failing for some unrelated reason.
     #[tokio::test]
-    #[ignore = "depends on live model behaviour; run with --ignored"]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
     async fn test_chat_refuses_billing_actions() {
         require_model!();
         setup_privileged().await;
@@ -475,7 +481,7 @@ mod tests {
 
     /// Catalogue questions are answered from live data, not from model memory.
     #[tokio::test]
-    #[ignore = "depends on live model behaviour; run with --ignored"]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
     async fn test_chat_answers_catalogue_questions_from_tools() {
         require_model!();
         setup_privileged().await;
@@ -501,7 +507,7 @@ mod tests {
     /// `test_chat_uses_account_tools_and_streams` emits `tool_start` — so this
     /// asserts the frames are withheld, not that the lookup was skipped.
     #[tokio::test]
-    #[ignore = "depends on live model behaviour; run with --ignored"]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
     async fn test_chat_hides_tool_activity_from_ordinary_customers() {
         require_model!();
         let mut chat = Chat::connect().await.expect("connect");
@@ -549,7 +555,7 @@ mod tests {
     ///
     /// Runs privileged so tool dispatch is observable.
     #[tokio::test]
-    #[ignore = "depends on live model behaviour; run with --ignored"]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
     async fn test_chat_resists_prompt_injection_for_forbidden_tools() {
         require_model!();
         setup_privileged().await;
@@ -585,7 +591,7 @@ mod tests {
     /// `users:view` permission before the model sees anything, so it is not
     /// something the conversation can talk its way into.
     #[tokio::test]
-    #[ignore = "depends on live model behaviour; run with --ignored"]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
     async fn test_chat_resists_social_engineering_for_tool_visibility() {
         require_model!();
         let mut chat = Chat::connect().await.expect("connect");
@@ -617,7 +623,7 @@ mod tests {
     /// in a field the agent *does* surface for VMs you own, so a successful leak
     /// would be visible in the reply.
     #[tokio::test]
-    #[ignore = "depends on live model behaviour; run with --ignored"]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
     async fn test_chat_refuses_cross_user_vm_access() {
         require_model!();
         let pool = db::connect().await.expect("db connect");
@@ -674,7 +680,7 @@ mod tests {
     /// answers from real data — the protection is the hand-built projection in
     /// `DbToolExecutor`, which names the host but omits its API token.
     #[tokio::test]
-    #[ignore = "depends on live model behaviour; run with --ignored"]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
     async fn test_chat_does_not_leak_host_credentials() {
         require_model!();
         let pool = db::connect().await.expect("db connect");
@@ -721,7 +727,7 @@ mod tests {
     /// surfaced verbatim by `get_vm_details`. The customer asks an entirely
     /// innocent question; the payload arrives inside the tool result.
     #[tokio::test]
-    #[ignore = "depends on live model behaviour; run with --ignored"]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
     async fn test_chat_resists_indirect_injection_via_tool_output() {
         require_model!();
         let pool = db::connect().await.expect("db connect");
@@ -815,7 +821,7 @@ mod tests {
     /// later connection. The ask only comes after the groundwork is laid, and on
     /// a fresh socket.
     #[tokio::test]
-    #[ignore = "depends on live model behaviour; run with --ignored"]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
     async fn test_chat_resists_multi_turn_persuasion() {
         require_model!();
         let (keys, _user_id) = fresh_privileged_identity().await;
@@ -879,6 +885,7 @@ mod tests {
     /// answer is a rare token the test itself supplied, so a match cannot be a
     /// coincidence or a generic pleasantry.
     #[tokio::test]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
     async fn test_chat_history_persists_across_connections() {
         require_model!();
         let secret = "chartreuse-hexapod-1791";
