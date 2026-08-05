@@ -25,6 +25,12 @@ enum Command {
     Inventory,
     /// Check the configuration and credential without contacting LNVPS.
     Check,
+    /// Print the node's TLS fingerprint, the value LNVPS pins at registration.
+    Fingerprint {
+        /// State directory holding the identity (defaults to the configured one).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -53,6 +59,20 @@ fn main() -> Result<()> {
                     control.listen, control.port, control.tunnel_interface
                 ),
                 None => println!("control:    not configured (node not yet paired)"),
+            }
+        }
+        Command::Fingerprint { state_dir } => {
+            let state_dir = match state_dir {
+                Some(dir) => dir,
+                None => NodeConfig::load(&cli.config)?.state_dir,
+            };
+            let tls = lnvps_node::tls::load_or_generate(&state_dir, None)?;
+            println!("{}", tls.fingerprint);
+            if tls.generated {
+                eprintln!(
+                    "note: a new certificate was generated; register this fingerprint with \
+                     LNVPS or control requests will not reach this node"
+                );
             }
         }
     }

@@ -463,6 +463,17 @@ v1.
    Consequences: the release workflow **must** inject `LNVPS_CONTROL_PUBKEY` at build time;
    a binary built without it refuses to serve the control API rather than serving it to
    everyone. Self-hosted deployments rebuild with their own key.
+14. **Control calls run over HTTPS with a certificate pinned at registration.** NIP-98
+   authenticates requests *to* the node, but nothing authenticated the node's *replies*:
+   anything able to answer on the tunnel address — a guest on the same machine that grabbed
+   the IP, a route-server misconfiguration — could report that a VM started when it did not.
+   The node self-signs, LNVPS records the SHA-256 fingerprint at registration, and every
+   later call checks the presented certificate against that pin. No CA is involved: a public
+   CA would add a third party able to issue for a name we already control out-of-band.
+   Consequences: the identity is **persisted**, because a certificate minted on each restart
+   would break the pin and make the node unreachable; a corrupt certificate is a hard failure
+   rather than a silent regeneration, for the same reason; and registration (increment 3)
+   must carry the fingerprint, with a re-registration path for rotation.
 13. **The tunnel is not by itself a trust boundary.** Guests run on the node, so a guest that
    can route to the node's tunnel address could otherwise stop its neighbours. Two independent
    defences, both required: the listener binds **only** the tunnel interface address (enforced
@@ -528,6 +539,8 @@ Two guards worth remembering:
   enforced, NIP-98 signing for outbound calls, secrets kept out of `Debug` output.
 - `control_auth`: NIP-98 verification of inbound commands against the pinned LNVPS key
   (decision 12) — signature, pubkey, URL, method, body hash, clock window, replay cache.
+- `tls`: persisted self-signed identity whose fingerprint LNVPS pins (decision 14), verified
+  against `openssl x509 -fingerprint -sha256`.
 - `config`: control listener address validated against the tunnel interface (decision 13).
 - Inventory (memory, kernel, os, uptime, disks, SEV-SNP/TDX/nested-virt) built on
   `lnvps_host_util`, which became a lib + bin so the daemon and the operator's
@@ -548,7 +561,9 @@ Two guards worth remembering:
 
 ### Increment 3 — Pairing + admin approval flow (M)  ⬅ NEXT (with increment 2)
 - `POST /api/v1/node/register` under standard consumer auth → node bound to the calling user,
-  lands in `pending`. The authenticated user *is* the operator; no pairing code needed for the
+  lands in `pending`. Carries the node's TLS fingerprint (decision 14), stored on
+  `marketplace_node`; plus a re-registration path for when the certificate is rotated, or a
+  node that regenerates one becomes permanently unreachable. The authenticated user *is* the operator; no pairing code needed for the
   nostr/session-token path (keep a code only for headless installs).
 - Operator-facing user API: list own nodes, set payout address, view earnings.
 - Admin API: list/approve/reject/suspend/drain node, set trust tier, set capacity caps, set the

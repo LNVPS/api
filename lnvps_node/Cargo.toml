@@ -15,6 +15,9 @@ path = "src/main.rs"
 lnvps_host_util = { path = "../lnvps_host_util", default-features = false }
 
 nostr = { version = "0.44", default-features = false, features = ["std"] }
+# Self-signed TLS identity, pinned by LNVPS at registration. Same crate and
+# approach as lnvps_fw's control API.
+rcgen = "0.13"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
 
