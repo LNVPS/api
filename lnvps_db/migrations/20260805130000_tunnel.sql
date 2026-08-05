@@ -16,7 +16,10 @@
 -- bolted onto each consumer:
 --   * marketplace node data planes (guest traffic back to a route server),
 --   * plain WireGuard VPNs sold to users,
---   * infrastructure peerings, including tunnels carrying BGP.
+--   * BGP peerings requested by a customer.
+--
+-- Every one of these is sold to somebody; this table is not for LNVPS's own
+-- internal plumbing.
 --
 -- There is no `purpose` column, and `user_id` is not one either. What a tunnel
 -- is *for* is decided by whichever table links to it —
@@ -36,11 +39,14 @@ CREATE TABLE tunnel (
     -- compared without a translation table.
     kind SMALLINT UNSIGNED NOT NULL DEFAULT 2,
 
-    -- Who owns this allocation. Always set: every tunnel belongs to somebody,
-    -- including LNVPS's own infrastructure, which is owned by the account that
-    -- represents us. NOT NULL so "unowned" is not a state that has to be
-    -- handled — an allocation nobody owns is one nobody can be billed for,
-    -- audited against, or have revoked with their account.
+    -- Who owns this allocation. Always set: every tunnel belongs to a real
+    -- customer account — the operator's merchant account for a marketplace
+    -- node, the requesting user for a BGP tunnel or a VPN. These are tunnels
+    -- sold to somebody, not LNVPS internal plumbing.
+    --
+    -- NOT NULL so "unowned" is not a state that has to be handled — an
+    -- allocation nobody owns is one nobody can be billed for, audited against,
+    -- or have revoked with their account.
     --
     -- Ownership says nothing about what the tunnel is for; that is the
     -- referencing table's job.
