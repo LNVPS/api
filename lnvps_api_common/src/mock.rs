@@ -4014,19 +4014,6 @@ impl LNVpsDbBase for MockDb {
             .into());
         }
         let mut pools = self.tunnel_pools.lock().await;
-        // uk_tunnel_pool_router_interface: two pools on one interface would
-        // each carve addresses the other does not know about, onto one link.
-        if pools
-            .values()
-            .any(|p| p.router_id == pool.router_id && p.interface == pool.interface)
-        {
-            return Err(anyhow!(
-                "Interface {} on router {} already has a pool",
-                pool.interface,
-                pool.router_id
-            )
-            .into());
-        }
         // uk_tunnel_pool_router_port: an interface listens on every local
         // address at its port, so two of them collide over the port.
         if pools
@@ -4061,16 +4048,6 @@ impl LNVpsDbBase for MockDb {
         }
         let mut pools = self.tunnel_pools.lock().await;
         if pools.values().any(|p| {
-            p.id != pool.id && p.router_id == pool.router_id && p.interface == pool.interface
-        }) {
-            return Err(anyhow!(
-                "Interface {} on router {} already has a pool",
-                pool.interface,
-                pool.router_id
-            )
-            .into());
-        }
-        if pools.values().any(|p| {
             p.id != pool.id && p.router_id == pool.router_id && p.listen_port == pool.listen_port
         }) {
             return Err(anyhow!(
@@ -4088,7 +4065,6 @@ impl LNVpsDbBase for MockDb {
         // interface that does not exist there.
         existing.region_id = pool.region_id;
         existing.name = pool.name.clone();
-        existing.interface = pool.interface.clone();
         existing.listen_addr = pool.listen_addr.clone();
         existing.listen_port = pool.listen_port;
         existing.private_key = pool.private_key.clone();

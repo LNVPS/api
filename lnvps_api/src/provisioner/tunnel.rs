@@ -386,7 +386,6 @@ mod tests {
             router_id,
             region_id: 1,
             name: format!("pool-{interface}"),
-            interface: interface.to_string(),
             listen_addr: "rs.example".to_string(),
             listen_port: 51820,
             private_key: lnvps_api_common::generate_wireguard_keypair()

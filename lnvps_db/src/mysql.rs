@@ -4381,14 +4381,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_tunnel_pool(&self, pool: &TunnelPool) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO tunnel_pool (router_id, region_id, name, interface, listen_addr, \
+            "INSERT INTO tunnel_pool (router_id, region_id, name, listen_addr, \
              listen_port, private_key, public_key, cidr4, cidr6, keepalive, mtu, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(pool.router_id)
         .bind(pool.region_id)
         .bind(&pool.name)
-        .bind(&pool.interface)
         .bind(&pool.listen_addr)
         .bind(pool.listen_port)
         .bind(&pool.private_key)
@@ -4406,14 +4405,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn update_tunnel_pool(&self, pool: &TunnelPool) -> DbResult<()> {
         sqlx::query(
             "UPDATE tunnel_pool \
-             SET region_id = ?, name = ?, interface = ?, listen_addr = ?, listen_port = ?, \
+             SET region_id = ?, name = ?, listen_addr = ?, listen_port = ?, \
                  private_key = ?, public_key = ?, cidr4 = ?, cidr6 = ?, keepalive = ?, \
                  mtu = ?, enabled = ? \
              WHERE id = ?",
         )
         .bind(pool.region_id)
         .bind(&pool.name)
-        .bind(&pool.interface)
         .bind(&pool.listen_addr)
         .bind(pool.listen_port)
         .bind(&pool.private_key)

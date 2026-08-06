@@ -29,9 +29,19 @@ CREATE TABLE tunnel_pool (
     -- Admin label. Not an identifier.
     name VARCHAR(100) NOT NULL,
 
-    -- The WireGuard interface on the route server that peers are added to.
-    -- Correlates with `router_tunnel.name` once the interface is observed.
-    interface VARCHAR(64) NOT NULL,
+    -- There is no interface name column. The interface is named `wgln<id>`,
+    -- derived from this row's id:
+    --
+    --   * the route server is not LNVPS-exclusive — it carries interfaces
+    --     nobody here configured — and a fixed prefix keeps a managed interface
+    --     from ever being confused with, or clobbering, one of those;
+    --   * ids are unique, so two pools cannot be given the same name by an
+    --     admin typing it twice, on this router or any other;
+    --   * a stored name could be edited to point at an interface the pool does
+    --     not own, and the next sync would rewrite somebody else's tunnel.
+    --
+    -- It correlates with `router_tunnel.name` once the interface is observed,
+    -- exactly as a stored name would have.
 
     -- Where the data plane listens, stated in full: the address on the route
     -- server that peers send to, and the UDP port the interface listens on.
@@ -97,11 +107,6 @@ CREATE TABLE tunnel_pool (
     created DATETIME NOT NULL DEFAULT NOW(),
 
     PRIMARY KEY (id),
-
-    -- One interface on one router is one pool. Two pools sharing an interface
-    -- would each carve addresses the other does not know about, onto the same
-    -- link.
-    UNIQUE KEY uk_tunnel_pool_router_interface (router_id, interface),
 
     -- A WireGuard interface listens on *every* local address at its port, on
     -- both Linux and RouterOS, so the port — not the address — is what two

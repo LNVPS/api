@@ -887,16 +887,21 @@ impl Worker {
             );
         }
 
+        // Named from the pool's id under a fixed prefix, so a managed
+        // interface can never be confused with one the operator of the route
+        // server configured themselves.
+        let interface = pool.interface();
+
         let existing = tr
             .list_tunnels()
             .await
             .map_err(|e| anyhow!("failed to list tunnels: {}", e))?
             .into_iter()
-            .find(|t| t.name == pool.interface);
+            .find(|t| t.name == interface);
 
         let desired = crate::router::Tunnel {
             id: existing.as_ref().and_then(|t| t.id.clone()),
-            name: pool.interface.clone(),
+            name: interface.clone(),
             // The address the data plane listens on. Recorded so the interface
             // and the endpoint peers are told to dial cannot disagree.
             local_addr: Some(pool.listen_addr.clone()),
@@ -916,7 +921,7 @@ impl Worker {
             None => {
                 info!(
                     "Creating WireGuard interface {} on router {}",
-                    pool.interface, pool.router_id
+                    interface, pool.router_id
                 );
                 tr.add_tunnel(&desired)
                     .await
@@ -944,13 +949,13 @@ impl Worker {
                         "WireGuard interface {} on router {} has drifted (key_changed={}, \
                          port_changed={}); re-applying, which drops its peers until they are \
                          pushed again",
-                        pool.interface, pool.router_id, key_drifted, port_drifted
+                        interface, pool.router_id, key_drifted, port_drifted
                     );
                     tr.update_tunnel(&desired)
                         .await
                         .map_err(|e| anyhow!("failed to update tunnel interface: {}", e))?;
                 } else if current.enabled != pool.enabled {
-                    let id = current.id.as_deref().unwrap_or(pool.interface.as_str());
+                    let id = current.id.as_deref().unwrap_or(interface.as_str());
                     tr.set_tunnel_enabled(id, pool.enabled)
                         .await
                         .map_err(|e| anyhow!("failed to toggle tunnel interface: {}", e))?;
@@ -4923,7 +4928,7 @@ mod tests {
     }
 
     /// A route server with a mock router and one pool on it.
-    async fn setup_pool(db: &Arc<MockDb>, interface: &str, port: u16) -> Result<u64> {
+    async fn setup_pool(db: &Arc<MockDb>, port: u16) -> Result<u64> {
         use lnvps_api_common::generate_wireguard_keypair;
         use lnvps_db::{Router, RouterKind, TunnelPool};
 
@@ -4953,7 +4958,6 @@ mod tests {
                 router_id: 1,
                 region_id: 1,
                 name: "pool".to_string(),
-                interface: interface.to_string(),
                 listen_addr: "192.0.2.1".to_string(),
                 listen_port: port,
                 private_key: keys.private_key.into(),
@@ -4974,7 +4978,7 @@ mod tests {
         use crate::router::{Router as _, TunnelConfig};
 
         let db = Arc::new(MockDb::empty());
-        let pool_id = setup_pool(&db, "wg-mkt0", 51820).await?;
+        let pool_id = setup_pool(&db, 51820).await?;
         let mr = MockRouter::new();
         mr.clear().await;
 
@@ -4983,7 +4987,9 @@ mod tests {
 
         let tunnels = mr.tunnel().unwrap().list_tunnels().await.unwrap();
         assert_eq!(tunnels.len(), 1);
-        assert_eq!(tunnels[0].name, "wg-mkt0");
+        // Named from the pool id under a fixed prefix, so a managed interface
+        // cannot collide with one the route server already carries.
+        assert_eq!(tunnels[0].name, format!("wgln{pool_id}"));
         assert_eq!(tunnels[0].local_addr.as_deref(), Some("192.0.2.1"));
         let pool = db.get_tunnel_pool(pool_id).await?;
         match &tunnels[0].config {
@@ -5023,7 +5029,7 @@ mod tests {
         use crate::router::Router as _;
 
         let db = Arc::new(MockDb::empty());
-        let pool_id = setup_pool(&db, "wg-mkt0", 51820).await?;
+        let pool_id = setup_pool(&db, 51820).await?;
         let mut pool = db.get_tunnel_pool(pool_id).await?;
         pool.public_key = vec![0xaa; 32];
         db.update_tunnel_pool(&pool).await?;
@@ -5055,7 +5061,7 @@ mod tests {
         use crate::router::Router as _;
 
         let db = Arc::new(MockDb::empty());
-        let pool_id = setup_pool(&db, "wg-mkt0", 51820).await?;
+        let pool_id = setup_pool(&db, 51820).await?;
         let mr = MockRouter::new();
         mr.clear().await;
 
@@ -5063,7 +5069,8 @@ mod tests {
         worker.sync_tunnel_pool(pool_id).await?;
         assert_eq!(mr.tunnel().unwrap().list_tunnels().await.unwrap().len(), 1);
 
-        worker.remove_tunnel_interface(1, "wg-mkt0").await?;
+        let interface = db.get_tunnel_pool(pool_id).await?.interface();
+        worker.remove_tunnel_interface(1, &interface).await?;
         assert!(
             mr.tunnel()
                 .unwrap()
@@ -5079,7 +5086,7 @@ mod tests {
 
         // Removing it again is the desired state, not a failure to retry
         // forever — the job runs after the row is already deleted.
-        worker.remove_tunnel_interface(1, "wg-mkt0").await?;
+        worker.remove_tunnel_interface(1, &interface).await?;
 
         mr.clear().await;
         Ok(())

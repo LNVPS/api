@@ -3902,7 +3902,12 @@ that point-to-point links are carved out of.
 
 **LNVPS manages the interface.** Creating a pool generates its WireGuard
 keypair, stores the private key encrypted, and configures the interface on the
-route server; editing one re-applies it; deleting one removes it. An admin never
+route server; editing one re-applies it; deleting one removes it. The interface
+is named `wgln<id>` from the pool's own id and is not settable: a route server
+also carries interfaces LNVPS did not configure, and a fixed prefix keeps a
+managed interface from being confused with — or clobbering — one of those. A
+stored name could also be edited to point at an interface the pool does not own,
+which the next sync would rewrite. An admin never
 pastes key material for an interface they configured by hand — a pool that only
 *recorded* somebody else's public key could describe an interface but never
 create one, and there would be no way to rebuild it after the machine is
@@ -3949,8 +3954,6 @@ Create body:
   "router_id": 3,
   "region_id": 1,
   "name": "lon marketplace",
-  "interface": "wg-mkt0",
-  // WireGuard interface LNVPS creates on the route server
   "listen_addr": "rs1.example.com",
   // The address peers send to. An address, not host:port and not a URL
   "listen_port": 51820,
@@ -3973,7 +3976,8 @@ Create body:
 
 PATCH takes the same fields, all optional, **except `router_id`**: moving a pool
 to another route server would leave every tunnel carved from it pointing at an
-interface that does not exist there. Sending `private_key` re-keys the
+interface that does not exist there. `interface` is returned but never accepted,
+being derived from the pool id. Sending `private_key` re-keys the
 interface, which cuts every node holding the old public key until it re-reads
 its configuration — so it happens only when the field is present, never as a
 side effect of an unrelated edit; a blank value generates a fresh pair. Blocks

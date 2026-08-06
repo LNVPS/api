@@ -59,7 +59,10 @@ pub struct AdminTunnelPoolInfo {
     pub region_id: u64,
     pub region_name: String,
     pub name: String,
-    /// The WireGuard interface LNVPS configures on the route server.
+    /// The WireGuard interface LNVPS configures on the route server, named
+    /// `wgln<id>`. Derived from the pool id rather than chosen: a route server
+    /// also carries interfaces LNVPS did not configure, and a managed one must
+    /// never be confused with those or be re-pointed by an edit.
     pub interface: String,
     /// The address peers send to. Not the router's management URL.
     pub listen_addr: String,
@@ -106,8 +109,6 @@ pub struct CreateTunnelPoolRequest {
     /// The region whose nodes may be allocated from it.
     pub region_id: u64,
     pub name: String,
-    /// WireGuard interface to configure on the route server, e.g. `wg-mkt0`.
-    pub interface: String,
     /// The address peers send to — the route server's own address for this
     /// data plane, not its management address.
     pub listen_addr: String,
@@ -136,7 +137,6 @@ pub struct UpdateTunnelPoolRequest {
     /// interface that does not exist there.
     pub region_id: Option<u64>,
     pub name: Option<String>,
-    pub interface: Option<String>,
     pub listen_addr: Option<String>,
     pub listen_port: Option<u16>,
     /// Replace the interface's key. Omitted leaves it alone; `""` (or any
@@ -201,9 +201,11 @@ async fn pool_info(
     .min()
     .unwrap_or(0);
 
-    // Derived, never stored, so what a peer is told to dial cannot disagree
-    // with the socket that was configured.
+    // Both derived, never stored: what a peer is told to dial cannot disagree
+    // with the socket that was configured, and the interface name cannot be
+    // re-pointed at something the pool does not own.
     let endpoint = pool.endpoint();
+    let interface = pool.interface();
 
     Ok(AdminTunnelPoolInfo {
         id: pool.id,
@@ -212,7 +214,7 @@ async fn pool_info(
         region_id: pool.region_id,
         region_name: region.name,
         name: pool.name,
-        interface: pool.interface,
+        interface,
         listen_addr: pool.listen_addr,
         listen_port: pool.listen_port,
         endpoint,
@@ -290,7 +292,6 @@ pub(crate) async fn create_tunnel_pool(
         ));
     }
     let name = required(&req.name, "name")?;
-    let interface = required(&req.interface, "interface")?;
     let listen_addr = parse_listen_addr(&req.listen_addr)?;
     let listen_port = parse_listen_port(req.listen_port)?;
 
@@ -300,7 +301,6 @@ pub(crate) async fn create_tunnel_pool(
             router_id: req.router_id,
             region_id: req.region_id,
             name,
-            interface,
             listen_addr,
             listen_port,
             private_key: private_key.into(),
@@ -391,9 +391,6 @@ pub(crate) async fn update_tunnel_pool(
     if let Some(name) = &req.name {
         pool.name = required(name, "name")?;
     }
-    if let Some(interface) = &req.interface {
-        pool.interface = required(interface, "interface")?;
-    }
     if let Some(listen_addr) = &req.listen_addr {
         pool.listen_addr = parse_listen_addr(listen_addr)?;
     }
@@ -474,14 +471,14 @@ async fn admin_delete_tunnel_pool(
         .work_commander
         .send(WorkJob::RemoveTunnelInterface {
             router_id: pool.router_id,
-            interface: pool.interface.clone(),
+            interface: pool.interface(),
         })
         .await
     {
         log::error!(
             "Deleted tunnel pool {id} but could not queue removal of interface {} on router {}: \
              {e}. The interface is still configured and must be removed by hand.",
-            pool.interface,
+            pool.interface(),
             pool.router_id
         );
     }
@@ -602,7 +599,6 @@ mod tests {
             router_id,
             region_id: 1,
             name: "lon marketplace".to_string(),
-            interface: "wg-mkt0".to_string(),
             listen_addr: "rs1.example.com".to_string(),
             listen_port: Some(51820),
             private_key: None,
@@ -620,7 +616,9 @@ mod tests {
         let pool = create_tunnel_pool(&db, &create(router_id)).await.unwrap();
 
         assert_eq!(pool.router_id, router_id);
-        assert_eq!(pool.interface, "wg-mkt0");
+        // The interface is named from the pool's id under a fixed prefix, so it
+        // cannot collide with an interface the route server already carries.
+        assert_eq!(pool.interface(), format!("wgln{}", pool.id));
         // The key is generated, not supplied, and the stored public half is
         // the one the stored private half produces.
         assert_eq!(
@@ -825,7 +823,6 @@ mod tests {
         let err = create_tunnel_pool(
             &db,
             &CreateTunnelPoolRequest {
-                interface: "wg-mkt1".to_string(),
                 ..create(router_id)
             },
         )
@@ -837,7 +834,6 @@ mod tests {
         create_tunnel_pool(
             &db,
             &CreateTunnelPoolRequest {
-                interface: "wg-mkt1".to_string(),
                 listen_port: Some(51821),
                 ..create(router_id)
             },
@@ -989,7 +985,6 @@ mod tests {
             &UpdateTunnelPoolRequest {
                 region_id: Some(1),
                 name: Some("lon marketplace 2".to_string()),
-                interface: Some("wg-mkt1".to_string()),
                 listen_port: Some(51821),
                 cidr6: Some(Some("fd00:67::/64".to_string())),
                 ..Default::default()
@@ -998,21 +993,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(retuned.name, "lon marketplace 2");
-        assert_eq!(retuned.interface, "wg-mkt1");
         assert_eq!(retuned.listen_port, 51821);
         assert_eq!(retuned.cidr6.as_deref(), Some("fd00:67::/64"));
 
         // Blank is not a rename.
-        for req in [
-            UpdateTunnelPoolRequest {
-                name: Some("  ".to_string()),
-                ..Default::default()
-            },
-            UpdateTunnelPoolRequest {
-                interface: Some("".to_string()),
-                ..Default::default()
-            },
-        ] {
+        for req in [UpdateTunnelPoolRequest {
+            name: Some("  ".to_string()),
+            ..Default::default()
+        }] {
             assert!(update_tunnel_pool(&db, pool.id, &req).await.is_err());
         }
         assert_eq!(
@@ -1214,7 +1202,7 @@ mod tests {
         let got = admin_get_tunnel_pool(admin(), State(this.clone()), Path(pool_id))
             .await
             .unwrap();
-        assert_eq!(got.data.interface, "wg-mkt0");
+        assert_eq!(got.data.interface, format!("wgln{pool_id}"));
 
         let updated = admin_update_tunnel_pool(
             admin(),
@@ -1309,7 +1297,7 @@ mod tests {
             matches!(
                 jobs.recv().await.unwrap().first().map(|m| &m.job),
                 Some(WorkJob::RemoveTunnelInterface { router_id: r, interface })
-                    if *r == router_id && interface == "wg-mkt0"
+                    if *r == router_id && *interface == format!("wgln{pool_id}")
             ),
             "deleting a pool left its interface configured on the route server"
         );
