@@ -46,10 +46,11 @@ pub fn router() -> Router<RouterState> {
         )
 }
 
-/// Point-to-point prefix lengths, matching the allocator. A pool's capacity is
-/// counted in links, not addresses, because a link is what a node consumes.
-const LINK_PREFIX_V4: u8 = 31;
-const LINK_PREFIX_V6: u8 = 127;
+/// A node consumes one address, matching the allocator: WireGuard needs no
+/// gateway on the node's side, so a point-to-point link spent two addresses to
+/// describe something that needs one.
+const NODE_PREFIX_V4: u8 = 32;
+const NODE_PREFIX_V6: u8 = 128;
 
 #[derive(Serialize, Debug)]
 pub struct AdminTunnelPoolInfo {
@@ -165,21 +166,30 @@ pub struct UpdateTunnelPoolRequest {
     pub enabled: Option<bool>,
 }
 
-/// How many point-to-point links `cidr` can supply, saturating: a /48 of IPv6
-/// holds more /127s than a `u64` can count, and the exact figure is not the
+/// How many nodes `cidr` can supply addresses for, saturating: a /48 of IPv6
+/// holds more addresses than a `u64` can count, and the exact figure is not the
 /// point once it is that large.
+///
+/// The addresses the route server reserves come off the top (see
+/// `reserved_addresses` in the allocator), so this is what an admin can
+/// actually place.
 fn link_capacity(cidr: Option<&str>) -> Option<u64> {
     let net: IpNetwork = cidr?.parse().ok()?;
-    let link_prefix = if net.is_ipv4() {
-        LINK_PREFIX_V4
+    let node_prefix = if net.is_ipv4() {
+        NODE_PREFIX_V4
     } else {
-        LINK_PREFIX_V6
+        NODE_PREFIX_V6
     };
-    if net.prefix() > link_prefix {
+    if net.prefix() > node_prefix {
         return Some(0);
     }
-    let bits = link_prefix - net.prefix();
-    Some(if bits >= 64 { u64::MAX } else { 1u64 << bits })
+    let bits = node_prefix - net.prefix();
+    let total = if bits >= 64 { u64::MAX } else { 1u64 << bits };
+    // The route server holds the whole block on-link, so the block's own
+    // network address, the route server's address after it, and — on IPv4 —
+    // the broadcast address are not the pool's to hand out.
+    let reserved = if net.is_ipv4() { 3 } else { 2 };
+    Some(total.saturating_sub(reserved))
 }
 
 async fn pool_info(
@@ -515,14 +525,12 @@ fn parse_block(
             if want_v4 { 4 } else { 6 }
         )));
     }
-    let link_prefix = if want_v4 {
-        LINK_PREFIX_V4
-    } else {
-        LINK_PREFIX_V6
-    };
-    if net.prefix() > link_prefix {
+    // Judged by what the block can actually place, not by its prefix: the
+    // route server's own address and the block's reserved ones come out of it,
+    // so a /31 that looks like it holds two nodes holds none.
+    if link_capacity(Some(value)).unwrap_or(0) == 0 {
         return Err(ApiError::bad_request(format!(
-            "{field} is smaller than a single /{link_prefix} link"
+            "{field} has no room for a node once the route server's own address is reserved"
         )));
     }
     // Store the network address, so two pools written as `10.0.0.5/24` and
@@ -634,9 +642,10 @@ mod tests {
         let info = pool_info(&db, pool).await.unwrap();
         assert_eq!(info.router_name, "rs1");
         assert_eq!(info.links_used, 0);
-        // A /24 holds 128 /31 links; the /64 holds far more, so the v4 block is
-        // what actually limits the pool.
-        assert_eq!(info.links_total, 128);
+        // A /24 places 253 nodes — 256 less its network address, the route
+        // server's own address and its broadcast address. The /64 holds far
+        // more, so the v4 block is what actually limits the pool.
+        assert_eq!(info.links_total, 253);
     }
 
     /// Capacity has to reflect what can be handed out, not the roomier of the
@@ -656,21 +665,28 @@ mod tests {
         .unwrap();
 
         let info = pool_info(&db, pool).await.unwrap();
-        assert_eq!(info.links_total, 8, "the /28 limits the pool to 8 links");
+        assert_eq!(info.links_total, 13, "the /28 limits the pool to 13 nodes");
     }
 
-    /// A block exactly one link wide is not a rounding error, and one that
-    /// cannot hold a link reports no capacity rather than shifting negatively.
+    /// Capacity is what can actually be placed: the block's own reserved
+    /// addresses and the route server's are not a node's, and a block with no
+    /// room reports zero rather than shifting negatively.
     #[test]
-    fn capacity_counts_links_not_addresses() {
-        assert_eq!(link_capacity(Some("10.0.0.0/31")), Some(1));
-        assert_eq!(link_capacity(Some("10.0.0.0/24")), Some(128));
-        assert_eq!(link_capacity(Some("fd00::/127")), Some(1));
-        // Saturated rather than overflowed: the exact number of /127s in a /48
-        // is not a figure anyone needs.
-        assert_eq!(link_capacity(Some("fd00::/48")), Some(u64::MAX));
-        // Smaller than one link. Creation refuses these, but an older row or a
-        // direct database edit must not panic the listing.
+    fn capacity_counts_what_can_be_placed() {
+        // 256 less the network, route server and broadcast addresses.
+        assert_eq!(link_capacity(Some("10.0.0.0/24")), Some(253));
+        // A /30 is the smallest IPv4 block that can place anything at all.
+        assert_eq!(link_capacity(Some("10.0.0.0/30")), Some(1));
+        assert_eq!(link_capacity(Some("10.0.0.0/31")), Some(0));
+        // IPv6 has no broadcast address, so only two come off.
+        assert_eq!(link_capacity(Some("fd00::/127")), Some(0));
+        assert_eq!(link_capacity(Some("fd00::/126")), Some(2));
+        // Saturated rather than overflowed: the exact number of addresses in a
+        // /48 is not a figure anyone needs, and subtracting the reserved ones
+        // from a saturated count is noise at that scale.
+        assert_eq!(link_capacity(Some("fd00::/48")), Some(u64::MAX - 2));
+        // Creation refuses these, but an older row or a direct database edit
+        // must not panic the listing.
         assert_eq!(link_capacity(Some("10.0.0.1/32")), Some(0));
         assert_eq!(link_capacity(Some("not-a-cidr")), None);
         assert_eq!(link_capacity(None), None);
@@ -679,13 +695,15 @@ mod tests {
     /// A v6 block in the v4 column would be handed out as an IPv4 link by an
     /// allocator that trusts the column.
     #[tokio::test]
-    async fn blocks_must_match_their_family_and_hold_a_link() {
+    async fn blocks_must_match_their_family_and_have_room() {
         let (db, router_id) = db().await;
         for (cidr4, cidr6) in [
             (Some("fd00::/64"), None),
             (Some("not-a-cidr"), None),
-            // A /32 cannot hold a /31, and a /128 cannot hold a /127.
+            // Nothing left to place once the route server's own address and
+            // the block's reserved ones are taken out.
             (Some("10.0.0.1/32"), None),
+            (Some("10.0.0.0/31"), None),
             (None, Some("fd00::1/128")),
             (None, Some("10.0.0.0/24")),
         ] {

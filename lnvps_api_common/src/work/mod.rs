@@ -240,6 +240,20 @@ pub enum WorkJob {
     /// *after* the pool row is gone — the alternative is deleting the row and
     /// leaving a configured interface behind with no record that it exists.
     RemoveTunnelInterface { router_id: u64, interface: String },
+    /// Reconcile the peers, addresses and routes on a tunnel pool's interface
+    /// against the tunnels allocated from it.
+    ///
+    /// Separate from [`SyncTunnelPool`](Self::SyncTunnelPool) because that
+    /// re-applies the interface itself, which on Linux means recreating it and
+    /// dropping every peer. This one touches only what has actually drifted,
+    /// which is what makes it safe to run on a schedule.
+    ReconcileTunnelPeers { pool_id: u64 },
+    /// Push one node's peer onto its route server.
+    ///
+    /// The fast path for "this node just got an address": a full reconcile of
+    /// the pool would work, but a node waiting on its first guest should not
+    /// wait for every other node on the route server to be checked first.
+    SyncNodeTunnel { tunnel_id: u64 },
     /// Re-apply forward + reverse DNS records for every IP assignment in a range.
     ///
     /// Used after changing a range's DNS server configuration (e.g. switching
@@ -347,6 +361,8 @@ impl fmt::Display for WorkJob {
             WorkJob::ToggleTunnel { .. } => write!(f, "ToggleTunnel"),
             WorkJob::SyncTunnelPool { .. } => write!(f, "SyncTunnelPool"),
             WorkJob::RemoveTunnelInterface { .. } => write!(f, "RemoveTunnelInterface"),
+            WorkJob::ReconcileTunnelPeers { .. } => write!(f, "ReconcileTunnelPeers"),
+            WorkJob::SyncNodeTunnel { .. } => write!(f, "SyncNodeTunnel"),
             WorkJob::PatchIpRangeDns { .. } => write!(f, "PatchIpRangeDns"),
         }
     }
@@ -398,6 +414,14 @@ mod tests {
             }
             .to_string(),
             "RemoveTunnelInterface"
+        );
+        assert_eq!(
+            WorkJob::ReconcileTunnelPeers { pool_id: 2 }.to_string(),
+            "ReconcileTunnelPeers"
+        );
+        assert_eq!(
+            WorkJob::SyncNodeTunnel { tunnel_id: 5 }.to_string(),
+            "SyncNodeTunnel"
         );
     }
 }

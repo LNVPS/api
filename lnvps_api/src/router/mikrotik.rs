@@ -746,4 +746,21 @@ mod tunnel_tests {
         assert_eq!(p2.keepalive_secs(), Some(30));
         assert_eq!(p2.endpoint(), None);
     }
+
+    /// A marketplace route server is a Linux box: peers, interface addresses
+    /// and per-guest routes are pushed with `wg` and `ip`. A Mikrotik carrying
+    /// a tunnel pool would silently accept the pool and configure nothing, so
+    /// the unimplemented half of the capability says so instead.
+    #[tokio::test]
+    async fn peer_level_operations_are_refused_rather_than_ignored() {
+        let r = MikrotikRouter::new("http://10.0.0.1", "admin", "pw");
+        assert!(
+            r.set_tunnel_peer("wgln1", &WireguardPeer::default())
+                .await
+                .is_err()
+        );
+        assert!(r.remove_tunnel_peer("wgln1", "key").await.is_err());
+        assert!(r.sync_tunnel_addresses("wgln1", &[]).await.is_err());
+        assert!(r.sync_tunnel_routes("wgln1", &[]).await.is_err());
+    }
 }

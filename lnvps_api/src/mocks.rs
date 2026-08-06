@@ -52,6 +52,10 @@ pub struct MockRouter {
     tunnels: Arc<Mutex<HashMap<String, Tunnel>>>,
     sessions: Arc<Mutex<HashMap<String, BgpSession>>>,
     default_route: Arc<Mutex<Option<BgpRoute>>>,
+    /// Addresses configured per tunnel interface
+    addresses: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Routes pointing down each tunnel interface
+    routes: Arc<Mutex<HashMap<String, Vec<String>>>>,
 }
 
 impl Default for MockRouter {
@@ -75,6 +79,10 @@ impl MockRouter {
                 Arc::new(Mutex::new(HashMap::new()));
             static TL_SESSIONS: Arc<Mutex<HashMap<String, BgpSession>>> =
                 Arc::new(Mutex::new(HashMap::new()));
+            static TL_ADDRESSES: Arc<Mutex<HashMap<String, Vec<String>>>> =
+                Arc::new(Mutex::new(HashMap::new()));
+            static TL_ROUTES: Arc<Mutex<HashMap<String, Vec<String>>>> =
+                Arc::new(Mutex::new(HashMap::new()));
             static TL_DEFAULT_ROUTE: Arc<Mutex<Option<BgpRoute>>> =
                 Arc::new(Mutex::new(Some(BgpRoute {
                     prefix: "0.0.0.0/0".to_string(),
@@ -87,6 +95,8 @@ impl MockRouter {
             tunnels: TL_TUNNELS.with(|t| t.clone()),
             sessions: TL_SESSIONS.with(|s| s.clone()),
             default_route: TL_DEFAULT_ROUTE.with(|d| d.clone()),
+            addresses: TL_ADDRESSES.with(|a| a.clone()),
+            routes: TL_ROUTES.with(|r| r.clone()),
         }
     }
 
@@ -98,6 +108,31 @@ impl MockRouter {
         tunnels.clear();
         let mut sessions = self.sessions.lock().await;
         sessions.clear();
+        let mut addresses = self.addresses.lock().await;
+        addresses.clear();
+        let mut routes = self.routes.lock().await;
+        routes.clear();
+    }
+
+    /// Addresses configured on a tunnel interface
+    pub async fn interface_addresses(&self, interface: &str) -> Vec<String> {
+        let addresses = self.addresses.lock().await;
+        addresses.get(interface).cloned().unwrap_or_default()
+    }
+
+    /// Routes pointing down a tunnel interface
+    pub async fn interface_routes(&self, interface: &str) -> Vec<String> {
+        let routes = self.routes.lock().await;
+        routes.get(interface).cloned().unwrap_or_default()
+    }
+
+    /// Peers configured on a tunnel interface
+    pub async fn peers(&self, interface: &str) -> Vec<crate::router::WireguardPeer> {
+        let tunnels = self.tunnels.lock().await;
+        match tunnels.get(interface).map(|t| &t.config) {
+            Some(crate::router::TunnelConfig::Wireguard(c)) => c.peers.clone(),
+            _ => vec![],
+        }
     }
 
     /// Seed a BGP session for tests
@@ -254,6 +289,48 @@ impl TunnelRouter for MockRouter {
         if let Some(t) = tunnels.get_mut(id) {
             t.enabled = enabled;
         }
+        Ok(())
+    }
+
+    async fn set_tunnel_peer(
+        &self,
+        interface: &str,
+        peer: &crate::router::WireguardPeer,
+    ) -> OpResult<()> {
+        let mut tunnels = self.tunnels.lock().await;
+        let Some(t) = tunnels.get_mut(interface) else {
+            return Err(OpError::Fatal(anyhow::anyhow!(
+                "No such tunnel interface: {interface}"
+            )));
+        };
+        if let crate::router::TunnelConfig::Wireguard(c) = &mut t.config {
+            // Keyed by public key, like the real thing: pushing the same peer
+            // twice updates it rather than duplicating it.
+            c.peers.retain(|p| p.public_key != peer.public_key);
+            c.peers.push(peer.clone());
+        }
+        Ok(())
+    }
+
+    async fn remove_tunnel_peer(&self, interface: &str, public_key: &str) -> OpResult<()> {
+        let mut tunnels = self.tunnels.lock().await;
+        if let Some(t) = tunnels.get_mut(interface)
+            && let crate::router::TunnelConfig::Wireguard(c) = &mut t.config
+        {
+            c.peers.retain(|p| p.public_key != public_key);
+        }
+        Ok(())
+    }
+
+    async fn sync_tunnel_addresses(&self, interface: &str, addresses: &[String]) -> OpResult<()> {
+        let mut map = self.addresses.lock().await;
+        map.insert(interface.to_string(), addresses.to_vec());
+        Ok(())
+    }
+
+    async fn sync_tunnel_routes(&self, interface: &str, prefixes: &[String]) -> OpResult<()> {
+        let mut map = self.routes.lock().await;
+        map.insert(interface.to_string(), prefixes.to_vec());
         Ok(())
     }
 

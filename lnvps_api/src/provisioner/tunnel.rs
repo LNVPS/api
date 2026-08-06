@@ -21,6 +21,7 @@ use ipnetwork::IpNetwork;
 use lnvps_db::{LNVpsDb, MarketplaceNode, RouterTunnelKind, Tunnel, TunnelPool};
 
 use crate::provisioner::allocate_subnet;
+use crate::router::WireguardPeer;
 
 /// A node's tunnel and the pool it came from.
 ///
@@ -34,54 +35,64 @@ pub struct NodeTunnel {
 }
 
 impl NodeTunnel {
-    /// The route server's address on the inner link.
+    /// The route server's address, which every node on the pool shares.
     ///
-    /// Derived from the node's own address rather than stored: on a /31 (or
-    /// /127) there are exactly two addresses, LNVPS takes the first and the
-    /// node the second. A stored copy would be a second answer to a question
-    /// that already has one.
+    /// Derived from the pool's block rather than stored, and one address for
+    /// the whole pool rather than one per node: WireGuard is layer 3 and
+    /// point-to-point, with no ARP and no on-link requirement, so a per-node
+    /// link address bought nothing and cost the route server one address per
+    /// node on a single interface.
     pub fn gateway4(&self) -> Option<String> {
-        link_gateway(self.tunnel.address4.as_deref())
+        server_address(self.pool.cidr4.as_deref()).map(|a| bare_address(&a))
     }
 
-    /// The route server's address on the inner IPv6 link.
+    /// The route server's IPv6 address on the pool.
     pub fn gateway6(&self) -> Option<String> {
-        link_gateway(self.tunnel.address6.as_deref())
+        server_address(self.pool.cidr6.as_deref()).map(|a| bare_address(&a))
     }
 }
 
-/// The first address of the link `addr` sits on, as plain text.
-fn link_gateway(addr: Option<&str>) -> Option<String> {
-    let net: IpNetwork = addr?.parse().ok()?;
-    Some(net.network().to_string())
+/// The route server's own address in `cidr`, as CIDR carrying the block's
+/// prefix (`10.66.0.1/16`).
+///
+/// The first usable address of the block, so it is fixed for the life of the
+/// pool: it is handed to every node as their gateway, and a value that moved
+/// when the block was edited would strand all of them at once.
+///
+/// Carries the block's prefix rather than a host prefix so the route server
+/// treats the whole pool as on-link — that is what makes one address serve
+/// every node.
+pub fn server_address(cidr: Option<&str>) -> Option<String> {
+    let net: IpNetwork = cidr?.parse().ok()?;
+    let first = next_address(&net)?;
+    Some(format!("{first}/{}", net.prefix()))
 }
 
-/// The second address of `link`, which is the peer's side.
-///
-/// A /31 or /127 has no network or broadcast address to skip — that is the
-/// point of using them for point-to-point links — so the peer's side is simply
-/// the other of the two.
-///
-/// Setting the low bit rather than adding one is deliberate: on a link that
-/// wide the network address always has it clear, so this cannot overflow and
-/// there is no arithmetic failure case to invent an error for.
-fn peer_address(link: &IpNetwork) -> String {
-    match link {
+/// The address one above the network address of `net`.
+fn next_address(net: &IpNetwork) -> Option<std::net::IpAddr> {
+    Some(match net {
         IpNetwork::V4(v4) => {
-            let addr = std::net::Ipv4Addr::from(u32::from(v4.network()) | 1);
-            format!("{}/{}", addr, v4.prefix())
+            std::net::Ipv4Addr::from(u32::from(v4.network()).checked_add(1)?).into()
         }
         IpNetwork::V6(v6) => {
-            let addr = std::net::Ipv6Addr::from(u128::from(v6.network()) | 1);
-            format!("{}/{}", addr, v6.prefix())
+            std::net::Ipv6Addr::from(u128::from(v6.network()).checked_add(1)?).into()
         }
-    }
+    })
 }
 
-/// Point-to-point prefix lengths. A /31 (RFC 3021) and a /127 (RFC 6164) are
-/// exactly two addresses, so a link costs nothing beyond the two ends.
-const LINK_PREFIX_V4: u8 = 31;
-const LINK_PREFIX_V6: u8 = 127;
+/// `10.66.0.1/16` -> `10.66.0.1`.
+fn bare_address(cidr: &str) -> String {
+    cidr.split_once('/').map_or(cidr, |(a, _)| a).to_string()
+}
+
+/// A node holds a single address, not a link.
+///
+/// WireGuard needs no gateway on the node's side (`ip route add default dev
+/// wg0` is enough on a point-to-point layer 3 interface), so a /31 spent two
+/// addresses to describe something that needs one — and forced the route server
+/// to carry an address per node.
+const NODE_PREFIX_V4: u8 = 32;
+const NODE_PREFIX_V6: u8 = 128;
 
 /// Fetch a node's existing data plane, if it has one.
 pub async fn get_node_tunnel(
@@ -252,7 +263,7 @@ fn peer_name(node: &MarketplaceNode) -> String {
 }
 
 /// Carve the next free link out of `pool`, returning `(address4, address6)` in
-/// the peer's own form (`10.0.0.1/31`).
+/// the peer's own form (`10.0.0.2/32`).
 ///
 /// A pool with both blocks must supply both halves: a node given only one
 /// family would silently be single-stack, which is the kind of thing that is
@@ -267,21 +278,41 @@ async fn carve_link(
         .iter()
         .flat_map(|t| [t.address4.clone(), t.address6.clone()])
         .flatten()
-        // A stored address is the peer's own (`10.0.0.1/31`); parsing keeps the
-        // host bits, and the overlap check works off the network address, so
-        // the whole link is excluded rather than just the one address.
         .filter_map(|a| a.parse::<IpNetwork>().ok())
         .collect();
 
     let address4 = match pool.cidr4.as_deref() {
-        Some(cidr) => Some(carve_one(cidr, LINK_PREFIX_V4, &taken, pool)?),
+        Some(cidr) => Some(carve_one(cidr, NODE_PREFIX_V4, &taken, pool)?),
         None => None,
     };
     let address6 = match pool.cidr6.as_deref() {
-        Some(cidr) => Some(carve_one(cidr, LINK_PREFIX_V6, &taken, pool)?),
+        Some(cidr) => Some(carve_one(cidr, NODE_PREFIX_V6, &taken, pool)?),
         None => None,
     };
     Ok((address4, address6))
+}
+
+/// Addresses in `cidr` that are not the pool's to hand out.
+///
+/// The route server holds the whole block on-link, so the addresses that block
+/// reserves are reserved here too: its network address, the route server's own
+/// address immediately after it, and — on IPv4 — its broadcast address.
+/// Handing any of them to a node would produce an address the route server
+/// itself will not forward to.
+pub fn reserved_addresses(cidr: &str) -> Vec<IpNetwork> {
+    let Ok(net) = cidr.parse::<IpNetwork>() else {
+        return vec![];
+    };
+    let mut out = vec![IpNetwork::from(net.network())];
+    if let Some(server) = server_address(Some(cidr))
+        && let Ok(addr) = bare_address(&server).parse::<IpNetwork>()
+    {
+        out.push(addr);
+    }
+    if let IpNetwork::V4(v4) = net {
+        out.push(IpNetwork::from(std::net::IpAddr::from(v4.broadcast())));
+    }
+    out
 }
 
 fn carve_one(cidr: &str, prefix: u8, taken: &[IpNetwork], pool: &TunnelPool) -> Result<String> {
@@ -291,13 +322,140 @@ fn carve_one(cidr: &str, prefix: u8, taken: &[IpNetwork], pool: &TunnelPool) -> 
             pool.id
         )
     })?;
-    let link = allocate_subnet(&block, prefix, taken).ok_or_else(|| {
+    let mut taken = taken.to_vec();
+    taken.extend(reserved_addresses(cidr));
+    let addr = allocate_subnet(&block, prefix, &taken).ok_or_else(|| {
         anyhow!(
             "Tunnel pool {} has no free /{prefix} left in {cidr}",
             pool.id
         )
     })?;
-    Ok(peer_address(&link))
+    Ok(addr.to_string())
+}
+
+/// What one pool's interface should have configured on its route server.
+///
+/// Computed in one pass over the pool's tunnels because the three parts are
+/// answers to the same question and must agree: an address without its peer is
+/// a link to nowhere, a peer without its route drops the guest traffic it was
+/// created to carry, and a route to a peer that is not there is a black hole.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PoolPlan {
+    /// Addresses on the interface — the route server's side of each link.
+    pub addresses: Vec<String>,
+    /// One peer per realisable tunnel.
+    pub peers: Vec<WireguardPeer>,
+    /// Guest prefixes routed down the interface.
+    pub routes: Vec<String>,
+}
+
+/// Work out what `pool`'s interface should look like.
+///
+/// A tunnel that cannot be realised — disabled, or with no key presented yet —
+/// contributes nothing at all, not an empty peer: half-configuring it would
+/// give the node a link with no way to authenticate over it.
+pub async fn plan_pool(db: &Arc<dyn LNVpsDb>, pool: &TunnelPool) -> Result<PoolPlan> {
+    let mut plan = PoolPlan::default();
+
+    // One address for the whole pool, carrying the block's prefix so every
+    // node in it is on-link. A per-node address would put one address on this
+    // interface for every node on the route server — thousands, on a /16 — to
+    // describe links that WireGuard, being layer 3 and point-to-point, does
+    // not need described.
+    plan.addresses.extend(
+        [
+            server_address(pool.cidr4.as_deref()),
+            server_address(pool.cidr6.as_deref()),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+
+    for tunnel in db.list_tunnels_in_pool(pool.id).await? {
+        if !tunnel.enabled {
+            continue;
+        }
+        let Some(key) = tunnel.peer_pubkey.as_deref() else {
+            continue;
+        };
+
+        // AllowedIPs is both the routing table for this peer and the
+        // anti-spoof boundary: WireGuard drops an inbound packet whose source
+        // is not listed, so a node cannot claim another node's guest address.
+        let mut allowed_ips: Vec<String> = [
+            host_address(tunnel.address4.as_deref()),
+            host_address(tunnel.address6.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+
+        let guests = guest_addresses(db, &tunnel).await?;
+        allowed_ips.extend(guests.iter().cloned());
+        plan.routes.extend(guests);
+
+        plan.peers.push(WireguardPeer {
+            public_key: lnvps_api_common::wireguard_key_to_base64(key),
+            // Nodes dial out from behind NAT; the endpoint is learned from the
+            // handshake. Configuring a stale one would stop the peer from
+            // being reachable after the node's address changes.
+            endpoint: tunnel.peer_endpoint.clone(),
+            allowed_ips,
+            persistent_keepalive: tunnel.keepalive,
+        });
+    }
+    Ok(plan)
+}
+
+/// The public addresses assigned to the guests running on `tunnel`'s node.
+///
+/// Empty for a tunnel that is not a marketplace node's, or a node with no
+/// guests yet — a node is realised before it has customers, and the peer exists
+/// so it can be given some.
+async fn guest_addresses(db: &Arc<dyn LNVpsDb>, tunnel: &Tunnel) -> Result<Vec<String>> {
+    let Some(node) = db.get_marketplace_node_by_tunnel(tunnel.id).await? else {
+        return Ok(vec![]);
+    };
+    let Some(host) = db.get_marketplace_node_host(node.id).await? else {
+        return Ok(vec![]);
+    };
+
+    let mut out = Vec::new();
+    for vm in db.list_vms_on_host(host.id).await? {
+        if vm.deleted {
+            continue;
+        }
+        for ip in db.list_vm_ip_assignments(vm.id).await? {
+            // A freed assignment must stop being routed here immediately: the
+            // address goes back in the pool and may already be somebody
+            // else's.
+            if ip.deleted {
+                continue;
+            }
+            if let Some(addr) = host_address(Some(&ip.ip)) {
+                out.push(addr);
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// A single address as a host prefix (`/32` or `/128`).
+///
+/// Accepts either a bare address or one already carrying a prefix, because
+/// tunnel addresses are stored as CIDR and guest assignments as bare addresses.
+fn host_address(addr: Option<&str>) -> Option<String> {
+    let addr = addr?;
+    let ip: std::net::IpAddr = match addr.split_once('/') {
+        Some((a, _)) => a.parse().ok()?,
+        None => addr.parse().ok()?,
+    };
+    Some(match ip {
+        std::net::IpAddr::V4(v4) => format!("{v4}/32"),
+        std::net::IpAddr::V6(v6) => format!("{v6}/128"),
+    })
 }
 
 #[cfg(test)]
@@ -404,20 +562,22 @@ mod tests {
         .unwrap()
     }
 
-    /// The first allocation takes the first link, both families, and gives the
-    /// node the second address of each — LNVPS keeps the first.
+    /// The first allocation takes one address of each family — the first the
+    /// block has left, after its own network address and the route server's.
     #[tokio::test]
-    async fn allocating_takes_the_first_free_link_in_both_families() {
+    async fn allocating_takes_the_first_free_address_in_both_families() {
         let (db, _mock, node, pool_id) = fixture().await;
 
         let allocation = allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
-        assert_eq!(allocation.tunnel.address4.as_deref(), Some("10.66.0.1/31"));
+        assert_eq!(allocation.tunnel.address4.as_deref(), Some("10.66.0.2/32"));
         assert_eq!(
             allocation.tunnel.address6.as_deref(),
-            Some("fd00:66::1/127")
+            Some("fd00:66::2/128")
         );
-        assert_eq!(allocation.gateway4().as_deref(), Some("10.66.0.0"));
-        assert_eq!(allocation.gateway6().as_deref(), Some("fd00:66::"));
+        // One gateway for the whole pool, not one per node: the route server
+        // holds a single address and every node in the block is on-link to it.
+        assert_eq!(allocation.gateway4().as_deref(), Some("10.66.0.1"));
+        assert_eq!(allocation.gateway6().as_deref(), Some("fd00:66::1"));
         assert_eq!(allocation.tunnel.pool_id, Some(pool_id));
         assert_eq!(allocation.tunnel.kind, RouterTunnelKind::Wireguard);
         assert_eq!(
@@ -437,13 +597,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(host.ip, "10.66.0.1");
+        assert_eq!(host.ip, "10.66.0.2");
         assert!(!host.enabled);
     }
 
-    /// Two nodes must never share a link; the second takes the next one.
+    /// Two nodes must never share an address; the second takes the next one.
     #[tokio::test]
-    async fn a_second_node_gets_the_next_link() {
+    async fn a_second_node_gets_the_next_address() {
         let (db, _mock, first, _) = fixture().await;
         allocate_node_tunnel(&db, &first, &NODE_KEY).await.unwrap();
 
@@ -472,10 +632,10 @@ mod tests {
         let allocation = allocate_node_tunnel(&db, &second, &OTHER_KEY)
             .await
             .unwrap();
-        assert_eq!(allocation.tunnel.address4.as_deref(), Some("10.66.0.3/31"));
+        assert_eq!(allocation.tunnel.address4.as_deref(), Some("10.66.0.3/32"));
         assert_eq!(
             allocation.tunnel.address6.as_deref(),
-            Some("fd00:66::3/127")
+            Some("fd00:66::3/128")
         );
     }
 
@@ -599,9 +759,10 @@ mod tests {
     #[tokio::test]
     async fn a_full_pool_falls_through_to_the_next_one() {
         let (db, mock, node, first_pool) = fixture().await;
-        // A /31 out of a /31 block: one link, and it is already taken.
+        // A /30 holds one placeable address once the network, route server and
+        // broadcast addresses are reserved — and it is already taken.
         let mut tiny = db.get_tunnel_pool(first_pool).await.unwrap();
-        tiny.cidr4 = Some("10.66.0.0/31".to_string());
+        tiny.cidr4 = Some("10.66.0.0/30".to_string());
         tiny.cidr6 = None;
         db.update_tunnel_pool(&tiny).await.unwrap();
         let user_id = db
@@ -615,7 +776,7 @@ mod tests {
             router_id: Some(tiny.router_id),
             pool_id: Some(tiny.id),
             name: "squatter".to_string(),
-            address4: Some("10.66.0.1/31".to_string()),
+            address4: Some("10.66.0.2/32".to_string()),
             enabled: true,
             ..Default::default()
         })
@@ -625,7 +786,7 @@ mod tests {
         let spare = pool(&db, &mock, "10.77.0.0/24", None, "wg-mkt1").await;
         let allocation = allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
         assert_eq!(allocation.tunnel.pool_id, Some(spare));
-        assert_eq!(allocation.tunnel.address4.as_deref(), Some("10.77.0.1/31"));
+        assert_eq!(allocation.tunnel.address4.as_deref(), Some("10.77.0.2/32"));
     }
 
     /// A pool on a different router than the tunnel claims is a peer
@@ -667,13 +828,13 @@ mod tests {
 
         let allocation = allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
         assert_eq!(allocation.tunnel.address4, None);
-        assert_eq!(allocation.control_address().unwrap(), "[fd00:66::1]");
+        assert_eq!(allocation.control_address().unwrap(), "[fd00:66::2]");
         let host = db
             .get_marketplace_node_host(node.id)
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(host.ip, "[fd00:66::1]");
+        assert_eq!(host.ip, "[fd00:66::2]");
     }
 
     /// Reading back an allocation is how the node re-reads its configuration
@@ -691,22 +852,39 @@ mod tests {
         assert_eq!(read.pool.mtu, 1420);
     }
 
-    /// The last link in a block is still a link. Deriving the peer's side by
-    /// setting the low bit is what makes that true without an overflow case.
+    /// The route server takes one address for the whole pool, and the block's
+    /// own reserved addresses are not the pool's to hand out: giving a node the
+    /// network or broadcast address of a block the route server holds on-link
+    /// produces an address it will not forward to.
     #[test]
-    fn the_top_of_the_address_space_still_yields_a_peer_address() {
+    fn the_block_keeps_its_reserved_addresses() {
         assert_eq!(
-            peer_address(&"255.255.255.254/31".parse().unwrap()),
-            "255.255.255.255/31"
+            server_address(Some("10.66.0.0/16")).as_deref(),
+            Some("10.66.0.1/16")
         );
         assert_eq!(
-            peer_address(
-                &"ffff:ffff:ffff:ffff:ffff:ffff:ffff:fffe/127"
-                    .parse()
-                    .unwrap()
-            ),
-            "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff/127"
+            server_address(Some("fd00:66::/48")).as_deref(),
+            Some("fd00:66::1/48")
         );
+
+        let reserved: Vec<String> = reserved_addresses("10.66.0.0/16")
+            .iter()
+            .map(|a| a.ip().to_string())
+            .collect();
+        assert_eq!(reserved, ["10.66.0.0", "10.66.0.1", "10.66.255.255"]);
+
+        // IPv6 has no broadcast address, but the subnet-router anycast address
+        // is still not a node's.
+        let reserved: Vec<String> = reserved_addresses("fd00:66::/64")
+            .iter()
+            .map(|a| a.ip().to_string())
+            .collect();
+        assert_eq!(reserved, ["fd00:66::", "fd00:66::1"]);
+
+        // Nothing to reserve out of a block nobody can parse; the allocator
+        // reports that against the pool.
+        assert!(reserved_addresses("not-a-cidr").is_empty());
+        assert_eq!(server_address(None), None);
     }
 
     /// A tunnel with no address is unreachable, and saying so beats handing
@@ -738,5 +916,182 @@ mod tests {
             .await
             .expect_err("an unparseable block allocated an address");
         assert!(format!("{err}").contains("unparseable block"), "{err}");
+    }
+
+    /// A realised peer is the anti-spoof boundary: `AllowedIPs` is the node's
+    /// own inner addresses plus exactly the guest addresses LNVPS assigned to
+    /// it, so a node cannot source traffic as another node's customer.
+    #[tokio::test]
+    async fn a_peer_allows_the_node_its_own_addresses_and_its_guests() {
+        let (db, mock, node, pool_id) = fixture().await;
+        let allocation = allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+        let host = db
+            .get_marketplace_node_host(node.id)
+            .await
+            .unwrap()
+            .unwrap();
+        add_guest(&db, &mock, host.id, &["203.0.113.5", "2001:db8::5"]).await;
+
+        let pool = db.get_tunnel_pool(pool_id).await.unwrap();
+        let plan = plan_pool(&db, &pool).await.unwrap();
+
+        assert_eq!(plan.peers.len(), 1);
+        let peer = &plan.peers[0];
+        assert_eq!(
+            peer.public_key,
+            lnvps_api_common::wireguard_key_to_base64(&NODE_KEY)
+        );
+        assert_eq!(
+            peer.allowed_ips,
+            vec![
+                "10.66.0.2/32".to_string(),
+                "fd00:66::2/128".to_string(),
+                "2001:db8::5/128".to_string(),
+                "203.0.113.5/32".to_string(),
+            ]
+        );
+        assert_eq!(peer.persistent_keepalive, Some(25));
+
+        // One address for the whole pool, carrying the block's prefix so every
+        // node in it is on-link. A per-node address would put one address on
+        // this interface for every node on the route server.
+        assert_eq!(
+            plan.addresses,
+            vec!["10.66.0.1/24".to_string(), "fd00:66::1/64".to_string()]
+        );
+        // ...and a route for each guest address, because AllowedIPs picks the
+        // peer for a packet already headed down the tunnel, it does not put it
+        // there.
+        assert_eq!(
+            plan.routes,
+            vec!["2001:db8::5/128".to_string(), "203.0.113.5/32".to_string()]
+        );
+        assert_eq!(allocation.tunnel.pool_id, Some(pool_id));
+    }
+
+    /// A freed address must stop being routed to the node at once: it goes
+    /// straight back in the pool and may already be somebody else's.
+    #[tokio::test]
+    async fn a_released_guest_address_is_not_routed() {
+        let (db, mock, node, pool_id) = fixture().await;
+        allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+        let host = db
+            .get_marketplace_node_host(node.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let vm_id = add_guest(&db, &mock, host.id, &["203.0.113.5"]).await;
+
+        // Release the address, leaving the VM in place.
+        {
+            let mut ips = mock.ip_assignments.lock().await;
+            for ip in ips.values_mut().filter(|i| i.vm_id == vm_id) {
+                ip.deleted = true;
+            }
+        }
+        let pool = db.get_tunnel_pool(pool_id).await.unwrap();
+        let plan = plan_pool(&db, &pool).await.unwrap();
+        assert_eq!(plan.routes, Vec::<String>::new());
+        assert_eq!(plan.peers[0].allowed_ips.len(), 2, "only the node's own");
+
+        // A deleted VM takes its addressing with it for the same reason.
+        {
+            let mut ips = mock.ip_assignments.lock().await;
+            for ip in ips.values_mut().filter(|i| i.vm_id == vm_id) {
+                ip.deleted = false;
+            }
+            let mut vms = mock.vms.lock().await;
+            if let Some(vm) = vms.get_mut(&vm_id) {
+                vm.deleted = true;
+            }
+        }
+        let plan = plan_pool(&db, &pool).await.unwrap();
+        assert_eq!(plan.routes, Vec::<String>::new());
+    }
+
+    /// A tunnel that cannot be realised contributes nothing at all, rather than
+    /// an empty peer: a link with no key is one the node cannot authenticate
+    /// over, and an address on it would be a link to nowhere.
+    #[tokio::test]
+    async fn an_unrealisable_tunnel_is_left_out_entirely() {
+        let (db, _mock, node, pool_id) = fixture().await;
+        let allocation = allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+        let pool = db.get_tunnel_pool(pool_id).await.unwrap();
+
+        for broken in [
+            Tunnel {
+                enabled: false,
+                ..allocation.tunnel.clone()
+            },
+            Tunnel {
+                peer_pubkey: None,
+                ..allocation.tunnel.clone()
+            },
+        ] {
+            db.update_tunnel(&broken).await.unwrap();
+            let plan = plan_pool(&db, &pool).await.unwrap();
+            assert!(plan.peers.is_empty());
+            assert!(plan.routes.is_empty());
+            // The interface still holds the pool's address: it exists whether
+            // or not anything has been placed in it yet.
+            assert_eq!(plan.addresses.len(), 2);
+        }
+    }
+
+    /// A tunnel that is not a node's — a customer VPN carved from the same
+    /// pool later — is still a peer, just one with no guests behind it.
+    #[tokio::test]
+    async fn a_tunnel_with_no_node_behind_it_is_still_a_peer() {
+        let (db, mock, _node, pool_id) = fixture().await;
+        let user_id = db.upsert_user(&[9u8; 32]).await.unwrap();
+        db.insert_tunnel(&Tunnel {
+            kind: RouterTunnelKind::Wireguard,
+            user_id,
+            router_id: Some(db.get_tunnel_pool(pool_id).await.unwrap().router_id),
+            pool_id: Some(pool_id),
+            name: "vpn".to_string(),
+            peer_pubkey: Some(OTHER_KEY.to_vec()),
+            address4: Some("10.66.9.1/32".to_string()),
+            enabled: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let pool = db.get_tunnel_pool(pool_id).await.unwrap();
+        let plan = plan_pool(&db, &pool).await.unwrap();
+        assert_eq!(plan.peers.len(), 1);
+        assert_eq!(plan.peers[0].allowed_ips, vec!["10.66.9.1/32".to_string()]);
+        assert!(plan.routes.is_empty());
+        let _ = mock;
+    }
+
+    /// Give `host` a VM holding `ips`. Written through the mock's maps because
+    /// a VM needs a template, an image and a disk that this test does not care
+    /// about.
+    async fn add_guest(db: &Arc<dyn LNVpsDb>, mock: &MockDb, host_id: u64, ips: &[&str]) -> u64 {
+        let vm_id = {
+            let mut vms = mock.vms.lock().await;
+            let id = vms.keys().max().copied().unwrap_or(0) + 1;
+            vms.insert(
+                id,
+                lnvps_db::Vm {
+                    id,
+                    host_id,
+                    ..Default::default()
+                },
+            );
+            id
+        };
+        for ip in ips {
+            db.insert_vm_ip_assignment(&lnvps_db::VmIpAssignment {
+                vm_id,
+                ip: ip.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        vm_id
     }
 }

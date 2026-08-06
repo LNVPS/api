@@ -136,6 +136,53 @@ struct HostInfoOutput {
     gpu_features: Vec<String>,
 }
 
+/// What a tunnel pool's route server disagreed with the database about.
+///
+/// Kept as three lists rather than a count because they mean different things:
+/// a peer that is *missing* was configured and is gone, a *changed* one is
+/// carrying the wrong anti-spoof list, and an *unclaimed* one is a key on an
+/// LNVPS interface that no allocation accounts for.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TunnelPeerDrift {
+    /// Allocated peers the route server did not have
+    pub missing: Vec<String>,
+    /// Peers whose allowed IPs no longer matched their allocation
+    pub changed: Vec<String>,
+    /// Peers on the interface that no tunnel claims
+    pub unclaimed: Vec<String>,
+}
+
+impl TunnelPeerDrift {
+    pub fn is_empty(&self) -> bool {
+        self.missing.is_empty() && self.changed.is_empty() && self.unclaimed.is_empty()
+    }
+}
+
+impl std::fmt::Display for TunnelPeerDrift {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} missing, {} changed, {} unclaimed",
+            self.missing.len(),
+            self.changed.len(),
+            self.unclaimed.len()
+        )
+    }
+}
+
+/// Whether two peers permit the same set of addresses.
+///
+/// Compared as a set: `wg` reports allowed IPs in its own order, and treating
+/// that as a difference would rewrite a working peer's anti-spoof list on every
+/// single reconcile.
+fn same_allowed_ips(a: &crate::router::WireguardPeer, b: &crate::router::WireguardPeer) -> bool {
+    let mut x: Vec<&String> = a.allowed_ips.iter().collect();
+    let mut y: Vec<&String> = b.allowed_ips.iter().collect();
+    x.sort();
+    y.sort();
+    x == y
+}
+
 /// Primary background worker logic
 /// Handles deleting expired VMs and sending notifications
 #[derive(Clone)]
@@ -728,6 +775,26 @@ impl Worker {
                     router_id, e
                 ),
             }
+
+            // Reconcile every pool this router terminates. This is where drift
+            // is actually caught: a peer wiped by a reboot, a stale key left
+            // behind, or a guest address assigned since the last push. Doing it
+            // on the existing router poll rather than on every VM change keeps
+            // guest addressing correct without wiring a route-server call into
+            // the provisioning path.
+            match self.db.list_tunnel_pools(None).await {
+                Ok(pools) => {
+                    for pool in pools
+                        .iter()
+                        .filter(|p| p.router_id == router_id && p.enabled)
+                    {
+                        if let Err(e) = self.reconcile_tunnel_peers(pool.id).await {
+                            warn!("Failed to reconcile tunnel pool {}: {}", pool.id, e);
+                        }
+                    }
+                }
+                Err(e) => warn!("Failed to list tunnel pools for router {router_id}: {e}"),
+            }
         }
 
         // BGP: refresh cached session state (no traffic counters)
@@ -972,6 +1039,158 @@ impl Worker {
                 }
             }
         }
+
+        // Whatever happened above, the interface now has to carry the peers
+        // that were allocated from this pool. This matters most in the case the
+        // push above just created or re-applied it: on Linux that is a fresh
+        // interface with no peers at all, and every node on it is cut until
+        // they are put back.
+        self.reconcile_tunnel_peers(pool.id).await?;
+        Ok(())
+    }
+
+    /// Reconcile the peers, addresses and routes on a pool's interface against
+    /// the tunnels allocated from it.
+    ///
+    /// The `tunnel` table is the desired state and the router is the observed
+    /// one, exactly as with host state. A peer that has vanished from a route
+    /// server is drift to put back and report, not an allocation to forget:
+    /// forgetting it would hand the node's addresses to somebody else while the
+    /// node still believes they are its own.
+    ///
+    /// Returns what had drifted, so a caller running this on a schedule can say
+    /// whether anything was wrong rather than only that it ran.
+    pub async fn reconcile_tunnel_peers(&self, pool_id: u64) -> Result<TunnelPeerDrift> {
+        let pool = self.db.get_tunnel_pool(pool_id).await?;
+        let router = crate::router::get_router(&self.db, pool.router_id)
+            .await
+            .map_err(|e| anyhow!("failed to load router {}: {}", pool.router_id, e))?;
+        let tr = router.tunnel().context("router does not support tunnels")?;
+        let interface = pool.interface();
+
+        let observed = tr
+            .list_tunnels()
+            .await
+            .map_err(|e| anyhow!("failed to list tunnels: {}", e))?
+            .into_iter()
+            .find(|t| t.name == interface);
+        // Peers are configured *on* an interface, so there is nothing to
+        // reconcile against until it exists. Creating it here would duplicate
+        // `sync_tunnel_pool` and hide the fact that it never ran.
+        let Some(observed) = observed else {
+            bail!(
+                "Tunnel pool {pool_id}'s interface {interface} is not configured on router {}; \
+                 run SyncTunnelPool first",
+                pool.router_id
+            );
+        };
+        let observed_peers = match &observed.config {
+            crate::router::TunnelConfig::Wireguard(c) => c.peers.clone(),
+            _ => bail!("Tunnel pool {pool_id}'s interface {interface} is not a WireGuard tunnel"),
+        };
+
+        let plan = crate::provisioner::plan_pool(&self.db, &pool).await?;
+        let mut drift = TunnelPeerDrift::default();
+
+        for want in &plan.peers {
+            match observed_peers
+                .iter()
+                .find(|p| p.public_key == want.public_key)
+            {
+                // Allowed IPs are compared as a set: `wg` reports them in its
+                // own order, and re-pushing on every reconcile because of that
+                // would rewrite the anti-spoof list of a working peer forever.
+                Some(have) if same_allowed_ips(have, want) => continue,
+                Some(_) => drift.changed.push(want.public_key.clone()),
+                None => drift.missing.push(want.public_key.clone()),
+            }
+            tr.set_tunnel_peer(&interface, want)
+                .await
+                .map_err(|e| anyhow!("failed to configure peer on {interface}: {}", e))?;
+        }
+
+        for have in &observed_peers {
+            if plan.peers.iter().any(|p| p.public_key == have.public_key) {
+                continue;
+            }
+            // LNVPS owns `wgln*` interfaces outright, so a peer no tunnel
+            // claims is either a revoked allocation that was never cleaned up
+            // or somebody else's key on our route server. Both are removed.
+            drift.unclaimed.push(have.public_key.clone());
+            tr.remove_tunnel_peer(&interface, &have.public_key)
+                .await
+                .map_err(|e| anyhow!("failed to remove peer from {interface}: {}", e))?;
+        }
+
+        tr.sync_tunnel_addresses(&interface, &plan.addresses)
+            .await
+            .map_err(|e| anyhow!("failed to configure addresses on {interface}: {}", e))?;
+        tr.sync_tunnel_routes(&interface, &plan.routes)
+            .await
+            .map_err(|e| anyhow!("failed to configure routes on {interface}: {}", e))?;
+
+        if !drift.is_empty() {
+            warn!(
+                "Tunnel pool {pool_id} on router {} had drifted: {drift}",
+                pool.router_id
+            );
+        }
+        Ok(drift)
+    }
+
+    /// Push one node's peer onto its route server.
+    ///
+    /// Used when a single allocation changes — a node asking for its tunnel, a
+    /// guest getting an address — so it does not wait behind a reconcile of
+    /// every other node on the same route server.
+    pub async fn sync_node_tunnel(&self, tunnel_id: u64) -> Result<()> {
+        let tunnel = self.db.get_tunnel(tunnel_id).await?;
+        let pool_id = tunnel.pool_id.ok_or_else(|| {
+            anyhow!("Tunnel {tunnel_id} was not allocated from a pool, so there is no interface")
+        })?;
+        let pool = self.db.get_tunnel_pool(pool_id).await?;
+        let router = crate::router::get_router(&self.db, pool.router_id)
+            .await
+            .map_err(|e| anyhow!("failed to load router {}: {}", pool.router_id, e))?;
+        let tr = router.tunnel().context("router does not support tunnels")?;
+        let interface = pool.interface();
+
+        // The peer's own share of the pool plan, rather than a second
+        // calculation of what one tunnel needs: the addresses and routes are
+        // per-interface, so one node's change is applied by re-stating the
+        // whole interface's addressing, and only its own peer is pushed.
+        let plan = crate::provisioner::plan_pool(&self.db, &pool).await?;
+        let key = tunnel
+            .peer_pubkey
+            .as_deref()
+            .map(lnvps_api_common::wireguard_key_to_base64);
+
+        match key
+            .as_ref()
+            .and_then(|k| plan.peers.iter().find(|p| &p.public_key == k))
+        {
+            Some(peer) => tr
+                .set_tunnel_peer(&interface, peer)
+                .await
+                .map_err(|e| anyhow!("failed to configure peer on {interface}: {}", e))?,
+            // A tunnel that is disabled or has never presented a key has no
+            // peer to push. Removing whatever is there under its key is the
+            // same statement in the other direction.
+            None => {
+                if let Some(key) = &key {
+                    tr.remove_tunnel_peer(&interface, key)
+                        .await
+                        .map_err(|e| anyhow!("failed to remove peer from {interface}: {}", e))?;
+                }
+            }
+        }
+
+        tr.sync_tunnel_addresses(&interface, &plan.addresses)
+            .await
+            .map_err(|e| anyhow!("failed to configure addresses on {interface}: {}", e))?;
+        tr.sync_tunnel_routes(&interface, &plan.routes)
+            .await
+            .map_err(|e| anyhow!("failed to configure routes on {interface}: {}", e))?;
         Ok(())
     }
 
@@ -2568,6 +2787,12 @@ impl Worker {
                 interface,
             } => {
                 self.remove_tunnel_interface(*router_id, interface).await?;
+            }
+            WorkJob::ReconcileTunnelPeers { pool_id } => {
+                self.reconcile_tunnel_peers(*pool_id).await?;
+            }
+            WorkJob::SyncNodeTunnel { tunnel_id } => {
+                self.sync_node_tunnel(*tunnel_id).await?;
             }
             WorkJob::DeleteVm {
                 vm_id,
@@ -4968,6 +5193,276 @@ mod tests {
                 ..Default::default()
             })
             .await?)
+    }
+
+    /// An approved node with a backing host, holding a tunnel from `pool_id`
+    /// and one guest address.
+    async fn setup_node_tunnel(db: &Arc<MockDb>, pool_id: u64) -> Result<lnvps_db::Tunnel> {
+        use lnvps_db::{
+            MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator, VmHost, VmHostKind,
+        };
+
+        let dbt: Arc<dyn LNVpsDb> = db.clone();
+        let user_id = dbt.upsert_user(&[7u8; 32]).await?;
+        let operator_id = dbt
+            .insert_marketplace_operator(&MarketplaceOperator {
+                user_id,
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let node_id = dbt
+            .insert_marketplace_node(&MarketplaceNode {
+                operator_id,
+                name: "rack 1".to_string(),
+                status: MarketplaceNodeStatus::Approved,
+                ..Default::default()
+            })
+            .await?;
+        let host_id = dbt
+            .create_host(&VmHost {
+                kind: VmHostKind::MarketplaceNode,
+                region_id: 1,
+                name: "node-host".to_string(),
+                ip: String::new(),
+                enabled: false,
+                marketplace_node_id: Some(node_id),
+                ..Default::default()
+            })
+            .await?;
+
+        let vm_id = {
+            let mut vms = db.vms.lock().await;
+            let id = vms.keys().max().copied().unwrap_or(0) + 1;
+            vms.insert(
+                id,
+                lnvps_db::Vm {
+                    id,
+                    host_id,
+                    ..Default::default()
+                },
+            );
+            id
+        };
+        dbt.insert_vm_ip_assignment(&lnvps_db::VmIpAssignment {
+            vm_id,
+            ip: "203.0.113.5".to_string(),
+            ..Default::default()
+        })
+        .await?;
+
+        let node = dbt.get_marketplace_node(node_id).await?;
+        let allocation =
+            crate::provisioner::allocate_node_tunnel(&dbt, &node, &[0x11u8; 32]).await?;
+        assert_eq!(allocation.tunnel.pool_id, Some(pool_id));
+        Ok(allocation.tunnel)
+    }
+
+    /// Configuring the interface is only half the job: the peers allocated from
+    /// the pool have to be on it, with an address on each link and a route for
+    /// each guest, or the node has a tunnel that carries nothing.
+    #[tokio::test]
+    async fn test_sync_tunnel_pool_realises_its_peers() -> Result<()> {
+        use crate::mocks::MockRouter;
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        let tunnel = setup_node_tunnel(&db, pool_id).await?;
+        let mr = MockRouter::new();
+        mr.clear().await;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.sync_tunnel_pool(pool_id).await?;
+
+        let interface = format!("wgln{pool_id}");
+        let peers = mr.peers(&interface).await;
+        assert_eq!(peers.len(), 1);
+        assert_eq!(
+            peers[0].public_key,
+            lnvps_api_common::wireguard_key_to_base64(&[0x11u8; 32])
+        );
+        // The node's own address plus exactly the guest address assigned to it:
+        // this list is the anti-spoof boundary, not just a routing hint.
+        assert_eq!(
+            peers[0].allowed_ips,
+            vec!["10.66.0.2/32".to_string(), "203.0.113.5/32".to_string()]
+        );
+        // One address for the pool, carrying the block's prefix: every node in
+        // it is on-link, so the route server does not carry an address per
+        // node on a single interface.
+        assert_eq!(
+            mr.interface_addresses(&interface).await,
+            vec!["10.66.0.1/24".to_string()]
+        );
+        // AllowedIPs picks which peer a packet belongs to; it does not put the
+        // packet on the tunnel. Without this route the guest's return traffic
+        // is dropped as unroutable.
+        assert_eq!(
+            mr.interface_routes(&interface).await,
+            vec!["203.0.113.5/32".to_string()]
+        );
+        assert_eq!(tunnel.pool_id, Some(pool_id));
+
+        mr.clear().await;
+        Ok(())
+    }
+
+    /// A peer that has vanished from a route server is drift to put back and
+    /// report, not an allocation to forget: forgetting it would hand the node's
+    /// addresses to somebody else while the node still uses them.
+    #[tokio::test]
+    async fn test_reconcile_tunnel_peers_repairs_and_reports_drift() -> Result<()> {
+        use crate::mocks::MockRouter;
+        use crate::router::{Router as _, WireguardPeer};
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        setup_node_tunnel(&db, pool_id).await?;
+        let mr = MockRouter::new();
+        mr.clear().await;
+        let worker = setup_worker(db.clone()).await?;
+        worker.sync_tunnel_pool(pool_id).await?;
+        let interface = format!("wgln{pool_id}");
+
+        // Nothing changed: a working peer must not be rewritten on every poll,
+        // and `wg` reports allowed IPs in its own order.
+        let drift = worker.reconcile_tunnel_peers(pool_id).await?;
+        assert!(drift.is_empty(), "{drift}");
+
+        // The route server lost the peer (a reboot without persistence).
+        let tr = mr.tunnel().unwrap();
+        let key = lnvps_api_common::wireguard_key_to_base64(&[0x11u8; 32]);
+        tr.remove_tunnel_peer(&interface, &key).await.unwrap();
+        let drift = worker.reconcile_tunnel_peers(pool_id).await?;
+        assert_eq!(drift.missing, vec![key.clone()]);
+        assert_eq!(mr.peers(&interface).await.len(), 1, "not put back");
+
+        // A peer whose allowed IPs no longer match its allocation is carrying
+        // the wrong anti-spoof list, which is a security boundary, not cosmetic.
+        tr.set_tunnel_peer(
+            &interface,
+            &WireguardPeer {
+                public_key: key.clone(),
+                allowed_ips: vec!["0.0.0.0/0".to_string()],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let drift = worker.reconcile_tunnel_peers(pool_id).await?;
+        assert_eq!(drift.changed, vec![key.clone()]);
+        assert_eq!(
+            mr.peers(&interface).await[0].allowed_ips,
+            vec!["10.66.0.2/32".to_string(), "203.0.113.5/32".to_string()]
+        );
+
+        // LNVPS owns `wgln*` outright, so a key no allocation accounts for is
+        // either a revoked node or somebody else's. Both are removed.
+        tr.set_tunnel_peer(
+            &interface,
+            &WireguardPeer {
+                public_key: "c3RyYXk=".to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let drift = worker.reconcile_tunnel_peers(pool_id).await?;
+        assert_eq!(drift.unclaimed, vec!["c3RyYXk=".to_string()]);
+        assert_eq!(mr.peers(&interface).await.len(), 1);
+
+        mr.clear().await;
+        Ok(())
+    }
+
+    /// Peers are configured *on* an interface. Creating it here would duplicate
+    /// the pool sync and hide the fact that it never ran.
+    #[tokio::test]
+    async fn test_reconcile_tunnel_peers_needs_the_interface() -> Result<()> {
+        use crate::mocks::MockRouter;
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        let mr = MockRouter::new();
+        mr.clear().await;
+        let worker = setup_worker(db.clone()).await?;
+
+        let err = worker
+            .reconcile_tunnel_peers(pool_id)
+            .await
+            .expect_err("peers were reconciled onto an interface that is not there");
+        assert!(format!("{err}").contains("SyncTunnelPool"), "{err}");
+
+        mr.clear().await;
+        Ok(())
+    }
+
+    /// One node getting an address must not wait behind a reconcile of every
+    /// other node on the same route server — and a tunnel that stops being
+    /// realisable takes its peer off the interface.
+    #[tokio::test]
+    async fn test_sync_node_tunnel_pushes_and_withdraws_one_peer() -> Result<()> {
+        use crate::mocks::MockRouter;
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        let tunnel = setup_node_tunnel(&db, pool_id).await?;
+        let mr = MockRouter::new();
+        mr.clear().await;
+        use crate::router::Router as _;
+        let worker = setup_worker(db.clone()).await?;
+        // The interface exists but has no peers, which is exactly the state
+        // right after a node asks for its tunnel.
+        worker.sync_tunnel_pool(pool_id).await?;
+        let interface = format!("wgln{pool_id}");
+        let tr = mr.tunnel().unwrap();
+        let key = lnvps_api_common::wireguard_key_to_base64(&[0x11u8; 32]);
+        tr.remove_tunnel_peer(&interface, &key).await.unwrap();
+
+        worker.sync_node_tunnel(tunnel.id).await?;
+        assert_eq!(mr.peers(&interface).await.len(), 1);
+
+        // Disabling the allocation is a statement in the other direction: the
+        // peer comes off rather than being left behind carrying traffic.
+        let dbt: Arc<dyn LNVpsDb> = db.clone();
+        dbt.update_tunnel(&lnvps_db::Tunnel {
+            enabled: false,
+            ..tunnel.clone()
+        })
+        .await?;
+        worker.sync_node_tunnel(tunnel.id).await?;
+        assert!(mr.peers(&interface).await.is_empty());
+
+        mr.clear().await;
+        Ok(())
+    }
+
+    /// A tunnel allocated outside a pool has no interface to be configured on,
+    /// and inventing one would write a peer onto somebody else's tunnel.
+    #[tokio::test]
+    async fn test_sync_node_tunnel_without_a_pool_is_refused() -> Result<()> {
+        let db = Arc::new(MockDb::empty());
+        let dbt: Arc<dyn LNVpsDb> = db.clone();
+        let user_id = dbt.upsert_user(&[3u8; 32]).await?;
+        let tunnel_id = dbt
+            .insert_tunnel(&lnvps_db::Tunnel {
+                user_id,
+                name: "hand-made".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        let err = worker
+            .sync_node_tunnel(tunnel_id)
+            .await
+            .expect_err("a pool-less tunnel was pushed to an interface");
+        assert!(
+            format!("{err}").contains("not allocated from a pool"),
+            "{err}"
+        );
+        Ok(())
     }
 
     /// A pool is not a description of an interface somebody configured by hand:

@@ -28,7 +28,18 @@ pub struct LinuxSshRouter {
     interface: String,
     /// SSH private key (PEM)
     key: String,
+    /// Stands in for the SSH connection under test.
+    ///
+    /// These methods run commands as root on somebody else's route server, so
+    /// what is worth asserting is the exact command issued — which needs the
+    /// transport replaced, not mocked around.
+    #[cfg(test)]
+    exec: Option<ExecFn>,
 }
+
+/// A stand-in for running a command over SSH.
+#[cfg(test)]
+type ExecFn = std::sync::Arc<dyn Fn(&str) -> OpResult<String> + Send + Sync>;
 
 impl LinuxSshRouter {
     /// Build a router from the stored config `url` and `token`.
@@ -57,7 +68,21 @@ impl LinuxSshRouter {
             username,
             interface,
             key: key.to_string(),
+            #[cfg(test)]
+            exec: None,
         })
+    }
+
+    /// A router whose commands are handled by `exec` instead of an SSH session.
+    #[cfg(test)]
+    fn with_exec(exec: ExecFn) -> Self {
+        Self {
+            host: "test:22".to_string(),
+            username: "root".to_string(),
+            interface: "eth0".to_string(),
+            key: String::new(),
+            exec: Some(exec),
+        }
     }
 
     /// Open a fresh SSH connection for a single operation.
@@ -76,6 +101,10 @@ impl LinuxSshRouter {
     /// Run a command, mapping connection failures to transient errors and
     /// non-zero exits to fatal errors. Returns stdout on success.
     async fn exec_checked(&self, cmd: &str) -> OpResult<String> {
+        #[cfg(test)]
+        if let Some(exec) = &self.exec {
+            return exec(cmd);
+        }
         let mut client = match self.connect().await {
             Ok(c) => c,
             Err(e) => op_transient!(e),
@@ -618,6 +647,90 @@ impl TunnelRouter for LinuxSshRouter {
         Ok(())
     }
 
+    async fn set_tunnel_peer(&self, interface: &str, peer: &WireguardPeer) -> OpResult<()> {
+        // `wg set ... peer` is additive and idempotent: it creates the peer or
+        // rewrites the fields given, and leaves the rest of the interface
+        // alone. That is the whole reason peers are pushed one at a time rather
+        // than through `update_tunnel`, which recreates the interface.
+        self.exec_checked(&format!("sh -c {}", shq(&wg_peer_script(interface, peer))))
+            .await?;
+        Ok(())
+    }
+
+    async fn remove_tunnel_peer(&self, interface: &str, public_key: &str) -> OpResult<()> {
+        // Removing a peer that is not there succeeds, which is what makes this
+        // safe to retry after a partial teardown.
+        self.exec_checked(&format!(
+            "wg set {} peer {} remove",
+            shq(interface),
+            shq(public_key)
+        ))
+        .await?;
+        Ok(())
+    }
+
+    async fn sync_tunnel_addresses(&self, interface: &str, addresses: &[String]) -> OpResult<()> {
+        let out = self
+            .exec_checked(&format!("ip -j addr show dev {}", shq(interface)))
+            .await?;
+        let observed = match parse_addr_show(&out) {
+            Ok(a) => a,
+            Err(e) => op_fatal!("Failed to parse ip addr output: {}", e),
+        };
+
+        let script = sync_set_script(
+            &observed,
+            addresses,
+            |a| format!("ip addr add {} dev {}", shq(a), shq(interface)),
+            // A link-local IPv6 address is put there by the kernel, not by us.
+            // Deleting it would be deleting the interface's ability to talk to
+            // itself, on every single sync.
+            |a| format!("ip addr del {} dev {}", shq(a), shq(interface)),
+            |a| !a.starts_with("fe80:"),
+        );
+        if let Some(script) = script {
+            self.exec_checked(&format!("sh -c {}", shq(&script)))
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn sync_tunnel_routes(&self, interface: &str, prefixes: &[String]) -> OpResult<()> {
+        // Both families have to be asked for separately: `ip route show` is
+        // IPv4 only, and a v6 guest prefix would otherwise look like a route
+        // that is missing on every sync and never stops being re-added.
+        let mut observed = Vec::new();
+        for family in ["-4", "-6"] {
+            let out = self
+                .exec_checked(&format!(
+                    "ip {} -j route show dev {}",
+                    family,
+                    shq(interface)
+                ))
+                .await?;
+            match parse_route_show(&out) {
+                Ok(r) => observed.extend(r),
+                Err(e) => op_fatal!("Failed to parse ip route output: {}", e),
+            }
+        }
+
+        let script = sync_set_script(
+            &observed,
+            prefixes,
+            |p| format!("ip route replace {} dev {}", shq(p), shq(interface)),
+            |p| format!("ip route del {} dev {}", shq(p), shq(interface)),
+            // The route the kernel installs for the interface's own address is
+            // the link itself. Removing it would break the link to keep a list
+            // tidy.
+            |p| !p.contains("/31") && !p.contains("/127"),
+        );
+        if let Some(script) = script {
+            self.exec_checked(&format!("sh -c {}", shq(&script)))
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn tunnel_traffic(&self) -> OpResult<Vec<TunnelTraffic>> {
         let out = self.exec_checked("ip -s -d -j link show").await?;
         let links: Vec<IpLink> = match serde_json::from_str(&out) {
@@ -641,6 +754,94 @@ impl TunnelRouter for LinuxSshRouter {
             })
             .collect())
     }
+}
+
+/// The commands that turn `observed` into `desired`, or `None` when they
+/// already agree.
+///
+/// Returning `None` rather than a no-op script keeps an unchanged interface
+/// from being touched at all, which matters because these run on somebody
+/// else's route server on every reconcile.
+///
+/// `is_ours` marks the entries this code is allowed to delete: an interface
+/// carries state the kernel put there, and a sync that removes everything it
+/// did not add would fight the kernel forever.
+fn sync_set_script(
+    observed: &[String],
+    desired: &[String],
+    add: impl Fn(&str) -> String,
+    del: impl Fn(&str) -> String,
+    is_ours: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    for want in desired {
+        if !observed.iter().any(|o| o == want) {
+            parts.push(add(want));
+        }
+    }
+    for have in observed {
+        if is_ours(have) && !desired.iter().any(|d| d == have) {
+            parts.push(del(have));
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" && "))
+    }
+}
+
+/// Build the `wg set` command for a single peer.
+///
+/// `allowed-ips` *replaces* the peer's list rather than adding to it, so this
+/// narrows a peer's reach as well as widening it — which is what makes it safe
+/// to use as the anti-spoof boundary.
+fn wg_peer_script(interface: &str, p: &WireguardPeer) -> String {
+    let mut script = String::new();
+    script.push_str(&format!(
+        "wg set {} peer {}",
+        shq(interface),
+        shq(&p.public_key)
+    ));
+    if let Some(e) = &p.endpoint {
+        script.push_str(&format!(" endpoint {}", shq(e)));
+    }
+    if !p.allowed_ips.is_empty() {
+        script.push_str(&format!(" allowed-ips {}", shq(&p.allowed_ips.join(","))));
+    }
+    if let Some(k) = p.persistent_keepalive {
+        script.push_str(&format!(" persistent-keepalive {}", k));
+    }
+    script
+}
+
+/// Addresses from `ip -j addr show dev X`, as CIDR.
+fn parse_addr_show(json: &str) -> Result<Vec<String>, serde_json::Error> {
+    let links: Vec<IpAddrLink> = serde_json::from_str(json)?;
+    Ok(links
+        .into_iter()
+        .flat_map(|l| l.addr_info)
+        .map(|a| format!("{}/{}", a.local, a.prefixlen))
+        .collect())
+}
+
+/// Destination prefixes from `ip -j route show dev X`.
+fn parse_route_show(json: &str) -> Result<Vec<String>, serde_json::Error> {
+    let routes: Vec<IpRouteEntry> = serde_json::from_str(json)?;
+    Ok(routes
+        .into_iter()
+        .map(|r| {
+            // iproute2 renders a host route as a bare address. Normalising it
+            // here means a desired "/32" is not re-added on every sync.
+            if r.dst.contains('/') || r.dst == "default" {
+                r.dst
+            } else if r.dst.contains(':') {
+                format!("{}/128", r.dst)
+            } else {
+                format!("{}/32", r.dst)
+            }
+        })
+        .collect())
 }
 
 /// Build a `wg set` command chain for a WireGuard interface configuration.
@@ -728,6 +929,25 @@ fn none_if_marker(s: &str) -> Option<&str> {
     }
 }
 
+/// One entry from `ip -j addr show`
+#[derive(Debug, Clone, Deserialize)]
+struct IpAddrLink {
+    #[serde(default)]
+    addr_info: Vec<IpAddrInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IpAddrInfo {
+    local: String,
+    prefixlen: u8,
+}
+
+/// One entry from `ip -j route show`
+#[derive(Debug, Clone, Deserialize)]
+struct IpRouteEntry {
+    dst: String,
+}
+
 /// One entry from `ip -s -d -j link show`
 #[derive(Debug, Clone, Deserialize)]
 struct IpLink {
@@ -793,6 +1013,7 @@ impl IpNeighEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
 
     #[test]
     fn test_new_parses_url() -> Result<()> {
@@ -1065,5 +1286,243 @@ mod tests {
         assert_eq!(arp[0].address, "10.0.0.5");
         assert_eq!(arp[0].mac_address, "aa:bb:cc:dd:ee:ff");
         assert_eq!(arp[0].id.as_deref(), Some("10.0.0.5"));
+    }
+
+    /// A peer push must not disturb the rest of the interface: it is one `wg
+    /// set peer`, not a re-apply, because re-applying recreates the interface
+    /// and drops every other node on it.
+
+    /// A router that records what it was asked to run and answers `ip` queries
+    /// from `state`.
+    fn recorded(state: &'static str) -> (LinuxSshRouter, std::sync::Arc<Mutex<Vec<String>>>) {
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = log.clone();
+        let r = LinuxSshRouter::with_exec(std::sync::Arc::new(move |cmd: &str| {
+            sink.lock().unwrap().push(cmd.to_string());
+            // Only the IPv4 query answers with state: a fixture that returned
+            // the same rows for both families would make a v4 route look like
+            // a v6 one as well.
+            Ok(if cmd.contains("-6 -j route show") {
+                "[]".to_string()
+            } else if cmd.contains("show") {
+                state.to_string()
+            } else {
+                String::new()
+            })
+        }));
+        (r, log)
+    }
+
+    /// A peer push is one `wg set peer` and nothing else: it must not recreate
+    /// the interface, which on this backend would drop every other node on it.
+    #[tokio::test]
+    async fn test_set_tunnel_peer_only_touches_that_peer() {
+        let (r, log) = recorded("[]");
+        r.set_tunnel_peer(
+            "wgln1",
+            &WireguardPeer {
+                public_key: "cGVlcg==".to_string(),
+                allowed_ips: vec!["10.66.0.1/32".to_string()],
+                persistent_keepalive: Some(25),
+                endpoint: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let ran = log.lock().unwrap().clone();
+        assert_eq!(ran.len(), 1);
+        assert!(ran[0].contains("wg set"), "{}", ran[0]);
+        assert!(ran[0].contains("peer"), "{}", ran[0]);
+        assert!(ran[0].contains("cGVlcg=="), "{}", ran[0]);
+        assert!(ran[0].contains("allowed-ips"), "{}", ran[0]);
+        assert!(ran[0].contains("persistent-keepalive 25"), "{}", ran[0]);
+        assert!(!ran[0].contains("ip link"), "{}", ran[0]);
+    }
+
+    /// Removing a peer that is not there succeeds, which is what makes the
+    /// teardown safe to retry after a partial failure.
+    #[tokio::test]
+    async fn test_remove_tunnel_peer_is_one_command() {
+        let (r, log) = recorded("[]");
+        r.remove_tunnel_peer("wgln1", "cGVlcg==").await.unwrap();
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec!["wg set 'wgln1' peer 'cGVlcg==' remove".to_string()]
+        );
+    }
+
+    /// Only the difference is applied, and the kernel's own link-local address
+    /// is left alone — deleting it would break the interface, on every sync.
+    #[tokio::test]
+    async fn test_sync_tunnel_addresses_applies_only_the_difference() {
+        let state = r#"[{"ifname":"wgln1","addr_info":[
+            {"local":"10.66.0.0","prefixlen":31},
+            {"local":"10.66.0.2","prefixlen":31},
+            {"local":"fe80::1","prefixlen":64}
+        ]}]"#;
+        let (r, log) = recorded(state);
+        r.sync_tunnel_addresses(
+            "wgln1",
+            &["10.66.0.0/31".to_string(), "10.66.0.4/31".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let ran = log.lock().unwrap().clone();
+        assert_eq!(ran.len(), 2, "{ran:?}");
+        assert!(ran[1].contains("ip addr add"), "{}", ran[1]);
+        assert!(ran[1].contains("10.66.0.4/31"), "{}", ran[1]);
+        assert!(ran[1].contains("ip addr del"), "{}", ran[1]);
+        assert!(ran[1].contains("10.66.0.2/31"), "{}", ran[1]);
+        assert!(
+            !ran[1].contains("fe80"),
+            "the kernel's own address was deleted"
+        );
+    }
+
+    /// An interface that already matches is not touched at all: this runs on
+    /// every reconcile, on a machine LNVPS does not own.
+    #[tokio::test]
+    async fn test_sync_tunnel_addresses_is_silent_when_correct() {
+        let state = r#"[{"ifname":"wgln1","addr_info":[{"local":"10.66.0.0","prefixlen":31}]}]"#;
+        let (r, log) = recorded(state);
+        r.sync_tunnel_addresses("wgln1", &["10.66.0.0/31".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(log.lock().unwrap().len(), 1, "only the query");
+    }
+
+    /// Both families have to be asked for separately, or a v6 guest prefix
+    /// looks absent on every sync and is re-added forever.
+    #[tokio::test]
+    async fn test_sync_tunnel_routes_covers_both_families() {
+        let (r, log) = recorded("[]");
+        r.sync_tunnel_routes("wgln1", &["203.0.113.5/32".to_string()])
+            .await
+            .unwrap();
+
+        let ran = log.lock().unwrap().clone();
+        assert!(ran[0].contains("ip -4 -j route show"), "{}", ran[0]);
+        assert!(ran[1].contains("ip -6 -j route show"), "{}", ran[1]);
+        assert!(ran[2].contains("ip route replace"), "{}", ran[2]);
+        assert!(ran[2].contains("203.0.113.5/32"), "{}", ran[2]);
+        assert!(ran[2].contains("wgln1"), "{}", ran[2]);
+    }
+
+    /// The link route the kernel installs for the interface's own /31 is the
+    /// link itself. Removing it to tidy a list would break the tunnel.
+    #[tokio::test]
+    async fn test_sync_tunnel_routes_keeps_the_link_route() {
+        let (r, log) = recorded(r#"[{"dst":"10.66.0.0/31"},{"dst":"198.51.100.9"}]"#);
+        r.sync_tunnel_routes("wgln1", &[]).await.unwrap();
+
+        let ran = log.lock().unwrap().clone();
+        let applied = ran.last().unwrap();
+        assert!(applied.contains("ip route del"), "{applied}");
+        assert!(applied.contains("198.51.100.9/32"), "{applied}");
+        assert!(!applied.contains("10.66.0.0/31"), "{applied}");
+    }
+
+    #[test]
+    fn test_wg_peer_script_touches_one_peer() {
+        let script = wg_peer_script(
+            "wgln1",
+            &WireguardPeer {
+                public_key: "cGVlcg==".to_string(),
+                endpoint: None,
+                allowed_ips: vec!["10.66.0.1/32".to_string(), "203.0.113.5/32".to_string()],
+                persistent_keepalive: Some(25),
+            },
+        );
+        assert_eq!(
+            script,
+            "wg set 'wgln1' peer 'cGVlcg==' allowed-ips '10.66.0.1/32,203.0.113.5/32' \
+             persistent-keepalive 25"
+        );
+        // Nothing that recreates or reconfigures the interface itself.
+        assert!(!script.contains("ip link"));
+        assert!(!script.contains("private-key"));
+    }
+
+    /// A peer with nothing but a key is still a valid statement: the node has
+    /// asked for a tunnel but has no addresses routed to it yet.
+    #[test]
+    fn test_wg_peer_script_without_optional_fields() {
+        let script = wg_peer_script(
+            "wgln1",
+            &WireguardPeer {
+                public_key: "cGVlcg==".to_string(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(script, "wg set 'wgln1' peer 'cGVlcg=='");
+    }
+
+    /// An interface that already matches must not be touched at all: these
+    /// commands run on somebody else's route server on every reconcile.
+    #[test]
+    fn test_sync_set_script_is_silent_when_nothing_changed() {
+        let observed = vec!["10.66.0.0/31".to_string()];
+        let desired = vec!["10.66.0.0/31".to_string()];
+        assert_eq!(
+            sync_set_script(
+                &observed,
+                &desired,
+                |a| format!("add {a}"),
+                |a| format!("del {a}"),
+                |_| true
+            ),
+            None
+        );
+    }
+
+    /// Both directions in one pass, and only over entries this code owns.
+    #[test]
+    fn test_sync_set_script_adds_and_removes() {
+        let observed = vec![
+            "10.66.0.0/31".to_string(),
+            "10.66.0.2/31".to_string(),
+            "fe80::1/64".to_string(),
+        ];
+        let desired = vec!["10.66.0.0/31".to_string(), "10.66.0.4/31".to_string()];
+        let script = sync_set_script(
+            &observed,
+            &desired,
+            |a| format!("add {a}"),
+            |a| format!("del {a}"),
+            // The kernel's own link-local address is not ours to delete.
+            |a| !a.starts_with("fe80:"),
+        )
+        .unwrap();
+        assert_eq!(script, "add 10.66.0.4/31 && del 10.66.0.2/31");
+    }
+
+    #[test]
+    fn test_parse_addr_show() {
+        let json = r#"[{"ifname":"wgln1","addr_info":[
+            {"family":"inet","local":"10.66.0.0","prefixlen":31},
+            {"family":"inet6","local":"fd00:66::","prefixlen":127}
+        ]}]"#;
+        assert_eq!(
+            parse_addr_show(json).unwrap(),
+            vec!["10.66.0.0/31".to_string(), "fd00:66::/127".to_string()]
+        );
+    }
+
+    /// iproute2 renders a host route as a bare address. Normalising it is what
+    /// stops a desired `/32` from looking absent on every single sync and being
+    /// re-added forever.
+    #[test]
+    fn test_parse_route_show_normalises_host_routes() {
+        let json = r#"[{"dst":"203.0.113.5"},{"dst":"2001:db8::5"},{"dst":"198.51.100.0/24"}]"#;
+        assert_eq!(
+            parse_route_show(json).unwrap(),
+            vec![
+                "203.0.113.5/32".to_string(),
+                "2001:db8::5/128".to_string(),
+                "198.51.100.0/24".to_string()
+            ]
+        );
     }
 }

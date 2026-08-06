@@ -4173,6 +4173,18 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn get_marketplace_node_by_tunnel(
+        &self,
+        tunnel_id: u64,
+    ) -> DbResult<Option<MarketplaceNode>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM marketplace_node WHERE tunnel_id = ?")
+                .bind(tunnel_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
     async fn get_marketplace_node_by_line_item(
         &self,
         line_item_id: u64,

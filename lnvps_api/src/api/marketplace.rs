@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use chrono::Utc;
 use lnvps_api_common::{
-    ApiData, ApiError, ApiResult, NODE_TOKEN_TTL_SECS, Nip98Auth, NodeAuth, issue_node_token,
-    session_auth_enabled,
+    ApiData, ApiError, ApiResult, NODE_TOKEN_TTL_SECS, Nip98Auth, NodeAuth, WorkJob,
+    issue_node_token, session_auth_enabled,
 };
 use lnvps_db::{
     IntervalType, MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator,
@@ -574,6 +574,25 @@ async fn v1_node_request_tunnel(
     let allocation = crate::provisioner::allocate_node_tunnel(&this.db, &auth.node, &key)
         .await
         .map_err(|e| ApiError::new(e.to_string()))?;
+
+    // Realise the peer on the route server. Queued rather than awaited: the
+    // node has what it needs to configure its own end either way, and making
+    // the answer wait on an SSH round trip to a route server would fail the
+    // request for something the node cannot fix. A failure to queue is logged
+    // and left to the periodic reconcile, which pushes the same peer.
+    if let Err(e) = this
+        .work_sender
+        .send(WorkJob::SyncNodeTunnel {
+            tunnel_id: allocation.tunnel.id,
+        })
+        .await
+    {
+        log::error!(
+            "Allocated tunnel {} for node {} but could not queue its peer push: {e}",
+            allocation.tunnel.id,
+            auth.node.id
+        );
+    }
     ApiData::ok(allocation.into())
 }
 
@@ -1002,12 +1021,14 @@ mod tests {
         let allocation = crate::provisioner::NodeTunnel {
             tunnel: lnvps_db::Tunnel {
                 id: 1,
-                address4: Some("10.66.0.1/31".to_string()),
-                address6: Some("fd00:66::1/127".to_string()),
+                address4: Some("10.66.0.2/32".to_string()),
+                address6: Some("fd00:66::2/128".to_string()),
                 keepalive: Some(25),
                 ..Default::default()
             },
             pool: lnvps_db::TunnelPool {
+                cidr4: Some("10.66.0.0/24".to_string()),
+                cidr6: Some("fd00:66::/64".to_string()),
                 public_key: vec![0x33; 32],
                 listen_addr: "rs.example".to_string(),
                 listen_port: 51820,
@@ -1017,12 +1038,12 @@ mod tests {
         };
 
         let api: ApiNodeTunnel = allocation.into();
-        assert_eq!(api.address4.as_deref(), Some("10.66.0.1/31"));
-        assert_eq!(api.address6.as_deref(), Some("fd00:66::1/127"));
-        // The gateway is derived from the link rather than stored, so a second
-        // copy cannot disagree with the address it is paired with.
-        assert_eq!(api.gateway4.as_deref(), Some("10.66.0.0"));
-        assert_eq!(api.gateway6.as_deref(), Some("fd00:66::"));
+        assert_eq!(api.address4.as_deref(), Some("10.66.0.2/32"));
+        assert_eq!(api.address6.as_deref(), Some("fd00:66::2/128"));
+        // The gateway is derived from the pool's block rather than stored, and
+        // is the same one address for every node on the pool.
+        assert_eq!(api.gateway4.as_deref(), Some("10.66.0.1"));
+        assert_eq!(api.gateway6.as_deref(), Some("fd00:66::1"));
         assert_eq!(api.server_public_key, hex::encode([0x33; 32]));
         assert_eq!(api.endpoint, "rs.example:51820");
         assert_eq!(api.keepalive, Some(25));
