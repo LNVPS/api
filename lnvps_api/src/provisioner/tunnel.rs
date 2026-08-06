@@ -407,6 +407,109 @@ pub async fn plan_pool(db: &Arc<dyn LNVpsDb>, pool: &TunnelPool) -> Result<PoolP
     Ok(plan)
 }
 
+/// The bridge a marketplace node puts its guests on.
+///
+/// Fixed rather than configurable: LNVPS drives it, every node is the same
+/// shape, and a per-node name would be one more thing to disagree about between
+/// what LNVPS thinks it configured and what the machine has.
+pub const NODE_BRIDGE: &str = "br-lnvps";
+
+/// The whole desired data plane for one node, in one document.
+///
+/// Fetched and applied together because it only makes sense together: a bridge
+/// with no tunnel carries nothing, a tunnel with no guest routes carries
+/// nothing back, and a document that can be half-fetched is a data plane that
+/// can be half-applied.
+#[derive(Debug, Clone)]
+pub struct NodeDataPlane {
+    pub tunnel: NodeTunnel,
+    pub bridge: String,
+    /// The guests placed on this node.
+    pub guests: Vec<GuestAddress>,
+}
+
+/// One address assigned to a guest on a node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuestAddress {
+    /// The guest's address as a host prefix (`203.0.113.5/32`).
+    pub address: String,
+    /// The gateway the guest is configured with.
+    ///
+    /// It belongs to the range, not to this node, and the guest believes it is
+    /// on-link — so the node has to answer for it on the bridge. Sent per
+    /// address rather than per node because one node can hold guests from
+    /// several ranges.
+    pub gateway: String,
+    /// The guest's MAC, when one is recorded. Lets the node bind an address to
+    /// a port rather than trusting whatever claims it.
+    pub mac: Option<String>,
+}
+
+impl NodeDataPlane {
+    /// The gateway addresses this node has to answer for, deduplicated.
+    pub fn gateways(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.guests.iter().map(|g| g.gateway.clone()).collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+}
+
+/// Assemble the desired data plane for `node`.
+pub async fn node_dataplane(
+    db: &Arc<dyn LNVpsDb>,
+    node: &MarketplaceNode,
+) -> Result<Option<NodeDataPlane>> {
+    let Some(tunnel) = get_node_tunnel(db, node).await? else {
+        return Ok(None);
+    };
+    Ok(Some(NodeDataPlane {
+        guests: node_guests(db, node).await?,
+        tunnel,
+        bridge: NODE_BRIDGE.to_string(),
+    }))
+}
+
+/// The guests placed on `node`, with what each needs to be reachable.
+pub async fn node_guests(
+    db: &Arc<dyn LNVpsDb>,
+    node: &MarketplaceNode,
+) -> Result<Vec<GuestAddress>> {
+    let Some(host) = db.get_marketplace_node_host(node.id).await? else {
+        return Ok(vec![]);
+    };
+    let mut out = Vec::new();
+    for vm in db.list_vms_on_host(host.id).await? {
+        if vm.deleted {
+            continue;
+        }
+        for ip in db.list_vm_ip_assignments(vm.id).await? {
+            if ip.deleted {
+                continue;
+            }
+            let Some(address) = host_address(Some(&ip.ip)) else {
+                continue;
+            };
+            // The range is what says which gateway the guest was handed; a
+            // node inventing one would answer for an address the guest never
+            // uses. Normalised to a bare address because a stored gateway may
+            // carry the range's prefix, and the node holds it as a host
+            // address on the bridge either way.
+            let range = db.get_ip_range(ip.ip_range_id).await?;
+            let gateway = lnvps_api_common::parse_gateway(&range.gateway)
+                .map(|g| g.ip().to_string())
+                .unwrap_or(range.gateway);
+            out.push(GuestAddress {
+                address,
+                gateway,
+                mac: Some(vm.mac_address.clone()).filter(|m| !m.is_empty()),
+            });
+        }
+    }
+    out.sort_by(|a, b| a.address.cmp(&b.address));
+    Ok(out)
+}
+
 /// The public addresses assigned to the guests running on `tunnel`'s node.
 ///
 /// Empty for a tunnel that is not a marketplace node's, or a node with no
@@ -1066,6 +1169,67 @@ mod tests {
         let _ = mock;
     }
 
+    /// The document is what the node acts on, so it has to carry everything the
+    /// node cannot work out for itself: the gateway a guest was configured with
+    /// belongs to the range, not to the node, and a node inventing one would
+    /// answer for an address no guest uses.
+    #[tokio::test]
+    async fn the_data_plane_document_describes_the_whole_node() {
+        let (db, mock, node, _) = fixture().await;
+        allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+        let node = db.get_marketplace_node(node.id).await.unwrap();
+        let host = db
+            .get_marketplace_node_host(node.id)
+            .await
+            .unwrap()
+            .unwrap();
+        add_guest(&db, &mock, host.id, &["203.0.113.5", "2001:db8::5"]).await;
+
+        let plane = node_dataplane(&db, &node).await.unwrap().unwrap();
+        assert_eq!(plane.bridge, NODE_BRIDGE);
+        assert_eq!(
+            plane.tunnel.tunnel.address4.as_deref(),
+            Some("10.66.0.2/32")
+        );
+        assert_eq!(
+            plane
+                .guests
+                .iter()
+                .map(|g| g.address.as_str())
+                .collect::<Vec<_>>(),
+            ["2001:db8::5/128", "203.0.113.5/32"]
+        );
+        // Bare, even though the range stores it with a prefix: the node holds
+        // it as a host address on the bridge.
+        assert_eq!(plane.guests[0].gateway, "10.0.0.1");
+        assert_eq!(plane.guests[0].mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+        // Deduplicated: two guests from one range give the node one address to
+        // answer for, not two identical ones.
+        assert_eq!(plane.gateways(), vec!["10.0.0.1".to_string()]);
+    }
+
+    /// A node with no tunnel has no data plane to describe — saying so beats
+    /// returning a document with an empty tunnel that a node would apply.
+    #[tokio::test]
+    async fn a_node_without_a_tunnel_has_no_document() {
+        let (db, _mock, node, _) = fixture().await;
+        assert!(node_dataplane(&db, &node).await.unwrap().is_none());
+    }
+
+    /// A node with no guests yet is still configured: it is realised before it
+    /// has customers, so it can be given some.
+    #[tokio::test]
+    async fn a_node_with_no_guests_still_has_a_document() {
+        let (db, _mock, node, _) = fixture().await;
+        allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+        let node = db.get_marketplace_node(node.id).await.unwrap();
+
+        let plane = node_dataplane(&db, &node).await.unwrap().unwrap();
+        assert!(plane.guests.is_empty());
+        assert!(plane.gateways().is_empty());
+        assert_eq!(plane.bridge, NODE_BRIDGE);
+    }
+
     /// Give `host` a VM holding `ips`. Written through the mock's maps because
     /// a VM needs a template, an image and a disk that this test does not care
     /// about.
@@ -1078,6 +1242,7 @@ mod tests {
                 lnvps_db::Vm {
                     id,
                     host_id,
+                    mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
                     ..Default::default()
                 },
             );
@@ -1087,6 +1252,7 @@ mod tests {
             db.insert_vm_ip_assignment(&lnvps_db::VmIpAssignment {
                 vm_id,
                 ip: ip.to_string(),
+                ip_range_id: 1,
                 ..Default::default()
             })
             .await

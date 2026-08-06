@@ -12,11 +12,18 @@
 //! - [`tls`] — the node's TLS identity, whose fingerprint LNVPS pins at
 //!   registration, so the node's *replies* are authenticated too.
 //! - [`inventory`] — what the node reports about the machine.
+//! - [`api`] — outbound calls to LNVPS, the only direction that works before
+//!   there is a tunnel.
+//! - [`net`] — applying the data plane LNVPS asked for, with `ip` and `wg`.
+//! - [`wgkey`] — the node's WireGuard key, generated here and never sent.
 //! - [`config`] — configuration, including where the control API may listen.
 
+pub mod api;
 pub mod config;
 pub mod control;
 pub mod control_auth;
 pub mod credential;
 pub mod inventory;
+pub mod net;
 pub mod tls;
+pub mod wgkey;

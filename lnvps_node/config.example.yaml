@@ -25,6 +25,11 @@ heartbeat-secs: 60
 
 # Inbound control API. Omit this section until the node is paired — without it
 # the daemon has nothing to serve and will say so.
+#
+# The daemon brings the tunnel up itself before binding, so `listen` is an
+# address that exists because of what the daemon did, not something to configure
+# by hand: it is the address LNVPS allocated, which `lnvps-node dataplane show`
+# prints.
 control:
   # Must be an address of tunnel-interface below, and never a wildcard. The
   # control API can start and stop other people's virtual machines, so it is

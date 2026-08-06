@@ -3611,10 +3611,13 @@ dependencies = [
  "clap",
  "config",
  "env_logger",
+ "hex",
+ "http",
  "if-addrs",
  "lnvps_host_util",
  "log 0.4.32",
  "nostr 0.44.3",
+ "rand 0.9.4",
  "rcgen",
  "reqwest 0.12.28",
  "rustls",
@@ -3624,6 +3627,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
+ "x25519-dalek",
 ]
 
 [[package]]

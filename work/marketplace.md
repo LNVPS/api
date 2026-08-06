@@ -831,12 +831,91 @@ for want of a real box, as before.
   from a router is drift to report, not an allocation to forget.
 - Route the guest prefixes at the route server towards the peer.
 
-#### 4c — Node data plane + health gate (L)  ⬅ NEXT
-- Node side: `wg0` + `br-lnvps`, default route into the tunnel, anti-spoof and anti-LAN-access
-  rules, MTU/MSS clamp.
-- Health gate: the host is only enabled after an end-to-end reachability probe from the route
-  server through the tunnel to a test guest IP. Failure leaves the node approved but unusable,
-  which is the safe direction.
+#### 4c — Node data plane + health gate (XL — split into 4c1/4c2/4c3)
+
+Sized as one increment it is XL. Three decisions taken before starting made it so, each
+deliberately:
+
+- **The daemon applies the configuration itself**, with `ip` and `wg`, rather than writing
+  `wg-quick` files for something else to read. A marketplace node runs on hardware LNVPS does
+  not own, so a data plane that depends on the operator having wired it up correctly is one
+  whose mistakes surface as a customer's VM having no network. The daemon re-converges instead.
+- **Both `nft` and `iptables` are supported**, detected at runtime, because a node is somebody
+  else's machine and refusing the ones that run iptables would refuse real hardware. It costs a
+  second dialect, which is why the firewall is its own increment.
+- **The health gate spawns a real guest and pings it** rather than asking the node how it
+  thinks it is doing. The node self-reporting "bridge up, forwarding on" cannot catch a bridge
+  with no path to the tunnel, which is exactly the mistake worth catching before a customer
+  finds it.
+
+The node also has no outbound API client yet (that was 2c, still pending), so 4c1 builds the
+one call it needs rather than waiting.
+
+#### 4c1 — Node data plane (L)  ✅ DONE
+
+What the build settled beyond the plan:
+- **The data plane is applied before the listener binds.** The control API binds an address of
+  the tunnel interface, and on a fresh machine that interface does not exist until the daemon
+  has fetched and applied its document — so the startup order is apply, then check, then serve.
+  A failure to fetch is a warning rather than a fatal error: a node whose tunnel is already up
+  from a previous run must keep serving through an LNVPS outage, or an API blip takes every node
+  on the platform dark at once.
+- **The gateway a guest uses belongs to its range, not to the node.** The guest is configured
+  with the range's gateway and believes it is on-link, so the node holds that address on the
+  bridge as a **host** address and turns on proxy ARP/NDP. Holding the whole range instead would
+  make the node believe every other node's guests were local, and their traffic would disappear
+  into the bridge instead of going up the tunnel.
+- **The bridge takes the tunnel's MTU.** A guest sending 1500 bytes into a 1420-byte tunnel gets
+  a connection that opens and then hangs on the first large transfer — the worst failure shape
+  there is, because everything looks fine until it does not.
+- **A peer that is not the route server is removed from `wg0`**, most likely a stale key left by
+  a re-key, which would otherwise still be able to send traffic the node treats as LNVPS's.
+- **Routes for departed guests are swept**, since a released address goes straight back in the
+  pool and may already be somebody else's; the bridge's own gateway addresses are excluded from
+  that sweep so tidying up after a guest cannot take the bridge's addressing with it.
+- **Observation reads the machine, never a cache.** `/api/v1/status` runs the queries on
+  demand: a cached answer reports that the tunnel was up once, which is exactly what the health
+  gate must not accept. A tunnel that has never handshaken is reported as configured but not
+  working, because `wg0` comes up perfectly happily with a peer that never answers.
+- **The node generates its key in-process** rather than shelling out to `wg genkey`, so a
+  missing `wg` fails when the interface is configured, with that error. The private key reaches
+  `wg` as a **path**, never an argument: arguments are visible in `ps` to every user on the
+  machine, and a marketplace node usually has more than one login.
+- **`lnvps-node dataplane observe` deliberately needs no credential**, because "what does this
+  machine actually have?" is the question asked when something is already broken.
+
+Testing note: `net.rs` runs commands through a `CommandRunner`, faked in tests to answer `ip`
+and `wg` queries from a script and record everything it was asked to change. These commands run
+as root on somebody else's hardware, so the exact command issued is the thing worth asserting.
+
+#### 4c1 — original scope
+- `GET /api/v1/node/dataplane` (node token): the desired state in one document — the tunnel
+  (key, addresses, endpoint, MTU, keepalive), the bridge, and the guest addresses assigned to
+  this node. One call rather than three: the node applies these together or not at all, and a
+  document that can be half-fetched is a data plane that can be half-applied.
+- Node keypair: generated on first use into the state directory, `0600`, public half presented
+  to `POST /api/v1/node/tunnel`. The private half never leaves the machine.
+- `net.rs`: `wg0`, `br-lnvps`, the default route into the tunnel, MTU, and IP forwarding —
+  idempotent, applied on startup and on every refresh, through a command runner that tests can
+  record. These commands run as root on somebody else's machine; the exact command is the thing
+  worth asserting.
+- `lnvps-node dataplane show|apply` so an operator can see and re-drive it without the daemon.
+- `/api/v1/status` reports the observed data plane, which 4c3's gate reads as its first check.
+
+#### 4c2 — Anti-spoof + anti-LAN firewall (M/L)  ⬅ NEXT
+- One ruleset the daemon owns wholesale, in `nft` where available and `iptables` where not,
+  with the backend detected once and reported in status.
+- Guests may not reach the operator's own LAN or the node's management addresses; may not
+  source traffic as an address LNVPS did not assign them; MSS clamped to the tunnel's MTU.
+- The guest address set comes from 4c1's document, so the boundary is LNVPS's list, not
+  something the node infers.
+
+#### 4c3 — Health gate (M/L)
+- A probe guest is provisioned through the ordinary path onto the new node, given a real
+  address, and pinged from the route server through the tunnel. Only then is the host enabled.
+- Failure leaves the node approved but unusable, with the failing step named. That is the safe
+  direction: a node that never carries a customer is a support conversation, a node that
+  carries one badly is an outage.
 
 ### Increment 5 — Confidential computing: attestation + encrypted disks (L)
 - Verify SEV-SNP attestation reports (`sev` crate) / TDX quotes (`dcap-qvl` crate) against

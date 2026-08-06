@@ -50,6 +50,7 @@ pub fn router() -> Router<RouterState> {
             "/api/v1/node/tunnel",
             get(v1_node_get_tunnel).post(v1_node_request_tunnel),
         )
+        .route("/api/v1/node/dataplane", get(v1_node_dataplane))
 }
 
 /// A node as its operator sees it.
@@ -607,6 +608,67 @@ async fn v1_node_get_tunnel(
         .map_err(|e| ApiError::new(e.to_string()))?
         .ok_or_else(|| ApiError::not_found("This node has no tunnel allocated yet"))?;
     ApiData::ok(allocation.into())
+}
+
+/// Everything the node's data plane should look like, in one document.
+#[derive(Serialize, Debug)]
+pub struct ApiNodeDataPlane {
+    pub tunnel: ApiNodeTunnel,
+    /// The bridge guests are placed on. LNVPS decides the name so every node is
+    /// the same shape.
+    pub bridge: String,
+    /// Gateway addresses this node must answer for on the bridge. They belong
+    /// to the ranges the guests were addressed from, and the guests believe
+    /// they are on-link.
+    pub gateways: Vec<String>,
+    /// The guests placed here. Also the anti-spoof list: an address that is not
+    /// in it is not this node's to send from.
+    pub guests: Vec<ApiNodeGuest>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct ApiNodeGuest {
+    /// Host prefix (`203.0.113.5/32`), so v4 and v6 read the same way.
+    pub address: String,
+    /// The gateway this guest was configured with.
+    pub gateway: String,
+    /// The guest's MAC, when recorded.
+    pub mac: Option<String>,
+}
+
+impl From<crate::provisioner::NodeDataPlane> for ApiNodeDataPlane {
+    fn from(d: crate::provisioner::NodeDataPlane) -> Self {
+        Self {
+            gateways: d.gateways(),
+            bridge: d.bridge.clone(),
+            guests: d
+                .guests
+                .iter()
+                .map(|g| ApiNodeGuest {
+                    address: g.address.clone(),
+                    gateway: g.gateway.clone(),
+                    mac: g.mac.clone(),
+                })
+                .collect(),
+            tunnel: d.tunnel.into(),
+        }
+    }
+}
+
+/// The node's whole desired data plane.
+///
+/// One call rather than three, because the node applies these together or not
+/// at all: a bridge with no tunnel carries nothing, and a tunnel with no guest
+/// routes carries nothing back.
+async fn v1_node_dataplane(
+    auth: NodeAuth,
+    State(this): State<RouterState>,
+) -> ApiResult<ApiNodeDataPlane> {
+    let plane = crate::provisioner::node_dataplane(&this.db, &auth.node)
+        .await
+        .map_err(|e| ApiError::new(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found("This node has no tunnel allocated yet"))?;
+    ApiData::ok(plane.into())
 }
 
 /// What a node is told about itself.

@@ -15,6 +15,15 @@ path = "src/main.rs"
 lnvps_host_util = { path = "../lnvps_host_util", default-features = false }
 
 nostr = { version = "0.44", default-features = false, features = ["std"] }
+# The node's own WireGuard key, generated here so LNVPS never holds the private
+# half. Generated in-process rather than by shelling out to `wg genkey`, and
+# without depending on lnvps_api_common, which would pull the database, axum and
+# the payment stack onto somebody else's hardware.
+x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+rand = "0.9"
+hex.workspace = true
+# Outbound calls to LNVPS: the node fetches the data plane it should be running.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 # Self-signed TLS identity, pinned by LNVPS at registration. Same crate and
 # approach as lnvps_fw's control API.
 rcgen = "0.13"
@@ -41,6 +50,8 @@ config.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Builds responses for the API-client tests without a live server.
+http = "1"
 # Drives the router directly in tests, so authentication is exercised without
 # binding a socket or terminating TLS.
 tower = { version = "0.5", features = ["util"] }

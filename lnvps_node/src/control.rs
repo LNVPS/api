@@ -57,6 +57,10 @@ pub struct ControlState {
     /// is compared against this, so a request signed for one node cannot be
     /// replayed against another by setting `Host` to the first node's address.
     pub base_url: String,
+    /// The bridge guests are placed on, as LNVPS named it. Kept so the status
+    /// report observes the bridge this node was actually told to build rather
+    /// than one the daemon assumes.
+    pub bridge: String,
 }
 
 impl ControlState {
@@ -66,6 +70,15 @@ impl ControlState {
             control_pubkey,
             replay: Mutex::new(ReplayGuard::new(REPLAY_WINDOW, REPLAY_CAPACITY)),
             base_url: format!("https://{addr}"),
+            bridge: crate::net::DEFAULT_BRIDGE.to_string(),
+        }
+    }
+
+    /// Same, for a node whose data plane names a different bridge.
+    pub fn with_bridge(control_pubkey: PublicKey, addr: SocketAddr, bridge: &str) -> Self {
+        Self {
+            bridge: bridge.to_string(),
+            ..Self::new(control_pubkey, addr)
         }
     }
 }
@@ -77,6 +90,11 @@ pub struct NodeStatus {
     pub version: &'static str,
     /// Host inventory, the same view `lnvps-node inventory` prints.
     pub inventory: crate::inventory::Inventory,
+    /// The data plane as the machine actually has it — read from the machine,
+    /// never remembered from what was applied. This is the first thing the
+    /// health gate checks, so a node that quietly lost its tunnel has to be
+    /// able to say so.
+    pub dataplane: crate::net::DataPlaneState,
 }
 
 /// The control router, with authentication layered over everything.
@@ -177,10 +195,15 @@ fn unauthorized(reason: &str) -> Response {
 }
 
 /// Report what this node is and what it is running.
-async fn get_status() -> Json<NodeStatus> {
+async fn get_status(State(state): State<Arc<ControlState>>) -> Json<NodeStatus> {
     Json(NodeStatus {
         version: env!("CARGO_PKG_VERSION"),
         inventory: crate::inventory::Inventory::collect(),
+        // Observed on demand rather than cached: a cached answer is a report
+        // that the tunnel was up once, which is exactly the thing the gate must
+        // not accept.
+        dataplane: crate::net::observe(&crate::net::SystemCommands, &state.bridge)
+            .unwrap_or_default(),
     })
 }
 
@@ -241,6 +264,28 @@ mod tests {
         let auth = auth_header(&keys, &url, "GET", b"");
 
         let code = status_of(state_for(&keys, ADDR), get("/api/v1/status", Some(&auth))).await;
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    /// The status report observes the bridge LNVPS named, not one the daemon
+    /// assumes: a node told to use a different bridge would otherwise report on
+    /// an interface that does not exist and look broken.
+    #[tokio::test]
+    async fn the_status_observes_the_bridge_lnvps_named() {
+        let keys = Keys::generate();
+        let addr: SocketAddr = ADDR.parse().unwrap();
+        let state = ControlState::with_bridge(keys.public_key(), addr, "br-other");
+        assert_eq!(state.bridge, "br-other");
+        assert_eq!(
+            ControlState::new(keys.public_key(), addr).bridge,
+            "br-lnvps"
+        );
+
+        // And the report is servable on a machine with no data plane at all,
+        // which is exactly the state a node is in before it is configured.
+        let url = format!("https://{ADDR}/api/v1/status");
+        let auth = auth_header(&keys, &url, "GET", b"");
+        let code = status_of(Arc::new(state), get("/api/v1/status", Some(&auth))).await;
         assert_eq!(code, StatusCode::OK);
     }
 
