@@ -3617,6 +3617,17 @@ impl LNVpsDbBase for MockDb {
             .ok_or_else(|| DbError::Other(anyhow!("Marketplace node not found")))
     }
 
+    async fn get_marketplace_node_by_tunnel(
+        &self,
+        tunnel_id: u64,
+    ) -> DbResult<Option<MarketplaceNode>> {
+        let nodes = self.marketplace_nodes.lock().await;
+        Ok(nodes
+            .values()
+            .find(|n| n.tunnel_id == Some(tunnel_id))
+            .cloned())
+    }
+
     async fn get_marketplace_node_by_line_item(
         &self,
         line_item_id: u64,

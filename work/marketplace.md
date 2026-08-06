@@ -776,7 +776,48 @@ the allocator; the admin pool handlers *are* covered end to end.
   an allocation is not a working tunnel.
 - Admin CRUD for pools, with utilisation.
 
-#### 4b — Route-server realisation + drift (M/L)  ⬅ NEXT
+#### 4b — Route-server realisation + drift (M/L)  ✅ DONE
+
+What the build settled beyond the plan:
+- **Peers are pushed one at a time, not through the interface.** `update_tunnel` recreates the
+  interface on the Linux backend and takes every peer with it, so one node getting a guest
+  address would cut every other node on the route server. `TunnelRouter` grew `set_tunnel_peer`
+  / `remove_tunnel_peer`, which are `wg set peer` — additive, idempotent, and leaving the rest
+  of the interface alone.
+- **`AllowedIPs` narrows as well as widens**, which is what makes it usable as the anti-spoof
+  boundary rather than a routing hint: `wg set peer allowed-ips` *replaces* the list, so a guest
+  address that was released stops being accepted from that node on the next reconcile.
+- **AllowedIPs is not a route.** It picks which peer a packet already headed down the tunnel
+  belongs to; without `ip route` the guest's return traffic reaches the route server and is
+  dropped as unroutable. Hence `sync_tunnel_routes` alongside `sync_tunnel_addresses`, both
+  declarative — the caller knows the desired set, working out the difference is the backend's
+  job.
+- **A sync must not touch what the kernel owns.** The IPv6 link-local address and the /31 link
+  route are put there by the kernel; a reconcile that deleted everything it did not add would
+  fight the kernel on every poll. Both are excluded explicitly.
+- **Both address families have to be queried separately.** `ip route show` is IPv4 only, so a v6
+  guest prefix would look absent on every sync and be re-added forever.
+- **Drift is reported, not just repaired.** `missing`, `changed` and `unclaimed` are kept apart
+  because they mean different things: a peer that is gone was configured and vanished, a changed
+  one is carrying the wrong anti-spoof list, and an unclaimed one is a key on an LNVPS interface
+  that no allocation accounts for. Unclaimed peers are **removed** — `wgln*` is ours outright.
+- **Allowed IPs are compared as a set.** `wg` reports them in its own order; treating that as a
+  difference would rewrite a working peer's security boundary on every single poll.
+- **Reconcile refuses to create the interface.** Peers are configured *on* an interface, and
+  creating it here would duplicate `SyncTunnelPool` and hide the fact that it never ran.
+- **Guest addressing is corrected by the existing router poll**, not by wiring a route-server
+  call into the VM provisioning path. `SyncNodeTunnel` exists for promptness when a node asks
+  for its tunnel; correctness does not depend on it firing.
+- **A Mikrotik route server refuses peer operations rather than ignoring them.** The four new
+  methods default to an error, so a pool put on a backend that cannot carry it fails loudly
+  instead of accepting the pool and configuring nothing.
+
+Testing note: `LinuxSshRouter` gained a `#[cfg(test)]` command hook. These methods run commands
+as root on somebody else's route server, so what is worth asserting is the exact command issued
+— which needs the transport replaced, not mocked around. The rest of that file remains untested
+for want of a real box, as before.
+
+#### 4b — original scope
 - Push the peer to the route server through the existing `TunnelRouter`: `AllowedIPs` is the
   node's inner addresses **plus** the guest IPs assigned to it, which is also the anti-spoof
   boundary.
@@ -784,7 +825,7 @@ the allocator; the admin pool handlers *are* covered end to end.
   from a router is drift to report, not an allocation to forget.
 - Route the guest prefixes at the route server towards the peer.
 
-#### 4c — Node data plane + health gate (L)
+#### 4c — Node data plane + health gate (L)  ⬅ NEXT
 - Node side: `wg0` + `br-lnvps`, default route into the tunnel, anti-spoof and anti-LAN-access
   rules, MTU/MSS clamp.
 - Health gate: the host is only enabled after an end-to-end reachability probe from the route

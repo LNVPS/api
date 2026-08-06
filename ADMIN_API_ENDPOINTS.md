@@ -4007,6 +4007,19 @@ or port has drifted is re-applied, and a pool whose stored keypair does not
 agree with itself is refused rather than configured into something no node could
 connect to.
 
+The sync then **reconciles the pool's peers**: every tunnel allocated from the
+pool is configured on the interface with its `AllowedIPs`, the route server gets
+an address on each point-to-point link, and each guest address is routed down
+the interface. This always runs, and it matters most right after the interface
+was created or re-applied — that is a fresh interface with no peers at all, and
+every node on it is cut until they are put back.
+
+Peers are reconciled again on the routine router poll, so a peer wiped by a
+reboot, a stale key nobody removed, or a guest address assigned since the last
+push is corrected without an admin doing anything. A peer on an LNVPS-managed
+interface that no allocation accounts for is **removed**: `wgln*` interfaces are
+LNVPS's, so an unclaimed key there is either a revoked node or somebody else's.
+
 ### Reports
 
 #### Time Series Report

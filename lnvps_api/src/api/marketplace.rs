@@ -18,8 +18,8 @@ use serde::{Deserialize, Serialize};
 
 use chrono::Utc;
 use lnvps_api_common::{
-    ApiData, ApiError, ApiResult, NODE_TOKEN_TTL_SECS, Nip98Auth, NodeAuth, issue_node_token,
-    session_auth_enabled,
+    ApiData, ApiError, ApiResult, NODE_TOKEN_TTL_SECS, Nip98Auth, NodeAuth, WorkJob,
+    issue_node_token, session_auth_enabled,
 };
 use lnvps_db::{
     IntervalType, MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator,
@@ -574,6 +574,25 @@ async fn v1_node_request_tunnel(
     let allocation = crate::provisioner::allocate_node_tunnel(&this.db, &auth.node, &key)
         .await
         .map_err(|e| ApiError::new(e.to_string()))?;
+
+    // Realise the peer on the route server. Queued rather than awaited: the
+    // node has what it needs to configure its own end either way, and making
+    // the answer wait on an SSH round trip to a route server would fail the
+    // request for something the node cannot fix. A failure to queue is logged
+    // and left to the periodic reconcile, which pushes the same peer.
+    if let Err(e) = this
+        .work_sender
+        .send(WorkJob::SyncNodeTunnel {
+            tunnel_id: allocation.tunnel.id,
+        })
+        .await
+    {
+        log::error!(
+            "Allocated tunnel {} for node {} but could not queue its peer push: {e}",
+            allocation.tunnel.id,
+            auth.node.id
+        );
+    }
     ApiData::ok(allocation.into())
 }
 

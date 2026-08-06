@@ -1118,6 +1118,17 @@ pub trait LNVpsDbBase: Send + Sync {
         fingerprint: &[u8],
     ) -> DbResult<MarketplaceNode>;
 
+    /// Get the marketplace node terminating `tunnel_id`, if any.
+    ///
+    /// The tunnel table deliberately records nothing about what a tunnel is
+    /// *for*, so realising a peer has to come back this way to find whose guest
+    /// addresses belong behind it. `uk_marketplace_node_tunnel` makes the
+    /// answer single-valued.
+    async fn get_marketplace_node_by_tunnel(
+        &self,
+        tunnel_id: u64,
+    ) -> DbResult<Option<MarketplaceNode>>;
+
     /// Get the marketplace node whose listing fee is billed by `line_item_id`.
     ///
     /// The back-reference direction matches `vm.subscription_line_item_id`: the

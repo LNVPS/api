@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use async_trait::async_trait;
+use lnvps_api_common::op_fatal;
 use lnvps_api_common::retry::OpResult;
 use lnvps_db::{LNVpsDb, RouterKind, Vm, VmIpAssignment};
 use std::sync::Arc;
@@ -161,6 +162,56 @@ pub trait TunnelRouter: Send + Sync {
     async fn set_tunnel_enabled(&self, id: &str, enabled: bool) -> OpResult<()>;
     /// Report per-tunnel rx/tx byte counters
     async fn tunnel_traffic(&self) -> OpResult<Vec<TunnelTraffic>>;
+
+    /// Add or update a single WireGuard peer on `interface`.
+    ///
+    /// Separate from [`update_tunnel`](Self::update_tunnel) because that
+    /// re-applies the whole interface — on the Linux backend by recreating it,
+    /// which drops every other peer with it. One node getting a new guest
+    /// address must not cut every other node on the same route server.
+    ///
+    /// Idempotent: a peer that is already configured this way is left as it is.
+    async fn set_tunnel_peer(&self, interface: &str, peer: &WireguardPeer) -> OpResult<()> {
+        let _ = (interface, peer);
+        op_fatal!("This router backend cannot manage individual tunnel peers")
+    }
+
+    /// Remove a WireGuard peer from `interface` by its public key.
+    ///
+    /// Idempotent: a peer that is not there is the desired state.
+    async fn remove_tunnel_peer(&self, interface: &str, public_key: &str) -> OpResult<()> {
+        let _ = (interface, public_key);
+        op_fatal!("This router backend cannot manage individual tunnel peers")
+    }
+
+    /// Make the addresses on `interface` exactly `addresses` (CIDR).
+    ///
+    /// A WireGuard interface with no address is a tunnel that terminates
+    /// nowhere: the peer's default route points at *some* address on this side,
+    /// and it has to exist for anything to answer.
+    ///
+    /// Declarative rather than add/remove, because the desired set is what the
+    /// allocator knows; working out which individual addresses drifted is this
+    /// method's job, not its caller's.
+    async fn sync_tunnel_addresses(&self, interface: &str, addresses: &[String]) -> OpResult<()> {
+        let _ = (interface, addresses);
+        op_fatal!("This router backend cannot manage tunnel interface addresses")
+    }
+
+    /// Make the routes pointing down `interface` exactly `prefixes` (CIDR).
+    ///
+    /// WireGuard's `AllowedIPs` decides which *peer* a packet already destined
+    /// for the tunnel belongs to; it does not put the packet on the tunnel in
+    /// the first place. Without a route, a guest's return traffic arrives at the
+    /// route server and is dropped as unroutable.
+    ///
+    /// No next hop: the interface plus `AllowedIPs` is enough to select the
+    /// peer, and naming a gateway would be a second place for the peer's
+    /// address to be recorded.
+    async fn sync_tunnel_routes(&self, interface: &str, prefixes: &[String]) -> OpResult<()> {
+        let _ = (interface, prefixes);
+        op_fatal!("This router backend cannot manage tunnel routes")
+    }
 }
 
 /// The kind of a tunnel interface
