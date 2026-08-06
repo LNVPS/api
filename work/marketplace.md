@@ -742,9 +742,15 @@ What the build settled beyond the plan:
   `tunnel_pool (id, router_id)` is enforced by MariaDB, verified against a real server: a tunnel
   claiming a pool on another router is rejected by the database, and a NULL `pool_id` skips the
   constraint, which is exactly the pool-less case. The mock mirrors it.
-- **The peer's address is the network address with the low bit set**, not plus one. On a /31 or
-  /127 the network address always has that bit clear, so there is no overflow case and no
-  arithmetic error to invent — the last link in a block is still a link.
+- **A node takes one address, not a link** (revised during 4b; 4a shipped /31s and /127s).
+  WireGuard is layer 3 and point-to-point, with no ARP and no on-link requirement, so the node
+  needs no gateway of its own — `ip route add default dev wg0` is enough. A /31 therefore spent
+  two addresses describing something that needs one, and worse, forced the route server to hold
+  one address per node on a single interface: a /16 pool with a thousand nodes meant a thousand
+  addresses on `wgln<id>`, re-parsed out of `ip addr show` on every reconcile. The route server
+  now holds **one** address per pool, carrying the block's own prefix so every node in it is
+  on-link. The block's network address, that address, and (on IPv4) the broadcast address are
+  reserved, so a /24 places 253 nodes.
 - **A dual-stack pool's capacity is the smaller block's**, because a link of each family is
   handed out together. Reporting the roomier one would promise capacity that cannot be
   allocated.

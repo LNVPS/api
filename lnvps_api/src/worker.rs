@@ -5285,11 +5285,14 @@ mod tests {
         // this list is the anti-spoof boundary, not just a routing hint.
         assert_eq!(
             peers[0].allowed_ips,
-            vec!["10.66.0.1/32".to_string(), "203.0.113.5/32".to_string()]
+            vec!["10.66.0.2/32".to_string(), "203.0.113.5/32".to_string()]
         );
+        // One address for the pool, carrying the block's prefix: every node in
+        // it is on-link, so the route server does not carry an address per
+        // node on a single interface.
         assert_eq!(
             mr.interface_addresses(&interface).await,
-            vec!["10.66.0.0/31".to_string()]
+            vec!["10.66.0.1/24".to_string()]
         );
         // AllowedIPs picks which peer a packet belongs to; it does not put the
         // packet on the tunnel. Without this route the guest's return traffic
@@ -5350,7 +5353,7 @@ mod tests {
         assert_eq!(drift.changed, vec![key.clone()]);
         assert_eq!(
             mr.peers(&interface).await[0].allowed_ips,
-            vec!["10.66.0.1/32".to_string(), "203.0.113.5/32".to_string()]
+            vec!["10.66.0.2/32".to_string(), "203.0.113.5/32".to_string()]
         );
 
         // LNVPS owns `wgln*` outright, so a key no allocation accounts for is

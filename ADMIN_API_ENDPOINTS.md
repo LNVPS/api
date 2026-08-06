@@ -3898,7 +3898,7 @@ Body:
 Where tunnel inner addresses are allocated from — the tunnel equivalent of an
 `ip_range`. A pool names the route server that terminates the peers, the region
 whose nodes may use it, the socket the data plane listens on, and the blocks
-that point-to-point links are carved out of.
+that node addresses are carved out of.
 
 **LNVPS manages the interface.** Creating a pool generates its WireGuard
 keypair, stores the private key encrypted, and configures the interface on the
@@ -3928,10 +3928,20 @@ Required Permission: `router::view`
 Query Parameters: `limit` (default 50, max 100), `offset`, `region_id`.
 
 Returns a paginated list of `AdminTunnelPoolInfo`. `links_used` is how many
-links are already carved out; `links_total` is what the **smaller** of the two
-blocks can supply, because a dual-stack pool hands out one link of each family
-together — reporting the roomier block would promise capacity that cannot be
-allocated. `endpoint` is derived from `listen_addr` and `listen_port` (IPv6
+nodes are already placed; `links_total` is what the **smaller** of the two
+blocks can supply, because a dual-stack pool hands out one address of each
+family together — reporting the roomier block would promise capacity that cannot
+be allocated.
+
+A node takes a single address (`/32` or `/128`), not a link: WireGuard is layer
+3 and point-to-point, so the node needs no gateway on its side and a
+point-to-point link would spend two addresses describing something that needs
+one. The route server holds **one** address for the whole pool, carrying the
+block's own prefix so every node in it is on-link — an address per node would
+put thousands of addresses on a single interface for a /16 pool. That block's
+network address, the route server's address after it, and (on IPv4) its
+broadcast address are reserved, which is why a /24 places 253 nodes rather than
+256. `endpoint` is derived from `listen_addr` and `listen_port` (IPv6
 bracketed) so what a peer is told to dial cannot disagree with the socket that
 was configured.
 
@@ -4009,7 +4019,7 @@ connect to.
 
 The sync then **reconciles the pool's peers**: every tunnel allocated from the
 pool is configured on the interface with its `AllowedIPs`, the route server gets
-an address on each point-to-point link, and each guest address is routed down
+its own address on the pool, and each guest address is routed down
 the interface. This always runs, and it matters most right after the interface
 was created or re-applied — that is a fresh interface with no peers at all, and
 every node on it is cut until they are put back.
