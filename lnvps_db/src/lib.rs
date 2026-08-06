@@ -1137,6 +1137,32 @@ pub trait LNVpsDbBase: Send + Sync {
         status: Option<MarketplaceNodeStatus>,
     ) -> DbResult<Vec<MarketplaceNode>>;
 
+    /// Admin listing of nodes with database-level pagination. Filters combine
+    /// with AND and are all optional. Returns `(rows, total_count)` where the
+    /// count reflects the filtered set. Newest first, so a review queue shows
+    /// the registrations an admin has not seen yet at the top.
+    async fn admin_list_marketplace_nodes_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+        status: Option<MarketplaceNodeStatus>,
+        operator_id: Option<u64>,
+    ) -> DbResult<(Vec<MarketplaceNode>, u64)>;
+
+    /// Admin listing of operator enrolments with database-level pagination.
+    async fn admin_list_marketplace_operators_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<MarketplaceOperator>, u64)>;
+
+    /// The host backed by this node, if approval has created one.
+    ///
+    /// Approval is what creates the host, so this is also how a second approval
+    /// is recognised as a repeat rather than allowed to insert a duplicate and
+    /// fail on the unique index.
+    async fn get_marketplace_node_host(&self, node_id: u64) -> DbResult<Option<VmHost>>;
+
     /// Register a new node, returning the new id
     async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64>;
 

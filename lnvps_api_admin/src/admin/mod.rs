@@ -17,6 +17,7 @@ mod docs;
 mod hosts;
 mod ip_ranges;
 mod ip_space;
+mod marketplace;
 mod model;
 mod passkeys;
 mod payment_methods;
@@ -73,6 +74,7 @@ pub fn admin_router(
         .merge(vm_ip_assignments::router())
         .merge(subscriptions::router())
         .merge(referrals::router())
+        .merge(marketplace::router())
         .merge(apps::router())
         .merge(reports::router())
         .merge(websocket::router())

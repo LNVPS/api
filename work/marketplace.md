@@ -2,7 +2,7 @@
 
 **Status:** planning
 **Started:** 2026-07-05
-**Last updated:** 2026-08-05 (increment 1 landed; GPU capacity scoped — two-tier offers, fractional in v1; increments 11a/11b)
+**Last updated:** 2026-08-06 (increment 3b landed: admin approval, the fee/certificate gates, and the backing host)
 
 ## Goal
 
@@ -595,7 +595,7 @@ Two guards worth remembering:
 - GPU inventory lands with increment 11a's eligibility probe, so PCI address, IOMMU group
   cleanliness, BAR sizes and CC capability are collected once, against real hardware.
 
-### Increment 3 — Pairing + admin approval flow (M)  ⬅ IN PROGRESS
+### Increment 3 — Pairing + admin approval flow (M)  ✅ DONE
 
 **3a — registration (done):** `POST /api/v1/marketplace/nodes` registers hardware under the
 operator's account and returns the node's token, shown once (decision 15). Enrolment as an
@@ -628,16 +628,53 @@ endpoint that proves the token works end to end.
    - **The company comes from a region the operator names when paying**, since a fresh node
      belongs to no region and every other product derives its company from what is bought.
 
-**3b — admin approval (next):** approve/reject/suspend/drain, trust tier, capacity caps, the
-per-operator rate override, and creating the backing `VmHost` row on approval. Approval is
-gated on a paid listing fee (decision 16) and on a pinned certificate — a node that never
-registered one cannot be reached. Reject deletes the registration (no `Rejected` state), so an
-operator may re-register the same hardware. Approval takes a `region_id` and creates the host
-`enabled = false` with an empty `ip`, filled in by increment 4 when the tunnel is allocated;
-a blank ip must be a hard error wherever a host is dialled, never a silent failure.
-`AdminResource::MarketplaceNode` (28) covers placement state and `MarketplaceOperator` (29)
-covers payout and revenue share, so suspending a node and changing what someone is paid are
-separately grantable.
+**3b — admin approval (done):** approve/reject/suspend/drain, trust tier and the per-operator
+rate override, with the backing `VmHost` created by approval. `AdminResource::MarketplaceNode`
+(28) covers placement state and `MarketplaceOperator` (29) covers payout and revenue share, so
+suspending a node and changing what someone is paid are separately grantable. What the build
+settled beyond the plan:
+- **Approval is the only way into `approved`.** The status endpoint refuses it, because the fee
+  and certificate gates live in the approval path and a second door into the same state is a
+  way past both.
+- **The fee must have been paid to the company that will sell the capacity.** Regions carry the
+  company, so without this check an operator could pay whichever company charges least and list
+  the hardware anywhere. The per-node gate would have quietly become a per-cheapest-company one.
+- **Suspend and drain disable the backing host.** Placement reads the host row, not node status
+  (that arrives in increment 7), so leaving the host enabled would mean a suspended node kept
+  taking VMs.
+- **Re-approval reuses the existing host** rather than creating a second one, and does not
+  re-charge: a node that was suspended and reinstated is one listing, not two. `region_id` is
+  therefore required only on a first approval — moving a host between regions would move its IP
+  space with it.
+- **Capacity is not guessed.** The host is created with `cpu = 0` / `memory = 0` unless an admin
+  supplies figures; real numbers arrive with telemetry, and a guess here oversells hardware
+  nobody has measured. Overcommit factors default to 1.0 — untrusted hardware is a poor place to
+  oversubscribe. Per-tier capacity caps remain deferred to increment 7, which is what will read
+  them.
+- The host is created `enabled = false` with an empty `ip`, filled in by increment 4 when the
+  tunnel is allocated; a blank ip must be a hard error wherever a host is dialled.
+- Reject deletes the registration (no `Rejected` state), so an operator may re-register the same
+  hardware, and is refused while the node still backs a host.
+- `MockDb::admin_create_region` and `admin_create_company` were stubs returning `Ok(1)`. A test
+  that created a second company to check the cross-company fee rule passed against the seeded
+  one instead, which is the failure mode a stub like that always has: the check appears to hold
+  because the setup silently did nothing.
+
+Three bugs the increment surfaced, none of them in new code:
+- **`create_host` never wrote `marketplace_node_id`.** The column was added by increment 1, but
+  the INSERT was not extended, so approval would have created a host that looked LNVPS-owned and
+  was bound to no node — and `get_marketplace_node_host` would never have found it. It is
+  written on insert and deliberately absent from the UPDATE: a host cannot change which machine
+  backs it.
+- **Enrolment created a *disabled* operator.** `MarketplaceOperator::default()` has
+  `enabled = false` and the insert binds the field rather than taking the column's `DEFAULT
+  TRUE`, so every operator registering hardware looked like one an admin had stopped.
+- **`MockDb::update_host` wrote only `enabled`, `cpu` and `memory`**, silently discarding every
+  other change; it now writes the same columns the real UPDATE does.
+
+Loose end for increment 10 (offboarding): there is no `delete_host` anywhere in the schema
+layer, so a node that has been approved can never be deleted — the guard refusing to delete a
+node that still backs a host is correct, but there is currently no way to satisfy it.
 
 **Original scope:**
 - `POST /api/v1/node/register` under standard consumer auth → node bound to the calling user,
