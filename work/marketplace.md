@@ -884,9 +884,38 @@ What the build settled beyond the plan:
 - **`lnvps-node dataplane observe` deliberately needs no credential**, because "what does this
   machine actually have?" is the question asked when something is already broken.
 
-Testing note: `net.rs` runs commands through a `CommandRunner`, faked in tests to answer `ip`
-and `wg` queries from a script and record everything it was asked to change. These commands run
-as root on somebody else's hardware, so the exact command issued is the thing worth asserting.
+Reworked during review, before merge:
+- **Netlink, not `ip`.** The daemon speaks to the kernel directly (`rtnetlink` for links,
+  addresses and routes; the WireGuard netlink interface for the tunnel; `/proc/sys` for the
+  forwarding knobs). `ip` is a program that formats netlink messages and formats the answers
+  back into text for us to parse; going direct removes a dependency on iproute2's presence and
+  version, the output parsing that changes between releases, and gives kernel error codes
+  instead of a line of English on stderr.
+- **The data plane lives in its own network namespace.** The first cut configured the
+  *machine's* network: it took the operator's default route and turned on forwarding
+  machine-wide, on hardware that is often not only an LNVPS node. Now `wg0` and `br-lnvps` live
+  in an `lnvps` namespace, so their default route stays theirs, the forwarding and proxy-ARP
+  knobs are ours alone, and guests cannot reach the operator's network — not because a rule
+  forbids it, but because no interface leads there. A tunnel that is down means no path at all,
+  rather than customer traffic leaking out the operator's uplink sourced from LNVPS addresses,
+  which looks like spoofing to their upstream. `wg0` is created in the machine's namespace and
+  *moved*, because a WireGuard interface keeps its UDP socket where it was created — that is
+  what lets the encrypted outer traffic still use the operator's uplink.
+- **The bridge name is no longer sent.** Both sides hold it as a constant, because the daemon
+  needs the name before it has ever spoken to LNVPS (`dataplane observe` takes no credential),
+  and a document that could name a different one would leave the node holding two answers. The
+  harness asserts the two constants agree.
+
+Testing note: the orchestration is tested against a fake kernel behind a `NetOps` trait — what
+is worth asserting is what the node *decides*. Whether those decisions work is proven by
+`lnvps_e2e/tests/tunnel_netns.rs`, which builds both ends in network namespaces and pings
+across the tunnel, including to a guest behind the node. It found four bugs nothing else did:
+a namespace pinned from `/proc/self/ns/net` (the *process's* namespace in a threaded program,
+so every "isolated" interface silently landed in the operator's network), WireGuard netlink
+calls made outside the namespace the interface had been moved into, local-table routes being
+mistaken for strays and deleted — and, in already-merged 4b code, **the route server never
+routing the pool's own block**, so a route server holding `10.66.0.1/16` answered "network is
+unreachable" for every node in the pool.
 
 #### 4c1 — original scope
 - `GET /api/v1/node/dataplane` (node token): the desired state in one document — the tunnel

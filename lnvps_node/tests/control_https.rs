@@ -32,7 +32,13 @@ async fn start_node(keys: &Keys, state_dir: &std::path::Path) -> (SocketAddr, Ve
     let node_tls = tls::load_or_generate(state_dir, Some(addr.ip())).unwrap();
     let (cert, fingerprint) = (node_tls.cert_pem.clone(), node_tls.fingerprint.clone());
 
-    let state = Arc::new(ControlState::new(keys.public_key(), addr));
+    // The data plane this reports on is the machine's; these tests are about
+    // TLS and authentication, so an unconfigured machine is the honest answer.
+    let state = Arc::new(ControlState::new(
+        keys.public_key(),
+        addr,
+        Arc::new(lnvps_node::net::UnavailableKernel),
+    ));
     tokio::spawn(async move { serve(state, addr, node_tls).await });
 
     // Wait for the listener rather than sleeping a fixed time.

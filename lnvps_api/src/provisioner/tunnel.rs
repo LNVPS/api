@@ -371,6 +371,18 @@ pub async fn plan_pool(db: &Arc<dyn LNVpsDb>, pool: &TunnelPool) -> Result<PoolP
         .flatten(),
     );
 
+    // The pool's own blocks are routed down the interface as well. An address
+    // on a point-to-point interface does not give the kernel a route to the
+    // rest of its prefix, so without this the route server holds
+    // `10.66.0.1/16` and still answers "network is unreachable" for every node
+    // in it. Found by the end-to-end harness rather than by reading the code.
+    plan.routes.extend(
+        [pool.cidr4.as_deref(), pool.cidr6.as_deref()]
+            .into_iter()
+            .flatten()
+            .map(str::to_string),
+    );
+
     for tunnel in db.list_tunnels_in_pool(pool.id).await? {
         if !tunnel.enabled {
             continue;
@@ -409,9 +421,12 @@ pub async fn plan_pool(db: &Arc<dyn LNVpsDb>, pool: &TunnelPool) -> Result<PoolP
 
 /// The bridge a marketplace node puts its guests on.
 ///
-/// Fixed rather than configurable: LNVPS drives it, every node is the same
-/// shape, and a per-node name would be one more thing to disagree about between
-/// what LNVPS thinks it configured and what the machine has.
+/// A constant on both sides rather than a field in the data-plane document.
+/// Sending it would imply LNVPS could choose a different one, which it cannot:
+/// the daemon has to know the name before it has ever spoken to LNVPS (it
+/// reports on that bridge, and an operator debugging a node asks about it
+/// offline), so a document that named a *different* bridge would leave the node
+/// holding two answers. The e2e harness asserts the two constants agree.
 pub const NODE_BRIDGE: &str = "br-lnvps";
 
 /// The whole desired data plane for one node, in one document.
@@ -423,7 +438,6 @@ pub const NODE_BRIDGE: &str = "br-lnvps";
 #[derive(Debug, Clone)]
 pub struct NodeDataPlane {
     pub tunnel: NodeTunnel,
-    pub bridge: String,
     /// The guests placed on this node.
     pub guests: Vec<GuestAddress>,
 }
@@ -466,7 +480,6 @@ pub async fn node_dataplane(
     Ok(Some(NodeDataPlane {
         guests: node_guests(db, node).await?,
         tunnel,
-        bridge: NODE_BRIDGE.to_string(),
     }))
 }
 
@@ -1062,12 +1075,27 @@ mod tests {
             plan.addresses,
             vec!["10.66.0.1/24".to_string(), "fd00:66::1/64".to_string()]
         );
+        // ...the pool's own blocks, because an address on a point-to-point
+        // interface does not route the rest of its prefix, and every node in
+        // the pool lives in it...
+        assert!(
+            plan.routes.contains(&"10.66.0.0/24".to_string()),
+            "{plan:?}"
+        );
+        assert!(
+            plan.routes.contains(&"fd00:66::/64".to_string()),
+            "{plan:?}"
+        );
         // ...and a route for each guest address, because AllowedIPs picks the
         // peer for a packet already headed down the tunnel, it does not put it
         // there.
-        assert_eq!(
-            plan.routes,
-            vec!["2001:db8::5/128".to_string(), "203.0.113.5/32".to_string()]
+        assert!(
+            plan.routes.contains(&"2001:db8::5/128".to_string()),
+            "{plan:?}"
+        );
+        assert!(
+            plan.routes.contains(&"203.0.113.5/32".to_string()),
+            "{plan:?}"
         );
         assert_eq!(allocation.tunnel.pool_id, Some(pool_id));
     }
@@ -1094,7 +1122,7 @@ mod tests {
         }
         let pool = db.get_tunnel_pool(pool_id).await.unwrap();
         let plan = plan_pool(&db, &pool).await.unwrap();
-        assert_eq!(plan.routes, Vec::<String>::new());
+        assert!(!plan.routes.iter().any(|r| r.starts_with("203.0.113")));
         assert_eq!(plan.peers[0].allowed_ips.len(), 2, "only the node's own");
 
         // A deleted VM takes its addressing with it for the same reason.
@@ -1109,7 +1137,7 @@ mod tests {
             }
         }
         let plan = plan_pool(&db, &pool).await.unwrap();
-        assert_eq!(plan.routes, Vec::<String>::new());
+        assert!(!plan.routes.iter().any(|r| r.starts_with("203.0.113")));
     }
 
     /// A tunnel that cannot be realised contributes nothing at all, rather than
@@ -1134,7 +1162,9 @@ mod tests {
             db.update_tunnel(&broken).await.unwrap();
             let plan = plan_pool(&db, &pool).await.unwrap();
             assert!(plan.peers.is_empty());
-            assert!(plan.routes.is_empty());
+            // The pool's blocks are routed whether or not anything is placed
+            // in it; the interface exists either way.
+            assert_eq!(plan.routes.len(), 2);
             // The interface still holds the pool's address: it exists whether
             // or not anything has been placed in it yet.
             assert_eq!(plan.addresses.len(), 2);
@@ -1165,7 +1195,8 @@ mod tests {
         let plan = plan_pool(&db, &pool).await.unwrap();
         assert_eq!(plan.peers.len(), 1);
         assert_eq!(plan.peers[0].allowed_ips, vec!["10.66.9.1/32".to_string()]);
-        assert!(plan.routes.is_empty());
+        // The pool's own blocks, and nothing a guest brought.
+        assert_eq!(plan.routes.len(), 2);
         let _ = mock;
     }
 
@@ -1186,7 +1217,6 @@ mod tests {
         add_guest(&db, &mock, host.id, &["203.0.113.5", "2001:db8::5"]).await;
 
         let plane = node_dataplane(&db, &node).await.unwrap().unwrap();
-        assert_eq!(plane.bridge, NODE_BRIDGE);
         assert_eq!(
             plane.tunnel.tunnel.address4.as_deref(),
             Some("10.66.0.2/32")
@@ -1227,7 +1257,6 @@ mod tests {
         let plane = node_dataplane(&db, &node).await.unwrap().unwrap();
         assert!(plane.guests.is_empty());
         assert!(plane.gateways().is_empty());
-        assert_eq!(plane.bridge, NODE_BRIDGE);
     }
 
     /// Give `host` a VM holding `ips`. Written through the mock's maps because

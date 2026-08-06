@@ -28,18 +28,18 @@ pub struct LinuxSshRouter {
     interface: String,
     /// SSH private key (PEM)
     key: String,
-    /// Stands in for the SSH connection under test.
+    /// Where commands are run, when that is not an SSH session.
     ///
-    /// These methods run commands as root on somebody else's route server, so
-    /// what is worth asserting is the exact command issued — which needs the
-    /// transport replaced, not mocked around.
-    #[cfg(test)]
+    /// These methods run commands as root on a route server, so what is worth
+    /// asserting is the exact command issued — which needs the transport
+    /// replaced rather than mocked around. Tests record the commands; the
+    /// end-to-end harness runs them in a network namespace against a real
+    /// kernel.
     exec: Option<ExecFn>,
 }
 
 /// A stand-in for running a command over SSH.
-#[cfg(test)]
-type ExecFn = std::sync::Arc<dyn Fn(&str) -> OpResult<String> + Send + Sync>;
+pub type ExecFn = std::sync::Arc<dyn Fn(&str) -> OpResult<String> + Send + Sync>;
 
 impl LinuxSshRouter {
     /// Build a router from the stored config `url` and `token`.
@@ -68,16 +68,17 @@ impl LinuxSshRouter {
             username,
             interface,
             key: key.to_string(),
-            #[cfg(test)]
             exec: None,
         })
     }
 
-    /// A router whose commands are handled by `exec` instead of an SSH session.
-    #[cfg(test)]
-    fn with_exec(exec: ExecFn) -> Self {
+    /// A router whose commands are run by `exec` rather than over SSH.
+    ///
+    /// The transport is the only thing that changes: the commands, and the
+    /// decisions behind them, are the ones a real route server gets.
+    pub fn with_exec(exec: ExecFn) -> Self {
         Self {
-            host: "test:22".to_string(),
+            host: "local".to_string(),
             username: "root".to_string(),
             interface: "eth0".to_string(),
             key: String::new(),
@@ -101,7 +102,6 @@ impl LinuxSshRouter {
     /// Run a command, mapping connection failures to transient errors and
     /// non-zero exits to fatal errors. Returns stdout on success.
     async fn exec_checked(&self, cmd: &str) -> OpResult<String> {
-        #[cfg(test)]
         if let Some(exec) = &self.exec {
             return exec(cmd);
         }

@@ -315,3 +315,51 @@ The `.github/workflows/e2e.yml` workflow runs E2E tests on every pull request. I
 | `.github/e2e/api-config.yaml` | User API config template (DB URL replaced at runtime) |
 | `.github/e2e/admin-config.yaml` | Admin API config template (DB URL replaced at runtime) |
 | `.github/e2e/wait-for-lnd.sh` | Script to wait for LND readiness and mine initial blocks |
+
+## Marketplace tunnel harness (`tests/tunnel_netns.rs`)
+
+A second kind of end-to-end test lives in the same crate and shares none of the
+above infrastructure: no API server, no database, no docker. It builds **both
+ends of a marketplace tunnel** out of Linux network namespaces and sends real
+packets across it.
+
+```text
+  [rs netns]                    [machine netns]           [lnvps netns]         [guest netns]
+  wgln<pool>  <══ WireGuard ══>  wg0 created here, then ══> wg0             veth
+  10.66.0.1/24                   its UDP socket stays here  10.66.0.2/32    br-lnvps ── 203.0.113.5/24
+```
+
+Both ends run production code: the route server is configured through
+`LinuxSshRouter` with its command transport pointed at `ip netns exec` instead
+of SSH, and the node end is `lnvps_node::net::apply` — the same netlink calls a
+real node makes.
+
+```sh
+sudo ./scripts/tunnel-e2e.sh                       # both scenarios
+./scripts/tunnel-e2e.sh --filter a_guest_behind    # one
+```
+
+Requires **root** (namespaces, veth, WireGuard) and `wireguard-tools` for the
+route-server end, so the tests are `#[ignore]`d and only run from that script.
+
+**Why it exists.** Unit tests assert what the code *decides* — which commands
+the route server issues, which netlink operations the node performs. None of
+that proves a packet moves. This harness caught four things nothing else did:
+
+- the node's namespace was pinned from `/proc/self/ns/net`, which in a
+  multi-threaded process is the *process's* namespace, so every "isolated"
+  interface was silently landing in the operator's own network;
+- WireGuard's netlink calls ran outside the namespace the interface had been
+  moved into, reporting "no such device" about an interface that plainly existed;
+- addresses on an interface produce routes in the kernel's *local* table, which
+  the node then tried to delete as strays;
+- **the route server never routed the pool's own block.** An address on a
+  point-to-point interface does not route the rest of its prefix, so a route
+  server holding `10.66.0.1/16` answered "network is unreachable" for every node
+  in the pool. Not visible in any unit test, because the code did exactly what it
+  was written to do.
+
+Coverage note: the netlink implementation (`lnvps_node::net::kernel`) and
+`lnvps_node::netns` are exercised here rather than by the normal test run, the
+same way `lnvps_fw`'s datapath is covered by its netns harness. Measure them
+with `sudo -E cargo llvm-cov -p lnvps_node -- --include-ignored`.

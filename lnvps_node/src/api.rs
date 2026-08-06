@@ -219,7 +219,6 @@ mod tests {
                             "keepalive": 25,
                             "mtu": 1420
                         },
-                        "bridge": "br-lnvps",
                         "gateways": ["203.0.113.1"],
                         "guests": [
                             {"address": "203.0.113.5/32", "gateway": "203.0.113.1", "mac": null}
@@ -246,7 +245,6 @@ mod tests {
             calls[0]
         );
 
-        assert_eq!(plane.bridge, "br-lnvps");
         assert_eq!(plane.tunnel.mtu, 1420);
         assert_eq!(plane.guests.len(), 1);
         assert_eq!(plane.gateways, vec!["203.0.113.1".to_string()]);

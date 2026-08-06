@@ -614,9 +614,6 @@ async fn v1_node_get_tunnel(
 #[derive(Serialize, Debug)]
 pub struct ApiNodeDataPlane {
     pub tunnel: ApiNodeTunnel,
-    /// The bridge guests are placed on. LNVPS decides the name so every node is
-    /// the same shape.
-    pub bridge: String,
     /// Gateway addresses this node must answer for on the bridge. They belong
     /// to the ranges the guests were addressed from, and the guests believe
     /// they are on-link.
@@ -640,7 +637,6 @@ impl From<crate::provisioner::NodeDataPlane> for ApiNodeDataPlane {
     fn from(d: crate::provisioner::NodeDataPlane) -> Self {
         Self {
             gateways: d.gateways(),
-            bridge: d.bridge.clone(),
             guests: d
                 .guests
                 .iter()

@@ -14,7 +14,9 @@
 //! - [`inventory`] — what the node reports about the machine.
 //! - [`api`] — outbound calls to LNVPS, the only direction that works before
 //!   there is a tunnel.
-//! - [`net`] — applying the data plane LNVPS asked for, with `ip` and `wg`.
+//! - [`net`] — applying the data plane LNVPS asked for, over netlink.
+//! - [`netns`] — the namespace that data plane lives in, so LNVPS configures
+//!   its own network rather than the operator's.
 //! - [`wgkey`] — the node's WireGuard key, generated here and never sent.
 //! - [`config`] — configuration, including where the control API may listen.
 
@@ -25,5 +27,6 @@ pub mod control_auth;
 pub mod credential;
 pub mod inventory;
 pub mod net;
+pub mod netns;
 pub mod tls;
 pub mod wgkey;
