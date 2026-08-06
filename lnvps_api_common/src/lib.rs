@@ -30,6 +30,7 @@ mod ssh_host_key;
 mod status;
 mod vat;
 mod vm_history;
+mod wireguard;
 mod work;
 
 pub use capacity::*;
@@ -59,6 +60,7 @@ pub use ssh_host_key::*;
 pub use status::*;
 pub use vat::*;
 pub use vm_history::*;
+pub use wireguard::*;
 pub use work::*;
 
 /// SATS per BTC

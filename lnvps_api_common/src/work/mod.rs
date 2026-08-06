@@ -226,6 +226,20 @@ pub enum WorkJob {
         name: String,
         enabled: bool,
     },
+    /// Configure a tunnel pool's WireGuard interface on its route server:
+    /// create it if it is missing, re-apply it if what the router reports has
+    /// drifted from what LNVPS holds, and bring it up or down to match the
+    /// pool's `enabled` flag.
+    ///
+    /// LNVPS owns the interface's key material, so this is a push, not a
+    /// reconcile against whatever happens to be configured.
+    SyncTunnelPool { pool_id: u64 },
+    /// Remove a tunnel interface from a router.
+    ///
+    /// Carries the router and interface rather than a pool id because it runs
+    /// *after* the pool row is gone — the alternative is deleting the row and
+    /// leaving a configured interface behind with no record that it exists.
+    RemoveTunnelInterface { router_id: u64, interface: String },
     /// Re-apply forward + reverse DNS records for every IP assignment in a range.
     ///
     /// Used after changing a range's DNS server configuration (e.g. switching
@@ -331,6 +345,8 @@ impl fmt::Display for WorkJob {
             WorkJob::SetRouterDefaultRoute { .. } => write!(f, "SetRouterDefaultRoute"),
             WorkJob::ClearRouterDefaultRoute { .. } => write!(f, "ClearRouterDefaultRoute"),
             WorkJob::ToggleTunnel { .. } => write!(f, "ToggleTunnel"),
+            WorkJob::SyncTunnelPool { .. } => write!(f, "SyncTunnelPool"),
+            WorkJob::RemoveTunnelInterface { .. } => write!(f, "RemoveTunnelInterface"),
             WorkJob::PatchIpRangeDns { .. } => write!(f, "PatchIpRangeDns"),
         }
     }
@@ -370,6 +386,18 @@ mod tests {
             }
             .to_string(),
             "PatchIpRangeDns"
+        );
+        assert_eq!(
+            WorkJob::SyncTunnelPool { pool_id: 2 }.to_string(),
+            "SyncTunnelPool"
+        );
+        assert_eq!(
+            WorkJob::RemoveTunnelInterface {
+                router_id: 1,
+                interface: "wg-mkt0".to_string(),
+            }
+            .to_string(),
+            "RemoveTunnelInterface"
         );
     }
 }

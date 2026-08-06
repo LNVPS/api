@@ -552,7 +552,7 @@ impl From<crate::provisioner::NodeTunnel> for ApiNodeTunnel {
             gateway4: t.gateway4(),
             gateway6: t.gateway6(),
             server_public_key: hex::encode(&t.pool.public_key),
-            endpoint: t.pool.endpoint.clone(),
+            endpoint: t.pool.endpoint(),
             keepalive: t.tunnel.keepalive,
             mtu: t.pool.mtu,
         }
@@ -1009,7 +1009,8 @@ mod tests {
             },
             pool: lnvps_db::TunnelPool {
                 public_key: vec![0x33; 32],
-                endpoint: "rs.example:51820".to_string(),
+                listen_addr: "rs.example".to_string(),
+                listen_port: 51820,
                 mtu: 1420,
                 ..Default::default()
             },

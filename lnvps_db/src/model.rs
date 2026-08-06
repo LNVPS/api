@@ -1872,11 +1872,26 @@ pub struct TunnelPool {
     pub name: String,
     /// The WireGuard interface on the route server that peers are added to.
     pub interface: String,
-    /// What a peer dials, `host:port`. Not derived from [`Router::url`], which
-    /// is a management endpoint and says nothing about the data plane.
-    pub endpoint: String,
-    /// The interface's public key, handed to peers. The private half lives on
-    /// the route server and is never stored.
+    /// The address on the route server that peers send to. Not derived from
+    /// [`Router::url`], which is a management endpoint and says nothing about
+    /// the data plane.
+    pub listen_addr: String,
+    /// The UDP port the interface listens on, and the port peers dial.
+    ///
+    /// Unique per route server: a WireGuard interface listens on every local
+    /// address at its port, so two interfaces on one machine collide over the
+    /// port rather than the address.
+    pub listen_port: u16,
+    /// The interface's private key, base64, encrypted at rest.
+    ///
+    /// LNVPS generates it and configures the interface itself — a pool that
+    /// only recorded somebody else's public key could describe an interface but
+    /// never create one. Peers are the other way round: a node generates its
+    /// own keypair and presents only the public half.
+    pub private_key: EncryptedString,
+    /// The interface's public key, handed to peers. Derived from
+    /// [`private_key`](Self::private_key), so the two can be checked against
+    /// each other rather than trusted.
     pub public_key: Vec<u8>,
     /// Inner IPv4 block that point-to-point links are carved from
     pub cidr4: Option<String>,
@@ -1893,6 +1908,22 @@ pub struct TunnelPool {
     pub enabled: bool,
     /// When this pool was created
     pub created: DateTime<Utc>,
+}
+
+impl TunnelPool {
+    /// What a peer dials, as `host:port`.
+    ///
+    /// Derived rather than stored, so the address a peer is told to send to
+    /// cannot disagree with the socket LNVPS configured. IPv6 is bracketed,
+    /// which is what `wg` expects and what a naive string join gets wrong.
+    pub fn endpoint(&self) -> String {
+        let host = self.listen_addr.trim();
+        if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{host}]:{}", self.listen_port)
+        } else {
+            format!("{host}:{}", self.listen_port)
+        }
+    }
 }
 
 /// A single machine offered by an operator.

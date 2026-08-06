@@ -709,6 +709,29 @@ it unique fleet-wide for free.
 #### 4a — Addressing + allocation (L)  ✅ DONE
 
 What the build settled beyond the plan:
+- **A pool configures its own interface.** The first cut recorded a public key an admin had
+  pasted in, which described an interface somebody had already built by hand: it could never
+  create one, could not rebuild it after a reinstall, and made standing up a route server a
+  manual job with a database row bolted on afterwards. LNVPS now generates the keypair, stores
+  the private key encrypted (`EncryptedString`, like every other credential in the schema) and
+  pushes the interface to the route server over the existing `TunnelRouter`. An existing
+  interface can still be adopted by handing over its private key; the public half is always
+  **derived**, never accepted, so a pool cannot be stored holding a pair that disagrees with
+  itself — and the sync refuses to configure one that does.
+- **The listening socket is stated in full and pinned per pool.** A route server carries several
+  interfaces, and a WireGuard interface listens on *every* local address at its port — so the
+  port, not the address, is what two interfaces collide over. `uk_tunnel_pool_router_port`
+  enforces it, verified against a real MariaDB. `endpoint` is derived from `listen_addr` +
+  `listen_port` (IPv6 bracketed) rather than stored, so what a peer is told to dial cannot
+  disagree with what was configured.
+- **Sync is a push that leaves working interfaces alone.** Re-applying recreates the interface
+  on the Linux backend and takes every peer with it, so it only happens when the key or port has
+  actually drifted; a pool that merely changed name is not a reason to cut live nodes. Enable
+  and disable go through `set_tunnel_enabled` instead.
+- **Deleting a pool tears the interface down**, addressed by router and interface because the
+  row it came from is already gone by then. A queue that is down still deletes the row and logs
+  loudly that an interface was left behind — a pool nobody can delete while Redis is down would
+  be worse.
 - **The composite foreign key works and is worth having.** `tunnel (pool_id, router_id)` →
   `tunnel_pool (id, router_id)` is enforced by MariaDB, verified against a real server: a tunnel
   claiming a pool on another router is rejected by the database, and a NULL `pool_id` skips the
@@ -734,8 +757,8 @@ test, because `lnvps_api`'s `RouterState` has no test harness. Their bodies are 
 the allocator; the admin pool handlers *are* covered end to end.
 
 #### 4a — original scope
-- `tunnel_pool` (router, region, interface, endpoint, server public key, inner v4/v6 blocks,
-  keepalive, enabled) + `tunnel.pool_id`. A **composite** FK `(pool_id, router_id)` →
+- `tunnel_pool` (router, region, interface, listen socket, generated key material, inner v4/v6
+  blocks, keepalive, enabled) + `tunnel.pool_id`. A **composite** FK `(pool_id, router_id)` →
   `tunnel_pool (id, router_id)` so the tunnel's router cannot drift from its pool's — the two
   copies exist because a pool-less tunnel (a customer VPN later) still has a router.
 - Allocator on the `tunnel` table: pick an enabled pool in the node's region, carve the first

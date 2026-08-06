@@ -387,7 +387,12 @@ mod tests {
             region_id: 1,
             name: format!("pool-{interface}"),
             interface: interface.to_string(),
-            endpoint: "rs.example:51820".to_string(),
+            listen_addr: "rs.example".to_string(),
+            listen_port: 51820,
+            private_key: lnvps_api_common::generate_wireguard_keypair()
+                .unwrap()
+                .private_key
+                .into(),
             public_key: vec![0x33; 32],
             cidr4: Some(cidr4.to_string()),
             cidr6: cidr6.map(str::to_string),
@@ -683,7 +688,7 @@ mod tests {
         let node = db.get_marketplace_node(node.id).await.unwrap();
         let read = get_node_tunnel(&db, &node).await.unwrap().unwrap();
         assert_eq!(read.tunnel.id, allocated.tunnel.id);
-        assert_eq!(read.pool.endpoint, "rs.example:51820");
+        assert_eq!(read.pool.endpoint(), "rs.example:51820");
         assert_eq!(read.pool.mtu, 1420);
     }
 

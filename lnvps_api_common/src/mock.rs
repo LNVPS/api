@@ -4027,6 +4027,19 @@ impl LNVpsDbBase for MockDb {
             )
             .into());
         }
+        // uk_tunnel_pool_router_port: an interface listens on every local
+        // address at its port, so two of them collide over the port.
+        if pools
+            .values()
+            .any(|p| p.router_id == pool.router_id && p.listen_port == pool.listen_port)
+        {
+            return Err(anyhow!(
+                "Port {} on router {} is already used by another pool",
+                pool.listen_port,
+                pool.router_id
+            )
+            .into());
+        }
         let id = pools.keys().max().copied().unwrap_or(0) + 1;
         pools.insert(
             id,
@@ -4057,6 +4070,16 @@ impl LNVpsDbBase for MockDb {
             )
             .into());
         }
+        if pools.values().any(|p| {
+            p.id != pool.id && p.router_id == pool.router_id && p.listen_port == pool.listen_port
+        }) {
+            return Err(anyhow!(
+                "Port {} on router {} is already used by another pool",
+                pool.listen_port,
+                pool.router_id
+            )
+            .into());
+        }
         let existing = pools
             .get_mut(&pool.id)
             .ok_or_else(|| DbError::Other(anyhow!("Tunnel pool {} not found", pool.id)))?;
@@ -4066,7 +4089,9 @@ impl LNVpsDbBase for MockDb {
         existing.region_id = pool.region_id;
         existing.name = pool.name.clone();
         existing.interface = pool.interface.clone();
-        existing.endpoint = pool.endpoint.clone();
+        existing.listen_addr = pool.listen_addr.clone();
+        existing.listen_port = pool.listen_port;
+        existing.private_key = pool.private_key.clone();
         existing.public_key = pool.public_key.clone();
         existing.cidr4 = pool.cidr4.clone();
         existing.cidr6 = pool.cidr6.clone();

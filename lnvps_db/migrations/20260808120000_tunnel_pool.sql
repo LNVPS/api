@@ -33,17 +33,44 @@ CREATE TABLE tunnel_pool (
     -- Correlates with `router_tunnel.name` once the interface is observed.
     interface VARCHAR(64) NOT NULL,
 
-    -- What a peer dials: `host:port`. Held here rather than derived from
-    -- `router.url`, which is a *management* endpoint (an SSH or REST URL, often
-    -- on a different address and always on a different port) and says nothing
-    -- about where the data plane listens.
-    endpoint VARCHAR(255) NOT NULL,
-
-    -- The interface's public key, handed to peers so they can configure their
-    -- end. BINARY(32) for the same reason as `tunnel.peer_pubkey`: the database
-    -- collation compares text case-insensitively and base64 is case-sensitive.
+    -- Where the data plane listens, stated in full: the address on the route
+    -- server that peers send to, and the UDP port the interface listens on.
     --
-    -- The private half is on the route server and is never stored here.
+    -- Not derived from `router.url`, which is a *management* endpoint (an SSH
+    -- or REST URL, on a different port and often a different address) and says
+    -- nothing about the data plane. Kept as two columns rather than one
+    -- `host:port` string because the port is also what LNVPS configures on the
+    -- interface, and an address has to be parsed back out of a joined string to
+    -- be checked — badly, for IPv6.
+    --
+    -- A route server carries several interfaces (different regions, different
+    -- purposes, a migration from one block to another), so the socket has to be
+    -- pinned per pool rather than assumed to be the default port.
+    listen_addr VARCHAR(255) NOT NULL,
+    listen_port SMALLINT UNSIGNED NOT NULL DEFAULT 51820,
+
+    -- The interface's key material.
+    --
+    -- LNVPS **generates** this pair and configures the interface itself. A pool
+    -- that only recorded somebody else's public key could describe an
+    -- interface but never create one, which makes bringing up a route server a
+    -- manual job with a database row bolted on afterwards — and leaves no way
+    -- to rebuild the interface after the machine is reinstalled.
+    --
+    -- The private key is stored the same way as every other credential in this
+    -- schema (`router.token`, `vm_host.api_token`): encrypted at rest by the
+    -- application, base64 inside, because base64 is the form `wg` reads and
+    -- writes.
+    --
+    -- The public key is BINARY(32) for the same reason as `tunnel.peer_pubkey`:
+    -- the database collation compares text case-insensitively and base64 is
+    -- case-sensitive. It is derived from the private key, so the two can be
+    -- checked against each other rather than trusted.
+    --
+    -- Peers are the other way round — a node generates its own keypair and
+    -- presents only the public half, so the private key of a machine LNVPS does
+    -- not own is never stored anywhere.
+    private_key TEXT NOT NULL,
     public_key BINARY(32) NOT NULL,
 
     -- Inner address blocks that point-to-point links are carved out of. Both
@@ -75,6 +102,13 @@ CREATE TABLE tunnel_pool (
     -- would each carve addresses the other does not know about, onto the same
     -- link.
     UNIQUE KEY uk_tunnel_pool_router_interface (router_id, interface),
+
+    -- A WireGuard interface listens on *every* local address at its port, on
+    -- both Linux and RouterOS, so the port — not the address — is what two
+    -- interfaces on one machine collide over. Recording a second pool on the
+    -- same port would produce an interface that cannot come up, discovered at
+    -- the point somebody's node fails to hand shake.
+    UNIQUE KEY uk_tunnel_pool_router_port (router_id, listen_port),
 
     -- Referenced by the composite foreign key on `tunnel` below, which is what
     -- keeps a tunnel's router and its pool's router from disagreeing.
