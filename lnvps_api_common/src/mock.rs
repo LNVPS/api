@@ -936,14 +936,36 @@ impl LNVpsDbBase for MockDb {
     async fn update_host(&self, host: &VmHost) -> DbResult<()> {
         let mut hosts = self.hosts.lock().await;
         if let Some(h) = hosts.get_mut(&host.id) {
-            h.enabled = host.enabled;
-            h.cpu = host.cpu;
-            h.memory = host.memory;
+            // Every column the real UPDATE writes, and only those:
+            // `marketplace_node_id` is deliberately absent, because a host
+            // cannot change which machine backs it.
+            let marketplace_node_id = h.marketplace_node_id;
+            *h = VmHost {
+                marketplace_node_id,
+                ..host.clone()
+            };
         }
         Ok(())
     }
 
     async fn create_host(&self, host: &VmHost) -> DbResult<u64> {
+        // fk/uk_vm_host_marketplace_node: a node backs exactly one host, so a
+        // second approval must not be able to create a second host that no
+        // control channel would ever reach.
+        if let Some(node_id) = host.marketplace_node_id {
+            if !self.marketplace_nodes.lock().await.contains_key(&node_id) {
+                return Err(anyhow!("Marketplace node {} not found", node_id).into());
+            }
+            if self
+                .hosts
+                .lock()
+                .await
+                .values()
+                .any(|h| h.marketplace_node_id == Some(node_id))
+            {
+                return Err(anyhow!("Marketplace node {} already backs a host", node_id).into());
+            }
+        }
         let mut hosts = self.hosts.lock().await;
         let id = (hosts.len() as u64) + 1;
         let mut new_host = host.clone();
@@ -3603,6 +3625,59 @@ impl LNVpsDbBase for MockDb {
         Ok(out)
     }
 
+    async fn admin_list_marketplace_nodes_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+        status: Option<MarketplaceNodeStatus>,
+        operator_id: Option<u64>,
+    ) -> DbResult<(Vec<MarketplaceNode>, u64)> {
+        let nodes = self.marketplace_nodes.lock().await;
+        let mut out: Vec<_> = nodes
+            .values()
+            .filter(|n| status.is_none_or(|s| n.status == s))
+            .filter(|n| operator_id.is_none_or(|o| n.operator_id == o))
+            .cloned()
+            .collect();
+        // Newest first, matching the SQL ordering, so a review queue paginates
+        // the same way against either implementation.
+        out.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = out.len() as u64;
+        Ok((
+            out.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn admin_list_marketplace_operators_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<MarketplaceOperator>, u64)> {
+        let operators = self.marketplace_operators.lock().await;
+        let mut out: Vec<_> = operators.values().cloned().collect();
+        out.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = out.len() as u64;
+        Ok((
+            out.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn get_marketplace_node_host(&self, node_id: u64) -> DbResult<Option<VmHost>> {
+        let hosts = self.hosts.lock().await;
+        Ok(hosts
+            .values()
+            .find(|h| h.marketplace_node_id == Some(node_id))
+            .cloned())
+    }
+
     async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64> {
         let operators = self.marketplace_operators.lock().await;
         // FK marketplace_node.operator_id
@@ -4576,11 +4651,29 @@ impl lnvps_db::AdminDb for MockDb {
     // Add stub implementations for all remaining AdminDb methods
     async fn admin_create_region(
         &self,
-        _name: &str,
-        _enabled: bool,
-        _company_id: u64,
+        name: &str,
+        enabled: bool,
+        company_id: u64,
     ) -> DbResult<u64> {
-        Ok(1)
+        // A real insert, not a stubbed `Ok(1)`: anything that derives a
+        // company from a region — marketplace listing fees, IP space pricing —
+        // would otherwise be tested against the seeded region no matter which
+        // one it asked for, and a cross-company check would pass by accident.
+        if !self.companies.lock().await.contains_key(&company_id) {
+            return Err(anyhow!("Company {} not found", company_id).into());
+        }
+        let mut regions = self.regions.lock().await;
+        let id = regions.keys().max().copied().unwrap_or(0) + 1;
+        regions.insert(
+            id,
+            Region {
+                id,
+                name: name.to_string(),
+                enabled,
+                company_id,
+            },
+        );
+        Ok(id)
     }
     async fn admin_update_region(&self, _region: &Region) -> DbResult<()> {
         Ok(())
@@ -4787,8 +4880,17 @@ impl lnvps_db::AdminDb for MockDb {
     async fn admin_get_company(&self, company_id: u64) -> DbResult<Company> {
         self.get_company(company_id).await
     }
-    async fn admin_create_company(&self, _company: &Company) -> DbResult<u64> {
-        Ok(1)
+    async fn admin_create_company(&self, company: &Company) -> DbResult<u64> {
+        let mut companies = self.companies.lock().await;
+        let id = companies.keys().max().copied().unwrap_or(0) + 1;
+        companies.insert(
+            id,
+            Company {
+                id,
+                ..company.clone()
+            },
+        );
+        Ok(id)
     }
     async fn admin_update_company(&self, _company: &Company) -> DbResult<()> {
         Ok(())

@@ -784,9 +784,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn create_host(&self, host: &VmHost) -> DbResult<u64> {
         let result = sqlx::query(
+            // `marketplace_node_id` is written here and nowhere else: a host is
+            // bound to the node that backs it when approval creates it, and a
+            // host cannot later change which machine it is. Leaving it out of
+            // the INSERT would have made every approved node's host look
+            // LNVPS-owned.
             "INSERT INTO vm_host (kind, region_id, name, ip, cpu, cpu_mfg, cpu_arch, \
              cpu_features, memory, enabled, api_token, load_cpu, load_memory, load_disk, \
-             vlan_id, mtu, ssh_user, ssh_key, sunset_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             vlan_id, mtu, ssh_user, ssh_key, sunset_date, marketplace_node_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&host.kind)
         .bind(host.region_id)
@@ -807,6 +813,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&host.ssh_user)
         .bind(&host.ssh_key)
         .bind(host.sunset_date)
+        .bind(host.marketplace_node_id)
         .execute(&self.db)
         .await?;
         Ok(result.last_insert_id())
@@ -4097,6 +4104,72 @@ impl LNVpsDbBase for LNVpsDbMysql {
                     .await?
             }
         })
+    }
+
+    async fn admin_list_marketplace_nodes_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+        status: Option<MarketplaceNodeStatus>,
+        operator_id: Option<u64>,
+    ) -> DbResult<(Vec<MarketplaceNode>, u64)> {
+        // Both filters are optional and bound the same way in both statements,
+        // so the page and its count can never disagree about what was filtered.
+        let where_clause = "WHERE (? IS NULL OR status = ?) AND (? IS NULL OR operator_id = ?)";
+        let status_value = status.map(|s| s as u16);
+
+        let nodes = sqlx::query_as::<_, MarketplaceNode>(&format!(
+            "SELECT * FROM marketplace_node {where_clause} ORDER BY id DESC LIMIT ? OFFSET ?"
+        ))
+        .bind(status_value)
+        .bind(status_value)
+        .bind(operator_id)
+        .bind(operator_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+
+        let total: (i64,) = sqlx::query_as(&format!(
+            "SELECT COUNT(*) FROM marketplace_node {where_clause}"
+        ))
+        .bind(status_value)
+        .bind(status_value)
+        .bind(operator_id)
+        .bind(operator_id)
+        .fetch_one(&self.db)
+        .await?;
+
+        Ok((nodes, total.0 as u64))
+    }
+
+    async fn admin_list_marketplace_operators_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<MarketplaceOperator>, u64)> {
+        let operators = sqlx::query_as::<_, MarketplaceOperator>(
+            "SELECT * FROM marketplace_operator ORDER BY id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+
+        let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM marketplace_operator")
+            .fetch_one(&self.db)
+            .await?;
+
+        Ok((operators, total.0 as u64))
+    }
+
+    async fn get_marketplace_node_host(&self, node_id: u64) -> DbResult<Option<VmHost>> {
+        Ok(
+            sqlx::query_as::<_, VmHost>("SELECT * FROM vm_host WHERE marketplace_node_id = ?")
+                .bind(node_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
     }
 
     async fn get_marketplace_node_by_line_item(

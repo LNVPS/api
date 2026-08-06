@@ -3732,6 +3732,167 @@ Required Permission: `referral::update`
 
 > **Automated on-chain payouts** (referrer `mode` = `on_chain`) are sent by a worker that batches **every eligible on-chain referrer into a single send-many transaction**. The **network fee is charged to the referrers**: the transaction fee is split across the batch in proportion to each payout and recorded in `fee`, debited from the referrer's balance (which may go negative, recovered from future referrals). Before broadcasting, the next-block fee rate is fetched from mempool.space and the batch is **deferred if it exceeds `max-onchain-fee-per-vbyte`** (default 50). Eligibility uses the `min-onchain-payout-sats` threshold (default 1000). Rows from one batch share the txid but carry distinct vouts in their `outpoint`.
 
+### Marketplace Node Management
+
+Operator-run compute nodes. Two resources on purpose: `marketplace_node` covers
+placement state (approve, suspend, drain, trust tier) and `marketplace_operator`
+covers money (revenue-share override, payout configuration). Stopping a
+misbehaving node does not require the ability to change what somebody is paid.
+
+Nodes are registered by their operator through the customer API and land in
+`pending`. Approval is the only transition into `approved`, and it is the only
+place the gates are enforced.
+
+#### List Nodes
+
+```
+GET /api/admin/v1/marketplace/nodes
+```
+
+Required Permission: `marketplace_node::view`
+
+Query Parameters:
+
+- `limit`: number (optional, default 50, max 100)
+- `offset`: number (optional, default 0)
+- `status`: string (optional) - `pending` | `approved` | `suspended` | `draining`. Use `pending` for the review queue.
+- `operator_id`: number (optional)
+
+Returns a paginated list of `AdminMarketplaceNodeInfo`, newest first. Each entry
+carries `fee_paid` (whether the one-off listing fee has settled),
+`fee_subscription_id`, `tls_fingerprint` (hex, `null` when the node cannot be
+reached) and `host_id` (the backing host, `null` until approval creates it).
+Node tokens are never returned — LNVPS keeps no copy of them.
+
+#### Get Node
+
+```
+GET /api/admin/v1/marketplace/nodes/{id}
+```
+
+Required Permission: `marketplace_node::view`
+
+#### Approve Node
+
+```
+POST /api/admin/v1/marketplace/nodes/{id}/approve
+```
+
+Required Permission: `marketplace_node::update`
+
+Body:
+
+```json
+{
+  "region_id": 1,
+  // Required on a node's first approval, ignored when re-approving one that
+  // already has a host (moving a host between regions would move its IP space)
+  "name": "operator-rack-1",
+  // Optional - host name; defaults to the operator's own label for the node
+  "trust_tier": "verified",
+  // Optional - untrusted|verified|partner; omitted leaves the node's current tier
+  "cpu": 0,
+  "memory": 0,
+  // Optional - total cores / bytes the host may sell. Both default to 0, which
+  // is a host that takes nothing: real figures arrive with node telemetry
+  "load_cpu": 1.0,
+  "load_memory": 1.0,
+  "load_disk": 1.0
+  // Optional - overcommit factors, default 1.0 (no overcommit)
+}
+```
+
+Approval is refused when:
+
+- the node has no pinned TLS certificate (every control call would fail closed);
+- the region's company charges a listing fee and it has not been paid;
+- the fee was paid to a different company than the region being approved into.
+
+The backing host is created **disabled** and with an **empty control address**:
+the node is reachable only over its data-plane tunnel, which does not exist yet.
+
+#### Update Node (suspend / drain / trust tier)
+
+```
+PATCH /api/admin/v1/marketplace/nodes/{id}
+```
+
+Required Permission: `marketplace_node::update`
+
+Body:
+
+```json
+{
+  "status": "suspended",
+  // Optional - suspended|draining. `approved` is rejected here: use the approve
+  // endpoint, which is where the fee and certificate gates live
+  "trust_tier": "partner"
+  // Optional - untrusted|verified|partner
+}
+```
+
+Suspending or draining a node also disables its backing host, so placement stops
+immediately rather than depending on the scheduler reading node status.
+
+#### Delete Node (reject / remove)
+
+```
+DELETE /api/admin/v1/marketplace/nodes/{id}
+```
+
+Required Permission: `marketplace_node::delete`
+
+There is no `rejected` state: the registration is deleted, so an operator whose
+hardware was turned away can fix what was wrong and register the same machine
+again. A node that still backs a host is refused — drain it and remove the host
+first.
+
+#### List Operators
+
+```
+GET /api/admin/v1/marketplace/operators
+```
+
+Required Permission: `marketplace_operator::view`
+
+Query Parameters: `limit`, `offset`. Returns a paginated list of
+`AdminMarketplaceOperatorInfo` (`rate`, `mode`, `address`, `payout_threshold`,
+`enabled`, `node_count`), newest first.
+
+#### Get Operator
+
+```
+GET /api/admin/v1/marketplace/operators/{id}
+```
+
+Required Permission: `marketplace_operator::view`
+
+#### Update Operator (revenue share / payout)
+
+```
+PATCH /api/admin/v1/marketplace/operators/{id}
+```
+
+Required Permission: `marketplace_operator::update`
+
+Body:
+
+```json
+{
+  "rate": 30.0,
+  // Set (0-100, whole percent), clear to the company default (null), or omit
+  "payout_threshold": 50000,
+  // Set (satoshis), clear to the system minimum (null), or omit
+  "address": "operator@example.com",
+  // Set, clear (null), or omit. Meaning depends on `mode`
+  "mode": "lightning_address",
+  // Optional - lightning_address|nwc|account_credit|on_chain
+  "enabled": false
+  // Optional - stop or resume placement across every node this operator owns,
+  // without deleting anything or withholding earnings already accrued
+}
+```
+
 ### Reports
 
 #### Time Series Report
@@ -4346,6 +4507,8 @@ The RBAC system uses the following permission format: `resource::action`
 - `payment_method_config` - Payment method configuration management
 - `referral` - Referral program management
 - `app` - Managed app catalog + cluster management
+- `marketplace_node` - Marketplace node lifecycle (approve, suspend, drain, trust tier)
+- `marketplace_operator` - Marketplace operator revenue share and payout configuration
 
 ### Actions:
 

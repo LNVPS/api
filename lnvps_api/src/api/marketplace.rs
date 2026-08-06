@@ -211,6 +211,12 @@ pub(crate) async fn register_node(
             let id = db
                 .insert_marketplace_operator(&MarketplaceOperator {
                     user_id: uid,
+                    // `enabled` is what an admin clears to stop placement
+                    // across an operator's whole fleet, so an enrolment that
+                    // started disabled would look like one that had been
+                    // stopped — and the insert binds this field rather than
+                    // taking the column default.
+                    enabled: true,
                     ..Default::default()
                 })
                 .await?;

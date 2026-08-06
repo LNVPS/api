@@ -2200,6 +2200,15 @@ pub enum AdminResource {
     /// Customer app deployments (read/write name, custom domain, config) —
     /// distinct from the catalog `App` resource.
     AppDeployment = 27,
+    /// Marketplace node lifecycle: approval, suspension, draining, trust tier.
+    /// Deliberately separate from [`AdminResource::MarketplaceOperator`] so
+    /// that stopping a misbehaving node does not also require the ability to
+    /// change what its operator is paid.
+    MarketplaceNode = 28,
+    /// Marketplace operator enrolment: revenue share, payout config, and
+    /// whether the operator may take placements at all. This is a money
+    /// control; see [`AdminResource::MarketplaceNode`].
+    MarketplaceOperator = 29,
 }
 
 /// Actions that can be performed on administrative resources
@@ -2247,6 +2256,8 @@ impl Display for AdminResource {
             AdminResource::Referral => write!(f, "referral"),
             AdminResource::App => write!(f, "app"),
             AdminResource::AppDeployment => write!(f, "app_deployment"),
+            AdminResource::MarketplaceNode => write!(f, "marketplace_node"),
+            AdminResource::MarketplaceOperator => write!(f, "marketplace_operator"),
         }
     }
 }
@@ -2284,6 +2295,10 @@ impl FromStr for AdminResource {
             "referral" => Ok(AdminResource::Referral),
             "app" => Ok(AdminResource::App),
             "app_deployment" | "app_deployments" => Ok(AdminResource::AppDeployment),
+            "marketplace_node" | "marketplace_nodes" => Ok(AdminResource::MarketplaceNode),
+            "marketplace_operator" | "marketplace_operators" => {
+                Ok(AdminResource::MarketplaceOperator)
+            }
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -2322,6 +2337,8 @@ impl TryFrom<u16> for AdminResource {
             25 => Ok(AdminResource::Referral),
             26 => Ok(AdminResource::App),
             27 => Ok(AdminResource::AppDeployment),
+            28 => Ok(AdminResource::MarketplaceNode),
+            29 => Ok(AdminResource::MarketplaceOperator),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -2359,6 +2376,8 @@ impl AdminResource {
             AdminResource::Referral,
             AdminResource::App,
             AdminResource::AppDeployment,
+            AdminResource::MarketplaceNode,
+            AdminResource::MarketplaceOperator,
         ]
     }
 }
