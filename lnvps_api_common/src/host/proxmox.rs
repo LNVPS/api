@@ -25,7 +25,9 @@ use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 use std::net::IpAddr;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::{Mutex, OnceCell};
 use tokio::time::sleep;
 
 /// Comment prefix used to tag user-defined firewall rules (#36) on Proxmox so
@@ -39,6 +41,23 @@ pub struct ProxmoxClient {
     ssh: Option<SshConfig>,
     mac_prefix: String,
     node: String,
+    /// Memoised snippet storage lookup for [`Self::node`].
+    ///
+    /// Shared between clones so every code path on a host operation pays the
+    /// `/nodes/{node}/storage` round-trip at most once.
+    snippet_storage: Arc<OnceCell<Option<String>>>,
+    /// Snippets already reconciled by this client: `filename -> content`.
+    ///
+    /// [`Self::write_snippet`] otherwise opens a *fresh* SSH connection on every
+    /// call just to `cat` the file back and find it unchanged. It is called once
+    /// per VM for the shared, constant vendor snippet and twice per VM for that
+    /// VM's network snippet, so on a host with N VMs a single sweep paid N + 2N
+    /// SSH handshakes to converge files that were already correct.
+    ///
+    /// Deliberately scoped to the client (rebuilt per host operation) rather
+    /// than process-global, so an out-of-band edit to a snippet is still picked
+    /// up on the next sweep.
+    written_snippets: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl ProxmoxClient {
@@ -56,6 +75,8 @@ impl ProxmoxClient {
             ssh,
             node: node.to_string(),
             mac_prefix: mac_prefix.unwrap_or("bc:24:11".to_string()),
+            snippet_storage: Arc::new(OnceCell::new()),
+            written_snippets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -363,6 +384,41 @@ impl ProxmoxClient {
         .await
     }
 
+    /// [`Self::get_snippet_storage`] for this client's node, resolved once.
+    ///
+    /// Only a successful lookup is memoised, so a transient API failure is
+    /// retried rather than cached as "no snippet storage".
+    async fn snippet_storage(&self) -> OpResult<Option<String>> {
+        self.snippet_storage
+            .get_or_try_init(|| self.get_snippet_storage(&self.node))
+            .await
+            .cloned()
+    }
+
+    /// Whether this client already reconciled `filename` to exactly `content`,
+    /// making another SSH round-trip to verify it redundant.
+    async fn snippet_is_current(&self, filename: &str, content: &str) -> bool {
+        self.written_snippets
+            .lock()
+            .await
+            .get(filename)
+            .map(String::as_str)
+            == Some(content)
+    }
+
+    /// Record that the host is known to hold `content` at `filename`.
+    async fn mark_snippet_written(&self, filename: &str, content: &str) {
+        self.written_snippets
+            .lock()
+            .await
+            .insert(filename.to_string(), content.to_string());
+    }
+
+    /// Forget any memo for `filename`, so the next write re-verifies the host.
+    async fn forget_snippet(&self, filename: &str) {
+        self.written_snippets.lock().await.remove(filename);
+    }
+
     /// Resolve the on-disk path of a snippet volume, writing it only when the
     /// content differs. Returns the volume reference to put in `cicustom`.
     async fn write_snippet(&self, filename: &str, content: &str) -> OpResult<Option<String>> {
@@ -370,10 +426,18 @@ impl ProxmoxClient {
             Some(s) => s,
             None => return Ok(None),
         };
-        let storage_name = match self.get_snippet_storage(&self.node).await? {
+        let storage_name = match self.snippet_storage().await? {
             Some(s) => s,
             None => return Ok(None),
         };
+
+        let vol_ref = format!("{storage_name}:snippets/{filename}");
+
+        // Already reconciled byte-for-byte by this client, so the SSH connect +
+        // `pvesm path` + `cat` below would only confirm what we already know.
+        if self.snippet_is_current(filename, content).await {
+            return Ok(Some(vol_ref));
+        }
 
         // Snippet storage path depends on the storage type; for the default
         // `local` storage this is `/var/lib/vz/snippets/`. For other directory-
@@ -384,7 +448,6 @@ impl ProxmoxClient {
             .await
             .map_err(OpError::Transient)?;
 
-        let vol_ref = format!("{storage_name}:snippets/{filename}");
         let (exit_code, path_output) = ssh
             .execute(&format!("pvesm path '{vol_ref}'"))
             .await
@@ -423,6 +486,11 @@ impl ProxmoxClient {
             .map_err(OpError::Transient)?;
             info!("Wrote cloud-init snippet to {}", snippet_path);
         }
+
+        // Recorded only once the host is known to hold this exact content, so a
+        // failure above is retried on the next call instead of being memoised.
+        self.mark_snippet_written(filename, content).await;
+
         Ok(Some(vol_ref))
     }
 
@@ -460,11 +528,17 @@ impl ProxmoxClient {
     /// A VM cannot start when a `cicustom` volume it references is missing, so
     /// this only ever runs after the VM itself is gone.
     async fn remove_network_snippet(&self, vm_id: u64) -> OpResult<()> {
+        // Drop any memo first: the file is about to stop existing, so a cached
+        // "already reconciled" entry would let a later write_snippet hand back a
+        // vol_ref for a snippet that is no longer on the host.
+        self.forget_snippet(&Self::network_snippet_filename(vm_id))
+            .await;
+
         let ssh_config = match &self.ssh {
             Some(s) => s,
             None => return Ok(()),
         };
-        let storage_name = match self.get_snippet_storage(&self.node).await? {
+        let storage_name = match self.snippet_storage().await? {
             Some(s) => s,
             None => return Ok(()),
         };
@@ -1240,7 +1314,56 @@ impl ProxmoxClient {
         cmp!(ip_config);
         cmp!(ssh_keys);
 
+        // `cmp!` is one-directional: it only fires for fields the expected
+        // config actually *sets*, so a field we have stopped emitting looks
+        // identical to a field we never managed. For the optional keys we own
+        // that is wrong — dropping the value means "remove it from the host",
+        // and without this the stale key is never even noticed, let alone
+        // patched away (see [`Self::removed_keys`]).
+        macro_rules! removed {
+            ($field:ident) => {
+                if current.$field.is_some() && expected.$field.is_none() {
+                    drift.push(stringify!($field).to_string());
+                }
+            };
+        }
+
+        removed!(balloon);
+        removed!(cpu_limit);
+        removed!(cicustom);
+
         drift
+    }
+
+    /// Proxmox config keys that the host still has set but the expected config no
+    /// longer wants, i.e. the keys to pass to the qemu config `delete` parameter.
+    ///
+    /// A Proxmox config POST only ever *sets* the keys it carries; a key that is
+    /// absent from the body keeps whatever value the host already had. So a
+    /// setting we stop emitting (the optional, config-driven ones below) has to
+    /// be deleted explicitly or it lingers on the VM forever — which is exactly
+    /// how a stale `balloon` floor survived `balloon_min_pct` being raised to
+    /// 100 and kept guests reporting the old floor as their total RAM.
+    ///
+    /// Only the optional keys we own are considered; everything else
+    /// [`Self::make_config`] emits is always set, and unmanaged keys on the host
+    /// (tags, extra disks, ...) must be left alone.
+    fn removed_keys(current: &VmConfig, expected: &VmConfig) -> Vec<String> {
+        let mut delete = Vec::new();
+
+        macro_rules! removed {
+            ($field:ident, $key:literal) => {
+                if current.$field.is_some() && expected.$field.is_none() {
+                    delete.push($key.to_string());
+                }
+            };
+        }
+
+        removed!(balloon, "balloon");
+        removed!(cpu_limit, "cpulimit");
+        removed!(cicustom, "cicustom");
+
+        delete
     }
 
     /// Apply disk options (iothread, SSD hints, I/O throttle limits) to the primary disk.
@@ -1263,6 +1386,7 @@ impl ProxmoxClient {
             current: None,
             snapshot: None,
             digest: None,
+            delete: None,
             config: VmConfig {
                 scsi_0: Some(Self::make_scsi0(&scsi_0, req)),
                 ..Default::default()
@@ -1924,6 +2048,13 @@ impl VmHostClient for ProxmoxClient {
         let mut config =
             self.make_config(cfg, vendor_snippet.as_deref(), network_snippet.as_deref())?;
 
+        // Work out which keys must be *removed* from the host config before the
+        // resend-suppression below rewrites `config` — Proxmox leaves a key at
+        // its old value when it is simply absent from the POST body, so a
+        // setting that is no longer wanted (e.g. `balloon` after
+        // `balloon_min_pct` moved to 100/0/unset) has to go through `delete`.
+        let delete = Self::removed_keys(&current_config.config, &config);
+
         // dont re-create the disks
         config.scsi_0 = None;
         config.scsi_1 = None;
@@ -1941,6 +2072,7 @@ impl VmHostClient for ProxmoxClient {
             current: None,
             snapshot: None,
             digest: Some(current_config.digest),
+            delete: (!delete.is_empty()).then(|| delete.join(",")),
             config,
         })
         .await?;
@@ -2002,6 +2134,7 @@ impl VmHostClient for ProxmoxClient {
                 current: None,
                 snapshot: None,
                 digest: Some(current_config.digest),
+                delete: None,
                 config: VmConfig {
                     ip_config: expected_config.ip_config,
                     ..Default::default()
@@ -2832,6 +2965,12 @@ pub struct ConfigureVm {
     pub snapshot: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+    /// Proxmox config keys to remove from the VM (the `delete` parameter on the
+    /// qemu config POST, a comma-separated list). Proxmox only clears a key when
+    /// it is listed here — omitting it from `config` just leaves the existing
+    /// value untouched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delete: Option<String>,
     #[serde(flatten)]
     pub config: VmConfig,
 }
@@ -3212,6 +3351,302 @@ mod tests {
             ProxmoxClient::config_drift(&drifted, &expected),
             vec!["ssh_keys"]
         );
+    }
+
+    /// Regression test: raising `balloon-min-pct` to 100 (or 0/unset) makes
+    /// `balloon_mb` return `None`, so the expected config stops emitting the
+    /// `balloon` key. The one-directional `cmp!` used to skip the field
+    /// entirely, so a VM still carrying the old floor reported no drift, was
+    /// never re-configured, and kept showing the stale floor as its total RAM.
+    #[test]
+    fn test_config_drift_detects_removed_balloon_floor() {
+        // Ballooning now disabled => expected config carries no balloon key.
+        let expected = VmConfig {
+            cores: Some(4),
+            balloon: None,
+            ..Default::default()
+        };
+
+        // Host still has the old 50% floor => must be flagged for removal.
+        let stale = VmConfig {
+            cores: Some(4),
+            balloon: Some(1024),
+            ..Default::default()
+        };
+        assert_eq!(
+            ProxmoxClient::config_drift(&stale, &expected),
+            vec!["balloon"]
+        );
+
+        // Host already has no balloon => converged, no drift (no reconfigure loop).
+        let converged = VmConfig {
+            cores: Some(4),
+            balloon: None,
+            ..Default::default()
+        };
+        assert!(ProxmoxClient::config_drift(&converged, &expected).is_empty());
+
+        // Lowering the floor (both sides set) is still caught by the normal path.
+        let expected_floor = VmConfig {
+            balloon: Some(512),
+            ..Default::default()
+        };
+        assert_eq!(
+            ProxmoxClient::config_drift(&stale, &expected_floor),
+            vec!["balloon"]
+        );
+    }
+
+    /// The other optional keys we own must be reconciled the same way, so a
+    /// removed cpu limit / cloud-init snippet doesn't linger on the host.
+    #[test]
+    fn test_config_drift_detects_removed_optional_keys() {
+        let expected = VmConfig::default();
+        let stale = VmConfig {
+            cpu_limit: Some(0.5),
+            cicustom: Some("vendor=local:snippets/x.yaml".parse().unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(
+            ProxmoxClient::config_drift(&stale, &expected),
+            vec!["cpu_limit", "cicustom"]
+        );
+    }
+
+    /// A dropped key has to reach Proxmox through the `delete` parameter — a key
+    /// merely missing from the POST body leaves the host value untouched.
+    #[test]
+    fn test_removed_keys_maps_dropped_settings_to_proxmox_delete() {
+        let current = VmConfig {
+            balloon: Some(1024),
+            cpu_limit: Some(0.5),
+            cicustom: Some("vendor=local:snippets/x.yaml".parse().unwrap()),
+            memory: Some("2048".to_string()),
+            ..Default::default()
+        };
+        let expected = VmConfig {
+            memory: Some("2048".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            ProxmoxClient::removed_keys(&current, &expected),
+            vec!["balloon", "cpulimit", "cicustom"]
+        );
+
+        // Nothing dropped => nothing deleted (never send a stray `delete`).
+        assert!(ProxmoxClient::removed_keys(&current, &current).is_empty());
+
+        // A key we still set is updated in-band, not deleted.
+        let keeps_balloon = VmConfig {
+            balloon: Some(512),
+            ..expected.clone()
+        };
+        assert!(
+            !ProxmoxClient::removed_keys(&current, &keeps_balloon).contains(&"balloon".to_string())
+        );
+    }
+
+    /// The snippet storage lookup must survive exactly one round-trip per
+    /// client, no matter how many VMs the sweep walks — `write_snippet` used to
+    /// re-issue it on every call.
+    #[tokio::test]
+    async fn test_snippet_storage_lookup_is_memoised() -> Result<()> {
+        let server = MockServer::start().await;
+
+        // `expect(1)` is the assertion: wiremock fails on drop if the storage
+        // endpoint is hit more than once across all the calls below.
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/storage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    { "storage": "fast", "content": "images", "type": "lvmthin" },
+                    { "storage": "local", "content": "snippets,iso", "type": "dir" },
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        let client = ProxmoxClient::new(server.uri().parse()?, "pve", "", None, q_cfg, None);
+
+        // The snippet-capable storage is picked out of the list...
+        assert_eq!(client.snippet_storage().await?, Some("local".to_string()));
+
+        // ...and every later caller (i.e. every other VM in the sweep) is served
+        // from the memo instead of re-querying the API.
+        for _ in 0..10 {
+            assert_eq!(client.snippet_storage().await?, Some("local".to_string()));
+        }
+
+        // Clones share the memo rather than each paying their own round-trip.
+        assert_eq!(
+            client.clone().snippet_storage().await?,
+            Some("local".to_string())
+        );
+
+        Ok(())
+    }
+
+    /// The snippet memo is what stops `write_snippet` opening a fresh SSH
+    /// connection once per VM (vendor snippet) and twice per VM (network
+    /// snippet) on every 30s sweep, to re-`cat` files that never changed.
+    #[tokio::test]
+    async fn test_snippet_memo_suppresses_redundant_writes() -> Result<()> {
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
+
+        let vendor = "lnvps-vendor.yaml";
+        let body = build_vendor_snippet(GUEST_DNS_SERVERS);
+
+        // Nothing reconciled yet => the first caller must do the real work.
+        assert!(!p.snippet_is_current(vendor, &body).await);
+
+        p.mark_snippet_written(vendor, &body).await;
+
+        // Every subsequent VM on this host short-circuits: this is the N-1
+        // redundant SSH handshakes per sweep that the memo removes.
+        assert!(p.snippet_is_current(vendor, &body).await);
+
+        // Changed content must NOT short-circuit, or a snippet edit would never
+        // reach the host.
+        assert!(
+            !p.snippet_is_current(vendor, "#cloud-config\nssh_deletekeys: true")
+                .await
+        );
+
+        // Distinct per-VM network snippets are tracked independently.
+        let net_1 = ProxmoxClient::network_snippet_filename(1);
+        let net_2 = ProxmoxClient::network_snippet_filename(2);
+        p.mark_snippet_written(&net_1, "net-1").await;
+        assert!(p.snippet_is_current(&net_1, "net-1").await);
+        assert!(!p.snippet_is_current(&net_2, "net-1").await);
+
+        // Removing a VM's snippet must drop the memo, otherwise a later write
+        // would hand back a vol_ref for a file that is no longer on the host.
+        p.forget_snippet(&net_1).await;
+        assert!(!p.snippet_is_current(&net_1, "net-1").await);
+
+        // Clones share the cache, so cloning a client cannot resurrect the work.
+        let clone = p.clone();
+        assert!(clone.snippet_is_current(vendor, &body).await);
+        clone.forget_snippet(vendor).await;
+        assert!(!p.snippet_is_current(vendor, &body).await);
+
+        Ok(())
+    }
+
+    /// Without SSH configured there is no way to place a snippet, so
+    /// `write_snippet` must degrade to "no snippet" rather than erroring — and
+    /// must not memoise anything, since nothing reached the host.
+    #[tokio::test]
+    async fn test_write_snippet_without_ssh_is_a_noop() -> Result<()> {
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        let p = ProxmoxClient::new(
+            "http://localhost:8006".parse()?,
+            "pve",
+            "",
+            None,
+            q_cfg,
+            None,
+        );
+
+        assert_eq!(p.write_snippet("lnvps-vendor.yaml", "body").await?, None);
+        // Nothing was written, so a later call with real SSH must still do the work.
+        assert!(!p.snippet_is_current("lnvps-vendor.yaml", "body").await);
+
+        Ok(())
+    }
+
+    /// Deleting a VM's network snippet must drop the memo *before* anything can
+    /// fail or short-circuit. Otherwise a later `write_snippet` would return a
+    /// `vol_ref` for a file that is gone, and a VM cannot start when its
+    /// `cicustom` points at a missing volume.
+    #[tokio::test]
+    async fn test_remove_network_snippet_invalidates_memo() -> Result<()> {
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        let p = ProxmoxClient::new(
+            "http://localhost:8006".parse()?,
+            "pve",
+            "",
+            None,
+            q_cfg,
+            None,
+        );
+
+        let name = ProxmoxClient::network_snippet_filename(7);
+        p.mark_snippet_written(&name, "net-7").await;
+        assert!(p.snippet_is_current(&name, "net-7").await);
+
+        p.remove_network_snippet(7).await?;
+
+        assert!(!p.snippet_is_current(&name, "net-7").await);
+        // An unrelated VM's snippet must survive.
+        let other = ProxmoxClient::network_snippet_filename(8);
+        p.mark_snippet_written(&other, "net-8").await;
+        p.remove_network_snippet(7).await?;
+        assert!(p.snippet_is_current(&other, "net-8").await);
+
+        Ok(())
+    }
+
+    /// The `delete` parameter must serialize as Proxmox's comma-separated list,
+    /// and must be omitted entirely when there is nothing to remove.
+    #[test]
+    fn test_configure_vm_serializes_delete_parameter() {
+        let req = ConfigureVm {
+            node: "node1".to_string(),
+            vm_id: 100.into(),
+            delete: Some("balloon,cpulimit".to_string()),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["delete"], serde_json::json!("balloon,cpulimit"));
+
+        let req = ConfigureVm {
+            node: "node1".to_string(),
+            vm_id: 100.into(),
+            delete: None,
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v.get("delete").is_none());
     }
 
     #[test]
