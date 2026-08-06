@@ -27,6 +27,7 @@ mod reports;
 mod roles;
 mod routers;
 mod subscriptions;
+mod tunnel_pools;
 mod user_payment_methods;
 mod users;
 mod vm_ip_assignments;
@@ -75,6 +76,7 @@ pub fn admin_router(
         .merge(subscriptions::router())
         .merge(referrals::router())
         .merge(marketplace::router())
+        .merge(tunnel_pools::router())
         .merge(apps::router())
         .merge(reports::router())
         .merge(websocket::router())

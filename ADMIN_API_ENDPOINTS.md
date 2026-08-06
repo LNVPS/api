@@ -3893,6 +3893,120 @@ Body:
 }
 ```
 
+### Tunnel Pools
+
+Where tunnel inner addresses are allocated from — the tunnel equivalent of an
+`ip_range`. A pool names the route server that terminates the peers, the region
+whose nodes may use it, the socket the data plane listens on, and the blocks
+that point-to-point links are carved out of.
+
+**LNVPS manages the interface.** Creating a pool generates its WireGuard
+keypair, stores the private key encrypted, and configures the interface on the
+route server; editing one re-applies it; deleting one removes it. The interface
+is named `wgln<id>` from the pool's own id and is not settable: a route server
+also carries interfaces LNVPS did not configure, and a fixed prefix keeps a
+managed interface from being confused with — or clobbering — one of those. A
+stored name could also be edited to point at an interface the pool does not own,
+which the next sync would rewrite. An admin never
+pastes key material for an interface they configured by hand — a pool that only
+*recorded* somebody else's public key could describe an interface but never
+create one, and there would be no way to rebuild it after the machine is
+reinstalled. The private key is never returned by any endpoint.
+
+Under the `router` resource: a pool is part of a route server's configuration,
+and anyone who can edit the router can already reconfigure the same interface by
+hand.
+
+#### List Tunnel Pools
+
+```
+GET /api/admin/v1/tunnel_pools
+```
+
+Required Permission: `router::view`
+
+Query Parameters: `limit` (default 50, max 100), `offset`, `region_id`.
+
+Returns a paginated list of `AdminTunnelPoolInfo`. `links_used` is how many
+links are already carved out; `links_total` is what the **smaller** of the two
+blocks can supply, because a dual-stack pool hands out one link of each family
+together — reporting the roomier block would promise capacity that cannot be
+allocated. `endpoint` is derived from `listen_addr` and `listen_port` (IPv6
+bracketed) so what a peer is told to dial cannot disagree with the socket that
+was configured.
+
+#### Get / Create / Update / Delete Tunnel Pool
+
+```
+GET    /api/admin/v1/tunnel_pools/{id}
+POST   /api/admin/v1/tunnel_pools
+PATCH  /api/admin/v1/tunnel_pools/{id}
+DELETE /api/admin/v1/tunnel_pools/{id}
+```
+
+Required Permissions: `router::view` / `router::create` / `router::update` /
+`router::delete`
+
+Create body:
+
+```json
+{
+  "router_id": 3,
+  "region_id": 1,
+  "name": "lon marketplace",
+  "listen_addr": "rs1.example.com",
+  // The address peers send to. An address, not host:port and not a URL
+  "listen_port": 51820,
+  // Optional, defaults to 51820. Unique per route server: a WireGuard
+  // interface listens on every local address at its port, so two interfaces
+  // collide over the port, not the address
+  "private_key": "<base64>",
+  // Optional. Omitted (the normal case) generates a keypair. Supply one only
+  // to adopt an interface that already exists; the public half is always
+  // derived, never accepted
+  "cidr4": "10.66.0.0/16",
+  "cidr6": "fd00:66::/48",
+  // Inner blocks links are carved from; at least one is required
+  "keepalive": 25,
+  "mtu": 1420,
+  // Optional, defaults to 1420 — 1500 less WireGuard's overhead
+  "enabled": true
+}
+```
+
+PATCH takes the same fields, all optional, **except `router_id`**: moving a pool
+to another route server would leave every tunnel carved from it pointing at an
+interface that does not exist there. `interface` is returned but never accepted,
+being derived from the pool id. Sending `private_key` re-keys the
+interface, which cuts every node holding the old public key until it re-reads
+its configuration — so it happens only when the field is present, never as a
+side effect of an unrelated edit; a blank value generates a fresh pair. Blocks
+are stored normalised to their network address, must match their column's
+address family, and cannot be shrunk or removed while a tunnel allocated from
+them still sits inside. Delete is refused while any tunnel remains in the pool,
+and otherwise removes the interface from the route server as well.
+
+#### Sync Tunnel Pool
+
+```
+POST /api/admin/v1/tunnel_pools/{id}/sync
+```
+
+Required Permission: `router::update`
+
+Re-applies the pool's interface on its route server and returns a
+`JobResponse`. Create and update queue this automatically; the endpoint exists
+because the push fails for reasons that have nothing to do with the pool — a
+rebuilt route server, a rotated SSH key, a box that is down — and the fix is to
+try again rather than to edit the row.
+
+The sync is a **push**: LNVPS holds the interface's key material, so the
+database is the desired state. An interface that already matches is left alone,
+because re-applying recreates it and would drop every peer on it; one whose key
+or port has drifted is re-applied, and a pool whose stored keypair does not
+agree with itself is refused rather than configured into something no node could
+connect to.
+
 ### Reports
 
 #### Time Series Report

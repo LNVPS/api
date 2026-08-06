@@ -860,6 +860,161 @@ impl Worker {
         Ok(())
     }
 
+    /// Configure a tunnel pool's WireGuard interface on its route server.
+    ///
+    /// This is a **push**, not a reconcile: LNVPS generates and holds the
+    /// interface's key material, so what the database says is what the
+    /// interface should be. Without it a pool could only describe an interface
+    /// somebody configured by hand, and bringing up a new route server would be
+    /// a manual job with a database row bolted on afterwards.
+    pub async fn sync_tunnel_pool(&self, pool_id: u64) -> Result<()> {
+        let pool = self.db.get_tunnel_pool(pool_id).await?;
+        let router = crate::router::get_router(&self.db, pool.router_id)
+            .await
+            .map_err(|e| anyhow!("failed to load router {}: {}", pool.router_id, e))?;
+        let tr = router.tunnel().context("router does not support tunnels")?;
+
+        let private_key = pool.private_key.as_str().to_string();
+        // The stored pair has to agree with itself before it is pushed: a
+        // public key that is not this private key's would be handed to every
+        // node and none of them could hand shake.
+        let derived = lnvps_api_common::wireguard_public_key(&private_key)?;
+        if derived != pool.public_key {
+            bail!(
+                "Tunnel pool {} has a public key that its private key does not produce; \
+                 refusing to configure an interface nobody could connect to",
+                pool.id
+            );
+        }
+
+        // Named from the pool's id under a fixed prefix, so a managed
+        // interface can never be confused with one the operator of the route
+        // server configured themselves.
+        let interface = pool.interface();
+
+        let existing = tr
+            .list_tunnels()
+            .await
+            .map_err(|e| anyhow!("failed to list tunnels: {}", e))?
+            .into_iter()
+            .find(|t| t.name == interface);
+
+        let desired = crate::router::Tunnel {
+            id: existing.as_ref().and_then(|t| t.id.clone()),
+            name: interface.clone(),
+            // The address the data plane listens on. Recorded so the interface
+            // and the endpoint peers are told to dial cannot disagree.
+            local_addr: Some(pool.listen_addr.clone()),
+            remote_addr: None,
+            enabled: pool.enabled,
+            config: crate::router::TunnelConfig::Wireguard(crate::router::WireguardConfig {
+                listen_port: Some(pool.listen_port),
+                private_key: Some(private_key),
+                public_key: Some(lnvps_api_common::wireguard_key_to_base64(&pool.public_key)),
+                // Peers are pushed per allocation, not here. Sending an empty
+                // list would be read as "this interface has no peers".
+                peers: vec![],
+            }),
+        };
+
+        match &existing {
+            None => {
+                info!(
+                    "Creating WireGuard interface {} on router {}",
+                    interface, pool.router_id
+                );
+                tr.add_tunnel(&desired)
+                    .await
+                    .map_err(|e| anyhow!("failed to create tunnel interface: {}", e))?;
+            }
+            Some(current) => {
+                // Re-applying recreates the interface on the Linux backend,
+                // which drops every peer with it. So it is only done when the
+                // interface is actually wrong — a node whose tunnel is working
+                // must not be cut because a pool was renamed.
+                let current_key = match &current.config {
+                    crate::router::TunnelConfig::Wireguard(c) => c.public_key.clone(),
+                    _ => None,
+                };
+                let current_port = match &current.config {
+                    crate::router::TunnelConfig::Wireguard(c) => c.listen_port,
+                    _ => None,
+                };
+                let want_key = lnvps_api_common::wireguard_key_to_base64(&pool.public_key);
+                let key_drifted = current_key.as_deref() != Some(want_key.as_str());
+                let port_drifted = current_port != Some(pool.listen_port);
+
+                if key_drifted || port_drifted {
+                    warn!(
+                        "WireGuard interface {} on router {} has drifted (key_changed={}, \
+                         port_changed={}); re-applying, which drops its peers until they are \
+                         pushed again",
+                        interface, pool.router_id, key_drifted, port_drifted
+                    );
+                    tr.update_tunnel(&desired)
+                        .await
+                        .map_err(|e| anyhow!("failed to update tunnel interface: {}", e))?;
+                } else if current.enabled != pool.enabled {
+                    let id = current.id.as_deref().unwrap_or(interface.as_str());
+                    tr.set_tunnel_enabled(id, pool.enabled)
+                        .await
+                        .map_err(|e| anyhow!("failed to toggle tunnel interface: {}", e))?;
+                }
+            }
+        }
+
+        // Refresh the observed-state cache so the admin API stops showing the
+        // interface as missing the moment it exists.
+        if let Ok(tunnels) = tr.list_tunnels().await {
+            for t in &tunnels {
+                if let Err(e) = self.db.upsert_router_tunnel(&t.to_db(pool.router_id)).await {
+                    warn!("Failed to refresh tunnel cache: {}", e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove a tunnel interface from a router, after its pool is deleted.
+    ///
+    /// Idempotent: an interface that is already gone is the desired state, not
+    /// a failure to retry forever.
+    pub async fn remove_tunnel_interface(&self, router_id: u64, interface: &str) -> Result<()> {
+        let router = crate::router::get_router(&self.db, router_id)
+            .await
+            .map_err(|e| anyhow!("failed to load router {}: {}", router_id, e))?;
+        let tr = router.tunnel().context("router does not support tunnels")?;
+
+        let existing = tr
+            .list_tunnels()
+            .await
+            .map_err(|e| anyhow!("failed to list tunnels: {}", e))?
+            .into_iter()
+            .find(|t| t.name == interface);
+        let Some(existing) = existing else {
+            info!("Tunnel interface {interface} is already gone from router {router_id}");
+            return Ok(());
+        };
+
+        let id = existing.id.as_deref().unwrap_or(interface);
+        tr.remove_tunnel(id)
+            .await
+            .map_err(|e| anyhow!("failed to remove tunnel interface: {}", e))?;
+        // Drop the observed-state row too, or the admin API keeps reporting an
+        // interface that is gone.
+        match self.db.list_router_tunnels(router_id).await {
+            Ok(cached) => {
+                for t in cached.iter().filter(|t| t.name == interface) {
+                    if let Err(e) = self.db.delete_router_tunnel(t.id).await {
+                        warn!("Failed to drop tunnel from cache: {}", e);
+                    }
+                }
+            }
+            Err(e) => warn!("Failed to read tunnel cache: {}", e),
+        }
+        Ok(())
+    }
+
     /// Install or replace the static default route on a router, then refresh the
     /// cached route table so the admin API reflects the change.
     pub async fn set_router_default_route(&self, router_id: u64, next_hop: &str) -> Result<()> {
@@ -2404,6 +2559,15 @@ impl Worker {
                 enabled,
             } => {
                 self.toggle_tunnel(*router_id, name, *enabled).await?;
+            }
+            WorkJob::SyncTunnelPool { pool_id } => {
+                self.sync_tunnel_pool(*pool_id).await?;
+            }
+            WorkJob::RemoveTunnelInterface {
+                router_id,
+                interface,
+            } => {
+                self.remove_tunnel_interface(*router_id, interface).await?;
             }
             WorkJob::DeleteVm {
                 vm_id,
@@ -4758,6 +4922,171 @@ mod tests {
         let tunnels = db.list_router_tunnels(1).await?;
         assert_eq!(tunnels.len(), 1);
         assert!(!tunnels[0].enabled);
+
+        mr.clear().await;
+        Ok(())
+    }
+
+    /// A route server with a mock router and one pool on it.
+    async fn setup_pool(db: &Arc<MockDb>, port: u16) -> Result<u64> {
+        use lnvps_api_common::generate_wireguard_keypair;
+        use lnvps_db::{Router, RouterKind, TunnelPool};
+
+        {
+            let mut routers = db.router.lock().await;
+            routers.entry(1).or_insert(Router {
+                id: 1,
+                name: "rs1".to_string(),
+                enabled: true,
+                kind: RouterKind::MockRouter,
+                url: "mock://".to_string(),
+                token: "".into(),
+            });
+        }
+        {
+            let mut regions = db.regions.lock().await;
+            regions.entry(1).or_insert(lnvps_db::Region {
+                id: 1,
+                name: "Mock".to_string(),
+                enabled: true,
+                company_id: 1,
+            });
+        }
+        let keys = generate_wireguard_keypair()?;
+        Ok(db
+            .insert_tunnel_pool(&TunnelPool {
+                router_id: 1,
+                region_id: 1,
+                name: "pool".to_string(),
+                listen_addr: "192.0.2.1".to_string(),
+                listen_port: port,
+                private_key: keys.private_key.into(),
+                public_key: keys.public_key,
+                cidr4: Some("10.66.0.0/24".to_string()),
+                mtu: 1420,
+                enabled: true,
+                ..Default::default()
+            })
+            .await?)
+    }
+
+    /// A pool is not a description of an interface somebody configured by hand:
+    /// syncing it creates the interface, with LNVPS's own key and port.
+    #[tokio::test]
+    async fn test_sync_tunnel_pool_creates_the_interface() -> Result<()> {
+        use crate::mocks::MockRouter;
+        use crate::router::{Router as _, TunnelConfig};
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        let mr = MockRouter::new();
+        mr.clear().await;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.sync_tunnel_pool(pool_id).await?;
+
+        let tunnels = mr.tunnel().unwrap().list_tunnels().await.unwrap();
+        assert_eq!(tunnels.len(), 1);
+        // Named from the pool id under a fixed prefix, so a managed interface
+        // cannot collide with one the route server already carries.
+        assert_eq!(tunnels[0].name, format!("wgln{pool_id}"));
+        assert_eq!(tunnels[0].local_addr.as_deref(), Some("192.0.2.1"));
+        let pool = db.get_tunnel_pool(pool_id).await?;
+        match &tunnels[0].config {
+            TunnelConfig::Wireguard(c) => {
+                assert_eq!(c.listen_port, Some(51820));
+                assert_eq!(
+                    c.public_key.as_deref(),
+                    Some(lnvps_api_common::wireguard_key_to_base64(&pool.public_key).as_str()),
+                    "the interface came up with a key nodes were not given"
+                );
+            }
+            other => panic!("expected a WireGuard interface, got {other:?}"),
+        }
+
+        // The observed-state cache knows about it, so the admin API stops
+        // reporting the interface as missing.
+        assert_eq!(db.list_router_tunnels(1).await?.len(), 1);
+
+        // Syncing again is a no-op rather than a recreate: re-applying drops
+        // every peer with the interface, so a working node must not be cut by
+        // a routine sync.
+        worker.sync_tunnel_pool(pool_id).await?;
+        let after = mr.tunnel().unwrap().list_tunnels().await.unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, tunnels[0].id);
+
+        mr.clear().await;
+        Ok(())
+    }
+
+    /// A stored pair that disagrees with itself would be pushed to the router
+    /// and handed to every node, and none of them could hand shake. Better to
+    /// refuse than to configure an interface nobody can reach.
+    #[tokio::test]
+    async fn test_sync_tunnel_pool_refuses_a_mismatched_keypair() -> Result<()> {
+        use crate::mocks::MockRouter;
+        use crate::router::Router as _;
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        let mut pool = db.get_tunnel_pool(pool_id).await?;
+        pool.public_key = vec![0xaa; 32];
+        db.update_tunnel_pool(&pool).await?;
+
+        let mr = MockRouter::new();
+        mr.clear().await;
+        let worker = setup_worker(db.clone()).await?;
+
+        assert!(worker.sync_tunnel_pool(pool_id).await.is_err());
+        assert!(
+            mr.tunnel()
+                .unwrap()
+                .list_tunnels()
+                .await
+                .unwrap()
+                .is_empty(),
+            "an interface was configured from a keypair that does not match"
+        );
+
+        mr.clear().await;
+        Ok(())
+    }
+
+    /// Deleting a pool has to take the interface with it, or a route server is
+    /// left carrying a configured tunnel that no record mentions.
+    #[tokio::test]
+    async fn test_remove_tunnel_interface() -> Result<()> {
+        use crate::mocks::MockRouter;
+        use crate::router::Router as _;
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        let mr = MockRouter::new();
+        mr.clear().await;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.sync_tunnel_pool(pool_id).await?;
+        assert_eq!(mr.tunnel().unwrap().list_tunnels().await.unwrap().len(), 1);
+
+        let interface = db.get_tunnel_pool(pool_id).await?.interface();
+        worker.remove_tunnel_interface(1, &interface).await?;
+        assert!(
+            mr.tunnel()
+                .unwrap()
+                .list_tunnels()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_router_tunnels(1).await?.is_empty(),
+            "the cache still reports an interface that is gone"
+        );
+
+        // Removing it again is the desired state, not a failure to retry
+        // forever — the job runs after the row is already deleted.
+        worker.remove_tunnel_interface(1, &interface).await?;
 
         mr.clear().await;
         Ok(())

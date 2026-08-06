@@ -1822,6 +1822,15 @@ pub struct Tunnel {
     pub user_id: u64,
     /// Route server terminating this tunnel. `None` until one is chosen.
     pub router_id: Option<u64>,
+    /// The pool this tunnel's inner addresses were carved from, and therefore
+    /// which interface its peer belongs to. `None` for a tunnel allocated
+    /// outside a pool — a hand-configured peering, or a VPN on a router with no
+    /// pool — which is why [`router_id`](Self::router_id) is still here.
+    ///
+    /// The database enforces `(pool_id, router_id)` against the pool's own
+    /// `(id, router_id)`, so the two copies of "which router" cannot disagree.
+    #[sqlx(default)]
+    pub pool_id: Option<u64>,
     /// Interface/peer name to configure on the router; correlates with
     /// [`RouterTunnel::name`] once realised
     pub name: String,
@@ -1841,6 +1850,92 @@ pub struct Tunnel {
     pub enabled: bool,
     /// When this tunnel was allocated
     pub created: DateTime<Utc>,
+}
+
+/// Where tunnel inner addresses are allocated from.
+///
+/// The tunnel equivalent of [`IpRange`]: a block to carve links out of, scoped
+/// to a region, attached to the device that terminates them. A pool is not a
+/// set of columns on [`Router`] because a route server can terminate several
+/// WireGuard interfaces and a peer belongs to an interface, not to a machine.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct TunnelPool {
+    /// Unique id of this pool
+    pub id: u64,
+    /// The route server that terminates peers allocated from this pool
+    pub router_id: u64,
+    /// The region whose nodes this pool serves. Guest traffic leaves through
+    /// the route server, so a tunnel must terminate in the same region the
+    /// guest's addresses came from.
+    pub region_id: u64,
+    /// Admin label. Not an identifier.
+    pub name: String,
+    /// The address on the route server that peers send to. Not derived from
+    /// [`Router::url`], which is a management endpoint and says nothing about
+    /// the data plane.
+    pub listen_addr: String,
+    /// The UDP port the interface listens on, and the port peers dial.
+    ///
+    /// Unique per route server: a WireGuard interface listens on every local
+    /// address at its port, so two interfaces on one machine collide over the
+    /// port rather than the address.
+    pub listen_port: u16,
+    /// The interface's private key, base64, encrypted at rest.
+    ///
+    /// LNVPS generates it and configures the interface itself — a pool that
+    /// only recorded somebody else's public key could describe an interface but
+    /// never create one. Peers are the other way round: a node generates its
+    /// own keypair and presents only the public half.
+    pub private_key: EncryptedString,
+    /// The interface's public key, handed to peers. Derived from
+    /// [`private_key`](Self::private_key), so the two can be checked against
+    /// each other rather than trusted.
+    pub public_key: Vec<u8>,
+    /// Inner IPv4 block that point-to-point links are carved from
+    pub cidr4: Option<String>,
+    /// Inner IPv6 block that point-to-point links are carved from
+    pub cidr6: Option<String>,
+    /// Persistent keepalive handed to peers, in seconds
+    pub keepalive: Option<u16>,
+    /// MTU peers should use inside the tunnel. WireGuard's overhead means this
+    /// is not 1500, and getting it wrong hangs large transfers rather than
+    /// failing outright.
+    pub mtu: u16,
+    /// Whether new allocations may be made from this pool. Disabling stops new
+    /// placements without touching what is already carved out of it.
+    pub enabled: bool,
+    /// When this pool was created
+    pub created: DateTime<Utc>,
+}
+
+impl TunnelPool {
+    /// The WireGuard interface this pool is configured as, derived from its id.
+    ///
+    /// Derived rather than stored, and prefixed, for three reasons: a route
+    /// server also carries interfaces LNVPS did not configure and a managed one
+    /// must never be confused with those; ids are unique, so two pools cannot
+    /// be given the same name; and a stored name could be edited to point at an
+    /// interface the pool does not own, which the next sync would rewrite.
+    ///
+    /// Stays inside the kernel's 15-character interface-name limit for any id
+    /// short of 12 digits.
+    pub fn interface(&self) -> String {
+        format!("wgln{}", self.id)
+    }
+
+    /// What a peer dials, as `host:port`.
+    ///
+    /// Derived rather than stored, so the address a peer is told to send to
+    /// cannot disagree with the socket LNVPS configured. IPv6 is bracketed,
+    /// which is what `wg` expects and what a naive string join gets wrong.
+    pub fn endpoint(&self) -> String {
+        let host = self.listen_addr.trim();
+        if host.parse::<std::net::Ipv6Addr>().is_ok() {
+            format!("[{host}]:{}", self.listen_port)
+        } else {
+            format!("{host}:{}", self.listen_port)
+        }
+    }
 }
 
 /// A single machine offered by an operator.
@@ -2919,6 +3014,61 @@ mod tests {
         let img = os_image("https://example.com/images/foo.raw");
         assert_eq!(img.compression(), None);
         assert_eq!(img.filename().unwrap(), "foo.img");
+    }
+
+    /// The interface name is derived, prefixed and unique by construction: a
+    /// route server also carries interfaces LNVPS did not configure, and a
+    /// managed one must never be confused with, or clobber, one of those.
+    #[test]
+    fn test_tunnel_pool_interface_name_is_derived_and_prefixed() {
+        let pool = TunnelPool {
+            id: 7,
+            ..Default::default()
+        };
+        assert_eq!(pool.interface(), "wgln7");
+
+        // Distinct ids give distinct names, on any router — which is what
+        // removes the chance of an admin naming two pools the same thing.
+        let other = TunnelPool {
+            id: 8,
+            ..Default::default()
+        };
+        assert_ne!(pool.interface(), other.interface());
+
+        // Interface names are capped at 15 characters by the kernel, so the
+        // prefix has to leave room for a realistic id.
+        let big = TunnelPool {
+            id: 99_999_999_999,
+            ..Default::default()
+        };
+        assert!(big.interface().len() <= 15, "{}", big.interface());
+    }
+
+    /// The endpoint is derived from the socket, so what a peer is told to dial
+    /// cannot disagree with what was configured. IPv6 is bracketed, which a
+    /// naive join gets wrong.
+    #[test]
+    fn test_tunnel_pool_endpoint_is_derived() {
+        let v4 = TunnelPool {
+            listen_addr: "192.0.2.1".to_string(),
+            listen_port: 51820,
+            ..Default::default()
+        };
+        assert_eq!(v4.endpoint(), "192.0.2.1:51820");
+
+        let host = TunnelPool {
+            listen_addr: "rs1.example.com".to_string(),
+            listen_port: 51821,
+            ..Default::default()
+        };
+        assert_eq!(host.endpoint(), "rs1.example.com:51821");
+
+        let v6 = TunnelPool {
+            listen_addr: "2a01:db8::1".to_string(),
+            listen_port: 51820,
+            ..Default::default()
+        };
+        assert_eq!(v6.endpoint(), "[2a01:db8::1]:51820");
     }
 
     #[test]

@@ -46,6 +46,10 @@ pub fn router() -> Router<RouterState> {
         .route("/api/v1/marketplace/operator", get(v1_get_operator))
         // Node-facing: authenticated by the node's own token, not a user.
         .route("/api/v1/node/self", get(v1_node_self))
+        .route(
+            "/api/v1/node/tunnel",
+            get(v1_node_get_tunnel).post(v1_node_request_tunnel),
+        )
 }
 
 /// A node as its operator sees it.
@@ -506,6 +510,86 @@ async fn v1_list_nodes(
     ApiData::ok(nodes.into_iter().map(Into::into).collect())
 }
 
+/// A node asking for its data plane.
+#[derive(Deserialize)]
+pub struct RequestTunnelRequest {
+    /// The node's WireGuard **public** key, 64 hex characters.
+    ///
+    /// Generated on the node. The private half never leaves the operator's
+    /// machine, which is why this is presented rather than issued.
+    pub public_key: String,
+}
+
+/// Everything a node needs to bring its tunnel up.
+#[derive(Serialize, Debug)]
+pub struct ApiNodeTunnel {
+    /// The node's own inner addresses, as CIDR (`10.0.0.1/31`). Configure these
+    /// on the WireGuard interface.
+    pub address4: Option<String>,
+    pub address6: Option<String>,
+    /// The route server's addresses on the same links — the node's default
+    /// gateway for guest traffic.
+    pub gateway4: Option<String>,
+    pub gateway6: Option<String>,
+    /// The route server's WireGuard public key, hex.
+    pub server_public_key: String,
+    /// `host:port` to dial.
+    pub endpoint: String,
+    /// Persistent keepalive in seconds, when the pool sets one. A node behind
+    /// NAT needs it or the route server cannot reach it between handshakes.
+    pub keepalive: Option<u16>,
+    /// MTU to use inside the tunnel. Not 1500: WireGuard's overhead comes off
+    /// it, and guessing wrong hangs large transfers rather than failing
+    /// outright.
+    pub mtu: u16,
+}
+
+impl From<crate::provisioner::NodeTunnel> for ApiNodeTunnel {
+    fn from(t: crate::provisioner::NodeTunnel) -> Self {
+        Self {
+            address4: t.tunnel.address4.clone(),
+            address6: t.tunnel.address6.clone(),
+            gateway4: t.gateway4(),
+            gateway6: t.gateway6(),
+            server_public_key: hex::encode(&t.pool.public_key),
+            endpoint: t.pool.endpoint(),
+            keepalive: t.tunnel.keepalive,
+            mtu: t.pool.mtu,
+        }
+    }
+}
+
+/// Ask for a data plane, presenting the node's public key.
+///
+/// Idempotent: a node that retries gets the allocation it already has. A node
+/// that presents a **new** key has regenerated its keypair and is re-pinned in
+/// place — the addresses do not move, and refusing would leave a machine that
+/// can never be reached again.
+async fn v1_node_request_tunnel(
+    auth: NodeAuth,
+    State(this): State<RouterState>,
+    Json(req): Json<RequestTunnelRequest>,
+) -> ApiResult<ApiNodeTunnel> {
+    let key = parse_32_bytes(&req.public_key, "public_key")?;
+    let allocation = crate::provisioner::allocate_node_tunnel(&this.db, &auth.node, &key)
+        .await
+        .map_err(|e| ApiError::new(e.to_string()))?;
+    ApiData::ok(allocation.into())
+}
+
+/// Read back the node's data plane, which is how it re-reads its configuration
+/// after a restart without asking for a new allocation.
+async fn v1_node_get_tunnel(
+    auth: NodeAuth,
+    State(this): State<RouterState>,
+) -> ApiResult<ApiNodeTunnel> {
+    let allocation = crate::provisioner::get_node_tunnel(&this.db, &auth.node)
+        .await
+        .map_err(|e| ApiError::new(e.to_string()))?
+        .ok_or_else(|| ApiError::not_found("This node has no tunnel allocated yet"))?;
+    ApiData::ok(allocation.into())
+}
+
 /// What a node is told about itself.
 ///
 /// The daemon uses this to confirm its token works and to see whether it has
@@ -908,5 +992,56 @@ mod tests {
                 .is_ok(),
             "the node cannot be found by the lowercase form its daemon will send"
         );
+    }
+
+    /// What the daemon is handed has to be enough to configure WireGuard
+    /// without a second call: its own addresses, the gateway to route through,
+    /// the server key, where to dial, and the MTU.
+    #[test]
+    fn a_tunnel_response_carries_a_complete_wireguard_configuration() {
+        let allocation = crate::provisioner::NodeTunnel {
+            tunnel: lnvps_db::Tunnel {
+                id: 1,
+                address4: Some("10.66.0.1/31".to_string()),
+                address6: Some("fd00:66::1/127".to_string()),
+                keepalive: Some(25),
+                ..Default::default()
+            },
+            pool: lnvps_db::TunnelPool {
+                public_key: vec![0x33; 32],
+                listen_addr: "rs.example".to_string(),
+                listen_port: 51820,
+                mtu: 1420,
+                ..Default::default()
+            },
+        };
+
+        let api: ApiNodeTunnel = allocation.into();
+        assert_eq!(api.address4.as_deref(), Some("10.66.0.1/31"));
+        assert_eq!(api.address6.as_deref(), Some("fd00:66::1/127"));
+        // The gateway is derived from the link rather than stored, so a second
+        // copy cannot disagree with the address it is paired with.
+        assert_eq!(api.gateway4.as_deref(), Some("10.66.0.0"));
+        assert_eq!(api.gateway6.as_deref(), Some("fd00:66::"));
+        assert_eq!(api.server_public_key, hex::encode([0x33; 32]));
+        assert_eq!(api.endpoint, "rs.example:51820");
+        assert_eq!(api.keepalive, Some(25));
+        assert_eq!(
+            api.mtu, 1420,
+            "the daemon must be told the MTU: 1500 inside a tunnel hangs large transfers"
+        );
+    }
+
+    /// A key that is not 32 bytes is not a WireGuard key. Storing it would fail
+    /// every handshake later, with nothing to point at.
+    #[test]
+    fn a_malformed_wireguard_key_is_refused_at_the_door() {
+        for (key, expect) in [
+            ("zz", "public_key is not valid hex"),
+            ("1122", "public_key must be 32 bytes"),
+        ] {
+            let err = parse_32_bytes(key, "public_key").expect_err("malformed key accepted");
+            assert!(format!("{err:?}").contains(expect), "got {err:?}");
+        }
     }
 }
