@@ -114,6 +114,18 @@ pub struct MockDb {
 }
 
 impl MockDb {
+    /// Set a company's one-off marketplace node listing fee.
+    ///
+    /// Test support: the fee is normally set through the admin API, which is
+    /// behind a feature the consumer API crate does not enable, so its tests
+    /// cannot reach `admin_update_company`.
+    pub async fn set_marketplace_node_fee(&self, company_id: u64, fee: u64) {
+        let mut companies = self.companies.lock().await;
+        if let Some(company) = companies.get_mut(&company_id) {
+            company.marketplace_node_fee = fee;
+        }
+    }
+
     /// The `uk_tunnel_*` unique keys: a peer key or an inner address may belong
     /// to at most one tunnel. Two tunnels sharing an inner address is a routing
     /// collision that delivers one tenant's traffic to another, so the mock
@@ -368,6 +380,7 @@ impl Default for MockDb {
                         referral_rate: 0.0,
                         max_prepay_days: 0,
                         marketplace_rate: 0.0,
+                        marketplace_node_fee: 0,
                     },
                 );
                 companies
@@ -2723,31 +2736,52 @@ impl LNVpsDbBase for MockDb {
         }
         drop(payments);
 
+        // Same one-off rule as the real schema: a subscription that bills nothing
+        // recurring never acquires an expiry, or a paid-once listing fee would
+        // start being dunned for renewal. Mirrored here on purpose — a mock that
+        // expires what MariaDB leaves alone makes every test about it fiction.
+        let one_off = {
+            let items = self.subscription_line_items.lock().await;
+            let mine: Vec<_> = items
+                .values()
+                .filter(|li| li.subscription_id == payment.subscription_id)
+                .collect();
+            !mine.is_empty()
+                && mine.iter().all(|li| li.amount == 0)
+                && mine.iter().any(|li| li.setup_amount > 0)
+        };
+
         let mut subscriptions = self.subscriptions.lock().await;
         if let Some(subscription) = subscriptions.get_mut(&payment.subscription_id) {
-            let base = subscription
-                .expires
-                .unwrap_or_else(Utc::now)
-                .max(Utc::now());
-
-            let new_expires = if let Some(time_value) = payment.time_value {
-                // VM path: extend by explicit time_value seconds
-                base.add(TimeDelta::seconds(time_value as i64))
+            if one_off {
+                // Activated, but never given an expiry.
+                subscription.is_active = true;
+                subscription.is_setup = true;
             } else {
-                // Regular subscription path: use interval from subscription
-                match subscription.interval_type {
-                    IntervalType::Day => base.add(Days::new(subscription.interval_amount)),
-                    IntervalType::Month => {
-                        base.add(Months::new(subscription.interval_amount as u32))
+                let base = subscription
+                    .expires
+                    .unwrap_or_else(Utc::now)
+                    .max(Utc::now());
+
+                let new_expires = if let Some(time_value) = payment.time_value {
+                    // VM path: extend by explicit time_value seconds
+                    base.add(TimeDelta::seconds(time_value as i64))
+                } else {
+                    // Regular subscription path: use interval from subscription
+                    match subscription.interval_type {
+                        IntervalType::Day => base.add(Days::new(subscription.interval_amount)),
+                        IntervalType::Month => {
+                            base.add(Months::new(subscription.interval_amount as u32))
+                        }
+                        IntervalType::Year => {
+                            base.add(Months::new((12 * subscription.interval_amount) as u32))
+                        }
                     }
-                    IntervalType::Year => {
-                        base.add(Months::new((12 * subscription.interval_amount) as u32))
-                    }
-                }
-            };
-            subscription.expires = Some(new_expires);
-            subscription.is_active = true;
-            subscription.is_setup = true;
+                };
+                subscription.expires = Some(new_expires);
+                subscription.is_active = true;
+                subscription.is_setup = true;
+            }
         }
         drop(subscriptions);
 
@@ -3532,6 +3566,18 @@ impl LNVpsDbBase for MockDb {
             .ok_or_else(|| DbError::Other(anyhow!("Marketplace node not found")))
     }
 
+    async fn get_marketplace_node_by_line_item(
+        &self,
+        line_item_id: u64,
+    ) -> DbResult<MarketplaceNode> {
+        let nodes = self.marketplace_nodes.lock().await;
+        nodes
+            .values()
+            .find(|n| n.subscription_line_item_id == Some(line_item_id))
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow!("Marketplace node not found")))
+    }
+
     async fn list_marketplace_nodes(&self, operator_id: u64) -> DbResult<Vec<MarketplaceNode>> {
         let nodes = self.marketplace_nodes.lock().await;
         let mut out: Vec<_> = nodes
@@ -3596,6 +3642,19 @@ impl LNVpsDbBase for MockDb {
         {
             return Err(anyhow!("Tunnel {} already backs another node", tunnel_id).into());
         }
+        // fk/uk_marketplace_node_line_item: one paid fee covers exactly one
+        // node, or the per-node gate silently degrades into a per-operator one.
+        if let Some(li) = node.subscription_line_item_id {
+            if !self.subscription_line_items.lock().await.contains_key(&li) {
+                return Err(anyhow!("Subscription line item {} not found", li).into());
+            }
+            if nodes
+                .values()
+                .any(|n| n.subscription_line_item_id == Some(li))
+            {
+                return Err(anyhow!("Line item {} already bills another node", li).into());
+            }
+        }
         let new_id = nodes.keys().max().copied().unwrap_or(0) + 1;
         nodes.insert(
             new_id,
@@ -3638,6 +3697,17 @@ impl LNVpsDbBase for MockDb {
         {
             return Err(anyhow!("A node with that TLS fingerprint already exists").into());
         }
+        if let Some(li) = node.subscription_line_item_id {
+            if !self.subscription_line_items.lock().await.contains_key(&li) {
+                return Err(anyhow!("Subscription line item {} not found", li).into());
+            }
+            if nodes
+                .values()
+                .any(|n| n.id != node.id && n.subscription_line_item_id == Some(li))
+            {
+                return Err(anyhow!("Line item {} already bills another node", li).into());
+            }
+        }
         let existing = nodes
             .get_mut(&node.id)
             .ok_or_else(|| DbError::Other(anyhow!("Marketplace node {} not found", node.id)))?;
@@ -3650,6 +3720,7 @@ impl LNVpsDbBase for MockDb {
         existing.status = node.status;
         existing.trust_tier = node.trust_tier;
         existing.tunnel_id = node.tunnel_id;
+        existing.subscription_line_item_id = node.subscription_line_item_id;
         Ok(())
     }
 
@@ -8290,7 +8361,10 @@ impl crate::dns::DnsServer for MockDnsServer {
 #[cfg(test)]
 mod marketplace_tests {
     use super::*;
-    use lnvps_db::{LNVpsDbBase, MarketplaceTrustTier, PayoutMode, RouterTunnelKind};
+    use lnvps_db::{
+        LNVpsDbBase, MarketplaceTrustTier, PayoutMode, RouterTunnelKind, Subscription,
+        SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType, SubscriptionType,
+    };
 
     /// Create a user, returning its id. The marketplace tables carry real FKs
     /// to `users`, so tests cannot invent owners.
@@ -8315,6 +8389,174 @@ mod marketplace_tests {
             name: name.to_string(),
             ..Default::default()
         }
+    }
+
+    /// Build a subscription with the given line item amounts, plus an unpaid
+    /// payment against it. `(amount, setup_amount)` per line item.
+    async fn subscription_with(db: &MockDb, uid: u64, items: &[(u64, u64)]) -> (u64, Vec<u8>) {
+        let sub = Subscription {
+            id: 0,
+            user_id: uid,
+            company_id: 1,
+            name: "sub".to_string(),
+            description: None,
+            created: Utc::now(),
+            expires: None,
+            is_active: false,
+            is_setup: false,
+            currency: "EUR".to_string(),
+            interval_amount: 1,
+            interval_type: IntervalType::Month,
+            setup_fee: 0,
+            auto_renewal_enabled: false,
+            external_id: None,
+        };
+        let line_items = items
+            .iter()
+            .map(|(amount, setup_amount)| SubscriptionLineItem {
+                id: 0,
+                subscription_id: 0,
+                subscription_type: SubscriptionType::MarketplaceNodeFee,
+                name: "item".to_string(),
+                description: None,
+                amount: *amount,
+                setup_amount: *setup_amount,
+                configuration: None,
+            })
+            .collect();
+        let (sub_id, _) = db
+            .insert_subscription_with_line_items(&sub, line_items)
+            .await
+            .unwrap();
+
+        let payment = SubscriptionPayment {
+            id: vec![sub_id as u8; 32],
+            subscription_id: sub_id,
+            user_id: uid,
+            created: Utc::now(),
+            expires: Utc::now() + TimeDelta::hours(1),
+            amount: 1000,
+            currency: "EUR".to_string(),
+            rate: 1.0,
+            time_value: Some(2_592_000),
+            payment_method: PaymentMethod::Lightning,
+            payment_type: SubscriptionPaymentType::Purchase,
+            external_data: Default::default(),
+            external_id: None,
+            is_paid: false,
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+        };
+        db.insert_subscription_payment(&payment).await.unwrap();
+        (sub_id, payment.id.clone())
+    }
+
+    /// A one-off purchase must never acquire an expiry, or `check_subscriptions`
+    /// mails the customer "your subscription will expire soon" about something
+    /// they bought outright.
+    #[tokio::test]
+    async fn a_one_off_fee_never_gets_an_expiry() {
+        let db = MockDb::default();
+        let uid = user(&db, 1).await;
+        let (sub_id, pid) = subscription_with(&db, uid, &[(0, 5000)]).await;
+
+        let payment = db.get_subscription_payment(&pid).await.unwrap();
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let sub = db.get_subscription(sub_id).await.unwrap();
+        assert_eq!(sub.expires, None, "a one-off fee was given an expiry");
+        // ...but it is still activated: the expiry UPDATE is also what sets
+        // these, so skipping it wholesale would leave a paid fee looking unpaid.
+        assert!(sub.is_active, "paid fee left inactive");
+        assert!(sub.is_setup, "paid fee left un-set-up");
+    }
+
+    /// The narrow half of the rule. A recurring subscription must keep expiring
+    /// exactly as before — this branch sits in the shared payment path.
+    #[tokio::test]
+    async fn a_recurring_subscription_still_expires() {
+        let db = MockDb::default();
+        let uid = user(&db, 1).await;
+        let (sub_id, pid) = subscription_with(&db, uid, &[(1000, 500)]).await;
+
+        let payment = db.get_subscription_payment(&pid).await.unwrap();
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let sub = db.get_subscription(sub_id).await.unwrap();
+        assert!(
+            sub.expires.is_some(),
+            "a recurring subscription stopped expiring — renewals would never be billed"
+        );
+    }
+
+    /// The case that makes the rule "no recurring amount AND a setup fee"
+    /// rather than just "no recurring amount": a free or fully-discounted
+    /// subscription has neither, and must still lapse on schedule.
+    #[tokio::test]
+    async fn a_free_subscription_still_expires() {
+        let db = MockDb::default();
+        let uid = user(&db, 1).await;
+        let (sub_id, pid) = subscription_with(&db, uid, &[(0, 0)]).await;
+
+        let payment = db.get_subscription_payment(&pid).await.unwrap();
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let sub = db.get_subscription(sub_id).await.unwrap();
+        assert!(
+            sub.expires.is_some(),
+            "a zero-amount subscription stopped expiring — it would never be cleaned up"
+        );
+    }
+
+    /// Mirrors `uk_marketplace_node_line_item`. Without it two nodes could
+    /// point at one paid fee, turning the per-node gate into a per-operator one.
+    #[tokio::test]
+    async fn one_paid_fee_covers_one_node() {
+        let db = MockDb::default();
+        let uid = user(&db, 1).await;
+        let op = db
+            .insert_marketplace_operator(&operator(uid))
+            .await
+            .unwrap();
+        let (_, _) = subscription_with(&db, uid, &[(0, 5000)]).await;
+        let li = db.list_subscription_line_items(1).await.unwrap()[0].id;
+
+        db.insert_marketplace_node(&MarketplaceNode {
+            subscription_line_item_id: Some(li),
+            ..node(op, "first")
+        })
+        .await
+        .unwrap();
+
+        let err = db
+            .insert_marketplace_node(&MarketplaceNode {
+                subscription_line_item_id: Some(li),
+                ..node(op, "second")
+            })
+            .await
+            .expect_err("two nodes shared one listing fee");
+        assert!(format!("{err}").contains("already bills"), "got: {err}");
+
+        // ...and the same must hold on update, not just insert.
+        let other = db
+            .insert_marketplace_node(&node(op, "third"))
+            .await
+            .unwrap();
+        let mut steal = db.get_marketplace_node(other).await.unwrap();
+        steal.subscription_line_item_id = Some(li);
+        assert!(db.update_marketplace_node(&steal).await.is_err());
+
+        // The fee resolves back to the node it paid for.
+        let found = db.get_marketplace_node_by_line_item(li).await.unwrap();
+        assert_eq!(found.name, "first");
     }
 
     /// Mirrors `uk_marketplace_node_tls_fingerprint`: two nodes serving the

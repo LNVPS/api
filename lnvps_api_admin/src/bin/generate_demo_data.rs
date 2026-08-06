@@ -160,6 +160,7 @@ async fn create_companies(db: &LNVpsDbMysql) -> Result<Vec<Company>> {
             referral_rate: 0.0,
             max_prepay_days: 0,
             marketplace_rate: 0.0,
+            marketplace_node_fee: 0,
             address_2: None,
         },
         Company {
@@ -178,6 +179,7 @@ async fn create_companies(db: &LNVpsDbMysql) -> Result<Vec<Company>> {
             referral_rate: 0.0,
             max_prepay_days: 0,
             marketplace_rate: 0.0,
+            marketplace_node_fee: 0,
             address_2: None,
         },
         Company {
@@ -196,6 +198,7 @@ async fn create_companies(db: &LNVpsDbMysql) -> Result<Vec<Company>> {
             referral_rate: 0.0,
             max_prepay_days: 0,
             marketplace_rate: 0.0,
+            marketplace_node_fee: 0,
             address_2: None,
         },
     ];

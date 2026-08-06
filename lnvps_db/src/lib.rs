@@ -1118,6 +1118,15 @@ pub trait LNVpsDbBase: Send + Sync {
         fingerprint: &[u8],
     ) -> DbResult<MarketplaceNode>;
 
+    /// Get the marketplace node whose listing fee is billed by `line_item_id`.
+    ///
+    /// The back-reference direction matches `vm.subscription_line_item_id`: the
+    /// node points at its line item, so this is a lookup, not a join table.
+    async fn get_marketplace_node_by_line_item(
+        &self,
+        line_item_id: u64,
+    ) -> DbResult<MarketplaceNode>;
+
     /// List the nodes belonging to one operator
     async fn list_marketplace_nodes(&self, operator_id: u64) -> DbResult<Vec<MarketplaceNode>>;
 

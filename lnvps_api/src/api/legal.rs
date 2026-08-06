@@ -262,6 +262,9 @@ async fn v1_generate_lir_agreement_from_subscription(
             lnvps_db::SubscriptionType::DnsHosting => ("DNS Hosting".to_string(), "—".to_string()),
             lnvps_db::SubscriptionType::Vps => ("VPS".to_string(), "—".to_string()),
             lnvps_db::SubscriptionType::App => ("App".to_string(), "—".to_string()),
+            lnvps_db::SubscriptionType::MarketplaceNodeFee => {
+                ("Marketplace Node Listing Fee".to_string(), "—".to_string())
+            }
         };
 
         resources.push(ResourceRequest {

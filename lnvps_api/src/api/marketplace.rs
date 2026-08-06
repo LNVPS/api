@@ -16,11 +16,15 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
+use chrono::Utc;
 use lnvps_api_common::{
     ApiData, ApiError, ApiResult, NODE_TOKEN_TTL_SECS, Nip98Auth, NodeAuth, issue_node_token,
     session_auth_enabled,
 };
-use lnvps_db::{MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator, MarketplaceTrustTier};
+use lnvps_db::{
+    IntervalType, MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator,
+    MarketplaceTrustTier, Subscription, SubscriptionLineItem, SubscriptionType,
+};
 
 use crate::api::RouterState;
 
@@ -34,6 +38,10 @@ pub fn router() -> Router<RouterState> {
         .route(
             "/api/v1/marketplace/nodes/{id}/token",
             post(v1_rotate_node_token),
+        )
+        .route(
+            "/api/v1/marketplace/nodes/{id}/fee",
+            post(v1_start_node_fee),
         )
         .route("/api/v1/marketplace/operator", get(v1_get_operator))
         // Node-facing: authenticated by the node's own token, not a user.
@@ -351,6 +359,132 @@ pub(crate) async fn owned_node(
     Ok(node)
 }
 
+/// Start paying a node's one-off listing fee.
+#[derive(Deserialize)]
+pub struct StartNodeFeeRequest {
+    /// The region the operator wants this node listed in.
+    ///
+    /// The fee's company and currency come from the region, exactly as an IP
+    /// range's come from its IP space — a node belongs to no region when it is
+    /// registered, so there is nothing else to derive them from. It also tells
+    /// the admin where the operator intends the hardware to live; approval can
+    /// still place it elsewhere.
+    pub region_id: u64,
+}
+
+/// The fee subscription for a node.
+#[derive(Serialize, Debug)]
+pub struct ApiNodeFee {
+    /// Subscription to pay. Pay it through the normal subscription renewal
+    /// endpoint — there is no separate payment rail for fees.
+    pub subscription_id: u64,
+    /// Amount due, in `currency`.
+    pub amount: u64,
+    pub currency: String,
+    /// Whether the fee has already been paid.
+    pub is_paid: bool,
+}
+
+/// Create (or return) the subscription covering a node's listing fee.
+///
+/// Idempotent on purpose: an operator who calls this twice must not end up with
+/// two fee subscriptions for one node, one of which they never pay and which
+/// then sits unpaid forever. The second call returns the first.
+async fn v1_start_node_fee(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<StartNodeFeeRequest>,
+) -> ApiResult<ApiNodeFee> {
+    ApiData::ok(start_node_fee(&this.db, &auth.pubkey(), id, &req).await?)
+}
+
+/// The body of [`v1_start_node_fee`], without the extractors, so it can be
+/// tested against a database rather than a live HTTP stack.
+pub(crate) async fn start_node_fee(
+    db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+    caller: &[u8; 32],
+    id: u64,
+    req: &StartNodeFeeRequest,
+) -> Result<ApiNodeFee, ApiError> {
+    let mut node = owned_node(db, caller, id).await?;
+
+    // Already started: hand back the existing subscription rather than making
+    // a second one.
+    if let Some(line_item_id) = node.subscription_line_item_id {
+        let line_item = db.get_subscription_line_item(line_item_id).await?;
+        let sub = db.get_subscription(line_item.subscription_id).await?;
+        return Ok(ApiNodeFee {
+            subscription_id: sub.id,
+            amount: line_item.setup_amount,
+            currency: sub.currency,
+            // `is_setup` is what payment sets, and a one-off fee never gets an
+            // expiry to check instead.
+            is_paid: sub.is_setup,
+        });
+    }
+
+    let region = db.get_host_region(req.region_id).await?;
+    let company = db.get_company(region.company_id).await?;
+    if company.marketplace_node_fee == 0 {
+        return Err(ApiError::new(
+            "No listing fee is required for nodes in this region",
+        ));
+    }
+
+    let subscription = Subscription {
+        id: 0,
+        user_id: db.upsert_user(caller).await?,
+        company_id: region.company_id,
+        name: format!("Marketplace node listing fee: {}", node.name),
+        description: Some(format!(
+            "One-off fee to list node '{}' in {}",
+            node.name, region.name
+        )),
+        created: Utc::now(),
+        expires: None,
+        is_active: false,
+        is_setup: false,
+        currency: company.base_currency.clone(),
+        interval_amount: 1,
+        interval_type: IntervalType::Month,
+        setup_fee: company.marketplace_node_fee,
+        // Nothing recurring to renew.
+        auto_renewal_enabled: false,
+        external_id: None,
+    };
+
+    // amount = 0 with a setup_amount is what marks this a one-off: it is the
+    // shape `subscription_payment_paid` recognises to leave `expires` NULL.
+    let line_item = SubscriptionLineItem {
+        id: 0,
+        subscription_id: 0,
+        subscription_type: SubscriptionType::MarketplaceNodeFee,
+        name: format!("Node listing fee: {}", node.name),
+        description: None,
+        amount: 0,
+        setup_amount: company.marketplace_node_fee,
+        configuration: None,
+    };
+
+    let (subscription_id, line_item_ids) = db
+        .insert_subscription_with_line_items(&subscription, vec![line_item])
+        .await?;
+    let line_item_id = *line_item_ids
+        .first()
+        .ok_or_else(|| ApiError::new("Failed to create fee line item"))?;
+
+    node.subscription_line_item_id = Some(line_item_id);
+    db.update_marketplace_node(&node).await?;
+
+    Ok(ApiNodeFee {
+        subscription_id,
+        amount: company.marketplace_node_fee,
+        currency: company.base_currency,
+        is_paid: false,
+    })
+}
+
 /// List the caller's own nodes.
 async fn v1_list_nodes(
     auth: Nip98Auth,
@@ -407,11 +541,147 @@ mod tests {
         Arc::new(MockDb::default())
     }
 
+    /// A database whose company charges `fee` to list a node, plus the id of a
+    /// region to derive that company from.
+    async fn db_with_fee(fee: u64) -> (Arc<dyn lnvps_db::LNVpsDb>, u64) {
+        init_session_secret(b"test-secret-for-marketplace".to_vec());
+        let mock = MockDb::default();
+        mock.set_marketplace_node_fee(1, fee).await;
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(mock);
+        let region_id = db.get_host_region(1).await.expect("mock region 1").id;
+        (db, region_id)
+    }
+
     fn request(name: &str, fingerprint: &str) -> RegisterNodeRequest {
         RegisterNodeRequest {
             name: name.to_string(),
             tls_fingerprint: fingerprint.to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn paying_a_fee_creates_a_one_off_subscription_for_that_node() {
+        let (db, region_id) = db_with_fee(5000).await;
+        let (node, _) = register_node(&db, &OPERATOR, &request("rack 1", FINGERPRINT_1))
+            .await
+            .unwrap();
+
+        let fee = start_node_fee(&db, &OPERATOR, node.id, &StartNodeFeeRequest { region_id })
+            .await
+            .unwrap();
+        assert_eq!(fee.amount, 5000);
+        assert_eq!(fee.currency, "EUR");
+        assert!(!fee.is_paid);
+
+        // The shape matters: amount 0 with a setup fee is what makes
+        // `subscription_payment_paid` treat this as a one-off and leave
+        // `expires` NULL. A recurring line item here would start dunning the
+        // operator for a fee they paid once.
+        let items = db
+            .list_subscription_line_items(fee.subscription_id)
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].amount, 0, "listing fee must not bill recurring");
+        assert_eq!(items[0].setup_amount, 5000);
+        assert_eq!(
+            items[0].subscription_type,
+            SubscriptionType::MarketplaceNodeFee
+        );
+
+        let sub = db.get_subscription(fee.subscription_id).await.unwrap();
+        assert_eq!(sub.expires, None);
+        assert!(
+            !sub.auto_renewal_enabled,
+            "a one-off fee must not auto-renew"
+        );
+
+        // The node now points at the line item that bills it.
+        let reloaded = db.get_marketplace_node(node.id).await.unwrap();
+        assert_eq!(reloaded.subscription_line_item_id, Some(items[0].id));
+        assert_eq!(
+            db.get_marketplace_node_by_line_item(items[0].id)
+                .await
+                .unwrap()
+                .id,
+            node.id
+        );
+    }
+
+    /// An operator who retries must not end up with two fee subscriptions, one
+    /// of which they never pay and which then sits unpaid forever.
+    #[tokio::test]
+    async fn starting_a_fee_twice_returns_the_same_subscription() {
+        let (db, region_id) = db_with_fee(5000).await;
+        let (node, _) = register_node(&db, &OPERATOR, &request("rack 1", FINGERPRINT_1))
+            .await
+            .unwrap();
+
+        let first = start_node_fee(&db, &OPERATOR, node.id, &StartNodeFeeRequest { region_id })
+            .await
+            .unwrap();
+        let second = start_node_fee(&db, &OPERATOR, node.id, &StartNodeFeeRequest { region_id })
+            .await
+            .unwrap();
+        assert_eq!(first.subscription_id, second.subscription_id);
+    }
+
+    /// Each node is charged separately — paying once must not license a fleet.
+    #[tokio::test]
+    async fn each_node_needs_its_own_fee() {
+        let (db, region_id) = db_with_fee(5000).await;
+        let (a, _) = register_node(&db, &OPERATOR, &request("a", FINGERPRINT_1))
+            .await
+            .unwrap();
+        let (b, _) = register_node(&db, &OPERATOR, &request("b", FINGERPRINT_2))
+            .await
+            .unwrap();
+
+        let fee_a = start_node_fee(&db, &OPERATOR, a.id, &StartNodeFeeRequest { region_id })
+            .await
+            .unwrap();
+        let fee_b = start_node_fee(&db, &OPERATOR, b.id, &StartNodeFeeRequest { region_id })
+            .await
+            .unwrap();
+        assert_ne!(
+            fee_a.subscription_id, fee_b.subscription_id,
+            "two nodes shared one listing fee"
+        );
+    }
+
+    /// Node ids must not be probeable through the fee endpoint either.
+    #[tokio::test]
+    async fn another_operators_node_cannot_be_paid_for() {
+        let (db, region_id) = db_with_fee(5000).await;
+        let (node, _) = register_node(&db, &OPERATOR, &request("rack 1", FINGERPRINT_1))
+            .await
+            .unwrap();
+
+        let err = start_node_fee(
+            &db,
+            &SOMEONE_ELSE,
+            node.id,
+            &StartNodeFeeRequest { region_id },
+        )
+        .await
+        .expect_err("paid for another operator's node");
+        assert!(format!("{err:?}").contains("not found"), "got: {err:?}");
+    }
+
+    /// A company that charges nothing must not create a zero-amount invoice
+    /// that can never be paid and would block approval forever.
+    #[tokio::test]
+    async fn no_fee_configured_means_nothing_to_pay() {
+        let (db, region_id) = db_with_fee(0).await;
+        let (node, _) = register_node(&db, &OPERATOR, &request("rack 1", FINGERPRINT_1))
+            .await
+            .unwrap();
+
+        assert!(
+            start_node_fee(&db, &OPERATOR, node.id, &StartNodeFeeRequest { region_id })
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

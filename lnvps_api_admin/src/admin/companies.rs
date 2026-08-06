@@ -159,9 +159,11 @@ async fn admin_create_company(
         referral_rate: req.referral_rate.unwrap_or(0.0).max(0.0),
         max_prepay_days: req.max_prepay_days.unwrap_or(0),
         // Marketplace revenue share is not settable through the admin API yet
-        // (no marketplace exists to pay out); the column defaults to 0, which
-        // means "no revenue share", and is left untouched by company updates.
+        // (no payouts exist to run); it defaults to 0, meaning "no revenue
+        // share". Company updates read the row first and write it back
+        // unchanged, so a value set directly in the DB survives them.
         marketplace_rate: 0.0,
+        marketplace_node_fee: req.marketplace_node_fee.unwrap_or(0),
     };
 
     let company_id = this.db.admin_create_company(&company).await?;
@@ -277,6 +279,9 @@ async fn admin_update_company(
             return ApiData::err("referral_rate cannot be negative");
         }
         company.referral_rate = rate;
+    }
+    if let Some(fee) = req.marketplace_node_fee {
+        company.marketplace_node_fee = fee;
     }
     if let Some(days) = req.max_prepay_days {
         company.max_prepay_days = days;

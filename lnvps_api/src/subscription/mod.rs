@@ -36,6 +36,7 @@ use std::time::{Duration, Instant};
 
 mod app;
 mod ip_range;
+mod marketplace_node_fee;
 mod vm;
 
 use crate::provisioner::{IpRangeProvisioner, VmProvisioner};
@@ -232,6 +233,9 @@ impl SubscriptionHandler {
                 self.ip_range_provisioner.clone(),
                 li.id,
             ))),
+            SubscriptionType::MarketplaceNodeFee => Ok(Box::new(
+                marketplace_node_fee::MarketplaceNodeFeeLineItemHandler::new(li.id),
+            )),
             SubscriptionType::App => Ok(Box::new(AppLineItemHandler::new(
                 self.db.clone(),
                 li.id,

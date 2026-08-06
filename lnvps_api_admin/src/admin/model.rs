@@ -1925,6 +1925,9 @@ pub struct AdminCompanyInfo {
     /// Maximum number of days a subscription may be prepaid/renewed in advance
     /// (0 = inherit the global default).
     pub max_prepay_days: u16,
+    /// One-off fee charged per marketplace node before an admin can approve it,
+    /// in this company's `base_currency`. `0` requires no fee.
+    pub marketplace_node_fee: u64,
     pub region_count: u64, // Number of regions assigned to this company
 }
 
@@ -1945,6 +1948,8 @@ pub struct CreateCompanyRequest {
     pub referral_rate: Option<f32>,
     /// Maximum prepay/renewal window in days (0 = inherit the global default).
     pub max_prepay_days: Option<u16>,
+    /// One-off marketplace node listing fee, in the company's base currency.
+    pub marketplace_node_fee: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1964,6 +1969,8 @@ pub struct UpdateCompanyRequest {
     pub referral_rate: Option<f32>,
     /// Maximum prepay/renewal window in days (0 = inherit the global default).
     pub max_prepay_days: Option<u16>,
+    /// One-off marketplace node listing fee, in the company's base currency.
+    pub marketplace_node_fee: Option<u64>,
 }
 
 impl From<lnvps_db::Company> for AdminCompanyInfo {
@@ -1984,6 +1991,7 @@ impl From<lnvps_db::Company> for AdminCompanyInfo {
             base_currency: company.base_currency,
             referral_rate: company.referral_rate,
             max_prepay_days: company.max_prepay_days,
+            marketplace_node_fee: company.marketplace_node_fee,
             region_count: 0, // Will be filled by handler
         }
     }

@@ -607,8 +607,37 @@ than as a unique-index violation. Another operator's node answers "not found" ra
 "forbidden", so ids cannot be probed. `GET /api/v1/node/self` is the node-authenticated
 endpoint that proves the token works end to end.
 
+16. **Listing a node costs a one-off, non-refundable, per-node fee, and the gate sits at
+   approval.** An operator registers and is reviewed for free, then pays before an admin can
+   approve — so hardware is vetted before money changes hands and rejected hardware costs its
+   operator nothing. Per node, because one payment unlocking an unlimited fleet prices spam
+   only once. Non-refundable, so LNVPS never custodies operator money and needs no return or
+   slashing procedure. Consequences that had to be built:
+   - **The fee is a `SubscriptionType::MarketplaceNodeFee`, not a new payments table.**
+     `subscription_payment` is the only table the Lightning settlement listener resolves
+     against, and its resume cursor is `last_paid_subscription_invoice`. A parallel table
+     would have to extend both, and a paid fee that missed either would settle into a
+     "not found" log line and be lost.
+   - **A one-off must never acquire an expiry.** No path through `subscription_payment_paid`
+     left `expires` NULL, so a paid fee would have been dunned by `check_subscriptions`.
+     One-offs are now recognised from the data — no recurring amount *and* a setup fee — and
+     keep `expires` NULL, which every expiry query already filters on. The rule is narrow on
+     purpose: a free or fully-discounted subscription has neither, and must keep lapsing.
+   - **The same UPDATE sets `is_active`/`is_setup`**, so the one-off branch sets them
+     explicitly rather than leaving a paid fee looking unpaid.
+   - **The company comes from a region the operator names when paying**, since a fresh node
+     belongs to no region and every other product derives its company from what is bought.
+
 **3b — admin approval (next):** approve/reject/suspend/drain, trust tier, capacity caps, the
-per-operator rate override, and creating the backing `VmHost` row on approval.
+per-operator rate override, and creating the backing `VmHost` row on approval. Approval is
+gated on a paid listing fee (decision 16) and on a pinned certificate — a node that never
+registered one cannot be reached. Reject deletes the registration (no `Rejected` state), so an
+operator may re-register the same hardware. Approval takes a `region_id` and creates the host
+`enabled = false` with an empty `ip`, filled in by increment 4 when the tunnel is allocated;
+a blank ip must be a hard error wherever a host is dialled, never a silent failure.
+`AdminResource::MarketplaceNode` (28) covers placement state and `MarketplaceOperator` (29)
+covers payout and revenue share, so suspending a node and changing what someone is paid are
+separately grantable.
 
 **Original scope:**
 - `POST /api/v1/node/register` under standard consumer auth → node bound to the calling user,
