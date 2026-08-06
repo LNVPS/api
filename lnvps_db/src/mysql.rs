@@ -7,9 +7,10 @@ use crate::{
     PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
     Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
     RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, Tunnel, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
-    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
+    SubscriptionPaymentWithCompany, Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm,
+    VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
+    VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
+    WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -4272,13 +4273,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_tunnel(&self, tunnel: &Tunnel) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO tunnel (kind, user_id, router_id, name, \
+            "INSERT INTO tunnel (kind, user_id, router_id, pool_id, name, \
              peer_pubkey, peer_endpoint, address4, address6, keepalive, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(tunnel.kind)
         .bind(tunnel.user_id)
         .bind(tunnel.router_id)
+        .bind(tunnel.pool_id)
         .bind(&tunnel.name)
         .bind(&tunnel.peer_pubkey)
         .bind(&tunnel.peer_endpoint)
@@ -4294,12 +4296,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn update_tunnel(&self, tunnel: &Tunnel) -> DbResult<()> {
         sqlx::query(
             "UPDATE tunnel \
-             SET kind = ?, router_id = ?, name = ?, peer_pubkey = ?, peer_endpoint = ?, \
-                 address4 = ?, address6 = ?, keepalive = ?, enabled = ? \
+             SET kind = ?, router_id = ?, pool_id = ?, name = ?, peer_pubkey = ?, \
+                 peer_endpoint = ?, address4 = ?, address6 = ?, keepalive = ?, enabled = ? \
              WHERE id = ?",
         )
         .bind(tunnel.kind)
         .bind(tunnel.router_id)
+        .bind(tunnel.pool_id)
         .bind(&tunnel.name)
         .bind(&tunnel.peer_pubkey)
         .bind(&tunnel.peer_endpoint)
@@ -4315,6 +4318,114 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn delete_tunnel(&self, id: u64) -> DbResult<()> {
         sqlx::query("DELETE FROM tunnel WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    // ----- Tunnel pools -----
+
+    async fn get_tunnel_pool(&self, id: u64) -> DbResult<TunnelPool> {
+        Ok(sqlx::query_as("SELECT * FROM tunnel_pool WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn list_tunnel_pools(&self, region_id: Option<u64>) -> DbResult<Vec<TunnelPool>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM tunnel_pool WHERE (? IS NULL OR region_id = ?) ORDER BY id",
+        )
+        .bind(region_id)
+        .bind(region_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_tunnels_in_pool(&self, pool_id: u64) -> DbResult<Vec<Tunnel>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM tunnel WHERE pool_id = ? ORDER BY id")
+                .bind(pool_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn admin_list_tunnel_pools_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+        region_id: Option<u64>,
+    ) -> DbResult<(Vec<TunnelPool>, u64)> {
+        let pools = sqlx::query_as::<_, TunnelPool>(
+            "SELECT * FROM tunnel_pool WHERE (? IS NULL OR region_id = ?) \
+             ORDER BY id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(region_id)
+        .bind(region_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+
+        let total: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM tunnel_pool WHERE (? IS NULL OR region_id = ?)")
+                .bind(region_id)
+                .bind(region_id)
+                .fetch_one(&self.db)
+                .await?;
+
+        Ok((pools, total.0 as u64))
+    }
+
+    async fn insert_tunnel_pool(&self, pool: &TunnelPool) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO tunnel_pool (router_id, region_id, name, interface, endpoint, \
+             public_key, cidr4, cidr6, keepalive, mtu, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
+        )
+        .bind(pool.router_id)
+        .bind(pool.region_id)
+        .bind(&pool.name)
+        .bind(&pool.interface)
+        .bind(&pool.endpoint)
+        .bind(&pool.public_key)
+        .bind(&pool.cidr4)
+        .bind(&pool.cidr6)
+        .bind(pool.keepalive)
+        .bind(pool.mtu)
+        .bind(pool.enabled)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn update_tunnel_pool(&self, pool: &TunnelPool) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE tunnel_pool \
+             SET region_id = ?, name = ?, interface = ?, endpoint = ?, public_key = ?, \
+                 cidr4 = ?, cidr6 = ?, keepalive = ?, mtu = ?, enabled = ? \
+             WHERE id = ?",
+        )
+        .bind(pool.region_id)
+        .bind(&pool.name)
+        .bind(&pool.interface)
+        .bind(&pool.endpoint)
+        .bind(&pool.public_key)
+        .bind(&pool.cidr4)
+        .bind(&pool.cidr6)
+        .bind(pool.keepalive)
+        .bind(pool.mtu)
+        .bind(pool.enabled)
+        .bind(pool.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_tunnel_pool(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM tunnel_pool WHERE id = ?")
             .bind(id)
             .execute(&self.db)
             .await?;

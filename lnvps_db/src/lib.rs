@@ -1208,6 +1208,42 @@ pub trait LNVpsDbBase: Send + Sync {
     /// while a marketplace node still references it.
     async fn delete_tunnel(&self, id: u64) -> DbResult<()>;
 
+    // ----- Tunnel pools -----
+
+    /// Get a tunnel pool by id
+    async fn get_tunnel_pool(&self, id: u64) -> DbResult<TunnelPool>;
+
+    /// List tunnel pools, optionally only those a region's nodes may be
+    /// allocated from. The allocator asks by region; the admin UI asks for all.
+    async fn list_tunnel_pools(&self, region_id: Option<u64>) -> DbResult<Vec<TunnelPool>>;
+
+    /// List the tunnels carved out of one pool. This is what the allocator
+    /// subtracts from the pool's blocks to find a free link, so it must return
+    /// every allocation, enabled or not — a disabled tunnel still owns its
+    /// addresses.
+    async fn list_tunnels_in_pool(&self, pool_id: u64) -> DbResult<Vec<Tunnel>>;
+
+    /// Admin listing of tunnel pools with database-level pagination, optionally
+    /// filtered to one region. Returns `(rows, total_count)` for the filtered
+    /// set.
+    async fn admin_list_tunnel_pools_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+        region_id: Option<u64>,
+    ) -> DbResult<(Vec<TunnelPool>, u64)>;
+
+    /// Create a tunnel pool, returning the new id
+    async fn insert_tunnel_pool(&self, pool: &TunnelPool) -> DbResult<u64>;
+
+    /// Update a pool. `router_id` and `created` are immutable and are not
+    /// written: moving a pool to another route server would leave every tunnel
+    /// carved from it pointing at an interface that does not exist there.
+    async fn update_tunnel_pool(&self, pool: &TunnelPool) -> DbResult<()>;
+
+    /// Delete a pool. Fails while any tunnel is still carved out of it.
+    async fn delete_tunnel_pool(&self, id: u64) -> DbResult<()>;
+
     // ----- App catalog -----
 
     /// List catalog apps. When `enabled_only` is set, only apps offered in the

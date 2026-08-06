@@ -12,8 +12,8 @@ use lnvps_db::{
     NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod,
     PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region, Router,
     RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription,
-    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, Tunnel, User,
-    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
+    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, Tunnel, TunnelPool,
+    User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
     VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind,
     VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
 };
@@ -77,6 +77,7 @@ pub struct MockDb {
     pub marketplace_operators: Arc<Mutex<HashMap<u64, MarketplaceOperator>>>,
     pub marketplace_nodes: Arc<Mutex<HashMap<u64, MarketplaceNode>>>,
     pub tunnels: Arc<Mutex<HashMap<u64, Tunnel>>>,
+    pub tunnel_pools: Arc<Mutex<HashMap<u64, TunnelPool>>>,
     pub referral_payouts: Arc<Mutex<Vec<ReferralPayout>>>,
     pub router_tunnels: Arc<Mutex<HashMap<u64, RouterTunnel>>>,
     pub router_tunnel_traffic: Arc<Mutex<Vec<RouterTunnelTraffic>>>,
@@ -130,6 +131,33 @@ impl MockDb {
     /// to at most one tunnel. Two tunnels sharing an inner address is a routing
     /// collision that delivers one tenant's traffic to another, so the mock
     /// enforces it exactly as the schema does.
+    /// `fk_tunnel_pool`: the composite key `(pool_id, router_id)` against the
+    /// pool's `(id, router_id)`. A tunnel pointing at a pool on some other
+    /// router would be a peer configured on an interface that is not there.
+    async fn check_tunnel_pool_link(&self, tunnel: &Tunnel) -> DbResult<()> {
+        let Some(pool_id) = tunnel.pool_id else {
+            return Ok(());
+        };
+        let pools = self.tunnel_pools.lock().await;
+        let pool = pools
+            .get(&pool_id)
+            .ok_or_else(|| DbError::Other(anyhow!("Tunnel pool {} not found", pool_id)))?;
+        // A NULL in either column skips the constraint, exactly as the database
+        // does for a composite foreign key.
+        if let Some(router_id) = tunnel.router_id
+            && router_id != pool.router_id
+        {
+            return Err(anyhow!(
+                "Tunnel pool {} is on router {}, not router {} (fk_tunnel_pool)",
+                pool_id,
+                pool.router_id,
+                router_id
+            )
+            .into());
+        }
+        Ok(())
+    }
+
     fn check_tunnel_uniqueness(
         tunnels: &HashMap<u64, Tunnel>,
         candidate: &Tunnel,
@@ -436,6 +464,7 @@ impl Default for MockDb {
             marketplace_operators: Arc::new(Default::default()),
             marketplace_nodes: Arc::new(Default::default()),
             tunnels: Arc::new(Default::default()),
+            tunnel_pools: Arc::new(Default::default()),
             referral_payouts: Arc::new(Default::default()),
             router_tunnels: Arc::new(Default::default()),
             router_tunnel_traffic: Arc::new(Default::default()),
@@ -3861,6 +3890,7 @@ impl LNVpsDbBase for MockDb {
         if !self.users.lock().await.contains_key(&tunnel.user_id) {
             return Err(anyhow!("User {} not found", tunnel.user_id).into());
         }
+        self.check_tunnel_pool_link(tunnel).await?;
         let mut tunnels = self.tunnels.lock().await;
         Self::check_tunnel_uniqueness(&tunnels, tunnel, None)?;
         let new_id = tunnels.keys().max().copied().unwrap_or(0) + 1;
@@ -3876,6 +3906,7 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn update_tunnel(&self, tunnel: &Tunnel) -> DbResult<()> {
+        self.check_tunnel_pool_link(tunnel).await?;
         let mut tunnels = self.tunnels.lock().await;
         Self::check_tunnel_uniqueness(&tunnels, tunnel, Some(tunnel.id))?;
         let existing = tunnels
@@ -3885,6 +3916,7 @@ impl LNVpsDbBase for MockDb {
         // owner would hand one tenant's addresses and key to another.
         existing.kind = tunnel.kind;
         existing.router_id = tunnel.router_id;
+        existing.pool_id = tunnel.pool_id;
         existing.name = tunnel.name.clone();
         existing.peer_pubkey = tunnel.peer_pubkey.clone();
         existing.peer_endpoint = tunnel.peer_endpoint.clone();
@@ -3907,6 +3939,155 @@ impl LNVpsDbBase for MockDb {
             return Err(anyhow!("Tunnel {} still backs a marketplace node", id).into());
         }
         self.tunnels.lock().await.remove(&id);
+        Ok(())
+    }
+
+    // ----- Tunnel pools -----
+
+    async fn get_tunnel_pool(&self, id: u64) -> DbResult<TunnelPool> {
+        let pools = self.tunnel_pools.lock().await;
+        pools
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Tunnel pool {} not found", id).into())
+    }
+
+    async fn list_tunnel_pools(&self, region_id: Option<u64>) -> DbResult<Vec<TunnelPool>> {
+        let pools = self.tunnel_pools.lock().await;
+        let mut out: Vec<_> = pools
+            .values()
+            .filter(|p| region_id.is_none_or(|r| p.region_id == r))
+            .cloned()
+            .collect();
+        out.sort_by_key(|p| p.id);
+        Ok(out)
+    }
+
+    async fn list_tunnels_in_pool(&self, pool_id: u64) -> DbResult<Vec<Tunnel>> {
+        let tunnels = self.tunnels.lock().await;
+        let mut out: Vec<_> = tunnels
+            .values()
+            .filter(|t| t.pool_id == Some(pool_id))
+            .cloned()
+            .collect();
+        out.sort_by_key(|t| t.id);
+        Ok(out)
+    }
+
+    async fn admin_list_tunnel_pools_paginated(
+        &self,
+        limit: u64,
+        offset: u64,
+        region_id: Option<u64>,
+    ) -> DbResult<(Vec<TunnelPool>, u64)> {
+        let pools = self.tunnel_pools.lock().await;
+        let mut out: Vec<_> = pools
+            .values()
+            .filter(|p| region_id.is_none_or(|r| p.region_id == r))
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = out.len() as u64;
+        Ok((
+            out.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn insert_tunnel_pool(&self, pool: &TunnelPool) -> DbResult<u64> {
+        // FK tunnel_pool.router_id / region_id
+        if !self.router.lock().await.contains_key(&pool.router_id) {
+            return Err(anyhow!("Router {} not found", pool.router_id).into());
+        }
+        if !self.regions.lock().await.contains_key(&pool.region_id) {
+            return Err(anyhow!("Region {} not found", pool.region_id).into());
+        }
+        // ck_tunnel_pool_has_a_block: a pool with neither block can allocate
+        // nothing, and would only be discovered when a node asked for a tunnel.
+        if pool.cidr4.is_none() && pool.cidr6.is_none() {
+            return Err(anyhow!(
+                "A tunnel pool must have an address block (ck_tunnel_pool_has_a_block)"
+            )
+            .into());
+        }
+        let mut pools = self.tunnel_pools.lock().await;
+        // uk_tunnel_pool_router_interface: two pools on one interface would
+        // each carve addresses the other does not know about, onto one link.
+        if pools
+            .values()
+            .any(|p| p.router_id == pool.router_id && p.interface == pool.interface)
+        {
+            return Err(anyhow!(
+                "Interface {} on router {} already has a pool",
+                pool.interface,
+                pool.router_id
+            )
+            .into());
+        }
+        let id = pools.keys().max().copied().unwrap_or(0) + 1;
+        pools.insert(
+            id,
+            TunnelPool {
+                id,
+                created: Utc::now(),
+                ..pool.clone()
+            },
+        );
+        Ok(id)
+    }
+
+    async fn update_tunnel_pool(&self, pool: &TunnelPool) -> DbResult<()> {
+        if pool.cidr4.is_none() && pool.cidr6.is_none() {
+            return Err(anyhow!(
+                "A tunnel pool must have an address block (ck_tunnel_pool_has_a_block)"
+            )
+            .into());
+        }
+        let mut pools = self.tunnel_pools.lock().await;
+        if pools.values().any(|p| {
+            p.id != pool.id && p.router_id == pool.router_id && p.interface == pool.interface
+        }) {
+            return Err(anyhow!(
+                "Interface {} on router {} already has a pool",
+                pool.interface,
+                pool.router_id
+            )
+            .into());
+        }
+        let existing = pools
+            .get_mut(&pool.id)
+            .ok_or_else(|| DbError::Other(anyhow!("Tunnel pool {} not found", pool.id)))?;
+        // router_id and created are not written: moving a pool to another route
+        // server would leave every tunnel carved from it pointing at an
+        // interface that does not exist there.
+        existing.region_id = pool.region_id;
+        existing.name = pool.name.clone();
+        existing.interface = pool.interface.clone();
+        existing.endpoint = pool.endpoint.clone();
+        existing.public_key = pool.public_key.clone();
+        existing.cidr4 = pool.cidr4.clone();
+        existing.cidr6 = pool.cidr6.clone();
+        existing.keepalive = pool.keepalive;
+        existing.mtu = pool.mtu;
+        existing.enabled = pool.enabled;
+        Ok(())
+    }
+
+    async fn delete_tunnel_pool(&self, id: u64) -> DbResult<()> {
+        // FK tunnel.pool_id
+        if self
+            .tunnels
+            .lock()
+            .await
+            .values()
+            .any(|t| t.pool_id == Some(id))
+        {
+            return Err(anyhow!("Tunnel pool {} still has tunnels carved out of it", id).into());
+        }
+        self.tunnel_pools.lock().await.remove(&id);
         Ok(())
     }
 

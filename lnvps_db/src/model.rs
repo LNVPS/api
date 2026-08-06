@@ -1822,6 +1822,15 @@ pub struct Tunnel {
     pub user_id: u64,
     /// Route server terminating this tunnel. `None` until one is chosen.
     pub router_id: Option<u64>,
+    /// The pool this tunnel's inner addresses were carved from, and therefore
+    /// which interface its peer belongs to. `None` for a tunnel allocated
+    /// outside a pool — a hand-configured peering, or a VPN on a router with no
+    /// pool — which is why [`router_id`](Self::router_id) is still here.
+    ///
+    /// The database enforces `(pool_id, router_id)` against the pool's own
+    /// `(id, router_id)`, so the two copies of "which router" cannot disagree.
+    #[sqlx(default)]
+    pub pool_id: Option<u64>,
     /// Interface/peer name to configure on the router; correlates with
     /// [`RouterTunnel::name`] once realised
     pub name: String,
@@ -1840,6 +1849,49 @@ pub struct Tunnel {
     /// Whether this tunnel should be configured on the router at all
     pub enabled: bool,
     /// When this tunnel was allocated
+    pub created: DateTime<Utc>,
+}
+
+/// Where tunnel inner addresses are allocated from.
+///
+/// The tunnel equivalent of [`IpRange`]: a block to carve links out of, scoped
+/// to a region, attached to the device that terminates them. A pool is not a
+/// set of columns on [`Router`] because a route server can terminate several
+/// WireGuard interfaces and a peer belongs to an interface, not to a machine.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct TunnelPool {
+    /// Unique id of this pool
+    pub id: u64,
+    /// The route server that terminates peers allocated from this pool
+    pub router_id: u64,
+    /// The region whose nodes this pool serves. Guest traffic leaves through
+    /// the route server, so a tunnel must terminate in the same region the
+    /// guest's addresses came from.
+    pub region_id: u64,
+    /// Admin label. Not an identifier.
+    pub name: String,
+    /// The WireGuard interface on the route server that peers are added to.
+    pub interface: String,
+    /// What a peer dials, `host:port`. Not derived from [`Router::url`], which
+    /// is a management endpoint and says nothing about the data plane.
+    pub endpoint: String,
+    /// The interface's public key, handed to peers. The private half lives on
+    /// the route server and is never stored.
+    pub public_key: Vec<u8>,
+    /// Inner IPv4 block that point-to-point links are carved from
+    pub cidr4: Option<String>,
+    /// Inner IPv6 block that point-to-point links are carved from
+    pub cidr6: Option<String>,
+    /// Persistent keepalive handed to peers, in seconds
+    pub keepalive: Option<u16>,
+    /// MTU peers should use inside the tunnel. WireGuard's overhead means this
+    /// is not 1500, and getting it wrong hangs large transfers rather than
+    /// failing outright.
+    pub mtu: u16,
+    /// Whether new allocations may be made from this pool. Disabling stops new
+    /// placements without touching what is already carved out of it.
+    pub enabled: bool,
+    /// When this pool was created
     pub created: DateTime<Utc>,
 }
 

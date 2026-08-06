@@ -2,7 +2,7 @@
 
 **Status:** planning
 **Started:** 2026-07-05
-**Last updated:** 2026-08-06 (increment 3b landed: admin approval, the fee/certificate gates, and the backing host)
+**Last updated:** 2026-08-08 (increment 4a landed: tunnel pools, the allocator, and the node-facing tunnel endpoints)
 
 ## Goal
 
@@ -687,18 +687,80 @@ node that still backs a host is correct, but there is currently no way to satisf
   per-operator rate override.
 - On approval, create the backing `VmHost` row (disabled until networking is up).
 
-### Increment 4 — WireGuard data plane (L)
-- Allocator on top of the `tunnel` table from increment 1: pick a route server, assign the
-  inner /31 (and/or /127), record the node-generated peer key. The schema already enforces
-  that an inner address or peer key belongs to exactly one tunnel.
-- Reconcile desired state (`tunnel`) against observed state (`router_tunnel`); a peer that has
-  vanished from a router is drift to report, not an allocation to forget.
-- Route-server side: push the peer and routes for the guest IPs assigned to that node via the
-  existing `TunnelRouter` trait (`router/mod.rs`).
-- Node side: create `wg0` + `br-lnvps`, default route into the tunnel, anti-spoof and
-  anti-LAN-access rules, MTU/MSS clamp.
-- Health gate: node is only marked `online` after an end-to-end reachability probe from the
-  route server through the tunnel to a test guest IP.
+### Increment 4 — WireGuard data plane (XL — split into 4a/4b/4c)
+
+Sized as one increment it is XL: it spans a new addressing schema, an allocator, live
+route-server I/O, drift reconciliation, real Linux networking on somebody else's machine, and
+an end-to-end health gate. Split so each piece lands with its own tests.
+
+**Where the addresses come from.** `router` carries no region, no endpoint, no server key and
+no address block, so there was nothing to allocate *from*. A `tunnel_pool` supplies all four:
+which route server terminates the peers, which region's nodes it serves, the endpoint and
+server public key a node needs to dial it, and the inner blocks the /31 and /127 are carved
+out of — the same shape `ip_range` has for guest addresses, and `allocate_subnet` from
+`provisioner/ip_range.rs` does the carving in both cases.
+
+**Who presents the key.** The node generates its own WireGuard keypair and asks for a data
+plane after approval, presenting the public half; the private half never leaves the operator's
+machine. That is why there is no WireGuard column on `marketplace_node`: the key belongs on the
+`tunnel` row, which does not exist until the node asks, and `uk_tunnel_peer_pubkey` then makes
+it unique fleet-wide for free.
+
+#### 4a — Addressing + allocation (L)  ✅ DONE
+
+What the build settled beyond the plan:
+- **The composite foreign key works and is worth having.** `tunnel (pool_id, router_id)` →
+  `tunnel_pool (id, router_id)` is enforced by MariaDB, verified against a real server: a tunnel
+  claiming a pool on another router is rejected by the database, and a NULL `pool_id` skips the
+  constraint, which is exactly the pool-less case. The mock mirrors it.
+- **The peer's address is the network address with the low bit set**, not plus one. On a /31 or
+  /127 the network address always has that bit clear, so there is no overflow case and no
+  arithmetic error to invent — the last link in a block is still a link.
+- **A dual-stack pool's capacity is the smaller block's**, because a link of each family is
+  handed out together. Reporting the roomier one would promise capacity that cannot be
+  allocated.
+- **Pools are tried in order and the first with room wins**, rather than balancing across them.
+  A second pool in a region exists because the first filled up or is being migrated away from;
+  spreading nodes over both would leave neither drainable.
+- **A block cannot be shrunk or removed under a live allocation.** Otherwise the tunnel sits
+  outside its own pool and the allocator hands its addresses to somebody else.
+- **A pool cannot be moved between route servers.** Every tunnel carved from it would point at
+  an interface that is not there, so there is no `router_id` in the update request at all.
+- Allocation fills the host's blank `ip` with the node's inner address and leaves the host
+  disabled — 4b realises the peer, 4c brings the link up and enables it.
+
+Known gap, matching increment 3a: the two node-facing axum handlers are thin wrappers with no
+test, because `lnvps_api`'s `RouterState` has no test harness. Their bodies are covered through
+the allocator; the admin pool handlers *are* covered end to end.
+
+#### 4a — original scope
+- `tunnel_pool` (router, region, interface, endpoint, server public key, inner v4/v6 blocks,
+  keepalive, enabled) + `tunnel.pool_id`. A **composite** FK `(pool_id, router_id)` →
+  `tunnel_pool (id, router_id)` so the tunnel's router cannot drift from its pool's — the two
+  copies exist because a pool-less tunnel (a customer VPN later) still has a router.
+- Allocator on the `tunnel` table: pick an enabled pool in the node's region, carve the first
+  free /31 and /127 against what is already allocated, record the node-supplied peer key.
+- Node-facing `POST`/`GET /api/v1/node/tunnel`: the node presents its public key and receives
+  its addresses, the server key, the endpoint and the MTU. Idempotent — a node that retries
+  gets the allocation it already has, never a second one.
+- Fills the backing host's blank `ip` with the node's inner address. The host stays disabled:
+  an allocation is not a working tunnel.
+- Admin CRUD for pools, with utilisation.
+
+#### 4b — Route-server realisation + drift (M/L)  ⬅ NEXT
+- Push the peer to the route server through the existing `TunnelRouter`: `AllowedIPs` is the
+  node's inner addresses **plus** the guest IPs assigned to it, which is also the anti-spoof
+  boundary.
+- Reconcile desired (`tunnel`) against observed (`router_tunnel`); a peer that has vanished
+  from a router is drift to report, not an allocation to forget.
+- Route the guest prefixes at the route server towards the peer.
+
+#### 4c — Node data plane + health gate (L)
+- Node side: `wg0` + `br-lnvps`, default route into the tunnel, anti-spoof and anti-LAN-access
+  rules, MTU/MSS clamp.
+- Health gate: the host is only enabled after an end-to-end reachability probe from the route
+  server through the tunnel to a test guest IP. Failure leaves the node approved but unusable,
+  which is the safe direction.
 
 ### Increment 5 — Confidential computing: attestation + encrypted disks (L)
 - Verify SEV-SNP attestation reports (`sev` crate) / TDX quotes (`dcap-qvl` crate) against
