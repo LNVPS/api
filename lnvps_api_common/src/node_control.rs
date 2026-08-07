@@ -30,6 +30,18 @@ use nostr::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// The port every node's control API listens on.
+/// The DN LNVPS's libvirt client certificate carries.
+///
+/// Nodes are told to accept this and nothing else, so a certificate signed by
+/// the same CA for another purpose still cannot drive a node. Stated here
+/// rather than configured, for the same reason as the control port: both ends
+/// have to agree, and a value each side sets separately is one they can
+/// disagree about silently.
+/// The port a node's libvirtd serves TLS on, fleet-wide.
+pub const LIBVIRT_TLS_PORT: u16 = 16514;
+
+pub const LIBVIRT_CLIENT_DN: &str = "CN=lnvps-marketplace";
+
 pub const CONTROL_PORT: u16 = 8890;
 
 /// LNVPS's published nostr identity, for reference.

@@ -619,6 +619,7 @@ pub fn mock_settings() -> Settings {
         public_url: "http://localhost:8000".to_string(),
         read_only: false,
         provisioner: ProvisionerConfig {
+            marketplace: None,
             proxmox: Some(ProxmoxConfig {
                 qemu: QemuConfig {
                     machine: "q35".to_string(),

@@ -14,6 +14,48 @@ use std::path::PathBuf;
 pub struct ProvisionerConfig {
     pub proxmox: Option<ProxmoxConfig>,
     pub libvirt: Option<LibVirtConfig>,
+    /// How LNVPS drives libvirt on a marketplace node. When unset, nodes can be
+    /// enrolled and networked but no VM can be placed on one: the connection
+    /// would have no credentials, and refusing to build it is better than
+    /// falling back to an unauthenticated one on a listener a customer VM can
+    /// address.
+    #[serde(default)]
+    pub marketplace: Option<MarketplaceLibvirtConfig>,
+}
+
+/// LNVPS's client identity for marketplace nodes' libvirtd, and where the
+/// per-node trust material it implies is kept.
+///
+/// One client certificate for the fleet rather than one per node: every node is
+/// told to accept exactly this DN, and a per-node certificate would be a
+/// per-node key to issue, ship and rotate for a decision that is identical
+/// everywhere.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct MarketplaceLibvirtConfig {
+    /// PEM of the CA that signed the client certificate. Also sent to nodes, so
+    /// rotating it reaches the fleet on the next poll rather than requiring a
+    /// new node package.
+    pub ca_cert: PathBuf,
+    /// PEM of LNVPS's client certificate. Its subject must be the DN nodes are
+    /// told to allow.
+    pub client_cert: PathBuf,
+    /// PEM of the matching private key — what actually proves a connection is
+    /// LNVPS's.
+    pub client_key: PathBuf,
+    /// Where per-node trust directories are written. libvirt reads its client
+    /// credentials from a directory, so each node gets one containing that
+    /// node's certificate as the CA to verify against.
+    ///
+    /// A cache rather than a record: nodes re-present their certificate on
+    /// every poll, so a deployment that loses this directory repairs itself
+    /// within one poll interval instead of needing an operator to act.
+    #[serde(default = "default_marketplace_pki_dir")]
+    pub pki_dir: PathBuf,
+}
+
+fn default_marketplace_pki_dir() -> PathBuf {
+    PathBuf::from("/var/lib/lnvps/marketplace-pki")
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

@@ -4199,12 +4199,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO marketplace_node (operator_id, name, tls_fingerprint, token_version, status, trust_tier, tunnel_id, last_seen, subscription_line_item_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
+            "INSERT INTO marketplace_node (operator_id, name, tls_fingerprint, libvirt_cert, token_version, status, trust_tier, tunnel_id, last_seen, subscription_line_item_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(node.operator_id)
         .bind(&node.name)
         .bind(&node.tls_fingerprint)
+        .bind(&node.libvirt_cert)
         .bind(node.token_version)
         .bind(node.status)
         .bind(node.trust_tier)
@@ -4219,11 +4220,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn update_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<()> {
         sqlx::query(
             "UPDATE marketplace_node \
-             SET name = ?, tls_fingerprint = ?, token_version = ?, status = ?, trust_tier = ?, tunnel_id = ?, subscription_line_item_id = ? \
+             SET name = ?, tls_fingerprint = ?, libvirt_cert = ?, token_version = ?, status = ?, trust_tier = ?, tunnel_id = ?, subscription_line_item_id = ? \
              WHERE id = ?",
         )
         .bind(&node.name)
         .bind(&node.tls_fingerprint)
+        .bind(&node.libvirt_cert)
         .bind(node.token_version)
         .bind(node.status)
         .bind(node.trust_tier)

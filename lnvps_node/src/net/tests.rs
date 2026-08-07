@@ -216,6 +216,7 @@ impl NetOps for FakeKernel {
 
 fn desired() -> DesiredDataPlane {
     DesiredDataPlane {
+        libvirt: None,
         tunnel: DesiredTunnel {
             address4: Some("10.66.0.2/32".to_string()),
             address6: Some("fd00:66::2/128".to_string()),

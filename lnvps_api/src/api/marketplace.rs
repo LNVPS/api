@@ -51,6 +51,7 @@ pub fn router() -> Router<RouterState> {
             get(v1_node_get_tunnel).post(v1_node_request_tunnel),
         )
         .route("/api/v1/node/dataplane", get(v1_node_dataplane))
+        .route("/api/v1/node/libvirt", post(v1_node_libvirt_cert))
 }
 
 /// A node as its operator sees it.
@@ -140,6 +141,13 @@ pub struct UpdateNodeRequest {
     /// fingerprint LNVPS does not have, every control call to it fails closed,
     /// and without this it would be unreachable for good.
     pub tls_fingerprint: Option<String>,
+}
+
+/// The certificate a node serves libvirt with.
+#[derive(Deserialize)]
+pub struct NodeLibvirtCertRequest {
+    /// PEM, self-signed and CA-capable so it can be its own trust anchor.
+    pub cert_pem: String,
 }
 
 /// A newly registered node, with the one and only copy of its token.
@@ -621,6 +629,26 @@ pub struct ApiNodeDataPlane {
     /// The guests placed here. Also the anti-spoof list: an address that is not
     /// in it is not this node's to send from.
     pub guests: Vec<ApiNodeGuest>,
+    /// How the node should set up the libvirtd LNVPS drives. `null` when LNVPS
+    /// has no client identity configured, which is a deployment that can enrol
+    /// and network nodes but not place VMs on them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub libvirt: Option<ApiNodeLibvirt>,
+}
+
+/// What a node needs to serve libvirt to LNVPS and nobody else.
+#[derive(Serialize, Debug)]
+pub struct ApiNodeLibvirt {
+    /// PEM of the CA that signed LNVPS's client certificate. Delivered here
+    /// rather than compiled into the node package, so rotating it reaches the
+    /// fleet on the next poll instead of stranding every deployed node.
+    pub ca_pem: String,
+    /// The only client DN the node may accept. A certificate signed by the same
+    /// CA for anything else is still refused.
+    pub allowed_dn: String,
+    /// The address libvirtd must bind — the node's own tunnel address, and not
+    /// the machine's other interfaces, which are the operator's LAN and uplink.
+    pub listen: String,
 }
 
 #[derive(Serialize, Debug)]
@@ -647,6 +675,9 @@ impl From<crate::provisioner::NodeDataPlane> for ApiNodeDataPlane {
                 })
                 .collect(),
             tunnel: d.tunnel.into(),
+            // Filled by the handler, which is the only place that can see both
+            // the node's address and LNVPS's own credentials.
+            libvirt: None,
         }
     }
 }
@@ -656,6 +687,83 @@ impl From<crate::provisioner::NodeDataPlane> for ApiNodeDataPlane {
 /// One call rather than three, because the node applies these together or not
 /// at all: a bridge with no tunnel carries nothing, and a tunnel with no guest
 /// routes carries nothing back.
+/// What a node is told about serving libvirt, if LNVPS can drive it at all.
+///
+/// `None` when no client identity is configured: such a deployment can enrol
+/// and network nodes but not place VMs on them. Telling the node to open an
+/// unauthenticated listener instead would put hypervisor control on an address
+/// its own guests can reach.
+fn node_libvirt(
+    settings: &crate::settings::Settings,
+    listen: Option<&str>,
+) -> Option<ApiNodeLibvirt> {
+    let cfg = settings.provisioner.marketplace.as_ref()?;
+    let listen = listen?;
+    // The document carries addresses as CIDR; libvirtd binds an address.
+    let listen = listen.split('/').next()?.to_string();
+    let ca_pem = std::fs::read_to_string(&cfg.ca_cert)
+        .map_err(|e| {
+            // A missing CA is a deployment fault, not a node fault: log it and
+            // send nothing, so the node keeps its existing configuration rather
+            // than being told to trust an empty file.
+            log::error!(
+                "marketplace libvirt CA {} unreadable: {e}",
+                cfg.ca_cert.display()
+            );
+        })
+        .ok()?;
+
+    Some(ApiNodeLibvirt {
+        ca_pem,
+        allowed_dn: lnvps_api_common::node_control::LIBVIRT_CLIENT_DN.to_string(),
+        listen,
+    })
+}
+
+/// Register the certificate LNVPS should trust when driving this node's
+/// libvirtd.
+///
+/// Sent by the node once it has a tunnel address to name in the certificate.
+/// The whole certificate rather than a fingerprint, because libvirt's client
+/// verifies a chain against a CA file and a hash gives it nothing to read.
+///
+/// Rotation is the same call: a node restored from backup, or one whose tunnel
+/// address moved, regenerates its identity and presents the new certificate.
+/// Without that path it would be unreachable for good.
+async fn v1_node_libvirt_cert(
+    auth: NodeAuth,
+    State(this): State<RouterState>,
+    Json(req): Json<NodeLibvirtCertRequest>,
+) -> ApiResult<()> {
+    let cert = req.cert_pem.trim();
+    // Checked here rather than at connection time: a malformed certificate
+    // stored now is a VM that fails to provision later, at which point the
+    // failing thing is a long way from the thing that was wrong.
+    if !cert.starts_with("-----BEGIN CERTIFICATE-----")
+        || !cert.ends_with("-----END CERTIFICATE-----")
+    {
+        return Err(ApiError::bad_request(
+            "cert_pem must be a single PEM certificate",
+        ));
+    }
+
+    let updated = MarketplaceNode {
+        libvirt_cert: Some(cert.to_string()),
+        ..auth.node
+    };
+    this.db.update_marketplace_node(&updated).await?;
+
+    // Written here as well as stored, because libvirt reads its trust material
+    // from a directory rather than from us. Doing it on every registration —
+    // which is every poll — is what lets a deployment that lost that directory
+    // repair itself without anyone noticing.
+    if let Some(cfg) = this.settings.provisioner.marketplace.as_ref() {
+        lnvps_api_common::host::marketplace_pki::materialise(cfg, updated.id, cert)
+            .map_err(|e| ApiError::new(format!("Storing the node certificate failed: {e}")))?;
+    }
+    ApiData::ok(())
+}
+
 async fn v1_node_dataplane(
     auth: NodeAuth,
     State(this): State<RouterState>,
@@ -664,7 +772,19 @@ async fn v1_node_dataplane(
         .await
         .map_err(|e| ApiError::new(e.to_string()))?
         .ok_or_else(|| ApiError::not_found("This node has no tunnel allocated yet"))?;
-    ApiData::ok(plane.into())
+
+    // libvirtd binds the node's own inner address, preferring v4 only because
+    // that is what an operator reading their journal will recognise; either
+    // works, and a node with neither has no tunnel to serve on.
+    let listen = plane
+        .tunnel
+        .tunnel
+        .address4
+        .clone()
+        .or_else(|| plane.tunnel.tunnel.address6.clone());
+    let mut out: ApiNodeDataPlane = plane.into();
+    out.libvirt = node_libvirt(&this.settings, listen.as_deref());
+    ApiData::ok(out)
 }
 
 /// What a node is told about itself.

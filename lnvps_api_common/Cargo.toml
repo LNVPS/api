@@ -61,6 +61,7 @@ quick-xml = { version = "0.39", features = ["serde", "serialize"], optional = tr
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 
 [dev-dependencies]
+tempfile = "3"
 env_logger = "0.11"
 sqlx = { version = "0.8", default-features = false }
 wiremock = "0.6"

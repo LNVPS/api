@@ -1967,6 +1967,13 @@ pub struct MarketplaceNode {
     /// Unique across the fleet: two nodes presenting the same certificate would
     /// mean either can answer for the other, which is what the pin prevents.
     pub tls_fingerprint: Option<Vec<u8>>,
+    /// The PEM certificate LNVPS trusts when driving this node's libvirtd.
+    ///
+    /// The whole certificate rather than a hash, unlike `tls_fingerprint`: our
+    /// own HTTP client can compare a hash of what it was shown, but libvirt's
+    /// client verifies a chain against a CA file, and a hash gives it nothing to
+    /// read. `None` until the node has a tunnel address to name in it.
+    pub libvirt_cert: Option<String>,
     /// The node's data plane, once assigned. `None` until then; a tunnel backs
     /// exactly one node.
     pub tunnel_id: Option<u64>,

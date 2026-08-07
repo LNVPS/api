@@ -66,6 +66,24 @@ pub struct DesiredDataPlane {
     pub gateways: Vec<String>,
     #[serde(default)]
     pub guests: Vec<DesiredGuest>,
+    /// How to serve libvirt to LNVPS. Absent when LNVPS has no client identity
+    /// configured, which is a deployment that networks nodes but places no VMs
+    /// on them — so the node leaves libvirt alone rather than opening a
+    /// listener nobody can authenticate to.
+    #[serde(default)]
+    pub libvirt: Option<DesiredLibvirt>,
+}
+
+/// What the node's libvirtd should be, as LNVPS states it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DesiredLibvirt {
+    /// PEM of the CA that signed LNVPS's client certificate.
+    pub ca_pem: String,
+    /// The only client DN allowed to connect.
+    pub allowed_dn: String,
+    /// The address libvirtd binds: this node's own tunnel address, never the
+    /// machine's other interfaces.
+    pub listen: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]

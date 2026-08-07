@@ -20,6 +20,7 @@ pub mod cloud_init;
 pub mod config;
 #[cfg(feature = "libvirt")]
 mod libvirt;
+pub mod marketplace_pki;
 #[cfg(feature = "proxmox")]
 mod proxmox;
 #[cfg(feature = "proxmox")]
@@ -209,6 +210,31 @@ pub fn get_host_client(
         VmHostKind::LibVirt if cfg.libvirt.is_some() => {
             let cfg = cfg.libvirt.clone().unwrap();
             Arc::new(libvirt::LibVirtHost::new(&host.ip, cfg)?)
+        }
+        // A marketplace node is just another libvirt host: same client, same
+        // flows, reached over the tunnel instead of the LAN. What differs is
+        // trust — each node is verified against the certificate it registered,
+        // so nothing else answering on its tunnel address can report that a
+        // customer's VM is fine.
+        #[cfg(feature = "libvirt")]
+        VmHostKind::MarketplaceNode if cfg.libvirt.is_some() && cfg.marketplace.is_some() => {
+            let libvirt = cfg.libvirt.clone().unwrap();
+            let marketplace = cfg.marketplace.clone().unwrap();
+            let node_id = host
+                .marketplace_node_id
+                .ok_or_else(|| anyhow::anyhow!("Host {} is not backed by a node", host.id))?;
+            let pki = marketplace_pki::node_pki_path(&marketplace, node_id);
+            // Written when the node presents its certificate. Absent means it
+            // never has, and connecting without it would mean not checking
+            // which machine answered.
+            if !pki.join("cacert.pem").exists() {
+                bail!(
+                    "Node {node_id} has not registered a libvirt certificate; \
+                     it cannot be verified and will not be dialled"
+                );
+            }
+            let uri = marketplace_pki::connection_uri(&host.ip, &pki);
+            Arc::new(libvirt::LibVirtHost::new(&uri, libvirt)?)
         }
         VmHostKind::Dummy => {
             if cfg!(test) {
