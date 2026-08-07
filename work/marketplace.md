@@ -937,13 +937,52 @@ unreachable" for every node in the pool.
 - `lnvps-node dataplane show|apply` so an operator can see and re-drive it without the daemon.
 - `/api/v1/status` reports the observed data plane, which 4c3's gate reads as its first check.
 
-#### 4c2 — Anti-spoof + anti-LAN firewall (M/L)  ⬅ NEXT
-- One ruleset the daemon owns wholesale, in `nft` where available and `iptables` where not,
-  with the backend detected once and reported in status.
-- Guests may not reach the operator's own LAN or the node's management addresses; may not
-  source traffic as an address LNVPS did not assign them; MSS clamped to the tunnel's MTU.
-- The guest address set comes from 4c1's document, so the boundary is LNVPS's list, not
-  something the node infers.
+#### 4c2 — Anti-spoof + guest isolation (M/L)  ✅
+Re-scoped after 4c1: the namespace already did the anti-LAN half. There is no path from
+`br-lnvps` to the operator's network to block, so the rules that remain are the ones no
+topology can enforce.
+
+- **Anti-spoof, bound to the MAC where there is one.** A guest may source only the addresses
+  LNVPS assigned it. The route server's `AllowedIPs` stops node A pretending to be node B; this
+  stops guest A pretending to be guest B *on the same node*, which `AllowedIPs` cannot see
+  because both addresses legitimately belong to that node's peer.
+- **Guests may not reach each other at L2.** They share one bridge, and with proxy ARP they
+  believe every address is on-link, so without this a tenant can ARP-poison, ND-poison or
+  DHCP-spoof their neighbours — attacks that never reach the IP layer where the rest of the
+  ruleset lives. Dropping the bridge's forward hook leaves guest-to-guest traffic to be
+  *routed* by the node, which is exactly where it can be filtered. It is also what they would
+  get if the two guests were on different nodes, so it is the consistent answer, not a
+  restriction.
+- **MSS clamped to the path MTU** on forwarded SYNs, so a guest that ignores path MTU discovery
+  gets a connection that works rather than one that opens and hangs.
+- **The ruleset is owned wholesale and replaced atomically.** The daemon does not add rules to
+  the operator's chains: it renders a complete table and swaps it in one transaction, so there
+  is no window in which a guest is unfiltered and no way for a half-applied set to persist.
+- **`nft` where available, `iptables` where not**, detected at runtime and reported in status —
+  the whole point of the marketplace is hardware LNVPS did not choose.
+- The guest list comes from 4c1's document, so the boundary is LNVPS's, not something the node
+  infers from what it happens to see on the bridge.
+
+Deferred to increment 5, where the daemon starts creating taps: per-port `isolated` flags and
+per-tap filtering. Binding an address to a *port* is stronger than binding it to a MAC, which a
+guest chooses. Until the daemon owns the ports it cannot do this, and MAC binding plus L2
+isolation is what is available in the meantime.
+
+Built as `lnvps_node/src/fw.rs`, and two decisions are worth recording:
+
+- **The machine states which ruleset it is running, and the daemon believes it.** The tag is
+  rendered into a rule comment and read back out of `nft list` / `iptables-save`, so an
+  operator who flushes the table by hand gets it rebuilt on the next refresh. A daemon that
+  remembered what it last applied would go on reporting a filter that no longer existed —
+  which is the failure this whole increment exists to prevent, arrived at from the other side.
+- **Nothing is reloaded when nothing has changed.** Reloading would be harmless, since every
+  backend swaps atomically, but a daemon that reported a change on every poll produces a log
+  in which nothing can be noticed.
+
+The end-to-end harness proves the drop rather than the ping: a spoofed packet fails to get a
+reply anyway for want of a return route, so a failed ping proves nothing. What proves it is the
+drop counter moving — the packet stopped on the node, before the tunnel, LNVPS's network, or an
+upstream that would attribute it to the operator.
 
 #### 4c3 — Health gate (M/L)
 - A probe guest is provisioned through the ordinary path onto the new node, given a real

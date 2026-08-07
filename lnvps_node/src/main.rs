@@ -119,7 +119,11 @@ async fn dataplane(config_path: &Path, action: DataplaneAction) -> Result<()> {
     // have?" is the question an operator asks when something is wrong, and it
     // must not fail because the token is missing or LNVPS is unreachable.
     if let DataplaneAction::Observe = action {
-        let state = lnvps_node::net::observe(&lnvps_node::net::Kernel::new()?).await?;
+        let state = lnvps_node::net::observe(
+            &lnvps_node::net::Kernel::new()?,
+            &lnvps_node::fw::SystemFirewall::new(lnvps_node::netns::ensure_default()?),
+        )
+        .await?;
         println!("{}", serde_json::to_string_pretty(&state)?);
         return Ok(());
     }
@@ -141,7 +145,8 @@ async fn dataplane(config_path: &Path, action: DataplaneAction) -> Result<()> {
         DataplaneAction::Show => println!("{}", serde_json::to_string_pretty(&desired)?),
         DataplaneAction::Apply => {
             let kernel = lnvps_node::net::Kernel::new()?;
-            let applied = lnvps_node::net::apply(&kernel, &desired, &key).await?;
+            let fw = lnvps_node::fw::SystemFirewall::new(lnvps_node::netns::ensure_default()?);
+            let applied = lnvps_node::net::apply(&kernel, &fw, &desired, &key).await?;
             for line in applied {
                 println!("{line}");
             }
@@ -173,7 +178,10 @@ async fn run(config_path: &Path) -> Result<()> {
     // control API binds the tunnel interface, and on a fresh machine the tunnel
     // does not exist until now.
     let kernel = Arc::new(lnvps_node::net::Kernel::new()?);
-    if let Err(e) = apply_dataplane(&config, kernel.as_ref()).await {
+    let fw = Arc::new(lnvps_node::fw::SystemFirewall::new(
+        lnvps_node::netns::ensure_default()?,
+    ));
+    if let Err(e) = apply_dataplane(&config, kernel.as_ref(), fw.as_ref()).await {
         // Not fatal. A node whose tunnel is already up from a previous run must
         // keep serving through an LNVPS outage — refusing to start would turn
         // an API blip into every node on the platform going dark.
@@ -209,11 +217,14 @@ async fn run(config_path: &Path) -> Result<()> {
     // startup would route a departed customer's address until it was restarted.
     let refresh = config.clone();
     let refresh_kernel = kernel.clone();
+    let refresh_fw = fw.clone();
     tokio::spawn(async move {
         let interval = Duration::from_secs(refresh.heartbeat_secs.max(10));
         loop {
             tokio::time::sleep(interval).await;
-            if let Err(e) = apply_dataplane(&refresh, refresh_kernel.as_ref()).await {
+            if let Err(e) =
+                apply_dataplane(&refresh, refresh_kernel.as_ref(), refresh_fw.as_ref()).await
+            {
                 log::warn!("Data plane refresh failed: {e}");
             }
         }
@@ -228,7 +239,7 @@ async fn run(config_path: &Path) -> Result<()> {
     })?;
 
     control::serve_on(
-        Arc::new(ControlState::new(control_pubkey, addr, kernel)),
+        Arc::new(ControlState::new(control_pubkey, addr, kernel, fw)),
         listener,
         tls,
     )
@@ -236,7 +247,11 @@ async fn run(config_path: &Path) -> Result<()> {
 }
 
 /// Fetch the data plane and apply it.
-async fn apply_dataplane(config: &NodeConfig, kernel: &dyn lnvps_node::net::NetOps) -> Result<()> {
+async fn apply_dataplane(
+    config: &NodeConfig,
+    kernel: &dyn lnvps_node::net::NetOps,
+    fw: &dyn lnvps_node::fw::FirewallOps,
+) -> Result<()> {
     let credential = Credential::load_checked(&config.credential)?;
     let api = lnvps_node::api::LnvpsApi::new(&config.api_url, &credential)?;
 
@@ -250,7 +265,7 @@ async fn apply_dataplane(config: &NodeConfig, kernel: &dyn lnvps_node::net::NetO
     api.request_tunnel(&key.public_bytes()).await?;
     let desired = api.dataplane().await?;
 
-    let applied = lnvps_node::net::apply(kernel, &desired, &key).await?;
+    let applied = lnvps_node::net::apply(kernel, fw, &desired, &key).await?;
     if !applied.is_empty() {
         log::debug!("Applied data plane: {}", applied.join("; "));
     }

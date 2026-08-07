@@ -359,7 +359,13 @@ that proves a packet moves. This harness caught four things nothing else did:
   in the pool. Not visible in any unit test, because the code did exactly what it
   was written to do.
 
+The same harness covers the packet filter (`lnvps_node::fw`): a guest is given a second address
+nobody assigned it — which any customer with root in their own VM can do — and the node's spoof
+counter is asserted to move. The counter, not the ping's exit status: a spoofed packet gets no
+reply in any case, for want of a return route.
+
 Coverage note: the netlink implementation (`lnvps_node::net::kernel`) and
-`lnvps_node::netns` are exercised here rather than by the normal test run, the
+`lnvps_node::netns`, along with `lnvps_node::fw`'s `SystemFirewall`, are exercised here rather
+than by the normal test run, the
 same way `lnvps_fw`'s datapath is covered by its netns harness. Measure them
 with `sudo -E cargo llvm-cov -p lnvps_node -- --include-ignored`.

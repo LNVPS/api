@@ -40,6 +40,11 @@ const RS_INNER: &str = "10.66.0.1/24";
 const NODE_INNER: &str = "10.66.0.2/32";
 /// A customer address, as LNVPS assigns it to a guest on this node.
 const GUEST_ADDRESS: &str = "203.0.113.5";
+/// The guest's MAC, which the filter binds its address to. LNVPS knows it
+/// because LNVPS assigned it when the VM was created.
+const GUEST_MAC: &str = "52:54:00:e2:e0:05";
+/// An address nobody assigned this guest, used to prove the filter drops it.
+const SPOOFED_ADDRESS: &str = "203.0.113.99";
 const GUEST_GATEWAY: &str = "203.0.113.1";
 
 /// Namespaces, torn down on drop even when a test panics.
@@ -262,10 +267,11 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
         guests: vec![DesiredGuest {
             address: format!("{GUEST_ADDRESS}/32"),
             gateway: GUEST_GATEWAY.to_string(),
-            mac: None,
+            mac: Some(GUEST_MAC.to_string()),
         }],
     };
-    lnvps_node::net::apply(&kernel, &desired, &node_key).await?;
+    let firewall = lnvps_node::fw::SystemFirewall::new(topology.open_dataplane()?);
+    lnvps_node::net::apply(&kernel, &firewall, &desired, &node_key).await?;
 
     // ---- a guest on the node's bridge, addressed as a customer's VM is
     run(
@@ -291,11 +297,23 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
         "ip",
         &["link", "set", "e2e-guest", "netns", &topology.guest],
     )?;
+    topology.in_guest(&["ip", "link", "set", "e2e-guest", "address", GUEST_MAC])?;
     topology.in_guest(&[
         "ip",
         "addr",
         "add",
         &format!("{GUEST_ADDRESS}/24"),
+        "dev",
+        "e2e-guest",
+    ])?;
+    // A second address the guest simply gave itself. Nothing stops a customer
+    // doing this — root in their own VM is the whole product — so the filter is
+    // what has to stop the packets.
+    topology.in_guest(&[
+        "ip",
+        "addr",
+        "add",
+        &format!("{SPOOFED_ADDRESS}/24"),
         "dev",
         "e2e-guest",
     ])?;
@@ -328,7 +346,7 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
 
     // The node reports itself healthy only once that has happened: WireGuard comes
     // up perfectly happily with a peer that never answers.
-    let state = lnvps_node::net::observe(&kernel).await?;
+    let state = lnvps_node::net::observe(&kernel, &firewall).await?;
     assert!(state.tunnel_up, "{state:?}");
     assert!(state.bridge_up, "{state:?}");
     assert!(
@@ -336,6 +354,61 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
         "a tunnel that carried packets reported no handshake: {state:?}"
     );
     assert!(state.healthy(), "{state:?}");
+
+    // ---- and what the filter is for
+    //
+    // The guest's own address reaches the route server; the address it made up
+    // does not. This is the check the route server's AllowedIPs cannot make:
+    // both addresses are inside the node's peer, so from the far end a guest
+    // stealing its neighbour's address is indistinguishable from the real
+    // thing.
+    let rs_inner = "10.66.0.1";
+    topology
+        .in_guest(&["ping", "-c", "2", "-W", "5", "-I", GUEST_ADDRESS, rs_inner])
+        .context("a guest could not reach the route server from its own address")?;
+    assert!(
+        topology
+            .in_guest(&[
+                "ping",
+                "-c",
+                "2",
+                "-W",
+                "3",
+                "-I",
+                SPOOFED_ADDRESS,
+                rs_inner
+            ])
+            .is_err(),
+        "a guest reached the network sourcing an address LNVPS never assigned it:\n{}",
+        topology
+            .in_dataplane(&["nft", "list", "table", "inet", "lnvps"])
+            .unwrap_or_default()
+    );
+
+    // ...and the filter says which ruleset it is enforcing, read back off the
+    // kernel rather than remembered by the daemon.
+    let firewall_state = lnvps_node::fw::observe(&firewall).await;
+    assert_eq!(firewall_state.backend, Some(lnvps_node::fw::Backend::Nft));
+    assert!(firewall_state.present, "{firewall_state:?}");
+    assert!(
+        firewall_state.isolated,
+        "guests were not isolated from each other at layer 2: {firewall_state:?}"
+    );
+    assert_eq!(
+        firewall_state.ruleset,
+        Some(lnvps_node::fw::fingerprint(
+            &lnvps_node::fw::Policy::from_desired(&desired)?
+        )),
+        "the machine is enforcing a different ruleset from the one applied"
+    );
+
+    // A second apply changes nothing: this runs every few seconds forever, and
+    // a node that reported a change on every poll would make the log useless.
+    let again = lnvps_node::net::apply(&kernel, &firewall, &desired, &node_key).await?;
+    assert!(
+        !again.iter().any(|c| c.contains("nft")),
+        "the filter was reloaded when nothing had changed: {again:?}"
+    );
     Ok(())
 }
 
@@ -361,8 +434,10 @@ async fn the_operators_machine_keeps_its_own_network() -> Result<()> {
     run("ip", &["link", "add", "wg0", "type", "wireguard"])?;
 
     let kernel = lnvps_node::net::Kernel::in_namespace(topology.open_dataplane()?)?;
+    let firewall = lnvps_node::fw::SystemFirewall::new(topology.open_dataplane()?);
     lnvps_node::net::apply(
         &kernel,
+        &firewall,
         &DesiredDataPlane {
             tunnel: DesiredTunnel {
                 address4: Some(NODE_INNER.to_string()),

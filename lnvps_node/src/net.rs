@@ -165,6 +165,9 @@ pub struct DataPlaneState {
     pub forwarding6: bool,
     /// Guest addresses actually routed to the bridge.
     pub routed_guests: usize,
+    /// The packet filter around those guests.
+    #[serde(default)]
+    pub firewall: crate::fw::FirewallState,
 }
 
 impl DataPlaneState {
@@ -173,8 +176,17 @@ impl DataPlaneState {
     /// A handshake is required, not just an interface: WireGuard comes up happily
     /// with a peer that never answers, and a node in that state looks
     /// configured while being unreachable.
+    ///
+    /// The filter is required for a different reason: a node that forwards
+    /// without one is a node where any guest can source any address and reach
+    /// any neighbour. That is worse than a node that carries nobody, so it is
+    /// counted as unhealthy rather than as a warning.
     pub fn healthy(&self) -> bool {
-        self.tunnel_up && self.last_handshake_secs.is_some() && self.bridge_up && self.forwarding4
+        self.tunnel_up
+            && self.last_handshake_secs.is_some()
+            && self.bridge_up
+            && self.forwarding4
+            && self.firewall.present
     }
 }
 
@@ -186,12 +198,18 @@ impl DataPlaneState {
 /// the first.
 pub async fn apply(
     ops: &dyn NetOps,
+    fw: &dyn crate::fw::FirewallOps,
     desired: &DesiredDataPlane,
     key: &NodeKey,
 ) -> Result<Vec<String>> {
     let mut changed = Vec::new();
     apply_tunnel(ops, desired, key, &mut changed).await?;
     apply_bridge(ops, desired, &mut changed).await?;
+
+    // The filter before forwarding, every time. Between the two the machine
+    // routes guest traffic with nothing checking it, and on a refresh that adds
+    // a guest that window is exactly when the new guest starts sending.
+    changed.extend(crate::fw::apply(fw, &crate::fw::Policy::from_desired(desired)?).await?);
     apply_forwarding(ops, &mut changed).await?;
     Ok(changed)
 }
@@ -425,7 +443,7 @@ fn is_link_local(address: &IpNetwork) -> bool {
 }
 
 /// Read back what the machine actually has.
-pub async fn observe(ops: &dyn NetOps) -> Result<DataPlaneState> {
+pub async fn observe(ops: &dyn NetOps, fw: &dyn crate::fw::FirewallOps) -> Result<DataPlaneState> {
     let (tunnel_up, tunnel_mtu) = ops.link_state(TUNNEL_INTERFACE).await?;
     let (bridge_up, _) = ops.link_state(GUEST_BRIDGE).await?;
     let last_handshake_secs = ops
@@ -440,6 +458,7 @@ pub async fn observe(ops: &dyn NetOps) -> Result<DataPlaneState> {
         forwarding4: enabled(ops, "net/ipv4/ip_forward").await?,
         forwarding6: enabled(ops, "net/ipv6/conf/all/forwarding").await?,
         routed_guests: ops.routes(GUEST_BRIDGE).await?.len(),
+        firewall: crate::fw::observe(fw).await,
     })
 }
 
