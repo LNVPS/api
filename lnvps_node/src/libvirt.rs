@@ -69,6 +69,21 @@ const PRIVATE_DIRS: [(&str, &str); 4] = [
     ("cache", "/var/cache/libvirt"),
 ];
 
+/// The storage pool LNVPS builds VMs in.
+///
+/// Named, not configured. LNVPS's client asks for a pool by name and the node
+/// has to have one by that name; a setting here would be a setting an operator
+/// could change into a node that silently refuses every VM.
+pub const POOL: &str = "default";
+
+/// Where that pool's volumes live, relative to the instance's root.
+///
+/// A plain directory, which an operator who wants their VMs on other storage can
+/// bind-mount or symlink to it. That keeps the arrangement one libvirt
+/// understands without LNVPS having to describe every storage layout an operator
+/// might have.
+const POOL_DIR: &str = "images";
+
 /// Where the instance's TLS material lives, relative to its root.
 const PKI_DIR: &str = "pki";
 const SERVER_CERT: &str = "server-cert.pem";
@@ -167,6 +182,23 @@ impl Paths {
     /// This node's own CA, registered with LNVPS.
     fn node_ca(&self) -> PathBuf {
         self.pki().join(NODE_CA)
+    }
+
+    /// Where the pool's volumes are written.
+    fn pool_dir(&self) -> PathBuf {
+        self.root.join(POOL_DIR)
+    }
+
+    /// libvirt's own config for the pool, inside this instance's `/etc/libvirt`.
+    fn pool_xml(&self) -> PathBuf {
+        self.root.join("etc/storage").join(format!("{POOL}.xml"))
+    }
+
+    /// The marker that makes libvirtd start the pool with itself.
+    fn pool_autostart(&self) -> PathBuf {
+        self.root
+            .join("etc/storage/autostart")
+            .join(format!("{POOL}.xml"))
     }
 
     fn unit(&self) -> PathBuf {
@@ -363,6 +395,27 @@ stdio_handler = "file"
     .to_string()
 }
 
+/// The storage pool's definition.
+///
+/// Written as a file rather than defined through libvirt's API, because
+/// libvirtd reads `/etc/libvirt/storage` at startup and this instance's copy of
+/// that directory is ours. The node therefore needs no libvirt client at all:
+/// the daemon stays a thing that writes configuration files, which is the whole
+/// reason it can be small enough to audit.
+pub fn render_pool_xml(paths: &Paths) -> String {
+    format!(
+        r#"<!-- Managed by lnvps-node. Local edits are overwritten. -->
+<pool type='dir'>
+  <name>{POOL}</name>
+  <target>
+    <path>{path}</path>
+  </target>
+</pool>
+"#,
+        path = paths.pool_dir().display(),
+    )
+}
+
 /// The systemd unit.
 ///
 /// The two namespace lines are the feature: the network one puts guest taps on
@@ -440,6 +493,23 @@ pub fn apply(paths: &Paths, params: &Params, identity: &Identity) -> Result<bool
     )?;
     changed |= write_if_changed(&paths.root.join(QEMU_CONF), render_qemu_conf().as_bytes())?;
     changed |= write_if_changed(&paths.unit(), render_unit(paths).as_bytes())?;
+
+    // The pool LNVPS builds VMs in. Without it every create fails with "storage
+    // pool not found": this instance's /etc/libvirt is its own and starts empty,
+    // so the pools on the operator's machine are not visible here — which is the
+    // isolation working, not a problem to route around.
+    fs::create_dir_all(paths.pool_dir()).context("libvirt pool directory")?;
+    fs::create_dir_all(paths.root.join("etc/storage/autostart"))
+        .context("libvirt storage config")?;
+    changed |= write_if_changed(&paths.pool_xml(), render_pool_xml(paths).as_bytes())?;
+    // Autostart is a symlink into the definitions directory, which is how
+    // libvirt itself records it — a copy would be a second definition to drift.
+    if !paths.pool_autostart().exists() {
+        std::os::unix::fs::symlink(paths.pool_xml(), paths.pool_autostart())
+            .context("marking the pool for autostart")?;
+        changed = true;
+    }
+
     Ok(changed)
 }
 

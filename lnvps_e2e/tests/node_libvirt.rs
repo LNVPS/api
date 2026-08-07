@@ -134,6 +134,35 @@ async fn lnvps_drives_a_nodes_libvirt_over_the_tunnel() -> Result<()> {
         "a certificate LNVPS never issued was accepted"
     );
 
+    // The pool LNVPS builds VMs in exists and is running. Without it every
+    // create fails with "storage pool not found", and this instance's
+    // /etc/libvirt starts empty — the operator's pools are deliberately not
+    // visible here.
+    let pools = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            &stack.names.rs_ns,
+            "virsh",
+            "-c",
+            &uri,
+            "pool-list",
+            "--all",
+        ])
+        .output()
+        .context("listing the node's storage pools")?;
+    let pools = String::from_utf8_lossy(&pools.stdout);
+    assert!(
+        pools.contains(lnvps_node::libvirt::POOL),
+        "the node has no storage pool to build VMs in:\n{pools}"
+    );
+    assert!(
+        pools
+            .lines()
+            .any(|l| l.contains(lnvps_node::libvirt::POOL) && l.contains("active")),
+        "the pool exists but is not running:\n{pools}"
+    );
+
     // 4: the operator's own libvirtd is still theirs.
     let machine = run("systemctl", &["is-active", "libvirtd"]).unwrap_or_default();
     assert!(

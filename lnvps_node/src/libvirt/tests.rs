@@ -323,3 +323,42 @@ fn the_reported_state_carries_the_certificate() {
     let json = serde_json::to_string(&state).unwrap();
     assert_eq!(serde_json::from_str::<LibvirtState>(&json).unwrap(), state);
 }
+
+/// The instance defines the storage pool LNVPS builds VMs in. Its /etc/libvirt
+/// is its own and starts empty, so the operator's pools are not visible here —
+/// that is the isolation working, and without a pool of our own every VM
+/// creation fails with "storage pool not found".
+#[test]
+fn the_instance_defines_the_pool_lnvps_builds_in() {
+    let dir = TempDir::new().unwrap();
+    let p = paths(&dir);
+    let id = generate_identity(params().listen).unwrap();
+    apply(&p, &params(), &id).unwrap();
+
+    let xml = fs::read_to_string(p.pool_xml()).unwrap();
+    assert!(xml.contains(&format!("<name>{POOL}</name>")), "{xml}");
+    assert!(
+        xml.contains(&p.pool_dir().display().to_string()),
+        "the pool must point at a directory that exists\n{xml}"
+    );
+    assert!(
+        p.pool_dir().is_dir(),
+        "libvirt will not start a pool with no target"
+    );
+}
+
+/// The pool starts with libvirtd. A pool that has to be started by hand is a
+/// node that works until it reboots, which is the worst kind of node to own.
+#[test]
+fn the_pool_starts_with_the_daemon() {
+    let dir = TempDir::new().unwrap();
+    let p = paths(&dir);
+    let id = generate_identity(params().listen).unwrap();
+    apply(&p, &params(), &id).unwrap();
+
+    let link = p.pool_autostart();
+    assert!(link.exists(), "the pool is not marked for autostart");
+    // A symlink into the definitions directory, which is how libvirt records
+    // this itself; a copy would be a second definition free to drift.
+    assert_eq!(fs::read_link(&link).unwrap(), p.pool_xml());
+}
