@@ -22,10 +22,10 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use nostr::PublicKey;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::control_auth::{self, ReplayGuard};
 use crate::tls::NodeTls;
@@ -62,6 +62,14 @@ pub struct ControlState {
     pub net: Arc<dyn crate::net::NetOps>,
     /// How the node reads its packet filter back, for the same reason.
     pub fw: Arc<dyn crate::fw::FirewallOps>,
+    /// How the node re-applies its data plane when LNVPS asks it to.
+    ///
+    /// Optional because the control API is constructed before the daemon has a
+    /// credential to fetch with, and because `dataplane observe` serves without
+    /// one at all. A node that cannot refresh says so rather than pretending it
+    /// did — LNVPS would otherwise conclude the node had applied a document it
+    /// never fetched.
+    pub refresh: Option<Arc<dyn Refresh>>,
 }
 
 impl ControlState {
@@ -78,7 +86,14 @@ impl ControlState {
             base_url: format!("https://{addr}"),
             net,
             fw,
+            refresh: None,
         }
+    }
+
+    /// Let LNVPS ask this node to re-apply its data plane.
+    pub fn with_refresh(mut self, refresh: Arc<dyn Refresh>) -> Self {
+        self.refresh = Some(refresh);
+        self
     }
 
     /// The data plane as this machine actually has it.
@@ -103,10 +118,23 @@ pub struct NodeStatus {
     pub dataplane: crate::net::DataPlaneState,
 }
 
+/// Re-fetching and applying the data plane on demand.
+///
+/// A trait rather than the daemon's own function, because the control API is
+/// built long before the credential and the outbound client are — and because a
+/// test needs to know that a refresh was asked for without one being performed.
+#[async_trait::async_trait]
+pub trait Refresh: Send + Sync {
+    /// Fetch the current document from LNVPS and apply it, returning what
+    /// changed.
+    async fn refresh(&self) -> Result<Vec<String>>;
+}
+
 /// The control router, with authentication layered over everything.
 pub fn router(state: Arc<ControlState>) -> Router {
     Router::new()
         .route("/api/v1/status", get(get_status))
+        .route("/api/v1/dataplane/refresh", post(refresh_dataplane))
         // Order matters: the body limit is outermost so an oversized body is
         // rejected before authentication reads it into memory.
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
@@ -236,6 +264,40 @@ async fn get_status(State(state): State<Arc<ControlState>>) -> Json<NodeStatus> 
         // configured, which is a truthful answer and one the gate can act on.
         dataplane: state.observe().await,
     })
+}
+
+/// What a refresh changed.
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq)]
+pub struct RefreshResult {
+    /// The applied changes, in the daemon's own words. Empty means the node was
+    /// already right, which is the normal answer on every refresh after the
+    /// first — and, for the health gate, the answer that says the probe address
+    /// was already in place.
+    pub changed: Vec<String>,
+}
+
+/// Re-fetch the data plane from LNVPS and apply it now.
+///
+/// Exists so LNVPS does not have to wait out a heartbeat to see a change it
+/// just made take effect. Nothing here is trusted from the request: the node
+/// fetches the document itself, from LNVPS, with its own credential — this only
+/// says *when*.
+async fn refresh_dataplane(
+    State(state): State<Arc<ControlState>>,
+) -> Result<Json<RefreshResult>, (StatusCode, String)> {
+    let Some(refresh) = state.refresh.clone() else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "This node cannot refresh on demand; it has no credential to fetch with".to_string(),
+        ));
+    };
+    match refresh.refresh().await {
+        Ok(changed) => Ok(Json(RefreshResult { changed })),
+        // The daemon's own message, because every cause needs a different
+        // person: an expired credential is the operator's, an unreachable LNVPS
+        // is ours, and a netlink error is neither.
+        Err(e) => Err((StatusCode::BAD_GATEWAY, format!("{e:#}"))),
+    }
 }
 
 #[cfg(test)]

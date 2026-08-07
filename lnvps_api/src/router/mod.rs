@@ -212,6 +212,22 @@ pub trait TunnelRouter: Send + Sync {
         let _ = (interface, prefixes);
         op_fatal!("This router backend cannot manage tunnel routes")
     }
+
+    /// Whether the route server can reach `address`.
+    ///
+    /// Asked *from the route server* rather than from LNVPS, because that is
+    /// where a customer's packet comes from: the address is statically routed
+    /// from the core network to this machine, and it is this machine's routing
+    /// table, this machine's `AllowedIPs` and this tunnel that decide whether
+    /// it arrives. A ping from anywhere else would prove a path nobody uses.
+    ///
+    /// `false` for unreachable, `Err` only when the question could not be
+    /// asked — the health gate has to tell "this node is broken" from "the
+    /// route server is broken", and they need different people.
+    async fn probe_address(&self, address: &str) -> OpResult<bool> {
+        let _ = address;
+        op_fatal!("This router backend cannot probe an address")
+    }
 }
 
 /// The kind of a tunnel interface
@@ -464,6 +480,39 @@ mod tests {
             enabled: false,
             config: TunnelConfig::Gre(GreConfig { key: Some(7) }),
         }
+    }
+
+    /// A backend that cannot probe says so rather than answering "no". A
+    /// silent `false` would fail every node behind a Mikrotik route server and
+    /// blame the nodes for it.
+    #[tokio::test]
+    async fn a_backend_that_cannot_probe_refuses() {
+        struct NoProbe;
+
+        #[async_trait::async_trait]
+        impl TunnelRouter for NoProbe {
+            async fn list_tunnels(&self) -> OpResult<Vec<Tunnel>> {
+                Ok(vec![])
+            }
+            async fn add_tunnel(&self, t: &Tunnel) -> OpResult<Tunnel> {
+                Ok(t.clone())
+            }
+            async fn remove_tunnel(&self, _id: &str) -> OpResult<()> {
+                Ok(())
+            }
+            async fn update_tunnel(&self, t: &Tunnel) -> OpResult<Tunnel> {
+                Ok(t.clone())
+            }
+            async fn set_tunnel_enabled(&self, _id: &str, _enabled: bool) -> OpResult<()> {
+                Ok(())
+            }
+            async fn tunnel_traffic(&self) -> OpResult<Vec<TunnelTraffic>> {
+                Ok(vec![])
+            }
+        }
+
+        let err = NoProbe.probe_address("203.0.113.9").await.unwrap_err();
+        assert!(err.to_string().contains("cannot probe"), "{err}");
     }
 
     #[tokio::test]

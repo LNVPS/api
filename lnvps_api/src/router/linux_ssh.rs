@@ -21,6 +21,11 @@ use crate::ssh_client::SshClient;
 /// Connection details are encoded in the router config:
 /// - `url`: `ssh://<user>@<host>[:<port>]/<interface>` (port defaults to 22)
 /// - `token`: the SSH private key in PEM format
+/// What a successful probe prints.
+const PROBE_REACHED: &str = "lnvps-probe-reached";
+/// ...and what an unsuccessful one prints, so a silent command is neither.
+const PROBE_UNREACHED: &str = "lnvps-probe-unreached";
+
 pub struct LinuxSshRouter {
     host: String,
     username: String,
@@ -693,6 +698,33 @@ impl TunnelRouter for LinuxSshRouter {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn probe_address(&self, address: &str) -> OpResult<bool> {
+        let parsed: std::net::IpAddr = match address.parse() {
+            Ok(ip) => ip,
+            // Not a transient failure: something upstream built a probe out of
+            // a value that is not an address, and retrying cannot fix it.
+            Err(e) => op_fatal!("{address} is not an address: {e}"),
+        };
+        // `ping` for v4 and v6 alike on any current iproute2/iputils; the flag
+        // is what selects the family, so a v6 address is never sent to a v4
+        // resolver.
+        let family = if parsed.is_ipv6() { "-6" } else { "-4" };
+        // Three attempts, two seconds each: a node that answers at all answers
+        // in milliseconds — it is one hop away — and a gate that waited longer
+        // would only be waiting on a node that is not going to answer.
+        // The verdict is echoed rather than taken from ping's exit code: to
+        // this transport a non-zero exit means "the command failed", which is
+        // the right contract for every other call and the wrong one here. "No
+        // reply" is the answer the gate asked for, not a fault, and it must
+        // stay distinguishable from a route server that cannot be reached at
+        // all — those two results need different people.
+        let command = format!(
+            "ping {family} -c 3 -W 2 -q {} >/dev/null 2>&1 && echo {PROBE_REACHED} || echo {PROBE_UNREACHED}",
+            shq(address)
+        );
+        Ok(self.exec_checked(&command).await?.contains(PROBE_REACHED))
     }
 
     async fn sync_tunnel_routes(&self, interface: &str, prefixes: &[String]) -> OpResult<()> {
@@ -1408,6 +1440,61 @@ mod tests {
         assert!(ran[2].contains("ip route replace"), "{}", ran[2]);
         assert!(ran[2].contains("203.0.113.5/32"), "{}", ran[2]);
         assert!(ran[2].contains("wgln1"), "{}", ran[2]);
+    }
+
+    /// The health gate asks the route server whether it can reach an address,
+    /// and both answers have to come back as answers. "No reply" is a verdict
+    /// about the node; a command that could not be run is a fault on the route
+    /// server, and the two need different people.
+    #[tokio::test]
+    async fn test_probe_address_reports_both_answers() {
+        // A shell that answers as the real one does: the command itself echoes
+        // the verdict, so the transport's "non-zero means failed" contract is
+        // left intact for every other call.
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = log.clone();
+        let r = LinuxSshRouter::with_exec(std::sync::Arc::new(move |cmd: &str| {
+            sink.lock().unwrap().push(cmd.to_string());
+            Ok("lnvps-probe-reached\n".to_string())
+        }));
+
+        assert!(r.probe_address("203.0.113.9").await.unwrap());
+        let ran = log.lock().unwrap().clone();
+        assert!(ran[0].contains("ping -4 -c 3"), "{}", ran[0]);
+        assert!(ran[0].contains("203.0.113.9"), "{}", ran[0]);
+
+        // A v6 address is asked about with the v6 flag, or the command resolves
+        // the wrong family and answers about nothing.
+        let log6 = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink6 = log6.clone();
+        let r6 = LinuxSshRouter::with_exec(std::sync::Arc::new(move |cmd: &str| {
+            sink6.lock().unwrap().push(cmd.to_string());
+            Ok(String::new())
+        }));
+        let _ = r6.probe_address("2001:db8::9").await;
+        assert!(log6.lock().unwrap()[0].contains("ping -6"), "{log6:?}");
+    }
+
+    /// A silent route server is not a reachable node. The verdict is echoed by
+    /// the command, so output that says nothing must not be read as success.
+    #[tokio::test]
+    async fn test_probe_address_does_not_assume_reachable() {
+        let r = LinuxSshRouter::with_exec(std::sync::Arc::new(|_cmd: &str| {
+            Ok("lnvps-probe-unreached".to_string())
+        }));
+        assert!(!r.probe_address("203.0.113.9").await.unwrap());
+
+        let quiet = LinuxSshRouter::with_exec(std::sync::Arc::new(|_cmd: &str| Ok(String::new())));
+        assert!(!quiet.probe_address("203.0.113.9").await.unwrap());
+    }
+
+    /// A value that is not an address is a fault upstream, not a node that
+    /// failed: retrying it forever would never make it an address.
+    #[tokio::test]
+    async fn test_probe_address_refuses_a_non_address() {
+        let r = LinuxSshRouter::with_exec(std::sync::Arc::new(|_cmd: &str| Ok(String::new())));
+        let err = r.probe_address("not-an-address").await.unwrap_err();
+        assert!(err.to_string().contains("not an address"), "{err}");
     }
 
     /// The link route the kernel installs for the interface's own /31 is the

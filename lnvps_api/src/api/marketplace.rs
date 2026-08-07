@@ -594,6 +594,24 @@ async fn v1_node_request_tunnel(
             auth.node.id
         );
     }
+
+    // A node with a tunnel is a node that can finally be tested end to end.
+    // Queued here rather than at approval, because at approval there was no
+    // tunnel and nothing to test — this is the first moment the gate can run,
+    // and a node whose hardware works should not wait for an admin to notice.
+    if let Err(e) = this
+        .work_sender
+        .send(WorkJob::HealthCheckNode {
+            node_id: auth.node.id,
+        })
+        .await
+    {
+        log::error!(
+            "Allocated tunnel {} for node {} but could not queue its health check: {e}",
+            allocation.tunnel.id,
+            auth.node.id
+        );
+    }
     ApiData::ok(allocation.into())
 }
 

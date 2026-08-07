@@ -135,6 +135,35 @@ pub struct NodeFirewallState {
     pub spoofed_packets: u64,
 }
 
+/// Calling a node, as the health gate needs it.
+///
+/// A trait so the gate's decisions can be tested against a node that answers in
+/// a chosen way. Every interesting case here is a node behaving badly —
+/// claiming a tunnel it does not have, refusing to apply a document, answering
+/// slowly — and none of those are states a real node can be asked to be in on
+/// demand.
+#[async_trait::async_trait]
+pub trait NodeControlApi: Send + Sync {
+    async fn status(&self, node: &MarketplaceNode, host: &VmHost) -> Result<NodeStatus>;
+    async fn refresh_dataplane(&self, node: &MarketplaceNode, host: &VmHost)
+    -> Result<Vec<String>>;
+}
+
+#[async_trait::async_trait]
+impl NodeControlApi for NodeControl {
+    async fn status(&self, node: &MarketplaceNode, host: &VmHost) -> Result<NodeStatus> {
+        NodeControl::status(self, node, host).await
+    }
+
+    async fn refresh_dataplane(
+        &self,
+        node: &MarketplaceNode,
+        host: &VmHost,
+    ) -> Result<Vec<String>> {
+        NodeControl::refresh_dataplane(self, node, host).await
+    }
+}
+
 /// Signs and sends control requests.
 ///
 /// Holds the key rather than taking it per call so that a deployment without a
@@ -171,17 +200,55 @@ impl NodeControl {
             .with_context(|| format!("Node {} returned a status this LNVPS cannot read", node.id))
     }
 
+    /// Ask a node to re-fetch and apply its data plane now.
+    ///
+    /// Nothing about the document is sent: the node fetches it itself, from
+    /// LNVPS, with its own credential. This only says *when*, so that a change
+    /// LNVPS has just made — a probe address, a new guest — does not have to
+    /// wait out the node's heartbeat before it can be tested.
+    pub async fn refresh_dataplane(
+        &self,
+        node: &MarketplaceNode,
+        host: &VmHost,
+    ) -> Result<Vec<String>> {
+        let body = self
+            .send(node, host, "POST", "/api/v1/dataplane/refresh")
+            .await?;
+        #[derive(Deserialize, Default)]
+        struct RefreshResult {
+            #[serde(default)]
+            changed: Vec<String>,
+        }
+        let result: RefreshResult = serde_json::from_str(&body).unwrap_or_default();
+        Ok(result.changed)
+    }
+
     /// `GET path` against a node, signed and pinned.
     async fn get(&self, node: &MarketplaceNode, host: &VmHost, path: &str) -> Result<String> {
+        self.send(node, host, "GET", path).await
+    }
+
+    /// One signed, pinned request.
+    async fn send(
+        &self,
+        node: &MarketplaceNode,
+        host: &VmHost,
+        method: &str,
+        path: &str,
+    ) -> Result<String> {
         let url = endpoint(host, path)?;
         let fingerprint = node.tls_fingerprint.clone().context(
             "This node has no pinned certificate, so there is no way to tell its answers \
              from anyone else's; it must re-register",
         )?;
 
-        let auth = self.authorization("GET", &url, &[])?;
-        let response = pinned_client(&fingerprint, self.timeout)?
-            .get(&url)
+        let auth = self.authorization(method, &url, &[])?;
+        let client = pinned_client(&fingerprint, self.timeout)?;
+        let request = match method {
+            "POST" => client.post(&url),
+            _ => client.get(&url),
+        };
+        let response = request
             .header("Authorization", auth)
             .send()
             .await

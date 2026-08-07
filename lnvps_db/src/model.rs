@@ -1938,6 +1938,51 @@ impl TunnelPool {
     }
 }
 
+/// How a health-gate run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, sqlx::Type)]
+#[repr(u16)]
+pub enum MarketplaceProbeStatus {
+    /// The gate is running: an address is held and nothing is decided.
+    #[default]
+    Running = 0,
+    /// A packet reached the node's bridge from the route server.
+    Passed = 1,
+    /// It did not, and `detail` says at which step.
+    Failed = 2,
+}
+
+impl Display for MarketplaceProbeStatus {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            MarketplaceProbeStatus::Running => "running",
+            MarketplaceProbeStatus::Passed => "passed",
+            MarketplaceProbeStatus::Failed => "failed",
+        })
+    }
+}
+
+/// The last health-gate run for a node.
+///
+/// Holds an address from a real customer range while it runs, so a VM cannot be
+/// given the same one, and keeps the verdict after releasing it — an operator
+/// reading why their node is disabled should not be costing them an address to
+/// do it.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct MarketplaceNodeProbe {
+    pub id: u64,
+    pub node_id: u64,
+    /// The range the held address came from, once one has been taken. `None`
+    /// for a run that failed before it got that far.
+    pub ip_range_id: Option<u64>,
+    /// The address held right now, or `None` once the run is over.
+    pub ip: Option<String>,
+    pub status: MarketplaceProbeStatus,
+    /// Which step failed, in the words an operator needs.
+    pub detail: Option<String>,
+    pub created: DateTime<Utc>,
+    pub finished: Option<DateTime<Utc>>,
+}
+
 /// A single machine offered by an operator.
 ///
 /// There is deliberately no region here: an approved node's region lives on its

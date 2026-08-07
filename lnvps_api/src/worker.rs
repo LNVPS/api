@@ -7,6 +7,7 @@ use crate::subscription::SubscriptionHandler;
 use anyhow::{Context, Result, anyhow, bail};
 use chrono::{DateTime, Days, TimeDelta, Utc};
 use hickory_resolver::TokioResolver;
+use lnvps_api_common::node_control::NodeControlApi;
 use lnvps_api_common::{
     BlackholeWorkFeedback, ChannelWorkCommander, InMemoryKeyValueStore, JobFeedback, KeyValueStore,
     NetworkProvisioner, RedisConfig, RedisKeyValueStore, RedisWorkCommander, RedisWorkFeedback,
@@ -16,9 +17,10 @@ use lnvps_api_common::{
     retry::{OpError, Pipeline, RetryPolicy},
 };
 use lnvps_db::{
-    CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, PaymentMethod, RouterTunnelTraffic,
-    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionType, Vm,
-    VmHistoryActionType, VmHost, VmHostKind, VmIpAssignment, VmOsImage,
+    CpuArch, CpuFeature, CpuMfg, IntervalType, IpRange, LNVpsDb, MarketplaceNode,
+    MarketplaceProbeStatus, PaymentMethod, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionType, Vm, VmHistoryActionType, VmHost, VmHostKind,
+    VmIpAssignment, VmOsImage,
 };
 use log::{debug, error, info, warn};
 use nostr_sdk::Client;
@@ -199,6 +201,9 @@ pub struct Worker {
     http_client: reqwest::Client,
     referral_payouts: crate::referral::ReferralPayoutHandler,
     refunds: crate::refund::VmRefundHandler,
+    /// How marketplace nodes are called. `None` in a deployment with no nostr
+    /// identity, where the health gate says so rather than failing obscurely.
+    node_control: Option<Arc<dyn lnvps_api_common::node_control::NodeControlApi>>,
 }
 
 #[derive(Clone)]
@@ -226,11 +231,15 @@ pub struct WorkerSettings {
     pub referral_min_fiat_payout_sats: Option<u64>,
     /// Source of the on-chain fee-rate estimate for the cap above.
     pub referral_fee_estimator: crate::settings::FeeEstimatorConfig,
+    /// LNVPS's nostr identity, which is also how it calls marketplace nodes.
+    /// `None` in a deployment that runs no marketplace.
+    pub nostr: Option<lnvps_api_common::node_control::NostrConfig>,
 }
 
 impl From<&Settings> for WorkerSettings {
     fn from(val: &Settings) -> Self {
         WorkerSettings {
+            nostr: val.nostr.clone(),
             delete_after: val.delete_after,
             smtp: val.smtp.clone(),
             telegram: val.telegram.clone(),
@@ -284,6 +293,14 @@ impl Worker {
             Arc::new(InMemoryKeyValueStore::new())
         };
 
+        // The marketplace control client. A key that cannot be parsed is a
+        // startup failure, not a surprise on the first node this deployment
+        // tries to gate.
+        let node_control = match &settings.nostr {
+            Some(n) => Some(n.control()?),
+            None => None,
+        };
+
         let referral_payouts = crate::referral::ReferralPayoutHandler::new(
             db.clone(),
             node.clone(),
@@ -328,6 +345,10 @@ impl Worker {
             http_client,
             referral_payouts,
             refunds,
+            // Built once, at startup, so a deployment configured with a key
+            // that cannot be parsed fails here rather than on the first node it
+            // tries to gate.
+            node_control: node_control.map(|c| Arc::new(c) as Arc<dyn NodeControlApi>),
         })
     }
 
@@ -1192,6 +1213,220 @@ impl Worker {
             .await
             .map_err(|e| anyhow!("failed to configure routes on {interface}: {}", e))?;
         Ok(())
+    }
+
+    /// Prove a node can carry a customer, and enable it if it can.
+    ///
+    /// The gate takes an address from the range customers are given, has the
+    /// node hold it as a guest, and pings it from the route server. That is the
+    /// production path exactly: a VM's address is statically routed from the
+    /// core network to the node's tunnel address, forwarded across the guest
+    /// bridge, and answered back out the node's default route. Anything less —
+    /// asking the node how it thinks it is doing, pinging its tunnel address —
+    /// tests a path no customer takes, and the failure worth catching is the
+    /// node that believes it is fine.
+    ///
+    /// Never returns `Err` for a node that fails: a failed gate is a recorded
+    /// verdict, not a job to retry forever. `Err` is reserved for not being able
+    /// to *ask* — no route server, no control key — which is LNVPS's problem
+    /// rather than the operator's.
+    pub async fn health_check_node(&self, node_id: u64) -> Result<()> {
+        let node = self.db.get_marketplace_node(node_id).await?;
+        let host = self
+            .db
+            .get_marketplace_node_host(node_id)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "Node {node_id} has no host, so it has not been approved and cannot be gated"
+                )
+            })?;
+
+        // The run is recorded before it starts, so a node refused at the first
+        // step still gets a verdict an operator can read. A gate that only
+        // wrote a row once it had taken an address would tell the operator
+        // whose node never handshook precisely nothing.
+        self.db.start_marketplace_node_probe(node_id).await?;
+        let outcome = self.run_health_check(&node, &host).await;
+
+        // The address goes back before anything else, including before the
+        // verdict is acted on. A gate that failed halfway and kept its address
+        // would leak one address per attempt out of a range customers are
+        // waiting for.
+        let (status, detail) = match &outcome {
+            Ok(()) => (MarketplaceProbeStatus::Passed, None),
+            Err(e) => (MarketplaceProbeStatus::Failed, Some(format!("{e:#}"))),
+        };
+        self.db
+            .finish_marketplace_node_probe(node_id, status, detail.as_deref())
+            .await?;
+
+        // ...and the node is told to let go of it, so it stops answering for an
+        // address that is back in the pool. Best effort: the periodic refresh
+        // does the same thing, and a node that cannot be reached to release an
+        // address is a node that just failed its gate anyway.
+        if let Some(tunnel_id) = node.tunnel_id {
+            if let Err(e) = self.sync_node_tunnel(tunnel_id).await {
+                warn!("Could not un-route the probe address for node {node_id}: {e}");
+            }
+        }
+        if let Some(control) = self.node_control() {
+            let _ = control.refresh_dataplane(&node, &host).await;
+        }
+
+        match outcome {
+            Ok(()) => {
+                // Enabling is the whole point: an admin approved the hardware,
+                // and this is the machine check that was standing between that
+                // decision and the node taking customers.
+                let mut host = host;
+                if !host.enabled {
+                    host.enabled = true;
+                    self.db.update_host(&host).await?;
+                    info!("Node {node_id} passed its health check and is now enabled");
+                }
+            }
+            Err(e) => {
+                // Left approved but unusable, with the failing step named. That
+                // is the safe direction: a node that never carries a customer is
+                // a support conversation, and a node that carries one badly is
+                // an outage.
+                warn!("Node {node_id} failed its health check: {e:#}");
+            }
+        }
+        Ok(())
+    }
+
+    /// The gate's steps, each failing with the sentence an operator needs.
+    async fn run_health_check(&self, node: &MarketplaceNode, host: &VmHost) -> Result<()> {
+        let tunnel_id = node.tunnel_id.ok_or_else(|| {
+            anyhow!("This node has no tunnel allocated, so nothing can reach it yet")
+        })?;
+        let tunnel = self.db.get_tunnel(tunnel_id).await?;
+        let pool_id = tunnel.pool_id.ok_or_else(|| {
+            anyhow!("This node's tunnel came from no pool, so it has no route server")
+        })?;
+        let pool = self.db.get_tunnel_pool(pool_id).await?;
+
+        // The node's own report first. It cannot be trusted as a pass — a node
+        // that believes it is fine is the case this whole job exists for — but
+        // as a *failure* it is exact, and it names the step before an address is
+        // taken out of a customer range to prove the same thing slowly.
+        let control = self.node_control().ok_or_else(|| {
+            anyhow!("This deployment has no nostr identity configured, so no node can be called")
+        })?;
+        let status = control
+            .status(node, host)
+            .await
+            .map_err(|e| anyhow!("The node could not be reached: {e:#}"))?;
+        if !status.dataplane.tunnel_up || status.dataplane.last_handshake_secs.is_none() {
+            bail!(
+                "The node's tunnel has never handshaken with the route server, so nothing can                  reach its guests"
+            );
+        }
+        if !status.dataplane.firewall.present {
+            bail!(
+                "The node is not filtering its guests, so any guest on it could claim another                  customer's address"
+            );
+        }
+
+        // A real address, from the range a customer would be given. The
+        // allocator excludes addresses held by other gates as well as assigned
+        // ones, so two nodes are never proved with the same address.
+        let (range, address) = self.pick_probe_address(host).await?;
+        self.db
+            .hold_marketplace_probe_address(node.id, range.id, &address.to_string())
+            .await?;
+
+        // The route server has to route it and admit it from this peer, and the
+        // node has to hold it on its bridge. Both are the ordinary guest path —
+        // the probe is in the node's guest list, so nothing here is special
+        // cased, which is what makes the result mean something.
+        self.sync_node_tunnel(tunnel_id).await.map_err(|e| {
+            anyhow!("The route server could not be configured for the probe: {e:#}")
+        })?;
+        control
+            .refresh_dataplane(node, host)
+            .await
+            .map_err(|e| anyhow!("The node would not apply its data plane: {e:#}"))?;
+
+        let router = crate::router::get_router(&self.db, pool.router_id)
+            .await
+            .map_err(|e| anyhow!("Cannot reach the route server for this node: {e}"))?;
+        let tr = router
+            .tunnel()
+            .context("This node's route server cannot be asked to probe an address")?;
+
+        if !tr
+            .probe_address(&address.to_string())
+            .await
+            .map_err(|e| anyhow!("The route server could not run the probe: {e}"))?
+        {
+            bail!(
+                "The route server could not reach {address} on this node, so a customer's VM                  would not be reachable either"
+            );
+        }
+        Ok(())
+    }
+
+    /// An address from a range in the node's region.
+    async fn pick_probe_address(&self, host: &VmHost) -> Result<(IpRange, std::net::IpAddr)> {
+        let network = NetworkProvisioner::new(self.db.clone());
+        let mut ranges: Vec<IpRange> = self
+            .db
+            .list_ip_range_in_region(host.region_id)
+            .await?
+            .into_iter()
+            .filter(|r| r.enabled)
+            .collect();
+
+        // IPv4 first. A guest's IPv6 address is normally derived from its MAC
+        // (EUI64) and a probe has no guest, so the v4 path is the one a probe
+        // can stand in for exactly. A v6-only region is still gated, from the
+        // first free address in its range — a weaker stand-in, but the
+        // alternative is not gating those nodes at all.
+        ranges.sort_by_key(|r| {
+            r.cidr
+                .parse::<ipnetwork::IpNetwork>()
+                .map(|c| c.is_ipv6())
+                .unwrap_or(true)
+        });
+
+        let mut last_error = None;
+        for range in ranges {
+            match network.pick_ip_from_range(&range).await {
+                Ok(available) => return Ok((range, available.ip.ip())),
+                // A full range is not a reason to give up: a region usually has
+                // several, and the gate only needs one address from any of them.
+                Err(e) => last_error = Some(e),
+            }
+        }
+        match last_error {
+            Some(e) => Err(anyhow!(
+                "No address could be taken from any range in this region to test the node with: {e}"
+            )),
+            None => Err(anyhow!(
+                "This node's region has no enabled IP range, so there is no address a customer                  could be given here either"
+            )),
+        }
+    }
+
+    /// The control client, when this deployment has an identity to call with.
+    fn node_control(&self) -> Option<Arc<dyn lnvps_api_common::node_control::NodeControlApi>> {
+        self.node_control.clone()
+    }
+
+    /// Point the health gate at a different node client.
+    ///
+    /// For tests: every case the gate has to get right is a node behaving
+    /// badly, and none of those are states a real node can be asked to be in.
+    #[cfg(test)]
+    pub(crate) fn with_node_control(
+        mut self,
+        control: Arc<dyn lnvps_api_common::node_control::NodeControlApi>,
+    ) -> Self {
+        self.node_control = Some(control);
+        self
     }
 
     /// Remove a tunnel interface from a router, after its pool is deleted.
@@ -2794,6 +3029,9 @@ impl Worker {
             WorkJob::SyncNodeTunnel { tunnel_id } => {
                 self.sync_node_tunnel(*tunnel_id).await?;
             }
+            WorkJob::HealthCheckNode { node_id } => {
+                self.health_check_node(*node_id).await?;
+            }
             WorkJob::DeleteVm {
                 vm_id,
                 reason,
@@ -4312,6 +4550,82 @@ mod tests {
         }
     }
 
+    /// A node that answers everything as a working node would.
+    ///
+    /// Every interesting case in the gate is a node behaving badly, and none of
+    /// those are states a real node can be asked to be in on demand.
+    struct HealthyNode {
+        status: lnvps_api_common::node_control::NodeStatus,
+        refreshed: std::sync::Mutex<usize>,
+    }
+
+    impl Default for HealthyNode {
+        fn default() -> Self {
+            use lnvps_api_common::node_control::*;
+            Self {
+                status: NodeStatus {
+                    version: "test".to_string(),
+                    dataplane: NodeDataPlaneState {
+                        tunnel_up: true,
+                        last_handshake_secs: Some(2),
+                        bridge_up: true,
+                        forwarding4: true,
+                        firewall: NodeFirewallState {
+                            available: true,
+                            present: true,
+                            isolated: true,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                },
+                refreshed: std::sync::Mutex::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl lnvps_api_common::node_control::NodeControlApi for HealthyNode {
+        async fn status(
+            &self,
+            _node: &MarketplaceNode,
+            _host: &VmHost,
+        ) -> Result<lnvps_api_common::node_control::NodeStatus> {
+            Ok(self.status.clone())
+        }
+
+        async fn refresh_dataplane(
+            &self,
+            _node: &MarketplaceNode,
+            _host: &VmHost,
+        ) -> Result<Vec<String>> {
+            *self.refreshed.lock().unwrap() += 1;
+            Ok(vec![])
+        }
+    }
+
+    /// A node that is not there, or is not the node it claims to be.
+    struct SilentNode;
+
+    #[async_trait::async_trait]
+    impl lnvps_api_common::node_control::NodeControlApi for SilentNode {
+        async fn status(
+            &self,
+            _node: &MarketplaceNode,
+            _host: &VmHost,
+        ) -> Result<lnvps_api_common::node_control::NodeStatus> {
+            bail!("certificate does not match the pin")
+        }
+
+        async fn refresh_dataplane(
+            &self,
+            _node: &MarketplaceNode,
+            _host: &VmHost,
+        ) -> Result<Vec<String>> {
+            bail!("certificate does not match the pin")
+        }
+    }
+
     async fn setup_worker(db: Arc<MockDb>) -> Result<Worker> {
         setup_worker_with_delete_after(db, 0).await
     }
@@ -5586,6 +5900,329 @@ mod tests {
         worker.remove_tunnel_interface(1, &interface).await?;
 
         mr.clear().await;
+        Ok(())
+    }
+
+    /// A node that answers, filters and carries a packet is enabled. That is
+    /// the whole gate: an admin approved hardware they cannot see, and this is
+    /// the machine check standing between that decision and customers.
+    #[tokio::test]
+    async fn test_health_check_enables_a_node_that_carries_a_packet() -> Result<()> {
+        use crate::mocks::MockRouter;
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        setup_node_tunnel(&db, pool_id).await?;
+        let mr = MockRouter::new();
+        mr.clear().await;
+
+        let dbt: Arc<dyn LNVpsDb> = db.clone();
+        let node = dbt.get_marketplace_node(1).await?;
+        let worker = setup_worker(db.clone())
+            .await?
+            .with_node_control(Arc::new(HealthyNode::default()));
+        // The interface has to exist before a peer can be pushed onto it, as it
+        // would on a route server LNVPS has already configured.
+        worker.sync_tunnel_pool(pool_id).await?;
+
+        // The route server can reach whatever the gate asks it about, which is
+        // what a working node looks like from the only place that matters.
+        mr.set_reach_all(true).await;
+        worker.health_check_node(node.id).await?;
+
+        let host = dbt.get_marketplace_node_host(node.id).await?.unwrap();
+        assert!(host.enabled, "a node that carried a packet must be enabled");
+
+        let probe = dbt.get_marketplace_node_probe(node.id).await?.unwrap();
+        assert_eq!(probe.status, MarketplaceProbeStatus::Passed);
+        assert_eq!(probe.detail, None);
+        // The address is given back. A gate that kept it would cost one address
+        // per run out of a range customers are waiting for.
+        assert_eq!(probe.ip, None);
+        assert!(probe.finished.is_some());
+        Ok(())
+    }
+
+    /// The address the route server was asked about is a real one from the
+    /// region's range, and while the gate ran it was routed to the node like
+    /// any guest — that is what makes the result mean something.
+    #[tokio::test]
+    async fn test_health_check_uses_a_real_customer_address() -> Result<()> {
+        use crate::mocks::MockRouter;
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        setup_node_tunnel(&db, pool_id).await?;
+        let mr = MockRouter::new();
+        mr.clear().await;
+
+        let dbt: Arc<dyn LNVpsDb> = db.clone();
+        let node = dbt.get_marketplace_node(1).await?;
+        let range = dbt.get_ip_range(1).await?;
+        let cidr: ipnetwork::IpNetwork = range.cidr.parse()?;
+
+        let control = Arc::new(HealthyNode::default());
+        let worker = setup_worker(db.clone())
+            .await?
+            .with_node_control(control.clone());
+        worker.sync_tunnel_pool(pool_id).await?;
+        mr.set_reach_all(true).await;
+        worker.health_check_node(node.id).await?;
+
+        let probed = mr.probed().await;
+        assert_eq!(probed.len(), 1, "{probed:?}");
+        let address: std::net::IpAddr = probed[0].parse()?;
+        assert!(
+            cidr.contains(address),
+            "{probed:?} is not from {}",
+            range.cidr
+        );
+        // Not an address a VM already has: the allocator sees held probe
+        // addresses and assigned ones alike.
+        assert_ne!(probed[0], "203.0.113.5");
+
+        // The node was told to apply the document rather than left to its
+        // heartbeat: an approval that took a minute to conclude would be a
+        // minute of an operator watching nothing happen.
+        assert!(*control.refreshed.lock().unwrap() >= 1);
+        Ok(())
+    }
+
+    /// A node the route server cannot reach is left approved and disabled, with
+    /// the failing step named. That is the safe direction: a node that never
+    /// carries a customer is a support conversation, and one that carries a
+    /// customer badly is an outage.
+    #[tokio::test]
+    async fn test_health_check_leaves_an_unreachable_node_disabled() -> Result<()> {
+        use crate::mocks::MockRouter;
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        setup_node_tunnel(&db, pool_id).await?;
+        let mr = MockRouter::new();
+        mr.clear().await;
+
+        let dbt: Arc<dyn LNVpsDb> = db.clone();
+        let node = dbt.get_marketplace_node(1).await?;
+        let worker = setup_worker(db.clone())
+            .await?
+            .with_node_control(Arc::new(HealthyNode::default()));
+        worker.sync_tunnel_pool(pool_id).await?;
+
+        // The route server reaches nothing, which is what a node with a broken
+        // bridge looks like from outside — while the node itself insists it is
+        // fine, the exact case the gate exists for.
+        worker.health_check_node(node.id).await?;
+
+        let host = dbt.get_marketplace_node_host(node.id).await?.unwrap();
+        assert!(!host.enabled);
+        let probe = dbt.get_marketplace_node_probe(node.id).await?.unwrap();
+        assert_eq!(probe.status, MarketplaceProbeStatus::Failed);
+        assert!(
+            probe
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("would not be reachable"),
+            "{probe:?}"
+        );
+        assert_eq!(probe.ip, None, "a failed gate gives its address back too");
+        Ok(())
+    }
+
+    /// A node whose tunnel has never handshaken is refused before an address is
+    /// taken out of a customer range to prove the same thing slowly.
+    #[tokio::test]
+    async fn test_health_check_refuses_a_node_with_no_handshake() -> Result<()> {
+        use crate::mocks::MockRouter;
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        setup_node_tunnel(&db, pool_id).await?;
+        MockRouter::new().clear().await;
+
+        let dbt: Arc<dyn LNVpsDb> = db.clone();
+        let node = dbt.get_marketplace_node(1).await?;
+        let mut control = HealthyNode::default();
+        control.status.dataplane.last_handshake_secs = None;
+        let worker = setup_worker(db.clone())
+            .await?
+            .with_node_control(Arc::new(control));
+
+        worker.health_check_node(node.id).await?;
+
+        let probe = dbt.get_marketplace_node_probe(node.id).await?.unwrap();
+        assert_eq!(probe.status, MarketplaceProbeStatus::Failed);
+        assert!(
+            probe.detail.as_deref().unwrap().contains("handshaken"),
+            "{probe:?}"
+        );
+        assert!(
+            dbt.list_marketplace_probe_ips_in_range(1).await?.is_empty(),
+            "no address should have been taken"
+        );
+        Ok(())
+    }
+
+    /// A node with no packet filter loaded is refused: on it, any guest could
+    /// claim another customer's address.
+    #[tokio::test]
+    async fn test_health_check_refuses_an_unfiltered_node() -> Result<()> {
+        use crate::mocks::MockRouter;
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        setup_node_tunnel(&db, pool_id).await?;
+        MockRouter::new().clear().await;
+
+        let dbt: Arc<dyn LNVpsDb> = db.clone();
+        let node = dbt.get_marketplace_node(1).await?;
+        let mut control = HealthyNode::default();
+        control.status.dataplane.firewall.present = false;
+        let worker = setup_worker(db.clone())
+            .await?
+            .with_node_control(Arc::new(control));
+
+        worker.health_check_node(node.id).await?;
+
+        let probe = dbt.get_marketplace_node_probe(node.id).await?.unwrap();
+        assert_eq!(probe.status, MarketplaceProbeStatus::Failed);
+        assert!(
+            probe.detail.as_deref().unwrap().contains("filtering"),
+            "{probe:?}"
+        );
+        Ok(())
+    }
+
+    /// A node that cannot be reached at all fails with the node's own error,
+    /// because "connection refused" and "certificate does not match" send an
+    /// operator to different places.
+    #[tokio::test]
+    async fn test_health_check_quotes_the_reason_a_node_is_unreachable() -> Result<()> {
+        use crate::mocks::MockRouter;
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        setup_node_tunnel(&db, pool_id).await?;
+        MockRouter::new().clear().await;
+
+        let dbt: Arc<dyn LNVpsDb> = db.clone();
+        let node = dbt.get_marketplace_node(1).await?;
+        let worker = setup_worker(db.clone())
+            .await?
+            .with_node_control(Arc::new(SilentNode));
+
+        worker.health_check_node(node.id).await?;
+
+        let probe = dbt.get_marketplace_node_probe(node.id).await?.unwrap();
+        assert_eq!(probe.status, MarketplaceProbeStatus::Failed);
+        assert!(
+            probe
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("certificate does not match"),
+            "{probe:?}"
+        );
+        Ok(())
+    }
+
+    /// A held probe address is not handed to a VM. Two machines answering for
+    /// one address is the failure this gate is meant to prevent, not cause.
+    #[tokio::test]
+    async fn test_a_held_probe_address_is_not_allocated_to_a_vm() -> Result<()> {
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        setup_node_tunnel(&db, pool_id).await?;
+
+        let dbt: Arc<dyn LNVpsDb> = db.clone();
+        let range = dbt.get_ip_range(1).await?;
+        let network = NetworkProvisioner::new(dbt.clone());
+
+        let free = network
+            .pick_ip_from_range(&range)
+            .await?
+            .ip
+            .ip()
+            .to_string();
+        dbt.start_marketplace_node_probe(1).await?;
+        dbt.hold_marketplace_probe_address(1, range.id, &free)
+            .await?;
+
+        let next = network
+            .pick_ip_from_range(&range)
+            .await?
+            .ip
+            .ip()
+            .to_string();
+        assert_ne!(
+            next, free,
+            "the allocator handed out an address a gate holds"
+        );
+
+        // ...and once the gate finishes, the address comes back into use.
+        dbt.finish_marketplace_node_probe(1, MarketplaceProbeStatus::Passed, None)
+            .await?;
+        assert!(
+            dbt.list_marketplace_probe_ips_in_range(range.id)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    /// While a gate runs, the address is in the node's guest list — the route
+    /// server routes it, the peer is allowed it, and the node holds it on the
+    /// bridge. A probe the node treated specially would prove a path no
+    /// customer takes.
+    #[tokio::test]
+    async fn test_a_running_probe_is_routed_like_a_guest() -> Result<()> {
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        setup_node_tunnel(&db, pool_id).await?;
+
+        let dbt: Arc<dyn LNVpsDb> = db.clone();
+        let node = dbt.get_marketplace_node(1).await?;
+        dbt.start_marketplace_node_probe(node.id).await?;
+        dbt.hold_marketplace_probe_address(node.id, 1, "10.0.0.9")
+            .await?;
+
+        // The VM the fixture put on this host has an assignment with no range,
+        // which the node's guest list cannot describe a gateway for. Pointing
+        // it at a real range is what a real assignment looks like.
+        {
+            let mut assignments = db.ip_assignments.lock().await;
+            for a in assignments.values_mut() {
+                a.ip_range_id = 1;
+            }
+        }
+
+        let guests = crate::provisioner::node_guests(&dbt, &node).await?;
+        let probe = guests
+            .iter()
+            .find(|g| g.address.starts_with("10.0.0.9"))
+            .expect("the probe address is sent to the node as a guest");
+        // The gateway is the range's, exactly as a customer's VM is given —
+        // the node answers for it on the bridge by proxy ARP. Normalised out of
+        // the range's stored `10.0.0.1/8`, because a guest is configured with an
+        // address, not a prefix.
+        assert_eq!(probe.gateway, "10.0.0.1");
+        // No MAC: nothing owns it but the node, which holds it itself.
+        assert_eq!(probe.mac, None);
+
+        // ...and the route server is told to route it and admit it from this
+        // peer. The node holding an address the route server does not route is
+        // a probe that fails for the wrong reason — and this list comes from a
+        // different function than the one above, so both have to be checked.
+        let pool = dbt.get_tunnel_pool(pool_id).await?;
+        let plan = crate::provisioner::plan_pool(&dbt, &pool).await?;
+        assert!(plan.routes.contains(&"10.0.0.9/32".to_string()), "{plan:?}");
+        assert!(
+            plan.peers[0]
+                .allowed_ips
+                .contains(&"10.0.0.9/32".to_string()),
+            "{plan:?}"
+        );
         Ok(())
     }
 }

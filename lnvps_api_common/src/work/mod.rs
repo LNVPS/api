@@ -254,6 +254,13 @@ pub enum WorkJob {
     /// the pool would work, but a node waiting on its first guest should not
     /// wait for every other node on the route server to be checked first.
     SyncNodeTunnel { tunnel_id: u64 },
+    /// Prove a marketplace node can carry a customer, and enable it if it can.
+    ///
+    /// Everything between an admin approving hardware they cannot see and a
+    /// customer's VM working is machinery nobody has tested on that particular
+    /// machine. This tests it, with a real address from a real range, and
+    /// enables the host only if a packet arrives.
+    HealthCheckNode { node_id: u64 },
     /// Re-apply forward + reverse DNS records for every IP assignment in a range.
     ///
     /// Used after changing a range's DNS server configuration (e.g. switching
@@ -363,6 +370,7 @@ impl fmt::Display for WorkJob {
             WorkJob::RemoveTunnelInterface { .. } => write!(f, "RemoveTunnelInterface"),
             WorkJob::ReconcileTunnelPeers { .. } => write!(f, "ReconcileTunnelPeers"),
             WorkJob::SyncNodeTunnel { .. } => write!(f, "SyncNodeTunnel"),
+            WorkJob::HealthCheckNode { .. } => write!(f, "HealthCheckNode"),
             WorkJob::PatchIpRangeDns { .. } => write!(f, "PatchIpRangeDns"),
         }
     }
@@ -422,6 +430,10 @@ mod tests {
         assert_eq!(
             WorkJob::SyncNodeTunnel { tunnel_id: 5 }.to_string(),
             "SyncNodeTunnel"
+        );
+        assert_eq!(
+            WorkJob::HealthCheckNode { node_id: 9 }.to_string(),
+            "HealthCheckNode"
         );
     }
 }

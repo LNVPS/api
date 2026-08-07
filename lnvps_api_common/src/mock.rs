@@ -8,14 +8,15 @@ use lnvps_db::{
     AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
     Company, CpuArch, CpuMfg, DbError, DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind,
     EncryptedString, IntervalType, IpRange, IpRangeAllocationMode, IpRangeSubscription,
-    IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator,
-    NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod,
-    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region, Router,
-    RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription,
-    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, Tunnel, TunnelPool,
-    User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
-    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind,
-    VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
+    IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeProbe, MarketplaceNodeStatus,
+    MarketplaceOperator, MarketplaceProbeStatus, NewAgentMessage, NostrDomain, NostrDomainHandle,
+    OsDistribution, PaymentMethod, PaymentMethodConfig, Referral, ReferralCostUsage,
+    ReferralPayout, Region, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
+    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentWithCompany, Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm,
+    VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
+    VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment, VmOsImage,
+    VmTemplate, WebauthnCredential,
 };
 
 use async_trait::async_trait;
@@ -76,6 +77,9 @@ pub struct MockDb {
     pub referrals: Arc<Mutex<HashMap<u64, Referral>>>,
     pub marketplace_operators: Arc<Mutex<HashMap<u64, MarketplaceOperator>>>,
     pub marketplace_nodes: Arc<Mutex<HashMap<u64, MarketplaceNode>>>,
+    /// Health-gate runs, keyed by node — one live gate per node, as the unique
+    /// key on the real table enforces.
+    pub marketplace_node_probes: Arc<Mutex<HashMap<u64, MarketplaceNodeProbe>>>,
     pub tunnels: Arc<Mutex<HashMap<u64, Tunnel>>>,
     pub tunnel_pools: Arc<Mutex<HashMap<u64, TunnelPool>>>,
     pub referral_payouts: Arc<Mutex<Vec<ReferralPayout>>>,
@@ -463,6 +467,7 @@ impl Default for MockDb {
             referrals: Arc::new(Default::default()),
             marketplace_operators: Arc::new(Default::default()),
             marketplace_nodes: Arc::new(Default::default()),
+            marketplace_node_probes: Arc::new(Default::default()),
             tunnels: Arc::new(Default::default()),
             tunnel_pools: Arc::new(Default::default()),
             referral_payouts: Arc::new(Default::default()),
@@ -3716,6 +3721,109 @@ impl LNVpsDbBase for MockDb {
             .values()
             .find(|h| h.marketplace_node_id == Some(node_id))
             .cloned())
+    }
+
+    async fn get_marketplace_node_probe(
+        &self,
+        node_id: u64,
+    ) -> DbResult<Option<MarketplaceNodeProbe>> {
+        Ok(self
+            .marketplace_node_probes
+            .lock()
+            .await
+            .get(&node_id)
+            .cloned())
+    }
+
+    async fn start_marketplace_node_probe(&self, node_id: u64) -> DbResult<u64> {
+        // FK marketplace_node_probe.node_id
+        if !self.marketplace_nodes.lock().await.contains_key(&node_id) {
+            return Err(anyhow!("Node {node_id} not found").into());
+        }
+        let mut probes = self.marketplace_node_probes.lock().await;
+        let id = probes
+            .get(&node_id)
+            .map(|p| p.id)
+            .unwrap_or_else(|| probes.values().map(|p| p.id).max().unwrap_or(0) + 1);
+        probes.insert(
+            node_id,
+            MarketplaceNodeProbe {
+                id,
+                node_id,
+                ip_range_id: None,
+                ip: None,
+                status: MarketplaceProbeStatus::Running,
+                detail: None,
+                created: Utc::now(),
+                finished: None,
+            },
+        );
+        Ok(id)
+    }
+
+    async fn hold_marketplace_probe_address(
+        &self,
+        node_id: u64,
+        ip_range_id: u64,
+        ip: &str,
+    ) -> DbResult<()> {
+        // FK marketplace_node_probe.ip_range_id
+        if !self.ip_range.lock().await.contains_key(&ip_range_id) {
+            return Err(anyhow!("IP range {ip_range_id} not found").into());
+        }
+        let mut probes = self.marketplace_node_probes.lock().await;
+        // uk_marketplace_node_probe_ip: two nodes holding one address would
+        // both be routed it, and the route server would send it to whichever
+        // peer claimed it last.
+        if probes
+            .values()
+            .any(|p| p.node_id != node_id && p.ip.as_deref() == Some(ip))
+        {
+            return Err(anyhow!("{ip} is already held by another probe").into());
+        }
+        if let Some(probe) = probes.get_mut(&node_id) {
+            probe.ip_range_id = Some(ip_range_id);
+            probe.ip = Some(ip.to_string());
+        }
+        Ok(())
+    }
+
+    async fn finish_marketplace_node_probe(
+        &self,
+        node_id: u64,
+        status: MarketplaceProbeStatus,
+        detail: Option<&str>,
+    ) -> DbResult<()> {
+        let mut probes = self.marketplace_node_probes.lock().await;
+        if let Some(probe) = probes.get_mut(&node_id) {
+            probe.status = status;
+            probe.detail = detail.map(str::to_string);
+            probe.ip = None;
+            probe.finished = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn list_marketplace_probe_ips_in_range(&self, range_id: u64) -> DbResult<Vec<String>> {
+        Ok(self
+            .marketplace_node_probes
+            .lock()
+            .await
+            .values()
+            .filter(|p| p.ip_range_id == Some(range_id))
+            .filter_map(|p| p.ip.clone())
+            .collect())
+    }
+
+    async fn list_marketplace_probe_ips_for_node(&self, node_id: u64) -> DbResult<Vec<String>> {
+        Ok(self
+            .marketplace_node_probes
+            .lock()
+            .await
+            .values()
+            .filter(|p| p.node_id == node_id)
+            .filter_map(|p| p.ip.clone())
+            .collect())
     }
 
     async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64> {

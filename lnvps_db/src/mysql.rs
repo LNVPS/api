@@ -3,14 +3,14 @@ use crate::{
     AppDeploymentFilter, AppDeploymentServiceUsage, AppDeploymentVolumeUsage, AppTag,
     AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, DbError, DbResult,
     DnsServer, EncryptedString, IntervalType, IpRange, IpRangeSubscription, IpSpacePricing,
-    LNVpsDbBase, MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage,
-    PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
-    Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
-    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm,
-    VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
-    VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
-    WebauthnCredential,
+    LNVpsDbBase, MarketplaceNode, MarketplaceNodeProbe, MarketplaceNodeStatus, MarketplaceOperator,
+    MarketplaceProbeStatus, NewAgentMessage, PaymentMethod, PaymentMethodConfig, PaymentType,
+    Referral, ReferralCostUsage, ReferralPayout, Region, RegionStats, Router, RouterBgpRoute,
+    RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionPaymentWithCompany, Tunnel, TunnelPool, User,
+    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
+    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk,
+    VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -4214,6 +4214,94 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .fetch_one(&self.db)
         .await?;
         Ok(res.try_get(0)?)
+    }
+
+    async fn get_marketplace_node_probe(
+        &self,
+        node_id: u64,
+    ) -> DbResult<Option<MarketplaceNodeProbe>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM marketplace_node_probe WHERE node_id = ?")
+                .bind(node_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn start_marketplace_node_probe(&self, node_id: u64) -> DbResult<u64> {
+        // One statement rather than delete-then-insert: the unique key on
+        // `node_id` is what stops two gates running against one node, and a
+        // gap between the two would be exactly the window for the second to
+        // start. `created` and `finished` are reset because this is a new run,
+        // not an amendment of the last one.
+        let res = sqlx::query(
+            "INSERT INTO marketplace_node_probe (node_id, ip_range_id, ip, status, detail, created, finished) \
+             VALUES (?, NULL, NULL, ?, NULL, CURRENT_TIMESTAMP, NULL) \
+             ON DUPLICATE KEY UPDATE ip_range_id = NULL, ip = NULL, \
+             status = VALUES(status), detail = NULL, created = CURRENT_TIMESTAMP, finished = NULL, \
+             id = LAST_INSERT_ID(id)",
+        )
+        .bind(node_id)
+        .bind(MarketplaceProbeStatus::Running)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn hold_marketplace_probe_address(
+        &self,
+        node_id: u64,
+        ip_range_id: u64,
+        ip: &str,
+    ) -> DbResult<()> {
+        sqlx::query("UPDATE marketplace_node_probe SET ip_range_id = ?, ip = ? WHERE node_id = ?")
+            .bind(ip_range_id)
+            .bind(ip)
+            .bind(node_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn finish_marketplace_node_probe(
+        &self,
+        node_id: u64,
+        status: MarketplaceProbeStatus,
+        detail: Option<&str>,
+    ) -> DbResult<()> {
+        // The address is released in the same statement as the verdict: a gate
+        // that recorded its result and then failed to give the address back
+        // would leak one address per run, from a range customers are waiting
+        // for.
+        sqlx::query(
+            "UPDATE marketplace_node_probe \
+             SET status = ?, detail = ?, ip = NULL, finished = CURRENT_TIMESTAMP \
+             WHERE node_id = ?",
+        )
+        .bind(status)
+        .bind(detail)
+        .bind(node_id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_marketplace_probe_ips_in_range(&self, range_id: u64) -> DbResult<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT ip FROM marketplace_node_probe WHERE ip_range_id = ? AND ip IS NOT NULL",
+        )
+        .bind(range_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_marketplace_probe_ips_for_node(&self, node_id: u64) -> DbResult<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT ip FROM marketplace_node_probe WHERE node_id = ? AND ip IS NOT NULL",
+        )
+        .bind(node_id)
+        .fetch_all(&self.db)
+        .await?)
     }
 
     async fn update_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<()> {

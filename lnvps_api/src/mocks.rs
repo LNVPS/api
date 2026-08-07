@@ -39,7 +39,7 @@ use payments_rs::onchain::{
     ChainPaymentUpdate, NewAddressRequest, NewAddressResponse, OnChainProvider, PaymentCursor,
     SendCoinsRequest, SendCoinsResponse,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Add;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -56,6 +56,11 @@ pub struct MockRouter {
     addresses: Arc<Mutex<HashMap<String, Vec<String>>>>,
     /// Routes pointing down each tunnel interface
     routes: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Whether this route server can reach anything at all. A caller cannot
+    /// know in advance which address the code under test will pick, so the
+    /// switch is all-or-nothing.
+    reach_all: Arc<Mutex<bool>>,
+    probed: Arc<Mutex<Vec<String>>>,
 }
 
 impl Default for MockRouter {
@@ -83,6 +88,8 @@ impl MockRouter {
                 Arc::new(Mutex::new(HashMap::new()));
             static TL_ROUTES: Arc<Mutex<HashMap<String, Vec<String>>>> =
                 Arc::new(Mutex::new(HashMap::new()));
+            static TL_PROBED: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            static TL_REACH_ALL: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
             static TL_DEFAULT_ROUTE: Arc<Mutex<Option<BgpRoute>>> =
                 Arc::new(Mutex::new(Some(BgpRoute {
                     prefix: "0.0.0.0/0".to_string(),
@@ -97,6 +104,8 @@ impl MockRouter {
             default_route: TL_DEFAULT_ROUTE.with(|d| d.clone()),
             addresses: TL_ADDRESSES.with(|a| a.clone()),
             routes: TL_ROUTES.with(|r| r.clone()),
+            reach_all: TL_REACH_ALL.with(|r| r.clone()),
+            probed: TL_PROBED.with(|p| p.clone()),
         }
     }
 
@@ -112,6 +121,8 @@ impl MockRouter {
         addresses.clear();
         let mut routes = self.routes.lock().await;
         routes.clear();
+        *self.reach_all.lock().await = false;
+        self.probed.lock().await.clear();
     }
 
     /// Addresses configured on a tunnel interface
@@ -121,6 +132,16 @@ impl MockRouter {
     }
 
     /// Routes pointing down a tunnel interface
+    /// Make this route server able to reach every address it is asked about.
+    pub async fn set_reach_all(&self, reach: bool) {
+        *self.reach_all.lock().await = reach;
+    }
+
+    /// Every address this route server has been asked to probe.
+    pub async fn probed(&self) -> Vec<String> {
+        self.probed.lock().await.clone()
+    }
+
     pub async fn interface_routes(&self, interface: &str) -> Vec<String> {
         let routes = self.routes.lock().await;
         routes.get(interface).cloned().unwrap_or_default()
@@ -326,6 +347,13 @@ impl TunnelRouter for MockRouter {
         let mut map = self.addresses.lock().await;
         map.insert(interface.to_string(), addresses.to_vec());
         Ok(())
+    }
+
+    async fn probe_address(&self, address: &str) -> OpResult<bool> {
+        self.probed.lock().await.push(address.to_string());
+        // A route server with nothing configured reaches nothing, which is the
+        // honest default and the one that makes a test say what it means.
+        Ok(*self.reach_all.lock().await)
     }
 
     async fn sync_tunnel_routes(&self, interface: &str, prefixes: &[String]) -> OpResult<()> {

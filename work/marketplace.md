@@ -1020,7 +1020,7 @@ for the guest, on the same address it would have had.
   competes for the port. An operator who changes it makes their own node unreachable, which the
   gate reports as unreachable — self-correcting, and cheaper than a column.
 
-##### 4c3b — The gate itself (M/L)
+##### 4c3b — The gate itself (M/L)  ✅
 - A probe address is taken from a real customer range in the node's region, sent to the node as
   a guest, and pinged from the route server. That is the production path exactly: a VM's address
   is statically routed from the core network to the node's `wgln0`, forwarded over `br-lnvps`
@@ -1031,6 +1031,35 @@ for the guest, on the same address it would have had.
 - Failure leaves the node approved but unusable, with the failing step named. That is the safe
   direction: a node that never carries a customer is a support conversation, a node that
   carries one badly is an outage.
+
+Built as `Worker::health_check_node`, with `marketplace_node_probe` holding the run. Decisions
+worth recording:
+
+- **The run is recorded before it starts.** A gate that only wrote a row once it had taken an
+  address would tell the operator whose node never handshook precisely nothing, and that is the
+  most common failure.
+- **The address is released in the same statement as the verdict.** A gate that recorded its
+  result and then failed to give the address back would leak one address per attempt out of a
+  range customers are waiting for.
+- **The allocator sees held probe addresses.** They are not `vm_ip_assignment` rows, so without
+  that the gate could hand a VM the address it is currently proving a node with — two machines
+  answering for one address, which is the failure this whole increment exists to prevent.
+- **IPv4 ranges are preferred.** A guest's IPv6 address is normally derived from its MAC
+  (EUI64) and a probe has no guest, so the v4 path is the one a probe stands in for exactly. A
+  v6-only region is still gated, from the first free address in its range.
+- **The node is told to apply the document rather than left to its heartbeat**, via a new
+  `POST /api/v1/dataplane/refresh` on the node control API. Nothing about the document is sent
+  — the node fetches it itself, with its own credential; this only says *when*. An approval
+  that took a minute to conclude would be a minute of an operator watching nothing happen.
+- **`probe_address` echoes its verdict rather than using ping's exit code.** To the SSH
+  transport a non-zero exit means "the command failed", which is right everywhere else and
+  wrong here: "no reply" is the answer the gate asked for, and it has to stay distinguishable
+  from a route server that cannot be reached at all. Those two results need different people.
+
+Caught while writing the tests: the node's guest list (`node_guests`) and the route server's
+plan (`guest_addresses`) are **two separate functions** over the same idea. Adding the probe to
+one and not the other would have produced a node holding an address the route server never
+routed — a gate that failed for a reason that had nothing to do with the node.
 
 ### Increment 5 — Confidential computing: attestation + encrypted disks (L)
 - Verify SEV-SNP attestation reports (`sev` crate) / TDX quotes (`dcap-qvl` crate) against

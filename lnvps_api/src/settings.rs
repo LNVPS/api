@@ -453,11 +453,9 @@ pub enum CaptchaConfig {
     Turnstile { secret_key: String },
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct NostrConfig {
-    pub relays: Vec<String>,
-    pub nsec: String,
-}
+/// LNVPS's nostr identity, shared with the admin API and with the marketplace
+/// control client — one account, not three keys that can disagree.
+pub use lnvps_api_common::node_control::NostrConfig;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]

@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use lnvps_api_common::node_control::NodeStatus;
 use lnvps_api_common::{
-    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery,
+    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, WorkJob,
     deserialize_from_str_optional,
 };
 use lnvps_db::{
@@ -49,6 +49,10 @@ pub fn router() -> Router<RouterState> {
         .route(
             "/api/admin/v1/marketplace/nodes/{id}/status",
             get(admin_node_status),
+        )
+        .route(
+            "/api/admin/v1/marketplace/nodes/{id}/health_check",
+            post(admin_health_check_node),
         )
         .route(
             "/api/admin/v1/marketplace/operators",
@@ -81,6 +85,13 @@ pub struct AdminMarketplaceNodeInfo {
     pub tunnel_id: Option<u64>,
     /// The backing host row, created by approval. `null` before then.
     pub host_id: Option<u64>,
+    /// Whether the host is taking placements. Approval alone does not enable a
+    /// node: the health gate does, and until it passes this stays `false` while
+    /// `status` reads `approved`. That pair is the answer to "why is my node
+    /// approved and empty?".
+    pub host_enabled: bool,
+    /// The last health-gate run, once a node has been gated.
+    pub probe: Option<AdminNodeProbeInfo>,
     /// Whether the one-off listing fee has been paid. `false` also covers "not
     /// started" — either way there is nothing to approve against.
     pub fee_paid: bool,
@@ -88,6 +99,25 @@ pub struct AdminMarketplaceNodeInfo {
     pub fee_subscription_id: Option<u64>,
     pub last_seen: Option<DateTime<Utc>>,
     pub created: DateTime<Utc>,
+}
+
+/// The last health-gate run.
+#[derive(Serialize, Debug)]
+pub struct AdminNodeProbeInfo {
+    /// `running`, `passed` or `failed`.
+    pub status: String,
+    /// The address held right now, `null` once the run is over. An address is
+    /// only held while a gate is running, so a value here on an old run means a
+    /// gate that never finished.
+    pub ip: Option<String>,
+    /// The range the address came from — a failure reads as "this node cannot
+    /// carry addresses from that range". `null` for a run that was refused
+    /// before an address was worth taking out of a customer range.
+    pub ip_range_id: Option<u64>,
+    /// Which step failed, in the words an operator needs.
+    pub detail: Option<String>,
+    pub created: DateTime<Utc>,
+    pub finished: Option<DateTime<Utc>>,
 }
 
 /// An operator enrolment as an admin sees it.
@@ -204,6 +234,7 @@ async fn node_info(
     let user = db.get_user(operator.user_id).await?;
     let host = db.get_marketplace_node_host(node.id).await?;
     let (fee_paid, fee_subscription_id) = fee_state(db, &node).await?;
+    let probe = db.get_marketplace_node_probe(node.id).await?;
 
     Ok(AdminMarketplaceNodeInfo {
         id: node.id,
@@ -215,7 +246,16 @@ async fn node_info(
         trust_tier: node.trust_tier.to_string(),
         tls_fingerprint: node.tls_fingerprint.map(hex::encode),
         tunnel_id: node.tunnel_id,
+        host_enabled: host.as_ref().map(|h| h.enabled).unwrap_or(false),
         host_id: host.map(|h| h.id),
+        probe: probe.map(|p| AdminNodeProbeInfo {
+            status: p.status.to_string(),
+            ip: p.ip,
+            ip_range_id: p.ip_range_id,
+            detail: p.detail,
+            created: p.created,
+            finished: p.finished,
+        }),
         fee_paid,
         fee_subscription_id,
         last_seen: node.last_seen,
@@ -339,6 +379,35 @@ async fn admin_node_status(
         .await
         .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
     ApiData::ok(status)
+}
+
+/// Run the health gate against a node now.
+///
+/// Queued rather than run inline: the gate takes an address, waits on a route
+/// server and pings across a tunnel, which is not work to hold an HTTP request
+/// open for. The verdict lands on the node's `probe`, which `GET
+/// /marketplace/nodes/{id}` returns.
+///
+/// Exists because the automatic run happens when a node's tunnel is allocated,
+/// and the interesting cases are the ones after that: an operator who has
+/// fixed their firewall, a node whose route server was down at the time.
+async fn admin_health_check_node(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<()> {
+    auth.require_permission(AdminResource::MarketplaceNode, AdminAction::Update)?;
+    let node = this.db.get_marketplace_node(id).await?;
+    if this.db.get_marketplace_node_host(node.id).await?.is_none() {
+        return Err(ApiError::bad_request(
+            "This node has not been approved, so it has no host to enable",
+        ));
+    }
+    this.work_commander
+        .send(WorkJob::HealthCheckNode { node_id: node.id })
+        .await
+        .map_err(|e| ApiError::internal(format!("Cannot queue the health check: {e}")))?;
+    ApiData::ok(())
 }
 
 /// Approve a node: create its backing host and make it placeable.

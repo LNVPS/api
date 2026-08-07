@@ -1177,6 +1177,49 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Register a new node, returning the new id
     async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64>;
 
+    /// The last health-gate run for a node, if it has ever been gated.
+    async fn get_marketplace_node_probe(
+        &self,
+        node_id: u64,
+    ) -> DbResult<Option<MarketplaceNodeProbe>>;
+
+    /// Start a gate run, replacing any previous one for this node.
+    ///
+    /// Replacing rather than appending: this is the *last* run, not a history.
+    /// A history belongs with SLA accounting, where the retention and the
+    /// questions are different.
+    ///
+    /// No address yet — the early steps can refuse a node before one is worth
+    /// taking, and those refusals still have to be recorded.
+    async fn start_marketplace_node_probe(&self, node_id: u64) -> DbResult<u64>;
+
+    /// Hold `ip` against a running gate until it finishes.
+    async fn hold_marketplace_probe_address(
+        &self,
+        node_id: u64,
+        ip_range_id: u64,
+        ip: &str,
+    ) -> DbResult<()>;
+
+    /// Record the verdict and release the held address.
+    async fn finish_marketplace_node_probe(
+        &self,
+        node_id: u64,
+        status: MarketplaceProbeStatus,
+        detail: Option<&str>,
+    ) -> DbResult<()>;
+
+    /// Addresses currently held by health gates in one range.
+    ///
+    /// Read by the IP allocator: a probe's address is not a `vm_ip_assignment`,
+    /// so without this a VM could be handed the address a gate is using, and
+    /// two machines would answer for it.
+    async fn list_marketplace_probe_ips_in_range(&self, range_id: u64) -> DbResult<Vec<String>>;
+
+    /// Addresses held by gates against one node, which the node must route and
+    /// admit exactly as it would a guest — that is the point of the exercise.
+    async fn list_marketplace_probe_ips_for_node(&self, node_id: u64) -> DbResult<Vec<String>>;
+
     /// Update a node's name, key, status, trust tier or assigned tunnel.
     /// `operator_id` and
     /// `created` are immutable and are not written: a node cannot change hands,

@@ -232,6 +232,18 @@ impl NetworkProvisioner {
         let mut ips: HashSet<IpAddr> = ips.iter().filter_map(|i| i.ip.parse().ok()).collect();
         ips.extend(exclude.iter().copied());
 
+        // Addresses a marketplace health gate is currently holding. They are
+        // not `vm_ip_assignment` rows — no VM owns them — but they are being
+        // routed to a node and answered for right now, so handing one to a VM
+        // would put two machines on one address.
+        ips.extend(
+            self.db
+                .list_marketplace_probe_ips_in_range(range.id)
+                .await?
+                .iter()
+                .filter_map(|ip| ip.parse::<IpAddr>().ok()),
+        );
+
         let gateway: IpNetwork = parse_gateway(&range.gateway)?;
 
         // Calculate the prefix to use: take the smallest prefix value (largest network)

@@ -239,11 +239,38 @@ async fn run(config_path: &Path) -> Result<()> {
     })?;
 
     control::serve_on(
-        Arc::new(ControlState::new(control_pubkey, addr, kernel, fw)),
+        Arc::new(
+            ControlState::new(control_pubkey, addr, kernel.clone(), fw.clone()).with_refresh(
+                Arc::new(OnDemandRefresh {
+                    config: config.clone(),
+                    kernel,
+                    fw,
+                }),
+            ),
+        ),
         listener,
         tls,
     )
     .await
+}
+
+/// Re-applying the data plane because LNVPS asked, rather than because the
+/// timer came round.
+///
+/// The same code path as the periodic refresh, deliberately: a prompt path that
+/// did something slightly different would be a second way for a node to be
+/// configured, exercised only when LNVPS is in a hurry.
+struct OnDemandRefresh {
+    config: NodeConfig,
+    kernel: Arc<lnvps_node::net::Kernel>,
+    fw: Arc<lnvps_node::fw::SystemFirewall>,
+}
+
+#[async_trait::async_trait]
+impl control::Refresh for OnDemandRefresh {
+    async fn refresh(&self) -> Result<Vec<String>> {
+        apply_dataplane_changes(&self.config, self.kernel.as_ref(), self.fw.as_ref()).await
+    }
 }
 
 /// Fetch the data plane and apply it.
@@ -252,6 +279,16 @@ async fn apply_dataplane(
     kernel: &dyn lnvps_node::net::NetOps,
     fw: &dyn lnvps_node::fw::FirewallOps,
 ) -> Result<()> {
+    apply_dataplane_changes(config, kernel, fw).await?;
+    Ok(())
+}
+
+/// The same, returning what changed, for the caller that has somebody waiting.
+async fn apply_dataplane_changes(
+    config: &NodeConfig,
+    kernel: &dyn lnvps_node::net::NetOps,
+    fw: &dyn lnvps_node::fw::FirewallOps,
+) -> Result<Vec<String>> {
     let credential = Credential::load_checked(&config.credential)?;
     let api = lnvps_node::api::LnvpsApi::new(&config.api_url, &credential)?;
 
@@ -269,5 +306,5 @@ async fn apply_dataplane(
     if !applied.is_empty() {
         log::debug!("Applied data plane: {}", applied.join("; "));
     }
-    Ok(())
+    Ok(applied)
 }

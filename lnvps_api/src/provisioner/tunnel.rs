@@ -519,6 +519,36 @@ pub async fn node_guests(
             });
         }
     }
+    // Any address a health gate is holding against this node. It is sent as a
+    // guest because that is the whole point: the gate proves the *guest* path —
+    // the route server's route and AllowedIPs, the node's bridge route, the
+    // packet filter's binding, proxy ARP for the range's gateway. A probe the
+    // node treated specially would prove a path no customer takes.
+    for ip in db.list_marketplace_probe_ips_for_node(node.id).await? {
+        let Some(probe) = db.get_marketplace_node_probe(node.id).await? else {
+            continue;
+        };
+        let Some(address) = host_address(Some(&ip)) else {
+            continue;
+        };
+        let Some(range_id) = probe.ip_range_id else {
+            continue;
+        };
+        let range = db.get_ip_range(range_id).await?;
+        let gateway = lnvps_api_common::parse_gateway(&range.gateway)
+            .map(|g| g.ip().to_string())
+            .unwrap_or(range.gateway);
+        out.push(GuestAddress {
+            address,
+            gateway,
+            // No MAC: nothing owns this address but the node itself, which
+            // holds it on the bridge rather than handing it to a guest. The
+            // filter admits it on address alone, which is the weaker check and
+            // visibly so.
+            mac: None,
+        });
+    }
+
     out.sort_by(|a, b| a.address.cmp(&b.address));
     Ok(out)
 }
@@ -553,6 +583,17 @@ async fn guest_addresses(db: &Arc<dyn LNVpsDb>, tunnel: &Tunnel) -> Result<Vec<S
             }
         }
     }
+
+    // Any address a health gate is holding against this node. The route server
+    // has to route it and admit it from this peer, exactly as it will for the
+    // customer who gets that address next — a probe the route server treated
+    // differently would prove a path nobody uses.
+    for ip in db.list_marketplace_probe_ips_for_node(node.id).await? {
+        if let Some(addr) = host_address(Some(&ip)) {
+            out.push(addr);
+        }
+    }
+
     out.sort();
     out.dedup();
     Ok(out)

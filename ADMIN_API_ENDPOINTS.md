@@ -3764,6 +3764,28 @@ carries `fee_paid` (whether the one-off listing fee has settled),
 reached) and `host_id` (the backing host, `null` until approval creates it).
 Node tokens are never returned — LNVPS keeps no copy of them.
 
+Each node carries `host_enabled` and `probe`. Approval alone does not enable a
+node: the health gate does, so a node reading `approved` with `host_enabled:
+false` is waiting on (or has failed) its gate, and `probe.detail` says which
+step. That pair answers "why is my node approved and empty?".
+
+```json
+{
+  "host_enabled": false,
+  "probe": {
+    "status": "failed",
+    // running|passed|failed
+    "ip": null,
+    // The address held while the gate runs; released when it finishes
+    "ip_range_id": 4,
+    // null when the run was refused before an address was worth taking
+    "detail": "The route server could not reach 203.0.113.9 on this node, so a customer's VM would not be reachable either",
+    "created": "2026-08-10T09:00:00Z",
+    "finished": "2026-08-10T09:00:12Z"
+  }
+}
+```
+
 #### Get Node
 
 ```
@@ -3771,6 +3793,32 @@ GET /api/admin/v1/marketplace/nodes/{id}
 ```
 
 Required Permission: `marketplace_node::view`
+
+#### Run the Health Gate
+
+```
+POST /api/admin/v1/marketplace/nodes/{id}/health_check
+```
+
+Required Permission: `marketplace_node::update`
+
+Queues a health-gate run. The gate takes an address from a real customer range
+in the node's region, sends it to the node as a guest, and pings it **from the
+route server** — which is the path a customer's traffic takes: the address is
+statically routed from the core network to the node's tunnel address, forwarded
+across the guest bridge, and answered back out the node's default route. On a
+pass the backing host is **enabled**; on a failure it is left approved and
+disabled, with the failing step recorded.
+
+Queued rather than run inline: it waits on a route server and a tunnel, which is
+not work to hold an HTTP request open for. The verdict lands on the node's
+`probe` field, returned by `GET /marketplace/nodes/{id}`.
+
+The gate also runs automatically when a node's tunnel is allocated, which is the
+first moment it can run at all. This endpoint is for the cases after that — an
+operator who has fixed their firewall, a node whose route server was down.
+
+Errors: `400` when the node has no host yet (not approved).
 
 #### Get Live Node Status
 
