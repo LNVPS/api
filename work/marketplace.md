@@ -1070,6 +1070,77 @@ and the thing a ping says nothing about.
 `VmHostKind::MarketplaceNode`. That is increment 5 either way, and doing it first means LNVPS's
 own probes exercise the provisioning path before a customer is the first VM a node ever builds.
 
+### Increment 4d — VM lifecycle on a marketplace node (XL — split into 4d1/4d2/4d3)
+
+A node cannot build a VM. Its document describes addresses, not machines, and `get_host_client`
+has no arm for `VmHostKind::MarketplaceNode`. Everything from here — probe VMs, customer VMs,
+confidential computing — is behind that.
+
+**The shape.** The node holds **desired state** and manages libvirt itself; LNVPS **reads**
+state over the tunnel through a host client, and the operations that would normally *create*
+something are no-ops there, because creation is the document's job.
+
+```
+LNVPS                                   node (hardware LNVPS does not own)
+  worker / provisioner
+    └ VmHostClient (marketplace)         GET /api/v1/node/state   ← the node polls
+        ├ get_vm_state      → HTTPS ──>    └ reconcile against libvirt (qemu:///system)
+        ├ get_all_vm_states → HTTPS ──>         ├ create what is missing
+        ├ get_info          → HTTPS ──>         ├ match the run state LNVPS asked for
+        └ create/configure/resize/delete        └ destroy what LNVPS no longer lists
+              → no-op, the document does it
+```
+
+Why this way rather than exposing libvirtd on the tunnel: libvirt is machine-wide, so handing
+LNVPS a connection to it hands LNVPS every domain on the operator's machine, including their
+own. It also adds a second authentication scheme — TLS client certs to distribute, rotate and
+revoke — beside the mutually-pinned channel already built. The node is the only party that needs
+libvirt, and it is already the party that configures the machine.
+
+Why a host client at all, when the document does the work: every existing worker flow speaks
+`VmHostClient`. A marketplace node that implements the *reading* half slots into all of them, so
+VM state, host capacity and the admin UI work with no special cases. The writing half being a
+no-op is honest — the document is the write path, and a client that pretended otherwise would
+report success for something that had not happened yet.
+
+Why the node destroys what LNVPS does not list: it is the only tear-down mechanism that
+survives LNVPS failing. An API restart mid-probe leaves nothing to clean up, because the probe
+VM is simply absent from the next document. Scoped to LNVPS-owned domains — the libvirt client
+already derives deterministic per-VM UUIDs — so an operator's own VMs on the same machine are
+never touched.
+
+#### 4d1 — The desired-state document (M/L)
+- `GET /api/v1/node/state` returns the node's whole desired state: the data plane it already
+  gets, plus `vms[]` — uuid, shape, disk, image (url + hash), cloud-init, MAC, addresses,
+  gateways, and the run state LNVPS wants.
+- Built from the same rows `FullVmInfo` loads, but shipped as a **node-shaped spec** rather than
+  database rows: the node has no business knowing about cost plans, users or subscriptions, and
+  a wire format that mirrored the schema would make every migration a node-compatibility
+  question.
+- Image by URL and hash, because a node fetches it itself. LNVPS mirrors images already.
+
+#### 4d2 — The node's VM manager (L)
+- `lnvps_node` gains the libvirt client from `lnvps_api_common` (feature `libvirt`), pointed at
+  `qemu:///system`, and a reconciler: create what is missing, match the run state, destroy what
+  is absent — the last scoped to domains LNVPS owns.
+- Disks come from the operator's storage pool, named in the node's own config: LNVPS does not
+  know what storage this machine has, and a node that guessed would fail on every machine whose
+  pool is not called `default`.
+- Idempotent and crash-safe: the reconciler is the only writer, and every step is re-entrant, so
+  a daemon killed halfway through a create finishes it on the next poll rather than leaving a
+  half-built domain nobody owns.
+
+#### 4d3 — The marketplace host client (M)
+- `VmHostClient` for `VmHostKind::MarketplaceNode`, over the node control API: `get_info`,
+  `get_vm_state`, `get_all_vm_states` real; create, configure, resize, import, download no-ops;
+  start/stop/delete expressed as desired state rather than as calls.
+- Node control API gains the read endpoints those need.
+- Wired into `get_host_client`, which is what makes marketplace nodes visible to every existing
+  flow.
+
+Once 4d lands, **4c3c (probe VMs)** becomes small: a VM in the document that exists only in
+LNVPS's memory, plus the SSH measurements and the results table.
+
 ### Increment 5 — Confidential computing: attestation + encrypted disks (L)
 - Verify SEV-SNP attestation reports (`sev` crate) / TDX quotes (`dcap-qvl` crate) against
   AMD/Intel roots + measurement allow-list; store attestation state on `marketplace_node`;
