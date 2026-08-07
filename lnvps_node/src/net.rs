@@ -35,7 +35,13 @@ use serde::{Deserialize, Serialize};
 use crate::wgkey::{self, NodeKey};
 
 /// The tunnel interface the node terminates its data plane on.
-pub const TUNNEL_INTERFACE: &str = "wg0";
+///
+/// `wgln0`, not `wg0`: the interface is created in the *machine's* namespace
+/// before being moved into the data plane's, and an operator's own `wg0` — a
+/// VPN, a mesh, anything — is a name we would collide with there. The `wgln`
+/// prefix is the same one LNVPS uses for its route-server interfaces, so a
+/// managed interface is recognisable as ours wherever it turns up.
+pub const TUNNEL_INTERFACE: &str = "wgln0";
 
 /// The bridge guests sit on.
 ///
@@ -164,7 +170,7 @@ pub struct DataPlaneState {
 impl DataPlaneState {
     /// Whether this node can carry a customer.
     ///
-    /// A handshake is required, not just an interface: `wg0` comes up happily
+    /// A handshake is required, not just an interface: WireGuard comes up happily
     /// with a peer that never answers, and a node in that state looks
     /// configured while being unreachable.
     pub fn healthy(&self) -> bool {
@@ -190,7 +196,7 @@ pub async fn apply(
     Ok(changed)
 }
 
-/// Bring up `wg0` and point the default route down it.
+/// Bring up the tunnel interface and point the default route down it.
 async fn apply_tunnel(
     ops: &dyn NetOps,
     desired: &DesiredDataPlane,

@@ -9,7 +9,7 @@
 //!
 //! ```text
 //!   [rs netns]                    [test machine's netns]      [lnvps netns]        [guest netns]
-//!   wgln<pool>  <══ WireGuard ══>  wg0 created here, then ══>  wg0            veth
+//!   wgln<pool>  <══ WireGuard ══>  wgln0 created here, then ═>  wgln0          veth
 //!   10.66.0.1/24                   its UDP socket stays here   10.66.0.2/32   br-lnvps ── 203.0.113.5/24
 //!        │                                                     203.0.113.1/32
 //!    rs_up veth ────────────────── node_up veth
@@ -17,7 +17,7 @@
 //! ```
 //!
 //! The shape is the production one, including the part that is easy to get
-//! wrong: `wg0` is created in the machine's own namespace so its UDP socket can
+//! wrong: `wgln0` is created in the machine's own namespace so its UDP socket can
 //! reach the route server through the operator's uplink, and is then moved into
 //! the LNVPS namespace so that everything carried *over* the tunnel is isolated
 //! from the operator's network.
@@ -116,10 +116,11 @@ impl Topology {
         let _ = Command::new("ip")
             .args(["netns", "delete", &self.dataplane])
             .output();
-        let _ = Command::new("ip")
-            .args(["link", "del", "e2e-node"])
-            .output();
-        let _ = Command::new("ip").args(["link", "del", "wg0"]).output();
+        // Anything the node's code created in the machine's namespace, which
+        // is where a half-finished run leaves it.
+        for link in ["e2e-node", "e2e-guest", "wgln0", "wg0", "br-lnvps"] {
+            let _ = Command::new("ip").args(["link", "del", link]).output();
+        }
     }
 }
 
@@ -325,7 +326,7 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
         .in_rs(&["ping", "-c", "3", "-W", "5", GUEST_ADDRESS])
         .context("the route server could not reach a guest behind the node")?;
 
-    // The node reports itself healthy only once that has happened: `wg0` comes
+    // The node reports itself healthy only once that has happened: WireGuard comes
     // up perfectly happily with a peer that never answers.
     let state = lnvps_node::net::observe(&kernel).await?;
     assert!(state.tunnel_up, "{state:?}");
@@ -353,6 +354,12 @@ async fn the_operators_machine_keeps_its_own_network() -> Result<()> {
 
     let default_before = run("ip", &["-j", "route", "show", "default"])?;
 
+    // The operator's own WireGuard interface, which is why the node's is not
+    // called `wg0`: the node creates its interface in *this* namespace before
+    // moving it, so a collision here would either fail outright or, worse,
+    // adopt somebody's VPN and move it out from under them.
+    run("ip", &["link", "add", "wg0", "type", "wireguard"])?;
+
     let kernel = lnvps_node::net::Kernel::in_namespace(topology.open_dataplane()?)?;
     lnvps_node::net::apply(
         &kernel,
@@ -374,17 +381,23 @@ async fn the_operators_machine_keeps_its_own_network() -> Result<()> {
     )
     .await?;
 
+    // The operator's interface is still theirs, still where they left it.
+    assert!(
+        run("ip", &["link", "show", "wg0"]).is_ok(),
+        "the operator's own wg0 was taken or destroyed"
+    );
+
     // The interfaces exist in the namespace and nowhere else. Asserted first,
     // because if this is wrong every later assertion is wrong for the same
     // reason and this is the one that says why.
     assert!(
-        run("ip", &["link", "show", "wg0"]).is_err(),
-        "wg0 is still in the machine's namespace: {}",
+        run("ip", &["link", "show", "wgln0"]).is_err(),
+        "the node's interface is still in the machine's namespace: {}",
         run("ip", &["link", "show"]).unwrap_or_default()
     );
     assert!(
         topology
-            .in_dataplane(&["ip", "link", "show", "wg0"])
+            .in_dataplane(&["ip", "link", "show", "wgln0"])
             .is_ok()
     );
     assert!(run("ip", &["link", "show", "br-lnvps"]).is_err());

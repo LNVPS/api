@@ -447,7 +447,7 @@ async fn observation_reports_what_the_machine_has() {
     let kernel = FakeKernel::new();
     apply(&kernel, &desired(), &key()).await.unwrap();
 
-    // `wg0` comes up happily with a peer that never answers, so an interface
+    // WireGuard comes up happily with a peer that never answers, so an interface
     // that has never handshaken is configured, not working.
     let state = observe(&kernel).await.unwrap();
     assert!(state.tunnel_up);

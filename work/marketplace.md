@@ -99,7 +99,7 @@ Node is a **client**, never a server:
 ### Data plane (all traffic over WireGuard)
 
 ```
-guest VM ─ tap ─ br-lnvps (no operator uplink) ─ wg0 ─┐
+guest VM ─ tap ─ br-lnvps (no operator uplink) ─ wgln0 ─┐
                                                        │  WG (UDP)
                          operator NAT / any ISP        │
                                                        ▼
@@ -744,7 +744,7 @@ What the build settled beyond the plan:
   constraint, which is exactly the pool-less case. The mock mirrors it.
 - **A node takes one address, not a link** (revised during 4b; 4a shipped /31s and /127s).
   WireGuard is layer 3 and point-to-point, with no ARP and no on-link requirement, so the node
-  needs no gateway of its own — `ip route add default dev wg0` is enough. A /31 therefore spent
+  needs no gateway of its own — `ip route add default dev wgln0` is enough. A /31 therefore spent
   two addresses describing something that needs one, and worse, forced the route server to hold
   one address per node on a single interface: a /16 pool with a thousand nodes meant a thousand
   addresses on `wgln<id>`, re-parsed out of `ip addr show` on every reconcile. The route server
@@ -868,7 +868,7 @@ What the build settled beyond the plan:
 - **The bridge takes the tunnel's MTU.** A guest sending 1500 bytes into a 1420-byte tunnel gets
   a connection that opens and then hangs on the first large transfer — the worst failure shape
   there is, because everything looks fine until it does not.
-- **A peer that is not the route server is removed from `wg0`**, most likely a stale key left by
+- **A peer that is not the route server is removed from the tunnel interface**, most likely a stale key left by
   a re-key, which would otherwise still be able to send traffic the node treats as LNVPS's.
 - **Routes for departed guests are swept**, since a released address goes straight back in the
   pool and may already be somebody else's; the bridge's own gateway addresses are excluded from
@@ -876,7 +876,7 @@ What the build settled beyond the plan:
 - **Observation reads the machine, never a cache.** `/api/v1/status` runs the queries on
   demand: a cached answer reports that the tunnel was up once, which is exactly what the health
   gate must not accept. A tunnel that has never handshaken is reported as configured but not
-  working, because `wg0` comes up perfectly happily with a peer that never answers.
+  working, because WireGuard comes up perfectly happily with a peer that never answers.
 - **The node generates its key in-process** rather than shelling out to `wg genkey`, so a
   missing `wg` fails when the interface is configured, with that error. The private key reaches
   `wg` as a **path**, never an argument: arguments are visible in `ps` to every user on the
@@ -901,6 +901,12 @@ Reworked during review, before merge:
   which looks like spoofing to their upstream. `wg0` is created in the machine's namespace and
   *moved*, because a WireGuard interface keeps its UDP socket where it was created — that is
   what lets the encrypted outer traffic still use the operator's uplink.
+- **The node's tunnel is `wgln0`, not `wg0`.** It is created in the *machine's* namespace
+  before being moved into the data plane's, so the name has to be one an operator is not
+  already using — a VPN, a mesh, anything called `wg0` would either fail the creation or, worse,
+  be adopted and moved out from under them. The `wgln` prefix is the same one the route server
+  uses, so a managed interface is recognisable as LNVPS's wherever it appears. The harness
+  proves it by putting an operator's own `wg0` on the machine first and checking it survives.
 - **The bridge name is no longer sent.** Both sides hold it as a constant, because the daemon
   needs the name before it has ever spoken to LNVPS (`dataplane observe` takes no credential),
   and a document that could name a different one would leave the node holding two answers. The

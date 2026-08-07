@@ -23,7 +23,8 @@
 //!
 //! The one thing that must stay outside is the tunnel's own UDP socket: a
 //! WireGuard interface keeps its socket in the namespace it was *created* in,
-//! so `wg0` is created in the machine's namespace and then moved into this one.
+//! so the tunnel interface is created in the machine's namespace and then moved
+//! into this one.
 //! The encrypted outer traffic still leaves through the operator's uplink,
 //! while the inner interface — and everything routed over it — is isolated.
 

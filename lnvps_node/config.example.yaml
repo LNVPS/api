@@ -37,4 +37,7 @@ control:
   # real addresses at startup.
   listen: "10.66.0.2"
   port: 8890
-  tunnel-interface: "wg0"
+  # Named with the LNVPS prefix rather than wg0: the daemon creates it on the
+  # machine before moving it into its own network namespace, and an operator's
+  # own wg0 is a name it must not collide with.
+  tunnel-interface: "wgln0"

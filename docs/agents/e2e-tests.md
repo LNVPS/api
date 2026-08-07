@@ -325,7 +325,7 @@ packets across it.
 
 ```text
   [rs netns]                    [machine netns]           [lnvps netns]         [guest netns]
-  wgln<pool>  <══ WireGuard ══>  wg0 created here, then ══> wg0             veth
+  wgln<pool>  <══ WireGuard ══>  wgln0 created here, then ═> wgln0           veth
   10.66.0.1/24                   its UDP socket stays here  10.66.0.2/32    br-lnvps ── 203.0.113.5/24
 ```
 

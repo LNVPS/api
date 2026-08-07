@@ -80,7 +80,7 @@ fn default_control_port() -> u16 {
 }
 
 fn default_tunnel_interface() -> String {
-    "wg0".to_string()
+    crate::net::TUNNEL_INTERFACE.to_string()
 }
 
 impl NodeConfig {
@@ -257,7 +257,7 @@ control:
         let control = NodeConfig::load(&path).unwrap().control.unwrap();
         assert_eq!(control.listen, v4("10.66.0.1"));
         assert_eq!(control.port, 8890);
-        assert_eq!(control.tunnel_interface, "wg0");
+        assert_eq!(control.tunnel_interface, "wgln0");
     }
 
     /// A typo in a key must not be silently ignored: a misspelled `listen`
