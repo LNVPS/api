@@ -38,6 +38,7 @@ async fn start_node(keys: &Keys, state_dir: &std::path::Path) -> (SocketAddr, Ve
         keys.public_key(),
         addr,
         Arc::new(lnvps_node::net::UnavailableKernel),
+        Arc::new(lnvps_node::fw::UnavailableFirewall),
     ));
     tokio::spawn(async move { serve(state, addr, node_tls).await });
 

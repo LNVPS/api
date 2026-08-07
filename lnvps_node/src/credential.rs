@@ -15,7 +15,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 /// Where the node's token lives.

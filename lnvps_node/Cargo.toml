@@ -22,6 +22,7 @@ nostr = { version = "0.44", default-features = false, features = ["std"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 rand = "0.9"
 hex.workspace = true
+nftables.workspace = true
 # Outbound calls to LNVPS: the node fetches the data plane it should be running.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 # Self-signed TLS identity, pinned by LNVPS at registration. Same crate and

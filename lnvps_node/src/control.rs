@@ -60,6 +60,8 @@ pub struct ControlState {
     /// How the node reads its own network back. Held here so a test can supply
     /// a machine that is not the one the tests run on.
     pub net: Arc<dyn crate::net::NetOps>,
+    /// How the node reads its packet filter back, for the same reason.
+    pub fw: Arc<dyn crate::fw::FirewallOps>,
 }
 
 impl ControlState {
@@ -68,18 +70,20 @@ impl ControlState {
         control_pubkey: PublicKey,
         addr: SocketAddr,
         net: Arc<dyn crate::net::NetOps>,
+        fw: Arc<dyn crate::fw::FirewallOps>,
     ) -> Self {
         Self {
             control_pubkey,
             replay: Mutex::new(ReplayGuard::new(REPLAY_WINDOW, REPLAY_CAPACITY)),
             base_url: format!("https://{addr}"),
             net,
+            fw,
         }
     }
 
     /// The data plane as this machine actually has it.
     pub async fn observe(&self) -> crate::net::DataPlaneState {
-        crate::net::observe(self.net.as_ref())
+        crate::net::observe(self.net.as_ref(), self.fw.as_ref())
             .await
             .unwrap_or_default()
     }
@@ -250,6 +254,7 @@ mod tests {
             keys.public_key(),
             addr.parse().unwrap(),
             Arc::new(crate::net::tests::FakeKernel::default()),
+            Arc::new(crate::fw::tests::FakeFirewall::default()),
         ))
     }
 
@@ -309,6 +314,7 @@ mod tests {
             keys.public_key(),
             addr,
             Arc::new(crate::net::tests::FakeKernel::default()),
+            Arc::new(crate::fw::tests::FakeFirewall::default()),
         );
 
         let url = format!("https://{ADDR}/api/v1/status");

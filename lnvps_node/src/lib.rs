@@ -15,6 +15,8 @@
 //! - [`api`] — outbound calls to LNVPS, the only direction that works before
 //!   there is a tunnel.
 //! - [`net`] — applying the data plane LNVPS asked for, over netlink.
+//! - [`fw`] — the packet filter around the guests, which is what stops one
+//!   customer being another.
 //! - [`netns`] — the namespace that data plane lives in, so LNVPS configures
 //!   its own network rather than the operator's.
 //! - [`wgkey`] — the node's WireGuard key, generated here and never sent.
@@ -25,6 +27,7 @@ pub mod config;
 pub mod control;
 pub mod control_auth;
 pub mod credential;
+pub mod fw;
 pub mod inventory;
 pub mod net;
 pub mod netns;
