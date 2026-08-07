@@ -10,23 +10,14 @@ use std::sync::Mutex;
 
 use super::*;
 
-/// A machine with a working `nft` that already carries the ruleset for the
+/// A machine with a working nftables, already carrying the ruleset for the
 /// guests below, for the tests that are about the network rather than the
 /// filter. The filter's own decisions are tested in [`crate::fw::tests`].
-fn fw() -> crate::fw::tests::FakeFirewall {
+async fn fw() -> crate::fw::tests::FakeFirewall {
+    let fake = crate::fw::tests::FakeFirewall::with_nft();
     let policy = crate::fw::Policy::from_desired(&desired()).unwrap();
-    crate::fw::tests::FakeFirewall {
-        programs: vec!["nft".to_string()],
-        output: vec![(
-            "nft".to_string(),
-            format!(
-                "chain forward {{ type filter hook forward priority filter; policy drop; }} \
-                 drop comment \"lnvps:{}\"",
-                crate::fw::fingerprint(&policy)
-            ),
-        )],
-        ..Default::default()
-    }
+    crate::fw::apply(&fake, &policy).await.unwrap();
+    fake
 }
 
 /// A machine that remembers what it was told, and answers questions from what
@@ -258,7 +249,9 @@ fn cidr(value: &str) -> IpNetwork {
 #[tokio::test]
 async fn a_bare_machine_gets_the_whole_data_plane() {
     let kernel = FakeKernel::new();
-    let changed = apply(&kernel, &fw(), &desired(), &key()).await.unwrap();
+    let changed = apply(&kernel, &fw().await, &desired(), &key())
+        .await
+        .unwrap();
     assert!(!changed.is_empty());
 
     assert_eq!(
@@ -322,9 +315,13 @@ async fn a_bare_machine_gets_the_whole_data_plane() {
 #[tokio::test]
 async fn a_correct_machine_is_not_touched_again() {
     let kernel = FakeKernel::new();
-    apply(&kernel, &fw(), &desired(), &key()).await.unwrap();
+    apply(&kernel, &fw().await, &desired(), &key())
+        .await
+        .unwrap();
 
-    let changed = apply(&kernel, &fw(), &desired(), &key()).await.unwrap();
+    let changed = apply(&kernel, &fw().await, &desired(), &key())
+        .await
+        .unwrap();
     // Configuring WireGuard is stated unconditionally — the kernel API takes
     // the whole interface and there is nothing to compare a private key
     // against — but nothing else may move.
@@ -349,7 +346,9 @@ async fn a_stale_peer_is_removed() {
         .peers
         .push(("c3RyYXk=".to_string(), None));
 
-    let changed = apply(&kernel, &fw(), &desired(), &key()).await.unwrap();
+    let changed = apply(&kernel, &fw().await, &desired(), &key())
+        .await
+        .unwrap();
     assert!(
         changed
             .iter()
@@ -370,13 +369,17 @@ async fn a_stale_peer_is_removed() {
 #[tokio::test]
 async fn a_departed_guest_stops_being_routed() {
     let kernel = FakeKernel::new();
-    apply(&kernel, &fw(), &desired(), &key()).await.unwrap();
+    apply(&kernel, &fw().await, &desired(), &key())
+        .await
+        .unwrap();
     kernel
         .add_route(cidr("203.0.113.9/32"), GUEST_BRIDGE)
         .await
         .unwrap();
 
-    let changed = apply(&kernel, &fw(), &desired(), &key()).await.unwrap();
+    let changed = apply(&kernel, &fw().await, &desired(), &key())
+        .await
+        .unwrap();
     assert!(
         changed
             .iter()
@@ -397,7 +400,9 @@ async fn a_departed_guest_stops_being_routed() {
 #[tokio::test]
 async fn a_stale_address_goes_and_the_kernels_own_stays() {
     let kernel = FakeKernel::new();
-    apply(&kernel, &fw(), &desired(), &key()).await.unwrap();
+    apply(&kernel, &fw().await, &desired(), &key())
+        .await
+        .unwrap();
     kernel
         .add_address(TUNNEL_INTERFACE, cidr("10.66.0.9/32"))
         .await
@@ -407,7 +412,9 @@ async fn a_stale_address_goes_and_the_kernels_own_stays() {
         .await
         .unwrap();
 
-    apply(&kernel, &fw(), &desired(), &key()).await.unwrap();
+    apply(&kernel, &fw().await, &desired(), &key())
+        .await
+        .unwrap();
     let addresses = kernel.addresses_of(TUNNEL_INTERFACE);
     assert!(!addresses.contains(&cidr("10.66.0.9/32")), "{addresses:?}");
     assert!(addresses.contains(&cidr("fe80::1/64")), "{addresses:?}");
@@ -421,7 +428,7 @@ async fn a_single_stack_tunnel_only_routes_its_own_family() {
     let kernel = FakeKernel::new();
     let mut plane = desired();
     plane.tunnel.address6 = None;
-    apply(&kernel, &fw(), &plane, &key()).await.unwrap();
+    apply(&kernel, &fw().await, &plane, &key()).await.unwrap();
     assert_eq!(kernel.routes_of(TUNNEL_INTERFACE), vec![cidr("0.0.0.0/0")]);
 }
 
@@ -436,7 +443,9 @@ async fn a_kernel_without_ipv6_still_configures() {
         ],
         ..FakeKernel::new()
     };
-    apply(&kernel, &fw(), &desired(), &key()).await.unwrap();
+    apply(&kernel, &fw().await, &desired(), &key())
+        .await
+        .unwrap();
     assert_eq!(
         kernel.sysctl_value("net/ipv4/ip_forward"),
         Some("1".to_string())
@@ -450,12 +459,16 @@ async fn a_malformed_address_is_reported() {
     let kernel = FakeKernel::new();
     let mut plane = desired();
     plane.tunnel.address4 = Some("not-an-address".to_string());
-    let err = apply(&kernel, &fw(), &plane, &key()).await.unwrap_err();
+    let err = apply(&kernel, &fw().await, &plane, &key())
+        .await
+        .unwrap_err();
     assert!(format!("{err:#}").contains("not-an-address"), "{err:#}");
 
     let mut plane = desired();
     plane.gateways = vec!["also-not".to_string()];
-    let err = apply(&kernel, &fw(), &plane, &key()).await.unwrap_err();
+    let err = apply(&kernel, &fw().await, &plane, &key())
+        .await
+        .unwrap_err();
     assert!(format!("{err:#}").contains("also-not"), "{err:#}");
 }
 
@@ -464,11 +477,13 @@ async fn a_malformed_address_is_reported() {
 #[tokio::test]
 async fn observation_reports_what_the_machine_has() {
     let kernel = FakeKernel::new();
-    apply(&kernel, &fw(), &desired(), &key()).await.unwrap();
+    apply(&kernel, &fw().await, &desired(), &key())
+        .await
+        .unwrap();
 
     // WireGuard comes up happily with a peer that never answers, so an interface
     // that has never handshaken is configured, not working.
-    let state = observe(&kernel, &fw()).await.unwrap();
+    let state = observe(&kernel, &fw().await).await.unwrap();
     assert!(state.tunnel_up);
     assert_eq!(state.tunnel_mtu, Some(1420));
     assert_eq!(state.last_handshake_secs, None);
@@ -488,7 +503,7 @@ async fn observation_reports_what_the_machine_has() {
         .get_mut(TUNNEL_INTERFACE)
         .unwrap()
         .peers = vec![("peer".to_string(), Some(12))];
-    let state = observe(&kernel, &fw()).await.unwrap();
+    let state = observe(&kernel, &fw().await).await.unwrap();
     assert_eq!(state.last_handshake_secs, Some(12));
     assert!(state.healthy());
 }

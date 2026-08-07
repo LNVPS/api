@@ -381,14 +381,14 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
             .is_err(),
         "a guest reached the network sourcing an address LNVPS never assigned it:\n{}",
         topology
-            .in_dataplane(&["nft", "list", "table", "inet", "lnvps"])
+            .in_dataplane(&["nft", "list", "ruleset"])
             .unwrap_or_default()
     );
 
     // ...and the filter says which ruleset it is enforcing, read back off the
     // kernel rather than remembered by the daemon.
     let firewall_state = lnvps_node::fw::observe(&firewall).await;
-    assert_eq!(firewall_state.backend, Some(lnvps_node::fw::Backend::Nft));
+    assert!(firewall_state.available, "{firewall_state:?}");
     assert!(firewall_state.present, "{firewall_state:?}");
     assert!(
         firewall_state.isolated,

@@ -840,9 +840,14 @@ deliberately:
   `wg-quick` files for something else to read. A marketplace node runs on hardware LNVPS does
   not own, so a data plane that depends on the operator having wired it up correctly is one
   whose mistakes surface as a customer's VM having no network. The daemon re-converges instead.
-- **Both `nft` and `iptables` are supported**, detected at runtime, because a node is somebody
-  else's machine and refusing the ones that run iptables would refuse real hardware. It costs a
-  second dialect, which is why the firewall is its own increment.
+- **nftables only, spoken as JSON through the `nftables` crate** — not `iptables`, and not `nft`
+  syntax this codebase formats and then parses back. Rules go to the kernel as typed objects and
+  come back the same way, so what the daemon reports is what the kernel holds rather than what a
+  scraper made of `nft list` output on whichever version the operator has. `iptables` was in the
+  first draft and dropped: it cannot express the layer 2 rule at all (that is `ebtables`, a third
+  tool), it has no typed exchange, and a second code path enforcing "the same" policy is a second
+  code path to get subtly wrong. Debian has shipped `nftables` by default since Buster (2019);
+  a machine without it is refused, which is the correct answer for a machine that cannot filter.
 - **The health gate spawns a real guest and pings it** rather than asking the node how it
   thinks it is doing. The node self-reporting "bridge up, forwarding on" cannot catch a bridge
   with no path to the tunnel, which is exactly the mistake worth catching before a customer
@@ -958,8 +963,10 @@ topology can enforce.
 - **The ruleset is owned wholesale and replaced atomically.** The daemon does not add rules to
   the operator's chains: it renders a complete table and swaps it in one transaction, so there
   is no window in which a guest is unfiltered and no way for a half-applied set to persist.
-- **`nft` where available, `iptables` where not**, detected at runtime and reported in status —
-  the whole point of the marketplace is hardware LNVPS did not choose.
+- **nftables only, and typed.** The ruleset is built as `nftables` crate schema objects and
+  exchanged with the kernel as JSON in both directions — never as text this codebase formats and
+  the machine parses back. A node whose nftables does not work is refused rather than configured
+  without a filter.
 - The guest list comes from 4c1's document, so the boundary is LNVPS's, not something the node
   infers from what it happens to see on the bridge.
 
@@ -971,7 +978,7 @@ isolation is what is available in the meantime.
 Built as `lnvps_node/src/fw.rs`, and two decisions are worth recording:
 
 - **The machine states which ruleset it is running, and the daemon believes it.** The tag is
-  rendered into a rule comment and read back out of `nft list` / `iptables-save`, so an
+  carried in a rule comment and read back out of the kernel's own JSON, so an
   operator who flushes the table by hand gets it rebuilt on the next refresh. A daemon that
   remembered what it last applied would go on reporting a filter that no longer existed —
   which is the failure this whole increment exists to prevent, arrived at from the other side.

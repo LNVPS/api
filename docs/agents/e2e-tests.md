@@ -359,7 +359,9 @@ that proves a packet moves. This harness caught four things nothing else did:
   in the pool. Not visible in any unit test, because the code did exactly what it
   was written to do.
 
-The same harness covers the packet filter (`lnvps_node::fw`): a guest is given a second address
+The same harness covers the packet filter (`lnvps_node::fw`), which is where its rules are
+proved to load at all — nftables rejects a ruleset the kernel cannot express, and no unit test
+against typed objects can tell you whether `nft` will accept them: a guest is given a second address
 nobody assigned it — which any customer with root in their own VM can do — and the node's spoof
 counter is asserted to move. The counter, not the ping's exit status: a spoofed packet gets no
 reply in any case, for want of a return route.
