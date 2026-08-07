@@ -38,6 +38,22 @@ pub fn probe_mac(node_id: u64) -> String {
     format!("52:54:01:{:02x}:{:02x}:{:02x}", id[5], id[6], id[7])
 }
 
+/// The gateway a probe VM is given, as a host prefix.
+///
+/// **Not the route server's address.** The node holds its guests' gateway on the
+/// bridge so they can reach it on-link, and the route server holds its own
+/// address on the same pool — so making the route server the probe's gateway
+/// gives two machines the same address. The guest's replies then arrive at the
+/// node, which delivers them to itself, and the route server sees nothing at
+/// all. A probe on a working node looks exactly like a node that cannot carry
+/// traffic.
+///
+/// Derived at a different offset from the probe's own address so the two can
+/// never collide, and per-node so two nodes never claim the same gateway.
+pub fn probe_gateway(tunnel: &Tunnel) -> Option<String> {
+    offset_address(tunnel, 0xC000)
+}
+
 /// The address a probe VM on this node gets, as a host prefix.
 ///
 /// The node's own inner v6 address with its last group offset, which keeps the
@@ -48,6 +64,15 @@ pub fn probe_mac(node_id: u64) -> String {
 /// carry a probe, and inventing a v4 one instead would spend the resource this
 /// deliberately avoids.
 pub fn probe_address(tunnel: &Tunnel) -> Option<String> {
+    offset_address(tunnel, 0x8000)
+}
+
+/// The node's own v6 address with its last group offset.
+///
+/// The offsets are large enough that they cannot land on another node's address
+/// in any pool we would allocate: nodes are handed consecutive addresses from
+/// the bottom of the block.
+fn offset_address(tunnel: &Tunnel, offset: u16) -> Option<String> {
     let addr = tunnel.address6.as_deref()?;
     let bare = addr.split('/').next()?;
     let IpAddr::V6(v6) = bare.parse::<IpAddr>().ok()? else {
@@ -55,11 +80,7 @@ pub fn probe_address(tunnel: &Tunnel) -> Option<String> {
     };
 
     let mut groups = v6.segments();
-    // The offset is large enough that it cannot land on another node's address
-    // in any pool we would allocate: nodes are handed consecutive addresses
-    // from the bottom of the block, and a pool with 32,768 nodes in it has
-    // problems this collision is the least of.
-    groups[7] = groups[7].checked_add(0x8000)?;
+    groups[7] = groups[7].checked_add(offset)?;
     Some(format!("{}/128", Ipv6Addr::from(groups)))
 }
 

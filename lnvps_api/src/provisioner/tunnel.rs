@@ -496,10 +496,12 @@ pub async fn node_dataplane(
     if let Some(address) = super::probe_address(&tunnel.tunnel) {
         guests.push(GuestAddress {
             address,
-            // Its gateway is the route server, which is where everything on
-            // this node's tunnel goes.
-            gateway: tunnel
-                .gateway6()
+            // The node's own address for probes, which it answers for on the
+            // bridge. Deliberately not the route server's: the node holds its
+            // guests' gateways itself, so sharing that address with the route
+            // server means the guest's replies are delivered to the node and
+            // the route server never sees them.
+            gateway: super::probe_gateway(&tunnel.tunnel)
                 .and_then(|g| g.split('/').next().map(str::to_string))
                 .unwrap_or_default(),
             mac: Some(super::probe_mac(node.id)),
@@ -1283,7 +1285,8 @@ mod tests {
         // configured specially proves nothing about a customer.
         assert_eq!(
             plane.gateways(),
-            vec!["10.0.0.1".to_string(), "fd00:66::1".to_string()]
+            vec!["10.0.0.1".to_string(), "fd00:66::c002".to_string()],
+            "the probe's gateway is the node's own, not the route server's"
         );
     }
 
@@ -1311,6 +1314,13 @@ mod tests {
         assert_eq!(
             plane.guests[0].mac.as_deref(),
             Some(&*super::super::probe_mac(node.id))
+        );
+        // The node's own gateway for probes, not the route server's: the node
+        // holds its guests' gateways itself, and sharing that address with the
+        // route server means every reply is delivered to the node instead.
+        assert_eq!(
+            plane.guests[0].gateway, "fd00:66::c002",
+            "the probe's gateway collides with the route server"
         );
     }
 

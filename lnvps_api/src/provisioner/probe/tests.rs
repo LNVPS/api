@@ -627,3 +627,40 @@ async fn a_node_with_no_host_is_skipped_quietly() -> Result<()> {
     assert!(probe_candidates(&db, chrono::Utc::now()).await?.is_empty());
     Ok(())
 }
+
+/// The guest is addressed from the pool's block, not from its own address.
+///
+/// Cloud-init widens a guest's prefix to the shorter of its range and its
+/// gateway, so describing the range as the probe's own /128 gives the guest a
+/// /128 whose gateway is not on-link — and a guest that cannot reach its
+/// gateway has no network at all, on a node that is working perfectly. It looks
+/// exactly like a broken machine.
+#[tokio::test]
+async fn a_probe_can_reach_its_gateway() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+    let node = a_node(&db).await?;
+    let spec = ProbeSpec::build(&db, &node, KEY.to_string()).await?;
+
+    let info = spec.vm_info();
+    let network = lnvps_api_common::host::cloud_init::network_config(&info)?;
+
+    // A host prefix: the guest's own address and nothing else is on-link, so
+    // everything it sends goes to the node — the only thing on that bridge that
+    // can route. A wider prefix would make the route server look on-link, and
+    // the guest would resolve it on a link where nothing answers.
+    assert!(
+        network.yaml.contains(&format!("{}/128", spec.ip())),
+        "{}",
+        network.yaml
+    );
+    // ...which requires the gateway to be marked reachable anyway.
+    assert!(
+        network.yaml.contains("on-link: true"),
+        "a gateway outside the guest's prefix is unusable without this:\n{}",
+        network.yaml
+    );
+    Ok(())
+}

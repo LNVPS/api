@@ -97,6 +97,16 @@ pub struct ProbeSpec {
     pub image: VmOsImage,
     pub address: String,
     pub gateway: String,
+    /// The block the probe is addressed from: its own host prefix.
+    ///
+    /// Deliberately *not* the pool's block. A guest whose prefix covers the
+    /// pool treats every address in it as on-link — including the route
+    /// server's — and resolves them on the bridge instead of sending them to
+    /// its gateway. Nothing on that bridge answers for a machine up a tunnel,
+    /// so replies are never sent and a working node looks dead. A host prefix
+    /// plus an on-link gateway sends everything to the node, which is the only
+    /// thing on that link that can route.
+    pub range_cidr: String,
     /// The public half of a keypair generated for this probe and thrown away
     /// after it. A long-lived key that opened a shell on every operator's
     /// hardware would be the most valuable secret LNVPS holds.
@@ -125,10 +135,15 @@ impl ProbeSpec {
             .ok_or_else(|| anyhow::anyhow!("Node {} has no tunnel", node.id))?;
         let address = probe_address(&tunnel.tunnel)
             .ok_or_else(|| anyhow::anyhow!("Node {} has no IPv6 address to probe on", node.id))?;
-        let gateway = tunnel
-            .gateway6()
+        // The node's own probe gateway, which it answers for on the bridge —
+        // not the route server's address, which the node also holds and would
+        // therefore swallow every reply to.
+        let gateway = super::probe_gateway(&tunnel.tunnel)
             .and_then(|g| g.split('/').next().map(str::to_string))
             .ok_or_else(|| anyhow::anyhow!("Node {} has no IPv6 gateway", node.id))?;
+        // Its own address as the range, so the guest's prefix covers nothing
+        // but itself.
+        let range_cidr = address.clone();
 
         let mut templates: Vec<VmTemplate> = db
             .list_vm_templates()
@@ -159,6 +174,7 @@ impl ProbeSpec {
             image,
             address,
             gateway,
+            range_cidr,
             ssh_public_key,
         })
     }
@@ -214,7 +230,7 @@ impl ProbeSpec {
             }],
             ranges: vec![IpRange {
                 id: 0,
-                cidr: self.address.clone(),
+                cidr: self.range_cidr.clone(),
                 gateway: self.gateway.clone(),
                 enabled: true,
                 region_id: self.host.region_id,

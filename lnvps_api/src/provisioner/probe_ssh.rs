@@ -87,7 +87,13 @@ pub async fn measure(
     key: &ProbeKey,
     started: Instant,
 ) -> Result<ProbeResult> {
-    let mut client = wait_for_login(address, SSH_PORT, username, key, started).await?;
+    // The login window starts *now*, not when the VM was asked for. Building it
+    // includes fetching an OS image the node has never seen and cloning a disk,
+    // which on a cold node is minutes; a deadline measured from the request
+    // spends that budget on the provisioning and then reports the guest as
+    // unreachable. `provision_ms` still covers the whole thing, because that is
+    // what a customer waits through — it is measured, not enforced.
+    let mut client = wait_for_login(address, SSH_PORT, username, key, LOGIN_TIMEOUT).await?;
     let provision_ms = started.elapsed().as_millis() as u32;
 
     Ok(ProbeResult {
@@ -108,10 +114,11 @@ async fn wait_for_login(
     port: u16,
     username: &str,
     key: &ProbeKey,
-    started: Instant,
+    window: Duration,
 ) -> Result<SshClient> {
+    let started = Instant::now();
     let mut last = String::new();
-    while started.elapsed() < LOGIN_TIMEOUT {
+    while started.elapsed() < window {
         let mut client = SshClient::new();
         match client
             .connect_with_key((address, port), username, &key.private_pem)
@@ -122,10 +129,7 @@ async fn wait_for_login(
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
-    bail!(
-        "could not log in within {}s: {last}",
-        LOGIN_TIMEOUT.as_secs()
-    )
+    bail!("could not log in within {}s: {last}", window.as_secs())
 }
 
 /// Memory the guest can allocate *and write to*, in MB.

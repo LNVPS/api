@@ -4188,13 +4188,13 @@ mod tests {
         let net = ProxmoxClient::make_network_config(&cfg)?.expect("two v4 needs a snippet");
 
         // Both addresses, widened to the gateway prefix so the gateway is on-link.
-        assert!(net.contains("- 185.18.221.65/24"), "{net}");
-        assert!(net.contains("- 185.18.221.66/24"), "{net}");
+        assert!(net.contains(r#"- "185.18.221.65/24""#), "{net}");
+        assert!(net.contains(r#"- "185.18.221.66/24""#), "{net}");
         // Matched by MAC, not by guest interface name.
-        assert!(net.contains("macaddress: ff:ff:ff:ff:ff:fe"), "{net}");
+        assert!(net.contains(r#"macaddress: "ff:ff:ff:ff:ff:fe""#), "{net}");
         // One default route, not one per address.
         assert_eq!(1, net.matches("to: default").count(), "{net}");
-        assert!(net.contains("via: 185.18.221.1"), "{net}");
+        assert!(net.contains(r#"via: "185.18.221.1""#), "{net}");
         Ok(())
     }
 
@@ -4280,8 +4280,8 @@ mod tests {
         let net = ProxmoxClient::make_network_config(&cfg)?.expect("two v4 needs a snippet");
         assert_eq!(1, net.matches("to: default").count(), "{net}");
         // The first assignment's gateway wins, as it does via `ipconfig`.
-        assert!(net.contains("via: 185.18.221.1"), "{net}");
-        assert!(net.contains("- 185.18.221.130/24"), "{net}");
+        assert!(net.contains(r#"via: "185.18.221.1""#), "{net}");
+        assert!(net.contains(r#"- "185.18.221.130/24""#), "{net}");
         Ok(())
     }
 

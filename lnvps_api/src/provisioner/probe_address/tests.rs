@@ -84,3 +84,39 @@ fn a_probes_mac_is_stable_and_its_own() {
     // QEMU's OUI, so an operator reading their own bridge sees what they expect.
     assert!(probe_mac(7).starts_with("52:54:"), "{}", probe_mac(7));
 }
+
+/// A probe's gateway is the node's own, never the route server's.
+///
+/// The node holds its guests' gateway on the bridge so they can reach it
+/// on-link, and the route server holds its own address on the same pool. Give
+/// the probe the route server's address and two machines hold one address: the
+/// guest's replies are delivered to the node, the route server sees nothing,
+/// and a working node looks exactly like one that cannot carry traffic.
+#[test]
+fn a_probes_gateway_is_not_the_route_servers() {
+    let t = tunnel(Some("fd00:66::2/128"));
+    let gateway = probe_gateway(&t).unwrap();
+
+    // The route server's address is the bottom of the pool; the node's gateway
+    // for probes is nowhere near it.
+    assert_ne!(gateway, "fd00:66::1/128");
+    assert_ne!(gateway, probe_address(&t).unwrap());
+    assert_eq!(gateway, "fd00:66::c002/128");
+}
+
+/// Gateways and probe addresses never collide, across every node in a pool.
+#[test]
+fn gateways_and_probes_share_no_addresses() {
+    let mut seen = Vec::new();
+    for n in 1..=64u16 {
+        let t = tunnel(Some(&format!("fd00:66::{n:x}/128")));
+        seen.push(probe_address(&t).unwrap());
+        seen.push(probe_gateway(&t).unwrap());
+        // The route server's own address, which neither may take.
+        assert_ne!(probe_gateway(&t).unwrap(), "fd00:66::1/128");
+    }
+    let mut sorted = seen.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), seen.len(), "two addresses collided");
+}

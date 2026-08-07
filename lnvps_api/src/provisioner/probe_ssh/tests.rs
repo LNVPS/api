@@ -83,9 +83,9 @@ async fn a_node_that_never_answers_says_why() {
     let key = ProbeKey::generate().unwrap();
     // Loopback and a port nothing listens on: refused immediately, so the test
     // measures the reporting rather than a TCP timeout.
-    let started = Instant::now() - (LOGIN_TIMEOUT - Duration::from_millis(200));
 
-    let Err(err) = wait_for_login("127.0.0.1", 1, "probe", &key, started).await else {
+    let Err(err) = wait_for_login("127.0.0.1", 1, "probe", &key, Duration::from_millis(600)).await
+    else {
         panic!("nothing is listening on that port");
     };
 
@@ -140,4 +140,25 @@ fn memory_is_read_or_reported_as_unreadable() {
     assert_eq!(parse_mem_total(" 2048000 \n").unwrap(), 2_048_000);
     let err = parse_mem_total("MemTotal: lots").unwrap_err();
     assert!(err.to_string().contains("lots"), "{err}");
+}
+
+/// The login deadline does not include provisioning.
+///
+/// Building the VM includes fetching an OS image the node has never seen and
+/// cloning a disk — minutes on a cold node. A deadline measured from the request
+/// spends its whole budget there and then reports a healthy guest as
+/// unreachable, which is the worst possible answer: it condemns the node for
+/// being new.
+#[tokio::test]
+async fn a_slow_build_does_not_eat_the_login_window() {
+    let key = ProbeKey::generate().unwrap();
+    // A window that starts when the guest does, not when the request did: the
+    // caller has already spent longer than the whole budget on provisioning.
+    let began = Instant::now();
+    let _ = wait_for_login("127.0.0.1", 1, "probe", &key, Duration::from_millis(600)).await;
+
+    assert!(
+        began.elapsed() >= Duration::from_millis(500),
+        "the probe gave up without waiting for the guest at all"
+    );
 }

@@ -16,7 +16,7 @@ set -euo pipefail
 
 # Every harness that needs a real kernel. Listed once: a test added here and
 # nowhere else is one nobody ever runs.
-TESTS=(tunnel_netns node_libvirt)
+TESTS=(tunnel_netns node_libvirt node_probe)
 TEST_ARGS=()
 for t in "${TESTS[@]}"; do TEST_ARGS+=(--test "$t"); done
 
