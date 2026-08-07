@@ -18,6 +18,12 @@ pub struct Settings {
     /// `LNVPS_ENCRYPTION_KEY` environment variable is not set)
     pub encryption: Option<EncryptionConfig>,
 
+    /// LNVPS's nostr identity, the same key the main API holds. Marketplace
+    /// nodes are built to obey its public half, so the admin API needs it to
+    /// call them. Absent in a deployment that runs no marketplace, where every
+    /// node call is refused with that reason rather than a missing-key panic.
+    pub nostr: Option<lnvps_api_common::node_control::NostrConfig>,
+
     /// Per-IP API rate limiting. Enabled unless explicitly turned off, which
     /// is only intended for the E2E suite (hundreds of requests a minute from
     /// one address).

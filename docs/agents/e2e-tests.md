@@ -316,6 +316,25 @@ The `.github/workflows/e2e.yml` workflow runs E2E tests on every pull request. I
 | `.github/e2e/admin-config.yaml` | Admin API config template (DB URL replaced at runtime) |
 | `.github/e2e/wait-for-lnd.sh` | Script to wait for LND readiness and mine initial blocks |
 
+## Node control interop (`tests/node_control.rs`)
+
+`lnvps_api_common::node_control` signs and pins; `lnvps_node::control` verifies and serves. Each
+side is unit-tested against its own idea of the other, which is exactly the arrangement in which
+two correct-looking halves fail to interoperate — a tag named differently on each side, a URL
+built with a port on one and without on the other, a fingerprint stored as hex here and bytes
+there. This test stands up the real node server and calls it with the real client.
+
+No root and no namespaces; it runs in the ordinary suite:
+
+```sh
+cargo test -p lnvps_e2e --test node_control
+```
+
+Each test binds its node on a different loopback address rather than a different port, because
+the port is the one LNVPS dials fleet-wide — a test that picked a free port would pass while
+production called the wrong one. It is also where the TLS verifier's signature callbacks are
+covered, since those only run in a real handshake.
+
 ## Marketplace tunnel harness (`tests/tunnel_netns.rs`)
 
 A second kind of end-to-end test lives in the same crate and shares none of the

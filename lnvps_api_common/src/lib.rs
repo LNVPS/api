@@ -13,6 +13,7 @@ mod model;
 mod network;
 mod nip98;
 pub mod node_auth;
+pub mod node_control;
 mod ovh;
 mod panic_guard;
 mod pricing;

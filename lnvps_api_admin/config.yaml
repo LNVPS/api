@@ -5,3 +5,10 @@ redis:
 encryption:
   key-file: "../encryption.key"
   auto-generate: true
+
+# LNVPS's nostr identity — the same key the main API holds, the account
+# customers DM for support. Marketplace nodes are built to obey its public half
+# (LNVPS_CONTROL_PUBKEY at node build time), so the admin API needs it to call
+# them. Omit this section entirely in a deployment that runs no marketplace.
+#nostr:
+#  nsec: "nsec1..."

@@ -991,9 +991,43 @@ reply anyway for want of a return route, so a failed ping proves nothing. What p
 drop counter moving — the packet stopped on the node, before the tunnel, LNVPS's network, or an
 upstream that would attribute it to the operator.
 
-#### 4c3 — Health gate (M/L)
-- A probe guest is provisioned through the ordinary path onto the new node, given a real
-  address, and pinged from the route server through the tunnel. Only then is the host enabled.
+#### 4c3 — Health gate (L — split into 4c3a/4c3b)
+Re-sized once the code was read: the gate needs LNVPS to *call* a node, and LNVPS has never
+called one. Nothing dials the control API — there is no client, no signing key in settings, and
+no pinned-certificate verifier. That is an increment of its own, and useful on its own.
+
+The original wording said the gate provisions "a probe guest through the ordinary path". There
+is no ordinary path yet: `get_host_client` has no arm for `VmHostKind::MarketplaceNode`, so a
+node cannot start a VM at all until its hypervisor backend lands. The probe therefore stands in
+for the guest, on the same address it would have had.
+
+##### 4c3a — LNVPS can call a node (M)
+- A control client: NIP-98 signed with **LNVPS's own nostr identity** — the account customers
+  DM for support, `npub1lnvps32qq2nvg75cqwflq4y6cmnzn55d26ypzjakpkp3khqcx2ns7t7vjj` — over
+  HTTPS pinned to the certificate fingerprint the node registered. One identity rather than a
+  control key of its own: a separate secret would have to be generated, handed to whoever
+  builds the node binaries, and kept in step with the value compiled into them, while this one
+  is already published. An operator can check the key their node obeys against an account that
+  publicly answers, which is not a check anyone could make against a key held only by LNVPS. Both directions authenticated — the node already
+  verifies the signature against a key compiled into its binary, and this is the other half.
+- `GET /api/v1/status` read into typed LNVPS-side structs. Deliberately *not* by depending on
+  `lnvps_node`: that would pull netlink, nftables and WireGuard into the API binary, and the
+  wire format is the contract, not the Rust type.
+- Surfaced as an admin endpoint, because "what does this node say about itself right now" is
+  the first question anyone asks about hardware they cannot see.
+- Dialled at the node's tunnel address, port 8890 fleet-wide. Not stored per node: the control
+  API exists only inside the tunnel, where every node has an address to itself and nothing
+  competes for the port. An operator who changes it makes their own node unreachable, which the
+  gate reports as unreachable — self-correcting, and cheaper than a column.
+
+##### 4c3b — The gate itself (M/L)
+- A probe address is taken from a real customer range in the node's region, sent to the node as
+  a guest, and pinged from the route server. That is the production path exactly: a VM's address
+  is statically routed from the core network to the node's `wgln0`, forwarded over `br-lnvps`
+  to the guest, and answered back out the node's default route — while the guest itself routes
+  to the core router's address, which the node holds on the bridge and answers for by proxy ARP.
+  A probe on any other address would test a path no customer takes.
+- Only then is the host enabled.
 - Failure leaves the node approved but unusable, with the failing step named. That is the safe
   direction: a node that never carries a customer is a support conversation, a node that
   carries one badly is an outage.

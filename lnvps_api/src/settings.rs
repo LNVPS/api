@@ -44,7 +44,8 @@ pub struct Settings {
     /// `DnsDataMigration`, to bootstrap those DB rows for existing deployments.
     pub dns: Option<DnsServerConfig>,
 
-    /// Nostr config for sending DMs
+    /// LNVPS's nostr identity: support DMs, signed agreements, and the key
+    /// marketplace nodes are built to obey.
     pub nostr: Option<NostrConfig>,
 
     /// Telegram bot config for sending notifications

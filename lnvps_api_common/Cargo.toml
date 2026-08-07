@@ -35,8 +35,11 @@ chrono = { version = "0.4", features = ["serde"] }
 base64 = { version = "0.22", features = ["alloc"] }
 nostr = { version = "0.44", default-features = false, features = ["std"] }
 # `stream` is needed to download OS images without buffering them in memory
-reqwest = { version = "0.13", features = ["json", "stream"] }
+reqwest = { version = "0.13", features = ["json", "stream", "rustls-no-provider"] }
 rand = "0.9"
+# Marketplace node control calls pin the certificate the node registered,
+# which needs a verifier of our own rather than a CA.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 sha1 = "0.10"
 sha2 = "0.10"
 hmac = "0.12"

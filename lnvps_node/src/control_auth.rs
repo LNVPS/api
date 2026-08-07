@@ -30,6 +30,14 @@ use nostr::prelude::*;
 /// Deliberately not configurable at runtime: a config file on the operator's
 /// own disk that names the key allowed to control the node is a config file
 /// worth editing. Self-hosted deployments rebuild with their own key.
+///
+/// For the LNVPS fleet this is LNVPS's published nostr identity —
+/// `npub1lnvps32qq2nvg75cqwflq4y6cmnzn55d26ypzjakpkp3khqcx2ns7t7vjj`, hex
+/// `fcd818454002a6c47a980393f0549ac6e629d28d5688114bb60d831b5c1832a7` — the
+/// same account customers DM for support. That is the point of reusing it: an
+/// operator can check the key their binary was built with against an account
+/// that publicly answers, which is not a check anyone could make against a key
+/// that existed only inside LNVPS.
 pub const CONTROL_PUBKEY: Option<&str> = option_env!("LNVPS_CONTROL_PUBKEY");
 
 /// How far from the current time a signed request may be.

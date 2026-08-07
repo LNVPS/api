@@ -112,6 +112,13 @@ async fn main() -> Result<(), Error> {
         vm_state_cache,
         exchange,
         feedback,
+        // A misconfigured key is fatal at startup rather than at the first call
+        // to a node: an admin API that starts and then cannot reach any node is
+        // a much harder failure to read.
+        match &settings.nostr {
+            Some(config) => Some(config.control()?),
+            None => None,
+        },
     );
 
     // Same cross-cutting stack as the public API. The admin surface previously
