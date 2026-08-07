@@ -718,6 +718,60 @@ impl Worker {
         msg
     }
 
+    /// Probe one marketplace node that is due one.
+    ///
+    /// Proving a node can carry a customer means building a customer's VM on it:
+    /// everything else LNVPS can see is what the operator's machine chooses to
+    /// report. A passing probe is what enables the backing host, which is the
+    /// point at which real customers can be placed there.
+    ///
+    /// One node per run. A probe puts real load on hardware LNVPS does not own,
+    /// and a sweep that probed the whole fleet at once would arrive as a
+    /// thundering herd on the operators least able to absorb it.
+    #[cfg(feature = "linux-ssh")]
+    pub async fn probe_marketplace_node(&self) -> Result<()> {
+        let due = crate::provisioner::probe_candidates(&self.db, chrono::Utc::now()).await?;
+        let Some(node) = due.into_iter().next() else {
+            return Ok(());
+        };
+
+        let result =
+            crate::provisioner::run_probe(&self.db, &self.settings.provisioner_config, &node)
+                .await?;
+        if !result.passed() {
+            // Recorded, not acted on. One bad probe is a bad afternoon — a
+            // backup job, a noisy neighbour — and taking a node out of service
+            // for it would make the marketplace hostile to the people it needs.
+            // Suspension on a trend is increment 12's job.
+            warn!(
+                "Marketplace node {} failed its probe: {}",
+                node.id,
+                result.failure.as_deref().unwrap_or("unknown")
+            );
+            return Ok(());
+        }
+
+        // The gate: a host is only enabled once a VM has actually run on it.
+        let Some(host) = self.db.get_marketplace_node_host(node.id).await? else {
+            return Ok(());
+        };
+        if !host.enabled {
+            info!(
+                "Marketplace node {} carried a probe VM in {}ms; enabling host {}",
+                node.id,
+                result.provision_ms.unwrap_or_default(),
+                host.id
+            );
+            self.db
+                .update_host(&VmHost {
+                    enabled: true,
+                    ..host
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Poll every enabled router to refresh cached tunnel/BGP session/route state
     /// and record per-tunnel traffic samples.
     ///
@@ -2755,6 +2809,17 @@ impl Worker {
             WorkJob::SyncRouterState => {
                 self.sync_router_state().await?;
             }
+            #[cfg(feature = "linux-ssh")]
+            WorkJob::ProbeMarketplaceNode => {
+                self.probe_marketplace_node().await?;
+            }
+            #[cfg(not(feature = "linux-ssh"))]
+            WorkJob::ProbeMarketplaceNode => {
+                // A build without SSH cannot log into a probe VM, and a probe
+                // that only created and destroyed one would report a node
+                // healthy on the strength of nothing.
+                warn!("Marketplace probes need the linux-ssh feature; skipping");
+            }
             WorkJob::ToggleBgpSession {
                 router_id,
                 session_id,
@@ -4314,6 +4379,58 @@ mod tests {
 
     async fn setup_worker(db: Arc<MockDb>) -> Result<Worker> {
         setup_worker_with_delete_after(db, 0).await
+    }
+
+    /// A node whose probe cannot even be attempted must not have its host
+    /// enabled.
+    ///
+    /// This is the gate the whole marketplace rests on: an enabled host is one
+    /// LNVPS will place paying customers on, and the only thing that should
+    /// open it is a VM having actually run there. A gate that opened on a
+    /// failure — or on nothing at all — would put customers on hardware nobody
+    /// has tested.
+    #[cfg(feature = "linux-ssh")]
+    #[tokio::test]
+    async fn a_host_is_not_enabled_without_a_passing_probe() -> Result<()> {
+        let mock = Arc::new(MockDb::empty());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let user_id = db.upsert_user(&[4u8; 32]).await?;
+        let operator_id = db
+            .insert_marketplace_operator(&lnvps_db::MarketplaceOperator {
+                user_id,
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let node_id = db
+            .insert_marketplace_node(&lnvps_db::MarketplaceNode {
+                operator_id,
+                name: "unproven".to_string(),
+                status: lnvps_db::MarketplaceNodeStatus::Approved,
+                ..Default::default()
+            })
+            .await?;
+        let host_id = db
+            .create_host(&VmHost {
+                kind: lnvps_db::VmHostKind::MarketplaceNode,
+                region_id: 1,
+                name: "unproven".to_string(),
+                enabled: false,
+                marketplace_node_id: Some(node_id),
+                ..Default::default()
+            })
+            .await?;
+
+        let worker = setup_worker(mock.clone()).await?;
+        // No tunnel, so the probe cannot even be specified — the sweep reports
+        // the error rather than quietly treating it as a pass.
+        assert!(worker.probe_marketplace_node().await.is_err());
+
+        assert!(
+            !db.get_host(host_id).await?.enabled,
+            "a host was opened to customers without a VM ever running on it"
+        );
+        Ok(())
     }
 
     async fn setup_worker_with_delete_after(db: Arc<MockDb>, delete_after: u16) -> Result<Worker> {

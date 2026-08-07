@@ -320,6 +320,14 @@ async fn main() -> Result<(), Error> {
         tasks.push(worker.spawn_job_interval(WorkJob::CheckSubscriptions, Duration::from_secs(30)));
         // Refresh cached router tunnel/BGP session/route state + traffic every 60s
         tasks.push(worker.spawn_job_interval(WorkJob::SyncRouterState, Duration::from_secs(60)));
+        // Probe one marketplace node that is due one. Every five minutes, and
+        // one node per run: the per-node cooldown decides how often any given
+        // machine is touched, and this only decides how quickly a newly
+        // approved node gets its first VM — which is what enables its host and
+        // lets it start earning.
+        tasks.push(
+            worker.spawn_job_interval(WorkJob::ProbeMarketplaceNode, Duration::from_secs(300)),
+        );
         // Catch VMs that changed host without going through this API (issue
         // #66). Every 10 minutes: it lists the VMs on every host, and a stale
         // host_id breaks that VM's lifecycle operations until it is corrected.
