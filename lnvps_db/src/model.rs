@@ -4343,3 +4343,94 @@ pub struct NewAgentMessage {
     pub tool_calls: Option<String>,
     pub tool_call_id: Option<String>,
 }
+
+#[cfg(test)]
+mod rbac_grant_tests {
+    use super::*;
+
+    /// Every admin resource must be granted to `super_admin` by a migration.
+    ///
+    /// This exists because the marketplace resources were not. There is no
+    /// super-admin bypass — the check is a set lookup against granted tuples —
+    /// so a resource nobody granted is a set of endpoints that answer 403 to
+    /// everyone, and nothing anywhere fails at the point the omission is made.
+    /// A resource with no grants is a legitimate state as far as the schema is
+    /// concerned; it just means the feature is unusable.
+    ///
+    /// Reading the migrations as text is crude, and it is the only way to check
+    /// this without a database: the grants live in SQL, and the enum lives in
+    /// Rust, and nothing else compares them.
+    #[test]
+    fn every_admin_resource_is_granted_to_super_admin() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut sql = String::new();
+        for entry in std::fs::read_dir(&dir).expect("migrations directory") {
+            let path = entry.expect("migration entry").path();
+            if path.extension().is_some_and(|e| e == "sql") {
+                sql.push_str(&std::fs::read_to_string(&path).expect("migration file"));
+                sql.push('\n');
+            }
+        }
+
+        // Two shapes are used across the migrations: `SELECT id, <resource>,
+        // <action> FROM admin_roles WHERE name = 'super_admin'` in the
+        // per-feature grants, and parenthesised `(<role>, <resource>,
+        // <action>)` tuples — several to a line — in the original seed.
+        let mut granted: Vec<(u16, u16)> = Vec::new();
+
+        for line in sql.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("SELECT id,") {
+                let numbers: Vec<u16> = rest
+                    .split(',')
+                    .filter_map(|part| part.trim().parse().ok())
+                    .collect();
+                if numbers.len() >= 2 {
+                    granted.push((numbers[0], numbers[1]));
+                }
+                continue;
+            }
+            // Comments carry things like "(resource=0)", which is not a grant.
+            if line.starts_with("--") {
+                continue;
+            }
+            for group in line.split('(').skip(1) {
+                let Some(inner) = group.split(')').next() else {
+                    continue;
+                };
+                // The role is a SQL variable (`@super_admin_id`) in the seed
+                // and a literal elsewhere; either way only the last two
+                // columns are the resource and the action.
+                // Three columns in the seed, four where a created_at is
+                // written out: either way the resource and action are the
+                // second and third.
+                let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+                if parts.len() < 3 {
+                    continue;
+                }
+                if let (Ok(resource), Ok(action)) = (parts[1].parse(), parts[2].parse()) {
+                    granted.push((resource, action));
+                }
+            }
+        }
+
+        let mut missing = Vec::new();
+        for value in 0u16.. {
+            let Ok(resource) = AdminResource::try_from(value) else {
+                break;
+            };
+            for action in 0u16..=3 {
+                if !granted.contains(&(value, action)) {
+                    missing.push(format!("{resource} (={value}) action {action}"));
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "these admin resources are used by endpoints but granted to nobody, \
+             so those endpoints answer 403 to every caller:\n  {}",
+            missing.join("\n  ")
+        );
+    }
+}
