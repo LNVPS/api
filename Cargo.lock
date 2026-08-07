@@ -3676,6 +3676,7 @@ dependencies = [
  "nostr 0.44.3",
  "p256 0.13.2",
  "rand_core 0.6.4",
+ "rcgen",
  "redis",
  "reqwest 0.13.4",
  "serde",

@@ -286,3 +286,260 @@ pub fn run(program: &str, args: &[&str]) -> Result<String> {
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
+
+/// A node whose data plane is up: tunnel, bridge and filter, built by the
+/// node's own code from a document LNVPS would have sent it.
+pub struct DataPlane {
+    pub node_key: lnvps_node::wgkey::NodeKey,
+    /// The route server's keypair, kept so a test can rebuild the same document
+    /// rather than describing it a second time.
+    pub server_key: lnvps_api_common::WireguardKeypair,
+    pub kernel: lnvps_node::net::Kernel,
+    pub firewall: lnvps_node::fw::SystemFirewall,
+    /// The route server's interface name, derived from the pool as production
+    /// derives it.
+    pub rs_interface: String,
+    _state: tempfile::TempDir,
+}
+
+impl Stack {
+    /// Bring up both ends: the route server's interface and peer, then the
+    /// node's own data plane.
+    ///
+    /// Shared rather than copied into each test, because a second copy is a
+    /// second place for the two ends to be configured differently — and a
+    /// harness whose ends disagree fails as a production bug.
+    pub async fn bring_up(&self, index: u8, guests: &[String]) -> Result<DataPlane> {
+        use lnvps_api::router::{
+            Tunnel, TunnelConfig, TunnelRouter, WireguardConfig, WireguardPeer,
+        };
+
+        let state = tempfile::TempDir::new().context("node state directory")?;
+        let node_key = lnvps_node::wgkey::load_or_generate(state.path())?;
+        let server_key = lnvps_api_common::generate_wireguard_keypair()?;
+        let rs = self.route_server();
+        let rs_interface = format!("wgln{index}");
+
+        rs.add_tunnel(&Tunnel {
+            id: None,
+            name: rs_interface.clone(),
+            local_addr: None,
+            remote_addr: None,
+            enabled: true,
+            config: TunnelConfig::Wireguard(WireguardConfig {
+                listen_port: Some(self.addrs.listen_port),
+                private_key: Some(server_key.private_key.clone()),
+                public_key: Some(lnvps_api_common::wireguard_key_to_base64(
+                    &server_key.public_key,
+                )),
+                peers: vec![],
+            }),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        rs.sync_tunnel_addresses(&rs_interface, &[self.addrs.rs_inner.clone()])
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // The peer's AllowedIPs is the node's own address plus exactly the
+        // guests LNVPS placed there — the anti-spoof boundary the node cannot
+        // opt out of.
+        let mut allowed = vec![self.addrs.node_inner.clone()];
+        allowed.extend(guests.iter().cloned());
+        rs.set_tunnel_peer(
+            &rs_interface,
+            &WireguardPeer {
+                public_key: node_key.public_base64(),
+                endpoint: None,
+                allowed_ips: allowed,
+                persistent_keepalive: None,
+            },
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // The pool's own block as well as the guests: an address on a
+        // point-to-point interface does not route the rest of its prefix, so
+        // without the block the route server reaches no node in the pool.
+        let mut routes = vec![self.addrs.pool_block.clone()];
+        routes.extend(guests.iter().cloned());
+        rs.sync_tunnel_routes(&rs_interface, &routes)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        let kernel = lnvps_node::net::Kernel::in_namespace(self.open_dataplane()?)?;
+        let firewall = lnvps_node::fw::SystemFirewall::new(self.open_dataplane()?);
+        let desired = self.document(&server_key, guests);
+        // Applied before the struct takes ownership of the key, which the
+        // document needs.
+        lnvps_node::net::apply(&kernel, &firewall, &desired, &node_key).await?;
+
+        Ok(DataPlane {
+            node_key,
+            server_key,
+            kernel,
+            firewall,
+            rs_interface,
+            _state: state,
+        })
+    }
+
+    /// The document LNVPS would have sent this node.
+    pub fn document(
+        &self,
+        server_key: &lnvps_api_common::WireguardKeypair,
+        guests: &[String],
+    ) -> lnvps_node::net::DesiredDataPlane {
+        lnvps_node::net::DesiredDataPlane {
+            // Set by tests that want a hypervisor; the network tests do not,
+            // and starting one there would be testing systemd.
+            libvirt: None,
+            tunnel: lnvps_node::net::DesiredTunnel {
+                address4: Some(self.addrs.node_inner.clone()),
+                address6: None,
+                gateway4: Some(Addrs::bare(&self.addrs.rs_inner).to_string()),
+                gateway6: None,
+                server_public_key: hex::encode(&server_key.public_key),
+                endpoint: self.addrs.endpoint(),
+                keepalive: Some(25),
+                mtu: 1420,
+            },
+            gateways: guests
+                .iter()
+                .map(|_| self.addrs.guest_gateway.clone())
+                .collect(),
+            guests: guests
+                .iter()
+                .map(|address| lnvps_node::net::DesiredGuest {
+                    address: address.clone(),
+                    gateway: self.addrs.guest_gateway.clone(),
+                    mac: Some(self.addrs.guest_mac.clone()),
+                })
+                .collect(),
+        }
+    }
+
+    /// LNVPS's route server, driven through its production configuration path
+    /// with commands executed in the route server's namespace.
+    pub fn route_server(&self) -> lnvps_api::router::LinuxSshRouter {
+        let namespace = self.names.rs_ns.clone();
+        lnvps_api::router::LinuxSshRouter::with_exec(std::sync::Arc::new(move |cmd: &str| {
+            let out = Command::new("ip")
+                .args(["netns", "exec", &namespace, "sh", "-c", cmd])
+                .output()
+                .map_err(|e| lnvps_api_common::retry::OpError::Fatal(e.into()))?;
+            if !out.status.success() {
+                return Err(lnvps_api_common::retry::OpError::Fatal(anyhow::anyhow!(
+                    "`{cmd}` failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                )));
+            }
+            Ok(String::from_utf8_lossy(&out.stdout).to_string())
+        }))
+    }
+
+    /// Whether this machine can run a stack at all.
+    ///
+    /// Skipping beats failing: a developer's laptop without root should not
+    /// report a red test it was never able to run.
+    pub fn requirements_met() -> bool {
+        if !nix::unistd::Uid::effective().is_root() {
+            eprintln!("skipping: needs root for network namespaces and WireGuard");
+            return false;
+        }
+        if run("modprobe", &["wireguard"]).is_err()
+            && !std::path::Path::new("/sys/module/wireguard").exists()
+        {
+            eprintln!("skipping: no WireGuard support in this kernel");
+            return false;
+        }
+        true
+    }
+}
+
+/// A real libvirtd, started from the unit production renders.
+///
+/// Deliberately not a stand-in. The unit is the artefact most likely to be
+/// wrong — two namespaces, four bind mounts and a config file, none of which a
+/// unit test can do more than assert the text of — and systemd is the only
+/// thing that can say whether it is right. So the harness writes production's
+/// unit where systemd reads units, starts it, and lets systemd answer.
+///
+/// It also runs beside the machine's own libvirtd, which is the point: an
+/// instance that disturbed the operator's would be visible here as their
+/// daemon failing, not as ours succeeding.
+pub struct Libvirtd {
+    pub paths: lnvps_node::libvirt::Paths,
+    pub cert_pem: String,
+    /// Kept so the instance's state outlives construction and no longer.
+    _state: tempfile::TempDir,
+}
+
+impl Stack {
+    /// Configure and start the node's libvirtd for this stack.
+    ///
+    /// `ca_pem` is LNVPS's client CA, exactly as it arrives in the node's
+    /// document.
+    pub fn start_libvirtd(&self, ca_pem: &str, allowed_dn: &str) -> Result<Libvirtd> {
+        use lnvps_node::libvirt;
+
+        let state = tempfile::TempDir::new().context("libvirt state directory")?;
+        let mut paths = libvirt::Paths::new(state.path());
+        // Where systemd reads units that do not survive a reboot, which is
+        // exactly what a test's unit should be.
+        paths.unit_dir = std::path::PathBuf::from("/run/systemd/system");
+        paths.netns_name = self.names.dataplane_ns.clone();
+
+        let listen = Addrs::bare(&self.addrs.node_inner)
+            .parse()
+            .context("the node's inner address")?;
+        let identity = libvirt::load_or_generate_identity(&paths, listen)?;
+        let params = libvirt::Params {
+            listen,
+            ca_pem: ca_pem.to_string(),
+            allowed_dn: allowed_dn.to_string(),
+        };
+        let changed = libvirt::apply(&paths, &params, &identity)?;
+
+        // systemd opens the namespace by path, from PID 1's mount namespace.
+        // If the pin is invisible there the unit fails with a bare "no such
+        // file or directory" naming the *binary*, which is a long way from the
+        // truth.
+        let pinned = lnvps_node::netns::path(&paths.netns_root, &paths.netns_name);
+        anyhow::ensure!(
+            pinned.exists(),
+            "the data plane namespace is not pinned at {}",
+            pinned.display()
+        );
+        let propagation = run("findmnt", &["-no", "PROPAGATION", "/run/netns"]).unwrap_or_default();
+        anyhow::ensure!(
+            propagation.contains("shared"),
+            "/run/netns propagation is {propagation:?}; systemd cannot see the pin"
+        );
+
+        libvirt::ensure_running(&paths, changed)?;
+
+        Ok(Libvirtd {
+            cert_pem: identity.cert_pem.clone(),
+            paths,
+            _state: state,
+        })
+    }
+}
+
+impl Drop for Libvirtd {
+    fn drop(&mut self) {
+        // Stopped and removed rather than left running: the next test writes
+        // the same unit, and systemd would otherwise keep serving the previous
+        // one's certificate from a state directory that has been deleted.
+        let unit = lnvps_node::libvirt::UNIT;
+        let _ = Command::new(&self.paths.systemctl)
+            .args(["disable", "--now", unit])
+            .output();
+        let _ = std::fs::remove_file(self.paths.unit_dir.join(unit));
+        let _ = Command::new(&self.paths.systemctl)
+            .arg("daemon-reload")
+            .output();
+    }
+}

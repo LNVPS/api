@@ -29,9 +29,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use lnvps_api::router::{Tunnel, TunnelConfig, TunnelRouter, WireguardConfig, WireguardPeer};
 use lnvps_e2e::stack::{Addrs, Stack, run};
-use lnvps_node::net::{DesiredDataPlane, DesiredGuest, DesiredTunnel};
+use lnvps_node::net::{DesiredDataPlane, DesiredTunnel};
 
 /// A route server whose commands run inside a namespace instead of over SSH.
 ///
@@ -80,93 +79,10 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
     }
     let stack = Stack::new("guest", 1)?;
 
-    // ---- the node generates its own key; LNVPS never sees the private half
-    let state_dir = tempfile::tempdir()?;
-    let node_key = lnvps_node::wgkey::load_or_generate(state_dir.path())?;
-
-    // ---- the route server's own interface, configured by production code
-    let server_key = lnvps_api_common::generate_wireguard_keypair()?;
-    let rs = route_server(&stack.names.rs_ns);
-    let interface = "wgln1";
-    rs.add_tunnel(&Tunnel {
-        id: None,
-        name: interface.to_string(),
-        local_addr: None,
-        remote_addr: None,
-        enabled: true,
-        config: TunnelConfig::Wireguard(WireguardConfig {
-            listen_port: Some(stack.addrs.listen_port),
-            private_key: Some(server_key.private_key.clone()),
-            public_key: Some(lnvps_api_common::wireguard_key_to_base64(
-                &server_key.public_key,
-            )),
-            peers: vec![],
-        }),
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    // The pool's address, and the peer as the reconciler builds it: the node's
-    // own address plus exactly the guest addresses LNVPS assigned to it, which
-    // is the anti-spoof boundary.
-    rs.sync_tunnel_addresses(interface, &[stack.addrs.rs_inner.to_string()])
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    rs.set_tunnel_peer(
-        interface,
-        &WireguardPeer {
-            public_key: node_key.public_base64(),
-            endpoint: None,
-            allowed_ips: vec![
-                stack.addrs.node_inner.to_string(),
-                format!("{}/32", &stack.addrs.guest),
-            ],
-            persistent_keepalive: None,
-        },
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    // The pool's block *and* the guest address: an address on a
-    // point-to-point interface does not route the rest of its prefix, so
-    // without the block the route server cannot reach any node in the pool.
-    rs.sync_tunnel_routes(
-        interface,
-        &[
-            // The pool's own block, which the route server has to route rather
-            // than assume on-link: an address on a point-to-point interface
-            // does not route the rest of its prefix.
-            stack.addrs.pool_block.clone(),
-            format!("{}/32", &stack.addrs.guest),
-        ],
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    // ---- the node applies the document LNVPS would have sent it
-    let kernel = lnvps_node::net::Kernel::in_namespace(stack.open_dataplane()?)?;
-    let desired = DesiredDataPlane {
-        // The harness proves the network; libvirt on a node is exercised by its
-        // own tests, and starting a hypervisor here would test systemd.
-        libvirt: None,
-        tunnel: DesiredTunnel {
-            address4: Some(stack.addrs.node_inner.to_string()),
-            address6: None,
-            gateway4: Some("10.66.0.1".to_string()),
-            gateway6: None,
-            server_public_key: hex::encode(&server_key.public_key),
-            endpoint: stack.addrs.endpoint(),
-            keepalive: Some(25),
-            mtu: 1420,
-        },
-        gateways: vec![stack.addrs.guest_gateway.to_string()],
-        guests: vec![DesiredGuest {
-            address: format!("{}/32", &stack.addrs.guest),
-            gateway: stack.addrs.guest_gateway.to_string(),
-            mac: Some(stack.addrs.guest_mac.to_string()),
-        }],
-    };
-    let firewall = lnvps_node::fw::SystemFirewall::new(stack.open_dataplane()?);
-    lnvps_node::net::apply(&kernel, &firewall, &desired, &node_key).await?;
+    // ---- both ends, built by production code from one shared description
+    let guest_cidr = format!("{}/32", &stack.addrs.guest);
+    let dataplane = stack.bring_up(1, std::slice::from_ref(&guest_cidr)).await?;
+    let (kernel, firewall) = (&dataplane.kernel, &dataplane.firewall);
 
     // ---- a guest on the node's bridge, addressed as a customer's VM is
     run(
@@ -274,7 +190,7 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
 
     // The node reports itself healthy only once that has happened: WireGuard comes
     // up perfectly happily with a peer that never answers.
-    let state = lnvps_node::net::observe(&kernel, &firewall).await?;
+    let state = lnvps_node::net::observe(kernel, firewall).await?;
     assert!(state.tunnel_up, "{state:?}");
     assert!(state.bridge_up, "{state:?}");
     assert!(
@@ -324,7 +240,7 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
 
     // ...and the filter says which ruleset it is enforcing, read back off the
     // kernel rather than remembered by the daemon.
-    let firewall_state = lnvps_node::fw::observe(&firewall).await;
+    let firewall_state = lnvps_node::fw::observe(firewall).await;
     assert!(firewall_state.available, "{firewall_state:?}");
     assert!(firewall_state.present, "{firewall_state:?}");
     assert!(
@@ -334,14 +250,22 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
     assert_eq!(
         firewall_state.ruleset,
         Some(lnvps_node::fw::fingerprint(
-            &lnvps_node::fw::Policy::from_desired(&desired)?
+            &lnvps_node::fw::Policy::from_desired(
+                &stack.document(&dataplane.server_key, std::slice::from_ref(&guest_cidr))
+            )?
         )),
         "the machine is enforcing a different ruleset from the one applied"
     );
 
     // A second apply changes nothing: this runs every few seconds forever, and
     // a node that reported a change on every poll would make the log useless.
-    let again = lnvps_node::net::apply(&kernel, &firewall, &desired, &node_key).await?;
+    let again = lnvps_node::net::apply(
+        kernel,
+        firewall,
+        &stack.document(&dataplane.server_key, std::slice::from_ref(&guest_cidr)),
+        &dataplane.node_key,
+    )
+    .await?;
     assert!(
         !again.iter().any(|c| c.contains("nft")),
         "the filter was reloaded when nothing had changed: {again:?}"

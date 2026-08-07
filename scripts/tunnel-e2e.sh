@@ -14,6 +14,12 @@
 
 set -euo pipefail
 
+# Every harness that needs a real kernel. Listed once: a test added here and
+# nowhere else is one nobody ever runs.
+TESTS=(tunnel_netns node_libvirt)
+TEST_ARGS=()
+for t in "${TESTS[@]}"; do TEST_ARGS+=(--test "$t"); done
+
 FILTER=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -29,9 +35,11 @@ cd "$(cd "$SCRIPT_DIR/.." && pwd)"
 # Built as the invoking user so the build cache and toolchain resolve against
 # the normal $HOME; only the run needs to be privileged.
 echo "=== Building the tunnel harness ==="
-cargo test -p lnvps_e2e --test tunnel_netns --no-run
+for t in "${TESTS[@]}"; do
+    cargo test -p lnvps_e2e --test "$t" --no-run
+done
 
-CMD=(cargo test -p lnvps_e2e --test tunnel_netns -- --ignored --test-threads=1)
+CMD=(cargo test -p lnvps_e2e "${TEST_ARGS[@]}" -- --ignored --test-threads=1)
 [[ -n "$FILTER" ]] && CMD+=("$FILTER")
 [[ $# -gt 0 ]] && CMD+=("$@")
 

@@ -247,6 +247,7 @@ fn defaults_point_at_the_machine() {
     assert_eq!(p.unit_dir, PathBuf::from("/etc/systemd/system"));
     assert_eq!(p.systemctl, PathBuf::from("/usr/bin/systemctl"));
     assert_eq!(p.netns_root, PathBuf::from("/run/netns"));
+    assert_eq!(p.netns_name, "lnvps");
     assert!(p.conf().starts_with("/var/lib/lnvps-node/libvirt"));
     assert_eq!(p.unit().file_name().unwrap(), UNIT);
 }

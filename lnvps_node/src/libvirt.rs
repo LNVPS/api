@@ -96,6 +96,10 @@ pub struct Paths {
     pub libvirtd: PathBuf,
     /// Where namespaces are pinned; matches [`crate::netns`].
     pub netns_root: PathBuf,
+    /// Which namespace the instance runs in. Carried rather than assumed so a
+    /// harness can stand a whole node up beside a real one without either
+    /// taking the other's guests.
+    pub netns_name: String,
 }
 
 impl Paths {
@@ -106,6 +110,7 @@ impl Paths {
             systemctl: PathBuf::from(DEFAULT_SYSTEMCTL),
             libvirtd: PathBuf::from(DEFAULT_LIBVIRTD),
             netns_root: PathBuf::from(netns::NETNS_DIR),
+            netns_name: netns::NAMESPACE.to_string(),
         }
     }
 
@@ -321,7 +326,7 @@ WantedBy=multi-user.target
 "#,
         libvirtd = paths.libvirtd.display(),
         conf = CONF,
-        netns = netns::path(&paths.netns_root, netns::NAMESPACE).display(),
+        netns = netns::path(&paths.netns_root, &paths.netns_name).display(),
         binds = PRIVATE_DIRS
             .iter()
             .map(|(name, at)| format!("BindPaths={root}/{name}:{at}\n"))
