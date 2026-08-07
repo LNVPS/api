@@ -471,7 +471,8 @@ impl Stack {
 /// daemon failing, not as ours succeeding.
 pub struct Libvirtd {
     pub paths: lnvps_node::libvirt::Paths,
-    pub cert_pem: String,
+    /// What the node registers with LNVPS: its CA, not the leaf libvirtd serves.
+    pub ca_pem: String,
     /// Kept so the instance's state outlives construction and no longer.
     _state: tempfile::TempDir,
 }
@@ -521,7 +522,7 @@ impl Stack {
         libvirt::ensure_running(&paths, changed)?;
 
         Ok(Libvirtd {
-            cert_pem: identity.cert_pem.clone(),
+            ca_pem: identity.ca_pem.clone(),
             paths,
             _state: state,
         })

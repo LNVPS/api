@@ -39,10 +39,20 @@ pub fn materialise(
     let dir = node_pki_path(cfg, node_id);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
-    // The node's own certificate is the trust anchor for this node and no
-    // other. libvirt verifies a chain, so it has to be a certificate rather
-    // than the fingerprint the control API pins.
-    write_if_changed(&dir.join("cacert.pem"), node_cert_pem.as_bytes())?;
+    // The node's CA anchors this node and no other. libvirt verifies a chain,
+    // so it has to be a certificate rather than the fingerprint the control API
+    // pins.
+    //
+    // LNVPS's own CA is in the same file because libvirt's client validates the
+    // certificate *it presents* against this file as well as the one it is
+    // served: with only the node's CA in it, every connection fails with "our
+    // own certificate failed validation ... hasn't got a known issuer" — an
+    // error that names the client's certificate and says nothing about the node.
+    // The node's daemon has the mirror image of this, for the same reason.
+    let lnvps_ca = fs::read_to_string(&cfg.ca_cert)
+        .with_context(|| format!("reading {}", cfg.ca_cert.display()))?;
+    let bundle = format!("{}\n{}", node_cert_pem.trim(), lnvps_ca.trim());
+    write_if_changed(&dir.join("cacert.pem"), bundle.as_bytes())?;
 
     copy_if_changed(&cfg.client_cert, &dir.join("clientcert.pem"))?;
     copy_private_if_changed(&cfg.client_key, &dir.join("clientkey.pem"))?;

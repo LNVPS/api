@@ -1326,7 +1326,11 @@ mod libvirt_tests {
             .join("pki")
             .join(node.id.to_string())
             .join("cacert.pem");
-        assert_eq!(std::fs::read_to_string(anchor).unwrap(), CERT);
+        let trust = std::fs::read_to_string(anchor).unwrap();
+        assert!(trust.contains(CERT), "the node's own CA anchors it");
+        // LNVPS's CA is in the same file because libvirt's client validates the
+        // certificate it presents against it too.
+        assert!(trust.contains('x'), "{trust}");
     }
 
     /// A node re-presenting a new certificate replaces the old one. A node

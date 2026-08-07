@@ -73,11 +73,25 @@ const PRIVATE_DIRS: [(&str, &str); 4] = [
 const PKI_DIR: &str = "pki";
 const SERVER_CERT: &str = "server-cert.pem";
 const SERVER_KEY: &str = "server-key.pem";
-const CA_CERT: &str = "ca-cert.pem";
+/// LNVPS's CA, which decides who may connect.
+const CLIENT_CA: &str = "client-ca.pem";
+/// Both CAs in one file, which is what libvirtd is given.
+const TRUST_BUNDLE: &str = "trust.pem";
+/// The node's own CA, which LNVPS registers and verifies the server against.
+const NODE_CA: &str = "node-ca.pem";
 /// Recorded beside the certificate so the address it names can be checked
 /// without parsing X.509.
 const SERVER_ADDR: &str = "server-addr";
 const CONF: &str = "libvirtd.conf";
+
+/// Where this instance writes its pid file.
+///
+/// Inside the private `/run/libvirt`, and stated explicitly, because libvirtd's
+/// default is `/run/libvirtd.pid` — which is in `/run`, a directory this
+/// instance does *not* replace. Two system libvirtds then contend for one lock
+/// file and the second refuses to start with "resource temporarily
+/// unavailable", naming a path neither of them appears to configure.
+const PID_FILE: &str = "/run/libvirt/lnvps-libvirtd.pid";
 const QEMU_CONF: &str = "etc/qemu.conf";
 
 /// Where the second instance keeps the state the first one keeps in
@@ -130,8 +144,29 @@ impl Paths {
         self.pki().join(SERVER_KEY)
     }
 
+    /// LNVPS's CA: the issuer whose client certificates are accepted.
     fn ca(&self) -> PathBuf {
-        self.pki().join(CA_CERT)
+        self.pki().join(CLIENT_CA)
+    }
+
+    /// What libvirtd is actually given as its `ca_file`.
+    ///
+    /// Both CAs, because libvirtd validates *its own* certificate against this
+    /// file as well as its clients': with only LNVPS's CA in it, the daemon
+    /// refuses to start with "our own certificate failed validation ... the
+    /// certificate hasn't got a known issuer".
+    ///
+    /// The cost is stated plainly: a client certificate issued by the node's own
+    /// CA would also pass this check. `tls_allowed_dn_list` still admits only
+    /// LNVPS's DN, and the node's CA key lives on the node — anything holding it
+    /// already owns the machine it would be impersonating a client to.
+    fn trust(&self) -> PathBuf {
+        self.pki().join(TRUST_BUNDLE)
+    }
+
+    /// This node's own CA, registered with LNVPS.
+    fn node_ca(&self) -> PathBuf {
+        self.pki().join(NODE_CA)
     }
 
     fn unit(&self) -> PathBuf {
@@ -154,15 +189,22 @@ pub struct Params {
     pub allowed_dn: String,
 }
 
-/// The instance's TLS identity: what libvirtd presents to LNVPS.
+/// The instance's TLS identity: a tiny CA of the node's own, and the server
+/// certificate it signs.
 ///
-/// Self-signed, and marked as a CA so LNVPS can use the certificate itself as
-/// the trust anchor for this one node. libvirt verifies a chain rather than
-/// pinning a hash, so the registered certificate has to be usable as a root —
-/// the alternative is running a CA that signs every node's server certificate,
-/// which is a key to hold and a rotation to run for no additional guarantee.
+/// Two certificates rather than one self-signed, CA-capable certificate, which
+/// is what this was until libvirt refused it: *"basic constraints show a CA, but
+/// we need one for a server"*. libvirt verifies a chain rather than pinning a
+/// hash, so LNVPS needs a root to anchor on — and gnutls will not accept a root
+/// as the leaf that is served. The node therefore roots its own one-certificate
+/// chain: the CA is what LNVPS registers and trusts, the leaf is what libvirtd
+/// presents, and LNVPS still runs no CA of its own for node identities, which
+/// would be a key to hold and a rotation to run across the fleet.
 #[derive(Clone)]
 pub struct Identity {
+    /// What LNVPS registers and verifies against.
+    pub ca_pem: String,
+    /// What libvirtd presents. Signed by the CA above.
     pub cert_pem: String,
     pub key_pem: String,
 }
@@ -171,6 +213,7 @@ impl std::fmt::Debug for Identity {
     /// The private key never reaches a log line.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Identity")
+            .field("ca_pem", &self.ca_pem)
             .field("cert_pem", &self.cert_pem)
             .finish_non_exhaustive()
     }
@@ -198,9 +241,14 @@ pub struct LibvirtState {
 pub fn load_or_generate_identity(paths: &Paths, listen: IpAddr) -> Result<Identity> {
     if let Ok(cert_pem) = fs::read_to_string(paths.cert())
         && let Ok(key_pem) = fs::read_to_string(paths.key())
+        && let Ok(ca_pem) = fs::read_to_string(paths.node_ca())
         && stored_address(paths) == Some(listen)
     {
-        return Ok(Identity { cert_pem, key_pem });
+        return Ok(Identity {
+            ca_pem,
+            cert_pem,
+            key_pem,
+        });
     }
 
     let identity = generate_identity(listen)?;
@@ -208,28 +256,48 @@ pub fn load_or_generate_identity(paths: &Paths, listen: IpAddr) -> Result<Identi
     fs::create_dir_all(&dir).context("libvirt pki directory")?;
     write_private(&paths.key(), identity.key_pem.as_bytes())?;
     fs::write(paths.cert(), identity.cert_pem.as_bytes()).context("libvirt server certificate")?;
+    fs::write(paths.node_ca(), identity.ca_pem.as_bytes()).context("libvirt node CA")?;
     fs::write(dir.join(SERVER_ADDR), listen.to_string()).context("libvirt server address")?;
     info!("generated a libvirt server identity for {listen}");
     Ok(identity)
 }
 
-/// Generate a self-signed CA-capable certificate naming `listen`.
+/// Generate this node's CA and the server certificate it signs.
+///
+/// Two certificates, because libvirt refuses to serve a CA certificate as a
+/// leaf: *"basic constraints show a CA, but we need one for a server"*. LNVPS
+/// needs a root to verify a chain against, gnutls will not let that root also
+/// be what is served, so the node roots its own one-certificate chain.
 pub fn generate_identity(listen: IpAddr) -> Result<Identity> {
+    let mut ca_params = rcgen::CertificateParams::new(vec![])
+        .map_err(|e| anyhow::anyhow!("CA parameters rejected: {e}"))?;
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, format!("lnvps-node {listen}"));
+    let ca_key =
+        rcgen::KeyPair::generate().map_err(|e| anyhow::anyhow!("CA key generation failed: {e}"))?;
+    let ca = ca_params
+        .self_signed(&ca_key)
+        .map_err(|e| anyhow::anyhow!("Self-signing the CA failed: {e}"))?;
+
+    // The address goes in a SAN: libvirt's client checks the address it dialled
+    // against the certificate it was served.
     let mut params = rcgen::CertificateParams::new(vec![listen.to_string()])
         .map_err(|e| anyhow::anyhow!("Certificate parameters rejected: {e}"))?;
-    // Its own trust anchor: LNVPS pins this certificate as the CA for this node.
-    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Constrained(0));
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, listen.to_string());
-
+    params.use_authority_key_identifier_extension = true;
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let key =
         rcgen::KeyPair::generate().map_err(|e| anyhow::anyhow!("Key generation failed: {e}"))?;
     let cert = params
-        .self_signed(&key)
-        .map_err(|e| anyhow::anyhow!("Self-signing failed: {e}"))?;
+        .signed_by(&key, &ca, &ca_key)
+        .map_err(|e| anyhow::anyhow!("Signing the server certificate failed: {e}"))?;
 
     Ok(Identity {
+        ca_pem: ca.pem(),
         cert_pem: cert.pem(),
         key_pem: key.serialize_pem(),
     })
@@ -278,7 +346,7 @@ unix_sock_rw_perms = "0700"
         port = TLS_PORT,
         key = paths.key().display(),
         cert = paths.cert().display(),
-        ca = paths.ca().display(),
+        ca = paths.trust().display(),
         dn = params.allowed_dn,
     )
 }
@@ -310,8 +378,14 @@ After=network.target
 
 [Service]
 Type=notify
-ExecStart={libvirtd} --listen --config {root}/{conf}
+ExecStart={libvirtd} --listen --config {root}/{conf} --pid-file {pid}
 Restart=on-failure
+# A failure here is usually a machine problem — a busy pid file, a namespace
+# that has not been built yet — and none of those clear inside a second. Without
+# a delay systemd burns its five attempts immediately and leaves the operator a
+# rate-limited unit whose last message is "start request repeated too quickly",
+# which says nothing about what went wrong.
+RestartSec=5
 
 # Guest taps are created in the namespace of the libvirtd that starts the
 # domain, and the guest bridge only exists in this one.
@@ -326,6 +400,7 @@ WantedBy=multi-user.target
 "#,
         libvirtd = paths.libvirtd.display(),
         conf = CONF,
+        pid = PID_FILE,
         netns = netns::path(&paths.netns_root, &paths.netns_name).display(),
         binds = PRIVATE_DIRS
             .iter()
@@ -352,8 +427,13 @@ pub fn apply(paths: &Paths, params: &Params, identity: &Identity) -> Result<bool
 
     let mut changed = false;
     changed |= write_if_changed(&paths.cert(), identity.cert_pem.as_bytes())?;
+    changed |= write_if_changed(&paths.node_ca(), identity.ca_pem.as_bytes())?;
     changed |= write_private_if_changed(&paths.key(), identity.key_pem.as_bytes())?;
     changed |= write_if_changed(&paths.ca(), params.ca_pem.as_bytes())?;
+    changed |= write_if_changed(
+        &paths.trust(),
+        format!("{}\n{}", identity.ca_pem.trim(), params.ca_pem.trim()).as_bytes(),
+    )?;
     changed |= write_if_changed(
         &paths.conf(),
         render_libvirtd_conf(params, paths).as_bytes(),

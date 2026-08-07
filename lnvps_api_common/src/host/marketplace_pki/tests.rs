@@ -32,14 +32,17 @@ fn a_node_is_its_own_trust_anchor() {
     let two = materialise(&cfg, 2, "node-two-cert").unwrap();
 
     assert_ne!(one, two);
-    assert_eq!(
-        fs::read_to_string(one.join("cacert.pem")).unwrap(),
-        "node-one-cert"
+    let anchor_one = fs::read_to_string(one.join("cacert.pem")).unwrap();
+    let anchor_two = fs::read_to_string(two.join("cacert.pem")).unwrap();
+    assert!(anchor_one.contains("node-one-cert"));
+    assert!(
+        !anchor_one.contains("node-two-cert"),
+        "one node must not be able to answer for another"
     );
-    assert_eq!(
-        fs::read_to_string(two.join("cacert.pem")).unwrap(),
-        "node-two-cert"
-    );
+    assert!(anchor_two.contains("node-two-cert"));
+    // LNVPS's own CA rides along: libvirt's client validates the certificate it
+    // presents against this same file.
+    assert!(anchor_one.contains("lnvps-ca"), "{anchor_one}");
 }
 
 /// LNVPS's own client credentials land beside it, because libvirt reads all of
@@ -109,9 +112,11 @@ fn a_rotated_certificate_replaces_the_old_one() {
 
     materialise(&cfg, 5, "old-cert").unwrap();
     let path = materialise(&cfg, 5, "new-cert").unwrap();
-    assert_eq!(
-        fs::read_to_string(path.join("cacert.pem")).unwrap(),
-        "new-cert"
+    let anchor = fs::read_to_string(path.join("cacert.pem")).unwrap();
+    assert!(anchor.contains("new-cert"));
+    assert!(
+        !anchor.contains("old-cert"),
+        "the old anchor must not linger"
     );
 }
 
@@ -123,6 +128,7 @@ fn missing_credentials_are_an_error() {
     let dir = TempDir::new().unwrap();
     let mut cfg = config(&dir);
     cfg.client_cert = dir.path().join("absent.pem");
+    // The CA is read first; point the missing file at the one under test.
 
     let err = materialise(&cfg, 6, "node-cert").unwrap_err();
     assert!(err.to_string().contains("absent.pem"), "{err}");

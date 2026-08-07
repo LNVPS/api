@@ -86,6 +86,56 @@ fn the_unit_isolates_both_namespaces() {
     }
 }
 
+/// libvirtd is given both CAs, because it validates its own certificate against
+/// the same file it validates clients with — with only LNVPS's CA it refuses to
+/// start at all.
+#[test]
+fn the_trust_file_carries_both_cas() {
+    let dir = TempDir::new().unwrap();
+    let p = paths(&dir);
+    let id = generate_identity(params().listen).unwrap();
+    apply(&p, &params(), &id).unwrap();
+
+    let trust = fs::read_to_string(p.trust()).unwrap();
+    assert!(
+        trust.contains(id.ca_pem.trim()),
+        "the node's own CA is missing"
+    );
+    assert!(
+        trust.contains(params().ca_pem.trim()),
+        "LNVPS's CA is missing"
+    );
+    assert!(
+        render_libvirtd_conf(&params(), &p).contains(&p.trust().display().to_string()),
+        "libvirtd must be pointed at the bundle, not at one CA"
+    );
+}
+
+/// The pid file lives inside the private tree. libvirtd's default is
+/// `/run/libvirtd.pid`, which is in `/run` — a directory this instance does not
+/// replace — so leaving it alone means the operator's libvirtd holds the lock
+/// and ours refuses to start.
+#[test]
+fn the_pid_file_cannot_collide_with_the_operators() {
+    let dir = TempDir::new().unwrap();
+    let unit = render_unit(&paths(&dir));
+
+    assert!(unit.contains("--pid-file /run/libvirt/"), "{unit}");
+    assert!(
+        unit.contains("BindPaths=") && unit.contains(":/run/libvirt"),
+        "the pid file's directory must be one of the private ones\n{unit}"
+    );
+}
+
+/// A failed start waits before retrying. Without it systemd spends all five
+/// attempts in under a second and the operator is left with a rate-limited unit
+/// whose final message says nothing about the cause.
+#[test]
+fn a_failed_start_backs_off() {
+    let dir = TempDir::new().unwrap();
+    assert!(render_unit(&paths(&dir)).contains("RestartSec="));
+}
+
 /// Logs are written directly. `virtlogd` is reached through a socket in
 /// `/run/libvirt`, which this instance replaces, so depending on it would mean
 /// running a second helper daemon inside the same sandbox.
@@ -133,6 +183,10 @@ fn an_identity_survives_a_restart() {
     let first = load_or_generate_identity(&p, listen).unwrap();
     let second = load_or_generate_identity(&p, listen).unwrap();
     assert_eq!(first.cert_pem, second.cert_pem);
+    assert_eq!(
+        first.ca_pem, second.ca_pem,
+        "LNVPS pins the CA, not the leaf"
+    );
 }
 
 /// A moved tunnel address means a new certificate. libvirt's client refuses a
@@ -148,32 +202,34 @@ fn a_moved_address_regenerates_the_identity() {
     assert_ne!(first.cert_pem, moved.cert_pem);
 }
 
-/// The certificate is its own trust anchor, so LNVPS can pin the node's
-/// certificate directly rather than us running a CA whose key would have to be
-/// held and rotated for no additional guarantee.
-#[test]
-fn the_certificate_can_anchor_itself() {
-    let id = generate_identity(params().listen).unwrap();
-    assert!(id.cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+fn der_of(pem: &str) -> Vec<u8> {
+    use base64::Engine;
+    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    base64::engine::general_purpose::STANDARD
+        .decode(body)
+        .unwrap()
+}
 
-    let der = {
-        use base64::Engine;
-        let body: String = id
-            .cert_pem
-            .lines()
-            .filter(|l| !l.starts_with("-----"))
-            .collect();
-        base64::engine::general_purpose::STANDARD
-            .decode(body)
-            .unwrap()
-    };
-    // basicConstraints CA:TRUE with pathLen 0 encodes as the sequence
-    // 30 06 01 01 FF 02 01 00 inside the extension.
+/// basicConstraints CA:TRUE with pathLen 0, as DER.
+const CA_TRUE: [u8; 8] = [0x30, 0x06, 0x01, 0x01, 0xff, 0x02, 0x01, 0x00];
+
+/// The node roots its own chain: a CA LNVPS registers, and a leaf libvirtd
+/// serves. It cannot be one certificate doing both — libvirt refuses to serve a
+/// CA certificate ("basic constraints show a CA, but we need one for a server"),
+/// and LNVPS needs a root to verify a chain against.
+#[test]
+fn the_node_roots_its_own_chain() {
+    let id = generate_identity(params().listen).unwrap();
+
     assert!(
-        der.windows(8)
-            .any(|w| w == [0x30, 0x06, 0x01, 0x01, 0xff, 0x02, 0x01, 0x00]),
-        "the certificate must be usable as a CA"
+        der_of(&id.ca_pem).windows(8).any(|w| w == CA_TRUE),
+        "what LNVPS registers must be a CA"
     );
+    assert!(
+        !der_of(&id.cert_pem).windows(8).any(|w| w == CA_TRUE),
+        "what libvirtd serves must not be a CA, or gnutls refuses to start"
+    );
+    assert_ne!(id.ca_pem, id.cert_pem);
 }
 
 /// The private key is owner-only. The machine has users the operator has given
@@ -235,6 +291,7 @@ fn the_identity_does_not_print_its_key() {
     let shown = format!("{id:?}");
 
     assert!(!shown.contains("PRIVATE KEY"), "{shown}");
+    assert!(!shown.contains(&id.key_pem), "{shown}");
     assert!(shown.contains("cert_pem"));
 }
 

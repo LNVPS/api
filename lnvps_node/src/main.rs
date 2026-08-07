@@ -306,7 +306,9 @@ async fn apply_libvirt(
     let changed = libvirt::apply(&paths, &params, &identity)?;
     libvirt::ensure_running(&paths, changed)?;
 
-    // Last, because a certificate LNVPS trusts for a libvirtd that is not
-    // running is a node it will try to place VMs on and fail.
-    api.register_libvirt_cert(&identity.cert_pem).await
+    // The CA rather than the leaf: LNVPS verifies a chain, and the leaf is
+    // reissued whenever the tunnel address moves. Last of all, because a
+    // certificate LNVPS trusts for a libvirtd that is not running is a node it
+    // will try to place VMs on and fail.
+    api.register_libvirt_cert(&identity.ca_pem).await
 }
