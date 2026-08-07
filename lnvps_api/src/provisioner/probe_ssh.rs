@@ -137,20 +137,13 @@ async fn wait_for_login(
 /// run while this happens.
 async fn measure_memory(client: &mut SshClient) -> Result<u32> {
     let (_, total) = client
-        .execute("awk '/MemTotal/ {print $2}' /proc/meminfo")
+        .execute(MEMINFO_COMMAND)
         .await
         .context("reading the guest's memory")?;
-    let total_kb: u64 = total
-        .trim()
-        .parse()
-        .with_context(|| format!("the guest reported its memory as {total:?}"))?;
-    let touch_mb = (total_kb / 1024) * 45 / 100;
+    let total_kb = parse_mem_total(&total)?;
 
     let (code, out) = client
-        .execute(&format!(
-            "dd if=/dev/zero of=/dev/shm/probe bs=1M count={touch_mb} 2>&1; \
-             rm -f /dev/shm/probe"
-        ))
+        .execute(&touch_command(touch_mb(total_kb)))
         .await
         .context("touching the guest's memory")?;
     if code != 0 {
@@ -158,6 +151,30 @@ async fn measure_memory(client: &mut SshClient) -> Result<u32> {
     }
 
     Ok((total_kb / 1024) as u32)
+}
+
+/// What the guest says it has, in kB.
+const MEMINFO_COMMAND: &str = "awk '/MemTotal/ {print $2}' /proc/meminfo";
+
+fn parse_mem_total(out: &str) -> Result<u64> {
+    out.trim()
+        .parse()
+        .with_context(|| format!("the guest reported its memory as {out:?}"))
+}
+
+/// How much of it to write, in MB.
+///
+/// 45%: tmpfs defaults to half of RAM, and the guest still has to run while
+/// this happens. Enough to catch a host that promised memory it does not have,
+/// which is what this is for.
+fn touch_mb(total_kb: u64) -> u64 {
+    (total_kb / 1024) * 45 / 100
+}
+
+fn touch_command(mb: u64) -> String {
+    // Removed in the same command, so a probe that loses its connection here
+    // does not leave the guest's RAM full for whatever runs next.
+    format!("dd if=/dev/zero of=/dev/shm/probe bs=1M count={mb} 2>&1; rm -f /dev/shm/probe")
 }
 
 /// Sequential write, MB/s.
@@ -168,9 +185,7 @@ async fn measure_memory(client: &mut SshClient) -> Result<u32> {
 async fn measure_disk_write(client: &mut SshClient) -> Result<u32> {
     let started = Instant::now();
     let (code, out) = client
-        .execute(&format!(
-            "dd if=/dev/zero of=/var/tmp/probe bs=1M count={DISK_MB} conv=fdatasync 2>&1"
-        ))
+        .execute(&write_command(DISK_MB))
         .await
         .context("writing to the guest's disk")?;
     if code != 0 {
@@ -191,7 +206,7 @@ async fn measure_disk_read(client: &mut SshClient) -> Result<u32> {
 
     let started = Instant::now();
     let (code, out) = client
-        .execute("dd if=/var/tmp/probe of=/dev/null bs=1M 2>&1; rm -f /var/tmp/probe")
+        .execute(READ_COMMAND)
         .await
         .context("reading the guest's disk")?;
     if code != 0 {
@@ -199,6 +214,17 @@ async fn measure_disk_read(client: &mut SshClient) -> Result<u32> {
     }
     Ok(rate_mb_s(DISK_MB, started.elapsed()))
 }
+
+/// `conv=fdatasync` so the rate is the disk's and not the guest's page cache:
+/// without it a node with a slow disk and plenty of RAM reports a gigabyte a
+/// second.
+fn write_command(mb: u64) -> String {
+    format!("dd if=/dev/zero of=/var/tmp/probe bs=1M count={mb} conv=fdatasync 2>&1")
+}
+
+/// Read back and remove, so a probe cannot leave a quarter of a gigabyte behind
+/// on an operator's disk.
+const READ_COMMAND: &str = "dd if=/var/tmp/probe of=/dev/null bs=1M 2>&1; rm -f /var/tmp/probe";
 
 /// Timed here rather than parsed from `dd`, whose output format varies with
 /// version and locale — a parser that silently returns zero on an unfamiliar
@@ -214,3 +240,36 @@ fn rate_mb_s(mb: u64, elapsed: Duration) -> u32 {
 
 #[cfg(test)]
 mod tests;
+
+/// Probe a node end to end: build a VM on it, measure it, destroy it, and write
+/// down what happened.
+///
+/// The result is recorded whatever it is. A node that fails is a row, because a
+/// node that never completes a probe is indistinguishable from one nobody
+/// probed unless the failures are written down — and the first thing anybody
+/// will ask about a suspended node is what it did before.
+pub async fn run_probe(
+    db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+    cfg: &lnvps_api_common::host::config::ProvisionerConfig,
+    node: &lnvps_db::MarketplaceNode,
+) -> Result<ProbeResult> {
+    let key = ProbeKey::generate()?;
+    let spec = super::ProbeSpec::build(db, node, key.public_openssh.clone()).await?;
+    // The image's own default user. A probe that assumed root would fail on
+    // every image that disables it, which is most of them, and would look like
+    // a broken node.
+    let username = spec
+        .image
+        .default_username
+        .clone()
+        .unwrap_or_else(|| "root".to_string());
+
+    let started = Instant::now();
+    let result = super::with_probe_vm(db, cfg, &spec, || async {
+        measure(spec.ip(), &username, &key, started).await
+    })
+    .await;
+
+    super::record(db, node.id, &spec, result.clone()).await?;
+    Ok(result)
+}

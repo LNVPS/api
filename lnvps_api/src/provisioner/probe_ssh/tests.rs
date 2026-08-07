@@ -91,3 +91,53 @@ async fn a_node_that_never_answers_says_why() {
 
     assert!(err.to_string().contains("could not log in"), "{err}");
 }
+
+/// The memory test writes a fixed share of what the guest reports. tmpfs
+/// defaults to half of RAM and the guest still has to run, so asking for all of
+/// it would fail on a healthy node.
+#[test]
+fn the_memory_test_leaves_the_guest_room_to_run() {
+    // 2 GB guest.
+    assert_eq!(touch_mb(2 * 1024 * 1024), 921);
+    assert!(touch_mb(2 * 1024 * 1024) < 1024, "under half of RAM");
+    // A tiny guest still writes something rather than nothing.
+    assert!(touch_mb(512 * 1024) > 0);
+}
+
+/// The memory is written *and* released in one command, so a probe that loses
+/// its connection halfway does not leave the guest's RAM full.
+#[test]
+fn the_memory_test_cleans_up_in_the_same_breath() {
+    let cmd = touch_command(921);
+
+    assert!(
+        cmd.contains("/dev/shm/"),
+        "tmpfs is RAM; a file on disk is not"
+    );
+    assert!(cmd.contains("count=921"));
+    assert!(cmd.contains("rm -f"), "{cmd}");
+}
+
+/// The write is synced. Without it a node with a slow disk and plenty of RAM
+/// reports a gigabyte a second, which is the exact node this is meant to catch.
+#[test]
+fn the_disk_write_is_not_measuring_the_page_cache() {
+    assert!(
+        write_command(256).contains("conv=fdatasync"),
+        "{}",
+        write_command(256)
+    );
+    assert!(
+        READ_COMMAND.contains("rm -f"),
+        "a probe must not leave files behind"
+    );
+}
+
+/// What the guest reports is parsed strictly: a number that failed to parse
+/// would otherwise become a memory figure nobody can explain.
+#[test]
+fn memory_is_read_or_reported_as_unreadable() {
+    assert_eq!(parse_mem_total(" 2048000 \n").unwrap(), 2_048_000);
+    let err = parse_mem_total("MemTotal: lots").unwrap_err();
+    assert!(err.to_string().contains("lots"), "{err}");
+}

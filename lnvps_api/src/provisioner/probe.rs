@@ -314,3 +314,49 @@ pub async fn record(
 
 #[cfg(test)]
 mod tests;
+
+/// How long a node is left alone after a probe.
+///
+/// A probe costs the operator real resources — a disk clone, a boot, a few
+/// hundred megabytes of I/O — on hardware they are not yet being paid much for.
+/// Probing a node every few minutes would be indistinguishable from abusing it.
+pub const PROBE_COOLDOWN: chrono::Duration = chrono::Duration::hours(6);
+
+/// Nodes that are due a probe, oldest measurement first.
+///
+/// A node that has never been probed comes before one that was probed a week
+/// ago: the first is a node LNVPS knows nothing about and may already be placing
+/// customers on.
+pub async fn probe_candidates(
+    db: &Arc<dyn LNVpsDb>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<MarketplaceNode>> {
+    let mut due = Vec::new();
+    for node in db
+        .list_all_marketplace_nodes(Some(lnvps_db::MarketplaceNodeStatus::Approved))
+        .await?
+    {
+        // A node with no host has nothing to build a VM on, and a node with no
+        // tunnel has nowhere to reach it. Both are states an approved node
+        // passes through, and neither is a failure worth recording.
+        if db.get_marketplace_node_host(node.id).await?.is_none() {
+            continue;
+        }
+
+        let last = db
+            .list_marketplace_node_health(node.id, 1, 0)
+            .await?
+            .0
+            .into_iter()
+            .next();
+        match last {
+            Some(h) if now - h.created < PROBE_COOLDOWN => continue,
+            Some(h) => due.push((Some(h.created), node)),
+            None => due.push((None, node)),
+        }
+    }
+
+    // Never probed first, then longest since.
+    due.sort_by_key(|(created, _)| *created);
+    Ok(due.into_iter().map(|(_, node)| node).collect())
+}

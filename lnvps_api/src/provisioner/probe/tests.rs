@@ -497,3 +497,133 @@ async fn an_unreachable_node_is_a_failed_probe() -> Result<()> {
     assert!(result.failure.unwrap().contains("cannot reach the node"));
     Ok(())
 }
+
+/// A node nobody has probed comes first. It is the one LNVPS knows nothing
+/// about and may already be placing customers on; a node measured last week is
+/// a known quantity by comparison.
+#[tokio::test]
+async fn an_unprobed_node_is_probed_first() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+
+    let measured = a_node(&db).await?;
+    let never = {
+        // A second node, so there is something to order against.
+        let id = db
+            .insert_marketplace_node(&MarketplaceNode {
+                operator_id: measured.operator_id,
+                name: "never probed".to_string(),
+                status: MarketplaceNodeStatus::Approved,
+                ..Default::default()
+            })
+            .await?;
+        db.create_host(&lnvps_db::VmHost {
+            kind: VmHostKind::MarketplaceNode,
+            region_id: 1,
+            name: "node-2".to_string(),
+            marketplace_node_id: Some(id),
+            ..Default::default()
+        })
+        .await?;
+        db.get_marketplace_node(id).await?
+    };
+
+    let now = chrono::Utc::now();
+    let spec = ProbeSpec::build(&db, &measured, KEY.to_string()).await?;
+    record(&db, measured.id, &spec, ProbeResult::default()).await?;
+
+    let due = probe_candidates(&db, now + PROBE_COOLDOWN + chrono::Duration::minutes(1)).await?;
+    assert_eq!(due.len(), 2);
+    assert_eq!(due[0].id, never.id, "the unknown node goes first");
+    Ok(())
+}
+
+/// A node probed recently is left alone. A probe costs the operator a disk
+/// clone, a boot and a few hundred megabytes of I/O on hardware they are barely
+/// being paid for; doing it every few minutes would be indistinguishable from
+/// abuse.
+#[tokio::test]
+async fn a_recently_probed_node_is_left_alone() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+    let node = a_node(&db).await?;
+    let spec = ProbeSpec::build(&db, &node, KEY.to_string()).await?;
+
+    record(&db, node.id, &spec, ProbeResult::default()).await?;
+
+    let now = chrono::Utc::now();
+    assert!(probe_candidates(&db, now).await?.is_empty());
+    // ...and is due again once the cooldown has passed.
+    let later = now + PROBE_COOLDOWN + chrono::Duration::minutes(1);
+    assert_eq!(probe_candidates(&db, later).await?.len(), 1);
+    Ok(())
+}
+
+/// A failed probe still starts the cooldown. Retrying a broken node every few
+/// minutes would hammer the machine least able to cope with it, and the failure
+/// is already recorded for anyone deciding what to do about it.
+#[tokio::test]
+async fn a_failure_also_starts_the_cooldown() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+    let node = a_node(&db).await?;
+    let spec = ProbeSpec::build(&db, &node, KEY.to_string()).await?;
+
+    record(&db, node.id, &spec, ProbeResult::failed("no route".into())).await?;
+
+    assert!(probe_candidates(&db, chrono::Utc::now()).await?.is_empty());
+    Ok(())
+}
+
+/// A node that is not approved is not probed: an unapproved node has no host,
+/// and probing one would mean building VMs on hardware nobody has accepted.
+#[tokio::test]
+async fn only_approved_nodes_are_probed() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+    let node = a_node(&db).await?;
+
+    let mut nodes = mock.marketplace_nodes.lock().await;
+    nodes.get_mut(&node.id).unwrap().status = MarketplaceNodeStatus::Suspended;
+    drop(nodes);
+
+    assert!(probe_candidates(&db, chrono::Utc::now()).await?.is_empty());
+    Ok(())
+}
+
+/// An approved node with no host yet is skipped rather than recorded as a
+/// failure: it is a state every node passes through on the way in, and a
+/// failure row would make a normal enrolment look like a broken machine.
+#[tokio::test]
+async fn a_node_with_no_host_is_skipped_quietly() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+    let user_id = db.upsert_user(&[8u8; 32]).await?;
+    let operator_id = db
+        .insert_marketplace_operator(&MarketplaceOperator {
+            user_id,
+            enabled: true,
+            ..Default::default()
+        })
+        .await?;
+    db.insert_marketplace_node(&MarketplaceNode {
+        operator_id,
+        name: "no host".to_string(),
+        status: MarketplaceNodeStatus::Approved,
+        ..Default::default()
+    })
+    .await?;
+
+    assert!(probe_candidates(&db, chrono::Utc::now()).await?.is_empty());
+    Ok(())
+}
