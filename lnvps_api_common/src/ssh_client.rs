@@ -37,6 +37,33 @@ pub struct SshClient {
     session: Option<Handle<Handler>>,
 }
 
+/// Generate an ed25519 keypair, returned as OpenSSH text.
+///
+/// Here rather than in the caller because this crate is the one that owns the
+/// SSH dependency: a second place generating keys would be a second place to
+/// pick an algorithm, and the pair has to match what [`SshClient`] can load.
+///
+/// Returns `(private OpenSSH PEM, public authorized_keys line)`.
+pub fn generate_keypair() -> Result<(String, String)> {
+    // `rand::rng()` from rand 0.10, the only generator in this dependency graph
+    // that satisfies ssh-key's bound: the graph carries three versions of
+    // rand_core, ssh-key resolves to 0.10's trait, and 0.10 removed `OsRng` in
+    // favour of this. A mismatch is a compile error rather than a silent
+    // downgrade, which is what to want on the one call in this codebase that
+    // generates a key granting shell access to somebody else's machine.
+    let key = russh::keys::PrivateKey::random(&mut rand_10::rng(), russh::keys::Algorithm::Ed25519)
+        .map_err(|e| anyhow::anyhow!("Key generation failed: {e}"))?;
+
+    Ok((
+        key.to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .map_err(|e| anyhow::anyhow!("Private key could not be encoded: {e}"))?
+            .to_string(),
+        key.public_key()
+            .to_openssh()
+            .map_err(|e| anyhow::anyhow!("Public key could not be encoded: {e}"))?,
+    ))
+}
+
 impl SshClient {
     pub fn new() -> SshClient {
         SshClient { session: None }

@@ -130,6 +130,9 @@ uuid = { version = "1.16", features = ["v4", "serde"], optional = true }
 quick-xml = { version = "0.39", features = ["serde", "serialize"], optional = true }
 
 [dev-dependencies]
+# Loading back a probe key to prove the pair matches; the client itself lives
+# in lnvps_api_common.
+russh = "0.62"
 tempfile = "3"
 env_logger = "0.11"
 tower = { version = "0.5.3", features = ["util"] }

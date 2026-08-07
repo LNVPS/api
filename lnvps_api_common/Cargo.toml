@@ -8,12 +8,12 @@ default = ["nostr-domain"]
 nostr-domain = ["lnvps_db/nostr-domain"]
 admin = ["lnvps_db/admin"]
 # Proxmox hypervisor host client (shares SshClient with linux-ssh)
-proxmox = ["dep:russh", "dep:russh-sftp", "dep:tokio-tungstenite"]
+proxmox = ["dep:russh", "dep:russh-sftp", "dep:tokio-tungstenite", "dep:rand_10"]
 # LibVirt hypervisor host client. Pulls in native libvirt C bindings, so it is
 # off by default and must be opted into explicitly.
 libvirt = ["dep:virt", "dep:uuid", "dep:quick-xml"]
 # Linux router managed over SSH (shares the SshClient with proxmox)
-linux-ssh = ["dep:russh", "dep:russh-sftp"]
+linux-ssh = ["dep:russh", "dep:russh-sftp", "dep:rand_10"]
 
 [dependencies]
 lnvps_db = { path = "../lnvps_db" }
@@ -37,6 +37,14 @@ nostr = { version = "0.44", default-features = false, features = ["std"] }
 # `stream` is needed to download OS images without buffering them in memory
 reqwest = { version = "0.13", features = ["json", "stream", "rustls-no-provider"] }
 rand = "0.9"
+# ssh-key's CryptoRng bound is rand_core's own trait, and `rand::rngs::OsRng` is
+# a different type that does not implement it. Depending on rand_core directly
+# is the only way to hand it something it accepts.
+# ssh-key's CryptoRng bound resolves to rand_core 0.10's trait, and the graph
+# carries three versions of rand_core. 0.10 has no OsRng at all — the line
+# replaced it with `rand::rng()`, a CSPRNG seeded from the OS — so this is the
+# rand that can satisfy it, kept separate from the workspace's 0.9.
+rand_10 = { package = "rand", version = "0.10", optional = true }
 # Marketplace node control calls pin the certificate the node registered,
 # which needs a verifier of our own rather than a CA.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

@@ -2,6 +2,8 @@ mod ip_range;
 mod migrate;
 mod probe;
 mod probe_address;
+#[cfg(feature = "linux-ssh")]
+mod probe_ssh;
 mod tunnel;
 mod vm;
 mod vm_network;
@@ -20,6 +22,8 @@ pub use lnvps_api_common::{HostCapacityService, NetworkProvisioner, PricingEngin
 pub use migrate::*;
 pub use probe::*;
 pub use probe_address::*;
+#[cfg(feature = "linux-ssh")]
+pub use probe_ssh::*;
 pub use tunnel::*;
 pub use vm::*;
 pub use vm_network::*;
