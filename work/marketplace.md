@@ -1070,76 +1070,51 @@ and the thing a ping says nothing about.
 `VmHostKind::MarketplaceNode`. That is increment 5 either way, and doing it first means LNVPS's
 own probes exercise the provisioning path before a customer is the first VM a node ever builds.
 
-### Increment 4d — VM lifecycle on a marketplace node (XL — split into 4d1/4d2/4d3)
+### Increment 4d — VMs on a marketplace node, over the tunnel (L)
 
-A node cannot build a VM. Its document describes addresses, not machines, and `get_host_client`
-has no arm for `VmHostKind::MarketplaceNode`. Everything from here — probe VMs, customer VMs,
-confidential computing — is behind that.
+The node stays dumb. It brings up the tunnel, the data plane and the firewall — and runs a
+**libvirtd that LNVPS drives directly** over the tunnel with the existing `LibVirtHost` client.
+No VM document, no node-side reconciler, no marketplace host client: `get_host_client` gains an
+arm and every existing worker flow works, because a marketplace node becomes just another
+libvirt host.
 
-**The shape.** The node holds **desired state** and manages libvirt itself; LNVPS **reads**
-state over the tunnel through a host client, and the operations that would normally *create*
-something are no-ops there, because creation is the document's job.
+Two facts from the code decide the shape, and neither is optional:
 
-```
-LNVPS                                   node (hardware LNVPS does not own)
-  worker / provisioner
-    └ VmHostClient (marketplace)         GET /api/v1/node/state   ← the node polls
-        ├ get_vm_state      → HTTPS ──>    └ reconcile against libvirt (qemu:///system)
-        ├ get_all_vm_states → HTTPS ──>         ├ create what is missing
-        ├ get_info          → HTTPS ──>         ├ match the run state LNVPS asked for
-        └ create/configure/resize/delete        └ destroy what LNVPS no longer lists
-              → no-op, the document does it
-```
+- **libvirtd's network namespace decides where VM taps land.** Guests have to be on `br-lnvps`
+  inside `/run/netns/lnvps`; a libvirtd in the machine's own namespace creates taps where that
+  bridge does not exist. So libvirtd must run *inside* the namespace — which is why it is a
+  **dedicated instance** (`lnvps-libvirtd`, its own config, socket and unit with
+  `NetworkNamespacePath=`) rather than the machine's. Moving the operator's libvirtd into our
+  namespace would take the networking off every VM they already run, and would hand LNVPS
+  control of their domains; a separate instance means LNVPS sees only its own.
+- **Guests can reach the node's tunnel address.** They are on `br-lnvps`, which is in the same
+  namespace as `wgln0`. The nft input chain drops everything from the bridge except ICMP, but
+  a listener there means one firewall regression would hand a customer VM control of the node
+  and every other customer on it. Hence **TLS client certificates**: a guest that gets past the
+  filter still cannot authenticate.
 
-Why this way rather than exposing libvirtd on the tunnel: libvirt is machine-wide, so handing
-LNVPS a connection to it hands LNVPS every domain on the operator's machine, including their
-own. It also adds a second authentication scheme — TLS client certs to distribute, rotate and
-revoke — beside the mutually-pinned channel already built. The node is the only party that needs
-libvirt, and it is already the party that configures the machine.
+#### The PKI
+- The node generates a libvirt server key and certificate, and **registers the certificate**
+  with LNVPS. LNVPS already pins the node's control certificate by fingerprint; this is the same
+  idea for the other direction, except the *certificate* is needed rather than a hash, because
+  libvirt verifies a chain rather than a pin.
+- LNVPS holds one **client certificate** for the fleet, signed by an LNVPS CA. The node is sent
+  that CA in its data-plane document — it is public, and the document is already authenticated,
+  so there is nothing to distribute out of band and nothing compiled into the binary that a
+  rotation would strand.
+- LNVPS connects with `qemu+tls://<tunnel address>/system?pkipath=…`, materialising a per-node
+  directory from the certificate the node registered. `no_verify` is never used: the whole point
+  is that the machine answering is the node LNVPS registered.
 
-Why a host client at all, when the document does the work: every existing worker flow speaks
-`VmHostClient`. A marketplace node that implements the *reading* half slots into all of them, so
-VM state, host capacity and the admin UI work with no special cases. The writing half being a
-no-op is honest — the document is the write path, and a client that pretended otherwise would
-report success for something that had not happened yet.
-
-Why the node destroys what LNVPS does not list: it is the only tear-down mechanism that
-survives LNVPS failing. An API restart mid-probe leaves nothing to clean up, because the probe
-VM is simply absent from the next document. Scoped to LNVPS-owned domains — the libvirt client
-already derives deterministic per-VM UUIDs — so an operator's own VMs on the same machine are
-never touched.
-
-#### 4d1 — The desired-state document (M/L)
-- `GET /api/v1/node/state` returns the node's whole desired state: the data plane it already
-  gets, plus `vms[]` — uuid, shape, disk, image (url + hash), cloud-init, MAC, addresses,
-  gateways, and the run state LNVPS wants.
-- Built from the same rows `FullVmInfo` loads, but shipped as a **node-shaped spec** rather than
-  database rows: the node has no business knowing about cost plans, users or subscriptions, and
-  a wire format that mirrored the schema would make every migration a node-compatibility
-  question.
-- Image by URL and hash, because a node fetches it itself. LNVPS mirrors images already.
-
-#### 4d2 — The node's VM manager (L)
-- `lnvps_node` gains the libvirt client from `lnvps_api_common` (feature `libvirt`), pointed at
-  `qemu:///system`, and a reconciler: create what is missing, match the run state, destroy what
-  is absent — the last scoped to domains LNVPS owns.
-- Disks come from the operator's storage pool, named in the node's own config: LNVPS does not
-  know what storage this machine has, and a node that guessed would fail on every machine whose
-  pool is not called `default`.
-- Idempotent and crash-safe: the reconciler is the only writer, and every step is re-entrant, so
-  a daemon killed halfway through a create finishes it on the next poll rather than leaving a
-  half-built domain nobody owns.
-
-#### 4d3 — The marketplace host client (M)
-- `VmHostClient` for `VmHostKind::MarketplaceNode`, over the node control API: `get_info`,
-  `get_vm_state`, `get_all_vm_states` real; create, configure, resize, import, download no-ops;
-  start/stop/delete expressed as desired state rather than as calls.
-- Node control API gains the read endpoints those need.
-- Wired into `get_host_client`, which is what makes marketplace nodes visible to every existing
-  flow.
-
-Once 4d lands, **4c3c (probe VMs)** becomes small: a VM in the document that exists only in
-LNVPS's memory, plus the SSH measurements and the results table.
+#### Work
+- **Node**: generate and persist the libvirt identity; present it at registration; write
+  `libvirtd.conf` (listen on the tunnel address only, `tls_allowed_dn_list` naming LNVPS's client
+  DN) and a systemd unit with `NetworkNamespacePath=/run/netns/lnvps`; keep it running and
+  report it in `/status`. Storage pool comes from the node's own config — LNVPS does not know
+  what storage the machine has.
+- **LNVPS**: store the node's libvirt certificate; settings for the client certificate, key and
+  CA; materialise `pkipath` per node; `get_host_client` arm for `VmHostKind::MarketplaceNode`.
+- **Then**: probe VMs (4c3c) are just VMs LNVPS creates and deletes through that client.
 
 ### Increment 5 — Confidential computing: attestation + encrypted disks (L)
 - Verify SEV-SNP attestation reports (`sev` crate) / TDX quotes (`dcap-qvl` crate) against
