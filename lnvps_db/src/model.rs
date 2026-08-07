@@ -1940,6 +1940,38 @@ impl TunnelPool {
 
 /// A single machine offered by an operator.
 ///
+/// One probe's findings on a node.
+///
+/// A series rather than a verdict: one bad run is a bad afternoon, a trend is a
+/// node to act on. What was asked for is recorded alongside what was measured,
+/// because regions sell different templates and raw seconds across different
+/// shapes rank machines by what we happened to request.
+#[derive(FromRow, Clone, Debug, Default, PartialEq)]
+pub struct MarketplaceNodeHealth {
+    pub id: u64,
+    pub node_id: u64,
+    pub created: DateTime<Utc>,
+    /// Whether the probe completed. A failure is a result, and is kept: a node
+    /// that never completes one looks identical to a node nobody probed unless
+    /// the failures are written down.
+    pub passed: bool,
+    /// Why it failed, in the words of whatever failed.
+    pub failure: Option<String>,
+    /// Asking for the VM to being able to log into it — what a customer waits.
+    pub provision_ms: Option<u32>,
+    /// Memory the guest allocated *and touched*, in MB. Allocation alone proves
+    /// nothing where the host overcommits.
+    pub memory_mb: Option<u32>,
+    pub disk_write_mb: Option<u32>,
+    pub disk_read_mb: Option<u32>,
+    /// The shape that was asked for, denormalised so a template edited later
+    /// cannot change what an old measurement appears to say.
+    pub cpu: u16,
+    pub memory_bytes: u64,
+    pub disk_bytes: u64,
+    pub image: String,
+}
+
 /// There is deliberately no region here: an approved node's region lives on its
 /// backing [`VmHost`], which is what capacity and placement read. A second copy
 /// would be free to drift as soon as an admin edited the host, and the copy

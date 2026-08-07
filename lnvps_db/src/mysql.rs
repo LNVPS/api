@@ -3,14 +3,14 @@ use crate::{
     AppDeploymentFilter, AppDeploymentServiceUsage, AppDeploymentVolumeUsage, AppTag,
     AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, DbError, DbResult,
     DnsServer, EncryptedString, IntervalType, IpRange, IpRangeSubscription, IpSpacePricing,
-    LNVpsDbBase, MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage,
-    PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
-    Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
-    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm,
-    VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
-    VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
-    WebauthnCredential,
+    LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus,
+    MarketplaceOperator, NewAgentMessage, PaymentMethod, PaymentMethodConfig, PaymentType,
+    Referral, ReferralCostUsage, ReferralPayout, Region, RegionStats, Router, RouterBgpRoute,
+    RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionPaymentWithCompany, Tunnel, TunnelPool, User,
+    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
+    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk,
+    VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -4195,6 +4195,53 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_one(&self.db)
                 .await?,
         )
+    }
+
+    async fn insert_marketplace_node_health(
+        &self,
+        health: &MarketplaceNodeHealth,
+    ) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO marketplace_node_health (node_id, passed, failure, provision_ms, memory_mb, \
+             disk_write_mb, disk_read_mb, cpu, memory_bytes, disk_bytes, image) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
+        )
+        .bind(health.node_id)
+        .bind(health.passed)
+        .bind(&health.failure)
+        .bind(health.provision_ms)
+        .bind(health.memory_mb)
+        .bind(health.disk_write_mb)
+        .bind(health.disk_read_mb)
+        .bind(health.cpu)
+        .bind(health.memory_bytes)
+        .bind(health.disk_bytes)
+        .bind(&health.image)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn list_marketplace_node_health(
+        &self,
+        node_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<MarketplaceNodeHealth>, i64)> {
+        let rows = sqlx::query_as(
+            "SELECT * FROM marketplace_node_health WHERE node_id = ? ORDER BY created DESC LIMIT ? OFFSET ?",
+        )
+        .bind(node_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM marketplace_node_health WHERE node_id = ?")
+                .bind(node_id)
+                .fetch_one(&self.db)
+                .await?;
+        Ok((rows, total))
     }
 
     async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64> {
