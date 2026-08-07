@@ -629,3 +629,92 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, feature = "libvirt"))]
+mod marketplace_client_tests {
+    use lnvps_db::{VmHost, VmHostKind};
+    use tempfile::TempDir;
+
+    use super::config::{MarketplaceLibvirtConfig, ProvisionerConfig, QemuConfig};
+    use super::*;
+
+    fn host(node_id: Option<u64>) -> VmHost {
+        VmHost {
+            id: 1,
+            kind: VmHostKind::MarketplaceNode,
+            ip: "10.66.0.2".to_string(),
+            marketplace_node_id: node_id,
+            ..Default::default()
+        }
+    }
+
+    fn config(dir: &TempDir) -> ProvisionerConfig {
+        for name in ["ca.pem", "client.pem", "client.key"] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        ProvisionerConfig {
+            proxmox: None,
+            libvirt: Some(config::LibVirtConfig {
+                qemu: QemuConfig {
+                    machine: "q35".to_string(),
+                    os_type: "l26".to_string(),
+                    bridge: "br-lnvps".to_string(),
+                    cpu: "host".to_string(),
+                    kvm: true,
+                    arch: "x86_64".to_string(),
+                    balloon_min_pct: None,
+                    firewall_config: None,
+                },
+                image_pool: None,
+                image_cache_dir: None,
+                vlan_aware_bridge: false,
+                secure_boot: false,
+                shutdown_timeout_secs: None,
+            }),
+            marketplace: Some(MarketplaceLibvirtConfig {
+                ca_cert: dir.path().join("ca.pem"),
+                client_cert: dir.path().join("client.pem"),
+                client_key: dir.path().join("client.key"),
+                pki_dir: dir.path().join("pki"),
+            }),
+        }
+    }
+
+    /// A node that never registered a certificate is refused rather than
+    /// dialled. Connecting without one would mean not checking which machine
+    /// answered — and the machine is the operator's, on an address their own
+    /// guests share a namespace with.
+    #[test]
+    fn an_unverifiable_node_is_not_dialled() {
+        let dir = TempDir::new().unwrap();
+        let err = get_host_client(&host(Some(9)), &config(&dir))
+            .err()
+            .expect("an unverifiable node must not produce a client");
+
+        assert!(err.to_string().contains("libvirt certificate"), "{err}");
+    }
+
+    /// A marketplace host with no node behind it is a broken row, and is named
+    /// as such rather than producing a connection to nowhere.
+    #[test]
+    fn a_host_with_no_node_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let err = get_host_client(&host(None), &config(&dir))
+            .err()
+            .expect("a host with no node must not produce a client");
+
+        assert!(err.to_string().contains("not backed by a node"), "{err}");
+    }
+
+    /// Without a client identity, no VM is placed on a node at all. The
+    /// alternative is an unauthenticated hypervisor connection over the tunnel,
+    /// which is worse than not having the feature.
+    #[test]
+    fn no_client_identity_means_no_marketplace_hosts() {
+        let dir = TempDir::new().unwrap();
+        let mut cfg = config(&dir);
+        cfg.marketplace = None;
+
+        assert!(get_host_client(&host(Some(9)), &cfg).is_err());
+    }
+}

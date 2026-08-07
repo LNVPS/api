@@ -253,6 +253,9 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
     // ---- the node applies the document LNVPS would have sent it
     let kernel = lnvps_node::net::Kernel::in_namespace(topology.open_dataplane()?)?;
     let desired = DesiredDataPlane {
+        // The harness proves the network; libvirt on a node is exercised by its
+        // own tests, and starting a hypervisor here would test systemd.
+        libvirt: None,
         tunnel: DesiredTunnel {
             address4: Some(NODE_INNER.to_string()),
             address6: None,
@@ -439,6 +442,7 @@ async fn the_operators_machine_keeps_its_own_network() -> Result<()> {
         &kernel,
         &firewall,
         &DesiredDataPlane {
+            libvirt: None,
             tunnel: DesiredTunnel {
                 address4: Some(NODE_INNER.to_string()),
                 address6: None,

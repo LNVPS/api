@@ -3536,6 +3536,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ssh-key 0.6.7",
+ "tempfile",
  "tokio",
  "tower",
  "tower-http",

@@ -3831,6 +3831,7 @@ impl LNVpsDbBase for MockDb {
         // `touch_marketplace_node`.
         existing.name = node.name.clone();
         existing.tls_fingerprint = node.tls_fingerprint.clone();
+        existing.libvirt_cert = node.libvirt_cert.clone();
         existing.token_version = node.token_version;
         existing.status = node.status;
         existing.trust_tier = node.trust_tier;

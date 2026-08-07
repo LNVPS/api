@@ -1070,7 +1070,7 @@ and the thing a ping says nothing about.
 `VmHostKind::MarketplaceNode`. That is increment 5 either way, and doing it first means LNVPS's
 own probes exercise the provisioning path before a customer is the first VM a node ever builds.
 
-### Increment 4d — VMs on a marketplace node, over the tunnel (L)
+### Increment 4d — VMs on a marketplace node, over the tunnel (L) ✅ **done**
 
 The node stays dumb. It brings up the tunnel, the data plane and the firewall — and runs a
 **libvirtd that LNVPS drives directly** over the tunnel with the existing `LibVirtHost` client.
@@ -1105,6 +1105,21 @@ Two facts from the code decide the shape, and neither is optional:
 - LNVPS connects with `qemu+tls://<tunnel address>/system?pkipath=…`, materialising a per-node
   directory from the certificate the node registered. `no_verify` is never used: the whole point
   is that the machine answering is the node LNVPS registered.
+
+#### What landed
+- `lnvps_node/src/libvirt.rs` — the dedicated instance: identity, `libvirtd.conf`, `qemu.conf`,
+  the systemd unit with both namespaces, and `systemctl` handling. 16 tests.
+- `lnvps_api_common/src/host/marketplace_pki.rs` — per-node trust directories and the connection
+  URI. 7 tests.
+- `MarketplaceLibvirtConfig` on `ProvisionerConfig`; `VmHostKind::MarketplaceNode` arm in
+  `get_host_client`, which refuses a node that has not registered a certificate.
+- `POST /api/v1/node/libvirt` (node token) and `libvirt{}` in the data-plane document.
+- `marketplace_node.libvirt_cert` (migration `20260812120000`).
+
+One constraint found while building, which changed the design: **two system libvirtds cannot
+share `/var/lib/libvirt`**, so the dedicated instance needs a private *mount* namespace as well as
+the network one. That in turn made `virtlogd` unreachable (its socket lives in `/run/libvirt`,
+which we replace), so the instance writes logs directly instead.
 
 #### Work
 - **Node**: generate and persist the libvirt identity; present it at registration; write

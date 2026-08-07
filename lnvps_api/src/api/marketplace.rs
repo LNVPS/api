@@ -735,7 +735,18 @@ async fn v1_node_libvirt_cert(
     State(this): State<RouterState>,
     Json(req): Json<NodeLibvirtCertRequest>,
 ) -> ApiResult<()> {
-    let cert = req.cert_pem.trim();
+    store_libvirt_cert(&this.db, &this.settings, auth.node, &req.cert_pem).await?;
+    ApiData::ok(())
+}
+
+/// Store a node's libvirt certificate and place it where libvirt will read it.
+async fn store_libvirt_cert(
+    db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+    settings: &crate::settings::Settings,
+    node: MarketplaceNode,
+    cert_pem: &str,
+) -> Result<(), ApiError> {
+    let cert = cert_pem.trim();
     // Checked here rather than at connection time: a malformed certificate
     // stored now is a VM that fails to provision later, at which point the
     // failing thing is a long way from the thing that was wrong.
@@ -749,19 +760,19 @@ async fn v1_node_libvirt_cert(
 
     let updated = MarketplaceNode {
         libvirt_cert: Some(cert.to_string()),
-        ..auth.node
+        ..node
     };
-    this.db.update_marketplace_node(&updated).await?;
+    db.update_marketplace_node(&updated).await?;
 
     // Written here as well as stored, because libvirt reads its trust material
     // from a directory rather than from us. Doing it on every registration —
     // which is every poll — is what lets a deployment that lost that directory
     // repair itself without anyone noticing.
-    if let Some(cfg) = this.settings.provisioner.marketplace.as_ref() {
+    if let Some(cfg) = settings.provisioner.marketplace.as_ref() {
         lnvps_api_common::host::marketplace_pki::materialise(cfg, updated.id, cert)
             .map_err(|e| ApiError::new(format!("Storing the node certificate failed: {e}")))?;
     }
-    ApiData::ok(())
+    Ok(())
 }
 
 async fn v1_node_dataplane(
@@ -1242,5 +1253,178 @@ mod tests {
             let err = parse_32_bytes(key, "public_key").expect_err("malformed key accepted");
             assert!(format!("{err:?}").contains(expect), "got {err:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod libvirt_tests {
+    use lnvps_api_common::MockDb;
+    use lnvps_api_common::host::config::MarketplaceLibvirtConfig;
+    use lnvps_db::{LNVpsDbBase, MarketplaceNode, MarketplaceOperator};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    use super::*;
+
+    const CERT: &str = "-----BEGIN CERTIFICATE-----\nnode\n-----END CERTIFICATE-----";
+
+    fn settings(dir: Option<&TempDir>) -> crate::settings::Settings {
+        let mut settings = crate::settings::mock_settings();
+        settings.provisioner.marketplace = dir.map(|dir: &TempDir| {
+            for name in ["ca.pem", "client.pem", "client.key"] {
+                std::fs::write(dir.path().join(name), b"x").unwrap();
+            }
+            MarketplaceLibvirtConfig {
+                ca_cert: dir.path().join("ca.pem"),
+                client_cert: dir.path().join("client.pem"),
+                client_key: dir.path().join("client.key"),
+                pki_dir: dir.path().join("pki"),
+            }
+        });
+        settings
+    }
+
+    async fn a_node(db: &Arc<dyn lnvps_db::LNVpsDb>) -> MarketplaceNode {
+        let user_id = db.upsert_user(&[7u8; 32]).await.unwrap();
+        let operator_id = db
+            .insert_marketplace_operator(&MarketplaceOperator {
+                user_id,
+                enabled: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let id = db
+            .insert_marketplace_node(&MarketplaceNode {
+                operator_id,
+                name: "rack 1".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.get_marketplace_node(id).await.unwrap()
+    }
+
+    /// The certificate is stored *and* written where libvirt reads it. Storing
+    /// it alone would leave the connection unverifiable until something else
+    /// happened to rebuild the directory.
+    #[tokio::test]
+    async fn a_registered_certificate_is_stored_and_placed() {
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(MockDb::empty());
+        let dir = TempDir::new().unwrap();
+        let settings = settings(Some(&dir));
+        let node = a_node(&db).await;
+
+        store_libvirt_cert(&db, &settings, node.clone(), CERT)
+            .await
+            .unwrap();
+
+        let stored = db.get_marketplace_node(node.id).await.unwrap();
+        assert_eq!(stored.libvirt_cert.as_deref(), Some(CERT));
+        let anchor = dir
+            .path()
+            .join("pki")
+            .join(node.id.to_string())
+            .join("cacert.pem");
+        assert_eq!(std::fs::read_to_string(anchor).unwrap(), CERT);
+    }
+
+    /// A node re-presenting a new certificate replaces the old one. A node
+    /// restored from backup is the ordinary case, and without this it would be
+    /// undialable for good.
+    #[tokio::test]
+    async fn a_node_can_rotate_its_certificate() {
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(MockDb::empty());
+        let dir = TempDir::new().unwrap();
+        let settings = settings(Some(&dir));
+        let node = a_node(&db).await;
+
+        store_libvirt_cert(&db, &settings, node.clone(), CERT)
+            .await
+            .unwrap();
+        let rotated = "-----BEGIN CERTIFICATE-----\nnew\n-----END CERTIFICATE-----";
+        let node = db.get_marketplace_node(node.id).await.unwrap();
+        store_libvirt_cert(&db, &settings, node.clone(), rotated)
+            .await
+            .unwrap();
+
+        let stored = db.get_marketplace_node(node.id).await.unwrap();
+        assert_eq!(stored.libvirt_cert.as_deref(), Some(rotated));
+    }
+
+    /// Rubbish is refused at the door. A malformed certificate accepted here is
+    /// a VM that fails to provision much later, a long way from the thing that
+    /// was actually wrong.
+    #[tokio::test]
+    async fn a_malformed_certificate_is_refused() {
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(MockDb::empty());
+        let dir = TempDir::new().unwrap();
+        let settings = settings(Some(&dir));
+        let node = a_node(&db).await;
+
+        assert!(
+            store_libvirt_cert(&db, &settings, node.clone(), "not a certificate")
+                .await
+                .is_err()
+        );
+        let stored = db.get_marketplace_node(node.id).await.unwrap();
+        assert!(stored.libvirt_cert.is_none(), "nothing must be stored");
+    }
+
+    /// With no client identity configured the certificate is still recorded, so
+    /// enabling the feature later does not require every node to re-register.
+    #[tokio::test]
+    async fn a_certificate_is_kept_even_with_no_client_identity() {
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(MockDb::empty());
+        let node = a_node(&db).await;
+
+        store_libvirt_cert(&db, &settings(None), node.clone(), CERT)
+            .await
+            .unwrap();
+
+        let stored = db.get_marketplace_node(node.id).await.unwrap();
+        assert_eq!(stored.libvirt_cert.as_deref(), Some(CERT));
+    }
+
+    /// A node is told to bind its own tunnel address, never a wildcard: the
+    /// machine's other interfaces are the operator's LAN and their uplink.
+    #[test]
+    fn a_node_is_told_to_bind_its_tunnel_address() {
+        let dir = TempDir::new().unwrap();
+        let out = node_libvirt(&settings(Some(&dir)), Some("10.66.0.2/32")).unwrap();
+
+        assert_eq!(out.listen, "10.66.0.2", "the prefix is not an address");
+        assert_eq!(out.ca_pem, "x");
+        assert_eq!(
+            out.allowed_dn,
+            lnvps_api_common::node_control::LIBVIRT_CLIENT_DN
+        );
+    }
+
+    /// Without a client identity the node is told nothing, and so leaves
+    /// libvirt alone. Telling it to open an unauthenticated listener would put
+    /// hypervisor control on an address its own guests can reach.
+    #[test]
+    fn no_client_identity_means_no_instruction() {
+        assert!(node_libvirt(&settings(None), Some("10.66.0.2/32")).is_none());
+    }
+
+    /// A node with no tunnel address has nowhere to serve, and is told nothing
+    /// rather than being told to bind something it does not have.
+    #[test]
+    fn no_tunnel_address_means_no_instruction() {
+        let dir = TempDir::new().unwrap();
+        assert!(node_libvirt(&settings(Some(&dir)), None).is_none());
+    }
+
+    /// A CA the API host cannot read is a deployment fault, and the node keeps
+    /// what it already has rather than being told to trust an empty file.
+    #[test]
+    fn an_unreadable_ca_sends_nothing() {
+        let dir = TempDir::new().unwrap();
+        let mut settings = settings(Some(&dir));
+        settings.provisioner.marketplace.as_mut().unwrap().ca_cert = dir.path().join("absent.pem");
+
+        assert!(node_libvirt(&settings, Some("10.66.0.2/32")).is_none());
     }
 }
