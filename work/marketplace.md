@@ -1020,17 +1020,55 @@ for the guest, on the same address it would have had.
   competes for the port. An operator who changes it makes their own node unreachable, which the
   gate reports as unreachable — self-correcting, and cheaper than a column.
 
-##### 4c3b — The gate itself (M/L)
-- A probe address is taken from a real customer range in the node's region, sent to the node as
-  a guest, and pinged from the route server. That is the production path exactly: a VM's address
-  is statically routed from the core network to the node's `wgln0`, forwarded over `br-lnvps`
-  to the guest, and answered back out the node's default route — while the guest itself routes
-  to the core router's address, which the node holds on the bridge and answers for by proxy ARP.
-  A probe on any other address would test a path no customer takes.
-- Only then is the host enabled.
-- Failure leaves the node approved but unusable, with the failing step named. That is the safe
-  direction: a node that never carries a customer is a support conversation, a node that
-  carries one badly is an outage.
+##### 4c3b — Reachability gate (built, rejected, not landed)
+Written and closed unmerged (#369). It took an address from a customer range, had the node hold
+it on the bridge, and pinged it from the route server. That proves the tunnel handshook, the
+route server routes and admits the address, the node's bridge route and filter binding exist,
+forwarding is on, and proxy ARP answers.
+
+It does not prove the node can build and run a VM, which is the first thing a customer touches —
+so it was a data-plane reachability check wearing the health gate's name. It also spent an IPv4
+address per run, on the platform's scarcest resource, to check the cheapest of the properties
+worth checking.
+
+##### 4c3c — Probe VMs (L, blocked on the node VM lifecycle)
+A probe is a **real VM**, built by the node through exactly the path a customer's VM takes, run
+for a few minutes, measured over SSH, and destroyed. It looks like a regular VM to the node
+because it is one — which means the probe tests provisioning, the thing a customer hits first
+and the thing a ping says nothing about.
+
+- **IPv6 only.** There is plenty of it and none to spare of v4, and a node that cannot carry a
+  v6 guest cannot carry a dual-stack one either.
+- **Nothing about a probe VM is stored.** It lives in LNVPS's memory and in the node's desired
+  state, nowhere else. That is the failure model, not a shortcut: if the API restarts mid-probe
+  the VM is simply absent from the next document the node fetches, and the node tears it down as
+  it would any guest LNVPS no longer lists. A row in a table would need a reaper, and a reaper
+  is another thing that can fail — leaving somebody's hardware running our VM indefinitely.
+- **Chosen at random, when a node polls.** The node already fetches its data plane on a timer;
+  LNVPS decides on that request whether this is a node worth looking at. No scheduler, no push,
+  no queue. A fleet-wide cap keeps a large fleet from spawning a hundred probes at once, and a
+  per-node cooldown keeps anyone's hardware from running our VMs continuously.
+- **Built from the region's cheapest sellable template and an existing image**, so a probe runs
+  the same artefacts a customer would get and proves those work on this node — rather than a
+  bespoke image that only proves the bespoke image works. The cost is that node A may be
+  measured at 1 GB and node B at 4 GB, so the **shape and image are recorded with every result**
+  and the measurements normalised where they can be (MB/s, MB/s per GB). A raw number with no
+  shape beside it is not a series anybody can read.
+- **Measured over SSH**, with an ephemeral keypair generated per probe and never stored:
+  - **login works at all** — the customer-visible failure a reachability check misses;
+  - **memory actually allocates and is touched** — a node selling 8 GB that pages at 3 is the
+    most profitable lie an operator can tell, and asking for the memory is the only way to catch
+    it;
+  - **disk read and write speed** — the second most profitable lie;
+  - **time from asked to answering**, which is what a customer experiences as provisioning.
+- **Results stored as a series** (`marketplace_node_health`), not a latest verdict: one bad run
+  is a bad afternoon, a trend is a node to suspend, and the trust tier and SLA accounting in
+  increment 12 both want the history.
+
+**Blocked on:** the node cannot build a VM. Its document describes addresses, not machines
+(`ApiNodeGuest` is an address, a gateway and a MAC), and `get_host_client` has no arm for
+`VmHostKind::MarketplaceNode`. That is increment 5 either way, and doing it first means LNVPS's
+own probes exercise the provisioning path before a customer is the first VM a node ever builds.
 
 ### Increment 5 — Confidential computing: attestation + encrypted disks (L)
 - Verify SEV-SNP attestation reports (`sev` crate) / TDX quotes (`dcap-qvl` crate) against
