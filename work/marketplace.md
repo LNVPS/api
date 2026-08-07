@@ -1116,10 +1116,29 @@ Two facts from the code decide the shape, and neither is optional:
 - `POST /api/v1/node/libvirt` (node token) and `libvirt{}` in the data-plane document.
 - `marketplace_node.libvirt_cert` (migration `20260812120000`).
 
-One constraint found while building, which changed the design: **two system libvirtds cannot
-share `/var/lib/libvirt`**, so the dedicated instance needs a private *mount* namespace as well as
-the network one. That in turn made `virtlogd` unreachable (its socket lives in `/run/libvirt`,
-which we replace), so the instance writes logs directly instead.
+#### What only a real run found
+
+The design survived review, unit tests and a full workspace suite. Starting an actual libvirtd
+found five things, three of them in code that had already merged:
+
+1. **Two system libvirtds cannot share `/var/lib/libvirt`.** The dedicated instance needs a
+   private *mount* namespace as well as the network one. That in turn made `virtlogd` unreachable
+   (its socket lives in `/run/libvirt`, which we replace), so the instance writes logs directly.
+2. **The pid file.** libvirtd defaults to `/run/libvirtd.pid` — in `/run`, which we do *not*
+   replace — so the operator's daemon holds the lock and ours refuses to start, naming a path
+   neither appears to configure.
+3. **libvirt will not serve a CA certificate as its own leaf** ("basic constraints show a CA, but
+   we need one for a server"). The original design — one self-signed, CA-capable certificate, so
+   LNVPS could pin it directly — was unstartable. The node now roots a one-certificate chain.
+4. **Both ends validate the certificate they present against the file they verify the peer with.**
+   Each side's trust file therefore carries two CAs, and each error names the complainant's own
+   certificate rather than anything about the peer, which is why it bit once per side.
+5. **The node's filter accepted only ICMP.** Every TCP call LNVPS makes to a node was dropped —
+   the libvirt connection and the **control API** alike. A node in that state pings, handshakes,
+   reports itself healthy and answers nothing, and it had been that way since 4c2 landed.
+
+The last one is the lesson worth keeping: 4c2 and 4c3a each shipped with tests that asserted the
+right ruleset and the right client, and the combination was inert. Nothing asserted a packet.
 
 #### Work
 - **Node**: generate and persist the libvirt identity; present it at registration; write
