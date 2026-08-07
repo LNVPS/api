@@ -51,7 +51,6 @@ pub fn router() -> Router<RouterState> {
             get(v1_node_get_tunnel).post(v1_node_request_tunnel),
         )
         .route("/api/v1/node/dataplane", get(v1_node_dataplane))
-        .route("/api/v1/node/state", get(v1_node_state))
 }
 
 /// A node as its operator sees it.
@@ -634,16 +633,6 @@ pub struct ApiNodeGuest {
     pub mac: Option<String>,
 }
 
-/// A node's whole desired state.
-#[derive(Serialize, Debug)]
-pub struct ApiNodeState {
-    /// `null` before a tunnel is allocated: a node that cannot carry anything
-    /// yet is told so, rather than being sent VMs it has nowhere to put.
-    pub dataplane: Option<ApiNodeDataPlane>,
-    /// Every VM this node should run, and nothing else.
-    pub vms: Vec<crate::provisioner::NodeVm>,
-}
-
 impl From<crate::provisioner::NodeDataPlane> for ApiNodeDataPlane {
     fn from(d: crate::provisioner::NodeDataPlane) -> Self {
         Self {
@@ -676,28 +665,6 @@ async fn v1_node_dataplane(
         .map_err(|e| ApiError::new(e.to_string()))?
         .ok_or_else(|| ApiError::not_found("This node has no tunnel allocated yet"))?;
     ApiData::ok(plane.into())
-}
-
-/// The node's whole desired state: its network, and every VM it should run.
-///
-/// One document rather than two calls, for the same reason the data plane is one
-/// document: a node that fetched its VMs and its network separately could act on
-/// half a change — a guest built before its addresses are routed comes up with
-/// no network and, on most images, stops asking.
-///
-/// A VM the node is running that is *not* here is one LNVPS has deleted, moved,
-/// or never finished creating, and the node destroys it. That absence is the
-/// only tear-down mechanism that survives LNVPS failing: an API that dies
-/// mid-provision leaves nothing to clean up, because the half-built VM is simply
-/// not in the next document.
-async fn v1_node_state(auth: NodeAuth, State(this): State<RouterState>) -> ApiResult<ApiNodeState> {
-    let state = crate::provisioner::node_state(&this.db, &auth.node)
-        .await
-        .map_err(|e| ApiError::new(e.to_string()))?;
-    ApiData::ok(ApiNodeState {
-        dataplane: state.dataplane.map(Into::into),
-        vms: state.vms,
-    })
 }
 
 /// What a node is told about itself.
