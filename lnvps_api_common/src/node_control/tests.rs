@@ -252,21 +252,24 @@ fn an_empty_status_is_a_node_with_nothing_working() {
     assert!(!status.dataplane.firewall.present);
 }
 
-/// The config is what a deployment actually holds, so it is what has to fail
-/// loudly. A key that cannot be parsed is caught when the process starts rather
-/// than when the first node is called, which may be days later.
+/// The control key is LNVPS's own nostr identity — the account customers DM for
+/// support — not a secret of its own. A key that cannot be parsed is caught when
+/// the process starts rather than when the first node is called, which may be
+/// days later.
 #[test]
 fn a_deployment_builds_its_client_from_config() {
-    let config = MarketplaceConfig {
-        control_key: OTHER_KEY.to_string(),
+    let config = NostrConfig {
+        relays: vec![],
+        nsec: OTHER_KEY.to_string(),
     };
     assert_eq!(
         config.control().unwrap().public_key(),
         NodeControl::new(OTHER_KEY).unwrap().public_key()
     );
 
-    let broken = MarketplaceConfig {
-        control_key: "nsec1-nonsense".to_string(),
+    let broken = NostrConfig {
+        relays: vec![],
+        nsec: "nsec1-nonsense".to_string(),
     };
     // `NodeControl` has no `Debug` on purpose — it holds a secret key — so the
     // error is matched out rather than unwrapped.
@@ -277,5 +280,19 @@ fn a_deployment_builds_its_client_from_config() {
     assert!(
         err.to_string().contains("not a valid nostr secret key"),
         "{err}"
+    );
+}
+
+/// The identity nodes are built to obey is LNVPS's published account, so the
+/// constant recording it must actually be that account — a typo here would be a
+/// documented value that no node trusts, discovered by an operator when their
+/// node refuses every command.
+#[test]
+fn the_published_identity_is_a_real_key() {
+    let key = PublicKey::parse(LNVPS_NPUB).expect("LNVPS_NPUB is a nostr public key");
+    assert_eq!(
+        key.to_hex(),
+        "fcd818454002a6c47a980393f0549ac6e629d28d5688114bb60d831b5c1832a7",
+        "this is the value compiled into node binaries as LNVPS_CONTROL_PUBKEY"
     );
 }

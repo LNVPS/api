@@ -32,24 +32,40 @@ use serde::{Deserialize, Serialize};
 /// The port every node's control API listens on.
 pub const CONTROL_PORT: u16 = 8890;
 
-/// How a deployment configures its side of the marketplace.
+/// LNVPS's published nostr identity, for reference.
+///
+/// Not enforced here — self-hosted deployments sign with their own key and
+/// build their nodes with its public half — but recorded so the value an
+/// operator is asked to trust is written down somewhere authoritative.
+pub const LNVPS_NPUB: &str = "npub1lnvps32qq2nvg75cqwflq4y6cmnzn55d26ypzjakpkp3khqcx2ns7t7vjj";
+
+/// LNVPS's nostr identity.
+///
+/// The same key throughout: the account customers DM for support, the key legal
+/// agreements are signed with, and — its public half — the key every
+/// marketplace node is built to obey. One identity rather than a control key of
+/// its own, because a separate secret would have to be generated, distributed
+/// to whoever builds the node binaries, and kept in step with the value
+/// compiled into them, while this one is already published. An operator can
+/// check the key their node was built with against the account LNVPS answers
+/// support DMs from, which is not a check they could make against a key that
+/// existed only in LNVPS's config file.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
-pub struct MarketplaceConfig {
-    /// The secret key every control request to a node is signed with, `nsec…`
-    /// or hex.
-    ///
-    /// Its public half is compiled into the node daemon at build time, so this
-    /// cannot be rotated without rebuilding and redistributing the binary —
-    /// which is the point. A key a node read from its own config file would be
-    /// a key the operator could change.
-    pub control_key: String,
+pub struct NostrConfig {
+    /// Relays for outbound messages. Not needed to sign a control request,
+    /// hence defaulted: the admin API holds this identity to call nodes and
+    /// speaks to no relay at all.
+    #[serde(default)]
+    pub relays: Vec<String>,
+    /// The secret key, `nsec…` or hex.
+    pub nsec: String,
 }
 
-impl MarketplaceConfig {
-    /// The client this config describes.
+impl NostrConfig {
+    /// The control client this identity signs with.
     pub fn control(&self) -> Result<NodeControl> {
-        NodeControl::new(&self.control_key)
+        NodeControl::new(&self.nsec)
     }
 }
 

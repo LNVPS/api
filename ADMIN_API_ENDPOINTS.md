@@ -3792,15 +3792,18 @@ which is not the question anyone is asking when a customer's VM is unreachable.
 It is also the only way to see a node's data plane before it has been enabled,
 which is what debugging a failed approval needs.
 
-The call is signed with LNVPS's control key and the node's certificate is
-checked against the fingerprint it registered, so both ends are authenticated.
+The call is signed with LNVPS's nostr identity — the same account customers DM
+for support (`npub1lnvps32qq2nvg75cqwflq4y6cmnzn55d26ypzjakpkp3khqcx2ns7t7vjj`),
+configured as `nostr.nsec` — and the node's certificate is checked against the
+fingerprint it registered, so both ends are authenticated. Nodes are built to
+obey that key's public half, so an operator can verify what their binary trusts
+against an account that publicly answers.
 Failures are returned verbatim — "connection refused", "certificate does not
 match the pin", "clock is 400s out" each send an operator somewhere different,
 where a generic 502 sends them nowhere.
 
 Errors: `400` when the node has no host yet (not approved), when this
-deployment has no marketplace control key configured, or when the node cannot
-be reached.
+deployment has no nostr identity configured, or when the node cannot be reached.
 
 ```json
 {

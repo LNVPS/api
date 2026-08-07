@@ -44,11 +44,9 @@ pub struct Settings {
     /// `DnsDataMigration`, to bootstrap those DB rows for existing deployments.
     pub dns: Option<DnsServerConfig>,
 
-    /// Nostr config for sending DMs
+    /// LNVPS's nostr identity: support DMs, signed agreements, and the key
+    /// marketplace nodes are built to obey.
     pub nostr: Option<NostrConfig>,
-
-    /// Marketplace config: the key LNVPS controls its nodes with.
-    pub marketplace: Option<lnvps_api_common::node_control::MarketplaceConfig>,
 
     /// Telegram bot config for sending notifications
     pub telegram: Option<TelegramConfig>,
@@ -618,7 +616,6 @@ pub fn mock_settings() -> Settings {
         rate_limit: Default::default(),
         db: "".to_string(),
         encryption: None,
-        marketplace: None,
         public_url: "http://localhost:8000".to_string(),
         read_only: false,
         provisioner: ProvisionerConfig {

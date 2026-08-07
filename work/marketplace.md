@@ -1002,8 +1002,13 @@ node cannot start a VM at all until its hypervisor backend lands. The probe ther
 for the guest, on the same address it would have had.
 
 ##### 4c3a — LNVPS can call a node (M)
-- A control client: NIP-98 signed with LNVPS's control key, over HTTPS pinned to the
-  certificate fingerprint the node registered. Both directions authenticated — the node already
+- A control client: NIP-98 signed with **LNVPS's own nostr identity** — the account customers
+  DM for support, `npub1lnvps32qq2nvg75cqwflq4y6cmnzn55d26ypzjakpkp3khqcx2ns7t7vjj` — over
+  HTTPS pinned to the certificate fingerprint the node registered. One identity rather than a
+  control key of its own: a separate secret would have to be generated, handed to whoever
+  builds the node binaries, and kept in step with the value compiled into them, while this one
+  is already published. An operator can check the key their node obeys against an account that
+  publicly answers, which is not a check anyone could make against a key held only by LNVPS. Both directions authenticated — the node already
   verifies the signature against a key compiled into its binary, and this is the other half.
 - `GET /api/v1/status` read into typed LNVPS-side structs. Deliberately *not* by depending on
   `lnvps_node`: that would pull netlink, nftables and WireGuard into the API binary, and the

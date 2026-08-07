@@ -115,7 +115,7 @@ async fn main() -> Result<(), Error> {
         // A misconfigured key is fatal at startup rather than at the first call
         // to a node: an admin API that starts and then cannot reach any node is
         // a much harder failure to read.
-        match &settings.marketplace {
+        match &settings.nostr {
             Some(config) => Some(config.control()?),
             None => None,
         },
