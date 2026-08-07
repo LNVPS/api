@@ -111,6 +111,8 @@ pub struct Addrs {
     /// address on a point-to-point interface does not route the rest of its
     /// prefix, so holding `.1/24` answers for nothing else in the block.
     pub pool_block: String,
+    /// The pool's v6 block, which probe addresses come out of.
+    pub pool_block6: String,
     pub rs_inner: String,
     pub node_inner: String,
     pub guest: String,
@@ -140,6 +142,7 @@ impl Addrs {
             rs_underlay: format!("198.51.100.{}/24", index * 2 + 1),
             node_underlay: format!("198.51.100.{}/24", index * 2 + 2),
             pool_block: format!("10.66.{index}.0/24"),
+            pool_block6: format!("fd00:66:{index}::/64"),
             rs_inner: format!("10.66.{index}.1/24"),
             node_inner: format!("10.66.{index}.2/32"),
             guest: format!("203.0.{index}.5"),
@@ -267,6 +270,24 @@ impl Drop for Stack {
     }
 }
 
+/// Run something with this thread inside a named namespace.
+///
+/// LNVPS sits behind the route server, and a node's inner addresses are not
+/// routable from the machine's own namespace — that is the isolation the data
+/// plane exists to provide. Anything standing in for LNVPS therefore has to run
+/// where LNVPS would.
+pub fn in_namespace<T, F>(name: &str, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send,
+    T: Send,
+{
+    let handle = lnvps_node::netns::Handle::open(
+        &std::path::Path::new(lnvps_node::netns::NETNS_DIR).join(name),
+    )
+    .with_context(|| format!("opening namespace {name}"))?;
+    handle.enter(f)
+}
+
 /// Run `ip`, reporting what failed rather than a bare exit code.
 pub fn ip(args: &[&str]) -> Result<String> {
     run("ip", args)
@@ -278,10 +299,13 @@ pub fn run(program: &str, args: &[&str]) -> Result<String> {
         .output()
         .with_context(|| format!("running {program} {}", args.join(" ")))?;
     if !out.status.success() {
+        // Both streams: ping writes its diagnosis to stdout and exits non-zero
+        // with nothing on stderr, which produced "failed:" and no reason at all.
         bail!(
-            "{program} {} failed: {}",
+            "{program} {} failed: {}{}",
             args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
+            String::from_utf8_lossy(&out.stderr).trim(),
+            String::from_utf8_lossy(&out.stdout).trim()
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
@@ -418,6 +442,64 @@ impl Stack {
                 })
                 .collect(),
         }
+    }
+
+    /// Configure the route server from the database, exactly as the worker's
+    /// reconcile does: `plan_pool` decides the addresses, routes and peers, and
+    /// this applies them.
+    ///
+    /// Used where a test has a real database — it is the production path on the
+    /// LNVPS side, so a harness cannot quietly configure the far end more
+    /// helpfully than the API would.
+    /// The pool's own keypair is used, from the row: that is what production
+    /// does, and a harness that configured the route server with a *different*
+    /// key would leave the node encrypting to a key nobody holds — which shows
+    /// up as a tunnel that comes up, handshakes never complete, and every
+    /// packet disappears.
+    pub async fn apply_pool(
+        &self,
+        db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+        pool: &lnvps_db::TunnelPool,
+    ) -> Result<String> {
+        use lnvps_api::router::{Tunnel, TunnelConfig, TunnelRouter, WireguardConfig};
+
+        let plan = lnvps_api::provisioner::plan_pool(db, pool).await?;
+        let interface = format!("wgln{}", pool.id);
+        let rs = self.route_server();
+
+        rs.add_tunnel(&Tunnel {
+            id: None,
+            name: interface.clone(),
+            local_addr: None,
+            remote_addr: None,
+            enabled: true,
+            config: TunnelConfig::Wireguard(WireguardConfig {
+                listen_port: Some(pool.listen_port),
+                // `as_str`, not `to_string`: Display on an EncryptedString is
+                // the literal "[ENCRYPTED]", so the latter configures the route
+                // server with a key that is not a key. wg then has no private
+                // key and no listen port, the node's handshakes go to a port
+                // nothing is on, and the tunnel is up and silent.
+                private_key: Some(pool.private_key.as_str().to_string()),
+                public_key: Some(lnvps_api_common::wireguard_key_to_base64(&pool.public_key)),
+                peers: vec![],
+            }),
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        rs.sync_tunnel_addresses(&interface, &plan.addresses)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        for peer in &plan.peers {
+            rs.set_tunnel_peer(&interface, peer)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        rs.sync_tunnel_routes(&interface, &plan.routes)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(interface)
     }
 
     /// LNVPS's route server, driven through its production configuration path

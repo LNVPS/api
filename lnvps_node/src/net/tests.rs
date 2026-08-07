@@ -547,3 +547,45 @@ fn kernel_knobs_are_files() {
     assert_eq!(read_sysctl(dir.path(), "net/ipv6/absent").unwrap(), None);
     assert!(write_sysctl(dir.path(), "net/ipv6/absent", "1").is_err());
 }
+
+/// A gateway the node answers for is not unrouted.
+///
+/// Holding an address on an interface makes the kernel route it, and that route
+/// is not the node's to remove. With IPv6 the attempt fails outright — "no such
+/// process" — which stops the whole apply, so a node with a v6 gateway could not
+/// bring its data plane up at all. Found by the first probe VM, which is the
+/// first guest with an IPv6 gateway.
+#[tokio::test]
+async fn a_gateway_this_node_answers_for_is_not_unrouted() -> Result<()> {
+    let kernel = FakeKernel::default();
+    let mut want = desired();
+    want.gateways = vec!["fd00:66::1".to_string()];
+    want.guests = vec![DesiredGuest {
+        address: "fd00:66::8002/128".to_string(),
+        gateway: "fd00:66::1".to_string(),
+        mac: Some("52:54:01:00:00:01".to_string()),
+    }];
+
+    // The kernel's own route for the address the node holds on the bridge.
+    kernel
+        .routes
+        .lock()
+        .unwrap()
+        .entry(GUEST_BRIDGE.to_string())
+        .or_default()
+        .push("fd00:66::1/128".parse()?);
+
+    apply(&kernel, &fw().await, &want, &key()).await?;
+
+    let routes = kernel.routes.lock().unwrap();
+    let bridge = routes.get(GUEST_BRIDGE).cloned().unwrap_or_default();
+    assert!(
+        bridge.iter().any(|r| r.to_string() == "fd00:66::1/128"),
+        "the node deleted the route for its own gateway: {bridge:?}"
+    );
+    assert!(
+        bridge.iter().any(|r| r.to_string() == "fd00:66::8002/128"),
+        "the guest is not routed: {bridge:?}"
+    );
+    Ok(())
+}

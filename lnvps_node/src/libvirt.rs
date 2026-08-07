@@ -55,6 +55,7 @@ pub const UNIT: &str = "lnvps-libvirtd.service";
 const DEFAULT_UNIT_DIR: &str = "/etc/systemd/system";
 const DEFAULT_SYSTEMCTL: &str = "/usr/bin/systemctl";
 const DEFAULT_LIBVIRTD: &str = "/usr/sbin/libvirtd";
+const STOCK_NWFILTER_DIR: &str = "/etc/libvirt/nwfilter";
 
 /// The directories this instance keeps its own copies of, each bind-mounted
 /// over libvirt's usual path.
@@ -129,6 +130,12 @@ pub struct Paths {
     /// harness can stand a whole node up beside a real one without either
     /// taking the other's guests.
     pub netns_name: String,
+    /// Where libvirt's stock packet-filter definitions live on this machine.
+    ///
+    /// They are shipped by the libvirt package into `/etc/libvirt/nwfilter`,
+    /// which this instance replaces with its own empty directory — so they have
+    /// to be copied in, or every domain that references one refuses to start.
+    pub stock_nwfilter_dir: PathBuf,
 }
 
 impl Paths {
@@ -140,6 +147,7 @@ impl Paths {
             libvirtd: PathBuf::from(DEFAULT_LIBVIRTD),
             netns_root: PathBuf::from(netns::NETNS_DIR),
             netns_name: netns::NAMESPACE.to_string(),
+            stock_nwfilter_dir: PathBuf::from(STOCK_NWFILTER_DIR),
         }
     }
 
@@ -494,6 +502,20 @@ pub fn apply(paths: &Paths, params: &Params, identity: &Identity) -> Result<bool
     changed |= write_if_changed(&paths.root.join(QEMU_CONF), render_qemu_conf().as_bytes())?;
     changed |= write_if_changed(&paths.unit(), render_unit(paths).as_bytes())?;
 
+    // libvirt's stock packet-filter definitions, copied into this instance's
+    // own /etc/libvirt.
+    //
+    // A guest's interface references `no-mac-spoofing`, and libvirt refuses to
+    // start a domain whose filter is missing: "referenced filter
+    // 'no-mac-spoofing' is missing". The operator's copy is not visible here,
+    // which is the isolation working — so the instance gets its own.
+    //
+    // Copied rather than reimplemented. These are the definitions the machine's
+    // libvirt was packaged with, and writing our own would mean a marketplace
+    // guest was filtered differently from every other libvirt guest on earth,
+    // with the difference invisible until it mattered.
+    copy_stock_nwfilters(paths, &mut changed)?;
+
     // The pool LNVPS builds VMs in. Without it every create fails with "storage
     // pool not found": this instance's /etc/libvirt is its own and starts empty,
     // so the pools on the operator's machine are not visible here — which is the
@@ -511,6 +533,34 @@ pub fn apply(paths: &Paths, params: &Params, identity: &Identity) -> Result<bool
     }
 
     Ok(changed)
+}
+
+/// Copy the machine's stock nwfilter definitions into the instance.
+fn copy_stock_nwfilters(paths: &Paths, changed: &mut bool) -> Result<()> {
+    let target = paths.root.join("etc/nwfilter");
+    fs::create_dir_all(&target).context("libvirt nwfilter directory")?;
+
+    let entries = fs::read_dir(&paths.stock_nwfilter_dir).with_context(|| {
+        format!(
+            "This machine has no libvirt packet-filter definitions at {}. \
+             Guests reference them by name and libvirt refuses to start a domain \
+             whose filter is missing, so no VM could be built here.",
+            paths.stock_nwfilter_dir.display()
+        )
+    })?;
+
+    for entry in entries {
+        let path = entry.context("reading a nwfilter definition")?.path();
+        if path.extension().is_none_or(|e| e != "xml") {
+            continue;
+        }
+        let Some(name) = path.file_name() else {
+            continue;
+        };
+        let contents = fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        *changed |= write_if_changed(&target.join(name), &contents)?;
+    }
+    Ok(())
 }
 
 /// Make sure the unit is enabled and running, restarting it if `changed`.

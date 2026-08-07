@@ -15,8 +15,23 @@ use tempfile::TempDir;
 
 use super::*;
 
+/// Stock nwfilter definitions, as the libvirt package ships them.
+fn stock_nwfilters(dir: &TempDir) -> PathBuf {
+    let stock = dir.path().join("stock-nwfilter");
+    fs::create_dir_all(&stock).unwrap();
+    fs::write(
+        stock.join("no-mac-spoofing.xml"),
+        "<filter name='no-mac-spoofing'/>",
+    )
+    .unwrap();
+    // Something that is not a definition, to prove only definitions are taken.
+    fs::write(stock.join("README"), "not a filter").unwrap();
+    stock
+}
+
 fn paths(dir: &TempDir) -> Paths {
     let mut p = Paths::new(dir.path());
+    p.stock_nwfilter_dir = stock_nwfilters(dir);
     // The unit and systemctl are the two things a test must not reach for real.
     p.unit_dir = dir.path().join("systemd");
     p.systemctl = PathBuf::from("/bin/true");
@@ -305,6 +320,11 @@ fn defaults_point_at_the_machine() {
     assert_eq!(p.systemctl, PathBuf::from("/usr/bin/systemctl"));
     assert_eq!(p.netns_root, PathBuf::from("/run/netns"));
     assert_eq!(p.netns_name, "lnvps");
+    assert_eq!(
+        p.stock_nwfilter_dir,
+        PathBuf::from("/etc/libvirt/nwfilter"),
+        "where the libvirt package puts them"
+    );
     assert!(p.conf().starts_with("/var/lib/lnvps-node/libvirt"));
     assert_eq!(p.unit().file_name().unwrap(), UNIT);
 }
@@ -322,6 +342,43 @@ fn the_reported_state_carries_the_certificate() {
 
     let json = serde_json::to_string(&state).unwrap();
     assert_eq!(serde_json::from_str::<LibvirtState>(&json).unwrap(), state);
+}
+
+/// A guest's interface references `no-mac-spoofing`, and libvirt refuses to
+/// start a domain whose filter is missing. The operator's copies are not
+/// visible in this instance — that is the isolation working — so they are
+/// copied in, rather than reimplemented: writing our own would filter a
+/// marketplace guest differently from every other libvirt guest, invisibly.
+#[test]
+fn the_instance_carries_the_filters_guests_reference() {
+    let dir = TempDir::new().unwrap();
+    let p = paths(&dir);
+    let id = generate_identity(params().listen).unwrap();
+    apply(&p, &params(), &id).unwrap();
+
+    let copied = p.root.join("etc/nwfilter/no-mac-spoofing.xml");
+    assert!(copied.exists(), "a domain referencing this would not start");
+    assert!(
+        !p.root.join("etc/nwfilter/README").exists(),
+        "only definitions belong in libvirt's filter directory"
+    );
+}
+
+/// A machine with no filter definitions is refused with the reason, rather than
+/// producing an instance on which every VM creation fails later with libvirt's
+/// own wording about a missing filter.
+#[test]
+fn a_machine_without_filter_definitions_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let mut p = paths(&dir);
+    p.stock_nwfilter_dir = dir.path().join("absent");
+    let id = generate_identity(params().listen).unwrap();
+
+    let err = apply(&p, &params(), &id).unwrap_err();
+    assert!(
+        err.to_string().contains("packet-filter definitions"),
+        "{err}"
+    );
 }
 
 /// The instance defines the storage pool LNVPS builds VMs in. Its /etc/libvirt

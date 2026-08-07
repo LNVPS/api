@@ -344,9 +344,16 @@ async fn apply_bridge(
     // else's. Routes the kernel maintains for the link itself are left alone —
     // deleting the IPv6 link-local prefix to tidy a list would take the
     // interface's own connectivity with it.
+    //
+    // The gateways this node answers for are left alone for the same reason.
+    // Holding an address on an interface makes the kernel route it, and that
+    // route is not ours to remove: with IPv6 the attempt fails outright with
+    // "no such process", which stops the whole apply — a node with a v6 gateway
+    // could not bring its data plane up at all.
+    let own: HashSet<IpNetwork> = want.iter().copied().collect();
     let mut to_drop: Vec<&IpNetwork> = existing
         .difference(&guests)
-        .filter(|r| !is_link_local(r))
+        .filter(|r| !is_link_local(r) && !own.contains(r))
         .collect();
     to_drop.sort();
     for address in to_drop {
