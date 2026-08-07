@@ -36,6 +36,7 @@ futures-util = "0.3"
 # namespaces: the route server's configuration path and the node daemon's.
 lnvps_api = { path = "../lnvps_api" }
 lnvps_api_common = { path = "../lnvps_api_common" }
+lnvps_db = { path = "../lnvps_db" }
 lnvps_node = { path = "../lnvps_node" }
 tempfile = "3"
 nix = { version = "0.30", features = ["user"] }

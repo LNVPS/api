@@ -5,3 +5,10 @@ redis:
 encryption:
   key-file: "../encryption.key"
   auto-generate: true
+
+# Marketplace: the key LNVPS signs control requests to its nodes with.
+# Its public half is compiled into the node daemon at build time
+# (LNVPS_CONTROL_PUBKEY), so a node only obeys the LNVPS that built its binary.
+# Omit this section entirely in a deployment that runs no marketplace.
+#marketplace:
+#  control-key: "nsec1..."

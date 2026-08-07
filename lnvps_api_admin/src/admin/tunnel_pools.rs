@@ -1150,6 +1150,7 @@ mod tests {
         let (db, router_id) = db().await;
         let jobs = Arc::new(ChannelWorkCommander::new());
         let this = RouterState {
+            node_control: None,
             db: db.clone(),
             work_commander: jobs.clone(),
             feedback: None,
@@ -1352,6 +1353,7 @@ mod tests {
 
         let (db, router_id) = db().await;
         let this = RouterState {
+            node_control: None,
             db: db.clone(),
             work_commander: Arc::new(DeadQueue),
             feedback: None,

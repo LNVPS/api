@@ -3772,6 +3772,59 @@ GET /api/admin/v1/marketplace/nodes/{id}
 
 Required Permission: `marketplace_node::view`
 
+#### Get Live Node Status
+
+```
+GET /api/admin/v1/marketplace/nodes/{id}/status
+```
+
+Required Permission: `marketplace_node::view`
+
+Calls the node and returns what it says about itself *now* — its daemon
+version, its tunnel (up, seconds since the last handshake, MTU), its bridge,
+its forwarding knobs, how many guest addresses it is routing, and its packet
+filter (available, loaded, layer 2 isolation, guest bindings, the ruleset tag
+the kernel is enforcing, and how many packets it has dropped for claiming an
+address the guest was not assigned).
+
+Live rather than remembered: the stored `last_seen` says a node *was* there,
+which is not the question anyone is asking when a customer's VM is unreachable.
+It is also the only way to see a node's data plane before it has been enabled,
+which is what debugging a failed approval needs.
+
+The call is signed with LNVPS's control key and the node's certificate is
+checked against the fingerprint it registered, so both ends are authenticated.
+Failures are returned verbatim — "connection refused", "certificate does not
+match the pin", "clock is 400s out" each send an operator somewhere different,
+where a generic 502 sends them nowhere.
+
+Errors: `400` when the node has no host yet (not approved), when this
+deployment has no marketplace control key configured, or when the node cannot
+be reached.
+
+```json
+{
+  "version": "0.4.7",
+  "dataplane": {
+    "tunnel_up": true,
+    "last_handshake_secs": 3,
+    "tunnel_mtu": 1420,
+    "bridge_up": true,
+    "forwarding4": true,
+    "forwarding6": true,
+    "routed_guests": 4,
+    "firewall": {
+      "available": true,
+      "present": true,
+      "isolated": true,
+      "bindings": 4,
+      "ruleset": "lnvps:9f2c1a04bb7e5d63",
+      "spoofed_packets": 0
+    }
+  }
+}
+```
+
 #### Approve Node
 
 ```

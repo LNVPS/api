@@ -18,6 +18,11 @@ pub struct Settings {
     /// `LNVPS_ENCRYPTION_KEY` environment variable is not set)
     pub encryption: Option<EncryptionConfig>,
 
+    /// Marketplace config: the key LNVPS controls its nodes with. Absent in a
+    /// deployment that runs no marketplace, where every node call is refused
+    /// with that reason rather than with a missing-key panic.
+    pub marketplace: Option<lnvps_api_common::node_control::MarketplaceConfig>,
+
     /// Per-IP API rate limiting. Enabled unless explicitly turned off, which
     /// is only intended for the E2E suite (hundreds of requests a minute from
     /// one address).

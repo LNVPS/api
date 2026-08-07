@@ -39,6 +39,10 @@ mod websocket;
 #[derive(Clone, FromRef)]
 pub(crate) struct RouterState {
     pub db: Arc<dyn LNVpsDb>,
+    /// How the admin API calls a marketplace node. `None` in a deployment that
+    /// runs no marketplace, where the node endpoints answer with that reason
+    /// rather than with a key nobody configured.
+    pub node_control: Option<lnvps_api_common::node_control::NodeControl>,
     pub work_commander: Arc<dyn WorkCommander>,
     pub feedback: Option<RedisWorkFeedback>,
     pub vm_state_cache: VmStateCache,
@@ -51,6 +55,7 @@ pub fn admin_router(
     vm_state_cache: VmStateCache,
     exchange: Arc<dyn ExchangeRateService>,
     feedback: Option<RedisWorkFeedback>,
+    node_control: Option<lnvps_api_common::node_control::NodeControl>,
 ) -> Router {
     Router::new()
         .merge(docs::router())
@@ -83,6 +88,7 @@ pub fn admin_router(
         .merge(payment_methods::router())
         .merge(user_payment_methods::router())
         .with_state(RouterState {
+            node_control,
             db,
             work_commander,
             vm_state_cache,

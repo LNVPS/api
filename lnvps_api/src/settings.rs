@@ -47,6 +47,9 @@ pub struct Settings {
     /// Nostr config for sending DMs
     pub nostr: Option<NostrConfig>,
 
+    /// Marketplace config: the key LNVPS controls its nodes with.
+    pub marketplace: Option<lnvps_api_common::node_control::MarketplaceConfig>,
+
     /// Telegram bot config for sending notifications
     pub telegram: Option<TelegramConfig>,
 
@@ -615,6 +618,7 @@ pub fn mock_settings() -> Settings {
         rate_limit: Default::default(),
         db: "".to_string(),
         encryption: None,
+        marketplace: None,
         public_url: "http://localhost:8000".to_string(),
         read_only: false,
         provisioner: ProvisionerConfig {

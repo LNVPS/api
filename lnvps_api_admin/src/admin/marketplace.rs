@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 use std::sync::Arc;
 
+use lnvps_api_common::node_control::NodeStatus;
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery,
     deserialize_from_str_optional,
@@ -44,6 +45,10 @@ pub fn router() -> Router<RouterState> {
         .route(
             "/api/admin/v1/marketplace/nodes/{id}/approve",
             post(admin_approve_node),
+        )
+        .route(
+            "/api/admin/v1/marketplace/nodes/{id}/status",
+            get(admin_node_status),
         )
         .route(
             "/api/admin/v1/marketplace/operators",
@@ -296,6 +301,44 @@ async fn admin_get_node(
     auth.require_permission(AdminResource::MarketplaceNode, AdminAction::View)?;
     let node = this.db.get_marketplace_node(id).await?;
     ApiData::ok(node_info(&this.db, node).await?)
+}
+
+/// Ask a node how it is, right now.
+///
+/// Live rather than remembered: the stored `last_seen` says a node was there,
+/// which is the question nobody is asking when a customer's VM is unreachable.
+/// This is also the only way to see a node's data plane before it has been
+/// enabled, which is what an operator debugging a failed approval needs.
+async fn admin_node_status(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<NodeStatus> {
+    auth.require_permission(AdminResource::MarketplaceNode, AdminAction::View)?;
+    let node = this.db.get_marketplace_node(id).await?;
+    let host = this
+        .db
+        .get_marketplace_node_host(node.id)
+        .await?
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "This node has not been approved, so it has no host and no control address",
+            )
+        })?;
+    let control = this.node_control.as_ref().ok_or_else(|| {
+        ApiError::bad_request(
+            "This deployment has no marketplace control key configured, so no node can be called",
+        )
+    })?;
+
+    // The node's own failure, verbatim: "connection refused", "certificate does
+    // not match the pin", "clock is 400s out". Each sends an operator somewhere
+    // different, and a generic 502 sends them nowhere.
+    let status = control
+        .status(&node, &host)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    ApiData::ok(status)
 }
 
 /// Approve a node: create its backing host and make it placeable.
@@ -592,12 +635,14 @@ mod tests {
     use lnvps_db::{Company, IntervalType, Subscription, SubscriptionLineItem, SubscriptionType};
 
     use crate::admin::model::Permission;
+    use lnvps_api_common::node_control::NodeStatus;
     use lnvps_api_common::{ChannelWorkCommander, MockExchangeRate, VmStateCache};
 
     const FINGERPRINT: [u8; 32] = [0xab; 32];
 
     fn state(db: &Arc<dyn LNVpsDb>) -> RouterState {
         RouterState {
+            node_control: None,
             db: db.clone(),
             work_commander: Arc::new(ChannelWorkCommander::new()),
             feedback: None,
