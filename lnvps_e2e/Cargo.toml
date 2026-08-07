@@ -32,6 +32,13 @@ tokio-tungstenite = "0.28"
 futures-util = "0.3"
 
 [dev-dependencies]
+# Both ends of a marketplace tunnel, driven by the real code, in network
+# namespaces: the route server's configuration path and the node daemon's.
+lnvps_api = { path = "../lnvps_api" }
+lnvps_api_common = { path = "../lnvps_api_common" }
+lnvps_node = { path = "../lnvps_node" }
+tempfile = "3"
+nix = { version = "0.30", features = ["user"] }
 # Used only to validate the software authenticator offline: register via
 # webauthn-rs-core (as the server does) and verify a discoverable assertion via
 # the high-level webauthn-rs discoverable flow.

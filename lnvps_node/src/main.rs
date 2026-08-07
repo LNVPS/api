@@ -3,6 +3,7 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -31,12 +32,27 @@ enum Command {
     Inventory,
     /// Check the configuration and credential without contacting LNVPS.
     Check,
+    /// Show or apply the data plane LNVPS has asked this node to run.
+    Dataplane {
+        #[command(subcommand)]
+        action: DataplaneAction,
+    },
     /// Print the node's TLS fingerprint, the value LNVPS pins at registration.
     Fingerprint {
         /// State directory holding the identity (defaults to the configured one).
         #[arg(long)]
         state_dir: Option<PathBuf>,
     },
+}
+
+#[derive(Subcommand)]
+enum DataplaneAction {
+    /// Fetch what LNVPS wants and print it, changing nothing.
+    Show,
+    /// Fetch it and apply it.
+    Apply,
+    /// Print what this machine currently has, read from the machine itself.
+    Observe,
 }
 
 #[tokio::main]
@@ -73,6 +89,7 @@ async fn main() -> Result<()> {
                 None => println!("control:    not configured (node not yet paired)"),
             }
         }
+        Command::Dataplane { action } => dataplane(&cli.config, action).await?,
         Command::Fingerprint { state_dir } => {
             let state_dir = match state_dir {
                 Some(dir) => dir,
@@ -87,6 +104,49 @@ async fn main() -> Result<()> {
                 );
             }
         }
+    }
+    Ok(())
+}
+
+/// Show, apply or observe the data plane.
+///
+/// Exposed as a command of its own so an operator can see exactly what LNVPS
+/// asked for, and re-drive it, without running the daemon or reading its logs.
+async fn dataplane(config_path: &Path, action: DataplaneAction) -> Result<()> {
+    let config = NodeConfig::load(config_path)?;
+
+    // Deliberately before the credential is loaded: "what does this machine
+    // have?" is the question an operator asks when something is wrong, and it
+    // must not fail because the token is missing or LNVPS is unreachable.
+    if let DataplaneAction::Observe = action {
+        let state = lnvps_node::net::observe(&lnvps_node::net::Kernel::new()?).await?;
+        println!("{}", serde_json::to_string_pretty(&state)?);
+        return Ok(());
+    }
+
+    let credential = Credential::load_checked(&config.credential)?;
+    let api = lnvps_node::api::LnvpsApi::new(&config.api_url, &credential)?;
+
+    // Presented before fetching: the document describes a tunnel that does not
+    // exist until LNVPS has this node's public key, so asking for it first
+    // would report "no tunnel allocated" on every first run.
+    let key = lnvps_node::wgkey::load_or_generate(&config.state_dir)?;
+    if key.generated {
+        log::info!("Generated this node's tunnel key; presenting it to LNVPS");
+    }
+    api.request_tunnel(&key.public_bytes()).await?;
+    let desired = api.dataplane().await?;
+
+    match action {
+        DataplaneAction::Show => println!("{}", serde_json::to_string_pretty(&desired)?),
+        DataplaneAction::Apply => {
+            let kernel = lnvps_node::net::Kernel::new()?;
+            let applied = lnvps_node::net::apply(&kernel, &desired, &key).await?;
+            for line in applied {
+                println!("{line}");
+            }
+        }
+        DataplaneAction::Observe => unreachable!("handled above, before loading a credential"),
     }
     Ok(())
 }
@@ -108,9 +168,28 @@ async fn run(config_path: &Path) -> Result<()> {
     // than starting a listener that can never authorise anything (decision 12).
     let control_pubkey = control_auth::control_pubkey()?;
 
+    // The data plane is applied *before* the listen address is checked, because
+    // the address being checked for is one this brings into existence: the
+    // control API binds the tunnel interface, and on a fresh machine the tunnel
+    // does not exist until now.
+    let kernel = Arc::new(lnvps_node::net::Kernel::new()?);
+    if let Err(e) = apply_dataplane(&config, kernel.as_ref()).await {
+        // Not fatal. A node whose tunnel is already up from a previous run must
+        // keep serving through an LNVPS outage — refusing to start would turn
+        // an API blip into every node on the platform going dark.
+        log::warn!(
+            "Could not apply the data plane ({e}); continuing with whatever this machine \
+             already has configured"
+        );
+    }
+
     // Decision 13: the address must belong to the tunnel interface, checked
-    // against the interface itself.
-    let addrs = config::interface_addresses(&control.tunnel_interface)?;
+    // against the interface itself — inside the data plane namespace, which is
+    // the only place that interface exists.
+    let interface = control.tunnel_interface.clone();
+    let addrs = kernel
+        .namespace()
+        .enter(move || config::interface_addresses(&interface))?;
     config::validate_listen_address(control.listen, &addrs)?;
 
     let tls = tls::load_or_generate(&config.state_dir, Some(control.listen))?;
@@ -124,5 +203,56 @@ async fn run(config_path: &Path) -> Result<()> {
     }
 
     let addr = SocketAddr::new(control.listen, control.port);
-    control::serve(Arc::new(ControlState::new(control_pubkey, addr)), addr, tls).await
+
+    // Re-applied on a timer for the same reason the route server reconciles its
+    // end: guests come and go, and a node that only configured itself at
+    // startup would route a departed customer's address until it was restarted.
+    let refresh = config.clone();
+    let refresh_kernel = kernel.clone();
+    tokio::spawn(async move {
+        let interval = Duration::from_secs(refresh.heartbeat_secs.max(10));
+        loop {
+            tokio::time::sleep(interval).await;
+            if let Err(e) = apply_dataplane(&refresh, refresh_kernel.as_ref()).await {
+                log::warn!("Data plane refresh failed: {e}");
+            }
+        }
+    });
+
+    // Bound inside the namespace, because that is where the tunnel address
+    // lives. The socket keeps that namespace while the rest of the daemon stays
+    // in the machine's own, which is what lets it go on reaching LNVPS.
+    let listener = kernel.namespace().enter(move || {
+        std::net::TcpListener::bind(addr)
+            .with_context(|| format!("Cannot bind the control API to {addr}"))
+    })?;
+
+    control::serve_on(
+        Arc::new(ControlState::new(control_pubkey, addr, kernel)),
+        listener,
+        tls,
+    )
+    .await
+}
+
+/// Fetch the data plane and apply it.
+async fn apply_dataplane(config: &NodeConfig, kernel: &dyn lnvps_node::net::NetOps) -> Result<()> {
+    let credential = Credential::load_checked(&config.credential)?;
+    let api = lnvps_node::api::LnvpsApi::new(&config.api_url, &credential)?;
+
+    let key = lnvps_node::wgkey::load_or_generate(&config.state_dir)?;
+    if key.generated {
+        log::warn!(
+            "Generated a new tunnel key. LNVPS re-pins a node that presents one, but the \
+             tunnel stays down until it has been presented."
+        );
+    }
+    api.request_tunnel(&key.public_bytes()).await?;
+    let desired = api.dataplane().await?;
+
+    let applied = lnvps_node::net::apply(kernel, &desired, &key).await?;
+    if !applied.is_empty() {
+        log::debug!("Applied data plane: {}", applied.join("; "));
+    }
+    Ok(())
 }

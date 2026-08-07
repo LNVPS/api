@@ -5295,11 +5295,13 @@ mod tests {
             vec!["10.66.0.1/24".to_string()]
         );
         // AllowedIPs picks which peer a packet belongs to; it does not put the
-        // packet on the tunnel. Without this route the guest's return traffic
-        // is dropped as unroutable.
+        // packet on the tunnel. Without these routes the guest's return traffic
+        // is dropped as unroutable — and without the pool's own block, so is
+        // everything addressed to the nodes themselves, because an address on a
+        // point-to-point interface does not route the rest of its prefix.
         assert_eq!(
             mr.interface_routes(&interface).await,
-            vec!["203.0.113.5/32".to_string()]
+            vec!["10.66.0.0/24".to_string(), "203.0.113.5/32".to_string()]
         );
         assert_eq!(tunnel.pool_id, Some(pool_id));
 

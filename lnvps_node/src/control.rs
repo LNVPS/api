@@ -57,16 +57,31 @@ pub struct ControlState {
     /// is compared against this, so a request signed for one node cannot be
     /// replayed against another by setting `Host` to the first node's address.
     pub base_url: String,
+    /// How the node reads its own network back. Held here so a test can supply
+    /// a machine that is not the one the tests run on.
+    pub net: Arc<dyn crate::net::NetOps>,
 }
 
 impl ControlState {
     /// Build state for a node serving on `addr`.
-    pub fn new(control_pubkey: PublicKey, addr: SocketAddr) -> Self {
+    pub fn new(
+        control_pubkey: PublicKey,
+        addr: SocketAddr,
+        net: Arc<dyn crate::net::NetOps>,
+    ) -> Self {
         Self {
             control_pubkey,
             replay: Mutex::new(ReplayGuard::new(REPLAY_WINDOW, REPLAY_CAPACITY)),
             base_url: format!("https://{addr}"),
+            net,
         }
+    }
+
+    /// The data plane as this machine actually has it.
+    pub async fn observe(&self) -> crate::net::DataPlaneState {
+        crate::net::observe(self.net.as_ref())
+            .await
+            .unwrap_or_default()
     }
 }
 
@@ -77,6 +92,11 @@ pub struct NodeStatus {
     pub version: &'static str,
     /// Host inventory, the same view `lnvps-node inventory` prints.
     pub inventory: crate::inventory::Inventory,
+    /// The data plane as the machine actually has it — read from the machine,
+    /// never remembered from what was applied. This is the first thing the
+    /// health gate checks, so a node that quietly lost its tunnel has to be
+    /// able to say so.
+    pub dataplane: crate::net::DataPlaneState,
 }
 
 /// The control router, with authentication layered over everything.
@@ -92,6 +112,22 @@ pub fn router(state: Arc<ControlState>) -> Router {
 
 /// Serve the control API over HTTPS until the process exits.
 pub async fn serve(state: Arc<ControlState>, addr: SocketAddr, tls: NodeTls) -> Result<()> {
+    let listener = std::net::TcpListener::bind(addr)
+        .with_context(|| format!("Cannot bind the control API to {addr}"))?;
+    serve_on(state, listener, tls).await
+}
+
+/// Serve on a socket somebody else opened.
+///
+/// The tunnel address lives in the data plane's network namespace, so the
+/// listening socket has to be created in there — a socket keeps the namespace
+/// it was created in, which is what lets the rest of the daemon stay in the
+/// machine's own namespace and go on reaching LNVPS.
+pub async fn serve_on(
+    state: Arc<ControlState>,
+    listener: std::net::TcpListener,
+    tls: NodeTls,
+) -> Result<()> {
     // rustls needs a process-wide crypto provider; installing twice is not an
     // error worth failing a startup over.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -100,11 +136,17 @@ pub async fn serve(state: Arc<ControlState>, addr: SocketAddr, tls: NodeTls) -> 
         .await
         .context("Control API TLS configuration is invalid")?;
 
+    let addr = listener
+        .local_addr()
+        .context("The control API socket has no address")?;
     log::info!(
         "Control API listening on https://{addr} (certificate fingerprint {})",
         tls.fingerprint
     );
-    axum_server::bind_rustls(addr, cfg)
+    listener
+        .set_nonblocking(true)
+        .context("Cannot make the control API socket non-blocking")?;
+    axum_server::from_tcp_rustls(listener, cfg)
         .serve(router(state).into_make_service())
         .await
         .context("Control API server stopped")
@@ -177,10 +219,18 @@ fn unauthorized(reason: &str) -> Response {
 }
 
 /// Report what this node is and what it is running.
-async fn get_status() -> Json<NodeStatus> {
+async fn get_status(State(state): State<Arc<ControlState>>) -> Json<NodeStatus> {
     Json(NodeStatus {
         version: env!("CARGO_PKG_VERSION"),
         inventory: crate::inventory::Inventory::collect(),
+        // Observed on demand rather than cached: a cached answer is a report
+        // that the tunnel was up once, which is exactly the thing the gate must
+        // not accept.
+        // Observed on demand rather than cached: a cached answer is a report
+        // that the tunnel was up once, which is exactly what the health gate
+        // must not accept. A machine this cannot be read from reports nothing
+        // configured, which is a truthful answer and one the gate can act on.
+        dataplane: state.observe().await,
     })
 }
 
@@ -196,7 +246,11 @@ mod tests {
     const ADDR: &str = "10.66.0.7:8890";
 
     fn state_for(keys: &Keys, addr: &str) -> Arc<ControlState> {
-        Arc::new(ControlState::new(keys.public_key(), addr.parse().unwrap()))
+        Arc::new(ControlState::new(
+            keys.public_key(),
+            addr.parse().unwrap(),
+            Arc::new(crate::net::tests::FakeKernel::default()),
+        ))
     }
 
     /// A NIP-98 header, with every field overridable so tests can tamper with
@@ -241,6 +295,25 @@ mod tests {
         let auth = auth_header(&keys, &url, "GET", b"");
 
         let code = status_of(state_for(&keys, ADDR), get("/api/v1/status", Some(&auth))).await;
+        assert_eq!(code, StatusCode::OK);
+    }
+
+    /// The status report is servable on a machine with no data plane at all —
+    /// the state a node is in before it has been configured, and one the health
+    /// gate has to be able to read rather than time out on.
+    #[tokio::test]
+    async fn the_status_is_served_before_there_is_a_data_plane() {
+        let keys = Keys::generate();
+        let addr: SocketAddr = ADDR.parse().unwrap();
+        let state = ControlState::new(
+            keys.public_key(),
+            addr,
+            Arc::new(crate::net::tests::FakeKernel::default()),
+        );
+
+        let url = format!("https://{ADDR}/api/v1/status");
+        let auth = auth_header(&keys, &url, "GET", b"");
+        let code = status_of(Arc::new(state), get("/api/v1/status", Some(&auth))).await;
         assert_eq!(code, StatusCode::OK);
     }
 
