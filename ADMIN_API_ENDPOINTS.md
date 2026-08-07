@@ -3798,6 +3798,41 @@ configured as `nostr.nsec` — and the node's certificate is checked against the
 fingerprint it registered, so both ends are authenticated. Nodes are built to
 obey that key's public half, so an operator can verify what their binary trusts
 against an account that publicly answers.
+
+#### Get Node Probe History
+
+```
+GET /api/admin/v1/marketplace/nodes/{id}/health?limit=50&offset=0
+```
+
+Required Permission: `marketplace_node::view`
+
+What probe VMs found on this node, newest first. LNVPS periodically builds a
+real VM on a marketplace node through the ordinary customer path, logs into it,
+measures it and destroys it; each row is one of those runs.
+
+Every row carries `passed`, and on a failure the reason verbatim — an admin
+deciding whether to suspend somebody's hardware needs what actually happened,
+not a category. Successful rows carry `provision_ms` (asking for the VM to being
+able to log in, which is what a customer waits through), `memory_mb` (memory the
+guest allocated **and touched**, so a host that overcommits is visible),
+`disk_write_mb` and `disk_read_mb`.
+
+Each row also states the shape it measured — `cpu`, `memory_bytes`,
+`disk_bytes`, `image`. Regions sell different templates, so raw numbers compared
+across nodes would rank machines by what LNVPS happened to ask them for. The
+shape is stored with the result rather than looked up, so a template edited
+later cannot change what an old measurement appears to say.
+
+A series rather than a verdict, because that is the question an admin actually
+has: one bad run is a bad afternoon — a backup job, a noisy neighbour — and a
+node worth suspending is one whose numbers have been getting worse. Failures are
+rows too, since a node that never completes a probe is indistinguishable from
+one nobody probed unless they are written down.
+
+Remembered rather than live, unlike `/status`: these are measurements that were
+made, and re-running one on demand would put real load on an operator's machine
+because somebody opened a page.
 Failures are returned verbatim — "connection refused", "certificate does not
 match the pin", "clock is 400s out" each send an operator somewhere different,
 where a generic 502 sends them nowhere.
