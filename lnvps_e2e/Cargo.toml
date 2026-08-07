@@ -27,6 +27,9 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
 base64urlsafedata = "0.5"
+# The node daemon's production code, so the stack fixture builds a real node
+# rather than a description of one.
+lnvps_node = { path = "../lnvps_node" }
 # Live-chat support agent websocket (lnvps_e2e::agent_chat)
 tokio-tungstenite = "0.28"
 futures-util = "0.3"
@@ -37,7 +40,6 @@ futures-util = "0.3"
 lnvps_api = { path = "../lnvps_api" }
 lnvps_api_common = { path = "../lnvps_api_common" }
 lnvps_db = { path = "../lnvps_db" }
-lnvps_node = { path = "../lnvps_node" }
 tempfile = "3"
 nix = { version = "0.30", features = ["user"] }
 # Used only to validate the software authenticator offline: register via

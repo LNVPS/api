@@ -10,10 +10,10 @@
 //! ```text
 //!   [rs netns]                    [test machine's netns]      [lnvps netns]        [guest netns]
 //!   wgln<pool>  <══ WireGuard ══>  wgln0 created here, then ═>  wgln0          veth
-//!   10.66.0.1/24                   its UDP socket stays here   10.66.0.2/32   br-lnvps ── 203.0.113.5/24
+//!   <rs inner>                     its UDP socket stays here   <node inner>   <bridge> ── <guest>
 //!        │                                                     203.0.113.1/32
 //!    rs_up veth ────────────────── node_up veth
-//!    198.51.100.1/24               198.51.100.2/24
+//!    <rs underlay>                 <node underlay>
 //! ```
 //!
 //! The shape is the production one, including the part that is easy to get
@@ -28,127 +28,10 @@
 use std::process::Command;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use lnvps_api::router::{Tunnel, TunnelConfig, TunnelRouter, WireguardConfig, WireguardPeer};
+use lnvps_e2e::stack::{Addrs, Stack, run};
 use lnvps_node::net::{DesiredDataPlane, DesiredGuest, DesiredTunnel};
-
-/// Underlay: the "internet" between the two machines.
-const RS_UNDERLAY: &str = "198.51.100.1/24";
-const NODE_UNDERLAY: &str = "198.51.100.2/24";
-/// Inner tunnel addresses, as the allocator hands them out.
-const RS_INNER: &str = "10.66.0.1/24";
-const NODE_INNER: &str = "10.66.0.2/32";
-/// A customer address, as LNVPS assigns it to a guest on this node.
-const GUEST_ADDRESS: &str = "203.0.113.5";
-/// The guest's MAC, which the filter binds its address to. LNVPS knows it
-/// because LNVPS assigned it when the VM was created.
-const GUEST_MAC: &str = "52:54:00:e2:e0:05";
-/// An address nobody assigned this guest, used to prove the filter drops it.
-const SPOOFED_ADDRESS: &str = "203.0.113.99";
-const GUEST_GATEWAY: &str = "203.0.113.1";
-
-/// Namespaces, torn down on drop even when a test panics.
-struct Topology {
-    rs: String,
-    guest: String,
-    /// The node's data plane namespace, pinned where iproute2 looks so an
-    /// operator — and this harness — can reach it with `ip netns exec`.
-    dataplane: String,
-}
-
-impl Topology {
-    fn new(tag: &str) -> Result<Self> {
-        let topology = Self {
-            rs: format!("lnvps-e2e-rs-{tag}"),
-            guest: format!("lnvps-e2e-guest-{tag}"),
-            dataplane: format!("lnvps-e2e-dp-{tag}"),
-        };
-        topology.teardown();
-
-        run("ip", &["netns", "add", &topology.rs])?;
-        run("ip", &["netns", "add", &topology.guest])?;
-
-        // The underlay: the route server and the node's machine, reachable to
-        // each other and to nothing else.
-        run(
-            "ip",
-            &[
-                "link", "add", "e2e-rs", "type", "veth", "peer", "name", "e2e-node",
-            ],
-        )?;
-        run("ip", &["link", "set", "e2e-rs", "netns", &topology.rs])?;
-        topology.in_rs(&["ip", "addr", "add", RS_UNDERLAY, "dev", "e2e-rs"])?;
-        topology.in_rs(&["ip", "link", "set", "e2e-rs", "up"])?;
-        topology.in_rs(&["ip", "link", "set", "lo", "up"])?;
-        run("ip", &["addr", "add", NODE_UNDERLAY, "dev", "e2e-node"])?;
-        run("ip", &["link", "set", "e2e-node", "up"])?;
-
-        Ok(topology)
-    }
-
-    fn in_rs(&self, argv: &[&str]) -> Result<String> {
-        let mut full = vec!["netns", "exec", &self.rs];
-        full.extend_from_slice(argv);
-        run("ip", &full)
-    }
-
-    fn in_guest(&self, argv: &[&str]) -> Result<String> {
-        let mut full = vec!["netns", "exec", &self.guest];
-        full.extend_from_slice(argv);
-        run("ip", &full)
-    }
-
-    /// Run commands in the node's *data plane* namespace, which the production
-    /// code created and pinned.
-    fn in_dataplane(&self, argv: &[&str]) -> Result<String> {
-        let mut full = vec!["netns", "exec", &self.dataplane];
-        full.extend_from_slice(argv);
-        run("ip", &full)
-    }
-
-    /// The namespace the node's code builds, as production code would.
-    fn open_dataplane(&self) -> Result<lnvps_node::netns::Handle> {
-        lnvps_node::netns::ensure(std::path::Path::new("/run/netns"), &self.dataplane)
-    }
-
-    fn teardown(&self) {
-        let _ = Command::new("ip")
-            .args(["netns", "delete", &self.rs])
-            .output();
-        let _ = Command::new("ip")
-            .args(["netns", "delete", &self.guest])
-            .output();
-        let _ = Command::new("ip")
-            .args(["netns", "delete", &self.dataplane])
-            .output();
-        // Anything the node's code created in the machine's namespace, which
-        // is where a half-finished run leaves it.
-        for link in ["e2e-node", "e2e-guest", "wgln0", "wg0", "br-lnvps"] {
-            let _ = Command::new("ip").args(["link", "del", link]).output();
-        }
-    }
-}
-
-impl Drop for Topology {
-    fn drop(&mut self) {
-        self.teardown();
-    }
-}
-
-fn run(program: &str, args: &[&str]) -> Result<String> {
-    let out = Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("cannot run {program}"))?;
-    if !out.status.success() {
-        bail!(
-            "`{program} {}` failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
 
 /// A route server whose commands run inside a namespace instead of over SSH.
 ///
@@ -195,7 +78,7 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
     if !requirements_met() {
         return Ok(());
     }
-    let topology = Topology::new("guest")?;
+    let stack = Stack::new("guest", 1)?;
 
     // ---- the node generates its own key; LNVPS never sees the private half
     let state_dir = tempfile::tempdir()?;
@@ -203,7 +86,7 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
 
     // ---- the route server's own interface, configured by production code
     let server_key = lnvps_api_common::generate_wireguard_keypair()?;
-    let rs = route_server(&topology.rs);
+    let rs = route_server(&stack.names.rs_ns);
     let interface = "wgln1";
     rs.add_tunnel(&Tunnel {
         id: None,
@@ -212,7 +95,7 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
         remote_addr: None,
         enabled: true,
         config: TunnelConfig::Wireguard(WireguardConfig {
-            listen_port: Some(51820),
+            listen_port: Some(stack.addrs.listen_port),
             private_key: Some(server_key.private_key.clone()),
             public_key: Some(lnvps_api_common::wireguard_key_to_base64(
                 &server_key.public_key,
@@ -226,7 +109,7 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
     // The pool's address, and the peer as the reconciler builds it: the node's
     // own address plus exactly the guest addresses LNVPS assigned to it, which
     // is the anti-spoof boundary.
-    rs.sync_tunnel_addresses(interface, &[RS_INNER.to_string()])
+    rs.sync_tunnel_addresses(interface, &[stack.addrs.rs_inner.to_string()])
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     rs.set_tunnel_peer(
@@ -234,7 +117,10 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
         &WireguardPeer {
             public_key: node_key.public_base64(),
             endpoint: None,
-            allowed_ips: vec![NODE_INNER.to_string(), format!("{GUEST_ADDRESS}/32")],
+            allowed_ips: vec![
+                stack.addrs.node_inner.to_string(),
+                format!("{}/32", &stack.addrs.guest),
+            ],
             persistent_keepalive: None,
         },
     )
@@ -245,35 +131,41 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
     // without the block the route server cannot reach any node in the pool.
     rs.sync_tunnel_routes(
         interface,
-        &["10.66.0.0/24".to_string(), format!("{GUEST_ADDRESS}/32")],
+        &[
+            // The pool's own block, which the route server has to route rather
+            // than assume on-link: an address on a point-to-point interface
+            // does not route the rest of its prefix.
+            stack.addrs.pool_block.clone(),
+            format!("{}/32", &stack.addrs.guest),
+        ],
     )
     .await
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // ---- the node applies the document LNVPS would have sent it
-    let kernel = lnvps_node::net::Kernel::in_namespace(topology.open_dataplane()?)?;
+    let kernel = lnvps_node::net::Kernel::in_namespace(stack.open_dataplane()?)?;
     let desired = DesiredDataPlane {
         // The harness proves the network; libvirt on a node is exercised by its
         // own tests, and starting a hypervisor here would test systemd.
         libvirt: None,
         tunnel: DesiredTunnel {
-            address4: Some(NODE_INNER.to_string()),
+            address4: Some(stack.addrs.node_inner.to_string()),
             address6: None,
             gateway4: Some("10.66.0.1".to_string()),
             gateway6: None,
             server_public_key: hex::encode(&server_key.public_key),
-            endpoint: "198.51.100.1:51820".to_string(),
+            endpoint: stack.addrs.endpoint(),
             keepalive: Some(25),
             mtu: 1420,
         },
-        gateways: vec![GUEST_GATEWAY.to_string()],
+        gateways: vec![stack.addrs.guest_gateway.to_string()],
         guests: vec![DesiredGuest {
-            address: format!("{GUEST_ADDRESS}/32"),
-            gateway: GUEST_GATEWAY.to_string(),
-            mac: Some(GUEST_MAC.to_string()),
+            address: format!("{}/32", &stack.addrs.guest),
+            gateway: stack.addrs.guest_gateway.to_string(),
+            mac: Some(stack.addrs.guest_mac.to_string()),
         }],
     };
-    let firewall = lnvps_node::fw::SystemFirewall::new(topology.open_dataplane()?);
+    let firewall = lnvps_node::fw::SystemFirewall::new(stack.open_dataplane()?);
     lnvps_node::net::apply(&kernel, &firewall, &desired, &node_key).await?;
 
     // ---- a guest on the node's bridge, addressed as a customer's VM is
@@ -282,69 +174,102 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
         &[
             "link",
             "add",
-            "e2e-guest",
+            &stack.names.guest_peer,
             "type",
             "veth",
             "peer",
             "name",
-            "e2e-tap",
+            &stack.names.guest_veth,
         ],
     )?;
     run(
         "ip",
-        &["link", "set", "e2e-tap", "netns", &topology.dataplane],
+        &[
+            "link",
+            "set",
+            &stack.names.guest_veth,
+            "netns",
+            &stack.names.dataplane_ns,
+        ],
     )?;
-    topology.in_dataplane(&["ip", "link", "set", "e2e-tap", "master", "br-lnvps"])?;
-    topology.in_dataplane(&["ip", "link", "set", "e2e-tap", "up"])?;
+    stack.in_dataplane(&[
+        "ip",
+        "link",
+        "set",
+        &stack.names.guest_veth,
+        "master",
+        &stack.names.bridge,
+    ])?;
+    stack.in_dataplane(&["ip", "link", "set", &stack.names.guest_veth, "up"])?;
     run(
         "ip",
-        &["link", "set", "e2e-guest", "netns", &topology.guest],
+        &[
+            "link",
+            "set",
+            &stack.names.guest_peer,
+            "netns",
+            &stack.names.guest_ns,
+        ],
     )?;
-    topology.in_guest(&["ip", "link", "set", "e2e-guest", "address", GUEST_MAC])?;
-    topology.in_guest(&[
+    stack.in_guest(&[
+        "ip",
+        "link",
+        "set",
+        &stack.names.guest_peer,
+        "address",
+        &stack.addrs.guest_mac,
+    ])?;
+    stack.in_guest(&[
         "ip",
         "addr",
         "add",
-        &format!("{GUEST_ADDRESS}/24"),
+        &format!("{}/24", &stack.addrs.guest),
         "dev",
-        "e2e-guest",
+        &stack.names.guest_peer,
     ])?;
     // A second address the guest simply gave itself. Nothing stops a customer
     // doing this — root in their own VM is the whole product — so the filter is
     // what has to stop the packets.
-    topology.in_guest(&[
+    stack.in_guest(&[
         "ip",
         "addr",
         "add",
-        &format!("{SPOOFED_ADDRESS}/24"),
+        &format!("{}/24", &stack.addrs.guest_spoof),
         "dev",
-        "e2e-guest",
+        &stack.names.guest_peer,
     ])?;
-    topology.in_guest(&["ip", "link", "set", "e2e-guest", "up"])?;
+    stack.in_guest(&["ip", "link", "set", &stack.names.guest_peer, "up"])?;
     // The guest is configured with its range's gateway and believes it is
     // on-link — which is exactly why the node holds that address and answers
     // for it.
-    topology.in_guest(&["ip", "route", "replace", "default", "via", GUEST_GATEWAY])?;
+    stack.in_guest(&[
+        "ip",
+        "route",
+        "replace",
+        "default",
+        "via",
+        &stack.addrs.guest_gateway,
+    ])?;
 
     // ---- the tunnel itself
-    let node_inner = NODE_INNER.split('/').next().unwrap();
-    topology
+    let node_inner = stack.addrs.node_inner.split('/').next().unwrap();
+    stack
         .in_rs(&["ping", "-c", "3", "-W", "5", node_inner])
         .with_context(|| {
             format!(
                 "the route server could not reach the node over the tunnel\n\
                  route server:\n{}{}\n\
                  node data plane:\n{}{}",
-                topology.in_rs(&["ip", "addr"]).unwrap_or_default(),
-                topology.in_rs(&["wg", "show"]).unwrap_or_default(),
-                topology.in_dataplane(&["ip", "addr"]).unwrap_or_default(),
-                topology.in_dataplane(&["wg", "show"]).unwrap_or_default(),
+                stack.in_rs(&["ip", "addr"]).unwrap_or_default(),
+                stack.in_rs(&["wg", "show"]).unwrap_or_default(),
+                stack.in_dataplane(&["ip", "addr"]).unwrap_or_default(),
+                stack.in_dataplane(&["wg", "show"]).unwrap_or_default(),
             )
         })?;
 
     // ---- and the path a customer's traffic actually takes
-    topology
-        .in_rs(&["ping", "-c", "3", "-W", "5", GUEST_ADDRESS])
+    stack
+        .in_rs(&["ping", "-c", "3", "-W", "5", &stack.addrs.guest])
         .context("the route server could not reach a guest behind the node")?;
 
     // The node reports itself healthy only once that has happened: WireGuard comes
@@ -365,12 +290,21 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
     // both addresses are inside the node's peer, so from the far end a guest
     // stealing its neighbour's address is indistinguishable from the real
     // thing.
-    let rs_inner = "10.66.0.1";
-    topology
-        .in_guest(&["ping", "-c", "2", "-W", "5", "-I", GUEST_ADDRESS, rs_inner])
+    let rs_inner = Addrs::bare(&stack.addrs.rs_inner);
+    stack
+        .in_guest(&[
+            "ping",
+            "-c",
+            "2",
+            "-W",
+            "5",
+            "-I",
+            &stack.addrs.guest,
+            rs_inner,
+        ])
         .context("a guest could not reach the route server from its own address")?;
     assert!(
-        topology
+        stack
             .in_guest(&[
                 "ping",
                 "-c",
@@ -378,12 +312,12 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
                 "-W",
                 "3",
                 "-I",
-                SPOOFED_ADDRESS,
+                &stack.addrs.guest_spoof,
                 rs_inner
             ])
             .is_err(),
         "a guest reached the network sourcing an address LNVPS never assigned it:\n{}",
-        topology
+        stack
             .in_dataplane(&["nft", "list", "ruleset"])
             .unwrap_or_default()
     );
@@ -423,7 +357,7 @@ async fn the_operators_machine_keeps_its_own_network() -> Result<()> {
     if !requirements_met() {
         return Ok(());
     }
-    let topology = Topology::new("isolation")?;
+    let stack = Stack::new("isolation", 3)?;
     let state_dir = tempfile::tempdir()?;
     let node_key = lnvps_node::wgkey::load_or_generate(state_dir.path())?;
     let server_key = lnvps_api_common::generate_wireguard_keypair()?;
@@ -434,26 +368,29 @@ async fn the_operators_machine_keeps_its_own_network() -> Result<()> {
     // called `wg0`: the node creates its interface in *this* namespace before
     // moving it, so a collision here would either fail outright or, worse,
     // adopt somebody's VPN and move it out from under them.
-    run("ip", &["link", "add", "wg0", "type", "wireguard"])?;
+    run(
+        "ip",
+        &["link", "add", &stack.names.operator_wg, "type", "wireguard"],
+    )?;
 
-    let kernel = lnvps_node::net::Kernel::in_namespace(topology.open_dataplane()?)?;
-    let firewall = lnvps_node::fw::SystemFirewall::new(topology.open_dataplane()?);
+    let kernel = lnvps_node::net::Kernel::in_namespace(stack.open_dataplane()?)?;
+    let firewall = lnvps_node::fw::SystemFirewall::new(stack.open_dataplane()?);
     lnvps_node::net::apply(
         &kernel,
         &firewall,
         &DesiredDataPlane {
             libvirt: None,
             tunnel: DesiredTunnel {
-                address4: Some(NODE_INNER.to_string()),
+                address4: Some(stack.addrs.node_inner.to_string()),
                 address6: None,
                 gateway4: Some("10.66.0.1".to_string()),
                 gateway6: None,
                 server_public_key: hex::encode(&server_key.public_key),
-                endpoint: "198.51.100.1:51820".to_string(),
+                endpoint: stack.addrs.endpoint(),
                 keepalive: Some(25),
                 mtu: 1420,
             },
-            gateways: vec![GUEST_GATEWAY.to_string()],
+            gateways: vec![stack.addrs.guest_gateway.to_string()],
             guests: vec![],
         },
         &node_key,
@@ -462,7 +399,7 @@ async fn the_operators_machine_keeps_its_own_network() -> Result<()> {
 
     // The operator's interface is still theirs, still where they left it.
     assert!(
-        run("ip", &["link", "show", "wg0"]).is_ok(),
+        run("ip", &["link", "show", &stack.names.operator_wg]).is_ok(),
         "the operator's own wg0 was taken or destroyed"
     );
 
@@ -474,11 +411,7 @@ async fn the_operators_machine_keeps_its_own_network() -> Result<()> {
         "the node's interface is still in the machine's namespace: {}",
         run("ip", &["link", "show"]).unwrap_or_default()
     );
-    assert!(
-        topology
-            .in_dataplane(&["ip", "link", "show", "wgln0"])
-            .is_ok()
-    );
+    assert!(stack.in_dataplane(&["ip", "link", "show", "wgln0"]).is_ok());
     assert!(run("ip", &["link", "show", "br-lnvps"]).is_err());
 
     // The default route the node installed is the data plane's, not the
@@ -492,11 +425,11 @@ async fn the_operators_machine_keeps_its_own_network() -> Result<()> {
 
     // Forwarding is enabled in the namespace only. On a machine that is also
     // the operator's workstation, turning it on globally is not ours to do.
-    let inside = topology.in_dataplane(&["cat", "/proc/sys/net/ipv4/ip_forward"]);
+    let inside = stack.in_dataplane(&["cat", "/proc/sys/net/ipv4/ip_forward"]);
     assert_eq!(inside.unwrap_or_default().trim(), "1");
 
     assert!(
-        topology
+        stack
             .in_dataplane(&["ip", "link", "show", "e2e-node"])
             .is_err(),
         "the operator's uplink is reachable from inside the data plane"

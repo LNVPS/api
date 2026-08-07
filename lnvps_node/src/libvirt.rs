@@ -52,11 +52,33 @@ pub const TLS_PORT: u16 = 16514;
 /// The systemd unit the daemon owns.
 pub const UNIT: &str = "lnvps-libvirtd.service";
 
-/// The DN LNVPS's client certificate carries.
+const DEFAULT_UNIT_DIR: &str = "/etc/systemd/system";
+const DEFAULT_SYSTEMCTL: &str = "/usr/bin/systemctl";
+const DEFAULT_LIBVIRTD: &str = "/usr/sbin/libvirtd";
+
+/// The directories this instance keeps its own copies of, each bind-mounted
+/// over libvirt's usual path.
 ///
-/// libvirtd is told to accept this and nothing else, so a certificate signed by
-/// the same CA for some other purpose still cannot drive the node.
-pub const LNVPS_CLIENT_DN: &str = "CN=lnvps-marketplace";
+/// One list, used both to create them and to render the unit that mounts them.
+/// Two lists would be a mount of a directory nobody made, which systemd reports
+/// as a unit that will not start and nothing else.
+const PRIVATE_DIRS: [(&str, &str); 4] = [
+    ("lib", "/var/lib/libvirt"),
+    ("etc", "/etc/libvirt"),
+    ("run", "/run/libvirt"),
+    ("cache", "/var/cache/libvirt"),
+];
+
+/// Where the instance's TLS material lives, relative to its root.
+const PKI_DIR: &str = "pki";
+const SERVER_CERT: &str = "server-cert.pem";
+const SERVER_KEY: &str = "server-key.pem";
+const CA_CERT: &str = "ca-cert.pem";
+/// Recorded beside the certificate so the address it names can be checked
+/// without parsing X.509.
+const SERVER_ADDR: &str = "server-addr";
+const CONF: &str = "libvirtd.conf";
+const QEMU_CONF: &str = "etc/qemu.conf";
 
 /// Where the second instance keeps the state the first one keeps in
 /// `/var/lib/libvirt`, `/etc/libvirt` and friends.
@@ -68,6 +90,10 @@ pub struct Paths {
     pub unit_dir: PathBuf,
     /// `systemctl`, overridable so the plumbing can be tested without root.
     pub systemctl: PathBuf,
+    /// The libvirt daemon binary. Named rather than assumed so a machine that
+    /// ships it elsewhere — or a harness running a stand-in — does not need the
+    /// unit rewritten by hand.
+    pub libvirtd: PathBuf,
     /// Where namespaces are pinned; matches [`crate::netns`].
     pub netns_root: PathBuf,
 }
@@ -76,26 +102,31 @@ impl Paths {
     pub fn new(state_dir: &Path) -> Self {
         Self {
             root: state_dir.join("libvirt"),
-            unit_dir: PathBuf::from("/etc/systemd/system"),
-            systemctl: PathBuf::from("/usr/bin/systemctl"),
+            unit_dir: PathBuf::from(DEFAULT_UNIT_DIR),
+            systemctl: PathBuf::from(DEFAULT_SYSTEMCTL),
+            libvirtd: PathBuf::from(DEFAULT_LIBVIRTD),
             netns_root: PathBuf::from(netns::NETNS_DIR),
         }
     }
 
     fn conf(&self) -> PathBuf {
-        self.root.join("libvirtd.conf")
+        self.root.join(CONF)
+    }
+
+    fn pki(&self) -> PathBuf {
+        self.root.join(PKI_DIR)
     }
 
     fn cert(&self) -> PathBuf {
-        self.root.join("pki/server-cert.pem")
+        self.pki().join(SERVER_CERT)
     }
 
     fn key(&self) -> PathBuf {
-        self.root.join("pki/server-key.pem")
+        self.pki().join(SERVER_KEY)
     }
 
     fn ca(&self) -> PathBuf {
-        self.root.join("pki/ca-cert.pem")
+        self.pki().join(CA_CERT)
     }
 
     fn unit(&self) -> PathBuf {
@@ -168,11 +199,11 @@ pub fn load_or_generate_identity(paths: &Paths, listen: IpAddr) -> Result<Identi
     }
 
     let identity = generate_identity(listen)?;
-    let dir = paths.root.join("pki");
+    let dir = paths.pki();
     fs::create_dir_all(&dir).context("libvirt pki directory")?;
     write_private(&paths.key(), identity.key_pem.as_bytes())?;
     fs::write(paths.cert(), identity.cert_pem.as_bytes()).context("libvirt server certificate")?;
-    fs::write(dir.join("server-addr"), listen.to_string()).context("libvirt server address")?;
+    fs::write(dir.join(SERVER_ADDR), listen.to_string()).context("libvirt server address")?;
     info!("generated a libvirt server identity for {listen}");
     Ok(identity)
 }
@@ -205,7 +236,7 @@ pub fn generate_identity(listen: IpAddr) -> Result<Identity> {
 /// X.509 to answer a question we already knew the answer to when we wrote the
 /// file is a parser's worth of failure modes for nothing.
 fn stored_address(paths: &Paths) -> Option<IpAddr> {
-    fs::read_to_string(paths.root.join("pki/server-addr"))
+    fs::read_to_string(paths.pki().join(SERVER_ADDR))
         .ok()?
         .trim()
         .parse()
@@ -274,7 +305,7 @@ After=network.target
 
 [Service]
 Type=notify
-ExecStart=/usr/sbin/libvirtd --listen --config {root}/libvirtd.conf
+ExecStart={libvirtd} --listen --config {root}/{conf}
 Restart=on-failure
 
 # Guest taps are created in the namespace of the libvirtd that starts the
@@ -284,15 +315,17 @@ NetworkNamespacePath={netns}
 # A private view of libvirt's state, so this instance and the operator's do not
 # contend over domain state, storage pools or sockets.
 PrivateMounts=yes
-BindPaths={root}/lib:/var/lib/libvirt
-BindPaths={root}/etc:/etc/libvirt
-BindPaths={root}/run:/run/libvirt
-BindPaths={root}/cache:/var/cache/libvirt
-
+{binds}
 [Install]
 WantedBy=multi-user.target
 "#,
+        libvirtd = paths.libvirtd.display(),
+        conf = CONF,
         netns = netns::path(&paths.netns_root, netns::NAMESPACE).display(),
+        binds = PRIVATE_DIRS
+            .iter()
+            .map(|(name, at)| format!("BindPaths={root}/{name}:{at}\n"))
+            .collect::<String>(),
     )
 }
 
@@ -303,7 +336,11 @@ WantedBy=multi-user.target
 /// poll, and customer VMs keep running across a restart only because nothing
 /// asked them not to.
 pub fn apply(paths: &Paths, params: &Params, identity: &Identity) -> Result<bool> {
-    for dir in ["lib", "etc", "run", "cache", "pki"] {
+    for dir in PRIVATE_DIRS
+        .iter()
+        .map(|(name, _)| *name)
+        .chain(std::iter::once(PKI_DIR))
+    {
         fs::create_dir_all(paths.root.join(dir))
             .with_context(|| format!("libvirt {dir} directory"))?;
     }
@@ -316,10 +353,7 @@ pub fn apply(paths: &Paths, params: &Params, identity: &Identity) -> Result<bool
         &paths.conf(),
         render_libvirtd_conf(params, paths).as_bytes(),
     )?;
-    changed |= write_if_changed(
-        &paths.root.join("etc/qemu.conf"),
-        render_qemu_conf().as_bytes(),
-    )?;
+    changed |= write_if_changed(&paths.root.join(QEMU_CONF), render_qemu_conf().as_bytes())?;
     changed |= write_if_changed(&paths.unit(), render_unit(paths).as_bytes())?;
     Ok(changed)
 }

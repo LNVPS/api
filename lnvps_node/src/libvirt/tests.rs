@@ -6,6 +6,11 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
+/// The DN the node is told to accept. Written out here rather than imported,
+/// because the node holds no opinion about it: LNVPS states it in the document,
+/// and a constant on this side would be a second opinion to disagree with.
+const A_DN: &str = "CN=lnvps-marketplace";
+
 use tempfile::TempDir;
 
 use super::*;
@@ -22,7 +27,7 @@ fn params() -> Params {
     Params {
         listen: IpAddr::V4(Ipv4Addr::new(10, 66, 0, 2)),
         ca_pem: "-----BEGIN CERTIFICATE-----\nlnvps-ca\n-----END CERTIFICATE-----\n".to_string(),
-        allowed_dn: LNVPS_CLIENT_DN.to_string(),
+        allowed_dn: A_DN.to_string(),
     }
 }
 
@@ -53,7 +58,7 @@ fn only_lnvps_may_connect() {
     let conf = render_libvirtd_conf(&params(), &paths(&dir));
 
     assert!(
-        conf.contains(&format!(r#"tls_allowed_dn_list = ["{LNVPS_CLIENT_DN}"]"#)),
+        conf.contains(&format!(r#"tls_allowed_dn_list = ["{A_DN}"]"#)),
         "{conf}"
     );
 }
