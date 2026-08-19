@@ -18,6 +18,7 @@ path = "src/bin/fix_lnurlp_topups.rs"
 
 [features]
 default = [
+    "agent",
     "mikrotik",
     "nostr-dm",
     "nostr-dvm",
@@ -35,8 +36,12 @@ default = [
     "payments-rs/tls-ring"
 ]
 openapi = ["dep:openapi-build-gen"]
-# AI support agent served over a live-chat websocket. Off by default: it pulls
-# an OpenAI client and is inert unless `agent` is set in the config.
+# AI support agent served over a live-chat websocket. On by default so the
+# published images serve `/api/v1/support/chat` — the route is compiled in
+# behind this flag, so without it the endpoint is not merely disabled but
+# absent (404), and a client cannot tell it apart from a bad URL. Still inert
+# unless `agent` is set in the config: the handler refuses every connection
+# with an error frame when no agent is configured.
 # `lnvps_api_common/admin` brings in the RBAC tables so the chat handler can
 # check `users:view` before exposing tool activity.
 agent = ["dep:lnvps_agent", "lnvps_api_common/admin"]
