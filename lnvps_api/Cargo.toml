@@ -135,6 +135,11 @@ uuid = { version = "1.16", features = ["v4", "serde"], optional = true }
 quick-xml = { version = "0.39", features = ["serde", "serialize"], optional = true }
 
 [dev-dependencies]
+# `test-util` gives the paused clock the support-chat keepalive tests drive, so
+# a 20s ping interval is asserted in microseconds instead of real time. A
+# dev-dependency on purpose: it must never reach the shipped binary, where it
+# would let time be paused at runtime.
+tokio = { workspace = true, features = ["test-util"] }
 # Loading back a probe key to prove the pair matches; the client itself lives
 # in lnvps_api_common.
 russh = "0.62"

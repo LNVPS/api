@@ -36,8 +36,62 @@ fn truncate_chars(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
 }
 
+/// Render the text handed to the model for summarisation.
+///
+/// Pulled out of [`SupportAgent::compact`] so the deterministic fallback
+/// summarises exactly what the model was asked to, and so both can be tested
+/// without a provider.
+fn compaction_transcript(summary: Option<&str>, messages: &[ChatMessage]) -> String {
+    let mut transcript = String::new();
+    if let Some(existing) = summary {
+        transcript.push_str("Existing summary (incorporate into your updated summary):\n");
+        transcript.push_str(existing);
+        transcript.push_str("\n\nNew exchanges to fold in:\n");
+    }
+    for message in messages {
+        transcript.push_str(&message.transcript_line());
+        transcript.push('\n');
+    }
+    transcript
+}
+
+/// Summarise a transcript without the model: keep the head, mark the cut.
+///
+/// Used when the provider cannot produce a summary. The head is kept rather
+/// than the tail because the recent messages are retained verbatim in the
+/// replay window (see [`FALLBACK_TAIL`]) and would otherwise be duplicated;
+/// what this preserves is the older context that is about to leave the window
+/// for good.
+///
+/// The marker is not decoration: without it the model reads a transcript that
+/// stops mid-sentence as a complete account of the conversation, and answers
+/// confidently from a history it cannot see the end of.
+fn fallback_summary(transcript: &str) -> String {
+    let kept = truncate_chars(transcript, FALLBACK_SUMMARY_CHARS);
+    if kept.chars().count() < transcript.chars().count() {
+        format!(
+            "[Automatic summary unavailable; earlier conversation truncated.]\n{kept}\n[… earlier detail omitted …]"
+        )
+    } else {
+        format!("[Automatic summary unavailable; raw transcript follows.]\n{kept}")
+    }
+}
+
 /// Number of stored chat messages that triggers a compaction pass.
 const COMPACTION_THRESHOLD: usize = 30;
+
+/// Messages kept in the replay window when compaction falls back to the
+/// deterministic path.
+///
+/// Small enough that the next turn is cheap, large enough that the immediate
+/// back-and-forth ("do it" / "which one?") is not cut mid-exchange.
+const FALLBACK_TAIL: usize = 6;
+
+/// Characters of transcript retained by the deterministic fallback summary.
+///
+/// A bounded, dumb summary. The point is that the replay window stops growing,
+/// not that the text is good.
+const FALLBACK_SUMMARY_CHARS: usize = 2000;
 
 /// Maximum tool-calling iterations for a general (public) request.
 const PUBLIC_MAX_ITERATIONS: usize = 5;
@@ -657,8 +711,20 @@ impl SupportAgent {
                 sender_id,
                 conv.messages.len()
             );
+            // Not swallowed: `compact` only returns `Err` once the deterministic
+            // fallback has *also* failed, which means the store itself is
+            // refusing writes. Nothing here can recover from that, but the log
+            // must say that the replay window is now growing without bound —
+            // the previous message ("Failed to compact") read as a transient
+            // per-turn blip and hid exactly that.
             if let Err(e) = self.compact(sender_id).await {
-                log::error!("Failed to compact conversation for {}: {}", sender_id, e);
+                log::error!(
+                    "Conversation for {} could not be compacted or truncated ({}); \
+                     the replay window is unbounded and every turn will now be \
+                     slower and more expensive than the last",
+                    sender_id,
+                    e
+                );
             }
         }
     }
@@ -677,17 +743,68 @@ impl SupportAgent {
             return Ok(());
         }
 
-        let mut transcript = String::new();
-        if let Some(ref existing) = conv.summary {
-            transcript.push_str("Existing summary (incorporate into your updated summary):\n");
-            transcript.push_str(existing);
-            transcript.push_str("\n\nNew exchanges to fold in:\n");
-        }
-        for message in &conv.messages {
-            transcript.push_str(&message.transcript_line());
-            transcript.push('\n');
-        }
+        let transcript = compaction_transcript(conv.summary.as_deref(), &conv.messages);
+        let message_count = conv.messages.len();
 
+        // A summary the model wrote is better than one we cut with scissors, so
+        // that is tried first — but it must not be the only option. When it
+        // fails the conversation still has to stop growing, because every
+        // uncompacted message is replayed on every subsequent turn: the cost of
+        // a turn rises, its latency rises with it, and the transcript this very
+        // function has to summarise gets larger, so the next attempt is *more*
+        // likely to fail than this one was. That is a doom loop, and it is what
+        // ran in production — 31, 33, 35, 39 messages within minutes, every
+        // attempt failing, until turns were slow enough to be cut off by the
+        // proxy in front of the API.
+        //
+        // The trade-off is deliberate and one-directional: a worse summary is
+        // better than an unbounded one. The fallback keeps the tail verbatim
+        // and truncates the rest, which loses detail from the middle of a long
+        // conversation but bounds what is replayed forever after.
+        let (summary, cursor) = match self.llm_summary(&transcript).await {
+            Ok(summary) => {
+                log::info!(
+                    "Compacted conversation for {}: {} messages -> {} chars summary",
+                    sender_id,
+                    message_count,
+                    summary.len()
+                );
+                // Pass back the cursor from the snapshot we actually
+                // summarised, so a message that arrived mid-summarisation stays
+                // in the replay window.
+                (summary, conv.cursor)
+            }
+            Err(e) => {
+                let tail = FALLBACK_TAIL.min(message_count);
+                let kept = message_count - tail;
+                log::warn!(
+                    "LLM compaction failed for {} ({}); falling back to truncation: \
+                     {} messages summarised verbatim, {} most recent kept",
+                    sender_id,
+                    e,
+                    kept,
+                    tail
+                );
+                (
+                    fallback_summary(&transcript),
+                    // Only advance past what the fallback actually folded in.
+                    // Keeping a tail means the customer's most recent exchange
+                    // survives compaction verbatim rather than being reduced to
+                    // a truncated line.
+                    conv.cursor.saturating_sub(tail as u64),
+                )
+            }
+        };
+
+        self.store.compact(sender_id, summary, cursor).await
+    }
+
+    /// Ask the model for a summary of `transcript`.
+    ///
+    /// Separated from [`Self::compact`] so that a provider that cannot produce
+    /// one is an ordinary `Err` the caller can fall back from, rather than the
+    /// end of compaction.
+    async fn llm_summary(&self, transcript: &str) -> Result<String> {
         let client = self.openai_client();
         let messages: Vec<ChatCompletionRequestMessage> = vec![
             ChatCompletionRequestSystemMessageArgs::default()
@@ -704,30 +821,48 @@ impl SupportAgent {
 
         let request = CreateChatCompletionRequestArgs::default()
             .model(&self.openai.model)
-            .max_completion_tokens(1024u32)
+            // Was hardcoded to 1024, which is what broke this in production.
+            // The configured model is a reasoning model whose thinking tokens
+            // are charged against this budget and are *not* returned in
+            // `content`, so a long transcript consumed the entire allowance
+            // before a single character of summary was emitted: the response
+            // came back `finish_reason: "length"` with `content: null`. Using
+            // the operator's own budget (`max-tokens`, 16384 in production)
+            // makes the ceiling one an operator can raise for their model
+            // instead of one compiled in for a non-reasoning one.
+            .max_completion_tokens(self.max_tokens())
             .messages(messages)
             .build()?;
 
         let response = client.chat().create(request).await?;
-        let summary = response
+        let choice = response
             .choices
             .first()
-            .ok_or_else(|| anyhow!("LLM returned no choices"))?
-            .message
-            .content
-            .clone()
-            .ok_or_else(|| anyhow!("LLM returned empty summary"))?;
+            .ok_or_else(|| anyhow!("LLM returned no choices"))?;
 
-        log::info!(
-            "Compacted conversation for {}: {} messages -> {} chars summary",
-            sender_id,
-            conv.messages.len(),
-            summary.len()
-        );
+        // `refusal` is a separate field, so a model that declines to summarise
+        // reports it here while `content` stays `None`. Naming it turns "empty
+        // summary" into the actual reason.
+        if let Some(refusal) = choice.message.refusal.as_deref().map(str::trim)
+            && !refusal.is_empty()
+        {
+            return Err(anyhow!("LLM refused to summarise: {refusal}"));
+        }
 
-        // Pass back the cursor from the snapshot we actually summarised, so a
-        // message that arrived mid-summarisation stays in the replay window.
-        self.store.compact(sender_id, summary, conv.cursor).await
+        // Treat whitespace-only content as absent: it is no more usable as a
+        // summary than `None`, and the two arrive interchangeably depending on
+        // the provider.
+        match choice.message.content.as_deref().map(str::trim) {
+            Some(summary) if !summary.is_empty() => Ok(summary.to_string()),
+            _ => Err(anyhow!(
+                "LLM returned no summary text (finish_reason: {}); \
+                 a reasoning model can exhaust max-tokens before emitting content",
+                choice
+                    .finish_reason
+                    .map(|r| format!("{r:?}"))
+                    .unwrap_or_else(|| "none".to_string()),
+            )),
+        }
     }
 
     pub async fn process_request(
@@ -1044,5 +1179,61 @@ mod tests {
                 .iter()
                 .all(|s| matches!(s.r#type, ChatCompletionToolType::Function))
         );
+    }
+
+    /// The transcript must carry the previous summary as well as the new
+    /// messages: dropping it would make each compaction forget everything the
+    /// one before it had already condensed.
+    #[test]
+    fn compaction_transcript_folds_in_the_existing_summary() {
+        let messages = vec![ChatMessage::user("vm 7 is down")];
+
+        let without = compaction_transcript(None, &messages);
+        assert!(without.contains("User: vm 7 is down"));
+        assert!(!without.contains("Existing summary"));
+
+        let with = compaction_transcript(Some("customer owns vm 7"), &messages);
+        assert!(with.contains("customer owns vm 7"));
+        assert!(with.contains("User: vm 7 is down"));
+    }
+
+    /// The fallback exists to bound the replay window, so its output must be
+    /// bounded no matter how large the conversation got.
+    #[test]
+    fn fallback_summary_is_bounded_and_says_it_was_truncated() {
+        let huge = "User: please help with my vm\n".repeat(5_000);
+        let summary = fallback_summary(&huge);
+
+        assert!(summary.chars().count() < huge.chars().count());
+        assert!(
+            summary.chars().count() < FALLBACK_SUMMARY_CHARS + 200,
+            "summary was {} chars",
+            summary.chars().count()
+        );
+        // Without the marker the model reads a transcript that stops
+        // mid-sentence as the whole story.
+        assert!(summary.contains("truncated"));
+        assert!(summary.contains("omitted"));
+    }
+
+    /// A transcript already under the cap is kept whole, and is not labelled as
+    /// truncated when nothing was cut.
+    #[test]
+    fn fallback_summary_keeps_a_short_transcript_whole() {
+        let short = "User: hello\nAgent: hi\n";
+        let summary = fallback_summary(short);
+
+        assert!(summary.contains("User: hello"));
+        assert!(summary.contains("Agent: hi"));
+        assert!(!summary.contains("omitted"));
+    }
+
+    /// Multi-byte input must not panic the fallback (the cut is by character,
+    /// not by byte).
+    #[test]
+    fn fallback_summary_handles_multibyte() {
+        let emoji = "🚀".repeat(FALLBACK_SUMMARY_CHARS * 2);
+        let summary = fallback_summary(&emoji);
+        assert!(summary.contains("omitted"));
     }
 }
