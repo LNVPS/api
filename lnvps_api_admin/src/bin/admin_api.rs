@@ -51,6 +51,13 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     env_logger::init();
+
+    // This API is reachable only by authenticated admins, for whom the
+    // underlying error is the useful part of a 500. The default is sanitised
+    // and the public API must leave it that way: `lnvps_api_common` is compiled
+    // once for both binaries, so this cannot be a compile-time choice.
+    lnvps_api_common::set_verbose_internal_errors(true);
+
     let args = Args::parse();
 
     let settings: Settings = Config::builder()

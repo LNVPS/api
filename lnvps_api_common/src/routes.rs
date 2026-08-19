@@ -1,8 +1,38 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use log::error;
 use serde::{Deserialize, Serialize};
+
+/// Whether a 500 returns the underlying error text to the caller.
+///
+/// Process state rather than a Cargo feature, because a feature cannot express
+/// this. `lnvps_api_admin` depends on this crate with `admin` on and the
+/// Dockerfile builds it in the same `cargo build` as `lnvps_api`; feature
+/// unification then compiles one `lnvps_api_common` with `admin` enabled and
+/// links it into *both* binaries, so the public API served admin-verbosity
+/// errors — sqlx messages naming tables, columns, constraints and duplicate-key
+/// values, database host:port, SSH usernames and file paths — to anonymous
+/// callers.
+///
+/// Defaults to sanitised so a binary that forgets to opt in is safe: the
+/// failure mode of forgetting is a less useful error message, not a leak.
+static VERBOSE_INTERNAL_ERRORS: AtomicBool = AtomicBool::new(false);
+
+/// Return the underlying error text on a 500 for this process.
+///
+/// Call from an admin binary's startup, before serving. Never call it from a
+/// binary that serves customers.
+pub fn set_verbose_internal_errors(verbose: bool) {
+    VERBOSE_INTERNAL_ERRORS.store(verbose, Ordering::Relaxed);
+}
+
+/// Whether this process returns the underlying error text on a 500.
+pub fn verbose_internal_errors() -> bool {
+    VERBOSE_INTERNAL_ERRORS.load(Ordering::Relaxed)
+}
 
 pub type ApiResult<T> = Result<Json<ApiData<T>>, ApiError>;
 pub type ApiPaginatedResult<T> = Result<Json<ApiPaginatedData<T>>, ApiError>;
@@ -111,23 +141,22 @@ impl ApiError {
         Self::with_status(StatusCode::NOT_IMPLEMENTED, message)
     }
 
-    /// Create an API error from an internal error, logging the full details
-    /// but only returning a generic message to the client (in non-admin mode)
-    #[cfg(not(feature = "admin"))]
+    /// Create an API error from an internal error, always logging the full
+    /// details and returning them to the caller only where the process has
+    /// opted in with [`set_verbose_internal_errors`].
+    ///
+    /// The detail an admin wants for debugging is the detail a customer must
+    /// not see, and which of the two this is cannot be decided at compile time:
+    /// see [`VERBOSE_INTERNAL_ERRORS`].
     pub fn internal(err: impl std::fmt::Display) -> Self {
         error!("Internal error: {}", err);
+        let error = if verbose_internal_errors() {
+            err.to_string()
+        } else {
+            "An internal error occurred".to_string()
+        };
         Self {
-            error: "An internal error occurred".to_string(),
-            code: StatusCode::INTERNAL_SERVER_ERROR,
-        }
-    }
-
-    /// In admin mode, show the full error message for debugging
-    #[cfg(feature = "admin")]
-    pub fn internal(err: impl std::fmt::Display) -> Self {
-        error!("Internal error: {}", err);
-        Self {
-            error: err.to_string(),
+            error,
             code: StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -228,17 +257,25 @@ mod tests {
         assert_eq!(err.code, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
+    /// Both verbosity behaviours, and the default, in one test.
+    ///
+    /// One test rather than three because the switch is process-global: tests
+    /// in a crate share a process and run in parallel, so separate tests would
+    /// race and pass or fail depending on scheduling.
     #[test]
-    #[cfg(not(feature = "admin"))]
-    fn test_api_error_internal_sanitizes() {
-        let error = ApiError::internal("secret internal details at 192.168.1.1");
-        assert_eq!(error.error, "An internal error occurred");
-    }
+    fn test_api_error_internal_verbosity() {
+        const SECRET: &str = "secret internal details at 192.168.1.1";
 
-    #[test]
-    #[cfg(feature = "admin")]
-    fn test_api_error_internal_shows_details() {
-        let error = ApiError::internal("secret internal details at 192.168.1.1");
-        assert_eq!(error.error, "secret internal details at 192.168.1.1");
+        // The default is sanitised, so a binary that never opts in is safe.
+        assert!(!verbose_internal_errors());
+        assert_eq!(ApiError::internal(SECRET).error, "An internal error occurred");
+
+        set_verbose_internal_errors(true);
+        assert_eq!(ApiError::internal(SECRET).error, SECRET);
+
+        // Restored, so this test cannot make an unrelated one see verbose
+        // errors and pass for the wrong reason.
+        set_verbose_internal_errors(false);
+        assert_eq!(ApiError::internal(SECRET).error, "An internal error occurred");
     }
 }
