@@ -12,9 +12,11 @@
 //! Three properties keep this from becoming its own liability:
 //!
 //! - **Nothing is stored about the VM.** It exists in this process's memory and
-//!   in the node's libvirt, and it is destroyed in a guard so a panic mid-probe
-//!   still takes it down. A row pointing at a probe would need a reaper, and a
-//!   reaper that fails leaves our VM running on hardware we do not own.
+//!   in the node's libvirt. It is destroyed inline on the ordinary paths and by
+//!   a `Drop` guard on the ones that never reach them — a panic in the
+//!   measurement, or the probe future being dropped by a timeout or a shutdown.
+//!   A row pointing at a probe would need a reaper, and a reaper that fails
+//!   leaves our VM running on hardware we do not own.
 //! - **Its id is outside the range a customer can reach.** Domains are named
 //!   from the VM id, so a probe using a plausible id could collide with a
 //!   customer's domain on that node — and `delete_vm` would then destroy a
@@ -250,13 +252,76 @@ impl ProbeSpec {
     }
 }
 
+/// Destroys the probe VM if the normal path did not get to.
+///
+/// The normal path deletes inline, because a delete that fails has to be
+/// reported on the result rather than logged and forgotten. This is the
+/// backstop for the paths that never reach it: a panic in the measurement, and
+/// — more likely on a probe that runs for minutes — the whole future being
+/// dropped by a `tokio::time::timeout`, a task abort or a shutdown. Without it
+/// those leave an LNVPS VM running on hardware LNVPS does not own, which is the
+/// one outcome this module exists to prevent.
+///
+/// `Drop` cannot await, so the delete is spawned. A spawn can itself be lost if
+/// the runtime is shutting down; that is strictly better than not trying, and
+/// the stale-probe delete at the start of the next probe on this node is the
+/// final catch.
+struct ProbeVmGuard {
+    client: Arc<dyn lnvps_api_common::host::VmHostClient>,
+    vm: Vm,
+    node_id: u64,
+    armed: bool,
+}
+
+impl ProbeVmGuard {
+    /// Stop the guard from deleting: the inline delete already ran, and its
+    /// outcome is on the result.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ProbeVmGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let client = self.client.clone();
+        let vm = self.vm.clone();
+        let node_id = self.node_id;
+        let vm_id = vm.id;
+        // `tokio::spawn` needs a runtime; a drop outside one (a synchronous
+        // test, a runtime already gone) must not panic in a destructor.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            log::error!(
+                "Probe VM {vm_id} on marketplace node {node_id} could not be destroyed: \
+                 no runtime to do it on"
+            );
+            return;
+        };
+        handle.spawn(async move {
+            if let Err(e) = client.delete_vm(&vm).await {
+                // Logged rather than returned: by definition nothing is waiting
+                // for this result. A node accumulating probe VMs is visible
+                // here and in the next probe's own cleanup.
+                log::error!(
+                    "Probe VM {vm_id} on marketplace node {node_id} could not be destroyed \
+                     after an interrupted probe: {e}"
+                );
+            }
+        });
+    }
+}
+
 /// Build a probe VM, hand it to `measure`, and destroy it whatever happens.
 ///
-/// The VM is deleted in every path out of this function, including a panic in
-/// the measurement: the guard runs on unwind. A probe that leaked its VM would
-/// leave LNVPS squatting on an operator's machine, which is exactly the
-/// behaviour that would get the marketplace a reputation it could not recover
-/// from.
+/// The VM is deleted on every path out of this function. The normal paths —
+/// including a measurement that returns an error — delete inline, so a failed
+/// delete is reported on the result. A panic in the measurement, or this future
+/// being dropped before it finishes, is caught by [`ProbeVmGuard`] instead. A
+/// probe that leaked its VM would leave LNVPS squatting on an operator's
+/// machine, which is exactly the behaviour that would get the marketplace a
+/// reputation it could not recover from.
 pub async fn with_probe_vm<F, Fut>(
     db: &Arc<dyn LNVpsDb>,
     cfg: &ProvisionerConfig,
@@ -281,6 +346,15 @@ where
     // the machine.
     let _ = client.delete_vm(&vm).await;
 
+    // Armed before the VM exists: `create_vm` can fail having already built the
+    // domain, and a delete of a VM that was never created is a no-op anyway.
+    let mut guard = ProbeVmGuard {
+        client: client.clone(),
+        vm: vm.clone(),
+        node_id: spec.node_id,
+        armed: true,
+    };
+
     let started = std::time::Instant::now();
     let mut result = match client.create_vm(&info).await {
         Ok(()) => match measure().await {
@@ -294,7 +368,11 @@ where
         Err(e) => ProbeResult::failed(format!("the node could not build the VM: {e}")),
     };
 
-    if let Err(e) = client.delete_vm(&vm).await {
+    let deleted = client.delete_vm(&vm).await;
+    // Only now: until the inline delete has actually run, the guard is the only
+    // thing that would clean up.
+    guard.disarm();
+    if let Err(e) = deleted {
         // Reported on the result rather than logged and forgotten: a node whose
         // probes cannot be cleaned up is one LNVPS is accumulating VMs on, and
         // that has to be visible in the series rather than in a log nobody

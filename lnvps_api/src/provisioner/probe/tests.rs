@@ -664,3 +664,177 @@ async fn a_probe_can_reach_its_gateway() -> Result<()> {
     );
     Ok(())
 }
+
+/// A host client that records every delete, so a test can tell whether the
+/// probe VM was actually destroyed. `DummyVmHost::new()` builds a fresh map per
+/// instance, so asking a second client whether the VM is gone would pass
+/// whether or not anything deleted it.
+#[derive(Default)]
+struct RecordingHost {
+    deleted: Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+/// Every method a probe never calls answers "not supported by the test double"
+/// rather than a plausible value, so a future change that starts calling one
+/// fails loudly instead of measuring a fiction.
+macro_rules! unsupported {
+    () => {
+        Err(lnvps_api_common::retry::OpError::Fatal(anyhow::anyhow!(
+            "not supported by the test double"
+        )))
+    };
+}
+
+#[async_trait::async_trait]
+impl lnvps_api_common::host::VmHostClient for RecordingHost {
+    async fn delete_vm(&self, vm: &Vm) -> lnvps_api_common::retry::OpResult<()> {
+        self.deleted.lock().unwrap().push(vm.id);
+        Ok(())
+    }
+
+    async fn get_info(&self) -> lnvps_api_common::retry::OpResult<lnvps_api_common::host::VmHostInfo> {
+        unsupported!()
+    }
+    async fn download_os_image(&self, _image: &lnvps_db::VmOsImage) -> lnvps_api_common::retry::OpResult<()> {
+        unsupported!()
+    }
+    async fn generate_mac(&self, _vm: &Vm) -> lnvps_api_common::retry::OpResult<String> {
+        unsupported!()
+    }
+    async fn start_vm(&self, _vm: &Vm) -> lnvps_api_common::retry::OpResult<()> {
+        unsupported!()
+    }
+    async fn stop_vm(&self, _vm: &Vm) -> lnvps_api_common::retry::OpResult<()> {
+        unsupported!()
+    }
+    async fn reset_vm(&self, _vm: &Vm) -> lnvps_api_common::retry::OpResult<()> {
+        unsupported!()
+    }
+    async fn create_vm(&self, _cfg: &lnvps_api_common::host::FullVmInfo) -> lnvps_api_common::retry::OpResult<()> {
+        unsupported!()
+    }
+    async fn unlink_primary_disk(&self, _vm: &Vm) -> lnvps_api_common::retry::OpResult<()> {
+        unsupported!()
+    }
+    async fn import_template_disk(&self, _cfg: &lnvps_api_common::host::FullVmInfo) -> lnvps_api_common::retry::OpResult<()> {
+        unsupported!()
+    }
+    async fn resize_disk(&self, _cfg: &lnvps_api_common::host::FullVmInfo) -> lnvps_api_common::retry::OpResult<()> {
+        unsupported!()
+    }
+    async fn get_vm_state(&self, _vm: &Vm) -> lnvps_api_common::retry::OpResult<lnvps_api_common::VmRunningState> {
+        unsupported!()
+    }
+    async fn get_all_vm_states(&self) -> lnvps_api_common::retry::OpResult<Vec<(u64, lnvps_api_common::VmRunningState)>> {
+        unsupported!()
+    }
+    async fn configure_vm(&self, _cfg: &lnvps_api_common::host::FullVmInfo) -> lnvps_api_common::retry::OpResult<()> {
+        unsupported!()
+    }
+    async fn patch_firewall(&self, _cfg: &lnvps_api_common::host::FullVmInfo) -> lnvps_api_common::retry::OpResult<()> {
+        unsupported!()
+    }
+    async fn get_time_series_data(
+        &self,
+        _vm: &Vm,
+        _series: lnvps_api_common::host::TimeSeries,
+    ) -> lnvps_api_common::retry::OpResult<Vec<lnvps_api_common::host::TimeSeriesData>> {
+        unsupported!()
+    }
+    async fn connect_terminal(&self, _vm: &Vm) -> lnvps_api_common::retry::OpResult<lnvps_api_common::host::TerminalStream> {
+        unsupported!()
+    }
+}
+
+fn a_probe_vm(node_id: u64) -> Vm {
+    Vm {
+        id: probe_vm_id(node_id),
+        ..Default::default()
+    }
+}
+
+/// The guard destroys the VM when the probe is abandoned rather than finished.
+///
+/// This is the case the inline delete cannot cover: the future is dropped
+/// part-way — a `tokio::time::timeout`, a task abort, a shutdown mid-probe —
+/// and without the guard an LNVPS VM keeps running on an operator's machine.
+#[tokio::test]
+async fn an_abandoned_probe_still_destroys_its_vm() -> Result<()> {
+    let host = Arc::new(RecordingHost::default());
+    let deleted = host.deleted.clone();
+
+    {
+        let _guard = ProbeVmGuard {
+            client: host.clone(),
+            vm: a_probe_vm(7),
+            node_id: 7,
+            armed: true,
+        };
+        // Dropped here without ever being disarmed, exactly as it would be if
+        // the probe future were dropped mid-measurement.
+    }
+
+    // The delete is spawned, so it lands on a later poll of the runtime.
+    tokio::task::yield_now().await;
+    assert_eq!(
+        deleted.lock().unwrap().as_slice(),
+        &[probe_vm_id(7)],
+        "an abandoned probe left its VM running on the operator's node"
+    );
+    Ok(())
+}
+
+/// A disarmed guard does not delete again. The inline delete already ran and
+/// reported its outcome; a second one would be a delete nothing is waiting for,
+/// racing the next probe on that node.
+#[tokio::test]
+async fn a_completed_probe_is_not_deleted_twice() -> Result<()> {
+    let host = Arc::new(RecordingHost::default());
+    let deleted = host.deleted.clone();
+
+    {
+        let mut guard = ProbeVmGuard {
+            client: host.clone(),
+            vm: a_probe_vm(7),
+            node_id: 7,
+            armed: true,
+        };
+        guard.disarm();
+    }
+
+    tokio::task::yield_now().await;
+    assert!(deleted.lock().unwrap().is_empty());
+    Ok(())
+}
+
+/// A panic during the measurement destroys the VM too.
+///
+/// The panic unwinds past the inline delete, so the guard is the only thing
+/// that can clean up. Exercised on the guard directly because the panic has to
+/// cross the drop, and `with_probe_vm` builds its own client from the host
+/// kind — there is no way to hand it a double.
+#[tokio::test]
+async fn a_panicking_probe_still_destroys_its_vm() -> Result<()> {
+    let host = Arc::new(RecordingHost::default());
+    let deleted = host.deleted.clone();
+
+    let outcome = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(async {
+        let _guard = ProbeVmGuard {
+            client: host.clone(),
+            vm: a_probe_vm(7),
+            node_id: 7,
+            armed: true,
+        };
+        panic!("the measurement fell over");
+    }))
+    .await;
+
+    assert!(outcome.is_err(), "the panic must reach the caller");
+    tokio::task::yield_now().await;
+    assert_eq!(
+        deleted.lock().unwrap().as_slice(),
+        &[probe_vm_id(7)],
+        "a probe that panicked left its VM running on the operator's node"
+    );
+    Ok(())
+}
