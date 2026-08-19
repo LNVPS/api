@@ -97,6 +97,25 @@ async fn a_catalogue(mock: &MockDb) {
     );
 }
 
+/// Hands out a node id no other test in this binary will use.
+///
+/// A probe's VM id is derived from its node id, and every test builds a fresh
+/// `MockDb` whose ids restart at 1 — so without this every probe test works on
+/// the *same* VM id. The dummy host keys VMs by id in a process-wide map (see
+/// `DummyVmHost::new_persistent`; `get_host_client`'s `cfg!(test)` arm never
+/// fires, because this crate is compiled as a dependency where `cfg(test)` is
+/// false), so those tests were creating, deleting and asserting against each
+/// other's VMs. Ordering hid it while every delete was inline; a delete issued
+/// from `ProbeVmGuard`'s `Drop` lands whenever the runtime next polls, which
+/// can be inside another test's create/assert window.
+///
+/// Counter rather than a per-test constant so a test added later cannot
+/// silently reintroduce the collision by picking a number already in use.
+fn a_unique_node_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 async fn a_node(db: &Arc<dyn LNVpsDb>) -> Result<MarketplaceNode> {
     let user_id = db.upsert_user(&[5u8; 32]).await?;
     let operator_id = db
@@ -106,6 +125,20 @@ async fn a_node(db: &Arc<dyn LNVpsDb>) -> Result<MarketplaceNode> {
             ..Default::default()
         })
         .await?;
+    // `MockDb` assigns `max(id) + 1` and ignores the id it is handed, so the
+    // only way to land on a chosen id is to fill the ones below it. The
+    // placeholders are left `Pending`, which is the default: `probe_candidates`
+    // lists only approved nodes, so they cannot alter which node a selection
+    // test picks.
+    let wanted = a_unique_node_id();
+    for _ in 1..wanted {
+        db.insert_marketplace_node(&MarketplaceNode {
+            operator_id,
+            name: "placeholder".to_string(),
+            ..Default::default()
+        })
+        .await?;
+    }
     let node_id = db
         .insert_marketplace_node(&MarketplaceNode {
             operator_id,
@@ -114,6 +147,7 @@ async fn a_node(db: &Arc<dyn LNVpsDb>) -> Result<MarketplaceNode> {
             ..Default::default()
         })
         .await?;
+    assert_eq!(node_id, wanted, "a test did not get the node id it reserved");
     db.create_host(&lnvps_db::VmHost {
         kind: VmHostKind::MarketplaceNode,
         region_id: 1,
