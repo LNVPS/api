@@ -1,6 +1,12 @@
 //! Self-upgrade: check the GitHub releases API for a newer version, download
 //! the packaged `.deb`, and install + restart the service in a detached
 //! transient systemd unit (so the upgrade survives this process restarting).
+//!
+//! The firewall releases on its own tag (`lnvps_fw-vX.Y.Z`), separately from
+//! the main API's `vX.Y.Z` tags, so this cannot use `/releases/latest`: that is
+//! repo-wide and usually returns an API release carrying no `.deb` at all. It
+//! instead lists releases and picks the newest one that actually ships a
+//! firewall package — see [`select_release`].
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -9,12 +15,31 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Tag prefix carried by firewall releases (`lnvps_fw-v0.5.0`), mirroring the
+/// `nixos-image-v*` convention used for the other independently-released
+/// artifact in this repo.
+pub const RELEASE_TAG_PREFIX: &str = "lnvps_fw-v";
+
+/// Filename prefix of the packaged firewall `.deb` (as produced by
+/// `cargo deb`: `lnvps-fw_0.5.0-1_amd64.deb`). Used to recognise a release that
+/// actually carries a firewall build, rather than any release with any `.deb`.
+const DEB_ASSET_PREFIX: &str = "lnvps-fw";
+
+/// The version part of a release tag: `lnvps_fw-v0.5.0` and the legacy
+/// `v0.5.0` both yield `0.5.0`.
+fn tag_version(tag: &str) -> &str {
+    let t = tag.trim();
+    t.strip_prefix(RELEASE_TAG_PREFIX)
+        .unwrap_or_else(|| t.trim_start_matches('v'))
+}
+
 /// Upgrade availability, cached by the daemon and served over the API.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct UpgradeStatus {
     /// The running version.
     pub current: String,
-    /// The latest release tag (e.g. `v0.1.1`), if the check succeeded.
+    /// The latest firewall release tag (e.g. `lnvps_fw-v0.5.0`), if the check
+    /// succeeded.
     pub latest: Option<String>,
     /// True if `latest` is newer than `current` and a `.deb` asset exists.
     pub available: bool,
@@ -36,6 +61,10 @@ pub struct UpgradeStatus {
 #[derive(Deserialize)]
 struct GhRelease {
     tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
     #[serde(default)]
     assets: Vec<GhAsset>,
 }
@@ -72,26 +101,17 @@ struct DebAsset {
     sig_url: Option<String>,
 }
 
-/// Query the latest GitHub release: returns `(tag, deb_asset)`.
-async fn latest_release(repo: &str) -> Result<(String, Option<DebAsset>)> {
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
-    let rel: GhRelease = client()?
-        .get(&url)
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await
-        .context("parsing GitHub release JSON")?;
+/// The firewall `.deb` (and its signature) on one release, if it carries one.
+fn deb_asset(rel: &GhRelease) -> Option<DebAsset> {
+    let is_fw = |n: &str| n.starts_with(DEB_ASSET_PREFIX);
     let sig_url = rel
         .assets
         .iter()
-        .find(|a| a.name.ends_with(".deb.minisig"))
+        .find(|a| is_fw(&a.name) && a.name.ends_with(".deb.minisig"))
         .map(|a| a.browser_download_url.clone());
-    let deb = rel
-        .assets
+    rel.assets
         .iter()
-        .find(|a| a.name.ends_with(".deb"))
+        .find(|a| is_fw(&a.name) && a.name.ends_with(".deb"))
         .map(|a| DebAsset {
             url: a.browser_download_url.clone(),
             sha256: a
@@ -99,24 +119,71 @@ async fn latest_release(repo: &str) -> Result<(String, Option<DebAsset>)> {
                 .as_ref()
                 .and_then(|d| d.strip_prefix("sha256:"))
                 .map(|h| h.to_ascii_lowercase()),
-            sig_url: sig_url.clone(),
-        });
-    Ok((rel.tag_name, deb))
+            sig_url,
+        })
 }
 
-/// True if `latest` (e.g. `v0.1.1`) is a newer semantic version than `current`
-/// (e.g. `0.1.0`). Falls back to string inequality if either doesn't parse.
-pub fn is_newer(latest: &str, current: &str) -> bool {
-    fn parse(v: &str) -> Option<(u64, u64, u64)> {
-        let v = v.trim().trim_start_matches('v');
-        let mut it = v
-            .split('.')
-            .map(|x| x.split(['-', '+']).next().unwrap_or(x).parse::<u64>().ok());
-        Some((it.next()??, it.next()??, it.next()??))
+/// Pick the newest published release that actually ships a firewall `.deb`.
+///
+/// Selection is by *asset*, not by tag pattern, for two reasons: it ignores
+/// main-API releases (`vX.Y.Z`, no firewall package) without having to guess
+/// which tag shapes this repo uses, and it keeps working across the tag change
+/// — a legacy `vX.Y.Z` release that still carries a firewall `.deb` remains
+/// upgradeable to, so a daemon installed before the split is not stranded.
+/// Drafts and pre-releases are skipped, matching `/releases/latest` semantics.
+///
+/// Ordering is by the version parsed from the tag rather than by GitHub's
+/// listing order (creation date), so re-cutting an old release cannot present
+/// itself as newer than the current one.
+fn select_release(rels: Vec<GhRelease>) -> Option<(String, DebAsset)> {
+    rels.into_iter()
+        .filter(|r| !r.draft && !r.prerelease)
+        .filter_map(|r| deb_asset(&r).map(|d| (r.tag_name, d)))
+        .max_by_key(|(tag, _)| semver(tag_version(tag)).unwrap_or((0, 0, 0)))
+}
+
+/// Query the newest firewall release: returns `(tag, deb_asset)`.
+async fn latest_release(repo: &str) -> Result<(String, Option<DebAsset>)> {
+    // One page is ample: releases are listed newest-first, and the firewall
+    // ships far more often than 100 releases would take to bury.
+    let url = format!("https://api.github.com/repos/{repo}/releases?per_page=100");
+    let rels: Vec<GhRelease> = client()?
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await
+        .context("parsing GitHub releases JSON")?;
+    match select_release(rels) {
+        Some((tag, deb)) => Ok((tag, Some(deb))),
+        // No firewall release at all (fresh repo / all drafts): report the
+        // check as successful with nothing available, not as an error.
+        None => Ok((String::new(), None)),
     }
-    match (parse(latest), parse(current)) {
+}
+
+/// Parse a bare `X.Y.Z` version, ignoring any pre-release/build suffix.
+fn semver(v: &str) -> Option<(u64, u64, u64)> {
+    let mut it = v
+        .trim()
+        .split('.')
+        .map(|x| x.split(['-', '+']).next().unwrap_or(x).parse::<u64>().ok());
+    Some((it.next()??, it.next()??, it.next()??))
+}
+
+/// True if release tag `latest` (`lnvps_fw-v0.5.0`, or the legacy `v0.5.0`) is
+/// a newer semantic version than the running `current` (`0.4.7`). Falls back to
+/// string inequality if either doesn't parse; an empty tag (no release found)
+/// is never newer.
+pub fn is_newer(latest: &str, current: &str) -> bool {
+    let (l, c) = (tag_version(latest), current.trim());
+    if l.is_empty() {
+        return false;
+    }
+    match (semver(l), semver(c)) {
         (Some(l), Some(c)) => l > c,
-        _ => latest.trim().trim_start_matches('v') != current.trim(),
+        _ => l != c,
     }
 }
 
@@ -328,8 +395,94 @@ pub fn install_and_restart(deb: &Path, unit: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{hex, is_newer};
+    use super::{GhAsset, GhRelease, hex, is_newer, select_release, tag_version};
     use sha2::{Digest, Sha256};
+
+    /// A published release with the given tag and asset names.
+    fn rel(tag: &str, assets: &[&str]) -> GhRelease {
+        GhRelease {
+            tag_name: tag.into(),
+            draft: false,
+            prerelease: false,
+            assets: assets
+                .iter()
+                .map(|n| GhAsset {
+                    name: (*n).into(),
+                    browser_download_url: format!("https://example.invalid/{n}"),
+                    digest: Some("sha256:AB".into()),
+                })
+                .collect(),
+        }
+    }
+
+    const FW_DEB: &str = "lnvps-fw_0.5.0-1_amd64.deb";
+
+    #[test]
+    fn tag_version_strips_both_tag_forms() {
+        assert_eq!(tag_version("lnvps_fw-v0.5.0"), "0.5.0");
+        assert_eq!(tag_version("v0.4.7"), "0.4.7"); // legacy shared tag
+        assert_eq!(tag_version(" 0.4.7 "), "0.4.7");
+    }
+
+    /// The newest release *carrying a firewall .deb* wins — API releases on the
+    /// main `v*` tags carry none and must never be reported as an upgrade.
+    #[test]
+    fn select_release_ignores_releases_without_a_firewall_deb() {
+        let rels = vec![
+            rel("v9.9.9", &["lnvps-api-linux-amd64.tar.gz"]), // newest, but no .deb
+            rel(
+                "lnvps_fw-v0.5.0",
+                &[FW_DEB, "lnvps-fw_0.5.0-1_amd64.deb.minisig"],
+            ),
+            rel("v0.4.7", &["lnvps-fw_0.4.7-1_amd64.deb"]), // legacy fw release
+        ];
+        let (tag, deb) = select_release(rels).expect("a firewall release");
+        assert_eq!(tag, "lnvps_fw-v0.5.0");
+        assert!(deb.url.ends_with(FW_DEB));
+        assert_eq!(deb.sha256.as_deref(), Some("ab"), "digest lower-cased");
+        assert!(deb.sig_url.is_some(), "signature asset picked up");
+    }
+
+    /// A daemon installed before the tag split must still find the legacy
+    /// release, so it is never stranded on an un-upgradeable version.
+    #[test]
+    fn select_release_accepts_a_legacy_tag_when_it_is_the_only_firewall_build() {
+        let rels = vec![
+            rel("v9.9.9", &[]),
+            rel("v0.4.7", &["lnvps-fw_0.4.7-1_amd64.deb"]),
+        ];
+        let (tag, _) = select_release(rels).expect("legacy release");
+        assert_eq!(tag, "v0.4.7");
+    }
+
+    /// Ordering is by parsed version, not GitHub's listing order, so re-cutting
+    /// an older release cannot masquerade as the newest.
+    #[test]
+    fn select_release_orders_by_version_not_listing_order() {
+        let rels = vec![
+            rel("lnvps_fw-v0.4.9", &["lnvps-fw_0.4.9-1_amd64.deb"]),
+            rel("lnvps_fw-v0.10.0", &["lnvps-fw_0.10.0-1_amd64.deb"]),
+        ];
+        let (tag, _) = select_release(rels).expect("a release");
+        assert_eq!(tag, "lnvps_fw-v0.10.0", "0.10.0 > 0.4.9");
+    }
+
+    #[test]
+    fn select_release_skips_drafts_and_prereleases() {
+        let draft = GhRelease {
+            draft: true,
+            ..rel("lnvps_fw-v0.9.0", &["lnvps-fw_0.9.0-1_amd64.deb"])
+        };
+        let pre = GhRelease {
+            prerelease: true,
+            ..rel("lnvps_fw-v0.8.0", &["lnvps-fw_0.8.0-1_amd64.deb"])
+        };
+        let rels = vec![draft, pre, rel("lnvps_fw-v0.5.0", &[FW_DEB])];
+        let (tag, _) = select_release(rels).expect("a published release");
+        assert_eq!(tag, "lnvps_fw-v0.5.0");
+        // Nothing published at all -> no upgrade, not a panic.
+        assert!(select_release(vec![]).is_none());
+    }
 
     #[test]
     fn hex_encodes_lowercase() {
@@ -339,6 +492,20 @@ mod tests {
             hex(&Sha256::digest(b"")),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    /// The prefixed tag must compare as a version, not as a string: without
+    /// stripping it, `lnvps_fw-v0.4.7` would fall back to string inequality
+    /// against `0.4.7` and every daemon would report a perpetual upgrade.
+    #[test]
+    fn version_comparison_across_tag_prefixes() {
+        assert!(is_newer("lnvps_fw-v0.5.0", "0.4.7"));
+        assert!(!is_newer("lnvps_fw-v0.4.7", "0.4.7"));
+        assert!(!is_newer("lnvps_fw-v0.4.6", "0.4.7"));
+        // Legacy tags stay comparable during the transition.
+        assert!(is_newer("v0.5.0", "0.4.7"));
+        // No firewall release found -> nothing to upgrade to.
+        assert!(!is_newer("", "0.4.7"));
     }
 
     #[test]

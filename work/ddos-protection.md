@@ -359,7 +359,7 @@ increment only delivers the fw_service server side of that contract.
 - [ ] Prometheus metrics endpoint on fw_service: per-dest pass/drop, learned
       port counts, state distribution, map occupancy, event counters
 - [x] **Debian package + systemd unit** via `cargo-deb`
-      (`.github/workflows/lnvps_fw-deb.yml`, on `v*` tags + dispatch): installs
+      (`.github/workflows/lnvps_fw-deb.yml`, on `lnvps_fw-v*` tags + dispatch): installs
       `/usr/bin/lnvps_fw_service`, `lnvps_fw.service`, and the example config
       (a conffile under `/etc/lnvps_fw/`); postinst daemon-reloads + prompts to
       configure; prerm stops/disables. Metadata in `lnvps_fw_service/Cargo.toml`

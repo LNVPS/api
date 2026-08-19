@@ -50,14 +50,20 @@ section to disable the API entirely.
 
 ### Self-upgrade
 
-The daemon checks the GitHub releases API (`api.github-repo`, default
+The daemon lists the GitHub releases API (`api.github-repo`, default
 `LNVPS/api`) at startup and every 6h, caching the result. `GET /upgrade` returns
 it; the dashboard shows an **upgrade** button when a newer release with a `.deb`
 asset exists. `POST /upgrade` downloads that `.deb`, verifies it, and runs
 `dpkg -i` + `systemctl restart lnvps_fw` in a **detached transient systemd
 unit** (`systemd-run`) so the install completes across the service restart.
-Requires releases to exist — tag `vX.Y.Z` so the `lnvps_fw-deb.yml` workflow
-builds and attaches the package.
+
+The firewall releases on its own `lnvps_fw-vX.Y.Z` tag, separate from the API's
+`vX.Y.Z` — so the check cannot use `/releases/latest` (repo-wide, usually an API
+release with no package). `upgrade.rs` instead picks the newest release carrying
+an `lnvps-fw*.deb` asset, which also keeps pre-split `vX.Y.Z` firewall releases
+upgradeable. Tag `lnvps_fw-vX.Y.Z` so the `lnvps_fw-deb.yml` workflow builds and
+attaches the package; the workflow refuses to build if `lnvps_fw/Cargo.toml`
+does not match the tag.
 
 `flags` is the `DEST_MODE_*` protection bitmask: `PORT_FILTER=1`, `SYN_PROXY=2`,
 `RATE_CAPS=4`, `SOURCE_BLOCK=8`.

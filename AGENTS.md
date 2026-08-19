@@ -57,11 +57,23 @@ When the user asks to create a release:
 
 1. **Update `API_CHANGELOG.md`** — Change `## [Unreleased]` to `## [vX.Y.Z] - YYYY-MM-DD` with the current date
 2. **Update `Cargo.toml` versions** — Bump the version in the root `Cargo.toml` under `[workspace.package]` (all crates inherit via `version.workspace = true`)
-3. **Bump the `lnvps_fw` version** — `lnvps_fw` is a **separate workspace** (excluded from the root one) with its own `[workspace.package]` version in `lnvps_fw/Cargo.toml`. Bump it to the **same `X.Y.Z`** as the main workspace so the two stay in lockstep. This matters: the firewall daemon's self-upgrade (`lnvps_fw_service/src/upgrade.rs`) compares its compiled `CARGO_PKG_VERSION` against the newest `vX.Y.Z` GitHub release tag — if `lnvps_fw/Cargo.toml` lags behind the tag, every running daemon will report an upgrade is available on startup and every 6h.
-4. **Commit the changes** — `git commit -m "chore: release vX.Y.Z"`
-5. **Create an annotated tag** — `git tag -a vX.Y.Z -m "Release vX.Y.Z"`
-6. **Push commit and tag** — `git push https://github.com/LNVPS/api.git && git push https://github.com/LNVPS/api.git vX.Y.Z`
+3. **Commit the changes** — `git commit -m "chore: release vX.Y.Z"`
+4. **Create an annotated tag** — `git tag -a vX.Y.Z -m "Release vX.Y.Z"`
+5. **Push commit and tag** — `git push https://github.com/LNVPS/api.git && git push https://github.com/LNVPS/api.git vX.Y.Z`
 
-### `lnvps_fw` release artifact
+The `vX.Y.Z` tag covers the API and its images only. `lnvps_fw` and the NixOS cloud image are **separate artifacts on their own tags** — releasing the API neither builds nor publishes them.
 
-The `vX.Y.Z` tag is what drives the firewall release. Pushing it triggers the `.github/workflows/lnvps_fw-deb.yml` workflow, which builds the `lnvps_fw_service` daemon (including the eBPF datapath, via a nightly `rust-src` + `bpf-linker` toolchain) into a Debian package with `cargo deb` and attaches the `.deb` to the GitHub release. Running daemons then discover and install that `.deb` through the self-upgrade endpoint (`GET`/`POST /api/v1/upgrade`). There is **no separate `fw` tag** — the fw workspace shares the single `vX.Y.Z` tag, which is exactly why step 3's version bump must happen before tagging.
+## `lnvps_fw` Release Procedure
+
+`lnvps_fw` is a separate workspace (excluded from the root one) with its own `[workspace.package]` version in `lnvps_fw/Cargo.toml`, and it releases on its own tag — the same convention as the NixOS image's `nixos-image-v*`. Its version is **independent** of the API's: bump it when the firewall changes, leave it alone when it doesn't.
+
+1. **Bump `lnvps_fw/Cargo.toml`** — the `[workspace.package]` version (all three fw crates inherit it).
+2. **Rebuild the dashboard if `dashboard/src/` changed** — `cd lnvps_fw/lnvps_fw_service/dashboard && bun run build`, and commit `dist/index.html` (the daemon embeds it with `include_str!`).
+3. **Commit** — `git commit -m "chore(fw): release lnvps_fw-vX.Y.Z"`
+4. **Tag and push** — `git tag -a lnvps_fw-vX.Y.Z -m "lnvps_fw vX.Y.Z"` then `git push https://github.com/LNVPS/api.git && git push https://github.com/LNVPS/api.git lnvps_fw-vX.Y.Z`
+
+Pushing the tag triggers `.github/workflows/lnvps_fw-deb.yml`, which builds the daemon (including the eBPF datapath, via a nightly `rust-src` + `bpf-linker` toolchain) into a Debian package with `cargo deb` and attaches the `.deb` to the GitHub release. Running daemons discover and install it through the self-upgrade endpoint (`GET`/`POST /api/v1/upgrade`).
+
+The workflow **fails the build** if `lnvps_fw/Cargo.toml` does not match the tag, because the daemon compares its compiled `CARGO_PKG_VERSION` against the newest firewall release: were the version to lag the tag, every running daemon would report an upgrade available on startup and every 6h. Do step 1 before tagging.
+
+The self-upgrade check (`lnvps_fw_service/src/upgrade.rs`) selects the newest release that carries an `lnvps-fw*.deb` asset, so it ignores API releases and still finds pre-split `vX.Y.Z` firewall releases. If you change the artifact's package name, update `DEB_ASSET_PREFIX` with it.

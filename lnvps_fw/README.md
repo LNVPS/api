@@ -183,7 +183,9 @@ the previous slot keeps in-flight cookies valid across a rotation.
 
 ## Install (Debian/Ubuntu, from GitHub Releases)
 
-Each tagged release ships a prebuilt `.deb` (built by
+The firewall releases on its **own tag**, `lnvps_fw-vX.Y.Z`, independently of
+the API's `vX.Y.Z` tags (the same convention the NixOS image uses). Each such
+tag ships a prebuilt `.deb` (built by
 [`.github/workflows/lnvps_fw-deb.yml`](../.github/workflows/lnvps_fw-deb.yml)
 via `cargo-deb`) attached to the corresponding
 [GitHub release](https://github.com/LNVPS/api/releases). The package includes
@@ -192,15 +194,17 @@ you do **not** need a Rust or eBPF toolchain to install it (the eBPF object is
 compiled into the binary at release-build time).
 
 1. **Download the latest `.deb`.** Grab it from the
-   [releases page](https://github.com/LNVPS/api/releases/latest), or from the
-   shell:
+   [releases page](https://github.com/LNVPS/api/releases), or from the shell:
 
    ```sh
-   # picks the newest release and its lnvps-fw .deb asset (amd64)
-   URL=$(curl -fsSL https://api.github.com/repos/LNVPS/api/releases/latest \
-     | grep -o 'https://[^"]*lnvps-fw_[^"]*_amd64\.deb')
+   # newest release carrying an lnvps-fw .deb asset (amd64)
+   URL=$(curl -fsSL 'https://api.github.com/repos/LNVPS/api/releases?per_page=100' \
+     | grep -o 'https://[^"]*lnvps-fw_[^"]*_amd64\.deb' | head -1)
    curl -fLO "$URL"
    ```
+
+   > Don't filter on `releases/latest`: that is the repo-wide newest release,
+   > which is usually an API release carrying no firewall package.
 
 2. **Install it.** `apt` pulls in the auto-detected shared-library deps:
 
@@ -246,14 +250,22 @@ and runs as root because loading XDP/eBPF programs needs full privileges.
 
 ### Staying up to date (self-upgrade)
 
-Once it has an API configured, the daemon checks the GitHub
-[`releases/latest`](https://api.github.com/repos/LNVPS/api/releases/latest) API
-on startup and every ~6h, and can install a newer signed `.deb` for you via the
-`GET`/`POST /api/v1/upgrade` control endpoints — so you generally only install
-the `.deb` by hand once. Because that check compares the running binary's
-compiled version against the newest `vX.Y.Z` tag, always install the `.deb` from
-a **tagged release** (not an ad-hoc `workflow_dispatch` build) to avoid a
-perpetual "upgrade available" state.
+Once it has an API configured, the daemon lists the GitHub
+[releases](https://api.github.com/repos/LNVPS/api/releases) on startup and every
+~6h, and can install a newer signed `.deb` for you via the `GET`/`POST
+/api/v1/upgrade` control endpoints — so you generally only install the `.deb` by
+hand once.
+
+It picks the newest release that actually carries an `lnvps-fw*.deb` asset,
+rather than trusting `releases/latest`: firewall and API releases share a
+repository but not a tag, so the repo-wide latest release is usually an API one
+with no firewall package attached. Releases tagged before the split (bare
+`vX.Y.Z`) are still recognised, so a daemon installed then upgrades normally.
+
+Always install the `.deb` from a **tagged release**, not an ad-hoc
+`workflow_dispatch` build: the check compares the running binary's compiled
+version against the newest release, so an untagged build sits in a perpetual
+"upgrade available" state.
 
 ---
 
@@ -475,8 +487,8 @@ overrides, and the dashboard.
 
 Packaging: a GitHub Actions workflow (`.github/workflows/lnvps_fw-deb.yml`)
 builds a `.deb` (via `cargo-deb`) that installs the daemon binary, a systemd
-unit (`lnvps_fw.service`), and the example config; it is attached to GitHub
-releases on version tags.
+unit (`lnvps_fw.service`), and the example config; it is attached to the GitHub
+release for the firewall's own `lnvps_fw-vX.Y.Z` tags.
 
 Not yet done: `RATE_CAPS` (per-`(dst,port)` caps for open UDP); the `lnvps_api`
 side of the contract (rules-push client, event-poll-and-persist loop, DB +

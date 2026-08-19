@@ -50,7 +50,7 @@ place VMs on — with automatic sat payouts, uptime accounting, and full traffic
   it also carries plain WireGuard VPNs sold to users and infrastructure/BGP tunnels, rather
   than bolting WireGuard columns onto each consumer.
 - Daemon precedent: `lnvps_fw` (separate workspace, eBPF/XDP, bearer-token HTTPS API,
-  `.deb` via `lnvps_fw-deb.yml`, self-upgrade against `vX.Y.Z` GitHub releases) —
+  `.deb` via `lnvps_fw-deb.yml`, self-upgrade against its own `lnvps_fw-vX.Y.Z` releases) —
   `docs/agents/fw-api.md`. Reuse the packaging + self-upgrade design wholesale.
 - Nostr identity/auth already available: `lnvps_agent/src/{identity.rs,nip98.rs}`,
   `lnvps_nostr` crate. NIP-98 is the natural node↔API auth.
@@ -590,7 +590,8 @@ Two guards worth remembering:
 - Outbound registration and heartbeat frames (telemetry: cpu/mem/disk/net, libvirt version,
   firmware version).
 - `.deb` packaging + GitHub release workflow + self-upgrade, copied from `lnvps_fw`
-  (`upgrade.rs`, `lnvps_fw-deb.yml`). Version must move in lockstep with `vX.Y.Z`, and the
+  (`upgrade.rs`, `lnvps_fw-deb.yml`). Release it on its own tag prefix (as `lnvps_fw-v*`
+  and `nixos-image-v*` do) so it versions independently of the API's `vX.Y.Z`, and the
   workflow must inject `LNVPS_CONTROL_PUBKEY`.
 - GPU inventory lands with increment 11a's eligibility probe, so PCI address, IOMMU group
   cleanliness, BAR sizes and CC capability are collected once, against real hardware.

@@ -1,12 +1,18 @@
 name: Build lnvps_fw .deb
 
 # Builds the lnvps_fw_service daemon (including the eBPF datapath) into a Debian
-# package that installs the binary + a systemd unit. Runs on version tags and
-# on demand; on a tag the .deb is attached to the GitHub release.
+# package that installs the binary + a systemd unit. On a tag the .deb is
+# attached to the GitHub release.
+#
+# Triggers on a dedicated tag prefix (lnvps_fw-v*), the same convention as
+# nixos-image.yml, so the firewall releases on its own cadence and does NOT run
+# on the main `v*` API release tags (which drive build.yml). That decoupling is
+# the point: the daemon's self-upgrade compares its compiled version against the
+# newest firewall tag, so the two versions no longer have to move in lockstep.
 on:
   push:
     tags:
-      - "v*"
+      - "lnvps_fw-v*"
   workflow_dispatch:
 
 permissions:
@@ -25,17 +31,17 @@ jobs:
 
       - name: Assert Cargo.toml version matches the release tag
         # The lnvps_fw workspace version drives the daemon self-upgrade check
-        # (it compares its compiled CARGO_PKG_VERSION against the newest vX.Y.Z
-        # release tag). If it lags the tag, every running daemon reports an
-        # upgrade is available on startup and every 6h — so fail the build
-        # rather than ship a mismatched .deb.
-        if: startsWith(github.ref, 'refs/tags/v')
+        # (it compares its compiled CARGO_PKG_VERSION against the newest
+        # lnvps_fw-vX.Y.Z release tag). If it lags the tag, every running daemon
+        # reports an upgrade is available on startup and every 6h — so fail the
+        # build rather than ship a mismatched .deb.
+        if: startsWith(github.ref, 'refs/tags/lnvps_fw-v')
         run: |
-          TAG="${GITHUB_REF_NAME#v}"
+          TAG="${GITHUB_REF_NAME#lnvps_fw-v}"
           VER=$(awk '/^\[workspace.package\]/{f=1} f&&/^version[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/,"");print;exit}' lnvps_fw/Cargo.toml)
           echo "tag=$TAG  lnvps_fw/Cargo.toml=$VER"
           if [ "$VER" != "$TAG" ]; then
-            echo "::error::lnvps_fw/Cargo.toml version ($VER) != release tag ($TAG). Bump it (in lockstep with the main workspace) before tagging."
+            echo "::error::lnvps_fw/Cargo.toml version ($VER) != release tag ($TAG). Bump it before tagging lnvps_fw-v$VER."
             exit 1
           fi
 
@@ -97,7 +103,9 @@ jobs:
           path: lnvps_fw/target/debian/*.deb
 
       - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/')
+        # Only on a firewall tag: a manual dispatch build is an artifact, never
+        # a release (the self-upgrade check must only ever see tagged builds).
+        if: startsWith(github.ref, 'refs/tags/lnvps_fw-v')
         uses: softprops/action-gh-release@v3
         with:
           files: lnvps_fw/target/debian/*.deb
