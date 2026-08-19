@@ -1,16 +1,16 @@
 use crate::{
-    AccessPolicy, AgentConversation, AgentMessage, App, AppCluster, AppDeployment,
-    AppDeploymentFilter, AppDeploymentServiceUsage, AppDeploymentVolumeUsage, AppTag,
-    AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, DbError, DbResult,
-    DnsServer, EncryptedString, IntervalType, IpRange, IpRangeSubscription, IpSpacePricing,
-    LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus,
-    MarketplaceOperator, NewAgentMessage, PaymentMethod, PaymentMethodConfig, PaymentType,
-    Referral, ReferralCostUsage, ReferralPayout, Region, RegionStats, Router, RouterBgpRoute,
-    RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentWithCompany, Tunnel, TunnelPool, User,
-    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
-    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk,
-    VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
+    AccessPolicy, AgentConversation, AgentConversationFilter, AgentConversationOverview,
+    AgentMessage, App, AppCluster, AppDeployment, AppDeploymentFilter, AppDeploymentServiceUsage,
+    AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
+    Company, DbError, DbResult, DnsServer, EncryptedString, IntervalType, IpRange,
+    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth,
+    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, PaymentMethod,
+    PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout, Region,
+    RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic,
+    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany,
+    Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
+    VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost,
+    VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -20,6 +20,23 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{Executor, MySqlPool, QueryBuilder, Row};
+
+/// Conversation row plus its message counters, shared by the by-id read and the
+/// listing so the two can never drift in what they report.
+///
+/// The counters come from a grouped subquery rather than a correlated one so a
+/// page costs a single aggregate pass instead of one per row.
+const AGENT_CONVERSATION_OVERVIEW_SELECT: &str = r#"select c.*,
+          coalesce(m.message_count, 0) as message_count,
+          m.last_message_at
+     from agent_conversation c
+     left join (
+         select conversation_id,
+                count(*) as message_count,
+                max(created) as last_message_at
+           from agent_message
+          group by conversation_id
+     ) m on m.conversation_id = c.id"#;
 
 #[derive(Clone)]
 pub struct LNVpsDbMysql {
@@ -64,6 +81,21 @@ impl<'a> FilteredQuery<'a> {
         Self {
             count,
             data,
+            has_conditions: false,
+        }
+    }
+
+    /// Build over explicit `SELECT ... FROM ...` prefixes instead of a bare
+    /// table, for a listing whose rows carry aggregates and therefore need a
+    /// join. The count query is given separately because counting matching rows
+    /// does not need the aggregate subquery the page does.
+    ///
+    /// Both prefixes must alias the filtered table the same way, since the
+    /// conditions are appended to both verbatim.
+    fn over(data_select: &str, count_select: &str) -> Self {
+        Self {
+            count: QueryBuilder::new(count_select.to_string()),
+            data: QueryBuilder::new(data_select.to_string()),
             has_conditions: false,
         }
     }
@@ -2093,6 +2125,90 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_one(&self.db)
                 .await?,
         )
+    }
+
+    async fn get_agent_conversation_overview(
+        &self,
+        id: u64,
+    ) -> DbResult<AgentConversationOverview> {
+        Ok(sqlx::query_as::<_, AgentConversationOverview>(&format!(
+            "{AGENT_CONVERSATION_OVERVIEW_SELECT} where c.id = ?"
+        ))
+        .bind(id)
+        .fetch_one(&self.db)
+        .await?)
+    }
+
+    async fn list_agent_conversations(
+        &self,
+        filter: &AgentConversationFilter,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AgentConversationOverview>, u64)> {
+        let mut query = FilteredQuery::over(
+            AGENT_CONVERSATION_OVERVIEW_SELECT,
+            "SELECT COUNT(*) FROM agent_conversation c",
+        );
+        if let Some(user_id) = filter.user_id {
+            query.eq("c.user_id", user_id);
+        }
+        if let Some(term) = filter
+            .key_search
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            query.search(&["c.conversation_key"], term);
+        }
+
+        // Ordered by `updated` (touched on every append and every compaction),
+        // with id as the tie-break so a page boundary is stable when several
+        // threads share a timestamp.
+        query
+            .fetch(&self.db, "c.updated DESC, c.id DESC", limit, offset)
+            .await
+    }
+
+    async fn count_agent_messages(&self, conversation_id: u64) -> DbResult<u64> {
+        let count: i64 = sqlx::query("select count(*) from agent_message where conversation_id=?")
+            .bind(conversation_id)
+            .fetch_one(&self.db)
+            .await?
+            .try_get(0)?;
+        Ok(count.max(0) as u64)
+    }
+
+    async fn max_agent_message_id(&self, conversation_id: u64) -> DbResult<u64> {
+        // `coalesce` so a conversation with no messages answers 0 rather than
+        // failing to decode a NULL max().
+        let max: u64 =
+            sqlx::query("select coalesce(max(id), 0) from agent_message where conversation_id=?")
+                .bind(conversation_id)
+                .fetch_one(&self.db)
+                .await?
+                .try_get(0)?;
+        Ok(max)
+    }
+
+    async fn set_agent_conversation_memory(
+        &self,
+        conversation_id: u64,
+        summary: Option<&str>,
+        compacted_upto: u64,
+    ) -> DbResult<()> {
+        // No `greatest` here, unlike compact_agent_conversation: an admin reset
+        // must be able to move the watermark backwards.
+        sqlx::query(
+            r#"update agent_conversation
+                  set summary=?, compacted_upto=?
+                where id=?"#,
+        )
+        .bind(summary)
+        .bind(compacted_upto)
+        .bind(conversation_id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
     }
 
     async fn append_agent_messages(

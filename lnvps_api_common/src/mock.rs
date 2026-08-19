@@ -3,15 +3,16 @@ use anyhow::{Context, anyhow};
 use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
-    AccessPolicy, AgentConversation, AgentMessage, App, AppCluster, AppDeployment,
-    AppDeploymentDesiredState, AppDeploymentFilter, AppDeploymentServiceUsage, AppDeploymentStatus,
-    AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
-    Company, CpuArch, CpuMfg, DbError, DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind,
-    EncryptedString, IntervalType, IpRange, IpRangeAllocationMode, IpRangeSubscription,
-    IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus,
-    MarketplaceOperator, NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution,
-    PaymentMethod, PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region,
-    Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription,
+    AccessPolicy, AgentConversation, AgentConversationFilter, AgentConversationOverview,
+    AgentMessage, App, AppCluster, AppDeployment, AppDeploymentDesiredState, AppDeploymentFilter,
+    AppDeploymentServiceUsage, AppDeploymentStatus, AppDeploymentVolumeUsage, AppTag,
+    AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, CpuArch, CpuMfg, DbError,
+    DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind, EncryptedString, IntervalType,
+    IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase,
+    MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator,
+    NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod,
+    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region, Router,
+    RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription,
     SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, Tunnel, TunnelPool,
     User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
     VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind,
@@ -2074,6 +2075,122 @@ impl LNVpsDbBase for MockDb {
             .get(&id)
             .cloned()
             .ok_or_else(|| DbError::from(anyhow!("agent conversation {} not found", id)))
+    }
+
+    async fn get_agent_conversation_overview(
+        &self,
+        id: u64,
+    ) -> DbResult<AgentConversationOverview> {
+        let conversation = self.get_agent_conversation(id).await?;
+        let messages = self.agent_messages.lock().await;
+        let own: Vec<&AgentMessage> = messages
+            .iter()
+            .filter(|m| m.conversation_id == id)
+            .collect();
+        Ok(AgentConversationOverview {
+            id: conversation.id,
+            conversation_key: conversation.conversation_key,
+            user_id: conversation.user_id,
+            summary: conversation.summary,
+            compacted_upto: conversation.compacted_upto,
+            created: conversation.created,
+            updated: conversation.updated,
+            message_count: own.len() as u64,
+            last_message_at: own.iter().map(|m| m.created).max(),
+        })
+    }
+
+    async fn list_agent_conversations(
+        &self,
+        filter: &AgentConversationFilter,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AgentConversationOverview>, u64)> {
+        let messages = self.agent_messages.lock().await.clone();
+        let mut matched: Vec<AgentConversationOverview> = self
+            .agent_conversations
+            .lock()
+            .await
+            .values()
+            .filter(|c| filter.user_id.is_none() || c.user_id == filter.user_id)
+            .filter(|c| {
+                // Case-insensitive, matching the SQL implementation's LOWER().
+                filter.key_search.as_ref().is_none_or(|s| {
+                    c.conversation_key
+                        .to_lowercase()
+                        .contains(&s.trim().to_lowercase())
+                })
+            })
+            .map(|c| {
+                let own: Vec<&AgentMessage> = messages
+                    .iter()
+                    .filter(|m| m.conversation_id == c.id)
+                    .collect();
+                AgentConversationOverview {
+                    id: c.id,
+                    conversation_key: c.conversation_key.clone(),
+                    user_id: c.user_id,
+                    summary: c.summary.clone(),
+                    compacted_upto: c.compacted_upto,
+                    created: c.created,
+                    updated: c.updated,
+                    message_count: own.len() as u64,
+                    last_message_at: own.iter().map(|m| m.created).max(),
+                }
+            })
+            .collect();
+
+        // Same order as the SQL: most recently active first, id as tie-break.
+        matched.sort_by(|a, b| b.updated.cmp(&a.updated).then(b.id.cmp(&a.id)));
+        let total = matched.len() as u64;
+        Ok((
+            matched
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn count_agent_messages(&self, conversation_id: u64) -> DbResult<u64> {
+        Ok(self
+            .agent_messages
+            .lock()
+            .await
+            .iter()
+            .filter(|m| m.conversation_id == conversation_id)
+            .count() as u64)
+    }
+
+    async fn max_agent_message_id(&self, conversation_id: u64) -> DbResult<u64> {
+        Ok(self
+            .agent_messages
+            .lock()
+            .await
+            .iter()
+            .filter(|m| m.conversation_id == conversation_id)
+            .map(|m| m.id)
+            .max()
+            .unwrap_or(0))
+    }
+
+    async fn set_agent_conversation_memory(
+        &self,
+        conversation_id: u64,
+        summary: Option<&str>,
+        compacted_upto: u64,
+    ) -> DbResult<()> {
+        let mut conversations = self.agent_conversations.lock().await;
+        let conversation = conversations.get_mut(&conversation_id).ok_or_else(|| {
+            DbError::from(anyhow!("agent conversation {} not found", conversation_id))
+        })?;
+        // Unlike compact_agent_conversation this is not monotonic — see the
+        // trait docs for why an admin reset must be able to go backwards.
+        conversation.summary = summary.map(str::to_string);
+        conversation.compacted_upto = compacted_upto;
+        conversation.updated = chrono::Utc::now();
+        Ok(())
     }
 
     async fn append_agent_messages(

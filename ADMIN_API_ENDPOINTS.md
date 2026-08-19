@@ -4657,6 +4657,121 @@ Required Permissions: `app::view` / `app::create` / `app::update` / `app::delete
 
 Delete is rejected with a `400` while any `app_deployment` row still references the cluster, soft-deleted ones included — same rule and same purge-then-retry path as [Delete App](#delete-app).
 
+### Support Agent Conversations
+
+What the support agent has said to customers, and what it remembers of them.
+
+A conversation is a thread hung off a namespaced `conversation_key`. Every
+private channel for one account shares a thread (`user:<id>`), so email and live
+chat are one continuous history; an unrecognised sender gets `email:<addr>` or
+`pubkey:<hex>`. Public Nostr mentions get their own `nostr:<hex>` namespace and
+are **never** merged into the private thread — a kind-1 reply is readable by the
+whole relay network, and a shared thread would let the agent quote a privately
+reported billing detail into a public post. The namespace is returned as `kind`
+so a client does not have to parse the key to tell those apart.
+
+The transcript is append-only: it is also the training corpus, and there is no
+endpoint here that edits or deletes a message.
+
+`summary` and `compacted_upto` are the agent's *memory*, which is a different
+thing from the transcript. The summary stands in for everything at or below the
+watermark and messages above it are replayed verbatim, so those two fields are
+exactly what the model sees on the next turn. They are the only mutable state
+in this section.
+
+`support_agent` is its own permission resource rather than part of `users`: a
+transcript carries whatever a customer pasted into a support request, which is a
+wider disclosure than the account fields `users::view` implies.
+
+#### List Conversations
+
+```
+GET /api/admin/v1/agent/conversations
+```
+
+Required Permission: `support_agent::view`
+
+Query Parameters:
+
+- `limit`: number (optional, default 50, max 100)
+- `offset`: number (optional, default 0)
+- `user_id`: number (optional) - only threads belonging to this resolved account
+- `search`: string (optional) - substring match against `conversation_key`, including the namespace, so `nostr:` selects every public thread
+
+Returns a paginated list of `AdminAgentConversationInfo`, most recently active
+first.
+
+There is deliberately no message-content search: `agent_message.content` is
+encrypted at rest, so the database cannot match against it. Filtering is on the
+thread identity only.
+
+#### Get Conversation
+
+```
+GET /api/admin/v1/agent/conversations/{id}
+```
+
+Required Permission: `support_agent::view`
+
+Returns one `AdminAgentConversationInfo`, with the same counters the listing
+carries.
+
+#### List Conversation Messages
+
+```
+GET /api/admin/v1/agent/conversations/{id}/messages
+```
+
+Required Permission: `support_agent::view`
+
+Query Parameters: `limit` (default 50, max 100), `offset`.
+
+Returns a paginated list of `AdminAgentMessageInfo`, **oldest first** — a
+transcript is read as a conversation, and the newest-first ordering used
+elsewhere would show every page backwards.
+
+Content is decrypted in the response. A tool-using turn is stored the way the
+model produced it: one `assistant` row carrying `tool_calls` (and usually no
+prose), followed by one `tool` row per result. An unknown `{id}` is a `404`
+rather than an empty page, which would read as "this customer never wrote in".
+
+#### Update Conversation Memory
+
+```
+PATCH /api/admin/v1/agent/conversations/{id}
+```
+
+Required Permission: `support_agent::update`
+
+Body:
+
+```json
+{
+  "summary": null,
+  // Optional - replace the running summary (string), clear it (null), or omit
+  "compacted_upto": 0
+  // Optional - move the compaction watermark, or omit to leave it
+}
+```
+
+Omitting a field leaves it alone, so the summary can be rewritten without
+touching the watermark and vice versa. No message rows are modified.
+
+**Clearing `summary` alone is the safe reset.** The agent forgets what it
+believed about the customer, and the next prompt is still bounded by the
+messages above the watermark.
+
+**Setting `compacted_upto` to `0` makes the next turn replay the entire
+transcript**, which on a long thread is slow and expensive. Do it only to force
+a re-summarisation from scratch.
+
+`compacted_upto` may not exceed the highest message id in the conversation
+(`400`). A watermark past the end of the log would suppress every message
+appended afterwards, leaving the agent permanently blind to that thread.
+
+Unlike the compaction the agent performs itself, this endpoint allows the
+watermark to move **backwards** — that is the point of an admin reset.
+
 ## Error Responses
 
 All error responses follow the format:
@@ -4737,6 +4852,7 @@ The RBAC system uses the following permission format: `resource::action`
 - `app` - Managed app catalog + cluster management
 - `marketplace_node` - Marketplace node lifecycle (approve, suspend, drain, trust tier)
 - `marketplace_operator` - Marketplace operator revenue share and payout configuration
+- `support_agent` - Support-agent transcripts and the agent's memory of a customer
 
 ### Actions:
 
@@ -5438,6 +5554,60 @@ The RBAC system uses the following permission format: `resource::action`
   },
   "vm_count": number
   // Number of VMs using this template
+}
+```
+
+### AdminAgentConversationInfo
+
+```json
+{
+  "id": number,
+  "conversation_key": "string",
+  // Namespaced sender identity: user:<id> | email:<addr> | pubkey:<hex> | nostr:<hex>
+  "kind": "string",
+  // The namespace part: user | email | pubkey | nostr | unknown.
+  // `nostr` is the publicly readable class; the rest are private
+  "user_id": "number | null",
+  // Resolved account, when the sender matched one. A thread can start
+  // anonymous and become linked later
+  "summary": "string | null",
+  // The agent's running memory of everything at or below `compacted_upto`.
+  // Model-written text about the customer, not a customer message
+  "compacted_upto": number,
+  // Highest message id folded into `summary`; 0 when nothing is compacted.
+  // Messages above it are replayed to the model verbatim
+  "message_count": number,
+  // Total messages, ignoring the watermark
+  "last_message_at": "string (ISO 8601) | null",
+  // null for a thread that has never carried a message
+  "created": "string (ISO 8601)",
+  "updated": "string (ISO 8601)"
+  // Touched on every append and every compaction
+}
+```
+
+### AdminAgentMessageInfo
+
+```json
+{
+  "id": number,
+  "conversation_id": number,
+  "role": "string",
+  // user | assistant | tool
+  "channel": "string",
+  // email | nostr | webchat. Per message, because one private thread
+  // legitimately mixes channels
+  "content": "string | null",
+  // Decrypted message text. null for an assistant turn that only requested
+  // tool calls, which is distinct from an empty reply
+  "tool_calls": "array | null",
+  // [{id, name, arguments}] for an assistant turn that requested tools
+  "tool_call_id": "string | null",
+  // For a `tool` row, the tool_calls[].id it answers
+  "compacted": boolean,
+  // Whether this message is at or below the watermark — i.e. the agent no
+  // longer replays it and sees the summary in its place
+  "created": "string (ISO 8601)"
 }
 ```
 

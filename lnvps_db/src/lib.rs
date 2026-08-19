@@ -686,6 +686,42 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Get a conversation by id.
     async fn get_agent_conversation(&self, id: u64) -> DbResult<AgentConversation>;
 
+    /// Get a conversation by id, with the same message counters the listing
+    /// carries. Errors when the conversation does not exist.
+    async fn get_agent_conversation_overview(&self, id: u64)
+    -> DbResult<AgentConversationOverview>;
+
+    /// List conversations for review, most recently active first, with their
+    /// message counters. Returns the page and the total matching the filter.
+    async fn list_agent_conversations(
+        &self,
+        filter: &AgentConversationFilter,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AgentConversationOverview>, u64)>;
+
+    /// Count every message in a conversation, ignoring the watermark.
+    async fn count_agent_messages(&self, conversation_id: u64) -> DbResult<u64>;
+
+    /// Highest message id in a conversation, or `0` when it has none. Bounds a
+    /// watermark an admin sets so it can never point past the transcript.
+    async fn max_agent_message_id(&self, conversation_id: u64) -> DbResult<u64>;
+
+    /// Overwrite a conversation's memory: its summary and watermark.
+    ///
+    /// Separate from [`Self::compact_agent_conversation`], which keeps the
+    /// watermark monotonic so concurrent compactions cannot re-expose folded
+    /// messages. This one deliberately allows it to move backwards (and the
+    /// summary to be cleared), because that is the whole point of an admin
+    /// resetting an agent whose memory of a customer has gone wrong. No message
+    /// rows are touched.
+    async fn set_agent_conversation_memory(
+        &self,
+        conversation_id: u64,
+        summary: Option<&str>,
+        compacted_upto: u64,
+    ) -> DbResult<()>;
+
     /// Append messages to a conversation, in order. Returns the new message ids.
     ///
     /// The log is append-only; there is deliberately no update or delete.

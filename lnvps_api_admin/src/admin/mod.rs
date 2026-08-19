@@ -5,6 +5,7 @@ use lnvps_db::LNVpsDb;
 use std::sync::Arc;
 
 mod access_policies;
+mod agent;
 mod apps;
 mod auth;
 mod bulk_message;
@@ -60,6 +61,7 @@ pub fn admin_router(
     Router::new()
         .merge(docs::router())
         .merge(users::router())
+        .merge(agent::router())
         .merge(passkeys::router())
         .merge(bulk_message::router())
         .merge(vms::router())
