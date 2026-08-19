@@ -1,6 +1,8 @@
 use axum::Router;
 use axum::extract::FromRef;
-use lnvps_api_common::{ExchangeRateService, RedisWorkFeedback, VmStateCache, WorkCommander};
+use lnvps_api_common::{
+    ExchangeRateService, RedisWorkFeedback, VatClient, VmStateCache, WorkCommander,
+};
 use lnvps_db::LNVpsDb;
 use std::sync::Arc;
 
@@ -48,6 +50,10 @@ pub(crate) struct RouterState {
     pub feedback: Option<RedisWorkFeedback>,
     pub vm_state_cache: VmStateCache,
     pub exchange: Arc<dyn ExchangeRateService>,
+    /// EU VAT rate table, shared with the refresh task. Starts empty, so a
+    /// caller that reports a rate must check [`VatClient::rate_count`] before
+    /// presenting 0% as a determination rather than as "not loaded yet".
+    pub vat: VatClient,
 }
 
 pub fn admin_router(
@@ -57,6 +63,7 @@ pub fn admin_router(
     exchange: Arc<dyn ExchangeRateService>,
     feedback: Option<RedisWorkFeedback>,
     node_control: Option<lnvps_api_common::node_control::NodeControl>,
+    vat: VatClient,
 ) -> Router {
     Router::new()
         .merge(docs::router())
@@ -96,5 +103,6 @@ pub fn admin_router(
             vm_state_cache,
             feedback,
             exchange,
+            vat,
         })
 }

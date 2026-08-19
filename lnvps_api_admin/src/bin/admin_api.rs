@@ -5,12 +5,12 @@ use config::{Config, File};
 use lnvps_api_admin::admin::admin_router;
 use lnvps_api_admin::settings::Settings;
 use lnvps_api_common::{
-    RateLimiter, RedisWorkCommander, RedisWorkFeedback, VmStateCache, WorkCommander, WorkJob,
-    WorkJobMessage, handle_panic, make_exchange_service, nip98_payload_middleware,
+    RateLimiter, RedisWorkCommander, RedisWorkFeedback, VatClient, VmStateCache, WorkCommander,
+    WorkJob, WorkJobMessage, handle_panic, make_exchange_service, nip98_payload_middleware,
     rate_limit_middleware,
 };
 use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbBase, LNVpsDbMysql};
-use log::info;
+use log::{info, warn};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -107,6 +107,33 @@ async fn main() -> Result<(), Error> {
 
     // Initialize exchange rate service
     let exchange = make_exchange_service(&settings.redis);
+
+    // EU VAT rates, refreshed daily, mirroring the public API. The admin API
+    // reports the rate a user would be charged, and an empty table reports 0%
+    // for every country — which reads as "this customer pays no VAT" rather
+    // than "nothing is loaded". A failure here is logged, not fatal: every other
+    // admin endpoint works without it, and the one that needs it says so.
+    let vat = VatClient::new();
+    match vat.refresh_rates().await {
+        Ok(n) => info!("Loaded {} VAT rates", n),
+        Err(e) => warn!(
+            "Failed to load VAT rates (tax determination will report unavailable): {}",
+            e
+        ),
+    }
+    tokio::spawn({
+        let vat = vat.clone();
+        async move {
+            loop {
+                // Standard rates change rarely; daily is what the public API does.
+                tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+                match vat.refresh_rates().await {
+                    Ok(n) => info!("Refreshed {} VAT rates", n),
+                    Err(e) => log::error!("Failed to refresh VAT rates: {}", e),
+                }
+            }
+        }
+    });
     let ip: SocketAddr = match &settings.listen {
         Some(i) => i.parse()?,
         None => SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 8001),
@@ -126,6 +153,7 @@ async fn main() -> Result<(), Error> {
             Some(config) => Some(config.control()?),
             None => None,
         },
+        vat,
     );
 
     // Same cross-cutting stack as the public API. The admin surface previously

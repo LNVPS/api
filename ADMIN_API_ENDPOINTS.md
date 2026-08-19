@@ -89,6 +89,54 @@ Returns complete user information including VM count, admin status, `account_typ
 (`nostr`, `oauth` or `webauthn`) and `passkey_count` (number of registered
 passkeys).
 
+#### Get User Tax Treatment
+
+```
+GET /api/admin/v1/users/{id}/tax
+```
+
+Required Permission: `users::view`
+
+What tax this user attracts **right now**, computed by the same code that prices
+a sale. This answers "what would we charge them today", which is the question
+asked when a customer disputes VAT or has just added a VAT number. What they
+*were* charged is stored on each payment and is not this.
+
+A rate is not a property of a user: it is determined per seller company, because
+the seller's country is half of the rule. The response therefore carries one
+determination per company.
+
+```json
+{
+  "rates_loaded": true,
+  // false when the EU rate table has not loaded (no network at startup, or the
+  // feed is down). Every `rate` is then 0.0, because an unknown country falls
+  // back to zero — do NOT present that as "this customer pays no VAT".
+  // `treatment` stays correct either way.
+  "determinations": [
+    {
+      "company_id": 1,
+      "company_name": "LNVPS IE",
+      "seller_country": "IRL",
+      // From the company's VAT number when it has one, else its country
+      "rate": 0.0,
+      "treatment": "reverse_charge",
+      // domestic | oss_b2c | reverse_charge | out_of_scope | undetermined_default
+      "place_of_supply": "DEU",
+      "vat_number": "DE123456789",
+      "declared_country": "DEU",
+      "geo_country": "DEU"
+    }
+  ]
+}
+```
+
+**Read `treatment`, not just `rate`.** A `0.0` means different things: a
+`reverse_charge` (EU business supplying its VAT number cross-border) and an
+`out_of_scope` (non-EU customer, or a seller outside the EU VAT area) are both
+zero-rated for unrelated reasons, and `undetermined_default` means no customer
+country was known and the seller's own rate was applied as a fallback.
+
 #### Update User
 
 ```

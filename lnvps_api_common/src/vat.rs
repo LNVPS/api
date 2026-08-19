@@ -245,6 +245,15 @@ impl VatClient {
         Ok(n)
     }
 
+    /// How many countries the rate table currently holds.
+    ///
+    /// The cache starts empty and an unknown country falls back to 0%, so a
+    /// caller that *displays* a rate — rather than charging one — needs to be
+    /// able to tell "this sale is zero-rated" from "no rates have loaded yet".
+    pub fn rate_count(&self) -> usize {
+        self.cache.read().expect("vat cache poisoned").len()
+    }
+
     /// Look up the cached standard VAT rate (%) for a country, if known.
     pub fn rate_for(&self, country: CountryCode) -> Option<f32> {
         self.cache
