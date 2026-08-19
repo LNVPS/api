@@ -2343,6 +2343,14 @@ pub enum AdminResource {
     /// whether the operator may take placements at all. This is a money
     /// control; see [`AdminResource::MarketplaceNode`].
     MarketplaceOperator = 29,
+    /// Support-agent conversations: reading customer transcripts and managing
+    /// what the agent remembers of them.
+    ///
+    /// Its own resource rather than part of [`AdminResource::Users`] because a
+    /// transcript is raw customer PII — addresses, IPs, and whatever a customer
+    /// pasted into a support request — which is a wider disclosure than the
+    /// account fields `users::view` implies. Granting it is a separate decision.
+    SupportAgent = 30,
 }
 
 /// Actions that can be performed on administrative resources
@@ -2392,6 +2400,7 @@ impl Display for AdminResource {
             AdminResource::AppDeployment => write!(f, "app_deployment"),
             AdminResource::MarketplaceNode => write!(f, "marketplace_node"),
             AdminResource::MarketplaceOperator => write!(f, "marketplace_operator"),
+            AdminResource::SupportAgent => write!(f, "support_agent"),
         }
     }
 }
@@ -2433,6 +2442,7 @@ impl FromStr for AdminResource {
             "marketplace_operator" | "marketplace_operators" => {
                 Ok(AdminResource::MarketplaceOperator)
             }
+            "support_agent" => Ok(AdminResource::SupportAgent),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -2473,6 +2483,7 @@ impl TryFrom<u16> for AdminResource {
             27 => Ok(AdminResource::AppDeployment),
             28 => Ok(AdminResource::MarketplaceNode),
             29 => Ok(AdminResource::MarketplaceOperator),
+            30 => Ok(AdminResource::SupportAgent),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -2512,6 +2523,7 @@ impl AdminResource {
             AdminResource::AppDeployment,
             AdminResource::MarketplaceNode,
             AdminResource::MarketplaceOperator,
+            AdminResource::SupportAgent,
         ]
     }
 }
@@ -4329,6 +4341,41 @@ pub struct AgentMessage {
     /// For [`AgentMessageRole::Tool`], the tool call this row answers.
     pub tool_call_id: Option<String>,
     pub created: DateTime<Utc>,
+}
+
+/// A conversation plus the counters a list view needs.
+///
+/// Carries the aggregates rather than making the caller count per row: a list
+/// of threads is useless without "how many messages" and "when last active",
+/// and fetching those separately is a query per row.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct AgentConversationOverview {
+    pub id: u64,
+    pub conversation_key: String,
+    pub user_id: Option<u64>,
+    pub summary: Option<String>,
+    pub compacted_upto: u64,
+    pub created: DateTime<Utc>,
+    pub updated: DateTime<Utc>,
+    /// Total messages in the thread, ignoring the compaction watermark.
+    pub message_count: u64,
+    /// When the newest message landed. `None` for a thread whose row exists but
+    /// which has never carried a message.
+    pub last_message_at: Option<DateTime<Utc>>,
+}
+
+/// Which conversations to return from [`crate::LNVpsDb::list_agent_conversations`].
+///
+/// Deliberately has no message-content search: `agent_message.content` is
+/// encrypted at rest, so the database cannot match against it. Filtering is on
+/// the thread identity only.
+#[derive(Clone, Debug, Default)]
+pub struct AgentConversationFilter {
+    /// Only threads belonging to this resolved account.
+    pub user_id: Option<u64>,
+    /// Substring match against `conversation_key`. Matches the namespace prefix
+    /// too, so `nostr:` selects every public thread.
+    pub key_search: Option<String>,
 }
 
 /// A message queued for insertion into a conversation.
