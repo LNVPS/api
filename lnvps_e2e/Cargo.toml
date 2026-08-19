@@ -27,19 +27,27 @@ p256 = { version = "0.13", features = ["ecdsa"] }
 sha2 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
 base64urlsafedata = "0.5"
+# The node daemon's production code, so the stack fixture builds a real node
+# rather than a description of one.
+lnvps_node = { path = "../lnvps_node" }
+# The libvirt feature is what carries the marketplace host client: without it
+# get_host_client has no arm for a marketplace node and a probe fails with
+# "unknown host config", which reads like a bad database row.
+lnvps_api = { path = "../lnvps_api", features = ["libvirt"] }
+lnvps_api_common = { path = "../lnvps_api_common", features = ["libvirt"] }
+# The stack fixture configures the route server from the database, exactly as
+# the worker does, so it needs the row types.
+lnvps_db = { path = "../lnvps_db" }
+tempfile = "3"
+nix = { version = "0.30", features = ["user"] }
 # Live-chat support agent websocket (lnvps_e2e::agent_chat)
 tokio-tungstenite = "0.28"
 futures-util = "0.3"
 
 [dev-dependencies]
-# Both ends of a marketplace tunnel, driven by the real code, in network
-# namespaces: the route server's configuration path and the node daemon's.
-lnvps_api = { path = "../lnvps_api" }
-lnvps_api_common = { path = "../lnvps_api_common" }
-lnvps_db = { path = "../lnvps_db" }
-lnvps_node = { path = "../lnvps_node" }
-tempfile = "3"
-nix = { version = "0.30", features = ["user"] }
+# LNVPS's client identity for the node libvirt harness, generated per run rather
+# than checked in: a certificate in a repository is one somebody will deploy.
+rcgen = "0.13"
 # Used only to validate the software authenticator offline: register via
 # webauthn-rs-core (as the server does) and verify a discoverable assertion via
 # the high-level webauthn-rs discoverable flow.

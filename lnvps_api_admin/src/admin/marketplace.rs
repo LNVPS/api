@@ -51,6 +51,10 @@ pub fn router() -> Router<RouterState> {
             get(admin_node_status),
         )
         .route(
+            "/api/admin/v1/marketplace/nodes/{id}/health",
+            get(admin_node_health),
+        )
+        .route(
             "/api/admin/v1/marketplace/operators",
             get(admin_list_operators),
         )
@@ -58,6 +62,50 @@ pub fn router() -> Router<RouterState> {
             "/api/admin/v1/marketplace/operators/{id}",
             get(admin_get_operator).patch(admin_update_operator),
         )
+}
+
+/// One probe's findings.
+#[derive(Serialize, Debug)]
+pub struct AdminNodeHealthInfo {
+    pub id: u64,
+    pub created: chrono::DateTime<chrono::Utc>,
+    pub passed: bool,
+    /// Why it failed, in the words of whatever failed. Verbatim: an admin
+    /// deciding whether to suspend somebody's node needs what actually
+    /// happened, not a category.
+    pub failure: Option<String>,
+    /// Asking for the VM to being able to log in — what a customer waits.
+    pub provision_ms: Option<u32>,
+    /// Memory the guest allocated *and touched*, in MB.
+    pub memory_mb: Option<u32>,
+    pub disk_write_mb: Option<u32>,
+    pub disk_read_mb: Option<u32>,
+    /// What was asked for, so the numbers above can be read. Regions sell
+    /// different shapes, and raw seconds across different ones rank machines by
+    /// what we happened to request rather than by how good they are.
+    pub cpu: u16,
+    pub memory_bytes: u64,
+    pub disk_bytes: u64,
+    pub image: String,
+}
+
+impl From<lnvps_db::MarketplaceNodeHealth> for AdminNodeHealthInfo {
+    fn from(h: lnvps_db::MarketplaceNodeHealth) -> Self {
+        Self {
+            id: h.id,
+            created: h.created,
+            passed: h.passed,
+            failure: h.failure,
+            provision_ms: h.provision_ms,
+            memory_mb: h.memory_mb,
+            disk_write_mb: h.disk_write_mb,
+            disk_read_mb: h.disk_read_mb,
+            cpu: h.cpu,
+            memory_bytes: h.memory_bytes,
+            disk_bytes: h.disk_bytes,
+            image: h.image,
+        }
+    }
 }
 
 /// A registered node as an admin sees it.
@@ -309,6 +357,42 @@ async fn admin_get_node(
 /// which is the question nobody is asking when a customer's VM is unreachable.
 /// This is also the only way to see a node's data plane before it has been
 /// enabled, which is what an operator debugging a failed approval needs.
+/// A node's probe history, newest first.
+///
+/// A series rather than a verdict, because that is the question an admin
+/// actually has: one bad run is a bad afternoon, and a node worth suspending is
+/// one whose numbers have been getting worse. Paged at the database — a node
+/// probed every six hours for a year is over a thousand rows.
+///
+/// Remembered rather than live, unlike `/status`: these are measurements that
+/// were made, and re-running one on demand would put load on an operator's
+/// machine because somebody opened a page.
+async fn admin_node_health(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Query(params): Query<PageQuery>,
+) -> ApiPaginatedResult<AdminNodeHealthInfo> {
+    auth.require_permission(AdminResource::MarketplaceNode, AdminAction::View)?;
+    // Checked so an unknown node is a 404 rather than an empty series, which
+    // reads as "this node has never been probed".
+    let node = this.db.get_marketplace_node(id).await?;
+
+    let limit = params.limit.unwrap_or(50).min(100);
+    let offset = params.offset.unwrap_or(0);
+    let (rows, total) = this
+        .db
+        .list_marketplace_node_health(node.id, limit, offset)
+        .await?;
+
+    ApiPaginatedData::ok(
+        rows.into_iter().map(Into::into).collect(),
+        total.max(0) as u64,
+        limit,
+        offset,
+    )
+}
+
 async fn admin_node_status(
     auth: AdminAuth,
     State(this): State<RouterState>,
@@ -640,7 +724,7 @@ mod tests {
 
     const FINGERPRINT: [u8; 32] = [0xab; 32];
 
-    fn state(db: &Arc<dyn LNVpsDb>) -> RouterState {
+    pub(super) fn state(db: &Arc<dyn LNVpsDb>) -> RouterState {
         RouterState {
             node_control: None,
             db: db.clone(),
@@ -653,7 +737,7 @@ mod tests {
 
     /// An admin holding every action on one marketplace resource and nothing on
     /// the other — which is the split the two resources exist to make.
-    fn auth_for(resource: AdminResource) -> AdminAuth {
+    pub(super) fn auth_for(resource: AdminResource) -> AdminAuth {
         AdminAuth {
             user_id: 1,
             pubkey: vec![1u8; 32],
@@ -672,7 +756,7 @@ mod tests {
 
     /// A database with one operator, one registered node and a company that
     /// charges `fee` to list it.
-    async fn fixture(fee: u64) -> (Arc<dyn LNVpsDb>, u64) {
+    pub(super) async fn fixture(fee: u64) -> (Arc<dyn LNVpsDb>, u64) {
         let mock = MockDb::default();
         mock.set_marketplace_node_fee(1, fee).await;
         let db: Arc<dyn LNVpsDb> = Arc::new(mock);
@@ -1524,5 +1608,123 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(total, 0, "an approved node stayed in the review queue");
+    }
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::tests::*;
+    use super::*;
+    use lnvps_db::MarketplaceNodeHealth;
+
+    fn a_result(node_id: u64, passed: bool, provision_ms: u32) -> MarketplaceNodeHealth {
+        MarketplaceNodeHealth {
+            node_id,
+            passed,
+            failure: (!passed).then(|| "could not log in".to_string()),
+            provision_ms: passed.then_some(provision_ms),
+            memory_mb: passed.then_some(1900),
+            disk_write_mb: passed.then_some(410),
+            disk_read_mb: passed.then_some(1200),
+            cpu: 2,
+            memory_bytes: 2 * 1024 * 1024 * 1024,
+            disk_bytes: 40 * 1024 * 1024 * 1024,
+            image: "https://example.com/debian_12.img".to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The series comes back newest first, with the shape each row was measured
+    /// at: without it, numbers from different regions rank machines by what
+    /// LNVPS happened to ask them for.
+    #[tokio::test]
+    async fn a_nodes_probe_history_is_a_series() -> Result<(), ApiError> {
+        let (db, node_id) = fixture(0).await;
+        let this = state(&db);
+
+        for ms in [90_000u32, 60_000, 30_000] {
+            db.insert_marketplace_node_health(&a_result(node_id, true, ms))
+                .await?;
+        }
+
+        let got = admin_node_health(
+            auth_for(AdminResource::MarketplaceNode),
+            State(this),
+            Path(node_id),
+            Query(PageQuery::default()),
+        )
+        .await?;
+
+        assert_eq!(got.0.total, 3);
+        let rows = got.0.data;
+        assert_eq!(rows[0].provision_ms, Some(30_000), "newest first");
+        assert_eq!(rows[0].cpu, 2);
+        assert_eq!(rows[0].memory_bytes, 2 * 1024 * 1024 * 1024);
+        Ok(())
+    }
+
+    /// A failure is a row, with the reason verbatim. An admin deciding whether
+    /// to suspend somebody's hardware needs what actually happened, and a node
+    /// that never completes a probe is indistinguishable from one nobody probed
+    /// unless the failures are visible.
+    #[tokio::test]
+    async fn failures_are_visible_with_their_reason() -> Result<(), ApiError> {
+        let (db, node_id) = fixture(0).await;
+        let this = state(&db);
+        db.insert_marketplace_node_health(&a_result(node_id, false, 0))
+            .await?;
+
+        let got = admin_node_health(
+            auth_for(AdminResource::MarketplaceNode),
+            State(this),
+            Path(node_id),
+            Query(PageQuery::default()),
+        )
+        .await?;
+
+        let row = &got.0.data[0];
+        assert!(!row.passed);
+        assert_eq!(row.failure.as_deref(), Some("could not log in"));
+        assert!(row.provision_ms.is_none());
+        Ok(())
+    }
+
+    /// Reading a node's probes needs permission on the node resource — the same
+    /// check every other node endpoint makes, and the one that was granted to
+    /// nobody until it was noticed.
+    #[tokio::test]
+    async fn reading_probes_needs_permission() -> Result<(), ApiError> {
+        let (db, node_id) = fixture(0).await;
+        let this = state(&db);
+
+        let denied = admin_node_health(
+            auth_for(AdminResource::MarketplaceOperator),
+            State(this),
+            Path(node_id),
+            Query(PageQuery::default()),
+        )
+        .await;
+
+        assert!(denied.is_err(), "operator permissions must not read nodes");
+        Ok(())
+    }
+
+    /// An unknown node is a 404 rather than an empty series, which would read
+    /// as "this node has never been probed".
+    #[tokio::test]
+    async fn an_unknown_node_is_not_an_empty_series() {
+        let (db, _) = fixture(0).await;
+        let this = state(&db);
+
+        assert!(
+            admin_node_health(
+                auth_for(AdminResource::MarketplaceNode),
+                State(this),
+                Path(9_999),
+                Query(PageQuery::default()),
+            )
+            .await
+            .is_err()
+        );
     }
 }

@@ -74,6 +74,13 @@ pub fn network_config(value: &FullVmInfo) -> Result<NetworkConfig> {
         let range_gw: IpNetwork = parse_gateway(&ip_range.gateway)?;
         // Take the shorter prefix so an off-subnet gateway stays directly
         // reachable without needing an explicit on-link route.
+        //
+        // A guest whose prefix covers its gateway also treats everything else
+        // in that prefix as on-link, and will resolve those addresses on the
+        // link rather than sending them to the router. That is fine on a
+        // customer range, where the node proxies for the addresses in it, and
+        // wrong on a routed block, where the machine at the other end is up a
+        // tunnel and nothing on the link answers for it.
         let prefix = range.prefix().min(range_gw.prefix());
         let cidr = IpNetwork::new(addr, prefix)?.to_string();
         if addr.is_ipv4() {
@@ -87,20 +94,48 @@ pub fn network_config(value: &FullVmInfo) -> Result<NetworkConfig> {
         }
     }
 
-    let mut cfg = String::from("version: 2\nethernets:\n  nic0:\n    match:\n      macaddress: ");
+    // Quoted, and this is not cosmetic. YAML 1.1 reads a colon-separated run of
+    // digits as a base-60 integer, so a MAC with no hex letters in it —
+    // `52:54:01:00:00:01` — is parsed as the number 41135256001. netplan then
+    // refuses it ("Invalid MAC address"), cloud-init aborts its network stage,
+    // and the guest boots with no network at all on a host that is working.
+    //
+    // It bites intermittently, which is worse than always: a MAC containing any
+    // letter is a string and works, so roughly one VM in sixteen breaks and the
+    // rest are fine.
+    let mut cfg = String::from("version: 2\nethernets:\n  nic0:\n    match:\n      macaddress: \"");
     cfg.push_str(&value.vm.mac_address.to_lowercase());
-    cfg.push_str("\n    dhcp4: false\n    dhcp6: false\n");
+    cfg.push_str("\"\n    dhcp4: false\n    dhcp6: false\n");
     if accept_ra {
         cfg.push_str("    accept-ra: true\n");
     }
     cfg.push_str("    addresses:\n");
     for a in v4.iter().chain(v6.iter()) {
-        cfg.push_str(&format!("      - {a}\n"));
+        // Quoted for the same reason as the MAC: an address is a value with
+        // colons in it, and the parser's opinion of those is not ours.
+        cfg.push_str(&format!("      - \"{a}\"\n"));
     }
+    // `on-link` when the gateway is not inside the guest's own prefix: without
+    // it the guest has no way to reach the router at all, because the address
+    // it is told to send everything to is one it believes is somewhere else.
+    // netplan is explicit about this and silently produces an unusable
+    // configuration otherwise.
+    let on_link = |gw: IpAddr| {
+        let covered = v4
+            .iter()
+            .chain(v6.iter())
+            .filter_map(|a| a.parse::<IpNetwork>().ok())
+            .any(|a| a.contains(gw));
+        if covered {
+            ""
+        } else {
+            "\n        on-link: true"
+        }
+    };
     let routes: Vec<String> = gw4
         .into_iter()
         .chain(gw6)
-        .map(|gw| format!("      - to: default\n        via: {gw}"))
+        .map(|gw| format!("      - to: default\n        via: \"{gw}\"{}", on_link(gw)))
         .collect();
     if !routes.is_empty() {
         cfg.push_str("    routes:\n");
@@ -252,6 +287,35 @@ mod tests {
     #[test]
     fn hostname_matches_proxmox_naming() {
         assert_eq!(hostname(42), "VM42");
+    }
+
+    /// An all-digit MAC survives a YAML parser.
+    ///
+    /// YAML 1.1 reads `52:54:01:00:00:01` as a base-60 integer — 41135256001 —
+    /// and netplan then rejects it as an invalid MAC, cloud-init aborts its
+    /// network stage, and the guest boots with no network at all on a host that
+    /// is working perfectly. A MAC containing any hex letter is a string and is
+    /// unaffected, so this breaks about one VM in sixteen and looks like bad
+    /// hardware. Found by a probe VM, whose MAC is derived from a node id and is
+    /// therefore always all-digits.
+    #[test]
+    fn an_all_digit_mac_is_not_a_number() -> Result<()> {
+        let mut vm = mock_full_vm();
+        vm.vm.mac_address = "52:54:01:00:00:01".to_string();
+
+        let cfg = network_config(&vm)?;
+
+        // Asserted on the text, not by parsing it back. The parser in this
+        // workspace is YAML 1.2, which dropped sexagesimal integers and so
+        // reads this correctly whether or not it is quoted; the parser that
+        // actually consumes this file is netplan's, which is 1.1. A test that
+        // round-tripped through our own parser would pass with the bug present.
+        assert!(
+            cfg.yaml.contains(r#"macaddress: "52:54:01:00:00:01""#),
+            "an unquoted MAC is a number to the parser that reads it:\n{}",
+            cfg.yaml
+        );
+        Ok(())
     }
 
     #[test]

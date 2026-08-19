@@ -66,6 +66,24 @@ pub struct DesiredDataPlane {
     pub gateways: Vec<String>,
     #[serde(default)]
     pub guests: Vec<DesiredGuest>,
+    /// How to serve libvirt to LNVPS. Absent when LNVPS has no client identity
+    /// configured, which is a deployment that networks nodes but places no VMs
+    /// on them — so the node leaves libvirt alone rather than opening a
+    /// listener nobody can authenticate to.
+    #[serde(default)]
+    pub libvirt: Option<DesiredLibvirt>,
+}
+
+/// What the node's libvirtd should be, as LNVPS states it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct DesiredLibvirt {
+    /// PEM of the CA that signed LNVPS's client certificate.
+    pub ca_pem: String,
+    /// The only client DN allowed to connect.
+    pub allowed_dn: String,
+    /// The address libvirtd binds: this node's own tunnel address, never the
+    /// machine's other interfaces.
+    pub listen: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -326,9 +344,16 @@ async fn apply_bridge(
     // else's. Routes the kernel maintains for the link itself are left alone —
     // deleting the IPv6 link-local prefix to tidy a list would take the
     // interface's own connectivity with it.
+    //
+    // The gateways this node answers for are left alone for the same reason.
+    // Holding an address on an interface makes the kernel route it, and that
+    // route is not ours to remove: with IPv6 the attempt fails outright with
+    // "no such process", which stops the whole apply — a node with a v6 gateway
+    // could not bring its data plane up at all.
+    let own: HashSet<IpNetwork> = want.iter().copied().collect();
     let mut to_drop: Vec<&IpNetwork> = existing
         .difference(&guests)
-        .filter(|r| !is_link_local(r))
+        .filter(|r| !is_link_local(r) && !own.contains(r))
         .collect();
     to_drop.sort();
     for address in to_drop {

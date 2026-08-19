@@ -718,6 +718,72 @@ impl Worker {
         msg
     }
 
+    /// Probe one marketplace node that is due one.
+    ///
+    /// Proving a node can carry a customer means building a customer's VM on it:
+    /// everything else LNVPS can see is what the operator's machine chooses to
+    /// report. A passing probe is what enables the backing host, which is the
+    /// point at which real customers can be placed there.
+    ///
+    /// One node per run. A probe puts real load on hardware LNVPS does not own,
+    /// and a sweep that probed the whole fleet at once would arrive as a
+    /// thundering herd on the operators least able to absorb it.
+    #[cfg(feature = "linux-ssh")]
+    pub async fn probe_marketplace_node(&self) -> Result<()> {
+        let due = crate::provisioner::probe_candidates(&self.db, chrono::Utc::now()).await?;
+        let Some(node) = due.into_iter().next() else {
+            return Ok(());
+        };
+
+        // A probe that could not be run at all must not abort the sweep: this
+        // runs from `handle_job`, whose error stops the rest of the batch, so
+        // one unreachable node would take `CheckVms`, `CheckSubscriptions` and
+        // every other queued job down with it. What went wrong is already a
+        // health row for whoever looks at the node.
+        let result =
+            match crate::provisioner::run_probe(&self.db, &self.settings.provisioner_config, &node)
+                .await
+            {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!("Marketplace node {} could not be probed: {}", node.id, e);
+                    return Ok(());
+                }
+            };
+        if !result.passed() {
+            // Recorded, not acted on. One bad probe is a bad afternoon — a
+            // backup job, a noisy neighbour — and taking a node out of service
+            // for it would make the marketplace hostile to the people it needs.
+            // Suspension on a trend is increment 12's job.
+            warn!(
+                "Marketplace node {} failed its probe: {}",
+                node.id,
+                result.failure.as_deref().unwrap_or("unknown")
+            );
+            return Ok(());
+        }
+
+        // The gate: a host is only enabled once a VM has actually run on it.
+        let Some(host) = self.db.get_marketplace_node_host(node.id).await? else {
+            return Ok(());
+        };
+        if !host.enabled {
+            info!(
+                "Marketplace node {} carried a probe VM in {}ms; enabling host {}",
+                node.id,
+                result.provision_ms.unwrap_or_default(),
+                host.id
+            );
+            self.db
+                .update_host(&VmHost {
+                    enabled: true,
+                    ..host
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
     /// Poll every enabled router to refresh cached tunnel/BGP session/route state
     /// and record per-tunnel traffic samples.
     ///
@@ -2755,6 +2821,17 @@ impl Worker {
             WorkJob::SyncRouterState => {
                 self.sync_router_state().await?;
             }
+            #[cfg(feature = "linux-ssh")]
+            WorkJob::ProbeMarketplaceNode => {
+                self.probe_marketplace_node().await?;
+            }
+            #[cfg(not(feature = "linux-ssh"))]
+            WorkJob::ProbeMarketplaceNode => {
+                // A build without SSH cannot log into a probe VM, and a probe
+                // that only created and destroyed one would report a node
+                // healthy on the strength of nothing.
+                warn!("Marketplace probes need the linux-ssh feature; skipping");
+            }
             WorkJob::ToggleBgpSession {
                 router_id,
                 session_id,
@@ -4314,6 +4391,136 @@ mod tests {
 
     async fn setup_worker(db: Arc<MockDb>) -> Result<Worker> {
         setup_worker_with_delete_after(db, 0).await
+    }
+
+    /// A node whose probe cannot even be attempted must not have its host
+    /// enabled.
+    ///
+    /// This is the gate the whole marketplace rests on: an enabled host is one
+    /// LNVPS will place paying customers on, and the only thing that should
+    /// open it is a VM having actually run there. A gate that opened on a
+    /// failure — or on nothing at all — would put customers on hardware nobody
+    /// has tested.
+    #[cfg(feature = "linux-ssh")]
+    #[tokio::test]
+    async fn a_host_is_not_enabled_without_a_passing_probe() -> Result<()> {
+        let mock = Arc::new(MockDb::empty());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let user_id = db.upsert_user(&[4u8; 32]).await?;
+        let operator_id = db
+            .insert_marketplace_operator(&lnvps_db::MarketplaceOperator {
+                user_id,
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let node_id = db
+            .insert_marketplace_node(&lnvps_db::MarketplaceNode {
+                operator_id,
+                name: "unproven".to_string(),
+                status: lnvps_db::MarketplaceNodeStatus::Approved,
+                ..Default::default()
+            })
+            .await?;
+        let host_id = db
+            .create_host(&VmHost {
+                kind: lnvps_db::VmHostKind::MarketplaceNode,
+                region_id: 1,
+                name: "unproven".to_string(),
+                enabled: false,
+                marketplace_node_id: Some(node_id),
+                ..Default::default()
+            })
+            .await?;
+
+        let worker = setup_worker(mock.clone()).await?;
+        // No tunnel, so the probe cannot even be specified. The sweep records
+        // the failure and carries on rather than returning an error: this runs
+        // from `handle_job`, and an error there stops every other job in the
+        // batch.
+        worker.probe_marketplace_node().await?;
+
+        assert!(
+            !db.get_host(host_id).await?.enabled,
+            "a host was opened to customers without a VM ever running on it"
+        );
+
+        // Written down, so the node has a cooldown and an admin can see why it
+        // never came into service.
+        let (health, _) = db.list_marketplace_node_health(node_id, 10, 0).await?;
+        assert_eq!(health.len(), 1, "an unprobeable node recorded nothing");
+        assert!(!health[0].passed);
+        assert!(
+            health[0]
+                .failure
+                .as_deref()
+                .unwrap_or_default()
+                .contains("could not be specified"),
+            "{:?}",
+            health[0].failure
+        );
+        Ok(())
+    }
+
+    /// A node that cannot be probed must not monopolise every sweep.
+    ///
+    /// One node is probed per run, never-probed first. A node whose probe
+    /// failed before it could be specified used to record nothing, so it stayed
+    /// "never probed" forever: it was selected again five minutes later, and
+    /// again, and no other node in the fleet was ever reached. A broken node
+    /// silently disabled the health gate for every other operator's hardware.
+    #[cfg(feature = "linux-ssh")]
+    #[tokio::test]
+    async fn an_unprobeable_node_does_not_starve_the_fleet() -> Result<()> {
+        let mock = Arc::new(MockDb::empty());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let user_id = db.upsert_user(&[5u8; 32]).await?;
+        let operator_id = db
+            .insert_marketplace_operator(&lnvps_db::MarketplaceOperator {
+                user_id,
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+
+        // Two nodes, neither probeable (no tunnel), so selection is decided
+        // purely by what the previous sweep recorded.
+        let mut node_ids = Vec::new();
+        for name in ["first", "second"] {
+            let node_id = db
+                .insert_marketplace_node(&lnvps_db::MarketplaceNode {
+                    operator_id,
+                    name: name.to_string(),
+                    status: lnvps_db::MarketplaceNodeStatus::Approved,
+                    ..Default::default()
+                })
+                .await?;
+            db.create_host(&VmHost {
+                kind: lnvps_db::VmHostKind::MarketplaceNode,
+                region_id: 1,
+                name: name.to_string(),
+                enabled: false,
+                marketplace_node_id: Some(node_id),
+                ..Default::default()
+            })
+            .await?;
+            node_ids.push(node_id);
+        }
+
+        let worker = setup_worker(mock.clone()).await?;
+        worker.probe_marketplace_node().await?;
+        worker.probe_marketplace_node().await?;
+
+        // The second sweep moved on: the first node is now inside its cooldown.
+        for node_id in node_ids {
+            let (health, _) = db.list_marketplace_node_health(node_id, 10, 0).await?;
+            assert_eq!(
+                health.len(),
+                1,
+                "node {node_id} was probed the wrong number of times"
+            );
+        }
+        Ok(())
     }
 
     async fn setup_worker_with_delete_after(db: Arc<MockDb>, delete_after: u16) -> Result<Worker> {

@@ -8,10 +8,10 @@ use lnvps_db::{
     AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
     Company, CpuArch, CpuMfg, DbError, DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind,
     EncryptedString, IntervalType, IpRange, IpRangeAllocationMode, IpRangeSubscription,
-    IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator,
-    NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod,
-    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region, Router,
-    RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription,
+    IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus,
+    MarketplaceOperator, NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution,
+    PaymentMethod, PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region,
+    Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription,
     SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, Tunnel, TunnelPool,
     User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
     VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind,
@@ -76,6 +76,7 @@ pub struct MockDb {
     pub referrals: Arc<Mutex<HashMap<u64, Referral>>>,
     pub marketplace_operators: Arc<Mutex<HashMap<u64, MarketplaceOperator>>>,
     pub marketplace_nodes: Arc<Mutex<HashMap<u64, MarketplaceNode>>>,
+    pub marketplace_node_health: Arc<Mutex<HashMap<u64, MarketplaceNodeHealth>>>,
     pub tunnels: Arc<Mutex<HashMap<u64, Tunnel>>>,
     pub tunnel_pools: Arc<Mutex<HashMap<u64, TunnelPool>>>,
     pub referral_payouts: Arc<Mutex<Vec<ReferralPayout>>>,
@@ -463,6 +464,7 @@ impl Default for MockDb {
             referrals: Arc::new(Default::default()),
             marketplace_operators: Arc::new(Default::default()),
             marketplace_nodes: Arc::new(Default::default()),
+            marketplace_node_health: Arc::new(Default::default()),
             tunnels: Arc::new(Default::default()),
             tunnel_pools: Arc::new(Default::default()),
             referral_payouts: Arc::new(Default::default()),
@@ -3718,6 +3720,61 @@ impl LNVpsDbBase for MockDb {
             .cloned())
     }
 
+    async fn insert_marketplace_node_health(
+        &self,
+        health: &MarketplaceNodeHealth,
+    ) -> DbResult<u64> {
+        if !self
+            .marketplace_nodes
+            .lock()
+            .await
+            .contains_key(&health.node_id)
+        {
+            return Err(anyhow!("Marketplace node {} not found", health.node_id).into());
+        }
+        let mut rows = self.marketplace_node_health.lock().await;
+        let id = rows.keys().max().copied().unwrap_or(0) + 1;
+        rows.insert(
+            id,
+            MarketplaceNodeHealth {
+                id,
+                // The column defaults to now; rows written without one would
+                // otherwise all sort equal and a "most recent first" list would
+                // return them in whatever order the map happened to hold.
+                created: if health.created == DateTime::<Utc>::default() {
+                    Utc::now()
+                } else {
+                    health.created
+                },
+                ..health.clone()
+            },
+        );
+        Ok(id)
+    }
+
+    async fn list_marketplace_node_health(
+        &self,
+        node_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<MarketplaceNodeHealth>, i64)> {
+        let rows = self.marketplace_node_health.lock().await;
+        let mut mine: Vec<_> = rows
+            .values()
+            .filter(|h| h.node_id == node_id)
+            .cloned()
+            .collect();
+        mine.sort_by(|a, b| b.created.cmp(&a.created).then(b.id.cmp(&a.id)));
+        let total = mine.len() as i64;
+        Ok((
+            mine.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
     async fn insert_marketplace_node(&self, node: &MarketplaceNode) -> DbResult<u64> {
         let operators = self.marketplace_operators.lock().await;
         // FK marketplace_node.operator_id
@@ -3831,6 +3888,7 @@ impl LNVpsDbBase for MockDb {
         // `touch_marketplace_node`.
         existing.name = node.name.clone();
         existing.tls_fingerprint = node.tls_fingerprint.clone();
+        existing.libvirt_cert = node.libvirt_cert.clone();
         existing.token_version = node.token_version;
         existing.status = node.status;
         existing.trust_tier = node.trust_tier;

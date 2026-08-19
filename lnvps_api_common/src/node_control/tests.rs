@@ -17,6 +17,7 @@ const OTHER_KEY: &str = "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9l
 
 fn node(fingerprint: Option<Vec<u8>>) -> MarketplaceNode {
     MarketplaceNode {
+        libvirt_cert: None,
         id: 7,
         operator_id: 1,
         name: "a node".to_string(),

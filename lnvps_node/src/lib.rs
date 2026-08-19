@@ -29,6 +29,7 @@ pub mod control_auth;
 pub mod credential;
 pub mod fw;
 pub mod inventory;
+pub mod libvirt;
 pub mod net;
 pub mod netns;
 pub mod tls;

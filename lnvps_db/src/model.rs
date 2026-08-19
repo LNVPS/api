@@ -1940,6 +1940,38 @@ impl TunnelPool {
 
 /// A single machine offered by an operator.
 ///
+/// One probe's findings on a node.
+///
+/// A series rather than a verdict: one bad run is a bad afternoon, a trend is a
+/// node to act on. What was asked for is recorded alongside what was measured,
+/// because regions sell different templates and raw seconds across different
+/// shapes rank machines by what we happened to request.
+#[derive(FromRow, Clone, Debug, Default, PartialEq)]
+pub struct MarketplaceNodeHealth {
+    pub id: u64,
+    pub node_id: u64,
+    pub created: DateTime<Utc>,
+    /// Whether the probe completed. A failure is a result, and is kept: a node
+    /// that never completes one looks identical to a node nobody probed unless
+    /// the failures are written down.
+    pub passed: bool,
+    /// Why it failed, in the words of whatever failed.
+    pub failure: Option<String>,
+    /// Asking for the VM to being able to log into it — what a customer waits.
+    pub provision_ms: Option<u32>,
+    /// Memory the guest allocated *and touched*, in MB. Allocation alone proves
+    /// nothing where the host overcommits.
+    pub memory_mb: Option<u32>,
+    pub disk_write_mb: Option<u32>,
+    pub disk_read_mb: Option<u32>,
+    /// The shape that was asked for, denormalised so a template edited later
+    /// cannot change what an old measurement appears to say.
+    pub cpu: u16,
+    pub memory_bytes: u64,
+    pub disk_bytes: u64,
+    pub image: String,
+}
+
 /// There is deliberately no region here: an approved node's region lives on its
 /// backing [`VmHost`], which is what capacity and placement read. A second copy
 /// would be free to drift as soon as an admin edited the host, and the copy
@@ -1967,6 +1999,13 @@ pub struct MarketplaceNode {
     /// Unique across the fleet: two nodes presenting the same certificate would
     /// mean either can answer for the other, which is what the pin prevents.
     pub tls_fingerprint: Option<Vec<u8>>,
+    /// The PEM certificate LNVPS trusts when driving this node's libvirtd.
+    ///
+    /// The whole certificate rather than a hash, unlike `tls_fingerprint`: our
+    /// own HTTP client can compare a hash of what it was shown, but libvirt's
+    /// client verifies a chain against a CA file, and a hash gives it nothing to
+    /// read. `None` until the node has a tunnel address to name in it.
+    pub libvirt_cert: Option<String>,
     /// The node's data plane, once assigned. `None` until then; a tunnel backs
     /// exactly one node.
     pub tunnel_id: Option<u64>,
@@ -4303,4 +4342,95 @@ pub struct NewAgentMessage {
     pub content: Option<String>,
     pub tool_calls: Option<String>,
     pub tool_call_id: Option<String>,
+}
+
+#[cfg(test)]
+mod rbac_grant_tests {
+    use super::*;
+
+    /// Every admin resource must be granted to `super_admin` by a migration.
+    ///
+    /// This exists because the marketplace resources were not. There is no
+    /// super-admin bypass — the check is a set lookup against granted tuples —
+    /// so a resource nobody granted is a set of endpoints that answer 403 to
+    /// everyone, and nothing anywhere fails at the point the omission is made.
+    /// A resource with no grants is a legitimate state as far as the schema is
+    /// concerned; it just means the feature is unusable.
+    ///
+    /// Reading the migrations as text is crude, and it is the only way to check
+    /// this without a database: the grants live in SQL, and the enum lives in
+    /// Rust, and nothing else compares them.
+    #[test]
+    fn every_admin_resource_is_granted_to_super_admin() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut sql = String::new();
+        for entry in std::fs::read_dir(&dir).expect("migrations directory") {
+            let path = entry.expect("migration entry").path();
+            if path.extension().is_some_and(|e| e == "sql") {
+                sql.push_str(&std::fs::read_to_string(&path).expect("migration file"));
+                sql.push('\n');
+            }
+        }
+
+        // Two shapes are used across the migrations: `SELECT id, <resource>,
+        // <action> FROM admin_roles WHERE name = 'super_admin'` in the
+        // per-feature grants, and parenthesised `(<role>, <resource>,
+        // <action>)` tuples — several to a line — in the original seed.
+        let mut granted: Vec<(u16, u16)> = Vec::new();
+
+        for line in sql.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("SELECT id,") {
+                let numbers: Vec<u16> = rest
+                    .split(',')
+                    .filter_map(|part| part.trim().parse().ok())
+                    .collect();
+                if numbers.len() >= 2 {
+                    granted.push((numbers[0], numbers[1]));
+                }
+                continue;
+            }
+            // Comments carry things like "(resource=0)", which is not a grant.
+            if line.starts_with("--") {
+                continue;
+            }
+            for group in line.split('(').skip(1) {
+                let Some(inner) = group.split(')').next() else {
+                    continue;
+                };
+                // The role is a SQL variable (`@super_admin_id`) in the seed
+                // and a literal elsewhere; either way only the last two
+                // columns are the resource and the action.
+                // Three columns in the seed, four where a created_at is
+                // written out: either way the resource and action are the
+                // second and third.
+                let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+                if parts.len() < 3 {
+                    continue;
+                }
+                if let (Ok(resource), Ok(action)) = (parts[1].parse(), parts[2].parse()) {
+                    granted.push((resource, action));
+                }
+            }
+        }
+
+        let mut missing = Vec::new();
+        for value in 0u16.. {
+            let Ok(resource) = AdminResource::try_from(value) else {
+                break;
+            };
+            for action in 0u16..=3 {
+                if !granted.contains(&(value, action)) {
+                    missing.push(format!("{resource} (={value}) action {action}"));
+                }
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "these admin resources are used by endpoints but granted to nobody, \
+             so those endpoints answer 403 to every caller:\n  {}",
+            missing.join("\n  ")
+        );
+    }
 }

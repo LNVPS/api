@@ -577,6 +577,32 @@ pub fn ruleset(policy: &Policy) -> Nftables<'static> {
         ));
     }
 
+    // LNVPS reaching the node itself: the control API and the libvirtd it
+    // drives, both of which exist only inside the tunnel.
+    //
+    // Without these the node is unreachable for everything except ping, which
+    // is a state it can stay in indefinitely while looking healthy: the tunnel
+    // is up, handshakes happen, and every call LNVPS makes to it times out.
+    //
+    // Bound to the tunnel interface, never the guest bridge. The bridge shares
+    // this namespace with the tunnel, so a customer VM can address the node's
+    // inner address — and libvirtd on that address is root on the machine.
+    for port in [CONTROL_PORT, LIBVIRT_TLS_PORT] {
+        batch.add(rule(
+            "input",
+            vec![
+                iif(TUNNEL_INTERFACE),
+                Statement::Match(Match {
+                    left: field("tcp", "dport"),
+                    right: Expression::Number(port as u32),
+                    op: Operator::EQ,
+                }),
+                Statement::Accept(None),
+            ],
+            None,
+        ));
+    }
+
     // A second table, in the bridge family, because layer 2 is a different path
     // through the kernel: a frame from one guest to another never reaches the
     // forward hook above.
@@ -699,6 +725,20 @@ fn daddr_in(v6: bool, set: &str) -> Statement<'static> {
         op: Operator::EQ,
     })
 }
+
+/// The port the node's control API listens on, which LNVPS dials.
+///
+/// Stated here as well as in [`crate::config`] because the filter has to agree
+/// with the listener it lets through, and both are fleet-wide: an operator who
+/// moves either makes their own node unreachable, which is self-correcting.
+pub const CONTROL_PORT: u16 = 8890;
+
+/// The port a node's libvirtd serves TLS on.
+///
+/// Stated here as well as in [`crate::libvirt`] because the filter has to agree
+/// with the daemon it lets through, and a port read from a config file the
+/// operator can edit would be a filter hole they can widen.
+pub const LIBVIRT_TLS_PORT: u16 = crate::libvirt::TLS_PORT;
 
 /// `tcp option maxseg size set rt mtu`, for SYNs only.
 fn clamp_mss() -> Statement<'static> {

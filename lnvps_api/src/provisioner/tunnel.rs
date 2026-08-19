@@ -402,7 +402,12 @@ pub async fn plan_pool(db: &Arc<dyn LNVpsDb>, pool: &TunnelPool) -> Result<PoolP
         .flatten()
         .collect();
 
-        let guests = guest_addresses(db, &tunnel).await?;
+        let mut guests = guest_addresses(db, &tunnel).await?;
+        // The node's probe address, always — a probe is created and destroyed
+        // between polls, and reconfiguring the route server for the few minutes
+        // one exists would mean a probe that fails because the routing had not
+        // caught up. It costs one host route on a peer that already has one.
+        guests.extend(super::probe_address(&tunnel));
         allowed_ips.extend(guests.iter().cloned());
         plan.routes.extend(guests);
 
@@ -477,10 +482,34 @@ pub async fn node_dataplane(
     let Some(tunnel) = get_node_tunnel(db, node).await? else {
         return Ok(None);
     };
-    Ok(Some(NodeDataPlane {
-        guests: node_guests(db, node).await?,
-        tunnel,
-    }))
+    let mut guests = node_guests(db, node).await?;
+    // The probe's address, in the node's filter whether or not one is running.
+    //
+    // Sent always rather than when a probe exists, because a probe is created
+    // and destroyed between two of the node's polls: a document that named it
+    // only while it ran would give a probe that fails because the node had not
+    // fetched the document yet, and a node that tears the address down while
+    // LNVPS is still logged into it.
+    //
+    // It costs one address in an anti-spoof list. What it buys is that the
+    // check LNVPS makes on an operator's machine never depends on timing.
+    if let Some(address) = super::probe_address(&tunnel.tunnel) {
+        guests.push(GuestAddress {
+            address,
+            // The node's own address for probes, which it answers for on the
+            // bridge. Deliberately not the route server's: the node holds its
+            // guests' gateways itself, so sharing that address with the route
+            // server means the guest's replies are delivered to the node and
+            // the route server never sees them.
+            gateway: super::probe_gateway(&tunnel.tunnel)
+                .and_then(|g| g.split('/').next().map(str::to_string))
+                .unwrap_or_default(),
+            mac: Some(super::probe_mac(node.id)),
+        });
+    }
+    guests.sort_by(|a, b| a.address.cmp(&b.address));
+
+    Ok(Some(NodeDataPlane { guests, tunnel }))
 }
 
 /// The guests placed on `node`, with what each needs to be reachable.
@@ -1057,6 +1086,15 @@ mod tests {
             peer.public_key,
             lnvps_api_common::wireguard_key_to_base64(&NODE_KEY)
         );
+        // The probe address is here too, and always: a probe exists for a few
+        // minutes between two of the node's polls, and reconfiguring the route
+        // server around that window would mean probes that fail because the
+        // routing had not caught up yet.
+        assert!(
+            peer.allowed_ips.contains(&"fd00:66::8002/128".to_string()),
+            "{:?}",
+            peer.allowed_ips
+        );
         assert_eq!(
             peer.allowed_ips,
             vec![
@@ -1064,6 +1102,7 @@ mod tests {
                 "fd00:66::2/128".to_string(),
                 "2001:db8::5/128".to_string(),
                 "203.0.113.5/32".to_string(),
+                "fd00:66::8002/128".to_string(),
             ]
         );
         assert_eq!(peer.persistent_keepalive, Some(25));
@@ -1123,7 +1162,11 @@ mod tests {
         let pool = db.get_tunnel_pool(pool_id).await.unwrap();
         let plan = plan_pool(&db, &pool).await.unwrap();
         assert!(!plan.routes.iter().any(|r| r.starts_with("203.0.113")));
-        assert_eq!(plan.peers[0].allowed_ips.len(), 2, "only the node's own");
+        assert_eq!(
+            plan.peers[0].allowed_ips.len(),
+            3,
+            "the node's own two addresses and its probe address, nothing else"
+        );
 
         // A deleted VM takes its addressing with it for the same reason.
         {
@@ -1227,15 +1270,24 @@ mod tests {
                 .iter()
                 .map(|g| g.address.as_str())
                 .collect::<Vec<_>>(),
-            ["2001:db8::5/128", "203.0.113.5/32"]
+            // The customer's two addresses, and the node's probe address, which
+            // is present whether or not a probe is running.
+            ["2001:db8::5/128", "203.0.113.5/32", "fd00:66::8002/128"]
         );
         // Bare, even though the range stores it with a prefix: the node holds
         // it as a host address on the bridge.
         assert_eq!(plane.guests[0].gateway, "10.0.0.1");
         assert_eq!(plane.guests[0].mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
         // Deduplicated: two guests from one range give the node one address to
-        // answer for, not two identical ones.
-        assert_eq!(plane.gateways(), vec!["10.0.0.1".to_string()]);
+        // answer for, not two identical ones. The probe's gateway is the route
+        // server, which the node answers for on the bridge the same way — a
+        // probe VM is configured like any other guest, because a probe
+        // configured specially proves nothing about a customer.
+        assert_eq!(
+            plane.gateways(),
+            vec!["10.0.0.1".to_string(), "fd00:66::c002".to_string()],
+            "the probe's gateway is the node's own, not the route server's"
+        );
     }
 
     /// A node with no tunnel has no data plane to describe — saying so beats
@@ -1255,8 +1307,21 @@ mod tests {
         let node = db.get_marketplace_node(node.id).await.unwrap();
 
         let plane = node_dataplane(&db, &node).await.unwrap().unwrap();
-        assert!(plane.guests.is_empty());
-        assert!(plane.gateways().is_empty());
+        // Not empty: a node with no customers still carries its probe address,
+        // so LNVPS can find out whether it could carry one.
+        assert_eq!(plane.guests.len(), 1);
+        assert_eq!(plane.guests[0].address, "fd00:66::8002/128");
+        assert_eq!(
+            plane.guests[0].mac.as_deref(),
+            Some(&*super::super::probe_mac(node.id))
+        );
+        // The node's own gateway for probes, not the route server's: the node
+        // holds its guests' gateways itself, and sharing that address with the
+        // route server means every reply is delivered to the node instead.
+        assert_eq!(
+            plane.guests[0].gateway, "fd00:66::c002",
+            "the probe's gateway collides with the route server"
+        );
     }
 
     /// Give `host` a VM holding `ips`. Written through the mock's maps because

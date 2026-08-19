@@ -1141,6 +1141,22 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List the nodes belonging to one operator
     async fn list_marketplace_nodes(&self, operator_id: u64) -> DbResult<Vec<MarketplaceNode>>;
 
+    /// Record what a probe found on a node.
+    async fn insert_marketplace_node_health(&self, health: &MarketplaceNodeHealth)
+    -> DbResult<u64>;
+
+    /// A node's probe history, most recent first.
+    ///
+    /// Paged at the database, like every other list: a node probed every few
+    /// hours for a year is thousands of rows, and an admin reading a trend
+    /// wants the last few.
+    async fn list_marketplace_node_health(
+        &self,
+        node_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<MarketplaceNodeHealth>, i64)>;
+
     /// List every node, optionally filtered to a single status (admin review
     /// queues, placement scans and the SLA sweep all want one status at a time)
     async fn list_all_marketplace_nodes(

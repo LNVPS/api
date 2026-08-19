@@ -207,6 +207,14 @@ pub enum WorkJob {
     /// Poll routers to refresh cached tunnel/BGP session/route state and record
     /// per-tunnel traffic samples.
     SyncRouterState,
+    /// Build a short-lived VM on one marketplace node that is due a probe,
+    /// measure what a customer would get, and destroy it.
+    ///
+    /// One node per run rather than the whole fleet: a probe puts real load on
+    /// somebody else's hardware, and a sweep that probed every node at once
+    /// would arrive as a thundering herd on the operators least able to absorb
+    /// it.
+    ProbeMarketplaceNode,
     /// Enable or disable a BGP session on a router (admin action).
     ToggleBgpSession {
         router_id: u64,
@@ -355,6 +363,7 @@ impl fmt::Display for WorkJob {
             WorkJob::ProcessReferralPayouts => write!(f, "ProcessReferralPayouts"),
             WorkJob::SpawnVm { .. } => write!(f, "SpawnVm"),
             WorkJob::SyncRouterState => write!(f, "SyncRouterState"),
+            WorkJob::ProbeMarketplaceNode => write!(f, "ProbeMarketplaceNode"),
             WorkJob::ToggleBgpSession { .. } => write!(f, "ToggleBgpSession"),
             WorkJob::SetRouterDefaultRoute { .. } => write!(f, "SetRouterDefaultRoute"),
             WorkJob::ClearRouterDefaultRoute { .. } => write!(f, "ClearRouterDefaultRoute"),

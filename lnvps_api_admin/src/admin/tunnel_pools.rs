@@ -583,6 +583,9 @@ mod tests {
     const PRIVATE_KEY: &str = "aFq1uZ1B3d1QJHkkRhCsvCPPvTnJvbrMSpEuCbSFbHM=";
 
     async fn db() -> (Arc<dyn LNVpsDb>, u64) {
+        // These tests assert on the text of the errors they provoke, which the
+        // admin binary opts into from `main` — a function no unit test runs.
+        crate::verbose_errors_for_tests();
         let mock = MockDb::default();
         let router_id = {
             let mut routers = mock.router.lock().await;

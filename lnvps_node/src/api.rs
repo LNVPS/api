@@ -73,6 +73,27 @@ impl LnvpsApi {
             .with_context(|| format!("Cannot reach LNVPS at {url}"))?;
         decode(response, &url).await
     }
+
+    /// Present the certificate LNVPS should trust when driving this node's
+    /// libvirtd.
+    ///
+    /// Sent on every apply rather than once. It is cheap and idempotent, and it
+    /// means an LNVPS that lost its per-node trust directory — a fresh
+    /// container, a moved volume — recovers on the next poll instead of leaving
+    /// the node undialable until somebody notices.
+    pub async fn register_libvirt_cert(&self, cert_pem: &str) -> Result<()> {
+        let url = format!("{}/api/v1/node/libvirt", self.base_url);
+        let response = self
+            .http
+            .post(&url)
+            .header("Authorization", &self.authorization)
+            .json(&serde_json::json!({ "cert_pem": cert_pem }))
+            .send()
+            .await
+            .with_context(|| format!("Cannot reach LNVPS at {url}"))?;
+        let _: serde_json::Value = decode(response, &url).await?;
+        Ok(())
+    }
 }
 
 /// Unwrap an LNVPS response, preferring its own error message to the status.

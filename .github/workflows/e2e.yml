@@ -37,7 +37,12 @@ jobs:
             e2e-${{ runner.os }}-cargo-
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler jq
+        # libvirt-dev is not optional here any more: lnvps_e2e depends on
+        # lnvps_api/lnvps_api_common with the `libvirt` feature (the marketplace
+        # host client lives behind it), so the whole e2e binary links libvirt.
+        # Without the headers/library the suite fails at link time with
+        # `undefined symbol: virNWFilterGetUUIDString` and not one test runs.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler jq libvirt-dev pkg-config
 
       - name: Run E2E tests
         env:

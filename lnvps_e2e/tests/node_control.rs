@@ -63,6 +63,7 @@ async fn start_node(control_pubkey: nostr::PublicKey, address: &str) -> Result<N
 
 fn node_row(fingerprint: Vec<u8>) -> MarketplaceNode {
     MarketplaceNode {
+        libvirt_cert: None,
         id: 1,
         operator_id: 1,
         name: "a node".to_string(),

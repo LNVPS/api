@@ -3,7 +3,10 @@ mod contact;
 mod docs;
 mod ip_space;
 mod legal;
-mod marketplace;
+// Public so the e2e harness can carry a node's document across the wire format
+// both ends actually use: serialising this type and parsing the node's is the
+// only thing that proves the two agree.
+pub mod marketplace;
 mod model;
 #[cfg(feature = "nostr-domain")]
 mod nostr_domain;

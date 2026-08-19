@@ -14,6 +14,27 @@ use tokio::net::ToSocketAddrs;
 /// How long a connect/auth attempt may take before it is abandoned.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a single command may run before the channel is abandoned.
+///
+/// Every caller in this workspace runs a short administrative command —
+/// `pvesm path`, `mkdir`, `ssh-keyscan -T 5`, a bounded `dd` — so ten minutes
+/// bounds a hang without changing what any of them do. It has to be a bound
+/// rather than a tight limit: the peer may be a marketplace node, which is
+/// third-party hardware that controls the guest, and one that accepts a channel
+/// and never closes it would otherwise hold this future forever. The worker
+/// runs jobs serially, so "forever" means every other job in the deployment
+/// stops too.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// How much output one command may produce before it is abandoned.
+///
+/// The output of every command here is a path, a status line or a few lines of
+/// JSON. 8 MiB is far past all of them and still bounded, which matters because
+/// the peer chooses how much to send: without a cap a hostile or broken host
+/// can grow this `Vec` until the API process is killed by the OOM killer, and
+/// on a marketplace node the peer is somebody else's machine.
+const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
 /// Session event handler.
 ///
 /// Host keys are accepted unconditionally: hosts are addressed by IP from the
@@ -35,6 +56,33 @@ impl client::Handler for Handler {
 #[derive(Default)]
 pub struct SshClient {
     session: Option<Handle<Handler>>,
+}
+
+/// Generate an ed25519 keypair, returned as OpenSSH text.
+///
+/// Here rather than in the caller because this crate is the one that owns the
+/// SSH dependency: a second place generating keys would be a second place to
+/// pick an algorithm, and the pair has to match what [`SshClient`] can load.
+///
+/// Returns `(private OpenSSH PEM, public authorized_keys line)`.
+pub fn generate_keypair() -> Result<(String, String)> {
+    // `rand::rng()` from rand 0.10, the only generator in this dependency graph
+    // that satisfies ssh-key's bound: the graph carries three versions of
+    // rand_core, ssh-key resolves to 0.10's trait, and 0.10 removed `OsRng` in
+    // favour of this. A mismatch is a compile error rather than a silent
+    // downgrade, which is what to want on the one call in this codebase that
+    // generates a key granting shell access to somebody else's machine.
+    let key = russh::keys::PrivateKey::random(&mut rand_10::rng(), russh::keys::Algorithm::Ed25519)
+        .map_err(|e| anyhow::anyhow!("Key generation failed: {e}"))?;
+
+    Ok((
+        key.to_openssh(russh::keys::ssh_key::LineEnding::LF)
+            .map_err(|e| anyhow::anyhow!("Private key could not be encoded: {e}"))?
+            .to_string(),
+        key.public_key()
+            .to_openssh()
+            .map_err(|e| anyhow::anyhow!("Public key could not be encoded: {e}"))?,
+    ))
 }
 
 impl SshClient {
@@ -134,6 +182,20 @@ impl SshClient {
     }
 
     pub async fn execute(&mut self, command: &str) -> Result<(i32, String)> {
+        // Bounded in both time and size: see COMMAND_TIMEOUT and
+        // MAX_OUTPUT_BYTES. Both are properties of talking to a machine that
+        // may not be ours, so they belong here rather than at each call site.
+        tokio::time::timeout(COMMAND_TIMEOUT, self.execute_unbounded(command))
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "Command did not finish within {}s: {command}",
+                    COMMAND_TIMEOUT.as_secs()
+                )
+            })?
+    }
+
+    async fn execute_unbounded(&mut self, command: &str) -> Result<(i32, String)> {
         info!("Executing command: {}", command);
         let mut channel = self.session()?.channel_open_session().await?;
         channel.exec(true, command).await?;
@@ -152,6 +214,12 @@ impl SshClient {
                 ChannelMsg::ExtendedData { ref data, ext: 1 } => err.extend_from_slice(data),
                 ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status as i32),
                 _ => {}
+            }
+            // Checked as it arrives rather than at the end, because the point
+            // is to stop accumulating rather than to report afterwards that too
+            // much was accumulated.
+            if out.len() + err.len() > MAX_OUTPUT_BYTES {
+                bail!("Command produced more than {MAX_OUTPUT_BYTES} bytes of output: {command}");
             }
         }
 
@@ -215,5 +283,112 @@ impl SshClient {
 
         info!("SFTP upload complete");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Both bounds exist, and are generous enough not to change what any
+    /// existing caller does.
+    ///
+    /// Every command run through this client is a short administrative one — a
+    /// path lookup, a `mkdir`, an `ssh-keyscan -T 5`, a bounded `dd` — so these
+    /// limits are only ever reached by a peer that has stopped behaving. That
+    /// matters because the peer is not always ours: a marketplace node is
+    /// third-party hardware, and one that accepts a channel and never closes it
+    /// would otherwise hang the caller forever and, on the worker, stop every
+    /// other job in the deployment behind it.
+    #[test]
+    fn a_command_is_bounded_in_time_and_size() {
+        // `const` blocks, so a change that breaks one of these fails the build
+        // rather than waiting for the test to be run.
+        const {
+            assert!(
+                COMMAND_TIMEOUT.as_secs() >= 300,
+                "a legitimate slow command must not be cut off"
+            );
+            assert!(
+                COMMAND_TIMEOUT.as_secs() <= 3600,
+                "a bound nobody reaches is not a bound"
+            );
+            assert!(
+                MAX_OUTPUT_BYTES >= 1024 * 1024,
+                "real command output must fit comfortably"
+            );
+            assert!(
+                MAX_OUTPUT_BYTES <= 64 * 1024 * 1024,
+                "a peer must not be able to grow this until the process is killed"
+            );
+        }
+    }
+
+    /// A command on a client that was never connected fails rather than
+    /// waiting out the whole timeout.
+    ///
+    /// The timeout wraps `session()`, so a bug that made this path hang would
+    /// be invisible for ten minutes rather than immediate.
+    #[tokio::test]
+    async fn a_disconnected_client_fails_immediately() {
+        let mut client = SshClient::new();
+        let began = std::time::Instant::now();
+
+        let err = client
+            .execute("true")
+            .await
+            .expect_err("a client with no session cannot run anything");
+
+        assert!(err.to_string().contains("not connected"), "{err}");
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "the error waited on the command timeout instead of being reported"
+        );
+    }
+
+    /// A peer that accepts the connection and then says nothing does not hang
+    /// the caller.
+    ///
+    /// This is the shape of the problem on a marketplace node, which is
+    /// hardware LNVPS does not own: the TCP connect succeeds, so nothing fails
+    /// fast, and without a bound the caller waits forever.
+    ///
+    /// The assertion is that it *finishes* well inside a bound of its own, not
+    /// that it takes the full `CONNECT_TIMEOUT`: waiting out 30s of real time
+    /// would make this the slowest test in the crate to prove a constant that
+    /// is read directly above.
+    #[tokio::test]
+    async fn a_silent_peer_does_not_hang_the_caller() {
+        // Accepts and never speaks, so the SSH handshake cannot complete.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_socket, _) = listener.accept().await.unwrap();
+            // Held open deliberately: dropping the socket would close the
+            // connection and make this a connection error rather than a stall.
+            std::future::pending::<()>().await;
+        });
+
+        // A real key, so the failure is the stalled handshake rather than a
+        // key that could not be parsed.
+        let (private_pem, _) = generate_keypair().unwrap();
+        let mut client = SshClient::new();
+
+        // Bounded by more than CONNECT_TIMEOUT: if the connect is unbounded,
+        // this outer timeout is what fires, and the assertion below fails.
+        let outcome = tokio::time::timeout(
+            CONNECT_TIMEOUT + Duration::from_secs(15),
+            client.connect_with_key(addr, "probe", &private_pem),
+        )
+        .await;
+
+        assert!(
+            outcome.is_ok(),
+            "a stalled handshake was never abandoned; the caller would wait forever"
+        );
+        assert!(
+            outcome.unwrap().is_err(),
+            "a handshake that never completed must not be reported as connected"
+        );
     }
 }

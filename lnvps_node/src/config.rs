@@ -76,7 +76,9 @@ fn default_heartbeat_secs() -> u64 {
 }
 
 fn default_control_port() -> u16 {
-    8890
+    // The filter opens this port on the tunnel interface; a listener anywhere
+    // else is one LNVPS cannot reach.
+    crate::fw::CONTROL_PORT
 }
 
 fn default_tunnel_interface() -> String {

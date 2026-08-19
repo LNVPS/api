@@ -22,6 +22,8 @@ pub mod nip98;
 pub mod onchain;
 mod rbac;
 pub mod soft_authenticator;
+/// A disposable marketplace-node stack on real namespaces.
+pub mod stack;
 mod user_api;
 mod webauthn;
 pub mod worker;

@@ -269,5 +269,46 @@ async fn apply_dataplane(
     if !applied.is_empty() {
         log::debug!("Applied data plane: {}", applied.join("; "));
     }
+
+    // After the data plane, never before: libvirtd binds the tunnel address and
+    // its unit names the namespace, so both have to exist first.
+    if let Some(want) = &desired.libvirt
+        && let Err(e) = apply_libvirt(config, &api, want).await
+    {
+        // Not fatal. A node whose network is up still carries the guests it
+        // already has; refusing to continue would take them down over a
+        // hypervisor LNVPS may not even be placing VMs on yet.
+        log::error!("Could not configure libvirt: {e}");
+    }
     Ok(())
+}
+
+/// Configure and run the libvirtd LNVPS drives, and tell LNVPS what to trust.
+async fn apply_libvirt(
+    config: &NodeConfig,
+    api: &lnvps_node::api::LnvpsApi,
+    want: &lnvps_node::net::DesiredLibvirt,
+) -> Result<()> {
+    use lnvps_node::libvirt;
+
+    let listen = want
+        .listen
+        .parse()
+        .with_context(|| format!("LNVPS asked libvirt to listen on {}", want.listen))?;
+    let paths = libvirt::Paths::new(&config.state_dir);
+    let identity = libvirt::load_or_generate_identity(&paths, listen)?;
+
+    let params = libvirt::Params {
+        listen,
+        ca_pem: want.ca_pem.clone(),
+        allowed_dn: want.allowed_dn.clone(),
+    };
+    let changed = libvirt::apply(&paths, &params, &identity)?;
+    libvirt::ensure_running(&paths, changed)?;
+
+    // The CA rather than the leaf: LNVPS verifies a chain, and the leaf is
+    // reissued whenever the tunnel address moves. Last of all, because a
+    // certificate LNVPS trusts for a libvirtd that is not running is a node it
+    // will try to place VMs on and fail.
+    api.register_libvirt_cert(&identity.ca_pem).await
 }

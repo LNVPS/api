@@ -1,0 +1,28 @@
+-- The certificate LNVPS trusts when it drives this node's libvirtd.
+--
+-- LNVPS manages a marketplace node's VMs by talking to a libvirtd on the node
+-- over the tunnel. That connection is TLS in both directions: the node accepts
+-- only LNVPS's client certificate, and LNVPS verifies the node's server
+-- certificate against this value.
+--
+-- The whole certificate rather than a fingerprint, unlike `tls_fingerprint`
+-- above. The two columns look redundant and are not: the control API is dialled
+-- by our own HTTP client, which can compare a hash of the presented certificate
+-- and be done. libvirt's client verifies a *chain* against a CA file, which
+-- means it needs the certificate itself. Storing a hash here would leave nothing
+-- to write into that file.
+--
+-- The node self-signs it CA-capable so it can be its own trust anchor. The
+-- alternative — LNVPS running a CA that signs every node's server certificate —
+-- is a private key to hold and a rotation to run across the fleet, for a
+-- guarantee we already have: the node registers this over an authenticated
+-- connection, and an operator who swaps it swaps only their own node's identity.
+--
+-- TEXT because it is PEM, and PEM is what libvirt's `ca_file` reads. Storing DER
+-- would mean re-encoding it on every connection for no gain.
+--
+-- NULL until the node's daemon has a tunnel address to name in the certificate:
+-- one that does not name the address it is served on is refused by libvirt's
+-- client, so there is nothing useful to store before then.
+ALTER TABLE marketplace_node
+    ADD COLUMN libvirt_cert TEXT NULL DEFAULT NULL;

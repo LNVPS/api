@@ -1021,17 +1021,135 @@ for the guest, on the same address it would have had.
   competes for the port. An operator who changes it makes their own node unreachable, which the
   gate reports as unreachable — self-correcting, and cheaper than a column.
 
-##### 4c3b — The gate itself (M/L)
-- A probe address is taken from a real customer range in the node's region, sent to the node as
-  a guest, and pinged from the route server. That is the production path exactly: a VM's address
-  is statically routed from the core network to the node's `wgln0`, forwarded over `br-lnvps`
-  to the guest, and answered back out the node's default route — while the guest itself routes
-  to the core router's address, which the node holds on the bridge and answers for by proxy ARP.
-  A probe on any other address would test a path no customer takes.
-- Only then is the host enabled.
-- Failure leaves the node approved but unusable, with the failing step named. That is the safe
-  direction: a node that never carries a customer is a support conversation, a node that
-  carries one badly is an outage.
+##### 4c3b — Reachability gate (built, rejected, not landed)
+Written and closed unmerged (#369). It took an address from a customer range, had the node hold
+it on the bridge, and pinged it from the route server. That proves the tunnel handshook, the
+route server routes and admits the address, the node's bridge route and filter binding exist,
+forwarding is on, and proxy ARP answers.
+
+It does not prove the node can build and run a VM, which is the first thing a customer touches —
+so it was a data-plane reachability check wearing the health gate's name. It also spent an IPv4
+address per run, on the platform's scarcest resource, to check the cheapest of the properties
+worth checking.
+
+##### 4c3c — Probe VMs (L, blocked on the node VM lifecycle)
+A probe is a **real VM**, built by the node through exactly the path a customer's VM takes, run
+for a few minutes, measured over SSH, and destroyed. It looks like a regular VM to the node
+because it is one — which means the probe tests provisioning, the thing a customer hits first
+and the thing a ping says nothing about.
+
+- **IPv6 only.** There is plenty of it and none to spare of v4, and a node that cannot carry a
+  v6 guest cannot carry a dual-stack one either.
+- **Nothing about a probe VM is stored.** It lives in LNVPS's memory and in the node's desired
+  state, nowhere else. That is the failure model, not a shortcut: if the API restarts mid-probe
+  the VM is simply absent from the next document the node fetches, and the node tears it down as
+  it would any guest LNVPS no longer lists. A row in a table would need a reaper, and a reaper
+  is another thing that can fail — leaving somebody's hardware running our VM indefinitely.
+- **Chosen at random, when a node polls.** The node already fetches its data plane on a timer;
+  LNVPS decides on that request whether this is a node worth looking at. No scheduler, no push,
+  no queue. A fleet-wide cap keeps a large fleet from spawning a hundred probes at once, and a
+  per-node cooldown keeps anyone's hardware from running our VMs continuously.
+- **Built from the region's cheapest sellable template and an existing image**, so a probe runs
+  the same artefacts a customer would get and proves those work on this node — rather than a
+  bespoke image that only proves the bespoke image works. The cost is that node A may be
+  measured at 1 GB and node B at 4 GB, so the **shape and image are recorded with every result**
+  and the measurements normalised where they can be (MB/s, MB/s per GB). A raw number with no
+  shape beside it is not a series anybody can read.
+- **Measured over SSH**, with an ephemeral keypair generated per probe and never stored:
+  - **login works at all** — the customer-visible failure a reachability check misses;
+  - **memory actually allocates and is touched** — a node selling 8 GB that pages at 3 is the
+    most profitable lie an operator can tell, and asking for the memory is the only way to catch
+    it;
+  - **disk read and write speed** — the second most profitable lie;
+  - **time from asked to answering**, which is what a customer experiences as provisioning.
+- **Results stored as a series** (`marketplace_node_health`), not a latest verdict: one bad run
+  is a bad afternoon, a trend is a node to suspend, and the trust tier and SLA accounting in
+  increment 12 both want the history.
+
+**Blocked on:** the node cannot build a VM. Its document describes addresses, not machines
+(`ApiNodeGuest` is an address, a gateway and a MAC), and `get_host_client` has no arm for
+`VmHostKind::MarketplaceNode`. That is increment 5 either way, and doing it first means LNVPS's
+own probes exercise the provisioning path before a customer is the first VM a node ever builds.
+
+### Increment 4d — VMs on a marketplace node, over the tunnel (L) ✅ **done**
+
+The node stays dumb. It brings up the tunnel, the data plane and the firewall — and runs a
+**libvirtd that LNVPS drives directly** over the tunnel with the existing `LibVirtHost` client.
+No VM document, no node-side reconciler, no marketplace host client: `get_host_client` gains an
+arm and every existing worker flow works, because a marketplace node becomes just another
+libvirt host.
+
+Two facts from the code decide the shape, and neither is optional:
+
+- **libvirtd's network namespace decides where VM taps land.** Guests have to be on `br-lnvps`
+  inside `/run/netns/lnvps`; a libvirtd in the machine's own namespace creates taps where that
+  bridge does not exist. So libvirtd must run *inside* the namespace — which is why it is a
+  **dedicated instance** (`lnvps-libvirtd`, its own config, socket and unit with
+  `NetworkNamespacePath=`) rather than the machine's. Moving the operator's libvirtd into our
+  namespace would take the networking off every VM they already run, and would hand LNVPS
+  control of their domains; a separate instance means LNVPS sees only its own.
+- **Guests can reach the node's tunnel address.** They are on `br-lnvps`, which is in the same
+  namespace as `wgln0`. The nft input chain drops everything from the bridge except ICMP, but
+  a listener there means one firewall regression would hand a customer VM control of the node
+  and every other customer on it. Hence **TLS client certificates**: a guest that gets past the
+  filter still cannot authenticate.
+
+#### The PKI
+- The node generates a libvirt server key and certificate, and **registers the certificate**
+  with LNVPS. LNVPS already pins the node's control certificate by fingerprint; this is the same
+  idea for the other direction, except the *certificate* is needed rather than a hash, because
+  libvirt verifies a chain rather than a pin.
+- LNVPS holds one **client certificate** for the fleet, signed by an LNVPS CA. The node is sent
+  that CA in its data-plane document — it is public, and the document is already authenticated,
+  so there is nothing to distribute out of band and nothing compiled into the binary that a
+  rotation would strand.
+- LNVPS connects with `qemu+tls://<tunnel address>/system?pkipath=…`, materialising a per-node
+  directory from the certificate the node registered. `no_verify` is never used: the whole point
+  is that the machine answering is the node LNVPS registered.
+
+#### What landed
+- `lnvps_node/src/libvirt.rs` — the dedicated instance: identity, `libvirtd.conf`, `qemu.conf`,
+  the systemd unit with both namespaces, and `systemctl` handling. 16 tests.
+- `lnvps_api_common/src/host/marketplace_pki.rs` — per-node trust directories and the connection
+  URI. 7 tests.
+- `MarketplaceLibvirtConfig` on `ProvisionerConfig`; `VmHostKind::MarketplaceNode` arm in
+  `get_host_client`, which refuses a node that has not registered a certificate.
+- `POST /api/v1/node/libvirt` (node token) and `libvirt{}` in the data-plane document.
+- `marketplace_node.libvirt_cert` (migration `20260812120000`).
+
+#### What only a real run found
+
+The design survived review, unit tests and a full workspace suite. Starting an actual libvirtd
+found five things, three of them in code that had already merged:
+
+1. **Two system libvirtds cannot share `/var/lib/libvirt`.** The dedicated instance needs a
+   private *mount* namespace as well as the network one. That in turn made `virtlogd` unreachable
+   (its socket lives in `/run/libvirt`, which we replace), so the instance writes logs directly.
+2. **The pid file.** libvirtd defaults to `/run/libvirtd.pid` — in `/run`, which we do *not*
+   replace — so the operator's daemon holds the lock and ours refuses to start, naming a path
+   neither appears to configure.
+3. **libvirt will not serve a CA certificate as its own leaf** ("basic constraints show a CA, but
+   we need one for a server"). The original design — one self-signed, CA-capable certificate, so
+   LNVPS could pin it directly — was unstartable. The node now roots a one-certificate chain.
+4. **Both ends validate the certificate they present against the file they verify the peer with.**
+   Each side's trust file therefore carries two CAs, and each error names the complainant's own
+   certificate rather than anything about the peer, which is why it bit once per side.
+5. **The node's filter accepted only ICMP.** Every TCP call LNVPS makes to a node was dropped —
+   the libvirt connection and the **control API** alike. A node in that state pings, handshakes,
+   reports itself healthy and answers nothing, and it had been that way since 4c2 landed.
+
+The last one is the lesson worth keeping: 4c2 and 4c3a each shipped with tests that asserted the
+right ruleset and the right client, and the combination was inert. Nothing asserted a packet.
+
+#### Work
+- **Node**: generate and persist the libvirt identity; present it at registration; write
+  `libvirtd.conf` (listen on the tunnel address only, `tls_allowed_dn_list` naming LNVPS's client
+  DN) and a systemd unit with `NetworkNamespacePath=/run/netns/lnvps`; keep it running and
+  report it in `/status`. Storage pool comes from the node's own config — LNVPS does not know
+  what storage the machine has.
+- **LNVPS**: store the node's libvirt certificate; settings for the client certificate, key and
+  CA; materialise `pkipath` per node; `get_host_client` arm for `VmHostKind::MarketplaceNode`.
+- **Then**: probe VMs (4c3c) are just VMs LNVPS creates and deletes through that client.
 
 ### Increment 5 — Confidential computing: attestation + encrypted disks (L)
 - Verify SEV-SNP attestation reports (`sev` crate) / TDX quotes (`dcap-qvl` crate) against

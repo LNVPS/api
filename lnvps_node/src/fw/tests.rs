@@ -87,6 +87,7 @@ impl FirewallOps for FakeFirewall {
 
 fn desired(guests: Vec<DesiredGuest>) -> DesiredDataPlane {
     DesiredDataPlane {
+        libvirt: None,
         tunnel: DesiredTunnel {
             address4: Some("10.66.0.2/32".to_string()),
             address6: None,

@@ -41,7 +41,7 @@ pub const NAMESPACE: &str = "lnvps";
 
 /// Where namespaces are pinned, matching iproute2 so `ip netns exec lnvps …`
 /// works for an operator debugging their machine.
-const NETNS_DIR: &str = "/run/netns";
+pub const NETNS_DIR: &str = "/run/netns";
 
 /// The pinned path for a namespace.
 pub fn path(root: &Path, name: &str) -> PathBuf {
