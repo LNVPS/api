@@ -385,7 +385,7 @@ where
 }
 
 impl ProbeResult {
-    fn failed(why: String) -> Self {
+    pub(super) fn failed(why: String) -> Self {
         Self {
             failure: Some(why),
             ..Default::default()
@@ -403,6 +403,30 @@ pub async fn record(
     db.insert_marketplace_node_health(&result.into_health(node_id, spec))
         .await
         .context("recording the probe result")?;
+    Ok(())
+}
+
+/// Record a probe that never got as far as having a shape.
+///
+/// A node with no tunnel, no address, or a region with no template cannot be
+/// specified, so there is nothing to denormalise into the shape columns — they
+/// stay zero, which is honest: nothing was measured, and `passed` is false.
+/// Written down anyway, because the alternative was writing nothing, and a node
+/// with no rows is indistinguishable from a node nobody probed. It is also what
+/// starts the cooldown that stops this node monopolising every sweep.
+pub async fn record_unspecified(
+    db: &Arc<dyn LNVpsDb>,
+    node_id: u64,
+    result: ProbeResult,
+) -> Result<()> {
+    db.insert_marketplace_node_health(&MarketplaceNodeHealth {
+        node_id,
+        passed: result.passed(),
+        failure: result.failure,
+        ..Default::default()
+    })
+    .await
+    .context("recording an unspecifiable probe")?;
     Ok(())
 }
 

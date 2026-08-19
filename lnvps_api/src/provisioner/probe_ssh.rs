@@ -258,7 +258,21 @@ pub async fn run_probe(
     node: &lnvps_db::MarketplaceNode,
 ) -> Result<ProbeResult> {
     let key = ProbeKey::generate()?;
-    let spec = super::ProbeSpec::build(db, node, key.public_openssh.clone()).await?;
+    let spec = match super::ProbeSpec::build(db, node, key.public_openssh.clone()).await {
+        Ok(spec) => spec,
+        // A node that cannot even be specified is a finding, not an error to
+        // throw away. Returning `Err` here wrote no row, so the cooldown never
+        // started and this node — sorted first, as one never successfully
+        // probed — was picked again on the next sweep and every sweep after,
+        // and no other node in the fleet was ever probed. It is also the
+        // question an admin will actually ask about a node that never comes
+        // into service: nothing said why.
+        Err(e) => {
+            let result = ProbeResult::failed(format!("the probe could not be specified: {e}"));
+            super::record_unspecified(db, node.id, result.clone()).await?;
+            return Ok(result);
+        }
+    };
     // The image's own default user. A probe that assumed root would fail on
     // every image that disables it, which is most of them, and would look like
     // a broken node.
