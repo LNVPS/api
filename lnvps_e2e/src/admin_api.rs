@@ -4051,4 +4051,174 @@ mod tests {
             .unwrap();
         assert_ne!(resp.status(), StatusCode::OK);
     }
+
+    // ========================================================================
+    // Support agent conversations
+    // ========================================================================
+
+    /// Seed a thread with two messages and return `(conversation_id, user_id)`.
+    ///
+    /// Written straight to the tables rather than through the agent, so the test
+    /// does not need an LLM to produce a transcript.
+    async fn seed_conversation(pool: &sqlx::MySqlPool, key: &str, user_id: Option<u64>) -> u64 {
+        sqlx::query("INSERT INTO agent_conversation (conversation_key, user_id) VALUES (?, ?)")
+            .bind(key)
+            .bind(user_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let (id,): (u64,) =
+            sqlx::query_as("SELECT id FROM agent_conversation WHERE conversation_key = ?")
+                .bind(key)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+
+        // role 0 = User, 1 = Assistant; channel 0 = Email. Content is stored
+        // encrypted by the app, but a plaintext value round-trips through
+        // EncryptedString's decode path, which is all this test needs.
+        for (role, content) in [(0, "my vm is down"), (1, "looking now")] {
+            sqlx::query(
+                "INSERT INTO agent_message (conversation_id, role, channel, content) \
+                 VALUES (?, ?, 0, ?)",
+            )
+            .bind(id)
+            .bind(role)
+            .bind(content)
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+        id
+    }
+
+    /// The listing's counters come from an aggregate, and `COUNT(*)` is a signed
+    /// `BIGINT` in MariaDB while the field decodes as `u64` — a mismatch that
+    /// only appears against a real database, never against the mock. This test
+    /// exists because that shipped.
+    #[tokio::test]
+    async fn test_admin_agent_conversations_list_and_counters() {
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+        let keys = nostr::Keys::generate();
+        let uid = crate::db::ensure_user(&pool, &keys).await.unwrap();
+        let id = seed_conversation(&pool, &format!("user:{uid}"), Some(uid)).await;
+
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/agent/conversations?user_id={uid}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+
+        assert_eq!(body["total"], 1);
+        let row = &body["data"][0];
+        assert_eq!(row["id"], id);
+        assert_eq!(row["kind"], "user");
+        assert_eq!(row["message_count"], 2);
+        assert!(!row["last_message_at"].is_null());
+
+        // The by-id read runs the same aggregate select and must decode too.
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/agent/conversations/{id}"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"]["message_count"], 2);
+
+        pool.close().await;
+    }
+
+    /// The transcript reads oldest first with content decrypted.
+    #[tokio::test]
+    async fn test_admin_agent_conversation_messages() {
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+        let id = seed_conversation(&pool, "email:transcript@example.com", None).await;
+
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/agent/conversations/{id}/messages"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+
+        assert_eq!(body["total"], 2);
+        assert_eq!(body["data"][0]["role"], "user");
+        assert_eq!(body["data"][0]["content"], "my vm is down");
+        assert_eq!(body["data"][0]["compacted"], false);
+        assert_eq!(body["data"][1]["role"], "assistant");
+
+        pool.close().await;
+    }
+
+    /// Rewriting memory must persist, must not touch the transcript, and must
+    /// refuse a watermark past the end of the log.
+    #[tokio::test]
+    async fn test_admin_agent_conversation_memory() {
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+        let id = seed_conversation(&pool, "pubkey:deadbeef", None).await;
+        let (max_id,): (u64,) = sqlx::query_as(
+            "SELECT CAST(MAX(id) AS UNSIGNED) FROM agent_message WHERE conversation_id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/agent/conversations/{id}"),
+                &serde_json::json!({ "summary": "vm outage, resolved", "compacted_upto": max_id }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"]["summary"], "vm outage, resolved");
+        assert_eq!(body["data"]["compacted_upto"], max_id);
+        assert_eq!(
+            body["data"]["message_count"], 2,
+            "rewriting memory must not touch the transcript"
+        );
+
+        // Clearing the summary is the safe reset and leaves the watermark.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/agent/conversations/{id}"),
+                &serde_json::json!({ "summary": null }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert!(body["data"]["summary"].is_null());
+        assert_eq!(body["data"]["compacted_upto"], max_id);
+
+        // Past the end of the log: rejected, or every later message would be
+        // suppressed and the agent left blind to the thread.
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/agent/conversations/{id}"),
+                &serde_json::json!({ "compacted_upto": max_id + 1000 }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        pool.close().await;
+    }
+
+    /// An unknown conversation is a 404, not an empty page.
+    #[tokio::test]
+    async fn test_admin_agent_conversation_not_found() {
+        let client = setup().await;
+        let resp = client
+            .get_auth("/api/admin/v1/agent/conversations/999999/messages")
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK);
+    }
 }

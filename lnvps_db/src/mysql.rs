@@ -27,7 +27,7 @@ use sqlx::{Executor, MySqlPool, QueryBuilder, Row};
 /// The counters come from a grouped subquery rather than a correlated one so a
 /// page costs a single aggregate pass instead of one per row.
 const AGENT_CONVERSATION_OVERVIEW_SELECT: &str = r#"select c.*,
-          coalesce(m.message_count, 0) as message_count,
+          cast(coalesce(m.message_count, 0) as unsigned) as message_count,
           m.last_message_at
      from agent_conversation c
      left join (
@@ -2180,9 +2180,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn max_agent_message_id(&self, conversation_id: u64) -> DbResult<u64> {
         // `coalesce` so a conversation with no messages answers 0 rather than
-        // failing to decode a NULL max().
+        // failing to decode a NULL max(), and `cast` so the result is
+        // BIGINT UNSIGNED: an aggregate over an unsigned column still comes back
+        // signed once coalesced with a literal, which will not decode into u64.
         let max: u64 =
-            sqlx::query("select coalesce(max(id), 0) from agent_message where conversation_id=?")
+            sqlx::query(
+                "select cast(coalesce(max(id), 0) as unsigned) from agent_message where conversation_id=?",
+            )
                 .bind(conversation_id)
                 .fetch_one(&self.db)
                 .await?
