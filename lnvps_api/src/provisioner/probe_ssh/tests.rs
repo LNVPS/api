@@ -162,3 +162,24 @@ async fn a_slow_build_does_not_eat_the_login_window() {
         "the probe gave up without waiting for the guest at all"
     );
 }
+
+/// A probe is bounded end to end, and by more than the sum of the parts it
+/// already bounds.
+///
+/// The worker runs jobs one at a time, so a probe that hangs stops `CheckVms`,
+/// `CheckSubscriptions`, provisioning and everything else in the deployment —
+/// on the say-so of third-party hardware that controls both ends of the
+/// connection. The margin over the login window matters too: a slow node has to
+/// come back as a slow measurement, which is the finding, rather than as a
+/// timeout with no numbers in it.
+#[test]
+fn a_probe_cannot_run_forever() {
+    assert!(
+        PROBE_TIMEOUT > LOGIN_TIMEOUT,
+        "a node that logs in at the last moment would be cut off before it was measured"
+    );
+    assert!(
+        PROBE_TIMEOUT >= Duration::from_secs(600),
+        "a probe must have room to build a VM on a cold node"
+    );
+}

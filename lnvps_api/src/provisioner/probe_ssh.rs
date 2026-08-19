@@ -47,6 +47,17 @@ const SSH_PORT: u16 = 22;
 /// small enough that a probe never fills a template's disk.
 const DISK_MB: u64 = 256;
 
+/// The longest a whole probe may take, from generating the key to the VM being
+/// destroyed.
+///
+/// Comfortably more than the sum of its parts — a 300s login window plus a few
+/// bounded commands — so a merely slow node is still measured and recorded
+/// rather than reported as a timeout, which is the finding this exists to
+/// produce. It bounds the parts that no per-command timeout covers: building
+/// the VM on the node, and the node's own delete. The worker runs jobs
+/// serially, so an unbounded probe stops every other job in the deployment.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(900);
+
 /// An ephemeral keypair, generated per probe and dropped with it.
 ///
 /// A long-lived key that opened a shell on every operator's node would be the
@@ -253,6 +264,28 @@ mod tests;
 /// probed unless the failures are written down — and the first thing anybody
 /// will ask about a suspended node is what it did before.
 pub async fn run_probe(
+    db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+    cfg: &lnvps_api_common::host::config::ProvisionerConfig,
+    node: &lnvps_db::MarketplaceNode,
+) -> Result<ProbeResult> {
+    match tokio::time::timeout(PROBE_TIMEOUT, run_probe_unbounded(db, cfg, node)).await {
+        Ok(result) => result,
+        // The probe future is dropped here, which is what destroys the VM:
+        // `with_probe_vm`'s guard runs on drop precisely so a timeout does not
+        // leave an LNVPS VM on an operator's machine. The timeout itself is a
+        // finding, so it is recorded like any other failure.
+        Err(_) => {
+            let result = ProbeResult::failed(format!(
+                "the probe did not finish within {}s",
+                PROBE_TIMEOUT.as_secs()
+            ));
+            super::record_unspecified(db, node.id, result.clone()).await?;
+            Ok(result)
+        }
+    }
+}
+
+async fn run_probe_unbounded(
     db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
     cfg: &lnvps_api_common::host::config::ProvisionerConfig,
     node: &lnvps_db::MarketplaceNode,
