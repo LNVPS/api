@@ -17,6 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use lnvps_fw_common::SNI_MAX_BLOCKS;
+
 use crate::geoip::{GeoInfo, GeoIp};
 use axum::extract::DefaultBodyLimit;
 use axum::extract::{ConnectInfo, Query, State};
@@ -86,6 +88,74 @@ impl CidrKey {
 
 // --- Wire types ---
 
+/// One hostname on the operator TLS-SNI egress blocklist. Guest ClientHellos
+/// naming this server are dropped on the VM-facing hook, which is the only
+/// enforcement point a root-controlled guest cannot bypass (an IP block is
+/// useless behind a CDN, and a DNS sinkhole is bypassed by a custom resolver).
+///
+/// Matching is **exact**: blocking `example.com` does not block
+/// `www.example.com`. Add each name you mean to stop.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SniBlock {
+    /// Canonical (lower-case) hostname, as it appears in the ClientHello SNI.
+    pub sni: String,
+    /// Free-form operator note (e.g. an abuse-incident reference).
+    #[serde(default)]
+    pub label: String,
+}
+
+/// An SNI block plus its live datapath drop counter, for `GET /sni-blocks`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SniBlockInfo {
+    pub sni: String,
+    pub label: String,
+    /// The 64-bit FNV-1a hash this name is keyed by in the BPF map, hex.
+    /// Rendered as a string because a u64 does not survive a JSON number in a
+    /// browser (2^53 precision).
+    pub hash: String,
+    /// ClientHellos dropped for this name since the daemon started (or since
+    /// the block was added, whichever is later).
+    pub drops: u64,
+}
+
+/// Canonicalise and validate a hostname for the SNI blocklist: trims, lowers
+/// case (SNI is case-insensitive, and the datapath hashes case-folded), and
+/// strips one trailing root dot. Returns `None` for anything that is not a
+/// plain DNS name — in particular a wildcard, which would silently never match
+/// because the datapath compares exact hashes.
+pub fn parse_sni(s: &str) -> Option<String> {
+    let host = s.trim().trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() || host.len() > 253 {
+        return None;
+    }
+    let label_ok = |l: &str| {
+        !l.is_empty()
+            && l.len() <= 63
+            && !l.starts_with('-')
+            && !l.ends_with('-')
+            && l.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    };
+    host.split('.').all(label_ok).then_some(host)
+}
+
+/// Join the configured blocklist with the datapath drop counters (keyed by
+/// hash) for the `GET /sni-blocks` view.
+pub fn sni_block_infos(blocks: &[SniBlock], drops: &HashMap<u64, u64>) -> Vec<SniBlockInfo> {
+    blocks
+        .iter()
+        .map(|b| {
+            let hash = lnvps_fw_common::sni_hash(&b.sni);
+            SniBlockInfo {
+                sni: b.sni.clone(),
+                label: b.label.clone(),
+                hash: format!("{hash:016x}"),
+                drops: drops.get(&hash).copied().unwrap_or(0),
+            }
+        })
+        .collect()
+}
+
 /// A manual mitigation override pushed by an operator / `lnvps_api`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Override {
@@ -105,6 +175,9 @@ pub struct RuleSet {
     pub overrides: Vec<Override>,
     /// Manual source-CIDR blocks (drop an attacker range).
     pub source_blocks: Vec<String>,
+    /// TLS-SNI egress blocklist (drop guest ClientHellos naming these servers).
+    /// Seeded from `sni-blocks` in the local config at startup.
+    pub sni_blocks: Vec<SniBlock>,
 }
 
 /// One currently-active mitigation, reported in the status snapshot. Carries
@@ -552,6 +625,8 @@ pub struct SharedState {
     blocks: RwLock<Vec<SourceBlock>>,
     sources: RwLock<Vec<TrackedSource>>,
     ports: RwLock<Vec<LearnedPort>>,
+    /// SNI blocklist snapshot with live drop counters (published by the loop).
+    sni: RwLock<Vec<SniBlockInfo>>,
     totals: RwLock<Totals>,
     limits: RwLock<Limits>,
     upgrade: RwLock<crate::upgrade::UpgradeStatus>,
@@ -603,6 +678,7 @@ impl SharedState {
             blocks: RwLock::new(Vec::new()),
             sources: RwLock::new(Vec::new()),
             ports: RwLock::new(Vec::new()),
+            sni: RwLock::new(Vec::new()),
             totals: RwLock::new(Totals::default()),
             limits: RwLock::new(Limits::default()),
             upgrade: RwLock::new(crate::upgrade::UpgradeStatus::default()),
@@ -678,6 +754,11 @@ impl SharedState {
     /// Replace the learned-open-ports snapshot (called by the control loop).
     pub fn set_ports(&self, ports: Vec<LearnedPort>) {
         *self.ports.write().unwrap() = ports;
+    }
+
+    /// Replace the SNI-blocklist snapshot + drop counters (control loop).
+    pub fn set_sni_blocks(&self, sni: Vec<SniBlockInfo>) {
+        *self.sni.write().unwrap() = sni;
     }
 
     /// Replace the live tracked-IP rate snapshot (called by the control loop).
@@ -807,6 +888,12 @@ pub fn router(state: Arc<SharedState>) -> Router {
         .route(
             "/api/v1/blocks",
             get(get_blocks).post(post_block).delete(delete_block),
+        )
+        .route(
+            "/api/v1/sni-blocks",
+            get(get_sni_blocks)
+                .post(post_sni_block)
+                .delete(delete_sni_block),
         )
         .route("/api/v1/sources", get(get_sources))
         .route("/api/v1/origins", get(get_origins))
@@ -1117,6 +1204,76 @@ async fn get_limits(State(state): State<Arc<SharedState>>) -> Json<Limits> {
     Json(*state.limits.read().unwrap())
 }
 
+/// `GET /api/v1/sni-blocks` — the TLS-SNI egress blocklist with each entry's
+/// live drop counter (the abuse workflow's confirmation that a block is
+/// biting). The entries always come from the current ruleset, so a block added
+/// a moment ago is listed immediately (with 0 drops) rather than waiting for
+/// the control loop's next publish; only the counters come from the snapshot.
+async fn get_sni_blocks(State(state): State<Arc<SharedState>>) -> Json<Vec<SniBlockInfo>> {
+    let drops: HashMap<u64, u64> = state
+        .sni
+        .read()
+        .unwrap()
+        .iter()
+        .filter_map(|i| u64::from_str_radix(&i.hash, 16).ok().map(|h| (h, i.drops)))
+        .collect();
+    let blocks = state.rules.read().unwrap().sni_blocks.clone();
+    Json(sni_block_infos(&blocks, &drops))
+}
+
+/// `POST /api/v1/sni-blocks` — add (or relabel) a blocked server name. Applied
+/// to the datapath by the control loop on its next tick; no restart needed.
+async fn post_sni_block(
+    State(state): State<Arc<SharedState>>,
+    Json(mut b): Json<SniBlock>,
+) -> Response {
+    match parse_sni(&b.sni) {
+        Some(s) => b.sni = s,
+        None => return (StatusCode::BAD_REQUEST, format!("bad sni: {}", b.sni)).into_response(),
+    }
+    {
+        let mut rules = state.rules.write().unwrap();
+        if rules.sni_blocks.len() >= SNI_MAX_BLOCKS
+            && !rules.sni_blocks.iter().any(|e| e.sni == b.sni)
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("sni blocklist full (max {SNI_MAX_BLOCKS})"),
+            )
+                .into_response();
+        }
+        rules.sni_blocks.retain(|e| e.sni != b.sni);
+        rules.sni_blocks.push(b);
+    }
+    state.bump_rules();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct SniQuery {
+    sni: String,
+}
+
+/// `DELETE /api/v1/sni-blocks?sni=<host>` — lift a block (404 if not present).
+async fn delete_sni_block(
+    State(state): State<Arc<SharedState>>,
+    Query(q): Query<SniQuery>,
+) -> Response {
+    let sni = parse_sni(&q.sni).unwrap_or(q.sni);
+    let removed = {
+        let mut rules = state.rules.write().unwrap();
+        let before = rules.sni_blocks.len();
+        rules.sni_blocks.retain(|e| e.sni != sni);
+        before != rules.sni_blocks.len()
+    };
+    if removed {
+        state.bump_rules();
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        StatusCode::NOT_FOUND.into_response()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct UpgradeQuery {
     /// `?check=1` forces a fresh GitHub release check now (bypassing the cached
@@ -1248,6 +1405,21 @@ async fn put_rules(
                     format!("bad source-block cidr: {c}"),
                 )
                     .into_response();
+            }
+        }
+    }
+    if new_rules.sni_blocks.len() > SNI_MAX_BLOCKS {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("too many sni blocks (max {SNI_MAX_BLOCKS})"),
+        )
+            .into_response();
+    }
+    for b in &mut new_rules.sni_blocks {
+        match parse_sni(&b.sni) {
+            Some(s) => b.sni = s,
+            None => {
+                return (StatusCode::BAD_REQUEST, format!("bad sni: {}", b.sni)).into_response();
             }
         }
     }
@@ -1515,6 +1687,63 @@ mod tests {
             parse_cidr("2001:db8::1/48").unwrap().to_cidr_string(),
             "2001:db8::/48"
         );
+    }
+
+    #[test]
+    fn parse_sni_canonicalises_and_rejects_non_hostnames() {
+        // Case-folded, trimmed, trailing root dot stripped.
+        assert_eq!(
+            parse_sni("  EmailManager.PRO. ").as_deref(),
+            Some("emailmanager.pro")
+        );
+        assert_eq!(parse_sni("a_b-1.example").as_deref(), Some("a_b-1.example"));
+        // A bare host (no dot) is still a legal SNI.
+        assert_eq!(parse_sni("localhost").as_deref(), Some("localhost"));
+        // Wildcards would silently never match the exact-hash datapath.
+        assert!(parse_sni("*.example.com").is_none());
+        // Not hostnames: empty, URLs, ports, spaces, empty labels.
+        assert!(parse_sni("").is_none());
+        assert!(parse_sni("   ").is_none());
+        assert!(parse_sni("https://example.com").is_none());
+        assert!(parse_sni("example.com:443").is_none());
+        assert!(parse_sni("exa mple.com").is_none());
+        assert!(parse_sni("a..b").is_none());
+        assert!(parse_sni("-lead.example").is_none());
+        assert!(parse_sni("trail-.example").is_none());
+        // Length bounds: 63-byte label ok, 64 rejected; >253 total rejected.
+        let l63 = "a".repeat(63);
+        assert!(parse_sni(&format!("{l63}.example")).is_some());
+        assert!(parse_sni(&format!("{}.example", "a".repeat(64))).is_none());
+        assert!(parse_sni(&vec![l63; 4].join(".")).is_none());
+    }
+
+    #[test]
+    fn sni_block_infos_joins_drop_counters_by_hash() {
+        let blocks = vec![
+            SniBlock {
+                sni: "emailmanager.pro".into(),
+                label: "C2".into(),
+            },
+            SniBlock {
+                sni: "quiet.example".into(),
+                label: String::new(),
+            },
+        ];
+        let mut drops = HashMap::new();
+        drops.insert(lnvps_fw_common::sni_hash("emailmanager.pro"), 7);
+        let out = sni_block_infos(&blocks, &drops);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].sni, "emailmanager.pro");
+        assert_eq!(out[0].label, "C2");
+        assert_eq!(out[0].drops, 7);
+        // The hex hash round-trips back to the map key.
+        assert_eq!(
+            u64::from_str_radix(&out[0].hash, 16).unwrap(),
+            lnvps_fw_common::sni_hash("emailmanager.pro")
+        );
+        // A block that has never fired reports 0 rather than being dropped.
+        assert_eq!(out[1].sni, "quiet.example");
+        assert_eq!(out[1].drops, 0);
     }
 
     #[test]

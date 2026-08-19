@@ -127,7 +127,11 @@ pub struct GlobalConfig {
     /// port filter so open ports can still be learned while mitigating. `0`
     /// disables the leak.
     pub learn_leak_pps: u32,
-    pub _pad: u32,
+    /// Number of hostnames in the operator TLS-SNI egress blocklist
+    /// (`SNI_BLOCKED`). `0` makes the TC datapath skip ClientHello parsing
+    /// entirely — the common case, so an empty blocklist costs one field test
+    /// per packet and nothing else.
+    pub sni_blocks: u32,
 }
 
 /// Mitigation state for a destination IP. Written by userspace (detection
@@ -229,6 +233,54 @@ pub fn syn_cookie_v6(
     }
     h ^= secret;
     finalize32(h)
+}
+
+/// Number of destination ports on which the datapath looks for a ClientHello
+/// (the size of the `SNI_PORTS` array map). Shared so userspace validates the
+/// configured list against the same bound the datapath scans.
+pub const SNI_MAX_PORTS: usize = 8;
+
+/// Max number of hostnames in the SNI blocklist (`SNI_BLOCKED` map capacity).
+pub const SNI_MAX_BLOCKS: usize = 4096;
+
+/// FNV-1a offset basis for the SNI hash (see [`sni_hash`]).
+pub const SNI_HASH_INIT: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Mix one hostname byte into an SNI hash, normalising ASCII upper case to
+/// lower case first: TLS server names are case-insensitive, so `C2.Example`
+/// and `c2.example` must hash to the same key or a trivially re-cased
+/// ClientHello would evade the blocklist.
+#[inline(always)]
+pub fn sni_hash_byte(h: u64, b: u8) -> u64 {
+    // `b - 'A' < 26` is the branch-free ASCII upper-case test (wrapping, so
+    // bytes below 'A' wrap to a large value and fall through unchanged).
+    let b = if b.wrapping_sub(b'A') < 26 {
+        b | 0x20
+    } else {
+        b
+    };
+    mix64(h, b)
+}
+
+/// 64-bit FNV-1a hash of a TLS server name — the key of the `SNI_BLOCKED`
+/// map. BPF map keys are bounded (and a hostname is up to 253 bytes), so the
+/// datapath cannot key on the name itself: it hashes the ClientHello's SNI
+/// with this same function and looks the result up. Userspace hashes the
+/// operator's blocklist entries identically, so the two sides always agree.
+///
+/// Non-cryptographic by design (same mix as the SYN-cookie hash). A collision
+/// would block an unrelated hostname; with a 64-bit digest and an
+/// operator-managed list of at most a few thousand entries, that probability
+/// is negligible (~1e-13 at 4096 entries).
+pub fn sni_hash(host: &str) -> u64 {
+    let mut h = SNI_HASH_INIT;
+    let mut i = 0;
+    let bytes = host.as_bytes();
+    while i < bytes.len() {
+        h = sni_hash_byte(h, bytes[i]);
+        i += 1;
+    }
+    h
 }
 
 /// Config-map keys for the two-slot rotating SYN-cookie secret (current +
@@ -362,6 +414,45 @@ mod tests {
     }
 
     #[test]
+    fn sni_hash_is_deterministic_and_case_insensitive() {
+        let a = sni_hash("emailmanager.pro");
+        assert_eq!(a, sni_hash("emailmanager.pro"), "deterministic");
+        // SNI is case-insensitive: a re-cased ClientHello must not evade.
+        assert_eq!(a, sni_hash("EmailManager.PRO"));
+        assert_eq!(a, sni_hash("EMAILMANAGER.PRO"));
+        // Distinct names hash apart (including a sub-domain of the same zone,
+        // which the exact-match datapath treats as unrelated).
+        assert_ne!(a, sni_hash("emailmanager.pr"));
+        assert_ne!(a, sni_hash("www.emailmanager.pro"));
+        assert_ne!(a, sni_hash(""));
+        // Non-alphabetic bytes are passed through unchanged by the case fold
+        // (`-`, `.` and digits sit outside the A-Z range).
+        assert_eq!(sni_hash("a-1.b"), sni_hash("A-1.B"));
+    }
+
+    #[test]
+    fn sni_hash_byte_folds_only_ascii_upper() {
+        // Only A-Z is folded; the byte just below ('@') and just above ('[')
+        // must be mixed verbatim.
+        assert_eq!(
+            sni_hash_byte(SNI_HASH_INIT, b'A'),
+            sni_hash_byte(SNI_HASH_INIT, b'a')
+        );
+        assert_eq!(
+            sni_hash_byte(SNI_HASH_INIT, b'Z'),
+            sni_hash_byte(SNI_HASH_INIT, b'z')
+        );
+        assert_ne!(
+            sni_hash_byte(SNI_HASH_INIT, b'@'),
+            sni_hash_byte(SNI_HASH_INIT, b'`')
+        );
+        assert_ne!(
+            sni_hash_byte(SNI_HASH_INIT, b'['),
+            sni_hash_byte(SNI_HASH_INIT, b'{')
+        );
+    }
+
+    #[test]
     fn key_sizes_have_no_hidden_padding() {
         assert_eq!(core::mem::size_of::<PortKeyV4>(), 8);
         assert_eq!(core::mem::size_of::<PortKeyV6>(), 20);
@@ -371,5 +462,8 @@ mod tests {
         assert_eq!(core::mem::size_of::<SrcRateConfig>(), 24);
         // GlobalConfig: 24 (src_rate) + 8 (ttl) + 4+4+4+4 = 48, no padding.
         assert_eq!(core::mem::size_of::<GlobalConfig>(), 48);
+        // The former trailing `_pad` slot now carries `sni_blocks`, so the
+        // layout (and every existing map value) is unchanged.
+        assert_eq!(core::mem::offset_of!(GlobalConfig, sni_blocks), 44);
     }
 }

@@ -4,7 +4,9 @@ import { api } from "./api";
 import type { Status, TrackedIp, PrefixLoad, Mitigation, FwEvent, RuleSet, UpgradeStatus } from "./api";
 import { fmtn, fmtbps, timeStr, loadColor, dropColor } from "./format";
 import { LoadBar, Sparkline, PagedTable, Section, Modal, flagCell } from "./ui";
-import { Login, LimitsCard, MitigationsCard, SourcesCard, PortsCard, OriginsCard, geoCell } from "./cards";
+import {
+  Login, LimitsCard, MitigationsCard, SourcesCard, PortsCard, OriginsCard, SniBlocksCard, geoCell,
+} from "./cards";
 import {
   IconUpgrade, IconRefresh, IconSettings, IconUpdateCheck, IconDisconnect,
   IconArrowDown, IconArrowUp, IconNoSymbol, IconShieldCheck, IconShieldAlert,
@@ -22,7 +24,7 @@ interface Data {
 
 const EMPTY: Data = {
   status: null, tracked: [], prefixes: [], mitigations: [],
-  rules: { protected: [], overrides: [], source_blocks: [] }, upgrade: null, err: "",
+  rules: { protected: [], overrides: [], source_blocks: [], sni_blocks: [] }, upgrade: null, err: "",
 };
 
 // Baked in only for the demo image build (`VITE_DEMO_TOKEN=... bun run build`).
@@ -203,6 +205,7 @@ export function App() {
           <PagedTable cols={["ip", "origin", "rx pps", "rx bps", "tx pps", "tx bps", "syn/s", "drop/s", "drop%", "load", "state"]} rows={trackedRows} />
         </Section>
         <Section wide title="Sources"><SourcesCard token={token} /></Section>
+        <SniBlocksCard token={token} />
         <PortsCard token={token} />
         <Section wide title="Events" extra={"(" + events.length + ")"}>
           <PagedTable cols={evCols} rows={evRows} />

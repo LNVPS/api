@@ -327,6 +327,24 @@ impl Harness {
         Ok(())
     }
 
+    /// Install the operator TLS-SNI egress blocklist exactly as the daemon
+    /// does (inspection ports + hostname hashes + the `GLOBAL_CFG` gate), so
+    /// the harness exercises the real userspace sync path.
+    pub fn set_sni_blocks(&mut self, ports: &[u16], hosts: &[&str]) -> anyhow::Result<()> {
+        lnvps_fw_service::runtime::write_sni_ports(&mut self.bpf, ports)?;
+        let hosts: Vec<String> = hosts.iter().map(|h| h.to_string()).collect();
+        lnvps_fw_service::runtime::sync_sni_blocks(&mut self.bpf, &hosts)?;
+        Ok(())
+    }
+
+    /// ClientHellos the datapath has dropped for `host` (0 if never blocked).
+    pub fn sni_drops(&self, host: &str) -> anyhow::Result<u64> {
+        Ok(lnvps_fw_service::runtime::read_sni_drops(&self.bpf)?
+            .get(&lnvps_fw_common::sni_hash(host))
+            .copied()
+            .unwrap_or(0))
+    }
+
     /// Set the current SYN-cookie secret (slot 0). 64-bit key.
     pub fn set_cookie_secret(&mut self, secret: u64) -> anyhow::Result<()> {
         let mut map: Array<_, u64> = Array::try_from(self.bpf.map_mut("COOKIE_SECRET").unwrap())?;

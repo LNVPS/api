@@ -9,7 +9,8 @@ use axum::http::{StatusCode, header};
 use http_body_util::BodyExt;
 use lnvps_fw_service::api::{
     BlocksPage, Event, EventKind, EventsResponse, LearnedPort, Limits, OriginsResponse, Override,
-    PortsPage, RuleSet, SharedState, SourceBlock, SourcesPage, Status, TrackedSource, router,
+    PortsPage, RuleSet, SharedState, SniBlock, SniBlockInfo, SourceBlock, SourcesPage, Status,
+    TrackedSource, router,
 };
 use tower::ServiceExt;
 
@@ -109,6 +110,7 @@ async fn rules_round_trip_and_bad_cidr_rejected() {
             flags: 1,
         }],
         source_blocks: vec![],
+        sni_blocks: vec![],
     })
     .unwrap();
     let res = app
@@ -388,6 +390,151 @@ async fn blocks_endpoint() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
+}
+
+/// The TLS-SNI egress blocklist CRUD: add (canonicalised), list with drop
+/// counters, reject junk, and delete (404 when absent).
+#[tokio::test]
+async fn sni_block_crud_and_counters() {
+    let st = state();
+    let app = router(st.clone());
+
+    // Add: mixed case + trailing dot are canonicalised to the datapath form.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/sni-blocks",
+            Some("tok"),
+            Some(r#"{"sni":"EmailManager.pro.","label":"C2"}"#.into()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert_eq!(st.rules().sni_blocks[0].sni, "emailmanager.pro");
+
+    // Listing works before the control loop has published a snapshot (drops 0).
+    let res = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/sni-blocks", Some("tok"), None))
+        .await
+        .unwrap();
+    let items: Vec<SniBlockInfo> = body_json(res).await;
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].sni, "emailmanager.pro");
+    assert_eq!(items[0].label, "C2");
+    assert_eq!(items[0].drops, 0);
+
+    // Once the loop publishes counters, they are surfaced verbatim.
+    st.set_sni_blocks(vec![SniBlockInfo {
+        sni: "emailmanager.pro".into(),
+        label: "C2".into(),
+        hash: format!("{:016x}", lnvps_fw_common::sni_hash("emailmanager.pro")),
+        drops: 42,
+    }]);
+    let res = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/sni-blocks", Some("tok"), None))
+        .await
+        .unwrap();
+    let items: Vec<SniBlockInfo> = body_json(res).await;
+    assert_eq!(items[0].drops, 42);
+
+    // Re-adding the same name relabels rather than duplicating.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/sni-blocks",
+            Some("tok"),
+            Some(r#"{"sni":"emailmanager.pro","label":"C2 (2026-08-19)"}"#.into()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let rules = st.rules();
+    assert_eq!(rules.sni_blocks.len(), 1);
+    assert_eq!(rules.sni_blocks[0].label, "C2 (2026-08-19)");
+
+    // A wildcard can never match the exact-hash datapath, so it is rejected.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "POST",
+            "/api/v1/sni-blocks",
+            Some("tok"),
+            Some(r#"{"sni":"*.emailmanager.pro"}"#.into()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // Delete (canonicalising the query too), then 404 on the second attempt.
+    let res = app
+        .clone()
+        .oneshot(req(
+            "DELETE",
+            "/api/v1/sni-blocks?sni=EmailManager.pro",
+            Some("tok"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    assert!(st.rules().sni_blocks.is_empty());
+    let res = app
+        .oneshot(req(
+            "DELETE",
+            "/api/v1/sni-blocks?sni=emailmanager.pro",
+            Some("tok"),
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+/// A pushed ruleset carries the SNI blocklist (so `lnvps_api` can own it) and
+/// rejects a name the datapath could never match.
+#[tokio::test]
+async fn rules_push_round_trips_sni_blocks() {
+    let st = state();
+    let app = router(st.clone());
+    let body = serde_json::to_string(&RuleSet {
+        sni_blocks: vec![SniBlock {
+            sni: "EmailManager.pro".into(),
+            label: "C2".into(),
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+    let res = app
+        .clone()
+        .oneshot(req("PUT", "/api/v1/rules", Some("tok"), Some(body)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let res = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/rules", Some("tok"), None))
+        .await
+        .unwrap();
+    let rules: RuleSet = body_json(res).await;
+    assert_eq!(rules.sni_blocks[0].sni, "emailmanager.pro", "canonicalised");
+
+    let bad = serde_json::to_string(&RuleSet {
+        sni_blocks: vec![SniBlock {
+            sni: "not a hostname".into(),
+            label: String::new(),
+        }],
+        ..Default::default()
+    })
+    .unwrap();
+    let res = app
+        .oneshot(req("PUT", "/api/v1/rules", Some("tok"), Some(bad)))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

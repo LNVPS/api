@@ -162,6 +162,124 @@ pub fn tcp_listen_accept(ns_path: &str, bind: SocketAddr, timeout: Duration) -> 
     })?
 }
 
+/// Build a structurally valid TLS 1.3 ClientHello carrying `sni` in the
+/// server_name extension, as a guest's TLS library would emit it: a 32-byte
+/// session id, two cipher suites, and a decoy extension on each side of the
+/// SNI so the datapath's extension walk is genuinely exercised.
+pub fn client_hello(sni: &str) -> Vec<u8> {
+    let host = sni.as_bytes();
+    // server_name extension body: list_len(2) type(1) name_len(2) name.
+    let mut sni_ext = Vec::new();
+    sni_ext.extend_from_slice(&((host.len() + 3) as u16).to_be_bytes());
+    sni_ext.push(0); // host_name
+    sni_ext.extend_from_slice(&(host.len() as u16).to_be_bytes());
+    sni_ext.extend_from_slice(host);
+
+    let mut exts = Vec::new();
+    // Decoy before: supported_versions (0x002b) = TLS 1.3.
+    exts.extend_from_slice(&[0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]);
+    // server_name (0x0000).
+    exts.extend_from_slice(&[0x00, 0x00]);
+    exts.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
+    exts.extend_from_slice(&sni_ext);
+    // Decoy after: ec_point_formats (0x000b).
+    exts.extend_from_slice(&[0x00, 0x0b, 0x00, 0x02, 0x01, 0x00]);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&[0x03, 0x03]); // legacy_version
+    body.extend_from_slice(&[0x42; 32]); // random
+    body.push(32); // legacy_session_id length
+    body.extend_from_slice(&[0x11; 32]);
+    body.extend_from_slice(&[0x00, 0x04, 0x13, 0x01, 0x13, 0x02]); // cipher suites
+    body.extend_from_slice(&[0x01, 0x00]); // compression methods
+    body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    body.extend_from_slice(&exts);
+
+    let mut hs = vec![0x01]; // ClientHello
+    let len = body.len();
+    hs.extend_from_slice(&[(len >> 16) as u8, (len >> 8) as u8, len as u8]);
+    hs.extend_from_slice(&body);
+
+    let mut rec = vec![0x16, 0x03, 0x01]; // handshake record, legacy version
+    rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+    rec.extend_from_slice(&hs);
+    rec
+}
+
+/// Bind a TCP listener in `ns_path`, accept one connection and read from it
+/// until `timeout`, returning what arrived (empty when the peer's data never
+/// made it through the datapath). The connection itself still completes when
+/// only the payload is dropped, so an empty result is the drop signal.
+pub fn tcp_accept_read(ns_path: &str, bind: SocketAddr, timeout: Duration) -> io::Result<Vec<u8>> {
+    in_netns(ns_path, move || {
+        use std::io::Read;
+        let listener = TcpListener::bind(bind)?;
+        listener.set_nonblocking(true)?;
+        let deadline = Instant::now() + timeout;
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((s, _)) => break s,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Ok(Vec::new());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        stream.set_read_timeout(Some(deadline.saturating_duration_since(Instant::now())))?;
+        let mut buf = vec![0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(n) => {
+                buf.truncate(n);
+                Ok(buf)
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
+                Ok(Vec::new())
+            }
+            Err(e) => Err(e),
+        }
+    })?
+}
+
+/// Connect from `ns_path` to `dst` and send `payload` on the established
+/// connection. Returns whether the connection was established (the SNI filter
+/// only drops the ClientHello segment, never the handshake, so this stays true
+/// even for a blocked name).
+pub fn tcp_connect_send(
+    ns_path: &str,
+    dst: SocketAddr,
+    payload: &[u8],
+    timeout: Duration,
+) -> io::Result<bool> {
+    let payload = payload.to_vec();
+    in_netns(ns_path, move || {
+        use std::io::Write;
+        // Retry briefly: on a freshly-built topology the first attempt can lose
+        // the SYN to IPv6 neighbour discovery still resolving the gateway.
+        let deadline = Instant::now() + timeout * 3;
+        let mut stream = loop {
+            match TcpStream::connect_timeout(&dst, timeout) {
+                Ok(s) => break s,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(_) => return Ok(false),
+            }
+        };
+        stream.set_write_timeout(Some(timeout))?;
+        stream.write_all(&payload)?;
+        stream.flush()?;
+        // Hold the connection open briefly so the segment is not overtaken by
+        // a FIN in the same window.
+        std::thread::sleep(Duration::from_millis(200));
+        Ok(true)
+    })?
+}
+
 /// Attempt a TCP connection from `ns_path` to `dst`, returning whether it
 /// completed within `timeout`.
 pub fn tcp_connect(ns_path: &str, dst: SocketAddr, timeout: Duration) -> io::Result<bool> {

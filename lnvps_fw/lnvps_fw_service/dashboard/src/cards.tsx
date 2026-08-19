@@ -1,6 +1,9 @@
 import { useState, useEffect, useCallback } from "preact/hooks";
 import { api, authHeaders } from "./api";
-import type { InterfaceInfo, Limits, Mitigation, TrackedSource, SourcesPage, PortsPage, OriginsResponse } from "./api";
+import type {
+  InterfaceInfo, Limits, Mitigation, TrackedSource, SourcesPage, PortsPage, OriginsResponse,
+  SniBlockInfo,
+} from "./api";
 import { fmtn, fmtbps, fmtUnit, parseUnit, timeStr, dropColor, flagEmoji } from "./format";
 import { LoadBar, Table, Pager, PagedTable, Section, Modal, flagCell } from "./ui";
 import { IconTrash } from "./icons";
@@ -218,6 +221,68 @@ export function SourcesCard({ token }: { token: string }) {
         </Modal>
       )}
     </div>
+  );
+}
+
+// --- TLS-SNI egress blocks: the operator blocklist of server names guests may
+// not reach, with each entry's live drop counter. This is the abuse workflow's
+// whole loop — add the C2 name, watch drops climb — so the counter is the
+// column that matters, not a rate. ---
+export function SniBlocksCard({ token }: { token: string }) {
+  const [items, setItems] = useState<SniBlockInfo[]>([]);
+  const [show, setShow] = useState(false);
+  const [sni, setSni] = useState("");
+  const [label, setLabel] = useState("");
+  const [msg, setMsg] = useState("");
+  const hdr = authHeaders(token);
+  const load = useCallback(async () => {
+    try { setItems(await api<SniBlockInfo[]>("/api/v1/sni-blocks", token)); } catch { /* surfaced by the main poller */ }
+  }, [token]);
+  useEffect(() => { load(); const id = setInterval(load, 5000); return () => clearInterval(id); }, [load]);
+  const add = async () => {
+    setMsg("saving…");
+    try {
+      const r = await fetch("/api/v1/sni-blocks", { method: "POST", headers: hdr, body: JSON.stringify({ sni, label }) });
+      if (r.ok) { setShow(false); setSni(""); setLabel(""); setMsg(""); load(); }
+      else setMsg("error " + r.status + ": " + (await r.text()));
+    } catch (e) { setMsg((e as Error).message); }
+  };
+  const del = async (s: string) => {
+    try { await fetch("/api/v1/sni-blocks?sni=" + encodeURIComponent(s), { method: "DELETE", headers: hdr }); load(); } catch { /* */ }
+  };
+  const bin = (s: string) => <button class="binbtn" title="lift block" onClick={() => del(s)}><IconTrash /></button>;
+  // A block that has never fired is worth seeing as "quiet" rather than a bare
+  // 0: it usually means the name is wrong (matching is exact per hostname).
+  const dropCell = (b: SniBlockInfo) => b.drops
+    ? <b style={{ color: "#ff5d6c" }}>{fmtn(b.drops)}</b>
+    : <span class="muted" title="no ClientHello has matched this name yet — matching is exact, so sub-domains need their own entry">0</span>;
+  const rows = items.map((b) => [
+    b.sni, b.label ? <span class="tag">{b.label}</span> : <span class="muted">—</span>,
+    dropCell(b), <span class="muted" title={"FNV-1a map key: " + b.hash}>{b.hash.slice(0, 8)}…</span>, bin(b.sni),
+  ]);
+  return (
+    <Section wide title="TLS SNI egress blocks" extra={"(" + items.length + ")"}>
+      <div style={{ marginBottom: ".5rem" }}><button onClick={() => { setShow(true); setMsg(""); }}>+ block server name</button></div>
+      <div class="scroll"><Table cols={["server name", "note", "dropped", "key", ""]} rows={rows} /></div>
+      {show && (
+        <Modal title="Block a TLS server name" onClose={() => setShow(false)}>
+          <label>server name<input value={sni} placeholder="emailmanager.pro"
+            onInput={(e) => setSni((e.target as HTMLInputElement).value)} /></label>
+          <label>note<input value={label} placeholder="abuse incident reference"
+            onInput={(e) => setLabel((e.target as HTMLInputElement).value)} /></label>
+          <div class="muted" style={{ fontSize: ".72rem" }}>
+            Drops a guest's TLS ClientHello for this name on the VM-facing hook.
+            Matching is exact — <code>example.com</code> does not cover
+            <code> www.example.com</code>; wildcards are rejected.
+          </div>
+          <div class="act">
+            <button onClick={add} disabled={!sni}>block</button>
+            <button class="ghost" onClick={() => setShow(false)}>cancel</button>
+            <span class="muted err">{msg}</span>
+          </div>
+        </Modal>
+      )}
+    </Section>
   );
 }
 

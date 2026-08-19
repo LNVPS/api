@@ -27,7 +27,7 @@ use log::{info, warn};
 
 use lnvps_fw_common::{
     DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, DEST_MODE_SYN_PROXY,
-    DestCounters, DestState, GlobalConfig, SrcRateConfig, SrcState,
+    DestCounters, DestState, GlobalConfig, SNI_MAX_PORTS, SrcRateConfig, SrcState, sni_hash,
 };
 
 use crate::cidr::{mask_v4, mask_v6};
@@ -542,6 +542,62 @@ pub fn write_src_rate_cfg(bpf: &mut Ebpf, cfg: &RuntimeConfig) -> Result<()> {
 pub fn write_learn_leak_cfg(bpf: &mut Ebpf, cfg: &RuntimeConfig) -> Result<()> {
     let pps = cfg.learn_leak_pps.min(u32::MAX as u64) as u32;
     update_global_cfg(bpf, |c| c.learn_leak_pps = pps)
+}
+
+/// Write the destination ports the TC datapath inspects for a ClientHello into
+/// the `SNI_PORTS` array map (unused slots zeroed — port 0 is the datapath's
+/// "unused" sentinel). Called once at startup; the list is config-only.
+pub fn write_sni_ports(bpf: &mut Ebpf, ports: &[u16]) -> Result<()> {
+    let mut arr: aya::maps::Array<_, u16> =
+        aya::maps::Array::try_from(bpf.map_mut("SNI_PORTS").context("SNI_PORTS missing")?)?;
+    for i in 0..SNI_MAX_PORTS {
+        let port = ports.get(i).copied().unwrap_or(0);
+        arr.set(i as u32, port, 0)
+            .with_context(|| format!("writing SNI_PORTS[{i}]"))?;
+    }
+    Ok(())
+}
+
+/// Reconcile the TLS-SNI egress blocklist into the `SNI_BLOCKED` map and
+/// publish the entry count into `GLOBAL_CFG.sni_blocks` (the datapath's
+/// fast-path off switch). Hostnames must already be canonical
+/// (`api::parse_sni`); they are keyed by `sni_hash`.
+///
+/// Reconciliation diffs against the map's actual contents rather than
+/// bookkeeping state, so it is idempotent, self-healing after a partial write,
+/// and — by only inserting keys that are missing — preserves the drop counters
+/// of blocks that are still installed. Returns (added, removed).
+pub fn sync_sni_blocks(bpf: &mut Ebpf, hostnames: &[String]) -> Result<(usize, usize)> {
+    let desired: std::collections::HashSet<u64> = hostnames.iter().map(|h| sni_hash(h)).collect();
+    let existing: Vec<(u64, u64)> = scan_plain(&*bpf, "SNI_BLOCKED")?;
+    let have: std::collections::HashSet<u64> = existing.iter().map(|(k, _)| *k).collect();
+
+    let stale: Vec<u64> = have.difference(&desired).copied().collect();
+    let removed = delete_keys::<u64, u64>(bpf, "SNI_BLOCKED", &stale)?;
+
+    let mut added = 0;
+    {
+        let mut map: aya::maps::HashMap<_, u64, u64> = aya::maps::HashMap::try_from(
+            bpf.map_mut("SNI_BLOCKED").context("SNI_BLOCKED missing")?,
+        )?;
+        for h in desired.difference(&have) {
+            map.insert(h, 0u64, 0).context("inserting SNI block")?;
+            added += 1;
+        }
+    }
+    let count = desired.len() as u32;
+    update_global_cfg(bpf, |c| c.sni_blocks = count)?;
+    Ok((added, removed))
+}
+
+/// Read the per-hostname ClientHello drop counters (`SNI_BLOCKED` doubles as
+/// the hit counter), keyed by `sni_hash`. Read-only: counters are cumulative
+/// for the lifetime of the block, so the operator sees a total rather than a
+/// per-tick delta.
+pub fn read_sni_drops(bpf: &Ebpf) -> Result<HashMap<u64, u64>> {
+    Ok(scan_plain::<u64, u64>(bpf, "SNI_BLOCKED")?
+        .into_iter()
+        .collect())
 }
 
 /// Bulk-remove `keys` from a plain hash-family map named `name`, using one

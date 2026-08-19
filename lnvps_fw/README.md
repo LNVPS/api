@@ -67,6 +67,8 @@ single-IP attacks.
         ┌── TC egress    (tc_lnvps_egress, clsact) ────────────────────┐
         │  learn open ports: SYN-ACK from ip:port → TCP open           │
         │                    outbound UDP from ip:port → UDP service    │
+        │  SNI egress block: TLS ClientHello naming a blocked server    │
+        │                    → TC_ACT_SHOT + per-hostname drop counter  │
         └──────────────────────────────────────────────────────────────┘
                                    │ BPF maps
         ┌── lnvps_fw_service (userspace daemon) ───────────────────────┐
@@ -174,6 +176,8 @@ the previous slot keeps in-flight cookies valid across a rotation.
 | `VERIFIED_V4/V6` | LRU hash | XDP (`xdp_syn_proxy`/`_v6`) | XDP; daemon (TTL GC) |
 | `COOKIE_SECRET` | array[2] | daemon (rotation) | XDP |
 | `SYN_PROXY_JUMP` | prog array | daemon (setup) | XDP (`tail_call`) |
+| `SNI_BLOCKED` | LRU hash → drop count | daemon (blocklist sync) | TC (ClientHello match; counts its own drops) |
+| `SNI_PORTS` | array[8] | daemon (config) | TC (which ports to inspect) |
 
 ---
 
@@ -299,6 +303,8 @@ keys, matching the rest of the LNVPS API config style. Key sections:
 - `escalation` — per-source rate limit + cooldown (written into the in-kernel
   rate machine), the SOURCE_BLOCK escalation gate, and the SYN-proxy trigger.
   (Legacy aggregation/spoof-gate keys are still parsed but ignored.)
+- `sni-blocks` / `sni-ports` — TLS-SNI egress blocklist (see below) and the
+  destination ports on which a ClientHello is inspected (default `[443]`).
 
 > The `protected` prefixes and thresholds will be sourced from the LNVPS API in
 > a later increment; the local config is the bootstrap today.
@@ -329,12 +335,50 @@ Test binaries (`lnvps_fw_service/tests/`):
 | `escalation` | per-source rate limit for the in-kernel gate + SOURCE_BLOCK escalation |
 | `carpet_bomb` | thin prefix-wide flood flips the whole prefix |
 | `syn_proxy` | real client completes the cookie handshake + is verified; spoofed never verify |
+| `sni_block` | blocked ClientHello shot + counted (v4/v6), others pass, learning unaffected |
 
 See [`docs/agents/fw-testing.md`](../docs/agents/fw-testing.md) (repo root) for
 harness internals, kernel prerequisites, and how to add scenarios.
 
 The pure userspace logic (detection state machine, CIDR aggregation, config,
 GC, SYN-cookie) is covered by ordinary `cargo test` unit tests.
+
+---
+
+## TLS-SNI egress blocking
+
+Some abuse cannot be stopped on the ingress side at all: a spam agent installed
+on a rented VM polls its C2 over TLS to a domain behind a CDN. Blocking the IP
+would take out every other site on those shared addresses, and a DNS sinkhole
+is trivially bypassed by a guest with root (custom resolver, DoH, hardcoded
+address). The **ClientHello SNI** is the one field the guest cannot change
+without breaking certificate validation at the far end.
+
+The TC program on the VM-facing hook — the `learn` role NIC's ingress on a
+router (VM egress arrives there as plain L2, before NAT, so one hook covers the
+whole fleet), or the `host` role NIC's egress — matches the SNI of any
+ClientHello sent to a configured port (default 443) and shoots the packet if
+the name is on the operator blocklist. No per-flow state is needed: the
+ClientHello appears once per connection (and again, with the same name, on
+resumption). BPF map keys are bounded, so the name is keyed by a 64-bit FNV-1a
+hash; the map value is the drop counter, which the control API surfaces per
+hostname so an abuse takedown can confirm the block is biting.
+
+```sh
+curl -k -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{"sni":"emailmanager.pro","label":"2026-08-19 incident"}' \
+  https://127.0.0.1:8888/api/v1/sni-blocks
+curl -k -H "Authorization: Bearer $TOKEN" https://127.0.0.1:8888/api/v1/sni-blocks
+# [{"sni":"emailmanager.pro","label":"...","hash":"...","drops":17}]
+```
+
+Scope and limits: only traffic from a `protected` source is inspected when
+scoping is on (a router never touches transit); matching is **exact per
+hostname** (`example.com` does not cover `www.example.com`); TLS 1.3 Encrypted
+Client Hello hides the name outright; a hello split across TCP segments, or one
+burying its SNI behind more than 64 extensions, is passed. Every failure mode
+fails **open** — the blocklist can drop a connection, never break one it cannot
+parse.
 
 ---
 
