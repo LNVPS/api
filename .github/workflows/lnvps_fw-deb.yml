@@ -20,6 +20,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Toolchain the eBPF crate is built with. aya-build shells out by toolchain
+  # name, and the name `nightly` is deliberately NOT installed here — it would
+  # resolve to today's nightly (LLVM 23) and mismatch the pinned bpf-linker.
+  # Keep in step with the `Install Rust nightly` step below.
+  LNVPS_FW_EBPF_TOOLCHAIN: nightly-2026-05-17
 
 jobs:
   build-deb:
