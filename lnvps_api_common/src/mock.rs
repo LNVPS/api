@@ -5238,12 +5238,20 @@ impl lnvps_db::AdminDb for MockDb {
             .count();
         Ok(count as u64)
     }
-    async fn admin_list_companies(
-        &self,
-        _limit: u64,
-        _offset: u64,
-    ) -> DbResult<(Vec<Company>, u64)> {
-        Ok((vec![], 0))
+    async fn admin_list_companies(&self, limit: u64, offset: u64) -> DbResult<(Vec<Company>, u64)> {
+        let companies = self.companies.lock().await;
+        let mut rows: Vec<Company> = companies.values().cloned().collect();
+        // Newest first, matching the SQL implementation's ORDER BY created DESC,
+        // with id as a tie-break because fixtures share a timestamp.
+        rows.sort_by(|a, b| b.created.cmp(&a.created).then(b.id.cmp(&a.id)));
+        let total = rows.len() as u64;
+        Ok((
+            rows.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
     }
     async fn admin_get_company(&self, company_id: u64) -> DbResult<Company> {
         self.get_company(company_id).await

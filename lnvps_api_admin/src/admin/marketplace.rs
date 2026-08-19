@@ -720,7 +720,7 @@ mod tests {
 
     use crate::admin::model::Permission;
     use lnvps_api_common::node_control::NodeStatus;
-    use lnvps_api_common::{ChannelWorkCommander, MockExchangeRate, VmStateCache};
+    use lnvps_api_common::{ChannelWorkCommander, MockExchangeRate, VatClient, VmStateCache};
 
     const FINGERPRINT: [u8; 32] = [0xab; 32];
 
@@ -732,6 +732,7 @@ mod tests {
             feedback: None,
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
+            vat: VatClient::new(),
         }
     }
 

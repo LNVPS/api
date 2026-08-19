@@ -7,10 +7,10 @@ use axum::{Json, Router};
 use chrono::Utc;
 use isocountry::CountryCode;
 use lnvps_api_common::{
-    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery,
+    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, PricingEngine,
 };
 use lnvps_db::{AdminAction, AdminResource, UserFilters, email_hash};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -25,6 +25,7 @@ pub fn router() -> Router<RouterState> {
                 .patch(admin_update_user)
                 .delete(admin_delete_user),
         )
+        .route("/api/admin/v1/users/{id}/tax", get(admin_get_user_tax))
 }
 
 /// Get a specific user's information
@@ -258,4 +259,288 @@ async fn admin_update_user(
     // audit_log.log_user_update(auth.user_id, id, old_values, new_values).await?;
 
     ApiData::ok(())
+}
+
+/// What a user would be charged by one seller company, and why.
+#[derive(Serialize, Debug)]
+pub struct AdminUserTaxDetermination {
+    pub company_id: u64,
+    pub company_name: String,
+    /// Seller country (ISO 3166-1 alpha-3), taken from the company's VAT
+    /// registration number when it has one and its configured country otherwise.
+    /// `null` for a company with neither, which is untaxed by definition.
+    pub seller_country: Option<String>,
+    /// VAT rate as a whole percentage, e.g. `23.0`.
+    pub rate: f32,
+    /// `domestic`, `oss_b2c`, `reverse_charge`, `out_of_scope` or
+    /// `undetermined_default`. This is the part that explains a 0%: a reverse
+    /// charge and a non-EU customer are both zero-rated for different reasons.
+    pub treatment: String,
+    /// Determined place of supply (ISO alpha-3), if known.
+    pub place_of_supply: Option<String>,
+    /// The customer VAT number the determination used, if any.
+    pub vat_number: Option<String>,
+    /// Evidence: the customer's self-declared country.
+    pub declared_country: Option<String>,
+    /// Evidence: the country resolved from their IP.
+    pub geo_country: Option<String>,
+}
+
+/// Tax treatment for one user across every seller company.
+#[derive(Serialize, Debug)]
+pub struct AdminUserTaxInfo {
+    /// `false` when the EU rate table has not loaded (no network at startup, or
+    /// the feed is down). Every `rate` below is then `0.0` because an unknown
+    /// country falls back to zero — which must not be read as "this customer
+    /// pays no VAT". Treatments remain correct regardless.
+    pub rates_loaded: bool,
+    /// One determination per company, ordered by company id. A user can be
+    /// taxed differently by each: the seller country is half of the rule.
+    pub determinations: Vec<AdminUserTaxDetermination>,
+}
+
+/// What tax this user attracts right now, per seller company.
+///
+/// Computed live from the same code that prices a sale, rather than read back
+/// from their last payment: it answers "what would we charge them now", which is
+/// the question asked when a customer disputes VAT or has just added a VAT
+/// number. What they *were* charged is on the payments themselves.
+async fn admin_get_user_tax(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<AdminUserTaxInfo> {
+    auth.require_permission(AdminResource::Users, AdminAction::View)?;
+
+    // 404 on an unknown user rather than an empty list, which would read as
+    // "this user is taxed nowhere".
+    let _user = this.db.get_user(id).await?;
+
+    let pricing = PricingEngine::new(this.db.clone(), this.exchange.clone(), this.vat.clone());
+
+    // Every company, not just the ones they have bought from: the question is
+    // what they would be charged, including in a region they have not used yet.
+    // Paged rather than asked for in one unbounded read, so the answer stays
+    // complete if the company list ever outgrows a page.
+    const PAGE: u64 = 100;
+    let mut companies = Vec::new();
+    loop {
+        let (page, total) = this
+            .db
+            .admin_list_companies(PAGE, companies.len() as u64)
+            .await?;
+        let empty = page.is_empty();
+        companies.extend(page);
+        if empty || companies.len() as u64 >= total {
+            break;
+        }
+    }
+
+    let mut determinations = Vec::with_capacity(companies.len());
+    for company in companies {
+        // `amount` scales only the tax amount, never the rate, so 0 is safe
+        // here — this endpoint reports the rate and the reasoning, not a charge.
+        let tax = pricing.determine_tax(id, 0, company.id).await?;
+        determinations.push(AdminUserTaxDetermination {
+            company_id: company.id,
+            company_name: company.name,
+            seller_country: company.country_code.map(|c| c.to_uppercase()),
+            rate: tax.rate,
+            treatment: tax.treatment.as_str().to_string(),
+            place_of_supply: tax.country_code,
+            vat_number: tax.vat_number,
+            declared_country: tax.declared_country,
+            geo_country: tax.geo_country,
+        });
+    }
+
+    ApiData::ok(AdminUserTaxInfo {
+        rates_loaded: this.vat.rate_count() > 0,
+        determinations,
+    })
+}
+
+#[cfg(test)]
+mod tax_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use isocountry::CountryCode;
+    use lnvps_api_common::{
+        ChannelWorkCommander, MockDb, MockExchangeRate, VatClient, VmStateCache,
+    };
+    use lnvps_db::LNVpsDb;
+
+    use super::*;
+    use crate::admin::model::Permission;
+
+    fn rates() -> HashMap<CountryCode, f32> {
+        HashMap::from([
+            (CountryCode::IRL, 23.0),
+            (CountryCode::DEU, 19.0),
+            (CountryCode::FRA, 20.0),
+        ])
+    }
+
+    fn state(db: &Arc<dyn LNVpsDb>, vat: VatClient) -> RouterState {
+        RouterState {
+            node_control: None,
+            db: db.clone(),
+            work_commander: Arc::new(ChannelWorkCommander::new()),
+            feedback: None,
+            vm_state_cache: VmStateCache::new(),
+            exchange: Arc::new(MockExchangeRate::default()),
+            vat,
+        }
+    }
+
+    fn auth() -> AdminAuth {
+        AdminAuth {
+            user_id: 1,
+            pubkey: vec![1u8; 32],
+            permissions: [Permission {
+                resource: AdminResource::Users,
+                action: AdminAction::View,
+            }]
+            .into_iter()
+            .collect(),
+            nip98_auth: None,
+        }
+    }
+
+    /// A seller established in Ireland, and one customer.
+    async fn fixture(declared: Option<&str>, vat_number: Option<&str>) -> (Arc<dyn LNVpsDb>, u64) {
+        let mock = MockDb::default();
+        {
+            let mut companies = mock.companies.lock().await;
+            let company = companies.get_mut(&1).unwrap();
+            company.country_code = Some("IRL".to_string());
+            company.name = "LNVPS IE".to_string();
+        }
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let user_id = db.upsert_user(&[9u8; 32]).await.unwrap();
+        let mut user = db.get_user(user_id).await.unwrap();
+        user.country_code = declared.map(str::to_string);
+        user.billing_tax_id = vat_number.map(str::to_string);
+        db.update_user(&user).await.unwrap();
+        (db, user_id)
+    }
+
+    /// The ordinary case: an Irish customer of an Irish seller pays Irish VAT.
+    #[tokio::test]
+    async fn a_domestic_customer_pays_the_seller_country_rate() -> Result<(), ApiError> {
+        let (db, user_id) = fixture(Some("IRL"), None).await;
+
+        let got = admin_get_user_tax(
+            auth(),
+            State(state(&db, VatClient::with_rates(rates()))),
+            Path(user_id),
+        )
+        .await?;
+
+        assert!(got.0.data.rates_loaded);
+        let d = &got.0.data.determinations[0];
+        assert_eq!(d.rate, 23.0);
+        assert_eq!(d.treatment, "domestic");
+        assert_eq!(d.place_of_supply.as_deref(), Some("IRL"));
+        Ok(())
+    }
+
+    /// A German customer with no VAT number is destination-rated under OSS.
+    #[tokio::test]
+    async fn an_eu_consumer_elsewhere_pays_their_own_rate() -> Result<(), ApiError> {
+        let (db, user_id) = fixture(Some("DEU"), None).await;
+
+        let got = admin_get_user_tax(
+            auth(),
+            State(state(&db, VatClient::with_rates(rates()))),
+            Path(user_id),
+        )
+        .await?;
+
+        let d = &got.0.data.determinations[0];
+        assert_eq!(d.rate, 19.0);
+        assert_eq!(d.treatment, "oss_b2c");
+        Ok(())
+    }
+
+    /// The case a bare country rate would get wrong: a German business with a
+    /// VAT number pays 0%, and the reason is the treatment, not the country.
+    #[tokio::test]
+    async fn a_cross_border_vat_number_is_zero_rated_by_reverse_charge() -> Result<(), ApiError> {
+        let (db, user_id) = fixture(Some("DEU"), Some("DE123456789")).await;
+
+        let got = admin_get_user_tax(
+            auth(),
+            State(state(&db, VatClient::with_rates(rates()))),
+            Path(user_id),
+        )
+        .await?;
+
+        let d = &got.0.data.determinations[0];
+        assert_eq!(d.rate, 0.0);
+        assert_eq!(d.treatment, "reverse_charge");
+        assert_eq!(d.vat_number.as_deref(), Some("DE123456789"));
+        Ok(())
+    }
+
+    /// An empty rate table reports every rate as 0%. Saying so is the whole
+    /// point of the flag: otherwise the page shows "0% VAT" for every customer
+    /// on the planet and looks like a determination.
+    #[tokio::test]
+    async fn an_unloaded_rate_table_is_reported_as_such() -> Result<(), ApiError> {
+        let (db, user_id) = fixture(Some("IRL"), None).await;
+
+        let got =
+            admin_get_user_tax(auth(), State(state(&db, VatClient::new())), Path(user_id)).await?;
+
+        assert!(!got.0.data.rates_loaded);
+        assert_eq!(got.0.data.determinations[0].rate, 0.0);
+        // The reasoning survives an empty table; only the number is unusable.
+        assert_eq!(got.0.data.determinations[0].treatment, "domestic");
+        Ok(())
+    }
+
+    /// An unknown user is a 404, not a list of zero-rated companies.
+    #[tokio::test]
+    async fn an_unknown_user_is_not_zero_rated() {
+        let (db, _) = fixture(Some("IRL"), None).await;
+
+        assert!(
+            admin_get_user_tax(
+                auth(),
+                State(state(&db, VatClient::with_rates(rates()))),
+                Path(9_999),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    /// Reading a user's tax treatment is user data and needs the users grant.
+    #[tokio::test]
+    async fn reading_tax_needs_users_view() {
+        let (db, user_id) = fixture(Some("IRL"), None).await;
+        let wrong = AdminAuth {
+            user_id: 1,
+            pubkey: vec![1u8; 32],
+            permissions: [Permission {
+                resource: AdminResource::Hosts,
+                action: AdminAction::View,
+            }]
+            .into_iter()
+            .collect(),
+            nip98_auth: None,
+        };
+
+        assert!(
+            admin_get_user_tax(
+                wrong,
+                State(state(&db, VatClient::with_rates(rates()))),
+                Path(user_id),
+            )
+            .await
+            .is_err()
+        );
+    }
 }

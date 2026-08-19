@@ -1147,7 +1147,7 @@ mod tests {
     async fn the_endpoints_serve_pool_administration() {
         use crate::admin::model::Permission;
         use lnvps_api_common::{
-            ChannelWorkCommander, MockExchangeRate, VmStateCache, WorkCommander,
+            ChannelWorkCommander, MockExchangeRate, VatClient, VmStateCache, WorkCommander,
         };
 
         let (db, router_id) = db().await;
@@ -1159,6 +1159,7 @@ mod tests {
             feedback: None,
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
+            vat: VatClient::new(),
         };
         let auth = |resource: AdminResource| AdminAuth {
             user_id: 1,
@@ -1362,6 +1363,7 @@ mod tests {
             feedback: None,
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
+            vat: lnvps_api_common::VatClient::new(),
         };
         let admin = AdminAuth {
             user_id: 1,

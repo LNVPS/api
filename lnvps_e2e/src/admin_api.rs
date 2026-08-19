@@ -4053,6 +4053,93 @@ mod tests {
     }
 
     // ========================================================================
+    // User tax determination
+    // ========================================================================
+
+    /// The determination runs against real company and user rows, so this covers
+    /// the joins and decodes the unit tests cannot: MockDb returns Rust values
+    /// and never decodes a SQL type.
+    #[tokio::test]
+    async fn test_admin_user_tax_determination() {
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+        let keys = nostr::Keys::generate();
+        let uid = crate::db::ensure_user(&pool, &keys).await.unwrap();
+
+        // The seller has to be established in the EU VAT area or nothing is
+        // rated at all — the determination short-circuits to out_of_scope before
+        // it ever looks at the customer.
+        sqlx::query("UPDATE company SET country_code = 'IRL' WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET country_code = 'DEU', billing_tax_id = NULL WHERE id = ?")
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/users/{uid}/tax"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+
+        let determinations = body["data"]["determinations"].as_array().unwrap();
+        assert!(
+            !determinations.is_empty(),
+            "every company should produce a determination"
+        );
+        let eu = determinations
+            .iter()
+            .find(|d| d["company_id"] == 1)
+            .expect("the EU seller should be in the list");
+        // The evidence is echoed back whichever way the rate went, so the page
+        // can show what decided it.
+        assert_eq!(eu["declared_country"], "DEU");
+        // No VAT number and an EU consumer elsewhere: destination-rated.
+        assert_eq!(eu["treatment"], "oss_b2c");
+        assert_eq!(eu["place_of_supply"], "DEU");
+
+        // A VAT number in another EU country is a reverse charge, and that is
+        // the case a bare country rate would report wrongly.
+        sqlx::query("UPDATE users SET billing_tax_id = 'DE123456789' WHERE id = ?")
+            .bind(uid)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let resp = client
+            .get_auth(&format!("/api/admin/v1/users/{uid}/tax"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let d = body["data"]["determinations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["company_id"] == 1)
+            .expect("the EU seller should be in the list");
+        assert_eq!(d["vat_number"], "DE123456789");
+        assert_eq!(d["treatment"], "reverse_charge");
+        assert_eq!(d["rate"], 0.0);
+
+        pool.close().await;
+    }
+
+    /// An unknown user is a 404, not a list of zero-rated companies.
+    #[tokio::test]
+    async fn test_admin_user_tax_unknown_user() {
+        let client = setup().await;
+        let resp = client
+            .get_auth("/api/admin/v1/users/999999/tax")
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), StatusCode::OK);
+    }
+
+    // ========================================================================
     // Support agent conversations
     // ========================================================================
 

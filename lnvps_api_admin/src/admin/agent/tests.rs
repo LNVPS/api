@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VmStateCache};
+use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VatClient, VmStateCache};
 use lnvps_db::{AgentChannel, AgentMessageRole, LNVpsDb, NewAgentMessage};
 
 use super::*;
@@ -14,6 +14,7 @@ fn state(db: &Arc<dyn LNVpsDb>) -> RouterState {
         feedback: None,
         vm_state_cache: VmStateCache::new(),
         exchange: Arc::new(MockExchangeRate::default()),
+        vat: VatClient::new(),
     }
 }
 
