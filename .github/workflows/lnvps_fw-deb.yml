@@ -64,8 +64,22 @@ jobs:
           sudo apt-get install -y llvm clang libelf-dev
 
       - name: Install Rust nightly (with rust-src for the eBPF build-std)
-        uses: dtolnay/rust-toolchain@nightly
+        # Pinned, not floating. Two reasons, both release-critical:
+        #
+        # * bpf-linker binds to one LLVM major, and the working combination is
+        #   the toolchain's own LLVM (22 here) via aya's proxy — see the pin
+        #   below. A floating nightly silently moves to LLVM 23 and breaks it.
+        # * verifier acceptance is codegen-sensitive. The SNI ClientHello parse
+        #   walks packet-derived offsets, and which bounds checks survive
+        #   optimisation decides whether the program loads at all, so the
+        #   artifact we ship should come from the toolchain the datapath tests
+        #   were verified against.
+        #
+        # To move it: bump both pins together and re-run the root harness
+        # (scripts/fw-e2e.sh) before tagging.
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-05-17
           components: rust-src
 
       - name: Cache cargo + build
@@ -81,9 +95,22 @@ jobs:
             fwdeb-${{ runner.os }}-
 
       - name: Install bpf-linker and cargo-deb
+        # bpf-linker is pinned to the last version carrying the `rust-llvm-*`
+        # feature: it loads the LLVM shipped inside the Rust toolchain, so the
+        # runner needs no LLVM dev packages and cannot drift away from rustc's
+        # LLVM. 0.11 dropped that feature and links a system LLVM 23 instead,
+        # which no runner image has (`unable to find library -lLLVM`).
+        #
+        # Version-checked rather than presence-checked: ~/.cargo/bin is cached,
+        # so "already installed" may mean "installed at the wrong version".
+        env:
+          BPF_LINKER_VERSION: 0.10.3
         run: |
-          command -v bpf-linker >/dev/null || cargo install bpf-linker --locked
-          command -v cargo-deb  >/dev/null || cargo install cargo-deb  --locked
+          have=$(bpf-linker --version 2>/dev/null | awk '{print $2}')
+          if [ "$have" != "$BPF_LINKER_VERSION" ]; then
+            cargo install bpf-linker --locked --version "$BPF_LINKER_VERSION"
+          fi
+          command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
 
       - name: Build .deb
         working-directory: lnvps_fw/lnvps_fw_service
