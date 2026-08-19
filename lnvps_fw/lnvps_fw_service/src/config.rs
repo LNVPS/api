@@ -10,6 +10,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use lnvps_fw_common::SNI_MAX_PORTS;
+
 /// Warn (do not fail) if the config file is readable by group or others. It
 /// holds the API bearer token and possibly TLS key paths, so it should be
 /// `0600`/`0640` root-owned. A warning keeps existing deployments working while
@@ -64,6 +66,50 @@ pub struct Config {
     /// Optional GeoIP databases for enriching listed IPs with ASN/org/country.
     #[serde(default)]
     pub geoip: GeoIpConfig,
+    /// Operator TLS-SNI egress blocklist: guest ClientHellos naming one of
+    /// these servers are dropped on the VM-facing hook. Seeds the runtime list;
+    /// entries can also be added/removed live via the control API.
+    #[serde(default)]
+    pub sni_blocks: Vec<SniBlockSpec>,
+    /// Destination ports on which a ClientHello is inspected (default 443).
+    #[serde(default = "default_sni_ports")]
+    pub sni_ports: Vec<u16>,
+}
+
+/// One SNI blocklist entry: a bare hostname, or `{ sni, label }` when the
+/// operator wants to carry an incident reference for the dashboard.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum SniBlockSpec {
+    Bare(String),
+    Full(SniBlockFull),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct SniBlockFull {
+    pub sni: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+impl SniBlockSpec {
+    pub fn sni(&self) -> &str {
+        match self {
+            Self::Bare(s) => s,
+            Self::Full(f) => &f.sni,
+        }
+    }
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Bare(_) => "",
+            Self::Full(f) => &f.label,
+        }
+    }
+}
+
+fn default_sni_ports() -> Vec<u16> {
+    vec![443]
 }
 
 /// Optional MaxMind GeoLite2 databases used to annotate every IP the control
@@ -481,7 +527,28 @@ impl Config {
             network: NetworkThresholds::default(),
             api: None,
             geoip: GeoIpConfig::default(),
+            sni_blocks: Vec::new(),
+            sni_ports: default_sni_ports(),
         }
+    }
+
+    /// The configured SNI blocklist, canonicalised and validated. Invalid
+    /// hostnames are warned about and skipped rather than failing startup: a
+    /// typo in an abuse blocklist must never take the firewall down.
+    pub fn sni_blocklist(&self) -> Vec<crate::api::SniBlock> {
+        self.sni_blocks
+            .iter()
+            .filter_map(|spec| match crate::api::parse_sni(spec.sni()) {
+                Some(sni) => Some(crate::api::SniBlock {
+                    sni,
+                    label: spec.label().to_string(),
+                }),
+                None => {
+                    log::warn!("ignoring invalid sni-blocks entry '{}'", spec.sni());
+                    None
+                }
+            })
+            .collect()
     }
 
     fn validate(&self) -> Result<()> {
@@ -496,6 +563,16 @@ impl Config {
         anyhow::ensure!(
             self.thresholds.sample_interval_ms > 0,
             "thresholds.sample-interval-ms must be > 0"
+        );
+        // The datapath reads the inspection ports from a fixed-size array map,
+        // and port 0 is its "unused slot" sentinel.
+        anyhow::ensure!(
+            self.sni_ports.len() <= SNI_MAX_PORTS,
+            "sni-ports takes at most {SNI_MAX_PORTS} ports"
+        );
+        anyhow::ensure!(
+            !self.sni_ports.contains(&0),
+            "sni-ports must not contain port 0"
         );
         Ok(())
     }
@@ -703,6 +780,53 @@ thresholds:
             ..Config::from_interfaces(vec!["e".to_string()])
         };
         assert!(cfg.parse_protected().is_err());
+    }
+
+    #[test]
+    fn parses_sni_blocklist_bare_and_labelled() {
+        let cfg: Config = serde_yaml_ng::from_str(
+            "interfaces: [eno1]\nsni-blocks:\n  - EmailManager.pro\n  \
+             - { sni: c2.example, label: \"2026-08-19 incident\" }\n  - \"*.bad\"\n",
+        )
+        .unwrap();
+        let blocks = cfg.sni_blocklist();
+        // Canonicalised to lower case; the wildcard entry is dropped with a
+        // warning rather than failing startup.
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].sni, "emailmanager.pro");
+        assert_eq!(blocks[0].label, "");
+        assert_eq!(blocks[1].sni, "c2.example");
+        assert_eq!(blocks[1].label, "2026-08-19 incident");
+        // Default inspection port.
+        assert_eq!(cfg.sni_ports, vec![443]);
+    }
+
+    #[test]
+    fn sni_blocklist_empty_by_default() {
+        let cfg = Config::from_interfaces(vec!["eno1".to_string()]);
+        assert!(cfg.sni_blocklist().is_empty());
+        assert_eq!(cfg.sni_ports, vec![443]);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_and_validates_sni_ports() {
+        let cfg: Config =
+            serde_yaml_ng::from_str("interfaces: [eno1]\nsni-ports: [443, 8443]\n").unwrap();
+        assert_eq!(cfg.sni_ports, vec![443, 8443]);
+        cfg.validate().unwrap();
+        // Port 0 is the datapath's "unused slot" sentinel.
+        let zero = Config {
+            sni_ports: vec![0],
+            ..Config::from_interfaces(vec!["e".to_string()])
+        };
+        assert!(zero.validate().is_err());
+        // More ports than the array map has slots.
+        let too_many = Config {
+            sni_ports: (1..=(SNI_MAX_PORTS as u16 + 1)).collect(),
+            ..Config::from_interfaces(vec!["e".to_string()])
+        };
+        assert!(too_many.validate().is_err());
     }
 
     #[test]

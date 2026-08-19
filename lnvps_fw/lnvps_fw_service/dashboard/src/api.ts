@@ -52,7 +52,12 @@ export interface UpgradeStatus {
   deb_url: string | null; checked_at: number; error: string | null;
 }
 export interface Override { cidr: string; flags: number }
-export interface RuleSet { protected: string[]; overrides: Override[]; source_blocks: string[] }
+/** A blocked TLS server name plus the datapath's drop counter for it. */
+export interface SniBlockInfo { sni: string; label: string; hash: string; drops: number }
+export interface SniBlock { sni: string; label: string }
+export interface RuleSet {
+  protected: string[]; overrides: Override[]; source_blocks: string[]; sni_blocks: SniBlock[];
+}
 export interface BlocksPage { total: number; offset: number; limit: number; items: SourceBlock[] }
 export interface SourcesPage { total: number; offset: number; limit: number; items: TrackedSource[] }
 export interface PortsPage { total: number; offset: number; limit: number; items: LearnedPort[] }

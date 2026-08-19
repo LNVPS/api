@@ -715,7 +715,23 @@ async fn run_sim(state: Arc<SharedState>) {
         if t % 5 == 1 {
             state.set_ports(learned_ports(t));
         }
+        // SNI egress blocks: the demo's one entry accumulates drops slowly, the
+        // way a C2 agent's poll interval actually looks (a handful per minute,
+        // not a packet rate).
+        state.set_sni_blocks(sni_block_snapshot(t));
     }
+}
+
+/// The demo's TLS-SNI blocklist snapshot: one blocked C2 name whose drop
+/// counter creeps up as the simulated agent retries its poll.
+fn sni_block_snapshot(t: u64) -> Vec<lnvps_fw_service::api::SniBlockInfo> {
+    let sni = "emailmanager.pro";
+    vec![lnvps_fw_service::api::SniBlockInfo {
+        sni: sni.to_string(),
+        label: "spam agent C2".to_string(),
+        hash: format!("{:016x}", lnvps_fw_common::sni_hash(sni)),
+        drops: 3 + t / 7,
+    }]
 }
 
 /// Per-family running aggregate for a protected prefix.
@@ -749,6 +765,10 @@ async fn main() -> anyhow::Result<()> {
                 flags: DEST_MODE_PORT_FILTER | DEST_MODE_SYN_PROXY,
             }],
             source_blocks: vec!["45.134.26.0/24".into()],
+            sni_blocks: vec![lnvps_fw_service::api::SniBlock {
+                sni: "emailmanager.pro".into(),
+                label: "spam agent C2".into(),
+            }],
         },
         1024,
         "LNVPS/api".into(),

@@ -148,6 +148,18 @@ A normal `cargo test` (unprivileged) stays green: the harness tests are
   are decapsulated in-XDP and filtered on the *inner* header (closed port
   dropped, open port passed), verified via the per-dest counters.
 
+`tests/sni_block.rs` (TLS-SNI egress blocking on the VM-facing TC hook):
+- `blocked_client_hello_dropped_and_counted` — a guest ClientHello naming a
+  blocked server never reaches the far side, and the per-hostname drop counter
+  increments (the TCP handshake itself still completes: only the hello is shot).
+- `unblocked_client_hello_passes` — a hello for any other name arrives verbatim.
+- `non_tls_and_uninspected_ports_pass` — non-TLS payload on :443, and the same
+  blocked hello on an uninspected port, are both untouched.
+- `blocked_client_hello_dropped_over_ipv6` — the IPv6 parse path enforces the
+  same blocklist.
+- `port_learning_survives_sni_blocking` — regression: passive port learning
+  still runs on the same hook with a blocklist installed.
+
 `tests/scoping.rs` (destination scoping to `protected`):
 - `unprotected_destination_is_passed_and_uncounted` / 
   `protected_destination_is_still_mitigated` — with scoping on, a destination
@@ -156,7 +168,22 @@ A normal `cargo test` (unprivileged) stays green: the harness tests are
 
 Run a single binary with `scripts/fw-e2e.sh --test learning` (or `--test
 mitigation`, `--test escalation`, `--test carpet_bomb`, `--test syn_proxy`,
-`--test gre_decap`, `--test scoping`, `--test smoke`).
+`--test gre_decap`, `--test scoping`, `--test sni_block`, `--test smoke`).
+
+### Note on writing datapath tests that parse packet payload
+
+The TC SNI parser walks *variable* offsets (session id, cipher suites, and the
+extension list are all length-prefixed). Direct packet access cannot be used
+there: the verifier drops its range tracking across variable pointer
+arithmetic (`math between pkt pointer and register with unbounded min value`),
+and a large ClientHello may live in the skb's non-linear fragments, which
+direct access cannot reach at all. Payload reads therefore go through
+`bpf_skb_load_bytes` (aya's `ctx.load::<T>()`), with each running offset
+clamped to a fixed scan window so it stays a bounded scalar. A bulk read of the
+hostname is *not* possible: a variable length is rejected as a
+possibly-zero-sized read however the bound is expressed, and a fixed-size read
+fails whenever the name sits near the end of the packet — hence the per-byte
+hash loop.
 
 ## Service configuration
 

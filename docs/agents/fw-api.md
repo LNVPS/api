@@ -42,6 +42,9 @@ section to disable the API entirely.
 | GET | `/blocks` | legacy: currently-blocked sources only (manual CIDRs + kernel-blocked /32s|/128s), paginated |
 | POST | `/blocks` | add a permanent manual source block `{cidr}` (updates the ruleset) |
 | DELETE | `/blocks?cidr=<cidr>` | remove a manual source block |
+| GET | `/sni-blocks` | TLS-SNI egress blocklist with per-hostname drop counters |
+| POST | `/sni-blocks` | add/relabel a blocked server name `{sni, label?}` |
+| DELETE | `/sni-blocks?sni=<host>` | lift an SNI block (`404` if absent) |
 | GET | `/upgrade` | cached self-upgrade status: `current`, `latest`, `available`, `deb_url` |
 | POST | `/upgrade` | download the latest release `.deb` and install + restart (202) |
 
@@ -155,10 +158,48 @@ at response-build time over the bounded page — never on the detection hot path
 For a CIDR the network address is looked up. The GeoLite2 EULA forbids bundling
 the databases, so they are never shipped with the `.deb`.
 
+### TLS-SNI egress blocks (`/sni-blocks`)
+
+Spam/botnet C2 traffic often cannot be stopped at the IP layer (the C2 sits
+behind a CDN, so an IP block takes out unrelated sites) or by DNS (a
+root-controlled guest brings its own resolver, or hardcodes an address). The
+ClientHello **SNI** is the one field the guest cannot change without breaking
+certificate validation at the far end, so the TC program on the VM-facing hook
+matches it and drops the hello (`TC_ACT_SHOT`) — the connection never gets past
+the handshake.
+
+- Enforced on the `learn` role NIC's ingress (router: VM egress enters there as
+  plain L2, before NAT) or the `host` role NIC's egress. When `protected` is
+  set, only traffic from a protected source is inspected, so a router never
+  touches third-party transit.
+- `POST {"sni": "emailmanager.pro", "label": "2026-08-19 incident"}` takes
+  effect on the control loop's next tick — no restart. Hostnames are
+  canonicalised (trimmed, lower-cased, trailing root dot stripped); anything
+  that is not a plain DNS name — a wildcard, URL, or `host:port` — is rejected
+  with `400` rather than silently never matching.
+- `GET` returns `{sni, label, hash, drops}` per entry. `drops` is the datapath's
+  count of ClientHellos shot for that name, which is how an abuse takedown
+  confirms a fresh block is biting. `hash` is the 64-bit FNV-1a the BPF map is
+  keyed by (hex string, since a u64 does not survive a JSON number in a
+  browser) — BPF keys are bounded, so the datapath cannot key on the name
+  itself.
+- The list also round-trips through `PUT /rules` (`sni_blocks`), and is seeded
+  from `sni-blocks` in the daemon's local config at startup, so it survives a
+  restart even with no client pushing rules. As with `source_blocks`, a full
+  `PUT /rules` replaces the list.
+- **Admin-only.** This is never exposed on the customer API.
+
+Limitations, all fail-open by design: matching is **exact per hostname**
+(`example.com` does not cover `www.example.com`); TLS 1.3 **Encrypted Client
+Hello** hides the name outright; a ClientHello split across TCP segments, or
+one burying its SNI behind more than 64 extensions, is not matched. Inspection
+is limited to the ports in `sni-ports` (default `[443]`, max 8), so nothing
+else pays the parsing cost.
+
 ### Rules / overrides model
 
 `PUT /rules` sets `{ protected: ["203.0.113.0/24", ...], overrides: [{cidr,
-flags}, ...] }`. On change the control loop refreshes the protected-prefix list
+flags}, ...], source_blocks: [...], sni_blocks: [{sni, label}, ...] }`. On change the control loop refreshes the protected-prefix list
 used by prefix (carpet-bomb) detection and reconciles manual overrides into the
 dest-state BPF trie (added/removed as the set changes). Malformed CIDRs are
 rejected with `400`.
@@ -176,8 +217,13 @@ An internal, self-contained HTML dashboard is served at `/` (plain HTML + vanill
 JS, no external assets). It is outside the bearer-token layer (a browser can't
 send a bearer header on navigation) but still behind the source-IP allow-list;
 the page prompts once for the token (kept in `localStorage`) and calls the JSON
-API. It shows status, active mitigations, rules/overrides, and a live event
-feed.
+API. It shows status, active mitigations, rules/overrides, the TLS-SNI egress
+blocklist (add/lift a server name, with each entry's drop counter), and a live
+event feed.
+
+The dashboard is a Vite + Preact app under `lnvps_fw_service/dashboard/`; after
+changing anything in `src/`, run `bun run build` and commit the regenerated
+`dist/index.html` (the service embeds it with `include_str!`).
 
 ## Local preview / smoke test (no root)
 

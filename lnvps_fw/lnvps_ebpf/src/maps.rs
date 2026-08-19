@@ -4,8 +4,16 @@ use aya_ebpf::maps::lpm_trie::Key;
 use aya_ebpf::maps::{Array, LpmTrie, LruHashMap, LruPerCpuHashMap, ProgramArray};
 use lnvps_fw_common::{
     COOKIE_SECRET_CURRENT, COOKIE_SECRET_PREVIOUS, DEST_MODE_NORMAL, DestCounters, DestState,
-    GlobalConfig, LastSeen, PortKeyV4, PortKeyV6, SrcRateConfig, SrcState,
+    GlobalConfig, LastSeen, PortKeyV4, PortKeyV6, SNI_MAX_BLOCKS, SNI_MAX_PORTS, SrcRateConfig,
+    SrcState,
 };
+
+/// Max number of blocked TLS server names. Operator-managed (an abuse
+/// blocklist), so this is generous rather than load-bearing.
+pub const MAX_SNI_BLOCKS: u32 = SNI_MAX_BLOCKS as u32;
+
+/// Max number of destination ports on which a ClientHello is inspected.
+pub const MAX_SNI_PORTS: u32 = SNI_MAX_PORTS as u32;
 
 /// Max number of destination IPs to track (per address family). Sized to a
 /// bounded protected footprint rather than the whole internet: these back the
@@ -76,8 +84,8 @@ pub static V6_SRC_STATE: LruHashMap<[u8; 16], SrcState> =
 pub static GLOBAL_CFG: Array<GlobalConfig> = Array::with_max_entries(1, 0);
 
 /// Read the consolidated global config (zeroed defaults if never written:
-/// unscoped, no manual blocks, per-source blocking + learn-leak disabled, no
-/// in-kernel verified expiry).
+/// unscoped, no manual blocks, no SNI blocks, per-source blocking + learn-leak
+/// disabled, no in-kernel verified expiry).
 #[inline(always)]
 pub fn global_cfg() -> GlobalConfig {
     GLOBAL_CFG.get(0).copied().unwrap_or(GlobalConfig {
@@ -90,8 +98,52 @@ pub fn global_cfg() -> GlobalConfig {
         scoped: 0,
         manual_blocks: 0,
         learn_leak_pps: 0,
-        _pad: 0,
+        sni_blocks: 0,
     })
+}
+
+/// Operator TLS-SNI egress blocklist: FNV-1a hash of a blocked server name
+/// (see `lnvps_fw_common::sni_hash`) -> ClientHellos dropped for it. The map
+/// doubles as the hit counter so the abuse workflow (add a block, watch the
+/// counter) needs no second map; userspace only ever inserts a fresh entry
+/// with a zero count, so counters survive reconciliation.
+///
+/// Deliberately NOT per-CPU: a blocked C2 poll is a handful of packets per
+/// minute, so the shared cache line is never hot and a racing increment (which
+/// can only undercount) is irrelevant for an operator hit-rate view.
+#[map]
+pub static SNI_BLOCKED: LruHashMap<u64, u64> = LruHashMap::with_max_entries(MAX_SNI_BLOCKS, 0);
+
+/// Destination ports (host byte order) on which the TC datapath looks for a
+/// TLS ClientHello. Written by userspace from `sni-ports` (default: 443); an
+/// unused slot holds 0, which no real TCP destination port ever is.
+#[map]
+pub static SNI_PORTS: Array<u16> = Array::with_max_entries(MAX_SNI_PORTS, 0);
+
+/// True if `port` (host byte order) is a configured SNI-inspection port.
+#[inline(always)]
+pub fn sni_port(port: u16) -> bool {
+    for i in 0..MAX_SNI_PORTS {
+        if let Some(p) = SNI_PORTS.get(i)
+            && *p == port
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Look up a hashed server name in the blocklist, counting the drop on a hit.
+/// Returns true when the packet must be shot.
+#[inline(always)]
+pub fn sni_block_hit(hash: u64) -> bool {
+    match SNI_BLOCKED.get_ptr_mut(&hash) {
+        Some(p) => {
+            unsafe { *p += 1 };
+            true
+        }
+        None => false,
+    }
 }
 
 /// Per-destination learning-leak buckets (IPv4): a fixed 1s window counting
@@ -159,15 +211,6 @@ pub static MANUAL_BLOCK_V4: LpmTrie<[u8; 4], u8> = LpmTrie::with_max_entries(MAX
 /// Manual source-CIDR blocks (IPv6).
 #[map]
 pub static MANUAL_BLOCK_V6: LpmTrie<[u8; 16], u8> = LpmTrie::with_max_entries(MAX_CIDR_BLOCKS, 0);
-
-/// True if destination scoping is enabled (`protected` is non-empty). Reads the
-/// consolidated config; used on the TC egress learn path (which only needs this
-/// one field). The XDP ingress path instead reads [`global_cfg`] once and uses
-/// `cfg.scoped` directly, so it never double-looks-up.
-#[inline(always)]
-pub fn scoped() -> bool {
-    global_cfg().scoped != 0
-}
 
 /// Generate a dest-mode reader for one address family: a longest-prefix lookup
 /// returns the covering mitigation state (a /32|/128 exact entry or a wider

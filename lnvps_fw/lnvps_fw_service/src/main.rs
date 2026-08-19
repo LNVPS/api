@@ -18,7 +18,7 @@ use lnvps_fw_common::{
 
 use lnvps_fw_service::api::{
     self, CidrKey, InterfaceInfo, LearnedPort, Limits, Mitigation, Override, PrefixLoad, RuleSet,
-    SharedState, SourceBlock, Totals, TrackedIp, TrackedSource, parse_cidr,
+    SharedState, SourceBlock, Totals, TrackedIp, TrackedSource, parse_cidr, sni_block_infos,
 };
 use lnvps_fw_service::cidr::{mask_v4, mask_v6};
 use lnvps_fw_service::config::{Config, IfaceRole};
@@ -925,6 +925,9 @@ fn start_api(cfg: &Config) -> Result<Option<std::sync::Arc<SharedState>>> {
         protected: cfg.protected.clone(),
         overrides: Vec::new(),
         source_blocks: Vec::new(),
+        // Seed the runtime SNI blocklist from the local config; the API can
+        // then add/remove entries live.
+        sni_blocks: cfg.sni_blocklist(),
     };
     let state = SharedState::new(
         api_cfg.token.clone(),
@@ -1111,6 +1114,22 @@ async fn main() -> Result<()> {
     // Arm the in-kernel per-source rate machine before traffic decisions.
     runtime::write_src_rate_cfg(&mut bpf, &runtime_cfg)?;
     runtime::write_learn_leak_cfg(&mut bpf, &runtime_cfg)?;
+
+    // TLS-SNI egress blocklist: the inspection ports are config-only (written
+    // once), the hostnames are seeded from config here so they are enforced
+    // even with the control API disabled, and reconciled on every rules change
+    // below.
+    runtime::write_sni_ports(&mut bpf, &cfg.sni_ports)?;
+    let mut sni_hostnames: Vec<String> = cfg.sni_blocklist().into_iter().map(|b| b.sni).collect();
+    match runtime::sync_sni_blocks(&mut bpf, &sni_hostnames) {
+        Ok(_) if sni_hostnames.is_empty() => {}
+        Ok(_) => info!(
+            "SNI egress blocklist: {} hostname(s) on port(s) {:?}",
+            sni_hostnames.len(),
+            cfg.sni_ports
+        ),
+        Err(e) => warn!("writing SNI blocklist failed: {e}"),
+    }
     let mut detect_timer = tokio::time::interval(cfg.sample_interval());
     let mut gc_timer = tokio::time::interval(cfg.gc_interval());
     // Rotate the SYN-cookie secret periodically; cookies issued in the previous
@@ -1165,6 +1184,19 @@ async fn main() -> Result<()> {
                             &mut applied_protected_v6,
                         ) {
                             warn!("sync protected failed: {e}");
+                        }
+                        // Reconcile the SNI egress blocklist (API add/remove or
+                        // a full rules push) into the datapath.
+                        sni_hostnames =
+                            rules.sni_blocks.iter().map(|b| b.sni.clone()).collect();
+                        match runtime::sync_sni_blocks(&mut bpf, &sni_hostnames) {
+                            Ok((0, 0)) => {}
+                            Ok((added, removed)) => info!(
+                                "SNI egress blocklist updated: +{added} -{removed} \
+                                 ({} active)",
+                                sni_hostnames.len()
+                            ),
+                            Err(e) => warn!("sync SNI blocklist failed: {e}"),
                         }
                     }
                 }
@@ -1267,6 +1299,13 @@ async fn main() -> Result<()> {
                     st.set_blocks(collect_blocks(&detection_state, now));
                     st.set_sources(collect_sources(&detection_state, now));
                     st.set_totals(collect_totals(&detection_state, now));
+                    // Publish the SNI blocklist with its live drop counters.
+                    match runtime::read_sni_drops(&bpf) {
+                        Ok(drops) => {
+                            st.set_sni_blocks(sni_block_infos(&st.rules().sni_blocks, &drops))
+                        }
+                        Err(e) => warn!("reading SNI drop counters failed: {e}"),
+                    }
                 }
             }
             _ = gc_timer.tick() => {

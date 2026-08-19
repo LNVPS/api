@@ -121,6 +121,35 @@ escalation:
   # open port missing from the learned set for the whole flood. 0 disables it.
   learn-leak-pps: 100
 
+# --- TLS SNI egress blocklist ------------------------------------------------
+# Drop a guest's outbound TLS ClientHello when it names one of these servers.
+# This is the enforcement point for spam/botnet C2 that cannot be stopped any
+# other way: the C2 domain sits behind a CDN (so an IP block would take out
+# unrelated sites), and a root-controlled guest simply ignores a DNS sinkhole.
+# The SNI is the one field the guest cannot change without breaking certificate
+# validation at the far end.
+#
+# Enforced on the VM-facing hook -- the `learn` role NIC on a router, or the
+# single NIC's egress on a host -- and, when `protected` is set, only for
+# traffic sourced from a protected address, so a router never inspects
+# third-party transit.
+#
+# Matching is EXACT (per hostname, case-insensitive): blocking `example.com`
+# does not block `www.example.com` -- list every name you mean to stop.
+# Wildcards are rejected rather than silently ignored. TLS 1.3 Encrypted Client
+# Hello hides the name entirely and cannot be matched.
+#
+# Entries are also addable/removable at runtime via the control API
+# (GET/POST/DELETE /api/v1/sni-blocks), which reports a per-hostname drop
+# counter so an abuse takedown can confirm the block is biting.
+# sni-blocks:
+#   - emailmanager.pro
+#   - { sni: c2.example, label: "2026-08-19 incident" }
+
+# Destination ports on which a ClientHello is looked for (max 8). Only these
+# ports pay the parsing cost; everything else is passed untouched.
+# sni-ports: [443]
+
 # RESTful control API (increment 7). Omit this whole section to disable it.
 # HTTPS is mandatory: if no cert/key is given a self-signed pair is generated
 # at startup. lnvps_api is the client -- it pushes rules and polls state/events;

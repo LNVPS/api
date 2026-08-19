@@ -1,15 +1,16 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::bindings::TC_ACT_OK;
 use aya_ebpf::bindings::xdp_action::{XDP_DROP, XDP_PASS, XDP_TX};
+use aya_ebpf::bindings::{TC_ACT_OK, TC_ACT_SHOT};
 use aya_ebpf::helpers::bpf_xdp_get_buff_len;
 use aya_ebpf::macros::{classifier, xdp};
 use aya_ebpf::programs::{TcContext, XdpContext};
 use lnvps_fw_common::{
     DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DEST_MODE_SOURCE_BLOCK, DEST_MODE_SYN_PROXY,
     GlobalConfig, PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, PortKeyV4, PortKeyV6,
-    SLOT_SYN_PROXY_V4, SLOT_SYN_PROXY_V6, syn_cookie_v4, syn_cookie_v6,
+    SLOT_SYN_PROXY_V4, SLOT_SYN_PROXY_V6, SNI_HASH_INIT, sni_hash_byte, syn_cookie_v4,
+    syn_cookie_v6,
 };
 
 /// GRE inner protocol type for IPv4 / IPv6 payloads (ethertypes).
@@ -27,8 +28,8 @@ use maps::{
     dest_mode_v4, dest_mode_v6, global_cfg, learn_budget_v4, learn_budget_v6, learn_leak_v4,
     learn_leak_v6, learn_port_v4, learn_port_v6, manual_blocked_v4, manual_blocked_v6,
     mark_verified_v4, mark_verified_v6, port_is_open_v4, port_is_open_v6, port_open_refresh_v4,
-    port_open_refresh_v6, protected_v4, protected_v6, scoped, src_gate_v4, src_gate_v6,
-    src_verified_v4, src_verified_v6, tx_counters_v4, tx_counters_v6,
+    port_open_refresh_v6, protected_v4, protected_v6, sni_block_hit, sni_port, src_gate_v4,
+    src_gate_v6, src_verified_v4, src_verified_v6, tx_counters_v4, tx_counters_v6,
 };
 
 /// Normalized L4 metadata extracted from a packet, shared between the v4 and
@@ -475,8 +476,15 @@ struct EgressService {
 
 /// TC egress classifier: passively learns which ports each local IP actually
 /// uses by observing outbound traffic. Any outbound TCP or UDP packet from
-/// `src ip:port` marks that port as a live local service/flow. Never modifies
-/// or drops packets (always `TC_ACT_OK`).
+/// `src ip:port` marks that port as a live local service/flow.
+///
+/// This is also the enforcement point for the operator **TLS-SNI egress
+/// blocklist**: a guest's ClientHello to a blocked server name is shot here
+/// (`TC_ACT_SHOT`). The hook sees VM egress as plain L2 before NAT/routing --
+/// on a router it is the `learn` role's TC *ingress* (VM traffic entering the
+/// VM-facing NIC), on a single-NIC host the NIC's TC *egress* -- so one
+/// program covers the whole fleet in either topology. Everything else is
+/// passed untouched (`TC_ACT_OK`), and any parse failure fails open.
 ///
 /// Why learn on *every* outbound segment (not just a TCP SYN-ACK): PORT_FILTER
 /// drops inbound traffic to non-learned ports, and the return traffic of a
@@ -495,8 +503,11 @@ struct EgressService {
 /// pollution bounded; see docs/agents/fw-testing.md and work/ddos-protection.md.
 #[classifier]
 pub fn tc_lnvps_egress(ctx: TcContext) -> i32 {
-    let _ = try_learn(&ctx);
-    TC_ACT_OK
+    match try_learn(&ctx) {
+        Ok(verdict) => verdict,
+        // Fail open: a truncated/garbage packet is never dropped here.
+        Err(()) => TC_ACT_OK,
+    }
 }
 
 #[inline(always)]
@@ -510,12 +521,12 @@ fn tc_ptr_at<T>(ctx: &TcContext, offset: usize) -> Result<*const T, ()> {
 }
 
 #[inline(always)]
-fn try_learn(ctx: &TcContext) -> Result<(), ()> {
+fn try_learn(ctx: &TcContext) -> Result<i32, ()> {
     let eth = unsafe { &*tc_ptr_at::<EthHdr>(ctx, 0)? };
     match eth.ether_type() {
         Ok(EtherType::Ipv4) => learn_ipv4(ctx),
         Ok(EtherType::Ipv6) => learn_ipv6(ctx),
-        _ => Ok(()),
+        _ => Ok(TC_ACT_OK),
     }
 }
 
@@ -562,22 +573,193 @@ fn tx_account(c: *mut lnvps_fw_common::DestCounters, pkt_len: u64, proto: u8, ic
     }
 }
 
+// --- TLS SNI egress blocking (TC) ---
+
+/// TLS record content type for a handshake record.
+const TLS_RECORD_HANDSHAKE: u8 = 0x16;
+/// TLS handshake message type for ClientHello.
+const TLS_HS_CLIENT_HELLO: u8 = 0x01;
+/// TLS extension type `server_name` (RFC 6066).
+const TLS_EXT_SERVER_NAME: usize = 0x0000;
+/// `NameType` for a DNS hostname inside the server_name extension.
+const SNI_NAME_TYPE_HOST: u8 = 0x00;
+/// Longest hostname hashed. A DNS name is at most 253 bytes, so anything
+/// longer is not a name we could have been asked to block.
+const SNI_MAX_LEN: usize = 253;
+/// Extensions walked before giving up. A real ClientHello carries well under
+/// 20; the bound keeps the loop trivially finite for the verifier. A hello
+/// that buries its SNI behind more than this many extensions is passed (fail
+/// open) — see the evasion note on [`sni_blocked`].
+const SNI_MAX_EXTENSIONS: usize = 64;
+/// How far past the start of the TCP payload the ClientHello is parsed. Every
+/// running offset is clamped to this window, which both caps the work per
+/// packet and — crucially — keeps each offset a *bounded* scalar, without
+/// which the verifier rejects the pointer arithmetic outright.
+const SNI_SCAN_WINDOW: usize = 2048;
+
+/// Read one payload byte at `off`.
+///
+/// The ClientHello walk uses `bpf_skb_load_bytes` rather than direct packet
+/// access for two reasons: the offsets are packet-derived (variable), and the
+/// verifier cannot carry a usable range across variable pointer arithmetic
+/// (`math between pkt pointer and register with unbounded min value`); and the
+/// payload of a large hello may live in the skb's non-linear fragments, which
+/// direct access cannot reach at all. The helper handles both, and reads the
+/// same bytes the guest actually sent.
 #[inline(always)]
-fn learn_ipv4(ctx: &TcContext) -> Result<(), ()> {
+fn tc_u8(ctx: &TcContext, off: usize) -> Result<u8, ()> {
+    ctx.load::<u8>(off).map_err(|_| ())
+}
+
+/// Read a big-endian u16 payload field at `off`.
+#[inline(always)]
+fn tc_be16(ctx: &TcContext, off: usize) -> Result<usize, ()> {
+    let b = ctx.load::<[u8; 2]>(off).map_err(|_| ())?;
+    Ok(((b[0] as usize) << 8) | b[1] as usize)
+}
+
+/// Clamp a running parse offset to the scan window (see [`SNI_SCAN_WINDOW`]),
+/// bounding the work a single hello can cost. `Err` aborts the parse, which
+/// fails open.
+#[inline(always)]
+fn sni_bounded(off: usize, end: usize) -> Result<usize, ()> {
+    if off > end { Err(()) } else { Ok(off) }
+}
+
+/// True if this packet is a TLS ClientHello, sent to a configured inspection
+/// port, whose server name is on the operator blocklist — in which case the
+/// hit has already been counted and the caller must shoot the packet.
+///
+/// No per-flow state is needed: the ClientHello appears once per connection
+/// (and again, with the same SNI, on resumption), so matching it is enough to
+/// stop the connection — the guest cannot lie about the SNI without breaking
+/// certificate validation at the far end, which is exactly why this is the
+/// un-bypassable enforcement point for a root-controlled guest.
+///
+/// Fails open on every parse failure (`Err` from a bounds check, a truncated
+/// hello, a hello split across segments, SNI buried behind more than
+/// [`SNI_MAX_EXTENSIONS`] extensions, or TLS 1.3 Encrypted Client Hello, which
+/// hides the name outright).
+#[inline(always)]
+fn sni_blocked(ctx: &TcContext, cfg: &GlobalConfig, proto: u8, l4_off: usize) -> bool {
+    if cfg.sni_blocks == 0 || proto != PROTO_TCP {
+        return false;
+    }
+    try_sni_blocked(ctx, l4_off).unwrap_or(false)
+}
+
+#[inline(always)]
+fn try_sni_blocked(ctx: &TcContext, l4_off: usize) -> Result<bool, ()> {
+    let tcp = unsafe { &*tc_ptr_at::<TcpHdr>(ctx, l4_off)? };
+    if !sni_port(u16::from_be_bytes(tcp.dest)) {
+        return Ok(false);
+    }
+    // Honour the TCP data offset: a hello segment may carry options
+    // (timestamps), which would otherwise shift the payload out from under us.
+    let doff = tcp.doff() as usize * 4;
+    if doff < TcpHdr::LEN {
+        return Ok(false);
+    }
+    // TLS record header: type(1) legacy_version(2) length(2).
+    let rec = l4_off + doff;
+    let end = rec + SNI_SCAN_WINDOW;
+    if tc_u8(ctx, rec)? != TLS_RECORD_HANDSHAKE {
+        return Ok(false);
+    }
+    // Handshake header: msg_type(1) length(3).
+    let hs = rec + 5;
+    if tc_u8(ctx, hs)? != TLS_HS_CLIENT_HELLO {
+        return Ok(false);
+    }
+    // ClientHello body: legacy_version(2) random(32) then variable fields.
+    let mut p = hs + 4 + 2 + 32;
+    // legacy_session_id: len(1) + bytes.
+    p = sni_bounded(p + 1 + tc_u8(ctx, p)? as usize, end)?;
+    // cipher_suites: len(2) + bytes.
+    p = sni_bounded(p + 2 + tc_be16(ctx, p)?, end)?;
+    // legacy_compression_methods: len(1) + bytes.
+    p = sni_bounded(p + 1 + tc_u8(ctx, p)? as usize, end)?;
+    // extensions: len(2) + list.
+    let ext_end = sni_bounded(p + 2 + tc_be16(ctx, p)?, end)?;
+    p = sni_bounded(p + 2, end)?;
+    for _ in 0..SNI_MAX_EXTENSIONS {
+        // extension: type(2) len(2) + body.
+        if p + 4 > ext_end {
+            return Ok(false);
+        }
+        let etype = tc_be16(ctx, p)?;
+        let elen = tc_be16(ctx, p + 2)?;
+        p = sni_bounded(p + 4, end)?;
+        if p + elen > ext_end {
+            return Ok(false);
+        }
+        if etype == TLS_EXT_SERVER_NAME {
+            return sni_ext_blocked(ctx, p, elen);
+        }
+        p = sni_bounded(p + elen, end)?;
+    }
+    Ok(false)
+}
+
+/// Check the first DNS hostname in a `server_name` extension body (`len` bytes
+/// at `off`) against the blocklist. Only the first entry is considered: the
+/// list has been restricted to a single `host_name` since RFC 6066.
+#[inline(always)]
+fn sni_ext_blocked(ctx: &TcContext, off: usize, len: usize) -> Result<bool, ()> {
+    // ServerNameList: list_len(2) [ name_type(1) name_len(2) name ].
+    if len < 5 {
+        return Ok(false);
+    }
+    let list_len = tc_be16(ctx, off)?;
+    if list_len + 2 > len || tc_u8(ctx, off + 2)? != SNI_NAME_TYPE_HOST {
+        return Ok(false);
+    }
+    let name_len = tc_be16(ctx, off + 3)?;
+    if name_len == 0 || name_len > SNI_MAX_LEN || name_len + 3 > list_len {
+        return Ok(false);
+    }
+    // Hash the name one byte at a time. A bulk `bpf_skb_load_bytes` would need
+    // a variable length, which the verifier rejects as a possibly-zero-sized
+    // read however the bound is expressed; a fixed-size bulk read would fail
+    // whenever the name sits near the end of the packet. Per-byte loads are
+    // constant-sized, and the loop runs only for the name's actual length
+    // (~20 bytes for a real hostname), once per inspected ClientHello.
+    let name = off + 5;
+    let mut h = SNI_HASH_INIT;
+    for i in 0..SNI_MAX_LEN {
+        if i >= name_len {
+            break;
+        }
+        h = sni_hash_byte(h, tc_u8(ctx, name + i)?);
+    }
+    Ok(sni_block_hit(h))
+}
+
+#[inline(always)]
+fn learn_ipv4(ctx: &TcContext) -> Result<i32, ()> {
     let ip = unsafe { &*tc_ptr_at::<Ipv4Hdr>(ctx, EthHdr::LEN)? };
+    let cfg = global_cfg();
     // Only account/learn for protected servers (keeps state clean on a router
-    // that forwards for many networks).
-    if scoped() && !protected_v4(ip.src_addr) {
-        return Ok(());
+    // that forwards for many networks). The SNI blocklist honours the same
+    // scope, so a router never inspects third-party transit traffic.
+    if cfg.scoped != 0 && !protected_v4(ip.src_addr) {
+        return Ok(TC_ACT_OK);
+    }
+    // Options-bearing / fragmented headers put L4 somewhere else, so neither
+    // the SNI check nor port learning can read it (both simply skip).
+    let plain_l4 = ip.ihl() as usize == Ipv4Hdr::LEN && ip.frag_offset() == 0;
+    // SNI egress block first: a shot packet is neither accounted nor learned
+    // (its flow never completes, so there is no service to remember).
+    if plain_l4 && sni_blocked(ctx, &cfg, ip.proto, EthHdr::LEN + Ipv4Hdr::LEN) {
+        return Ok(TC_ACT_SHOT);
     }
     // TX accounting for every outbound packet from this source (before the
     // options-header early-out below, which only affects L4 port learning).
     if let Some(c) = tx_counters_v4(&ip.src_addr) {
         tx_account(c, ctx.len() as u64, ip.proto, PROTO_ICMP);
     }
-    // Options-bearing headers are skipped (rare); L4 offset would be wrong.
-    if ip.ihl() as usize != Ipv4Hdr::LEN {
-        return Ok(());
+    if !plain_l4 {
+        return Ok(TC_ACT_OK);
     }
     if let Some(svc) = egress_service(ctx, ip.proto, EthHdr::LEN + Ipv4Hdr::LEN)? {
         let key = PortKeyV4 {
@@ -588,14 +770,21 @@ fn learn_ipv4(ctx: &TcContext) -> Result<(), ()> {
         };
         learn_port_v4(&OPEN_PORTS_V4, &key);
     }
-    Ok(())
+    Ok(TC_ACT_OK)
 }
 
 #[inline(always)]
-fn learn_ipv6(ctx: &TcContext) -> Result<(), ()> {
+fn learn_ipv6(ctx: &TcContext) -> Result<i32, ()> {
     let ip = unsafe { &*tc_ptr_at::<Ipv6Hdr>(ctx, EthHdr::LEN)? };
-    if scoped() && !protected_v6(ip.src_addr) {
-        return Ok(());
+    let cfg = global_cfg();
+    if cfg.scoped != 0 && !protected_v6(ip.src_addr) {
+        return Ok(TC_ACT_OK);
+    }
+    // SNI egress block (see `learn_ipv4`). As with learning, only packets whose
+    // first next-header is directly TCP are inspected; extension-header chains
+    // are passed.
+    if sni_blocked(ctx, &cfg, ip.next_hdr, EthHdr::LEN + Ipv6Hdr::LEN) {
+        return Ok(TC_ACT_SHOT);
     }
     // TX accounting for every outbound packet from this source.
     if let Some(c) = tx_counters_v6(&ip.src_addr) {
@@ -611,7 +800,7 @@ fn learn_ipv6(ctx: &TcContext) -> Result<(), ()> {
         };
         learn_port_v6(&OPEN_PORTS_V6, &key);
     }
-    Ok(())
+    Ok(TC_ACT_OK)
 }
 
 // --- SYN-proxy tail-call program (IPv4) ---
