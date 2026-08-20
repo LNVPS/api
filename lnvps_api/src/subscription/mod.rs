@@ -1097,6 +1097,8 @@ impl SubscriptionHandler {
                 company_id: subscription.company_id,
                 amount: net_amount,
                 currency,
+                base_currency: Currency::from_str(&subscription.currency)
+                    .map_err(|_| anyhow::anyhow!("Invalid subscription currency"))?,
                 intervals: intervals as u64,
                 interval_type: subscription.interval_type,
                 // A purchase is the subscription's first payment; renewals and

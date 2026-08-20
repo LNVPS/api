@@ -658,6 +658,8 @@ mod tests {
                     items: Some(vec![lnvps_api_common::OrderLineItem {
                         line_item_id: 1,
                         name: "VPS".to_string(),
+                        amount: 10_000,
+                        setup_amount: 0,
                         product: lnvps_api_common::OrderProduct::Vm {
                             vm_id: Some(1),
                             template_id: Some(7),
@@ -679,6 +681,8 @@ mod tests {
                     items: Some(vec![lnvps_api_common::OrderLineItem {
                         line_item_id: 2,
                         name: "Managed app".to_string(),
+                        amount: 2_000,
+                        setup_amount: 500,
                         product: lnvps_api_common::OrderProduct::App {
                             deployment_id: Some(5),
                             app_id: Some(3),

@@ -60,6 +60,11 @@ pub struct DiscountOrder {
     /// Currency of [`Self::amount`] — the payment currency, after any
     /// conversion the pricing engine has already done.
     pub currency: Currency,
+    /// The subscription's base currency, which is what the line items'
+    /// `amount`/`setup_amount` are denominated in. They are converted into
+    /// [`Self::currency`] when the context is built, so a rule never has to
+    /// reason about two currencies at once.
+    pub base_currency: Currency,
     /// Billing intervals being purchased.
     pub intervals: u64,
     /// Billing interval unit.
@@ -149,6 +154,7 @@ impl PricingEngine {
     /// Build the read-only context a rule may read.
     async fn build_context(&self, order: &DiscountOrder) -> Result<DiscountContext> {
         let user = self.db().get_user(order.user_id).await?;
+        let items = self.items_in_payment_currency(order).await;
 
         // Settled payments only: an unpaid invoice is not an order.
         let orders = self
@@ -165,7 +171,7 @@ impl PricingEngine {
                 intervals: order.intervals as i64,
                 interval_type: interval_type_name(order.interval_type).to_string(),
                 is_new: order.is_new,
-                items: order.items.clone(),
+                items,
             },
             UserContext {
                 id: order.user_id as i64,
@@ -174,6 +180,46 @@ impl PricingEngine {
             HistoryContext { orders },
             Utc::now(),
         ))
+    }
+
+    /// The order's line items with their money converted from the
+    /// subscription's base currency into the payment currency.
+    ///
+    /// A line whose amount cannot be converted keeps its unconverted figure
+    /// rather than being dropped: its identity is what most rules read, and a
+    /// missing rate must not remove the line those rules match on.
+    async fn items_in_payment_currency(&self, order: &DiscountOrder) -> Vec<OrderLineItem> {
+        if order.base_currency == order.currency {
+            return order.items.clone();
+        }
+        let mut out = Vec::with_capacity(order.items.len());
+        for item in &order.items {
+            let amount = self.convert_minor(item.amount, order).await;
+            let setup = self.convert_minor(item.setup_amount, order).await;
+            out.push(item.clone().with_converted_money(amount, setup));
+        }
+        out
+    }
+
+    /// Convert one minor-unit amount from the base currency to the payment
+    /// currency, falling back to the input when no rate is available.
+    async fn convert_minor(&self, amount: i64, order: &DiscountOrder) -> i64 {
+        if amount <= 0 {
+            return amount;
+        }
+        match self
+            .convert_currency(
+                CurrencyAmount::from_u64(order.base_currency, amount as u64),
+                order.currency,
+            )
+            .await
+        {
+            Ok(converted) => converted.value().min(i64::MAX as u64) as i64,
+            Err(e) => {
+                warn!("Could not convert a discount line item amount, leaving it as-is: {e}");
+                amount
+            }
+        }
     }
 
     /// Evaluate every candidate and keep the one worth the most to the
@@ -392,6 +438,7 @@ mod tests {
             company_id: 1,
             amount: 10_000,
             currency: Currency::EUR,
+            base_currency: Currency::EUR,
             intervals: 1,
             interval_type: IntervalType::Month,
             is_new: true,
@@ -574,6 +621,36 @@ mod tests {
         // Another customer is unaffected by the first one's redemption.
         let u2 = db.upsert_user(&[2; 32]).await.unwrap();
         assert!(pe.quote_discount(&order(u2, Some("SAVE10"))).await.is_ok());
+    }
+
+    /// A rule sees every figure in one currency: line-item money is converted
+    /// out of the subscription's base currency into the payment currency,
+    /// alongside `order.amount`.
+    #[tokio::test]
+    async fn line_item_money_is_converted_into_the_payment_currency() {
+        let (pe, db) = engine().await;
+        let u = user(&db).await;
+        // 5.00 EUR/interval line, paid in sats at 100k EUR/BTC = 5_000_000 msat.
+        db.insert_discount(&discount(
+            "order.items.exists(i, i.amount == 5000000) ? {'percent': 10} : {}",
+        ))
+        .await
+        .unwrap();
+
+        let mut btc = order(u, Some("SAVE10"));
+        btc.currency = Currency::BTC;
+        btc.base_currency = Currency::EUR;
+        btc.amount = 100_000_000;
+        btc.items = vec![OrderLineItem {
+            amount: 500,
+            setup_amount: 0,
+            ..OrderLineItem::sample_vm()
+        }];
+        assert!(pe.quote_discount(&btc).await.unwrap().is_some());
+
+        // Same-currency orders are passed through untouched.
+        let ctx = pe.build_context(&order(u, Some("SAVE10"))).await.unwrap();
+        assert_eq!(ctx.order.items[0].amount, 10_000);
     }
 
     /// "5 EUR off" written once must work for a customer paying in sats.

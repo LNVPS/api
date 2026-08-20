@@ -3624,14 +3624,16 @@ Context available to a rule (read-only, money in minor units):
 | `history` | `orders` (settled payment count) |
 | `now` | unix timestamp (seconds) |
 
-`order.items` is the order's lines, each with `line_item_id`, `name` and a `type` tag plus that
-product's own fields — `vm` (`vm_id`, `template_id`, `region_id`, `cpu`, `memory`, `disk_size`,
+`order.items` is the order's lines, each with `line_item_id`, `name`, `amount` (the line's price for
+one interval), `setup_amount`, and a `type` tag plus that product's own fields — `vm` (`vm_id`, `template_id`, `region_id`, `cpu`, `memory`, `disk_size`,
 `disk_type`, `ip4_count`, `ip6_count`), `app` (`deployment_id`, `app_id`, `cluster_id`,
 `resource_multiplier`), `ip_range` (`subscription_id`, `cidr`), `asn_sponsoring`
 (`subscription_id`, `asn`, `registry`), `dns_hosting`, `marketplace_node_fee` (`node_id`). The
 `type` is always accurate; detail that does not exist yet (an IP range is allocated only when the
-first payment settles) is null. `template_id: null` on a `vm` line means a custom build. Items carry
-no price — use `order.amount` for the order total. CEL's `exists`/`all`/`size()` are available:
+first payment settles) is null. `template_id: null` on a `vm` line means a custom build. Line
+`amount`/`setup_amount` are converted into the payment currency and are the line's **list price**;
+for a VPS line the charge is recomputed at payment time from the cost plan and the machine's IP
+assignments, so use `order.amount` for a minimum-spend threshold. CEL's `exists`/`all`/`size()` are available:
 
 ```
 order.items.exists(i, i.type == 'vm' && i.template_id == 3) ? {'percent': 10} : {}
@@ -3805,6 +3807,8 @@ customers meet it.
       {
         "line_item_id": 1,
         "name": "VPS",
+        "amount": 10000,
+        "setup_amount": 0,
         "type": "vm",
         "vm_id": 1,
         "template_id": 1,

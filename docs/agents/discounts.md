@@ -60,7 +60,7 @@ All money is minor units (cents, millisats) as integers. There is no `f64` anywh
 
 Each line of the order, carrying the properties of the product it bills for, so a rule can target
 the thing being bought instead of a single scalar the engine picked on its behalf. Common fields:
-`line_item_id`, `name`, `type`.
+`line_item_id`, `name`, `type`, `amount`, `setup_amount`.
 
 | `type` | Fields |
 |---|---|
@@ -78,11 +78,14 @@ the line is never dropped — dropping it would make `i.type == 'ip_range'` fals
 buying one. Comparing against a null detail fails the rule, which applies no discount, so "unknown"
 never costs money.
 
-**Items carry no price.** A VPS line's stored `amount` is not what the VM costs — VMs are priced by
-the pricing engine from their cost plan, in the payment currency, while the stored amount is in the
-subscription's base currency and is not maintained for VPS lines. A per-item figure would be wrong
-exactly where a rule leaned on it. Money decisions use `order.amount`, the whole order in the
-payment currency.
+**Per-item money is a list price.** `amount` is the line's recurring price for **one interval** and
+`setup_amount` its one-off fee, both converted into the payment currency when the context is built,
+so every figure a rule sees is in one currency. For non-VPS lines this is exactly what is charged —
+the renewal sums `amount * intervals`. For a VPS line it is the base price recorded at order (and
+rewritten on upgrade), while the actual charge is recomputed at payment time from the cost plan or
+custom pricing including the machine's IP assignments, and a later cost-plan change does not rewrite
+it. Use `i.amount` for "this line is worth about X"; use `order.amount` — the actual net being
+charged — for a minimum-spend threshold.
 
 Lifetime spend is deliberately **not** exposed: a customer's payments span currencies, so any
 single number is either wrong or costs a full payment-history conversion at every quote.

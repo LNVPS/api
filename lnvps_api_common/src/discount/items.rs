@@ -27,15 +27,23 @@
 //! order that is buying one. A comparison against a null detail fails the rule,
 //! which applies no discount, so "unknown" never costs LNVPS money.
 //!
-//! # No per-item money
+//! # Per-item money
 //!
-//! Items deliberately carry no price. A VM line item's stored `amount` is not
-//! what the VM costs — VMs are priced by the pricing engine from their cost
-//! plan or custom pricing, in the payment currency, while the stored amount is
-//! in the subscription's base currency and is not maintained for VPS items. A
-//! per-item figure would therefore be wrong exactly where a rule leaned on it.
-//! Money decisions use `order.amount`, which is the whole order in the payment
-//! currency.
+//! `amount` is the line's recurring price for **one interval** and
+//! `setup_amount` its one-off fee, both converted into the order's payment
+//! currency by [`crate::PricingEngine::quote_discount`] so that everything a
+//! rule sees is in one currency.
+//!
+//! They are the line's **list price** — what the invoice shows for that line —
+//! not necessarily what is charged for it. For non-VPS lines the two are the
+//! same figure: the renewal sums `amount * intervals` directly. For a VPS line
+//! the stored amount is the base price recorded when the VM was ordered (and
+//! rewritten on upgrade), while the actual charge is recomputed at payment time
+//! by the pricing engine from the cost plan or custom pricing, including the
+//! machine's IP assignments; a later change to the cost plan does not rewrite
+//! it. So compare `i.amount` when a rule wants "this line is worth about X",
+//! and use `order.amount` — the actual net being charged — for a minimum-spend
+//! threshold.
 
 use lnvps_db::{LNVpsDb, SubscriptionLineItem, SubscriptionType};
 use serde::{Deserialize, Serialize};
@@ -43,11 +51,26 @@ use std::sync::Arc;
 
 /// One line of the order being priced.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// Every field except the product carries a serde default, so the admin rule
+/// preview can post a partial line (`{"type": "vm", "cpu": 8}`) to try a rule
+/// without inventing an invoice.
 pub struct OrderLineItem {
     /// Id of the `subscription_line_item` row.
+    #[serde(default)]
     pub line_item_id: i64,
     /// The line's display name, as it appears on the invoice.
+    #[serde(default)]
     pub name: String,
+    /// Recurring price of this line for one interval, in the order's payment
+    /// currency and minor units. See the module docs: this is the line's list
+    /// price, not necessarily what is charged for it.
+    #[serde(default)]
+    pub amount: i64,
+    /// One-off setup fee for this line, in the same units. Charged on the first
+    /// payment only.
+    #[serde(default)]
+    pub setup_amount: i64,
     /// The product this line bills for, and its properties. Flattened, so a
     /// rule reads `i.type` and `i.cpu` rather than `i.product.cpu`.
     #[serde(flatten)]
@@ -63,49 +86,67 @@ pub struct OrderLineItem {
 pub enum OrderProduct {
     /// A virtual machine, standard plan or custom build.
     Vm {
+        #[serde(default)]
         vm_id: Option<i64>,
         /// The standard plan being billed; null for a custom build, which is
         /// how a rule tells the two apart.
+        #[serde(default)]
         template_id: Option<i64>,
         /// Region the machine runs in.
+        #[serde(default)]
         region_id: Option<i64>,
         /// vCPU cores.
+        #[serde(default)]
         cpu: Option<i64>,
         /// Memory in bytes.
+        #[serde(default)]
         memory: Option<i64>,
         /// Disk size in bytes.
+        #[serde(default)]
         disk_size: Option<i64>,
         /// `ssd` or `hdd`.
+        #[serde(default)]
         disk_type: Option<String>,
         /// Included IPv4 addresses.
+        #[serde(default)]
         ip4_count: Option<i64>,
         /// Included IPv6 addresses.
+        #[serde(default)]
         ip6_count: Option<i64>,
     },
     /// A managed app deployment.
     App {
+        #[serde(default)]
         deployment_id: Option<i64>,
         /// The catalog app being deployed.
+        #[serde(default)]
         app_id: Option<i64>,
         /// The cluster it runs on.
+        #[serde(default)]
         cluster_id: Option<i64>,
         /// Resource sizing multiplier applied to the app's base resources.
+        #[serde(default)]
         resource_multiplier: Option<i64>,
     },
     /// A leased IP range. Allocated when the first payment settles, so the
     /// detail is null on the order that buys it.
     IpRange {
+        #[serde(default)]
         subscription_id: Option<i64>,
         /// The range in CIDR notation.
+        #[serde(default)]
         cidr: Option<String>,
     },
     /// A sponsored ASN. Assigned by the registry after purchase, so the detail
     /// is null on the order that buys it.
     AsnSponsoring {
+        #[serde(default)]
         subscription_id: Option<i64>,
         /// The assigned AS number.
+        #[serde(default)]
         asn: Option<i64>,
         /// The registry the ASN is held with, e.g. `ripe`.
+        #[serde(default)]
         registry: Option<String>,
     },
     /// DNS hosting. Has no product row of its own — the line item is the whole
@@ -170,7 +211,22 @@ impl OrderLineItem {
         Self {
             line_item_id: line_item.id as i64,
             name: line_item.name.clone(),
+            // Resolved in the subscription's base currency; the pricing engine
+            // converts it into the payment currency when it builds the context,
+            // because only it holds an exchange-rate service.
+            amount: line_item.amount as i64,
+            setup_amount: line_item.setup_amount as i64,
             product,
+        }
+    }
+
+    /// This line with its money converted by `convert`, used by the pricing
+    /// engine to put every figure in the context in the payment currency.
+    pub(crate) fn with_converted_money(self, amount: i64, setup_amount: i64) -> Self {
+        Self {
+            amount,
+            setup_amount,
+            ..self
         }
     }
 
@@ -257,6 +313,8 @@ impl OrderLineItem {
         Self {
             line_item_id: 1,
             name: "VPS".to_string(),
+            amount: 10_000,
+            setup_amount: 0,
             product: OrderProduct::Vm {
                 vm_id: Some(1),
                 template_id: Some(1),
