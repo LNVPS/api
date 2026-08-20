@@ -3619,10 +3619,24 @@ Context available to a rule (read-only, money in minor units):
 
 | Variable | Fields |
 |---|---|
-| `order` | `amount`, `currency`, `intervals`, `interval_type` (`day`/`month`/`year`), `is_new`, `template_id`, `product` |
+| `order` | `amount`, `currency`, `intervals`, `interval_type` (`day`/`month`/`year`), `is_new`, `items` |
 | `user` | `id`, `country` (ISO alpha-3, may be null) |
 | `history` | `orders` (settled payment count) |
 | `now` | unix timestamp (seconds) |
+
+`order.items` is the order's lines, each with `line_item_id`, `name` and a `type` tag plus that
+product's own fields — `vm` (`vm_id`, `template_id`, `region_id`, `cpu`, `memory`, `disk_size`,
+`disk_type`, `ip4_count`, `ip6_count`), `app` (`deployment_id`, `app_id`, `cluster_id`,
+`resource_multiplier`), `ip_range` (`subscription_id`, `cidr`), `asn_sponsoring`
+(`subscription_id`, `asn`, `registry`), `dns_hosting`, `marketplace_node_fee` (`node_id`). The
+`type` is always accurate; detail that does not exist yet (an IP range is allocated only when the
+first payment settles) is null. `template_id: null` on a `vm` line means a custom build. Items carry
+no price — use `order.amount` for the order total. CEL's `exists`/`all`/`size()` are available:
+
+```
+order.items.exists(i, i.type == 'vm' && i.template_id == 3) ? {'percent': 10} : {}
+order.items.all(i, i.type == 'vm' && i.cpu >= 8) ? {'percent': 5} : {}
+```
 
 Decision fields: `percent` (int), `amount` (int, minor units), `currency` (string, required with
 `amount`). `{}`, `null` and `false` all mean "does not apply". Any other return type is an error and
@@ -3785,16 +3799,32 @@ customers meet it.
     "intervals": 1,
     "interval_type": "month",
     "is_new": true,
-    "template_id": 1,
-    "product": "vm",
     "country": "IRL",
-    "orders": 0
+    "orders": 0,
+    "items": [
+      {
+        "line_item_id": 1,
+        "name": "VPS",
+        "type": "vm",
+        "vm_id": 1,
+        "template_id": 1,
+        "region_id": 1,
+        "cpu": 2,
+        "memory": 4294967296,
+        "disk_size": 85899345920,
+        "disk_type": "ssd",
+        "ip4_count": 1,
+        "ip6_count": 1
+      }
+    ]
   }
 }
 ```
 
 `order` and each of its fields are optional; omitted fields fall back to a representative sample
-(a new 100.00 EUR monthly template VM for an Irish customer with no order history).
+(a new 100.00 EUR monthly order for an Irish customer with no order history, containing one
+standard 2-core VM line). Supply `items` to try a rule against a custom build, a multi-line order,
+or a non-VM product.
 
 ```json
 {

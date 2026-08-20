@@ -249,6 +249,48 @@ mod tests {
         assert_eq!(clamped["data"]["percent"].as_u64().unwrap(), 100);
         assert_eq!(clamped["data"]["amount_off"].as_u64().unwrap(), 10_000);
 
+        // A rule aimed at the order's line items, against the default sample
+        // (one standard VM line).
+        let by_item = json_ok(
+            admin
+                .post_auth(
+                    "/api/admin/v1/discounts/preview",
+                    &json!({
+                        "rule": "order.items.exists(i, i.type == 'vm' && i.cpu >= 2) ? {'percent': 10} : {}"
+                    }),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(by_item["data"]["applies"].as_bool().unwrap());
+
+        // ...and a supplied multi-line order, including a product whose detail
+        // does not exist yet.
+        let supplied_items = json_ok(
+            admin
+                .post_auth(
+                    "/api/admin/v1/discounts/preview",
+                    &json!({
+                        "rule": "order.items.exists(i, i.type == 'ip_range') && size(order.items) == 2 ? {'percent': 20} : {}",
+                        "order": {
+                            "items": [
+                                {"line_item_id": 1, "name": "VPS", "type": "vm", "template_id": 3, "cpu": 4},
+                                {"line_item_id": 2, "name": "IPv4 /24", "type": "ip_range"}
+                            ]
+                        }
+                    }),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(supplied_items["data"]["applies"].as_bool().unwrap());
+        assert_eq!(
+            supplied_items["data"]["amount_off"].as_u64().unwrap(),
+            2_000
+        );
+
         // A tiered rule against a supplied sample order.
         let tiered = json_ok(
             admin

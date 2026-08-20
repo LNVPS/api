@@ -226,11 +226,8 @@ fn sample_context(order: Option<&AdminPreviewOrder>) -> DiscountContext {
     if let Some(is_new) = o.is_new {
         context.order.is_new = is_new;
     }
-    if o.template_id.is_some() {
-        context.order.template_id = o.template_id;
-    }
-    if let Some(product) = &o.product {
-        context.order.product = product.clone();
+    if let Some(items) = &o.items {
+        context.order.items = items.clone();
     }
     if o.country.is_some() {
         context.user = UserContext {
@@ -565,8 +562,7 @@ mod tests {
             intervals: None,
             interval_type: None,
             is_new: None,
-            template_id: None,
-            product: None,
+            items: None,
             country: None,
             orders: None,
         }
@@ -657,16 +653,39 @@ mod tests {
                 },
             ),
             (
-                "order.template_id == 7 ? {'percent': 1} : {}",
+                "order.items.exists(i, i.template_id == 7) ? {'percent': 1} : {}",
                 AdminPreviewOrder {
-                    template_id: Some(7),
+                    items: Some(vec![lnvps_api_common::OrderLineItem {
+                        line_item_id: 1,
+                        name: "VPS".to_string(),
+                        product: lnvps_api_common::OrderProduct::Vm {
+                            vm_id: Some(1),
+                            template_id: Some(7),
+                            region_id: Some(1),
+                            cpu: Some(2),
+                            memory: Some(4_294_967_296),
+                            disk_size: Some(85_899_345_920),
+                            disk_type: Some("ssd".to_string()),
+                            ip4_count: Some(1),
+                            ip6_count: Some(1),
+                        },
+                    }]),
                     ..order()
                 },
             ),
             (
-                "order.product == 'app' ? {'percent': 1} : {}",
+                "order.items.exists(i, i.type == 'app' && i.app_id == 3) ? {'percent': 1} : {}",
                 AdminPreviewOrder {
-                    product: Some("app".to_string()),
+                    items: Some(vec![lnvps_api_common::OrderLineItem {
+                        line_item_id: 2,
+                        name: "Managed app".to_string(),
+                        product: lnvps_api_common::OrderProduct::App {
+                            deployment_id: Some(5),
+                            app_id: Some(3),
+                            cluster_id: Some(1),
+                            resource_multiplier: Some(2),
+                        },
+                    }]),
                     ..order()
                 },
             ),

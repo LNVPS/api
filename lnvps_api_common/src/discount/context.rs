@@ -11,6 +11,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use super::OrderLineItem;
+
 /// Everything a discount rule may read about the order being priced.
 ///
 /// Serialized into the CEL evaluation context as the top-level variables
@@ -58,8 +60,7 @@ impl DiscountContext {
                 intervals: 1,
                 interval_type: "month".to_string(),
                 is_new: true,
-                template_id: Some(1),
-                product: "vm".to_string(),
+                items: vec![OrderLineItem::sample_vm()],
             },
             UserContext {
                 id: 42,
@@ -85,10 +86,9 @@ pub struct OrderContext {
     /// True when this is the first payment for the subscription (a new order)
     /// rather than a renewal or an upgrade.
     pub is_new: bool,
-    /// VM template being purchased, if this is a template (non-custom) VM.
-    pub template_id: Option<i64>,
-    /// Coarse product class, e.g. `vm`, `custom_vm`, `ip_range`.
-    pub product: String,
+    /// The lines of the order, each carrying the properties of the product it
+    /// bills for. See [`OrderLineItem`].
+    pub items: Vec<OrderLineItem>,
 }
 
 /// The customer placing the order.

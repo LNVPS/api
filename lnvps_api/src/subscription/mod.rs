@@ -1084,29 +1084,11 @@ impl SubscriptionHandler {
         if code.is_none() {
             return Ok(None);
         }
-        // A VM order quotes its template so a rule can target one plan; an
-        // order that mixes products has no single template and reports none
-        // rather than picking one of them arbitrarily.
-        let vps_items: Vec<&SubscriptionLineItem> = line_items
-            .iter()
-            .filter(|li| li.subscription_type == SubscriptionType::Vps)
-            .collect();
-        let template_id = match vps_items.as_slice() {
-            [only] => self
-                .db
-                .get_vm_by_line_item(only.id)
-                .await
-                .ok()
-                .and_then(|vm| vm.template_id),
-            _ => None,
-        };
-        let product = if vps_items.len() == line_items.len() && !vps_items.is_empty() {
-            "vm"
-        } else if vps_items.is_empty() {
-            "subscription"
-        } else {
-            "mixed"
-        };
+        // Resolve every line with the properties of the product it bills for,
+        // so a rule can target a plan, a machine size, a region or a product
+        // type without the engine having to guess which single one of them the
+        // order "is".
+        let items = lnvps_api_common::OrderLineItem::resolve_all(&self.db, line_items).await;
 
         self.pe
             .quote_discount(&lnvps_api_common::DiscountOrder {
@@ -1120,8 +1102,7 @@ impl SubscriptionHandler {
                 // A purchase is the subscription's first payment; renewals and
                 // upgrades are not new orders.
                 is_new: payment_type == SubscriptionPaymentType::Purchase,
-                template_id,
-                product: product.to_string(),
+                items,
             })
             .await
     }
@@ -2845,6 +2826,44 @@ mod discount_tests {
         // Replayed webhook / listener resuming from its cursor.
         sub.apply_payment(&payment).await.unwrap();
         assert_eq!(db.get_discount(discount_id).await.unwrap().used_count, 1);
+    }
+
+    /// A rule sees the order's real line items, so it can target the product
+    /// being bought rather than a single scalar the engine chose for it.
+    #[tokio::test]
+    async fn a_rule_can_target_the_order_line_items() {
+        let (db, sub, _user, sub_id) = setup().await;
+        // The subscription in `setup` bills one IP-range line named "hosting".
+        add_discount(
+            &db,
+            "IPONLY",
+            "order.items.exists(i, i.type == 'ip_range') ? {'percent': 10} : {}",
+        )
+        .await;
+        add_discount(
+            &db,
+            "VMONLY",
+            "order.items.exists(i, i.type == 'vm') ? {'percent': 10} : {}",
+        )
+        .await;
+        add_discount(
+            &db,
+            "BYNAME",
+            "order.items.exists(i, i.name == 'hosting') ? {'percent': 10} : {}",
+        )
+        .await;
+
+        assert_eq!(
+            renew(&sub, sub_id, Some("IPONLY")).await.unwrap().amount,
+            900
+        );
+        assert_eq!(
+            renew(&sub, sub_id, Some("BYNAME")).await.unwrap().amount,
+            900
+        );
+        // ...and an offer for a product this order does not contain does not
+        // apply, rather than matching on a coarse product label.
+        assert!(renew(&sub, sub_id, Some("VMONLY")).await.is_err());
     }
 
     /// An unpaid invoice must not be handed back when a code is entered: the

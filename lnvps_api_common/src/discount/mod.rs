@@ -19,10 +19,12 @@
 mod context;
 mod decision;
 mod engine;
+mod items;
 
 pub use context::{DiscountContext, HistoryContext, OrderContext, UserContext};
 pub use decision::DiscountDecision;
 pub use engine::{AppliedDiscount, DiscountOrder, allocate_discount, discount_tax_lines};
+pub use items::{OrderLineItem, OrderProduct};
 
 use anyhow::{Context as _, Result, bail};
 use cel::{Context, Program};
@@ -150,8 +152,12 @@ mod tests {
             "order.is_new ? {'percent': 5} : {}",
             "order.currency == 'EUR' ? {'percent': 5} : {}",
             "order.interval_type == 'month' ? {'percent': 5} : {}",
-            "order.product == 'vm' ? {'percent': 5} : {}",
-            "order.template_id == 1 ? {'percent': 5} : {}",
+            "order.items[0].type == 'vm' ? {'percent': 5} : {}",
+            "order.items.exists(i, i.template_id == 1) ? {'percent': 5} : {}",
+            "order.items.all(i, i.type == 'vm' && i.cpu >= 2) ? {'percent': 5} : {}",
+            "size(order.items) == 1 ? {'percent': 5} : {}",
+            "order.items[0].name == 'VPS' ? {'percent': 5} : {}",
+            "order.items.exists(i, i.region_id == 1) ? {'percent': 5} : {}",
             "history.orders == 0 ? {'percent': 5} : {}",
             "now > 0 ? {'percent': 5} : {}",
         ] {
@@ -164,13 +170,42 @@ mod tests {
     }
 
     #[test]
-    fn null_template_id_is_readable() {
+    fn a_custom_build_is_told_apart_by_a_null_template() {
         let mut c = ctx();
-        c.order.template_id = None;
+        c.order.items = vec![OrderLineItem {
+            product: match OrderLineItem::sample_vm().product {
+                crate::OrderProduct::Vm {
+                    vm_id,
+                    cpu,
+                    memory,
+                    disk_size,
+                    disk_type,
+                    ip4_count,
+                    ip6_count,
+                    region_id,
+                    ..
+                } => crate::OrderProduct::Vm {
+                    vm_id,
+                    template_id: None,
+                    region_id,
+                    cpu,
+                    memory,
+                    disk_size,
+                    disk_type,
+                    ip4_count,
+                    ip6_count,
+                },
+                other => other,
+            },
+            ..OrderLineItem::sample_vm()
+        }];
         assert_eq!(
-            evaluate_rule("order.template_id == null ? {'percent': 5} : {}", &c)
-                .unwrap()
-                .percent,
+            evaluate_rule(
+                "order.items.exists(i, i.type == 'vm' && i.template_id == null) ? {'percent': 5} : {}",
+                &c
+            )
+            .unwrap()
+            .percent,
             Some(5)
         );
     }

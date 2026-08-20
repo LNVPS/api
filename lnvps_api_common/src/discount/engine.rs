@@ -35,7 +35,9 @@ use log::warn;
 use payments_rs::currency::{Currency, CurrencyAmount};
 use std::str::FromStr;
 
-use super::{DiscountContext, DiscountDecision, HistoryContext, OrderContext, UserContext};
+use super::{
+    DiscountContext, DiscountDecision, HistoryContext, OrderContext, OrderLineItem, UserContext,
+};
 use crate::{PricingEngine, TaxLine};
 
 /// Everything needed to resolve a discount for one order.
@@ -64,10 +66,9 @@ pub struct DiscountOrder {
     pub interval_type: IntervalType,
     /// True for a first (purchase) payment, false for a renewal or upgrade.
     pub is_new: bool,
-    /// VM template being purchased, for template (non-custom) VMs.
-    pub template_id: Option<u64>,
-    /// Coarse product class, e.g. `vm`, `custom_vm`, `app`.
-    pub product: String,
+    /// The lines of the order, resolved with the properties of the products
+    /// they bill for (see [`OrderLineItem::resolve_all`]).
+    pub items: Vec<OrderLineItem>,
 }
 
 /// A discount that was resolved for an order and is ready to be applied.
@@ -164,8 +165,7 @@ impl PricingEngine {
                 intervals: order.intervals as i64,
                 interval_type: interval_type_name(order.interval_type).to_string(),
                 is_new: order.is_new,
-                template_id: order.template_id.map(|t| t as i64),
-                product: order.product.clone(),
+                items: order.items.clone(),
             },
             UserContext {
                 id: order.user_id as i64,
@@ -395,8 +395,7 @@ mod tests {
             intervals: 1,
             interval_type: IntervalType::Month,
             is_new: true,
-            template_id: Some(1),
-            product: "vm".to_string(),
+            items: vec![OrderLineItem::sample_vm()],
         }
     }
 

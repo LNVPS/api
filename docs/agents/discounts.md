@@ -35,7 +35,15 @@ order.intervals >= 12 ? {'percent': 15}
   : order.intervals >= 6 ? {'percent': 10} : {}                     term-length tiers
 order.amount >= 10000 ? {'amount': 500, 'currency': 'EUR'} : {}     5.00 EUR off over 100.00
 user.country == 'IRL' && history.orders == 0 ? {'percent': 20} : {} first order, one country
+order.items.exists(i, i.type == 'vm' && i.template_id == 3)
+  ? {'percent': 10} : {}                                            one plan
+order.items.all(i, i.type == 'vm' && i.cpu >= 8) ? {'percent': 5} : {}   big machines only
+order.items.exists(i, i.type == 'vm' && i.template_id == null)
+  ? {'percent': 10} : {}                                            custom builds only
+order.items.exists(i, i.type == 'ip_range') ? {'percent': 15} : {}  a product type
 ```
+
+CEL's `exists`, `all`, `exists_one`, `map` and `filter` macros are available, as is `size()`.
 
 ### Context
 
@@ -43,10 +51,38 @@ All money is minor units (cents, millisats) as integers. There is no `f64` anywh
 
 | Variable | Fields |
 |---|---|
-| `order` | `amount`, `currency`, `intervals`, `interval_type` (`day`/`month`/`year`), `is_new`, `template_id` (may be null), `product` (`vm`, `subscription`, `mixed`) |
+| `order` | `amount`, `currency`, `intervals`, `interval_type` (`day`/`month`/`year`), `is_new`, `items` |
 | `user` | `id`, `country` (ISO alpha-3, may be null) |
 | `history` | `orders` — settled payment count |
 | `now` | unix timestamp in seconds |
+
+### `order.items`
+
+Each line of the order, carrying the properties of the product it bills for, so a rule can target
+the thing being bought instead of a single scalar the engine picked on its behalf. Common fields:
+`line_item_id`, `name`, `type`.
+
+| `type` | Fields |
+|---|---|
+| `vm` | `vm_id`, `template_id` (null for a custom build — that is how a rule tells the two apart), `region_id`, `cpu`, `memory` (bytes), `disk_size` (bytes), `disk_type` (`ssd`/`hdd`), `ip4_count`, `ip6_count` |
+| `app` | `deployment_id`, `app_id`, `cluster_id`, `resource_multiplier` |
+| `ip_range` | `subscription_id`, `cidr` |
+| `asn_sponsoring` | `subscription_id`, `asn`, `registry` |
+| `dns_hosting` | — |
+| `marketplace_node_fee` | `node_id` |
+
+**Type is certain, detail is best-effort.** The line item itself says what it bills for, so `type`
+is always right; the detail comes from the product row behind it, which may not exist yet (an IP
+range or an ASN is allocated only when the first payment settles). Unknown detail is **null**, and
+the line is never dropped — dropping it would make `i.type == 'ip_range'` false on the very order
+buying one. Comparing against a null detail fails the rule, which applies no discount, so "unknown"
+never costs money.
+
+**Items carry no price.** A VPS line's stored `amount` is not what the VM costs — VMs are priced by
+the pricing engine from their cost plan, in the payment currency, while the stored amount is in the
+subscription's base currency and is not maintained for VPS lines. A per-item figure would be wrong
+exactly where a rule leaned on it. Money decisions use `order.amount`, the whole order in the
+payment currency.
 
 Lifetime spend is deliberately **not** exposed: a customer's payments span currencies, so any
 single number is either wrong or costs a full payment-history conversion at every quote.

@@ -5136,9 +5136,10 @@ pub struct AdminPreviewOrder {
     /// `day`, `month` or `year`.
     pub interval_type: Option<String>,
     pub is_new: Option<bool>,
-    pub template_id: Option<i64>,
-    /// e.g. `vm`, `custom_vm`, `app`.
-    pub product: Option<String>,
+    /// The order's lines. Omitted keeps the sample's single standard VM line;
+    /// supply this to try a rule against a custom build, a multi-line order, or
+    /// a non-VM product.
+    pub items: Option<Vec<lnvps_api_common::OrderLineItem>>,
     /// ISO 3166-1 alpha-3 country of the sample customer.
     pub country: Option<String>,
     /// Number of settled orders the sample customer has.
