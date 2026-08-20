@@ -372,8 +372,13 @@ pub fn install_and_restart(deb: &Path, unit: &str) -> Result<()> {
     // The .deb is removed inside this detached unit *after* dpkg installs it
     // (systemd-run is fire-and-forget, so cleaning it up in the parent would
     // race the dpkg here and delete the archive before it is read).
+    // dpkg must be fully non-interactive: the transient unit has no usable
+    // stdin, so any conffile prompt (e.g. an operator-deleted
+    // /etc/lnvps_fw/config.example.yaml) aborts the install with
+    // "end of file on stdin at conffile prompt". --force-confdef/--force-confold
+    // take the default (keep the operator's file) without asking.
     let script = format!(
-        "dpkg -i '{deb}' && rm -f '{deb}' && systemctl restart {unit}",
+        "dpkg --force-confdef --force-confold -i '{deb}' </dev/null && rm -f '{deb}' && systemctl restart {unit}",
         deb = deb.display(),
     );
     let status = std::process::Command::new("systemd-run")
@@ -381,6 +386,8 @@ pub fn install_and_restart(deb: &Path, unit: &str) -> Result<()> {
             "--collect",
             "--unit",
             "lnvps-fw-upgrade",
+            "--setenv",
+            "DEBIAN_FRONTEND=noninteractive",
             "/bin/sh",
             "-c",
             &script,
