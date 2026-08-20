@@ -456,31 +456,46 @@ impl VmProvisioner {
         let db = self.get_db();
         let vm = db.get_vm(drift.vm_id).await?;
 
-        // The VM's disk row belongs to the old host; move it to the pool it
-        // is actually on, else capacity accounting keeps charging the disk
-        // to a host that no longer stores it.
+        // The VM's disk row belongs to the old host; move it to the pool the
+        // host says the disk is on, else capacity accounting keeps charging the
+        // disk to a host that no longer stores it.
+        //
+        // Matched by name and by name only. A pool we cannot name is not a pool
+        // we can substitute for: every candidate is a guess about where a
+        // customer's disk physically is, and recording the wrong one charges the
+        // space to a pool that does not hold it and points the next reinstall's
+        // `qm set <storage>:0` at a name that may not even exist on the node.
+        // The VM's storage class does not come into it — a VM found on a
+        // different kind of pool keeps its price either way, since billing
+        // follows the template and never the disk row.
         let target_disks = db
             .list_host_disks(drift.to_host_id)
             .await
             .unwrap_or_default();
-        let disk = drift
+        let disk_id = drift
             .storage
             .as_ref()
             .and_then(|s| target_disks.iter().find(|d| &d.name == s))
-            .or_else(|| target_disks.iter().find(|d| d.enabled))
-            .or_else(|| target_disks.first());
-        let Some(disk) = disk else {
-            bail!(
-                "host {} has no disks recorded; leaving placement alone",
-                drift.to_host_id
+            .map(|d| d.id);
+
+        // Correcting `host_id` matters more than `disk_id` and is independently
+        // right: every lifecycle operation is aimed at `host_id`, so leaving it
+        // stale breaks the VM outright, whereas a stale `disk_id` only misplaces
+        // capacity accounting until an admin records the missing pool.
+        let disk_id = disk_id.unwrap_or_else(|| {
+            warn!(
+                "VM {} is on storage {:?} of host {}, which has no matching disk record; \
+                 fixing the host but leaving disk {} in place — add the disk to host {}",
+                drift.vm_id, drift.storage, drift.to_host_id, vm.disk_id, drift.to_host_id
             );
-        };
+            vm.disk_id
+        });
 
         info!(
             "VM {} found on host {} but recorded on host {}; updating database",
             drift.vm_id, drift.to_host_id, drift.from_host_id
         );
-        db.update_vm_host(vm.id, drift.to_host_id, disk.id).await?;
+        db.update_vm_host(vm.id, drift.to_host_id, disk_id).await?;
 
         let logger = VmHistoryLogger::new(db.clone());
         {
@@ -544,7 +559,7 @@ impl VmProvisioner {
 mod tests {
     use super::*;
     use lnvps_api_common::{DiskCapacity, GB, LoadFactors};
-    use lnvps_db::{CpuArch, VmHostKind};
+    use lnvps_db::{CpuArch, DiskType, VmHostKind};
 
     fn host(id: u64, region: u64, enabled: bool) -> VmHost {
         VmHost {
@@ -1015,6 +1030,69 @@ mod tests {
             provisioner.locate_vm(&stored).await.expect("locate"),
             VmLocation::Ambiguous(_)
         ));
+        DummyVmHost::clear_host_vms().await;
+    }
+
+    /// The disk row is matched on the reported pool name alone, whatever its
+    /// storage class: a VM found on an SSD pool it was not sold is re-pointed at
+    /// that pool, and keeps its price, which comes from its template.
+    #[tokio::test]
+    async fn test_reconcile_maps_the_reported_pool_regardless_of_its_class() {
+        let db = Arc::new(MockDb::default());
+        add_second_host(&db).await;
+        let vm_id = add_vm(&db).await;
+
+        // The VM was provisioned on an SSD pool and is now on an HDD one.
+        assert_eq!(db.get_host_disk(1).await.expect("disk").kind, DiskType::SSD);
+        {
+            let mut disks = db.host_disks.lock().await;
+            disks.get_mut(&2).expect("disk 2").kind = DiskType::HDD;
+        }
+        let template_id = db.get_vm(vm_id).await.expect("vm").template_id;
+
+        DummyVmHost::clear_host_vms().await;
+        DummyVmHost::set_host_vms_for(1, vec![]).await;
+        DummyVmHost::set_host_vms_for(2, vec![spec(vm_id, "mock-disk-2")]).await;
+
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        provisioner.reconcile_vm_hosts().await.expect("reconcile");
+
+        let stored = db.get_vm(vm_id).await.expect("vm");
+        assert_eq!(stored.host_id, 2);
+        assert_eq!(stored.disk_id, 2);
+        // Price follows the template, so the plan the customer pays for is
+        // untouched by the class of pool they were found on.
+        assert_eq!(stored.template_id, template_id);
+        DummyVmHost::clear_host_vms().await;
+    }
+
+    /// A pool we have no record of is never substituted for another one: the
+    /// host is corrected (every lifecycle operation depends on it) and the disk
+    /// mapping is left alone rather than guessed at, since a wrong disk row
+    /// charges the space to a pool that does not hold it and aims the next
+    /// reinstall's import at a name that may not exist on the node.
+    #[tokio::test]
+    async fn test_reconcile_never_guesses_an_unrecognised_pool() {
+        let db = Arc::new(MockDb::default());
+        add_second_host(&db).await;
+        let vm_id = add_vm(&db).await;
+        let original_disk = db.get_vm(vm_id).await.expect("vm").disk_id;
+
+        DummyVmHost::clear_host_vms().await;
+        DummyVmHost::set_host_vms_for(1, vec![]).await;
+        // Host 2 reports a pool nobody recorded against it.
+        DummyVmHost::set_host_vms_for(2, vec![spec(vm_id, "pool-nobody-recorded")]).await;
+
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let drifts = provisioner.reconcile_vm_hosts().await.expect("reconcile");
+        assert_eq!(drifts.len(), 1);
+
+        let stored = db.get_vm(vm_id).await.expect("vm");
+        assert_eq!(stored.host_id, 2, "the host must still be corrected");
+        assert_eq!(
+            stored.disk_id, original_disk,
+            "an unknown pool must not be swapped for an arbitrary disk row"
+        );
         DummyVmHost::clear_host_vms().await;
     }
 
