@@ -522,6 +522,72 @@ mod tests {
         Ok(())
     }
 
+    /// Regression: a *re-run* of the spawn pipeline over an already-provisioned
+    /// VM must not wipe its MAC when it fails.
+    ///
+    /// The worker re-spawns a VM it cannot find on the host the database names,
+    /// which happens whenever placement has drifted. `ip_allocation` then skips
+    /// ("VM N already has 2 ips") without generating anything, `host_spawn`
+    /// fails (`VM 2004 already exists on node 'pve2'`), and the rollback used to
+    /// reset the MAC to the unassigned placeholder — destroying the live VM's
+    /// ARP/firewall/SLAAC identity and making every "is this VM provisioned?"
+    /// check answer no.
+    #[tokio::test]
+    async fn test_rollback_keeps_mac_of_already_provisioned_vm() -> Result<()> {
+        use lnvps_api_common::retry::OpError;
+
+        clear_mock_state().await;
+        let settings = mock_settings();
+        let db = Arc::new(MockDb::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        let _dns = Arc::new(MockDnsServer::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, 69_420.0).await;
+
+        setup_db_with_static_arp(&db).await?;
+
+        let provisioner = VmProvisioner::new(settings, db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+
+        // First spawn succeeds: the VM now has a real MAC and its IPs.
+        provisioner
+            .spawn_vm_pipeline(vm.id)
+            .await?
+            .execute()
+            .await?;
+        let provisioned = db.get_vm(vm.id).await?;
+        assert_ne!(provisioned.mac_address, "ff:ff:ff:ff:ff:ff");
+        let ips_before = db.list_vm_ip_assignments(vm.id).await?;
+        assert_eq!(ips_before.len(), 2);
+
+        // Second spawn fails, as it does when the VM turns out to exist on
+        // another host.
+        let res = provisioner
+            .spawn_vm_pipeline(vm.id)
+            .await?
+            .step("force_fail", |_ctx| {
+                Box::pin(async { Err(OpError::Fatal(anyhow::anyhow!("already exists"))) })
+            })
+            .execute()
+            .await;
+        assert!(res.is_err(), "pipeline should fail on the forced step");
+
+        let after = db.get_vm(vm.id).await?;
+        assert_eq!(
+            after.mac_address, provisioned.mac_address,
+            "a failed re-spawn must leave an existing VM's MAC alone"
+        );
+        assert_eq!(
+            db.list_vm_ip_assignments(vm.id).await?.len(),
+            ips_before.len(),
+            "existing IP assignments must survive the rollback too"
+        );
+
+        Ok(())
+    }
+
     /// Regression: DNS is best-effort. A reverse (PTR) DNS failure — the classic
     /// OVH "forward not resolvable yet" 4xx — must NOT roll back / destroy the
     /// VM. The deploy should succeed with IPs + MAC intact and the reverse ref

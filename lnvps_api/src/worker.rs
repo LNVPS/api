@@ -1,6 +1,6 @@
 use crate::host::{FullVmInfo, VmHostClient, get_host_client};
 use crate::notifications::{Notification, NotificationChannel, build_channels, send_email};
-use crate::provisioner::VmProvisioner;
+use crate::provisioner::{VmLocation, VmProvisioner};
 use crate::settings::{ProvisionerConfig, Settings, SmtpConfig, TelegramConfig, WhatsAppConfig};
 use crate::ssh_client::SshClient;
 use crate::subscription::SubscriptionHandler;
@@ -1395,11 +1395,80 @@ impl Worker {
                         .map(|e| e > Utc::now())
                         .unwrap_or(false)
                 {
-                    self.spawn_vm_internal(vm).await?;
+                    self.recover_missing_vm(vm).await?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// A VM was not where the database said it would be: find it, or rebuild it.
+    ///
+    /// Which host a VM sits on is not something a check should depend on. A VM
+    /// absent from its recorded host is much more often one whose placement
+    /// drifted (a hand-run migration, a failed one that landed anyway) than one
+    /// that was destroyed, so the check re-points the database at the host that
+    /// actually has it and reads the state from there, in the same pass.
+    ///
+    /// Rebuilding is reserved for the case where every enabled host answered
+    /// and none of them has this VM. Spawning on weaker evidence tried to build
+    /// a second copy of a live customer VM; it only failed because Proxmox ids
+    /// are cluster-wide, and the failed spawn's rollback then wiped the live
+    /// VM's MAC address.
+    async fn recover_missing_vm(&self, vm: &Vm) -> Result<()> {
+        let provisioner = self.subscription_handler.vm_provisioner();
+        match provisioner.locate_vm(vm).await {
+            // `locate_vm` has already corrected the placement; read the state
+            // from where the VM really is so this pass is not wasted.
+            Ok(VmLocation::Host(host_id)) => {
+                if host_id == vm.host_id {
+                    warn!(
+                        "VM {} is on host {} after all; treating the failed state read as transient",
+                        vm.id, host_id
+                    );
+                    return Ok(());
+                }
+                info!(
+                    "VM {} was recorded on host {} but runs on host {}; placement corrected",
+                    vm.id, vm.host_id, host_id
+                );
+                let moved = self.db.get_vm(vm.id).await?;
+                let host = self.db.get_host(moved.host_id).await?;
+                let client = get_host_client(&host, &self.settings.provisioner_config)?;
+                match client.get_vm_state(&moved).await {
+                    Ok(s) => self.vm_state_cache.set_state(moved.id, s).await?,
+                    Err(e) => warn!(
+                        "VM {} still unreadable on host {} after reconciling placement: {}",
+                        moved.id, host.id, e
+                    ),
+                }
+                Ok(())
+            }
+            Ok(VmLocation::Nowhere) => self.spawn_vm_internal(vm).await,
+            Ok(VmLocation::Ambiguous(hosts)) => {
+                warn!(
+                    "VM {} exists on more than one host ({:?}); not rebuilding it",
+                    vm.id, hosts
+                );
+                Ok(())
+            }
+            Ok(VmLocation::Unknown) => {
+                warn!(
+                    "VM {} not found, but some hosts could not be polled; not rebuilding it",
+                    vm.id
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Never fall through to a spawn here: not knowing where a VM is
+                // is the one state in which building another one is worst.
+                warn!(
+                    "Could not establish where VM {} lives ({}); not rebuilding it",
+                    vm.id, e
+                );
+                Ok(())
+            }
+        }
     }
 
     /// Resolve the authoritative expiry for a VM from its subscription.
@@ -1447,11 +1516,23 @@ impl Worker {
                 .get_vm_state(vm)
                 .await
                 .map_err(|e| anyhow!("VM state error {e}")),
-            &vm,
+            vm,
         )
         .await?;
-        self.reconcile_vm_dns(vm).await;
-        self.capture_vm_ssh_host_keys(vm, &host, &mut HostSshSession::default())
+
+        // Placement may have just been corrected, and the remaining steps talk
+        // to the host: scanning SSH host keys from the node the VM left reads
+        // the wrong machine, or nothing at all.
+        let vm = self.db.get_vm(vm.id).await.unwrap_or_else(|_| vm.clone());
+        let host = match self.db.get_host(vm.host_id).await {
+            Ok(h) => h,
+            Err(e) => {
+                warn!("Failed to load host {} for VM {}: {}", vm.host_id, vm.id, e);
+                return Ok(());
+            }
+        };
+        self.reconcile_vm_dns(&vm).await;
+        self.capture_vm_ssh_host_keys(&vm, &host, &mut HostSshSession::default())
             .await;
         Ok(())
     }

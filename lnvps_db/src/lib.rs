@@ -481,6 +481,14 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Delete assigned VM ips
     async fn hard_delete_vm_ip_assignments_by_vm_id(&self, vm_id: u64) -> DbResult<()>;
 
+    /// Permanently remove a single IP assignment.
+    ///
+    /// For undoing an assignment that was inserted and then abandoned (a failed
+    /// spawn), where a soft delete would leave a row claiming an address that
+    /// was never used. Per-id rather than per-VM because the VM may be a live
+    /// one with other assignments that must survive.
+    async fn hard_delete_vm_ip_assignment(&self, assignment_id: u64) -> DbResult<()>;
+
     /// Delete assigned VM ip
     async fn delete_vm_ip_assignment(&self, assignment_id: u64) -> DbResult<()>;
 

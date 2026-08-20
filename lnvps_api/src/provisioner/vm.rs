@@ -590,6 +590,10 @@ impl VmProvisioner {
             network: self.network.clone(),
             host_client: get_host_client(&info.host, &self.provisioner_config)?,
             generated_mac: None,
+            created_ips: vec![],
+            // What the row held before this run touched anything, so a rollback
+            // can put it back instead of assuming there was nothing there.
+            mac_before: info.vm.mac_address.clone(),
             info,
         };
         Ok(Pipeline::new(ctx)
@@ -712,22 +716,36 @@ impl VmProvisioner {
                                 continue;
                             }
                             ctx.network.persist_ip_assignment(ip).await?;
+                            // Remember it so a rollback removes this row and
+                            // only this row.
+                            ctx.created_ips.push(ip.id);
                         }
                         Ok(())
                     })
                 },
                 |ctx| {
                     Box::pin(async move {
-                        // Clean up any IPs that were persisted to DB
-                        ctx.network
-                            .delete_all_ip_assignments(ctx.info.vm.id)
-                            .await?;
-                        // we can hard delete ips here because they were never used, so there is no need
-                        // to soft-delete
-                        Ok(ctx
-                            .db
-                            .hard_delete_vm_ip_assignments_by_vm_id(ctx.info.vm.id)
-                            .await?)
+                        // Only the assignments this run inserted. A spawn is
+                        // also re-run over VMs that already exist (the worker
+                        // does it when a VM is missing from the host the
+                        // database names), and wiping every assignment of a
+                        // live VM would take its addresses, static ARP and DNS
+                        // with it. They can be hard-deleted because they were
+                        // never used.
+                        let created: Vec<u64> = ctx.created_ips.clone();
+                        if created.is_empty() {
+                            return Ok(());
+                        }
+                        let mut ips = ctx.db.list_vm_ip_assignments(ctx.info.vm.id).await?;
+                        for ip in ips.iter_mut().filter(|i| created.contains(&i.id)) {
+                            let range = ctx.db.get_ip_range(ip.ip_range_id).await?;
+                            ctx.network.delete_ip_assignment(ip, &range).await?;
+                        }
+                        for id in created {
+                            ctx.db.hard_delete_vm_ip_assignment(id).await?;
+                        }
+                        ctx.created_ips.clear();
+                        Ok(())
                     })
                 },
             ))
@@ -1039,6 +1057,21 @@ pub struct SpawnVmContext {
 
     /// Generated mac address, can be rolled back if the entry has an ID
     generated_mac: Option<ArpEntry>,
+
+    /// Ids of the IP assignments this run inserted, so a rollback can remove
+    /// exactly those and leave a pre-existing VM's addresses alone.
+    created_ips: Vec<u64>,
+
+    /// The VM's MAC as the pipeline found it.
+    ///
+    /// A spawn is not only run on brand-new VMs: the worker also re-runs it
+    /// when a VM cannot be found on the host the database points at, which
+    /// happens whenever placement has drifted. Rolling such a run back must
+    /// restore this value rather than the unassigned placeholder — the MAC of a
+    /// live VM is its identity to the router's static ARP, the firewall and
+    /// SLAAC, and losing it also makes every "has this VM been provisioned?"
+    /// check answer no.
+    mac_before: String,
 }
 
 impl SpawnVmContext {
@@ -1174,11 +1207,13 @@ impl SpawnVmContext {
             }
         }
 
-        // Reset the VM's MAC back to the unassigned placeholder. The forward
-        // step persisted the generated MAC to the DB, so without this the VM
-        // would be left with a MAC but no IP assignment.
-        if self.info.vm.mac_address != UNASSIGNED_MAC {
-            self.info.vm.mac_address = UNASSIGNED_MAC.to_string();
+        // Put the MAC back to whatever the pipeline found. The forward step
+        // persisted the generated MAC to the DB, so a VM that had none must not
+        // be left with a MAC and no IP assignment — but a VM that arrived with
+        // one keeps it, because this run did not give it that MAC and its
+        // ARP/firewall/SLAAC identity depends on it.
+        if self.info.vm.mac_address != self.mac_before {
+            self.info.vm.mac_address = self.mac_before.clone();
             self.db.update_vm(&self.info.vm).await?;
         }
         Ok(())
@@ -2477,6 +2512,8 @@ mod tests {
             network: VmNetworkProvisioner::new(db_dyn.clone(), VmProvisioner::retry_policy()),
             host_client: Arc::new(crate::mocks::MockVmHost::new()),
             generated_mac: None,
+            created_ips: vec![],
+            mac_before: info.vm.mac_address.clone(),
             info,
         };
 
@@ -2552,6 +2589,8 @@ mod tests {
             network: VmNetworkProvisioner::new(db_dyn.clone(), VmProvisioner::retry_policy()),
             host_client: Arc::new(crate::mocks::MockVmHost::new()),
             generated_mac: None,
+            created_ips: vec![],
+            mac_before: info.vm.mac_address.clone(),
             info,
         };
 

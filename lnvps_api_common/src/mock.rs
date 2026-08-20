@@ -1563,6 +1563,12 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn hard_delete_vm_ip_assignment(&self, assignment_id: u64) -> DbResult<()> {
+        let mut ip_assignments = self.ip_assignments.lock().await;
+        ip_assignments.retain(|_, v| v.id != assignment_id);
+        Ok(())
+    }
+
     async fn delete_vm_ip_assignment(&self, assignment_id: u64) -> DbResult<()> {
         let mut ip_assignments = self.ip_assignments.lock().await;
         for ip_assignment in ip_assignments.values_mut() {

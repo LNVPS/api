@@ -11,7 +11,7 @@
 //! them at a node that no longer has the VM.
 
 use crate::host::{MigrateVmRequest, VmResources, get_host_client};
-use crate::provisioner::VmProvisioner;
+use crate::provisioner::{UNASSIGNED_MAC, VmProvisioner};
 use anyhow::{Result, anyhow, bail};
 use lnvps_api_common::{
     HostCapacity, HostCapacityService, HostVmSpec, VmHistoryLogger, VmRunningStates,
@@ -36,6 +36,20 @@ pub struct MigrationTarget {
     /// full disk transfer); on node-local storage of the same name — `local-zfs`
     /// on every node — the disk is copied into that name on the far side.
     pub target_storage: Option<String>,
+}
+
+/// Where the hosts say a VM is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmLocation {
+    /// Exactly one host has it. The database has been corrected if it disagreed.
+    Host(u64),
+    /// Every enabled host answered and none of them has this VM.
+    Nowhere,
+    /// More than one host has it — a leftover copy after a migration. Picking
+    /// one would flap the database, and acting on it could delete the wrong copy.
+    Ambiguous(Vec<u64>),
+    /// At least one enabled host could not be polled, so absence proves nothing.
+    Unknown,
 }
 
 /// A VM found running somewhere other than where the database says it is.
@@ -312,6 +326,89 @@ impl VmProvisioner {
         Ok(vm)
     }
 
+    /// Ask every host what it is running.
+    ///
+    /// Returns the VM lists of the hosts that **answered**, plus the number of
+    /// enabled hosts that did not. A host we could not reach is left out of the
+    /// map entirely rather than recorded as empty: its VMs have not vanished,
+    /// we simply cannot see them, and treating silence as absence is how a
+    /// network blip turns into a placement rewrite or a duplicate VM.
+    async fn observe_hosts(&self) -> Result<(HashMap<u64, Vec<HostVmSpec>>, usize)> {
+        let db = self.get_db();
+        let hosts = db.list_hosts().await?;
+
+        let mut observed: HashMap<u64, Vec<HostVmSpec>> = HashMap::new();
+        let mut unreachable = 0;
+        for host in &hosts {
+            let client = match get_host_client(host, self.config()) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Skipping host {} in placement check: {}", host.id, e);
+                    if host.enabled {
+                        unreachable += 1;
+                    }
+                    continue;
+                }
+            };
+            match client.list_host_vms().await {
+                Ok(vms) => {
+                    observed.insert(host.id, vms);
+                }
+                Err(e) => {
+                    warn!("Failed to list VMs on host {}: {}", host.id, e);
+                    if host.enabled {
+                        unreachable += 1;
+                    }
+                }
+            }
+        }
+        Ok((observed, unreachable))
+    }
+
+    /// Find out where a single VM actually lives, and correct the database if
+    /// that is not where it was recorded.
+    ///
+    /// Used before the worker concludes that a VM is missing and rebuilds it:
+    /// a VM absent from the host the database names is far more often one that
+    /// moved than one that was destroyed, and re-creating it would leave the
+    /// customer with two copies of their machine (or, when the ids collide as
+    /// they do on Proxmox, a failed spawn whose rollback damages the live VM).
+    pub async fn locate_vm(&self, vm: &Vm) -> Result<VmLocation> {
+        let (observed, unreachable) = self.observe_hosts().await?;
+
+        let mut found: Vec<(u64, Option<String>)> = observed
+            .iter()
+            .filter_map(|(host_id, specs)| {
+                specs
+                    .iter()
+                    .find(|s| s.mapped_vm_id == Some(vm.id))
+                    .map(|s| (*host_id, s.disk_storage.clone()))
+            })
+            .collect();
+        found.sort_by_key(|(host_id, _)| *host_id);
+
+        match found.len() {
+            0 if unreachable > 0 => Ok(VmLocation::Unknown),
+            0 => Ok(VmLocation::Nowhere),
+            1 => {
+                let (host_id, storage) = found.remove(0);
+                if host_id != vm.host_id {
+                    self.apply_drift(&VmHostDrift {
+                        vm_id: vm.id,
+                        from_host_id: vm.host_id,
+                        to_host_id: host_id,
+                        storage,
+                    })
+                    .await?;
+                }
+                Ok(VmLocation::Host(host_id))
+            }
+            _ => Ok(VmLocation::Ambiguous(
+                found.into_iter().map(|(h, _)| h).collect(),
+            )),
+        }
+    }
+
     /// Poll every enabled host and re-point `vm.host_id` at whichever host is
     /// actually running the VM.
     ///
@@ -321,26 +418,9 @@ impl VmProvisioner {
     /// subsequent lifecycle operation for that VM until someone notices.
     pub async fn reconcile_vm_hosts(&self) -> Result<Vec<VmHostDrift>> {
         let db = self.get_db();
-        let hosts = db.list_hosts().await?;
+        let (observed, _) = self.observe_hosts().await?;
 
-        let mut observed: HashMap<u64, Vec<HostVmSpec>> = HashMap::new();
-        for host in &hosts {
-            let client = match get_host_client(host, self.config()) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("Skipping host {} in placement check: {}", host.id, e);
-                    continue;
-                }
-            };
-            match client.list_host_vms().await {
-                // Only hosts that answered are considered: a host we could not
-                // reach must not make its VMs look like they moved away.
-                Ok(vms) => {
-                    observed.insert(host.id, vms);
-                }
-                Err(e) => warn!("Failed to list VMs on host {}: {}", host.id, e),
-            }
-        }
+        self.heal_unassigned_macs(&observed).await;
 
         let db_placement: HashMap<u64, u64> = db
             .list_vms()
@@ -359,46 +439,51 @@ impl VmProvisioner {
             );
         }
 
-        let logger = VmHistoryLogger::new(db.clone());
         let mut applied = Vec::new();
         for drift in drifts {
-            let vm = match db.get_vm(drift.vm_id).await {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!("Failed to load VM {} for placement fix: {}", drift.vm_id, e);
-                    continue;
-                }
-            };
-            // The VM's disk row belongs to the old host; move it to the pool it
-            // is actually on, else capacity accounting keeps charging the disk
-            // to a host that no longer stores it.
-            let target_disks = db
-                .list_host_disks(drift.to_host_id)
-                .await
-                .unwrap_or_default();
-            let disk = drift
-                .storage
-                .as_ref()
-                .and_then(|s| target_disks.iter().find(|d| &d.name == s))
-                .or_else(|| target_disks.iter().find(|d| d.enabled))
-                .or_else(|| target_disks.first());
-            let Some(disk) = disk else {
-                warn!(
-                    "VM {} appears on host {} which has no disks recorded; leaving placement alone",
-                    drift.vm_id, drift.to_host_id
-                );
-                continue;
-            };
-
-            info!(
-                "VM {} found on host {} but recorded on host {}; updating database",
-                drift.vm_id, drift.to_host_id, drift.from_host_id
-            );
-            if let Err(e) = db.update_vm_host(vm.id, drift.to_host_id, disk.id).await {
+            if let Err(e) = self.apply_drift(&drift).await {
                 warn!("Failed to fix placement of VM {}: {}", drift.vm_id, e);
                 continue;
             }
+            applied.push(drift);
+        }
 
+        Ok(applied)
+    }
+
+    /// Re-point one VM's `host_id`/`disk_id` at the host it was found on.
+    async fn apply_drift(&self, drift: &VmHostDrift) -> Result<()> {
+        let db = self.get_db();
+        let vm = db.get_vm(drift.vm_id).await?;
+
+        // The VM's disk row belongs to the old host; move it to the pool it
+        // is actually on, else capacity accounting keeps charging the disk
+        // to a host that no longer stores it.
+        let target_disks = db
+            .list_host_disks(drift.to_host_id)
+            .await
+            .unwrap_or_default();
+        let disk = drift
+            .storage
+            .as_ref()
+            .and_then(|s| target_disks.iter().find(|d| &d.name == s))
+            .or_else(|| target_disks.iter().find(|d| d.enabled))
+            .or_else(|| target_disks.first());
+        let Some(disk) = disk else {
+            bail!(
+                "host {} has no disks recorded; leaving placement alone",
+                drift.to_host_id
+            );
+        };
+
+        info!(
+            "VM {} found on host {} but recorded on host {}; updating database",
+            drift.vm_id, drift.to_host_id, drift.from_host_id
+        );
+        db.update_vm_host(vm.id, drift.to_host_id, disk.id).await?;
+
+        let logger = VmHistoryLogger::new(db.clone());
+        {
             if let Err(e) = logger
                 .log_vm_migrated(
                     drift.vm_id,
@@ -412,10 +497,46 @@ impl VmProvisioner {
             {
                 warn!("Failed to log placement fix for VM {}: {}", drift.vm_id, e);
             }
-            applied.push(drift);
         }
+        Ok(())
+    }
 
-        Ok(applied)
+    /// Put back a MAC address the database has lost.
+    ///
+    /// The placeholder `ff:ff:ff:ff:ff:ff` means "never provisioned", and every
+    /// check that asks whether a VM exists yet reads it that way. A running VM
+    /// carrying the placeholder is therefore not a cosmetic error: it is also
+    /// the address the router's static ARP, the firewall and SLAAC address
+    /// derivation depend on. The host's `net0` is the truth, so take it back
+    /// from there. Only the placeholder is overwritten — a disagreement between
+    /// two real addresses is a different problem and is left alone.
+    async fn heal_unassigned_macs(&self, observed: &HashMap<u64, Vec<HostVmSpec>>) {
+        let db = self.get_db();
+        for specs in observed.values() {
+            for spec in specs {
+                let (Some(vm_id), Some(mac)) = (spec.mapped_vm_id, spec.mac_address.as_ref())
+                else {
+                    continue;
+                };
+                if mac.is_empty() || mac.eq_ignore_ascii_case(UNASSIGNED_MAC) {
+                    continue;
+                }
+                let Ok(mut vm) = db.get_vm(vm_id).await else {
+                    continue;
+                };
+                if vm.deleted || !vm.mac_address.eq_ignore_ascii_case(UNASSIGNED_MAC) {
+                    continue;
+                }
+                warn!(
+                    "VM {} has no MAC recorded but the host reports {}; restoring it",
+                    vm_id, mac
+                );
+                vm.mac_address = mac.clone();
+                if let Err(e) = db.update_vm(&vm).await {
+                    warn!("Failed to restore MAC of VM {}: {}", vm_id, e);
+                }
+            }
+        }
     }
 }
 
@@ -850,6 +971,87 @@ mod tests {
         // Second pass is a no-op now the database agrees with the hosts.
         let drifts = provisioner.reconcile_vm_hosts().await.expect("reconcile");
         assert!(drifts.is_empty());
+        DummyVmHost::clear_host_vms().await;
+    }
+
+    /// Regression for the check that rebuilt a VM which had merely moved:
+    /// locating one must correct its placement, and must only report "nowhere"
+    /// when every host answered and none of them had it.
+    #[tokio::test]
+    async fn test_locate_vm_reconciles_instead_of_reporting_it_missing() {
+        let db = Arc::new(MockDb::default());
+        add_second_host(&db).await;
+        let vm_id = add_vm(&db).await;
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+
+        // Recorded on host 1, actually on host 2.
+        DummyVmHost::clear_host_vms().await;
+        DummyVmHost::set_host_vms_for(1, vec![]).await;
+        DummyVmHost::set_host_vms_for(2, vec![spec(vm_id, "mock-disk-2")]).await;
+
+        let vm = db.get_vm(vm_id).await.expect("vm");
+        let found = provisioner.locate_vm(&vm).await.expect("locate");
+        assert_eq!(found, VmLocation::Host(2));
+        // The database follows the host, so the next lifecycle operation is
+        // aimed at the node that has the VM.
+        let stored = db.get_vm(vm_id).await.expect("vm");
+        assert_eq!(stored.host_id, 2);
+        assert_eq!(stored.disk_id, 2);
+
+        // Gone from every host: the only case in which rebuilding it is right.
+        DummyVmHost::set_host_vms_for(1, vec![]).await;
+        DummyVmHost::set_host_vms_for(2, vec![]).await;
+        let stored = db.get_vm(vm_id).await.expect("vm");
+        assert_eq!(
+            provisioner.locate_vm(&stored).await.expect("locate"),
+            VmLocation::Nowhere
+        );
+
+        // On two hosts at once (a leftover copy after a migration): never a
+        // rebuild, and never a placement rewrite.
+        DummyVmHost::set_host_vms_for(1, vec![spec(vm_id, "mock-disk")]).await;
+        DummyVmHost::set_host_vms_for(2, vec![spec(vm_id, "mock-disk-2")]).await;
+        assert!(matches!(
+            provisioner.locate_vm(&stored).await.expect("locate"),
+            VmLocation::Ambiguous(_)
+        ));
+        DummyVmHost::clear_host_vms().await;
+    }
+
+    /// Regression: a VM left holding the "never provisioned" placeholder MAC
+    /// (a failed re-spawn used to overwrite the real one) has it restored from
+    /// the host, which is the only place the truth survives. Without it the VM
+    /// keeps a MAC that its static ARP, firewall and SLAAC address do not
+    /// match, and every "has this been provisioned?" check answers no.
+    #[tokio::test]
+    async fn test_reconcile_restores_a_wiped_mac_from_the_host() {
+        let db = Arc::new(MockDb::default());
+        let vm_id = add_vm(&db).await;
+
+        let mut vm = db.get_vm(vm_id).await.expect("vm");
+        assert_eq!(vm.mac_address, "ff:ff:ff:ff:ff:ff");
+
+        DummyVmHost::clear_host_vms().await;
+        let mut running = spec(vm_id, "mock-disk");
+        running.mac_address = Some("bc:24:11:4e:8f:d1".to_string());
+        DummyVmHost::set_host_vms_for(1, vec![running]).await;
+
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        provisioner.reconcile_vm_hosts().await.expect("reconcile");
+
+        vm = db.get_vm(vm_id).await.expect("vm");
+        assert_eq!(vm.mac_address, "bc:24:11:4e:8f:d1");
+
+        // A real MAC that disagrees with the host is a different problem and is
+        // left alone: the database is authoritative for a provisioned VM.
+        let mut other = spec(vm_id, "mock-disk");
+        other.mac_address = Some("02:00:00:00:00:99".to_string());
+        DummyVmHost::set_host_vms_for(1, vec![other]).await;
+        provisioner.reconcile_vm_hosts().await.expect("reconcile");
+        assert_eq!(
+            db.get_vm(vm_id).await.expect("vm").mac_address,
+            "bc:24:11:4e:8f:d1"
+        );
         DummyVmHost::clear_host_vms().await;
     }
 }
