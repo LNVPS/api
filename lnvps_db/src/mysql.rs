@@ -2,15 +2,16 @@ use crate::{
     AccessPolicy, AgentConversation, AgentConversationFilter, AgentConversationOverview,
     AgentMessage, App, AppCluster, AppDeployment, AppDeploymentFilter, AppDeploymentServiceUsage,
     AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
-    Company, DbError, DbResult, DnsServer, EncryptedString, IntervalType, IpRange,
-    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth,
-    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, PaymentMethod,
-    PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout, Region,
-    RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic,
-    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany,
-    Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
-    VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost,
-    VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
+    Company, DbError, DbResult, Discount, DiscountRedemption, DnsServer, EncryptedString,
+    IntervalType, IpRange, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode,
+    MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage,
+    PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
+    Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
+    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentWithCompany, Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm,
+    VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
+    VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
+    WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -4112,6 +4113,205 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .fetch_one(&self.db)
         .await?;
         Ok(count as u64)
+    }
+
+    // ========================================================================
+    // Discounts
+    // ========================================================================
+
+    async fn get_discount(&self, id: u64) -> DbResult<Discount> {
+        Ok(sqlx::query_as("SELECT * FROM discount WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn get_discount_by_code(&self, code: &str) -> DbResult<Discount> {
+        Ok(sqlx::query_as("SELECT * FROM discount WHERE code = ?")
+            .bind(code)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn list_discounts_paginated(
+        &self,
+        company_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<Discount>, u64)> {
+        let rows = sqlx::query_as(
+            "SELECT * FROM discount WHERE company_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(company_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM discount WHERE company_id = ?")
+            .bind(company_id)
+            .fetch_one(&self.db)
+            .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn insert_discount(&self, discount: &Discount) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO discount (company_id, code, name, rule, valid_from, valid_to, usage_limit, per_user_limit, active) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        )
+        .bind(discount.company_id)
+        .bind(&discount.code)
+        .bind(&discount.name)
+        .bind(&discount.rule)
+        .bind(discount.valid_from)
+        .bind(discount.valid_to)
+        .bind(discount.usage_limit)
+        .bind(discount.per_user_limit)
+        .bind(discount.active)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn update_discount(&self, discount: &Discount) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE discount SET code = ?, name = ?, rule = ?, valid_from = ?, valid_to = ?, \
+             usage_limit = ?, per_user_limit = ?, active = ? WHERE id = ?",
+        )
+        .bind(&discount.code)
+        .bind(&discount.name)
+        .bind(&discount.rule)
+        .bind(discount.valid_from)
+        .bind(discount.valid_to)
+        .bind(discount.usage_limit)
+        .bind(discount.per_user_limit)
+        .bind(discount.active)
+        .bind(discount.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_discount(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM discount WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn count_discount_redemptions(&self, discount_id: u64, user_id: u64) -> DbResult<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM discount_redemption \
+             WHERE discount_id = ? AND user_id = ? AND settled = 1",
+        )
+        .bind(discount_id)
+        .bind(user_id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(count as u64)
+    }
+
+    async fn insert_discount_redemption(&self, redemption: &DiscountRedemption) -> DbResult<()> {
+        // INSERT IGNORE against uk_discount_redemption_payment: a payment
+        // carries at most one discount, so a repeated call is a no-op rather
+        // than a second row.
+        sqlx::query(
+            "INSERT IGNORE INTO discount_redemption \
+             (discount_id, user_id, subscription_payment_id, amount_off, currency, settled) \
+             VALUES (?, ?, ?, ?, ?, 0)",
+        )
+        .bind(redemption.discount_id)
+        .bind(redemption.user_id)
+        .bind(&redemption.subscription_payment_id)
+        .bind(redemption.amount_off)
+        .bind(&redemption.currency)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_discount_redemption_by_payment(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<DiscountRedemption>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM discount_redemption WHERE subscription_payment_id = ?")
+                .bind(subscription_payment_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn settle_discount_redemption(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<DiscountRedemption>> {
+        let mut tx = self.db.begin().await?;
+
+        // `settled = 0` in the predicate is what makes this idempotent: a
+        // replayed settlement matches no row and increments nothing.
+        let settled = sqlx::query(
+            "UPDATE discount_redemption SET settled = 1, settled_at = NOW() \
+             WHERE subscription_payment_id = ? AND settled = 0",
+        )
+        .bind(subscription_payment_id)
+        .execute(&mut *tx)
+        .await?;
+        if settled.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        let row: DiscountRedemption =
+            sqlx::query_as("SELECT * FROM discount_redemption WHERE subscription_payment_id = ?")
+                .bind(subscription_payment_id)
+                .fetch_one(&mut *tx)
+                .await?;
+
+        sqlx::query("UPDATE discount SET used_count = used_count + 1 WHERE id = ?")
+            .bind(row.discount_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(Some(row))
+    }
+
+    async fn list_discount_redemptions_paginated(
+        &self,
+        discount_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<DiscountRedemption>, u64)> {
+        let rows = sqlx::query_as(
+            "SELECT * FROM discount_redemption WHERE discount_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(discount_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM discount_redemption WHERE discount_id = ?")
+                .bind(discount_id)
+                .fetch_one(&self.db)
+                .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn sum_discount_redemptions(&self, discount_id: u64) -> DbResult<Vec<(String, u64)>> {
+        // CAST because MySQL types SUM() as DECIMAL, which sqlx will not decode
+        // into an integer (the same reason the EXISTS query at the top of this
+        // file avoids SUM).
+        Ok(sqlx::query_as(
+            "SELECT currency, CAST(COALESCE(SUM(amount_off), 0) AS UNSIGNED) AS total \
+             FROM discount_redemption WHERE discount_id = ? AND settled = 1 \
+             GROUP BY currency ORDER BY currency",
+        )
+        .bind(discount_id)
+        .fetch_all(&self.db)
+        .await?)
     }
 
     // ----- Marketplace (operator-run compute nodes) -----

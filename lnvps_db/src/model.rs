@@ -1640,6 +1640,93 @@ impl ReferralCostUsage {
     }
 }
 
+/// A discount that can be applied to an order.
+///
+/// Eligibility and effect both live in [`Self::rule`], a CEL expression
+/// evaluated by `lnvps_api_common::discount`. Only the integrity guards —
+/// validity window and usage limits — are columns, because they need atomic
+/// enforcement at redemption time and cannot be counted inside a
+/// side-effect-free expression.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct Discount {
+    /// Unique id of this discount
+    pub id: u64,
+    /// The company whose orders this discount applies to
+    pub company_id: u64,
+    /// The code a customer enters. `None` is reserved for phase 2 automatic
+    /// discounts, which apply without a code.
+    pub code: Option<String>,
+    /// Admin-facing label, e.g. "Black Friday 2026"
+    pub name: String,
+    /// CEL expression returning a decision map, e.g. `{'percent': 10}`
+    pub rule: String,
+    /// Start of the validity window
+    pub valid_from: DateTime<Utc>,
+    /// End of the validity window; `None` means no end date
+    pub valid_to: Option<DateTime<Utc>>,
+    /// Total redemptions allowed across all users; `None` is unlimited
+    pub usage_limit: Option<u64>,
+    /// Redemptions so far, incremented atomically when a discounted payment
+    /// settles
+    pub used_count: u64,
+    /// Redemptions allowed per user; `None` is unlimited
+    pub per_user_limit: Option<u64>,
+    /// Kill switch: an inactive discount is never a candidate
+    pub active: bool,
+    /// When this discount was created
+    pub created: DateTime<Utc>,
+}
+
+impl Discount {
+    /// True when `now` falls inside the validity window.
+    pub fn in_window(&self, now: DateTime<Utc>) -> bool {
+        now >= self.valid_from && self.valid_to.is_none_or(|end| now < end)
+    }
+
+    /// True when the global usage limit still has room.
+    ///
+    /// Checked when a discount is *quoted*. Settlement increments the count
+    /// unconditionally (a customer who has paid a discounted invoice must be
+    /// honoured), so the count can end up at or past the limit — at which
+    /// point this refuses every further quote.
+    pub fn has_remaining_uses(&self) -> bool {
+        self.usage_limit.is_none_or(|limit| self.used_count < limit)
+    }
+
+    /// True when this discount is a candidate for an order priced at `now`:
+    /// active, inside its window, and not exhausted.
+    pub fn is_available(&self, now: DateTime<Utc>) -> bool {
+        self.active && self.in_window(now) && self.has_remaining_uses()
+    }
+}
+
+/// One discount applied to a payment.
+///
+/// Written unsettled when the discounted invoice is created, and settled when
+/// the payment is paid. Only settled rows consume limits or count towards what
+/// a campaign has cost, so an invoice that is never paid burns no stock.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct DiscountRedemption {
+    /// Unique id of this redemption
+    pub id: u64,
+    /// The discount that was applied
+    pub discount_id: u64,
+    /// The user the discount was applied for
+    pub user_id: u64,
+    /// Payment hash of the payment the discount was applied to
+    pub subscription_payment_id: Vec<u8>,
+    /// What the customer saved, in minor units of [`Self::currency`]
+    pub amount_off: u64,
+    /// ISO currency code of [`Self::amount_off`]
+    pub currency: String,
+    /// False until the payment settles
+    pub settled: bool,
+    /// When the discounted invoice was created
+    pub created: DateTime<Utc>,
+    /// When the payment settled, if it has
+    pub settled_at: Option<DateTime<Utc>>,
+}
+
 /// How an outbound payout reaches its recipient. Stored as a small integer; new
 /// methods are added as new variants (append-only to preserve values).
 ///
@@ -2351,6 +2438,12 @@ pub enum AdminResource {
     /// pasted into a support request — which is a wider disclosure than the
     /// account fields `users::view` implies. Granting it is a separate decision.
     SupportAgent = 30,
+    /// Discount campaigns: codes, their CEL rules and redemption reporting.
+    ///
+    /// Separate from [`AdminResource::Payments`] because creating a discount is
+    /// authority to give money away — a pricing decision, not payment
+    /// administration.
+    Discount = 31,
 }
 
 /// Actions that can be performed on administrative resources
@@ -2396,6 +2489,7 @@ impl Display for AdminResource {
             AdminResource::UserPaymentMethod => write!(f, "user_payment_method"),
             AdminResource::ResourceCost => write!(f, "resource_cost"),
             AdminResource::Referral => write!(f, "referral"),
+            AdminResource::Discount => write!(f, "discount"),
             AdminResource::App => write!(f, "app"),
             AdminResource::AppDeployment => write!(f, "app_deployment"),
             AdminResource::MarketplaceNode => write!(f, "marketplace_node"),
@@ -2443,6 +2537,7 @@ impl FromStr for AdminResource {
                 Ok(AdminResource::MarketplaceOperator)
             }
             "support_agent" => Ok(AdminResource::SupportAgent),
+            "discount" | "discounts" => Ok(AdminResource::Discount),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -2484,6 +2579,7 @@ impl TryFrom<u16> for AdminResource {
             28 => Ok(AdminResource::MarketplaceNode),
             29 => Ok(AdminResource::MarketplaceOperator),
             30 => Ok(AdminResource::SupportAgent),
+            31 => Ok(AdminResource::Discount),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -2524,6 +2620,7 @@ impl AdminResource {
             AdminResource::MarketplaceNode,
             AdminResource::MarketplaceOperator,
             AdminResource::SupportAgent,
+            AdminResource::Discount,
         ]
     }
 }
@@ -4478,6 +4575,90 @@ mod rbac_grant_tests {
             "these admin resources are used by endpoints but granted to nobody, \
              so those endpoints answer 403 to every caller:\n  {}",
             missing.join("\n  ")
+        );
+    }
+}
+
+#[cfg(test)]
+mod discount_tests {
+    use super::*;
+
+    fn discount() -> Discount {
+        Discount {
+            id: 1,
+            company_id: 1,
+            code: Some("SAVE10".to_string()),
+            name: "Save 10".to_string(),
+            rule: "{'percent': 10}".to_string(),
+            valid_from: DateTime::from_timestamp(1_000, 0).unwrap(),
+            valid_to: Some(DateTime::from_timestamp(2_000, 0).unwrap()),
+            usage_limit: Some(2),
+            used_count: 0,
+            per_user_limit: Some(1),
+            active: true,
+            created: DateTime::from_timestamp(0, 0).unwrap(),
+        }
+    }
+
+    fn at(ts: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(ts, 0).unwrap()
+    }
+
+    #[test]
+    fn window_is_start_inclusive_end_exclusive() {
+        let d = discount();
+        assert!(!d.in_window(at(999)));
+        assert!(d.in_window(at(1_000)));
+        assert!(d.in_window(at(1_999)));
+        // The end is exclusive: a discount that "runs until midnight" must not
+        // still apply at midnight.
+        assert!(!d.in_window(at(2_000)));
+    }
+
+    #[test]
+    fn open_ended_window_never_expires() {
+        let d = Discount {
+            valid_to: None,
+            ..discount()
+        };
+        assert!(d.in_window(at(i32::MAX as i64)));
+    }
+
+    #[test]
+    fn usage_limit_is_respected_and_optional() {
+        let mut d = discount();
+        assert!(d.has_remaining_uses());
+        d.used_count = 1;
+        assert!(d.has_remaining_uses());
+        d.used_count = 2;
+        assert!(!d.has_remaining_uses());
+        // Over-count (e.g. an admin lowering the limit) stays exhausted.
+        d.used_count = 5;
+        assert!(!d.has_remaining_uses());
+
+        d.usage_limit = None;
+        assert!(d.has_remaining_uses());
+    }
+
+    #[test]
+    fn availability_needs_active_window_and_uses() {
+        let d = discount();
+        assert!(d.is_available(at(1_500)));
+
+        assert!(
+            !Discount {
+                active: false,
+                ..discount()
+            }
+            .is_available(at(1_500))
+        );
+        assert!(!discount().is_available(at(2_500)));
+        assert!(
+            !Discount {
+                used_count: 2,
+                ..discount()
+            }
+            .is_available(at(1_500))
         );
     }
 }

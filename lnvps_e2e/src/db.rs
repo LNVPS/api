@@ -333,6 +333,28 @@ pub async fn hard_delete_cost_plan(pool: &MySqlPool, cost_plan_id: u64) -> anyho
     Ok(())
 }
 
+/// Hard-delete a company's discounts and their redemptions.
+///
+/// Discounts are company-scoped with a real FK, so they must go before the
+/// company does; the redemption rows reference the discount in turn.
+pub async fn hard_delete_company_discounts(
+    pool: &MySqlPool,
+    company_id: u64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "DELETE FROM discount_redemption WHERE discount_id IN \
+         (SELECT id FROM discount WHERE company_id = ?)",
+    )
+    .bind(company_id)
+    .execute(pool)
+    .await?;
+    sqlx::query("DELETE FROM discount WHERE company_id = ?")
+        .bind(company_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Hard-delete a company.
 pub async fn hard_delete_company(pool: &MySqlPool, company_id: u64) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM company WHERE id = ?")
@@ -936,6 +958,7 @@ pub async fn hard_delete_seeded_vm(pool: &MySqlPool, seeded: &SeededVm) -> anyho
     hard_delete_os_image(pool, seeded.image_id).await?;
     hard_delete_cost_plan(pool, seeded.cost_plan_id).await?;
     hard_delete_region(pool, seeded.region_id).await?;
+    hard_delete_company_discounts(pool, seeded.company_id).await?;
     hard_delete_company(pool, seeded.company_id).await?;
     Ok(())
 }

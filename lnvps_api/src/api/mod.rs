@@ -57,6 +57,9 @@ pub(crate) struct PaymentMethodQuery {
     /// For `method=saved` off-session charges: the specific saved payment
     /// method id to charge. Omitted selects the user's default saved card.
     pub payment_method_id: Option<u64>,
+    /// Discount code to apply to this order. A code that cannot be used fails
+    /// the request rather than quietly charging full price.
+    pub code: Option<String>,
 }
 
 impl PaymentMethodQuery {
@@ -161,6 +164,31 @@ pub struct RouterState {
 /// `payment_method_id`); anything else is an interactive payment in the requested
 /// method (default Lightning). Shared by the VM renew, VM upgrade and generic
 /// subscription renew endpoints so every payment type is collected identically.
+/// The discount line to show on a payment, if it carries one.
+///
+/// Read back from the recorded redemption rather than from the request, so a
+/// reused pending invoice still reports the discount it was actually created
+/// with. Failure to look it up hides the line rather than failing the payment.
+pub(crate) async fn discount_line(
+    db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+    payment_id: &Vec<u8>,
+) -> Option<crate::api::model::ApiDiscount> {
+    let redemption = db
+        .get_discount_redemption_by_payment(payment_id)
+        .await
+        .ok()
+        .flatten()?;
+    let code = db
+        .get_discount(redemption.discount_id)
+        .await
+        .ok()
+        .and_then(|d| d.code);
+    Some(crate::api::model::ApiDiscount {
+        code,
+        amount_off: redemption.amount_off,
+    })
+}
+
 pub(crate) async fn resolve_payment_mode(
     this: &RouterState,
     uid: u64,
@@ -218,6 +246,7 @@ mod tests {
             intervals,
             save_card: None,
             payment_method_id: None,
+            code: None,
         }
     }
 

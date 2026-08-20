@@ -414,6 +414,31 @@ pub struct ApiVmPayment {
     /// what this VM cost must subtract these rows. `data` is empty: a refund has
     /// no invoice to pay.
     pub is_refund: bool,
+    /// The discount applied to this payment, when a code was used. `amount`
+    /// (and `tax`) are already net of it — this is the line to *show*, not a
+    /// further reduction to apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discount: Option<ApiDiscount>,
+}
+
+/// A discount applied to a payment.
+#[derive(Serialize, Deserialize)]
+pub struct ApiDiscount {
+    /// The code the customer entered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// Amount taken off, in the payment's currency and smallest unit (cents for
+    /// fiat, millisats for BTC).
+    pub amount_off: u64,
+}
+
+impl From<lnvps_db::DiscountRedemption> for ApiDiscount {
+    fn from(r: lnvps_db::DiscountRedemption) -> Self {
+        Self {
+            code: None,
+            amount_off: r.amount_off,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -555,6 +580,8 @@ impl ApiVmPayment {
             upgrade_params,
             data,
             is_refund,
+            // Filled by handlers that have the database to look it up.
+            discount: None,
         })
     }
 }
@@ -1201,6 +1228,10 @@ pub struct ApiSubscriptionPayment {
     /// Payment-method-specific data needed to complete the payment
     /// (e.g. the Lightning invoice for `payment_method == "lightning"`).
     pub data: ApiPaymentData,
+    /// The discount applied to this payment, when a code was used. `amount`
+    /// (and `tax`) are already net of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discount: Option<ApiDiscount>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1282,6 +1313,8 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
             tax: tax.into(),
             processing_fee: processing_fee.into(),
             data,
+            // Filled by handlers that have the database to look it up.
+            discount: None,
         }
     }
 }

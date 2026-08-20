@@ -15,6 +15,7 @@ mod companies;
 mod cost_plans;
 mod costs;
 mod custom_pricing;
+mod discounts;
 mod dns_servers;
 mod docs;
 mod hosts;
@@ -85,6 +86,7 @@ pub fn admin_router(
         .merge(ip_space::router())
         .merge(access_policies::router())
         .merge(routers::router())
+        .merge(discounts::router())
         .merge(dns_servers::router())
         .merge(vm_ip_assignments::router())
         .merge(subscriptions::router())

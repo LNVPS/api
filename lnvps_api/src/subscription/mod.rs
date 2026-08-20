@@ -270,6 +270,33 @@ impl SubscriptionHandler {
         &self,
         payment: &SubscriptionPayment,
     ) -> Result<CompletePaymentResult> {
+        // Settle any discount on this payment first: this is the point at which
+        // a discount is really redeemed, so limits are consumed by money that
+        // arrived rather than by invoices that were merely created. It lives
+        // here rather than in `complete_payment` so every settlement path —
+        // Lightning, Revolut, Stripe, on-chain, and the admin override, which
+        // marks the payment paid itself and reaches this through
+        // `WorkJob::ApplySubscriptionPayment` — records it exactly once (the
+        // call is idempotent, so a replayed webhook counts nothing twice).
+        //
+        // A failure here must not un-pay a payment the customer has made, so it
+        // is logged rather than propagated.
+        match self.db.settle_discount_redemption(&payment.id).await {
+            Ok(Some(r)) => info!(
+                "Discount {} redeemed on payment {} ({} {})",
+                r.discount_id,
+                hex::encode(&payment.id),
+                r.amount_off,
+                r.currency
+            ),
+            Ok(None) => {}
+            Err(e) => warn!(
+                "Failed to settle discount for payment {}: {}",
+                hex::encode(&payment.id),
+                e
+            ),
+        }
+
         let line_items = self
             .db
             .list_subscription_line_items(payment.subscription_id)
@@ -436,8 +463,14 @@ impl SubscriptionHandler {
         method: PaymentMethod,
         intervals: u32,
     ) -> Result<SubscriptionPayment> {
-        self.renew_subscription_inner(subscription_id, method, intervals, RenewMode::default())
-            .await
+        self.renew_subscription_inner(
+            subscription_id,
+            method,
+            intervals,
+            RenewMode::default(),
+            None,
+        )
+        .await
     }
 
     /// Create a renewal/purchase payment for a subscription with an explicit
@@ -450,7 +483,23 @@ impl SubscriptionHandler {
         intervals: u32,
         mode: RenewMode,
     ) -> Result<SubscriptionPayment> {
-        self.renew_subscription_inner(subscription_id, method, intervals, mode)
+        self.renew_subscription_inner(subscription_id, method, intervals, mode, None)
+            .await
+    }
+
+    /// Create a renewal/purchase payment, optionally applying a discount code.
+    ///
+    /// An unusable code fails the request rather than silently billing full
+    /// price: the customer typed something and is owed an answer.
+    pub async fn renew_subscription_with_discount(
+        &self,
+        subscription_id: u64,
+        method: PaymentMethod,
+        intervals: u32,
+        mode: RenewMode,
+        discount_code: Option<String>,
+    ) -> Result<SubscriptionPayment> {
+        self.renew_subscription_inner(subscription_id, method, intervals, mode, discount_code)
             .await
     }
 
@@ -465,6 +514,7 @@ impl SubscriptionHandler {
         method: PaymentMethod,
         intervals: u32,
         mode: RenewMode,
+        discount_code: Option<String>,
     ) -> Result<SubscriptionPayment> {
         let intervals = intervals.max(1);
 
@@ -513,11 +563,19 @@ impl SubscriptionHandler {
                         sunset_date.format("%Y-%m-%d")
                     );
                 }
-                match self
-                    .pe
-                    .get_vm_cost_for_intervals(vm.id, method, intervals)
-                    .await?
-                {
+                // A discounted order is always priced fresh: handing back an
+                // invoice created before the code was entered would charge the
+                // customer list price while telling them the code worked.
+                let cost = if discount_code.is_some() {
+                    self.pe
+                        .get_vm_cost_for_intervals_fresh(vm.id, method, intervals)
+                        .await?
+                } else {
+                    self.pe
+                        .get_vm_cost_for_intervals(vm.id, method, intervals)
+                        .await?
+                };
+                match cost {
                     CostResult::New(p) => vm_payment_infos.push(p),
                     CostResult::Existing(p) => {
                         // An identical unpaid payment already exists — return it directly
@@ -654,16 +712,6 @@ impl SubscriptionHandler {
         if let Some(line) = non_vm_tax_line {
             tax_lines.push(line);
         }
-        let tax_summary = lnvps_api_common::summarize_tax_lines(&tax_lines);
-        let tax_breakdown = serde_json::to_value(&tax_lines).ok();
-        // The country signals are the same for every line (one customer).
-        let tax_evidence = Some(
-            self.pe
-                .determine_tax(subscription.user_id, 0, subscription.company_id)
-                .await?
-                .evidence_json(),
-        );
-
         // Payment method currency. VM items are already converted to the method
         // currency; for subscriptions with no VM items (e.g. managed apps) the
         // non-VM block converted the amount to the method currency too, so use
@@ -674,6 +722,57 @@ impl SubscriptionHandler {
             .map(|p| p.currency)
             .or(non_vm_currency)
             .unwrap_or(subscription_currency);
+
+        // Discount step. The discount applies to the *order*, not to a line
+        // item: it has to see the whole bill (every line plus setup fees) to
+        // judge a minimum spend and to be capped at what is actually owed.
+        //
+        // It is subtracted before tax and the processing fee are finalised, so
+        // the customer is never taxed — or charged a provider fee — on money
+        // they do not pay.
+        let discount = self
+            .quote_discount(
+                discount_code,
+                &subscription,
+                &line_items,
+                intervals,
+                total_amount,
+                payment_currency,
+                payment_type,
+            )
+            .await?;
+        let (total_amount, tax, processing_fee, tax_lines) = match &discount {
+            Some(applied) => {
+                let discounted =
+                    lnvps_api_common::discount_tax_lines(&tax_lines, applied.amount_off);
+                let net: u64 = discounted.iter().map(|l| l.net).sum();
+                let tax_after: u64 = discounted.iter().map(|l| l.tax).sum();
+                // The provider's fee is charged on what is actually collected.
+                // Scaled rather than recomputed so a discounted order keeps the
+                // same fee shape as an undiscounted one (the per-line flat base
+                // is summed per line above; re-deriving it once here would
+                // quietly change the fee for multi-line orders as well).
+                let gross_before = total_amount + tax;
+                let fee = if gross_before == 0 {
+                    0
+                } else {
+                    ((processing_fee as u128 * (net + tax_after) as u128) / gross_before as u128)
+                        as u64
+                };
+                (net, tax_after, fee, discounted)
+            }
+            None => (total_amount, tax, processing_fee, tax_lines),
+        };
+
+        let tax_summary = lnvps_api_common::summarize_tax_lines(&tax_lines);
+        let tax_breakdown = serde_json::to_value(&tax_lines).ok();
+        // The country signals are the same for every line (one customer).
+        let tax_evidence = Some(
+            self.pe
+                .determine_tax(subscription.user_id, 0, subscription.company_id)
+                .await?
+                .evidence_json(),
+        );
 
         // Wrap the aggregated values so the invoice/order creation below can use them
         let converted_amount = total_amount;
@@ -945,8 +1044,85 @@ impl SubscriptionHandler {
             .insert_subscription_payment(&subscription_payment)
             .await?;
 
+        // Record the discount against the payment, unsettled. It consumes no
+        // limit until the payment is actually paid, so an invoice the customer
+        // abandons does not burn a campaign's stock.
+        if let Some(applied) = &discount {
+            self.db
+                .insert_discount_redemption(&lnvps_db::DiscountRedemption {
+                    discount_id: applied.discount_id,
+                    user_id: subscription.user_id,
+                    subscription_payment_id: subscription_payment.id.clone(),
+                    amount_off: applied.amount_off,
+                    currency: applied.currency.to_string(),
+                    ..Default::default()
+                })
+                .await?;
+        }
+
         // For saved-method payments, charge on the spot and wait for settlement.
         self.collect_saved_payment(subscription_payment, &mode)
+            .await
+    }
+
+    /// Resolve a discount code for an order, in the payment currency.
+    ///
+    /// Returns `Ok(None)` when no code was supplied. An unusable code is an
+    /// error: the customer typed it, so silently charging full price would be
+    /// worse than telling them it did not work.
+    #[allow(clippy::too_many_arguments)]
+    async fn quote_discount(
+        &self,
+        code: Option<String>,
+        subscription: &Subscription,
+        line_items: &[SubscriptionLineItem],
+        intervals: u32,
+        net_amount: u64,
+        currency: Currency,
+        payment_type: SubscriptionPaymentType,
+    ) -> Result<Option<lnvps_api_common::AppliedDiscount>> {
+        if code.is_none() {
+            return Ok(None);
+        }
+        // A VM order quotes its template so a rule can target one plan; an
+        // order that mixes products has no single template and reports none
+        // rather than picking one of them arbitrarily.
+        let vps_items: Vec<&SubscriptionLineItem> = line_items
+            .iter()
+            .filter(|li| li.subscription_type == SubscriptionType::Vps)
+            .collect();
+        let template_id = match vps_items.as_slice() {
+            [only] => self
+                .db
+                .get_vm_by_line_item(only.id)
+                .await
+                .ok()
+                .and_then(|vm| vm.template_id),
+            _ => None,
+        };
+        let product = if vps_items.len() == line_items.len() && !vps_items.is_empty() {
+            "vm"
+        } else if vps_items.is_empty() {
+            "subscription"
+        } else {
+            "mixed"
+        };
+
+        self.pe
+            .quote_discount(&lnvps_api_common::DiscountOrder {
+                code,
+                user_id: subscription.user_id,
+                company_id: subscription.company_id,
+                amount: net_amount,
+                currency,
+                intervals: intervals as u64,
+                interval_type: subscription.interval_type,
+                // A purchase is the subscription's first payment; renewals and
+                // upgrades are not new orders.
+                is_new: payment_type == SubscriptionPaymentType::Purchase,
+                template_id,
+                product: product.to_string(),
+            })
             .await
     }
 
@@ -1369,6 +1545,7 @@ impl SubscriptionHandler {
                 PaymentMethod::Revolut,
                 1,
                 RenewMode::Saved { method_id: None },
+                None,
             )
             .await?;
         info!(
@@ -1638,7 +1815,7 @@ mod revolut_autorenew_tests {
 }
 
 #[cfg(test)]
-mod revolut_offline_tests {
+pub(crate) mod revolut_offline_tests {
     use super::*;
     use crate::mocks::{MockNode, MockOnChainProvider};
     use crate::settings::mock_settings;
@@ -1654,7 +1831,7 @@ mod revolut_offline_tests {
 
     /// A FiatPaymentService mock that records calls for assertions.
     #[derive(Default)]
-    struct MockFiat {
+    pub(crate) struct MockFiat {
         charged: Mutex<Vec<(String, String, u64)>>,
         created_subscription: Mutex<bool>,
         created_order: Mutex<bool>,
@@ -2457,5 +2634,265 @@ mod sunset_tests {
                 "unexpected prepay error: {e}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod discount_tests {
+    use super::*;
+    use crate::mocks::{MockNode, MockOnChainProvider};
+    use crate::settings::mock_settings;
+    use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VmStateCache};
+    use lnvps_db::{Discount, IntervalType, LNVpsDbBase, SubscriptionType};
+
+    /// A 10.00 EUR/month subscription, paid in EUR (Revolut) so the amounts in
+    /// these tests are cents and not exchange-rate dependent.
+    async fn setup() -> (Arc<MockDb>, SubscriptionHandler, u64, u64) {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[3u8; 32]).await.unwrap();
+        let (sub_id, _items) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "s".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: true,
+                    is_setup: true,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: SubscriptionType::IpRange,
+                    name: "hosting".to_string(),
+                    description: None,
+                    amount: 1_000,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let rates = Arc::new(MockExchangeRate::default());
+        rates
+            .set_rate(
+                lnvps_api_common::Ticker::btc_rate("EUR").unwrap(),
+                100_000.0,
+            )
+            .await;
+        let mut sub = SubscriptionHandler::new(
+            mock_settings(),
+            db.clone(),
+            Arc::new(MockNode::default()),
+            Arc::new(MockOnChainProvider::default()),
+            None,
+            rates,
+            VatClient::new(),
+            Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
+        )
+        .unwrap();
+        sub.set_revolut_for_test(Arc::new(super::revolut_offline_tests::MockFiat::default()));
+        sub.set_settle_timeout_for_test(Duration::ZERO);
+        (db, sub, user_id, sub_id)
+    }
+
+    async fn add_discount(db: &MockDb, code: &str, rule: &str) -> u64 {
+        db.insert_discount(&Discount {
+            company_id: 1,
+            code: Some(code.to_string()),
+            name: code.to_string(),
+            rule: rule.to_string(),
+            active: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn renew(
+        sub: &SubscriptionHandler,
+        sub_id: u64,
+        code: Option<&str>,
+    ) -> Result<SubscriptionPayment> {
+        sub.renew_subscription_with_discount(
+            sub_id,
+            PaymentMethod::Revolut,
+            1,
+            RenewMode::Interactive { save_card: false },
+            code.map(|c| c.to_string()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_order_without_a_code_is_unchanged() {
+        let (db, sub, _user, sub_id) = setup().await;
+        add_discount(&db, "SAVE10", "{'percent': 10}").await;
+
+        let payment = renew(&sub, sub_id, None).await.unwrap();
+        assert_eq!(payment.amount, 1_000);
+        assert!(
+            db.get_discount_redemption_by_payment(&payment.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_code_reduces_the_invoice_and_records_it_unsettled() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        let discount_id = add_discount(&db, "SAVE10", "{'percent': 10}").await;
+
+        let payment = renew(&sub, sub_id, Some("SAVE10")).await.unwrap();
+        assert_eq!(payment.amount, 900, "10% off 10.00 EUR");
+
+        let recorded = db
+            .get_discount_redemption_by_payment(&payment.id)
+            .await
+            .unwrap()
+            .expect("redemption recorded");
+        assert_eq!(recorded.discount_id, discount_id);
+        assert_eq!(recorded.amount_off, 100);
+        assert_eq!(recorded.currency, "EUR");
+        assert_eq!(recorded.user_id, user_id);
+
+        // Not yet redeemed: the invoice has not been paid.
+        assert!(!recorded.settled);
+        assert_eq!(db.get_discount(discount_id).await.unwrap().used_count, 0);
+    }
+
+    /// The customer typed something; charging them full price without saying so
+    /// would be worse than refusing.
+    #[tokio::test]
+    async fn an_unusable_code_fails_the_order() {
+        let (db, sub, _user, sub_id) = setup().await;
+        add_discount(&db, "SAVE10", "{'percent': 10}").await;
+
+        assert!(renew(&sub, sub_id, Some("NOPE")).await.is_err());
+        // A rule that declines this order is equally an error, not a silent
+        // full-price invoice.
+        add_discount(
+            &db,
+            "BIGSPEND",
+            "order.amount >= 100000 ? {'percent': 10} : {}",
+        )
+        .await;
+        assert!(renew(&sub, sub_id, Some("BIGSPEND")).await.is_err());
+    }
+
+    /// Tax follows the discount: a customer is never taxed on money they do not
+    /// pay.
+    #[tokio::test]
+    async fn tax_is_charged_on_the_discounted_amount() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        // An Irish customer of an Irish company: 23% VAT.
+        let mut user = db.get_user(user_id).await.unwrap();
+        user.country_code = Some("IRL".to_string());
+        db.update_user(&user).await.unwrap();
+        {
+            let mut companies = db.companies.lock().await;
+            if let Some(c) = companies.get_mut(&1) {
+                c.country_code = Some("IRL".to_string());
+                c.tax_id = None;
+            }
+        }
+        sub.pe
+            .vat_client()
+            .set_rates(std::collections::HashMap::from([(
+                isocountry::CountryCode::IRL,
+                23.0,
+            )]));
+
+        let full = renew(&sub, sub_id, None).await.unwrap();
+        assert_eq!((full.amount, full.tax), (1_000, 230));
+
+        add_discount(&db, "SAVE10", "{'percent': 10}").await;
+        let discounted = renew(&sub, sub_id, Some("SAVE10")).await.unwrap();
+        assert_eq!(discounted.amount, 900);
+        assert_eq!(discounted.tax, 207, "23% of 9.00, not of 10.00");
+    }
+
+    /// Settlement is where a discount is really redeemed, and it happens once
+    /// however many times the settlement path is replayed.
+    #[tokio::test]
+    async fn settlement_redeems_once() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        let discount_id = add_discount(&db, "SAVE10", "{'percent': 10}").await;
+        let payment = renew(&sub, sub_id, Some("SAVE10")).await.unwrap();
+
+        sub.apply_payment(&payment).await.unwrap();
+        let after = db.get_discount(discount_id).await.unwrap();
+        assert_eq!(after.used_count, 1);
+        assert_eq!(
+            db.count_discount_redemptions(discount_id, user_id)
+                .await
+                .unwrap(),
+            1
+        );
+
+        // Replayed webhook / listener resuming from its cursor.
+        sub.apply_payment(&payment).await.unwrap();
+        assert_eq!(db.get_discount(discount_id).await.unwrap().used_count, 1);
+    }
+
+    /// An unpaid invoice must not be handed back when a code is entered: the
+    /// customer would be told the code worked and then charged list price.
+    #[tokio::test]
+    async fn a_code_is_not_answered_with_an_existing_full_price_invoice() {
+        let (db, sub, _user, sub_id) = setup().await;
+        add_discount(&db, "SAVE10", "{'percent': 10}").await;
+
+        // An invoice already exists at list price...
+        let full = renew(&sub, sub_id, None).await.unwrap();
+        assert_eq!(full.amount, 1_000);
+
+        // ...and entering a code produces a new, cheaper one rather than
+        // returning it.
+        let discounted = renew(&sub, sub_id, Some("SAVE10")).await.unwrap();
+        assert_ne!(discounted.id, full.id);
+        assert_eq!(discounted.amount, 900);
+    }
+
+    /// A per-user limit is only consumed by payments that settle, so an
+    /// abandoned invoice does not lock the customer out of the offer.
+    #[tokio::test]
+    async fn an_unpaid_invoice_does_not_consume_the_per_user_limit() {
+        let (db, sub, _user, sub_id) = setup().await;
+        let discount_id = db
+            .insert_discount(&Discount {
+                company_id: 1,
+                code: Some("ONCE".to_string()),
+                name: "Once".to_string(),
+                rule: "{'percent': 10}".to_string(),
+                per_user_limit: Some(1),
+                active: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // First invoice, abandoned.
+        renew(&sub, sub_id, Some("ONCE")).await.unwrap();
+        // Second invoice still gets the discount.
+        let paid = renew(&sub, sub_id, Some("ONCE")).await.unwrap();
+        assert_eq!(paid.amount, 900);
+
+        sub.apply_payment(&paid).await.unwrap();
+        assert_eq!(db.get_discount(discount_id).await.unwrap().used_count, 1);
+
+        // Now the limit really is used up.
+        assert!(renew(&sub, sub_id, Some("ONCE")).await.is_err());
     }
 }

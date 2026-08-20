@@ -359,9 +359,12 @@ async fn v1_renew_subscription(
     let (method, mode) = crate::api::resolve_payment_mode(&this, uid, &q).await?;
     let payment = this
         .sub_handler
-        .renew_subscription_with_mode(id, method, intervals, mode)
+        .renew_subscription_with_discount(id, method, intervals, mode, q.code.clone())
         .await
         .map_err(|e| anyhow::anyhow!("Failed to generate payment: {}", e))?;
 
-    ApiData::ok(ApiSubscriptionPayment::from(payment))
+    let discount = crate::api::discount_line(&this.db, &payment.id).await;
+    let mut out = ApiSubscriptionPayment::from(payment);
+    out.discount = discount;
+    ApiData::ok(out)
 }

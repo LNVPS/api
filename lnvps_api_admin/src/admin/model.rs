@@ -5011,3 +5011,153 @@ pub struct AdminUpdateAppClusterRequest {
 fn default_true() -> bool {
     true
 }
+
+/// Admin view of a discount campaign.
+#[derive(Serialize, Deserialize)]
+pub struct AdminDiscountInfo {
+    pub id: u64,
+    pub company_id: u64,
+    /// The code customers enter. `None` is a phase 2 automatic discount.
+    pub code: Option<String>,
+    pub name: String,
+    /// The CEL expression evaluated when the code is used.
+    pub rule: String,
+    pub valid_from: DateTime<Utc>,
+    pub valid_to: Option<DateTime<Utc>>,
+    pub usage_limit: Option<u64>,
+    pub used_count: u64,
+    pub per_user_limit: Option<u64>,
+    pub active: bool,
+    pub created: DateTime<Utc>,
+    /// What this campaign has given away so far, per currency (minor units).
+    /// Redemptions are recorded in the currency the customer paid in, so this
+    /// is a list rather than one number.
+    pub given_away: Vec<AdminDiscountTotal>,
+}
+
+/// One currency's share of a campaign's cost.
+#[derive(Serialize, Deserialize)]
+pub struct AdminDiscountTotal {
+    pub currency: String,
+    /// Minor units (cents / milli-sats).
+    pub amount: u64,
+}
+
+/// One recorded redemption.
+#[derive(Serialize, Deserialize)]
+pub struct AdminDiscountRedemptionInfo {
+    pub id: u64,
+    pub discount_id: u64,
+    pub user_id: u64,
+    /// Hex payment hash of the payment the discount was applied to.
+    pub subscription_payment_id: String,
+    /// Minor units (cents / milli-sats).
+    pub amount_off: u64,
+    pub currency: String,
+    /// False while the discounted invoice is unpaid. Unsettled rows consume no
+    /// limit and do not count towards what the campaign has cost.
+    pub settled: bool,
+    /// When the discounted invoice was created.
+    pub created: DateTime<Utc>,
+    /// When the payment settled, if it has.
+    pub settled_at: Option<DateTime<Utc>>,
+}
+
+impl From<lnvps_db::DiscountRedemption> for AdminDiscountRedemptionInfo {
+    fn from(r: lnvps_db::DiscountRedemption) -> Self {
+        Self {
+            id: r.id,
+            discount_id: r.discount_id,
+            user_id: r.user_id,
+            subscription_payment_id: hex::encode(r.subscription_payment_id),
+            amount_off: r.amount_off,
+            currency: r.currency,
+            settled: r.settled,
+            created: r.created,
+            settled_at: r.settled_at,
+        }
+    }
+}
+
+/// Create a discount.
+#[derive(Deserialize)]
+pub struct AdminCreateDiscountRequest {
+    pub company_id: u64,
+    /// Customer-entered code. Required in phase 1 — a code-less discount would
+    /// apply automatically, which is not implemented yet.
+    pub code: String,
+    pub name: String,
+    /// CEL expression returning a decision map, e.g. `{'percent': 10}`.
+    pub rule: String,
+    /// Defaults to now.
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_to: Option<DateTime<Utc>>,
+    pub usage_limit: Option<u64>,
+    pub per_user_limit: Option<u64>,
+    /// Defaults to true.
+    pub active: Option<bool>,
+}
+
+/// Update a discount (omitted fields unchanged).
+///
+/// `used_count` is deliberately absent: it is owned by redemption, and an edit
+/// that could rewrite it would reopen an exhausted campaign by accident.
+#[derive(Deserialize)]
+pub struct AdminUpdateDiscountRequest {
+    pub code: Option<String>,
+    pub name: Option<String>,
+    pub rule: Option<String>,
+    pub valid_from: Option<DateTime<Utc>>,
+    pub valid_to: Option<DateTime<Utc>>,
+    pub usage_limit: Option<u64>,
+    pub per_user_limit: Option<u64>,
+    pub active: Option<bool>,
+}
+
+/// Try a rule against a sample order before saving it.
+#[derive(Deserialize)]
+pub struct AdminPreviewDiscountRequest {
+    /// The CEL expression to evaluate.
+    pub rule: String,
+    /// Sample context. Omitted fields fall back to a representative order:
+    /// a new 100.00 EUR monthly template VM for an Irish customer with no
+    /// order history.
+    #[serde(default)]
+    pub order: Option<AdminPreviewOrder>,
+}
+
+/// The sample order a rule preview is evaluated against.
+#[derive(Deserialize)]
+pub struct AdminPreviewOrder {
+    /// Net order amount in minor units (cents / milli-sats).
+    pub amount: Option<i64>,
+    pub currency: Option<String>,
+    pub intervals: Option<i64>,
+    /// `day`, `month` or `year`.
+    pub interval_type: Option<String>,
+    pub is_new: Option<bool>,
+    pub template_id: Option<i64>,
+    /// e.g. `vm`, `custom_vm`, `app`.
+    pub product: Option<String>,
+    /// ISO 3166-1 alpha-3 country of the sample customer.
+    pub country: Option<String>,
+    /// Number of settled orders the sample customer has.
+    pub orders: Option<i64>,
+}
+
+/// The outcome of a rule preview.
+#[derive(Serialize, Deserialize)]
+pub struct AdminDiscountPreview {
+    /// True when the rule applies to the sample order.
+    pub applies: bool,
+    /// Percentage off, after clamping to 0..=100.
+    pub percent: Option<u8>,
+    /// Fixed amount off in minor units of `currency`, after clamping.
+    pub amount: Option<u64>,
+    pub currency: Option<String>,
+    /// What the sample order would actually be reduced by, in its own currency
+    /// and minor units. Zero when the rule declines.
+    pub amount_off: u64,
+    /// Why the rule produced nothing, when it produced nothing.
+    pub error: Option<String>,
+}

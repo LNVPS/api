@@ -16,6 +16,7 @@ mod admin_api;
 mod agent_chat;
 pub mod client;
 pub mod db;
+mod discounts;
 mod lifecycle;
 pub mod lightning;
 pub mod nip98;

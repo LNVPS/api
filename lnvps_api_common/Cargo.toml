@@ -67,6 +67,7 @@ virt = { git = "https://gitlab.com/libvirt/libvirt-rust.git", optional = true }
 uuid = { version = "1.16", features = ["v4", "v5", "serde"], optional = true }
 quick-xml = { version = "0.39", features = ["serde", "serialize"], optional = true }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
+cel = "0.14"
 
 [dev-dependencies]
 tempfile = "3"
