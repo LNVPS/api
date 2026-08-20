@@ -189,6 +189,25 @@ pub(crate) async fn discount_line(
     })
 }
 
+/// Resolve a payment-method query for *pricing only*.
+///
+/// Same mapping as [`resolve_payment_mode`] — `nwc` prices as Lightning, `saved`
+/// as Revolut — but it collects nothing and so does not require the saved method
+/// to exist. A client pricing a saved card must not have to map it back to
+/// `revolut` itself, and must not risk charging the customer while doing so.
+pub(crate) fn resolve_quote_method(q: &PaymentMethodQuery) -> lnvps_db::PaymentMethod {
+    use lnvps_db::PaymentMethod;
+    use std::str::FromStr;
+
+    match q.method.as_deref() {
+        Some("nwc") => PaymentMethod::Lightning,
+        Some("saved") => PaymentMethod::Revolut,
+        other => other
+            .and_then(|m| PaymentMethod::from_str(m).ok())
+            .unwrap_or(PaymentMethod::Lightning),
+    }
+}
+
 pub(crate) async fn resolve_payment_mode(
     this: &RouterState,
     uid: u64,
@@ -356,5 +375,91 @@ mod tests {
             ticket: Some(issue_ticket(&pubkey, path, DEFAULT_TICKET_TTL_SECS).unwrap()),
         };
         assert_eq!(q.resolve(path).unwrap(), pubkey);
+    }
+
+    /// Pricing must accept the off-session method names, so a client can price a
+    /// saved card or NWC wallet without mapping it back to an interactive method
+    /// (and without risking a charge while doing so).
+    #[test]
+    fn resolve_quote_method_prices_off_session_methods() {
+        use lnvps_db::PaymentMethod;
+
+        assert_eq!(
+            resolve_quote_method(&query(Some("saved"), None)),
+            PaymentMethod::Revolut
+        );
+        assert_eq!(
+            resolve_quote_method(&query(Some("nwc"), None)),
+            PaymentMethod::Lightning
+        );
+        assert_eq!(
+            resolve_quote_method(&query(Some("revolut"), None)),
+            PaymentMethod::Revolut
+        );
+        // Unknown or absent falls back to Lightning, as the renew path does.
+        assert_eq!(
+            resolve_quote_method(&query(Some("nonsense"), None)),
+            PaymentMethod::Lightning
+        );
+        assert_eq!(
+            resolve_quote_method(&query(None, None)),
+            PaymentMethod::Lightning
+        );
+    }
+
+    /// The wire shape mirrors the payment: amounts already net of the discount,
+    /// with the discount reported as a line to show rather than to re-apply.
+    #[test]
+    fn renewal_quote_serializes_as_the_payment_does() {
+        use crate::api::model::ApiRenewalQuote;
+        use payments_rs::currency::Currency;
+
+        let quote = crate::subscription::RenewalQuote {
+            amount: 900,
+            tax: 207,
+            processing_fee: 25,
+            currency: Currency::EUR,
+            time_value: 2_592_000,
+            rate: 1.0,
+            payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
+            tax_lines: vec![],
+            discount: Some(lnvps_api_common::AppliedDiscount {
+                discount_id: 1,
+                code: Some("SAVE10".to_string()),
+                amount_off: 100,
+                currency: Currency::EUR,
+            }),
+        };
+        let out: ApiRenewalQuote = quote.into();
+        assert_eq!(out.amount, 900);
+        assert_eq!(out.tax, 207);
+        assert_eq!(out.processing_fee, 25);
+        assert_eq!(out.currency, "EUR");
+        assert_eq!(out.time, 2_592_000);
+        let d = out.discount.expect("discount line");
+        assert_eq!((d.code.as_deref(), d.amount_off), (Some("SAVE10"), 100));
+
+        // No code, no line at all — an absent field, not a zero saving.
+        let plain = crate::subscription::RenewalQuote {
+            discount: None,
+            ..quote_without_discount()
+        };
+        let out: ApiRenewalQuote = plain.into();
+        assert!(out.discount.is_none());
+        assert!(!serde_json::to_string(&out).unwrap().contains("discount"));
+    }
+
+    fn quote_without_discount() -> crate::subscription::RenewalQuote {
+        crate::subscription::RenewalQuote {
+            amount: 1_000,
+            tax: 0,
+            processing_fee: 0,
+            currency: payments_rs::currency::Currency::EUR,
+            time_value: 0,
+            rate: 1.0,
+            payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
+            tax_lines: vec![],
+            discount: None,
+        }
     }
 }

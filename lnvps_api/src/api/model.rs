@@ -421,6 +421,46 @@ pub struct ApiVmPayment {
     pub discount: Option<ApiDiscount>,
 }
 
+/// A priced renewal order, computed without creating a payment.
+///
+/// Mirrors [`ApiVmPayment`] field-for-field (minus the invoice) so a client can
+/// render the quote and the resulting payment with one code path.
+#[derive(Serialize, Deserialize)]
+pub struct ApiRenewalQuote {
+    /// Net amount, already reduced by any discount, in the smallest unit of
+    /// `currency` (cents for fiat, millisats for BTC).
+    pub amount: u64,
+    /// Tax on `amount`.
+    pub tax: u64,
+    /// Payment-provider fee, charged on `amount + tax`.
+    pub processing_fee: u64,
+    /// Currency of every amount here, determined by the payment method.
+    pub currency: String,
+    /// Seconds this order would add to the subscription expiry.
+    pub time: u64,
+    /// The discount that would be applied, when a code was supplied. `amount`
+    /// and `tax` are already net of it — this is the line to *show*, not a
+    /// further reduction to apply.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discount: Option<ApiDiscount>,
+}
+
+impl From<crate::subscription::RenewalQuote> for ApiRenewalQuote {
+    fn from(q: crate::subscription::RenewalQuote) -> Self {
+        Self {
+            amount: q.amount,
+            tax: q.tax,
+            processing_fee: q.processing_fee,
+            currency: q.currency.to_string(),
+            time: q.time_value,
+            discount: q.discount.map(|d| ApiDiscount {
+                code: d.code,
+                amount_off: d.amount_off,
+            }),
+        }
+    }
+}
+
 /// A discount applied to a payment.
 #[derive(Serialize, Deserialize)]
 pub struct ApiDiscount {

@@ -34,11 +34,12 @@ use lnvps_db::{
 use crate::api::model::{
     AccountPatchRequest, AccountPatchResult, AccountTaxInfo, AddNwcPaymentMethodRequest,
     ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmPrice, ApiCustomVmRequest,
-    ApiExchangeRates, ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiTemplatesResponse,
-    ApiVmFirewallPolicy, ApiVmFirewallRule, ApiVmHistory, ApiVmPayment, ApiVmStatus,
-    ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule, CreateVmRequest,
-    PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule, PaymentMethodResponse,
-    VMPatchRequest, validate_firewall_cidr, validate_firewall_ports, vm_to_status,
+    ApiExchangeRates, ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiRenewalQuote,
+    ApiTemplatesResponse, ApiVmFirewallPolicy, ApiVmFirewallRule, ApiVmHistory, ApiVmPayment,
+    ApiVmStatus, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule,
+    CreateVmRequest, PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule,
+    PaymentMethodResponse, VMPatchRequest, validate_firewall_cidr, validate_firewall_ports,
+    vm_to_status,
 };
 use crate::api::{
     AmountQuery, AuthQuery, PaymentMethodQuery, RouterState, TicketRequest, TicketResponse,
@@ -123,6 +124,7 @@ pub fn routes() -> Router<RouterState> {
             .route("/api/v1/ssh-key/{id}", delete(v1_delete_ssh_key))
             .route("/api/v1/vm", post(v1_create_vm_order))
             .route("/api/v1/vm/{id}/renew", get(v1_renew_vm))
+            .route("/api/v1/vm/{id}/renew/quote", get(v1_quote_vm_renewal))
             .route("/api/v1/vm/{id}/renew-lnurlp", get(v1_renew_vm_lnurlp))
             .route("/.well-known/lnurlp/{id}", get(v1_lnurlp))
             .route("/api/v1/vm/{id}/start", patch(v1_start_vm))
@@ -1481,6 +1483,37 @@ async fn v1_renew_vm(
     let mut out = ApiVmPayment::from_subscription_payment(payment, id)?;
     out.discount = discount;
     ApiData::ok(out)
+}
+
+/// Price a VM renewal without creating a payment
+///
+/// Returns exactly what `GET /api/v1/vm/{id}/renew` would charge for the same
+/// `method` / `intervals` / `code`, and creates nothing: no payment row, no
+/// Lightning invoice, no Revolut order. A discount code that cannot be used
+/// fails with the same error as the renew endpoint. Quoting a code never
+/// consumes its usage limit — that happens at settlement.
+///
+/// `method` also accepts the off-session values `saved` and `nwc`, priced as
+/// `revolut` and `lightning` respectively.
+async fn v1_quote_vm_renewal(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Query(q): Query<PaymentMethodQuery>,
+) -> ApiResult<ApiRenewalQuote> {
+    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+    let intervals = q.validated_intervals()?;
+    let vm_line = this
+        .db
+        .get_subscription_line_item(vm.subscription_line_item_id)
+        .await?;
+
+    let method = crate::api::resolve_quote_method(&q);
+    let quote = this
+        .sub_handler
+        .quote_renewal(vm_line.subscription_id, method, intervals, q.code.clone())
+        .await?;
+    ApiData::ok(quote.into())
 }
 
 /// LNURL-pay callback response (LUD-06).

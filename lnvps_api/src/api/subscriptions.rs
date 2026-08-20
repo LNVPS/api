@@ -1,5 +1,5 @@
 use crate::api::model::{
-    ApiCreateSubscriptionRequest, ApiSubscription, ApiSubscriptionPayment,
+    ApiCreateSubscriptionRequest, ApiRenewalQuote, ApiSubscription, ApiSubscriptionPayment,
     ApiUpdateSubscriptionRequest,
 };
 use crate::api::{PaymentMethodQuery, RouterState};
@@ -30,6 +30,10 @@ pub fn router() -> Router<RouterState> {
         .route(
             "/api/v1/subscriptions/{id}/renew",
             get(v1_renew_subscription),
+        )
+        .route(
+            "/api/v1/subscriptions/{id}/renew/quote",
+            get(v1_quote_subscription_renewal),
         )
         .route(
             "/api/v1/subscriptions/{id}/payments/{payment_id}",
@@ -367,4 +371,38 @@ async fn v1_renew_subscription(
     let mut out = ApiSubscriptionPayment::from(payment);
     out.discount = discount;
     ApiData::ok(out)
+}
+
+/// Price a subscription renewal without creating a payment
+///
+/// Returns exactly what `GET /api/v1/subscriptions/{id}/renew` would charge for
+/// the same `method` / `intervals` / `code`, and creates nothing: no payment
+/// row, no Lightning invoice, no Revolut order. A discount code that cannot be
+/// used fails with the same error as the renew endpoint, so the customer gets
+/// the same answer before committing. Quoting a code never consumes its usage
+/// limit — that happens at settlement.
+///
+/// `method` also accepts the off-session values `saved` and `nwc`, priced as
+/// `revolut` and `lightning` respectively.
+async fn v1_quote_subscription_renewal(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Query(q): Query<PaymentMethodQuery>,
+) -> ApiResult<ApiRenewalQuote> {
+    let pubkey = auth.pubkey();
+    let uid = this.db.upsert_user(&pubkey).await?;
+
+    let subscription = this.db.get_subscription(id).await?;
+    if subscription.user_id != uid {
+        return Err(ApiError::forbidden("Access denied: not your subscription"));
+    }
+
+    let intervals = q.validated_intervals()?;
+    let method = crate::api::resolve_quote_method(&q);
+    let quote = this
+        .sub_handler
+        .quote_renewal(id, method, intervals, q.code.clone())
+        .await?;
+    ApiData::ok(quote.into())
 }

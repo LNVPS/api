@@ -1143,6 +1143,24 @@ interface ExchangeRates {
 - **Response**: `VmPayment`
 - **Description**: Generates a payment invoice to extend the VM's expiration. The payment amount is calculated based on the VM's cost plan and the number of intervals requested. If `method=nwc` is specified and the user has a valid NWC connection string configured, the payment will be automatically processed via Nostr Wallet Connect. A renewal is **rejected** if it would push the VM's expiry beyond `now + max_prepay_days` (see `VmStatus.max_prepay_days`) or beyond the host's sunset date (see `VmStatus.host_sunset_date`); cap the `intervals` selector to what fits.
 
+#### Quote a VM Renewal
+- **GET** `/api/v1/vm/{id}/renew/quote?method={payment_method}&intervals={count}&code={code}`
+- **Auth**: Required
+- **Query Params**: same as [Renew/Extend VM](#renewextend-vm). `method` additionally accepts the off-session values `saved` and `nwc`, priced as `revolut` and `lightning` respectively, so a saved payment method can be priced without charging it.
+- **Response**: `RenewalQuote`
+- **Description**: Returns exactly what the renew endpoint would charge for the same parameters, and **creates nothing**: no payment record, no Lightning invoice, no Revolut order. The same validation applies (interval bounds, prepay horizon, host sunset, minimum amount), and an unusable discount code fails with the same error, so the customer gets the same answer before committing. Quoting a code never consumes its usage limit — limits are consumed at settlement.
+
+```typescript
+interface RenewalQuote {
+  amount: number;         // net of discount, smallest unit (cents / millisats)
+  tax: number;
+  processing_fee: number;
+  currency: string;
+  time: number;           // seconds this would add to expiry
+  discount?: { code?: string; amount_off: number };
+}
+```
+
 #### Get Payment Status
 - **GET** `/api/v1/payment/{payment_id}`
 - **Auth**: Required
@@ -1260,6 +1278,13 @@ const result: ApiResponse<Subscription> = await response.json();
   - `code`: Optional discount code. A code that cannot be used (unknown, expired, exhausted, or not applicable to this order) **fails the request** rather than quietly invoicing full price. The returned `amount` and `tax` are already net of any discount, and `discount` describes what was taken off. A discount applies to the payment it is used on only — renewals bill at list price.
 - **Response**: `SubscriptionPayment`
 - **Description**: Generates a payment invoice to renew/extend the subscription. For the first payment, the amount includes setup fees plus the monthly recurring cost. For subsequent renewals, only the monthly recurring cost is charged. After payment is confirmed, resources (IP ranges, etc.) are allocated and the subscription is activated.
+
+#### Quote a Subscription Renewal
+- **GET** `/api/v1/subscriptions/{id}/renew/quote?method={payment_method}&intervals={count}&code={code}`
+- **Auth**: Required
+- **Query Params**: same as [Renew Subscription](#renew-subscription). `method` additionally accepts `saved` and `nwc`, priced as `revolut` and `lightning`.
+- **Response**: `RenewalQuote` (see [Quote a VM Renewal](#quote-a-vm-renewal))
+- **Description**: Prices the renewal without creating a payment, invoice or provider order. Same validation and same discount-code behaviour as the renew endpoint; usage limits are untouched.
 
 #### List Subscription Payments
 - **GET** `/api/v1/subscriptions/{subscription_id}/payments?limit={limit}&offset={offset}`

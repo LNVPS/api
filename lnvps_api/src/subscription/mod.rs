@@ -98,6 +98,45 @@ impl Default for RenewMode {
     }
 }
 
+/// A priced renewal order: exactly what the renewal would charge, with nothing
+/// created. Produced by [`SubscriptionHandler::quote_renewal`] and consumed
+/// internally by the renewal path itself, so the two can never disagree.
+#[derive(Debug, Clone)]
+pub struct RenewalQuote {
+    /// Net amount, after any discount, in [`Self::currency`]'s minor units.
+    pub amount: u64,
+    /// Tax on [`Self::amount`].
+    pub tax: u64,
+    /// Payment-provider fee, charged on net + tax.
+    pub processing_fee: u64,
+    /// Currency of every amount here — determined by the payment method.
+    pub currency: Currency,
+    /// Seconds this order would add to the subscription expiry.
+    pub time_value: u64,
+    /// Exchange rate used for the conversion, if any.
+    pub rate: f32,
+    /// Whether this would be the subscription's first payment or a renewal.
+    pub payment_type: SubscriptionPaymentType,
+    /// Per-line tax breakdown backing [`Self::tax`]. Empty when the quote came
+    /// from an existing pending payment (whose breakdown is already stored).
+    pub tax_lines: Vec<lnvps_api_common::TaxLine>,
+    /// The discount applied, when a code was supplied.
+    pub discount: Option<lnvps_api_common::AppliedDiscount>,
+}
+
+/// Outcome of pricing a renewal order.
+enum PricedRenewal {
+    /// An identical unpaid payment already exists; the renewal path hands it
+    /// straight back rather than minting a second invoice.
+    Existing(Box<SubscriptionPayment>),
+    /// A freshly priced order, not yet turned into a payment.
+    Priced {
+        quote: RenewalQuote,
+        subscription: Subscription,
+        user: User,
+    },
+}
+
 /// Poll interval while waiting for an off-session (saved-method) payment to settle.
 const SAVED_PAYMENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Default maximum time to wait for an off-session payment to settle before
@@ -503,6 +542,70 @@ impl SubscriptionHandler {
             .await
     }
 
+    /// Price a renewal **without creating anything**.
+    ///
+    /// Runs exactly the pricing path [`Self::renew_subscription_with_discount`]
+    /// runs — same interval, prepay-horizon, host-sunset, discount-code and
+    /// minimum-amount rules — but stops before any invoice, order or payment row
+    /// exists. Discount usage limits are untouched: they are consumed at
+    /// settlement, so the same code can be quoted repeatedly.
+    pub async fn quote_renewal(
+        &self,
+        subscription_id: u64,
+        method: PaymentMethod,
+        intervals: u32,
+        discount_code: Option<String>,
+    ) -> Result<RenewalQuote> {
+        match self
+            .price_renewal(subscription_id, method, intervals, discount_code)
+            .await?
+        {
+            // A pending invoice would be handed straight back by the renew
+            // endpoint, so the quote must report that invoice's numbers rather
+            // than a fresh price the customer would never be charged.
+            PricedRenewal::Existing(payment) => {
+                let discount = match self
+                    .db
+                    .get_discount_redemption_by_payment(&payment.id)
+                    .await
+                    .ok()
+                    .flatten()
+                {
+                    Some(r) => {
+                        let code = self
+                            .db
+                            .get_discount(r.discount_id)
+                            .await
+                            .ok()
+                            .and_then(|d| d.code);
+                        Some(lnvps_api_common::AppliedDiscount {
+                            discount_id: r.discount_id,
+                            code,
+                            amount_off: r.amount_off,
+                            currency: Currency::from_str(&r.currency).unwrap_or(
+                                Currency::from_str(&payment.currency).unwrap_or(Currency::EUR),
+                            ),
+                        })
+                    }
+                    None => None,
+                };
+                Ok(RenewalQuote {
+                    amount: payment.amount,
+                    tax: payment.tax,
+                    processing_fee: payment.processing_fee,
+                    currency: Currency::from_str(&payment.currency)
+                        .map_err(|_| anyhow::anyhow!("Invalid currency"))?,
+                    time_value: payment.time_value.unwrap_or(0),
+                    rate: payment.rate,
+                    payment_type: payment.payment_type,
+                    tax_lines: vec![],
+                    discount,
+                })
+            }
+            PricedRenewal::Priced { quote, .. } => Ok(quote),
+        }
+    }
+
     /// Create a renewal/purchase payment for a subscription.
     ///
     /// For [`RenewMode::Saved`] the saved payment method is collected on the spot
@@ -516,6 +619,99 @@ impl SubscriptionHandler {
         mode: RenewMode,
         discount_code: Option<String>,
     ) -> Result<SubscriptionPayment> {
+        let (quote, subscription, user) = match self
+            .price_renewal(subscription_id, method, intervals, discount_code)
+            .await?
+        {
+            PricedRenewal::Existing(p) => return Ok(*p),
+            PricedRenewal::Priced {
+                quote,
+                subscription,
+                user,
+            } => (quote, subscription, user),
+        };
+
+        let RenewalQuote {
+            amount: converted_amount,
+            tax,
+            processing_fee,
+            currency: converted_currency,
+            time_value,
+            rate,
+            payment_type,
+            tax_lines,
+            discount,
+        } = quote;
+
+        let tax_summary = lnvps_api_common::summarize_tax_lines(&tax_lines);
+        let tax_breakdown = serde_json::to_value(&tax_lines).ok();
+        // The country signals are the same for every line (one customer).
+        let tax_evidence = Some(
+            self.pe
+                .determine_tax(subscription.user_id, 0, subscription.company_id)
+                .await?
+                .evidence_json(),
+        );
+
+        // Generate payment based on method
+        let subscription_payment = self
+            .build_payment(
+                subscription_id,
+                &subscription,
+                &user,
+                method,
+                &mode,
+                payment_type,
+                converted_amount,
+                converted_currency,
+                tax,
+                processing_fee,
+                rate,
+                time_value,
+                &tax_summary,
+                tax_evidence,
+                tax_breakdown,
+            )
+            .await?;
+
+        // Save payment to database
+        self.db
+            .insert_subscription_payment(&subscription_payment)
+            .await?;
+
+        // Record the discount against the payment, unsettled. It consumes no
+        // limit until the payment is actually paid, so an invoice the customer
+        // abandons does not burn a campaign's stock.
+        if let Some(applied) = &discount {
+            self.db
+                .insert_discount_redemption(&lnvps_db::DiscountRedemption {
+                    discount_id: applied.discount_id,
+                    user_id: subscription.user_id,
+                    subscription_payment_id: subscription_payment.id.clone(),
+                    amount_off: applied.amount_off,
+                    currency: applied.currency.to_string(),
+                    ..Default::default()
+                })
+                .await?;
+        }
+
+        // For saved-method payments, charge on the spot and wait for settlement.
+        self.collect_saved_payment(subscription_payment, &mode)
+            .await
+    }
+
+    /// Compute the price of a renewal order: everything the renew path does up
+    /// to (but not including) creating the invoice/order and the payment row.
+    ///
+    /// Shared by [`Self::renew_subscription_inner`] and [`Self::quote_renewal`]
+    /// so a quote can never drift from what the customer is actually charged.
+    async fn price_renewal(
+        &self,
+        subscription_id: u64,
+        method: PaymentMethod,
+        intervals: u32,
+        discount_code: Option<String>,
+    ) -> Result<PricedRenewal> {
         let intervals = intervals.max(1);
 
         // Get subscription and line items
@@ -579,7 +775,7 @@ impl SubscriptionHandler {
                     CostResult::New(p) => vm_payment_infos.push(p),
                     CostResult::Existing(p) => {
                         // An identical unpaid payment already exists — return it directly
-                        return Ok(p);
+                        return Ok(PricedRenewal::Existing(Box::new(p)));
                     }
                 }
             } else {
@@ -764,23 +960,15 @@ impl SubscriptionHandler {
             None => (total_amount, tax, processing_fee, tax_lines),
         };
 
-        let tax_summary = lnvps_api_common::summarize_tax_lines(&tax_lines);
-        let tax_breakdown = serde_json::to_value(&tax_lines).ok();
-        // The country signals are the same for every line (one customer).
-        let tax_evidence = Some(
-            self.pe
-                .determine_tax(subscription.user_id, 0, subscription.company_id)
-                .await?
-                .evidence_json(),
-        );
-
         // Wrap the aggregated values so the invoice/order creation below can use them
         let converted_amount = total_amount;
         let converted_currency = payment_currency;
 
         // Reject payments below the method's configured minimum (gross = net + tax
         // + processing fee). Prevents uneconomic small charges (e.g. Revolut's
-        // flat 20c base fee dominating a tiny payment).
+        // flat 20c base fee dominating a tiny payment). Enforced here rather than
+        // at invoice creation so a quote refuses an uneconomic order at the same
+        // point the renewal would.
         self.pe
             .enforce_min_amount(
                 subscription.company_id,
@@ -792,8 +980,46 @@ impl SubscriptionHandler {
             )
             .await?;
 
-        // Generate payment based on method
-        let subscription_payment = match method {
+        Ok(PricedRenewal::Priced {
+            quote: RenewalQuote {
+                amount: converted_amount,
+                tax,
+                processing_fee,
+                currency: converted_currency,
+                time_value,
+                rate,
+                payment_type,
+                tax_lines,
+                discount,
+            },
+            subscription,
+            user,
+        })
+    }
+
+    /// Create the provider-side object (Lightning invoice, Revolut order,
+    /// on-chain address) and the unsaved [`SubscriptionPayment`] describing it.
+    #[allow(clippy::too_many_arguments)]
+    async fn build_payment(
+        &self,
+        subscription_id: u64,
+        subscription: &Subscription,
+        user: &User,
+        method: PaymentMethod,
+        mode: &RenewMode,
+        payment_type: SubscriptionPaymentType,
+        converted_amount: u64,
+        converted_currency: Currency,
+        tax: u64,
+        processing_fee: u64,
+        rate: f32,
+        time_value: u64,
+        tax_summary: &lnvps_api_common::TaxSummary,
+        tax_evidence: Option<serde_json::Value>,
+        tax_breakdown: Option<serde_json::Value>,
+    ) -> Result<SubscriptionPayment> {
+        let subscription = &*subscription;
+        Ok(match method {
             PaymentMethod::Lightning => {
                 ensure!(
                     converted_currency == Currency::BTC,
@@ -1037,32 +1263,7 @@ impl SubscriptionHandler {
             }
             PaymentMethod::Paypal => bail!("PayPal not implemented"),
             PaymentMethod::Stripe => bail!("Stripe not implemented"),
-        };
-
-        // Save payment to database
-        self.db
-            .insert_subscription_payment(&subscription_payment)
-            .await?;
-
-        // Record the discount against the payment, unsettled. It consumes no
-        // limit until the payment is actually paid, so an invoice the customer
-        // abandons does not burn a campaign's stock.
-        if let Some(applied) = &discount {
-            self.db
-                .insert_discount_redemption(&lnvps_db::DiscountRedemption {
-                    discount_id: applied.discount_id,
-                    user_id: subscription.user_id,
-                    subscription_payment_id: subscription_payment.id.clone(),
-                    amount_off: applied.amount_off,
-                    currency: applied.currency.to_string(),
-                    ..Default::default()
-                })
-                .await?;
-        }
-
-        // For saved-method payments, charge on the spot and wait for settlement.
-        self.collect_saved_payment(subscription_payment, &mode)
-            .await
+        })
     }
 
     /// Resolve a discount code for an order, in the payment currency.
@@ -2630,7 +2831,7 @@ mod discount_tests {
 
     /// A 10.00 EUR/month subscription, paid in EUR (Revolut) so the amounts in
     /// these tests are cents and not exchange-rate dependent.
-    async fn setup() -> (Arc<MockDb>, SubscriptionHandler, u64, u64) {
+    pub(super) async fn setup() -> (Arc<MockDb>, SubscriptionHandler, u64, u64) {
         let db = Arc::new(MockDb::default());
         let user_id = db.upsert_user(&[3u8; 32]).await.unwrap();
         let (sub_id, _items) = db
@@ -2690,7 +2891,7 @@ mod discount_tests {
         (db, sub, user_id, sub_id)
     }
 
-    async fn add_discount(db: &MockDb, code: &str, rule: &str) -> u64 {
+    pub(super) async fn add_discount(db: &MockDb, code: &str, rule: &str) -> u64 {
         db.insert_discount(&Discount {
             company_id: 1,
             code: Some(code.to_string()),
@@ -2915,5 +3116,147 @@ mod discount_tests {
 
         // Now the limit really is used up.
         assert!(renew(&sub, sub_id, Some("ONCE")).await.is_err());
+    }
+}
+
+/// A quote must be the renewal's own price, arrived at without creating
+/// anything. Both halves matter: a quote that drifts misleads the customer, and
+/// a quote with side effects turns typing a code into minting invoices.
+#[cfg(test)]
+mod quote_tests {
+    use super::discount_tests::{add_discount, setup};
+    use super::*;
+    use lnvps_api_common::MockDb;
+    use lnvps_db::{Discount, LNVpsDbBase};
+
+    async fn quote(
+        sub: &SubscriptionHandler,
+        sub_id: u64,
+        code: Option<&str>,
+    ) -> Result<RenewalQuote> {
+        sub.quote_renewal(
+            sub_id,
+            PaymentMethod::Revolut,
+            1,
+            code.map(|c| c.to_string()),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_quote_matches_the_renewal_and_creates_nothing() {
+        let (db, sub, _user, sub_id) = setup().await;
+
+        let quoted = quote(&sub, sub_id, None).await.unwrap();
+
+        // Nothing was created: no payment row, and no Revolut order.
+        let (payments, total) = db
+            .list_subscription_payments_paginated(sub_id, 50, 0)
+            .await
+            .unwrap();
+        assert!(payments.is_empty());
+        assert_eq!(total, 0);
+
+        // ...and the numbers are the ones the customer would actually be charged.
+        let payment = sub
+            .renew_subscription_with_mode(
+                sub_id,
+                PaymentMethod::Revolut,
+                1,
+                RenewMode::Interactive { save_card: false },
+            )
+            .await
+            .unwrap();
+        assert_eq!(quoted.amount, payment.amount);
+        assert_eq!(quoted.tax, payment.tax);
+        assert_eq!(quoted.processing_fee, payment.processing_fee);
+        assert_eq!(quoted.currency.to_string(), payment.currency);
+        assert_eq!(quoted.time_value, payment.time_value.unwrap_or(0));
+    }
+
+    #[tokio::test]
+    async fn a_quoted_code_shows_the_saving_without_recording_a_redemption() {
+        let (db, sub, _user, sub_id) = setup().await;
+        let discount_id = add_discount(&db, "SAVE10", "{'percent': 10}").await;
+
+        let quoted = quote(&sub, sub_id, Some("SAVE10")).await.unwrap();
+        assert_eq!(quoted.amount, 900, "10% off 10.00 EUR");
+        let applied = quoted.discount.expect("discount line");
+        assert_eq!(applied.amount_off, 100);
+        assert_eq!(applied.code.as_deref(), Some("SAVE10"));
+        assert_eq!(applied.discount_id, discount_id);
+
+        assert_eq!(db.get_discount(discount_id).await.unwrap().used_count, 0);
+        assert!(
+            db.list_subscription_payments_paginated(sub_id, 50, 0)
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+        );
+    }
+
+    /// The point of quoting is to answer the customer *before* they commit, so a
+    /// code the renewal would reject must be rejected here too.
+    #[tokio::test]
+    async fn an_unusable_code_fails_the_quote() {
+        let (db, sub, _user, sub_id) = setup().await;
+        add_discount(&db, "SAVE10", "{'percent': 10}").await;
+
+        assert!(quote(&sub, sub_id, Some("NOPE")).await.is_err());
+        add_discount(
+            &db,
+            "BIGSPEND",
+            "order.amount >= 100000 ? {'percent': 10} : {}",
+        )
+        .await;
+        assert!(quote(&sub, sub_id, Some("BIGSPEND")).await.is_err());
+    }
+
+    /// Limits are consumed at settlement, so the same one-per-customer code has
+    /// to stay quotable however many times the checkout re-prices it.
+    #[tokio::test]
+    async fn quoting_never_consumes_a_usage_limit() {
+        let (db, sub, _user, sub_id) = setup().await;
+        let discount_id = db
+            .insert_discount(&Discount {
+                company_id: 1,
+                code: Some("ONCE".to_string()),
+                name: "Once".to_string(),
+                rule: "{'percent': 10}".to_string(),
+                per_user_limit: Some(1),
+                usage_limit: Some(1),
+                active: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        for _ in 0..5 {
+            assert_eq!(quote(&sub, sub_id, Some("ONCE")).await.unwrap().amount, 900);
+        }
+        assert_eq!(db.get_discount(discount_id).await.unwrap().used_count, 0);
+    }
+
+    /// An unpaid invoice is what the renewal would hand back, so that invoice's
+    /// numbers — not a fresh price — are what the customer must be quoted.
+    #[tokio::test]
+    async fn a_quote_reports_the_pending_invoice_the_renewal_would_return() {
+        let (_db, sub, _user, sub_id) = setup().await;
+
+        let payment = sub
+            .renew_subscription_with_mode(
+                sub_id,
+                PaymentMethod::Revolut,
+                1,
+                RenewMode::Interactive { save_card: false },
+            )
+            .await
+            .unwrap();
+
+        let quoted = quote(&sub, sub_id, None).await.unwrap();
+        assert_eq!(quoted.amount, payment.amount);
+        assert_eq!(quoted.tax, payment.tax);
+        assert_eq!(quoted.processing_fee, payment.processing_fee);
     }
 }
