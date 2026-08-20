@@ -2964,7 +2964,13 @@ mod discount_tests {
         let (db, sub, _user, sub_id) = setup().await;
         add_discount(&db, "SAVE10", "{'percent': 10}").await;
 
-        assert!(renew(&sub, sub_id, Some("NOPE")).await.is_err());
+        // Typed, so the API boundary answers 400 rather than logging a routine
+        // client mistake as a 500 internal error (issue #385).
+        let err = renew(&sub, sub_id, Some("NOPE")).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<lnvps_api_common::DiscountError>(),
+            Some(&lnvps_api_common::DiscountError::NotUsable)
+        );
         // A rule that declines this order is equally an error, not a silent
         // full-price invoice.
         add_discount(
@@ -2973,7 +2979,11 @@ mod discount_tests {
             "order.amount >= 100000 ? {'percent': 10} : {}",
         )
         .await;
-        assert!(renew(&sub, sub_id, Some("BIGSPEND")).await.is_err());
+        let err = renew(&sub, sub_id, Some("BIGSPEND")).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<lnvps_api_common::DiscountError>(),
+            Some(&lnvps_api_common::DiscountError::NotUsable)
+        );
     }
 
     /// Tax follows the discount: a customer is never taxed on money they do not
@@ -3203,14 +3213,22 @@ mod quote_tests {
         let (db, sub, _user, sub_id) = setup().await;
         add_discount(&db, "SAVE10", "{'percent': 10}").await;
 
-        assert!(quote(&sub, sub_id, Some("NOPE")).await.is_err());
+        let err = quote(&sub, sub_id, Some("NOPE")).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<lnvps_api_common::DiscountError>(),
+            Some(&lnvps_api_common::DiscountError::NotUsable)
+        );
         add_discount(
             &db,
             "BIGSPEND",
             "order.amount >= 100000 ? {'percent': 10} : {}",
         )
         .await;
-        assert!(quote(&sub, sub_id, Some("BIGSPEND")).await.is_err());
+        let err = quote(&sub, sub_id, Some("BIGSPEND")).await.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<lnvps_api_common::DiscountError>(),
+            Some(&lnvps_api_common::DiscountError::NotUsable)
+        );
     }
 
     /// Limits are consumed at settlement, so the same one-per-customer code has

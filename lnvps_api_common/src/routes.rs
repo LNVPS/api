@@ -169,6 +169,11 @@ impl From<anyhow::Error> for ApiError {
         if let Some(cap) = value.downcast_ref::<crate::CapacityError>() {
             return Self::conflict(cap);
         }
+        // An unusable discount code is a client mistake, not an internal fault:
+        // answer 400 with the (deliberately generic) message the engine wrote.
+        if let Some(dis) = value.downcast_ref::<crate::DiscountError>() {
+            return Self::bad_request(dis);
+        }
         Self::internal(value)
     }
 }
@@ -244,6 +249,22 @@ mod tests {
             ApiError::with_status(StatusCode::IM_A_TEAPOT, "x").code,
             StatusCode::IM_A_TEAPOT
         );
+    }
+
+    /// Regression: an unusable discount code returned 500 "An internal error
+    /// occurred" because the engine rejected with an untyped `anyhow!`.
+    #[test]
+    fn test_discount_error_maps_to_400() {
+        use anyhow::Context as _;
+        let err: ApiError = anyhow::Error::from(crate::DiscountError::NotUsable).into();
+        assert_eq!(err.code, StatusCode::BAD_REQUEST);
+        assert_eq!(err.error, "Discount code is not valid for this order");
+
+        // Still works when the error has been wrapped with context.
+        let err: ApiError = anyhow::Error::from(crate::DiscountError::NotUsable)
+            .context("quoting renewal")
+            .into();
+        assert_eq!(err.code, StatusCode::BAD_REQUEST);
     }
 
     #[test]

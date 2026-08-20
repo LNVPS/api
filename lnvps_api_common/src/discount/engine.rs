@@ -28,7 +28,7 @@
 //! reduces that stored amount, commission is paid on what the customer actually
 //! paid, with no change to the referral code.
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use chrono::Utc;
 use lnvps_db::{Discount, IntervalType};
 use log::warn;
@@ -76,6 +76,32 @@ pub struct DiscountOrder {
     pub items: Vec<OrderLineItem>,
 }
 
+/// Why a requested discount code cannot be used.
+///
+/// A single variant on purpose: every rejection reason — unknown code, another
+/// company's code, inactive, outside its validity window, usage limit reached,
+/// or a rule that declined this order — renders the same message, so the
+/// endpoint cannot be used to enumerate which codes exist.
+///
+/// This is a typed error rather than an `anyhow!` string so the API boundary
+/// can downcast it and answer 400 with the message, instead of logging a
+/// routine client mistake as an internal error and returning 500.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiscountError {
+    /// The code cannot be applied to this order.
+    NotUsable,
+}
+
+impl std::fmt::Display for DiscountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiscountError::NotUsable => write!(f, "Discount code is not valid for this order"),
+        }
+    }
+}
+
+impl std::error::Error for DiscountError {}
+
 /// A discount that was resolved for an order and is ready to be applied.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppliedDiscount {
@@ -111,7 +137,7 @@ impl PricingEngine {
             Some(applied) => Ok(Some(applied)),
             // Eligible on paper but the rule declined (e.g. minimum spend not
             // met), or it resolved to nothing after clamping.
-            None => bail!("Discount code is not valid for this order"),
+            None => Err(DiscountError::NotUsable.into()),
         }
     }
 
@@ -119,6 +145,10 @@ impl PricingEngine {
     /// company, `active`, validity window, global usage limit and per-user
     /// limit. These cannot live in the rule — counting redemptions is state a
     /// side-effect-free expression must not be given.
+    ///
+    /// The code is upper-cased before the lookup, matching the canonical form
+    /// the admin API stores, so a published code works however the customer
+    /// types it without the match depending on the column's collation.
     async fn discount_candidates(
         &self,
         code: &str,
@@ -126,11 +156,11 @@ impl PricingEngine {
     ) -> Result<Vec<Discount>> {
         // One generic message for every rejection below, so the endpoint cannot
         // be used to enumerate which codes exist.
-        let refuse = || anyhow!("Discount code is not valid for this order");
+        let refuse = || anyhow::Error::from(DiscountError::NotUsable);
 
         let discount = self
             .db()
-            .get_discount_by_code(code)
+            .get_discount_by_code(&code.to_uppercase())
             .await
             .map_err(|_| refuse())?;
 
@@ -480,10 +510,11 @@ mod tests {
         assert_eq!(applied.code.as_deref(), Some("SAVE10"));
     }
 
-    /// Codes are trimmed and matched exactly: a trailing space from a copy-paste
-    /// must work, a different code must not.
+    /// Codes are trimmed and matched case-insensitively: a trailing space from a
+    /// copy-paste must work, so must the case the customer felt like typing, and
+    /// a different code must not.
     #[tokio::test]
-    async fn codes_are_trimmed_and_matched_exactly() {
+    async fn codes_are_trimmed_and_matched_case_insensitively() {
         let (pe, db) = engine().await;
         let u = user(&db).await;
         db.insert_discount(&discount("{'percent': 10}"))
@@ -496,7 +527,12 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert!(pe.quote_discount(&order(u, Some("save10"))).await.is_err());
+        assert!(
+            pe.quote_discount(&order(u, Some("save10")))
+                .await
+                .unwrap()
+                .is_some()
+        );
         assert!(pe.quote_discount(&order(u, Some("OTHER"))).await.is_err());
     }
 

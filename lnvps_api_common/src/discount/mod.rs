@@ -23,7 +23,9 @@ mod items;
 
 pub use context::{DiscountContext, HistoryContext, OrderContext, UserContext};
 pub use decision::DiscountDecision;
-pub use engine::{AppliedDiscount, DiscountOrder, allocate_discount, discount_tax_lines};
+pub use engine::{
+    AppliedDiscount, DiscountError, DiscountOrder, allocate_discount, discount_tax_lines,
+};
 pub use items::{OrderLineItem, OrderProduct};
 
 use anyhow::{Context as _, Result, bail};

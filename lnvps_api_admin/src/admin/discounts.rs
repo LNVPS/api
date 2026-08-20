@@ -122,9 +122,11 @@ fn to_discount(request: &AdminCreateDiscountRequest) -> Result<Discount, ApiErro
     Ok(Discount {
         id: 0,
         company_id: request.company_id,
-        // Codes are stored and matched exactly; upper-casing here would make a
-        // lower-case code un-enterable rather than case-insensitive.
-        code: Some(code.to_string()),
+        // Upper case is the canonical stored form: the engine upper-cases what
+        // the customer typed before looking a code up, so a published code works
+        // however it is typed without the match depending on the column's
+        // collation, and `uk_discount_code` still catches duplicates.
+        code: Some(code.to_uppercase()),
         name: request.name.trim().to_string(),
         rule: request.rule.trim().to_string(),
         valid_from,
@@ -147,7 +149,8 @@ fn apply_update(
         if code.is_empty() {
             return Err(ApiError::new("Code cannot be empty"));
         }
-        discount.code = Some(code.to_string());
+        // Same canonical form as on create.
+        discount.code = Some(code.to_uppercase());
     }
     if let Some(name) = &request.name {
         if name.trim().is_empty() {
@@ -515,17 +518,26 @@ mod tests {
         assert!(d.valid_from <= Utc::now());
     }
 
-    /// Whitespace is trimmed, but case is preserved: upper-casing the stored
-    /// code would make a lower-case code impossible to enter, not
-    /// case-insensitive.
+    /// Whitespace is trimmed and the code is upper-cased, so the stored value is
+    /// the one canonical form the engine looks up.
     #[test]
-    fn code_is_trimmed_not_normalised() {
+    fn code_is_trimmed_and_upper_cased() {
         let d = to_discount(&AdminCreateDiscountRequest {
             code: "  save10  ".to_string(),
             ..create()
         })
         .unwrap();
-        assert_eq!(d.code.as_deref(), Some("save10"));
+        assert_eq!(d.code.as_deref(), Some("SAVE10"));
+
+        let updated = apply_update(
+            d,
+            &AdminUpdateDiscountRequest {
+                code: Some("  save20  ".to_string()),
+                ..update()
+            },
+        )
+        .unwrap();
+        assert_eq!(updated.code.as_deref(), Some("SAVE20"));
     }
 
     #[test]

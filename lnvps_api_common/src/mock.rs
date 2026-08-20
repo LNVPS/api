@@ -3665,6 +3665,8 @@ impl LNVpsDbBase for MockDb {
 
     async fn get_discount_by_code(&self, code: &str) -> DbResult<Discount> {
         let discounts = self.discounts.lock().await;
+        // Exact match, like the SQL `WHERE code = ?`: codes are normalised to
+        // upper case by the admin API and by the caller, not here.
         discounts
             .values()
             .find(|d| d.code.as_deref() == Some(code))
