@@ -39,11 +39,12 @@ pub struct MigrateVmRequest {
     pub target_node: String,
     /// Attempt a live (online) migration instead of stopping the VM first.
     pub online: bool,
-    /// Destination storage pool, when the disk has to be copied.
+    /// Destination storage pool, when the disk has to land somewhere new.
     ///
-    /// `None` means the same pool exists on the destination (shared or
-    /// identically named storage) and the hypervisor can keep the disk where it
-    /// is.
+    /// `None` means a pool of the same name exists on the destination, and
+    /// leaves the copy decision to the host client: only the hypervisor knows
+    /// whether that pool is shared (nothing to copy) or node-local (the disk
+    /// must travel, under the same name).
     pub target_storage: Option<String>,
 }
 

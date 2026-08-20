@@ -681,6 +681,110 @@ impl ProxmoxClient {
     /// The task runs on the **source** node, which is also where the returned
     /// task id must be polled: the destination has no record of the job until
     /// it completes.
+    /// Ask the node what stands between `vm` and a move to `target`.
+    ///
+    /// This is the call the Proxmox UI's migrate dialog makes before it offers
+    /// the "Target storage" selector, and `local_disks` is how it decides to
+    /// send `with-local-disks`.
+    pub async fn migrate_preconditions(
+        &self,
+        node: &str,
+        vm: ProxmoxVmId,
+        target: &str,
+    ) -> OpResult<MigratePreconditions> {
+        let rsp: ResponseBase<MigratePreconditions> = self
+            .api
+            .get(&format!(
+                "/api2/json/nodes/{node}/qemu/{vm}/migrate?target={target}"
+            ))
+            .await?;
+        Ok(rsp.data)
+    }
+
+    /// Storage pool the VM's disk is configured on, as a fallback for deciding
+    /// where a copied disk should land.
+    async fn configured_disk_storage(&self, vm: ProxmoxVmId) -> Option<String> {
+        match self.get_vm_config(&self.node, vm).await {
+            Ok(cfg) => cfg
+                .config
+                .scsi_0
+                .map(|d| d.volume.storage)
+                .filter(|s| !s.is_empty()),
+            Err(e) => {
+                warn!(
+                    "Failed to read config for vm {} during migration: {}",
+                    vm, e
+                );
+                None
+            }
+        }
+    }
+
+    /// Where the disks have to end up for a migration to `target_node` to work.
+    ///
+    /// `None` means "leave them alone": every volume is on storage the
+    /// destination can already reach, so no copy is needed and asking for one
+    /// would turn a seconds-long migration into a full disk transfer.
+    /// Otherwise the returned pool is sent as `targetstorage` alongside
+    /// `with-local-disks`.
+    ///
+    /// Sharedness is not something the caller can infer from names: a pool
+    /// called `local-zfs` exists on every node, but each node's is a different
+    /// disk. Only the hypervisor knows, and it will refuse a migration that
+    /// gets this wrong — "can't migrate local disk 'local-zfs:vm-2004-disk-0':
+    /// can't live migrate attached local disks without with-local-disks
+    /// option".
+    async fn resolve_migration_storage(
+        &self,
+        vm: ProxmoxVmId,
+        req: &MigrateVmRequest,
+    ) -> OpResult<Option<String>> {
+        // Caller named a pool: the destination has nothing by the source's
+        // name, so the disks have to be copied into that one regardless.
+        if req.target_storage.is_some() {
+            return Ok(req.target_storage.clone());
+        }
+
+        let local = match self
+            .migrate_preconditions(&self.node, vm, &req.target_node)
+            .await
+        {
+            Ok(pre) => pre.local_volumes(),
+            Err(e) => {
+                // Preconditions are advisory; a node that will not answer them
+                // must not block the migration. Copying is the safe guess:
+                // slower than needed on shared storage, but it completes.
+                warn!(
+                    "Could not read migration preconditions for VM {} on {}: {}",
+                    vm, self.node, e
+                );
+                vec![]
+            }
+        };
+
+        let Some(first) = local.first() else {
+            return Ok(None);
+        };
+        info!(
+            "VM {} has {} local volume(s) ({}); migrating them with the VM",
+            vm,
+            local.len(),
+            local.join(", ")
+        );
+        // Same pool name on the destination — the UI's "Current layout". Name
+        // it explicitly rather than relying on the `targetstorage=1` shorthand,
+        // which older nodes do not accept.
+        let storage = first
+            .split(':')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        Ok(match storage {
+            Some(s) => Some(s),
+            None => self.configured_disk_storage(vm).await,
+        })
+    }
+
     pub async fn migrate_vm(
         &self,
         node: &str,
@@ -1879,14 +1983,19 @@ impl VmHostClient for ProxmoxClient {
         if req.target_node == self.node {
             op_fatal!("VM {} is already on node {}", vm.id, req.target_node);
         }
+        // The caller names a destination pool only when the destination has no
+        // pool of the source's name. Matching names do not make the storage
+        // shared, so when it left the choice open, ask the node which volumes
+        // the destination cannot reach.
+        let target_storage = self.resolve_migration_storage(vm.id.into(), req).await?;
         let params = MigrateVmParams {
             target: req.target_node.clone(),
             online: Some(req.online as u8),
             // Only set when the disk cannot stay where it is: passing
             // `with-local-disks` for a VM on shared storage makes Proxmox copy a
             // disk that both nodes can already see.
-            with_local_disks: req.target_storage.as_ref().map(|_| 1),
-            targetstorage: req.target_storage.clone(),
+            with_local_disks: target_storage.as_ref().map(|_| 1),
+            targetstorage: target_storage,
         };
         let task = self.migrate_vm(&self.node, vm.id.into(), &params).await?;
         self.wait_for_task(&task).await?;
@@ -2879,6 +2988,42 @@ pub struct StorageContentEntry {
     pub vol_id: String,
     #[serde(rename = "vmid")]
     pub vm_id: Option<u32>,
+}
+
+/// Answer of `GET /nodes/{node}/qemu/{vmid}/migrate` — "get preconditions for
+/// migration".
+///
+/// `local_disks` lists the volumes the destination node cannot reach, which is
+/// the only trustworthy signal for whether a migration has to copy disks: pool
+/// names are per-node and say nothing about sharedness.
+#[derive(Debug, Deserialize, Default)]
+pub struct MigratePreconditions {
+    #[serde(default)]
+    pub running: Option<u8>,
+    /// Volumes on node-local storage. Entries are objects (`{volid, size, ..}`)
+    /// on current Proxmox and bare volume ids on older ones, so both shapes are
+    /// accepted rather than typed to whichever this cluster happens to run.
+    #[serde(default)]
+    pub local_disks: Vec<serde_json::Value>,
+    /// Node-local resources (passthrough devices) that block a migration.
+    #[serde(default)]
+    pub local_resources: Vec<serde_json::Value>,
+}
+
+impl MigratePreconditions {
+    /// Volume ids (`local-zfs:vm-100-disk-0`) that have to travel with the VM.
+    pub fn local_volumes(&self) -> Vec<String> {
+        self.local_disks
+            .iter()
+            .filter_map(|d| match d {
+                serde_json::Value::String(s) => Some(s.clone()),
+                other => other
+                    .get("volid")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            })
+            .collect()
+    }
 }
 
 /// Body of `POST /nodes/{node}/qemu/{vmid}/migrate`.
@@ -4547,6 +4692,98 @@ mod tests {
         // A named target storage implies the disk is copied.
         assert_eq!(body["with-local-disks"], 1);
         assert_eq!(body["targetstorage"], "nvme-b");
+        Ok(())
+    }
+
+    /// Regression: a pool of the same name on both nodes is not shared storage.
+    ///
+    /// The planner leaves `target_storage` unset when the destination has a
+    /// pool with the source's name, which is true of `local-zfs` on every
+    /// Proxmox node. Taking that as "nothing to copy" made the API omit
+    /// `with-local-disks`, and Proxmox refused the migration outright:
+    /// "can't migrate local disk 'local-zfs:vm-2004-disk-0': can't live migrate
+    /// attached local disks without with-local-disks option". The node's
+    /// migration preconditions — what the Proxmox UI reads before offering its
+    /// "Target storage" selector — are what decides this.
+    #[tokio::test]
+    async fn test_migrate_vm_copies_disk_on_same_named_local_pool() -> Result<()> {
+        async fn migrate_with_local_disks(
+            local_disks: serde_json::Value,
+        ) -> Result<serde_json::Value> {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r".*/qemu/\d+/migrate$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": { "running": 1, "local_disks": local_disks, "local_resources": [] }
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r".*/qemu/\d+/migrate$"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"data": "UPID:node:0:0:task"})),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path_regex(r".*/tasks/.*/status$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "data": {
+                        "id": "100", "node": "pve1", "pid": 1, "pstart": 1, "starttime": 1,
+                        "status": "stopped", "type": "qmigrate",
+                        "upid": "UPID:node:0:0:task", "user": "root@pam", "exitstatus": "OK"
+                    }
+                })))
+                .mount(&server)
+                .await;
+
+            let q_cfg = QemuConfig {
+                machine: "q35".to_string(),
+                os_type: "l26".to_string(),
+                bridge: "vmbr0".to_string(),
+                cpu: "kvm64".to_string(),
+                kvm: true,
+                arch: "x86_64".to_string(),
+                balloon_min_pct: None,
+                firewall_config: None,
+            };
+            let client = ProxmoxClient::new(server.uri().parse()?, "pve1", "", None, q_cfg, None);
+
+            VmHostClient::migrate_vm(
+                &client,
+                &mock_full_vm().vm,
+                &MigrateVmRequest {
+                    target_node: "pve2".to_string(),
+                    online: true,
+                    // Destination has a pool called `local-zfs` too.
+                    target_storage: None,
+                },
+            )
+            .await?;
+
+            let received = server.received_requests().await.unwrap();
+            let post = received
+                .iter()
+                .find(|r| r.method == wiremock::http::Method::POST)
+                .expect("expected a migrate POST");
+            Ok(serde_json::from_slice(&post.body)?)
+        }
+
+        // Node-local pool: the disk must travel, into the pool of the same name.
+        let body = migrate_with_local_disks(serde_json::json!([
+            {"volid": "local-zfs:vm-100-disk-0", "size": 100u64},
+            {"volid": "local-zfs:vm-100-disk-1", "size": 1u64}
+        ]))
+        .await?;
+        assert_eq!(body["with-local-disks"], 1, "{body:?}");
+        assert_eq!(body["targetstorage"], "local-zfs", "{body:?}");
+
+        // Shared pool: both nodes see the volume, so copying it would turn a
+        // seconds-long migration into a full disk transfer (issue #66).
+        let body = migrate_with_local_disks(serde_json::json!([])).await?;
+        assert!(body.get("with-local-disks").is_none(), "{body:?}");
+        assert!(body.get("targetstorage").is_none(), "{body:?}");
         Ok(())
     }
 

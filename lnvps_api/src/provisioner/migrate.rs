@@ -27,12 +27,14 @@ pub struct MigrationTarget {
     /// Database id of the destination host disk.
     pub disk_id: u64,
     /// Storage pool to copy the disk into, or `None` when a pool of the same
-    /// name exists on the destination and the disk can stay where it is.
+    /// name exists on the destination.
     ///
-    /// `None` is also what tells the hypervisor layer not to pass
-    /// `with-local-disks`: on shared (or identically named) storage there is
-    /// nothing to copy, and asking for a copy turns a seconds-long migration
-    /// into a full disk transfer.
+    /// `None` hands the copy decision to the hypervisor layer rather than
+    /// deciding it here: a same-named pool is the *same* storage only when it
+    /// is shared, and only the host knows that. On shared storage the disk
+    /// stays put (asking for a copy would turn a seconds-long migration into a
+    /// full disk transfer); on node-local storage of the same name — `local-zfs`
+    /// on every node — the disk is copied into that name on the far side.
     pub target_storage: Option<String>,
 }
 
@@ -110,9 +112,11 @@ pub fn plan_migration(
         );
     }
 
-    // Prefer the pool with the same name as the source: on a cluster with
-    // shared or mirrored storage that is the same storage, so Proxmox can move
-    // the VM without copying a single byte of disk.
+    // Prefer the pool with the same name as the source: on shared storage that
+    // is the same storage, so the VM moves without copying a byte, and on
+    // node-local storage it at least keeps the VM's disk layout unchanged.
+    // Whether a copy is needed is settled by the host client, which can see
+    // the pool's `shared` flag.
     let same_name = target_capacity
         .disks
         .iter()

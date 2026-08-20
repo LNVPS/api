@@ -54,6 +54,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **Contact form hardens email header values** — `POST /api/v1/contact` strips control characters from the sender name and subject (and caps the subject) before placing them in outgoing mail headers.
 
+### Fixed
+
+- **Migrating a VM between Proxmox nodes with local storage no longer fails** — `POST /api/admin/v1/vms/{id}/migrate` treated a destination pool with the source's name as the *same* storage and omitted `with-local-disks`, so the hypervisor refused the move outright (`can't migrate local disk 'local-zfs:vm-2004-disk-0': can't live migrate attached local disks without with-local-disks option`) and the queued job retried forever. A pool called `local-zfs` exists on every node but is node-local, and only the node can tell which volumes the destination cannot reach; the API now asks it (the same migration-precondition call the Proxmox UI's migrate dialog makes) and copies the disks into the same-named pool on the far side. VMs on genuinely shared storage still migrate without a copy.
+
 ### Added
 
 - **A user's tax treatment is now visible from the admin API** — `GET /api/admin/v1/users/{id}/tax` (`users::view`) runs the same determination the pricing engine uses and returns it per seller company: the rate, the treatment (`domestic`, `oss_b2c`, `reverse_charge`, `out_of_scope`, `undetermined_default`), the resolved place of supply, and the evidence that decided it (declared country, IP country, customer VAT number). Live rather than read back from the last payment, so it answers "what would we charge them now" — the question actually asked when a customer disputes VAT or has just supplied a VAT number.
