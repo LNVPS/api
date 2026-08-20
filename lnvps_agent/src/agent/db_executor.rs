@@ -24,6 +24,7 @@ use lnvps_api_common::{VmHistoryLogger, WorkCommander, WorkJob};
 use lnvps_db::{LNVpsDb, Vm};
 
 use crate::agent::ToolExecutor;
+use crate::diag::Diagnostics;
 
 /// Parse a tool's JSON arguments into a map (empty on parse failure).
 fn parse_args(arguments: &str) -> HashMap<String, Value> {
@@ -40,6 +41,11 @@ fn required_u64(args: &HashMap<String, Value>, key: &str) -> Result<u64> {
 /// Serialize a value as a pretty string for the LLM to read.
 fn pretty(value: &Value) -> Result<String> {
     Ok(serde_json::to_string_pretty(value)?)
+}
+
+/// Read the optional `ipv6` family selector, defaulting to IPv4.
+fn wants_ipv6(args: &HashMap<String, Value>) -> bool {
+    args.get("ipv6").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
 /// What a VM power action does to the host.
@@ -73,6 +79,8 @@ pub struct DbToolExecutor {
     provisioner: Option<ProvisionerConfig>,
     /// Queue used to reconcile VM state after a power action.
     work_sender: Option<Arc<dyn WorkCommander>>,
+    /// Looking-glass and policy clients backing the diagnostic tools.
+    diag: Diagnostics,
 }
 
 impl DbToolExecutor {
@@ -84,6 +92,7 @@ impl DbToolExecutor {
             user_id,
             provisioner: None,
             work_sender: None,
+            diag: Diagnostics::default(),
         }
     }
 
@@ -95,6 +104,13 @@ impl DbToolExecutor {
     ) -> Self {
         self.provisioner = Some(provisioner);
         self.work_sender = Some(work_sender);
+        self
+    }
+
+    /// Point the diagnostics at different endpoints than the production
+    /// looking glass and website (tests, staging deployments).
+    pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        self.diag = diag;
         self
     }
 
@@ -325,6 +341,18 @@ impl DbToolExecutor {
         ))
     }
 
+    /// Live IP assignments of a VM, as probe targets.
+    async fn vm_ips(&self, vm: &Vm) -> Vec<String> {
+        self.db
+            .list_vm_ip_assignments(vm.id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| !a.deleted)
+            .map(|a| a.ip)
+            .collect()
+    }
+
     /// Apply a power action to an owned VM.
     async fn power(&self, vm: &Vm, action: PowerAction) -> Result<Value> {
         let (Some(provisioner), Some(work_sender)) =
@@ -415,6 +443,29 @@ impl ToolExecutor for DbToolExecutor {
             "list_regions" => pretty(&self.regions().await?),
             "list_templates" => pretty(&self.templates().await?),
             "list_os_images" => pretty(&self.os_images().await?),
+            "get_terms_of_service" => Ok(self.diag.terms_of_service().await?.to_string()),
+            "ping_vm" => {
+                let vm = self.owned_vm(&args).await?;
+                let ips = self.vm_ips(&vm).await;
+                pretty(&serde_json::to_value(
+                    self.diag.ping(&ips, wants_ipv6(&args)).await?,
+                )?)
+            }
+            "traceroute_vm" => {
+                let vm = self.owned_vm(&args).await?;
+                let ips = self.vm_ips(&vm).await;
+                pretty(&serde_json::to_value(
+                    self.diag.traceroute(&ips, wants_ipv6(&args)).await?,
+                )?)
+            }
+            "check_vm_port" => {
+                let port = required_u64(&args, "port")?;
+                let vm = self.owned_vm(&args).await?;
+                let ips = self.vm_ips(&vm).await;
+                pretty(&serde_json::to_value(
+                    self.diag.check_port(&ips, wants_ipv6(&args), port).await?,
+                )?)
+            }
             // Billing-sensitive tools are never offered to live chat; reaching
             // this arm means the model invented the call.
             "extend_vm" | "refund_vm" | "delete_vm" => {
@@ -467,6 +518,10 @@ mod tests {
             "start_vm",
             "stop_vm",
             "restart_vm",
+            // Probes must fail the ownership check *before* any packet is
+            // sent, or support chat becomes a scanner aimed by vm_id.
+            "ping_vm",
+            "traceroute_vm",
         ] {
             let err = exec
                 .execute(tool, r#"{"vm_id":99}"#)
@@ -512,6 +567,90 @@ mod tests {
     async fn unknown_tool_errors() {
         let (_db, exec) = executor(1).await;
         assert!(exec.execute("rm_rf", "{}").await.is_err());
+    }
+
+    /// check_vm_port validates its port argument before touching the network.
+    #[tokio::test]
+    async fn check_vm_port_rejects_a_missing_or_foreign_vm() {
+        let (db, exec) = executor(1).await;
+        seed_vm(&db, 99, 2).await;
+
+        let err = exec
+            .execute("check_vm_port", r#"{"vm_id":5}"#)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("port required"));
+
+        let err = exec
+            .execute("check_vm_port", r#"{"vm_id":99,"port":22}"#)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("does not belong to you"));
+    }
+
+    /// Freed assignments must not be probed — the address may already belong to
+    /// another customer's VM.
+    #[tokio::test]
+    async fn vm_ips_skips_released_assignments() {
+        let db = Arc::new(MockDb::default());
+        seed_vm(&db, 7, 1).await;
+        {
+            let mut ips = db.ip_assignments.lock().await;
+            ips.insert(
+                1,
+                lnvps_db::VmIpAssignment {
+                    id: 1,
+                    vm_id: 7,
+                    ip: "10.0.0.5".to_string(),
+                    ..Default::default()
+                },
+            );
+            ips.insert(
+                2,
+                lnvps_db::VmIpAssignment {
+                    id: 2,
+                    vm_id: 7,
+                    ip: "10.0.0.6".to_string(),
+                    deleted: true,
+                    ..Default::default()
+                },
+            );
+        }
+        let dyn_db: Arc<dyn LNVpsDb> = db.clone();
+        let exec = DbToolExecutor::new(dyn_db, 1);
+        let vm = db.vms.lock().await.get(&7).cloned().unwrap();
+        assert_eq!(exec.vm_ips(&vm).await, vec!["10.0.0.5".to_string()]);
+    }
+
+    #[test]
+    fn wants_ipv6_defaults_to_v4() {
+        assert!(!wants_ipv6(&parse_args("{}")));
+        assert!(wants_ipv6(&parse_args(r#"{"ipv6":true}"#)));
+    }
+
+    /// The in-process executor must be able to quote policy too, not just the
+    /// HTTP-backed one used by the email/Nostr channels.
+    #[tokio::test]
+    async fn serves_the_terms_of_service() {
+        let site = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/tos"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_string(format!(
+                    "<body><h1>Terms</h1><p>{}</p></body>",
+                    "No port scanning. ".repeat(50)
+                )),
+            )
+            .mount(&site)
+            .await;
+
+        let (_db, exec) = executor(1).await;
+        let exec = exec.with_diagnostics(Diagnostics::new(
+            crate::diag::LookingGlass::default(),
+            crate::diag::PolicyDocs::new(site.uri()),
+        ));
+        let out = exec.execute("get_terms_of_service", "{}").await.unwrap();
+        assert!(out.contains("No port scanning."));
     }
 
     /// Power actions are unavailable unless explicitly wired up, so a read-only

@@ -5,6 +5,7 @@ use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 
 use crate::api_client::ApiClient;
+use crate::diag::Diagnostics;
 
 /// Executes tool calls by invoking the LNVPS APIs.
 /// Each instance is scoped to a single user — all tools operate
@@ -26,6 +27,23 @@ fn required_u64(args: &HashMap<String, serde_json::Value>, key: &str) -> Result<
         .ok_or_else(|| anyhow!("{} required", key))
 }
 
+/// Read the optional `ipv6` family selector, defaulting to IPv4.
+fn wants_ipv6(args: &HashMap<String, serde_json::Value>) -> bool {
+    args.get("ipv6").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// Pull the assigned addresses out of an admin VM record.
+fn vm_ips(vm: &serde_json::Value) -> Vec<String> {
+    vm["ip_addresses"]
+        .as_array()
+        .map(|ips| {
+            ips.iter()
+                .filter_map(|entry| entry["ip"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Serialize a JSON value as a pretty string for the LLM to read.
 fn pretty(value: &serde_json::Value) -> Result<String> {
     Ok(serde_json::to_string_pretty(value)?)
@@ -35,11 +53,32 @@ fn pretty(value: &serde_json::Value) -> Result<String> {
 pub struct LnvpsToolExecutor {
     api: Arc<ApiClient>,
     user_id: u64,
+    diag: Diagnostics,
 }
 
 impl LnvpsToolExecutor {
     pub fn new(api: Arc<ApiClient>, user_id: u64) -> Self {
-        Self { api, user_id }
+        Self {
+            api,
+            user_id,
+            diag: Diagnostics::default(),
+        }
+    }
+
+    /// Point the diagnostics at different endpoints than the production
+    /// looking glass and website (tests, staging deployments).
+    pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        self.diag = diag;
+        self
+    }
+
+    /// Addresses of an owned VM, for the network probes.
+    ///
+    /// Ownership is re-checked here rather than trusting the model's `vm_id`,
+    /// so a probe can only ever be aimed at the requester's own VM.
+    async fn owned_vm_ips(&self, args: &HashMap<String, serde_json::Value>) -> Result<Vec<String>> {
+        let vm_id = self.owned_vm_id(args).await?;
+        Ok(vm_ips(&self.api.admin_get_vm(vm_id).await?))
     }
 
     async fn check_vm_ownership(&self, vm_id: u64) -> Result<()> {
@@ -113,6 +152,26 @@ impl ToolExecutor for LnvpsToolExecutor {
             "list_os_images" => pretty(&serde_json::Value::Array(
                 self.api.admin_list_os_images().await?,
             )),
+            "get_terms_of_service" => Ok(self.diag.terms_of_service().await?.to_string()),
+            "ping_vm" => {
+                let ips = self.owned_vm_ips(&args).await?;
+                pretty(&serde_json::to_value(
+                    self.diag.ping(&ips, wants_ipv6(&args)).await?,
+                )?)
+            }
+            "traceroute_vm" => {
+                let ips = self.owned_vm_ips(&args).await?;
+                pretty(&serde_json::to_value(
+                    self.diag.traceroute(&ips, wants_ipv6(&args)).await?,
+                )?)
+            }
+            "check_vm_port" => {
+                let port = required_u64(&args, "port")?;
+                let ips = self.owned_vm_ips(&args).await?;
+                pretty(&serde_json::to_value(
+                    self.diag.check_port(&ips, wants_ipv6(&args), port).await?,
+                )?)
+            }
             _ => bail!("Unknown tool: {}", name),
         }
     }
@@ -122,11 +181,21 @@ impl ToolExecutor for LnvpsToolExecutor {
 /// Only exposes read-only endpoints that don't require authentication.
 pub struct PublicToolExecutor {
     api: Arc<ApiClient>,
+    diag: Diagnostics,
 }
 
 impl PublicToolExecutor {
     pub fn new(api: Arc<ApiClient>) -> Self {
-        Self { api }
+        Self {
+            api,
+            diag: Diagnostics::default(),
+        }
+    }
+
+    /// Point the policy fetcher at a different site (tests, staging).
+    pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
+        self.diag = diag;
+        self
     }
 }
 
@@ -134,6 +203,9 @@ impl PublicToolExecutor {
 impl ToolExecutor for PublicToolExecutor {
     async fn execute(&self, name: &str, _arguments: &str) -> Result<String> {
         match name {
+            // Public because the document is published; no account needed to
+            // ask what is allowed.
+            "get_terms_of_service" => return Ok(self.diag.terms_of_service().await?.to_string()),
             "list_regions" => pretty(&serde_json::Value::Array(
                 self.api.admin_list_regions().await?,
             )),
@@ -171,5 +243,21 @@ mod tests {
     fn pretty_serializes_value() {
         let out = pretty(&serde_json::json!({"a": 1})).unwrap();
         assert!(out.contains("\"a\": 1"));
+    }
+
+    #[test]
+    fn wants_ipv6_defaults_to_v4() {
+        assert!(!wants_ipv6(&parse_args("{}")));
+        assert!(wants_ipv6(&parse_args(r#"{"ipv6": true}"#)));
+        assert!(!wants_ipv6(&parse_args(r#"{"ipv6": "yes"}"#)));
+    }
+
+    #[test]
+    fn vm_ips_reads_admin_records() {
+        let vm = serde_json::json!({
+            "ip_addresses": [{"id": 1, "ip": "185.18.221.87"}, {"id": 2, "ip": "2a13::1"}]
+        });
+        assert_eq!(vm_ips(&vm), vec!["185.18.221.87", "2a13::1"]);
+        assert!(vm_ips(&serde_json::json!({})).is_empty());
     }
 }
