@@ -3558,15 +3558,28 @@ impl Worker {
                     // Nobody asked this API for the move, so surface it: either
                     // an operator migrated by hand, or a VM moved on its own
                     // (HA fail-over) and capacity planning needs to know.
-                    self.queue_admin_notification(
-                        format!(
-                            "VM {} was found on host {} but was recorded on host {}. \
-                             The database has been updated to match the host.",
-                            drift.vm_id, drift.to_host_id, drift.from_host_id
-                        ),
-                        Some(format!("VM {} Moved Host", drift.vm_id)),
-                    )
-                    .await;
+                    let (subject, body) = if drift.is_host_move() {
+                        (
+                            format!("VM {} Moved Host", drift.vm_id),
+                            format!(
+                                "VM {} was found on host {} but was recorded on host {}. \
+                                 The database has been updated to match the host.",
+                                drift.vm_id, drift.to_host_id, drift.from_host_id
+                            ),
+                        )
+                    } else {
+                        (
+                            format!("VM {} Disk Moved", drift.vm_id),
+                            format!(
+                                "VM {} is still on host {}, but its disk was found on storage {}. \
+                                 The database has been updated to match the host.",
+                                drift.vm_id,
+                                drift.to_host_id,
+                                drift.storage.as_deref().unwrap_or("(unknown)")
+                            ),
+                        )
+                    };
+                    self.queue_admin_notification(body, Some(subject)).await;
                 }
                 if !drifts.is_empty() {
                     return Ok(Some(format!(

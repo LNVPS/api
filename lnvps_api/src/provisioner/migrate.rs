@@ -52,7 +52,26 @@ pub enum VmLocation {
     Unknown,
 }
 
-/// A VM found running somewhere other than where the database says it is.
+/// What the database records about where a VM lives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VmPlacement {
+    /// Host the VM is recorded on.
+    pub host_id: u64,
+    /// Name of the storage pool the VM's disk row points at, or `None` when
+    /// that row could not be read. `None` disables the storage comparison for
+    /// this VM rather than treating the pool as changed: a disk row we cannot
+    /// name is not evidence that the disk moved.
+    pub disk_name: Option<String>,
+}
+
+/// A VM found somewhere other than where the database says it is — on another
+/// host, on another storage pool, or both.
+///
+/// `from_host_id == to_host_id` is a disk-only move: the VM stayed put and its
+/// disk was moved between pools (`qm move-disk`, or the Proxmox UI's "Move
+/// Storage"). That leaves `vm.disk_id` pointing at a pool that no longer holds
+/// the disk, which charges the space to the wrong pool in capacity planning and
+/// aims the next reinstall's import at the wrong storage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmHostDrift {
     pub vm_id: u64,
@@ -62,6 +81,13 @@ pub struct VmHostDrift {
     pub to_host_id: u64,
     /// Storage pool backing the VM's disk on the host it was found on.
     pub storage: Option<String>,
+}
+
+impl VmHostDrift {
+    /// Whether the VM changed host, as opposed to only changing storage pool.
+    pub fn is_host_move(&self) -> bool {
+        self.from_host_id != self.to_host_id
+    }
 }
 
 /// Decide whether `vm_resources` can move onto `target_host`, and where its
@@ -166,17 +192,23 @@ pub fn plan_migration(
 
 /// Compare recorded VM placement against what the hosts actually report.
 ///
-/// `db_placement` is `vm_id -> host_id` for live VMs; `observed` is the VM list
-/// each **reachable** host returned. Hosts that could not be polled must be left
-/// out entirely rather than passed as an empty list, or every VM on an
+/// `db_placement` is `vm_id -> `[`VmPlacement`] for live VMs; `observed` is the
+/// VM list each **reachable** host returned. Hosts that could not be polled must
+/// be left out entirely rather than passed as an empty list, or every VM on an
 /// unreachable host looks like it vanished.
+///
+/// Both halves of a placement are compared, because both are acted on: the host
+/// aims every lifecycle operation, and the disk row names the pool. A VM that
+/// never left its host but whose disk was moved between pools by hand is
+/// therefore reported too — the earlier version only compared hosts, so a
+/// `qm move-disk` was invisible.
 ///
 /// A VM seen on more than one host is reported as ambiguous and never
 /// reconciled: that is the signature of a leftover copy on the source node
 /// after a migration, and picking one of the two at random would flap the
 /// database between them on every poll.
 pub fn plan_host_drift(
-    db_placement: &HashMap<u64, u64>,
+    db_placement: &HashMap<u64, VmPlacement>,
     observed: &HashMap<u64, Vec<HostVmSpec>>,
 ) -> (Vec<VmHostDrift>, Vec<u64>) {
     // vm_id -> [(host_id, storage)]
@@ -193,7 +225,7 @@ pub fn plan_host_drift(
 
     let mut drift = Vec::new();
     let mut ambiguous = Vec::new();
-    for (vm_id, recorded_host) in db_placement {
+    for (vm_id, recorded) in db_placement {
         let Some(hosts) = seen.get(vm_id) else {
             // Not on any polled host: could be an unreachable host we skipped,
             // or a VM that was never spawned. Not evidence of a migration.
@@ -204,10 +236,18 @@ pub fn plan_host_drift(
             continue;
         }
         let (found_host, storage) = &hosts[0];
-        if found_host != recorded_host {
+        let host_moved = *found_host != recorded.host_id;
+        // Only a pool the host actually named can contradict the disk row. A
+        // host client that could not read the VM's config reports `None`, which
+        // is missing information, not a move.
+        let disk_moved = match (storage.as_deref(), recorded.disk_name.as_deref()) {
+            (Some(found), Some(recorded)) => found != recorded,
+            _ => false,
+        };
+        if host_moved || disk_moved {
             drift.push(VmHostDrift {
                 vm_id: *vm_id,
-                from_host_id: *recorded_host,
+                from_host_id: recorded.host_id,
                 to_host_id: *found_host,
                 storage: storage.clone(),
             });
@@ -422,12 +462,31 @@ impl VmProvisioner {
 
         self.heal_unassigned_macs(&observed).await;
 
-        let db_placement: HashMap<u64, u64> = db
+        // Disk rows are looked up once per host rather than once per VM: the
+        // storage comparison needs the *name* of the pool each VM's disk row
+        // points at, and a per-VM `get_host_disk` would be a query per VM on
+        // every pass.
+        let mut disk_names: HashMap<u64, String> = HashMap::new();
+        for host in db.list_hosts().await? {
+            for disk in db.list_host_disks(host.id).await.unwrap_or_default() {
+                disk_names.insert(disk.id, disk.name);
+            }
+        }
+
+        let db_placement: HashMap<u64, VmPlacement> = db
             .list_vms()
             .await?
             .into_iter()
             .filter(|v| !v.deleted)
-            .map(|v| (v.id, v.host_id))
+            .map(|v| {
+                (
+                    v.id,
+                    VmPlacement {
+                        host_id: v.host_id,
+                        disk_name: disk_names.get(&v.disk_id).cloned(),
+                    },
+                )
+            })
             .collect();
 
         let (drifts, ambiguous) = plan_host_drift(&db_placement, &observed);
@@ -441,18 +500,25 @@ impl VmProvisioner {
 
         let mut applied = Vec::new();
         for drift in drifts {
-            if let Err(e) = self.apply_drift(&drift).await {
-                warn!("Failed to fix placement of VM {}: {}", drift.vm_id, e);
-                continue;
+            match self.apply_drift(&drift).await {
+                // Nothing changed: a drift we could not act on (an unrecorded
+                // pool on a VM that never left its host) must not be reported,
+                // or every pass would raise the same alert forever.
+                Ok(false) => continue,
+                Ok(true) => applied.push(drift),
+                Err(e) => {
+                    warn!("Failed to fix placement of VM {}: {}", drift.vm_id, e);
+                    continue;
+                }
             }
-            applied.push(drift);
         }
 
         Ok(applied)
     }
 
-    /// Re-point one VM's `host_id`/`disk_id` at the host it was found on.
-    async fn apply_drift(&self, drift: &VmHostDrift) -> Result<()> {
+    /// Re-point one VM's `host_id`/`disk_id` at the host and pool it was found
+    /// on. Returns whether anything was actually written.
+    async fn apply_drift(&self, drift: &VmHostDrift) -> Result<bool> {
         let db = self.get_db();
         let vm = db.get_vm(drift.vm_id).await?;
 
@@ -491,15 +557,28 @@ impl VmProvisioner {
             vm.disk_id
         });
 
-        info!(
-            "VM {} found on host {} but recorded on host {}; updating database",
-            drift.vm_id, drift.to_host_id, drift.from_host_id
-        );
+        if disk_id == vm.disk_id && drift.to_host_id == vm.host_id {
+            // The only thing this drift could have fixed was the disk row, and
+            // the pool it names is one we have no record of.
+            return Ok(false);
+        }
+
+        if drift.is_host_move() {
+            info!(
+                "VM {} found on host {} but recorded on host {}; updating database",
+                drift.vm_id, drift.to_host_id, drift.from_host_id
+            );
+        } else {
+            info!(
+                "VM {} disk was moved to storage {:?} on host {}; re-pointing disk {} at {}",
+                drift.vm_id, drift.storage, drift.to_host_id, vm.disk_id, disk_id
+            );
+        }
         db.update_vm_host(vm.id, drift.to_host_id, disk_id).await?;
 
         let logger = VmHistoryLogger::new(db.clone());
-        {
-            if let Err(e) = logger
+        let logged = if drift.is_host_move() {
+            logger
                 .log_vm_migrated(
                     drift.vm_id,
                     None,
@@ -509,11 +588,26 @@ impl VmProvisioner {
                     Some(json!({ "storage": drift.storage })),
                 )
                 .await
-            {
-                warn!("Failed to log placement fix for VM {}: {}", drift.vm_id, e);
-            }
+        } else {
+            // Not a migration: the VM never left the host, so recording it as
+            // one would put a move that never happened in the customer's
+            // history. It is a configuration change, which is what it is.
+            let mut moved = vm.clone();
+            moved.disk_id = disk_id;
+            logger
+                .log_vm_configuration_changed(
+                    drift.vm_id,
+                    None,
+                    &vm,
+                    &moved,
+                    Some(json!({ "reason": "disk moved on host", "storage": drift.storage })),
+                )
+                .await
+        };
+        if let Err(e) = logged {
+            warn!("Failed to log placement fix for VM {}: {}", drift.vm_id, e);
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Put back a MAC address the database has lost.
@@ -783,9 +877,17 @@ mod tests {
     /// Regression for the reason this exists: a VM migrated by hand on the
     /// hypervisor leaves `vm.host_id` pointing at the old host, and every
     /// lifecycle operation then targets a node that no longer has the VM.
+    /// Recorded placement helper: host `host_id`, disk row naming `storage`.
+    fn placed(host_id: u64, storage: &str) -> VmPlacement {
+        VmPlacement {
+            host_id,
+            disk_name: Some(storage.to_string()),
+        }
+    }
+
     #[test]
     fn test_detects_vm_moved_to_another_host() {
-        let db: HashMap<u64, u64> = HashMap::from([(1, 10), (2, 10)]);
+        let db = HashMap::from([(1, placed(10, "local-lvm")), (2, placed(10, "local-lvm"))]);
         let observed = HashMap::from([
             (10, vec![spec(2, "local-lvm")]),
             (11, vec![spec(1, "nvme-b")]),
@@ -804,11 +906,56 @@ mod tests {
         );
     }
 
+    /// Regression for the drift this pass used to miss entirely: a disk moved
+    /// between pools on the host the VM already lives on (`qm move-disk`).
+    /// Only hosts were compared, so `vm.disk_id` kept naming the pool the disk
+    /// had left.
+    #[test]
+    fn test_detects_disk_moved_to_another_pool_on_the_same_host() {
+        let db = HashMap::from([(1, placed(10, "local-lvm")), (2, placed(10, "local-lvm"))]);
+        let observed = HashMap::from([(10, vec![spec(1, "nvme-b"), spec(2, "local-lvm")])]);
+
+        let (drift, ambiguous) = plan_host_drift(&db, &observed);
+        assert!(ambiguous.is_empty());
+        assert_eq!(
+            drift,
+            vec![VmHostDrift {
+                vm_id: 1,
+                from_host_id: 10,
+                to_host_id: 10,
+                storage: Some("nvme-b".to_string()),
+            }]
+        );
+        assert!(!drift[0].is_host_move());
+    }
+
+    /// A pool the host did not name, or a disk row we could not read, is
+    /// missing information rather than a move: reporting it would re-"fix" the
+    /// same VM on every pass.
+    #[test]
+    fn test_unknown_storage_on_either_side_is_not_a_disk_move() {
+        let mut unnamed = spec(1, "local-lvm");
+        unnamed.disk_storage = None;
+        let observed = HashMap::from([(10, vec![unnamed])]);
+        let db = HashMap::from([(1, placed(10, "local-lvm"))]);
+        assert!(plan_host_drift(&db, &observed).0.is_empty());
+
+        let observed = HashMap::from([(10, vec![spec(1, "nvme-b")])]);
+        let db = HashMap::from([(
+            1,
+            VmPlacement {
+                host_id: 10,
+                disk_name: None,
+            },
+        )]);
+        assert!(plan_host_drift(&db, &observed).0.is_empty());
+    }
+
     #[test]
     fn test_vm_on_two_hosts_is_ambiguous_not_reconciled() {
         // A leftover copy on the source node after a migration. Choosing either
         // host would flap the database between them on every poll.
-        let db: HashMap<u64, u64> = HashMap::from([(1, 10)]);
+        let db = HashMap::from([(1, placed(10, "local-lvm"))]);
         let observed = HashMap::from([
             (10, vec![spec(1, "local-lvm")]),
             (11, vec![spec(1, "local-lvm")]),
@@ -823,7 +970,7 @@ mod tests {
     fn test_unreachable_host_does_not_look_like_a_migration() {
         // Host 10 could not be polled, so it is absent from `observed`
         // entirely; its VMs must not be treated as having moved or vanished.
-        let db: HashMap<u64, u64> = HashMap::from([(1, 10), (2, 11)]);
+        let db = HashMap::from([(1, placed(10, "local-lvm")), (2, placed(11, "local-lvm"))]);
         let observed = HashMap::from([(11, vec![spec(2, "local-lvm")])]);
 
         let (drift, ambiguous) = plan_host_drift(&db, &observed);
@@ -835,7 +982,7 @@ mod tests {
     fn test_host_vms_outside_managed_range_are_ignored() {
         // Proxmox vmid < 100 has no database id; it must never be matched
         // against a VM row.
-        let db: HashMap<u64, u64> = HashMap::from([(1, 10)]);
+        let db = HashMap::from([(1, placed(10, "local-lvm"))]);
         let mut unmanaged = spec(1, "local-lvm");
         unmanaged.mapped_vm_id = None;
         let observed = HashMap::from([(10, vec![spec(1, "local-lvm")]), (11, vec![unmanaged])]);
@@ -1093,6 +1240,88 @@ mod tests {
             stored.disk_id, original_disk,
             "an unknown pool must not be swapped for an arbitrary disk row"
         );
+        DummyVmHost::clear_host_vms().await;
+    }
+
+    /// Regression for a VM whose disk was moved between pools *on the host it
+    /// already lived on*: nothing about its placement changed except the pool,
+    /// so the host-only comparison saw no drift and `vm.disk_id` kept charging
+    /// the space to a pool that no longer held the disk.
+    #[tokio::test]
+    async fn test_reconcile_follows_a_disk_moved_between_pools_on_one_host() {
+        let db = Arc::new(MockDb::default());
+        // A second pool on the same host, which is where the disk was moved to.
+        db.host_disks.lock().await.insert(
+            3,
+            VmHostDisk {
+                id: 3,
+                host_id: 1,
+                name: "mock-disk-1b".to_string(),
+                size: 10_000 * GB,
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let vm_id = add_vm(&db).await;
+        assert_eq!(db.get_vm(vm_id).await.expect("vm").disk_id, 1);
+
+        DummyVmHost::clear_host_vms().await;
+        DummyVmHost::set_host_vms_for(1, vec![spec(vm_id, "mock-disk-1b")]).await;
+
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let drifts = provisioner.reconcile_vm_hosts().await.expect("reconcile");
+        assert_eq!(drifts.len(), 1);
+        assert!(!drifts[0].is_host_move(), "the VM never left host 1");
+
+        let stored = db.get_vm(vm_id).await.expect("vm");
+        assert_eq!(stored.host_id, 1);
+        assert_eq!(stored.disk_id, 3);
+
+        // A disk move is not a migration, so it must not be written into the
+        // VM's history as one.
+        let history = db.list_vm_history(vm_id).await.expect("history");
+        assert!(
+            !history
+                .iter()
+                .any(|h| matches!(h.action_type, lnvps_db::VmHistoryActionType::Migrated))
+        );
+        assert!(history.iter().any(|h| matches!(
+            h.action_type,
+            lnvps_db::VmHistoryActionType::ConfigurationChanged
+        )));
+
+        // Second pass is a no-op now the database agrees with the host.
+        assert!(
+            provisioner
+                .reconcile_vm_hosts()
+                .await
+                .expect("reconcile")
+                .is_empty()
+        );
+        DummyVmHost::clear_host_vms().await;
+    }
+
+    /// A pool nobody recorded against the host cannot be substituted for the
+    /// disk row, and on a VM that never moved host there is then nothing to
+    /// write — so it must not be reported, or the same alert would be raised on
+    /// every pass forever.
+    #[tokio::test]
+    async fn test_reconcile_ignores_a_disk_move_to_an_unrecorded_pool() {
+        let db = Arc::new(MockDb::default());
+        let vm_id = add_vm(&db).await;
+
+        DummyVmHost::clear_host_vms().await;
+        DummyVmHost::set_host_vms_for(1, vec![spec(vm_id, "pool-nobody-recorded")]).await;
+
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        assert!(
+            provisioner
+                .reconcile_vm_hosts()
+                .await
+                .expect("reconcile")
+                .is_empty()
+        );
+        assert_eq!(db.get_vm(vm_id).await.expect("vm").disk_id, 1);
         DummyVmHost::clear_host_vms().await;
     }
 
