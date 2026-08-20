@@ -268,7 +268,10 @@ mod tests {
 
         // The default is sanitised, so a binary that never opts in is safe.
         assert!(!verbose_internal_errors());
-        assert_eq!(ApiError::internal(SECRET).error, "An internal error occurred");
+        assert_eq!(
+            ApiError::internal(SECRET).error,
+            "An internal error occurred"
+        );
 
         set_verbose_internal_errors(true);
         assert_eq!(ApiError::internal(SECRET).error, SECRET);
@@ -276,6 +279,9 @@ mod tests {
         // Restored, so this test cannot make an unrelated one see verbose
         // errors and pass for the wrong reason.
         set_verbose_internal_errors(false);
-        assert_eq!(ApiError::internal(SECRET).error, "An internal error occurred");
+        assert_eq!(
+            ApiError::internal(SECRET).error,
+            "An internal error occurred"
+        );
     }
 }

@@ -2904,6 +2904,35 @@ pub struct AdminRefundAmountInfo {
     pub seconds_remaining: i64,
 }
 
+/// The discount applied to one payment, as seen from the payment.
+///
+/// Without this a discounted payment is indistinguishable from a plain
+/// cheaper one in an admin payment table (issue #384).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AdminPaymentDiscountInfo {
+    pub discount_id: u64,
+    /// The code the customer entered. `None` for a code-less (automatic) discount.
+    pub code: Option<String>,
+    /// What was taken off, in minor units of [`Self::currency`].
+    pub amount_off: u64,
+    pub currency: String,
+    /// False while the discounted invoice is unpaid: the redemption consumes no
+    /// limit and has not yet cost the campaign anything.
+    pub settled: bool,
+}
+
+impl From<lnvps_db::DiscountRedemptionWithCode> for AdminPaymentDiscountInfo {
+    fn from(r: lnvps_db::DiscountRedemptionWithCode) -> Self {
+        Self {
+            discount_id: r.redemption.discount_id,
+            code: r.discount_code,
+            amount_off: r.redemption.amount_off,
+            currency: r.redemption.currency,
+            settled: r.redemption.settled,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct AdminVmPaymentInfo {
     pub id: String, // hex encoded payment ID
@@ -2928,6 +2957,10 @@ pub struct AdminVmPaymentInfo {
     /// For a `refund` row, the hex id of the payment it reverses; null otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refunded_payment_id: Option<String>,
+    /// The discount applied to this payment, if any. `amount` is already net of
+    /// it — this only says which code was used and how much came off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discount: Option<AdminPaymentDiscountInfo>,
     // Note: external_data is omitted as it may contain sensitive payment provider data
 }
 
@@ -2971,7 +3004,17 @@ impl AdminVmPaymentInfo {
             rate: payment.rate,
             payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
             refunded_payment_id: payment.refunded_payment_id.as_ref().map(hex::encode),
+            discount: None,
         }
+    }
+
+    /// Attach the discount applied to this payment, if one was.
+    ///
+    /// Separate from the constructor so listings can resolve a whole page of
+    /// discounts in one query and hand each row its own.
+    pub fn with_discount(mut self, discount: Option<AdminPaymentDiscountInfo>) -> Self {
+        self.discount = discount;
+        self
     }
 }
 
@@ -3382,6 +3425,10 @@ pub struct AdminSubscriptionPaymentInfo {
     pub metadata: Option<serde_json::Value>,
     pub tax: u64,
     pub processing_fee: u64,
+    /// The discount applied to this payment, if any. `amount` is already net of
+    /// it — this only says which code was used and how much came off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discount: Option<AdminPaymentDiscountInfo>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -3437,7 +3484,17 @@ impl AdminSubscriptionPaymentInfo {
             metadata: payment.metadata,
             tax: payment.tax,
             processing_fee: payment.processing_fee,
+            discount: None,
         }
+    }
+
+    /// Attach the discount applied to this payment, if one was.
+    ///
+    /// Separate from the constructor so listings can resolve a whole page of
+    /// discounts in one query and hand each row its own.
+    pub fn with_discount(mut self, discount: Option<AdminPaymentDiscountInfo>) -> Self {
+        self.discount = discount;
+        self
     }
 
     pub fn from_with_company(payment: lnvps_db::SubscriptionPaymentWithCompany) -> Self {
@@ -3460,6 +3517,7 @@ impl AdminSubscriptionPaymentInfo {
             metadata: payment.metadata,
             tax: payment.tax,
             processing_fee: payment.processing_fee,
+            discount: None,
         }
     }
 }
@@ -4331,6 +4389,78 @@ pub struct AdminUpdateUserPaymentMethodRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A payment carries its discount, and an undiscounted payment omits the
+    /// key entirely rather than serialising `null` (issue #384).
+    #[test]
+    fn payment_info_carries_optional_discount() {
+        let payment = lnvps_db::SubscriptionPayment {
+            id: vec![1; 32],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now(),
+            amount: 900,
+            currency: "EUR".to_string(),
+            payment_method: lnvps_db::PaymentMethod::Lightning,
+            payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
+            external_data: lnvps_db::EncryptedString::new(String::new()),
+            external_id: None,
+            is_paid: false,
+            rate: 1.0,
+            time_value: Some(2_592_000),
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+        };
+
+        let plain = AdminVmPaymentInfo::from_subscription_payment(&payment, 1, "EUR".to_string());
+        let json = serde_json::to_value(&plain).unwrap();
+        assert!(json.get("discount").is_none());
+
+        let discount = AdminPaymentDiscountInfo::from(lnvps_db::DiscountRedemptionWithCode {
+            redemption: lnvps_db::DiscountRedemption {
+                discount_id: 7,
+                amount_off: 100,
+                currency: "EUR".to_string(),
+                settled: true,
+                ..Default::default()
+            },
+            discount_code: Some("SAVE10".to_string()),
+        });
+
+        let vm = AdminVmPaymentInfo::from_subscription_payment(&payment, 1, "EUR".to_string())
+            .with_discount(Some(discount.clone()));
+        let json = serde_json::to_value(&vm).unwrap();
+        assert_eq!(json["discount"]["code"], "SAVE10");
+        assert_eq!(json["discount"]["discount_id"], 7);
+        assert_eq!(json["discount"]["amount_off"], 100);
+        assert_eq!(json["discount"]["currency"], "EUR");
+        assert_eq!(json["discount"]["settled"], true);
+        // The charged amount stays net of the discount.
+        assert_eq!(json["amount"], 900);
+
+        let sub = AdminSubscriptionPaymentInfo::new(payment.clone(), "EUR".to_string())
+            .with_discount(Some(discount));
+        let json = serde_json::to_value(&sub).unwrap();
+        assert_eq!(json["discount"]["code"], "SAVE10");
+
+        let sub_plain =
+            AdminSubscriptionPaymentInfo::new(payment, "EUR".to_string()).with_discount(None);
+        assert!(
+            serde_json::to_value(&sub_plain)
+                .unwrap()
+                .get("discount")
+                .is_none()
+        );
+    }
 
     #[test]
     fn test_partial_provider_config_deserializes_onchain() {

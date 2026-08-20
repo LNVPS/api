@@ -1180,6 +1180,17 @@ pub trait LNVpsDbBase: Send + Sync {
         subscription_payment_id: &Vec<u8>,
     ) -> DbResult<Option<DiscountRedemption>>;
 
+    /// The discounts applied to a set of payments, each joined with its
+    /// discount code.
+    ///
+    /// Batched deliberately: payment listings render a whole page of rows, and
+    /// calling [`Self::get_discount_redemption_by_payment`] per row would be an
+    /// N+1. Payments carrying no discount are simply absent from the result.
+    async fn get_discount_redemptions_by_payments(
+        &self,
+        subscription_payment_ids: &[Vec<u8>],
+    ) -> DbResult<Vec<DiscountRedemptionWithCode>>;
+
     /// Settle the discount on a paid payment: mark the row settled and
     /// increment the discount's `used_count`, in one transaction.
     ///

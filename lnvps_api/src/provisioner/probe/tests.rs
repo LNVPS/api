@@ -147,7 +147,10 @@ async fn a_node(db: &Arc<dyn LNVpsDb>) -> Result<MarketplaceNode> {
             ..Default::default()
         })
         .await?;
-    assert_eq!(node_id, wanted, "a test did not get the node id it reserved");
+    assert_eq!(
+        node_id, wanted,
+        "a test did not get the node id it reserved"
+    );
     db.create_host(&lnvps_db::VmHost {
         kind: VmHostKind::MarketplaceNode,
         region_id: 1,
@@ -726,10 +729,15 @@ impl lnvps_api_common::host::VmHostClient for RecordingHost {
         Ok(())
     }
 
-    async fn get_info(&self) -> lnvps_api_common::retry::OpResult<lnvps_api_common::host::VmHostInfo> {
+    async fn get_info(
+        &self,
+    ) -> lnvps_api_common::retry::OpResult<lnvps_api_common::host::VmHostInfo> {
         unsupported!()
     }
-    async fn download_os_image(&self, _image: &lnvps_db::VmOsImage) -> lnvps_api_common::retry::OpResult<()> {
+    async fn download_os_image(
+        &self,
+        _image: &lnvps_db::VmOsImage,
+    ) -> lnvps_api_common::retry::OpResult<()> {
         unsupported!()
     }
     async fn generate_mac(&self, _vm: &Vm) -> lnvps_api_common::retry::OpResult<String> {
@@ -744,28 +752,48 @@ impl lnvps_api_common::host::VmHostClient for RecordingHost {
     async fn reset_vm(&self, _vm: &Vm) -> lnvps_api_common::retry::OpResult<()> {
         unsupported!()
     }
-    async fn create_vm(&self, _cfg: &lnvps_api_common::host::FullVmInfo) -> lnvps_api_common::retry::OpResult<()> {
+    async fn create_vm(
+        &self,
+        _cfg: &lnvps_api_common::host::FullVmInfo,
+    ) -> lnvps_api_common::retry::OpResult<()> {
         unsupported!()
     }
     async fn unlink_primary_disk(&self, _vm: &Vm) -> lnvps_api_common::retry::OpResult<()> {
         unsupported!()
     }
-    async fn import_template_disk(&self, _cfg: &lnvps_api_common::host::FullVmInfo) -> lnvps_api_common::retry::OpResult<()> {
+    async fn import_template_disk(
+        &self,
+        _cfg: &lnvps_api_common::host::FullVmInfo,
+    ) -> lnvps_api_common::retry::OpResult<()> {
         unsupported!()
     }
-    async fn resize_disk(&self, _cfg: &lnvps_api_common::host::FullVmInfo) -> lnvps_api_common::retry::OpResult<()> {
+    async fn resize_disk(
+        &self,
+        _cfg: &lnvps_api_common::host::FullVmInfo,
+    ) -> lnvps_api_common::retry::OpResult<()> {
         unsupported!()
     }
-    async fn get_vm_state(&self, _vm: &Vm) -> lnvps_api_common::retry::OpResult<lnvps_api_common::VmRunningState> {
+    async fn get_vm_state(
+        &self,
+        _vm: &Vm,
+    ) -> lnvps_api_common::retry::OpResult<lnvps_api_common::VmRunningState> {
         unsupported!()
     }
-    async fn get_all_vm_states(&self) -> lnvps_api_common::retry::OpResult<Vec<(u64, lnvps_api_common::VmRunningState)>> {
+    async fn get_all_vm_states(
+        &self,
+    ) -> lnvps_api_common::retry::OpResult<Vec<(u64, lnvps_api_common::VmRunningState)>> {
         unsupported!()
     }
-    async fn configure_vm(&self, _cfg: &lnvps_api_common::host::FullVmInfo) -> lnvps_api_common::retry::OpResult<()> {
+    async fn configure_vm(
+        &self,
+        _cfg: &lnvps_api_common::host::FullVmInfo,
+    ) -> lnvps_api_common::retry::OpResult<()> {
         unsupported!()
     }
-    async fn patch_firewall(&self, _cfg: &lnvps_api_common::host::FullVmInfo) -> lnvps_api_common::retry::OpResult<()> {
+    async fn patch_firewall(
+        &self,
+        _cfg: &lnvps_api_common::host::FullVmInfo,
+    ) -> lnvps_api_common::retry::OpResult<()> {
         unsupported!()
     }
     async fn get_time_series_data(
@@ -775,7 +803,10 @@ impl lnvps_api_common::host::VmHostClient for RecordingHost {
     ) -> lnvps_api_common::retry::OpResult<Vec<lnvps_api_common::host::TimeSeriesData>> {
         unsupported!()
     }
-    async fn connect_terminal(&self, _vm: &Vm) -> lnvps_api_common::retry::OpResult<lnvps_api_common::host::TerminalStream> {
+    async fn connect_terminal(
+        &self,
+        _vm: &Vm,
+    ) -> lnvps_api_common::retry::OpResult<lnvps_api_common::host::TerminalStream> {
         unsupported!()
     }
 }

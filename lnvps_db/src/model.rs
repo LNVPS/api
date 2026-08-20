@@ -1727,6 +1727,19 @@ pub struct DiscountRedemption {
     pub settled_at: Option<DateTime<Utc>>,
 }
 
+/// A redemption joined with the code of the discount it used.
+///
+/// Payment-first admin surfaces (a VM's payment history, a subscription's
+/// payments) need the code alongside the amount taken off, and fetching the
+/// discount row per payment would be an N+1.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct DiscountRedemptionWithCode {
+    #[sqlx(flatten)]
+    pub redemption: DiscountRedemption,
+    /// The discount's code. `None` for a code-less (automatic) discount.
+    pub discount_code: Option<String>,
+}
+
 /// How an outbound payout reaches its recipient. Stored as a small integer; new
 /// methods are added as new variants (append-only to preserve values).
 ///

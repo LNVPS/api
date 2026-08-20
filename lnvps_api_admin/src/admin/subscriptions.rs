@@ -1,5 +1,6 @@
 use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
+use crate::admin::discounts::payment_discounts;
 use crate::admin::model::{
     AdminCreateSubscriptionLineItemRequest, AdminCreateSubscriptionRequest, AdminSubscriptionInfo,
     AdminSubscriptionLineItemInfo, AdminSubscriptionPaymentInfo,
@@ -560,9 +561,15 @@ async fn admin_list_subscription_payments(
         .list_subscription_payments_paginated(subscription_id, limit, offset)
         .await?;
 
+    let payment_ids: Vec<Vec<u8>> = page.iter().map(|p| p.id.clone()).collect();
+    let discounts = payment_discounts(&this.db, &payment_ids).await?;
+
     let payments: Vec<AdminSubscriptionPaymentInfo> = page
         .into_iter()
-        .map(|p| AdminSubscriptionPaymentInfo::new(p, base_currency.clone()))
+        .map(|p| {
+            let discount = discounts.get(&p.id).cloned();
+            AdminSubscriptionPaymentInfo::new(p, base_currency.clone()).with_discount(discount)
+        })
         .collect();
 
     ApiPaginatedData::ok(payments, total, limit, offset)
@@ -582,7 +589,13 @@ async fn admin_get_subscription_payment(
         .db
         .get_subscription_payment_with_company(&payment_id)
         .await?;
-    ApiData::ok(AdminSubscriptionPaymentInfo::from_with_company(payment))
+    let discount = this
+        .db
+        .get_discount_redemptions_by_payments(std::slice::from_ref(&payment_id))
+        .await?
+        .pop()
+        .map(Into::into);
+    ApiData::ok(AdminSubscriptionPaymentInfo::from_with_company(payment).with_discount(discount))
 }
 
 /// Manually mark a subscription payment as paid (admin override).
@@ -648,7 +661,13 @@ async fn admin_complete_subscription_payment(
         .db
         .get_subscription_payment_with_company(&payment_id)
         .await?;
-    ApiData::ok(AdminSubscriptionPaymentInfo::from_with_company(updated))
+    let discount = this
+        .db
+        .get_discount_redemptions_by_payments(std::slice::from_ref(&payment_id))
+        .await?
+        .pop()
+        .map(Into::into);
+    ApiData::ok(AdminSubscriptionPaymentInfo::from_with_company(updated).with_discount(discount))
 }
 
 #[cfg(test)]

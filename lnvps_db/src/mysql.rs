@@ -2,16 +2,16 @@ use crate::{
     AccessPolicy, AgentConversation, AgentConversationFilter, AgentConversationOverview,
     AgentMessage, App, AppCluster, AppDeployment, AppDeploymentFilter, AppDeploymentServiceUsage,
     AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
-    Company, DbError, DbResult, Discount, DiscountRedemption, DnsServer, EncryptedString,
-    IntervalType, IpRange, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode,
-    MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage,
-    PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
-    Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
-    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm,
-    VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
-    VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
-    WebauthnCredential,
+    Company, DbError, DbResult, Discount, DiscountRedemption, DiscountRedemptionWithCode,
+    DnsServer, EncryptedString, IntervalType, IpRange, IpRangeSubscription, IpSpacePricing,
+    LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus,
+    MarketplaceOperator, NewAgentMessage, PaymentMethod, PaymentMethodConfig, PaymentType,
+    Referral, ReferralCostUsage, ReferralPayout, Region, RegionStats, Router, RouterBgpRoute,
+    RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionPaymentWithCompany, Tunnel, TunnelPool, User,
+    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
+    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk,
+    VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -4241,6 +4241,27 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_optional(&self.db)
                 .await?,
         )
+    }
+
+    async fn get_discount_redemptions_by_payments(
+        &self,
+        subscription_payment_ids: &[Vec<u8>],
+    ) -> DbResult<Vec<DiscountRedemptionWithCode>> {
+        // `IN ()` is a syntax error in MySQL, and an empty set has no rows.
+        if subscription_payment_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut query = QueryBuilder::new(
+            "SELECT r.*, d.code AS discount_code FROM discount_redemption r \
+             JOIN discount d ON d.id = r.discount_id \
+             WHERE r.subscription_payment_id IN (",
+        );
+        let mut sep = query.separated(", ");
+        for id in subscription_payment_ids {
+            sep.push_bind(id);
+        }
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
     }
 
     async fn settle_discount_redemption(

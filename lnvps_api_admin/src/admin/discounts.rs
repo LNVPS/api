@@ -2,8 +2,8 @@ use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminCreateDiscountRequest, AdminDiscountInfo, AdminDiscountPreview,
-    AdminDiscountRedemptionInfo, AdminDiscountTotal, AdminPreviewDiscountRequest,
-    AdminPreviewOrder, AdminUpdateDiscountRequest,
+    AdminDiscountRedemptionInfo, AdminDiscountTotal, AdminPaymentDiscountInfo,
+    AdminPreviewDiscountRequest, AdminPreviewOrder, AdminUpdateDiscountRequest,
 };
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
@@ -13,8 +13,31 @@ use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, DiscountContext,
     HistoryContext, PageQuery, UserContext, evaluate_rule, validate_rule,
 };
-use lnvps_db::{AdminAction, AdminResource, Discount, LNVpsDb};
+use lnvps_db::{AdminAction, AdminResource, DbResult, Discount, LNVpsDb};
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// The discounts applied to `payment_ids`, keyed by payment id.
+///
+/// One query for the whole page: payment tables render up to 100 rows, and a
+/// per-row lookup would be an N+1 (issue #384). Payments with no discount are
+/// absent from the map.
+pub(crate) async fn payment_discounts(
+    db: &Arc<dyn LNVpsDb>,
+    payment_ids: &[Vec<u8>],
+) -> DbResult<HashMap<Vec<u8>, AdminPaymentDiscountInfo>> {
+    Ok(db
+        .get_discount_redemptions_by_payments(payment_ids)
+        .await?
+        .into_iter()
+        .map(|r| {
+            (
+                r.redemption.subscription_payment_id.clone(),
+                AdminPaymentDiscountInfo::from(r),
+            )
+        })
+        .collect())
+}
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -434,6 +457,52 @@ mod tests {
             totals,
             vec![("BTC".to_string(), 700), ("EUR".to_string(), 1_500)]
         );
+    }
+
+    /// Payment-first lookup: one query resolves a whole page of payments, and
+    /// a payment with no discount is simply absent (issue #384).
+    #[tokio::test]
+    async fn payment_discounts_resolve_per_payment_in_one_query() {
+        let mock = MockDb::default();
+        let user_id = mock.upsert_user(&[1; 32]).await.unwrap();
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let id = db
+            .insert_discount(&to_discount(&create()).unwrap())
+            .await
+            .unwrap();
+
+        db.insert_discount_redemption(&DiscountRedemption {
+            discount_id: id,
+            user_id,
+            subscription_payment_id: vec![1; 32],
+            amount_off: 250,
+            currency: "EUR".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // Two payments asked for, only one discounted.
+        let found = payment_discounts(&db, &[vec![1; 32], vec![2; 32]])
+            .await
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        let d = found.get(&vec![1; 32]).expect("discounted payment");
+        assert_eq!(d.discount_id, id);
+        assert_eq!(d.code.as_deref(), Some("SAVE10"));
+        assert_eq!(d.amount_off, 250);
+        assert_eq!(d.currency, "EUR");
+        assert!(!d.settled, "an unpaid invoice's discount is unsettled");
+
+        db.settle_discount_redemption(&vec![1; 32])
+            .await
+            .unwrap()
+            .expect("settles");
+        let after = payment_discounts(&db, &[vec![1; 32]]).await.unwrap();
+        assert!(after.get(&vec![1; 32]).expect("still there").settled);
+
+        // No ids means no query and no rows.
+        assert!(payment_discounts(&db, &[]).await.unwrap().is_empty());
     }
 
     #[test]

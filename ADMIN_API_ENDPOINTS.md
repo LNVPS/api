@@ -5548,8 +5548,26 @@ The RBAC system uses the following permission format: `resource::action`
   // Whether payment has been completed
   "paid_at": "string (ISO 8601) | null",
   // When payment was completed (null if unpaid)
-  "rate": number
+  "rate": number,
   // Exchange rate to company_base_currency
+  "discount": AdminPaymentDiscountInfo
+  // The discount applied to this payment; omitted when there was none.
+  // `amount` is already net of it.
+}
+```
+
+### AdminPaymentDiscountInfo
+
+```json
+{
+  "discount_id": number,
+  "code": "string | null",
+  // The code the customer entered; null for a code-less (automatic) discount
+  "amount_off": number,
+  // What was taken off, in minor units of `currency` (cents/millisats)
+  "currency": "string",
+  "settled": boolean
+  // False while the discounted invoice is unpaid
 }
 ```
 
@@ -5665,8 +5683,11 @@ The RBAC system uses the following permission format: `resource::action`
   // Service-specific JSON metadata (omitted if none)
   "tax": number,
   // Tax amount in cents/millisats
-  "processing_fee": number
+  "processing_fee": number,
   // Processing fee in cents/millisats
+  "discount": AdminPaymentDiscountInfo
+  // The discount applied to this payment; omitted when there was none.
+  // `amount` is already net of it.
 }
 ```
 

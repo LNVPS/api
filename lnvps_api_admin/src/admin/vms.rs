@@ -1,5 +1,6 @@
 use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
+use crate::admin::discounts::payment_discounts;
 use crate::admin::model::{
     AdminCreateCustomVmRequest, AdminCreateVmRequest, AdminPaymentRefundsInfo,
     AdminRefundAmountInfo, AdminVmHistoryInfo, AdminVmInfo, AdminVmPaymentInfo, JobResponse,
@@ -880,9 +881,15 @@ async fn admin_list_vm_payments(
 
     let base_currency = this.db.get_vm_base_currency(vm_id).await?;
 
+    let payment_ids: Vec<Vec<u8>> = payments.iter().map(|p| p.id.clone()).collect();
+    let discounts = payment_discounts(&this.db, &payment_ids).await?;
+
     let admin_payments: Vec<AdminVmPaymentInfo> = payments
         .iter()
-        .map(|p| AdminVmPaymentInfo::from_subscription_payment(p, vm_id, base_currency.clone()))
+        .map(|p| {
+            AdminVmPaymentInfo::from_subscription_payment(p, vm_id, base_currency.clone())
+                .with_discount(discounts.get(&p.id).cloned())
+        })
         .collect();
 
     ApiPaginatedData::ok(admin_payments, total, limit, offset)
@@ -916,8 +923,15 @@ async fn admin_get_vm_payment(
     }
 
     let base_currency = this.db.get_vm_base_currency(vm_id).await?;
+    let discount = this
+        .db
+        .get_discount_redemptions_by_payments(std::slice::from_ref(&payment.id))
+        .await?
+        .pop()
+        .map(Into::into);
     let admin_payment_info =
-        AdminVmPaymentInfo::from_subscription_payment(&payment, vm_id, base_currency);
+        AdminVmPaymentInfo::from_subscription_payment(&payment, vm_id, base_currency)
+            .with_discount(discount);
 
     ApiData::ok(admin_payment_info)
 }
@@ -1261,6 +1275,8 @@ async fn admin_list_payment_refunds(
         amount: payment.amount,
         refunded_total,
         refundable_remaining: payment.amount.saturating_sub(refunded_total),
+        // A refund row carries no discount of its own: the discount is on the
+        // payment it reverses, which the caller already has.
         refunds: refunds
             .iter()
             .map(|r| AdminVmPaymentInfo::from_subscription_payment(r, vm_id, base_currency.clone()))
@@ -1450,11 +1466,16 @@ async fn admin_complete_vm_payment(
     // Re-read the payment to get updated paid_at / is_paid
     let updated = this.db.get_subscription_payment(&payment_id_bytes).await?;
     let base_currency = this.db.get_vm_base_currency(vm_id).await?;
-    ApiData::ok(AdminVmPaymentInfo::from_subscription_payment(
-        &updated,
-        vm_id,
-        base_currency,
-    ))
+    let discount = this
+        .db
+        .get_discount_redemptions_by_payments(std::slice::from_ref(&updated.id))
+        .await?
+        .pop()
+        .map(Into::into);
+    ApiData::ok(
+        AdminVmPaymentInfo::from_subscription_payment(&updated, vm_id, base_currency)
+            .with_discount(discount),
+    )
 }
 
 #[cfg(test)]

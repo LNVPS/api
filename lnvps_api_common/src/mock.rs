@@ -3777,6 +3777,28 @@ impl LNVpsDbBase for MockDb {
             .cloned())
     }
 
+    async fn get_discount_redemptions_by_payments(
+        &self,
+        subscription_payment_ids: &[Vec<u8>],
+    ) -> DbResult<Vec<lnvps_db::DiscountRedemptionWithCode>> {
+        let redemptions = self.discount_redemptions.lock().await;
+        let discounts = self.discounts.lock().await;
+        Ok(redemptions
+            .iter()
+            .filter(|r| subscription_payment_ids.contains(&r.subscription_payment_id))
+            .filter_map(|r| {
+                // An orphan redemption cannot exist (FK), so a missing discount
+                // drops the row rather than inventing a code, matching the JOIN.
+                discounts
+                    .get(&r.discount_id)
+                    .map(|d| lnvps_db::DiscountRedemptionWithCode {
+                        redemption: r.clone(),
+                        discount_code: d.code.clone(),
+                    })
+            })
+            .collect())
+    }
+
     async fn settle_discount_redemption(
         &self,
         subscription_payment_id: &Vec<u8>,
