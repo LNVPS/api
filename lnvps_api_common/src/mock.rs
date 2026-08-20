@@ -7,12 +7,12 @@ use lnvps_db::{
     AgentMessage, App, AppCluster, AppDeployment, AppDeploymentDesiredState, AppDeploymentFilter,
     AppDeploymentServiceUsage, AppDeploymentStatus, AppDeploymentVolumeUsage, AppTag,
     AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, CpuArch, CpuMfg, DbError,
-    DbResult, DiskInterface, DiskType, DnsServer, DnsServerKind, EncryptedString, IntervalType,
-    IpRange, IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase,
-    MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator,
-    NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod,
-    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region, Router,
-    RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription,
+    DbResult, Discount, DiscountRedemption, DiskInterface, DiskType, DnsServer, DnsServerKind,
+    EncryptedString, IntervalType, IpRange, IpRangeAllocationMode, IpRangeSubscription,
+    IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus,
+    MarketplaceOperator, NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution,
+    PaymentMethod, PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region,
+    Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription,
     SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, Tunnel, TunnelPool,
     User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
     VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind,
@@ -75,6 +75,8 @@ pub struct MockDb {
     pub asn_subscriptions: Arc<Mutex<HashMap<u64, AsnSubscription>>>,
     pub payment_method_configs: Arc<Mutex<HashMap<u64, PaymentMethodConfig>>>,
     pub referrals: Arc<Mutex<HashMap<u64, Referral>>>,
+    pub discounts: Arc<Mutex<HashMap<u64, Discount>>>,
+    pub discount_redemptions: Arc<Mutex<Vec<DiscountRedemption>>>,
     pub marketplace_operators: Arc<Mutex<HashMap<u64, MarketplaceOperator>>>,
     pub marketplace_nodes: Arc<Mutex<HashMap<u64, MarketplaceNode>>>,
     pub marketplace_node_health: Arc<Mutex<HashMap<u64, MarketplaceNodeHealth>>>,
@@ -463,6 +465,8 @@ impl Default for MockDb {
             asn_subscriptions: Arc::new(Default::default()),
             payment_method_configs: Arc::new(Default::default()),
             referrals: Arc::new(Default::default()),
+            discounts: Arc::new(Default::default()),
+            discount_redemptions: Arc::new(Default::default()),
             marketplace_operators: Arc::new(Default::default()),
             marketplace_nodes: Arc::new(Default::default()),
             marketplace_node_health: Arc::new(Default::default()),
@@ -3645,6 +3649,189 @@ impl LNVpsDbBase for MockDb {
                 .unwrap_or(false)
             })
             .count() as u64)
+    }
+
+    // ========================================================================
+    // Discounts
+    // ========================================================================
+
+    async fn get_discount(&self, id: u64) -> DbResult<Discount> {
+        let discounts = self.discounts.lock().await;
+        discounts
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("Discount not found: {}", id).into())
+    }
+
+    async fn get_discount_by_code(&self, code: &str) -> DbResult<Discount> {
+        let discounts = self.discounts.lock().await;
+        discounts
+            .values()
+            .find(|d| d.code.as_deref() == Some(code))
+            .cloned()
+            .ok_or_else(|| anyhow!("Discount not found for code {}", code).into())
+    }
+
+    async fn list_discounts_paginated(
+        &self,
+        company_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<Discount>, u64)> {
+        let discounts = self.discounts.lock().await;
+        let mut all: Vec<Discount> = discounts
+            .values()
+            .filter(|d| d.company_id == company_id)
+            .cloned()
+            .collect();
+        all.sort_by_key(|d| std::cmp::Reverse(d.id));
+        let total = all.len() as u64;
+        Ok((
+            all.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn insert_discount(&self, discount: &Discount) -> DbResult<u64> {
+        let mut discounts = self.discounts.lock().await;
+        if discount.code.is_some() && discounts.values().any(|d| d.code == discount.code) {
+            return Err(anyhow!("Duplicate discount code").into());
+        }
+        let new_id = discounts.keys().max().copied().unwrap_or(0) + 1;
+        discounts.insert(
+            new_id,
+            Discount {
+                id: new_id,
+                used_count: 0,
+                ..discount.clone()
+            },
+        );
+        Ok(new_id)
+    }
+
+    async fn update_discount(&self, discount: &Discount) -> DbResult<()> {
+        let mut discounts = self.discounts.lock().await;
+        if let Some(d) = discounts.get_mut(&discount.id) {
+            // `used_count` is owned by settlement, matching the SQL impl.
+            d.code = discount.code.clone();
+            d.name = discount.name.clone();
+            d.rule = discount.rule.clone();
+            d.valid_from = discount.valid_from;
+            d.valid_to = discount.valid_to;
+            d.usage_limit = discount.usage_limit;
+            d.per_user_limit = discount.per_user_limit;
+            d.active = discount.active;
+        }
+        Ok(())
+    }
+
+    async fn delete_discount(&self, id: u64) -> DbResult<()> {
+        let redemptions = self.discount_redemptions.lock().await;
+        if redemptions.iter().any(|r| r.discount_id == id) {
+            return Err(anyhow!("Discount has redemptions").into());
+        }
+        let mut discounts = self.discounts.lock().await;
+        discounts.remove(&id);
+        Ok(())
+    }
+
+    async fn count_discount_redemptions(&self, discount_id: u64, user_id: u64) -> DbResult<u64> {
+        let redemptions = self.discount_redemptions.lock().await;
+        Ok(redemptions
+            .iter()
+            .filter(|r| r.discount_id == discount_id && r.user_id == user_id && r.settled)
+            .count() as u64)
+    }
+
+    async fn insert_discount_redemption(&self, redemption: &DiscountRedemption) -> DbResult<()> {
+        let mut redemptions = self.discount_redemptions.lock().await;
+        // A payment carries at most one discount, so a repeat is a no-op.
+        if redemptions
+            .iter()
+            .any(|r| r.subscription_payment_id == redemption.subscription_payment_id)
+        {
+            return Ok(());
+        }
+        let new_id = redemptions.len() as u64 + 1;
+        redemptions.push(DiscountRedemption {
+            id: new_id,
+            settled: false,
+            settled_at: None,
+            created: Utc::now(),
+            ..redemption.clone()
+        });
+        Ok(())
+    }
+
+    async fn get_discount_redemption_by_payment(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<DiscountRedemption>> {
+        let redemptions = self.discount_redemptions.lock().await;
+        Ok(redemptions
+            .iter()
+            .find(|r| &r.subscription_payment_id == subscription_payment_id)
+            .cloned())
+    }
+
+    async fn settle_discount_redemption(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<DiscountRedemption>> {
+        let mut redemptions = self.discount_redemptions.lock().await;
+        let Some(row) = redemptions
+            .iter_mut()
+            .find(|r| &r.subscription_payment_id == subscription_payment_id && !r.settled)
+        else {
+            return Ok(None);
+        };
+        row.settled = true;
+        row.settled_at = Some(Utc::now());
+        let settled = row.clone();
+
+        let mut discounts = self.discounts.lock().await;
+        if let Some(d) = discounts.get_mut(&settled.discount_id) {
+            d.used_count += 1;
+        }
+        Ok(Some(settled))
+    }
+
+    async fn list_discount_redemptions_paginated(
+        &self,
+        discount_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<DiscountRedemption>, u64)> {
+        let redemptions = self.discount_redemptions.lock().await;
+        let mut all: Vec<DiscountRedemption> = redemptions
+            .iter()
+            .filter(|r| r.discount_id == discount_id)
+            .cloned()
+            .collect();
+        all.sort_by_key(|r| std::cmp::Reverse(r.id));
+        let total = all.len() as u64;
+        Ok((
+            all.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn sum_discount_redemptions(&self, discount_id: u64) -> DbResult<Vec<(String, u64)>> {
+        let redemptions = self.discount_redemptions.lock().await;
+        let mut totals: std::collections::BTreeMap<String, u64> = Default::default();
+        for r in redemptions
+            .iter()
+            .filter(|r| r.discount_id == discount_id && r.settled)
+        {
+            *totals.entry(r.currency.clone()).or_default() += r.amount_off;
+        }
+        Ok(totals.into_iter().collect())
     }
 
     // ----- Marketplace (operator-run compute nodes) -----
@@ -9583,5 +9770,267 @@ mod marketplace_tests {
 
         // A tunnel cannot be allocated to a user who does not exist.
         assert!(db.insert_tunnel(&tunnel(999, "wg-ghost")).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod discount_tests {
+    use super::*;
+    use lnvps_db::LNVpsDbBase;
+
+    async fn user(db: &MockDb, n: u8) -> u64 {
+        db.upsert_user(&[n; 32]).await.unwrap()
+    }
+
+    fn discount(code: &str) -> Discount {
+        Discount {
+            company_id: 1,
+            code: Some(code.to_string()),
+            name: "Test discount".to_string(),
+            rule: "{'percent': 10}".to_string(),
+            active: true,
+            ..Default::default()
+        }
+    }
+
+    /// Apply a discount to a payment and settle it, as a real order does.
+    async fn redeem(db: &MockDb, discount_id: u64, user_id: u64, payment: u8) {
+        db.insert_discount_redemption(&redemption(discount_id, user_id, payment))
+            .await
+            .unwrap();
+        db.settle_discount_redemption(&vec![payment; 32])
+            .await
+            .unwrap()
+            .expect("settles");
+    }
+
+    fn redemption(discount_id: u64, user_id: u64, payment: u8) -> DiscountRedemption {
+        DiscountRedemption {
+            discount_id,
+            user_id,
+            subscription_payment_id: vec![payment; 32],
+            amount_off: 1_000,
+            currency: "EUR".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn crud_round_trip() {
+        let db = MockDb::default();
+        let id = db.insert_discount(&discount("SAVE10")).await.unwrap();
+
+        let loaded = db.get_discount(id).await.unwrap();
+        assert_eq!(loaded.code.as_deref(), Some("SAVE10"));
+        assert_eq!(db.get_discount_by_code("SAVE10").await.unwrap().id, id);
+        assert!(db.get_discount_by_code("NOPE").await.is_err());
+        assert!(db.get_discount(999).await.is_err());
+
+        let (listed, total) = db.list_discounts_paginated(1, 50, 0).await.unwrap();
+        assert_eq!((listed.len(), total), (1, 1));
+        assert!(
+            db.list_discounts_paginated(2, 50, 0)
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+        );
+
+        db.update_discount(&Discount {
+            name: "Renamed".to_string(),
+            active: false,
+            ..loaded
+        })
+        .await
+        .unwrap();
+        let updated = db.get_discount(id).await.unwrap();
+        assert_eq!(updated.name, "Renamed");
+        assert!(!updated.active);
+
+        db.delete_discount(id).await.unwrap();
+        assert!(db.get_discount(id).await.is_err());
+    }
+
+    /// A code must identify exactly one discount, or the code a customer types
+    /// is ambiguous at the moment it is used.
+    #[tokio::test]
+    async fn duplicate_codes_are_rejected() {
+        let db = MockDb::default();
+        db.insert_discount(&discount("SAVE10")).await.unwrap();
+        assert!(db.insert_discount(&discount("SAVE10")).await.is_err());
+
+        // ...but any number of code-less (phase 2 automatic) discounts coexist.
+        let auto = Discount {
+            code: None,
+            ..discount("unused")
+        };
+        db.insert_discount(&auto).await.unwrap();
+        db.insert_discount(&auto).await.unwrap();
+    }
+
+    /// An edit must not resurrect an exhausted campaign by writing back a stale
+    /// `used_count`.
+    #[tokio::test]
+    async fn update_cannot_reset_used_count() {
+        let db = MockDb::default();
+        let u = user(&db, 1).await;
+        let id = db
+            .insert_discount(&Discount {
+                usage_limit: Some(5),
+                ..discount("SAVE10")
+            })
+            .await
+            .unwrap();
+        redeem(&db, id, u, 1).await;
+
+        let mut edit = db.get_discount(id).await.unwrap();
+        edit.used_count = 0;
+        db.update_discount(&edit).await.unwrap();
+        assert_eq!(db.get_discount(id).await.unwrap().used_count, 1);
+    }
+
+    #[tokio::test]
+    async fn a_redemption_counts_only_once_it_settles() {
+        let db = MockDb::default();
+        let u = user(&db, 1).await;
+        let id = db.insert_discount(&discount("SAVE10")).await.unwrap();
+
+        // An invoice was created: the row exists but counts for nothing yet, so
+        // an unpaid invoice cannot burn a campaign's stock.
+        db.insert_discount_redemption(&redemption(id, u, 1))
+            .await
+            .unwrap();
+        assert_eq!(db.get_discount(id).await.unwrap().used_count, 0);
+        assert_eq!(db.count_discount_redemptions(id, u).await.unwrap(), 0);
+        assert!(db.sum_discount_redemptions(id).await.unwrap().is_empty());
+
+        let pending = db
+            .get_discount_redemption_by_payment(&vec![1; 32])
+            .await
+            .unwrap()
+            .expect("row exists");
+        assert!(!pending.settled);
+        assert!(pending.settled_at.is_none());
+
+        // A payment carries one discount: a repeat insert is a no-op, which is
+        // the no-stacking rule.
+        db.insert_discount_redemption(&DiscountRedemption {
+            amount_off: 9_999,
+            ..redemption(id, u, 1)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_discount_redemption_by_payment(&vec![1; 32])
+                .await
+                .unwrap()
+                .unwrap()
+                .amount_off,
+            1_000
+        );
+
+        let settled = db
+            .settle_discount_redemption(&vec![1; 32])
+            .await
+            .unwrap()
+            .expect("settles");
+        assert!(settled.settled);
+        assert_eq!(db.get_discount(id).await.unwrap().used_count, 1);
+        assert_eq!(db.count_discount_redemptions(id, u).await.unwrap(), 1);
+
+        // Settlement paths are replayed; only the first call counts.
+        assert!(
+            db.settle_discount_redemption(&vec![1; 32])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(db.get_discount(id).await.unwrap().used_count, 1);
+
+        // A payment that carried no discount settles to nothing.
+        assert!(
+            db.settle_discount_redemption(&vec![42; 32])
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_discount_redemption_by_payment(&vec![42; 32])
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The limit is enforced when a discount is *quoted*; by settlement the
+    /// customer has already paid a discounted invoice, which must be honoured.
+    /// The count therefore records what really happened, and every later quote
+    /// is refused because the count is at (or past) the limit.
+    #[tokio::test]
+    async fn settlement_records_past_the_limit_rather_than_refusing() {
+        let db = MockDb::default();
+        let u = user(&db, 1).await;
+        let id = db
+            .insert_discount(&Discount {
+                usage_limit: Some(1),
+                ..discount("SAVE10")
+            })
+            .await
+            .unwrap();
+
+        for p in 1..=2u8 {
+            redeem(&db, id, u, p).await;
+        }
+        let after = db.get_discount(id).await.unwrap();
+        assert_eq!(after.used_count, 2);
+        assert!(!after.has_remaining_uses(), "no further quote can succeed");
+    }
+
+    #[tokio::test]
+    async fn per_user_counts_and_listing() {
+        let db = MockDb::default();
+        let u1 = user(&db, 1).await;
+        let u2 = user(&db, 2).await;
+        let id = db.insert_discount(&discount("SAVE10")).await.unwrap();
+
+        redeem(&db, id, u1, 1).await;
+        redeem(&db, id, u1, 2).await;
+        redeem(&db, id, u2, 3).await;
+
+        assert_eq!(db.count_discount_redemptions(id, u1).await.unwrap(), 2);
+        assert_eq!(db.count_discount_redemptions(id, u2).await.unwrap(), 1);
+        assert_eq!(db.count_discount_redemptions(id, 999).await.unwrap(), 0);
+
+        let (listed, total) = db
+            .list_discount_redemptions_paginated(id, 50, 0)
+            .await
+            .unwrap();
+        assert_eq!((listed.len(), total), (3, 3));
+        // Newest first.
+        assert_eq!(listed[0].subscription_payment_id, vec![3u8; 32]);
+        // Pagination is a window on that order, not a re-sort.
+        let (page, total) = db
+            .list_discount_redemptions_paginated(id, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!((page.len(), total), (1, 3));
+        assert_eq!(page[0].subscription_payment_id, vec![2u8; 32]);
+        assert!(
+            db.list_discount_redemptions_paginated(999, 50, 0)
+                .await
+                .unwrap()
+                .0
+                .is_empty()
+        );
+
+        // Campaign cost, per currency, settled rows only.
+        assert_eq!(
+            db.sum_discount_redemptions(id).await.unwrap(),
+            vec![("EUR".to_string(), 3_000)]
+        );
+        assert!(db.sum_discount_redemptions(999).await.unwrap().is_empty());
+
+        // Deleting would orphan the campaign's cost record.
+        assert!(db.delete_discount(id).await.is_err());
     }
 }

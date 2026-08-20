@@ -1468,10 +1468,19 @@ async fn v1_renew_vm(
     let (method, mode) = crate::api::resolve_payment_mode(&this, uid, &q).await?;
     let payment = this
         .sub_handler
-        .renew_subscription_with_mode(vm_line.subscription_id, method, intervals, mode)
+        .renew_subscription_with_discount(
+            vm_line.subscription_id,
+            method,
+            intervals,
+            mode,
+            q.code.clone(),
+        )
         .await?;
 
-    ApiData::ok(ApiVmPayment::from_subscription_payment(payment, id)?)
+    let discount = crate::api::discount_line(&this.db, &payment.id).await;
+    let mut out = ApiVmPayment::from_subscription_payment(payment, id)?;
+    out.discount = discount;
+    ApiData::ok(out)
 }
 
 /// LNURL-pay callback response (LUD-06).

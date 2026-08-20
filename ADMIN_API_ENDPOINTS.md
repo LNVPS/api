@@ -3597,6 +3597,256 @@ All messages are structured with a `type` field for consistent handling:
   }
   ```
 
+### Discount Management
+
+All endpoints require the `discount` resource permissions. A discount's eligibility **and** its
+effect are one CEL expression (`rule`) returning a decision map; the result is clamped in Rust
+(percent `0..=100`, amount `>= 0` and never more than the order total), so a badly written rule
+cannot over-discount an order.
+
+Rule examples (note the **quoted map keys** — a bare `{percent: 10}` is a CEL variable reference and
+fails to evaluate):
+
+```
+{'percent': 10}
+order.amount >= 5000 ? {'percent': 10} : {}
+order.intervals >= 12 ? {'percent': 15} : order.intervals >= 6 ? {'percent': 10} : {}
+order.amount >= 10000 ? {'amount': 500, 'currency': 'EUR'} : {}
+user.country == 'IRL' && history.orders == 0 ? {'percent': 20} : {}
+```
+
+Context available to a rule (read-only, money in minor units):
+
+| Variable | Fields |
+|---|---|
+| `order` | `amount`, `currency`, `intervals`, `interval_type` (`day`/`month`/`year`), `is_new`, `items` |
+| `user` | `id`, `country` (ISO alpha-3, may be null) |
+| `history` | `orders` (settled payment count) |
+| `now` | unix timestamp (seconds) |
+
+`order.items` is the order's lines, each with `line_item_id`, `name`, `amount` (the line's price for
+one interval), `setup_amount`, and a `type` tag plus that product's own fields — `vm` (`vm_id`, `template_id`, `region_id`, `cpu`, `memory`, `disk_size`,
+`disk_type`, `ip4_count`, `ip6_count`), `app` (`deployment_id`, `app_id`, `cluster_id`,
+`resource_multiplier`), `ip_range` (`subscription_id`, `cidr`), `asn_sponsoring`
+(`subscription_id`, `asn`, `registry`), `dns_hosting`, `marketplace_node_fee` (`node_id`). The
+`type` is always accurate; detail that does not exist yet (an IP range is allocated only when the
+first payment settles) is null. `template_id: null` on a `vm` line means a custom build. Line
+`amount`/`setup_amount` are converted into the payment currency and are the line's **list price**;
+for a VPS line the charge is recomputed at payment time from the cost plan and the machine's IP
+assignments, so use `order.amount` for a minimum-spend threshold. CEL's `exists`/`all`/`size()` are available:
+
+```
+order.items.exists(i, i.type == 'vm' && i.template_id == 3) ? {'percent': 10} : {}
+order.items.all(i, i.type == 'vm' && i.cpu >= 8) ? {'percent': 5} : {}
+```
+
+Decision fields: `percent` (int), `amount` (int, minor units), `currency` (string, required with
+`amount`). `{}`, `null` and `false` all mean "does not apply". Any other return type is an error and
+applies no discount.
+
+#### List Discounts
+
+```
+GET /api/admin/v1/discounts
+```
+
+Required Permission: `discount::view`
+
+Query Parameters:
+
+- `company_id`: number (required) - discounts are per-company
+- `limit`: number (optional, default 50, max 100)
+- `offset`: number (optional, default 0)
+
+Returns a paginated list of `AdminDiscountInfo`:
+
+```json
+{
+  "data": [
+    {
+      "id": 3,
+      "company_id": 1,
+      "code": "SAVE10",
+      "name": "Black Friday 2026",
+      "rule": "order.amount >= 5000 ? {'percent': 10} : {}",
+      "valid_from": "2026-11-27T00:00:00Z",
+      "valid_to": "2026-12-01T00:00:00Z",
+      "usage_limit": 500,
+      "used_count": 42,
+      "per_user_limit": 1,
+      "active": true,
+      "created": "2026-11-01T09:00:00Z",
+      "given_away": [{ "currency": "EUR", "amount": 42000 }]
+    }
+  ],
+  "total": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+`given_away` is what the campaign has cost so far, per currency, in minor units. It is a list
+because redemptions are recorded in the currency the customer paid in.
+
+#### Get Discount
+
+```
+GET /api/admin/v1/discounts/{id}
+```
+
+Required Permission: `discount::view`
+
+Returns a single `AdminDiscountInfo`.
+
+#### Create Discount
+
+```
+POST /api/admin/v1/discounts
+```
+
+Required Permission: `discount::create`
+
+```json
+{
+  "company_id": 1,
+  "code": "SAVE10",
+  "name": "Black Friday 2026",
+  "rule": "{'percent': 10}",
+  "valid_from": "2026-11-27T00:00:00Z",
+  "valid_to": "2026-12-01T00:00:00Z",
+  "usage_limit": 500,
+  "per_user_limit": 1,
+  "active": true
+}
+```
+
+- `code` is required and must be unique across all companies (a customer types a code without
+  choosing a company). It is stored and matched exactly, with surrounding whitespace trimmed.
+- `rule` is validated by compiling it; an invalid expression is rejected with the parse error.
+- `valid_from` defaults to now; `valid_to` is optional and must be after `valid_from`.
+- `usage_limit` / `per_user_limit` are `null` for unlimited. `active` defaults to `true`.
+
+#### Update Discount
+
+```
+PATCH /api/admin/v1/discounts/{id}
+```
+
+Required Permission: `discount::update`
+
+All fields optional: `code`, `name`, `rule`, `valid_from`, `valid_to`, `usage_limit`,
+`per_user_limit`, `active`. `used_count` cannot be edited — it is owned by redemption, and an edit
+able to rewrite it would reopen an exhausted campaign by accident. To stop a campaign, set
+`active: false`.
+
+#### Delete Discount
+
+```
+DELETE /api/admin/v1/discounts/{id}
+```
+
+Required Permission: `discount::delete`
+
+Fails once the discount has been redeemed, because its redemption rows are the record of what the
+campaign cost. Deactivate instead.
+
+#### List Discount Redemptions
+
+```
+GET /api/admin/v1/discounts/{id}/redemptions
+```
+
+Required Permission: `discount::view`
+
+Query Parameters: `limit` (default 50, max 100), `offset` (default 0)
+
+Returns a paginated list, newest first:
+
+```json
+{
+  "data": [
+    {
+      "id": 91,
+      "discount_id": 3,
+      "user_id": 34,
+      "subscription_payment_id": "<hex payment hash>",
+      "amount_off": 1000,
+      "currency": "EUR",
+      "redeemed_at": "2026-11-28T12:00:00Z"
+    }
+  ],
+  "total": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+#### Preview Discount Rule
+
+```
+POST /api/admin/v1/discounts/preview
+```
+
+Required Permission: `discount::create`
+
+Evaluates a rule against a sample order without saving anything, so raw CEL can be checked before
+customers meet it.
+
+```json
+{
+  "rule": "order.amount >= 5000 ? {'percent': 10} : {}",
+  "order": {
+    "amount": 10000,
+    "currency": "EUR",
+    "intervals": 1,
+    "interval_type": "month",
+    "is_new": true,
+    "country": "IRL",
+    "orders": 0,
+    "items": [
+      {
+        "line_item_id": 1,
+        "name": "VPS",
+        "amount": 10000,
+        "setup_amount": 0,
+        "type": "vm",
+        "vm_id": 1,
+        "template_id": 1,
+        "region_id": 1,
+        "cpu": 2,
+        "memory": 4294967296,
+        "disk_size": 85899345920,
+        "disk_type": "ssd",
+        "ip4_count": 1,
+        "ip6_count": 1
+      }
+    ]
+  }
+}
+```
+
+`order` and each of its fields are optional; omitted fields fall back to a representative sample
+(a new 100.00 EUR monthly order for an Irish customer with no order history, containing one
+standard 2-core VM line). Supply `items` to try a rule against a custom build, a multi-line order,
+or a non-VM product.
+
+```json
+{
+  "data": {
+    "applies": true,
+    "percent": 10,
+    "amount": null,
+    "currency": null,
+    "amount_off": 1000,
+    "error": null
+  }
+}
+```
+
+`amount_off` is what the sample order would actually be reduced by, after clamping. `error` carries
+the reason when a rule fails to evaluate, returns a non-decision type, or names a currency other
+than the sample order's — the preview quotes no exchange rates, because it has no payment method.
+
 ### Referral Program Management
 
 All endpoints require the `referral` resource permissions. Responses never expose
@@ -4901,6 +5151,7 @@ The RBAC system uses the following permission format: `resource::action`
 - `marketplace_node` - Marketplace node lifecycle (approve, suspend, drain, trust tier)
 - `marketplace_operator` - Marketplace operator revenue share and payout configuration
 - `support_agent` - Support-agent transcripts and the agent's memory of a customer
+- `discount` - Discount campaigns: codes, their rules and redemption reporting
 
 ### Actions:
 

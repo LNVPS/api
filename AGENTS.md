@@ -30,6 +30,7 @@ These docs apply to all projects using this agent structure:
 | [docs/agents/api-guidelines.md](docs/agents/api-guidelines.md) | Modifying any user-facing or admin API endpoint |
 | [docs/agents/migrations.md](docs/agents/migrations.md) | Adding or modifying database migrations |
 | [docs/agents/currency.md](docs/agents/currency.md) | Working with money amounts, pricing, or payments |
+| [docs/agents/discounts.md](docs/agents/discounts.md) | Discount codes, discount rules (CEL), or the pricing engine's discount step |
 | [docs/agents/bug-fixes.md](docs/agents/bug-fixes.md) | Resolving bugs — LNVPS-specific additions |
 | [docs/agents/coverage.md](docs/agents/coverage.md) | Function coverage — LNVPS-specific additions |
 | [docs/agents/e2e-tests.md](docs/agents/e2e-tests.md) | Writing or running E2E integration tests (`lnvps_e2e` crate) |

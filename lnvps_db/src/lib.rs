@@ -1125,6 +1125,96 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Count VMs that used this referral code but have never made a paid subscription payment.
     async fn count_failed_referrals(&self, code: &str) -> DbResult<u64>;
 
+    // ========================================================================
+    // Discounts
+    // ========================================================================
+
+    /// Get a discount by id
+    async fn get_discount(&self, id: u64) -> DbResult<Discount>;
+
+    /// Get a discount by the code a customer entered.
+    ///
+    /// Returns every matching row regardless of `active`/window/limits: the
+    /// pricing engine decides eligibility, so it can tell "expired" apart from
+    /// "no such code" when reporting to admins.
+    async fn get_discount_by_code(&self, code: &str) -> DbResult<Discount>;
+
+    /// List discounts for a company, newest first, with the total row count.
+    async fn list_discounts_paginated(
+        &self,
+        company_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<Discount>, u64)>;
+
+    /// Insert a new discount, returning its id
+    async fn insert_discount(&self, discount: &Discount) -> DbResult<u64>;
+
+    /// Update an existing discount.
+    ///
+    /// `used_count` is deliberately not writable here — it is owned by
+    /// [`Self::settle_discount_redemption`], and letting an edit overwrite it would
+    /// reopen an exhausted campaign by accident.
+    async fn update_discount(&self, discount: &Discount) -> DbResult<()>;
+
+    /// Delete a discount. Fails while redemptions reference it (the FK has no
+    /// cascade); deactivate instead of deleting to keep campaign reporting.
+    async fn delete_discount(&self, id: u64) -> DbResult<()>;
+
+    /// Count how many **settled** redemptions `user_id` has of `discount_id`.
+    ///
+    /// Unsettled rows are invoices that may never be paid, and must not count
+    /// against a per-user limit.
+    async fn count_discount_redemptions(&self, discount_id: u64, user_id: u64) -> DbResult<u64>;
+
+    /// Record that a discount was applied to a payment that has just been
+    /// invoiced. The row is unsettled, so it consumes no limit yet.
+    ///
+    /// Idempotent: a second call for the same payment changes nothing, because
+    /// a payment can carry only one discount.
+    async fn insert_discount_redemption(&self, redemption: &DiscountRedemption) -> DbResult<()>;
+
+    /// The discount applied to a payment, if any.
+    async fn get_discount_redemption_by_payment(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<DiscountRedemption>>;
+
+    /// Settle the discount on a paid payment: mark the row settled and
+    /// increment the discount's `used_count`, in one transaction.
+    ///
+    /// Idempotent — settlement paths are replayed (webhook redelivery, an
+    /// invoice listener resuming from its cursor), and only the first call for
+    /// a payment counts. Returns the settled row, or `None` when the payment
+    /// carried no discount or was already settled.
+    ///
+    /// `used_count` is incremented unconditionally rather than being gated on
+    /// `usage_limit`: the limit is enforced when the discount is *quoted*, and
+    /// by this point the customer has already paid a discounted invoice, which
+    /// must be honoured. Letting the count exceed the limit records what really
+    /// happened and still refuses every subsequent quote.
+    async fn settle_discount_redemption(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<DiscountRedemption>>;
+
+    /// List redemptions of a discount, newest first, with the total row count
+    /// (campaign reporting).
+    async fn list_discount_redemptions_paginated(
+        &self,
+        discount_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<DiscountRedemption>, u64)>;
+
+    /// Total amount given away by a discount, per currency (campaign cost).
+    /// Settled redemptions only.
+    ///
+    /// Returned per currency rather than as one number because redemptions are
+    /// recorded in the currency the customer paid in, and summing sats with
+    /// cents would be meaningless.
+    async fn sum_discount_redemptions(&self, discount_id: u64) -> DbResult<Vec<(String, u64)>>;
+
     // ----- Marketplace (operator-run compute nodes) -----
 
     /// Get a marketplace operator enrolment by id

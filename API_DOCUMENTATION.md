@@ -502,6 +502,12 @@ interface VmPayment {
   time: number; // Seconds this payment adds to VM expiry
   is_upgrade: boolean;
   upgrade_params?: string; // JSON-encoded upgrade parameters (only present for upgrade payments)
+  discount?: Discount; // Present when a discount code was applied. `amount` and `tax` are already net of it
+}
+
+interface Discount {
+  code?: string; // The code that was applied
+  amount_off: number; // Amount taken off, in the payment currency's smallest unit (cents for fiat, millisats for BTC)
 }
 
 type PaymentData = 
@@ -571,6 +577,7 @@ interface SubscriptionPayment {
   paid_at?: string; // ISO 8601 datetime when payment was completed (only present when is_paid is true)
   tax: Price; // Tax amount
   processing_fee: Price; // Processing fee in the payment currency
+  discount?: Discount; // Present when a discount code was applied. `amount` and `tax` are already net of it
 }
 ```
 
@@ -1132,6 +1139,7 @@ interface ExchangeRates {
 - **Query Params**: 
   - `method`: Optional payment method ('lightning' | 'onchain' | 'revolut' | 'paypal' | 'nwc')
   - `intervals`: Optional number of billing intervals to renew (default: 1). For example, if the VM has a monthly billing cycle, `intervals=3` would generate a payment for 3 months.
+  - `code`: Optional discount code. A code that cannot be used (unknown, expired, exhausted, or not applicable to this order) **fails the request** rather than quietly invoicing full price, so the customer is told it did not work. The returned `amount` and `tax` are already net of any discount, and `discount` describes what was taken off.
 - **Response**: `VmPayment`
 - **Description**: Generates a payment invoice to extend the VM's expiration. The payment amount is calculated based on the VM's cost plan and the number of intervals requested. If `method=nwc` is specified and the user has a valid NWC connection string configured, the payment will be automatically processed via Nostr Wallet Connect. A renewal is **rejected** if it would push the VM's expiry beyond `now + max_prepay_days` (see `VmStatus.max_prepay_days`) or beyond the host's sunset date (see `VmStatus.host_sunset_date`); cap the `intervals` selector to what fits.
 
@@ -1248,6 +1256,8 @@ const result: ApiResponse<Subscription> = await response.json();
 - **Auth**: Required
 - **Query Params**:
   - `method`: Optional payment method (`'lightning'` | `'revolut'` | `'paypal'` | `'stripe'`). Defaults to `'lightning'`
+  - `intervals`: Optional number of billing intervals to renew (default: 1)
+  - `code`: Optional discount code. A code that cannot be used (unknown, expired, exhausted, or not applicable to this order) **fails the request** rather than quietly invoicing full price. The returned `amount` and `tax` are already net of any discount, and `discount` describes what was taken off. A discount applies to the payment it is used on only — renewals bill at list price.
 - **Response**: `SubscriptionPayment`
 - **Description**: Generates a payment invoice to renew/extend the subscription. For the first payment, the amount includes setup fees plus the monthly recurring cost. For subsequent renewals, only the monthly recurring cost is charged. After payment is confirmed, resources (IP ranges, etc.) are allocated and the subscription is activated.
 

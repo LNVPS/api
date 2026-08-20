@@ -1,5 +1,6 @@
 mod capacity;
 mod client_ip;
+pub mod discount;
 mod dns;
 mod exchange;
 mod expiry;
@@ -36,6 +37,7 @@ mod work;
 
 pub use capacity::*;
 pub use client_ip::*;
+pub use discount::*;
 pub use dns::*;
 pub use exchange::*;
 pub use expiry::*;

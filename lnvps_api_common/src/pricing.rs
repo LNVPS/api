@@ -297,6 +297,12 @@ impl PricingEngine {
         self.rates.clone()
     }
 
+    /// The database handle backing this engine, for pricing code that lives in
+    /// a sibling module (e.g. discount resolution).
+    pub fn db(&self) -> Arc<dyn LNVpsDb> {
+        self.db.clone()
+    }
+
     /// The shared VAT client backing this engine (for rate refreshes).
     pub fn vat_client(&self) -> VatClient {
         self.vat.clone()
@@ -696,6 +702,32 @@ impl PricingEngine {
         method: PaymentMethod,
         intervals: u32,
     ) -> Result<CostResult> {
+        self.vm_cost_for_intervals(vm_id, method, intervals, true)
+            .await
+    }
+
+    /// Price a renewal **without** reusing an existing pending payment.
+    ///
+    /// Used when the order carries a discount code: an unpaid invoice created
+    /// before the code was entered would otherwise be handed straight back, so
+    /// a customer who typed a valid code would silently be charged list price.
+    pub async fn get_vm_cost_for_intervals_fresh(
+        &self,
+        vm_id: u64,
+        method: PaymentMethod,
+        intervals: u32,
+    ) -> Result<CostResult> {
+        self.vm_cost_for_intervals(vm_id, method, intervals, false)
+            .await
+    }
+
+    async fn vm_cost_for_intervals(
+        &self,
+        vm_id: u64,
+        method: PaymentMethod,
+        intervals: u32,
+        reuse_pending: bool,
+    ) -> Result<CostResult> {
         // Bound the request before any arithmetic. `intervals` is caller
         // supplied; unbounded values used to overflow the expiry calculation
         // and panic (F-02). The API layer rejects out-of-range values with a
@@ -718,13 +750,15 @@ impl PricingEngine {
         // Match on payment_method + payment_type AND the time value it covers, so
         // that a pending 1-month invoice is NOT returned for a 12-month request
         // (which would let the user pay the smaller invoice and get 1 month).
-        let pending = self.db.list_pending_vm_subscription_payments(vm.id).await?;
-        if let Some(px) = pending.into_iter().find(|p| {
-            p.payment_method == method
-                && p.payment_type == SubscriptionPaymentType::Renewal
-                && p.time_value == Some(requested_time)
-        }) {
-            return Ok(CostResult::Existing(px));
+        if reuse_pending {
+            let pending = self.db.list_pending_vm_subscription_payments(vm.id).await?;
+            if let Some(px) = pending.into_iter().find(|p| {
+                p.payment_method == method
+                    && p.payment_type == SubscriptionPaymentType::Renewal
+                    && p.time_value == Some(requested_time)
+            }) {
+                return Ok(CostResult::Existing(px));
+            }
         }
 
         // Scale the cost by number of intervals

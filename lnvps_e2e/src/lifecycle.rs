@@ -778,6 +778,199 @@ mod tests {
         }
 
         // ----------------------------------------------------------------
+        // 14d. Discount code: a code reduces the invoice, VAT follows it, and
+        //      the redemption is only counted once the payment settles.
+        // ----------------------------------------------------------------
+        let discount = json_ok(
+            admin
+                .post_auth(
+                    "/api/admin/v1/discounts",
+                    &serde_json::json!({
+                        "company_id": company_id,
+                        "code": format!("E2E{ts}"),
+                        "name": "e2e discount",
+                        // A tiered rule, so the test exercises real CEL rather
+                        // than a constant: this order is one interval.
+                        "rule": "order.intervals >= 12 ? {'percent': 50} : {'percent': 10}",
+                        "usage_limit": 5,
+                        "per_user_limit": 1
+                    }),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        let discount_id = discount["data"]["id"].as_u64().unwrap();
+        let code = format!("E2E{ts}");
+        assert_eq!(discount["data"]["used_count"].as_u64().unwrap(), 0);
+
+        // The preview endpoint reports the clamped decision without saving.
+        let preview = json_ok(
+            admin
+                .post_auth(
+                    "/api/admin/v1/discounts/preview",
+                    &serde_json::json!({
+                        "rule": "{'percent': 900}",
+                        "order": {"amount": 10000, "currency": "EUR"}
+                    }),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(preview["data"]["percent"].as_u64().unwrap(), 100, "clamped");
+        assert_eq!(preview["data"]["amount_off"].as_u64().unwrap(), 10_000);
+
+        // Quote the renewal with the code. Deliberately no un-discounted quote
+        // first: that would leave a pending full-price invoice which a later
+        // renewal in this test would reuse (pending payments are matched on
+        // method/type/time_value, not on price), billing the pre-upgrade rate
+        // after the upgrade.
+        let discounted_resp = user
+            .get_auth(&format!("/api/v1/subscriptions/{sub_id}/renew?code={code}"))
+            .await
+            .unwrap();
+        assert_eq!(discounted_resp.status(), StatusCode::OK);
+        let discounted =
+            serde_json::from_str::<Value>(&discounted_resp.text().await.unwrap()).unwrap();
+        let discounted_payment_id = discounted["data"]["id"].as_str().unwrap().to_string();
+        let discounted_amount = discounted["data"]["amount"]["amount"].as_u64().unwrap();
+        let amount_off = discounted["data"]["discount"]["amount_off"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            discounted["data"]["discount"]["code"].as_str().unwrap(),
+            code
+        );
+        // The rule is 10% off a one-interval order, so the invoice is the list
+        // price less a tenth of it. (VAT following the discount is asserted
+        // precisely by the unit tests, which can control the tax rate.)
+        let list_price = discounted_amount + amount_off;
+        assert_eq!(
+            amount_off,
+            list_price / 10,
+            "10% off {list_price} should be {}",
+            list_price / 10
+        );
+        eprintln!(
+            "Discount {code} reduced renewal {list_price} → {discounted_amount} (off {amount_off}) ✓"
+        );
+
+        // An unusable code fails the request rather than quietly charging full
+        // price, and does not leak whether the code exists.
+        let bad = user
+            .get_auth(&format!(
+                "/api/v1/subscriptions/{sub_id}/renew?code=NOSUCHCODE"
+            ))
+            .await
+            .unwrap();
+        assert_ne!(
+            bad.status(),
+            StatusCode::OK,
+            "an unknown code must not silently invoice full price"
+        );
+
+        // Nothing is redeemed until the money arrives.
+        let before_pay = json_ok(
+            admin
+                .get_auth(&format!("/api/admin/v1/discounts/{discount_id}"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            before_pay["data"]["used_count"].as_u64().unwrap(),
+            0,
+            "an unpaid invoice must not consume the campaign"
+        );
+
+        let bolt11_discounted = crate::lightning::extract_bolt11(&discounted).unwrap();
+        pay_and_wait(
+            &admin,
+            &format!("/api/admin/v1/subscription_payments/{discounted_payment_id}"),
+            &bolt11_discounted,
+        )
+        .await;
+
+        let after_pay = json_ok(
+            admin
+                .get_auth(&format!("/api/admin/v1/discounts/{discount_id}"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            after_pay["data"]["used_count"].as_u64().unwrap(),
+            1,
+            "settlement redeems the discount exactly once"
+        );
+        let given_away = after_pay["data"]["given_away"].as_array().unwrap();
+        assert_eq!(given_away.len(), 1, "one currency was discounted");
+        assert_eq!(given_away[0]["amount"].as_u64().unwrap(), amount_off);
+
+        let redemptions = json_ok(
+            admin
+                .get_auth(&format!(
+                    "/api/admin/v1/discounts/{discount_id}/redemptions"
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let settled: Vec<&Value> = redemptions["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["settled"].as_bool().unwrap_or(false))
+            .collect();
+        assert_eq!(settled.len(), 1, "exactly one settled redemption");
+        assert_eq!(
+            settled[0]["subscription_payment_id"].as_str().unwrap(),
+            discounted_payment_id
+        );
+        assert_eq!(settled[0]["amount_off"].as_u64().unwrap(), amount_off);
+
+        // The per-user limit is now spent, so the same customer is refused.
+        let refused = user
+            .get_auth(&format!("/api/v1/subscriptions/{sub_id}/renew?code={code}"))
+            .await
+            .unwrap();
+        assert_ne!(
+            refused.status(),
+            StatusCode::OK,
+            "a one-per-customer code must be refused after it is redeemed"
+        );
+        eprintln!("Discount {code} redeemed once and then refused (per-user limit) ✓");
+
+        // Deactivating is the way to stop a campaign; deleting a redeemed one
+        // would orphan the record of what it cost.
+        let deleted = admin
+            .delete_auth(&format!("/api/admin/v1/discounts/{discount_id}"))
+            .await
+            .unwrap();
+        assert_ne!(
+            deleted.status(),
+            StatusCode::OK,
+            "a redeemed discount must not be deletable"
+        );
+        let deactivated = json_ok(
+            admin
+                .patch_auth(
+                    &format!("/api/admin/v1/discounts/{discount_id}"),
+                    &serde_json::json!({"active": false}),
+                )
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(!deactivated["data"]["active"].as_bool().unwrap());
+        assert_eq!(
+            deactivated["data"]["used_count"].as_u64().unwrap(),
+            1,
+            "an edit must not rewrite the redemption count"
+        );
+
+        // ----------------------------------------------------------------
         // 14c-2. Admin override completion must run the same on-payment
         //        handling as a Lightning settlement, by handing the line
         //        item handlers to the worker.
@@ -1864,6 +2057,10 @@ mod tests {
             .await
             .unwrap();
         eprintln!("Hard-deleted region {region_id}");
+        crate::db::hard_delete_company_discounts(&pool, company_id)
+            .await
+            .unwrap();
+        eprintln!("Hard-deleted discounts for company {company_id}");
         crate::db::hard_delete_company(&pool, company_id)
             .await
             .unwrap();
