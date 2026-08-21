@@ -16,10 +16,10 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::agent::{PublicToolExecutor, SupportAgent, ToolExecutor};
-use crate::api_client::ApiClient;
+use crate::agent::{DbToolExecutor, SupportAgent, ToolExecutor};
 use crate::identity::{Requester, SenderIdentity, SupportChannelKind, conversation_key};
 use crate::tools;
+use lnvps_db::LNVpsDb;
 
 /// Number of events buffered between the agent task and the client.
 ///
@@ -104,15 +104,14 @@ pub struct ChatSession {
 impl ChatSession {
     /// Build a session for a resolved sender with an explicit tool executor.
     ///
-    /// The executor is supplied by the caller so a session can be backed either
-    /// by the HTTP admin API or, when hosted inside `lnvps_api`, by direct
-    /// database access.
+    /// The executor is supplied by the caller so the session cannot widen its
+    /// own scope: the API builds one bound to the authenticated customer, or an
+    /// account-less one for a guest, and hands it in already narrowed.
     ///
     /// The tool set is chosen from the requester: a known customer gets the
-    /// live-chat tools (read-only plus reversible power actions), and an
-    /// unrecognised sender gets the public catalogue only. Note this is
-    /// deliberately narrower than the email/Nostr tool set — see
-    /// [`crate::tools::live_chat_tools`].
+    /// live-chat tools (everything read-only, plus the reversible workload
+    /// controls), and an unrecognised sender gets the public catalogue only —
+    /// see [`crate::tools::live_chat_tools`].
     pub fn new(
         agent: SupportAgent,
         identity: &SenderIdentity,
@@ -146,21 +145,24 @@ impl ChatSession {
         self
     }
 
-    /// Build a session backed by the HTTP API client, for an unresolved sender.
+    /// Resolve a sender and build a session around the result.
     ///
-    /// Convenience for callers that don't have a database handle; resolves the
-    /// sender first, then delegates to [`ChatSession::new`].
+    /// Convenience for callers that have not resolved the sender themselves.
+    /// The executor is chosen from the outcome: one scoped to the customer, or
+    /// an account-less one for a visitor who matched no account — which is
+    /// what makes a guest session unable to reach account data even if the
+    /// model names a tool it was never offered.
     pub async fn resolve(
         agent: SupportAgent,
-        api: Arc<ApiClient>,
+        db: Arc<dyn LNVpsDb>,
         identity: SenderIdentity,
     ) -> anyhow::Result<Self> {
-        let requester = api.resolve(&identity).await?;
+        let requester = crate::resolve::resolve(&db, &identity).await?;
         let executor: Arc<dyn ToolExecutor> = match &requester {
             Requester::Customer { user_id, .. } => {
-                Arc::new(crate::agent::LnvpsToolExecutor::new(api.clone(), *user_id))
+                Arc::new(DbToolExecutor::new(db.clone(), *user_id))
             }
-            Requester::Anonymous => Arc::new(PublicToolExecutor::new(api.clone())),
+            Requester::Anonymous => Arc::new(DbToolExecutor::public(db.clone())),
         };
         Ok(Self::new(agent, &identity, requester, executor))
     }
@@ -243,11 +245,12 @@ fn live_chat_prompt() -> &'static str {
 - Do NOT open with a greeting on every message, and do NOT sign off — this is
   an ongoing conversation, not a letter.
 - Ask one clarifying question at a time rather than a long list.
-- You can start, stop and restart the customer's VMs. Confirm with them before
-  stopping or restarting, since running services will be interrupted.
-- You cannot extend, refund or delete a VM from this chat. If the customer asks
-  for one of those, explain that you'll need to hand it to a human and ask them
-  to email support so it can be handled with the proper checks."#
+- You can start, stop and restart the customer's VMs and app deployments.
+  Confirm with them before stopping or restarting, since running services will
+  be interrupted.
+- Anything that moves money, grants paid time or destroys data is a human's
+  job. Say you'll hand it over and ask them to email support@lnvps.net; never
+  say it is done."#
 }
 
 /// Channel-specific prompt for a live chat with a visitor who is not logged in.
@@ -263,8 +266,8 @@ logged in:
 - Use plain text. Short markdown (**bold**, `code`, bullet lists) is fine.
 - Do NOT open with a greeting on every message, and do NOT sign off.
 - You have NO access to any account: you cannot see who they are, their VMs,
-  their payments or their invoices, and you cannot start, stop, restart,
-  extend, refund or delete anything.
+  their payments or their invoices, and you cannot start, stop or restart
+  anything.
 - You CAN answer questions about the service itself: regions, plans and specs,
   operating system images, pricing, payment methods, and the terms of service.
   Use your tools for those rather than guessing.
@@ -386,7 +389,8 @@ mod tests {
     #[test]
     fn live_chat_prompt_directs_escalation() {
         let prompt = live_chat_prompt();
-        assert!(prompt.contains("cannot extend, refund or delete"));
+        assert!(prompt.contains("support@lnvps.net"));
+        assert!(prompt.contains("never\n  say it is done"));
         assert!(prompt.contains("email support"));
     }
 

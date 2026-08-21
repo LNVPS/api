@@ -330,7 +330,9 @@ pub(crate) async fn v1_support_chat(
         // tools (chosen by `ChatSession` from `Requester::Anonymous`), and an
         // executor that cannot reach a user record even if the model invents a
         // call to a tool it was not offered.
-        let executor: Arc<dyn ToolExecutor> = Arc::new(DbToolExecutor::public(this.db.clone()));
+        let executor: Arc<dyn ToolExecutor> = Arc::new(
+            DbToolExecutor::public(this.db.clone()).with_exchange_rates(this.rates.clone()),
+        );
         (
             SenderIdentity::Guest(session_id.clone()),
             Requester::Anonymous,
@@ -376,7 +378,8 @@ pub(crate) async fn v1_support_chat(
 
         let executor: Arc<dyn ToolExecutor> = Arc::new(
             DbToolExecutor::new(this.db.clone(), uid)
-                .with_power_actions(this.settings.provisioner.clone(), this.work_sender.clone()),
+                .with_power_actions(this.settings.provisioner.clone(), this.work_sender.clone())
+                .with_exchange_rates(this.rates.clone()),
         );
         (
             SenderIdentity::Pubkey(hex::encode(pubkey)),

@@ -14,14 +14,15 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use lnvps_agent::agent::{SupportAgent, ToolExecutor};
-use lnvps_agent::api_client::ApiClient;
 use lnvps_agent::conversation::{ConversationStore, MemoryStore};
 use lnvps_agent::identity::{Requester, SenderIdentity};
 use lnvps_agent::session::{ChatEvent, ChatSession};
 use lnvps_agent::settings::{OpenAiConfig, Settings};
+use lnvps_api_common::MockDb;
+use lnvps_db::LNVpsDb;
 
-/// A throwaway nsec so `ApiClient` can be constructed; no request is made to
-/// the LNVPS API in these tests (the sender is pre-resolved).
+/// A throwaway nsec; no Nostr channel runs in these tests, and the sender is
+/// pre-resolved.
 const TEST_NSEC: &str = "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5";
 
 /// Render one SSE `data:` frame containing a chat completion chunk delta.
@@ -68,8 +69,8 @@ fn sse_stream_without_done(chunks: Vec<String>) -> String {
 fn settings(base_url: String) -> Settings {
     Settings {
         listen: None,
-        admin_api_url: "http://127.0.0.1:1".to_string(),
-        user_api_url: "http://127.0.0.1:1".to_string(),
+        db: "mock".to_string(),
+        encryption: None,
         nsec: TEST_NSEC.to_string(),
         openai: OpenAiConfig {
             base_url,
@@ -104,8 +105,8 @@ impl ToolExecutor for RecordingExecutor {
 /// Build an agent whose OpenAI calls hit `server`, sharing `store`.
 fn agent_for(server: &MockServer, store: Arc<dyn ConversationStore>) -> SupportAgent {
     let settings = settings(format!("{}/v1", server.uri()));
-    let api = Arc::new(ApiClient::new(&settings).expect("api client"));
-    SupportAgent::new(api, settings, store)
+    let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+    SupportAgent::new(db, settings, store)
 }
 
 fn customer() -> Requester {

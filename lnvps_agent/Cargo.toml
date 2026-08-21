@@ -8,17 +8,15 @@ description = "AI support agent for LNVPS — processes support requests using a
 name = "lnvps_agent"
 path = "src/main.rs"
 
-[features]
-default = []
-# Database-backed conversation storage and tool execution, for when the agent is
-# hosted inside `lnvps_api` rather than run as a standalone binary. Lets the
-# in-process agent read customer data directly instead of calling the admin API
-# over loopback with an admin nsec.
-db = ["dep:lnvps_db", "dep:lnvps_api_common", "dep:hex"]
-
 [dependencies]
-lnvps_db = { path = "../lnvps_db", optional = true }
-lnvps_api_common = { path = "../lnvps_api_common", optional = true }
+# The agent reads the database directly — both when hosted inside `lnvps_api`
+# and when run as a standalone binary for the email/Nostr channels. There is no
+# HTTP path to the admin API, and so no admin credential anywhere in the agent.
+# `admin` is required for the two lookups that resolve a sender to an account
+# (by pubkey, and by the indexed email hash).
+lnvps_db = { path = "../lnvps_db", features = ["admin"] }
+lnvps_api_common = { path = "../lnvps_api_common", features = ["admin"] }
+payments-rs = { workspace = true, features = ["fiat"] }
 tokio = { workspace = true, features = ["signal", "time"] }
 anyhow.workspace = true
 log.workspace = true
@@ -36,7 +34,7 @@ chrono = { version = "0.4", features = ["serde"] }
 nostr = { version = "0.44", default-features = false, features = ["std"] }
 nostr-sdk = { rev = "c69c4ae2bf1a5f340aba70c20d09323f5309a4e2", git = "https://github.com/rust-nostr/nostr", default-features = false }
 base64 = "0.22"
-hex = { workspace = true, optional = true }
+hex = { workspace = true }
 
 # Email support channel (IMAP poll + SMTP reply)
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }

@@ -4,9 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use lnvps_agent::agent::SupportAgent;
-use lnvps_agent::api_client::ApiClient;
 use lnvps_agent::conversation::JsonFileStore;
-use lnvps_agent::settings::Settings;
+use lnvps_agent::settings::{ENCRYPTION_KEY_ENV, Settings};
+use lnvps_db::{EncryptionContext, LNVpsDb, LNVpsDbMysql};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -20,9 +20,27 @@ async fn main() -> Result<()> {
 
     let settings = Settings::load()?;
     info!("LNVPS support agent starting...");
-    info!("Admin API URL: {}", settings.admin_api_url);
     info!("OpenAI URL: {}", settings.openai.base_url);
     info!("Model: {}", settings.openai.model);
+
+    // Encrypted columns (a user's email, SSH key material, saved payment
+    // instruments) are unreadable without this, and the failure would surface
+    // as a confusing per-tool error rather than at startup.
+    if let Ok(hex_key) = std::env::var(ENCRYPTION_KEY_ENV) {
+        EncryptionContext::init_from_hex(&hex_key)?;
+        info!("Database encryption initialized from environment");
+    } else if let Some(ref encryption) = settings.encryption {
+        EncryptionContext::init_from_file(&encryption.key_file, encryption.auto_generate)?;
+        info!("Database encryption initialized from key file");
+    } else {
+        info!("No encryption key configured — encrypted columns will not be readable");
+    }
+
+    // Connect read-only: the agent is not the owner of this schema and must
+    // never migrate it. A version skew is the API's problem to fix, and a
+    // migration run from a support process would be a very bad surprise.
+    let db: Arc<dyn LNVpsDb> = Arc::new(LNVpsDbMysql::new(&settings.db).await?);
+    info!("Database connected");
 
     let history_path = settings
         .conversation_history_path
@@ -31,8 +49,7 @@ async fn main() -> Result<()> {
     info!("Conversation history: {}", history_path.display());
 
     let store = Arc::new(JsonFileStore::new(history_path).await?);
-    let api_client = Arc::new(ApiClient::new(&settings)?);
-    let agent = SupportAgent::new(api_client.clone(), settings.clone(), store);
+    let agent = SupportAgent::new(db, settings.clone(), store);
 
     let mut handles = Vec::new();
 
