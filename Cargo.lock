@@ -3538,6 +3538,7 @@ dependencies = [
  "log 0.4.32",
  "nostr 0.44.3",
  "nostr-sdk",
+ "payments-rs",
  "reqwest 0.13.4",
  "rustls",
  "serde",

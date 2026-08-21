@@ -5241,11 +5241,29 @@ impl lnvps_db::AdminDb for MockDb {
         Ok((paginated_users, total))
     }
 
+    /// Match on the hash of each seeded user's address, like the real query
+    /// does against the indexed `email_hash` column.
+    ///
+    /// A stub returning `None` would make every caller of this lookup
+    /// untestable against the mock — including the support agent, which
+    /// resolves an email sender to an account through it.
     async fn admin_find_user_by_email_hash(
         &self,
-        _hash: &[u8; 32],
+        hash: &[u8; 32],
     ) -> DbResult<Option<AdminUserInfo>> {
-        Ok(None)
+        let users = self.users.lock().await;
+        Ok(users
+            .values()
+            .find(|u| {
+                let email = u.email.as_str();
+                !email.is_empty() && &lnvps_db::email_hash(email) == hash
+            })
+            .map(|u| AdminUserInfo {
+                user_info: u.clone(),
+                vm_count: 0,
+                is_admin: false,
+                has_nwc: false,
+            }))
     }
 
     async fn admin_list_regions(&self, limit: u64, offset: u64) -> DbResult<(Vec<Region>, u64)> {

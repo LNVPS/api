@@ -16,10 +16,10 @@ use futures::Stream;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::agent::{PublicToolExecutor, SupportAgent, ToolExecutor};
-use crate::api_client::ApiClient;
+use crate::agent::{DbToolExecutor, SupportAgent, ToolExecutor};
 use crate::identity::{Requester, SenderIdentity, SupportChannelKind, conversation_key};
 use crate::tools;
+use lnvps_db::LNVpsDb;
 
 /// Number of events buffered between the agent task and the client.
 ///
@@ -104,15 +104,14 @@ pub struct ChatSession {
 impl ChatSession {
     /// Build a session for a resolved sender with an explicit tool executor.
     ///
-    /// The executor is supplied by the caller so a session can be backed either
-    /// by the HTTP admin API or, when hosted inside `lnvps_api`, by direct
-    /// database access.
+    /// The executor is supplied by the caller so the session cannot widen its
+    /// own scope: the API builds one bound to the authenticated customer, or an
+    /// account-less one for a guest, and hands it in already narrowed.
     ///
     /// The tool set is chosen from the requester: a known customer gets the
-    /// live-chat tools (read-only plus reversible power actions), and an
-    /// unrecognised sender gets the public catalogue only. Note this is
-    /// deliberately narrower than the email/Nostr tool set — see
-    /// [`crate::tools::live_chat_tools`].
+    /// live-chat tools (everything read-only, plus the reversible workload
+    /// controls), and an unrecognised sender gets the public catalogue only —
+    /// see [`crate::tools::live_chat_tools`].
     pub fn new(
         agent: SupportAgent,
         identity: &SenderIdentity,
@@ -146,21 +145,24 @@ impl ChatSession {
         self
     }
 
-    /// Build a session backed by the HTTP API client, for an unresolved sender.
+    /// Resolve a sender and build a session around the result.
     ///
-    /// Convenience for callers that don't have a database handle; resolves the
-    /// sender first, then delegates to [`ChatSession::new`].
+    /// Convenience for callers that have not resolved the sender themselves.
+    /// The executor is chosen from the outcome: one scoped to the customer, or
+    /// an account-less one for a visitor who matched no account — which is
+    /// what makes a guest session unable to reach account data even if the
+    /// model names a tool it was never offered.
     pub async fn resolve(
         agent: SupportAgent,
-        api: Arc<ApiClient>,
+        db: Arc<dyn LNVpsDb>,
         identity: SenderIdentity,
     ) -> anyhow::Result<Self> {
-        let requester = api.resolve(&identity).await?;
+        let requester = crate::resolve::resolve(&db, &identity).await?;
         let executor: Arc<dyn ToolExecutor> = match &requester {
             Requester::Customer { user_id, .. } => {
-                Arc::new(crate::agent::LnvpsToolExecutor::new(api.clone(), *user_id))
+                Arc::new(DbToolExecutor::new(db.clone(), *user_id))
             }
-            Requester::Anonymous => Arc::new(PublicToolExecutor::new(api.clone())),
+            Requester::Anonymous => Arc::new(DbToolExecutor::public(db.clone())),
         };
         Ok(Self::new(agent, &identity, requester, executor))
     }

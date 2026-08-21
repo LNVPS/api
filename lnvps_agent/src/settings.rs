@@ -9,14 +9,25 @@ pub struct Settings {
     /// Listen address for the agent HTTP server
     pub listen: Option<String>,
 
-    /// Base URL of the LNVPS admin API
-    pub admin_api_url: String,
+    /// Database connection string (MySQL), e.g.
+    /// `mysql://user:pass@host:3306/lnvps`.
+    ///
+    /// The agent reads the database directly rather than calling the admin API,
+    /// so it needs no admin credential — but it does need an account whose
+    /// grants match what the tools read. Give it a **read-only** database user
+    /// unless the deployment enables tools that write (the app-deployment
+    /// start/stop pair is the only one).
+    pub db: String,
 
-    /// Base URL of the LNVPS user API
-    pub user_api_url: String,
+    /// Database encryption, for the columns stored encrypted at rest (a user's
+    /// email, SSH key material, payment instrument references).
+    ///
+    /// Optional here only because the environment variable
+    /// [`ENCRYPTION_KEY_ENV`] is the other way to supply it; without one of the
+    /// two, reading any encrypted column fails.
+    pub encryption: Option<EncryptionConfig>,
 
-    /// Nsec key (bech32 `nsec1...`) used to sign NIP-98 auth events and for Nostr channel operations.
-    /// Fresh tokens are generated per API call — no stale pre-encoded event needed.
+    /// Nsec key (bech32 `nsec1...`) used for Nostr channel operations.
     pub nsec: String,
 
     /// OpenAI-compatible API configuration
@@ -33,6 +44,23 @@ pub struct Settings {
 
     /// Path to conversation history storage directory
     pub conversation_history_path: Option<PathBuf>,
+}
+
+/// Environment variable holding the hex-encoded database encryption key.
+///
+/// Same name the API uses, so one deployment secret serves both.
+pub const ENCRYPTION_KEY_ENV: &str = "LNVPS_ENCRYPTION_KEY";
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct EncryptionConfig {
+    /// Path to the encryption key file.
+    pub key_file: PathBuf,
+    /// Generate the key if the file does not exist. Leave off for the agent:
+    /// generating a *new* key here would silently fail to decrypt everything
+    /// the API wrote with the real one.
+    #[serde(default)]
+    pub auto_generate: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -110,8 +138,8 @@ impl Settings {
     }
 
     fn validate(&self) -> Result<()> {
-        if self.admin_api_url.is_empty() {
-            return Err(anyhow!("admin_api_url must not be empty"));
+        if self.db.is_empty() {
+            return Err(anyhow!("db connection string must not be empty"));
         }
         if self.nsec.is_empty() {
             return Err(anyhow!("nsec must not be empty"));

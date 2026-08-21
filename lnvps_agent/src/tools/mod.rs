@@ -1,228 +1,115 @@
+//! Tool specifications advertised to the model, grouped by subject area.
+//!
+//! One module per group, mirroring [`crate::agent::db`]'s layout, so a tool's
+//! spec and its implementation are found in the same place:
+//!
+//! | Module | Tools |
+//! |---|---|
+//! | [`account`] | account record, SSH keys, saved payment methods |
+//! | [`vms`] | VM listing/details/payments/history, power, firewall, metrics |
+//! | [`catalogue`] | regions, plans, custom pricing, quotes, exchange rates, images, app catalogue |
+//! | [`billing`] | subscriptions, their payments, IP-space subscriptions |
+//! | [`apps`] | the customer's managed app deployments |
+//! | [`partners`] | referral programme, marketplace operator enrolment |
+//! | [`diagnostics`] | ping, traceroute, port check |
+//!
+//! The **sets** at the bottom are the security surface: which tools a channel
+//! is offered depends on who is asking and on what the executor behind that
+//! channel can actually serve. They are assembled here rather than in the
+//! modules so the whole policy is readable in one screen.
+
 use async_openai::types::FunctionObject;
-use serde_json::json;
+
+pub mod account;
+pub mod apps;
+pub mod billing;
+pub mod catalogue;
+pub mod diagnostics;
+pub mod partners;
+pub mod vms;
+
+// ── Spec builders ───────────────────────────────────────────────────
+
+/// Build a function spec from an explicit JSON schema.
+pub(crate) fn tool(name: &str, description: &str, parameters: serde_json::Value) -> FunctionObject {
+    use async_openai::types::FunctionObjectArgs;
+    FunctionObjectArgs::default()
+        .name(name)
+        .description(description)
+        .parameters(parameters)
+        .build()
+        .expect("valid tool definition")
+}
 
 /// Build a function spec taking no arguments.
-fn nullary(name: &str, description: &str) -> FunctionObject {
+pub(crate) fn nullary(name: &str, description: &str) -> FunctionObject {
     tool(
         name,
         description,
-        json!({ "type": "object", "properties": {} }),
+        serde_json::json!({ "type": "object", "properties": {} }),
     )
 }
 
-/// Build a function spec taking a single required `vm_id` integer.
-fn vm_scoped(name: &str, description: &str) -> FunctionObject {
+/// Build a function spec taking a single required integer id.
+pub(crate) fn id_scoped(name: &str, description: &str, key: &str, what: &str) -> FunctionObject {
     tool(
         name,
         description,
-        json!({
+        serde_json::json!({
             "type": "object",
-            "properties": {
-                "vm_id": {
-                    "type": "integer",
-                    "description": "The numeric VM ID"
-                }
-            },
-            "required": ["vm_id"]
-        }),
-    )
-}
-
-// ── Individual tool specs ───────────────────────────────────────────
-
-fn get_my_account() -> FunctionObject {
-    nullary(
-        "get_my_account",
-        "Get the current user's account information: billing details, contact preferences, email verification status, and NWC auto-renewal status.",
-    )
-}
-
-fn list_my_vms() -> FunctionObject {
-    nullary(
-        "list_my_vms",
-        "List all VMs belonging to the current user. Shows VM IDs, names, status, specs, IPs, expiry dates, and region info.",
-    )
-}
-
-fn get_vm_details() -> FunctionObject {
-    vm_scoped(
-        "get_vm_details",
-        "Get detailed information about a specific VM owned by the current user. Includes host, region, IP assignments, full specs, payment status, and exact expiry date.",
-    )
-}
-
-fn list_vm_payments() -> FunctionObject {
-    vm_scoped(
-        "list_vm_payments",
-        "List all payments for a specific VM owned by the current user. Shows amounts, currencies, paid/unpaid status, dates, and payment methods.",
-    )
-}
-
-fn list_vm_history() -> FunctionObject {
-    vm_scoped(
-        "list_vm_history",
-        "List the activity history for a specific VM. Shows creation, start/stop events, reinstallations, upgrades, and configuration changes with timestamps.",
-    )
-}
-
-fn extend_vm() -> FunctionObject {
-    tool(
-        "extend_vm",
-        "Extend (renew) a VM owned by the current user for a certain number of days. Use this when a customer asks for extra time or a manual renewal.",
-        json!({
-            "type": "object",
-            "properties": {
-                "vm_id": {
-                    "type": "integer",
-                    "description": "The numeric VM ID to extend"
-                },
-                "days": {
-                    "type": "integer",
-                    "description": "Number of days to extend the VM for"
-                }
-            },
-            "required": ["vm_id", "days"]
-        }),
-    )
-}
-
-fn refund_vm() -> FunctionObject {
-    vm_scoped(
-        "refund_vm",
-        "Process a refund for a VM. This is irreversible — always confirm with the user before executing. Only works on VMs owned by the current user.",
-    )
-}
-
-fn delete_vm() -> FunctionObject {
-    vm_scoped(
-        "delete_vm",
-        "Delete a VM owned by the current user. Use this only when explicitly requested and after confirming with the customer.",
-    )
-}
-
-fn start_vm() -> FunctionObject {
-    vm_scoped(
-        "start_vm",
-        "Power on a VM owned by the current user. Safe and reversible — use when the customer reports their VM is offline or asks to boot it.",
-    )
-}
-
-fn stop_vm() -> FunctionObject {
-    vm_scoped(
-        "stop_vm",
-        "Power off a VM owned by the current user. Confirm with the customer first, as running services will be interrupted.",
-    )
-}
-
-fn restart_vm() -> FunctionObject {
-    vm_scoped(
-        "restart_vm",
-        "Hard reset (restart) a VM owned by the current user. Confirm with the customer first. Often resolves an unresponsive VM.",
-    )
-}
-
-fn list_regions() -> FunctionObject {
-    nullary(
-        "list_regions",
-        "List all available hosting regions with their names and IDs. Use this to answer questions about where VMs can be provisioned or where an existing VM is located.",
-    )
-}
-
-fn list_templates() -> FunctionObject {
-    nullary(
-        "list_templates",
-        "List all available VM templates with specifications and pricing. Shows CPU, memory, storage, pricing plans, and which region each template belongs to. Use this to answer questions about available plans and pricing.",
-    )
-}
-
-fn list_os_images() -> FunctionObject {
-    nullary(
-        "list_os_images",
-        "List all available operating system images that can be installed on VMs. Shows image names, versions, OS types, and supported platforms.",
-    )
-}
-
-fn get_terms_of_service() -> FunctionObject {
-    nullary(
-        "get_terms_of_service",
-        "Fetch the current LNVPS Terms of Service and Acceptable Use Policy as plain text. Use this for ANY question about what is allowed, refunds, suspension, abuse handling, liability, data retention, or company details — quote the document rather than answering from memory.",
-    )
-}
-
-/// A VM-scoped tool that also takes an optional address family.
-fn vm_probe(name: &str, description: &str) -> FunctionObject {
-    tool(
-        name,
-        description,
-        json!({
-            "type": "object",
-            "properties": {
-                "vm_id": {
-                    "type": "integer",
-                    "description": "The numeric VM ID to probe"
-                },
-                "ipv6": {
-                    "type": "boolean",
-                    "description": "Probe the VM's IPv6 address instead of its IPv4 address. Defaults to false."
-                }
-            },
-            "required": ["vm_id"]
-        }),
-    )
-}
-
-fn ping_vm() -> FunctionObject {
-    vm_probe(
-        "ping_vm",
-        "Check whether a VM owned by the current user answers from the network edge. Returns reachability, packet loss and round-trip time. Use this first when a customer says their VM is unreachable or offline.",
-    )
-}
-
-fn traceroute_vm() -> FunctionObject {
-    vm_probe(
-        "traceroute_vm",
-        "Trace the network path from the LNVPS edge router to a VM owned by the current user. Returns every hop with loss and latency. Use this when ping_vm shows the VM unreachable or the customer reports packet loss, to see where the path breaks.",
-    )
-}
-
-fn check_vm_port() -> FunctionObject {
-    tool(
-        "check_vm_port",
-        "Test whether a TCP port on a VM owned by the current user accepts connections (e.g. 22 for SSH, 80/443 for web). Distinguishes 'open', 'refused' (VM up, nothing listening) and 'timeout' (filtered or down) — far more useful than ping when a specific service is unreachable.",
-        json!({
-            "type": "object",
-            "properties": {
-                "vm_id": {
-                    "type": "integer",
-                    "description": "The numeric VM ID to probe"
-                },
-                "port": {
-                    "type": "integer",
-                    "description": "TCP port to test (1-65535)"
-                },
-                "ipv6": {
-                    "type": "boolean",
-                    "description": "Probe the VM's IPv6 address instead of its IPv4 address. Defaults to false."
-                }
-            },
-            "required": ["vm_id", "port"]
+            "properties": { key: { "type": "integer", "description": what } },
+            "required": [key]
         }),
     )
 }
 
 // ── Tool sets ───────────────────────────────────────────────────────
 
-/// Catalogue tools that expose no customer data and need no authentication.
+/// Everything that needs no account: what LNVPS sells, what it costs, and the
+/// published policy.
 ///
 /// The terms of service belong here rather than in the customer sets: the
 /// document is published on the website, so answering "am I allowed to run
 /// this?" needs no account, and pre-sales askers are exactly who asks.
 fn catalogue_tools() -> Vec<FunctionObject> {
     vec![
-        list_regions(),
-        list_templates(),
-        list_os_images(),
-        get_terms_of_service(),
+        catalogue::list_regions(),
+        catalogue::list_templates(),
+        catalogue::list_custom_pricing(),
+        catalogue::price_custom_vm(),
+        catalogue::get_exchange_rate(),
+        catalogue::list_os_images(),
+        catalogue::list_apps(),
+        catalogue::get_app_details(),
+        catalogue::list_app_tags(),
+        catalogue::get_terms_of_service(),
+    ]
+}
+
+/// Every read-only tool scoped to the authenticated customer.
+///
+/// One list, because there is one executor: every channel reads the same
+/// database, so a tool available on live chat is available on email too.
+fn customer_read_tools() -> Vec<FunctionObject> {
+    vec![
+        account::get_my_account(),
+        account::list_my_ssh_keys(),
+        account::list_my_payment_methods(),
+        vms::list_my_vms(),
+        vms::get_vm_details(),
+        vms::list_vm_payments(),
+        vms::list_vm_history(),
+        vms::list_vm_firewall_rules(),
+        vms::get_vm_metrics(),
+        billing::list_my_subscriptions(),
+        billing::get_subscription_details(),
+        billing::list_subscription_payments(),
+        billing::list_my_ip_subscriptions(),
+        apps::list_my_app_deployments(),
+        apps::get_app_deployment_details(),
+        partners::get_my_referral(),
+        partners::list_referral_usage(),
+        partners::get_my_marketplace_operator(),
     ]
 }
 
@@ -232,17 +119,22 @@ fn catalogue_tools() -> Vec<FunctionObject> {
 /// tool here accepts a hostname or address, so support chat cannot be steered
 /// into scanning third parties.
 fn diagnostic_tools() -> Vec<FunctionObject> {
-    vec![ping_vm(), traceroute_vm(), check_vm_port()]
+    vec![
+        diagnostics::ping_vm(),
+        diagnostics::traceroute_vm(),
+        diagnostics::check_vm_port(),
+    ]
 }
 
-/// Read-only tools scoped to the authenticated customer.
-fn customer_read_tools() -> Vec<FunctionObject> {
+/// Reversible state changes: they interrupt a workload but destroy nothing and
+/// move no money, and the customer can already make them through the REST API.
+fn power_tools() -> Vec<FunctionObject> {
     vec![
-        get_my_account(),
-        list_my_vms(),
-        get_vm_details(),
-        list_vm_payments(),
-        list_vm_history(),
+        vms::start_vm(),
+        vms::stop_vm(),
+        vms::restart_vm(),
+        apps::start_app_deployment(),
+        apps::stop_app_deployment(),
     ]
 }
 
@@ -250,11 +142,14 @@ fn customer_read_tools() -> Vec<FunctionObject> {
 ///
 /// These are user-scoped — no tool accepts a pubkey or user_id parameter;
 /// the executor is already bound to the user identified by the support channel.
-/// Includes the billing-sensitive actions (`extend_vm`, `refund_vm`,
-/// `delete_vm`) because those channels are slow, auditable, and reviewable.
+///
+/// Read-only, plus the catalogue. There is deliberately no `extend_vm`,
+/// `refund_vm` or `delete_vm`: granting paid time, moving money and destroying
+/// data are subscription-lifecycle operations that live in the API, and
+/// re-implementing them against the database would mean a second, divergent
+/// copy of the billing rules driven by a language model. Escalate instead.
 pub fn support_tools() -> Vec<FunctionObject> {
     let mut tools = customer_read_tools();
-    tools.extend([extend_vm(), refund_vm(), delete_vm()]);
     tools.extend(diagnostic_tools());
     tools.extend(catalogue_tools());
     tools
@@ -269,27 +164,16 @@ pub fn public_tools() -> Vec<FunctionObject> {
 /// Tools available over the interactive live-chat websocket for an
 /// authenticated customer.
 ///
-/// Deliberately excludes `extend_vm`, `refund_vm` and `delete_vm`: those grant
-/// paid time, move money, or destroy data, and "the model asked the user to
-/// confirm" is not an authorisation control on a public, low-latency,
-/// prompt-injectable surface. Power actions are included because they are
-/// reversible and already available to the customer via the REST API.
+/// Adds the reversible workload controls to [`support_tools`]: powering a VM
+/// or a deployment interrupts a workload but destroys nothing, moves no money,
+/// and the customer can already do it through the REST API. Live chat is where
+/// they are useful, being the channel with a human waiting on the other end.
 pub fn live_chat_tools() -> Vec<FunctionObject> {
     let mut tools = customer_read_tools();
-    tools.extend([start_vm(), stop_vm(), restart_vm()]);
+    tools.extend(power_tools());
     tools.extend(diagnostic_tools());
     tools.extend(catalogue_tools());
     tools
-}
-
-fn tool(name: &str, description: &str, parameters: serde_json::Value) -> FunctionObject {
-    use async_openai::types::FunctionObjectArgs;
-    FunctionObjectArgs::default()
-        .name(name)
-        .description(description)
-        .parameters(parameters)
-        .build()
-        .expect("valid tool definition")
 }
 
 #[cfg(test)]
@@ -308,10 +192,44 @@ mod tests {
             vec![
                 "list_regions",
                 "list_templates",
+                "list_custom_pricing",
+                "price_custom_vm",
+                "get_exchange_rate",
                 "list_os_images",
+                "list_apps",
+                "get_app_details",
+                "list_app_tags",
                 "get_terms_of_service"
             ]
         );
+    }
+
+    /// No catalogue tool may take an account-scoped identifier: the public set
+    /// is served by an executor with no user, so such an argument could only
+    /// ever be an invitation for the model to guess one.
+    #[test]
+    fn catalogue_tools_take_no_account_identifiers() {
+        for tool in public_tools() {
+            let params = tool.parameters.expect("parameters");
+            let Some(properties) = params["properties"].as_object() else {
+                continue;
+            };
+            for key in properties.keys() {
+                assert!(
+                    ![
+                        "vm_id",
+                        "user_id",
+                        "pubkey",
+                        "subscription_id",
+                        "deployment_id"
+                    ]
+                    .contains(&key.as_str()),
+                    "{} exposes {}",
+                    tool.name,
+                    key
+                );
+            }
+        }
     }
 
     /// Diagnostics need an owned VM, so an anonymous requester must not get
@@ -346,39 +264,96 @@ mod tests {
         // The catalogue set is shared, so a regression would hit all three.
     }
 
+    /// Pre-sales questions are the common case for a logged-out visitor, so
+    /// every set must be able to quote fixed plans, custom VMs and apps.
     #[test]
-    fn check_vm_port_requires_a_port() {
-        let params = check_vm_port().parameters.expect("parameters");
-        let required = params["required"].as_array().unwrap();
-        assert!(required.iter().any(|v| v == "vm_id"));
-        assert!(required.iter().any(|v| v == "port"));
-        // The family selector is a hint, never mandatory.
-        assert!(!required.iter().any(|v| v == "ipv6"));
-        assert!(params["properties"]["ipv6"].is_object());
-    }
-
-    #[test]
-    fn support_tools_include_billing_actions() {
-        let tools = support_tools();
-        let names = names(&tools);
-        for expected in ["extend_vm", "refund_vm", "delete_vm", "get_my_account"] {
-            assert!(names.contains(&expected), "missing {expected}");
+    fn every_set_can_quote_pricing() {
+        for set in [public_tools(), support_tools(), live_chat_tools()] {
+            let names = names(&set);
+            for expected in [
+                "list_templates",
+                "list_custom_pricing",
+                "price_custom_vm",
+                "get_exchange_rate",
+                "list_apps",
+                "get_app_details",
+            ] {
+                assert!(names.contains(&expected), "missing {expected}");
+            }
         }
     }
 
-    /// Live chat must never be offered the money/data-destroying tools.
+    /// The account-scoped products a customer can hold must be reachable from
+    /// both customer channels, or support has to answer from memory.
     #[test]
-    fn live_chat_tools_exclude_destructive_actions() {
-        let tools = live_chat_tools();
-        let names = names(&tools);
-        for forbidden in ["extend_vm", "refund_vm", "delete_vm"] {
+    fn customer_sets_cover_every_product() {
+        for set in [support_tools(), live_chat_tools()] {
+            let names = names(&set);
+            for expected in [
+                "list_my_vms",
+                "list_my_subscriptions",
+                "list_subscription_payments",
+                "list_my_app_deployments",
+                "get_my_referral",
+                "get_my_marketplace_operator",
+            ] {
+                assert!(names.contains(&expected), "missing {expected}");
+            }
+        }
+    }
+
+    /// Every channel reads the same database, so nothing account-scoped may be
+    /// live-chat-only except the workload controls.
+    #[test]
+    fn both_customer_sets_read_the_same_data() {
+        let support_set = support_tools();
+        let chat_set = live_chat_tools();
+        let support = names(&support_set);
+        let chat = names(&chat_set);
+        for tool in names(&customer_read_tools()) {
+            assert!(support.contains(&tool), "{tool} missing from support");
+            assert!(chat.contains(&tool), "{tool} missing from live chat");
+        }
+    }
+
+    /// No set may offer a tool that grants paid time, moves money or destroys
+    /// data. Those live in the API's subscription lifecycle; a model-driven
+    /// second implementation against the database would be a divergent copy of
+    /// the billing rules.
+    #[test]
+    fn no_set_offers_destructive_billing_actions() {
+        for set in [public_tools(), support_tools(), live_chat_tools()] {
+            let names = names(&set);
+            for forbidden in ["extend_vm", "refund_vm", "delete_vm"] {
+                assert!(
+                    !names.contains(&forbidden),
+                    "{forbidden} must not be offered"
+                );
+            }
+        }
+    }
+
+    /// Reversible workload control is live-chat only: it is the channel with a
+    /// human waiting, where "start my VM" is worth doing in the conversation
+    /// rather than in a reply hours later.
+    #[test]
+    fn workload_controls_are_live_chat_only() {
+        let support_set = support_tools();
+        let chat_set = live_chat_tools();
+        let support = names(&support_set);
+        let chat = names(&chat_set);
+        for action in [
+            "start_vm",
+            "stop_vm",
+            "restart_vm",
+            "start_app_deployment",
+            "stop_app_deployment",
+        ] {
             assert!(
-                !names.contains(&forbidden),
-                "{forbidden} must not be exposed to live chat"
+                !support.contains(&action),
+                "{action} must not be in support"
             );
-        }
-        for expected in ["start_vm", "stop_vm", "restart_vm", "list_my_vms"] {
-            assert!(names.contains(&expected), "missing {expected}");
+            assert!(chat.contains(&action), "{action} missing from live chat");
         }
     }
 
@@ -393,23 +368,37 @@ mod tests {
         }
     }
 
+    /// Every advertised spec must be a well-formed object schema, or the model
+    /// silently drops the tool.
     #[test]
-    fn vm_scoped_tools_require_vm_id() {
-        let spec = get_vm_details();
-        let params = spec.parameters.expect("parameters");
-        assert_eq!(params["required"][0], "vm_id");
+    fn every_spec_is_an_object_schema() {
+        for set in [public_tools(), support_tools(), live_chat_tools()] {
+            for tool in set {
+                let params = tool
+                    .parameters
+                    .unwrap_or_else(|| panic!("{} has no parameters", tool.name));
+                assert_eq!(params["type"], "object", "{}", tool.name);
+                assert!(params["properties"].is_object(), "{}", tool.name);
+                assert!(
+                    !tool.description.unwrap_or_default().is_empty(),
+                    "{} has no description",
+                    tool.name
+                );
+            }
+        }
     }
 
     #[test]
-    fn extend_vm_requires_days() {
-        let params = extend_vm().parameters.expect("parameters");
-        let required = params["required"].as_array().unwrap();
-        assert!(required.iter().any(|v| v == "days"));
+    fn id_scoped_specs_require_their_id() {
+        let spec = id_scoped("x", "d", "thing_id", "the thing");
+        let params = spec.parameters.expect("parameters");
+        assert_eq!(params["required"][0], "thing_id");
+        assert_eq!(params["properties"]["thing_id"]["type"], "integer");
     }
 
     #[test]
     fn nullary_tools_have_no_required_args() {
-        let params = list_regions().parameters.expect("parameters");
+        let params = catalogue::list_regions().parameters.expect("parameters");
         assert!(params.get("required").is_none());
     }
 }

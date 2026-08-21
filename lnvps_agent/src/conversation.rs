@@ -7,9 +7,7 @@ use tokio::sync::RwLock;
 
 use crate::identity::SupportChannelKind;
 
-#[cfg(feature = "db")]
 pub mod db;
-#[cfg(feature = "db")]
 pub use db::DbConversationStore;
 
 /// A tool call requested by the assistant within a chat turn.

@@ -71,7 +71,7 @@ stripe = ["payments-rs/method-stripe"]
 lnvps_db = { path = "../lnvps_db" }
 lnvps_compose = { path = "../lnvps_compose" }
 lnvps_api_common = { path = "../lnvps_api_common" }
-lnvps_agent = { path = "../lnvps_agent", features = ["db"], optional = true }
+lnvps_agent = { path = "../lnvps_agent", optional = true }
 try-procedure = { path = "../try-procedure" }
 
 anyhow.workspace = true

@@ -1,6 +1,4 @@
-#[cfg(feature = "db")]
-mod db_executor;
-mod executor;
+mod db;
 mod prompts;
 
 use std::sync::Arc;
@@ -19,16 +17,26 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::session::ChatEvent;
+use lnvps_db::LNVpsDb;
 
-use crate::api_client::ApiClient;
 use crate::channel::IncomingSupportRequest;
 use crate::conversation::{ChatMessage, ConversationStore, StoredToolCall};
 use crate::identity::{Requester, SupportChannelKind, conversation_key};
 use crate::settings::{OpenAiConfig, Settings};
 
-#[cfg(feature = "db")]
-pub use db_executor::DbToolExecutor;
-pub use executor::{LnvpsToolExecutor, PublicToolExecutor, ToolExecutor};
+pub use db::DbToolExecutor;
+
+/// Executes a tool call on behalf of the model.
+///
+/// One implementation, [`DbToolExecutor`], which reads the database directly.
+/// The trait remains because a session is constructed with its executor: the
+/// live-chat path builds one scoped to the authenticated customer, or an
+/// account-less one for a guest, and the agent must not be able to tell the
+/// difference.
+#[async_trait::async_trait]
+pub trait ToolExecutor: Send + Sync {
+    async fn execute(&self, name: &str, arguments: &str) -> Result<String>;
+}
 
 /// Truncate a string to at most `max` characters for logging, without panicking
 /// on multi-byte UTF-8 boundaries (byte-index slicing would panic).
@@ -283,14 +291,13 @@ fn channel_prompt_with_extra(channel_prompt: &str, extra: Option<&str>) -> Strin
 /// The AI support agent that handles a support conversation.
 #[derive(Clone)]
 pub struct SupportAgent {
-    /// HTTP client for the LNVPS APIs.
+    /// Database handle used to resolve senders and execute tools.
     ///
-    /// `None` when the agent is hosted inside `lnvps_api`, where sender
-    /// resolution and tool execution are done against the database directly and
-    /// there is no admin nsec to sign with. Only the pull-based channel paths
-    /// ([`Self::process_request`], [`Self::run_loop`]) require it; the streaming
-    /// session path takes its executor from the caller.
-    api: Option<Arc<ApiClient>>,
+    /// `None` when the agent is driven by a [`crate::session::ChatSession`],
+    /// which is constructed with its own executor and resolved requester. Only
+    /// the pull-based channel paths ([`Self::process_request`],
+    /// [`Self::run_loop`]) need to resolve a sender themselves.
+    db: Option<Arc<dyn LNVpsDb>>,
     openai: OpenAiConfig,
     store: Arc<dyn ConversationStore>,
     /// Maximum stored messages to retain per sender before compaction.
@@ -304,13 +311,17 @@ pub struct SupportAgent {
 }
 
 impl SupportAgent {
-    pub fn new(api: Arc<ApiClient>, settings: Settings, store: Arc<dyn ConversationStore>) -> Self {
+    pub fn new(
+        db: Arc<dyn LNVpsDb>,
+        settings: Settings,
+        store: Arc<dyn ConversationStore>,
+    ) -> Self {
         let extra_prompt = settings
             .system_prompt
             .filter(|p| !p.trim().is_empty())
             .map(|p| p.trim().to_string());
         Self {
-            api: Some(api),
+            db: Some(db),
             openai: settings.openai,
             store,
             compaction_threshold: COMPACTION_THRESHOLD,
@@ -318,14 +329,14 @@ impl SupportAgent {
         }
     }
 
-    /// Build an agent with no HTTP API client, for in-process hosting.
+    /// Build an agent with no database handle, for in-process hosting.
     ///
     /// Suitable for [`crate::session::ChatSession`], which supplies its own tool
     /// executor. Calling [`Self::process_request`] or [`Self::run_loop`] on such
     /// an agent is an error, since neither can resolve a sender.
     pub fn detached(openai: OpenAiConfig, store: Arc<dyn ConversationStore>) -> Self {
         Self {
-            api: None,
+            db: None,
             openai,
             store,
             compaction_threshold: COMPACTION_THRESHOLD,
@@ -333,11 +344,11 @@ impl SupportAgent {
         }
     }
 
-    /// The HTTP API client, or a clear error when running detached.
-    fn api(&self) -> Result<Arc<ApiClient>> {
-        self.api
+    /// The database handle, or a clear error when running detached.
+    fn db(&self) -> Result<Arc<dyn LNVpsDb>> {
+        self.db
             .clone()
-            .ok_or_else(|| anyhow!("this agent has no API client; use a ChatSession instead"))
+            .ok_or_else(|| anyhow!("this agent has no database handle; use a ChatSession instead"))
     }
 
     fn openai_client(&self) -> Client<OpenAIConfig> {
@@ -871,7 +882,7 @@ impl SupportAgent {
         channel: SupportChannelKind,
         channel_prompt: &str,
     ) -> Result<String> {
-        let requester = self.api()?.resolve(&req.sender).await?;
+        let requester = crate::resolve::resolve(&self.db()?, &req.sender).await?;
         let key = conversation_key(&req.sender, &requester, channel);
 
         let (response, new_messages) = match requester {
@@ -900,7 +911,7 @@ impl SupportAgent {
             prompts::with_channel_prompt(prompts::general_system_message(), channel_prompt);
         let base = self.base_messages(sender_id, system).await;
         let tools = tool_specs(super::tools::public_tools());
-        let executor = Arc::new(PublicToolExecutor::new(self.api()?));
+        let executor = Arc::new(DbToolExecutor::public(self.db()?));
 
         self.run_chat_loop(
             executor,
@@ -932,7 +943,7 @@ impl SupportAgent {
             prompts::with_channel_prompt(prompts::user_system_message(account), channel_prompt);
         let base = self.base_messages(sender_id, system).await;
         let tools = tool_specs(super::tools::support_tools());
-        let executor = Arc::new(LnvpsToolExecutor::new(self.api()?, user_id));
+        let executor = Arc::new(DbToolExecutor::new(self.db()?, user_id));
 
         self.run_chat_loop(
             executor,

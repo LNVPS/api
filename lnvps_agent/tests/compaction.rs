@@ -12,20 +12,20 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use lnvps_agent::agent::SupportAgent;
-use lnvps_agent::api_client::ApiClient;
 use lnvps_agent::conversation::{ChatMessage, ConversationStore, MemoryStore};
 use lnvps_agent::identity::SupportChannelKind;
 use lnvps_agent::settings::{OpenAiConfig, Settings};
+use lnvps_api_common::MockDb;
+use lnvps_db::LNVpsDb;
 
-/// A throwaway nsec so `ApiClient` can be constructed; no request reaches the
-/// LNVPS API in these tests.
+/// A throwaway nsec; no Nostr channel runs in these tests.
 const TEST_NSEC: &str = "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5";
 
 fn settings(base_url: String) -> Settings {
     Settings {
         listen: None,
-        admin_api_url: "http://127.0.0.1:1".to_string(),
-        user_api_url: "http://127.0.0.1:1".to_string(),
+        db: "mock".to_string(),
+        encryption: None,
         nsec: TEST_NSEC.to_string(),
         openai: OpenAiConfig {
             base_url,
@@ -42,8 +42,8 @@ fn settings(base_url: String) -> Settings {
 
 fn agent_for(server: &MockServer, store: Arc<dyn ConversationStore>) -> SupportAgent {
     let settings = settings(format!("{}/v1", server.uri()));
-    let api = Arc::new(ApiClient::new(&settings).expect("api client"));
-    SupportAgent::new(api, settings, store)
+    let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+    SupportAgent::new(db, settings, store)
 }
 
 /// A non-streaming chat completion response body.
@@ -250,11 +250,11 @@ async fn whitespace_only_content_is_treated_as_no_summary() -> Result<()> {
 #[tokio::test]
 async fn a_provider_error_still_compacts() -> Result<()> {
     let settings = settings("http://127.0.0.1:1/v1".to_string());
-    let api = Arc::new(ApiClient::new(&settings).expect("api client"));
+    let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
     let store = Arc::new(MemoryStore::new());
     seed(&store, 40).await?;
 
-    SupportAgent::new(api, settings, store.clone())
+    SupportAgent::new(db, settings, store.clone())
         .compact("user:1")
         .await?;
 
