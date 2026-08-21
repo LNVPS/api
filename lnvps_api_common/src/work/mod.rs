@@ -60,11 +60,14 @@ pub enum WorkJob {
         message: String,
         title: Option<String>,
     },
-    /// Send bulk message to all active customers based on their contact preferences
+    /// Send bulk message to customers based on their contact preferences
     BulkMessage {
         subject: String,
         message: String,
         admin_user_id: u64,
+        /// Recipient selection. Absent (or empty) means every active customer.
+        #[serde(default)]
+        target: Option<lnvps_db::BulkMessageTarget>,
     },
     /// Delete a VM at admin request
     DeleteVm {

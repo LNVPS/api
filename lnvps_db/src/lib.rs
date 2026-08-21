@@ -779,9 +779,19 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Fetch raw string data from database bypassing EncryptedString decoding
     async fn fetch_raw_strings(&self, query: &str) -> DbResult<Vec<(u64, String)>>;
 
-    /// Get all active customers with their contact preferences for bulk messaging
-    /// Returns users who have at least one non-deleted VM and at least one contact method enabled
-    async fn get_active_customers_with_contact_prefs(&self) -> DbResult<Vec<crate::User>>;
+    /// Resolve the recipients of a bulk message.
+    ///
+    /// An empty [`BulkMessageTarget`] selects every active customer (any user
+    /// with at least one non-deleted VM); otherwise the populated filters are
+    /// unioned and de-duplicated by user id.
+    ///
+    /// Contact preferences are deliberately **not** applied here — users with
+    /// no usable contact method are returned too, so the caller can report them
+    /// as unreachable instead of silently dropping them.
+    async fn get_bulk_message_recipients(
+        &self,
+        target: &crate::BulkMessageTarget,
+    ) -> DbResult<Vec<crate::User>>;
 
     /// Get all user IDs that have admin privileges (active role assignments)
     async fn list_admin_user_ids(&self) -> DbResult<Vec<u64>>;

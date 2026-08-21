@@ -16,9 +16,9 @@ use lnvps_api_common::{
     retry::{OpError, Pipeline, RetryPolicy},
 };
 use lnvps_db::{
-    CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, PaymentMethod, RouterTunnelTraffic,
-    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionType, Vm,
-    VmHistoryActionType, VmHost, VmHostKind, VmIpAssignment, VmOsImage,
+    BulkMessageTarget, CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, PaymentMethod,
+    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionType,
+    Vm, VmHistoryActionType, VmHost, VmHostKind, VmIpAssignment, VmOsImage,
 };
 use log::{debug, error, info, warn};
 use nostr_sdk::Client;
@@ -2007,32 +2007,54 @@ impl Worker {
         }
     }
 
+    /// Send a bulk message to the customers selected by `target`.
+    ///
+    /// Returns a one-line summary used as the job result (visible on the
+    /// `/jobs/feedback` stream).
     async fn process_bulk_message(
         &self,
         subject: String,
         message: String,
         admin_user_id: u64,
-    ) -> Result<()> {
-        info!("Processing bulk message: '{}'", subject);
+        target: Option<BulkMessageTarget>,
+    ) -> Result<String> {
+        let target = target.unwrap_or_default();
+        info!("Processing bulk message: '{}' target={:?}", subject, target);
 
-        // Get all active customers with contact preferences
-        let active_customers = self.db.get_active_customers_with_contact_prefs().await?;
-        let total_customers = active_customers.len();
+        let recipients = self.db.get_bulk_message_recipients(&target).await?;
+        let total_recipients = recipients.len();
 
-        if total_customers == 0 {
-            info!("No active customers found for bulk message");
-            return Ok(());
+        if total_recipients == 0 {
+            info!("No recipients matched for bulk message '{}'", subject);
+            let summary = format!("Bulk message '{}' matched no recipients", subject.trim());
+            self.queue_notification(
+                admin_user_id,
+                summary.clone(),
+                Some("Bulk Message Complete".to_string()),
+            )
+            .await;
+            return Ok(summary);
         }
 
+        // Users with no usable contact method are reported rather than
+        // silently skipped: they are exactly the people a maintenance notice
+        // fails to reach, and the admin needs to know who they are.
+        let (reachable, unreachable): (Vec<_>, Vec<_>) = recipients
+            .into_iter()
+            .partition(|u| !u.contact_methods().is_empty());
+        let skipped_count = unreachable.len();
+
         info!(
-            "Sending bulk message to {} active customers",
-            total_customers
+            "Sending bulk message to {} of {} matched recipients ({} unreachable)",
+            reachable.len(),
+            total_recipients,
+            skipped_count
         );
 
         let mut sent_count = 0;
         let mut failed_count = 0;
 
-        for customer in active_customers {
+        for customer in reachable {
             // Personalize the message with customer name if available
             let personalized_message = if let Some(ref name) = customer.billing_name {
                 format!("Dear {},\n\n{}", name, message)
@@ -2040,7 +2062,8 @@ impl Worker {
                 format!("Dear Customer,\n\n{}", message)
             };
 
-            // Use the existing send_notification method which handles both email and NIP-17
+            // send_notification fans out over every channel the user wants
+            // (email, NIP-17, Telegram, WhatsApp)
             match self
                 .send_notification(customer.id, personalized_message, Some(subject.clone()))
                 .await
@@ -2059,23 +2082,35 @@ impl Worker {
             }
         }
 
-        info!(
-            "Bulk message completed: {} sent, {} failed out of {} total recipients",
-            sent_count, failed_count, total_customers
+        let summary = format!(
+            "Bulk message '{}' completed. Sent: {}, Failed: {}, Unreachable: {}, Matched: {}",
+            subject.trim(),
+            sent_count,
+            failed_count,
+            skipped_count,
+            total_recipients
         );
+        info!("{}", summary);
 
-        // Send completion notification to admin
+        let mut admin_report = format!(
+            "Bulk message '{}' completed.\nSent: {}\nFailed: {}\nUnreachable (no contact method): {}\nMatched recipients: {}",
+            subject, sent_count, failed_count, skipped_count, total_recipients
+        );
+        if !unreachable.is_empty() {
+            admin_report.push_str("\n\nUsers with no contact method (not messaged):\n");
+            for user in &unreachable {
+                admin_report.push_str(&format!("- user #{}\n", user.id));
+            }
+        }
+
         self.queue_notification(
             admin_user_id,
-            format!(
-                "Bulk message '{}' completed.\nSent: {}\nFailed: {}\nTotal recipients: {}",
-                subject, sent_count, failed_count, total_customers
-            ),
+            admin_report,
             Some("Bulk Message Complete".to_string()),
         )
         .await;
 
-        Ok(())
+        Ok(summary)
     }
 
     async fn queue_admin_notification(&self, message: String, title: Option<String>) {
@@ -2881,14 +2916,18 @@ impl Worker {
                 subject,
                 message,
                 admin_user_id,
+                target,
             } => {
-                self.process_bulk_message(subject.clone(), message.clone(), *admin_user_id)
+                let summary = self
+                    .process_bulk_message(
+                        subject.clone(),
+                        message.clone(),
+                        *admin_user_id,
+                        target.clone(),
+                    )
                     .await?;
 
-                return Ok(Some(format!(
-                    "Bulk message '{}' sent successfully",
-                    subject.trim()
-                )));
+                return Ok(Some(summary));
             }
             WorkJob::CheckVms => {
                 self.check_vms().await?;
@@ -5887,6 +5926,90 @@ mod tests {
         worker.remove_tunnel_interface(1, &interface).await?;
 
         mr.clear().await;
+        Ok(())
+    }
+
+    /// Bulk messaging must obey the target and must *report* the owners it
+    /// could not reach — the failure mode of the manual workaround this
+    /// replaced (issue #387) was that Nostr-only owners were silently missed.
+    #[tokio::test]
+    async fn test_bulk_message_targets_host_and_reports_unreachable() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let reachable = db.upsert_user(&[1u8; 32]).await?;
+        let unreachable = db.upsert_user(&[2u8; 32]).await?;
+        let other_host_owner = db.upsert_user(&[3u8; 32]).await?;
+        {
+            let mut users = db.users.lock().await;
+            let u = users.get_mut(&reachable).unwrap();
+            u.contact_nip17 = true;
+            u.billing_name = Some("Nostr Owner".to_string());
+            users.get_mut(&other_host_owner).unwrap().contact_nip17 = true;
+        }
+        {
+            let mut hosts = db.hosts.lock().await;
+            let mut second = hosts.get(&1).unwrap().clone();
+            second.id = 2;
+            second.name = "mock-host-2".to_string();
+            hosts.insert(2, second);
+        }
+        {
+            let mut vms = db.vms.lock().await;
+            for (id, host_id, user_id) in [
+                (1u64, 1u64, reachable),
+                (2, 1, unreachable),
+                (3, 2, other_host_owner),
+            ] {
+                vms.insert(
+                    id,
+                    Vm {
+                        id,
+                        host_id,
+                        user_id,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        let worker = setup_worker(db.clone()).await?;
+        let summary = worker
+            .process_bulk_message(
+                "Storage maintenance".to_string(),
+                "Your VM will reboot".to_string(),
+                reachable,
+                Some(BulkMessageTarget {
+                    host_ids: Some(vec![1]),
+                    ..Default::default()
+                }),
+            )
+            .await?;
+
+        // Only host 1's two owners are matched; one of them is unreachable.
+        assert!(
+            summary.contains("Sent: 1")
+                && summary.contains("Unreachable: 1")
+                && summary.contains("Matched: 2"),
+            "unexpected summary: {summary}"
+        );
+        assert!(
+            !summary.contains("Failed: 1"),
+            "unexpected summary: {summary}"
+        );
+        Ok(())
+    }
+
+    /// A target that matches nobody completes with a summary rather than
+    /// failing the job.
+    #[tokio::test]
+    async fn test_bulk_message_with_no_recipients() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let admin = db.upsert_user(&[9u8; 32]).await?;
+        let worker = setup_worker(db.clone()).await?;
+
+        let summary = worker
+            .process_bulk_message("Nobody home".to_string(), "text".to_string(), admin, None)
+            .await?;
+        assert!(summary.contains("matched no recipients"), "{summary}");
         Ok(())
     }
 }

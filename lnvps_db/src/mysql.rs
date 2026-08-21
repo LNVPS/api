@@ -2,16 +2,16 @@ use crate::{
     AccessPolicy, AgentConversation, AgentConversationFilter, AgentConversationOverview,
     AgentMessage, App, AppCluster, AppDeployment, AppDeploymentFilter, AppDeploymentServiceUsage,
     AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
-    Company, DbError, DbResult, Discount, DiscountRedemption, DiscountRedemptionWithCode,
-    DnsServer, EncryptedString, IntervalType, IpRange, IpRangeSubscription, IpSpacePricing,
-    LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus,
-    MarketplaceOperator, NewAgentMessage, PaymentMethod, PaymentMethodConfig, PaymentType,
-    Referral, ReferralCostUsage, ReferralPayout, Region, RegionStats, Router, RouterBgpRoute,
-    RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentWithCompany, Tunnel, TunnelPool, User,
-    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
-    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk,
-    VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
+    BulkMessageTarget, Company, DbError, DbResult, Discount, DiscountRedemption,
+    DiscountRedemptionWithCode, DnsServer, EncryptedString, IntervalType, IpRange,
+    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth,
+    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, PaymentMethod,
+    PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout, Region,
+    RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic,
+    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany,
+    Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
+    VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost,
+    VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -2348,51 +2348,65 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(results)
     }
 
-    async fn get_active_customers_with_contact_prefs(&self) -> DbResult<Vec<User>> {
-        let query = r#"
-            SELECT DISTINCT 
-                u.id,
-                u.pubkey,
-                u.created,
-                u.email,
-                u.email_hash,
-                u.email_verified,
-                u.email_verify_token,
-                u.contact_nip17,
-                u.contact_email,
-                u.contact_telegram,
-                u.telegram_chat_id,
-                u.telegram_link_token,
-                u.contact_whatsapp,
-                u.whatsapp_number,
-                u.whatsapp_verified,
-                u.whatsapp_verify_code,
-                u.whatsapp_verify_attempts,
-                u.country_code,
-                u.billing_name,
-                u.billing_address_1,
-                u.billing_address_2,
-                u.billing_city,
-                u.billing_state,
-                u.billing_postcode,
-                u.billing_tax_id,
-                u.geo_country_code,
-                u.geo_ip,
-                u.geo_updated
-            FROM users u
-            INNER JOIN vm ON u.id = vm.user_id
-            WHERE vm.deleted = 0 
-            AND (
-                (u.contact_email = 1 AND u.email != '') 
-                OR 
-                u.contact_nip17 = 1
-            )
-            ORDER BY u.id
-        "#;
+    async fn get_bulk_message_recipients(&self, target: &BulkMessageTarget) -> DbResult<Vec<User>> {
+        // A target that carries only empty lists resolves to nobody. Return an
+        // empty set rather than falling through to "everyone".
+        if target.is_explicitly_empty() {
+            return Ok(vec![]);
+        }
 
-        let users = sqlx::query_as(query).fetch_all(&self.db).await?;
+        let mut query = sqlx::QueryBuilder::new("SELECT * FROM users WHERE id IN (");
+        if target.is_empty() {
+            // No targeting: every user with at least one live VM.
+            query.push("SELECT DISTINCT user_id FROM vm WHERE deleted = 0");
+        } else {
+            let mut first = true;
+            let mut push_clause =
+                |query: &mut sqlx::QueryBuilder<sqlx::MySql>, prefix: &str, ids: &Vec<u64>| {
+                    if ids.is_empty() {
+                        return;
+                    }
+                    if !first {
+                        query.push(" UNION ");
+                    }
+                    first = false;
+                    query.push(prefix);
+                    let mut sep = query.separated(", ");
+                    for id in ids {
+                        sep.push_bind(*id);
+                    }
+                    query.push(")");
+                };
 
-        Ok(users)
+            if let Some(ids) = &target.user_ids {
+                push_clause(&mut query, "SELECT id FROM users WHERE id IN (", ids);
+            }
+            if let Some(ids) = &target.vm_ids {
+                push_clause(
+                    &mut query,
+                    "SELECT user_id FROM vm WHERE deleted = 0 AND id IN (",
+                    ids,
+                );
+            }
+            if let Some(ids) = &target.host_ids {
+                push_clause(
+                    &mut query,
+                    "SELECT user_id FROM vm WHERE deleted = 0 AND host_id IN (",
+                    ids,
+                );
+            }
+            if let Some(ids) = &target.region_ids {
+                push_clause(
+                    &mut query,
+                    "SELECT v.user_id FROM vm v JOIN vm_host h ON v.host_id = h.id \
+                     WHERE v.deleted = 0 AND h.region_id IN (",
+                    ids,
+                );
+            }
+        }
+        query.push(") ORDER BY id");
+
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
     }
 
     async fn list_admin_user_ids(&self) -> DbResult<Vec<u64>> {
