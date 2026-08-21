@@ -6,17 +6,18 @@ use lnvps_db::{
     AccessPolicy, AgentConversation, AgentConversationFilter, AgentConversationOverview,
     AgentMessage, App, AppCluster, AppDeployment, AppDeploymentDesiredState, AppDeploymentFilter,
     AppDeploymentServiceUsage, AppDeploymentStatus, AppDeploymentVolumeUsage, AppTag,
-    AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, Company, CpuArch, CpuMfg, DbError,
-    DbResult, Discount, DiscountRedemption, DiskInterface, DiskType, DnsServer, DnsServerKind,
-    EncryptedString, IntervalType, IpRange, IpRangeAllocationMode, IpRangeSubscription,
-    IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus,
-    MarketplaceOperator, NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution,
-    PaymentMethod, PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region,
-    Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic, Subscription,
-    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, Tunnel, TunnelPool,
-    User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
-    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind,
-    VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
+    AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, BulkMessageTarget, Company, CpuArch,
+    CpuMfg, DbError, DbResult, Discount, DiscountRedemption, DiskInterface, DiskType, DnsServer,
+    DnsServerKind, EncryptedString, IntervalType, IpRange, IpRangeAllocationMode,
+    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth,
+    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, NostrDomain, NostrDomainHandle,
+    OsDistribution, PaymentMethod, PaymentMethodConfig, Referral, ReferralCostUsage,
+    ReferralPayout, Region, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
+    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentWithCompany, Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm,
+    VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
+    VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment, VmOsImage,
+    VmTemplate, WebauthnCredential,
 };
 
 use async_trait::async_trait;
@@ -2362,27 +2363,53 @@ impl LNVpsDbBase for MockDb {
         Ok(vec![])
     }
 
-    async fn get_active_customers_with_contact_prefs(&self) -> DbResult<Vec<User>> {
+    async fn get_bulk_message_recipients(&self, target: &BulkMessageTarget) -> DbResult<Vec<User>> {
+        if target.is_explicitly_empty() {
+            return Ok(vec![]);
+        }
+
         let users = self.users.lock().await;
         let vms = self.vms.lock().await;
+        let hosts = self.hosts.lock().await;
 
-        // Find users who have non-deleted VMs and contact preferences enabled
-        let mut active_customers = Vec::new();
-
-        for user in users.values() {
-            // Check if user has at least one non-deleted VM
-            let has_active_vm = vms.values().any(|vm| vm.user_id == user.id && !vm.deleted);
-
-            if has_active_vm && (user.contact_email || user.contact_nip17) {
-                // For email: check if they have an email address
-                // For nip17: they should have a pubkey (which all users do)
-                if (user.contact_email && !user.email.is_empty()) || user.contact_nip17 {
-                    active_customers.push(user.clone());
-                }
+        let mut ids: HashSet<u64> = HashSet::new();
+        if target.is_empty() {
+            ids.extend(vms.values().filter(|v| !v.deleted).map(|v| v.user_id));
+        } else {
+            if let Some(user_ids) = &target.user_ids {
+                ids.extend(user_ids.iter().copied());
+            }
+            if let Some(vm_ids) = &target.vm_ids {
+                ids.extend(
+                    vms.values()
+                        .filter(|v| !v.deleted && vm_ids.contains(&v.id))
+                        .map(|v| v.user_id),
+                );
+            }
+            if let Some(host_ids) = &target.host_ids {
+                ids.extend(
+                    vms.values()
+                        .filter(|v| !v.deleted && host_ids.contains(&v.host_id))
+                        .map(|v| v.user_id),
+                );
+            }
+            if let Some(region_ids) = &target.region_ids {
+                ids.extend(
+                    vms.values()
+                        .filter(|v| {
+                            !v.deleted
+                                && hosts
+                                    .get(&v.host_id)
+                                    .is_some_and(|h| region_ids.contains(&h.region_id))
+                        })
+                        .map(|v| v.user_id),
+                );
             }
         }
 
-        Ok(active_customers)
+        let mut result: Vec<User> = ids.iter().filter_map(|id| users.get(id).cloned()).collect();
+        result.sort_by_key(|u| u.id);
+        Ok(result)
     }
 
     async fn list_admin_user_ids(&self) -> DbResult<Vec<u64>> {
@@ -10054,5 +10081,150 @@ mod discount_tests {
 
         // Deleting would orphan the campaign's cost record.
         assert!(db.delete_discount(id).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod bulk_message_tests {
+    use super::*;
+
+    /// Bulk-message targeting: each filter selects the right owners, filters
+    /// union and de-duplicate, and an absent target still means "everyone with
+    /// a live VM".
+    #[tokio::test]
+    async fn bulk_message_targets_select_and_deduplicate() {
+        let db = MockDb::default();
+
+        // Two hosts in two regions.
+        {
+            let mut hosts = db.hosts.lock().await;
+            let mut second = hosts.get(&1).unwrap().clone();
+            second.id = 2;
+            second.region_id = 2;
+            second.name = "mock-host-2".to_string();
+            hosts.insert(2, second);
+        }
+
+        let alice = db.upsert_user(&[1u8; 32]).await.unwrap();
+        let bob = db.upsert_user(&[2u8; 32]).await.unwrap();
+        let carol = db.upsert_user(&[3u8; 32]).await.unwrap();
+        // A user with no VM at all — only reachable by explicit user id.
+        let dave = db.upsert_user(&[4u8; 32]).await.unwrap();
+
+        {
+            let mut vms = db.vms.lock().await;
+            // alice owns two VMs on host 1, so a host filter must not message her twice
+            vms.insert(
+                1,
+                Vm {
+                    id: 1,
+                    host_id: 1,
+                    user_id: alice,
+                    ..Default::default()
+                },
+            );
+            vms.insert(
+                2,
+                Vm {
+                    id: 2,
+                    host_id: 1,
+                    user_id: alice,
+                    ..Default::default()
+                },
+            );
+            // bob is on host 2 (region 2)
+            vms.insert(
+                3,
+                Vm {
+                    id: 3,
+                    host_id: 2,
+                    user_id: bob,
+                    ..Default::default()
+                },
+            );
+            // carol's only VM is deleted, so she is not an active customer
+            vms.insert(
+                4,
+                Vm {
+                    id: 4,
+                    host_id: 1,
+                    user_id: carol,
+                    deleted: true,
+                    ..Default::default()
+                },
+            );
+        }
+
+        let ids = |users: Vec<User>| users.into_iter().map(|u| u.id).collect::<Vec<_>>();
+        let resolve =
+            async |t: BulkMessageTarget| ids(db.get_bulk_message_recipients(&t).await.unwrap());
+
+        // No target: every user with a live VM, deleted VMs excluded.
+        assert_eq!(
+            resolve(BulkMessageTarget::default()).await,
+            vec![alice, bob]
+        );
+
+        // Host filter: alice appears once despite owning two VMs there.
+        assert_eq!(
+            resolve(BulkMessageTarget {
+                host_ids: Some(vec![1]),
+                ..Default::default()
+            })
+            .await,
+            vec![alice]
+        );
+
+        // Region filter goes through the host's region.
+        assert_eq!(
+            resolve(BulkMessageTarget {
+                region_ids: Some(vec![2]),
+                ..Default::default()
+            })
+            .await,
+            vec![bob]
+        );
+
+        // VM filter selects owners; a deleted VM selects nobody.
+        assert_eq!(
+            resolve(BulkMessageTarget {
+                vm_ids: Some(vec![3, 4]),
+                ..Default::default()
+            })
+            .await,
+            vec![bob]
+        );
+
+        // Explicit user ids need no VM.
+        assert_eq!(
+            resolve(BulkMessageTarget {
+                user_ids: Some(vec![dave]),
+                ..Default::default()
+            })
+            .await,
+            vec![dave]
+        );
+
+        // Filters union and de-duplicate.
+        assert_eq!(
+            resolve(BulkMessageTarget {
+                user_ids: Some(vec![alice, dave]),
+                host_ids: Some(vec![1]),
+                region_ids: Some(vec![2]),
+                ..Default::default()
+            })
+            .await,
+            vec![alice, bob, dave]
+        );
+
+        // A target carrying only empty lists resolves to nobody, never to all.
+        assert!(
+            resolve(BulkMessageTarget {
+                host_ids: Some(vec![]),
+                ..Default::default()
+            })
+            .await
+            .is_empty()
+        );
     }
 }

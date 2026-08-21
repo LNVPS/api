@@ -213,23 +213,47 @@ Revokes a single passkey from a user's account.
   (`webauthn`) account, since that would permanently lock the user out. Add
   another login factor first, or leave at least one passkey.
 
-#### Bulk Message Active Customers
+#### Bulk Message Customers
 
 ```
 POST /api/admin/v1/users/bulk-message
 ```
 
-Dispatch a bulk message job to send messages to all active customers based on their contact preferences. The job is
-processed asynchronously by the worker system.
+Dispatch a bulk message job to customers, delivered over each user's own contact preferences. The job is processed
+asynchronously by the worker system.
 
 Request body:
 
 ```json
 {
   "subject": "Message subject",
-  "message": "Message content"
+  "message": "Message content",
+  "target": {
+    "user_ids": [1, 2],
+    "vm_ids": [10],
+    "host_ids": [1],
+    "region_ids": [1]
+  },
+  "dry_run": false
 }
 ```
+
+`target` is optional; when omitted the message goes to **all active customers**. Each field of `target` is optional too,
+and every populated field contributes recipients:
+
+| Field | Selects |
+|---|---|
+| `user_ids` | Exactly these users, whether or not they currently own a VM |
+| `vm_ids` | Owners of these VMs (deleted VMs select nobody) |
+| `host_ids` | Owners of any non-deleted VM on these hosts |
+| `region_ids` | Owners of any non-deleted VM in these regions |
+
+The resulting sets are **unioned and de-duplicated by user**, so an owner of several affected VMs is messaged once. A
+`target` that contains only *empty* lists (e.g. `{"host_ids": []}`) is rejected with `400` rather than being treated as
+"everyone".
+
+Set `dry_run: true` to resolve the recipient list and return it **without sending anything** — bulk messaging is
+irreversible, so this is the way to check the blast radius first.
 
 Response:
 
@@ -237,24 +261,45 @@ Response:
 {
   "data": {
     "job_dispatched": true,
-    "job_id": "1234567890-bulk-message"
+    "job_id": "1234567890-bulk-message",
+    "recipient_count": 17,
+    "reachable_count": 13,
+    "channel_counts": {
+      "email": 11,
+      "nip17": 6
+    },
+    "unreachable_users": [
+      {
+        "user_id": 42,
+        "billing_name": "Some Customer"
+      }
+    ]
   }
 }
 ```
 
-**Note:** The endpoint dispatches a work job and returns immediately with the job ID. The admin user will receive a
-completion notification via their contact preferences when the job finishes with full delivery statistics.
+- `recipient_count` — users the target resolved to.
+- `reachable_count` — how many of those have at least one usable contact method.
+- `channel_counts` — recipients per contact method (`email`, `nip17`, `telegram`, `whatsapp`); a user opted into several
+  channels counts once per channel.
+- `unreachable_users` — users the target matched that have **no** contact method at all. They are reported rather than
+  silently skipped; nothing is sent to them.
+- On a dry run, `job_dispatched` is `false` and `job_id` is `null`; the counts are populated identically.
 
-**Active customers** are defined as users who:
+**Note:** For a real send the endpoint dispatches a work job and returns immediately. The admin user receives a
+completion notification over their own contact preferences when the job finishes, listing sent / failed / unreachable /
+matched counts and the ids of the unreachable users. The same summary is published as the job result on
+`GET /api/admin/v1/jobs/feedback`.
 
-- Have at least one non-deleted VM (`vm.deleted = false`)
-- Have at least one contact method enabled (`contact_email = true` OR `contact_nip17 = true`)
-- Have the necessary contact information (email address for email, pubkey for NIP-17)
+**Active customers** (the default target) are users with at least one non-deleted VM (`vm.deleted = false`).
 
-**Message delivery priority:**
+**Message delivery** goes to *every* channel the user has both opted into and supplied data for, and that the server has
+configured:
 
-1. Email (if `contact_email = true` and email address exists and SMTP configured)
-2. NIP-17 DM (if `contact_nip17 = true` and email failed/unavailable and Nostr configured)
+- Email — `contact_email = true` and an email address on file (needs SMTP configured)
+- NIP-17 DM — `contact_nip17 = true` on a native Nostr account (needs Nostr configured)
+- Telegram — `contact_telegram = true` and a linked chat
+- WhatsApp — `contact_whatsapp = true` and a verified number
 
 Required Permission: `users::update`
 

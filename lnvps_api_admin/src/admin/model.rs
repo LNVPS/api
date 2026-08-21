@@ -3114,12 +3114,36 @@ pub struct UpdateVmIpAssignmentRequest {
 pub struct BulkMessageRequest {
     pub subject: String,
     pub message: String,
+    /// Optional recipient targeting; when absent, message all active customers.
+    #[serde(default)]
+    pub target: Option<lnvps_db::BulkMessageTarget>,
+    /// Resolve the recipient list and report it without sending anything.
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
 #[derive(Serialize)]
 pub struct BulkMessageResponse {
     pub job_dispatched: bool,
     pub job_id: Option<String>,
+    /// How many users the target resolved to (both runs and dry runs).
+    pub recipient_count: u64,
+    /// How many of those have at least one usable contact method.
+    pub reachable_count: u64,
+    /// Users matched by the target that have no contact method at all and so
+    /// will not be messaged. Reported rather than silently dropped.
+    pub unreachable_users: Vec<BulkMessageUnreachableUser>,
+    /// Per-channel recipient counts, keyed by contact method
+    /// (`email`, `nip17`, `telegram`, `whatsapp`). A user opted into several
+    /// channels counts once per channel.
+    pub channel_counts: HashMap<String, u64>,
+}
+
+#[derive(Serialize)]
+pub struct BulkMessageUnreachableUser {
+    pub user_id: u64,
+    /// Billing name if known, to make the user identifiable in the report.
+    pub billing_name: Option<String>,
 }
 
 #[derive(Deserialize)]

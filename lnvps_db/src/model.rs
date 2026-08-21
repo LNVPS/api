@@ -127,6 +127,106 @@ pub struct User {
     pub geo_updated: Option<DateTime<Utc>>,
 }
 
+/// A contact channel a user has both opted into and supplied the data for.
+///
+/// This mirrors the `wants()` rule of each notification channel, but is pure
+/// user data: it says nothing about whether the *server* has that channel
+/// configured. Used to report how (or whether) a bulk-message recipient can be
+/// reached before anything is sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContactMethod {
+    Nip17,
+    Email,
+    Telegram,
+    Whatsapp,
+}
+
+impl Display for ContactMethod {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ContactMethod::Nip17 => write!(f, "nip17"),
+            ContactMethod::Email => write!(f, "email"),
+            ContactMethod::Telegram => write!(f, "telegram"),
+            ContactMethod::Whatsapp => write!(f, "whatsapp"),
+        }
+    }
+}
+
+impl User {
+    /// Contact channels this user can actually be reached on.
+    ///
+    /// An empty result means the user has no usable contact method at all, and
+    /// a notification addressed to them would be silently dropped.
+    pub fn contact_methods(&self) -> Vec<ContactMethod> {
+        let mut methods = Vec::new();
+        // Only native Nostr accounts have a real key to DM; OAuth/WebAuthn
+        // accounts store a synthetic pubkey that is not a valid Nostr key.
+        if self.contact_nip17 && self.account_type == AccountType::Nostr {
+            methods.push(ContactMethod::Nip17);
+        }
+        if self.contact_email && !self.email.is_empty() {
+            methods.push(ContactMethod::Email);
+        }
+        if self.contact_telegram && self.telegram_chat_id.is_some() {
+            methods.push(ContactMethod::Telegram);
+        }
+        if self.contact_whatsapp && self.whatsapp_verified && self.whatsapp_number.is_some() {
+            methods.push(ContactMethod::Whatsapp);
+        }
+        methods
+    }
+}
+
+/// Recipient selection for an admin bulk message.
+///
+/// Every populated field contributes users to the recipient set; the sets are
+/// unioned and de-duplicated by user id, so a user owning several affected VMs
+/// is messaged once. An empty target means "every active customer".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BulkMessageTarget {
+    /// Explicit user ids. Unlike the other filters these are taken as given —
+    /// the user need not currently own a VM.
+    #[serde(default)]
+    pub user_ids: Option<Vec<u64>>,
+    /// Owners of these VMs.
+    #[serde(default)]
+    pub vm_ids: Option<Vec<u64>>,
+    /// Owners of any non-deleted VM on these hosts.
+    #[serde(default)]
+    pub host_ids: Option<Vec<u64>>,
+    /// Owners of any non-deleted VM in these regions.
+    #[serde(default)]
+    pub region_ids: Option<Vec<u64>>,
+}
+
+impl BulkMessageTarget {
+    /// Whether this target selects nothing in particular, i.e. every active
+    /// customer. A target whose only populated lists are empty counts as empty
+    /// too, so `{"host_ids": []}` cannot accidentally message the whole
+    /// platform... see [`BulkMessageTarget::is_explicitly_empty`].
+    pub fn is_empty(&self) -> bool {
+        self.lists().all(|l| l.is_none())
+    }
+
+    /// Whether the caller passed at least one filter list but every one of them
+    /// is empty. That resolves to zero recipients, and is treated as an error
+    /// rather than as "message everyone".
+    pub fn is_explicitly_empty(&self) -> bool {
+        !self.is_empty() && self.lists().flatten().all(|l| l.is_empty())
+    }
+
+    fn lists(&self) -> impl Iterator<Item = Option<&Vec<u64>>> {
+        [
+            self.user_ids.as_ref(),
+            self.vm_ids.as_ref(),
+            self.host_ids.as_ref(),
+            self.region_ids.as_ref(),
+        ]
+        .into_iter()
+    }
+}
+
 /// A saved payment method for off-session (merchant-initiated) automatic
 /// renewals. Provider-agnostic. Stores only opaque provider token references
 /// (encrypted) plus non-sensitive card metadata (brand/last4/expiry) — never
@@ -4673,5 +4773,85 @@ mod discount_tests {
             }
             .is_available(at(1_500))
         );
+    }
+}
+
+#[cfg(test)]
+mod bulk_message_tests {
+    use super::*;
+
+    /// The reachability report is only as good as this function: a user with an
+    /// opted-in channel but no data for it (nostr flag on an OAuth account, a
+    /// telegram opt-in with no linked chat) is *not* reachable, and must not be
+    /// counted as if a maintenance notice would arrive.
+    #[test]
+    fn contact_methods_need_both_optin_and_data() {
+        let mut user = User::default();
+        assert!(user.contact_methods().is_empty());
+
+        // NIP-17 needs a real Nostr key, not a synthetic OAuth identifier.
+        user.contact_nip17 = true;
+        user.account_type = AccountType::OAuth;
+        assert!(user.contact_methods().is_empty());
+        user.account_type = AccountType::Nostr;
+        assert_eq!(user.contact_methods(), vec![ContactMethod::Nip17]);
+
+        // Email opt-in without an address reaches nobody.
+        user.contact_email = true;
+        assert_eq!(user.contact_methods(), vec![ContactMethod::Nip17]);
+        user.email = "a@b.com".into();
+        assert_eq!(
+            user.contact_methods(),
+            vec![ContactMethod::Nip17, ContactMethod::Email]
+        );
+
+        // Telegram needs a linked chat.
+        user.contact_telegram = true;
+        assert_eq!(user.contact_methods().len(), 2);
+        user.telegram_chat_id = Some(42);
+        assert_eq!(user.contact_methods().len(), 3);
+
+        // WhatsApp needs a verified number.
+        user.contact_whatsapp = true;
+        user.whatsapp_number = Some("+15551234567".to_string());
+        assert_eq!(user.contact_methods().len(), 3);
+        user.whatsapp_verified = true;
+        assert_eq!(
+            user.contact_methods(),
+            vec![
+                ContactMethod::Nip17,
+                ContactMethod::Email,
+                ContactMethod::Telegram,
+                ContactMethod::Whatsapp
+            ]
+        );
+        assert_eq!(ContactMethod::Whatsapp.to_string(), "whatsapp");
+        assert_eq!(ContactMethod::Nip17.to_string(), "nip17");
+        assert_eq!(ContactMethod::Email.to_string(), "email");
+        assert_eq!(ContactMethod::Telegram.to_string(), "telegram");
+    }
+
+    /// "No target" and "a target whose lists are all empty" must not be
+    /// confused: the first messages every customer, the second nobody.
+    #[test]
+    fn empty_target_is_distinct_from_empty_lists() {
+        let all = BulkMessageTarget::default();
+        assert!(all.is_empty());
+        assert!(!all.is_explicitly_empty());
+
+        let none = BulkMessageTarget {
+            host_ids: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(!none.is_empty());
+        assert!(none.is_explicitly_empty());
+
+        let some = BulkMessageTarget {
+            host_ids: Some(vec![1]),
+            vm_ids: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(!some.is_empty());
+        assert!(!some.is_explicitly_empty());
     }
 }
