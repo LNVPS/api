@@ -245,11 +245,12 @@ fn live_chat_prompt() -> &'static str {
 - Do NOT open with a greeting on every message, and do NOT sign off — this is
   an ongoing conversation, not a letter.
 - Ask one clarifying question at a time rather than a long list.
-- You can start, stop and restart the customer's VMs. Confirm with them before
-  stopping or restarting, since running services will be interrupted.
-- You cannot extend, refund or delete a VM from this chat. If the customer asks
-  for one of those, explain that you'll need to hand it to a human and ask them
-  to email support so it can be handled with the proper checks."#
+- You can start, stop and restart the customer's VMs and app deployments.
+  Confirm with them before stopping or restarting, since running services will
+  be interrupted.
+- Anything that moves money, grants paid time or destroys data is a human's
+  job. Say you'll hand it over and ask them to email support@lnvps.net; never
+  say it is done."#
 }
 
 /// Channel-specific prompt for a live chat with a visitor who is not logged in.
@@ -265,8 +266,8 @@ logged in:
 - Use plain text. Short markdown (**bold**, `code`, bullet lists) is fine.
 - Do NOT open with a greeting on every message, and do NOT sign off.
 - You have NO access to any account: you cannot see who they are, their VMs,
-  their payments or their invoices, and you cannot start, stop, restart,
-  extend, refund or delete anything.
+  their payments or their invoices, and you cannot start, stop or restart
+  anything.
 - You CAN answer questions about the service itself: regions, plans and specs,
   operating system images, pricing, payment methods, and the terms of service.
   Use your tools for those rather than guessing.
@@ -388,7 +389,8 @@ mod tests {
     #[test]
     fn live_chat_prompt_directs_escalation() {
         let prompt = live_chat_prompt();
-        assert!(prompt.contains("cannot extend, refund or delete"));
+        assert!(prompt.contains("support@lnvps.net"));
+        assert!(prompt.contains("never\n  say it is done"));
         assert!(prompt.contains("email support"));
     }
 
