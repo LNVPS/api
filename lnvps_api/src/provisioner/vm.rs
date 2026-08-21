@@ -757,12 +757,15 @@ impl VmProvisioner {
     /// with all of its related records (history, firewall rules, IP
     /// assignments, and its subscription + payment history) via
     /// [`LNVpsDb::hard_delete_vm`]. Otherwise the VM is soft-deleted
-    /// (`deleted = 1`), matching production behaviour for paid VMs.
+    /// (`deleted = 1`), matching production behaviour for paid VMs, and its
+    /// subscription is deactivated so billing stops (issue #361) — the same
+    /// rule the admin app-deployment delete applies.
     ///
     /// Callers pass `purge = true` for never-paid (new) VMs and super-admin
     /// forced deletions so that they leave nothing behind in the database.
     pub async fn delete_vm(&self, vm_id: u64, purge: bool) -> OpResult<()> {
         let vm = self.db.get_vm(vm_id).await?;
+        let line_item_id = vm.subscription_line_item_id;
         let host = self.db.get_host(vm.host_id).await?;
 
         let client = get_host_client(&host, &self.provisioner_config)?;
@@ -776,6 +779,17 @@ impl VmProvisioner {
                     if purge {
                         Ok(ctx.0.hard_delete_vm(vm_id).await?)
                     } else {
+                        // Stop billing before soft-deleting: a soft-deleted VM
+                        // that keeps an active, auto-renewing subscription is
+                        // still invoiced and still reports as active in admin.
+                        if let Ok(mut sub) =
+                            ctx.0.get_subscription_by_line_item_id(line_item_id).await
+                            && (sub.is_active || sub.auto_renewal_enabled)
+                        {
+                            sub.is_active = false;
+                            sub.auto_renewal_enabled = false;
+                            ctx.0.update_subscription(&sub).await?;
+                        }
                         Ok(ctx.0.delete_vm(vm_id).await?)
                     }
                 })
@@ -2692,6 +2706,49 @@ mod tests {
     }
 
     // ── subscription / VM lifecycle tests ────────────────────────────────────
+
+    /// Regression (issue #361): soft-deleting a VM must deactivate its
+    /// subscription and stop auto-renewal, otherwise the deleted VM keeps
+    /// being invoiced and still reports as active in the admin API.
+    #[tokio::test]
+    async fn test_delete_vm_deactivates_subscription() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let sub_handler = make_sub_handler(db.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+
+        // Pay for it so the subscription becomes active and auto-renewing.
+        let payment = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+        sub_handler.complete_payment(&payment).await?;
+        let mut sub = db.get_subscription(li.subscription_id).await?;
+        assert!(sub.is_active, "precondition: paid subscription is active");
+        sub.auto_renewal_enabled = true;
+        db.update_subscription(&sub).await?;
+
+        // Soft delete (purge = false), the path taken for a paid VM.
+        provisioner.delete_vm(vm.id, false).await?;
+
+        assert!(db.get_vm(vm.id).await?.deleted, "VM must be soft-deleted");
+        let sub = db.get_subscription(li.subscription_id).await?;
+        assert!(
+            !sub.is_active,
+            "subscription must be deactivated when its VM is deleted"
+        );
+        assert!(
+            !sub.auto_renewal_enabled,
+            "auto-renewal must be off for a deleted VM"
+        );
+        Ok(())
+    }
 
     /// After any non-upgrade payment is completed, `WorkJob::SpawnVm` must be
     /// queued regardless of payment type. The MAC-address guard inside the
