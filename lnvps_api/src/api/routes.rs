@@ -51,15 +51,31 @@ use crate::provisioner::{HostCapacityService, PricingEngine};
 ///
 /// A no-op unless the `agent` feature is compiled in; even then the handler
 /// refuses connections until `agent` is present in the config.
+///
+/// The upgrade is taken as a `Result` so a plain `GET` — the availability probe
+/// the web client makes before rendering a chat box — gets a useful answer
+/// instead of axum's upgrade rejection.
 #[cfg(feature = "agent")]
 fn with_support_chat(router: Router<RouterState>) -> Router<RouterState> {
+    use axum::extract::ws::rejection::WebSocketUpgradeRejection;
+    use axum::response::{IntoResponse, Response};
+
     router.route(
         crate::api::support::CHAT_PATH,
         any(
-            async move |ws: WebSocketUpgrade,
-                        Query(q): Query<AuthQuery>,
+            async move |ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+                        Query(q): Query<crate::api::support::ChatQuery>,
+                        lnvps_api_common::ClientIp(ip): lnvps_api_common::ClientIp,
                         State(this): State<RouterState>| {
-                ws.on_upgrade(async move |s| crate::api::support::v1_support_chat(q, this, s).await)
+                let response: Response = match ws {
+                    Ok(ws) => ws
+                        .on_upgrade(async move |s| {
+                            crate::api::support::v1_support_chat(q, ip, this, s).await
+                        })
+                        .into_response(),
+                    Err(_) => crate::api::support::chat_availability(&this),
+                };
+                response
             },
         ),
     )

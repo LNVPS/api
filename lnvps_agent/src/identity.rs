@@ -11,6 +11,14 @@ pub enum SenderIdentity {
     Email(String),
     /// Identified by nostr pubkey hex (Nostr channel, live chat).
     Pubkey(String),
+    /// A logged-out visitor on live chat, identified only by an opaque
+    /// server-issued session id.
+    ///
+    /// The id is a bearer token: whoever presents it resumes that transcript,
+    /// so it must be unguessable (the API issues 32 random bytes). It proves
+    /// nothing about who the visitor is, which is why a guest never resolves to
+    /// a [`Requester::Customer`].
+    Guest(String),
 }
 
 impl SenderIdentity {
@@ -20,6 +28,7 @@ impl SenderIdentity {
         match self {
             SenderIdentity::Email(email) => email,
             SenderIdentity::Pubkey(pubkey) => pubkey,
+            SenderIdentity::Guest(session) => session,
         }
     }
 }
@@ -88,6 +97,8 @@ impl Requester {
 ///   network, so a thread shared with email would let the agent quote a
 ///   privately-reported billing or account detail into a public post.
 /// - `email:<addr>` / `pubkey:<hex>` — senders that matched no account.
+/// - `guest:<session>` — a logged-out live-chat visitor. Its own namespace so a
+///   guest id can never be confused with a pubkey, whatever its shape.
 pub fn conversation_key(
     identity: &SenderIdentity,
     requester: &Requester,
@@ -104,6 +115,7 @@ pub fn conversation_key(
         None => match identity {
             SenderIdentity::Email(email) => format!("email:{}", email.to_lowercase()),
             SenderIdentity::Pubkey(pubkey) => format!("pubkey:{pubkey}"),
+            SenderIdentity::Guest(session) => format!("guest:{session}"),
         },
     }
 }
@@ -172,6 +184,33 @@ mod tests {
         assert_eq!(
             conversation_key(&upper, &Requester::Anonymous, SupportChannelKind::Email),
             conversation_key(&lower, &Requester::Anonymous, SupportChannelKind::Email)
+        );
+    }
+
+    /// A guest transcript is keyed only on the server-issued session id, and
+    /// must never share a namespace with a pubkey-identified sender.
+    #[test]
+    fn guest_sessions_key_on_their_session_id() {
+        let session = "ab".repeat(32);
+        assert_eq!(
+            conversation_key(
+                &SenderIdentity::Guest(session.clone()),
+                &Requester::Anonymous,
+                SupportChannelKind::WebChat
+            ),
+            format!("guest:{session}")
+        );
+        assert_ne!(
+            conversation_key(
+                &SenderIdentity::Guest(session.clone()),
+                &Requester::Anonymous,
+                SupportChannelKind::WebChat
+            ),
+            conversation_key(
+                &SenderIdentity::Pubkey(session),
+                &Requester::Anonymous,
+                SupportChannelKind::WebChat
+            )
         );
     }
 

@@ -71,9 +71,17 @@ impl PowerAction {
 /// Power actions are optional: without a [`ProvisionerConfig`] and a work
 /// commander the executor is read-only, which is the right default for any
 /// caller that cannot reach the hypervisors.
+///
+/// The scoped user is optional too: [`DbToolExecutor::public`] builds an
+/// executor for a logged-out visitor, which can answer catalogue questions
+/// (regions, templates, images, terms) and nothing else. Every user-scoped tool
+/// checks for the account *here* rather than relying on the smaller tool list
+/// advertised to the model, because a model can invent a call to a tool it was
+/// never offered.
 pub struct DbToolExecutor {
     db: Arc<dyn LNVpsDb>,
-    user_id: u64,
+    /// `None` for an anonymous (guest) session — see [`DbToolExecutor::public`].
+    user_id: Option<u64>,
     history: VmHistoryLogger,
     /// Hypervisor configuration; `None` disables the power tools.
     provisioner: Option<ProvisionerConfig>,
@@ -89,11 +97,41 @@ impl DbToolExecutor {
         Self {
             history: VmHistoryLogger::new(db.clone()),
             db,
-            user_id,
+            user_id: Some(user_id),
             provisioner: None,
             work_sender: None,
             diag: Diagnostics::default(),
         }
+    }
+
+    /// Create an executor for a caller with no account.
+    ///
+    /// Serves only the public catalogue tools; every account-scoped tool fails
+    /// with a message the model can relay. Note [`Self::with_power_actions`]
+    /// cannot make this dangerous — the power tools resolve their VM through
+    /// the ownership check, which no anonymous caller can pass — but callers
+    /// should still not enable them.
+    pub fn public(db: Arc<dyn LNVpsDb>) -> Self {
+        Self {
+            history: VmHistoryLogger::new(db.clone()),
+            db,
+            user_id: None,
+            provisioner: None,
+            work_sender: None,
+            diag: Diagnostics::default(),
+        }
+    }
+
+    /// The scoped user, or an error naming what the caller must do instead.
+    ///
+    /// The message is written for the model to relay to a logged-out visitor.
+    fn require_user(&self) -> Result<u64> {
+        self.user_id.ok_or_else(|| {
+            anyhow!(
+                "That needs an account. Ask the visitor to log in at lnvps.net \
+                 to see their VMs, billing or account details."
+            )
+        })
     }
 
     /// Enable the `start_vm` / `stop_vm` / `restart_vm` tools.
@@ -120,9 +158,10 @@ impl DbToolExecutor {
     /// enforced here rather than by the prompt, because the model's `vm_id`
     /// argument is attacker-influencable: a customer can ask about any id.
     async fn owned_vm(&self, args: &HashMap<String, Value>) -> Result<Vm> {
+        let user_id = self.require_user()?;
         let vm_id = required_u64(args, "vm_id")?;
         let vm = self.db.get_vm(vm_id).await?;
-        if vm.user_id != self.user_id {
+        if vm.user_id != user_id {
             // Deliberately does not reveal the real owner.
             bail!("VM {} does not belong to you", vm_id);
         }
@@ -131,7 +170,7 @@ impl DbToolExecutor {
 
     /// The customer's own account, with verification tokens stripped.
     async fn account(&self) -> Result<Value> {
-        let user = self.db.get_user(self.user_id).await?;
+        let user = self.db.get_user(self.require_user()?).await?;
         Ok(json!({
             "id": user.id,
             "pubkey": hex::encode(&user.pubkey),
@@ -224,7 +263,7 @@ impl DbToolExecutor {
     }
 
     async fn list_vms(&self) -> Result<Value> {
-        let vms = self.db.list_user_vms(self.user_id).await?;
+        let vms = self.db.list_user_vms(self.require_user()?).await?;
         let mut out = Vec::with_capacity(vms.len());
         for vm in vms.iter().filter(|v| !v.deleted) {
             out.push(self.vm_summary(vm).await);
@@ -375,19 +414,11 @@ impl DbToolExecutor {
         // Each logger method returns a distinct opaque future, so they are
         // awaited in-arm rather than unified into one binding.
         let logged = match action {
-            PowerAction::Start => {
-                self.history
-                    .log_vm_started(vm.id, Some(self.user_id), None)
-                    .await
-            }
-            PowerAction::Stop => {
-                self.history
-                    .log_vm_stopped(vm.id, Some(self.user_id), None)
-                    .await
-            }
+            PowerAction::Start => self.history.log_vm_started(vm.id, self.user_id, None).await,
+            PowerAction::Stop => self.history.log_vm_stopped(vm.id, self.user_id, None).await,
             PowerAction::Restart => {
                 self.history
-                    .log_vm_restarted(vm.id, Some(self.user_id), None)
+                    .log_vm_restarted(vm.id, self.user_id, None)
                     .await
             }
         };
@@ -537,6 +568,57 @@ mod tests {
                 !message.contains('2') || !message.contains("owner"),
                 "{message}"
             );
+        }
+    }
+
+    /// A guest (logged-out) session must not be able to reach *any* account
+    /// data, whichever tool the model calls. The narrower tool list it is
+    /// offered is not the control — a model can name a tool it was never given,
+    /// and prompt injection makes that likely rather than hypothetical.
+    #[tokio::test]
+    async fn anonymous_executor_refuses_every_account_tool() {
+        let db = Arc::new(MockDb::default());
+        let dyn_db: Arc<dyn LNVpsDb> = db.clone();
+        seed_vm(&db, 42, 1).await;
+        let exec = DbToolExecutor::public(dyn_db);
+
+        for (tool, args) in [
+            ("get_my_account", "{}"),
+            ("list_my_vms", "{}"),
+            ("get_vm_details", r#"{"vm_id":42}"#),
+            ("list_vm_payments", r#"{"vm_id":42}"#),
+            ("list_vm_history", r#"{"vm_id":42}"#),
+            ("start_vm", r#"{"vm_id":42}"#),
+            ("stop_vm", r#"{"vm_id":42}"#),
+            ("restart_vm", r#"{"vm_id":42}"#),
+            ("ping_vm", r#"{"vm_id":42}"#),
+            ("traceroute_vm", r#"{"vm_id":42}"#),
+            ("check_vm_port", r#"{"vm_id":42,"port":22}"#),
+        ] {
+            let err = exec
+                .execute(tool, args)
+                .await
+                .expect_err(&format!("{tool} must be refused without an account"));
+            assert!(
+                err.to_string().contains("needs an account"),
+                "{tool}: {err}"
+            );
+        }
+    }
+
+    /// The point of a guest session: catalogue questions still work.
+    #[tokio::test]
+    async fn anonymous_executor_serves_the_catalogue() {
+        let db = Arc::new(MockDb::default());
+        let dyn_db: Arc<dyn LNVpsDb> = db.clone();
+        let exec = DbToolExecutor::public(dyn_db);
+
+        for tool in ["list_regions", "list_templates", "list_os_images"] {
+            let out = exec
+                .execute(tool, "{}")
+                .await
+                .unwrap_or_else(|e| panic!("{tool} must work without an account: {e}"));
+            assert!(out.starts_with('['), "{tool} returned {out}");
         }
     }
 

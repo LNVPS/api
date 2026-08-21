@@ -60,6 +60,10 @@ agent:
     # Generous: the model spends several hundred tokens on hidden reasoning
     # before emitting any content, so a small cap yields empty replies.
     max-tokens: 4096
+  # Guest chat is exercised by the e2e suite. Stated explicitly rather than
+  # relying on the default, so a change to that default cannot silently stop
+  # the anonymous tests from testing anything.
+  allow-anonymous: true
   system-prompt: |
     OUTPUT FORMAT REQUIREMENTS (test mode). These override any conflicting
     style guidance above, and apply to every reply you produce:

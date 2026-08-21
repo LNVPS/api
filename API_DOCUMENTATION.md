@@ -983,7 +983,7 @@ interface PatchPaymentMethodRequest {
 
 #### Live Chat with the Support Agent (WebSocket)
 - **WebSocket** `/api/v1/support/chat`
-- **Auth**: Query parameter `?ticket=<ticket>` from [Issue an Auth Ticket](#issue-an-auth-ticket). The legacy `?auth=<base64_nip98_event>` form (signed over `/api/v1/support/chat` with method `GET`) still works but is **deprecated**.
+- **Auth**: Query parameter `?ticket=<ticket>` from [Issue an Auth Ticket](#issue-an-auth-ticket). The legacy `?auth=<base64_nip98_event>` form (signed over `/api/v1/support/chat` with method `GET`) still works but is **deprecated**. Omitting both opens an [anonymous session](#anonymous-guest-chat), where the server allows it.
 - **Description**: Opens a live chat with the AI support agent. The agent has read access to your account, VMs, payment history and VM activity log, and can start, stop and restart your VMs.
 
 **Sending**: send each message as a single WebSocket **text frame** containing the plain message text. Binary frames are rejected.
@@ -1013,6 +1013,26 @@ Every message you send produces exactly one terminal frame — `final` or `error
 **Conversation history** is stored per account and is shared with the email support channel, so the agent remembers earlier exchanges regardless of how you contacted support. Public Nostr mentions are kept in a separate thread and are never mixed into it.
 
 **Availability**: this endpoint is only present when the server is built with the `agent` feature and an agent is configured; otherwise it returns an `error` frame and closes.
+
+A plain `GET` on the path (no WebSocket upgrade headers) is an availability probe:
+
+```typescript
+{ available: boolean; anonymous: boolean }
+```
+
+`200` with `available: true` when an agent is configured, and `anonymous` says whether a logged-out visitor may connect. `404` when no agent is configured, so a client that treats any non-404 as "chat exists" keeps working. Check `anonymous` before offering chat on a public page — otherwise the box renders and every connection is refused.
+
+#### Anonymous (guest) chat
+
+A connection with **no** `ticket` and no `auth` parameter is a guest session, for pre-sales questions from a visitor who has not logged in. It is on by default wherever an agent is configured, and an operator may disable it with `agent.allow-anonymous: false`; when off, connecting without credentials returns an `error` frame and closes — check the availability probe's `anonymous` field rather than assuming. Passing an *invalid* ticket is still an error rather than a downgrade to guest.
+
+Differences from an authenticated session:
+
+- The agent has **no account context and no account tools** — no VM list, no payments, no power actions. It answers from the public catalogue (regions, templates, OS images, terms of service).
+- The first frame is `{ type: "session", id: string }`, an opaque server-issued id. Reconnect with `?guest=<id>` to resume the same transcript — needed because a turn can run for minutes and idle proxies drop the socket. Treat the id as a bearer token: anyone holding it can read that conversation.
+- Lower limits: **10 messages per connection** by default (against 50 authenticated), plus per-IP caps on connections and on messages per hour that reconnecting does not reset. Exceeding a per-IP cap yields an `error` frame naming the retry delay.
+
+An id that this server did not issue (wrong shape) is ignored and a fresh session is started, so a client can always reconnect blindly.
 
 ### VM Firewall
 

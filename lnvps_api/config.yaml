@@ -93,6 +93,16 @@ captcha:
 #  #max-message-chars: 4000
 #  # Cap on messages accepted per websocket connection (default 50).
 #  #max-turns-per-connection: 50
+#  # Serve chat to logged-out visitors (public contact page). On by default;
+#  # set false to serve only logged-in customers. An anonymous turn costs
+#  # model tokens with no account behind it, which the caps below bound. A
+#  # guest gets catalogue tools only - no account data, no power actions.
+#  #allow-anonymous: true
+#  # Cap on messages per *anonymous* connection (default 10).
+#  #anonymous-max-turns-per-connection: 10
+#  # Per-client-IP caps on anonymous chat (defaults 20 / 60 per hour).
+#  #anonymous-connections-per-hour: 20
+#  #anonymous-messages-per-hour: 60
 # Telegram notification channel (optional). Create a bot via @BotFather.
 # When set, users can link their chat from account settings and receive
 # notifications via Telegram.

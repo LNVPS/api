@@ -114,6 +114,9 @@ impl ApiClient {
         let user = match sender {
             SenderIdentity::Email(email) => self.admin_find_user_by_email(email).await?,
             SenderIdentity::Pubkey(pubkey) => self.admin_find_user_by_pubkey(pubkey).await?,
+            // A guest session id identifies no account by construction, so
+            // there is nothing to look up.
+            SenderIdentity::Guest(_) => None,
         };
 
         let key = sender.as_str();
