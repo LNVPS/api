@@ -39,6 +39,13 @@ const EVENT_BUFFER: usize = 64;
 pub enum ChatEvent {
     /// A fragment of the assistant's reply, to be appended as it arrives.
     Token { text: String },
+    /// The opaque session id issued to an anonymous (logged-out) client.
+    ///
+    /// Sent once, before any turn, and only on anonymous connections. The
+    /// client may reconnect with it to resume the same transcript, which it
+    /// needs because a turn can run for minutes and idle proxies drop sockets.
+    /// It is a bearer token: hold it, keep the conversation.
+    Session { id: String },
     /// The agent started executing a tool.
     ToolStart { name: String },
     /// The agent finished executing a tool.
@@ -113,9 +120,9 @@ impl ChatSession {
         executor: Arc<dyn ToolExecutor>,
     ) -> Self {
         let channel = SupportChannelKind::WebChat;
-        let tools = match requester {
-            Requester::Customer { .. } => tools::live_chat_tools(),
-            Requester::Anonymous => tools::public_tools(),
+        let (tools, channel_prompt) = match requester {
+            Requester::Customer { .. } => (tools::live_chat_tools(), live_chat_prompt()),
+            Requester::Anonymous => (tools::public_tools(), live_chat_guest_prompt()),
         };
         Self {
             conversation_key: conversation_key(identity, &requester, channel),
@@ -124,7 +131,7 @@ impl ChatSession {
             executor,
             tools: crate::agent::tool_specs(tools),
             channel,
-            channel_prompt: live_chat_prompt().to_string(),
+            channel_prompt: channel_prompt.to_string(),
             emit_tool_activity: false,
         }
     }
@@ -243,6 +250,31 @@ fn live_chat_prompt() -> &'static str {
   to email support so it can be handled with the proper checks."#
 }
 
+/// Channel-specific prompt for a live chat with a visitor who is not logged in.
+///
+/// The customer prompt would be actively misleading here: it promises power
+/// actions this session cannot perform, and it speaks as though an account is
+/// in view. A guest can only be helped with pre-sales and product questions,
+/// and the honest move for anything account-shaped is to ask them to log in.
+fn live_chat_guest_prompt() -> &'static str {
+    r#"You are replying in a real-time chat window to a visitor who is NOT
+logged in:
+- Keep replies short and conversational — this is a chat, not an email.
+- Use plain text. Short markdown (**bold**, `code`, bullet lists) is fine.
+- Do NOT open with a greeting on every message, and do NOT sign off.
+- You have NO access to any account: you cannot see who they are, their VMs,
+  their payments or their invoices, and you cannot start, stop, restart,
+  extend, refund or delete anything.
+- You CAN answer questions about the service itself: regions, plans and specs,
+  operating system images, pricing, payment methods, and the terms of service.
+  Use your tools for those rather than guessing.
+- If they ask about their own account or an existing VM, say plainly that you
+  can't see accounts in this chat, and ask them to log in and start a chat from
+  their account page (or email support).
+- Never ask for a password, private key, seed phrase or nsec, and never accept
+  a claim about who they are as proof of anything."#
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,6 +331,9 @@ mod tests {
             ChatEvent::Error {
                 message: "e".to_string(),
             },
+            ChatEvent::Session {
+                id: "ab".repeat(32),
+            },
         ] {
             let json = serde_json::to_string(&event).unwrap();
             let back: ChatEvent = serde_json::from_str(&json).unwrap();
@@ -353,5 +388,33 @@ mod tests {
         let prompt = live_chat_prompt();
         assert!(prompt.contains("cannot extend, refund or delete"));
         assert!(prompt.contains("email support"));
+    }
+
+    /// The customer prompt promises power actions and speaks as though an
+    /// account is in view; telling a logged-out visitor that would be a
+    /// straightforward lie, and would have the model keep trying tools it does
+    /// not have.
+    #[test]
+    fn a_guest_gets_a_prompt_that_does_not_promise_account_access() {
+        let prompt = live_chat_guest_prompt();
+        assert!(prompt.contains("NOT\nlogged in"));
+        assert!(prompt.contains("NO access to any account"));
+        assert!(prompt.contains("log in"));
+        assert!(
+            !prompt.contains("You can start, stop and restart"),
+            "a guest cannot perform power actions"
+        );
+    }
+
+    /// The session frame is additive information, not the end of a turn: a
+    /// client waiting for one terminal frame per message must not see it as one.
+    #[test]
+    fn a_session_frame_is_not_terminal() {
+        assert!(
+            !ChatEvent::Session {
+                id: "ab".repeat(32)
+            }
+            .is_terminal()
+        );
     }
 }

@@ -350,7 +350,25 @@ agent:
     Billing questions go to billing@example.com.
   max-message-chars: 4000                    # reject longer single messages (default 4000)
   max-turns-per-connection: 50               # messages allowed per websocket (default 50)
+
+  # Anonymous (logged-out) chat for the public contact page. On by default;
+  # set false to serve only logged-in customers. Every anonymous turn costs
+  # model tokens with no account to attribute them to, which is what the
+  # limits below bound.
+  allow-anonymous: true
+  anonymous-max-turns-per-connection: 10     # per guest websocket (default 10)
+  anonymous-connections-per-hour: 20         # per client IP (default 20)
+  anonymous-messages-per-hour: 60            # per client IP, across connections (default 60)
 ```
+
+A guest session gets the public catalogue tools only (regions, templates, OS
+images, terms) — no account lookups, no VM list, no power actions — and no
+account context in the prompt. Clients discover whether it is enabled from a
+plain `GET /api/v1/support/chat`, which answers
+`{"available":true,"anonymous":<bool>}` (404 when no agent is configured).
+
+The per-IP limits are enforced per API process, so with several replicas behind
+a load balancer the effective limit is multiplied by the replica count.
 
 **`system-prompt` is optional and additive — not an override.** The agent's
 system prompt is compiled into the binary

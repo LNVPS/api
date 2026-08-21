@@ -184,19 +184,33 @@ impl RateLimiter {
     }
 }
 
-/// Fixed-window rate limiter keyed by user id rather than client IP.
+/// Fixed-window rate limiter keyed by something other than the request path.
 ///
-/// Some actions cost real money or send a message to a third party, and must be
-/// bounded per *account* — an attacker with many source addresses trivially
-/// defeats a per-IP bucket for those.
-pub struct UserRateLimiter {
-    buckets: Mutex<HashMap<u64, Bucket>>,
+/// Two keyings are in use, via the aliases below:
+///
+/// - [`UserRateLimiter`] (`u64` user id) for actions that cost real money or
+///   message a third party. Those must be bounded per *account*, because an
+///   attacker with many source addresses trivially defeats a per-IP bucket.
+/// - [`IpRateLimiter`] ([`IpAddr`]) for unauthenticated work with no account to
+///   bill it to — guest support chat, where each turn costs model tokens.
+pub struct KeyedRateLimiter<K> {
+    buckets: Mutex<HashMap<K, Bucket>>,
     max: u32,
     window: Duration,
 }
 
-impl UserRateLimiter {
-    /// Allow `max` actions per `window` per user.
+/// Fixed-window limiter keyed by LNVPS user id.
+pub type UserRateLimiter = KeyedRateLimiter<u64>;
+
+/// Fixed-window limiter keyed by client IP, for unauthenticated callers.
+///
+/// Weaker than a per-account limit (a botnet or a NAT gateway both blur it),
+/// so use it only where there is no account, and pair it with a per-connection
+/// cap that a single client cannot exceed at all.
+pub type IpRateLimiter = KeyedRateLimiter<IpAddr>;
+
+impl<K: std::hash::Hash + Eq> KeyedRateLimiter<K> {
+    /// Allow `max` actions per `window` per key.
     pub fn new(max: u32, window: Duration) -> Self {
         Self {
             buckets: Mutex::new(HashMap::new()),
@@ -205,9 +219,9 @@ impl UserRateLimiter {
         }
     }
 
-    /// Record one action for `user_id`, returning seconds until the window
+    /// Record one action for `key`, returning seconds until the window
     /// resets when the limit is exceeded.
-    pub fn check(&self, user_id: u64) -> Result<(), u64> {
+    pub fn check(&self, key: K) -> Result<(), u64> {
         let mut guard = self
             .buckets
             .lock()
@@ -217,7 +231,7 @@ impl UserRateLimiter {
         // Bound memory: drop entries whose window has fully elapsed.
         guard.retain(|_, b| now.duration_since(b.window_start) < self.window);
 
-        let bucket = guard.entry(user_id).or_insert(Bucket {
+        let bucket = guard.entry(key).or_insert(Bucket {
             count: 0,
             window_start: now,
             last_seen: now,

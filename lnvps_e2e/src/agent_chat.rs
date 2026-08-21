@@ -210,6 +210,59 @@ mod tests {
             Self::connect_with_auth(token).await
         }
 
+        /// Open a **guest** chat websocket: no ticket, no auth event.
+        ///
+        /// `resume` carries a previously issued session id, as a client
+        /// reconnecting after a dropped socket would.
+        async fn connect_anonymous(resume: Option<&str>) -> Result<Self> {
+            let query = match resume {
+                Some(id) => format!("?guest={}", urlencode(id)),
+                None => String::new(),
+            };
+            let ws_url = format!(
+                "{}{}{}",
+                user_api_url()
+                    .replace("http://", "ws://")
+                    .replace("https://", "wss://"),
+                CHAT_PATH,
+                query
+            );
+            let (socket, _) = tokio_tungstenite::connect_async(&ws_url)
+                .await
+                .with_context(|| format!("failed to connect to {ws_url}"))?;
+            Ok(Self { socket })
+        }
+
+        /// Read exactly one frame, without waiting for a terminal event.
+        async fn next_frame(&mut self) -> Result<Event> {
+            loop {
+                let frame = tokio::time::timeout(TURN_TIMEOUT, self.socket.next())
+                    .await
+                    .context("timed out waiting for a frame")?;
+                let text = match frame {
+                    Some(Ok(Message::Text(text))) => text.to_string(),
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => bail!("websocket error: {e}"),
+                    None => bail!("socket closed before any frame arrived"),
+                };
+                let value: Value = serde_json::from_str(&text)
+                    .with_context(|| format!("frame is not JSON: {text}"))?;
+                return Ok(Event {
+                    kind: value["type"]
+                        .as_str()
+                        .with_context(|| format!("frame has no type: {text}"))?
+                        .to_string(),
+                    payload: value["text"]
+                        .as_str()
+                        .or_else(|| value["message"].as_str())
+                        .or_else(|| value["name"].as_str())
+                        .or_else(|| value["id"].as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                });
+            }
+        }
+
         /// Open a chat websocket with an explicit `auth` query value.
         async fn connect_with_auth(auth: &str) -> Result<Self> {
             let ws_url = format!(
@@ -266,6 +319,7 @@ mod tests {
                     .as_str()
                     .or_else(|| value["message"].as_str())
                     .or_else(|| value["name"].as_str())
+                    .or_else(|| value["id"].as_str())
                     .unwrap_or_default()
                     .to_string();
 
@@ -346,6 +400,71 @@ mod tests {
             events[0].payload.to_lowercase().contains("auth"),
             "error should mention auth: {}",
             events[0].payload
+        );
+    }
+
+    /// The availability probe the web client makes before rendering a chat box.
+    /// A plain GET must answer rather than fail the upgrade, and must say
+    /// whether a *logged-out* visitor may connect — "chat exists" alone would
+    /// have the public page render a box that always refuses.
+    #[tokio::test]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
+    async fn test_chat_availability_probe() {
+        let url = format!("{}{}", user_api_url(), CHAT_PATH);
+        let rsp = reqwest::get(&url).await.expect("probe");
+        assert_eq!(rsp.status(), 200, "agent is configured in the e2e config");
+        let body: Value = rsp.json().await.expect("probe body is JSON");
+        assert_eq!(body["available"], true);
+        assert_eq!(
+            body["anonymous"], true,
+            "the e2e config enables allow-anonymous"
+        );
+    }
+
+    /// A connection with no credentials is a guest session: it is accepted, it
+    /// is told its session id before anything else, and presenting that id back
+    /// resumes the same conversation rather than starting a new one.
+    #[tokio::test]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
+    async fn test_chat_anonymous_session_is_issued_and_resumable() {
+        let mut chat = Chat::connect_anonymous(None).await.expect("connect");
+        let first = chat.next_frame().await.expect("first frame");
+        assert_eq!(
+            first.kind, "session",
+            "a guest must be told its session id first, got {first:?}"
+        );
+        let id = first.payload;
+        assert_eq!(id.len(), 64, "session id must be 32 random bytes in hex");
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+        drop(chat);
+
+        // Reconnecting with the id keeps the same conversation.
+        let mut resumed = Chat::connect_anonymous(Some(&id)).await.expect("reconnect");
+        let frame = resumed.next_frame().await.expect("first frame");
+        assert_eq!(frame.kind, "session");
+        assert_eq!(frame.payload, id, "a valid session id must be honoured");
+
+        // An id this server never issued is replaced rather than trusted, so a
+        // client can always reconnect blindly.
+        let mut junk = Chat::connect_anonymous(Some("not-a-session"))
+            .await
+            .expect("connect");
+        let frame = junk.next_frame().await.expect("first frame");
+        assert_eq!(frame.kind, "session");
+        assert_ne!(frame.payload, "not-a-session");
+        assert_eq!(frame.payload.len(), 64);
+    }
+
+    /// An authenticated session must not be given a guest session id — that
+    /// frame is the marker the client uses to know it is talking anonymously.
+    #[tokio::test]
+    #[ignore = "agent suite is opt-in; run with --ignored"]
+    async fn test_authenticated_chat_gets_no_session_frame() {
+        let mut chat = Chat::connect().await.expect("connect");
+        let events = chat.ask("hi").await.expect("ask");
+        assert!(
+            !events.iter().any(|e| e.kind == "session"),
+            "authenticated sessions must not be issued a guest id: {events:?}"
         );
     }
 

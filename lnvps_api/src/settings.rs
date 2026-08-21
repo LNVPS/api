@@ -576,6 +576,36 @@ pub struct AgentConfig {
     /// state (Redis), which is not wired up here.
     #[serde(default = "default_agent_max_turns")]
     pub max_turns_per_connection: usize,
+
+    /// Serve live chat to visitors who are not logged in (issue #389).
+    ///
+    /// **On** by default: the pre-sales question from a logged-out visitor is
+    /// the main reason to run chat on a public page at all, so a deployment
+    /// that configured an agent almost certainly wants it. An anonymous turn
+    /// does cost model tokens with no account to attribute the spend to — the
+    /// per-connection and per-IP caps below are what bound that — so set this
+    /// to `false` to serve only logged-in customers. A guest session gets the
+    /// public catalogue tools only: no account lookups and no power actions.
+    #[serde(default = "default_agent_allow_anonymous")]
+    pub allow_anonymous: bool,
+
+    /// Messages one *anonymous* websocket connection may send.
+    ///
+    /// Lower than [`Self::max_turns_per_connection`] because there is no
+    /// account behind it. Reconnecting resets this, which is why the per-IP
+    /// limits below exist as well.
+    #[serde(default = "default_agent_anonymous_max_turns")]
+    pub anonymous_max_turns_per_connection: usize,
+
+    /// Anonymous chat connections allowed per client IP per hour.
+    #[serde(default = "default_agent_anonymous_connections_per_hour")]
+    pub anonymous_connections_per_hour: u32,
+
+    /// Anonymous chat messages allowed per client IP per hour, across
+    /// connections. This is the cap that actually bounds token spend from one
+    /// source, since a client can always reconnect.
+    #[serde(default = "default_agent_anonymous_messages_per_hour")]
+    pub anonymous_messages_per_hour: u32,
 }
 
 /// Default cap on a single chat message (characters).
@@ -588,6 +618,33 @@ pub fn default_agent_max_message_chars() -> usize {
 #[cfg(feature = "agent")]
 pub fn default_agent_max_turns() -> usize {
     50
+}
+
+/// Whether anonymous (logged-out) chat is served when unspecified.
+#[cfg(feature = "agent")]
+pub fn default_agent_allow_anonymous() -> bool {
+    true
+}
+
+/// Default cap on messages per *anonymous* websocket connection.
+///
+/// A pre-sales question and a few follow-ups; well short of the authenticated
+/// 50, because nobody is accountable for the tokens.
+#[cfg(feature = "agent")]
+pub fn default_agent_anonymous_max_turns() -> usize {
+    10
+}
+
+/// Default cap on anonymous chat connections per client IP per hour.
+#[cfg(feature = "agent")]
+pub fn default_agent_anonymous_connections_per_hour() -> u32 {
+    20
+}
+
+/// Default cap on anonymous chat messages per client IP per hour.
+#[cfg(feature = "agent")]
+pub fn default_agent_anonymous_messages_per_hour() -> u32 {
+    60
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

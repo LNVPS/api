@@ -96,7 +96,7 @@ pub(crate) struct AmountQuery {
 /// legacy form, kept so existing clients keep working during the migration; it
 /// is single-use and 60-second bounded too, but it is a signature made by the
 /// user's identity key and so is a worse thing to leave in a log line.
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 pub(crate) struct AuthQuery {
     #[serde(default)]
     pub auth: Option<String>,

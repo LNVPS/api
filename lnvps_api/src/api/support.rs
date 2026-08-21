@@ -11,6 +11,14 @@
 //! one per message. The server replies with newline-free JSON frames, each a
 //! serialized [`ChatEvent`]:
 //!
+//! A connection carrying **no** `ticket`/`auth` parameter is an anonymous
+//! (guest) session, for the logged-out visitor on the public contact page. It
+//! is served only when `agent.allow-anonymous` is set, gets the public
+//! catalogue tools and no account context, and is bounded by per-IP limits on
+//! top of a lower per-connection message cap. The server issues an opaque
+//! session id as the first frame (`{"type":"session","id":"..."}`); reconnect
+//! with `?guest=<id>` to resume that transcript.
+//!
 //! ```text
 //! {"type":"token","text":"Your VM "}
 //! {"type":"tool_start","name":"list_my_vms"}
@@ -20,21 +28,27 @@
 //!
 //! Every message yields exactly one terminal frame (`final` or `error`).
 
-use std::sync::Arc;
+use std::net::{IpAddr, Ipv4Addr};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
 use log::{error, info, warn};
+use rand::RngCore;
+use serde::Deserialize;
 
 use lnvps_agent::agent::{DbToolExecutor, SupportAgent, ToolExecutor};
 use lnvps_agent::conversation::DbConversationStore;
 use lnvps_agent::identity::{Requester, SenderIdentity};
 use lnvps_agent::session::{ChatEvent, ChatSession};
-use lnvps_api_common::Nip98Auth;
-use lnvps_db::{AdminAction, AdminDb, AdminResource, LNVpsDb};
+use lnvps_api_common::IpRateLimiter;
+use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 
 use crate::api::RouterState;
+use crate::settings::AgentConfig;
 
 /// Whether `user_id` may see the agent's internal tool activity.
 ///
@@ -58,6 +72,127 @@ async fn may_view_tool_activity(db: &Arc<dyn LNVpsDb>, user_id: u64) -> bool {
 
 /// Path the NIP-98 auth event must be signed against.
 pub(crate) const CHAT_PATH: &str = "/api/v1/support/chat";
+
+/// Query parameters accepted on the chat socket.
+///
+/// `ticket`/`auth` (via [`crate::api::AuthQuery`]) select an authenticated
+/// customer session; their absence selects a guest session, and `guest` then
+/// resumes a previously issued one.
+#[derive(Deserialize, Default)]
+pub(crate) struct ChatQuery {
+    #[serde(flatten)]
+    pub auth: crate::api::AuthQuery,
+    #[serde(default)]
+    pub guest: Option<String>,
+}
+
+impl ChatQuery {
+    /// Whether this connection is asking for a guest session.
+    ///
+    /// Deliberately "no credential at all" rather than "an invalid one": a
+    /// client that *tried* to authenticate and failed must be told so, not
+    /// silently downgraded into a session that cannot see its own VMs.
+    fn is_anonymous(&self) -> bool {
+        self.auth.ticket.is_none() && self.auth.auth.is_none()
+    }
+}
+
+/// Window for the per-IP guest limits.
+const GUEST_LIMIT_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// Length in bytes of a guest session id before hex encoding.
+const GUEST_ID_BYTES: usize = 32;
+
+/// Per-IP limits on anonymous chat.
+struct GuestLimits {
+    /// Bounds sockets opened, i.e. handshake and prompt-context cost.
+    connections: IpRateLimiter,
+    /// Bounds *messages* across connections — the real token spend, and the
+    /// one a client cannot reset by reconnecting.
+    messages: IpRateLimiter,
+}
+
+/// Process-wide guest limiters, built from the first connection's config.
+///
+/// Config is loaded once at startup and never reloaded, so initialising here
+/// rather than at boot is equivalent — and keeps the limiters out of
+/// [`RouterState`], which every handler would otherwise carry.
+fn guest_limits(config: &AgentConfig) -> &'static GuestLimits {
+    static LIMITS: OnceLock<GuestLimits> = OnceLock::new();
+    LIMITS.get_or_init(|| GuestLimits {
+        connections: IpRateLimiter::new(config.anonymous_connections_per_hour, GUEST_LIMIT_WINDOW),
+        messages: IpRateLimiter::new(config.anonymous_messages_per_hour, GUEST_LIMIT_WINDOW),
+    })
+}
+
+/// Bucket used when no client address can be resolved.
+///
+/// A request with no usable forwarding header must not be waved through, so it
+/// is billed to one shared bucket — the same rule the HTTP limiter applies.
+const UNKNOWN_CLIENT: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+
+/// Mint an unguessable guest session id.
+fn new_guest_id() -> String {
+    let mut bytes = [0u8; GUEST_ID_BYTES];
+    rand::rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
+/// Whether `id` is shaped like an id this server issued.
+///
+/// The id is a bearer token for a stored transcript, so anything that is not
+/// exactly what [`new_guest_id`] produces is rejected rather than used as a
+/// conversation key: that keeps a client from choosing a short, guessable or
+/// deliberately-colliding key (`"1"`, someone's pubkey, a path).
+fn is_guest_id(id: &str) -> bool {
+    id.len() == GUEST_ID_BYTES * 2 && id.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// What a plain (non-upgrade) `GET` on the chat path reports.
+///
+/// The frontend probes this path to decide whether to render a chat box.
+/// `available` alone is not enough: with anonymous chat off, chat exists but
+/// the public contact page must not offer it, so `anonymous` says whether a
+/// logged-out visitor can use it.
+#[derive(serde::Serialize)]
+pub(crate) struct ChatAvailability {
+    /// The support agent is configured on this server.
+    pub available: bool,
+    /// A visitor who is not logged in may open a session.
+    pub anonymous: bool,
+}
+
+impl ChatAvailability {
+    /// What to report for a given agent configuration, with the status code the
+    /// probe should carry.
+    ///
+    /// 404 when the agent is not configured, so the existing "any non-404 means
+    /// available" client heuristic keeps working unchanged.
+    fn for_config(config: Option<&AgentConfig>) -> (StatusCode, Self) {
+        match config {
+            Some(config) => (
+                StatusCode::OK,
+                Self {
+                    available: true,
+                    anonymous: config.allow_anonymous,
+                },
+            ),
+            None => (
+                StatusCode::NOT_FOUND,
+                Self {
+                    available: false,
+                    anonymous: false,
+                },
+            ),
+        }
+    }
+}
+
+/// Answer the availability probe.
+pub(crate) fn chat_availability(this: &RouterState) -> Response {
+    let (status, body) = ChatAvailability::for_config(this.settings.agent.as_ref());
+    (status, axum::Json(body)).into_response()
+}
 
 /// How often the server sends an unsolicited WebSocket ping.
 ///
@@ -147,7 +282,8 @@ async fn send_error(ws: &mut WebSocket, message: &str) {
 
 /// Handle one live-chat websocket connection.
 pub(crate) async fn v1_support_chat(
-    auth: crate::api::AuthQuery,
+    query: ChatQuery,
+    client_ip: Option<IpAddr>,
     this: RouterState,
     mut ws: WebSocket,
 ) {
@@ -156,67 +292,139 @@ pub(crate) async fn v1_support_chat(
         return;
     };
 
-    // Authenticate exactly like the console endpoint: a single-use ticket (or,
-    // for older clients, a NIP-98 event signed over this path) passed as a query
-    // parameter, because browsers cannot set headers on a WebSocket handshake.
-    let pubkey = match auth.resolve(CHAT_PATH) {
-        Ok(pubkey) => pubkey,
-        Err(e) => {
-            send_error(&mut ws, e).await;
+    let anonymous = query.is_anonymous();
+    let ip = client_ip.unwrap_or(UNKNOWN_CLIENT);
+
+    // Everything that differs between a customer and a guest session, resolved
+    // once so the message loop below is identical for both.
+    let (identity, requester, executor, store_user, guest_id, max_turns) = if anonymous {
+        if !config.allow_anonymous {
+            send_error(
+                &mut ws,
+                "Live chat requires you to be logged in on this server",
+            )
+            .await;
             return;
         }
-    };
-    let uid = match this.db.upsert_user(&pubkey).await {
-        Ok(uid) => uid,
-        Err(e) => {
-            error!("Support chat: failed to resolve user: {}", e);
-            send_error(&mut ws, "Failed to resolve your account").await;
+        if let Err(retry_after) = guest_limits(&config).connections.check(ip) {
+            send_error(
+                &mut ws,
+                &format!(
+                    "Too many chat sessions from your network. Please try again in {} seconds.",
+                    retry_after
+                ),
+            )
+            .await;
             return;
         }
+
+        // Resume the transcript when the client presents an id we could have
+        // issued; otherwise start a fresh one. An unusable id is replaced
+        // rather than refused, because the visitor cannot fix it.
+        let session_id = query
+            .guest
+            .filter(|id| is_guest_id(id))
+            .unwrap_or_else(new_guest_id);
+
+        // No account, so: no account context in the prompt, catalogue-only
+        // tools (chosen by `ChatSession` from `Requester::Anonymous`), and an
+        // executor that cannot reach a user record even if the model invents a
+        // call to a tool it was not offered.
+        let executor: Arc<dyn ToolExecutor> = Arc::new(DbToolExecutor::public(this.db.clone()));
+        (
+            SenderIdentity::Guest(session_id.clone()),
+            Requester::Anonymous,
+            executor,
+            None,
+            Some(session_id),
+            config.anonymous_max_turns_per_connection,
+        )
+    } else {
+        // Authenticate exactly like the console endpoint: a single-use ticket
+        // (or, for older clients, a NIP-98 event signed over this path) passed
+        // as a query parameter, because browsers cannot set headers on a
+        // WebSocket handshake.
+        let pubkey = match query.auth.resolve(CHAT_PATH) {
+            Ok(pubkey) => pubkey,
+            Err(e) => {
+                send_error(&mut ws, e).await;
+                return;
+            }
+        };
+        let uid = match this.db.upsert_user(&pubkey).await {
+            Ok(uid) => uid,
+            Err(e) => {
+                error!("Support chat: failed to resolve user: {}", e);
+                send_error(&mut ws, "Failed to resolve your account").await;
+                return;
+            }
+        };
+
+        let account = match this.db.get_user(uid).await {
+            Ok(user) => serde_json::json!({
+                "id": user.id,
+                "pubkey": hex::encode(&user.pubkey),
+                "email_verified": user.email_verified,
+                "country_code": user.country_code,
+            }),
+            Err(e) => {
+                error!("Support chat: failed to load user {}: {}", uid, e);
+                send_error(&mut ws, "Failed to load your account").await;
+                return;
+            }
+        };
+
+        let executor: Arc<dyn ToolExecutor> = Arc::new(
+            DbToolExecutor::new(this.db.clone(), uid)
+                .with_power_actions(this.settings.provisioner.clone(), this.work_sender.clone()),
+        );
+        (
+            SenderIdentity::Pubkey(hex::encode(pubkey)),
+            // A NIP-98 signature proves control of the key, and `upsert_user`
+            // means the account exists by this point, so the requester is
+            // always a known customer.
+            Requester::Customer {
+                user_id: uid,
+                account,
+            },
+            executor,
+            Some(uid),
+            None,
+            config.max_turns_per_connection,
+        )
     };
 
-    let account = match this.db.get_user(uid).await {
-        Ok(user) => serde_json::json!({
-            "id": user.id,
-            "pubkey": hex::encode(&user.pubkey),
-            "email_verified": user.email_verified,
-            "country_code": user.country_code,
-        }),
-        Err(e) => {
-            error!("Support chat: failed to load user {}: {}", uid, e);
-            send_error(&mut ws, "Failed to load your account").await;
-            return;
-        }
-    };
-
-    // A NIP-98 signature proves control of the key, and `upsert_user` means the
-    // account exists by this point, so the requester is always a known customer.
-    let requester = Requester::Customer {
-        user_id: uid,
-        account,
-    };
-
-    let executor: Arc<dyn ToolExecutor> = Arc::new(
-        DbToolExecutor::new(this.db.clone(), uid)
-            .with_power_actions(this.settings.provisioner.clone(), this.work_sender.clone()),
-    );
-    let store = Arc::new(DbConversationStore::new(this.db.clone(), Some(uid)));
+    let store = Arc::new(DbConversationStore::new(this.db.clone(), store_user));
     let agent = SupportAgent::detached(config.openai.clone(), store);
-    let mut session = ChatSession::new(
-        agent,
-        &SenderIdentity::Pubkey(hex::encode(pubkey)),
-        requester,
-        executor,
-    );
+    let mut session = ChatSession::new(agent, &identity, requester, executor);
     if let Some(extra) = config.system_prompt.as_deref() {
         session = session.with_extra_prompt(extra);
     }
-    let privileged = may_view_tool_activity(&this.db, uid).await;
+    // A guest has no permissions to check, and nothing to reveal internals to.
+    let privileged = match store_user {
+        Some(uid) => may_view_tool_activity(&this.db, uid).await,
+        None => false,
+    };
     session = session.with_tool_activity(privileged);
 
+    // How this connection is named in logs. Never the guest session id: it is a
+    // bearer token for the transcript, so it does not belong in a log line.
+    let who = match store_user {
+        Some(uid) => format!("user {uid}"),
+        None => "guest".to_string(),
+    };
+
+    // Tell a guest which session it got, so a reconnect can resume it. Sent
+    // before any turn, and never on an authenticated connection.
+    if let Some(id) = guest_id
+        && ws.send(frame(&ChatEvent::Session { id })).await.is_err()
+    {
+        return;
+    }
+
     info!(
-        "Support chat opened for user {} ({}, tool activity {})",
-        uid,
+        "Support chat opened for {} ({}, tool activity {})",
+        who,
         session.conversation_key(),
         if privileged { "visible" } else { "hidden" }
     );
@@ -255,7 +463,7 @@ pub(crate) async fn v1_support_chat(
             }
             Ok(_) => continue,
             Err(e) => {
-                warn!("Support chat socket error for user {}: {}", uid, e);
+                warn!("Support chat socket error for {}: {}", who, e);
                 break;
             }
         };
@@ -277,10 +485,26 @@ pub(crate) async fn v1_support_chat(
         }
 
         turns += 1;
-        if turns > config.max_turns_per_connection {
+        if turns > max_turns {
             send_error(
                 &mut ws,
                 "This chat has reached its message limit. Please reconnect to continue.",
+            )
+            .await;
+            break;
+        }
+
+        // The per-connection cap above is per *socket*; a client can reconnect.
+        // This is the limit that actually bounds one source's token spend, so
+        // it is checked per message and survives reconnects.
+        if anonymous && let Err(retry_after) = guest_limits(&config).messages.check(ip) {
+            send_error(
+                &mut ws,
+                &format!(
+                    "You've reached the chat limit for now. Please try again in {} seconds, \
+                     or email support.",
+                    retry_after
+                ),
             )
             .await;
             break;
@@ -322,7 +546,7 @@ pub(crate) async fn v1_support_chat(
         }
     }
 
-    info!("Support chat closed for user {}", uid);
+    info!("Support chat closed for {}", who);
 }
 
 #[cfg(test)]
@@ -365,6 +589,152 @@ mod tests {
                 Some("final") | Some("error")
             ));
         }
+    }
+
+    /// A connection is a guest session only when it presents no credential at
+    /// all. A client that *tried* to authenticate and failed must get an error,
+    /// never a silent downgrade into a session that cannot see its own VMs.
+    #[test]
+    fn only_a_credential_free_connection_is_anonymous() {
+        assert!(ChatQuery::default().is_anonymous());
+        assert!(
+            !ChatQuery {
+                auth: crate::api::AuthQuery {
+                    ticket: Some("anything".into()),
+                    ..Default::default()
+                },
+                guest: None,
+            }
+            .is_anonymous()
+        );
+        assert!(
+            !ChatQuery {
+                auth: crate::api::AuthQuery {
+                    auth: Some("anything".into()),
+                    ..Default::default()
+                },
+                guest: None,
+            }
+            .is_anonymous()
+        );
+        // A guest id is not a credential: presenting one still yields a guest
+        // session, and presenting one alongside a ticket does not.
+        assert!(
+            ChatQuery {
+                auth: Default::default(),
+                guest: Some(new_guest_id()),
+            }
+            .is_anonymous()
+        );
+    }
+
+    /// The guest id is a bearer token for a stored transcript, so it must be
+    /// long and random. A short or attacker-chosen key would let one visitor
+    /// read another's conversation, or collide deliberately with a namespace.
+    #[test]
+    fn guest_ids_are_unguessable_and_validated() {
+        let id = new_guest_id();
+        assert_eq!(id.len(), GUEST_ID_BYTES * 2);
+        assert!(is_guest_id(&id));
+        assert_ne!(id, new_guest_id(), "guest ids must not repeat");
+
+        for bad in [
+            "",
+            "1",
+            &"a".repeat(GUEST_ID_BYTES * 2 - 1),
+            &"a".repeat(GUEST_ID_BYTES * 2 + 1),
+            &"z".repeat(GUEST_ID_BYTES * 2),
+            &format!("{}/..", "a".repeat(GUEST_ID_BYTES * 2 - 3)),
+        ] {
+            assert!(!is_guest_id(bad), "accepted a bad guest id: {bad:?}");
+        }
+    }
+
+    /// Anonymous chat is on by default, but must be cheaper to abuse than an
+    /// authenticated session — that asymmetry is the whole basis for serving it
+    /// without a credential.
+    #[test]
+    fn anonymous_defaults_are_tighter_than_authenticated() {
+        use crate::settings::*;
+        assert!(default_agent_allow_anonymous());
+        assert!(
+            default_agent_anonymous_max_turns() < default_agent_max_turns(),
+            "a guest connection must allow fewer messages than an authenticated one"
+        );
+        assert!(default_agent_anonymous_connections_per_hour() > 0);
+        assert!(default_agent_anonymous_messages_per_hour() > 0);
+    }
+
+    /// The session frame is what lets a guest resume after a dropped socket;
+    /// it must be an ordinary non-terminal event the client can switch on.
+    #[test]
+    fn the_session_frame_carries_the_guest_id() {
+        let id = new_guest_id();
+        let event = ChatEvent::Session { id: id.clone() };
+        assert!(!event.is_terminal());
+        let Message::Text(text) = frame(&event) else {
+            panic!("expected text frame");
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["type"], "session");
+        assert_eq!(value["id"], id);
+    }
+
+    /// The availability probe is what the public page uses to decide whether to
+    /// render a chat box at all: 404 when there is no agent (so the existing
+    /// "non-404 means available" heuristic holds), and `anonymous` reflecting
+    /// the config gate rather than merely that chat exists.
+    #[test]
+    fn availability_reports_the_anonymous_gate() {
+        let config = |allow_anonymous| AgentConfig {
+            openai: lnvps_agent::settings::OpenAiConfig {
+                base_url: "http://localhost:11434/v1".to_string(),
+                api_key: None,
+                model: "test".to_string(),
+                max_tokens: None,
+            },
+            system_prompt: None,
+            max_message_chars: crate::settings::default_agent_max_message_chars(),
+            max_turns_per_connection: crate::settings::default_agent_max_turns(),
+            allow_anonymous,
+            anonymous_max_turns_per_connection: crate::settings::default_agent_anonymous_max_turns(
+            ),
+            anonymous_connections_per_hour:
+                crate::settings::default_agent_anonymous_connections_per_hour(),
+            anonymous_messages_per_hour: crate::settings::default_agent_anonymous_messages_per_hour(
+            ),
+        };
+
+        // No agent: 404, so "non-404 means chat exists" stays true.
+        let (status, body) = ChatAvailability::for_config(None);
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!body.available);
+        assert!(!body.anonymous);
+
+        // Configured but gated: chat exists, guests may not use it. A client
+        // that only looked at the status code would render a box that always
+        // refuses — which is exactly why `anonymous` is reported separately.
+        let (status, body) = ChatAvailability::for_config(Some(&config(false)));
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.available);
+        assert!(!body.anonymous);
+
+        let (status, body) = ChatAvailability::for_config(Some(&config(true)));
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.available);
+        assert!(body.anonymous);
+    }
+
+    /// A caller with no resolvable address must not escape the guest limits
+    /// entirely; it is billed to one shared bucket instead.
+    #[test]
+    fn an_unknown_client_still_has_a_bucket() {
+        let limiter = IpRateLimiter::new(1, Duration::from_secs(60));
+        assert!(limiter.check(UNKNOWN_CLIENT).is_ok());
+        assert!(
+            limiter.check(UNKNOWN_CLIENT).is_err(),
+            "unattributable connections must share one bucket, not bypass the limit"
+        );
     }
 
     /// The auth event is signed over this exact path; changing one without the
