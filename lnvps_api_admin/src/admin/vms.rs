@@ -104,6 +104,44 @@ struct ListVmsQuery {
     include_deleted: Option<bool>,
 }
 
+/// Caches host/region lookups while building admin VM listings.
+///
+/// Uses [`LNVpsDb::get_host`]/[`LNVpsDb::get_host_region`] rather than
+/// `list_hosts()`/`list_host_region()`, because those list methods only return
+/// *enabled* hosts in *enabled* regions (they exist for provisioning). Admin
+/// views must keep working for VMs on disabled hosts.
+#[derive(Default)]
+struct HostRegionCache {
+    hosts: std::collections::HashMap<u64, lnvps_db::VmHost>,
+    regions: std::collections::HashMap<u64, lnvps_db::Region>,
+}
+
+impl HostRegionCache {
+    async fn get(
+        &mut self,
+        db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+        host_id: u64,
+    ) -> anyhow::Result<(lnvps_db::VmHost, lnvps_db::Region)> {
+        let host = match self.hosts.get(&host_id) {
+            Some(h) => h.clone(),
+            None => {
+                let h = db.get_host(host_id).await?;
+                self.hosts.insert(host_id, h.clone());
+                h
+            }
+        };
+        let region = match self.regions.get(&host.region_id) {
+            Some(r) => r.clone(),
+            None => {
+                let r = db.get_host_region(host.region_id).await?;
+                self.regions.insert(host.region_id, r.clone());
+                r
+            }
+        };
+        Ok((host, region))
+    }
+}
+
 /// List all VMs with pagination and filtering
 async fn admin_list_vms(
     auth: AdminAuth,
@@ -130,37 +168,16 @@ async fn admin_list_vms(
         )
         .await?;
 
-    // Load all hosts and regions upfront to avoid N+1 queries
-    let hosts = this.db.list_hosts().await?;
-    let mut host_map = std::collections::HashMap::new();
-    for host in hosts {
-        host_map.insert(host.id, host);
-    }
-
-    let regions = this.db.list_host_region().await?;
-    let mut region_map = std::collections::HashMap::new();
-    for region in regions {
-        region_map.insert(region.id, region);
-    }
+    // Cache host/region lookups across VMs to avoid N+1 queries
+    let mut host_cache = HostRegionCache::default();
 
     let mut admin_vms = Vec::new();
     for vm in vms {
         // Get user info for this VM
         let user = this.db.get_user(vm.user_id).await?;
 
-        // Get host info from pre-loaded map
-        let host = host_map.get(&vm.host_id).ok_or_else(|| {
-            anyhow::anyhow!("VM {} references non-existent host {}", vm.id, vm.host_id)
-        })?;
-
-        // Get region info from pre-loaded map
-        let region = region_map.get(&host.region_id).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Host {} references non-existent region {}",
-                host.id,
-                host.region_id
-            )
-        })?;
+        // Host/region may be disabled; admin listings must still resolve them
+        let (host, region) = host_cache.get(&this.db, vm.host_id).await?;
 
         // Get VM running state from cache
         let vm_running_state = get_vm_state(&this.vm_state_cache, vm.id).await;
@@ -205,34 +222,10 @@ async fn admin_get_vm(
     let vm = this.db.get_vm(id).await?;
     let user = this.db.get_user(vm.user_id).await?;
 
-    // Load all hosts and regions upfront for consistency
-    let hosts = this.db.list_hosts().await?;
-    let mut host_map = std::collections::HashMap::new();
-    for host in hosts {
-        host_map.insert(host.id, host);
-    }
-
-    let regions = this.db.list_host_region().await?;
-    let mut region_map = std::collections::HashMap::new();
-    for region in regions {
-        region_map.insert(region.id, region);
-    }
-
-    // Get host info from pre-loaded map
-    let host = host_map.get(&vm.host_id).ok_or_else(|| {
-        anyhow::anyhow!("VM {} references non-existent host {}", vm.id, vm.host_id)
-    })?;
+    // Host/region may be disabled; admin views must still resolve them
+    let (host, region) = HostRegionCache::default().get(&this.db, vm.host_id).await?;
 
     let host_name = host.name.clone();
-
-    // Get region info from pre-loaded map
-    let region = region_map.get(&host.region_id).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Host {} references non-existent region {}",
-            host.id,
-            host.region_id
-        )
-    })?;
 
     let region_id = region.id;
     let region_name = region.name.clone();
@@ -1481,6 +1474,36 @@ async fn admin_complete_vm_payment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: a disabled host must still resolve for admin VM listings.
+    /// `list_hosts()` skips disabled hosts, which made `GET /api/admin/v1/vms`
+    /// fail with "VM references non-existent host" after disabling a host.
+    #[tokio::test]
+    async fn host_region_cache_resolves_disabled_host() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::LNVpsDbBase;
+
+        let db = MockDb::default();
+        let mut host = db.get_host(1).await.unwrap();
+        host.enabled = false;
+        db.update_host(&host).await.unwrap();
+
+        let db: std::sync::Arc<dyn lnvps_db::LNVpsDb> = std::sync::Arc::new(db);
+        assert!(
+            db.list_hosts().await.unwrap().iter().all(|h| h.id != 1),
+            "precondition: list_hosts() hides disabled hosts"
+        );
+
+        let mut cache = HostRegionCache::default();
+        let (host, region) = cache.get(&db, 1).await.unwrap();
+        assert_eq!(host.id, 1);
+        assert!(!host.enabled);
+        assert_eq!(region.id, host.region_id);
+
+        // Second lookup is served from the cache.
+        let (host2, _) = cache.get(&db, 1).await.unwrap();
+        assert_eq!(host2.id, 1);
+    }
 
     #[test]
     fn admin_patch_vm_request_admin_notes_nullable() {
