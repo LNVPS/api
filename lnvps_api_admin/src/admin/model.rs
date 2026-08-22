@@ -2829,8 +2829,22 @@ pub struct AdminVmHistoryInfo {
     pub initiated_by_user_pubkey: Option<String>, // hex encoded
     pub initiated_by_user_email: Option<String>,
     pub description: Option<String>,
-    // Note: previous_state, new_state, and metadata are omitted as they contain binary data
-    // and may be sensitive. They can be added later if needed.
+    /// VM state before the action, as recorded by `VmHistoryLogger` (JSON, `None` when not recorded)
+    pub previous_state: Option<serde_json::Value>,
+    /// VM state after the action (JSON, `None` when not recorded)
+    pub new_state: Option<serde_json::Value>,
+    /// Extra context for the action, e.g. reason/admin_action flags (JSON, `None` when not recorded)
+    pub metadata: Option<serde_json::Value>,
+}
+
+/// Decode a `vm_history` JSON blob.
+///
+/// The columns are `BLOB`s written with `serde_json::to_vec`, but nothing at the
+/// database level guarantees that — rows predating the current writers, or a
+/// truncated write, would otherwise fail the whole request. An undecodable blob
+/// is therefore reported as absent rather than an error.
+fn decode_history_json(bytes: Option<&Vec<u8>>) -> Option<serde_json::Value> {
+    bytes.and_then(|b| serde_json::from_slice(b).ok())
 }
 
 impl AdminVmHistoryInfo {
@@ -2862,6 +2876,9 @@ impl AdminVmHistoryInfo {
             initiated_by_user_pubkey,
             initiated_by_user_email,
             description: history.description.clone(),
+            previous_state: decode_history_json(history.previous_state.as_ref()),
+            new_state: decode_history_json(history.new_state.as_ref()),
+            metadata: decode_history_json(history.metadata.as_ref()),
         })
     }
 }
@@ -4413,6 +4430,42 @@ pub struct AdminUpdateUserPaymentMethodRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The history state blobs are JSON and are surfaced verbatim (issue #393).
+    #[test]
+    fn decode_history_json_round_trips_and_tolerates_garbage() {
+        let value = serde_json::json!({"host_id": 3});
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert_eq!(decode_history_json(Some(&bytes)), Some(value));
+        assert_eq!(decode_history_json(None), None);
+        // A non-JSON blob must degrade to None rather than error the request
+        assert_eq!(decode_history_json(Some(&vec![0xff, 0x00, 0xfe])), None);
+    }
+
+    /// The state/metadata blobs reach the admin API response (issue #393).
+    #[tokio::test]
+    async fn vm_history_info_exposes_state_blobs() {
+        let db: std::sync::Arc<dyn lnvps_db::LNVpsDb> =
+            std::sync::Arc::new(lnvps_api_common::MockDb::default());
+        let history = VmHistory {
+            id: 1,
+            vm_id: 1,
+            action_type: VmHistoryActionType::Migrated,
+            timestamp: Utc::now(),
+            initiated_by_user: None,
+            previous_state: Some(serde_json::to_vec(&serde_json::json!({"host_id": 1})).unwrap()),
+            new_state: Some(serde_json::to_vec(&serde_json::json!({"host_id": 2})).unwrap()),
+            metadata: Some(serde_json::to_vec(&serde_json::json!({"detected": true})).unwrap()),
+            description: Some("moved".to_string()),
+        };
+
+        let info = AdminVmHistoryInfo::from_vm_history_with_admin_data(&db, &history)
+            .await
+            .unwrap();
+        assert_eq!(info.previous_state, Some(serde_json::json!({"host_id": 1})));
+        assert_eq!(info.new_state, Some(serde_json::json!({"host_id": 2})));
+        assert_eq!(info.metadata, Some(serde_json::json!({"detected": true})));
+    }
 
     /// A payment carries its discount, and an undiscounted payment omits the
     /// key entirely rather than serialising `null` (issue #384).

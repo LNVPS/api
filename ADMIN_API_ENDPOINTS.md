@@ -832,6 +832,28 @@ Query Parameters:
 
 Required Permission: `virtual_machines::view`
 
+Each entry:
+
+```json
+{
+  "id": 12,
+  "vm_id": 1,
+  "action_type": "migrated",
+  "timestamp": "2025-01-01T00:00:00Z",
+  "initiated_by_user": 5,
+  "initiated_by_user_pubkey": "<hex>",
+  "initiated_by_user_email": "user@example.com",
+  "description": "VM 1 was migrated from host 1 to host 2",
+  "previous_state": { "host_id": 1 },   // JSON or null - VM state before the action
+  "new_state": { "host_id": 2 },        // JSON or null - VM state after the action
+  "metadata": { "detected": false }     // JSON or null - extra context (reason, admin_action, payment details, ...)
+}
+```
+
+`previous_state` / `new_state` / `metadata` are whatever the action recorded
+(ids, states, expiry timestamps, amounts) and are `null` when the action did not
+record them or the stored blob cannot be parsed. They carry no credentials.
+
 #### Get VM History Entry
 
 ```
@@ -839,6 +861,8 @@ GET /api/admin/v1/vms/{vm_id}/history/{history_id}
 ```
 
 Required Permission: `virtual_machines::view`
+
+Returns a single entry in the shape shown above.
 
 #### List VM Payments
 
