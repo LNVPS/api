@@ -991,6 +991,13 @@ pub struct AdminHostDisk {
     pub kind: ApiDiskType,
     pub interface: ApiDiskInterface,
     pub enabled: bool,
+    /// Bytes consumed by the VM disks placed on this disk.
+    /// `None` when the response was produced without a capacity calculation.
+    pub usage: Option<u64>,
+    /// `usage` as a fraction of the load-adjusted disk size (0.0-1.0, may exceed 1.0
+    /// only in the saturated case where it is reported as 1.0).
+    /// `None` when the response was produced without a capacity calculation.
+    pub load: Option<f32>,
 }
 
 impl From<lnvps_db::VmHostDisk> for AdminHostDisk {
@@ -1002,7 +1009,36 @@ impl From<lnvps_db::VmHostDisk> for AdminHostDisk {
             kind: disk.kind.into(),
             interface: disk.interface.into(),
             enabled: disk.enabled,
+            usage: None,
+            load: None,
         }
+    }
+}
+
+impl AdminHostDisk {
+    /// Build the disk list for a host, attaching per-disk usage from the host
+    /// capacity calculation.
+    ///
+    /// The disk list comes from `disks` rather than from `capacity.disks` so the
+    /// admin UI always sees every configured disk: the capacity calculation may
+    /// filter disks by kind/interface, and a disk it skipped is still a disk the
+    /// operator manages (it just has no usage figure attached).
+    pub fn list_with_capacity(
+        disks: Vec<lnvps_db::VmHostDisk>,
+        capacity: &lnvps_api_common::HostCapacity,
+    ) -> Vec<Self> {
+        disks
+            .into_iter()
+            .map(|disk| {
+                let usage = capacity.disks.iter().find(|d| d.disk.id == disk.id);
+                let mut admin_disk: Self = disk.into();
+                if let Some(usage) = usage {
+                    admin_disk.usage = Some(usage.usage);
+                    admin_disk.load = Some(usage.load());
+                }
+                admin_disk
+            })
+            .collect()
     }
 }
 
@@ -1017,6 +1053,14 @@ pub struct AdminRegionInfo {
     pub total_cpu_cores: u64,
     pub total_memory_bytes: u64,
     pub total_ip_assignments: u64,
+    /// Active IPv4 assignments in this region
+    pub ipv4_assignments: u64,
+    /// Unassigned usable IPv4 addresses across the region's **enabled** IP ranges.
+    /// Disabled ranges are not available for allocation so they are not counted.
+    pub ipv4_available: u64,
+    /// Active IPv6 assignments in this region. There is no matching "available"
+    /// figure: an IPv6 range's free space is effectively unbounded.
+    pub ipv6_assignments: u64,
 }
 
 #[derive(Deserialize)]
@@ -1140,7 +1184,7 @@ impl AdminHostInfo {
         disks: Vec<lnvps_db::VmHostDisk>,
         active_vms: u64,
     ) -> Self {
-        let admin_disks = disks.into_iter().map(|disk| disk.into()).collect();
+        let admin_disks = AdminHostDisk::list_with_capacity(disks, capacity);
         let ssh_key_configured = capacity.host.ssh_key.is_some();
 
         Self {
@@ -1263,12 +1307,8 @@ impl AdminHostInfo {
             .await
         {
             Ok(capacity) => {
-                // Convert disks
-                let admin_disks = admin_host
-                    .disks
-                    .into_iter()
-                    .map(|disk| disk.into())
-                    .collect();
+                // Convert disks, attaching per-disk usage from the capacity calculation
+                let admin_disks = AdminHostDisk::list_with_capacity(admin_host.disks, &capacity);
                 let ssh_key_configured = capacity.host.ssh_key.is_some();
 
                 Self {
@@ -4430,6 +4470,52 @@ pub struct AdminUpdateUserPaymentMethodRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Per-disk usage is attached to each configured disk, and a disk the
+    /// capacity calculation did not cover reports no usage rather than zero
+    /// (which would read as "empty").
+    #[test]
+    fn host_disks_carry_per_disk_usage() {
+        let disk = |id: u64, size: u64| lnvps_db::VmHostDisk {
+            id,
+            host_id: 1,
+            name: format!("disk-{id}"),
+            size,
+            kind: lnvps_db::DiskType::SSD,
+            interface: lnvps_db::DiskInterface::PCIe,
+            enabled: true,
+        };
+        let host = lnvps_db::VmHost {
+            id: 1,
+            load_disk: 1.0,
+            ..Default::default()
+        };
+        let capacity = lnvps_api_common::HostCapacity {
+            load_factor: lnvps_api_common::LoadFactors {
+                cpu: 1.0,
+                memory: 1.0,
+                disk: 1.0,
+            },
+            host,
+            cpu: 0,
+            memory: 0,
+            disks: vec![lnvps_api_common::DiskCapacity {
+                load_factor: 1.0,
+                disk: disk(1, 400),
+                usage: 100,
+            }],
+            ranges: vec![],
+        };
+
+        let disks = AdminHostDisk::list_with_capacity(vec![disk(1, 400), disk(2, 800)], &capacity);
+
+        assert_eq!(disks.len(), 2);
+        assert_eq!(disks[0].usage, Some(100));
+        assert_eq!(disks[0].load, Some(0.25));
+        // Disk 2 was not part of the capacity calculation
+        assert_eq!(disks[1].usage, None);
+        assert_eq!(disks[1].load, None);
+    }
 
     /// The history state blobs are JSON and are surfaced verbatim (issue #393).
     #[test]

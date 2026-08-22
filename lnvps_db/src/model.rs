@@ -2381,6 +2381,10 @@ pub struct RegionStats {
     pub total_cpu_cores: u64,
     pub total_memory_bytes: u64,
     pub total_ip_assignments: u64,
+    /// Active IPv4 assignments (assignments whose `ip_range` is an IPv4 CIDR)
+    pub ipv4_assignments: u64,
+    /// Active IPv6 assignments (assignments whose `ip_range` is an IPv6 CIDR)
+    pub ipv6_assignments: u64,
 }
 
 #[derive(Clone, Debug, sqlx::Type)]

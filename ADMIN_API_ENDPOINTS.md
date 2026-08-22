@@ -5497,7 +5497,11 @@ The RBAC system uses the following permission format: `resource::action`
       // DiskType enum: "hdd", "ssd"
       "interface": "pcie",
       // DiskInterface enum: "sata", "scsi", "pcie"
-      "enabled": boolean
+      "enabled": boolean,
+      "usage": "number | null",
+      // Bytes consumed by VM disks placed on this disk (null if capacity was not calculated)
+      "load": "number | null"
+      // Usage as a fraction of the load-adjusted disk size, 0.0-1.0 (null if capacity was not calculated)
     }
   ],
   "calculated_load": {
@@ -5538,8 +5542,17 @@ The RBAC system uses the following permission format: `resource::action`
   "total_cpu_cores": number,
   "total_memory_bytes": number,
   // Total memory in bytes (not GB)
-  "total_ip_assignments": number
+  "total_ip_assignments": number,
   // IP assignments from active VMs only
+  "ipv4_assignments": number,
+  // IP assignments from active VMs whose range is an IPv4 CIDR
+  "ipv4_available": number,
+  // Unassigned usable IPv4 addresses across the region's enabled IP ranges.
+  // Disabled ranges are excluded (they cannot be allocated from), as are the
+  // gateway and, unless the range is use_full_range, the network/broadcast addresses
+  "ipv6_assignments": number
+  // IP assignments from active VMs whose range is an IPv6 CIDR. There is no
+  // matching "available" figure: IPv6 range capacity is effectively unbounded
 }
 ```
 
@@ -5561,7 +5574,12 @@ The RBAC system uses the following permission format: `resource::action`
   "size": number,
   "kind": "string",
   "interface": "string",
-  "enabled": boolean
+  "enabled": boolean,
+  "usage": "number | null",
+  // Bytes consumed by VM disks placed on this disk. Populated on host list/get
+  // responses; null on the disk CRUD endpoints, which do no capacity calculation
+  "load": "number | null"
+  // Usage as a fraction of the load-adjusted disk size, 0.0-1.0 (null as above)
 }
 ```
 

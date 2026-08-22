@@ -6325,7 +6325,7 @@ impl AdminDb for LNVpsDbMysql {
         // with identical cpu/memory were counted once. Compute host totals and
         // VM/IP counts in separate subqueries to avoid both the value-dedup bug
         // and row multiplication from the joins.
-        let row: (i64, i64, Option<u64>, Option<u64>, i64) = sqlx::query_as(
+        let row: (i64, i64, Option<u64>, Option<u64>, i64, i64, i64) = sqlx::query_as(
             r#"
             SELECT
                 (SELECT COUNT(*) FROM vm_host WHERE region_id = ?) as host_count,
@@ -6337,9 +6337,24 @@ impl AdminDb for LNVpsDbMysql {
                 (SELECT COUNT(*) FROM vm_ip_assignment ip
                     JOIN vm v ON ip.vm_id = v.id
                     JOIN vm_host h ON v.host_id = h.id
-                    WHERE h.region_id = ? AND v.deleted = 0 AND ip.deleted = 0) as total_ip_assignments
+                    WHERE h.region_id = ? AND v.deleted = 0 AND ip.deleted = 0) as total_ip_assignments,
+                -- Address family is derived from the range CIDR: only IPv6 CIDRs contain ':'
+                (SELECT COUNT(*) FROM vm_ip_assignment ip
+                    JOIN vm v ON ip.vm_id = v.id
+                    JOIN vm_host h ON v.host_id = h.id
+                    JOIN ip_range r ON ip.ip_range_id = r.id
+                    WHERE h.region_id = ? AND v.deleted = 0 AND ip.deleted = 0
+                      AND r.cidr NOT LIKE '%:%') as ipv4_assignments,
+                (SELECT COUNT(*) FROM vm_ip_assignment ip
+                    JOIN vm v ON ip.vm_id = v.id
+                    JOIN vm_host h ON v.host_id = h.id
+                    JOIN ip_range r ON ip.ip_range_id = r.id
+                    WHERE h.region_id = ? AND v.deleted = 0 AND ip.deleted = 0
+                      AND r.cidr LIKE '%:%') as ipv6_assignments
             "#,
         )
+        .bind(region_id)
+        .bind(region_id)
         .bind(region_id)
         .bind(region_id)
         .bind(region_id)
@@ -6354,6 +6369,8 @@ impl AdminDb for LNVpsDbMysql {
             total_cpu_cores: row.2.unwrap_or(0),
             total_memory_bytes: row.3.unwrap_or(0),
             total_ip_assignments: row.4 as u64,
+            ipv4_assignments: row.5 as u64,
+            ipv6_assignments: row.6 as u64,
         })
     }
 

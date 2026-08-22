@@ -5341,8 +5341,48 @@ impl lnvps_db::AdminDb for MockDb {
     async fn admin_count_region_hosts(&self, _region_id: u64) -> DbResult<u64> {
         Ok(0)
     }
-    async fn admin_get_region_stats(&self, _region_id: u64) -> DbResult<RegionStats> {
-        todo!()
+    async fn admin_get_region_stats(&self, region_id: u64) -> DbResult<RegionStats> {
+        let hosts = self.hosts.lock().await;
+        let region_hosts: Vec<&VmHost> = hosts
+            .values()
+            .filter(|h| h.region_id == region_id)
+            .collect();
+        let host_ids: Vec<u64> = region_hosts.iter().map(|h| h.id).collect();
+
+        let vms = self.vms.lock().await;
+        let region_vms: Vec<u64> = vms
+            .values()
+            .filter(|v| !v.deleted && host_ids.contains(&v.host_id))
+            .map(|v| v.id)
+            .collect();
+
+        let ranges = self.ip_range.lock().await;
+        let assignments = self.ip_assignments.lock().await;
+        let mut total_ip_assignments = 0;
+        let mut ipv4_assignments = 0;
+        let mut ipv6_assignments = 0;
+        for assignment in assignments
+            .values()
+            .filter(|a| !a.deleted && region_vms.contains(&a.vm_id))
+        {
+            total_ip_assignments += 1;
+            match ranges.get(&assignment.ip_range_id) {
+                // Address family is derived from the range CIDR, as in the MySQL impl
+                Some(r) if r.cidr.contains(':') => ipv6_assignments += 1,
+                Some(_) => ipv4_assignments += 1,
+                None => {}
+            }
+        }
+
+        Ok(RegionStats {
+            host_count: region_hosts.len() as u64,
+            total_vms: region_vms.len() as u64,
+            total_cpu_cores: region_hosts.iter().map(|h| h.cpu as u64).sum(),
+            total_memory_bytes: region_hosts.iter().map(|h| h.memory).sum(),
+            total_ip_assignments,
+            ipv4_assignments,
+            ipv6_assignments,
+        })
     }
     async fn admin_transfer_vm(&self, vm_id: u64, new_user_id: u64) -> DbResult<()> {
         let mut vms = self.vms.lock().await;
