@@ -277,6 +277,14 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List VM's owned by a specific user
     async fn list_hosts(&self) -> DbResult<Vec<VmHost>>;
 
+    /// List every host, including disabled hosts and hosts in disabled regions.
+    ///
+    /// `enabled` is a scheduling flag — "place no new VMs here" — not a claim
+    /// that the host has stopped existing. Reconciliation observes physical
+    /// reality and must see every host; only placement/capacity paths should
+    /// use the filtered [LNVpsDbBase::list_hosts].
+    async fn list_hosts_all(&self) -> DbResult<Vec<VmHost>>;
+
     /// List hosts with pagination
     async fn list_hosts_paginated(&self, limit: u64, offset: u64) -> DbResult<(Vec<VmHost>, u64)>;
 
@@ -298,6 +306,13 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// List enabled storage disks on the host
     async fn list_host_disks(&self, host_id: u64) -> DbResult<Vec<VmHostDisk>>;
+
+    /// List every storage disk on the host, including disabled pools.
+    ///
+    /// Draining a pool starts by disabling it, which is precisely when disks
+    /// move; reconciliation must still be able to name the pool a disk landed
+    /// on. Placement/capacity paths keep using [LNVpsDbBase::list_host_disks].
+    async fn list_host_disks_all(&self, host_id: u64) -> DbResult<Vec<VmHostDisk>>;
 
     /// Get a specific host disk
     async fn get_host_disk(&self, disk_id: u64) -> DbResult<VmHostDisk>;

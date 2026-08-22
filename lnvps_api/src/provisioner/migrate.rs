@@ -373,9 +373,16 @@ impl VmProvisioner {
     /// map entirely rather than recorded as empty: its VMs have not vanished,
     /// we simply cannot see them, and treating silence as absence is how a
     /// network blip turns into a placement rewrite or a duplicate VM.
+    ///
+    /// Disabled hosts (and hosts in a disabled region) are polled too: `enabled`
+    /// stops new placements, it does not stop the host from running the VMs it
+    /// already has — and a host is usually disabled precisely because VMs are
+    /// about to move off it. They do not count toward `unreachable`, since a
+    /// host taken out of service being silent is expected and must not block
+    /// reconciliation of the hosts that did answer.
     async fn observe_hosts(&self) -> Result<(HashMap<u64, Vec<HostVmSpec>>, usize)> {
         let db = self.get_db();
-        let hosts = db.list_hosts().await?;
+        let hosts = db.list_hosts_all().await?;
 
         let mut observed: HashMap<u64, Vec<HostVmSpec>> = HashMap::new();
         let mut unreachable = 0;
@@ -467,8 +474,8 @@ impl VmProvisioner {
         // points at, and a per-VM `get_host_disk` would be a query per VM on
         // every pass.
         let mut disk_names: HashMap<u64, String> = HashMap::new();
-        for host in db.list_hosts().await? {
-            for disk in db.list_host_disks(host.id).await.unwrap_or_default() {
+        for host in db.list_hosts_all().await? {
+            for disk in db.list_host_disks_all(host.id).await.unwrap_or_default() {
                 disk_names.insert(disk.id, disk.name);
             }
         }
@@ -535,7 +542,7 @@ impl VmProvisioner {
         // different kind of pool keeps its price either way, since billing
         // follows the template and never the disk row.
         let target_disks = db
-            .list_host_disks(drift.to_host_id)
+            .list_host_disks_all(drift.to_host_id)
             .await
             .unwrap_or_default();
         let disk_id = drift
@@ -1359,6 +1366,100 @@ mod tests {
             db.get_vm(vm_id).await.expect("vm").mac_address,
             "bc:24:11:4e:8f:d1"
         );
+        DummyVmHost::clear_host_vms().await;
+    }
+
+    /// Regression: draining a pool starts by disabling it, so a disabled pool
+    /// is exactly where disks are being moved *to* and *from*. Reconciliation
+    /// must still be able to name it, or the whole drain goes unrecorded and
+    /// capacity keeps being charged to the pool that no longer holds the data.
+    #[tokio::test]
+    async fn test_reconcile_follows_a_disk_moved_onto_a_disabled_pool() {
+        let db = Arc::new(MockDb::default());
+        db.host_disks.lock().await.insert(
+            3,
+            VmHostDisk {
+                id: 3,
+                host_id: 1,
+                name: "mock-disk-draining".to_string(),
+                size: 10_000 * GB,
+                // Disabled: no *new* VMs should land here. That says nothing
+                // about what is physically on it.
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        let vm_id = add_vm(&db).await;
+
+        DummyVmHost::clear_host_vms().await;
+        DummyVmHost::set_host_vms_for(1, vec![spec(vm_id, "mock-disk-draining")]).await;
+
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let drifts = provisioner.reconcile_vm_hosts().await.expect("reconcile");
+        assert_eq!(drifts.len(), 1);
+        assert!(!drifts[0].is_host_move());
+        assert_eq!(db.get_vm(vm_id).await.expect("vm").disk_id, 3);
+
+        // And back off it again once the pool is rebuilt.
+        DummyVmHost::set_host_vms_for(1, vec![spec(vm_id, "mock-disk")]).await;
+        provisioner.reconcile_vm_hosts().await.expect("reconcile");
+        assert_eq!(db.get_vm(vm_id).await.expect("vm").disk_id, 1);
+        DummyVmHost::clear_host_vms().await;
+    }
+
+    /// A host taken out of service still runs the VMs it has. Not observing it
+    /// leaves `host_id` stale, which every lifecycle operation is aimed at.
+    #[tokio::test]
+    async fn test_reconcile_observes_disabled_hosts_and_disabled_regions() {
+        let db = Arc::new(MockDb::default());
+        add_second_host(&db).await;
+        db.hosts.lock().await.get_mut(&2).expect("host 2").enabled = false;
+        let vm_id = add_vm(&db).await;
+
+        DummyVmHost::clear_host_vms().await;
+        DummyVmHost::set_host_vms_for(1, vec![]).await;
+        DummyVmHost::set_host_vms_for(2, vec![spec(vm_id, "mock-disk-2")]).await;
+
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let drifts = provisioner.reconcile_vm_hosts().await.expect("reconcile");
+        assert_eq!(drifts.len(), 1);
+        let stored = db.get_vm(vm_id).await.expect("vm");
+        assert_eq!(stored.host_id, 2, "a disabled host is still observed");
+        assert_eq!(stored.disk_id, 2);
+
+        // A disabled host is not a placement target, though — observing and
+        // scheduling are different questions.
+        assert!(
+            db.list_hosts()
+                .await
+                .expect("hosts")
+                .iter()
+                .all(|h| h.id != 2)
+        );
+
+        // Same again with the host re-enabled but its whole region disabled.
+        db.hosts.lock().await.get_mut(&2).expect("host 2").enabled = true;
+        db.regions
+            .lock()
+            .await
+            .get_mut(&1)
+            .expect("region 1")
+            .enabled = false;
+        assert!(
+            db.list_hosts().await.expect("hosts").is_empty(),
+            "precondition: a disabled region hides its hosts from placement"
+        );
+
+        DummyVmHost::set_host_vms_for(2, vec![]).await;
+        DummyVmHost::set_host_vms_for(1, vec![spec(vm_id, "mock-disk")]).await;
+        let drifts = provisioner.reconcile_vm_hosts().await.expect("reconcile");
+        assert_eq!(drifts.len(), 1);
+        let stored = db.get_vm(vm_id).await.expect("vm");
+        assert_eq!(
+            stored.host_id, 1,
+            "a host in a disabled region is still observed"
+        );
+        assert_eq!(stored.disk_id, 1);
         DummyVmHost::clear_host_vms().await;
     }
 }

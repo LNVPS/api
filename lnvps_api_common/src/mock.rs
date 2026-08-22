@@ -927,7 +927,25 @@ impl LNVpsDbBase for MockDb {
 
     async fn list_hosts(&self) -> DbResult<Vec<VmHost>> {
         let hosts = self.hosts.lock().await;
-        Ok(hosts.values().filter(|h| h.enabled).cloned().collect())
+        let regions = self.regions.lock().await;
+        // Mirrors the SQL: a host in a disabled region is not a placement
+        // target either.
+        Ok(hosts
+            .values()
+            .filter(|h| {
+                h.enabled
+                    && regions
+                        .get(&h.region_id)
+                        .map(|r| r.enabled)
+                        .unwrap_or(false)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn list_hosts_all(&self) -> DbResult<Vec<VmHost>> {
+        let hosts = self.hosts.lock().await;
+        Ok(hosts.values().cloned().collect())
     }
 
     async fn list_hosts_paginated(&self, limit: u64, offset: u64) -> DbResult<(Vec<VmHost>, u64)> {
@@ -1016,6 +1034,15 @@ impl LNVpsDbBase for MockDb {
         Ok(disks
             .values()
             .filter(|d| d.enabled && d.host_id == host_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_host_disks_all(&self, host_id: u64) -> DbResult<Vec<VmHostDisk>> {
+        let disks = self.host_disks.lock().await;
+        Ok(disks
+            .values()
+            .filter(|d| d.host_id == host_id)
             .cloned()
             .collect())
     }

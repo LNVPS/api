@@ -694,6 +694,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?)
     }
 
+    async fn list_hosts_all(&self) -> DbResult<Vec<VmHost>> {
+        Ok(sqlx::query_as("select * from vm_host")
+            .fetch_all(&self.db)
+            .await?)
+    }
+
     async fn list_hosts_paginated(&self, limit: u64, offset: u64) -> DbResult<(Vec<VmHost>, u64)> {
         // Get total count
         let total: i64 = sqlx::query_scalar(
@@ -856,6 +862,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn list_host_disks(&self, host_id: u64) -> DbResult<Vec<VmHostDisk>> {
         Ok(
             sqlx::query_as("select * from vm_host_disk where host_id = ? and enabled = 1")
+                .bind(host_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn list_host_disks_all(&self, host_id: u64) -> DbResult<Vec<VmHostDisk>> {
+        Ok(
+            sqlx::query_as("select * from vm_host_disk where host_id = ?")
                 .bind(host_id)
                 .fetch_all(&self.db)
                 .await?,
