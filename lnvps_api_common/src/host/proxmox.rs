@@ -1368,12 +1368,9 @@ impl ProxmoxClient {
             scsi_hw: Some("virtio-scsi-single".to_string()),
             serial_0: Some("socket".to_string()),
             scsi_1: Some(DiskDevice::volume(&value.disk.name, "cloudinit")),
-            // Never send an empty `sshkeys=`: Proxmox rejects it with
-            // "invalid urlencoded string".
-            ssh_keys: {
-                let keys = SshKeys::one(value.ssh_key.key_data.as_str());
-                (!keys.is_empty()).then_some(keys)
-            },
+            // `maybe_one` is `None` for a blank key: Proxmox rejects an empty
+            // `sshkeys=` with "invalid urlencoded string".
+            ssh_keys: SshKeys::maybe_one(&value.ssh_key.key_data),
             efi_disk_0: Some(DiskDevice {
                 efi_type: Some("4m".to_string()),
                 ..DiskDevice::volume(&value.disk.name, "0")

@@ -500,24 +500,20 @@ impl Display for CiCustom {
 pub struct SshKeys(pub Vec<String>);
 
 impl SshKeys {
-    /// Builds a key list from a single key, dropping it when it is blank.
-    ///
-    /// A blank key would otherwise serialise to an empty `sshkeys=` value,
-    /// which Proxmox rejects with `invalid urlencoded string`. It would also
-    /// never compare equal to the value read back from the host (which parses
-    /// as an empty list), so the broken update would be retried forever.
-    pub fn one(key: impl Into<String>) -> Self {
-        let key = key.into();
-        let key = key.trim();
-        if key.is_empty() {
-            Self(vec![])
-        } else {
-            Self(vec![key.to_string()])
-        }
+    pub fn one(key: impl AsRef<str>) -> Self {
+        Self(vec![key.as_ref().trim().to_string()])
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+    /// Builds a key list from a single key, or `None` when it is blank.
+    ///
+    /// A blank key serialises to an empty `sshkeys=` value, which Proxmox
+    /// rejects with `invalid urlencoded string`; it also never compares equal
+    /// to the value read back from the host (which parses as an empty list),
+    /// so the failing update would be retried forever. Omitting the key
+    /// entirely leaves the host value untouched.
+    pub fn maybe_one(key: impl AsRef<str>) -> Option<Self> {
+        let key = key.as_ref().trim();
+        (!key.is_empty()).then(|| Self::one(key))
     }
 }
 
@@ -769,11 +765,12 @@ mod tests {
     /// what an empty host value parses to, so no endless update loop occurs.
     #[test]
     fn test_ssh_keys_blank() {
-        assert!(SshKeys::one("").is_empty());
-        assert!(SshKeys::one("   \n").is_empty());
-        assert_eq!(SshKeys::one(""), "".parse::<SshKeys>().unwrap());
-        assert_eq!(SshKeys::one("").to_string(), "");
-        assert!(!SshKeys::one("ssh-ed25519 AAAA x").is_empty());
+        assert_eq!(SshKeys::maybe_one(""), None);
+        assert_eq!(SshKeys::maybe_one("   \n"), None);
+        assert_eq!(
+            SshKeys::maybe_one(" ssh-ed25519 AAAA x \n"),
+            Some(SshKeys::one("ssh-ed25519 AAAA x"))
+        );
     }
 
     #[test]
