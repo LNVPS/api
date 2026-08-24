@@ -3,8 +3,8 @@ use crate::admin::auth::AdminAuth;
 use crate::admin::discounts::payment_discounts;
 use crate::admin::model::{
     AdminCreateCustomVmRequest, AdminCreateVmRequest, AdminPaymentRefundsInfo,
-    AdminRefundAmountInfo, AdminVmHistoryInfo, AdminVmInfo, AdminVmPaymentInfo, AdminVmTrafficDay,
-    AdminVmTrafficInfo, AdminVmTrafficQuery, JobResponse,
+    AdminRefundAmountInfo, AdminVmBatch, AdminVmHistoryInfo, AdminVmInfo, AdminVmPaymentInfo,
+    AdminVmTrafficDay, AdminVmTrafficInfo, AdminVmTrafficQuery, JobResponse,
 };
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post, put};
@@ -29,6 +29,7 @@ pub fn router() -> Router<RouterState> {
             get(admin_list_vms).post(admin_create_vm),
         )
         .route("/api/admin/v1/vms/custom", post(admin_create_custom_vm))
+        .route("/api/admin/v1/vms/status", post(admin_bulk_vm_status))
         .route("/api/admin/v1/vms/extend-all", post(admin_extend_all_vms))
         .route(
             "/api/admin/v1/vms/{id}",
@@ -107,42 +108,72 @@ struct ListVmsQuery {
     include_deleted: Option<bool>,
 }
 
-/// Caches host/region lookups while building admin VM listings.
+/// Render a set of VMs as [`AdminVmInfo`], in the order given.
 ///
-/// Uses [`LNVpsDb::get_host`]/[`LNVpsDb::get_host_region`] rather than
-/// `list_hosts()`/`list_host_region()`, because those list methods only return
-/// *enabled* hosts in *enabled* regions (they exist for provisioning). Admin
-/// views must keep working for VMs on disabled hosts.
-#[derive(Default)]
-struct HostRegionCache {
-    hosts: std::collections::HashMap<u64, lnvps_db::VmHost>,
-    regions: std::collections::HashMap<u64, lnvps_db::Region>,
+/// Every admin endpoint that returns `AdminVmInfo` — the list, the single-VM
+/// view and the bulk status endpoint — goes through here, so they cannot drift
+/// apart in shape, and none of them can reintroduce a per-VM query: all the
+/// data comes from [`AdminVmBatch`], which bulk-loads one table at a time.
+async fn load_admin_vm_infos(
+    db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+    vm_state_cache: &VmStateCache,
+    vms: &[lnvps_db::Vm],
+) -> anyhow::Result<Vec<AdminVmInfo>> {
+    let batch = AdminVmBatch::load(db, vms).await?;
+    let mut out = Vec::with_capacity(vms.len());
+    for vm in vms {
+        let running_state = get_vm_state(vm_state_cache, vm.id).await;
+        out.push(AdminVmInfo::from_vm_batched(vm, &batch, running_state)?);
+    }
+    Ok(out)
 }
 
-impl HostRegionCache {
-    async fn get(
-        &mut self,
-        db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
-        host_id: u64,
-    ) -> anyhow::Result<(lnvps_db::VmHost, lnvps_db::Region)> {
-        let host = match self.hosts.get(&host_id) {
-            Some(h) => h.clone(),
-            None => {
-                let h = db.get_host(host_id).await?;
-                self.hosts.insert(host_id, h.clone());
-                h
-            }
-        };
-        let region = match self.regions.get(&host.region_id) {
-            Some(r) => r.clone(),
-            None => {
-                let r = db.get_host_region(host.region_id).await?;
-                self.regions.insert(host.region_id, r.clone());
-                r
-            }
-        };
-        Ok((host, region))
+/// Maximum number of VM ids accepted by the bulk status endpoint
+const BULK_VM_STATUS_MAX_IDS: usize = 100;
+
+#[derive(Deserialize)]
+struct AdminBulkVmStatusRequest {
+    /// VM ids to load (max [`BULK_VM_STATUS_MAX_IDS`])
+    ids: Vec<u64>,
+}
+
+/// Load the status of specific VMs by id.
+///
+/// POST (rather than GET) so a large id list travels in the body instead of the
+/// query string. Ids that do not resolve to a VM are omitted from the response
+/// rather than failing the whole batch; results are returned in request order.
+async fn admin_bulk_vm_status(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Json(req): Json<AdminBulkVmStatusRequest>,
+) -> ApiResult<Vec<AdminVmInfo>> {
+    auth.require_permission(AdminResource::VirtualMachines, AdminAction::View)?;
+
+    if req.ids.is_empty() {
+        return ApiData::ok(vec![]);
     }
+    if req.ids.len() > BULK_VM_STATUS_MAX_IDS {
+        return Err(ApiError::bad_request(format!(
+            "Too many ids requested, max {BULK_VM_STATUS_MAX_IDS}"
+        )));
+    }
+
+    // De-duplicate while preserving request order
+    let mut seen = std::collections::HashSet::new();
+    let ids: Vec<u64> = req.ids.into_iter().filter(|id| seen.insert(*id)).collect();
+
+    let mut vms = Vec::with_capacity(ids.len());
+    for id in ids {
+        match this.db.get_vm(id).await {
+            Ok(v) => vms.push(v),
+            Err(e) => info!("Bulk VM status: skipping VM {id}: {e}"),
+        }
+    }
+
+    // Same loader (and same bulk loads) as GET /api/admin/v1/vms
+    let out = load_admin_vm_infos(&this.db, &this.vm_state_cache, &vms).await?;
+
+    ApiData::ok(out)
 }
 
 /// List all VMs with pagination and filtering
@@ -171,43 +202,8 @@ async fn admin_list_vms(
         )
         .await?;
 
-    // Cache host/region lookups across VMs to avoid N+1 queries
-    let mut host_cache = HostRegionCache::default();
-
-    let mut admin_vms = Vec::new();
-    for vm in vms {
-        // Get user info for this VM
-        let user = this.db.get_user(vm.user_id).await?;
-
-        // Host/region may be disabled; admin listings must still resolve them
-        let (host, region) = host_cache.get(&this.db, vm.host_id).await?;
-
-        // Get VM running state from cache
-        let vm_running_state = get_vm_state(&this.vm_state_cache, vm.id).await;
-
-        // Build the AdminVmInfo with all data
-        let admin_vm = AdminVmInfo::from_vm_with_admin_data(
-            &this.db,
-            &vm,
-            vm_running_state,
-            vm.host_id,
-            vm.user_id,
-            hex::encode(&user.pubkey),
-            if user.email.is_empty() {
-                None
-            } else {
-                Some(user.email.into())
-            },
-            host.name.clone(),
-            region.id,
-            region.name.clone(),
-            vm.deleted,
-            vm.ref_code.clone(),
-        )
-        .await?;
-
-        admin_vms.push(admin_vm);
-    }
+    // Shared loader bulk-loads every table the payload needs (no N+1)
+    let admin_vms = load_admin_vm_infos(&this.db, &this.vm_state_cache, &vms).await?;
 
     ApiPaginatedData::ok(admin_vms, total, limit, offset)
 }
@@ -223,39 +219,10 @@ async fn admin_get_vm(
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::View)?;
 
     let vm = this.db.get_vm(id).await?;
-    let user = this.db.get_user(vm.user_id).await?;
-
-    // Host/region may be disabled; admin views must still resolve them
-    let (host, region) = HostRegionCache::default().get(&this.db, vm.host_id).await?;
-
-    let host_name = host.name.clone();
-
-    let region_id = region.id;
-    let region_name = region.name.clone();
-
-    // Get VM running state from cache
-    let vm_running_state = get_vm_state(&vm_state_cache, vm.id).await;
-
-    // Build the AdminVmInfo with all data
-    let admin_vm = AdminVmInfo::from_vm_with_admin_data(
-        &this.db,
-        &vm,
-        vm_running_state,
-        vm.host_id,
-        vm.user_id,
-        hex::encode(&user.pubkey),
-        if user.email.is_empty() {
-            None
-        } else {
-            Some(user.email.into())
-        },
-        host_name,
-        region_id,
-        region_name,
-        vm.deleted,
-        vm.ref_code.clone(),
-    )
-    .await?;
+    let admin_vm = load_admin_vm_infos(&this.db, &vm_state_cache, std::slice::from_ref(&vm))
+        .await?
+        .pop()
+        .ok_or_else(|| ApiError::not_found("VM not found"))?;
 
     ApiData::ok(admin_vm)
 }
@@ -1537,8 +1504,10 @@ mod tests {
     /// Regression: a disabled host must still resolve for admin VM listings.
     /// `list_hosts()` skips disabled hosts, which made `GET /api/admin/v1/vms`
     /// fail with "VM references non-existent host" after disabling a host.
+    /// The batch reads `list_hosts_all()`/`list_host_region_all()` for exactly
+    /// this reason.
     #[tokio::test]
-    async fn host_region_cache_resolves_disabled_host() {
+    async fn admin_vm_batch_resolves_disabled_host() {
         use lnvps_api_common::MockDb;
         use lnvps_db::LNVpsDbBase;
 
@@ -1546,6 +1515,11 @@ mod tests {
         let mut host = db.get_host(1).await.unwrap();
         host.enabled = false;
         db.update_host(&host).await.unwrap();
+        let user_id = db.upsert_user(&[1u8; 32]).await.unwrap();
+        let mut vm = MockDb::mock_vm();
+        vm.user_id = user_id;
+        vm.ssh_key_id = None;
+        let vm_id = db.insert_vm(&vm).await.unwrap();
 
         let db: std::sync::Arc<dyn lnvps_db::LNVpsDb> = std::sync::Arc::new(db);
         assert!(
@@ -1553,15 +1527,269 @@ mod tests {
             "precondition: list_hosts() hides disabled hosts"
         );
 
-        let mut cache = HostRegionCache::default();
-        let (host, region) = cache.get(&db, 1).await.unwrap();
-        assert_eq!(host.id, 1);
-        assert!(!host.enabled);
-        assert_eq!(region.id, host.region_id);
+        let vms = vec![db.get_vm(vm_id).await.unwrap()];
+        let infos = load_admin_vm_infos(&db, &VmStateCache::new(), &vms)
+            .await
+            .unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].host_id, 1);
+        assert!(!infos[0].host_name.is_empty());
+        assert!(!infos[0].region_name.is_empty());
+    }
 
-        // Second lookup is served from the cache.
-        let (host2, _) = cache.get(&db, 1).await.unwrap();
-        assert_eq!(host2.id, 1);
+    /// The list, single-VM and bulk-status endpoints all build their payload
+    /// through [`AdminVmBatch`], which bulk-loads each table once.
+    #[tokio::test]
+    async fn admin_vm_batch_builds_payloads_in_order() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::LNVpsDbBase;
+
+        let db = MockDb::default();
+        let user_id = db.upsert_user(&[1u8; 32]).await.unwrap();
+        let mut vm = MockDb::mock_vm();
+        vm.user_id = user_id;
+        vm.ssh_key_id = None;
+        let vm1 = db.insert_vm(&vm).await.unwrap();
+        let vm2 = db.insert_vm(&vm).await.unwrap();
+
+        let db: std::sync::Arc<dyn lnvps_db::LNVpsDb> = std::sync::Arc::new(db);
+        let state_cache = VmStateCache::new();
+
+        // Single load (GET /vms/{id})
+        let one = db.get_vm(vm1).await.unwrap();
+        let infos = load_admin_vm_infos(&db, &state_cache, std::slice::from_ref(&one))
+            .await
+            .unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].id, one.id);
+        assert_eq!(infos[0].user_id, one.user_id);
+        assert_eq!(infos[0].host_id, one.host_id);
+        assert!(!infos[0].host_name.is_empty());
+        assert_eq!(infos[0].traffic.bytes_out, 0);
+
+        // Batch load (list / bulk status) preserves request order
+        let vms = vec![db.get_vm(vm2).await.unwrap(), db.get_vm(vm1).await.unwrap()];
+        let infos = load_admin_vm_infos(&db, &state_cache, &vms).await.unwrap();
+        assert_eq!(
+            infos.iter().map(|i| i.id).collect::<Vec<_>>(),
+            vec![vm2, vm1]
+        );
+
+        // Empty batch is a no-op and issues no lookups
+        let batch = AdminVmBatch::load(&db, &[]).await.unwrap();
+        assert!(batch.hosts.is_empty());
+        assert!(
+            load_admin_vm_infos(&db, &state_cache, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Every per-VM table the payload renders — ssh keys, ip assignments,
+    /// traffic, subscription and its line items — comes out of the batch.
+    #[tokio::test]
+    async fn admin_vm_batch_renders_every_per_vm_table() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::{LNVpsDbBase, SubscriptionType};
+
+        let db = MockDb::default();
+        let user_id = db.upsert_user(&[2u8; 32]).await.unwrap();
+        let ssh_key_id = db
+            .insert_user_ssh_key(&lnvps_db::UserSshKey {
+                id: 0,
+                name: "laptop".to_string(),
+                user_id,
+                created: Utc::now(),
+                key_data: "ssh-ed25519 AAAA".to_string().into(),
+            })
+            .await
+            .unwrap();
+
+        let sub_id = db
+            .insert_subscription(&lnvps_db::Subscription {
+                id: 0,
+                user_id,
+                company_id: 1,
+                name: "vps sub".to_string(),
+                description: None,
+                created: Utc::now(),
+                expires: Some(Utc::now() + Days::new(30)),
+                is_active: true,
+                is_setup: true,
+                currency: "EUR".to_string(),
+                interval_amount: 1,
+                interval_type: lnvps_db::IntervalType::Month,
+                setup_fee: 0,
+                auto_renewal_enabled: true,
+                external_id: None,
+            })
+            .await
+            .unwrap();
+        let line_item_id = db
+            .insert_subscription_line_item(&lnvps_db::SubscriptionLineItem {
+                id: 0,
+                subscription_id: sub_id,
+                subscription_type: SubscriptionType::Vps,
+                name: "vps".to_string(),
+                description: None,
+                amount: 999,
+                setup_amount: 0,
+                configuration: None,
+            })
+            .await
+            .unwrap();
+
+        let mut vm = MockDb::mock_vm();
+        vm.user_id = user_id;
+        vm.ssh_key_id = Some(ssh_key_id);
+        vm.subscription_line_item_id = line_item_id;
+        let vm_id = db.insert_vm(&vm).await.unwrap();
+
+        db.insert_vm_ip_assignment(&lnvps_db::VmIpAssignment {
+            id: 0,
+            vm_id,
+            ip_range_id: 1,
+            ip: "185.18.221.10".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        db.add_vm_traffic(vm_id, Utc::now().date_naive(), 1_000, 2_000)
+            .await
+            .unwrap();
+
+        let db: std::sync::Arc<dyn lnvps_db::LNVpsDb> = std::sync::Arc::new(db);
+        let vms = vec![db.get_vm(vm_id).await.unwrap()];
+        let info = load_admin_vm_infos(&db, &VmStateCache::new(), &vms)
+            .await
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(info.ssh_key_id, ssh_key_id);
+        assert_eq!(info.ssh_key_name, "laptop");
+        assert_eq!(info.ip_addresses.len(), 1);
+        assert_eq!(info.ip_addresses[0].ip, "185.18.221.10");
+        assert_eq!(info.traffic.bytes_in, 1_000);
+        assert_eq!(info.traffic.bytes_out, 2_000);
+        assert!(info.auto_renewal_enabled);
+        assert!(info.expires.is_some());
+        let sub = info.subscription.expect("subscription rendered");
+        assert_eq!(sub.id, sub_id);
+        assert_eq!(sub.line_items.len(), 1);
+        assert_eq!(
+            sub.line_items[0].resource,
+            Some(lnvps_api_common::ApiSubscriptionLineItemResource::Vps { vm_id })
+        );
+        assert_eq!(sub.payment_count, 0);
+        assert_eq!(sub.user_pubkey, hex::encode([2u8; 32]));
+    }
+
+    /// The endpoint itself: permission gate, id cap, de-duplication, and
+    /// unknown ids skipped rather than failing the batch.
+    #[tokio::test]
+    async fn admin_bulk_vm_status_endpoint() {
+        use crate::admin::model::Permission;
+        use lnvps_api_common::{
+            ChannelWorkCommander, MockDb, MockExchangeRate, VatClient, VmStateCache,
+        };
+        use lnvps_db::LNVpsDbBase;
+        use std::sync::Arc;
+
+        crate::verbose_errors_for_tests();
+        let db = MockDb::default();
+        let user_id = db.upsert_user(&[3u8; 32]).await.unwrap();
+        let mut vm = MockDb::mock_vm();
+        vm.user_id = user_id;
+        vm.ssh_key_id = None;
+        let vm1 = db.insert_vm(&vm).await.unwrap();
+        let vm2 = db.insert_vm(&vm).await.unwrap();
+
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(db);
+        let this = RouterState {
+            node_control: None,
+            db: db.clone(),
+            work_commander: Arc::new(ChannelWorkCommander::new()),
+            feedback: None,
+            vm_state_cache: VmStateCache::new(),
+            exchange: Arc::new(MockExchangeRate::default()),
+            vat: VatClient::new(),
+        };
+        let auth = |permissions: Vec<Permission>| AdminAuth {
+            user_id: 1,
+            pubkey: vec![1u8; 32],
+            permissions: permissions.into_iter().collect(),
+            nip98_auth: None,
+        };
+        let viewer = || {
+            auth(vec![Permission {
+                resource: AdminResource::VirtualMachines,
+                action: AdminAction::View,
+            }])
+        };
+
+        // Unknown ids are skipped, duplicates collapsed, order preserved
+        let out = admin_bulk_vm_status(
+            viewer(),
+            State(this.clone()),
+            Json(AdminBulkVmStatusRequest {
+                ids: vec![vm2, vm1, vm2, 9999],
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            out.0.data.iter().map(|v| v.id).collect::<Vec<_>>(),
+            vec![vm2, vm1]
+        );
+
+        // Empty request short-circuits
+        let out = admin_bulk_vm_status(
+            viewer(),
+            State(this.clone()),
+            Json(AdminBulkVmStatusRequest { ids: vec![] }),
+        )
+        .await
+        .unwrap();
+        assert!(out.0.data.is_empty());
+
+        // Over the cap is refused rather than silently truncated
+        let err = admin_bulk_vm_status(
+            viewer(),
+            State(this.clone()),
+            Json(AdminBulkVmStatusRequest {
+                ids: (1..=(BULK_VM_STATUS_MAX_IDS as u64 + 1)).collect(),
+            }),
+        )
+        .await
+        .err()
+        .expect("over cap");
+        assert!(err.error.contains("Too many ids"), "{}", err.error);
+
+        // Requires virtual_machines::view
+        assert!(
+            admin_bulk_vm_status(
+                auth(vec![]),
+                State(this),
+                Json(AdminBulkVmStatusRequest { ids: vec![vm1] }),
+            )
+            .await
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn admin_bulk_vm_status_request_parses_ids() {
+        let req: AdminBulkVmStatusRequest =
+            serde_json::from_str(r#"{"ids": [1, 2, 2, 3]}"#).unwrap();
+        assert_eq!(req.ids, vec![1, 2, 2, 3]);
+
+        // De-duplication keeps request order
+        let mut seen = std::collections::HashSet::new();
+        let ids: Vec<u64> = req.ids.into_iter().filter(|id| seen.insert(*id)).collect();
+        assert_eq!(ids, vec![1, 2, 3]);
+
+        assert!(serde_json::from_str::<AdminBulkVmStatusRequest>(r#"{}"#).is_err());
     }
 
     #[test]

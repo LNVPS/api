@@ -653,6 +653,19 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?)
     }
 
+    async fn list_user_ssh_keys_by_ids(&self, ids: &[u64]) -> DbResult<Vec<UserSshKey>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut query = sqlx::QueryBuilder::new("select * from user_ssh_key where id in (");
+        let mut separated = query.separated(", ");
+        for id in ids {
+            separated.push_bind(id);
+        }
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
+    }
+
     async fn delete_user_ssh_key(&self, id: u64) -> DbResult<()> {
         sqlx::query("delete from user_ssh_key where id=?")
             .bind(id)
@@ -672,6 +685,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn list_host_region(&self) -> DbResult<Vec<Region>> {
         Ok(sqlx::query_as("select * from region where enabled=1")
+            .fetch_all(&self.db)
+            .await?)
+    }
+
+    async fn list_host_region_all(&self) -> DbResult<Vec<Region>> {
+        Ok(sqlx::query_as("select * from region")
             .fetch_all(&self.db)
             .await?)
     }
@@ -1058,6 +1077,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_vm_templates_all(&self) -> DbResult<Vec<VmTemplate>> {
+        Ok(sqlx::query_as("select * from vm_template")
+            .fetch_all(&self.db)
+            .await?)
+    }
+
     async fn insert_vm_template(&self, template: &VmTemplate) -> DbResult<u64> {
         Ok(sqlx::query("insert into vm_template(name,enabled,created,expires,cpu,cpu_mfg,cpu_arch,cpu_features,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id,ip4_count,ip6_count,disk_iops_read,disk_iops_write,disk_mbps_read,disk_mbps_write,network_mbps,cpu_limit,transfer_gb) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) returning id")
             .bind(&template.name)
@@ -1197,6 +1222,36 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?;
 
         Ok((rows, total.0 as u64))
+    }
+
+    async fn list_vm_traffic_totals_by_vms(
+        &self,
+        vm_ids: &[u64],
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> DbResult<Vec<VmTrafficTotal>> {
+        if vm_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        // Same CAST/COALESCE reasoning as `get_vm_traffic_total`; `user_id` is
+        // joined in so the row is self-describing, matching `VmTrafficTotal`.
+        let mut query = sqlx::QueryBuilder::new(
+            "select t.vm_id, v.user_id, \
+             cast(coalesce(sum(t.bytes_in), 0) as unsigned) as bytes_in, \
+             cast(coalesce(sum(t.bytes_out), 0) as unsigned) as bytes_out \
+             from vm_traffic_daily t inner join vm v on v.id = t.vm_id \
+             where t.day between ",
+        );
+        query.push_bind(start);
+        query.push(" and ");
+        query.push_bind(end);
+        query.push(" and t.vm_id in (");
+        let mut separated = query.separated(", ");
+        for id in vm_ids {
+            separated.push_bind(id);
+        }
+        query.push(") group by t.vm_id, v.user_id");
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
     }
 
     async fn get_vm_traffic_total(
@@ -1449,6 +1504,21 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_vms_by_line_items(&self, line_item_ids: &[u64]) -> DbResult<Vec<Vm>> {
+        if line_item_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT * FROM vm WHERE deleted = 0 AND subscription_line_item_id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in line_item_ids {
+            separated.push_bind(id);
+        }
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
+    }
+
     async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm> {
         Ok(sqlx::query_as(
             "SELECT v.* FROM vm v \
@@ -1567,6 +1637,21 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_all(&self.db)
                 .await?,
         )
+    }
+
+    async fn list_vm_ip_assignments_by_vms(&self, vm_ids: &[u64]) -> DbResult<Vec<VmIpAssignment>> {
+        if vm_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "select * from vm_ip_assignment where deleted = 0 and vm_id in (",
+        );
+        let mut separated = query.separated(", ");
+        for id in vm_ids {
+            separated.push_bind(id);
+        }
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
     }
 
     async fn list_vm_ip_assignments_in_range(
@@ -1699,6 +1784,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_all_custom_pricing(&self) -> DbResult<Vec<VmCustomPricing>> {
+        Ok(sqlx::query_as("select * from vm_custom_pricing")
+            .fetch_all(&self.db)
+            .await?)
+    }
+
     async fn list_custom_pricing_paginated(
         &self,
         region_id: Option<u64>,
@@ -1764,6 +1855,22 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_one(&self.db)
                 .await?,
         )
+    }
+
+    async fn list_custom_vm_templates_by_ids(
+        &self,
+        ids: &[u64],
+    ) -> DbResult<Vec<VmCustomTemplate>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut query = sqlx::QueryBuilder::new("select * from vm_custom_template where id in (");
+        let mut separated = query.separated(", ");
+        for id in ids {
+            separated.push_bind(id);
+        }
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
     }
 
     async fn insert_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<u64> {
@@ -3020,6 +3127,73 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    async fn list_subscriptions_by_ids(&self, ids: &[u64]) -> DbResult<Vec<Subscription>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut query = sqlx::QueryBuilder::new("SELECT * FROM subscription WHERE id IN (");
+        let mut separated = query.separated(", ");
+        for id in ids {
+            separated.push_bind(id);
+        }
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
+    }
+
+    async fn list_subscription_line_items_by_ids(
+        &self,
+        ids: &[u64],
+    ) -> DbResult<Vec<SubscriptionLineItem>> {
+        if ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut query =
+            sqlx::QueryBuilder::new("SELECT * FROM subscription_line_item WHERE id IN (");
+        let mut separated = query.separated(", ");
+        for id in ids {
+            separated.push_bind(id);
+        }
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
+    }
+
+    async fn list_subscription_line_items_by_subscriptions(
+        &self,
+        subscription_ids: &[u64],
+    ) -> DbResult<Vec<SubscriptionLineItem>> {
+        if subscription_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT * FROM subscription_line_item WHERE subscription_id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in subscription_ids {
+            separated.push_bind(id);
+        }
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
+    }
+
+    async fn count_subscription_payments_by_subscriptions(
+        &self,
+        subscription_ids: &[u64],
+    ) -> DbResult<Vec<(u64, u64)>> {
+        if subscription_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT subscription_id, cast(count(*) as unsigned) \
+             FROM subscription_payment WHERE subscription_id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in subscription_ids {
+            separated.push_bind(id);
+        }
+        query.push(") GROUP BY subscription_id");
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
+    }
+
     async fn insert_subscription_line_item(
         &self,
         line_item: &SubscriptionLineItem,
@@ -3601,6 +3775,24 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    async fn list_ip_range_subscriptions_by_line_items(
+        &self,
+        subscription_line_item_ids: &[u64],
+    ) -> DbResult<Vec<IpRangeSubscription>> {
+        if subscription_line_item_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT * FROM ip_range_subscription WHERE subscription_line_item_id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in subscription_line_item_ids {
+            separated.push_bind(id);
+        }
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
+    }
+
     async fn list_ip_range_subscriptions_by_subscription(
         &self,
         subscription_id: u64,
@@ -3767,6 +3959,24 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_all(&self.db)
                 .await?,
         )
+    }
+
+    async fn list_asn_subscriptions_by_line_items(
+        &self,
+        subscription_line_item_ids: &[u64],
+    ) -> DbResult<Vec<AsnSubscription>> {
+        if subscription_line_item_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT * FROM asn_subscription WHERE subscription_line_item_id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in subscription_line_item_ids {
+            separated.push_bind(id);
+        }
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
     }
 
     async fn list_asn_subscriptions_by_subscription(
@@ -4719,6 +4929,24 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_marketplace_nodes_by_line_items(
+        &self,
+        line_item_ids: &[u64],
+    ) -> DbResult<Vec<MarketplaceNode>> {
+        if line_item_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT * FROM marketplace_node WHERE subscription_line_item_id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in line_item_ids {
+            separated.push_bind(id);
+        }
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
+    }
+
     async fn insert_marketplace_node_health(
         &self,
         health: &MarketplaceNodeHealth,
@@ -5448,6 +5676,24 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_one(&self.db)
                 .await?,
         )
+    }
+
+    async fn list_app_deployments_by_line_items(
+        &self,
+        line_item_ids: &[u64],
+    ) -> DbResult<Vec<AppDeployment>> {
+        if line_item_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut query = sqlx::QueryBuilder::new(
+            "SELECT * FROM app_deployment WHERE subscription_line_item_id IN (",
+        );
+        let mut separated = query.separated(", ");
+        for id in line_item_ids {
+            separated.push_bind(id);
+        }
+        query.push(")");
+        Ok(query.build_query_as().fetch_all(&self.db).await?)
     }
 
     async fn find_app_deployment_by_cluster_name(

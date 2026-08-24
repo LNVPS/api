@@ -1028,6 +1028,92 @@ impl ApiSubscriptionLineItemResource {
     ///
     /// Returns `None` when the type has no linkable resource (e.g. ASN
     /// sponsoring, DNS hosting) or the back-reference row cannot be found.
+    /// Resolve the linked resource for many line items with one query per
+    /// resource table, keyed by line item id.
+    ///
+    /// The batch counterpart to [`Self::resolve`]: rendering a page of line
+    /// items must not issue a back-reference query per row. Line items whose
+    /// type has no linkable resource, or whose back-reference row is missing,
+    /// are simply absent from the map.
+    pub async fn resolve_many<D: LNVpsDbBase + ?Sized>(
+        db: &D,
+        line_items: &[SubscriptionLineItem],
+    ) -> HashMap<u64, Self> {
+        let ids_of = |t: SubscriptionType| -> Vec<u64> {
+            line_items
+                .iter()
+                .filter(|li| li.subscription_type == t)
+                .map(|li| li.id)
+                .collect()
+        };
+        let mut out = HashMap::new();
+
+        let vps = ids_of(SubscriptionType::Vps);
+        if !vps.is_empty() {
+            for vm in db.list_vms_by_line_items(&vps).await.unwrap_or_default() {
+                out.insert(vm.subscription_line_item_id, Self::Vps { vm_id: vm.id });
+            }
+        }
+
+        let ip_ranges = ids_of(SubscriptionType::IpRange);
+        if !ip_ranges.is_empty() {
+            for sub in db
+                .list_ip_range_subscriptions_by_line_items(&ip_ranges)
+                .await
+                .unwrap_or_default()
+            {
+                out.entry(sub.subscription_line_item_id)
+                    .or_insert(Self::IpRange {
+                        ip_range_subscription_id: sub.id,
+                    });
+            }
+        }
+
+        let asns = ids_of(SubscriptionType::AsnSponsoring);
+        if !asns.is_empty() {
+            for sub in db
+                .list_asn_subscriptions_by_line_items(&asns)
+                .await
+                .unwrap_or_default()
+            {
+                out.entry(sub.subscription_line_item_id)
+                    .or_insert(Self::Asn {
+                        asn_subscription_id: sub.id,
+                    });
+            }
+        }
+
+        let apps = ids_of(SubscriptionType::App);
+        if !apps.is_empty() {
+            for d in db
+                .list_app_deployments_by_line_items(&apps)
+                .await
+                .unwrap_or_default()
+            {
+                out.entry(d.subscription_line_item_id).or_insert(Self::App {
+                    app_deployment_id: d.id,
+                });
+            }
+        }
+
+        let nodes = ids_of(SubscriptionType::MarketplaceNodeFee);
+        if !nodes.is_empty() {
+            for n in db
+                .list_marketplace_nodes_by_line_items(&nodes)
+                .await
+                .unwrap_or_default()
+            {
+                if let Some(li) = n.subscription_line_item_id {
+                    out.entry(li).or_insert(Self::MarketplaceNode {
+                        marketplace_node_id: n.id,
+                    });
+                }
+            }
+        }
+
+        out
+    }
+
     pub async fn resolve<D: LNVpsDbBase + ?Sized>(
         db: &D,
         line_item: &SubscriptionLineItem,
@@ -1076,6 +1162,110 @@ impl ApiSubscriptionLineItemResource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `resolve_many` must issue one query per resource *table*, never per line
+    /// item, and must tolerate a line item whose backing row is missing.
+    #[tokio::test]
+    async fn resolve_many_batches_every_resource_type() {
+        use crate::MockDb;
+        use lnvps_db::LNVpsDbBase;
+
+        let db = MockDb::default();
+        let user_id = db.upsert_user(&[9u8; 32]).await.unwrap();
+        let sub_id = db
+            .insert_subscription(&lnvps_db::Subscription {
+                id: 0,
+                user_id,
+                company_id: 1,
+                name: "sub".to_string(),
+                description: None,
+                created: Utc::now(),
+                expires: None,
+                is_active: true,
+                is_setup: true,
+                currency: "EUR".to_string(),
+                interval_amount: 1,
+                interval_type: lnvps_db::IntervalType::Month,
+                setup_fee: 0,
+                auto_renewal_enabled: true,
+                external_id: None,
+            })
+            .await
+            .unwrap();
+
+        let mut ids: Vec<(SubscriptionType, u64)> = Vec::new();
+        let id_of = |ids: &[(SubscriptionType, u64)], t: SubscriptionType| -> u64 {
+            ids.iter().find(|(k, _)| *k == t).unwrap().1
+        };
+        for t in [
+            SubscriptionType::Vps,
+            SubscriptionType::IpRange,
+            SubscriptionType::AsnSponsoring,
+            SubscriptionType::App,
+            SubscriptionType::MarketplaceNodeFee,
+            SubscriptionType::DnsHosting,
+        ] {
+            let id = db
+                .insert_subscription_line_item(&SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: sub_id,
+                    subscription_type: t,
+                    name: format!("{t:?}"),
+                    description: None,
+                    amount: 100,
+                    setup_amount: 0,
+                    configuration: None,
+                })
+                .await
+                .unwrap();
+            ids.push((t, id));
+        }
+
+        // Only the VPS line item gets a backing row; the rest exercise the
+        // "queried, found nothing" path.
+        let mut vm = MockDb::mock_vm();
+        vm.user_id = user_id;
+        vm.ssh_key_id = None;
+        vm.subscription_line_item_id = id_of(&ids, SubscriptionType::Vps);
+        let vm_id = db.insert_vm(&vm).await.unwrap();
+
+        let line_items = db
+            .list_subscription_line_items_by_subscriptions(&[sub_id])
+            .await
+            .unwrap();
+        assert_eq!(line_items.len(), 6);
+
+        let resolved = ApiSubscriptionLineItemResource::resolve_many(&db, &line_items).await;
+        assert_eq!(
+            resolved.get(&id_of(&ids, SubscriptionType::Vps)),
+            Some(&ApiSubscriptionLineItemResource::Vps { vm_id })
+        );
+        for t in [
+            SubscriptionType::IpRange,
+            SubscriptionType::AsnSponsoring,
+            SubscriptionType::App,
+            SubscriptionType::MarketplaceNodeFee,
+            SubscriptionType::DnsHosting,
+        ] {
+            assert!(
+                !resolved.contains_key(&id_of(&ids, t)),
+                "{t:?} has no backing row"
+            );
+        }
+
+        // Same answer as the per-row path it replaces
+        for li in &line_items {
+            let one = ApiSubscriptionLineItemResource::resolve(&db, li).await;
+            assert_eq!(one.as_ref(), resolved.get(&li.id));
+        }
+
+        // Nothing to resolve issues no queries at all
+        assert!(
+            ApiSubscriptionLineItemResource::resolve_many(&db, &[])
+                .await
+                .is_empty()
+        );
+    }
 
     #[test]
     fn test_api_os_distribution_roundtrip_with_db() {

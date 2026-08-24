@@ -705,27 +705,206 @@ pub struct AdminVmInfo {
     pub traffic: ApiVmTrafficSummary,
 }
 
-impl AdminVmInfo {
-    pub async fn from_vm_with_admin_data(
-        db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
-        vm: &lnvps_db::Vm,
-        running_state: Option<VmRunningState>,
-        host_id: u64,
-        user_id: u64,
-        user_pubkey: String,
-        user_email: Option<String>,
-        host_name: String,
-        region_id: u64,
-        region_name: String,
-        deleted: bool,
-        ref_code: Option<String>,
+/// Everything needed to render a batch of VMs as [`AdminVmInfo`], loaded up
+/// front with a fixed number of queries.
+///
+/// Rendering one VM touches a dozen tables. Doing that per VM made a 50-row
+/// listing several hundred round trips, so every lookup here is either a whole
+/// small shared table (hosts, regions, os images, templates, custom pricing)
+/// or a single `IN (...)` query keyed on the batch. Adding a field to
+/// [`AdminVmInfo`] means adding a bulk load here — never a query per VM.
+pub struct AdminVmBatch {
+    pub hosts: HashMap<u64, lnvps_db::VmHost>,
+    pub regions: HashMap<u64, lnvps_db::Region>,
+    pub users: HashMap<u64, lnvps_db::User>,
+    pub os_images: HashMap<u64, lnvps_db::VmOsImage>,
+    pub templates: HashMap<u64, lnvps_db::VmTemplate>,
+    pub custom_templates: HashMap<u64, lnvps_db::VmCustomTemplate>,
+    pub custom_pricing: HashMap<u64, lnvps_db::VmCustomPricing>,
+    pub ssh_keys: HashMap<u64, lnvps_db::UserSshKey>,
+    /// Non-deleted ip assignments, keyed by vm id
+    pub ip_assignments: HashMap<u64, Vec<lnvps_db::VmIpAssignment>>,
+    /// `(bytes_in, bytes_out)` over the current quota period, keyed by vm id.
+    /// A VM with no traffic rows is absent and reads as zero.
+    pub traffic: HashMap<u64, (u64, u64)>,
+    /// Subscription owning each VM's line item, keyed by *line item* id
+    pub subscriptions_by_line_item: HashMap<u64, lnvps_db::Subscription>,
+    /// Rendered subscription payload, keyed by subscription id
+    pub subscription_infos: HashMap<u64, AdminSubscriptionInfo>,
+    pub period_start: NaiveDate,
+    pub period_end: NaiveDate,
+}
+
+impl AdminVmBatch {
+    /// Load everything the given VMs need.
+    ///
+    /// Hosts and regions are read whole (and unfiltered): `enabled` is a
+    /// placement flag, and a VM on a disabled host must still render.
+    pub async fn load(
+        db: &Arc<dyn lnvps_db::LNVpsDb>,
+        vms: &[lnvps_db::Vm],
     ) -> anyhow::Result<Self> {
-        let image = db.get_os_image(vm.image_id).await?;
-        let ssh_key = match vm.ssh_key_id {
-            Some(k) => Some(db.get_user_ssh_key(k).await?),
-            None => None,
+        let (period_start, period_end) = quota_period(Utc::now().date_naive());
+        let mut batch = Self {
+            hosts: HashMap::new(),
+            regions: HashMap::new(),
+            users: HashMap::new(),
+            os_images: HashMap::new(),
+            templates: HashMap::new(),
+            custom_templates: HashMap::new(),
+            custom_pricing: HashMap::new(),
+            ssh_keys: HashMap::new(),
+            ip_assignments: HashMap::new(),
+            traffic: HashMap::new(),
+            subscriptions_by_line_item: HashMap::new(),
+            subscription_infos: HashMap::new(),
+            period_start,
+            period_end,
         };
-        let ips = db.list_vm_ip_assignments(vm.id).await?;
+        if vms.is_empty() {
+            return Ok(batch);
+        }
+
+        let vm_ids: Vec<u64> = vms.iter().map(|v| v.id).collect();
+        let ssh_key_ids = dedup(vms.iter().filter_map(|v| v.ssh_key_id));
+        let custom_template_ids = dedup(vms.iter().filter_map(|v| v.custom_template_id));
+        let line_item_ids = dedup(vms.iter().map(|v| v.subscription_line_item_id));
+
+        // Small shared tables: one read each, whatever the batch size
+        batch.hosts = db
+            .list_hosts_all()
+            .await?
+            .into_iter()
+            .map(|h| (h.id, h))
+            .collect();
+        batch.regions = db
+            .list_host_region_all()
+            .await?
+            .into_iter()
+            .map(|r| (r.id, r))
+            .collect();
+        batch.os_images = db
+            .list_os_image()
+            .await?
+            .into_iter()
+            .map(|i| (i.id, i))
+            .collect();
+        batch.templates = db
+            .list_vm_templates_all()
+            .await?
+            .into_iter()
+            .map(|t| (t.id, t))
+            .collect();
+        batch.custom_pricing = db
+            .list_all_custom_pricing()
+            .await?
+            .into_iter()
+            .map(|p| (p.id, p))
+            .collect();
+
+        // Per-batch bulk loads
+        batch.custom_templates = db
+            .list_custom_vm_templates_by_ids(&custom_template_ids)
+            .await?
+            .into_iter()
+            .map(|t| (t.id, t))
+            .collect();
+        batch.ssh_keys = db
+            .list_user_ssh_keys_by_ids(&ssh_key_ids)
+            .await?
+            .into_iter()
+            .map(|k| (k.id, k))
+            .collect();
+        for ip in db.list_vm_ip_assignments_by_vms(&vm_ids).await? {
+            batch.ip_assignments.entry(ip.vm_id).or_default().push(ip);
+        }
+        batch.traffic = db
+            .list_vm_traffic_totals_by_vms(&vm_ids, period_start, period_end)
+            .await?
+            .into_iter()
+            .map(|t| (t.vm_id, (t.bytes_in, t.bytes_out)))
+            .collect();
+
+        // Subscriptions: vm -> line item -> subscription, then everything the
+        // rendered subscription payload needs for those subscriptions.
+        let vm_line_items = db
+            .list_subscription_line_items_by_ids(&line_item_ids)
+            .await?;
+        let subscription_ids = dedup(vm_line_items.iter().map(|li| li.subscription_id));
+        let subscriptions: HashMap<u64, lnvps_db::Subscription> = db
+            .list_subscriptions_by_ids(&subscription_ids)
+            .await?
+            .into_iter()
+            .map(|s| (s.id, s))
+            .collect();
+        for li in &vm_line_items {
+            if let Some(sub) = subscriptions.get(&li.subscription_id) {
+                batch.subscriptions_by_line_item.insert(li.id, sub.clone());
+            }
+        }
+
+        // Users: VM owners and subscription owners in one read
+        let user_ids = dedup(
+            vms.iter()
+                .map(|v| v.user_id)
+                .chain(subscriptions.values().map(|s| s.user_id)),
+        );
+        batch.users = db
+            .list_users_by_ids(&user_ids)
+            .await?
+            .into_iter()
+            .map(|u| (u.id, u))
+            .collect();
+        let pubkeys: HashMap<u64, String> = batch
+            .users
+            .iter()
+            .map(|(id, u)| (*id, hex::encode(&u.pubkey)))
+            .collect();
+
+        batch.subscription_infos =
+            AdminSubscriptionInfo::load_many(db, subscriptions.into_values().collect(), &pubkeys)
+                .await?
+                .into_iter()
+                .map(|i| (i.id, i))
+                .collect();
+
+        Ok(batch)
+    }
+}
+
+/// Distinct ids, order-preserving, for an `IN (...)` bulk load.
+fn dedup(ids: impl Iterator<Item = u64>) -> Vec<u64> {
+    let mut seen = std::collections::HashSet::new();
+    ids.filter(|id| seen.insert(*id)).collect()
+}
+
+impl AdminVmInfo {
+    /// Render one VM from an [`AdminVmBatch`]. Issues no queries: everything
+    /// missing from the batch is reported as absent rather than fetched.
+    pub fn from_vm_batched(
+        vm: &lnvps_db::Vm,
+        batch: &AdminVmBatch,
+        running_state: Option<VmRunningState>,
+    ) -> anyhow::Result<Self> {
+        let user = batch
+            .users
+            .get(&vm.user_id)
+            .ok_or_else(|| anyhow!("VM {} references non-existent user {}", vm.id, vm.user_id))?;
+        let host = batch
+            .hosts
+            .get(&vm.host_id)
+            .ok_or_else(|| anyhow!("VM {} references non-existent host {}", vm.id, vm.host_id))?;
+        let region = batch.regions.get(&host.region_id).ok_or_else(|| {
+            anyhow!(
+                "Host {} references non-existent region {}",
+                host.id,
+                host.region_id
+            )
+        })?;
+        let image = batch
+            .os_images
+            .get(&vm.image_id)
+            .ok_or_else(|| anyhow!("VM {} references non-existent image {}", vm.id, vm.image_id))?;
 
         // Get template info and VM resources
         let (
@@ -742,10 +921,9 @@ impl AdminVmInfo {
             disk_type,
             disk_interface,
             transfer_gb,
-        ) = if let Some(template_id) = vm.template_id {
-            let template = db.get_vm_template(template_id).await?;
+        ) = if let Some(template) = vm.template_id.and_then(|id| batch.templates.get(&id)) {
             (
-                Some(template_id),
+                Some(template.id),
                 template.name.clone(),
                 None,
                 true,
@@ -771,13 +949,19 @@ impl AdminVmInfo {
                 ApiDiskInterface::from(template.disk_interface),
                 template.transfer_gb,
             )
-        } else if let Some(custom_template_id) = vm.custom_template_id {
-            let custom_template = db.get_custom_vm_template(custom_template_id).await?;
-            let pricing = db.get_custom_pricing(custom_template.pricing_id).await?;
+        } else if let Some(custom_template) = vm
+            .custom_template_id
+            .and_then(|id| batch.custom_templates.get(&id))
+        {
+            let pricing_name = batch
+                .custom_pricing
+                .get(&custom_template.pricing_id)
+                .map(|p| p.name.clone())
+                .unwrap_or_else(|| "Unknown".to_string());
             (
                 None, // No standard template ID
-                format!("Custom - {}", pricing.name),
-                Some(custom_template_id),
+                format!("Custom - {}", pricing_name),
+                Some(custom_template.id),
                 false,
                 custom_template.cpu,
                 if matches!(custom_template.cpu_mfg, lnvps_db::CpuMfg::Unknown) {
@@ -819,40 +1003,36 @@ impl AdminVmInfo {
             )
         };
 
-        let (period_start, period_end) = quota_period(Utc::now().date_naive());
-        let (traffic_in, traffic_out) = db
-            .get_vm_traffic_total(vm.id, period_start, period_end)
-            .await?;
+        let (traffic_in, traffic_out) = batch.traffic.get(&vm.id).copied().unwrap_or((0, 0));
 
-        let mut ip_addresses = Vec::new();
-        for ip in ips {
-            ip_addresses.push(AdminVmIpAddress {
-                id: ip.id,
-                ip: ip.ip,
-                range_id: ip.ip_range_id,
-            });
-        }
+        let ip_addresses = batch
+            .ip_assignments
+            .get(&vm.id)
+            .map(|ips| {
+                ips.iter()
+                    .map(|ip| AdminVmIpAddress {
+                        id: ip.id,
+                        ip: ip.ip.clone(),
+                        range_id: ip.ip_range_id,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        // Fetch subscription via the VM's subscription line item
-        let subscription = match db
-            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
-            .await
-        {
-            Ok(sub) => AdminSubscriptionInfo::from_subscription(db, &sub)
-                .await
-                .ok(),
-            Err(_) => None,
-        };
-
-        // Load subscription for expiry + auto_renewal (use shortcut function)
-        let sub = db
-            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
-            .await?;
+        // Subscription supplies created/expires/auto-renewal as well as the
+        // rendered payload; a VM whose line item has lost its subscription
+        // still renders, with those fields left at their neutral values.
+        let sub = batch
+            .subscriptions_by_line_item
+            .get(&vm.subscription_line_item_id);
+        let subscription = sub
+            .and_then(|s| batch.subscription_infos.get(&s.id))
+            .cloned();
 
         Ok(Self {
             id: vm.id,
-            created: sub.created,
-            expires: sub.expires,
+            created: sub.map(|s| s.created).unwrap_or_else(Utc::now),
+            expires: sub.and_then(|s| s.expires),
             mac_address: vm.mac_address.clone(),
             image_id: vm.image_id,
             image_name: format!("{} {} {}", image.distribution, image.flavour, image.version),
@@ -861,10 +1041,14 @@ impl AdminVmInfo {
             custom_template_id,
             is_standard_template,
             ssh_key_id: vm.ssh_key_id.unwrap_or(0),
-            ssh_key_name: ssh_key.map(|k| k.name).unwrap_or_default(),
+            ssh_key_name: vm
+                .ssh_key_id
+                .and_then(|id| batch.ssh_keys.get(&id))
+                .map(|k| k.name.clone())
+                .unwrap_or_default(),
             ip_addresses,
             running_state,
-            auto_renewal_enabled: sub.auto_renewal_enabled,
+            auto_renewal_enabled: sub.map(|s| s.auto_renewal_enabled).unwrap_or_default(),
             cpu,
             cpu_mfg,
             cpu_arch,
@@ -873,22 +1057,26 @@ impl AdminVmInfo {
             disk_size,
             disk_type,
             disk_interface,
-            host_id,
-            user_id,
-            user_pubkey,
-            user_email,
-            host_name,
-            region_id,
-            region_name,
-            deleted,
-            ref_code,
+            host_id: vm.host_id,
+            user_id: vm.user_id,
+            user_pubkey: hex::encode(&user.pubkey),
+            user_email: if user.email.is_empty() {
+                None
+            } else {
+                Some(user.email.clone().into())
+            },
+            host_name: host.name.clone(),
+            region_id: region.id,
+            region_name: region.name.clone(),
+            deleted: vm.deleted,
+            ref_code: vm.ref_code.clone(),
             disabled: vm.disabled,
             admin_notes: vm.admin_notes.clone(),
             subscription,
             traffic: ApiVmTrafficSummary {
                 transfer_gb,
-                period_start,
-                period_end,
+                period_start: batch.period_start,
+                period_end: batch.period_end,
                 bytes_out: traffic_out,
                 bytes_in: traffic_in,
             },
@@ -3356,7 +3544,7 @@ impl From<lnvps_api_common::HostVmSpec> for AdminUnmanagedVmInfo {
 // Subscription Models
 // ============================================================================
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct AdminSubscriptionInfo {
     pub id: u64,
     pub user_id: u64,
@@ -3451,6 +3639,73 @@ impl From<lnvps_db::Subscription> for AdminSubscriptionInfo {
     }
 }
 
+impl AdminSubscriptionInfo {
+    /// Render many subscriptions with a fixed number of queries: one for their
+    /// line items, one per resource table behind those line items, and one for
+    /// the payment counts.
+    ///
+    /// `pubkeys` is the caller's already-loaded owner index (subscriptions are
+    /// always rendered alongside their users, so re-reading them here would be
+    /// a second pass over the same rows); an owner missing from it renders as
+    /// an empty pubkey rather than failing the row.
+    pub async fn load_many(
+        db: &Arc<dyn lnvps_db::LNVpsDb>,
+        subscriptions: Vec<lnvps_db::Subscription>,
+        pubkeys: &HashMap<u64, String>,
+    ) -> anyhow::Result<Vec<Self>> {
+        if subscriptions.is_empty() {
+            return Ok(vec![]);
+        }
+        let ids: Vec<u64> = subscriptions.iter().map(|s| s.id).collect();
+
+        let line_items = db
+            .list_subscription_line_items_by_subscriptions(&ids)
+            .await?;
+        let resources =
+            ApiSubscriptionLineItemResource::resolve_many(db.as_ref(), &line_items).await;
+        let payment_counts: HashMap<u64, u64> = db
+            .count_subscription_payments_by_subscriptions(&ids)
+            .await?
+            .into_iter()
+            .collect();
+
+        let mut by_subscription: HashMap<u64, Vec<AdminSubscriptionLineItemInfo>> = HashMap::new();
+        for li in line_items {
+            let resource = resources.get(&li.id).cloned();
+            by_subscription.entry(li.subscription_id).or_default().push(
+                AdminSubscriptionLineItemInfo::from_line_item_with_resource(li, resource),
+            );
+        }
+
+        Ok(subscriptions
+            .into_iter()
+            .map(|sub| {
+                let id = sub.id;
+                let user_pubkey = pubkeys.get(&sub.user_id).cloned().unwrap_or_default();
+                let line_items = by_subscription.remove(&id).unwrap_or_default();
+                let payment_count = payment_counts.get(&id).copied().unwrap_or(0);
+                Self::from_parts(sub, user_pubkey, line_items, payment_count)
+            })
+            .collect())
+    }
+
+    /// Assemble from parts already loaded by the caller. The batch path: no
+    /// query is issued here, so a page of subscriptions costs a fixed number
+    /// of queries rather than a handful per row.
+    pub fn from_parts(
+        subscription: lnvps_db::Subscription,
+        user_pubkey: String,
+        line_items: Vec<AdminSubscriptionLineItemInfo>,
+        payment_count: u64,
+    ) -> Self {
+        let mut info = AdminSubscriptionInfo::from(subscription);
+        info.user_pubkey = user_pubkey;
+        info.line_items = line_items;
+        info.payment_count = payment_count;
+        info
+    }
+}
+
 impl AdminCreateSubscriptionRequest {
     pub fn to_subscription(&self) -> anyhow::Result<lnvps_db::Subscription> {
         if self.name.trim().is_empty() {
@@ -3482,7 +3737,7 @@ impl AdminCreateSubscriptionRequest {
 }
 
 // Subscription Line Item Models
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct AdminSubscriptionLineItemInfo {
     pub id: u64,
     pub subscription_id: u64,
@@ -3529,7 +3784,16 @@ impl AdminSubscriptionLineItemInfo {
         line_item: lnvps_db::SubscriptionLineItem,
     ) -> Self {
         let resource = ApiSubscriptionLineItemResource::resolve(db, &line_item).await;
+        Self::from_line_item_with_resource(line_item, resource)
+    }
 
+    /// Build from a line item whose resource link has already been resolved
+    /// (see [`ApiSubscriptionLineItemResource::resolve_many`]), so a batch of
+    /// line items costs no per-row query.
+    pub fn from_line_item_with_resource(
+        line_item: lnvps_db::SubscriptionLineItem,
+        resource: Option<ApiSubscriptionLineItemResource>,
+    ) -> Self {
         Self {
             id: line_item.id,
             subscription_id: line_item.subscription_id,

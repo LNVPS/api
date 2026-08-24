@@ -99,36 +99,22 @@ impl AdminSubscriptionInfo {
 
     /// Build an `AdminSubscriptionInfo` with the owner's pubkey supplied by the caller.
     /// Lets the list endpoint bulk-load users once instead of one query per row.
+    ///
+    /// A batch of one: the loading itself lives in
+    /// [`AdminSubscriptionInfo::load_many`], so the single-subscription views
+    /// cannot drift from the list view or reintroduce a per-line-item query.
     pub async fn from_subscription_with_pubkey(
         db: &Arc<dyn LNVpsDb>,
         subscription: &lnvps_db::Subscription,
         user_pubkey: String,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // Fetch line items
-        let line_items = db
-            .list_subscription_line_items(subscription.id)
-            .await
-            .unwrap_or_default();
-
-        let mut line_item_infos: Vec<AdminSubscriptionLineItemInfo> =
-            Vec::with_capacity(line_items.len());
-        for item in line_items {
-            line_item_infos
-                .push(AdminSubscriptionLineItemInfo::from_line_item(db.as_ref(), item).await);
-        }
-
-        // Count payments
-        let payments = db
-            .list_subscription_payments(subscription.id)
-            .await
-            .unwrap_or_default();
-        let payment_count = payments.len() as u64;
-
-        let mut info = AdminSubscriptionInfo::from(subscription.clone());
-        info.user_pubkey = user_pubkey;
-        info.line_items = line_item_infos;
-        info.payment_count = payment_count;
-        Ok(info)
+        let pubkeys = std::collections::HashMap::from([(subscription.user_id, user_pubkey)]);
+        Self::load_many(db, vec![subscription.clone()], &pubkeys)
+            .await?
+            .pop()
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("subscription {} could not be rendered", subscription.id).into()
+            })
     }
 }
 
@@ -179,23 +165,10 @@ async fn admin_list_subscriptions(
         .map(|u| (u.id, hex::encode(&u.pubkey)))
         .collect();
 
-    let mut subscription_infos = Vec::new();
-    for subscription in subscriptions {
-        let user_pubkey = pubkeys
-            .get(&subscription.user_id)
-            .cloned()
-            .unwrap_or_default();
-        match AdminSubscriptionInfo::from_subscription_with_pubkey(
-            &this.db,
-            &subscription,
-            user_pubkey,
-        )
-        .await
-        {
-            Ok(info) => subscription_infos.push(info),
-            Err(_) => continue,
-        }
-    }
+    // Line items, their linked resources and the payment counts are bulk-loaded
+    // for the whole page — one query per table, not per subscription.
+    let subscription_infos =
+        AdminSubscriptionInfo::load_many(&this.db, subscriptions, &pubkeys).await?;
 
     ApiPaginatedData::ok(subscription_infos, total, limit, offset)
 }

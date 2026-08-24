@@ -396,6 +396,46 @@ Example (abbreviated):
 
 `subscription` is `null`/omitted if no subscription is linked to the VM.
 
+#### Bulk Load VM Status
+
+```
+POST /api/admin/v1/vms/status
+```
+
+Required Permission: `virtual_machines::view`
+
+Request body:
+
+```json
+{
+  "ids": [1, 2, 3]
+}
+```
+
+Loads specific VMs by id in one call. Returns an array of the same `AdminVmInfo`
+objects as [Get VM Details](#get-vm-details) (including `running_state`,
+`traffic` and `subscription`), in request order.
+
+POST is used rather than GET so a long id list travels in the body instead of
+the query string.
+
+- Maximum **100** ids per request (400 otherwise)
+- Duplicate ids are collapsed
+- Ids that do not resolve to a VM are omitted from the response rather than
+  failing the whole batch, so the array may be shorter than `ids`
+- Deleted VMs are returned (with `deleted: true`)
+
+Response:
+
+```json
+{
+  "data": [
+    { "id": 1, "running_state": { "state": "running", "cpu_usage": 0.12 } },
+    { "id": 3, "running_state": null }
+  ]
+}
+```
+
 #### Create VM for User
 
 ```

@@ -259,6 +259,10 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Get user ssh key by id
     async fn get_user_ssh_key(&self, id: u64) -> DbResult<UserSshKey>;
 
+    /// Fetch multiple ssh keys by id in a single query. Missing ids are simply
+    /// absent from the result; an empty `ids` slice returns an empty vec.
+    async fn list_user_ssh_keys_by_ids(&self, ids: &[u64]) -> DbResult<Vec<UserSshKey>>;
+
     /// Delete a user ssh key by id
     async fn delete_user_ssh_key(&self, id: u64) -> DbResult<()>;
 
@@ -267,6 +271,12 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Get VM host regions
     async fn list_host_region(&self) -> DbResult<Vec<Region>>;
+
+    /// Every region, including disabled ones.
+    ///
+    /// Same reasoning as [LNVpsDbBase::list_hosts_all]: `enabled` is a
+    /// placement flag, and admin views must still resolve a disabled region.
+    async fn list_host_region_all(&self) -> DbResult<Vec<Region>>;
 
     /// Get VM host region by id
     async fn get_host_region(&self, id: u64) -> DbResult<Region>;
@@ -369,8 +379,15 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Get VM template by id
     async fn get_vm_template(&self, id: u64) -> DbResult<VmTemplate>;
 
-    /// List VM templates
+    /// List VM templates available for new orders (enabled and unexpired)
     async fn list_vm_templates(&self) -> DbResult<Vec<VmTemplate>>;
+
+    /// Every VM template, including disabled and expired ones.
+    ///
+    /// An existing VM keeps referencing the template it was ordered on long
+    /// after that plan stops being sold, so any view that renders existing VMs
+    /// must read from here rather than [LNVpsDbBase::list_vm_templates].
+    async fn list_vm_templates_all(&self) -> DbResult<Vec<VmTemplate>>;
 
     /// Insert a new VM template
     async fn insert_vm_template(&self, template: &VmTemplate) -> DbResult<u64>;
@@ -423,6 +440,16 @@ pub trait LNVpsDbBase: Send + Sync {
         limit: u64,
         offset: u64,
     ) -> DbResult<(Vec<VmTrafficTotal>, u64)>;
+
+    /// Per-VM `(bytes_in, bytes_out)` totals over an inclusive date range, for
+    /// many VMs in one query. VMs with no rows in the range are absent from the
+    /// result rather than reported as zero.
+    async fn list_vm_traffic_totals_by_vms(
+        &self,
+        vm_ids: &[u64],
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> DbResult<Vec<VmTrafficTotal>>;
 
     /// Total `(bytes_in, bytes_out)` for a VM over an inclusive date range.
     ///
@@ -513,6 +540,10 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Get a VM by its subscription line item ID
     async fn get_vm_by_line_item(&self, line_item_id: u64) -> DbResult<Vm>;
 
+    /// The (non-deleted) VMs attached to any of the given line items, in one
+    /// query. Rows carry `subscription_line_item_id` for grouping.
+    async fn list_vms_by_line_items(&self, line_item_ids: &[u64]) -> DbResult<Vec<Vm>>;
+
     /// Get a VM by subscription ID — finds the VM(Renewal/Upgrade) line item for the subscription
     async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm>;
 
@@ -545,6 +576,10 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// List VM ip assignments
     async fn list_vm_ip_assignments(&self, vm_id: u64) -> DbResult<Vec<VmIpAssignment>>;
+
+    /// List the (non-deleted) ip assignments of many VMs in a single query.
+    /// Rows carry `vm_id`, so the caller groups them itself.
+    async fn list_vm_ip_assignments_by_vms(&self, vm_ids: &[u64]) -> DbResult<Vec<VmIpAssignment>>;
 
     /// List VM ip assignments by IP range
     async fn list_vm_ip_assignments_in_range(&self, range_id: u64)
@@ -593,6 +628,10 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Return the list of active custom pricing models for a given region
     async fn list_custom_pricing(&self, region_id: u64) -> DbResult<Vec<VmCustomPricing>>;
 
+    /// Every custom pricing model, enabled or not, across all regions. Small,
+    /// shared table — loaded whole rather than one row per VM being rendered.
+    async fn list_all_custom_pricing(&self) -> DbResult<Vec<VmCustomPricing>>;
+
     /// List all custom pricing models with optional filters and database-level pagination.
     /// `region_id = None` returns all regions. `enabled = None` returns all.
     /// Returns (rows, total_count).
@@ -609,6 +648,10 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Get a custom pricing model
     async fn get_custom_vm_template(&self, id: u64) -> DbResult<VmCustomTemplate>;
+
+    /// Fetch multiple custom VM templates by id in a single query.
+    async fn list_custom_vm_templates_by_ids(&self, ids: &[u64])
+    -> DbResult<Vec<VmCustomTemplate>>;
 
     /// Insert custom vm template
     async fn insert_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<u64>;
@@ -949,6 +992,30 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Get subscription directly from line item ID (avoids doing two lookups)
     async fn get_subscription_by_line_item_id(&self, line_item_id: u64) -> DbResult<Subscription>;
 
+    /// Fetch multiple subscriptions by id in a single query.
+    async fn list_subscriptions_by_ids(&self, ids: &[u64]) -> DbResult<Vec<Subscription>>;
+
+    /// Fetch multiple subscription line items by id in a single query. Each row
+    /// carries its `subscription_id`, so this is also how a batch of line item
+    /// ids is resolved to the subscriptions owning them.
+    async fn list_subscription_line_items_by_ids(
+        &self,
+        ids: &[u64],
+    ) -> DbResult<Vec<SubscriptionLineItem>>;
+
+    /// Line items belonging to any of the given subscriptions, in one query.
+    async fn list_subscription_line_items_by_subscriptions(
+        &self,
+        subscription_ids: &[u64],
+    ) -> DbResult<Vec<SubscriptionLineItem>>;
+
+    /// Payment counts per subscription, as `(subscription_id, count)` pairs.
+    /// Subscriptions with no payments are absent from the result.
+    async fn count_subscription_payments_by_subscriptions(
+        &self,
+        subscription_ids: &[u64],
+    ) -> DbResult<Vec<(u64, u64)>>;
+
     async fn insert_subscription_line_item(
         &self,
         line_item: &SubscriptionLineItem,
@@ -1053,6 +1120,13 @@ pub trait LNVpsDbBase: Send + Sync {
         &self,
         subscription_line_item_id: u64,
     ) -> DbResult<Vec<IpRangeSubscription>>;
+
+    /// Ip range subscriptions for many line items in one query. Rows carry
+    /// `subscription_line_item_id` for grouping.
+    async fn list_ip_range_subscriptions_by_line_items(
+        &self,
+        subscription_line_item_ids: &[u64],
+    ) -> DbResult<Vec<IpRangeSubscription>>;
     async fn list_ip_range_subscriptions_by_subscription(
         &self,
         subscription_id: u64,
@@ -1088,6 +1162,12 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn list_asn_subscriptions_by_line_item(
         &self,
         subscription_line_item_id: u64,
+    ) -> DbResult<Vec<AsnSubscription>>;
+
+    /// ASN subscriptions for many line items in one query.
+    async fn list_asn_subscriptions_by_line_items(
+        &self,
+        subscription_line_item_ids: &[u64],
     ) -> DbResult<Vec<AsnSubscription>>;
     async fn list_asn_subscriptions_by_subscription(
         &self,
@@ -1368,6 +1448,12 @@ pub trait LNVpsDbBase: Send + Sync {
         line_item_id: u64,
     ) -> DbResult<MarketplaceNode>;
 
+    /// Marketplace nodes attached to any of the given line items, in one query.
+    async fn list_marketplace_nodes_by_line_items(
+        &self,
+        line_item_ids: &[u64],
+    ) -> DbResult<Vec<MarketplaceNode>>;
+
     /// List the nodes belonging to one operator
     async fn list_marketplace_nodes(&self, operator_id: u64) -> DbResult<Vec<MarketplaceNode>>;
 
@@ -1598,6 +1684,12 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn get_app_deployment(&self, id: u64) -> DbResult<AppDeployment>;
     /// Resolve the deployment billed by a given subscription line item.
     async fn get_app_deployment_by_line_item(&self, line_item_id: u64) -> DbResult<AppDeployment>;
+
+    /// App deployments attached to any of the given line items, in one query.
+    async fn list_app_deployments_by_line_items(
+        &self,
+        line_item_ids: &[u64],
+    ) -> DbResult<Vec<AppDeployment>>;
     /// Find a non-deleted deployment by its `name` on a given cluster, if any.
     /// Used to enforce unique deployment names per cluster (the name becomes the
     /// ingress hostname subdomain, so duplicates would collide).

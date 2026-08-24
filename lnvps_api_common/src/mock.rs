@@ -908,6 +908,11 @@ impl LNVpsDbBase for MockDb {
         Ok(keys.get(&id).ok_or(anyhow!("no key"))?.clone())
     }
 
+    async fn list_user_ssh_keys_by_ids(&self, ids: &[u64]) -> DbResult<Vec<UserSshKey>> {
+        let keys = self.user_ssh_keys.lock().await;
+        Ok(ids.iter().filter_map(|id| keys.get(id).cloned()).collect())
+    }
+
     async fn delete_user_ssh_key(&self, id: u64) -> DbResult<()> {
         let mut keys = self.user_ssh_keys.lock().await;
         keys.remove(&id);
@@ -926,6 +931,11 @@ impl LNVpsDbBase for MockDb {
     async fn list_host_region(&self) -> DbResult<Vec<Region>> {
         let regions = self.regions.lock().await;
         Ok(regions.values().filter(|r| r.enabled).cloned().collect())
+    }
+
+    async fn list_host_region_all(&self) -> DbResult<Vec<Region>> {
+        let regions = self.regions.lock().await;
+        Ok(regions.values().cloned().collect())
     }
 
     async fn get_host_region(&self, id: u64) -> DbResult<Region> {
@@ -1201,6 +1211,11 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
+    async fn list_vm_templates_all(&self) -> DbResult<Vec<VmTemplate>> {
+        let templates = self.templates.lock().await;
+        Ok(templates.values().cloned().collect())
+    }
+
     async fn insert_vm_template(&self, template: &VmTemplate) -> DbResult<u64> {
         let mut templates = self.templates.lock().await;
         let max_id = *templates.keys().max().unwrap_or(&0);
@@ -1315,6 +1330,42 @@ impl LNVpsDbBase for MockDb {
                 .collect(),
             total,
         ))
+    }
+
+    async fn list_vm_traffic_totals_by_vms(
+        &self,
+        vm_ids: &[u64],
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> DbResult<Vec<lnvps_db::VmTrafficTotal>> {
+        let vms = self.vms.lock().await;
+        let owners: std::collections::HashMap<u64, u64> = vms
+            .values()
+            .map(|v| (v.id, v.user_id))
+            .filter(|(id, _)| vm_ids.contains(id))
+            .collect();
+        drop(vms);
+
+        let rows = self.vm_traffic_daily.lock().await;
+        let mut totals: std::collections::HashMap<u64, (u64, u64)> = Default::default();
+        for ((vm_id, day), row) in rows.iter() {
+            if !vm_ids.contains(vm_id) || *day < start || *day > end {
+                continue;
+            }
+            let e = totals.entry(*vm_id).or_default();
+            e.0 += row.bytes_in;
+            e.1 += row.bytes_out;
+        }
+
+        Ok(totals
+            .into_iter()
+            .map(|(vm_id, (bytes_in, bytes_out))| lnvps_db::VmTrafficTotal {
+                vm_id,
+                user_id: owners.get(&vm_id).copied().unwrap_or_default(),
+                bytes_in,
+                bytes_out,
+            })
+            .collect())
     }
 
     async fn get_vm_traffic_total(
@@ -1586,6 +1637,15 @@ impl LNVpsDbBase for MockDb {
             .ok_or_else(|| anyhow!("VM not found for line item {}", line_item_id).into())
     }
 
+    async fn list_vms_by_line_items(&self, line_item_ids: &[u64]) -> DbResult<Vec<Vm>> {
+        let vms = self.vms.lock().await;
+        Ok(vms
+            .values()
+            .filter(|v| line_item_ids.contains(&v.subscription_line_item_id) && !v.deleted)
+            .cloned()
+            .collect())
+    }
+
     async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm> {
         use lnvps_db::SubscriptionType;
         let items = self.subscription_line_items.lock().await;
@@ -1707,6 +1767,15 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
+    async fn list_vm_ip_assignments_by_vms(&self, vm_ids: &[u64]) -> DbResult<Vec<VmIpAssignment>> {
+        let ip_assignments = self.ip_assignments.lock().await;
+        Ok(ip_assignments
+            .values()
+            .filter(|a| vm_ids.contains(&a.vm_id) && !a.deleted)
+            .cloned()
+            .collect())
+    }
+
     async fn list_vm_ip_assignments_in_range(
         &self,
         range_id: u64,
@@ -1818,6 +1887,11 @@ impl LNVpsDbBase for MockDb {
         Ok(p.values().cloned().collect())
     }
 
+    async fn list_all_custom_pricing(&self) -> DbResult<Vec<VmCustomPricing>> {
+        let p = self.custom_pricing.lock().await;
+        Ok(p.values().cloned().collect())
+    }
+
     async fn list_custom_pricing_paginated(
         &self,
         region_id: Option<u64>,
@@ -1850,6 +1924,14 @@ impl LNVpsDbBase for MockDb {
     async fn get_custom_vm_template(&self, id: u64) -> DbResult<VmCustomTemplate> {
         let t = self.custom_template.lock().await;
         Ok(t.get(&id).cloned().context("no custom template")?)
+    }
+
+    async fn list_custom_vm_templates_by_ids(
+        &self,
+        ids: &[u64],
+    ) -> DbResult<Vec<VmCustomTemplate>> {
+        let t = self.custom_template.lock().await;
+        Ok(ids.iter().filter_map(|id| t.get(id).cloned()).collect())
     }
 
     async fn insert_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<u64> {
@@ -2860,6 +2942,48 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
+    async fn list_subscriptions_by_ids(&self, ids: &[u64]) -> DbResult<Vec<Subscription>> {
+        let subs = self.subscriptions.lock().await;
+        Ok(ids.iter().filter_map(|id| subs.get(id).cloned()).collect())
+    }
+
+    async fn list_subscription_line_items_by_ids(
+        &self,
+        ids: &[u64],
+    ) -> DbResult<Vec<SubscriptionLineItem>> {
+        let line_items = self.subscription_line_items.lock().await;
+        Ok(ids
+            .iter()
+            .filter_map(|id| line_items.get(id).cloned())
+            .collect())
+    }
+
+    async fn list_subscription_line_items_by_subscriptions(
+        &self,
+        subscription_ids: &[u64],
+    ) -> DbResult<Vec<SubscriptionLineItem>> {
+        let line_items = self.subscription_line_items.lock().await;
+        Ok(line_items
+            .values()
+            .filter(|item| subscription_ids.contains(&item.subscription_id))
+            .cloned()
+            .collect())
+    }
+
+    async fn count_subscription_payments_by_subscriptions(
+        &self,
+        subscription_ids: &[u64],
+    ) -> DbResult<Vec<(u64, u64)>> {
+        let payments = self.subscription_payments.lock().await;
+        let mut counts: std::collections::HashMap<u64, u64> = Default::default();
+        for p in payments.iter() {
+            if subscription_ids.contains(&p.subscription_id) {
+                *counts.entry(p.subscription_id).or_default() += 1;
+            }
+        }
+        Ok(counts.into_iter().collect())
+    }
+
     async fn get_subscription_line_item(&self, id: u64) -> DbResult<SubscriptionLineItem> {
         let line_items = self.subscription_line_items.lock().await;
         Ok(line_items
@@ -3295,6 +3419,18 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
+    async fn list_ip_range_subscriptions_by_line_items(
+        &self,
+        subscription_line_item_ids: &[u64],
+    ) -> DbResult<Vec<IpRangeSubscription>> {
+        let ip_subs = self.ip_range_subscriptions.lock().await;
+        Ok(ip_subs
+            .values()
+            .filter(|s| subscription_line_item_ids.contains(&s.subscription_line_item_id))
+            .cloned()
+            .collect())
+    }
+
     async fn list_ip_range_subscriptions_by_subscription(
         &self,
         subscription_id: u64,
@@ -3447,6 +3583,18 @@ impl LNVpsDbBase for MockDb {
         Ok(subs
             .values()
             .filter(|s| s.subscription_line_item_id == subscription_line_item_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_asn_subscriptions_by_line_items(
+        &self,
+        subscription_line_item_ids: &[u64],
+    ) -> DbResult<Vec<AsnSubscription>> {
+        let subs = self.asn_subscriptions.lock().await;
+        Ok(subs
+            .values()
+            .filter(|s| subscription_line_item_ids.contains(&s.subscription_line_item_id))
             .cloned()
             .collect())
     }
@@ -4168,6 +4316,21 @@ impl LNVpsDbBase for MockDb {
             .find(|n| n.subscription_line_item_id == Some(line_item_id))
             .cloned()
             .ok_or_else(|| DbError::Other(anyhow!("Marketplace node not found")))
+    }
+
+    async fn list_marketplace_nodes_by_line_items(
+        &self,
+        line_item_ids: &[u64],
+    ) -> DbResult<Vec<MarketplaceNode>> {
+        let nodes = self.marketplace_nodes.lock().await;
+        Ok(nodes
+            .values()
+            .filter(|n| {
+                n.subscription_line_item_id
+                    .is_some_and(|id| line_item_ids.contains(&id))
+            })
+            .cloned()
+            .collect())
     }
 
     async fn list_marketplace_nodes(&self, operator_id: u64) -> DbResult<Vec<MarketplaceNode>> {
@@ -5071,6 +5234,20 @@ impl LNVpsDbBase for MockDb {
             .find(|x| x.subscription_line_item_id == line_item_id)
             .cloned()
             .ok_or_else(|| anyhow!("app deployment not found").into())
+    }
+
+    async fn list_app_deployments_by_line_items(
+        &self,
+        line_item_ids: &[u64],
+    ) -> DbResult<Vec<AppDeployment>> {
+        Ok(self
+            .app_deployments
+            .lock()
+            .await
+            .values()
+            .filter(|x| line_item_ids.contains(&x.subscription_line_item_id))
+            .cloned()
+            .collect())
     }
 
     async fn find_app_deployment_by_cluster_name(
