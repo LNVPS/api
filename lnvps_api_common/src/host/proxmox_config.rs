@@ -500,8 +500,24 @@ impl Display for CiCustom {
 pub struct SshKeys(pub Vec<String>);
 
 impl SshKeys {
+    /// Builds a key list from a single key, dropping it when it is blank.
+    ///
+    /// A blank key would otherwise serialise to an empty `sshkeys=` value,
+    /// which Proxmox rejects with `invalid urlencoded string`. It would also
+    /// never compare equal to the value read back from the host (which parses
+    /// as an empty list), so the broken update would be retried forever.
     pub fn one(key: impl Into<String>) -> Self {
-        Self(vec![key.into()])
+        let key = key.into();
+        let key = key.trim();
+        if key.is_empty() {
+            Self(vec![])
+        } else {
+            Self(vec![key.to_string()])
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 }
 
@@ -746,6 +762,18 @@ mod tests {
         let two = SshKeys(vec![key.to_string(), "ssh-rsa BBBB other".to_string()]);
         assert_eq!(two, two.to_string().parse().unwrap());
         assert_eq!(two.0.len(), 2);
+    }
+
+    /// A blank key must not produce `sshkeys=` (Proxmox: "unable to parse value
+    /// of 'sshkeys' - invalid urlencoded string"), and must compare equal to
+    /// what an empty host value parses to, so no endless update loop occurs.
+    #[test]
+    fn test_ssh_keys_blank() {
+        assert!(SshKeys::one("").is_empty());
+        assert!(SshKeys::one("   \n").is_empty());
+        assert_eq!(SshKeys::one(""), "".parse::<SshKeys>().unwrap());
+        assert_eq!(SshKeys::one("").to_string(), "");
+        assert!(!SshKeys::one("ssh-ed25519 AAAA x").is_empty());
     }
 
     #[test]
