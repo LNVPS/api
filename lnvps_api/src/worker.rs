@@ -10,9 +10,9 @@ use hickory_resolver::TokioResolver;
 use lnvps_api_common::{
     BlackholeWorkFeedback, ChannelWorkCommander, InMemoryKeyValueStore, JobFeedback, KeyValueStore,
     NetworkProvisioner, RedisConfig, RedisKeyValueStore, RedisWorkCommander, RedisWorkFeedback,
-    SCANNED_KEY_FAMILIES, UpgradeConfig, VmHistoryLogger, VmRunningState, VmRunningStates,
-    VmStateCache, WorkCommander, WorkFeedback, WorkJob, WorkJobMessage, capture_is_complete,
-    merge_ssh_host_keys, op_fatal, parse_ssh_host_keys,
+    SCANNED_KEY_FAMILIES, TrafficRecorder, UpgradeConfig, VmHistoryLogger, VmRunningState,
+    VmRunningStates, VmStateCache, WorkCommander, WorkFeedback, WorkJob, WorkJobMessage,
+    capture_is_complete, merge_ssh_host_keys, op_fatal, parse_ssh_host_keys,
     retry::{OpError, Pipeline, RetryPolicy},
 };
 use lnvps_db::{
@@ -192,6 +192,7 @@ pub struct Worker {
     subscription_handler: SubscriptionHandler,
     notification_channels: Vec<Arc<dyn NotificationChannel>>,
     vm_history_logger: VmHistoryLogger,
+    traffic_recorder: TrafficRecorder,
     vm_state_cache: VmStateCache,
     work_commander: Arc<dyn WorkCommander>,
     feedback: Arc<dyn WorkFeedback>,
@@ -275,6 +276,7 @@ impl Worker {
         nostr: Option<Client>,
     ) -> Result<Self> {
         let vm_history_logger = VmHistoryLogger::new(db.clone());
+        let traffic_recorder = TrafficRecorder::new(db.clone());
         let settings = settings.into();
         let fee_estimator =
             crate::fee_estimate::build_fee_estimator(&settings.referral_fee_estimator);
@@ -323,6 +325,7 @@ impl Worker {
             kv,
             feedback,
             vm_history_logger,
+            traffic_recorder,
             settings,
             work_commander,
             http_client,
@@ -1384,6 +1387,11 @@ impl Worker {
     async fn handle_vm_state(&self, state: Result<VmRunningState>, vm: &Vm) -> Result<()> {
         match state {
             Ok(s) => {
+                // Every path that reads a VM's state funnels through here, so
+                // this is the one place traffic has to be sampled from. It runs
+                // before the cache write only because the cache takes ownership
+                // of the state.
+                self.traffic_recorder.record_best_effort(vm.id, &s).await;
                 self.vm_state_cache.set_state(vm.id, s).await?;
             }
             Err(e) => {
@@ -4793,6 +4801,47 @@ mod tests {
             tax_breakdown: None,
             refunded_payment_id: None,
         }
+    }
+
+    /// Every state read funnels through `handle_vm_state`, so that is where
+    /// traffic accounting has to happen — otherwise the periodic sweep, which
+    /// is the only pass that visits every VM, would record nothing.
+    ///
+    /// The first read can only establish a baseline; the second is the one that
+    /// has a difference to attribute.
+    #[tokio::test]
+    async fn test_handle_vm_state_records_traffic() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        let worker = setup_worker(db.clone()).await?;
+        let vm = db.get_vm(vm_id).await?;
+
+        let reading = |net_in: u64, net_out: u64| VmRunningState {
+            state: VmRunningStates::Running,
+            net_in,
+            net_out,
+            ..Default::default()
+        };
+
+        worker
+            .handle_vm_state(Ok(reading(1_000, 4_000)), &vm)
+            .await?;
+        let today = Utc::now().date_naive();
+        assert_eq!(
+            db.get_vm_traffic_total(vm_id, today, today).await?,
+            (0, 0),
+            "a single reading has no difference to attribute"
+        );
+
+        worker
+            .handle_vm_state(Ok(reading(1_250, 9_000)), &vm)
+            .await?;
+        assert_eq!(
+            db.get_vm_traffic_total(vm_id, today, today).await?,
+            (250, 5_000),
+            "the sweep must fold the counter difference into today's row"
+        );
+        Ok(())
     }
 
     /// The periodic fleet sweep — not just the per-VM check dispatched on

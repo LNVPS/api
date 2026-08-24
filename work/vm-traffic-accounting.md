@@ -106,17 +106,27 @@ append-only history that must survive VM deletion policy decisions.
 - [x] Unit tests in `mock::vm_traffic_tests`; migration and both upsert
       statements verified against the real MariaDB container
 
-### Increment 2 — worker sampling (M)
+### Increment 2 — worker sampling (M) ✅
 
-- [ ] Traffic accumulator in `lnvps_api/src/worker.rs` fed from
-      `check_vms_on_host()`, with counter-reset detection
-- [ ] Day rollover handling (a sample spanning UTC midnight attributes the whole
-      delta to the day the sample was taken — document this, it is a rounding
-      error of at most one poll interval)
-- [ ] Skip accounting for VMs whose state is not `Running` where the counter is
-      meaningless
-- [ ] Tests: normal delta, counter reset, first sample (no baseline → record
-      nothing, just set baseline), day rollover, deleted VM
+- [x] `TrafficRecorder` in `lnvps_api_common/src/traffic.rs` rather than in
+      `worker.rs`: the differencing rules are the interesting part and testing
+      them should not need a worker
+- [x] Hooked into `Worker::handle_vm_state`, which is the single funnel both
+      `check_vm` (customer action) and `check_vms_on_host` (periodic sweep) go
+      through — hooking the sweep alone would have missed half the readings
+- [x] Counter-reset detection: a reading below its baseline contributes the new
+      reading itself, not an underflowing subtraction
+- [x] First reading sets the baseline and records nothing
+- [x] Implausible-jump clamp at 4 GB/s of elapsed time (see below)
+- [x] Recording is best-effort — it must never abort a sweep and leave the VMs
+      behind it unchecked
+- [x] Tests: `traffic::tests` (11) + `worker::tests::test_handle_vm_state_
+      records_traffic`; `traffic.rs` at 100% function coverage
+
+No state filter was added. A stopped VM reads zero on both counters, which the
+reset rule already handles as "contributes nothing", and a frozen counter
+differences to zero — so filtering on `VmRunningStates` would only add a way to
+lose the last sample before a shutdown.
 
 ### Increment 3 — user API (S/M)
 
@@ -142,6 +152,17 @@ append-only history that must survive VM deletion policy decisions.
 
 ## Notes
 
+- **Migration between hosts is the known inaccuracy.** The counter belongs to
+  the hypervisor, not the guest, so a VM migrated onto a host where it had run
+  before can read *above* its baseline and book the difference as traffic. The
+  4 GB/s clamp (`MAX_SAMPLE_BYTES_PER_SEC`) bounds the damage to something a
+  real link could have carried, which stops a bogus terabyte from silently
+  exhausting a quota — it does not eliminate the error. Set well above 25
+  Gbit/s (~3.1 GB/s) so a saturated NIC is never clamped.
+- **Day attribution.** A delta is booked to the UTC day of the *reading*, so
+  traffic either side of midnight lands on the later day. Worst case is one
+  sweep interval (30s) of traffic on the wrong day, which is immaterial against
+  a monthly quota.
 - `cargo check --workspace --all-features` fails on master with a pre-existing
   `BitvoraNode` / `payments-rs` type error in
   `lnvps_api/src/payment_factory.rs:98`. Default features build clean. Not
