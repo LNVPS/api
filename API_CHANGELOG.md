@@ -78,7 +78,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
   The allowance is **outbound only** and resets on the 1st of each UTC month; inbound transfer is reported for display but never counted against it. Figures derive from the hypervisor's per-VM interface counters sampled on the existing VM sweep, so they are near-real-time rather than exact to the byte, and traffic either side of UTC midnight may land on the adjacent day.
 
-  **Exceeding an allowance currently does nothing**: no throttle, no suspension, no overage billing. The data is being recorded and surfaced first so that any future enforcement policy can be set against real numbers.
+  **Exceeding an allowance currently does nothing**: no throttle, no suspension, no overage billing. The customer is emailed once when a VM passes 80% of its allowance and once when it passes 100% (per VM, per month), and both messages say plainly that nothing has been done to the VM. The data is being recorded and surfaced first so that any future enforcement policy can be set against real numbers.
 
   Admins set the allowance via `transfer_gb` on `POST`/`PATCH /api/admin/v1/vm_templates` and `POST`/`PATCH /api/admin/v1/custom_pricing` (send `null` to clear it back to unmetered); it is returned on the corresponding `GET`s. A custom-pricing plan's `transfer_gb` is copied onto each custom VM built from it, exactly as the existing bandwidth and IOPS caps are.
 

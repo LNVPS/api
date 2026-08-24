@@ -1744,7 +1744,9 @@ periodically, so they are near-real-time rather than exact to the byte, and
 traffic either side of UTC midnight may land on the adjacent day.
 
 Exceeding the allowance currently has **no automatic effect** — the VM is not
-throttled, suspended or billed for overage.
+throttled, suspended or billed for overage. The account is emailed once at 80%
+and once at 100% of the allowance (per VM, per month) as a courtesy; both
+messages state that no action has been taken.
 
 ### LNURL Support
 

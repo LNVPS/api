@@ -1,6 +1,6 @@
 # Per-day VM traffic accounting and monthly transfer quotas
 
-**Status:** in-progress
+**Status:** complete
 **Started:** 2026-08-24
 **Last updated:** 2026-08-24
 
@@ -168,12 +168,38 @@ they already load. The traffic endpoints exist for the day-by-day breakdown and
 arbitrary ranges, and their `summary` field is the identical object, so there is
 one shape to render rather than two.
 
-### Increment 5 — notifications (S)
+### Increment 5 — notifications (S) ✅
 
-- [ ] Worker check: on crossing 80% / 100% of monthly quota, email the customer
-- [ ] Suppress repeat notifications within the same month (a `vm_history` entry
-      or a dedicated `notified` marker — decide during implementation)
-- [ ] Tests
+- [x] `Worker::check_transfer_quotas` warns at 80% and 100% of the monthly
+      allowance, through the existing notification channels
+- [x] Thresholds are checked highest-first, so a VM that jumps from 50% to 105%
+      between passes is told it is over, not that it is at 80%
+- [x] Suppression via a KV key scoped to `(vm, quota month, threshold)`. Month
+      scoping means a new month starts clean with nothing to expire or sweep;
+      threshold scoping means the 80% warning does not suppress the later 100%
+      one. The key is written **after** the notification is queued, so a queue
+      failure retries rather than being silently swallowed.
+- [x] Hourly cadence, not per 30-second VM sweep: the figures move slowly and
+      the check costs an aggregate query per metered VM. Standard-template
+      allowances are pre-loaded once per pass (there are far fewer templates
+      than VMs); custom templates are 1:1 with their VM so they are fetched
+      only for VMs that have one.
+- [x] Both messages state plainly that nothing has been done to the VM
+- [x] Tests: below threshold, warn-once, highest-threshold-wins, unmetered
+      plans ignored, cadence gate
+
+Deliberately **not** done: a `VmHistoryActionType::TransferWarning` audit entry.
+It would be a nice admin-visible record, but it needs a new enum variant plus
+admin model mapping, and the KV key already answers "has this been sent". Worth
+revisiting if support needs to see warnings in the VM history.
+
+## Status
+
+All five increments are complete. What exists now: per-day per-VM byte counters
+sampled from hypervisor interface counters, a monthly outbound allowance on
+templates and custom specs, usage on the customer and admin VM detail responses,
+day-by-day and fleet-ranked endpoints, and 80%/100% courtesy warnings. Nothing
+is enforced.
 
 ## Notes
 
