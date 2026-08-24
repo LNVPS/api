@@ -1,7 +1,7 @@
 use crate::comma_separated::CommaSeparated;
 use crate::encrypted_string::EncryptedString;
 use anyhow::{Result, anyhow, bail};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, Type};
 use std::fmt::{Display, Formatter};
@@ -1318,6 +1318,11 @@ pub struct VmTemplate {
     pub cpu_limit: Option<f32>,
     /// Maximum number of user firewall rules per VM (None = use global default)
     pub firewall_rule_limit: Option<u16>,
+    /// Monthly **outbound** transfer quota in GB (None = unmetered).
+    ///
+    /// Informational: exceeding it warns the customer, it does not throttle or
+    /// suspend. Inbound traffic is not counted against it.
+    pub transfer_gb: Option<u32>,
 }
 
 /// A custom pricing template, used for billing calculation of a specific VM
@@ -1352,6 +1357,8 @@ pub struct VmCustomTemplate {
     pub cpu_limit: Option<f32>,
     /// Maximum number of user firewall rules per VM (None = use global default)
     pub firewall_rule_limit: Option<u16>,
+    /// Monthly **outbound** transfer quota in GB (None = unmetered)
+    pub transfer_gb: Option<u32>,
 }
 
 /// Custom pricing template, usually 1 per region
@@ -1403,6 +1410,9 @@ pub struct VmCustomPricing {
     pub network_mbps: Option<u32>,
     /// Maximum CPU usage as a fraction of allocated cores (e.g. 0.5 = 50%; None = uncapped)
     pub cpu_limit: Option<f32>,
+    /// Monthly **outbound** transfer quota in GB granted to VMs built on this
+    /// plan (None = unmetered)
+    pub transfer_gb: Option<u32>,
 }
 
 /// Pricing per GB on a disk type (SSD/HDD)
@@ -4341,6 +4351,31 @@ pub struct AppDeploymentServiceUsage {
     pub cpu_milli: u32,
     pub memory_bytes: u64,
     pub collected: DateTime<Utc>,
+}
+
+/// One VM's traffic for one UTC day, in bytes.
+///
+/// Accumulated by the worker from deltas between hypervisor counter readings,
+/// so it is only as granular as the VM sweep interval: traffic on either side
+/// of UTC midnight is attributed to the day the sample that observed it was
+/// taken, which can misplace up to one poll interval's worth.
+#[derive(FromRow, Clone, Debug, PartialEq, Eq)]
+pub struct VmTrafficDaily {
+    pub vm_id: u64,
+    pub day: NaiveDate,
+    /// Bytes received by the VM
+    pub bytes_in: u64,
+    /// Bytes sent by the VM; this is what a transfer quota counts
+    pub bytes_out: u64,
+}
+
+/// The last raw counter reading taken for a VM, used as the delta baseline.
+#[derive(FromRow, Clone, Debug, PartialEq, Eq)]
+pub struct VmTrafficSample {
+    pub vm_id: u64,
+    pub last_bytes_in: u64,
+    pub last_bytes_out: u64,
+    pub sampled: DateTime<Utc>,
 }
 
 /// One persistent volume's last observed use.

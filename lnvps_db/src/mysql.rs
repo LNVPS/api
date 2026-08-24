@@ -11,7 +11,8 @@ use crate::{
     Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany,
     Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
     VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost,
-    VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, WebauthnCredential,
+    VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample,
+    WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -19,7 +20,7 @@ use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
 use crate::{LNVPSNostrDb, NostrDomain, NostrDomainHandle};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::{Executor, MySqlPool, QueryBuilder, Row};
 
 /// Conversation row plus its message counters, shared by the by-id read and the
@@ -1057,7 +1058,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_vm_template(&self, template: &VmTemplate) -> DbResult<u64> {
-        Ok(sqlx::query("insert into vm_template(name,enabled,created,expires,cpu,cpu_mfg,cpu_arch,cpu_features,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id,ip4_count,ip6_count,disk_iops_read,disk_iops_write,disk_mbps_read,disk_mbps_write,network_mbps,cpu_limit) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) returning id")
+        Ok(sqlx::query("insert into vm_template(name,enabled,created,expires,cpu,cpu_mfg,cpu_arch,cpu_features,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id,ip4_count,ip6_count,disk_iops_read,disk_iops_write,disk_mbps_read,disk_mbps_write,network_mbps,cpu_limit,transfer_gb) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) returning id")
             .bind(&template.name)
             .bind(template.enabled)
             .bind(template.created)
@@ -1080,9 +1081,102 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(template.disk_mbps_write)
             .bind(template.network_mbps)
             .bind(template.cpu_limit)
+            .bind(template.transfer_gb)
             .fetch_one(&self.db)
             .await?
             .try_get(0)?)
+    }
+
+    async fn get_vm_traffic_sample(&self, vm_id: u64) -> DbResult<Option<VmTrafficSample>> {
+        Ok(
+            sqlx::query_as("select * from vm_traffic_sample where vm_id=?")
+                .bind(vm_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn upsert_vm_traffic_sample(
+        &self,
+        vm_id: u64,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "insert into vm_traffic_sample(vm_id,last_bytes_in,last_bytes_out,sampled) \
+             values(?,?,?,current_timestamp) \
+             on duplicate key update last_bytes_in=values(last_bytes_in), \
+             last_bytes_out=values(last_bytes_out), sampled=current_timestamp",
+        )
+        .bind(vm_id)
+        .bind(bytes_in)
+        .bind(bytes_out)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn add_vm_traffic(
+        &self,
+        vm_id: u64,
+        day: NaiveDate,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> DbResult<()> {
+        // The addition happens in SQL so concurrent writers (the worker and a
+        // backfill, or two workers) cannot lose an increment to a read-modify-
+        // write race.
+        sqlx::query(
+            "insert into vm_traffic_daily(vm_id,day,bytes_in,bytes_out) values(?,?,?,?) \
+             on duplicate key update bytes_in=bytes_in+values(bytes_in), \
+             bytes_out=bytes_out+values(bytes_out)",
+        )
+        .bind(vm_id)
+        .bind(day)
+        .bind(bytes_in)
+        .bind(bytes_out)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_vm_traffic(
+        &self,
+        vm_id: u64,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> DbResult<Vec<VmTrafficDaily>> {
+        Ok(sqlx::query_as(
+            "select vm_id,day,bytes_in,bytes_out from vm_traffic_daily \
+             where vm_id=? and day between ? and ? order by day asc",
+        )
+        .bind(vm_id)
+        .bind(start)
+        .bind(end)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn get_vm_traffic_total(
+        &self,
+        vm_id: u64,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> DbResult<(u64, u64)> {
+        // CAST because MySQL's SUM() over an integer column is DECIMAL, which
+        // does not decode into u64; COALESCE because a VM with no rows in the
+        // range must read as zero rather than NULL.
+        let row: (u64, u64) = sqlx::query_as(
+            "select coalesce(cast(sum(bytes_in) as unsigned), 0), \
+             coalesce(cast(sum(bytes_out) as unsigned), 0) \
+             from vm_traffic_daily where vm_id=? and day between ? and ?",
+        )
+        .bind(vm_id)
+        .bind(start)
+        .bind(end)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(row)
     }
 
     async fn list_vms(&self) -> DbResult<Vec<Vm>> {
@@ -1625,7 +1719,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<u64> {
-        Ok(sqlx::query("insert into vm_custom_template(cpu,memory,disk_size,disk_type,disk_interface,pricing_id,ip4_count,ip6_count,cpu_mfg,cpu_arch,cpu_features,disk_iops_read,disk_iops_write,disk_mbps_read,disk_mbps_write,network_mbps,cpu_limit) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) returning id")
+        Ok(sqlx::query("insert into vm_custom_template(cpu,memory,disk_size,disk_type,disk_interface,pricing_id,ip4_count,ip6_count,cpu_mfg,cpu_arch,cpu_features,disk_iops_read,disk_iops_write,disk_mbps_read,disk_mbps_write,network_mbps,cpu_limit,transfer_gb) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) returning id")
             .bind(template.cpu)
             .bind(template.memory)
             .bind(template.disk_size)
@@ -1643,13 +1737,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(template.disk_mbps_write)
             .bind(template.network_mbps)
             .bind(template.cpu_limit)
+            .bind(template.transfer_gb)
             .fetch_one(&self.db)
             .await?
             .try_get(0)?)
     }
 
     async fn update_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<()> {
-        sqlx::query("update vm_custom_template set cpu=?, memory=?, disk_size=?, disk_type=?, disk_interface=?, pricing_id=?, ip4_count=?, ip6_count=?, cpu_mfg=?, cpu_arch=?, cpu_features=?, disk_iops_read=?, disk_iops_write=?, disk_mbps_read=?, disk_mbps_write=?, network_mbps=?, cpu_limit=? where id=?")
+        sqlx::query("update vm_custom_template set cpu=?, memory=?, disk_size=?, disk_type=?, disk_interface=?, pricing_id=?, ip4_count=?, ip6_count=?, cpu_mfg=?, cpu_arch=?, cpu_features=?, disk_iops_read=?, disk_iops_write=?, disk_mbps_read=?, disk_mbps_write=?, network_mbps=?, cpu_limit=?, transfer_gb=? where id=?")
             .bind(template.cpu)
             .bind(template.memory)
             .bind(template.disk_size)
@@ -1667,6 +1762,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(template.disk_mbps_write)
             .bind(template.network_mbps)
             .bind(template.cpu_limit)
+            .bind(template.transfer_gb)
             .bind(template.id)
             .execute(&self.db)
             .await?;
@@ -6535,7 +6631,7 @@ impl AdminDb for LNVpsDbMysql {
                disk_size = ?, disk_type = ?, disk_interface = ?, 
                cost_plan_id = ?, region_id = ?, ip4_count = ?, ip6_count = ?,
                disk_iops_read = ?, disk_iops_write = ?, disk_mbps_read = ?, disk_mbps_write = ?,
-               network_mbps = ?, cpu_limit = ?
+               network_mbps = ?, cpu_limit = ?, transfer_gb = ?
                WHERE id = ?"#,
         )
         .bind(&template.name)
@@ -6559,6 +6655,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(template.disk_mbps_write)
         .bind(template.network_mbps)
         .bind(template.cpu_limit)
+        .bind(template.transfer_gb)
         .bind(template.id)
         .execute(&self.db)
         .await?;
@@ -6633,8 +6730,8 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> DbResult<u64> {
         let query = r#"
-             INSERT INTO vm_custom_pricing (name, enabled, created, expires, region_id, currency, cpu_mfg, cpu_arch, cpu_features, cpu_cost, memory_cost, ip4_cost, ip6_cost, min_cpu, max_cpu, min_memory, max_memory, min_ip4, max_ip4, min_ip6, max_ip6, disk_iops_read, disk_iops_write, disk_mbps_read, disk_mbps_write, network_mbps, cpu_limit)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             INSERT INTO vm_custom_pricing (name, enabled, created, expires, region_id, currency, cpu_mfg, cpu_arch, cpu_features, cpu_cost, memory_cost, ip4_cost, ip6_cost, min_cpu, max_cpu, min_memory, max_memory, min_ip4, max_ip4, min_ip6, max_ip6, disk_iops_read, disk_iops_write, disk_mbps_read, disk_mbps_write, network_mbps, cpu_limit, transfer_gb)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          "#;
 
         let result = sqlx::query(query)
@@ -6665,6 +6762,7 @@ impl AdminDb for LNVpsDbMysql {
             .bind(pricing.disk_mbps_write)
             .bind(pricing.network_mbps)
             .bind(pricing.cpu_limit)
+            .bind(pricing.transfer_gb)
             .execute(&self.db)
             .await?;
 
@@ -6679,7 +6777,7 @@ impl AdminDb for LNVpsDbMysql {
                  min_cpu = ?, max_cpu = ?, min_memory = ?, max_memory = ?,
                  min_ip4 = ?, max_ip4 = ?, min_ip6 = ?, max_ip6 = ?,
                  disk_iops_read = ?, disk_iops_write = ?, disk_mbps_read = ?, disk_mbps_write = ?,
-                 network_mbps = ?, cpu_limit = ?
+                 network_mbps = ?, cpu_limit = ?, transfer_gb = ?
              WHERE id = ?
          "#;
 
@@ -6710,6 +6808,7 @@ impl AdminDb for LNVpsDbMysql {
             .bind(pricing.disk_mbps_write)
             .bind(pricing.network_mbps)
             .bind(pricing.cpu_limit)
+            .bind(pricing.transfer_gb)
             .bind(pricing.id)
             .execute(&self.db)
             .await?;

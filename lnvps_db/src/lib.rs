@@ -1,6 +1,6 @@
 use anyhow::{Error, Result, anyhow};
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::migrate::MigrateError;
 use thiserror::Error;
 
@@ -374,6 +374,52 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Insert a new VM template
     async fn insert_vm_template(&self, template: &VmTemplate) -> DbResult<u64>;
+
+    /// Last raw traffic counter reading for a VM, or `None` if none has been
+    /// taken (a VM that has never been sampled, or one sampled before this
+    /// feature existed).
+    async fn get_vm_traffic_sample(&self, vm_id: u64) -> DbResult<Option<VmTrafficSample>>;
+
+    /// Store the raw counter reading a future delta will be measured against.
+    async fn upsert_vm_traffic_sample(
+        &self,
+        vm_id: u64,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> DbResult<()>;
+
+    /// Add a measured delta to a VM's counters for one UTC day.
+    ///
+    /// Additive rather than a write of the whole figure: the worker only ever
+    /// knows the increment since its last pass, and two passes must not
+    /// overwrite each other.
+    async fn add_vm_traffic(
+        &self,
+        vm_id: u64,
+        day: NaiveDate,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> DbResult<()>;
+
+    /// Daily traffic rows for a VM over an inclusive date range, oldest first.
+    /// Days with no recorded traffic are absent rather than zero.
+    async fn list_vm_traffic(
+        &self,
+        vm_id: u64,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> DbResult<Vec<VmTrafficDaily>>;
+
+    /// Total `(bytes_in, bytes_out)` for a VM over an inclusive date range.
+    ///
+    /// Summed in SQL rather than over [`Self::list_vm_traffic`] because the
+    /// common caller (quota checks on every VM) wants only the total.
+    async fn get_vm_traffic_total(
+        &self,
+        vm_id: u64,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> DbResult<(u64, u64)>;
 
     /// List all VM's
     async fn list_vms(&self) -> DbResult<Vec<Vm>>;

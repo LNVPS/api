@@ -296,6 +296,7 @@ impl DbToolExecutor {
             network_mbps: pricing.network_mbps,
             cpu_limit: pricing.cpu_limit,
             firewall_rule_limit: None,
+            transfer_gb: pricing.transfer_gb,
         };
 
         PricingEngine::validate_custom_vm_spec(&self.db, &template).await?;

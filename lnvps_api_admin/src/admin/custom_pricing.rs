@@ -113,6 +113,7 @@ impl AdminCustomPricingInfo {
             disk_mbps_write: pricing.disk_mbps_write,
             network_mbps: pricing.network_mbps,
             cpu_limit: pricing.cpu_limit,
+            transfer_gb: pricing.transfer_gb,
         })
     }
 }
@@ -213,6 +214,7 @@ async fn admin_create_custom_pricing(
         disk_mbps_write: req.disk_mbps_write,
         network_mbps: req.network_mbps,
         cpu_limit: req.cpu_limit,
+        transfer_gb: req.transfer_gb,
     };
 
     validate_ip_ranges(&pricing)?;
@@ -341,6 +343,9 @@ async fn admin_update_custom_pricing(
     if let Some(v) = req.cpu_limit {
         pricing.cpu_limit = v;
     }
+    if let Some(v) = req.transfer_gb {
+        pricing.transfer_gb = v;
+    }
 
     validate_ip_ranges(&pricing)?;
 
@@ -460,6 +465,7 @@ async fn admin_copy_custom_pricing(
         disk_mbps_write: source_pricing.disk_mbps_write,
         network_mbps: source_pricing.network_mbps,
         cpu_limit: source_pricing.cpu_limit,
+        transfer_gb: source_pricing.transfer_gb,
     };
 
     let new_pricing_id = this.db.insert_custom_pricing(&new_pricing).await?;

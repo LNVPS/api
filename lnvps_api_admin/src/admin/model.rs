@@ -1577,6 +1577,9 @@ pub struct AdminVmTemplateInfo {
     /// Maximum CPU usage as a fraction of allocated cores (None = uncapped)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_limit: Option<f32>,
+    /// Monthly outbound transfer quota in GB (None = unmetered)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer_gb: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1621,6 +1624,8 @@ pub struct AdminCreateVmTemplateRequest {
     pub network_mbps: Option<u32>,
     /// Maximum CPU usage as a fraction of allocated cores, e.g. 0.5 = 50% (None = uncapped)
     pub cpu_limit: Option<f32>,
+    /// Monthly outbound transfer quota in GB (None = unmetered)
+    pub transfer_gb: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1705,6 +1710,12 @@ pub struct AdminUpdateVmTemplateRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub cpu_limit: Option<Option<f32>>,
+    /// Monthly outbound transfer quota in GB — use `null` to clear (unmetered)
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub transfer_gb: Option<Option<u32>>,
 }
 
 // Common response structures
@@ -1777,6 +1788,10 @@ pub struct AdminCustomPricingInfo {
     /// Maximum CPU usage as a fraction of allocated cores (None = uncapped)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_limit: Option<f32>,
+    /// Monthly outbound transfer quota in GB granted to VMs on this plan
+    /// (None = unmetered)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer_gb: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -1875,6 +1890,12 @@ pub struct UpdateCustomPricingRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub cpu_limit: Option<Option<f32>>,
+    /// Monthly outbound transfer quota in GB — use `null` to clear (unmetered)
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub transfer_gb: Option<Option<u32>>,
 }
 
 #[derive(Deserialize)]
@@ -1924,6 +1945,8 @@ pub struct CreateCustomPricingRequest {
     pub network_mbps: Option<u32>,
     /// Maximum CPU usage as a fraction of allocated cores, e.g. 0.5 = 50% (None = uncapped)
     pub cpu_limit: Option<f32>,
+    /// Monthly outbound transfer quota in GB (None = unmetered)
+    pub transfer_gb: Option<u32>,
 }
 
 #[derive(Deserialize)]

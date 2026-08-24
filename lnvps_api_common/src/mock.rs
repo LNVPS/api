@@ -1,6 +1,6 @@
 use crate::{ExchangeRateService, Ticker, TickerRate};
 use anyhow::{Context, anyhow};
-use chrono::{DateTime, Days, Months, TimeDelta, Utc};
+use chrono::{DateTime, Days, Months, NaiveDate, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, AgentConversation, AgentConversationFilter, AgentConversationOverview,
@@ -17,7 +17,7 @@ use lnvps_db::{
     SubscriptionPaymentWithCompany, Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm,
     VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
     VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment, VmOsImage,
-    VmTemplate, WebauthnCredential,
+    VmTemplate, VmTrafficDaily, VmTrafficSample, WebauthnCredential,
 };
 
 use async_trait::async_trait;
@@ -89,6 +89,11 @@ pub struct MockDb {
     pub router_bgp_sessions: Arc<Mutex<HashMap<u64, RouterBgpSession>>>,
     pub router_bgp_routes: Arc<Mutex<HashMap<u64, RouterBgpRoute>>>,
     pub firewall_rules: Arc<Mutex<HashMap<u64, VmFirewallRule>>>,
+    /// Daily traffic rows keyed by `(vm_id, day)` — the same composite primary
+    /// key the table has.
+    pub vm_traffic_daily: Arc<Mutex<HashMap<(u64, NaiveDate), VmTrafficDaily>>>,
+    /// Last raw counter reading per VM.
+    pub vm_traffic_samples: Arc<Mutex<HashMap<u64, VmTrafficSample>>>,
     pub webauthn_credentials: Arc<Mutex<HashMap<u64, WebauthnCredential>>>,
     pub apps: Arc<Mutex<HashMap<u64, App>>>,
     pub app_tags: Arc<Mutex<HashMap<u64, AppTag>>>,
@@ -228,6 +233,7 @@ impl MockDb {
             disk_mbps_write: None,
             network_mbps: None,
             cpu_limit: None,
+            transfer_gb: None,
             firewall_rule_limit: None,
         }
     }
@@ -374,6 +380,8 @@ impl Default for MockDb {
         Self {
             agent_conversations: Arc::new(Mutex::new(HashMap::new())),
             agent_messages: Arc::new(Mutex::new(Vec::new())),
+            vm_traffic_daily: Arc::new(Mutex::new(HashMap::new())),
+            vm_traffic_samples: Arc::new(Mutex::new(HashMap::new())),
             regions: Arc::new(Mutex::new(regions)),
             ip_range: Arc::new(Mutex::new(ip_ranges)),
             hosts: Arc::new(Mutex::new(hosts)),
@@ -1194,6 +1202,79 @@ impl LNVpsDbBase for MockDb {
             },
         );
         Ok(max_id + 1)
+    }
+
+    async fn get_vm_traffic_sample(&self, vm_id: u64) -> DbResult<Option<VmTrafficSample>> {
+        let samples = self.vm_traffic_samples.lock().await;
+        Ok(samples.get(&vm_id).cloned())
+    }
+
+    async fn upsert_vm_traffic_sample(
+        &self,
+        vm_id: u64,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> DbResult<()> {
+        let mut samples = self.vm_traffic_samples.lock().await;
+        samples.insert(
+            vm_id,
+            VmTrafficSample {
+                vm_id,
+                last_bytes_in: bytes_in,
+                last_bytes_out: bytes_out,
+                sampled: Utc::now(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn add_vm_traffic(
+        &self,
+        vm_id: u64,
+        day: NaiveDate,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> DbResult<()> {
+        let mut traffic = self.vm_traffic_daily.lock().await;
+        let row = traffic
+            .entry((vm_id, day))
+            .or_insert_with(|| VmTrafficDaily {
+                vm_id,
+                day,
+                bytes_in: 0,
+                bytes_out: 0,
+            });
+        row.bytes_in += bytes_in;
+        row.bytes_out += bytes_out;
+        Ok(())
+    }
+
+    async fn list_vm_traffic(
+        &self,
+        vm_id: u64,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> DbResult<Vec<VmTrafficDaily>> {
+        let traffic = self.vm_traffic_daily.lock().await;
+        let mut rows: Vec<VmTrafficDaily> = traffic
+            .values()
+            .filter(|r| r.vm_id == vm_id && r.day >= start && r.day <= end)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|r| r.day);
+        Ok(rows)
+    }
+
+    async fn get_vm_traffic_total(
+        &self,
+        vm_id: u64,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> DbResult<(u64, u64)> {
+        let rows = self.list_vm_traffic(vm_id, start, end).await?;
+        Ok(rows
+            .iter()
+            .fold((0, 0), |(i, o), r| (i + r.bytes_in, o + r.bytes_out)))
     }
 
     async fn list_vms(&self) -> DbResult<Vec<Vm>> {
@@ -10313,5 +10394,95 @@ mod bulk_message_tests {
             .await
             .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod vm_traffic_tests {
+    use super::*;
+    use lnvps_db::LNVpsDbBase;
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
+    }
+
+    /// Traffic is additive: the worker only ever knows the increment since its
+    /// last pass, so two writes on the same day must sum rather than replace.
+    #[tokio::test]
+    async fn vm_traffic_accumulates_per_day() {
+        let db = MockDb::default();
+        let d = day(2026, 8, 24);
+
+        db.add_vm_traffic(1, d, 100, 200).await.unwrap();
+        db.add_vm_traffic(1, d, 50, 25).await.unwrap();
+
+        let rows = db.list_vm_traffic(1, d, d).await.unwrap();
+        assert_eq!(rows.len(), 1, "one row per (vm, day)");
+        assert_eq!(rows[0].bytes_in, 150);
+        assert_eq!(rows[0].bytes_out, 225);
+    }
+
+    /// Rows are per VM and per day, ordered oldest first, and a range excludes
+    /// days outside it.
+    #[tokio::test]
+    async fn vm_traffic_listing_is_scoped_and_ordered() {
+        let db = MockDb::default();
+
+        db.add_vm_traffic(1, day(2026, 8, 23), 1, 10).await.unwrap();
+        db.add_vm_traffic(1, day(2026, 8, 24), 2, 20).await.unwrap();
+        db.add_vm_traffic(1, day(2026, 8, 25), 4, 40).await.unwrap();
+        // Another VM's traffic must never leak into this VM's usage.
+        db.add_vm_traffic(2, day(2026, 8, 24), 99, 99)
+            .await
+            .unwrap();
+
+        let rows = db
+            .list_vm_traffic(1, day(2026, 8, 23), day(2026, 8, 24))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.day).collect::<Vec<_>>(),
+            vec![day(2026, 8, 23), day(2026, 8, 24)]
+        );
+
+        let total = db
+            .get_vm_traffic_total(1, day(2026, 8, 23), day(2026, 8, 24))
+            .await
+            .unwrap();
+        assert_eq!(total, (3, 30));
+    }
+
+    /// A VM with nothing recorded reads as zero, not as an error or a missing
+    /// row: an unmetered or brand-new VM still has to render a usage figure.
+    #[tokio::test]
+    async fn vm_traffic_total_of_nothing_is_zero() {
+        let db = MockDb::default();
+        let total = db
+            .get_vm_traffic_total(404, day(2026, 8, 1), day(2026, 8, 31))
+            .await
+            .unwrap();
+        assert_eq!(total, (0, 0));
+        assert!(
+            db.list_vm_traffic(404, day(2026, 8, 1), day(2026, 8, 31))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The counter baseline is one row per VM, overwritten each pass, and
+    /// absent until the first sample is taken.
+    #[tokio::test]
+    async fn vm_traffic_sample_is_replaced_not_appended() {
+        let db = MockDb::default();
+        assert!(db.get_vm_traffic_sample(1).await.unwrap().is_none());
+
+        db.upsert_vm_traffic_sample(1, 10, 20).await.unwrap();
+        db.upsert_vm_traffic_sample(1, 30, 40).await.unwrap();
+
+        let s = db.get_vm_traffic_sample(1).await.unwrap().expect("sampled");
+        assert_eq!(s.last_bytes_in, 30);
+        assert_eq!(s.last_bytes_out, 40);
+        assert!(db.get_vm_traffic_sample(2).await.unwrap().is_none());
     }
 }
