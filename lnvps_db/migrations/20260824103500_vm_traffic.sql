@@ -17,7 +17,13 @@ create table vm_traffic_daily
     bytes_out bigint unsigned  not null default 0,
     updated   timestamp        not null default current_timestamp on update current_timestamp,
     primary key (vm_id, day),
-    constraint fk_vm_traffic_daily_vm foreign key (vm_id) references vm (id)
+    -- ON DELETE CASCADE, unlike the other vm_* children (see
+    -- 20260720130000_cascade_delete_child_tables.sql). `delete_vm` is a soft
+    -- delete that does not touch these rows, so ordinary VM lifecycle keeps the
+    -- history; `hard_delete_vm` and the user purge are genuine purges, where
+    -- removing it is the intent. Spelling that out as hand-written deletes in
+    -- every purge path is how a new path silently fails the FK instead.
+    constraint fk_vm_traffic_daily_vm foreign key (vm_id) references vm (id) on delete cascade
 );
 
 -- Index for "usage across all VMs in a period" reports, which the primary key
@@ -30,7 +36,8 @@ create index ix_vm_traffic_daily_day on vm_traffic_daily (day);
 -- treated as a first sample, double-count a whole counter's worth.
 --
 -- Deliberately a separate table from vm_traffic_daily: this is transient state
--- overwritten every pass, while the daily rows are retained history.
+-- overwritten every pass, while the daily rows are history retained for as long
+-- as the VM exists.
 create table vm_traffic_sample
 (
     vm_id          integer unsigned not null primary key,
@@ -39,7 +46,7 @@ create table vm_traffic_sample
     -- When the reading above was taken; a stale sample (VM off the sweep for a
     -- long time) is still a valid baseline, but it is useful to see.
     sampled        timestamp        not null default current_timestamp,
-    constraint fk_vm_traffic_sample_vm foreign key (vm_id) references vm (id)
+    constraint fk_vm_traffic_sample_vm foreign key (vm_id) references vm (id) on delete cascade
 );
 
 -- Monthly outbound transfer quota in GB. NULL = unmetered, which is what every

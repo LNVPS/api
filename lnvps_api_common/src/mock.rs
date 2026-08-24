@@ -704,6 +704,16 @@ impl LNVpsDbBase for MockDb {
             .lock()
             .await
             .retain(|_, h| !user_vm_ids.contains(&h.vm_id));
+        // Stands in for the ON DELETE CASCADE on the traffic tables; the mock
+        // has no foreign keys to do it.
+        self.vm_traffic_daily
+            .lock()
+            .await
+            .retain(|_, t| !user_vm_ids.contains(&t.vm_id));
+        self.vm_traffic_samples
+            .lock()
+            .await
+            .retain(|vm_id, _| !user_vm_ids.contains(vm_id));
 
         // Remove the VMs, their 1:1 custom templates, and the user's other records.
         self.vms.lock().await.retain(|_, v| v.user_id != id);
@@ -1496,8 +1506,8 @@ impl LNVpsDbBase for MockDb {
             .lock()
             .await
             .retain(|_, a| a.vm_id != vm_id);
-        // Mirrors the FK cleanup the MySQL implementation has to do: traffic
-        // rows are per VM id and nothing can reach them once the VM is gone.
+        // Stands in for the ON DELETE CASCADE on the traffic tables; the mock
+        // has no foreign keys to do it.
         self.vm_traffic_daily
             .lock()
             .await

@@ -388,8 +388,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             "delete from vm_ip_assignment where vm_id in (select id from vm where user_id = ?)",
             "delete from vm_firewall_rule where vm_id in (select id from vm where user_id = ?)",
             "delete from vm_history where vm_id in (select id from vm where user_id = ?)",
-            "delete from vm_traffic_daily where vm_id in (select id from vm where user_id = ?)",
-            "delete from vm_traffic_sample where vm_id in (select id from vm where user_id = ?)",
+            // Traffic rows are absent by design: they cascade on the VM delete.
         ] {
             sqlx::query(child).bind(id).execute(&mut *tx).await?;
         }
@@ -1363,17 +1362,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(vm_id)
             .execute(&mut *tx)
             .await?;
-        // Traffic history goes with the VM. It is only meaningful per VM id, and
-        // ids are reused by nobody, so retaining it would leave rows no query
-        // can reach while still holding the FK that blocks this delete.
-        sqlx::query("delete from vm_traffic_daily where vm_id = ?")
-            .bind(vm_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("delete from vm_traffic_sample where vm_id = ?")
-            .bind(vm_id)
-            .execute(&mut *tx)
-            .await?;
+        // vm_traffic_daily and vm_traffic_sample are not listed here: they
+        // cascade on the VM delete below.
 
         // Delete the VM row itself (frees the FK to subscription_line_item).
         sqlx::query("delete from vm where id = ?")

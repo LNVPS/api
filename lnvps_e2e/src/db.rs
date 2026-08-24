@@ -202,14 +202,8 @@ pub async fn hard_delete_vm(pool: &MySqlPool, vm_id: u64) -> anyhow::Result<()> 
         .execute(pool)
         .await?;
 
-    // Traffic rows hold an FK to the VM, and the worker may have written some
-    // for this VM during the test.
-    for table in ["vm_traffic_daily", "vm_traffic_sample"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE vm_id = ?"))
-            .bind(vm_id)
-            .execute(pool)
-            .await?;
-    }
+    // Traffic rows need no cleanup here: their FK cascades on the VM delete
+    // below, which is exactly what this teardown is asserting still works.
 
     // The worker may still be writing history for this VM while teardown runs,
     // which re-parents a `vm_history` row between the child delete and the
