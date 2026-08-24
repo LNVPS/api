@@ -911,6 +911,27 @@ interface PatchPaymentMethodRequest {
 - **Auth**: Required
 - **Response**: `VmStatus`
 
+`VmStatus` (from either endpoint above) carries a `traffic` object with the VM's
+network transfer for the current UTC calendar month:
+
+```json
+"traffic": {
+  "transfer_gb": 2000,
+  "period_start": "2026-08-01",
+  "period_end": "2026-08-31",
+  "bytes_out": 41231000000,
+  "bytes_in": 8800000000
+}
+```
+
+`transfer_gb` is the plan's **outbound** allowance per month and is omitted when
+the plan is unmetered; `bytes_out` is the figure it bounds. Inbound transfer is
+reported but never counted against the allowance. Exceeding it currently has no
+automatic effect — no throttle, no suspension, no overage billing.
+
+Use `GET /api/v1/vm/{id}/traffic` only when a day-by-day breakdown or a
+historical range is needed; a usage bar can be rendered from this object alone.
+
 #### Update VM Configuration
 - **PATCH** `/api/v1/vm/{id}`
 - **Auth**: Required
@@ -1690,11 +1711,13 @@ content and competes with the app's own page for the same query.
 
 ```json
 {
-  "transfer_gb": 2000,
-  "quota_period_start": "2026-08-01",
-  "quota_period_end": "2026-08-31",
-  "quota_bytes_out": 41231000000,
-  "quota_bytes_in": 8800000000,
+  "summary": {
+    "transfer_gb": 2000,
+    "period_start": "2026-08-01",
+    "period_end": "2026-08-31",
+    "bytes_out": 41231000000,
+    "bytes_in": 8800000000
+  },
   "days": [
     { "day": "2026-08-23", "bytes_in": 400000000, "bytes_out": 1900000000 },
     { "day": "2026-08-24", "bytes_in": 310000000, "bytes_out": 2250000000 }
@@ -1702,15 +1725,19 @@ content and competes with the app's own page for the same query.
 }
 ```
 
-`transfer_gb` is the plan's **outbound** allowance per UTC calendar month, and is
-omitted entirely when the plan is unmetered. Inbound transfer is reported for
-display but never counted against it, so `quota_bytes_out` is the figure to
-compare against the allowance.
+`summary` is the **same object** as the `traffic` field on `GET /api/v1/vm/{id}`
+and on each entry of `GET /api/v1/vm`, so a client that only needs a usage bar
+never has to call this endpoint. It always describes the **current** calendar
+month whatever range is requested. Call this endpoint for the day-by-day
+breakdown or for an arbitrary historical range.
 
-The `quota_*` fields always describe the **current** calendar month whatever
-range is requested, so a usage bar needs no second call and no date arithmetic
-in the client. `days` covers the requested range only; days with no recorded
-traffic are omitted rather than returned as zero.
+`summary.transfer_gb` is the plan's **outbound** allowance per UTC calendar
+month, and is omitted entirely when the plan is unmetered. Inbound transfer is
+reported for display but never counted against it, so `summary.bytes_out` is the
+figure to compare against the allowance.
+
+`days` covers the requested range only; days with no recorded traffic are
+omitted rather than returned as zero.
 
 Figures come from the hypervisor's per-VM interface counters, sampled
 periodically, so they are near-real-time rather than exact to the byte, and

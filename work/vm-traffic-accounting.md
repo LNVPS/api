@@ -146,13 +146,27 @@ lose the last sample before a shutdown.
       surfaces, out-of-range returns no rows but still reports the month,
       inverted range and unbounded span rejected
 
-### Increment 4 — admin API (S)
+### Increment 4 — admin API (M) ✅
 
 - [x] `transfer_gb` on admin template / custom-pricing create/update/list models
       (done in increment 1)
-- [ ] Admin VM traffic listing endpoint + quota field in admin VM info
-- [ ] Region/host traffic report in `lnvps_api_admin/src/admin/reports.rs`
-- [ ] `ADMIN_API_ENDPOINTS.md` + `API_CHANGELOG.md`
+- [x] `traffic` summary on `AdminVmInfo`, same object as the customer-facing
+      `VmStatus.traffic`
+- [x] `GET /api/admin/v1/vms/{id}/traffic` (`virtual_machines::view`)
+- [x] `GET /api/admin/v1/reports/traffic` (`analytics::view`) — fleet ranked by
+      outbound bytes, backed by a new `list_vm_traffic_totals` aggregate with
+      database-level pagination; `total` counts VMs, not daily rows
+- [x] `ADMIN_API_ENDPOINTS.md` + `API_CHANGELOG.md`
+- [x] Mock tests for the aggregate (ranking, summing, paging, purged VMs) and
+      lifecycle e2e assertions on all three admin surfaces
+
+**Traffic is on the main VM detail responses, not only the traffic endpoints**
+(user instruction, 2026-08-24). `vm_to_status` and
+`AdminVmInfo::from_vm_with_admin_data` each cost one extra aggregate query per
+VM; both already issue a dozen, and the quota itself rides free on the template
+they already load. The traffic endpoints exist for the day-by-day breakdown and
+arbitrary ranges, and their `summary` field is the identical object, so there is
+one shape to render rather than two.
 
 ### Increment 5 — notifications (S)
 
@@ -174,6 +188,16 @@ lose the last sample before a shutdown.
   traffic either side of midnight lands on the later day. Worst case is one
   sweep interval (30s) of traffic on the wrong day, which is immaterial against
   a monthly quota.
+- **Both directions are recorded; only outbound is metered.** `bytes_in` is
+  stored and returned everywhere but never counted against `transfer_gb`. It
+  costs nothing extra (same reading) and is the signal that distinguishes a VM
+  being flooded from a VM abusing its allowance — relevant given the AVS/GSL
+  scrubbing path in front of this network.
+- **These are hypervisor NIC counters**, so `bytes_out` includes inter-VM and
+  LAN-local egress, not just billable internet egress. Fine while the number is
+  informational; **this gap must be closed before any enforcement or overage
+  billing** (the firewall datapath is the natural source for internet-only
+  accounting).
 - **`CAST` must be outside `COALESCE` when summing.** `get_vm_traffic_total`
   first used `coalesce(cast(sum(x) as unsigned), 0)`, which decodes at runtime
   as `DECIMAL` and fails — COALESCE takes the aggregate type of its arguments

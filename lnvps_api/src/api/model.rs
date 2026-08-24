@@ -1596,27 +1596,14 @@ pub struct ApiVmTrafficDay {
     pub bytes_out: u64,
 }
 
-/// A VM's network transfer, and its use of the monthly quota.
-///
-/// The quota totals always cover the current UTC calendar month regardless of
-/// the range requested, so a client can render "X of Y GB used this month"
-/// without a second call or any date arithmetic of its own.
+/// A VM's network transfer, day by day, plus its use of the monthly quota.
 #[derive(Serialize)]
 pub struct ApiVmTraffic {
-    /// Outbound transfer included per calendar month, in GB. Omitted when the
-    /// VM's plan is unmetered, in which case the quota fields below are
-    /// informational only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub transfer_gb: Option<u32>,
-    /// First day of the current quota period (the 1st of this UTC month)
-    pub quota_period_start: NaiveDate,
-    /// Last day of the current quota period (the last day of this UTC month)
-    pub quota_period_end: NaiveDate,
-    /// Bytes sent so far in the quota period — the figure to compare against
-    /// `transfer_gb`
-    pub quota_bytes_out: u64,
-    /// Bytes received so far in the quota period, for display only
-    pub quota_bytes_in: u64,
+    /// Current calendar month's usage and allowance — the identical object
+    /// carried by `traffic` on the VM detail response, and always describing
+    /// the current month whatever range was requested. A client that only
+    /// wants a usage bar does not need this endpoint at all.
+    pub summary: ApiVmTrafficSummary,
     /// Daily rows over the requested range, oldest first. Days with no recorded
     /// traffic are omitted rather than returned as zero.
     pub days: Vec<ApiVmTrafficDay>,

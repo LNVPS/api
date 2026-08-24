@@ -12,7 +12,7 @@ use crate::{
     Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
     VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost,
     VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample,
-    WebauthnCredential,
+    VmTrafficTotal, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -1157,6 +1157,47 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(end)
         .fetch_all(&self.db)
         .await?)
+    }
+
+    async fn list_vm_traffic_totals(
+        &self,
+        start: NaiveDate,
+        end: NaiveDate,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmTrafficTotal>, u64)> {
+        // Joined to `vm` rather than left-joined: a traffic row whose VM has
+        // been purged cannot be attributed to anyone, and the delete paths
+        // remove those rows anyway.
+        let rows: Vec<VmTrafficTotal> = sqlx::query_as(
+            "select t.vm_id, v.user_id, \
+             cast(sum(t.bytes_in) as unsigned) as bytes_in, \
+             cast(sum(t.bytes_out) as unsigned) as bytes_out \
+             from vm_traffic_daily t join vm v on v.id = t.vm_id \
+             where t.day between ? and ? \
+             group by t.vm_id, v.user_id \
+             order by bytes_out desc, t.vm_id asc limit ? offset ?",
+        )
+        .bind(start)
+        .bind(end)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+
+        // Counting VMs, not rows: the grouped query collapses each VM's days
+        // into one entry, so a `count(*)` over the raw table would overstate
+        // the total by roughly the number of days in the range.
+        let total: (i64,) = sqlx::query_as(
+            "select count(distinct t.vm_id) from vm_traffic_daily t \
+             join vm v on v.id = t.vm_id where t.day between ? and ?",
+        )
+        .bind(start)
+        .bind(end)
+        .fetch_one(&self.db)
+        .await?;
+
+        Ok((rows, total.0 as u64))
     }
 
     async fn get_vm_traffic_total(

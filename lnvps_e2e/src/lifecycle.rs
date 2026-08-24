@@ -556,19 +556,28 @@ mod tests {
         )
         .await;
         let t = &traffic["data"];
-        let period_start = t["quota_period_start"]
+        let period_start = t["summary"]["period_start"]
             .as_str()
             .expect("quota period start");
         assert!(
             period_start.ends_with("-01"),
             "quota period must start on the 1st of the month, got {period_start}"
         );
-        assert!(t["quota_period_end"].is_string());
+        assert!(t["summary"]["period_end"].is_string());
         // A VM nothing has been sampled for reads as zero, not as absent: the
         // usage bar has to render either way.
-        assert_eq!(t["quota_bytes_out"].as_u64(), Some(0));
-        assert_eq!(t["quota_bytes_in"].as_u64(), Some(0));
+        assert_eq!(t["summary"]["bytes_out"].as_u64(), Some(0));
+        assert_eq!(t["summary"]["bytes_in"].as_u64(), Some(0));
         assert_eq!(t["days"].as_array().map(|d| d.len()), Some(0));
+
+        // The same summary must ride on the VM detail response, so a dashboard
+        // never needs the traffic endpoint just to draw a usage bar.
+        let vm_detail = json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap()).await;
+        assert_eq!(
+            vm_detail["data"]["traffic"],
+            *t.get("summary").unwrap(),
+            "VmStatus.traffic must be the same object the traffic endpoint returns"
+        );
 
         // Recorded traffic surfaces on the day it was booked and in the month
         // total.
@@ -583,12 +592,20 @@ mod tests {
         )
         .await;
         let t = &traffic["data"];
-        assert_eq!(t["quota_bytes_in"].as_u64(), Some(111));
-        assert_eq!(t["quota_bytes_out"].as_u64(), Some(222));
+        assert_eq!(t["summary"]["bytes_in"].as_u64(), Some(111));
+        assert_eq!(t["summary"]["bytes_out"].as_u64(), Some(222));
         let days = t["days"].as_array().unwrap();
         assert_eq!(days.len(), 1, "{days:?}");
         assert_eq!(days[0]["day"].as_str(), Some(today.to_string().as_str()));
         assert_eq!(days[0]["bytes_out"].as_u64(), Some(222));
+
+        // Recorded traffic must also reach the VM detail response.
+        let vm_detail = json_ok(user.get_auth(&format!("/api/v1/vm/{vm_id}")).await.unwrap()).await;
+        assert_eq!(
+            vm_detail["data"]["traffic"]["bytes_out"].as_u64(),
+            Some(222),
+            "VmStatus.traffic must reflect recorded traffic"
+        );
 
         // A range outside the recorded day returns no rows but still reports
         // the current month's quota usage.
@@ -601,7 +618,11 @@ mod tests {
         )
         .await;
         assert_eq!(traffic["data"]["days"].as_array().map(|d| d.len()), Some(0));
-        assert_eq!(traffic["data"]["quota_bytes_out"].as_u64(), Some(222));
+        assert_eq!(
+            traffic["data"]["summary"]["bytes_out"].as_u64(),
+            Some(222),
+            "the summary describes the current month whatever range was asked for"
+        );
 
         // An inverted range is a client bug and must be reported, not answered
         // with an empty list.
@@ -615,6 +636,52 @@ mod tests {
         assert!(
             body["error"].is_string(),
             "end before start must be rejected, got {body}"
+        );
+
+        // The admin surfaces must show the same traffic: one VM in detail, and
+        // the fleet ranked by who is pushing it.
+        let admin_traffic = json_ok(
+            admin
+                .get_auth(&format!("/api/admin/v1/vms/{vm_id}/traffic"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(admin_traffic["data"]["vm_id"].as_u64(), Some(vm_id));
+        assert_eq!(
+            admin_traffic["data"]["summary"]["bytes_out"].as_u64(),
+            Some(222)
+        );
+
+        let admin_vm = json_ok(
+            admin
+                .get_auth(&format!("/api/admin/v1/vms/{vm_id}"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            admin_vm["data"]["traffic"]["bytes_out"].as_u64(),
+            Some(222),
+            "AdminVmInfo must carry the same traffic summary"
+        );
+
+        let report = json_ok(
+            admin
+                .get_auth("/api/admin/v1/reports/traffic")
+                .await
+                .unwrap(),
+        )
+        .await;
+        let rows = report["data"].as_array().unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r["vm_id"].as_u64() == Some(vm_id))
+            .unwrap_or_else(|| panic!("VM {vm_id} missing from traffic report: {rows:?}"));
+        assert_eq!(row["bytes_out"].as_u64(), Some(222));
+        assert!(
+            row["user_id"].as_u64().is_some_and(|u| u > 0),
+            "the report must name the owner so traffic can be attributed"
         );
 
         // The span is bounded because the response is one unpaged row per day.

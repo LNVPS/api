@@ -36,10 +36,10 @@ use crate::api::model::{
     ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmPrice, ApiCustomVmRequest,
     ApiExchangeRates, ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiRenewalQuote,
     ApiTemplatesResponse, ApiVmFirewallPolicy, ApiVmFirewallRule, ApiVmHistory, ApiVmPayment,
-    ApiVmStatus, ApiVmTraffic, ApiVmTrafficDay, ApiVmUpgradeQuote, ApiVmUpgradeRequest,
-    CreateSshKey, CreateVmFirewallRule, CreateVmRequest, PatchPaymentMethodRequest,
-    PatchVmFirewallPolicy, PatchVmFirewallRule, PaymentMethodResponse, VMPatchRequest,
-    VmTrafficQuery, quota_period, resolve_traffic_range, validate_firewall_cidr,
+    ApiVmStatus, ApiVmTraffic, ApiVmTrafficDay, ApiVmTrafficSummary, ApiVmUpgradeQuote,
+    ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule, CreateVmRequest,
+    PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule, PaymentMethodResponse,
+    VMPatchRequest, VmTrafficQuery, quota_period, resolve_traffic_range, validate_firewall_cidr,
     validate_firewall_ports, vm_to_status,
 };
 use crate::api::{
@@ -2535,11 +2535,13 @@ async fn v1_get_vm_traffic(
         .await?;
 
     ApiData::ok(ApiVmTraffic {
-        transfer_gb: vm_transfer_quota_gb(&this, &vm).await?,
-        quota_period_start: quota_start,
-        quota_period_end: quota_end,
-        quota_bytes_out,
-        quota_bytes_in,
+        summary: ApiVmTrafficSummary {
+            transfer_gb: vm_transfer_quota_gb(&this, &vm).await?,
+            period_start: quota_start,
+            period_end: quota_end,
+            bytes_out: quota_bytes_out,
+            bytes_in: quota_bytes_in,
+        },
         days: days
             .into_iter()
             .map(|d| ApiVmTrafficDay {

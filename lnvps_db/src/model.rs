@@ -4369,6 +4369,17 @@ pub struct VmTrafficDaily {
     pub bytes_out: u64,
 }
 
+/// One VM's traffic totalled over a date range, for fleet-wide reporting.
+#[derive(FromRow, Clone, Debug, PartialEq, Eq)]
+pub struct VmTrafficTotal {
+    pub vm_id: u64,
+    /// Owner, carried through from the VM so a report does not need a lookup
+    /// per row to say whose traffic this is.
+    pub user_id: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
 /// The last raw counter reading taken for a VM, used as the delta baseline.
 #[derive(FromRow, Clone, Debug, PartialEq, Eq)]
 pub struct VmTrafficSample {

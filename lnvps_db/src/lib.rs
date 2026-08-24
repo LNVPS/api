@@ -410,6 +410,20 @@ pub trait LNVpsDbBase: Send + Sync {
         end: NaiveDate,
     ) -> DbResult<Vec<VmTrafficDaily>>;
 
+    /// Per-VM traffic totals across the fleet over an inclusive date range,
+    /// heaviest sender first.
+    ///
+    /// The "who is pushing all the traffic" query. Ordered by outbound bytes
+    /// because that is the direction that costs transit and the direction a
+    /// quota counts; ties break on `vm_id` so pagination is stable.
+    async fn list_vm_traffic_totals(
+        &self,
+        start: NaiveDate,
+        end: NaiveDate,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmTrafficTotal>, u64)>;
+
     /// Total `(bytes_in, bytes_out)` for a VM over an inclusive date range.
     ///
     /// Summed in SQL rather than over [`Self::list_vm_traffic`] because the

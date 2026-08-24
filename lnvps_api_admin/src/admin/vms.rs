@@ -3,7 +3,8 @@ use crate::admin::auth::AdminAuth;
 use crate::admin::discounts::payment_discounts;
 use crate::admin::model::{
     AdminCreateCustomVmRequest, AdminCreateVmRequest, AdminPaymentRefundsInfo,
-    AdminRefundAmountInfo, AdminVmHistoryInfo, AdminVmInfo, AdminVmPaymentInfo, JobResponse,
+    AdminRefundAmountInfo, AdminVmHistoryInfo, AdminVmInfo, AdminVmPaymentInfo, AdminVmTrafficDay,
+    AdminVmTrafficInfo, AdminVmTrafficQuery, JobResponse,
 };
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post, put};
@@ -11,9 +12,10 @@ use axum::{Json, Router};
 use chrono::{DateTime, Days, Utc};
 use lightning_invoice::Bolt11Invoice;
 use lnvps_api_common::{
-    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery, PricingEngine,
-    RefundEvidence, UpgradeConfig, VatClient, VmHistoryLogger, VmRunningState, VmStateCache,
-    WorkJob, build_refund_row, refundable_remaining,
+    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, ApiVmTrafficSummary,
+    PageQuery, PricingEngine, RefundEvidence, UpgradeConfig, VatClient, VmHistoryLogger,
+    VmRunningState, VmStateCache, WorkJob, build_refund_row, quota_period, refundable_remaining,
+    resolve_traffic_range,
 };
 use lnvps_db::{AdminAction, AdminResource, SubscriptionPaymentType};
 use log::{error, info};
@@ -40,6 +42,7 @@ pub fn router() -> Router<RouterState> {
         .route("/api/admin/v1/vms/{id}/stop", post(admin_stop_vm))
         .route("/api/admin/v1/vms/{id}/extend", put(admin_extend_vm))
         .route("/api/admin/v1/vms/{id}/history", get(admin_list_vm_history))
+        .route("/api/admin/v1/vms/{id}/traffic", get(admin_get_vm_traffic))
         .route(
             "/api/admin/v1/vms/{id}/history/{history_id}",
             get(admin_get_vm_history),
@@ -782,6 +785,62 @@ async fn admin_extend_all_vms(
     );
 
     ApiData::ok(AdminExtendAllVmsResult { extended, failed })
+}
+
+/// Get a VM's network transfer, by day, plus its use of the monthly allowance.
+///
+/// The admin twin of `GET /api/v1/vm/{id}/traffic`, for answering "what is this
+/// VM doing" without impersonating the customer.
+async fn admin_get_vm_traffic(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(vm_id): Path<u64>,
+    Query(q): Query<AdminVmTrafficQuery>,
+) -> ApiResult<AdminVmTrafficInfo> {
+    auth.require_permission(AdminResource::VirtualMachines, AdminAction::View)?;
+
+    let vm = this.db.get_vm(vm_id).await?;
+
+    let today = Utc::now().date_naive();
+    let (period_start, period_end) = quota_period(today);
+    let (start, end) = match resolve_traffic_range(q.start, q.end, today) {
+        Ok(r) => r,
+        Err(e) => return ApiData::err(&e),
+    };
+
+    let days = this.db.list_vm_traffic(vm_id, start, end).await?;
+    let (bytes_in, bytes_out) = this
+        .db
+        .get_vm_traffic_total(vm_id, period_start, period_end)
+        .await?;
+
+    let transfer_gb = if let Some(t) = vm.template_id {
+        this.db.get_vm_template(t).await?.transfer_gb
+    } else if let Some(t) = vm.custom_template_id {
+        this.db.get_custom_vm_template(t).await?.transfer_gb
+    } else {
+        None
+    };
+
+    ApiData::ok(AdminVmTrafficInfo {
+        vm_id,
+        user_id: vm.user_id,
+        summary: ApiVmTrafficSummary {
+            transfer_gb,
+            period_start,
+            period_end,
+            bytes_out,
+            bytes_in,
+        },
+        days: days
+            .into_iter()
+            .map(|d| AdminVmTrafficDay {
+                day: d.day,
+                bytes_in: d.bytes_in,
+                bytes_out: d.bytes_out,
+            })
+            .collect(),
+    })
 }
 
 /// List VM history with pagination

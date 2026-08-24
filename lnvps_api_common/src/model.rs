@@ -1,8 +1,9 @@
 use crate::VmRunningState;
 use crate::pricing::PricingEngine;
 use crate::ssh_host_key::{ApiVmHostKey, parse_ssh_host_keys};
+use crate::traffic::quota_period;
 use anyhow::{Result, anyhow, bail};
-use chrono::{DateTime, Days, Utc};
+use chrono::{DateTime, Days, NaiveDate, Utc};
 use futures::future::join_all;
 use ipnetwork::IpNetwork;
 use lnvps_db::{
@@ -293,6 +294,33 @@ pub struct ApiVmStatus {
     /// reinstall (which regenerates them). Not to be confused with `ssh_key`,
     /// which is the customer's authorized key.
     pub host_ssh_keys: Vec<ApiVmHostKey>,
+    /// Network transfer used in the current UTC calendar month, against the
+    /// plan's allowance.
+    ///
+    /// Included here rather than only on `GET /api/v1/vm/{id}/traffic` so a
+    /// dashboard can render a usage bar from the VM it already fetched. Use the
+    /// traffic endpoint for the day-by-day breakdown or an arbitrary range.
+    pub traffic: ApiVmTrafficSummary,
+}
+
+/// A VM's transfer in the current quota period.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ApiVmTrafficSummary {
+    /// Outbound transfer included per calendar month, in GB. Omitted when the
+    /// plan is unmetered, in which case the byte counts below are informational
+    /// only. Same value as `template.transfer_gb`, repeated so a usage bar can
+    /// be rendered from this object alone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer_gb: Option<u32>,
+    /// First day of the current quota period (the 1st of this UTC month)
+    pub period_start: NaiveDate,
+    /// Last day of the current quota period
+    pub period_end: NaiveDate,
+    /// Bytes sent so far this period — the figure `transfer_gb` bounds
+    pub bytes_out: u64,
+    /// Bytes received so far this period, for display only; never counted
+    /// against the allowance
+    pub bytes_in: u64,
 }
 
 /// Grace period (days) for a subscription, tiered by how long the subscription
@@ -356,6 +384,7 @@ pub async fn vm_to_status(
         .collect();
 
     let template = ApiVmTemplate::from_vm(db, &vm).await?;
+    let template_transfer_gb = template.transfer_gb;
     // Load subscription for created + expiry + auto_renewal + dynamic deletion date
     let (sub_id, sub_created, sub_expires, sub_auto_renewal, deleting_on, max_prepay_days) =
         match db
@@ -395,6 +424,14 @@ pub async fn vm_to_status(
         .map(parse_ssh_host_keys)
         .unwrap_or_default();
 
+    // One extra aggregate per VM. `vm_to_status` already issues a dozen
+    // queries, so this does not change the shape of a listing, and the quota
+    // itself is free: it rides on the template already loaded above.
+    let (period_start, period_end) = quota_period(Utc::now().date_naive());
+    let (traffic_in, traffic_out) = db
+        .get_vm_traffic_total(vm.id, period_start, period_end)
+        .await?;
+
     Ok(ApiVmStatus {
         id: vm.id,
         created: sub_created,
@@ -426,6 +463,13 @@ pub async fn vm_to_status(
         }),
         max_prepay_days,
         host_ssh_keys,
+        traffic: ApiVmTrafficSummary {
+            transfer_gb: template_transfer_gb,
+            period_start,
+            period_end,
+            bytes_out: traffic_out,
+            bytes_in: traffic_in,
+        },
     })
 }
 

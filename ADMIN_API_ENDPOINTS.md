@@ -4731,6 +4731,82 @@ Response:
 - Payments whose currency cannot be converted to the company base currency are
   skipped.
 
+#### Fleet Traffic Report
+
+```
+GET /api/admin/v1/reports/traffic
+```
+
+Which VMs are pushing the traffic, heaviest sender first. Transit is bought in
+aggregate, so when the bill or the pipe moves, this is the query that says which
+handful of guests moved it.
+
+Required Permission: `analytics::view`.
+
+Query Parameters:
+
+| Parameter | Type | Description |
+|---|---|---|
+| `start` | string | Inclusive UTC start date, `YYYY-MM-DD`. Default: 1st of the current month |
+| `end` | string | Inclusive UTC end date, `YYYY-MM-DD`. Default: last day of the current month |
+| `limit` | int | Page size (default `50`, max `100`) |
+| `offset` | int | Rows to skip (default `0`) |
+
+A range may span at most 400 days; `end` before `start` is a 400.
+
+Returns the standard paginated envelope. `total` counts **VMs with traffic in
+the range**, not daily rows.
+
+```json
+{
+  "vm_id": 1042,
+  "user_id": 88,
+  "bytes_in": 8800000000,
+  "bytes_out": 41231000000
+}
+```
+
+Ordered by `bytes_out` descending (ties break on `vm_id`, so paging is stable):
+outbound is the direction that costs transit and the direction an allowance
+bounds. Traffic belonging to a VM that has since been purged is not reported —
+it cannot be attributed to an owner.
+
+Figures come from the hypervisor's per-VM interface counters sampled on the
+worker's VM sweep, so they include all egress from the guest's interface, not
+only billable internet egress.
+
+#### Per-VM Traffic
+
+```
+GET /api/admin/v1/vms/{id}/traffic
+```
+
+The admin twin of `GET /api/v1/vm/{id}/traffic`, for investigating one VM
+without impersonating its owner. Required Permission: `virtual_machines::view`.
+Same `start`/`end` parameters and same 400-day cap as the report above.
+
+```json
+{
+  "vm_id": 1042,
+  "user_id": 88,
+  "summary": {
+    "transfer_gb": 2000,
+    "period_start": "2026-08-01",
+    "period_end": "2026-08-31",
+    "bytes_out": 41231000000,
+    "bytes_in": 8800000000
+  },
+  "days": [
+    { "day": "2026-08-24", "bytes_in": 310000000, "bytes_out": 2250000000 }
+  ]
+}
+```
+
+`summary` always describes the **current** calendar month whatever range was
+requested, and is the same object carried by `traffic` on `AdminVmInfo` and on
+the customer-facing `VmStatus`. `transfer_gb` is the plan's outbound allowance
+(omitted when unmetered); exceeding it currently has no automatic effect.
+
 ### App Deployments — Catalog & Clusters
 
 Manage the **managed app** catalog (predefined apps deployed on shared Kubernetes
