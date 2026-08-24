@@ -339,7 +339,7 @@ export function PortsCard({ token }: { token: string }) {
   const pages = Math.max(1, Math.ceil(data.total / PAGE));
   const rows = data.items.map((p) => [p.ip, p.port, p.proto, p.age_secs + "s"]);
   return (
-    <Section wide title="Learned open ports" extra={"(" + data.total + ")"}>
+    <Section wide title="Learned open ports" extra={"(" + data.total + (data.sampled ? ", freshest sample" : "") + ")"}>
       <input placeholder="filter ip/port/proto" value={q}
         onInput={(e) => { setPage(0); setQ((e.target as HTMLInputElement).value); }} style={{ marginBottom: ".5rem" }} />
       <div class="scroll"><Table cols={["ip", "port", "proto", "age"]} rows={rows} /></div>

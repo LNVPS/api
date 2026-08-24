@@ -13,7 +13,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -625,6 +625,9 @@ pub struct SharedState {
     blocks: RwLock<Vec<SourceBlock>>,
     sources: RwLock<Vec<TrackedSource>>,
     ports: RwLock<Vec<LearnedPort>>,
+    /// Total learned ports in the kernel maps. `ports` holds only a bounded
+    /// freshest-first sample of them, so the count is published separately.
+    ports_total: AtomicUsize,
     /// SNI blocklist snapshot with live drop counters (published by the loop).
     sni: RwLock<Vec<SniBlockInfo>>,
     totals: RwLock<Totals>,
@@ -678,6 +681,7 @@ impl SharedState {
             blocks: RwLock::new(Vec::new()),
             sources: RwLock::new(Vec::new()),
             ports: RwLock::new(Vec::new()),
+            ports_total: AtomicUsize::new(0),
             sni: RwLock::new(Vec::new()),
             totals: RwLock::new(Totals::default()),
             limits: RwLock::new(Limits::default()),
@@ -752,8 +756,11 @@ impl SharedState {
     }
 
     /// Replace the learned-open-ports snapshot (called by the control loop).
-    pub fn set_ports(&self, ports: Vec<LearnedPort>) {
+    /// `total` is the full entry count in the kernel maps; `ports` may be a
+    /// bounded freshest-first sample of it.
+    pub fn set_ports(&self, ports: Vec<LearnedPort>, total: usize) {
         *self.ports.write().unwrap() = ports;
+        self.ports_total.store(total, Ordering::Relaxed);
     }
 
     /// Replace the SNI-blocklist snapshot + drop counters (control loop).
@@ -989,7 +996,7 @@ async fn get_status(State(state): State<Arc<SharedState>>) -> Json<Status> {
         nics: state.nics.read().unwrap().clone(),
         protected_prefixes: rules.protected.len(),
         active_mitigations: active.len(),
-        learned_ports: state.ports.read().unwrap().len(),
+        learned_ports: state.ports_total.load(Ordering::Relaxed),
         events_cursor: cursor,
         totals: *state.totals.read().unwrap(),
     })
@@ -1008,6 +1015,7 @@ async fn get_ports(
                 .contains(&needle)
     };
     let total = all.iter().filter(|p| matches(p)).count();
+    let sampled = state.ports_total.load(Ordering::Relaxed) > all.len();
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     let items: Vec<LearnedPort> = all
         .iter()
@@ -1021,6 +1029,7 @@ async fn get_ports(
         offset: q.offset,
         limit,
         items,
+        sampled,
     })
 }
 
@@ -1510,6 +1519,11 @@ pub struct PortsPage {
     pub offset: usize,
     pub limit: usize,
     pub items: Vec<LearnedPort>,
+    /// True when the daemon is paging over a bounded freshest-first sample of
+    /// the learned ports rather than all of them (see `Status::learned_ports`
+    /// for the real count).
+    #[serde(default)]
+    pub sampled: bool,
 }
 
 #[derive(Debug, Deserialize)]

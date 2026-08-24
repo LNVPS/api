@@ -209,20 +209,23 @@ async fn events_poll_incrementally() {
 async fn learned_ports_endpoint() {
     let st = state();
     let app = router(st.clone());
-    st.set_ports(vec![
-        LearnedPort {
-            ip: "185.18.221.87".into(),
-            port: 443,
-            proto: "tcp".into(),
-            age_secs: 5,
-        },
-        LearnedPort {
-            ip: "185.18.221.140".into(),
-            port: 51820,
-            proto: "udp".into(),
-            age_secs: 12,
-        },
-    ]);
+    st.set_ports(
+        vec![
+            LearnedPort {
+                ip: "185.18.221.87".into(),
+                port: 443,
+                proto: "tcp".into(),
+                age_secs: 5,
+            },
+            LearnedPort {
+                ip: "185.18.221.140".into(),
+                port: 51820,
+                proto: "udp".into(),
+                age_secs: 12,
+            },
+        ],
+        2,
+    );
     // Paginated: limit=1 returns 1 of 2, with total.
     let res = app
         .clone()
@@ -248,6 +251,39 @@ async fn learned_ports_endpoint() {
     let page: PortsPage = body_json(res).await;
     assert_eq!(page.total, 1);
     assert_eq!(page.items[0].proto, "udp");
+}
+
+/// A snapshot bounded below the kernel-map total is flagged `sampled`, and the
+/// status count reports the real total rather than the sample size.
+#[tokio::test]
+async fn learned_ports_report_sampling_and_true_total() {
+    let st = state();
+    let app = router(st.clone());
+    st.set_ports(
+        vec![LearnedPort {
+            ip: "185.18.221.87".into(),
+            port: 443,
+            proto: "tcp".into(),
+            age_secs: 5,
+        }],
+        500_000,
+    );
+
+    let res = app
+        .clone()
+        .oneshot(req("GET", "/api/v1/ports", Some("tok"), None))
+        .await
+        .unwrap();
+    let page: PortsPage = body_json(res).await;
+    assert!(page.sampled);
+    assert_eq!(page.total, 1);
+
+    let res = app
+        .oneshot(req("GET", "/api/v1/status", Some("tok"), None))
+        .await
+        .unwrap();
+    let status: Status = body_json(res).await;
+    assert_eq!(status.learned_ports, 500_000);
 }
 
 #[tokio::test]

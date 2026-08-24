@@ -57,6 +57,25 @@ where
         .collect()
 }
 
+/// Keep at most `cap` entries of a learned-ports snapshot, retaining the ones
+/// refreshed most recently. Used to bound the snapshot published to the
+/// control API: the kernel map holds up to a million entries (one per learned
+/// `(ip, port, proto)`, including the ephemeral ports of VM-initiated
+/// connections), and formatting all of them into strings on every GC tick is
+/// far more work than any operator view needs.
+pub fn freshest<K>(mut entries: Vec<(K, LastSeen)>, cap: usize) -> Vec<(K, LastSeen)>
+where
+    K: Pod,
+{
+    if entries.len() > cap {
+        // Partial selection (O(n)) rather than a full sort: only the retained
+        // prefix has to be the freshest, its internal order is irrelevant.
+        entries.select_nth_unstable_by_key(cap, |(_, v)| std::cmp::Reverse(v.last_seen));
+        entries.truncate(cap);
+    }
+    entries
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -85,6 +104,38 @@ mod tests {
     fn future_timestamp_not_expired() {
         let now = 1_000 * 1_000_000_000;
         assert!(!is_expired(now + 5, now, TTL));
+    }
+
+    #[test]
+    fn freshest_keeps_the_most_recent_entries() {
+        let entries: Vec<(u32, LastSeen)> = (0..10u32)
+            .map(|i| {
+                (
+                    i,
+                    LastSeen {
+                        last_seen: i as u64,
+                    },
+                )
+            })
+            .collect();
+        let mut kept: Vec<u32> = freshest(entries, 3).into_iter().map(|(k, _)| k).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn freshest_returns_everything_under_the_cap() {
+        let entries: Vec<(u32, LastSeen)> = (0..3u32)
+            .map(|i| {
+                (
+                    i,
+                    LastSeen {
+                        last_seen: i as u64,
+                    },
+                )
+            })
+            .collect();
+        assert_eq!(freshest(entries, 10).len(), 3);
     }
 
     #[test]

@@ -60,7 +60,7 @@ export interface RuleSet {
 }
 export interface BlocksPage { total: number; offset: number; limit: number; items: SourceBlock[] }
 export interface SourcesPage { total: number; offset: number; limit: number; items: TrackedSource[] }
-export interface PortsPage { total: number; offset: number; limit: number; items: LearnedPort[] }
+export interface PortsPage { total: number; offset: number; limit: number; items: LearnedPort[]; sampled?: boolean }
 export interface EventsResponse { events: FwEvent[]; cursor: number }
 
 /** GET a JSON endpoint with bearer auth. Returns null on 204. Throws on !ok. */

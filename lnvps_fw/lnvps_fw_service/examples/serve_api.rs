@@ -713,7 +713,9 @@ async fn run_sim(state: Arc<SharedState>) {
         state.set_blocks(blocks);
         state.set_sources(sources);
         if t % 5 == 1 {
-            state.set_ports(learned_ports(t));
+            let ports = learned_ports(t);
+            let total = ports.len();
+            state.set_ports(ports, total);
         }
         // SNI egress blocks: the demo's one entry accumulates drops slowly, the
         // way a C2 agent's poll interval actually looks (a handful per minute,
@@ -786,7 +788,9 @@ async fn main() -> anyhow::Result<()> {
         speed_mbps: Some(10_000),
         role: "host".into(),
     }]);
-    state.set_ports(learned_ports(0));
+    let ports = learned_ports(0);
+    let total = ports.len();
+    state.set_ports(ports, total);
 
     let sim_state = state.clone();
     tokio::spawn(async move { run_sim(sim_state).await });

@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use aya::maps::lpm_trie::{Key, LpmTrie};
-use aya::maps::{Array, HashMap as AyaHashMap, ProgramArray};
+use aya::maps::{Array, ProgramArray};
 use aya::programs::{SchedClassifier, TcAttachType, Xdp, XdpMode, tc::qdisc_add_clsact};
 use aya::util::KernelVersion;
 use aya::{Ebpf, include_bytes_aligned};
@@ -30,6 +30,13 @@ use lnvps_fw_service::runtime::{self, DetectionState, RuntimeConfig, run_control
 /// A NORMAL (unblocked) source state idle for this long is swept from the
 /// kernel state maps by the GC timer.
 const SRC_STATE_IDLE_TTL_NS: u64 = 60 * 1_000_000_000;
+
+/// Upper bound on the learned-ports snapshot published to the control API.
+/// The kernel map holds up to a million entries (every VM-initiated connection
+/// learns its ephemeral source port too), and every published entry allocates
+/// two strings on each GC tick, so the full set is neither cheap nor useful.
+/// `Status::learned_ports` still reports the true total.
+const MAX_PUBLISHED_PORTS: usize = 20_000;
 
 /// Sweep both learned-ports maps, returning the total number of entries
 /// removed. TTL is compared against the monotonic clock (matching
@@ -835,7 +842,7 @@ fn manual_block(bpf: &mut Ebpf, key: CidrKey, set: bool) -> Result<()> {
 }
 
 /// Snapshot the learned open ports (both families) for the control API.
-fn collect_ports(bpf: &Ebpf) -> Vec<LearnedPort> {
+fn collect_ports(bpf: &Ebpf) -> (Vec<LearnedPort>, usize) {
     let now = gc::monotonic_now_ns();
     let proto_str = |p: u8| match p {
         PROTO_TCP => "tcp".to_string(),
@@ -843,34 +850,52 @@ fn collect_ports(bpf: &Ebpf) -> Vec<LearnedPort> {
         other => format!("proto-{other}"),
     };
     let age = |last_seen: u64| now.saturating_sub(last_seen) / 1_000_000_000;
-    let mut out = Vec::new();
-    if let Some(m) = bpf.map("OPEN_PORTS_V4")
-        && let Ok(map) = AyaHashMap::<_, PortKeyV4, LastSeen>::try_from(m)
-    {
-        for k in map.keys().flatten() {
-            let age_secs = map.get(&k, 0).map(|ls| age(ls.last_seen)).unwrap_or(0);
-            out.push(LearnedPort {
-                ip: Ipv4Addr::from(k.addr).to_string(),
-                port: k.port,
-                proto: proto_str(k.proto),
-                age_secs,
-            });
+    // Batched scan (one syscall per ~4k entries). A per-key `keys()` walk with
+    // a `get()` per key costs two syscalls per entry, which pegs a core for
+    // tens of seconds once the map holds hundreds of thousands of entries --
+    // and because that ran on the control loop, it stalled the control API too.
+    let v4: Vec<(PortKeyV4, LastSeen)> = scan_or_empty(bpf, "OPEN_PORTS_V4");
+    let v6: Vec<(PortKeyV6, LastSeen)> = scan_or_empty(bpf, "OPEN_PORTS_V6");
+    let total = v4.len() + v6.len();
+
+    // Bound the published snapshot: keep the freshest entries per family, then
+    // trim the merged list. Only the retained entries are formatted.
+    let v4 = gc::freshest(v4, MAX_PUBLISHED_PORTS);
+    let v6 = gc::freshest(v6, MAX_PUBLISHED_PORTS);
+    let mut out = Vec::with_capacity(v4.len() + v6.len());
+    out.extend(v4.into_iter().map(|(k, ls)| LearnedPort {
+        ip: Ipv4Addr::from(k.addr).to_string(),
+        port: k.port,
+        proto: proto_str(k.proto),
+        age_secs: age(ls.last_seen),
+    }));
+    out.extend(v6.into_iter().map(|(k, ls)| LearnedPort {
+        ip: Ipv6Addr::from(k.addr).to_string(),
+        port: k.port,
+        proto: proto_str(k.proto),
+        age_secs: age(ls.last_seen),
+    }));
+    if out.len() > MAX_PUBLISHED_PORTS {
+        out.select_nth_unstable_by_key(MAX_PUBLISHED_PORTS, |p| p.age_secs);
+        out.truncate(MAX_PUBLISHED_PORTS);
+    }
+    (out, total)
+}
+
+/// Batched map scan that degrades to an empty snapshot (with a warning) rather
+/// than failing the control loop -- the snapshot is a view, not state.
+fn scan_or_empty<K, V>(bpf: &Ebpf, name: &str) -> Vec<(K, V)>
+where
+    K: aya::Pod,
+    V: aya::Pod,
+{
+    match scan_plain::<K, V>(bpf, name) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("scanning {name} failed: {e}");
+            Vec::new()
         }
     }
-    if let Some(m) = bpf.map("OPEN_PORTS_V6")
-        && let Ok(map) = AyaHashMap::<_, PortKeyV6, LastSeen>::try_from(m)
-    {
-        for k in map.keys().flatten() {
-            let age_secs = map.get(&k, 0).map(|ls| age(ls.last_seen)).unwrap_or(0);
-            out.push(LearnedPort {
-                ip: Ipv6Addr::from(k.addr).to_string(),
-                port: k.port,
-                proto: proto_str(k.proto),
-                age_secs,
-            });
-        }
-    }
-    out
 }
 
 /// Reconcile the protected-prefix tries and the `scoped` flag from the current
@@ -1038,7 +1063,11 @@ fn start_api(cfg: &Config) -> Result<Option<std::sync::Arc<SharedState>>> {
     Ok(Some(state))
 }
 
-#[tokio::main(flavor = "current_thread")]
+// Multi-threaded on purpose: the control loop below runs long blocking BPF map
+// sweeps (GC, snapshots) on the thread that drives `main`, so the control API
+// and the other background tasks need worker threads of their own to stay
+// responsive while a sweep is in progress.
+#[tokio::main(worker_threads = 2)]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -1327,7 +1356,8 @@ async fn main() -> Result<()> {
                 }
                 // Refresh the learned-ports snapshot for the control API.
                 if let Some(st) = &api_state {
-                    st.set_ports(collect_ports(&bpf));
+                    let (ports, total) = collect_ports(&bpf);
+                    st.set_ports(ports, total);
                 }
             }
             _ = cookie_timer.tick() => {
