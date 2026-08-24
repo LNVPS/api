@@ -172,6 +172,7 @@ impl ApiVmTemplate {
             },
             ip4_count: template.ip4_count,
             ip6_count: template.ip6_count,
+            transfer_gb: template.transfer_gb,
         })
     }
 
@@ -233,6 +234,7 @@ impl ApiVmTemplate {
             },
             ip4_count: template.ip4_count,
             ip6_count: template.ip6_count,
+            transfer_gb: template.transfer_gb,
         })
     }
 }
@@ -531,6 +533,13 @@ pub struct ApiVmTemplate {
     /// IPv6 addresses included. Assignment is best-effort: a region without an
     /// IPv6 range still provisions, so a VM may hold fewer than this.
     pub ip6_count: u16,
+    /// Outbound transfer included per calendar month, in GB. Omitted when the
+    /// offer is unmetered. Inbound transfer is never counted.
+    ///
+    /// Exceeding it does not throttle or suspend the VM; see
+    /// `GET /api/v1/vm/{id}/traffic` for usage against it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer_gb: Option<u32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]

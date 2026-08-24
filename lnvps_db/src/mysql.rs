@@ -388,6 +388,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
             "delete from vm_ip_assignment where vm_id in (select id from vm where user_id = ?)",
             "delete from vm_firewall_rule where vm_id in (select id from vm where user_id = ?)",
             "delete from vm_history where vm_id in (select id from vm where user_id = ?)",
+            "delete from vm_traffic_daily where vm_id in (select id from vm where user_id = ?)",
+            "delete from vm_traffic_sample where vm_id in (select id from vm where user_id = ?)",
         ] {
             sqlx::query(child).bind(id).execute(&mut *tx).await?;
         }
@@ -1163,12 +1165,16 @@ impl LNVpsDbBase for LNVpsDbMysql {
         start: NaiveDate,
         end: NaiveDate,
     ) -> DbResult<(u64, u64)> {
-        // CAST because MySQL's SUM() over an integer column is DECIMAL, which
-        // does not decode into u64; COALESCE because a VM with no rows in the
-        // range must read as zero rather than NULL.
+        // COALESCE because a VM with no rows in the range must read as zero
+        // rather than NULL, and CAST because SUM() over an integer column is
+        // DECIMAL, which does not decode into u64.
+        //
+        // The CAST has to be the *outer* call: COALESCE takes the aggregate
+        // type of its arguments, so `coalesce(cast(...), 0)` widens straight
+        // back to DECIMAL and fails to decode at runtime.
         let row: (u64, u64) = sqlx::query_as(
-            "select coalesce(cast(sum(bytes_in) as unsigned), 0), \
-             coalesce(cast(sum(bytes_out) as unsigned), 0) \
+            "select cast(coalesce(sum(bytes_in), 0) as unsigned), \
+             cast(coalesce(sum(bytes_out), 0) as unsigned) \
              from vm_traffic_daily where vm_id=? and day between ? and ?",
         )
         .bind(vm_id)
@@ -1313,6 +1319,17 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .execute(&mut *tx)
             .await?;
         sqlx::query("delete from vm_ip_assignment where vm_id = ?")
+            .bind(vm_id)
+            .execute(&mut *tx)
+            .await?;
+        // Traffic history goes with the VM. It is only meaningful per VM id, and
+        // ids are reused by nobody, so retaining it would leave rows no query
+        // can reach while still holding the FK that blocks this delete.
+        sqlx::query("delete from vm_traffic_daily where vm_id = ?")
+            .bind(vm_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from vm_traffic_sample where vm_id = ?")
             .bind(vm_id)
             .execute(&mut *tx)
             .await?;

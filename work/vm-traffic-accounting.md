@@ -128,17 +128,28 @@ reset rule already handles as "contributes nothing", and a frozen counter
 differences to zero — so filtering on `VmRunningStates` would only add a way to
 lose the last sample before a shutdown.
 
-### Increment 3 — user API (S/M)
+### Increment 3 — user API (M) ✅
 
-- [ ] `GET /api/v1/vm/<id>/traffic?start=&end=` returning daily rows
-- [ ] Include current-month usage + `transfer_gb` quota in the VM detail response
-- [ ] Quota resolution helper (standard vs custom template), mirroring
+- [x] `GET /api/v1/vm/{id}/traffic?start=&end=` returning daily rows plus the
+      current month's quota totals
+- [x] `transfer_gb` on `ApiVmTemplate`, so the allowance shows on the offer
+      (`GET /api/v1/vm/templates`) and on the VM, rather than only in a usage
+      call
+- [x] `vm_transfer_quota_gb()` helper (standard vs custom template), mirroring
       `vm_firewall_rule_limit()`
-- [ ] `API_DOCUMENTATION.md` + `API_CHANGELOG.md`
+- [x] `resolve_traffic_range()` in `traffic.rs` — range defaulting and
+      validation kept out of the handler so it is unit-testable; 400-day cap
+- [x] Traffic rows are cleared on VM hard-delete and user purge (MySQL and
+      mock). They hold an FK to `vm`, so without this every hard delete fails
+- [x] `API_DOCUMENTATION.md`, `API_CHANGELOG.md`, `ADMIN_API_ENDPOINTS.md`
+- [x] Lifecycle e2e coverage: quota period always reported, recorded traffic
+      surfaces, out-of-range returns no rows but still reports the month,
+      inverted range and unbounded span rejected
 
-### Increment 4 — admin API (S/M)
+### Increment 4 — admin API (S)
 
-- [ ] `transfer_gb` on admin template / custom-pricing create/update/list models
+- [x] `transfer_gb` on admin template / custom-pricing create/update/list models
+      (done in increment 1)
 - [ ] Admin VM traffic listing endpoint + quota field in admin VM info
 - [ ] Region/host traffic report in `lnvps_api_admin/src/admin/reports.rs`
 - [ ] `ADMIN_API_ENDPOINTS.md` + `API_CHANGELOG.md`
@@ -163,6 +174,16 @@ lose the last sample before a shutdown.
   traffic either side of midnight lands on the later day. Worst case is one
   sweep interval (30s) of traffic on the wrong day, which is immaterial against
   a monthly quota.
+- **`CAST` must be outside `COALESCE` when summing.** `get_vm_traffic_total`
+  first used `coalesce(cast(sum(x) as unsigned), 0)`, which decodes at runtime
+  as `DECIMAL` and fails — COALESCE takes the aggregate type of its arguments
+  and widens the cast straight back. The working form is
+  `cast(coalesce(sum(x), 0) as unsigned)`. Neither `cargo test` nor a `mariadb`
+  CLI query catches this (the CLI does not use the binary protocol); only the
+  e2e run against a real server did. **Run the e2e suite for any change that
+  adds an aggregate query.**
+- Locally, port 8001 may be taken by an unrelated `vllm` process. Run the e2e
+  script with `LNVPS_ADMIN_API_URL=http://localhost:8011` in that case.
 - `cargo check --workspace --all-features` fails on master with a pre-existing
   `BitvoraNode` / `payments-rs` type error in
   `lnvps_api/src/payment_factory.rs:98`. Default features build clean. Not

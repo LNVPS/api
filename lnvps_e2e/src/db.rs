@@ -202,6 +202,15 @@ pub async fn hard_delete_vm(pool: &MySqlPool, vm_id: u64) -> anyhow::Result<()> 
         .execute(pool)
         .await?;
 
+    // Traffic rows hold an FK to the VM, and the worker may have written some
+    // for this VM during the test.
+    for table in ["vm_traffic_daily", "vm_traffic_sample"] {
+        sqlx::query(&format!("DELETE FROM {table} WHERE vm_id = ?"))
+            .bind(vm_id)
+            .execute(pool)
+            .await?;
+    }
+
     // The worker may still be writing history for this VM while teardown runs,
     // which re-parents a `vm_history` row between the child delete and the
     // parent delete and fails the FK. Retry the pair; a handler that is mid
@@ -372,6 +381,29 @@ pub async fn set_vm_ssh_host_keys(pool: &MySqlPool, vm_id: u64, keys: &str) -> a
         .bind(vm_id)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// Book traffic for a VM directly, standing in for the worker's sampling of
+/// hypervisor counters (which needs a real running VM on a reachable host).
+pub async fn add_vm_traffic(
+    pool: &MySqlPool,
+    vm_id: u64,
+    day: chrono::NaiveDate,
+    bytes_in: u64,
+    bytes_out: u64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO vm_traffic_daily(vm_id, day, bytes_in, bytes_out) VALUES(?, ?, ?, ?) \
+         ON DUPLICATE KEY UPDATE bytes_in = bytes_in + VALUES(bytes_in), \
+         bytes_out = bytes_out + VALUES(bytes_out)",
+    )
+    .bind(vm_id)
+    .bind(day)
+    .bind(bytes_in)
+    .bind(bytes_out)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

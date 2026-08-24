@@ -3,7 +3,7 @@ pub use lnvps_api_common::*;
 
 use crate::exchange::{ExchangeRateService, alt_prices};
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use humantime::format_duration;
 use lnvps_api_common::{ApiDiskInterface, ApiDiskType};
 use lnvps_db::{PaymentMethod, VmCustomTemplate};
@@ -1583,6 +1583,51 @@ pub enum ApiCreateSubscriptionLineItemRequest {
         domain: String,
         // Add pricing/plan details here
     },
+}
+
+/// One UTC day's network transfer for a VM, in bytes.
+#[derive(Serialize)]
+pub struct ApiVmTrafficDay {
+    /// UTC date, `YYYY-MM-DD`
+    pub day: NaiveDate,
+    /// Bytes received by the VM. Not counted against the quota.
+    pub bytes_in: u64,
+    /// Bytes sent by the VM. This is what counts against `transfer_gb`.
+    pub bytes_out: u64,
+}
+
+/// A VM's network transfer, and its use of the monthly quota.
+///
+/// The quota totals always cover the current UTC calendar month regardless of
+/// the range requested, so a client can render "X of Y GB used this month"
+/// without a second call or any date arithmetic of its own.
+#[derive(Serialize)]
+pub struct ApiVmTraffic {
+    /// Outbound transfer included per calendar month, in GB. Omitted when the
+    /// VM's plan is unmetered, in which case the quota fields below are
+    /// informational only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer_gb: Option<u32>,
+    /// First day of the current quota period (the 1st of this UTC month)
+    pub quota_period_start: NaiveDate,
+    /// Last day of the current quota period (the last day of this UTC month)
+    pub quota_period_end: NaiveDate,
+    /// Bytes sent so far in the quota period — the figure to compare against
+    /// `transfer_gb`
+    pub quota_bytes_out: u64,
+    /// Bytes received so far in the quota period, for display only
+    pub quota_bytes_in: u64,
+    /// Daily rows over the requested range, oldest first. Days with no recorded
+    /// traffic are omitted rather than returned as zero.
+    pub days: Vec<ApiVmTrafficDay>,
+}
+
+/// Date range for a traffic query. Both bounds are inclusive UTC dates
+/// (`YYYY-MM-DD`) and both default to the current calendar month.
+#[derive(Deserialize)]
+pub struct VmTrafficQuery {
+    pub start: Option<NaiveDate>,
+    pub end: Option<NaiveDate>,
 }
 
 #[cfg(test)]

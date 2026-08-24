@@ -9,7 +9,7 @@
 //! served at full speed, and the quota only drives display and warnings.
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Datelike, NaiveDate, Utc};
 use log::warn;
 use std::sync::Arc;
 
@@ -30,6 +30,58 @@ use crate::status::VmRunningState;
 /// Set well above any link this fleet has (25 Gbit/s ≈ 3.1 GB/s) so a genuinely
 /// saturated NIC is never clamped.
 const MAX_SAMPLE_BYTES_PER_SEC: u64 = 4_000_000_000;
+
+/// First and last day of the UTC calendar month containing `day`.
+///
+/// The quota period. Calendar months rather than the VM's billing cycle: a
+/// monthly plan, a yearly plan and a VM renewed on the 3rd all then share one
+/// window, which is both what customers expect from a "monthly transfer
+/// allowance" and what makes a daily table aggregate without per-VM arithmetic.
+pub fn quota_period(day: NaiveDate) -> (NaiveDate, NaiveDate) {
+    let start = NaiveDate::from_ymd_opt(day.year(), day.month(), 1).unwrap_or(day);
+    // The last day is the day before the first of the next month, which avoids
+    // hardcoding month lengths and leap years.
+    let end = match day.month() {
+        12 => NaiveDate::from_ymd_opt(day.year() + 1, 1, 1),
+        m => NaiveDate::from_ymd_opt(day.year(), m + 1, 1),
+    }
+    .and_then(|d| d.pred_opt())
+    .unwrap_or(day);
+    (start, end)
+}
+
+/// Longest range a single traffic query may span, in days.
+///
+/// Bounds the response: without it a caller could ask for a VM's whole history
+/// and get an unpaged row per day. A little over a year, so "the last 12
+/// months" is always answerable in one call.
+pub const MAX_TRAFFIC_RANGE_DAYS: i64 = 400;
+
+/// Resolve an optional traffic date range into an inclusive, validated one.
+///
+/// Both bounds default to the quota period containing `today`, so the common
+/// query — "what have I used this month" — needs no parameters at all.
+///
+/// Returns the message to hand back to the caller if the range is unusable.
+pub fn resolve_traffic_range(
+    start: Option<NaiveDate>,
+    end: Option<NaiveDate>,
+    today: NaiveDate,
+) -> std::result::Result<(NaiveDate, NaiveDate), String> {
+    let (period_start, period_end) = quota_period(today);
+    let start = start.unwrap_or(period_start);
+    let end = end.unwrap_or(period_end);
+
+    if end < start {
+        return Err("end must not be before start".to_string());
+    }
+    if (end - start).num_days() > MAX_TRAFFIC_RANGE_DAYS {
+        return Err(format!(
+            "Range too large, maximum {MAX_TRAFFIC_RANGE_DAYS} days"
+        ));
+    }
+    Ok((start, end))
+}
 
 /// Records VM traffic deltas into the daily counters.
 #[derive(Clone)]
@@ -155,6 +207,83 @@ mod tests {
     /// One hour of headroom, so the clamp is never what a test is measuring
     /// unless it says so.
     const HOUR: u64 = 3600;
+
+    #[test]
+    fn quota_period_spans_the_whole_calendar_month() {
+        let (start, end) = quota_period(NaiveDate::from_ymd_opt(2026, 8, 24).unwrap());
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 8, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 8, 31).unwrap());
+    }
+
+    /// December must roll the year, not overflow the month.
+    #[test]
+    fn quota_period_handles_december() {
+        let (start, end) = quota_period(NaiveDate::from_ymd_opt(2026, 12, 9).unwrap());
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 12, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 12, 31).unwrap());
+    }
+
+    /// Month length is derived, so a leap February is 29 days without a table.
+    #[test]
+    fn quota_period_handles_leap_february() {
+        let (_, end) = quota_period(NaiveDate::from_ymd_opt(2028, 2, 5).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2028, 2, 29).unwrap());
+        let (_, end) = quota_period(NaiveDate::from_ymd_opt(2027, 2, 5).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2027, 2, 28).unwrap());
+    }
+
+    /// No parameters must answer the question customers actually ask, which is
+    /// about this month.
+    #[test]
+    fn traffic_range_defaults_to_the_quota_period() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        assert_eq!(
+            resolve_traffic_range(None, None, today).unwrap(),
+            (
+                NaiveDate::from_ymd_opt(2026, 8, 1).unwrap(),
+                NaiveDate::from_ymd_opt(2026, 8, 31).unwrap()
+            )
+        );
+    }
+
+    /// One bound given, the other still falls back to the period.
+    #[test]
+    fn traffic_range_accepts_a_partial_range() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        let start = NaiveDate::from_ymd_opt(2026, 8, 10).unwrap();
+        assert_eq!(
+            resolve_traffic_range(Some(start), None, today).unwrap(),
+            (start, NaiveDate::from_ymd_opt(2026, 8, 31).unwrap())
+        );
+    }
+
+    /// An inverted range is a caller bug and must be reported, not silently
+    /// answered with an empty list.
+    #[test]
+    fn traffic_range_rejects_end_before_start() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        assert!(
+            resolve_traffic_range(
+                Some(NaiveDate::from_ymd_opt(2026, 8, 10).unwrap()),
+                Some(NaiveDate::from_ymd_opt(2026, 8, 1).unwrap()),
+                today
+            )
+            .is_err()
+        );
+    }
+
+    /// The response is one row per day and unpaged, so the span has to be
+    /// bounded.
+    #[test]
+    fn traffic_range_rejects_an_unbounded_span() {
+        let today = NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        let start = NaiveDate::from_ymd_opt(2020, 1, 1).unwrap();
+        assert!(resolve_traffic_range(Some(start), Some(today), today).is_err());
+
+        // The limit itself is allowed.
+        let start = today - Duration::days(MAX_TRAFFIC_RANGE_DAYS);
+        assert!(resolve_traffic_range(Some(start), Some(today), today).is_ok());
+    }
 
     #[test]
     fn delta_is_the_difference_between_readings() {

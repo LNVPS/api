@@ -1454,6 +1454,13 @@ impl LNVpsDbBase for MockDb {
             .lock()
             .await
             .retain(|_, a| a.vm_id != vm_id);
+        // Mirrors the FK cleanup the MySQL implementation has to do: traffic
+        // rows are per VM id and nothing can reach them once the VM is gone.
+        self.vm_traffic_daily
+            .lock()
+            .await
+            .retain(|_, t| t.vm_id != vm_id);
+        self.vm_traffic_samples.lock().await.remove(&vm_id);
 
         if let Some(subscription_id) = subscription_id {
             self.subscription_payments

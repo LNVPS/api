@@ -1990,8 +1990,12 @@ Body:
   // optional - max disk write throughput in MB/s (default uncapped)
   "network_mbps": number,
   // optional - max network bandwidth in Mbit/s (default uncapped)
-  "cpu_limit": number
+  "cpu_limit": number,
   // optional - max CPU usage as fraction of allocated cores, e.g. 0.5 (default uncapped)
+  "transfer_gb": number
+  // optional - monthly OUTBOUND transfer allowance in GB (default unmetered).
+  // Resets on the 1st of each UTC month; inbound is never counted. Exceeding it
+  // does not throttle, suspend or bill — it only drives usage display.
 }
 ```
 
@@ -2049,8 +2053,10 @@ Body (all optional):
   // Max disk write throughput in MB/s — set null to remove limit
   "network_mbps": number | null,
   // Max network bandwidth in Mbit/s — set null to remove limit
-  "cpu_limit": number | null
+  "cpu_limit": number | null,
   // Max CPU usage as fraction of allocated cores — set null to remove limit
+  "transfer_gb": number | null
+  // Monthly outbound transfer allowance in GB — set null for unmetered
 }
 ```
 
@@ -2249,6 +2255,9 @@ Body:
   // optional - Maximum network bandwidth in Mbit/s (omit or null = uncapped)
   "cpu_limit": number,
   // optional - Maximum CPU usage as a fraction of allocated cores e.g. 0.5 = 50% (omit or null = uncapped)
+  "transfer_gb": number,
+  // optional - Monthly outbound transfer allowance in GB granted to VMs built on
+  // this plan (omit or null = unmetered)
   "disk_pricing": [
     // Array of disk pricing configurations
     {
@@ -2326,6 +2335,8 @@ Body (all optional):
   // Maximum network bandwidth in Mbit/s - send null to clear
   "cpu_limit": "number | null",
   // Maximum CPU usage as fraction of allocated cores e.g. 0.5 = 50% - send null to clear
+  "transfer_gb": "number | null",
+  // Monthly outbound transfer allowance in GB - send null for unmetered
   "disk_pricing": [
     {
       "kind": "ssd",
@@ -5842,8 +5853,10 @@ The RBAC system uses the following permission format: `resource::action`
   // Maximum disk write throughput in MB/s — omitted if uncapped
   "network_mbps": number | null,
   // Maximum network bandwidth in Mbit/s — omitted if uncapped
-  "cpu_limit": number | null
+  "cpu_limit": number | null,
   // Maximum CPU usage as a fraction of allocated cores (e.g. 0.5 = 50%) — omitted if uncapped
+  "transfer_gb": number | null
+  // Monthly outbound transfer allowance in GB — omitted if unmetered
 }
 ```
 
@@ -5903,6 +5916,8 @@ The RBAC system uses the following permission format: `resource::action`
   // Maximum network bandwidth in Mbit/s - omitted when uncapped
   "cpu_limit": number,
   // Maximum CPU usage as a fraction of allocated cores e.g. 0.5 = 50% - omitted when uncapped
+  "transfer_gb": number,
+  // Monthly outbound transfer allowance in GB - omitted when unmetered
   "disk_pricing": [
     // Array of disk pricing configurations
     {

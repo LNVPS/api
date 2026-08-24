@@ -36,10 +36,11 @@ use crate::api::model::{
     ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmPrice, ApiCustomVmRequest,
     ApiExchangeRates, ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiRenewalQuote,
     ApiTemplatesResponse, ApiVmFirewallPolicy, ApiVmFirewallRule, ApiVmHistory, ApiVmPayment,
-    ApiVmStatus, ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule,
-    CreateVmRequest, PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule,
-    PaymentMethodResponse, VMPatchRequest, validate_firewall_cidr, validate_firewall_ports,
-    vm_to_status,
+    ApiVmStatus, ApiVmTraffic, ApiVmTrafficDay, ApiVmUpgradeQuote, ApiVmUpgradeRequest,
+    CreateSshKey, CreateVmFirewallRule, CreateVmRequest, PatchPaymentMethodRequest,
+    PatchVmFirewallPolicy, PatchVmFirewallRule, PaymentMethodResponse, VMPatchRequest,
+    VmTrafficQuery, quota_period, resolve_traffic_range, validate_firewall_cidr,
+    validate_firewall_ports, vm_to_status,
 };
 use crate::api::{
     AmountQuery, AuthQuery, PaymentMethodQuery, RouterState, TicketRequest, TicketResponse,
@@ -168,6 +169,7 @@ pub fn routes() -> Router<RouterState> {
             .route("/api/v1/payment/{id}/invoice", get(v1_get_payment_invoice))
             .route("/api/v1/vm/{id}/payments", get(v1_payment_history))
             .route("/api/v1/vm/{id}/history", get(v1_get_vm_history))
+            .route("/api/v1/vm/{id}/traffic", get(v1_get_vm_traffic))
             .route("/api/v1/vm/{id}/upgrade/quote", post(v1_vm_upgrade_quote))
             .route("/api/v1/vm/{id}/upgrade", post(v1_vm_upgrade))
             .route(
@@ -2494,6 +2496,59 @@ async fn v1_vm_upgrade(
 
     // Note: The actual upgrade happens after payment is confirmed
     ApiData::ok(ApiVmPayment::from_subscription_payment(payment, id)?)
+}
+
+/// Resolve the monthly outbound transfer quota for a VM from its (custom)
+/// template. `None` means the VM's plan is unmetered.
+async fn vm_transfer_quota_gb(this: &RouterState, vm: &Vm) -> Result<Option<u32>, ApiError> {
+    Ok(if let Some(t) = vm.template_id {
+        this.db.get_vm_template(t).await?.transfer_gb
+    } else if let Some(t) = vm.custom_template_id {
+        this.db.get_custom_vm_template(t).await?.transfer_gb
+    } else {
+        None
+    })
+}
+
+/// Get network transfer for a VM, by day, plus its use of the monthly quota.
+async fn v1_get_vm_traffic(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Query(q): Query<VmTrafficQuery>,
+) -> ApiResult<ApiVmTraffic> {
+    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+
+    let today = Utc::now().date_naive();
+    let (quota_start, quota_end) = quota_period(today);
+    let (start, end) = match resolve_traffic_range(q.start, q.end, today) {
+        Ok(r) => r,
+        Err(e) => return ApiData::err(&e),
+    };
+
+    let days = this.db.list_vm_traffic(vm.id, start, end).await?;
+    // Queried separately from the rows above: the requested range is arbitrary,
+    // but the quota figure must always describe the current month.
+    let (quota_bytes_in, quota_bytes_out) = this
+        .db
+        .get_vm_traffic_total(vm.id, quota_start, quota_end)
+        .await?;
+
+    ApiData::ok(ApiVmTraffic {
+        transfer_gb: vm_transfer_quota_gb(&this, &vm).await?,
+        quota_period_start: quota_start,
+        quota_period_end: quota_end,
+        quota_bytes_out,
+        quota_bytes_in,
+        days: days
+            .into_iter()
+            .map(|d| ApiVmTrafficDay {
+                day: d.day,
+                bytes_in: d.bytes_in,
+                bytes_out: d.bytes_out,
+            })
+            .collect(),
+    })
 }
 
 /// Default maximum number of user firewall rules per VM when no template limit is set.
