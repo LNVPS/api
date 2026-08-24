@@ -5,14 +5,14 @@ use crate::settings::{ProvisionerConfig, Settings, SmtpConfig, TelegramConfig, W
 use crate::ssh_client::SshClient;
 use crate::subscription::SubscriptionHandler;
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Days, TimeDelta, Utc};
+use chrono::{DateTime, Days, NaiveDate, TimeDelta, Utc};
 use hickory_resolver::TokioResolver;
 use lnvps_api_common::{
     BlackholeWorkFeedback, ChannelWorkCommander, InMemoryKeyValueStore, JobFeedback, KeyValueStore,
     NetworkProvisioner, RedisConfig, RedisKeyValueStore, RedisWorkCommander, RedisWorkFeedback,
-    SCANNED_KEY_FAMILIES, UpgradeConfig, VmHistoryLogger, VmRunningState, VmRunningStates,
-    VmStateCache, WorkCommander, WorkFeedback, WorkJob, WorkJobMessage, capture_is_complete,
-    merge_ssh_host_keys, op_fatal, parse_ssh_host_keys,
+    SCANNED_KEY_FAMILIES, TrafficRecorder, UpgradeConfig, VmHistoryLogger, VmRunningState,
+    VmRunningStates, VmStateCache, WorkCommander, WorkFeedback, WorkJob, WorkJobMessage,
+    capture_is_complete, merge_ssh_host_keys, op_fatal, parse_ssh_host_keys, quota_period,
     retry::{OpError, Pipeline, RetryPolicy},
 };
 use lnvps_db::{
@@ -192,6 +192,7 @@ pub struct Worker {
     subscription_handler: SubscriptionHandler,
     notification_channels: Vec<Arc<dyn NotificationChannel>>,
     vm_history_logger: VmHistoryLogger,
+    traffic_recorder: TrafficRecorder,
     vm_state_cache: VmStateCache,
     work_commander: Arc<dyn WorkCommander>,
     feedback: Arc<dyn WorkFeedback>,
@@ -275,6 +276,7 @@ impl Worker {
         nostr: Option<Client>,
     ) -> Result<Self> {
         let vm_history_logger = VmHistoryLogger::new(db.clone());
+        let traffic_recorder = TrafficRecorder::new(db.clone());
         let settings = settings.into();
         let fee_estimator =
             crate::fee_estimate::build_fee_estimator(&settings.referral_fee_estimator);
@@ -323,6 +325,7 @@ impl Worker {
             kv,
             feedback,
             vm_history_logger,
+            traffic_recorder,
             settings,
             work_commander,
             http_client,
@@ -1384,6 +1387,11 @@ impl Worker {
     async fn handle_vm_state(&self, state: Result<VmRunningState>, vm: &Vm) -> Result<()> {
         match state {
             Ok(s) => {
+                // Every path that reads a VM's state funnels through here, so
+                // this is the one place traffic has to be sampled from. It runs
+                // before the cache write only because the cache takes ownership
+                // of the state.
+                self.traffic_recorder.record_best_effort(vm.id, &s).await;
                 self.vm_state_cache.set_state(vm.id, s).await?;
             }
             Err(e) => {
@@ -1928,7 +1936,183 @@ impl Worker {
             }
         }
 
+        // Runs after the sweep that produced the numbers, and gates itself to
+        // an hourly cadence internally.
+        if let Err(e) = self.check_transfer_quotas().await {
+            error!("Failed to check transfer quotas: {}", e);
+        }
+
         self.set_last_check_vms(Utc::now()).await?;
+        Ok(())
+    }
+
+    /// Percentages of a VM's monthly transfer allowance that trigger a warning.
+    ///
+    /// 80 is early enough to act on with most of the month's usage still ahead;
+    /// 100 is the one that matters. Descending so the highest crossed threshold
+    /// is the one reported — a VM that jumps from 50% to 105% between passes
+    /// should be told it is over, not that it is at 80%.
+    const TRANSFER_WARN_THRESHOLDS: [u8; 2] = [100, 80];
+
+    /// How often the allowance check runs.
+    ///
+    /// Not every VM sweep: the sweep is every 30 seconds, the figures move
+    /// slowly, and the check costs an aggregate query per metered VM.
+    const CHECK_TRANSFER_SECONDS: i64 = 3600;
+
+    /// Key marking a warning as already sent, scoped to the VM, the quota month
+    /// and the threshold.
+    ///
+    /// Month-scoped so a new month starts clean without anything having to
+    /// expire or be swept, and threshold-scoped so crossing 80% does not
+    /// suppress the later 100% warning.
+    fn transfer_warned_key(vm_id: u64, period_start: NaiveDate, threshold: u8) -> String {
+        format!("vm-transfer-warned:{vm_id}:{period_start}:{threshold}")
+    }
+
+    /// Warn customers whose VMs are at or past their monthly transfer
+    /// allowance.
+    ///
+    /// Warning only — nothing here throttles, suspends or bills. The figures
+    /// come from hypervisor interface counters and include traffic that is not
+    /// billable internet egress, so they are not yet a basis for enforcement.
+    async fn check_transfer_quotas(&self) -> Result<()> {
+        let last_check = self.get_last_check_transfer().await?;
+        if Utc::now().signed_duration_since(last_check).num_seconds() < Self::CHECK_TRANSFER_SECONDS
+        {
+            return Ok(());
+        }
+
+        let (period_start, period_end) = quota_period(Utc::now().date_naive());
+
+        // Allowances live on templates, and there are far fewer templates than
+        // VMs, so they are resolved once here rather than per VM.
+        let mut standard_quota: HashMap<u64, Option<u32>> = HashMap::new();
+        for t in self.db.list_vm_templates().await? {
+            standard_quota.insert(t.id, t.transfer_gb);
+        }
+
+        for vm in self.db.list_vms().await? {
+            if vm.deleted {
+                continue;
+            }
+            // A custom template is 1:1 with its VM, so unlike the standard ones
+            // it cannot be pre-loaded and is fetched only for VMs that have one.
+            let quota_gb = match (vm.template_id, vm.custom_template_id) {
+                (Some(t), _) => standard_quota.get(&t).copied().flatten(),
+                (_, Some(t)) => match self.db.get_custom_vm_template(t).await {
+                    Ok(t) => t.transfer_gb,
+                    Err(e) => {
+                        warn!("Failed to load custom template for VM {}: {}", vm.id, e);
+                        continue;
+                    }
+                },
+                _ => None,
+            };
+            // Unmetered: there is no allowance to be near.
+            let Some(quota_gb) = quota_gb.filter(|g| *g > 0) else {
+                continue;
+            };
+
+            if let Err(e) = self
+                .check_vm_transfer_quota(&vm, quota_gb, period_start, period_end)
+                .await
+            {
+                warn!("Failed to check transfer quota for VM {}: {}", vm.id, e);
+            }
+        }
+
+        self.set_last_check_transfer(Utc::now()).await?;
+        Ok(())
+    }
+
+    /// Warn about one VM if it has crossed a threshold it has not been warned
+    /// about this month.
+    async fn check_vm_transfer_quota(
+        &self,
+        vm: &Vm,
+        quota_gb: u32,
+        period_start: NaiveDate,
+        period_end: NaiveDate,
+    ) -> Result<()> {
+        let (_, bytes_out) = self
+            .db
+            .get_vm_traffic_total(vm.id, period_start, period_end)
+            .await?;
+
+        let quota_bytes = quota_gb as u64 * 1_000_000_000;
+        let used_pct = (bytes_out as f64 / quota_bytes as f64 * 100.0) as u64;
+
+        let Some(threshold) = Self::TRANSFER_WARN_THRESHOLDS
+            .into_iter()
+            .find(|t| used_pct >= *t as u64)
+        else {
+            return Ok(());
+        };
+
+        let key = Self::transfer_warned_key(vm.id, period_start, threshold);
+        if self.kv.get(&key).await?.is_some() {
+            return Ok(());
+        }
+
+        let used_gb = bytes_out as f64 / 1_000_000_000.0;
+        let message = if threshold >= 100 {
+            format!(
+                "VM {} has used {:.1} GB of its {} GB monthly outbound transfer allowance ({}%).\n\n\
+                 Your VM has not been throttled, suspended or charged for the excess — this is a \
+                 notification only. The allowance resets on {}.",
+                vm.id,
+                used_gb,
+                quota_gb,
+                used_pct,
+                period_end.succ_opt().unwrap_or(period_end)
+            )
+        } else {
+            format!(
+                "VM {} has used {:.1} GB of its {} GB monthly outbound transfer allowance ({}%).\n\n\
+                 The allowance resets on {}. Nothing changes if you exceed it — this is an early \
+                 notice, not a warning of any action.",
+                vm.id,
+                used_gb,
+                quota_gb,
+                used_pct,
+                period_end.succ_opt().unwrap_or(period_end)
+            )
+        };
+
+        self.queue_notification(
+            vm.user_id,
+            message,
+            Some(format!(
+                "VM {} transfer allowance {}% used",
+                vm.id, used_pct
+            )),
+        )
+        .await;
+
+        // Marked only after the notification is queued, so a failure to queue
+        // is retried on the next pass rather than silently suppressed.
+        self.kv.store(&key, &[1u8]).await?;
+        Ok(())
+    }
+
+    pub async fn get_last_check_transfer(&self) -> Result<DateTime<Utc>> {
+        let Some(v) = self.kv.get("worker-last-check-transfer").await? else {
+            return Ok(DateTime::UNIX_EPOCH);
+        };
+        let timestamp = if v.len() == 8 {
+            u64::from_le_bytes(v.as_slice().try_into()?)
+        } else {
+            0
+        };
+        Ok(DateTime::from_timestamp(timestamp as _, 0).unwrap_or(DateTime::UNIX_EPOCH))
+    }
+
+    pub async fn set_last_check_transfer(&self, ts: DateTime<Utc>) -> Result<()> {
+        let t = ts.timestamp() as u64;
+        self.kv
+            .store("worker-last-check-transfer", &t.to_le_bytes())
+            .await?;
         Ok(())
     }
 
@@ -4793,6 +4977,180 @@ mod tests {
             tax_breakdown: None,
             refunded_payment_id: None,
         }
+    }
+
+    /// Set the monthly transfer allowance on the mock's standard template.
+    async fn set_template_transfer_gb(db: &Arc<MockDb>, gb: Option<u32>) {
+        db.templates
+            .lock()
+            .await
+            .get_mut(&1)
+            .expect("mock template")
+            .transfer_gb = gb;
+    }
+
+    /// Book outbound traffic for a VM in the current quota period.
+    async fn book_traffic(db: &Arc<MockDb>, vm_id: u64, bytes_out: u64) {
+        db.add_vm_traffic(vm_id, Utc::now().date_naive(), 0, bytes_out)
+            .await
+            .expect("book traffic");
+    }
+
+    fn warned_key(vm_id: u64, threshold: u8) -> String {
+        let (period_start, _) = quota_period(Utc::now().date_naive());
+        Worker::transfer_warned_key(vm_id, period_start, threshold)
+    }
+
+    /// A VM comfortably inside its allowance must not be told anything.
+    #[tokio::test]
+    async fn test_transfer_quota_below_threshold_is_silent() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        set_template_transfer_gb(&db, Some(100)).await;
+        // 50 GB of a 100 GB allowance.
+        book_traffic(&db, vm_id, 50_000_000_000).await;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_transfer_quotas().await?;
+
+        assert!(worker.kv.get(&warned_key(vm_id, 80)).await?.is_none());
+        assert!(worker.kv.get(&warned_key(vm_id, 100)).await?.is_none());
+        Ok(())
+    }
+
+    /// Crossing 80% warns once, and only once for that month — the check runs
+    /// repeatedly and must not mail the customer on every pass.
+    #[tokio::test]
+    async fn test_transfer_quota_warns_once_per_threshold() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        set_template_transfer_gb(&db, Some(100)).await;
+        book_traffic(&db, vm_id, 85_000_000_000).await;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_transfer_quotas().await?;
+        assert!(
+            worker.kv.get(&warned_key(vm_id, 80)).await?.is_some(),
+            "crossing 80% must warn"
+        );
+
+        // A second pass has nothing new to say. The hourly gate is cleared so
+        // this exercises the per-threshold suppression, not the cadence.
+        worker.set_last_check_transfer(DateTime::UNIX_EPOCH).await?;
+        worker.check_transfer_quotas().await?;
+        assert!(
+            worker.kv.get(&warned_key(vm_id, 100)).await?.is_none(),
+            "still under 100%, so the 100% warning must not fire"
+        );
+        Ok(())
+    }
+
+    /// A VM that jumps straight past its allowance must be told it is over, not
+    /// that it is at 80%.
+    #[tokio::test]
+    async fn test_transfer_quota_reports_highest_threshold_crossed() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        set_template_transfer_gb(&db, Some(100)).await;
+        book_traffic(&db, vm_id, 150_000_000_000).await;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_transfer_quotas().await?;
+
+        assert!(
+            worker.kv.get(&warned_key(vm_id, 100)).await?.is_some(),
+            "over the allowance must report the 100% threshold"
+        );
+        assert!(
+            worker.kv.get(&warned_key(vm_id, 80)).await?.is_none(),
+            "the lower threshold must not also fire"
+        );
+        Ok(())
+    }
+
+    /// An unmetered plan has no allowance to be near, however much it sends.
+    #[tokio::test]
+    async fn test_transfer_quota_ignores_unmetered_plans() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        set_template_transfer_gb(&db, None).await;
+        book_traffic(&db, vm_id, 900_000_000_000).await;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_transfer_quotas().await?;
+
+        assert!(worker.kv.get(&warned_key(vm_id, 100)).await?.is_none());
+        assert!(worker.kv.get(&warned_key(vm_id, 80)).await?.is_none());
+        Ok(())
+    }
+
+    /// The check is hourly, not once per 30-second VM sweep: the figures move
+    /// slowly and it costs a query per metered VM.
+    #[tokio::test]
+    async fn test_transfer_quota_check_is_rate_limited() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        set_template_transfer_gb(&db, Some(100)).await;
+
+        let worker = setup_worker(db.clone()).await?;
+        // First pass has nothing to report but stamps the check time.
+        worker.check_transfer_quotas().await?;
+
+        book_traffic(&db, vm_id, 150_000_000_000).await;
+        worker.check_transfer_quotas().await?;
+        assert!(
+            worker.kv.get(&warned_key(vm_id, 100)).await?.is_none(),
+            "a second pass within the hour must be skipped entirely"
+        );
+
+        worker.set_last_check_transfer(DateTime::UNIX_EPOCH).await?;
+        worker.check_transfer_quotas().await?;
+        assert!(
+            worker.kv.get(&warned_key(vm_id, 100)).await?.is_some(),
+            "once the cadence allows it, the warning fires"
+        );
+        Ok(())
+    }
+
+    /// Every state read funnels through `handle_vm_state`, so that is where
+    /// traffic accounting has to happen — otherwise the periodic sweep, which
+    /// is the only pass that visits every VM, would record nothing.
+    ///
+    /// The first read can only establish a baseline; the second is the one that
+    /// has a difference to attribute.
+    #[tokio::test]
+    async fn test_handle_vm_state_records_traffic() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        let worker = setup_worker(db.clone()).await?;
+        let vm = db.get_vm(vm_id).await?;
+
+        let reading = |net_in: u64, net_out: u64| VmRunningState {
+            state: VmRunningStates::Running,
+            net_in,
+            net_out,
+            ..Default::default()
+        };
+
+        worker
+            .handle_vm_state(Ok(reading(1_000, 4_000)), &vm)
+            .await?;
+        let today = Utc::now().date_naive();
+        assert_eq!(
+            db.get_vm_traffic_total(vm_id, today, today).await?,
+            (0, 0),
+            "a single reading has no difference to attribute"
+        );
+
+        worker
+            .handle_vm_state(Ok(reading(1_250, 9_000)), &vm)
+            .await?;
+        assert_eq!(
+            db.get_vm_traffic_total(vm_id, today, today).await?,
+            (250, 5_000),
+            "the sweep must fold the counter difference into today's row"
+        );
+        Ok(())
     }
 
     /// The periodic fleet sweep — not just the per-VM check dispatched on

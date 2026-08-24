@@ -3,7 +3,7 @@ pub use lnvps_api_common::*;
 
 use crate::exchange::{ExchangeRateService, alt_prices};
 use anyhow::Result;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use humantime::format_duration;
 use lnvps_api_common::{ApiDiskInterface, ApiDiskType};
 use lnvps_db::{PaymentMethod, VmCustomTemplate};
@@ -1583,6 +1583,38 @@ pub enum ApiCreateSubscriptionLineItemRequest {
         domain: String,
         // Add pricing/plan details here
     },
+}
+
+/// One UTC day's network transfer for a VM, in bytes.
+#[derive(Serialize)]
+pub struct ApiVmTrafficDay {
+    /// UTC date, `YYYY-MM-DD`
+    pub day: NaiveDate,
+    /// Bytes received by the VM. Not counted against the quota.
+    pub bytes_in: u64,
+    /// Bytes sent by the VM. This is what counts against `transfer_gb`.
+    pub bytes_out: u64,
+}
+
+/// A VM's network transfer, day by day, plus its use of the monthly quota.
+#[derive(Serialize)]
+pub struct ApiVmTraffic {
+    /// Current calendar month's usage and allowance — the identical object
+    /// carried by `traffic` on the VM detail response, and always describing
+    /// the current month whatever range was requested. A client that only
+    /// wants a usage bar does not need this endpoint at all.
+    pub summary: ApiVmTrafficSummary,
+    /// Daily rows over the requested range, oldest first. Days with no recorded
+    /// traffic are omitted rather than returned as zero.
+    pub days: Vec<ApiVmTrafficDay>,
+}
+
+/// Date range for a traffic query. Both bounds are inclusive UTC dates
+/// (`YYYY-MM-DD`) and both default to the current calendar month.
+#[derive(Deserialize)]
+pub struct VmTrafficQuery {
+    pub start: Option<NaiveDate>,
+    pub end: Option<NaiveDate>,
 }
 
 #[cfg(test)]

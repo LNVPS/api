@@ -81,6 +81,7 @@ impl AdminVmTemplateInfo {
             disk_mbps_write: template.disk_mbps_write,
             network_mbps: template.network_mbps,
             cpu_limit: template.cpu_limit,
+            transfer_gb: template.transfer_gb,
         })
     }
 }
@@ -213,6 +214,7 @@ async fn admin_create_vm_template(
         network_mbps: req.network_mbps,
         cpu_limit: req.cpu_limit,
         firewall_rule_limit: None,
+        transfer_gb: req.transfer_gb,
     };
 
     let template_id = this.db.insert_vm_template(&template).await?;
@@ -349,6 +351,9 @@ async fn admin_update_vm_template(
     }
     if let Some(v) = req.cpu_limit {
         template.cpu_limit = v;
+    }
+    if let Some(v) = req.transfer_gb {
+        template.transfer_gb = v;
     }
 
     this.db.update_vm_template(&template).await?;

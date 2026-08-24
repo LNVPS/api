@@ -911,6 +911,27 @@ interface PatchPaymentMethodRequest {
 - **Auth**: Required
 - **Response**: `VmStatus`
 
+`VmStatus` (from either endpoint above) carries a `traffic` object with the VM's
+network transfer for the current UTC calendar month:
+
+```json
+"traffic": {
+  "transfer_gb": 2000,
+  "period_start": "2026-08-01",
+  "period_end": "2026-08-31",
+  "bytes_out": 41231000000,
+  "bytes_in": 8800000000
+}
+```
+
+`transfer_gb` is the plan's **outbound** allowance per month and is omitted when
+the plan is unmetered; `bytes_out` is the figure it bounds. Inbound transfer is
+reported but never counted against the allowance. Exceeding it currently has no
+automatic effect — no throttle, no suspension, no overage billing.
+
+Use `GET /api/v1/vm/{id}/traffic` only when a day-by-day breakdown or a
+historical range is needed; a usage bar can be rendered from this object alone.
+
 #### Update VM Configuration
 - **PATCH** `/api/v1/vm/{id}`
 - **Auth**: Required
@@ -1678,6 +1699,54 @@ content and competes with the app's own page for the same query.
   - `limit`: Optional number of records to return
   - `offset`: Optional offset for pagination
 - **Response**: `VmHistory[]`
+
+#### Get VM Network Transfer
+- **GET** `/api/v1/vm/{id}/traffic?start={date}&end={date}`
+- **Auth**: Required
+- **Query Params**:
+  - `start`: Optional inclusive UTC start date, `YYYY-MM-DD`. Defaults to the 1st of the current month.
+  - `end`: Optional inclusive UTC end date, `YYYY-MM-DD`. Defaults to the last day of the current month.
+  - A range may span at most 400 days; `end` before `start` is an error.
+- **Response**: `VmTraffic`
+
+```json
+{
+  "summary": {
+    "transfer_gb": 2000,
+    "period_start": "2026-08-01",
+    "period_end": "2026-08-31",
+    "bytes_out": 41231000000,
+    "bytes_in": 8800000000
+  },
+  "days": [
+    { "day": "2026-08-23", "bytes_in": 400000000, "bytes_out": 1900000000 },
+    { "day": "2026-08-24", "bytes_in": 310000000, "bytes_out": 2250000000 }
+  ]
+}
+```
+
+`summary` is the **same object** as the `traffic` field on `GET /api/v1/vm/{id}`
+and on each entry of `GET /api/v1/vm`, so a client that only needs a usage bar
+never has to call this endpoint. It always describes the **current** calendar
+month whatever range is requested. Call this endpoint for the day-by-day
+breakdown or for an arbitrary historical range.
+
+`summary.transfer_gb` is the plan's **outbound** allowance per UTC calendar
+month, and is omitted entirely when the plan is unmetered. Inbound transfer is
+reported for display but never counted against it, so `summary.bytes_out` is the
+figure to compare against the allowance.
+
+`days` covers the requested range only; days with no recorded traffic are
+omitted rather than returned as zero.
+
+Figures come from the hypervisor's per-VM interface counters, sampled
+periodically, so they are near-real-time rather than exact to the byte, and
+traffic either side of UTC midnight may land on the adjacent day.
+
+Exceeding the allowance currently has **no automatic effect** — the VM is not
+throttled, suspended or billed for overage. The account is emailed once at 80%
+and once at 100% of the allowance (per VM, per month) as a courtesy; both
+messages state that no action has been taken.
 
 ### LNURL Support
 

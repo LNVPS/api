@@ -1408,6 +1408,7 @@ impl PricingEngine {
             network_mbps: pricing.network_mbps,
             cpu_limit: pricing.cpu_limit,
             firewall_rule_limit: None,
+            transfer_gb: pricing.transfer_gb,
         };
         Ok(new_custom_template)
     }

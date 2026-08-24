@@ -292,6 +292,7 @@ impl VmProvisioner {
         template.disk_mbps_write = pricing.disk_mbps_write;
         template.network_mbps = pricing.network_mbps;
         template.cpu_limit = pricing.cpu_limit;
+        template.transfer_gb = pricing.transfer_gb;
 
         let cap = HostCapacityService::new(self.db.clone());
         let host = cap
@@ -486,6 +487,7 @@ impl VmProvisioner {
             network_mbps: pricing.network_mbps,
             cpu_limit: pricing.cpu_limit,
             firewall_rule_limit: None,
+            transfer_gb: pricing.transfer_gb,
         };
         let template_id = self.db.insert_custom_vm_template(&template).await?;
         let region = self.db.get_host_region(host.region_id).await?;
@@ -1014,6 +1016,7 @@ impl VmProvisioner {
             disk_mbps_write: custom_pricing.disk_mbps_write,
             network_mbps: custom_pricing.network_mbps,
             cpu_limit: custom_pricing.cpu_limit,
+            transfer_gb: custom_pricing.transfer_gb,
             ..Default::default()
         };
 

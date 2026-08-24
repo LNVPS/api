@@ -1,6 +1,6 @@
 use crate::{ExchangeRateService, Ticker, TickerRate};
 use anyhow::{Context, anyhow};
-use chrono::{DateTime, Days, Months, TimeDelta, Utc};
+use chrono::{DateTime, Days, Months, NaiveDate, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, AgentConversation, AgentConversationFilter, AgentConversationOverview,
@@ -17,7 +17,7 @@ use lnvps_db::{
     SubscriptionPaymentWithCompany, Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm,
     VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
     VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment, VmOsImage,
-    VmTemplate, WebauthnCredential,
+    VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, WebauthnCredential,
 };
 
 use async_trait::async_trait;
@@ -89,6 +89,11 @@ pub struct MockDb {
     pub router_bgp_sessions: Arc<Mutex<HashMap<u64, RouterBgpSession>>>,
     pub router_bgp_routes: Arc<Mutex<HashMap<u64, RouterBgpRoute>>>,
     pub firewall_rules: Arc<Mutex<HashMap<u64, VmFirewallRule>>>,
+    /// Daily traffic rows keyed by `(vm_id, day)` — the same composite primary
+    /// key the table has.
+    pub vm_traffic_daily: Arc<Mutex<HashMap<(u64, NaiveDate), VmTrafficDaily>>>,
+    /// Last raw counter reading per VM.
+    pub vm_traffic_samples: Arc<Mutex<HashMap<u64, VmTrafficSample>>>,
     pub webauthn_credentials: Arc<Mutex<HashMap<u64, WebauthnCredential>>>,
     pub apps: Arc<Mutex<HashMap<u64, App>>>,
     pub app_tags: Arc<Mutex<HashMap<u64, AppTag>>>,
@@ -228,6 +233,7 @@ impl MockDb {
             disk_mbps_write: None,
             network_mbps: None,
             cpu_limit: None,
+            transfer_gb: None,
             firewall_rule_limit: None,
         }
     }
@@ -374,6 +380,8 @@ impl Default for MockDb {
         Self {
             agent_conversations: Arc::new(Mutex::new(HashMap::new())),
             agent_messages: Arc::new(Mutex::new(Vec::new())),
+            vm_traffic_daily: Arc::new(Mutex::new(HashMap::new())),
+            vm_traffic_samples: Arc::new(Mutex::new(HashMap::new())),
             regions: Arc::new(Mutex::new(regions)),
             ip_range: Arc::new(Mutex::new(ip_ranges)),
             hosts: Arc::new(Mutex::new(hosts)),
@@ -696,6 +704,16 @@ impl LNVpsDbBase for MockDb {
             .lock()
             .await
             .retain(|_, h| !user_vm_ids.contains(&h.vm_id));
+        // Stands in for the ON DELETE CASCADE on the traffic tables; the mock
+        // has no foreign keys to do it.
+        self.vm_traffic_daily
+            .lock()
+            .await
+            .retain(|_, t| !user_vm_ids.contains(&t.vm_id));
+        self.vm_traffic_samples
+            .lock()
+            .await
+            .retain(|vm_id, _| !user_vm_ids.contains(vm_id));
 
         // Remove the VMs, their 1:1 custom templates, and the user's other records.
         self.vms.lock().await.retain(|_, v| v.user_id != id);
@@ -1196,6 +1214,121 @@ impl LNVpsDbBase for MockDb {
         Ok(max_id + 1)
     }
 
+    async fn get_vm_traffic_sample(&self, vm_id: u64) -> DbResult<Option<VmTrafficSample>> {
+        let samples = self.vm_traffic_samples.lock().await;
+        Ok(samples.get(&vm_id).cloned())
+    }
+
+    async fn upsert_vm_traffic_sample(
+        &self,
+        vm_id: u64,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> DbResult<()> {
+        let mut samples = self.vm_traffic_samples.lock().await;
+        samples.insert(
+            vm_id,
+            VmTrafficSample {
+                vm_id,
+                last_bytes_in: bytes_in,
+                last_bytes_out: bytes_out,
+                sampled: Utc::now(),
+            },
+        );
+        Ok(())
+    }
+
+    async fn add_vm_traffic(
+        &self,
+        vm_id: u64,
+        day: NaiveDate,
+        bytes_in: u64,
+        bytes_out: u64,
+    ) -> DbResult<()> {
+        let mut traffic = self.vm_traffic_daily.lock().await;
+        let row = traffic
+            .entry((vm_id, day))
+            .or_insert_with(|| VmTrafficDaily {
+                vm_id,
+                day,
+                bytes_in: 0,
+                bytes_out: 0,
+            });
+        row.bytes_in += bytes_in;
+        row.bytes_out += bytes_out;
+        Ok(())
+    }
+
+    async fn list_vm_traffic(
+        &self,
+        vm_id: u64,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> DbResult<Vec<VmTrafficDaily>> {
+        let traffic = self.vm_traffic_daily.lock().await;
+        let mut rows: Vec<VmTrafficDaily> = traffic
+            .values()
+            .filter(|r| r.vm_id == vm_id && r.day >= start && r.day <= end)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|r| r.day);
+        Ok(rows)
+    }
+
+    async fn list_vm_traffic_totals(
+        &self,
+        start: NaiveDate,
+        end: NaiveDate,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmTrafficTotal>, u64)> {
+        let vms = self.vms.lock().await;
+        let traffic = self.vm_traffic_daily.lock().await;
+
+        let mut totals: HashMap<u64, VmTrafficTotal> = HashMap::new();
+        for row in traffic.values() {
+            if row.day < start || row.day > end {
+                continue;
+            }
+            // Rows whose VM is gone cannot be attributed, matching the join in
+            // the MySQL implementation.
+            let Some(vm) = vms.get(&row.vm_id) else {
+                continue;
+            };
+            let entry = totals.entry(row.vm_id).or_insert(VmTrafficTotal {
+                vm_id: row.vm_id,
+                user_id: vm.user_id,
+                bytes_in: 0,
+                bytes_out: 0,
+            });
+            entry.bytes_in += row.bytes_in;
+            entry.bytes_out += row.bytes_out;
+        }
+
+        let mut rows: Vec<VmTrafficTotal> = totals.into_values().collect();
+        rows.sort_by(|a, b| b.bytes_out.cmp(&a.bytes_out).then(a.vm_id.cmp(&b.vm_id)));
+        let total = rows.len() as u64;
+        Ok((
+            rows.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn get_vm_traffic_total(
+        &self,
+        vm_id: u64,
+        start: NaiveDate,
+        end: NaiveDate,
+    ) -> DbResult<(u64, u64)> {
+        let rows = self.list_vm_traffic(vm_id, start, end).await?;
+        Ok(rows
+            .iter()
+            .fold((0, 0), |(i, o), r| (i + r.bytes_in, o + r.bytes_out)))
+    }
+
     async fn list_vms(&self) -> DbResult<Vec<Vm>> {
         let vms = self.vms.lock().await;
         Ok(vms.values().filter(|v| !v.deleted).cloned().collect())
@@ -1373,6 +1506,13 @@ impl LNVpsDbBase for MockDb {
             .lock()
             .await
             .retain(|_, a| a.vm_id != vm_id);
+        // Stands in for the ON DELETE CASCADE on the traffic tables; the mock
+        // has no foreign keys to do it.
+        self.vm_traffic_daily
+            .lock()
+            .await
+            .retain(|_, t| t.vm_id != vm_id);
+        self.vm_traffic_samples.lock().await.remove(&vm_id);
 
         if let Some(subscription_id) = subscription_id {
             self.subscription_payments
@@ -10313,5 +10453,177 @@ mod bulk_message_tests {
             .await
             .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod vm_traffic_tests {
+    use super::*;
+    use lnvps_db::LNVpsDbBase;
+
+    fn day(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).expect("valid date")
+    }
+
+    /// Traffic is additive: the worker only ever knows the increment since its
+    /// last pass, so two writes on the same day must sum rather than replace.
+    #[tokio::test]
+    async fn vm_traffic_accumulates_per_day() {
+        let db = MockDb::default();
+        let d = day(2026, 8, 24);
+
+        db.add_vm_traffic(1, d, 100, 200).await.unwrap();
+        db.add_vm_traffic(1, d, 50, 25).await.unwrap();
+
+        let rows = db.list_vm_traffic(1, d, d).await.unwrap();
+        assert_eq!(rows.len(), 1, "one row per (vm, day)");
+        assert_eq!(rows[0].bytes_in, 150);
+        assert_eq!(rows[0].bytes_out, 225);
+    }
+
+    /// Rows are per VM and per day, ordered oldest first, and a range excludes
+    /// days outside it.
+    #[tokio::test]
+    async fn vm_traffic_listing_is_scoped_and_ordered() {
+        let db = MockDb::default();
+
+        db.add_vm_traffic(1, day(2026, 8, 23), 1, 10).await.unwrap();
+        db.add_vm_traffic(1, day(2026, 8, 24), 2, 20).await.unwrap();
+        db.add_vm_traffic(1, day(2026, 8, 25), 4, 40).await.unwrap();
+        // Another VM's traffic must never leak into this VM's usage.
+        db.add_vm_traffic(2, day(2026, 8, 24), 99, 99)
+            .await
+            .unwrap();
+
+        let rows = db
+            .list_vm_traffic(1, day(2026, 8, 23), day(2026, 8, 24))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r.day).collect::<Vec<_>>(),
+            vec![day(2026, 8, 23), day(2026, 8, 24)]
+        );
+
+        let total = db
+            .get_vm_traffic_total(1, day(2026, 8, 23), day(2026, 8, 24))
+            .await
+            .unwrap();
+        assert_eq!(total, (3, 30));
+    }
+
+    /// A VM with nothing recorded reads as zero, not as an error or a missing
+    /// row: an unmetered or brand-new VM still has to render a usage figure.
+    #[tokio::test]
+    async fn vm_traffic_total_of_nothing_is_zero() {
+        let db = MockDb::default();
+        let total = db
+            .get_vm_traffic_total(404, day(2026, 8, 1), day(2026, 8, 31))
+            .await
+            .unwrap();
+        assert_eq!(total, (0, 0));
+        assert!(
+            db.list_vm_traffic(404, day(2026, 8, 1), day(2026, 8, 31))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The counter baseline is one row per VM, overwritten each pass, and
+    /// absent until the first sample is taken.
+    #[tokio::test]
+    async fn vm_traffic_sample_is_replaced_not_appended() {
+        let db = MockDb::default();
+        assert!(db.get_vm_traffic_sample(1).await.unwrap().is_none());
+
+        db.upsert_vm_traffic_sample(1, 10, 20).await.unwrap();
+        db.upsert_vm_traffic_sample(1, 30, 40).await.unwrap();
+
+        let s = db.get_vm_traffic_sample(1).await.unwrap().expect("sampled");
+        assert_eq!(s.last_bytes_in, 30);
+        assert_eq!(s.last_bytes_out, 40);
+        assert!(db.get_vm_traffic_sample(2).await.unwrap().is_none());
+    }
+
+    /// Insert `n` VMs (ids 1..=n) so traffic rows have an owner to join to,
+    /// mirroring the `vm` join the MySQL implementation does.
+    async fn with_vms(db: &MockDb, n: u64) {
+        // insert_vm validates the owning user exists.
+        db.upsert_user(&[1u8; 32]).await.expect("user");
+        for _ in 0..n {
+            db.insert_vm(&Vm {
+                ssh_key_id: None,
+                ..MockDb::mock_vm()
+            })
+            .await
+            .expect("insert vm");
+        }
+    }
+
+    /// The fleet report answers "who is pushing the traffic", so it must rank
+    /// by outbound bytes and total each VM's days into one row.
+    #[tokio::test]
+    async fn traffic_totals_rank_the_heaviest_senders() {
+        let db = MockDb::default();
+        with_vms(&db, 3).await;
+        let (start, end) = (day(2026, 8, 1), day(2026, 8, 31));
+
+        // VM 1 is the heaviest sender, but only once its two days are summed.
+        db.add_vm_traffic(1, day(2026, 8, 1), 10, 600)
+            .await
+            .unwrap();
+        db.add_vm_traffic(1, day(2026, 8, 2), 10, 600)
+            .await
+            .unwrap();
+        db.add_vm_traffic(2, day(2026, 8, 2), 99, 900)
+            .await
+            .unwrap();
+        // Outside the range, so it must not appear at all.
+        db.add_vm_traffic(3, day(2026, 7, 30), 1, 5_000)
+            .await
+            .unwrap();
+
+        let (rows, total) = db.list_vm_traffic_totals(start, end, 50, 0).await.unwrap();
+        assert_eq!(total, 2, "only VMs with traffic in range are counted");
+        assert_eq!(rows[0].vm_id, 1);
+        assert_eq!(rows[0].bytes_out, 1_200, "a VM's days must be summed");
+        assert_eq!(rows[1].vm_id, 2);
+        assert_eq!(rows[1].bytes_out, 900);
+    }
+
+    /// Paging must be stable and reflect the same ordering.
+    #[tokio::test]
+    async fn traffic_totals_paginate() {
+        let db = MockDb::default();
+        with_vms(&db, 3).await;
+        let (start, end) = (day(2026, 8, 1), day(2026, 8, 31));
+        for (vm, out) in [(1u64, 300u64), (2, 200), (3, 100)] {
+            db.add_vm_traffic(vm, day(2026, 8, 5), 1, out)
+                .await
+                .unwrap();
+        }
+
+        let (page1, total) = db.list_vm_traffic_totals(start, end, 2, 0).await.unwrap();
+        let (page2, _) = db.list_vm_traffic_totals(start, end, 2, 2).await.unwrap();
+        assert_eq!(total, 3, "total counts VMs, not the rows on this page");
+        assert_eq!(
+            page1.iter().map(|r| r.vm_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(page2.iter().map(|r| r.vm_id).collect::<Vec<_>>(), vec![3]);
+    }
+
+    /// Traffic for a VM that no longer exists cannot be attributed to anyone,
+    /// matching the join the MySQL implementation uses.
+    #[tokio::test]
+    async fn traffic_totals_skip_vms_that_are_gone() {
+        let db = MockDb::default();
+        db.add_vm_traffic(999, day(2026, 8, 5), 1, 1).await.unwrap();
+        let (rows, total) = db
+            .list_vm_traffic_totals(day(2026, 8, 1), day(2026, 8, 31), 50, 0)
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+        assert_eq!(total, 0);
     }
 }

@@ -985,6 +985,7 @@ async fn create_custom_pricing(
             disk_mbps_write: None,
             network_mbps: None,
             cpu_limit: None,
+            transfer_gb: None,
         };
 
         let id = db.insert_custom_pricing(&pricing).await?;

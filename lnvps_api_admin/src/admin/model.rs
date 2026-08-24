@@ -1,5 +1,5 @@
 use anyhow::anyhow;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use lnvps_api_common::{
     ApiDiskInterface, ApiDiskType, ApiIntervalType, ApiOsDistribution,
-    ApiSubscriptionLineItemResource, VmRunningState,
+    ApiSubscriptionLineItemResource, ApiVmTrafficSummary, VmRunningState, quota_period,
 };
 use lnvps_db::{
     AdminAction, AdminResource, AdminRole, IpRangeAllocationMode, NetworkAccessPolicy,
@@ -700,6 +700,9 @@ pub struct AdminVmInfo {
     /// Subscription linked to this VM (includes line items and payment count)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subscription: Option<AdminSubscriptionInfo>,
+    /// Network transfer used in the current UTC calendar month, against the
+    /// plan's allowance. Same shape as the customer-facing `VmStatus.traffic`.
+    pub traffic: ApiVmTrafficSummary,
 }
 
 impl AdminVmInfo {
@@ -738,6 +741,7 @@ impl AdminVmInfo {
             disk_size,
             disk_type,
             disk_interface,
+            transfer_gb,
         ) = if let Some(template_id) = vm.template_id {
             let template = db.get_vm_template(template_id).await?;
             (
@@ -765,6 +769,7 @@ impl AdminVmInfo {
                 template.disk_size,
                 ApiDiskType::from(template.disk_type),
                 ApiDiskInterface::from(template.disk_interface),
+                template.transfer_gb,
             )
         } else if let Some(custom_template_id) = vm.custom_template_id {
             let custom_template = db.get_custom_vm_template(custom_template_id).await?;
@@ -794,6 +799,7 @@ impl AdminVmInfo {
                 custom_template.disk_size,
                 ApiDiskType::from(custom_template.disk_type),
                 ApiDiskInterface::from(custom_template.disk_interface),
+                custom_template.transfer_gb,
             )
         } else {
             (
@@ -809,8 +815,14 @@ impl AdminVmInfo {
                 0,
                 ApiDiskType::HDD,
                 ApiDiskInterface::SATA,
+                None,
             )
         };
+
+        let (period_start, period_end) = quota_period(Utc::now().date_naive());
+        let (traffic_in, traffic_out) = db
+            .get_vm_traffic_total(vm.id, period_start, period_end)
+            .await?;
 
         let mut ip_addresses = Vec::new();
         for ip in ips {
@@ -873,8 +885,54 @@ impl AdminVmInfo {
             disabled: vm.disabled,
             admin_notes: vm.admin_notes.clone(),
             subscription,
+            traffic: ApiVmTrafficSummary {
+                transfer_gb,
+                period_start,
+                period_end,
+                bytes_out: traffic_out,
+                bytes_in: traffic_in,
+            },
         })
     }
+}
+
+/// Date range for an admin traffic query. Both bounds are inclusive UTC dates
+/// (`YYYY-MM-DD`) and default to the current calendar month.
+#[derive(Deserialize)]
+pub struct AdminVmTrafficQuery {
+    pub start: Option<NaiveDate>,
+    pub end: Option<NaiveDate>,
+}
+
+/// One UTC day's transfer for a VM, in bytes.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AdminVmTrafficDay {
+    pub day: NaiveDate,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+}
+
+/// A VM's transfer over a range, plus the current month's use of its allowance.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AdminVmTrafficInfo {
+    pub vm_id: u64,
+    /// Owner, so a traffic investigation does not need a second lookup to know
+    /// whose VM this is.
+    pub user_id: u64,
+    /// Current calendar month, whatever range was requested
+    pub summary: ApiVmTrafficSummary,
+    /// Daily rows over the requested range, oldest first. Days with no recorded
+    /// traffic are omitted.
+    pub days: Vec<AdminVmTrafficDay>,
+}
+
+/// One VM's transfer totalled over a range, for the fleet-wide report.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct AdminVmTrafficTotal {
+    pub vm_id: u64,
+    pub user_id: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -1577,6 +1635,9 @@ pub struct AdminVmTemplateInfo {
     /// Maximum CPU usage as a fraction of allocated cores (None = uncapped)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_limit: Option<f32>,
+    /// Monthly outbound transfer quota in GB (None = unmetered)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer_gb: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1621,6 +1682,8 @@ pub struct AdminCreateVmTemplateRequest {
     pub network_mbps: Option<u32>,
     /// Maximum CPU usage as a fraction of allocated cores, e.g. 0.5 = 50% (None = uncapped)
     pub cpu_limit: Option<f32>,
+    /// Monthly outbound transfer quota in GB (None = unmetered)
+    pub transfer_gb: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -1705,6 +1768,12 @@ pub struct AdminUpdateVmTemplateRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub cpu_limit: Option<Option<f32>>,
+    /// Monthly outbound transfer quota in GB — use `null` to clear (unmetered)
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub transfer_gb: Option<Option<u32>>,
 }
 
 // Common response structures
@@ -1777,6 +1846,10 @@ pub struct AdminCustomPricingInfo {
     /// Maximum CPU usage as a fraction of allocated cores (None = uncapped)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_limit: Option<f32>,
+    /// Monthly outbound transfer quota in GB granted to VMs on this plan
+    /// (None = unmetered)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer_gb: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -1875,6 +1948,12 @@ pub struct UpdateCustomPricingRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub cpu_limit: Option<Option<f32>>,
+    /// Monthly outbound transfer quota in GB — use `null` to clear (unmetered)
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub transfer_gb: Option<Option<u32>>,
 }
 
 #[derive(Deserialize)]
@@ -1924,6 +2003,8 @@ pub struct CreateCustomPricingRequest {
     pub network_mbps: Option<u32>,
     /// Maximum CPU usage as a fraction of allocated cores, e.g. 0.5 = 50% (None = uncapped)
     pub cpu_limit: Option<f32>,
+    /// Monthly outbound transfer quota in GB (None = unmetered)
+    pub transfer_gb: Option<u32>,
 }
 
 #[derive(Deserialize)]

@@ -1,10 +1,14 @@
 use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
+use crate::admin::model::AdminVmTrafficTotal;
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::routing::get;
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
-use lnvps_api_common::{ApiData, ApiError, ApiResult, TaxLine, TaxTreatment, Ticker, TickerRate};
+use lnvps_api_common::{
+    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, TaxLine, TaxTreatment,
+    Ticker, TickerRate, resolve_traffic_range,
+};
 use lnvps_db::{AdminAction, AdminResource, CostResourceType, CostType, IntervalType};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::{Deserialize, Serialize};
@@ -26,6 +30,57 @@ pub fn router() -> Router<RouterState> {
             get(admin_profit_loss_report),
         )
         .route("/api/admin/v1/reports/oss", get(admin_oss_report))
+        .route("/api/admin/v1/reports/traffic", get(admin_traffic_report))
+}
+
+/// Range and paging for the fleet traffic report.
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct TrafficReportQuery {
+    start: Option<NaiveDate>,
+    end: Option<NaiveDate>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+}
+
+/// Which VMs are pushing the traffic, heaviest sender first.
+///
+/// The operational question behind per-VM accounting: transit is bought in
+/// aggregate, so when the bill or the pipe moves, the answer needed is which
+/// handful of guests moved it. Ordered by outbound bytes, since that is the
+/// direction that costs and the direction an allowance bounds.
+async fn admin_traffic_report(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Query(params): Query<TrafficReportQuery>,
+) -> ApiPaginatedResult<AdminVmTrafficTotal> {
+    auth.require_permission(AdminResource::Analytics, AdminAction::View)?;
+
+    let today = Utc::now().date_naive();
+    let (start, end) = resolve_traffic_range(params.start, params.end, today)
+        .map_err(|e| ApiError::bad_request(&e))?;
+
+    let limit = params.limit.unwrap_or(50).min(100);
+    let offset = params.offset.unwrap_or(0);
+
+    let (rows, total) = this
+        .db
+        .list_vm_traffic_totals(start, end, limit, offset)
+        .await?;
+
+    ApiPaginatedData::ok(
+        rows.into_iter()
+            .map(|r| AdminVmTrafficTotal {
+                vm_id: r.vm_id,
+                user_id: r.user_id,
+                bytes_in: r.bytes_in,
+                bytes_out: r.bytes_out,
+            })
+            .collect(),
+        total,
+        limit as u64,
+        offset,
+    )
 }
 
 #[derive(Deserialize, Default)]
