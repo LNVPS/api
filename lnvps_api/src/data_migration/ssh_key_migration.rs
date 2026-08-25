@@ -50,8 +50,11 @@ impl DataMigration for SshKeyMigration {
                 ssh_config.key
             );
 
-            // Get all hosts
-            let hosts = db.list_hosts().await?;
+            // Every host, not just the placement targets: a host disabled when
+            // this ran would keep an empty `ssh_key`, and every node-local
+            // command (`qm`, image downloads) hard-fails without one — so
+            // re-enabling it later would need the row filled in by hand.
+            let hosts = db.list_hosts_all().await?;
             let mut migrated_count = 0;
 
             for mut host in hosts {
@@ -71,5 +74,57 @@ impl DataMigration for SshKeyMigration {
 
             Ok(format!("migrated SSH key to {migrated_count} host(s)"))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::mock_settings;
+    use lnvps_api_common::MockDb;
+    use lnvps_db::LNVpsDbBase;
+
+    /// Regression: the migration must reach disabled hosts.
+    ///
+    /// It listed hosts with `list_hosts()`, which hides disabled hosts, so a
+    /// host that happened to be disabled when this ran kept an empty `ssh_key` —
+    /// and every node-local command (`qm`, image downloads) hard-fails without
+    /// one, so re-enabling that host later needed the row filled in by hand.
+    #[tokio::test]
+    async fn test_ssh_key_migration_covers_disabled_hosts() -> Result<()> {
+        let key_path = std::env::temp_dir().join("lnvps_ssh_key_migration_test.key");
+        std::fs::write(&key_path, "PRIVATE KEY")?;
+
+        let mut settings = mock_settings();
+        settings.provisioner.proxmox.as_mut().unwrap().ssh =
+            Some(lnvps_api_common::host::config::SshConfig {
+                key: key_path.clone(),
+                user: "root".to_string(),
+            });
+
+        let db = MockDb::default();
+        let mut host = db.get_host(1).await?;
+        host.enabled = false;
+        host.ssh_key = None;
+        host.ssh_user = None;
+        db.update_host(&host).await?;
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        assert!(
+            db.list_hosts().await?.iter().all(|h| h.id != 1),
+            "precondition: list_hosts() hides disabled hosts"
+        );
+
+        SshKeyMigration::new(db.clone(), settings).migrate().await?;
+
+        let host = db.get_host(1).await?;
+        assert!(
+            host.ssh_key.is_some(),
+            "a disabled host must still receive the SSH key"
+        );
+        assert_eq!(host.ssh_user.as_deref(), Some("root"));
+
+        std::fs::remove_file(&key_path)?;
+        Ok(())
     }
 }

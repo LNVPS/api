@@ -956,6 +956,23 @@ async fn v1_whatsapp_unlink(auth: Nip98Auth, State(this): State<RouterState>) ->
     ApiData::ok(())
 }
 
+/// Hosts indexed by id, for building VM status payloads in bulk.
+///
+/// Every host, disabled ones included: `list_hosts()` is the *placement*
+/// listing, and a VM whose host is missing from this map loses its
+/// `host_sunset_date` and `cpu_arch` (see [`vm_to_status`]). A disabled host is
+/// usually one being decommissioned, so the warning users need most was the one
+/// that disappeared — and only from the list, since `v1_get_vm` reads the host
+/// with the unfiltered `get_host()` and still showed it.
+async fn vm_status_hosts(db: &Arc<dyn LNVpsDb>) -> Result<HashMap<u64, VmHost>> {
+    Ok(db
+        .list_hosts_all()
+        .await?
+        .into_iter()
+        .map(|h| (h.id, h))
+        .collect())
+}
+
 /// List VMs belonging to user
 async fn v1_list_vms(
     auth: Nip98Auth,
@@ -966,13 +983,7 @@ async fn v1_list_vms(
     let vms = this.db.list_user_vms(uid).await?;
     // Bulk-load hosts once (there are few) and index by id, instead of a
     // per-VM host lookup inside vm_to_status.
-    let hosts: HashMap<u64, VmHost> = this
-        .db
-        .list_hosts()
-        .await?
-        .into_iter()
-        .map(|h| (h.id, h))
-        .collect();
+    let hosts = vm_status_hosts(&this.db).await?;
     let mut ret = vec![];
     for vm in vms {
         let vm_id = vm.id;
@@ -2789,6 +2800,40 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use lnvps_db::PaymentMethodConfig;
+
+    /// Regression: `GET /api/v1/vm` must resolve a disabled host.
+    ///
+    /// The listing bulk-loaded hosts with `list_hosts()`, which hides disabled
+    /// hosts, so `vm_to_status` was handed `None` and dropped `host_sunset_date`
+    /// and `cpu_arch`. A disabled host is typically one being decommissioned —
+    /// exactly when the sunset date is the field users must see — and the
+    /// single-VM endpoint kept showing it, so the two disagreed.
+    #[tokio::test]
+    async fn test_vm_status_hosts_include_disabled_host() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::LNVpsDbBase;
+
+        let db = MockDb::default();
+        let mut host = db.get_host(1).await.unwrap();
+        host.enabled = false;
+        host.sunset_date = Some(Utc::now());
+        db.update_host(&host).await.unwrap();
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        assert!(
+            db.list_hosts().await.unwrap().iter().all(|h| h.id != 1),
+            "precondition: list_hosts() hides disabled hosts"
+        );
+
+        let hosts = vm_status_hosts(&db).await.unwrap();
+        let host = hosts
+            .get(&1)
+            .expect("a VM on a disabled host must still resolve its host");
+        assert!(
+            host.sunset_date.is_some(),
+            "the sunset date must survive to the API payload"
+        );
+    }
 
     fn make_config(
         id: u64,

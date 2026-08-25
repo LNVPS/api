@@ -3040,7 +3040,7 @@ impl Worker {
                 self.patch_host(&mut host).await?;
             }
             WorkJob::PatchHosts => {
-                let mut hosts = self.db.list_hosts().await?;
+                let mut hosts = self.reconcile_hosts().await?;
                 for host in &mut hosts {
                     info!("Patching host {}", host.name);
                     self.patch_host(host).await?;
@@ -3892,7 +3892,7 @@ impl Worker {
             }
         }
 
-        let hosts = self.image_download_targets().await?;
+        let hosts = self.reconcile_hosts().await?;
         let clients: Vec<(String, Arc<dyn VmHostClient>)> = hosts
             .iter()
             .filter_map(
@@ -3910,16 +3910,20 @@ impl Worker {
         Ok(())
     }
 
-    /// Hosts that must hold a copy of every OS image.
+    /// Hosts that reconciliation sweeps must visit.
     ///
     /// Every host, including disabled ones and hosts in disabled regions:
     /// `enabled` means "place no new VMs here", not "this host is gone". A
-    /// disabled host still runs the VMs it already has, and a reinstall or a
-    /// rebuild there imports the image from local storage — which fails if the
-    /// image was never downloaded. Disabling a host must not quietly make its
-    /// existing VMs unrepairable, and re-enabling one must not need a manual
-    /// image sync first.
-    async fn image_download_targets(&self) -> Result<Vec<VmHost>> {
+    /// disabled host still runs the VMs it already has, so it still needs OS
+    /// images (a reinstall or rebuild imports one from local storage) and still
+    /// needs its cpu/memory/disk sizes re-read, or its capacity is frozen at
+    /// whatever it was when someone disabled it. `PatchHost { host_id }` — what
+    /// the admin force-sync calls — patches a disabled host quite happily, so
+    /// skipping it in the sweep only made the two disagree.
+    ///
+    /// Placement and pricing use the filtered [`LNVpsDbBase::list_hosts`]
+    /// instead; those must not offer a disabled host.
+    async fn reconcile_hosts(&self) -> Result<Vec<VmHost>> {
         Ok(self.db.list_hosts_all().await?)
     }
 
@@ -4728,14 +4732,16 @@ mod tests {
         setup_worker_with_delete_after(db, 0).await
     }
 
-    /// Regression test: OS images must be downloaded to disabled hosts too.
+    /// Regression test: reconciliation sweeps must visit disabled hosts too.
     ///
-    /// The sweep listed hosts with `list_hosts()`, which hides disabled hosts
-    /// and hosts in disabled regions, so a disabled host never received new
-    /// images — and a reinstall or rebuild of a VM still living there failed on
-    /// a missing local image. `enabled` gates placement, not existence.
+    /// Both the OS image download and `PatchHosts` listed hosts with
+    /// `list_hosts()`, which hides disabled hosts and hosts in disabled regions.
+    /// A disabled host therefore never received new images (a reinstall of a VM
+    /// still living there then failed on a missing local image) and never had
+    /// its cpu/memory/disk sizes re-read. `enabled` gates placement, not
+    /// existence.
     #[tokio::test]
-    async fn test_image_download_targets_include_disabled_hosts() -> Result<()> {
+    async fn test_reconcile_hosts_include_disabled_hosts() -> Result<()> {
         let db = Arc::new(MockDb::default());
         let enabled_id = db
             .create_host(&VmHost {
@@ -4763,15 +4769,15 @@ mod tests {
         );
 
         let worker = setup_worker(db.clone()).await?;
-        let targets = worker.image_download_targets().await?;
+        let targets = worker.reconcile_hosts().await?;
 
         assert!(
             targets.iter().any(|h| h.id == disabled_id),
-            "a disabled host must still receive OS images"
+            "a disabled host must still be reconciled"
         );
         assert!(
             targets.iter().any(|h| h.id == enabled_id),
-            "an enabled host must still receive OS images"
+            "an enabled host must still be reconciled"
         );
         Ok(())
     }
