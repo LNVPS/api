@@ -328,6 +328,14 @@ impl WorkJob {
             // Placement drift is re-detected on the next pass, so a failed run
             // (usually an unreachable host) costs one interval, not a fix.
             Self::ReconcileVmHosts => true,
+            // A spawn that keeps failing must not be redelivered forever. An
+            // unacked job is reclaimed on every poll, so a permanently failing
+            // spawn (a misconfigured host, a missing image) re-ran the pipeline
+            // every few seconds, and each attempt built and abandoned state on
+            // the host. `CheckVms` re-drives a VM that is missing from its host
+            // every 30s anyway (see `recover_missing_vm`), so nothing is lost by
+            // letting the queued copy go.
+            Self::SpawnVm { .. } => true,
             _ => false,
         }
     }

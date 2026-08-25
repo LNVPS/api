@@ -46,6 +46,11 @@ pub struct ProxmoxClient {
     /// Shared between clones so every code path on a host operation pays the
     /// `/nodes/{node}/storage` round-trip at most once.
     snippet_storage: Arc<OnceCell<Option<String>>>,
+    /// Memoised hostname of the machine this client's SSH commands land on.
+    ///
+    /// Shared between clones: one `hostname` round-trip per host operation, not
+    /// one per `qm` call. See [`Self::ensure_ssh_node`].
+    ssh_node: Arc<OnceCell<String>>,
     /// Snippets already reconciled by this client: `filename -> content`.
     ///
     /// [`Self::write_snippet`] otherwise opens a *fresh* SSH connection on every
@@ -76,6 +81,7 @@ impl ProxmoxClient {
             node: node.to_string(),
             mac_prefix: mac_prefix.unwrap_or("bc:24:11".to_string()),
             snippet_storage: Arc::new(OnceCell::new()),
+            ssh_node: Arc::new(OnceCell::new()),
             written_snippets: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -1617,9 +1623,25 @@ impl ProxmoxClient {
                 .await
                 .map_err(OpError::Transient)?;
             info!("{}", rsp);
-            // exit code 2 = doesn't exist, ignore
-            if code != 0 && code != 2 {
-                op_fatal!("Failed to destroy vm, exit-code {}, {}", code, rsp)
+            if code != 0 {
+                // `qm destroy` answers exit-code 2 both for "already gone" and
+                // for "not on *this* node", and this used to accept 2 outright:
+                // a destroy aimed at the wrong machine reported success while
+                // the VM stayed where it was, which is how a failed spawn's
+                // rollback silently left a diskless VM behind. The API knows
+                // which of the two it is, so ask it rather than guess.
+                if self.get_vm_status_opt(&self.node, vm_id).await?.is_none() {
+                    info!("VM {} is already gone, treating destroy as done", vm_id);
+                    return Ok(());
+                }
+                op_fatal!(
+                    "Failed to destroy vm {}, exit-code {}, {} (the API still reports it on {}: \
+                     the command may have run on the wrong node)",
+                    vm_id,
+                    code,
+                    rsp,
+                    &self.node
+                )
             }
         }
         Ok(())
@@ -2041,10 +2063,49 @@ impl VmHostClient for ProxmoxClient {
                     .with_min_delay(Duration::from_secs(3))
                     .with_max_delay(Duration::from_secs(60)),
             )
+            // Checked before anything is created: a host whose API and SSH land
+            // on different nodes cannot complete a spawn, and every attempt
+            // strands a VM (see `ensure_ssh_node`).
+            .step("check_node", |ctx| {
+                Box::pin(async move { ctx.client.ensure_ssh_node().await })
+            })
             .step_with_rollback(
                 "create_vm_shell",
                 |ctx| {
                     Box::pin(async move {
+                        // Idempotent: this runs under retry, and a redelivered
+                        // spawn job re-runs the whole pipeline. Proxmox answers a
+                        // duplicate create with a 500, which is classified as
+                        // transient and retried until the step gives up, so a
+                        // shell left by an earlier attempt could never be built
+                        // on — or removed.
+                        if ctx
+                            .client
+                            .get_vm_status_opt(&ctx.client.node, ctx.vm_id)
+                            .await?
+                            .is_some()
+                        {
+                            // Only a shell with no primary disk is a leftover of
+                            // a failed attempt. Anything with a disk is a real
+                            // VM, and continuing would have `import_disk` unlink
+                            // a live customer's disk before overwriting it.
+                            let cfg = ctx
+                                .client
+                                .get_vm_config_raw(&ctx.client.node, ctx.vm_id)
+                                .await?;
+                            if cfg.contains_key("scsi0") {
+                                op_fatal!(
+                                    "VM {} already exists on {} with a primary disk, refusing to re-create it",
+                                    ctx.vm_id,
+                                    &ctx.client.node
+                                );
+                            }
+                            info!(
+                                "VM {} already exists without a disk (leftover of a failed attempt), reusing it",
+                                ctx.vm_id
+                            );
+                            return Ok(());
+                        }
                         let t_create = ctx
                             .client
                             .create_vm(CreateVm {
@@ -2518,6 +2579,65 @@ impl ProxmoxClient {
         };
         let host = crate::host::extract_host_from_url(&self.api.base().to_string());
         SshClient::run_command(host, 22, ssh_cfg.user.clone(), ssh_cfg.key.clone(), command).await
+    }
+
+    /// Does the machine SSH landed on call itself `node`?
+    ///
+    /// A Proxmox node's name is its short hostname, so an FQDN answer still
+    /// identifies the same node, and hostnames are case-insensitive.
+    fn node_matches(hostname: &str, node: &str) -> bool {
+        let short = hostname.trim().split('.').next().unwrap_or("").trim();
+        !short.is_empty() && short.eq_ignore_ascii_case(node.trim())
+    }
+
+    /// Refuse to operate when SSH lands on a different node than the API addresses.
+    ///
+    /// `self.node` is the host row's `name` and addresses every API path, while
+    /// everything node-local (`qm`, `pvesm`, image downloads) runs over SSH
+    /// against whatever the host row's `ip` resolves to. A row that names one
+    /// node but points at another still *looks* healthy: the API happily creates
+    /// the VM on `self.node` (a cluster proxies the request), and then `qm set
+    /// --import-from` runs on the other machine and answers "Configuration file
+    /// 'nodes/<other>/qemu-server/<id>.conf' does not exist". The rollback's `qm
+    /// destroy` fails for the same reason, so the VM is left on the real node
+    /// with no disk and the spawn is retried forever.
+    ///
+    /// Fatal, not transient: no amount of retrying corrects a host row.
+    async fn ensure_ssh_node(&self) -> OpResult<()> {
+        // Hosts without SSH cannot run any node-local command; the operations
+        // that need it report that themselves, with what they were trying to do.
+        if self.ssh.is_none() {
+            return Ok(());
+        }
+        let hostname = self
+            .ssh_node
+            .get_or_try_init(|| async {
+                let (code, out) = self
+                    .ssh_run("hostname".to_string())
+                    .await
+                    // Unreachable is not misconfigured: let it be retried.
+                    .map_err(OpError::Transient)?;
+                if code != 0 {
+                    return Err(OpError::Transient(anyhow::anyhow!(
+                        "hostname failed with exit-code {}: {}",
+                        code,
+                        out
+                    )));
+                }
+                Ok(out.trim().to_string())
+            })
+            .await?;
+
+        if Self::node_matches(hostname, &self.node) {
+            return Ok(());
+        }
+        op_fatal!(
+            "host is misconfigured: its API address {} is node '{}', but it is recorded as node \
+             '{}'. Node-local commands would run on the wrong machine; fix the host's ip or name",
+            crate::host::extract_host_from_url(self.api.base().as_ref()),
+            hostname,
+            &self.node
+        )
     }
 
     /// Path to the sidecar file that records the *source* (compressed) checksum
@@ -3413,6 +3533,59 @@ mod tests {
     use lnvps_db::IpRange;
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Regression test: a host whose `ip` points at a different node than its
+    /// `name` must be rejected, not worked around.
+    ///
+    /// With the API on one node and SSH on another, the API created the VM on
+    /// the named node while `qm set --import-from` ran on the machine behind the
+    /// ip and answered "Configuration file 'nodes/pve2/qemu-server/2033.conf'
+    /// does not exist". The rollback's `qm destroy` failed identically but was
+    /// read as "already gone", so every spawn left another diskless VM behind.
+    #[test]
+    fn test_node_matches_rejects_a_different_node() {
+        // The failure from the incident: SSH landed on pve2, the row said pve.
+        assert!(!ProxmoxClient::node_matches("pve2", "pve"));
+        assert!(!ProxmoxClient::node_matches("pve", "pve2"));
+
+        // The same node still matches through an FQDN, trailing newline from
+        // `hostname`, or a case difference — none of those is a misconfiguration.
+        assert!(ProxmoxClient::node_matches("pve2", "pve2"));
+        assert!(ProxmoxClient::node_matches("pve2.example.com", "pve2"));
+        assert!(ProxmoxClient::node_matches("pve2\n", "pve2"));
+        assert!(ProxmoxClient::node_matches("PVE2", "pve2"));
+
+        // An empty answer identifies nothing and must not pass.
+        assert!(!ProxmoxClient::node_matches("", ""));
+        assert!(!ProxmoxClient::node_matches("   ", "pve"));
+    }
+
+    /// A client with no SSH configured cannot run `hostname`, and must not be
+    /// blocked by the node guard — the operations that need SSH refuse on their
+    /// own, with a message about what they were trying to do.
+    #[tokio::test]
+    async fn test_ensure_ssh_node_skipped_without_ssh() -> Result<()> {
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        let client = ProxmoxClient::new(
+            "http://localhost:8006".parse()?,
+            "pve",
+            "",
+            None,
+            q_cfg,
+            None,
+        );
+        assert!(client.ensure_ssh_node().await.is_ok());
+        Ok(())
+    }
 
     #[test]
     fn test_make_scsi0() {

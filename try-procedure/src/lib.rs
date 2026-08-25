@@ -6,7 +6,10 @@
 //!   distinguishing between transient (retryable) and fatal (non-recoverable) errors.
 //!
 //! - [`Pipeline`]: Execute a sequence of async steps with automatic rollback on failure.
-//!   If step N fails, rollbacks for steps 0..N-1 are executed in reverse order.
+//!   If step N fails, rollbacks for steps 0..=N are executed in reverse order — a
+//!   step's own rollback included, because a step that fails partway may already
+//!   have created the resource it was asked to create. Rollbacks must therefore
+//!   tolerate having nothing to undo.
 //!
 //! # Error Classification
 //!
@@ -518,8 +521,14 @@ where
 
     /// Add a step with both an action and a rollback.
     ///
+    /// The rollback runs if this step *started* and the pipeline later fails —
+    /// including a failure of this very step. A step is not atomic (creating a
+    /// remote resource and confirming it are two calls), so a rollback that only
+    /// ran after success would strand whatever a half-finished step created. Write
+    /// rollbacks to be idempotent and to tolerate the resource not existing.
+    ///
     /// The action returns [`OpResult`] for retry classification.
-    /// The rollback runs only if this step succeeded and a later step fails.
+    /// The rollback runs if this step started and the pipeline later fails.
     /// Rollbacks return [`OpResult`] and are retried on transient failures
     /// when a retry policy is set.
     pub fn step_with_rollback(
@@ -549,6 +558,17 @@ where
         let steps: Vec<PipelineStep<'a, Ctx, E>> = self.steps.drain(..).collect();
 
         for mut step in steps {
+            // Registered *before* the action runs, not after it succeeds. A step
+            // is rarely atomic: `create_vm_shell` creates the VM on Proxmox and
+            // then waits for the task, so a failure in the wait (or in a retry
+            // that finds the VM already there) used to leave a VM behind that
+            // nothing would ever clean up. Rollbacks are written to check for
+            // the resource first, so running one for a step that did nothing is
+            // a no-op.
+            if let Some(rollback) = step.rollback.take() {
+                completed_rollbacks.push(rollback);
+            }
+
             let result = match &self.retry_policy {
                 Some(policy) => {
                     let mut attempt = 0u32;
@@ -586,11 +606,7 @@ where
             };
 
             match result {
-                Ok(()) => {
-                    if let Some(rollback) = step.rollback {
-                        completed_rollbacks.push(rollback);
-                    }
-                }
+                Ok(()) => {}
                 Err(e) => {
                     warn!(
                         "Pipeline step '{}' failed: {}, rolling back {} steps",
@@ -993,8 +1009,16 @@ mod tests {
         assert_eq!(*order, vec!["rollback2", "rollback1"]);
     }
 
+    /// Regression test: a step that fails must have its *own* rollback run.
+    ///
+    /// The Proxmox `create_vm_shell` step creates the VM and then waits for the
+    /// task; when the wait failed (or a retry hit Proxmox's 500 "VM already
+    /// exists"), the step reported failure with the VM sitting on the host, and
+    /// because the rollback was only registered on success nothing ever removed
+    /// it. Every later spawn attempt then failed the same way, wedging the job
+    /// and leaving a diskless VM on the host.
     #[tokio::test]
-    async fn pipeline_no_rollback_when_first_step_fails() {
+    async fn pipeline_rolls_back_the_step_that_failed() {
         let rollback_ran = Arc::new(AtomicU32::new(0));
         let rr = rollback_ran.clone();
 
@@ -1016,8 +1040,8 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        // step1's own rollback should NOT run since it didn't succeed
-        assert_eq!(rollback_ran.load(Ordering::SeqCst), 0);
+        // The failing step may have got halfway, so its rollback runs — once.
+        assert_eq!(rollback_ran.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
