@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Debug;
 use std::net::IpAddr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -1114,6 +1114,82 @@ pub fn deployment_hostname(name: &str, ingress_domain: &str) -> String {
     format!("{name}.{ingress_domain}")
 }
 
+/// Settle a deployment's custom domain for this pass, returning the deployment
+/// as it must now be written back.
+///
+/// A domain nobody has pointed at us yet is held: no rule to serve it, and no
+/// annotation asking cert-manager for a certificate whose HTTP-01 challenge
+/// would fail on every pass and spend the account's failed validation budget.
+///
+/// The flag is returned on the struct — not merely written to the DB — because
+/// the status write-back at the end of the pass rewrites the whole row from the
+/// in-memory deployment. A flag that exists only in the DB is overwritten with
+/// `0` by that same pass, which is how a verified domain stayed `false` forever
+/// while its ingress and certificate lived on, and how "probes once per domain"
+/// became "probes on every pass".
+async fn resolve_custom_domain(
+    db: &Arc<dyn LNVpsDb>,
+    deployment: &AppDeployment,
+    hostname: &str,
+) -> Result<AppDeployment> {
+    let probe_passed = match deployment.custom_domain.as_deref() {
+        // Verified is sticky, so an already-verified domain is never re-probed.
+        Some(cd) if !deployment.custom_domain_verified => {
+            resolves_to_same_address(cd, hostname).await
+        }
+        _ => false,
+    };
+    apply_custom_domain_probe(db, deployment, probe_passed, hostname).await
+}
+
+/// Persist a passing probe and return the deployment as the rest of the pass
+/// must see it. Split from the DNS lookup so the flag's journey from probe to
+/// write-back is testable without a resolver.
+async fn apply_custom_domain_probe(
+    db: &Arc<dyn LNVpsDb>,
+    deployment: &AppDeployment,
+    probe_passed: bool,
+    hostname: &str,
+) -> Result<AppDeployment> {
+    let id = deployment.id;
+    let Some(cd) = deployment.custom_domain.as_deref() else {
+        return Ok(deployment.clone());
+    };
+    if deployment.custom_domain_verified {
+        return Ok(deployment.clone());
+    }
+    if !probe_passed {
+        info!("app deployment {id} custom domain held: {cd} does not resolve to {hostname}");
+        return Ok(deployment.clone());
+    }
+    db.set_app_deployment_custom_domain_verified(id).await?;
+    Ok(AppDeployment {
+        custom_domain_verified: true,
+        ..deployment.clone()
+    })
+}
+
+/// The custom domain that may be served this pass — `None` while it is held.
+fn servable_custom_domain(deployment: &AppDeployment) -> Option<&str> {
+    deployment
+        .custom_domain
+        .as_deref()
+        .filter(|_| deployment.custom_domain_verified)
+}
+
+/// The host customers connect on, which is what `${HOSTNAME}` renders to.
+///
+/// A verified custom domain wins over the cluster hostname: the customer chose
+/// it, and an app that bakes its own public identity out of `${HOSTNAME}` is
+/// wrong everywhere if it is handed the `*.apps.lnvps.cloud` name instead. The
+/// cluster hostname keeps serving — this changes what the app calls itself, not
+/// what routes to it.
+fn public_hostname(hostname: &str, deployment: &AppDeployment) -> String {
+    servable_custom_domain(deployment)
+        .unwrap_or(hostname)
+        .to_string()
+}
+
 /// Build the merged `${…}` substitution map from generated secrets + config
 /// values + operator context (currently `HOSTNAME`).
 pub fn build_vars(
@@ -1618,7 +1694,7 @@ async fn reconcile_one(
     if !provisions_cluster_objects(&gate) {
         info!("app deployment {id} not provisioned: {gate}");
         // Nothing was applied, so there is no workload to read.
-        return write_back_status(ctx, deployment, hostname, &gate, None).await;
+        return write_back_status(&ctx.db, deployment, hostname, &gate, None).await;
     }
 
     // 1. Namespace (Pod Security Standard) + isolation NetworkPolicy.
@@ -1651,8 +1727,16 @@ async fn reconcile_one(
     apply(client, &build_generated_secret(id, &generated)).await?;
 
     // 3. Resolve env + files against generated secrets + customer config.
+    //
+    // The custom domain is settled *before* rendering: `${HOSTNAME}` is the
+    // host customers actually connect on, and an app that derives identity from
+    // it (a relay's `RELAY_URL`, a public base URL) must be told the custom
+    // domain, not the cluster hostname it is merely reachable at.
+    let deployment = &resolve_custom_domain(&ctx.db, deployment, &hostname).await?;
+    let custom_domain = servable_custom_domain(deployment);
+    let public_hostname = public_hostname(&hostname, deployment);
     let config = parse_config(&deployment.config);
-    let vars = build_vars(&compose, &generated, &config, &hostname);
+    let vars = build_vars(&compose, &generated, &config, &public_hostname);
     let env = compose.resolve_env(&vars)?;
     let files = compose.resolve_files(&vars)?;
     let init = compose.resolve_init(&vars)?;
@@ -1711,31 +1795,6 @@ async fn reconcile_one(
         .unwrap_or("letsencrypt-prod");
     let class = ctx.settings.ingress_class.as_deref().unwrap_or("nginx");
 
-    // A domain nobody has pointed at us yet is held: no rule to serve it, and
-    // no annotation asking cert-manager for a certificate whose HTTP-01
-    // challenge would fail on every pass and spend the account's failed
-    // validation budget. Verified is sticky, so this probes once per domain.
-    let mut custom_domain_verified = deployment.custom_domain_verified;
-    let custom_domain = match deployment.custom_domain.as_deref() {
-        Some(cd) if !deployment.custom_domain_verified => {
-            if resolves_to_same_address(cd, &hostname).await {
-                ctx.db.set_app_deployment_custom_domain_verified(id).await?;
-                // Carried into the status write-back below: that write updates
-                // the whole row from this (pre-probe) struct, so without this
-                // the flag we just set is immediately overwritten with 0 and
-                // the domain is re-probed on every pass forever.
-                custom_domain_verified = true;
-                Some(cd)
-            } else {
-                info!(
-                    "app deployment {id} custom domain held: {cd} does not resolve to {hostname}"
-                );
-                None
-            }
-        }
-        other => other,
-    };
-
     // Applied before the default host so a custom domain already being served
     // is never momentarily unrouted while the two objects are swapped.
     match build_custom_domain_ingress(id, &compose, &hostname, custom_domain, issuer, class) {
@@ -1777,11 +1836,7 @@ async fn reconcile_one(
             None
         }
     };
-    let deployment = &AppDeployment {
-        custom_domain_verified,
-        ..deployment.clone()
-    };
-    let status = write_back_status(ctx, deployment, hostname, &gate, health).await?;
+    let status = write_back_status(&ctx.db, deployment, hostname, &gate, health).await?;
     info!("reconciled app deployment {id}");
     Ok(status)
 }
@@ -1952,7 +2007,7 @@ fn pod_failures(pod: &Pod) -> Vec<ContainerFailure> {
 /// return, so an unpaid order still gets its hostname and a reason the customer
 /// can act on — it just gets no cluster objects.
 async fn write_back_status(
-    ctx: &Context,
+    db: &Arc<dyn LNVpsDb>,
     deployment: &AppDeployment,
     hostname: String,
     gate: &GateReason,
@@ -1996,7 +2051,7 @@ async fn write_back_status(
             info!("app deployment {id} not running: {reason}");
         }
     }
-    ctx.db.update_app_deployment(&updated).await?;
+    db.update_app_deployment(&updated).await?;
     Ok(updated.status)
 }
 
@@ -3968,5 +4023,133 @@ config:
         // Breakdown denied: the totals still stand on their own.
         assert_eq!(deps[&3].usage_cpu_milli, Some(750));
         assert!(!breakdown.contains_key(&3));
+    }
+
+    /// The status write-back rewrites the whole deployment row, so a domain
+    /// verified earlier in the same pass must reach it on the struct — not just
+    /// in the DB. It previously did not: the flag was set, the ingress and its
+    /// certificate were created, and then this write put `custom_domain_verified`
+    /// straight back to 0, so the API reported the domain unverified forever and
+    /// every pass re-ran the DNS probe.
+    #[tokio::test]
+    async fn a_domain_verified_this_pass_survives_the_status_write_back() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::LNVpsDbBase;
+
+        let db = MockDb::default();
+        let id = db
+            .insert_app_deployment(&deployment_with_custom_domain())
+            .await
+            .unwrap();
+
+        let stale = AppDeployment {
+            id,
+            ..deployment_with_custom_domain()
+        };
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+
+        // The pass verifies the domain, then writes the row back. Both steps
+        // must see the flag: the write-back rebuilds the whole row from the
+        // struct it is handed, so it is the struct — not the DB — that carries
+        // the result of the probe forward.
+        let verified = apply_custom_domain_probe(&db, &stale, true, "app-1.apps.example.com")
+            .await
+            .unwrap();
+        assert!(
+            verified.custom_domain_verified,
+            "a passing probe must be returned on the struct, not left in the DB"
+        );
+
+        write_back_status(
+            &db,
+            &verified,
+            "app-1.apps.example.com".to_string(),
+            &GateReason::Running,
+            Some(WorkloadHealth {
+                desired: 1,
+                ready: 1,
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            db.get_app_deployment(id)
+                .await
+                .unwrap()
+                .custom_domain_verified,
+            "status write-back cleared a domain verified in the same pass"
+        );
+    }
+
+    /// A held domain stays held: no flag, so no ingress and no certificate
+    /// request whose HTTP-01 challenge would fail on every pass.
+    #[tokio::test]
+    async fn an_unverified_domain_is_not_served_and_does_not_rename_the_app() {
+        let d = deployment_with_custom_domain();
+        assert_eq!(servable_custom_domain(&d), None);
+        assert_eq!(
+            public_hostname("app-1.apps.example.com", &d),
+            "app-1.apps.example.com"
+        );
+    }
+
+    /// `${HOSTNAME}` is the host customers connect on. Once the domain is
+    /// verified that is the custom domain — an app that builds its own public
+    /// identity out of it (a relay's `RELAY_URL`) is wrong everywhere if it is
+    /// handed the cluster hostname instead.
+    #[test]
+    fn a_verified_custom_domain_becomes_the_apps_public_hostname() {
+        let d = AppDeployment {
+            custom_domain_verified: true,
+            ..deployment_with_custom_domain()
+        };
+        assert_eq!(servable_custom_domain(&d), Some("relay.example.org"));
+        assert_eq!(
+            public_hostname("app-1.apps.example.com", &d),
+            "relay.example.org"
+        );
+    }
+
+    /// No custom domain at all: the cluster hostname is the public one.
+    #[test]
+    fn without_a_custom_domain_the_cluster_hostname_is_public() {
+        let d = AppDeployment {
+            custom_domain: None,
+            custom_domain_verified: true, // stale flag, no domain to serve
+            ..deployment_with_custom_domain()
+        };
+        assert_eq!(servable_custom_domain(&d), None);
+        assert_eq!(
+            public_hostname("app-1.apps.example.com", &d),
+            "app-1.apps.example.com"
+        );
+    }
+
+    fn deployment_with_custom_domain() -> AppDeployment {
+        AppDeployment {
+            id: 1,
+            user_id: 1,
+            app_id: 1,
+            cluster_id: 1,
+            resource_multiplier: 1,
+            subscription_line_item_id: 1,
+            name: "app-1".to_string(),
+            namespace: namespace_name(1),
+            hostname: None,
+            custom_domain: Some("relay.example.org".to_string()),
+            custom_domain_verified: false,
+            config: None,
+            desired_state: lnvps_db::AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Running,
+            status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
+            created: chrono::Utc::now(),
+            deleted: false,
+        }
     }
 }
