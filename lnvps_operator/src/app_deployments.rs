@@ -1715,10 +1715,16 @@ async fn reconcile_one(
     // no annotation asking cert-manager for a certificate whose HTTP-01
     // challenge would fail on every pass and spend the account's failed
     // validation budget. Verified is sticky, so this probes once per domain.
+    let mut custom_domain_verified = deployment.custom_domain_verified;
     let custom_domain = match deployment.custom_domain.as_deref() {
         Some(cd) if !deployment.custom_domain_verified => {
             if resolves_to_same_address(cd, &hostname).await {
                 ctx.db.set_app_deployment_custom_domain_verified(id).await?;
+                // Carried into the status write-back below: that write updates
+                // the whole row from this (pre-probe) struct, so without this
+                // the flag we just set is immediately overwritten with 0 and
+                // the domain is re-probed on every pass forever.
+                custom_domain_verified = true;
                 Some(cd)
             } else {
                 info!(
@@ -1770,6 +1776,10 @@ async fn reconcile_one(
             warn!("app deployment {id}: could not read workload health: {e}");
             None
         }
+    };
+    let deployment = &AppDeployment {
+        custom_domain_verified,
+        ..deployment.clone()
     };
     let status = write_back_status(ctx, deployment, hostname, &gate, health).await?;
     info!("reconciled app deployment {id}");
