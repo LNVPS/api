@@ -37,10 +37,13 @@ RUN cargo build --release --locked --bins \
           target/release/lnvps_nostr target/release/lnvps_agent /out/
 
 # --- crane: fetch pre-built host-info binaries for the api image ---
-FROM gcr.io/go-containerregistry/crane:latest AS crane-bin
+# Pinned: the image is ko-built and upstream moved the binary from
+# /ko-app/crane to /crane, which broke every build here the moment it was
+# published. A tag we bump deliberately beats :latest changing layout under us.
+FROM gcr.io/go-containerregistry/crane:v0.22.0 AS crane-bin
 FROM debian:trixie-slim AS crane
 RUN apt update && apt install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=crane-bin /ko-app/crane /usr/local/bin/crane
+COPY --from=crane-bin /crane /usr/local/bin/crane
 
 ARG HOST_INFO_IMAGE
 ARG REGISTRY_USER
