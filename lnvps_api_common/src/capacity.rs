@@ -1401,6 +1401,8 @@ mod tests {
                 disk_type: ApiDiskType::SSD,
                 disk_interface: ApiDiskInterface::PCIe,
             }],
+            transfer_gb: None,
+            limits: Default::default(),
         }
     }
 

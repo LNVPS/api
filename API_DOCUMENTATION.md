@@ -1139,6 +1139,40 @@ the full firewall ruleset on the host.
 }
 ```
 
+Every `VmTemplate` (here, on `GET /api/v1/vm/{id}` and on each VM listing) and
+every `CustomTemplateParams` carries a `limits` object describing the
+performance caps applied to a VM built from that offer:
+
+```json
+"limits": {
+  "disk_iops_read": 5000,
+  "disk_iops_write": 2500,
+  "disk_mbps_read": 500,
+  "disk_mbps_write": 250,
+  "network_mbps": 1000,
+  "cpu_limit": 0.5,
+  "firewall_rule_limit": 20
+}
+```
+
+A field is **omitted when uncapped**, so `"limits": {}` means a VM on that offer
+is bounded only by the hardware it lands on. Every current offer is uncapped.
+
+`cpu_limit` is a fraction of the cores in `cpu`, not a replacement for it: an
+offer with `cpu: 4` and `cpu_limit: 0.5` gives the guest four cores and half
+their total time. `network_mbps` applies in each direction and is a *rate*, not
+the monthly volume — that is `transfer_gb`. `firewall_rule_limit` is the number
+of user firewall rules the VM may hold; omitted means the server default.
+
+These are properties of the offer, not of a host. A host's own capacity is never
+reported to customers: two hosts backing the same plan must be indistinguishable
+to the buyer.
+
+`CustomTemplateParams` also carries `transfer_gb`, the allowance copied onto
+every custom VM built from that plan. Its `limits` never includes
+`firewall_rule_limit` — a pricing plan holds none, so such a VM uses the server
+default.
+
 #### List OS Images
 - **GET** `/api/v1/image`
 - **Auth**: None

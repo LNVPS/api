@@ -174,6 +174,10 @@ impl ApiVmTemplate {
             ip4_count: template.ip4_count,
             ip6_count: template.ip6_count,
             transfer_gb: template.transfer_gb,
+            // Copied onto the custom template when it was ordered, so the caps
+            // reported are the ones this VM actually runs under, not whatever
+            // the pricing plan says today.
+            limits: (&template).into(),
         })
     }
 
@@ -236,6 +240,7 @@ impl ApiVmTemplate {
             ip4_count: template.ip4_count,
             ip6_count: template.ip6_count,
             transfer_gb: template.transfer_gb,
+            limits: template.into(),
         })
     }
 }
@@ -584,6 +589,87 @@ pub struct ApiVmTemplate {
     /// `GET /api/v1/vm/{id}/traffic` for usage against it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transfer_gb: Option<u32>,
+    /// Performance caps enforced on a VM built from this offer.
+    pub limits: ApiVmTemplateLimits,
+}
+
+/// The performance caps an offer carries, as enforced on the hypervisor.
+///
+/// Every field is **omitted when uncapped**, so an empty object means a VM on
+/// this offer is limited only by the hardware it lands on. They are properties
+/// of the *offer*, not of a host: two hosts backing the same plan must be
+/// indistinguishable to the buyer, so a host's own capacity is never reported
+/// here.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub struct ApiVmTemplateLimits {
+    /// Maximum disk read IOPS
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_iops_read: Option<u32>,
+    /// Maximum disk write IOPS
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_iops_write: Option<u32>,
+    /// Maximum disk read throughput in MB/s
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_mbps_read: Option<u32>,
+    /// Maximum disk write throughput in MB/s
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_mbps_write: Option<u32>,
+    /// Maximum network bandwidth in Mbit/s, applied in each direction
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network_mbps: Option<u32>,
+    /// Maximum CPU usage as a fraction of the allocated cores (0.5 = half of
+    /// what `cpu` states). Distinct from `cpu`: a capped offer hands the guest
+    /// the cores but not all of their time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_limit: Option<f32>,
+    /// Maximum user firewall rules per VM. Omitted when the offer sets none,
+    /// in which case the server's global default applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub firewall_rule_limit: Option<u16>,
+}
+
+impl From<&VmTemplate> for ApiVmTemplateLimits {
+    fn from(t: &VmTemplate) -> Self {
+        Self {
+            disk_iops_read: t.disk_iops_read,
+            disk_iops_write: t.disk_iops_write,
+            disk_mbps_read: t.disk_mbps_read,
+            disk_mbps_write: t.disk_mbps_write,
+            network_mbps: t.network_mbps,
+            cpu_limit: t.cpu_limit,
+            firewall_rule_limit: t.firewall_rule_limit,
+        }
+    }
+}
+
+impl From<&VmCustomTemplate> for ApiVmTemplateLimits {
+    fn from(t: &VmCustomTemplate) -> Self {
+        Self {
+            disk_iops_read: t.disk_iops_read,
+            disk_iops_write: t.disk_iops_write,
+            disk_mbps_read: t.disk_mbps_read,
+            disk_mbps_write: t.disk_mbps_write,
+            network_mbps: t.network_mbps,
+            cpu_limit: t.cpu_limit,
+            firewall_rule_limit: t.firewall_rule_limit,
+        }
+    }
+}
+
+impl From<&VmCustomPricing> for ApiVmTemplateLimits {
+    fn from(p: &VmCustomPricing) -> Self {
+        Self {
+            disk_iops_read: p.disk_iops_read,
+            disk_iops_write: p.disk_iops_write,
+            disk_mbps_read: p.disk_mbps_read,
+            disk_mbps_write: p.disk_mbps_write,
+            network_mbps: p.network_mbps,
+            cpu_limit: p.cpu_limit,
+            // A custom pricing plan carries no firewall rule limit; a VM built
+            // from one uses the server default.
+            firewall_rule_limit: None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
@@ -936,6 +1022,13 @@ pub struct ApiCustomTemplateParams {
     /// Maximum IPv6 addresses selectable on this plan
     pub max_ip6: u16,
     pub disks: Vec<ApiCustomTemplateDiskParam>,
+    /// Outbound transfer included per calendar month, in GB, copied onto every
+    /// custom VM built from this plan. Omitted when the plan is unmetered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer_gb: Option<u32>,
+    /// Performance caps applied to every custom VM built from this plan,
+    /// whatever specification is chosen. Not selectable.
+    pub limits: ApiVmTemplateLimits,
 }
 
 impl ApiCustomTemplateParams {
@@ -985,6 +1078,8 @@ impl ApiCustomTemplateParams {
                     disk_interface: d.interface.into(),
                 })
                 .collect(),
+            transfer_gb: pricing.transfer_gb,
+            limits: pricing.into(),
         }
     }
 }
@@ -1417,6 +1512,90 @@ mod tests {
         let s = serde_json::to_string(&res).unwrap();
         assert!(s.contains(r#""type":"ip_range""#));
         assert!(s.contains(r#""ip_range_subscription_id":7"#));
+    }
+
+    const EXPECTED_LIMITS: ApiVmTemplateLimits = ApiVmTemplateLimits {
+        disk_iops_read: Some(5000),
+        disk_iops_write: Some(2500),
+        disk_mbps_read: Some(500),
+        disk_mbps_write: Some(250),
+        network_mbps: Some(1000),
+        cpu_limit: Some(0.5),
+        firewall_rule_limit: Some(20),
+    };
+
+    /// A standard offer reports every cap it carries.
+    #[test]
+    fn test_limits_from_vm_template() {
+        let t = VmTemplate {
+            disk_iops_read: Some(5000),
+            disk_iops_write: Some(2500),
+            disk_mbps_read: Some(500),
+            disk_mbps_write: Some(250),
+            network_mbps: Some(1000),
+            cpu_limit: Some(0.5),
+            firewall_rule_limit: Some(20),
+            ..Default::default()
+        };
+        assert_eq!(ApiVmTemplateLimits::from(&t), EXPECTED_LIMITS);
+    }
+
+    /// A custom VM reports the caps copied onto it when it was ordered, so an
+    /// edit to the pricing plan cannot misdescribe a running machine.
+    #[test]
+    fn test_limits_from_custom_vm_template() {
+        let t = VmCustomTemplate {
+            disk_iops_read: Some(5000),
+            disk_iops_write: Some(2500),
+            disk_mbps_read: Some(500),
+            disk_mbps_write: Some(250),
+            network_mbps: Some(1000),
+            cpu_limit: Some(0.5),
+            firewall_rule_limit: Some(20),
+            ..Default::default()
+        };
+        assert_eq!(ApiVmTemplateLimits::from(&t), EXPECTED_LIMITS);
+    }
+
+    /// A pricing plan carries no firewall rule limit of its own — a custom VM
+    /// built from one falls back to the server default, so reporting a number
+    /// here would be inventing one.
+    #[test]
+    fn test_limits_from_custom_pricing_has_no_firewall_limit() {
+        let p = VmCustomPricing {
+            disk_iops_read: Some(5000),
+            disk_iops_write: Some(2500),
+            disk_mbps_read: Some(500),
+            disk_mbps_write: Some(250),
+            network_mbps: Some(1000),
+            cpu_limit: Some(0.5),
+            ..Default::default()
+        };
+        let limits = ApiVmTemplateLimits::from(&p);
+        assert_eq!(limits.network_mbps, Some(1000));
+        assert_eq!(limits.cpu_limit, Some(0.5));
+        assert_eq!(limits.firewall_rule_limit, None);
+    }
+
+    /// An uncapped offer serialises as an empty object rather than a wall of
+    /// nulls: absent means "limited only by the hardware", which is what every
+    /// offer says today.
+    #[test]
+    fn test_uncapped_limits_serialise_empty() {
+        let limits = ApiVmTemplateLimits::from(&VmTemplate::default());
+        assert_eq!(serde_json::to_string(&limits).unwrap(), "{}");
+    }
+
+    /// A cap that is set must survive the round trip, including the fractional
+    /// CPU limit — a client reading 0.5 as 0 would advertise a plan as twice
+    /// the CPU it delivers.
+    #[test]
+    fn test_capped_limits_round_trip() {
+        let json = serde_json::to_string(&EXPECTED_LIMITS).unwrap();
+        assert!(json.contains(r#""network_mbps":1000"#));
+        assert!(json.contains(r#""cpu_limit":0.5"#));
+        let back: ApiVmTemplateLimits = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, EXPECTED_LIMITS);
     }
 }
 
