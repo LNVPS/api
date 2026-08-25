@@ -3041,9 +3041,23 @@ impl Worker {
             }
             WorkJob::PatchHosts => {
                 let mut hosts = self.reconcile_hosts().await?;
+                let total = hosts.len();
+                let mut failed = 0usize;
                 for host in &mut hosts {
                     info!("Patching host {}", host.name);
-                    self.patch_host(host).await?;
+                    // Each host is an independent hypervisor, so one that is
+                    // unreachable or misconfigured must not stop the sweep
+                    // before the hosts after it in the list — which it did,
+                    // silently, for as long as that host stayed broken. The
+                    // per-host `PatchHost { host_id }` still reports its
+                    // failure: that one is tied to a waiting admin request.
+                    if let Err(e) = self.patch_host(host).await {
+                        failed += 1;
+                        warn!("Failed to patch host {}: {}", host.name, e);
+                    }
+                }
+                if failed > 0 {
+                    warn!("Patched hosts with {}/{} failures", failed, total);
                 }
             }
             WorkJob::CheckVm { vm_id } => {
@@ -4730,6 +4744,43 @@ mod tests {
 
     async fn setup_worker(db: Arc<MockDb>) -> Result<Worker> {
         setup_worker_with_delete_after(db, 0).await
+    }
+
+    /// Regression test: one broken host must not abort the `PatchHosts` sweep.
+    ///
+    /// The loop used `?`, so the first host whose client could not be built (a
+    /// bad address, a hypervisor that is down) ended the job and every host
+    /// after it in the list went unpatched — for as long as that host stayed
+    /// broken, which is indefinitely.
+    #[tokio::test]
+    async fn test_patch_hosts_continues_past_a_failing_host() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        // A Proxmox host whose address cannot be parsed: `get_host_client`
+        // fails, which is what used to abort the sweep.
+        db.create_host(&VmHost {
+            kind: VmHostKind::Proxmox,
+            region_id: 1,
+            name: "broken-host".to_string(),
+            ip: "not a url".to_string(),
+            enabled: true,
+            ..Default::default()
+        })
+        .await?;
+        db.create_host(&VmHost {
+            kind: VmHostKind::Dummy,
+            region_id: 1,
+            name: "dummy-host".to_string(),
+            enabled: true,
+            ..Default::default()
+        })
+        .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .try_job(&WorkJob::PatchHosts)
+            .await
+            .expect("a single unpatchable host must not fail the whole sweep");
+        Ok(())
     }
 
     /// Regression test: reconciliation sweeps must visit disabled hosts too.
