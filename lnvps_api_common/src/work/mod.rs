@@ -37,6 +37,8 @@ pub trait WorkCommander: Send + Sync {
 pub enum WorkJob {
     /// Sync resources from hosts to database
     PatchHosts,
+    /// Sync resources (cpu/memory/disks) from a single host to the database
+    PatchHost { host_id: u64 },
     /// Check all running VMS
     CheckVms,
     /// Check the VM status matches database state
@@ -337,6 +339,7 @@ impl fmt::Display for WorkJob {
             WorkJob::ReconcileAppDeployment { .. } => write!(f, "ReconcileAppDeployment"),
             WorkJob::ApplySubscriptionPayment { .. } => write!(f, "ApplySubscriptionPayment"),
             WorkJob::PatchHosts => write!(f, "PatchHosts"),
+            WorkJob::PatchHost { .. } => write!(f, "PatchHost"),
             WorkJob::CheckVms => write!(f, "CheckVms"),
             WorkJob::CheckVm { .. } => write!(f, "CheckVm"),
             WorkJob::SendNotification { .. } => write!(f, "SendNotification"),
@@ -383,6 +386,17 @@ impl fmt::Display for WorkJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_patch_host_job_display_and_roundtrip() {
+        let job = WorkJob::PatchHost { host_id: 7 };
+        assert_eq!(job.to_string(), "PatchHost");
+        let json = serde_json::to_string(&job).unwrap();
+        match serde_json::from_str::<WorkJob>(&json).unwrap() {
+            WorkJob::PatchHost { host_id } => assert_eq!(host_id, 7),
+            other => panic!("unexpected job: {other}"),
+        }
+    }
 
     #[test]
     fn test_router_default_route_job_display() {

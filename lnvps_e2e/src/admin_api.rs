@@ -659,6 +659,26 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_admin_patch_host() {
+        let client = setup().await;
+        let resp = client.get_auth("/api/admin/v1/hosts").await.unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        if let Some(h) = body["data"].as_array().and_then(|h| h.first()) {
+            let host_id = h["id"].as_u64().unwrap();
+            let resp = client
+                .post_auth(
+                    &format!("/api/admin/v1/hosts/{host_id}/patch"),
+                    &serde_json::json!({}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            assert!(body["data"]["job_id"].is_string());
+        }
+    }
+
     // ========================================================================
     // Region CRUD Lifecycle
     // ========================================================================

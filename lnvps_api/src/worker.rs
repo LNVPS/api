@@ -3034,6 +3034,11 @@ impl Worker {
     async fn try_job(&self, job: &WorkJob) -> Result<Option<String>> {
         info!("Starting job: {}", job);
         match job {
+            WorkJob::PatchHost { host_id } => {
+                let mut host = self.db.get_host(*host_id).await?;
+                info!("Patching host {}", host.name);
+                self.patch_host(&mut host).await?;
+            }
             WorkJob::PatchHosts => {
                 let mut hosts = self.db.list_hosts().await?;
                 for host in &mut hosts {

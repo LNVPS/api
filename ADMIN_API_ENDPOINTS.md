@@ -1668,6 +1668,28 @@ Body (all optional):
 }
 ```
 
+#### Force Host Resource Sync
+
+```
+POST /api/admin/v1/hosts/{id}/patch
+```
+
+Required Permission: `hosts::update`
+
+Queues a `PatchHost` job for this host: the worker reads the host's real CPU,
+memory and disks from the hypervisor and updates the database (adding disks that
+aren't recorded yet). Useful right after creating a host, since the equivalent
+bulk sync otherwise only runs at worker startup. No body is required. Dummy
+hosts are a no-op.
+
+Response:
+
+```json
+{
+  "job_id": "string"
+}
+```
+
 #### List Unmanaged VMs
 
 ```

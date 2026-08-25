@@ -43,6 +43,8 @@ pub fn router() -> Router<RouterState> {
             get(admin_list_unmanaged_vms),
         )
         .route("/api/admin/v1/hosts/{id}/vms/import", post(admin_import_vm))
+        // Force a resource sync (cpu/memory/disks) from the host
+        .route("/api/admin/v1/hosts/{id}/patch", post(admin_patch_host))
 }
 
 /// List all VM hosts with pagination
@@ -604,6 +606,37 @@ async fn admin_import_vm(
             ApiData::ok(JobResponse { job_id })
         }
         Err(e) => ApiData::err(&format!("Failed to queue VM import job: {}", e)),
+    }
+}
+
+/// Force a resource sync for a single host.
+///
+/// The periodic `PatchHosts` job only runs on worker startup, so a freshly
+/// added host keeps its manually entered cpu/memory and has no disks until the
+/// next restart. This queues a `PatchHost` job for one host on demand.
+async fn admin_patch_host(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<JobResponse> {
+    auth.require_permission(AdminResource::Hosts, AdminAction::Update)?;
+
+    // Validate the host exists before dispatching work
+    let _host = this.db.get_host(id).await?;
+
+    match this
+        .work_commander
+        .send(WorkJob::PatchHost { host_id: id })
+        .await
+    {
+        Ok(job_id) => {
+            info!(
+                "Host patch job queued (host {}) with stream ID: {}",
+                id, job_id
+            );
+            ApiData::ok(JobResponse { job_id })
+        }
+        Err(e) => ApiData::err(&format!("Failed to queue host patch job: {}", e)),
     }
 }
 
