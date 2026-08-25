@@ -10,6 +10,59 @@ fn serialize_json_to_bytes(value: Option<Value>) -> Option<Vec<u8>> {
     value.and_then(|v| serde_json::to_vec(&v).ok())
 }
 
+/// Format a timestamp the way it is shown to customers in history entries.
+fn format_time(time: chrono::DateTime<Utc>) -> String {
+    time.format("%-d %B %Y at %H:%M UTC").to_string()
+}
+
+/// Turn a plain count into a phrase with a correctly pluralised unit,
+/// e.g. `1 day` / `7 days`.
+fn plural(count: u64, unit: &str) -> String {
+    if count == 1 {
+        format!("{count} {unit}")
+    } else {
+        format!("{count} {unit}s")
+    }
+}
+
+/// Render a duration in the largest sensible whole unit, so a customer reads
+/// "30 days added" rather than "2592000 seconds added".
+fn format_duration(seconds: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+
+    if seconds >= DAY {
+        let days = seconds / DAY;
+        let hours = (seconds % DAY) / HOUR;
+        if hours > 0 {
+            format!("{} {}", plural(days, "day"), plural(hours, "hour"))
+        } else {
+            plural(days, "day")
+        }
+    } else if seconds >= HOUR && seconds.is_multiple_of(HOUR) {
+        plural(seconds / HOUR, "hour")
+    } else if seconds >= MINUTE && seconds.is_multiple_of(MINUTE) {
+        plural(seconds / MINUTE, "minute")
+    } else {
+        plural(seconds, "second")
+    }
+}
+
+/// Format a money amount the way it is shown on invoices.
+fn format_amount(amount: u64, currency: &str) -> String {
+    let parsed = Currency::from_str(currency).unwrap_or(Currency::BTC);
+    CurrencyAmount::from_u64(parsed, amount).to_string()
+}
+
+/// Append `(reason: ...)` to a sentence when a reason was supplied.
+fn with_reason(text: String, reason: Option<&str>) -> String {
+    match reason {
+        Some(r) if !r.trim().is_empty() => format!("{text} (reason: {})", r.trim()),
+        _ => text,
+    }
+}
+
 #[derive(Clone)]
 pub struct VmHistoryLogger {
     db: Arc<dyn LNVpsDb>,
@@ -47,7 +100,10 @@ impl VmHistoryLogger {
             previous_state: None,
             new_state: serialize_json_to_bytes(Some(vm_state)),
             metadata: serialize_json_to_bytes(metadata),
-            description: Some(format!("VM {} was created", vm.id)),
+            description: Some(match self.image_name(vm.image_id).await {
+                Some(image) => format!("VM created running {image}"),
+                None => "VM created".to_string(),
+            }),
         };
 
         self.db.insert_vm_history(&history).await?;
@@ -69,7 +125,7 @@ impl VmHistoryLogger {
             previous_state: None,
             new_state: None,
             metadata: serialize_json_to_bytes(metadata),
-            description: Some(format!("VM {} was started", vm_id)),
+            description: Some("VM started".to_string()),
         };
 
         self.db.insert_vm_history(&history).await?;
@@ -91,7 +147,7 @@ impl VmHistoryLogger {
             previous_state: None,
             new_state: None,
             metadata: serialize_json_to_bytes(metadata),
-            description: Some(format!("VM {} was stopped", vm_id)),
+            description: Some("VM stopped".to_string()),
         };
 
         self.db.insert_vm_history(&history).await?;
@@ -113,7 +169,7 @@ impl VmHistoryLogger {
             previous_state: None,
             new_state: None,
             metadata: serialize_json_to_bytes(metadata),
-            description: Some(format!("VM {} was restarted", vm_id)),
+            description: Some("VM restarted".to_string()),
         };
 
         self.db.insert_vm_history(&history).await?;
@@ -127,10 +183,7 @@ impl VmHistoryLogger {
         reason: Option<&str>,
         metadata: Option<Value>,
     ) -> Result<()> {
-        let description = match reason {
-            Some(r) => format!("VM {} was deleted: {}", vm_id, r),
-            None => format!("VM {} was deleted", vm_id),
-        };
+        let description = with_reason("VM deleted".to_string(), reason);
 
         let history = VmHistory {
             id: 0,
@@ -158,7 +211,7 @@ impl VmHistoryLogger {
             previous_state: None,
             new_state: None,
             metadata: serialize_json_to_bytes(metadata),
-            description: Some(format!("VM {} expired", vm_id)),
+            description: Some("VM expired, renew it to restore service".to_string()),
         };
 
         self.db.insert_vm_history(&history).await?;
@@ -192,11 +245,7 @@ impl VmHistoryLogger {
             previous_state: serialize_json_to_bytes(Some(json!({"expires": old_expires}))),
             new_state: serialize_json_to_bytes(Some(json!({"expires": new_expires}))),
             metadata: serialize_json_to_bytes(Some(meta)),
-            description: Some(format!(
-                "VM {} was renewed until {}",
-                vm_id,
-                new_expires.format("%Y-%m-%d %H:%M UTC")
-            )),
+            description: Some(format!("VM renewed until {}", format_time(new_expires))),
         };
 
         self.db.insert_vm_history(&history).await?;
@@ -220,21 +269,14 @@ impl VmHistoryLogger {
             meta["reason"] = json!(r);
         }
 
-        let description = match reason {
-            Some(r) => format!(
-                "VM {} was extended by {} days until {} - Reason: {}",
-                vm_id,
-                days_extended,
-                new_expires.format("%Y-%m-%d %H:%M UTC"),
-                r
+        let description = with_reason(
+            format!(
+                "VM extended by {}, now expires {}",
+                plural(days_extended as u64, "day"),
+                format_time(new_expires)
             ),
-            None => format!(
-                "VM {} was extended by {} days until {}",
-                vm_id,
-                days_extended,
-                new_expires.format("%Y-%m-%d %H:%M UTC")
-            ),
-        };
+            reason.as_deref(),
+        );
 
         let history = VmHistory {
             id: 0,
@@ -269,7 +311,12 @@ impl VmHistoryLogger {
             previous_state: serialize_json_to_bytes(Some(json!({"image_id": old_image_id}))),
             new_state: serialize_json_to_bytes(Some(json!({"image_id": new_image_id}))),
             metadata: serialize_json_to_bytes(metadata),
-            description: Some(format!("VM {} was reinstalled with new image", vm_id)),
+            description: Some(match self.image_name(new_image_id).await {
+                Some(image) => {
+                    format!("VM reinstalled with {image}, all data on the disk was erased")
+                }
+                None => "VM reinstalled, all data on the disk was erased".to_string(),
+            }),
         };
 
         self.db.insert_vm_history(&history).await?;
@@ -293,10 +340,7 @@ impl VmHistoryLogger {
             previous_state: serialize_json_to_bytes(Some(json!({"user_id": old_user_id}))),
             new_state: serialize_json_to_bytes(Some(json!({"user_id": new_user_id}))),
             metadata: serialize_json_to_bytes(metadata),
-            description: Some(format!(
-                "VM {} was transferred from user {} to user {}",
-                vm_id, old_user_id, new_user_id
-            )),
+            description: Some("VM ownership transferred to another account".to_string()),
         };
 
         self.db.insert_vm_history(&history).await?;
@@ -311,6 +355,12 @@ impl VmHistoryLogger {
     /// migrated it by hand in the Proxmox UI) and reconciled the record. The
     /// second case has no initiating user, so without the flag the two are
     /// indistinguishable after the fact.
+    ///
+    /// `disks` is the VM's disk before and after the move, when the caller
+    /// knows it: a host move usually moves the storage too, and a customer
+    /// cares which media their VM landed on, so the media type is named in the
+    /// description when it changes.
+    #[allow(clippy::too_many_arguments)]
     pub async fn log_vm_migrated(
         &self,
         vm_id: u64,
@@ -318,10 +368,33 @@ impl VmHistoryLogger {
         old_host_id: u64,
         new_host_id: u64,
         detected: bool,
+        disks: Option<(u64, u64)>,
         metadata: Option<Value>,
     ) -> Result<()> {
         let mut meta = metadata.unwrap_or_else(|| json!({}));
         meta["detected"] = json!(detected);
+        if let Some((old_disk_id, new_disk_id)) = disks {
+            meta["old_disk_id"] = json!(old_disk_id);
+            meta["new_disk_id"] = json!(new_disk_id);
+        }
+
+        // Only mention storage when it actually changed, and only name the
+        // media type when both disks resolve to a known type.
+        let storage_note = match disks {
+            Some((old_disk_id, new_disk_id)) if old_disk_id != new_disk_id => {
+                match (
+                    self.disk_type(old_disk_id).await,
+                    self.disk_type(new_disk_id).await,
+                ) {
+                    (Some(old), Some(new)) if old != new => {
+                        format!(", storage moved from {old} to {new}")
+                    }
+                    (_, Some(new)) => format!(", storage moved to another {new} disk"),
+                    _ => ", storage moved to a different disk".to_string(),
+                }
+            }
+            _ => String::new(),
+        };
 
         let history = VmHistory {
             id: 0,
@@ -329,20 +402,24 @@ impl VmHistoryLogger {
             action_type: VmHistoryActionType::Migrated,
             timestamp: Utc::now(),
             initiated_by_user,
-            previous_state: serialize_json_to_bytes(Some(json!({"host_id": old_host_id}))),
-            new_state: serialize_json_to_bytes(Some(json!({"host_id": new_host_id}))),
+            previous_state: serialize_json_to_bytes(Some(json!({
+                "host_id": old_host_id,
+                "disk_id": disks.map(|(old, _)| old),
+            }))),
+            new_state: serialize_json_to_bytes(Some(json!({
+                "host_id": new_host_id,
+                "disk_id": disks.map(|(_, new)| new),
+            }))),
             metadata: serialize_json_to_bytes(Some(meta)),
-            description: Some(if detected {
-                format!(
-                    "VM {} was found on host {} instead of host {}, database updated to match",
-                    vm_id, new_host_id, old_host_id
-                )
-            } else {
-                format!(
-                    "VM {} was migrated from host {} to host {}",
-                    vm_id, old_host_id, new_host_id
-                )
-            }),
+            description: Some(format!(
+                "{}{}",
+                if detected {
+                    "VM was found running on a different host, our records were updated to match"
+                } else {
+                    "VM was moved to a different host"
+                },
+                storage_note
+            )),
         };
 
         self.db.insert_vm_history(&history).await?;
@@ -377,23 +454,10 @@ impl VmHistoryLogger {
             meta["reason"] = json!(r);
         }
 
-        let description = match reason {
-            Some(r) => format!(
-                "VM {} was refunded {} {} against payment {} - Reason: {}",
-                vm_id,
-                amount,
-                currency,
-                hex::encode(refunded_payment_id),
-                r
-            ),
-            None => format!(
-                "VM {} was refunded {} {} against payment {}",
-                vm_id,
-                amount,
-                currency,
-                hex::encode(refunded_payment_id)
-            ),
-        };
+        let description = with_reason(
+            format!("Refund of {} issued", format_amount(amount, currency)),
+            reason,
+        );
 
         let history = VmHistory {
             id: 0,
@@ -428,8 +492,8 @@ impl VmHistoryLogger {
             new_state: serialize_json_to_bytes(Some(json!({"state": new_state}))),
             metadata: serialize_json_to_bytes(metadata),
             description: Some(format!(
-                "VM {} state changed from {} to {}",
-                vm_id, old_state, new_state
+                "VM state changed from {} to {}",
+                old_state, new_state
             )),
         };
 
@@ -450,8 +514,7 @@ impl VmHistoryLogger {
         meta["payment_currency"] = json!(payment_currency);
         meta["time_added_seconds"] = json!(time_added_seconds);
 
-        let currency = Currency::from_str(payment_currency).unwrap_or(Currency::BTC);
-        let formatted_amount = CurrencyAmount::from_u64(currency, payment_amount);
+        let formatted_amount = format_amount(payment_amount, payment_currency);
 
         let history = VmHistory {
             id: 0,
@@ -463,8 +526,9 @@ impl VmHistoryLogger {
             new_state: None,
             metadata: serialize_json_to_bytes(Some(meta)),
             description: Some(format!(
-                "VM {} received payment of {} ({} seconds added)",
-                vm_id, formatted_amount, time_added_seconds
+                "Payment of {} received, {} added to VM expiry",
+                formatted_amount,
+                format_duration(time_added_seconds)
             )),
         };
 
@@ -508,12 +572,143 @@ impl VmHistoryLogger {
             initiated_by_user,
             previous_state: serialize_json_to_bytes(Some(previous_state)),
             new_state: serialize_json_to_bytes(Some(new_state)),
-            metadata: serialize_json_to_bytes(metadata),
-            description: Some(format!("VM {} configuration was changed", vm_id)),
+            metadata: serialize_json_to_bytes(metadata.clone()),
+            description: Some(
+                self.describe_config_change(old_vm, new_vm, metadata.as_ref())
+                    .await,
+            ),
         };
 
         self.db.insert_vm_history(&history).await?;
         Ok(())
+    }
+
+    /// Best-effort lookup of a human name for an OS image (e.g. `Ubuntu 24.04`).
+    /// History logging must never fail because of this, so lookup errors just
+    /// drop the name from the sentence.
+    async fn image_name(&self, image_id: u64) -> Option<String> {
+        self.db
+            .get_os_image(image_id)
+            .await
+            .ok()
+            .map(|i| i.to_string())
+    }
+
+    /// Best-effort lookup of a disk's media type as a customer-facing label
+    /// (`SSD` / `HDD`).
+    async fn disk_type(&self, disk_id: u64) -> Option<String> {
+        self.db
+            .get_host_disk(disk_id)
+            .await
+            .ok()
+            .map(|d| d.kind.to_string().to_uppercase())
+    }
+
+    /// Describe a change of the disk the VM's storage lives on. Which media the
+    /// VM sits on is the part a customer actually cares about (an HDD to SSD
+    /// move changes performance), so the type is named whenever both disks can
+    /// be resolved.
+    async fn describe_disk_move(&self, old_disk_id: u64, new_disk_id: u64) -> String {
+        match (
+            self.disk_type(old_disk_id).await,
+            self.disk_type(new_disk_id).await,
+        ) {
+            (Some(old), Some(new)) if old != new => {
+                format!("VM storage moved from {old} to {new}")
+            }
+            (_, Some(new)) => format!("VM storage moved to a different {new} disk"),
+            _ => "VM storage moved to a different disk".to_string(),
+        }
+    }
+
+    /// Build a customer-readable sentence for a configuration change.
+    ///
+    /// `ConfigurationChanged` covers several very different events (IP address
+    /// added or removed, resources upgraded, disk moved, image or SSH key
+    /// swapped), so a generic "configuration was changed" tells the customer
+    /// nothing. The callers already put the specifics in `metadata`; this reads
+    /// them back out and falls back to diffing the VM record.
+    async fn describe_config_change(
+        &self,
+        old_vm: &Vm,
+        new_vm: &Vm,
+        metadata: Option<&Value>,
+    ) -> String {
+        if let Some(meta) = metadata {
+            if let Some(ip) = meta.get("assigned_ip").and_then(|v| v.as_str()) {
+                return format!("IP address {ip} assigned to VM");
+            }
+            if let Some(ip) = meta.get("unassigned_ip").and_then(|v| v.as_str()) {
+                return format!("IP address {ip} removed from VM");
+            }
+            if let Some(specs) = meta.get("new_specs").or_else(|| meta.get("changes")) {
+                let cpu = specs.get("cpu").and_then(|v| v.as_u64());
+                let memory = specs
+                    .get("memory")
+                    .and_then(|v| v.as_u64())
+                    .map(|b| b / crate::GB);
+                let disk = specs
+                    .get("disk_size")
+                    .or_else(|| specs.get("disk"))
+                    .and_then(|v| v.as_u64())
+                    .map(|b| b / crate::GB);
+
+                let mut parts = Vec::new();
+                if let Some(cpu) = cpu {
+                    parts.push(plural(cpu, "CPU core"));
+                }
+                if let Some(memory) = memory {
+                    parts.push(format!("{memory} GB memory"));
+                }
+                if let Some(disk) = disk {
+                    parts.push(format!("{disk} GB disk"));
+                }
+                if !parts.is_empty() {
+                    return format!("VM resources changed to {}", parts.join(", "));
+                }
+            }
+            if meta.get("reason").and_then(|v| v.as_str()) == Some("disk moved on host") {
+                return self
+                    .describe_disk_move(old_vm.disk_id, new_vm.disk_id)
+                    .await;
+            }
+        }
+
+        let mut changes = Vec::new();
+        if old_vm.image_id != new_vm.image_id {
+            match self.image_name(new_vm.image_id).await {
+                Some(image) => changes.push(format!("OS image changed to {image}")),
+                None => changes.push("OS image changed".to_string()),
+            }
+        }
+        if old_vm.ssh_key_id != new_vm.ssh_key_id {
+            changes.push("SSH key changed".to_string());
+        }
+        if old_vm.template_id != new_vm.template_id
+            || old_vm.custom_template_id != new_vm.custom_template_id
+        {
+            changes.push("VM resources changed".to_string());
+        }
+        if old_vm.host_id != new_vm.host_id {
+            changes.push("VM moved to a different host".to_string());
+        }
+        if old_vm.disk_id != new_vm.disk_id {
+            changes.push(
+                self.describe_disk_move(old_vm.disk_id, new_vm.disk_id)
+                    .await,
+            );
+        }
+        if old_vm.mac_address != new_vm.mac_address {
+            changes.push("network hardware address changed".to_string());
+        }
+
+        if changes.is_empty() {
+            "VM configuration updated".to_string()
+        } else {
+            let mut desc = changes.join(", ");
+            let first = desc.remove(0).to_uppercase().to_string();
+            format!("{first}{desc}")
+        }
     }
 
     pub async fn get_vm_history(&self, vm_id: u64) -> Result<Vec<VmHistory>> {
@@ -572,6 +767,230 @@ mod tests {
             description.contains("BTC 0.00000001"),
             "description should contain formatted amount 'BTC 0.00000001', got: {description}"
         );
+        // Durations are humanised, not printed as raw seconds
+        assert!(
+            description.contains("1 hour") && !description.contains("3600"),
+            "description should humanise the duration, got: {description}"
+        );
+    }
+
+    /// Customer-facing descriptions must not leak internal database ids.
+    #[tokio::test]
+    async fn test_descriptions_are_plain_text_without_internal_ids() {
+        let logger = make_logger();
+        logger.log_vm_started(30, None, None).await.unwrap();
+        logger
+            .log_vm_transferred(30, Some(9), 3, 7, None)
+            .await
+            .unwrap();
+        logger
+            .log_vm_migrated(30, None, 1, 2, true, None, None)
+            .await
+            .unwrap();
+        logger
+            .log_vm_refunded(30, Some(1), &[0xab, 0xcd], &[0x12], 1000, "BTC", None, None)
+            .await
+            .unwrap();
+
+        let history = logger.db.list_vm_history(30).await.unwrap();
+        assert_eq!(history.len(), 4);
+        for h in &history {
+            let d = h.description.as_deref().unwrap_or("");
+            assert!(!d.contains("user 3"), "leaks user id: {d}");
+            assert!(!d.contains("host 1"), "leaks host id: {d}");
+            assert!(!d.contains("abcd"), "leaks payment id: {d}");
+            assert!(!d.contains("database"), "leaks db jargon: {d}");
+        }
+        let by_action = |action: &str| {
+            history
+                .iter()
+                .find(|h| h.action_type.to_string() == action)
+                .and_then(|h| h.description.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(by_action("started"), "VM started");
+        // Refund amounts are formatted like invoice amounts
+        assert!(by_action("refunded").contains("BTC 0.00000001"));
+    }
+
+    #[test]
+    fn test_format_duration_units() {
+        assert_eq!(format_duration(30), "30 seconds");
+        assert_eq!(format_duration(60), "1 minute");
+        assert_eq!(format_duration(3600), "1 hour");
+        assert_eq!(format_duration(7200), "2 hours");
+        assert_eq!(format_duration(86400), "1 day");
+        assert_eq!(format_duration(30 * 86400), "30 days");
+        assert_eq!(format_duration(86400 + 3600), "1 day 1 hour");
+        assert_eq!(format_duration(86400 + 90), "1 day");
+    }
+
+    #[test]
+    fn test_plural_and_reason_helpers() {
+        assert_eq!(plural(1, "day"), "1 day");
+        assert_eq!(plural(2, "day"), "2 days");
+        assert_eq!(with_reason("VM deleted".to_string(), None), "VM deleted");
+        assert_eq!(
+            with_reason("VM deleted".to_string(), Some("  abuse ")),
+            "VM deleted (reason: abuse)"
+        );
+        assert_eq!(
+            with_reason("VM deleted".to_string(), Some("   ")),
+            "VM deleted"
+        );
+    }
+
+    #[test]
+    fn test_format_time_and_amount() {
+        let t = chrono::DateTime::parse_from_rfc3339("2025-03-05T09:07:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(format_time(t), "5 March 2025 at 09:07 UTC");
+        assert_eq!(format_amount(1000, "BTC"), "BTC 0.00000001");
+    }
+
+    #[tokio::test]
+    async fn test_config_change_descriptions_from_metadata() {
+        let logger = make_logger();
+        let vm = lnvps_db::Vm {
+            id: 31,
+            host_id: 1,
+            user_id: 1,
+            image_id: 1,
+            template_id: Some(1),
+            custom_template_id: None,
+            subscription_line_item_id: 0,
+            ssh_key_id: Some(1),
+            disk_id: 1,
+            mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+            ssh_host_keys: None,
+            deleted: false,
+            ref_code: None,
+            disabled: false,
+            fw_policy_in: None,
+            fw_policy_out: None,
+            admin_notes: None,
+        };
+
+        let ip_assigned = logger
+            .describe_config_change(&vm, &vm, Some(&json!({"assigned_ip": "1.2.3.4"})))
+            .await;
+        assert_eq!(ip_assigned, "IP address 1.2.3.4 assigned to VM");
+
+        let ip_removed = logger
+            .describe_config_change(&vm, &vm, Some(&json!({"unassigned_ip": "1.2.3.4"})))
+            .await;
+        assert_eq!(ip_removed, "IP address 1.2.3.4 removed from VM");
+
+        let upgraded = logger
+            .describe_config_change(
+                &vm,
+                &vm,
+                Some(&json!({"new_specs": {"cpu": 4, "memory": 4 * crate::GB, "disk_size": 80 * crate::GB}})),
+            )
+            .await;
+        assert_eq!(
+            upgraded,
+            "VM resources changed to 4 CPU cores, 4 GB memory, 80 GB disk"
+        );
+
+        let mut moved = vm.clone();
+        moved.disk_id = 99; // unknown disk: type cannot be resolved
+        let disk_moved = logger
+            .describe_config_change(&vm, &moved, Some(&json!({"reason": "disk moved on host"})))
+            .await;
+        assert_eq!(disk_moved, "VM storage moved to a different disk");
+
+        let mut changed = vm.clone();
+        changed.ssh_key_id = Some(2);
+        let ssh = logger.describe_config_change(&vm, &changed, None).await;
+        assert_eq!(ssh, "SSH key changed");
+
+        let noop = logger.describe_config_change(&vm, &vm, None).await;
+        assert_eq!(noop, "VM configuration updated");
+    }
+
+    /// A storage move must name the media type, since HDD vs SSD is the part
+    /// the customer feels.
+    #[tokio::test]
+    async fn test_disk_move_descriptions_include_disk_type() {
+        let db = Arc::new(MockDb::empty());
+        {
+            let mut disks = db.host_disks.lock().await;
+            disks.insert(
+                1,
+                lnvps_db::VmHostDisk {
+                    id: 1,
+                    host_id: 1,
+                    name: "spinning".to_string(),
+                    size: crate::GB * 1000,
+                    kind: lnvps_db::DiskType::HDD,
+                    interface: lnvps_db::DiskInterface::SATA,
+                    enabled: true,
+                },
+            );
+            disks.insert(
+                2,
+                lnvps_db::VmHostDisk {
+                    id: 2,
+                    host_id: 1,
+                    name: "fast".to_string(),
+                    size: crate::GB * 1000,
+                    kind: lnvps_db::DiskType::SSD,
+                    interface: lnvps_db::DiskInterface::PCIe,
+                    enabled: true,
+                },
+            );
+            disks.insert(
+                3,
+                lnvps_db::VmHostDisk {
+                    id: 3,
+                    host_id: 2,
+                    name: "fast2".to_string(),
+                    size: crate::GB * 1000,
+                    kind: lnvps_db::DiskType::SSD,
+                    interface: lnvps_db::DiskInterface::PCIe,
+                    enabled: true,
+                },
+            );
+        }
+        let logger = VmHistoryLogger::new(db.clone());
+
+        assert_eq!(
+            logger.describe_disk_move(1, 2).await,
+            "VM storage moved from HDD to SSD"
+        );
+        assert_eq!(
+            logger.describe_disk_move(2, 3).await,
+            "VM storage moved to a different SSD disk"
+        );
+        // Unknown disks degrade gracefully rather than failing the log write
+        assert_eq!(
+            logger.describe_disk_move(2, 999).await,
+            "VM storage moved to a different disk"
+        );
+
+        // Host migration carries the same storage detail
+        logger
+            .log_vm_migrated(40, Some(1), 1, 2, false, Some((1, 3)), None)
+            .await
+            .unwrap();
+        let history = logger.db.list_vm_history(40).await.unwrap();
+        assert_eq!(
+            history[0].description.as_deref(),
+            Some("VM was moved to a different host, storage moved from HDD to SSD")
+        );
+
+        // Same disk on both sides: no storage clause at all
+        logger
+            .log_vm_migrated(41, Some(1), 1, 2, false, Some((2, 2)), None)
+            .await
+            .unwrap();
+        let history = logger.db.list_vm_history(41).await.unwrap();
+        assert_eq!(
+            history[0].description.as_deref(),
+            Some("VM was moved to a different host")
+        );
     }
 
     #[tokio::test]
@@ -620,7 +1039,7 @@ mod tests {
                 .description
                 .as_deref()
                 .unwrap_or("")
-                .contains("42")
+                .starts_with("VM created")
         );
     }
 
@@ -727,7 +1146,7 @@ mod tests {
                 .description
                 .as_deref()
                 .unwrap_or("")
-                .contains("admin gift")
+                .contains("(reason: admin gift)")
         );
         let meta: serde_json::Value =
             serde_json::from_slice(history[0].metadata.as_ref().unwrap()).unwrap();

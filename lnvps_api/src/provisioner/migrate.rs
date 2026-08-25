@@ -331,6 +331,7 @@ impl VmProvisioner {
             .await?;
 
         let old_host_id = vm.host_id;
+        let old_disk_id = vm.disk_id;
         db.update_vm_host(vm.id, target_host.id, target.disk_id)
             .await?;
         vm.host_id = target_host.id;
@@ -354,6 +355,7 @@ impl VmProvisioner {
                 old_host_id,
                 target_host.id,
                 false,
+                Some((old_disk_id, target.disk_id)),
                 Some(json!({
                     "live": live,
                     "source_host": source_host.name,
@@ -592,6 +594,7 @@ impl VmProvisioner {
                     drift.from_host_id,
                     drift.to_host_id,
                     true,
+                    Some((vm.disk_id, disk_id)),
                     Some(json!({ "storage": drift.storage })),
                 )
                 .await
