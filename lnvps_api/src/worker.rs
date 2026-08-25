@@ -4396,13 +4396,21 @@ impl Worker {
             );
         }
 
-        // Send ConfigureVm job to update VM network configuration
-        self.work_commander
-            .send(WorkJob::ConfigureVm {
-                vm_id: vm.id,
-                admin_user_id,
-            })
-            .await?;
+        // Send ConfigureVm job to update VM network configuration.
+        // Deleted VMs no longer exist on the host, so there is nothing to configure.
+        if vm.deleted {
+            info!(
+                "Skipping ConfigureVm for deleted VM {} after unassigning IP {}",
+                vm.id, assignment.ip
+            );
+        } else {
+            self.work_commander
+                .send(WorkJob::ConfigureVm {
+                    vm_id: vm.id,
+                    admin_user_id,
+                })
+                .await?;
+        }
 
         info!(
             "Successfully unassigned IP {} (assignment {}) from VM {}",
@@ -5320,6 +5328,50 @@ mod tests {
             worker.kv.get(&host_key_attempt_key(vm_id)).await?.is_some(),
             "periodic sweep did not attempt host key capture"
         );
+        Ok(())
+    }
+
+    /// Regression: unassigning an IP from a deleted VM must not queue a `ConfigureVm` job.
+    ///
+    /// A deleted VM no longer exists on the host, so reconfiguring it always
+    /// fails; the job just churns in the queue.
+    #[tokio::test]
+    async fn test_unassign_vm_ip_skips_configure_for_deleted_vm() -> Result<()> {
+        for deleted in [true, false] {
+            let db = Arc::new(MockDb::default());
+            let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+            if deleted {
+                db.delete_vm(vm_id).await?;
+            }
+            let assignment_id = db
+                .insert_vm_ip_assignment(&VmIpAssignment {
+                    vm_id,
+                    ip_range_id: 1,
+                    ip: "10.0.0.5".to_string(),
+                    ..Default::default()
+                })
+                .await?;
+
+            let worker = setup_worker(db.clone()).await?;
+            worker.unassign_vm_ip(assignment_id, None).await?;
+
+            let queued =
+                tokio::time::timeout(Duration::from_millis(100), worker.work_commander.recv())
+                    .await;
+            if deleted {
+                assert!(
+                    queued.is_err(),
+                    "deleted VM must not get a ConfigureVm job after unassigning its IP"
+                );
+            } else {
+                let jobs = queued.expect("live VM should get a job")?;
+                assert!(
+                    jobs.iter()
+                        .any(|j| matches!(j.job, WorkJob::ConfigureVm { .. })),
+                    "live VM should get a ConfigureVm job"
+                );
+            }
+        }
         Ok(())
     }
 
