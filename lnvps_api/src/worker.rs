@@ -3892,7 +3892,7 @@ impl Worker {
             }
         }
 
-        let hosts = self.db.list_hosts().await?;
+        let hosts = self.image_download_targets().await?;
         let clients: Vec<(String, Arc<dyn VmHostClient>)> = hosts
             .iter()
             .filter_map(
@@ -3908,6 +3908,19 @@ impl Worker {
 
         download_images_on_hosts(clients, &images).await;
         Ok(())
+    }
+
+    /// Hosts that must hold a copy of every OS image.
+    ///
+    /// Every host, including disabled ones and hosts in disabled regions:
+    /// `enabled` means "place no new VMs here", not "this host is gone". A
+    /// disabled host still runs the VMs it already has, and a reinstall or a
+    /// rebuild there imports the image from local storage — which fails if the
+    /// image was never downloaded. Disabling a host must not quietly make its
+    /// existing VMs unrepairable, and re-enabling one must not need a manual
+    /// image sync first.
+    async fn image_download_targets(&self) -> Result<Vec<VmHost>> {
+        Ok(self.db.list_hosts_all().await?)
     }
 
     /// Resolve sha2/sha2_url for an image that is missing them, then persist
@@ -4713,6 +4726,54 @@ mod tests {
 
     async fn setup_worker(db: Arc<MockDb>) -> Result<Worker> {
         setup_worker_with_delete_after(db, 0).await
+    }
+
+    /// Regression test: OS images must be downloaded to disabled hosts too.
+    ///
+    /// The sweep listed hosts with `list_hosts()`, which hides disabled hosts
+    /// and hosts in disabled regions, so a disabled host never received new
+    /// images — and a reinstall or rebuild of a VM still living there failed on
+    /// a missing local image. `enabled` gates placement, not existence.
+    #[tokio::test]
+    async fn test_image_download_targets_include_disabled_hosts() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let enabled_id = db
+            .create_host(&VmHost {
+                kind: VmHostKind::Proxmox,
+                region_id: 1,
+                name: "enabled-host".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let disabled_id = db
+            .create_host(&VmHost {
+                kind: VmHostKind::Proxmox,
+                region_id: 1,
+                name: "disabled-host".to_string(),
+                enabled: false,
+                ..Default::default()
+            })
+            .await?;
+
+        // Precondition: the placement listing is what used to be used here.
+        assert!(
+            db.list_hosts().await?.iter().all(|h| h.id != disabled_id),
+            "precondition: list_hosts() hides disabled hosts"
+        );
+
+        let worker = setup_worker(db.clone()).await?;
+        let targets = worker.image_download_targets().await?;
+
+        assert!(
+            targets.iter().any(|h| h.id == disabled_id),
+            "a disabled host must still receive OS images"
+        );
+        assert!(
+            targets.iter().any(|h| h.id == enabled_id),
+            "an enabled host must still receive OS images"
+        );
+        Ok(())
     }
 
     /// A node whose probe cannot even be attempted must not have its host
