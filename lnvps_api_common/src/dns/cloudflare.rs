@@ -1,7 +1,7 @@
 use crate::dns::{BasicRecord, DnsRef, DnsServer, DnsZone};
 use crate::json_api::JsonApi;
 use crate::op_transient;
-use crate::retry::OpResult;
+use crate::retry::{OpError, OpResult};
 use anyhow::Context;
 use async_trait::async_trait;
 use log::info;
@@ -22,6 +22,52 @@ impl Cloudflare {
         Self {
             api: JsonApi::token(base, &format!("Bearer {}", token), false).unwrap(),
         }
+    }
+
+    /// Cloudflare's error code for "An identical record already exists.".
+    ///
+    /// It is returned as a `400`, which `JsonApi` maps to a fatal error, so an
+    /// add that races or replays a previous success kills the job for good
+    /// unless it is treated as the no-op it actually is.
+    const ERR_IDENTICAL_RECORD: i32 = 81058;
+
+    /// Whether a failed request is Cloudflare complaining that the record we
+    /// wanted to add is already there.
+    ///
+    /// `JsonApi` folds the response body into the error message, so the code is
+    /// matched in the text rather than a typed field.
+    fn is_identical_record_error(err: &OpError<anyhow::Error>) -> bool {
+        let msg = err.inner().to_string();
+        msg.contains(&format!("\"code\":{}", Self::ERR_IDENTICAL_RECORD))
+            || msg.contains("An identical record already exists")
+    }
+
+    /// Look up a record by exact type/name/content, i.e. the record Cloudflare
+    /// considers "identical" to one being added.
+    async fn find_record(
+        &self,
+        zone_id: &str,
+        record: &BasicRecord,
+    ) -> OpResult<Option<BasicRecord>> {
+        let rsp: CfResult<Vec<CfRecord>> = self
+            .api
+            .get(&format!(
+                "/client/v4/zones/{}/dns_records?type={}&name={}&content={}",
+                zone_id,
+                urlencoding::encode(&record.kind.to_string()),
+                urlencoding::encode(&record.name),
+                urlencoding::encode(&record.value),
+            ))
+            .await?;
+        Self::bail_error(&rsp)?;
+        Ok(rsp.result.into_iter().next().map(|r| BasicRecord {
+            name: r.name,
+            value: r.content,
+            id: r.id.map(DnsRef::Id),
+            kind: record.kind.clone(),
+            ip: record.ip.clone(),
+            zone: record.zone.clone(),
+        }))
     }
 
     fn bail_error<T>(rsp: &CfResult<T>) -> OpResult<()> {
@@ -54,7 +100,7 @@ impl DnsServer for Cloudflare {
             "Adding record: [{}] {} => {}",
             record.kind, record.name, record.value
         );
-        let id_response: CfResult<CfRecord> = self
+        let posted: OpResult<CfResult<CfRecord>> = self
             .api
             .post(
                 &format!("/client/v4/zones/{zone_id}/dns_records"),
@@ -65,7 +111,30 @@ impl DnsServer for Cloudflare {
                     id: None,
                 },
             )
-            .await?;
+            .await;
+        let id_response = match posted {
+            Ok(r) => r,
+            // The record we wanted already exists — a replayed or retried job,
+            // or an assignment being re-applied. Adopt the existing record
+            // instead of failing the whole job over work already done.
+            Err(e) if Self::is_identical_record_error(&e) => {
+                return match self.find_record(zone_id, record).await? {
+                    Some(existing) => {
+                        info!(
+                            "Record already exists, reusing: [{}] {} => {}",
+                            record.kind, record.name, record.value
+                        );
+                        Ok(existing)
+                    }
+                    // Cloudflare says it exists but will not show it to us
+                    // (a different zone, or a permissions-scoped token);
+                    // surface the original error rather than inventing a
+                    // record with no id.
+                    None => Err(e),
+                };
+            }
+            Err(e) => return Err(e),
+        };
         Self::bail_error(&id_response)?;
         Ok(BasicRecord {
             name: id_response.result.name,
@@ -226,6 +295,109 @@ mod tests {
     use crate::dns::DnsServer;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::dns::{DnsRef, RecordType};
+
+    fn record() -> BasicRecord {
+        BasicRecord {
+            name: "vm-699.lnvps.cloud".to_string(),
+            value: "51.68.216.208".to_string(),
+            id: None,
+            kind: RecordType::A,
+            ip: "51.68.216.208".to_string(),
+            zone: DnsRef::Id("zone1".to_string()),
+        }
+    }
+
+    fn identical_record_body() -> serde_json::Value {
+        serde_json::json!({
+            "result": null,
+            "success": false,
+            "errors": [{ "code": 81058, "message": "An identical record already exists." }],
+            "messages": []
+        })
+    }
+
+    #[test]
+    fn test_is_identical_record_error() {
+        let err = OpError::Fatal(anyhow::anyhow!(
+            "POST /client/v4/zones/z/dns_records: 400 Bad Request: {}",
+            identical_record_body()
+        ));
+        assert!(Cloudflare::is_identical_record_error(&err));
+
+        // Any other 400 must keep failing the job.
+        let other = OpError::Fatal(anyhow::anyhow!(
+            "POST /client/v4/zones/z/dns_records: 400 Bad Request: \
+             {{\"errors\":[{{\"code\":9103,\"message\":\"Unauthorized\"}}]}}"
+        ));
+        assert!(!Cloudflare::is_identical_record_error(&other));
+    }
+
+    /// The bug this guards: a replayed or retried AssignVmIp hit Cloudflare's
+    /// 81058 and killed the job for good, even though the record it wanted was
+    /// already in place.
+    #[tokio::test]
+    async fn test_add_record_adopts_an_existing_identical_record() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(identical_record_body()))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "errors": [],
+                "result": [{
+                    "id": "rec1",
+                    "name": "vm-699.lnvps.cloud",
+                    "content": "51.68.216.208",
+                    "type": "A"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let cf = Cloudflare::with_base(&server.uri(), "token");
+        let out = cf.add_record(&record()).await?;
+        assert_eq!(out.id, Some(DnsRef::Id("rec1".to_string())));
+        assert_eq!(out.value, "51.68.216.208");
+        Ok(())
+    }
+
+    /// Cloudflare claiming the record exists while refusing to show it (a
+    /// scope-limited token) must not silently produce a record with no id.
+    #[tokio::test]
+    async fn test_add_record_reports_the_error_when_the_record_is_not_visible() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(identical_record_body()))
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "errors": [],
+                "result": []
+            })))
+            .mount(&server)
+            .await;
+
+        let cf = Cloudflare::with_base(&server.uri(), "token");
+        let err = cf
+            .add_record(&record())
+            .await
+            .expect_err("must not succeed");
+        assert!(err.inner().to_string().contains("81058"));
+    }
 
     #[tokio::test]
     async fn test_list_zones_paginates() -> anyhow::Result<()> {
