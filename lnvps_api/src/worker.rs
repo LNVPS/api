@@ -4521,10 +4521,23 @@ impl Worker {
                     );
                 }
                 // if job can be skipped, just acknowledge job
-                if msg.job.can_skip()
-                    && let Err(e) = self.work_commander.ack(&msg.id).await
-                {
-                    error!("Failed to acknowledge job {}: {}", stream_id, e);
+                if msg.job.can_skip() {
+                    if let Err(e) = self.work_commander.ack(&msg.id).await {
+                        error!("Failed to acknowledge job {}: {}", stream_id, e);
+                    }
+                } else {
+                    // Left unacked so it is retried with backoff; stash why, so
+                    // that if it burns through its attempts the dead-lettered
+                    // entry says what kept failing instead of just naming the
+                    // job.
+                    let reason = e.to_string();
+                    if let Err(rec_err) = self.work_commander.record_failure(&msg.id, &reason).await
+                    {
+                        warn!(
+                            "Failed to record failure reason for job {}: {}",
+                            stream_id, rec_err
+                        );
+                    }
                 }
             }
         }

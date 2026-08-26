@@ -31,6 +31,14 @@ pub trait WorkCommander: Send + Sync {
     }
     async fn recv(&self) -> Result<Vec<WorkJobMessage>>;
     async fn ack(&self, id: &str) -> Result<()>;
+    /// Record why an attempt failed, so a job that later exhausts its retries
+    /// can be dead-lettered with the reason attached rather than just an id.
+    ///
+    /// Defaults to doing nothing, which is right for the in-process
+    /// implementations: they have no redelivery and so nothing to explain.
+    async fn record_failure(&self, _id: &str, _error: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
