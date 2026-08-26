@@ -1040,14 +1040,23 @@ struct RenewalsQuery {
     region_id: u64,
 }
 
-/// One month of renewal activity: what is due, and what happened.
+/// One month of renewal activity: what is due, what renewed, and what was lost.
+///
+/// A subscription's `expires` moves forward every time it renews, so a
+/// subscription still carrying an expiry in a **past** month is one that
+/// reached its renewal date and never came back — that is the churn event, and
+/// it is dated by that expiry. In a **future** month the same count is the
+/// renewal outlook. The two are reported separately so neither is mistaken for
+/// the other.
 #[derive(Serialize, Deserialize)]
 struct RenewalsPeriod {
     /// "2026-09"
     period: String,
+    /// True once the month is over, i.e. its counts are final.
+    complete: bool,
 
-    // --- Forward looking: subscriptions whose expiry falls in this month ---
-    /// Subscriptions expiring in this period, whether or not they have renewed.
+    // --- Subscriptions whose expiry falls in this month ---
+    /// Subscriptions expiring in this period.
     due: u64,
     /// Of `due`: auto-renewal enabled AND the user has an enabled saved payment
     /// method — i.e. the worker will actually attempt a charge.
@@ -1059,16 +1068,33 @@ struct RenewalsPeriod {
     /// Of `due`: auto-renewal off. Renews only if the customer acts.
     due_manual: u64,
 
-    // --- Backward looking: renewal payments actually collected this month ---
-    /// Paid renewal payments created in this period.
+    // --- Churn: only meaningful for a completed month ---
+    /// Subscriptions that expired in this month and have not renewed since.
+    /// Zero for the current and future months, where an expiry is not yet a
+    /// loss. Paid customers only.
+    lapsed: u64,
+    /// Expired without the first payment ever being confirmed: an abandoned
+    /// signup rather than a lost customer. Kept out of `lapsed` and out of the
+    /// churn rate so it cannot flatter or inflate them.
+    lapsed_never_paid: u64,
+    /// Distinct subscriptions that renewed in this month.
+    renewed_subscriptions: u64,
+    /// `lapsed / (lapsed + renewed_subscriptions)` as a percentage: of the
+    /// subscriptions that reached a renewal decision this month, the share that
+    /// walked away. `None` for months that are not complete, or where nothing
+    /// was up for decision.
+    churn_rate: Option<f32>,
+
+    // --- Renewal payments collected in this month ---
+    /// Paid renewal payments created in this period (payments, not
+    /// subscriptions: one subscription may renew more than once).
     renewed: u64,
     /// Of `renewed`: charged by the worker against a saved method.
     renewed_auto: u64,
     /// Of `renewed`: paid by the customer.
     renewed_manual: u64,
     /// Of `renewed`: created before renewal source was recorded, so genuinely
-    /// unknown. Never folded into either bucket — see the `renewal_source`
-    /// migration.
+    /// unknown. Never folded into either bucket.
     renewed_unknown: u64,
 }
 
@@ -1083,25 +1109,38 @@ struct RenewalsReport {
     periods: Vec<RenewalsPeriod>,
 }
 
-/// Bucket subscriptions due to renew and renewal payments collected into one
-/// row per calendar month.
+/// Bucket subscriptions and renewal payments into one row per calendar month.
 ///
-/// Pure so the classification is testable without a database: the two halves
-/// are independent (a future month has only `due`, a past month has both), and
-/// a month that appears on either side must appear in the output.
+/// `now` decides which months are complete: a subscription expiring later this
+/// month has not churned, it simply has not been asked yet. Only a month that
+/// has finished can turn its expiries into losses, which is why `lapsed` is
+/// zero for the current and future months rather than counting down as the
+/// month elapses.
+///
+/// Pure so the classification is testable without a database.
 fn build_renewal_periods(
     outlook: &[lnvps_db::SubscriptionRenewalOutlook],
-    renewals: &[(DateTime<Utc>, Option<RenewalSource>)],
+    renewals: &[(u64, DateTime<Utc>, Option<RenewalSource>)],
+    now: DateTime<Utc>,
 ) -> Vec<RenewalsPeriod> {
+    let current = period_key(now, false);
     let mut acc: BTreeMap<String, RenewalsPeriod> = BTreeMap::new();
-    let mut row = |acc: &mut BTreeMap<String, RenewalsPeriod>, at: DateTime<Utc>| -> String {
+    let mut renewed_subs: BTreeMap<String, std::collections::HashSet<u64>> = BTreeMap::new();
+
+    let row = |acc: &mut BTreeMap<String, RenewalsPeriod>, at: DateTime<Utc>| -> String {
         let key = period_key(at, false);
+        let complete = key < current;
         acc.entry(key.clone()).or_insert_with(|| RenewalsPeriod {
             period: key.clone(),
+            complete,
             due: 0,
             due_auto_capable: 0,
             due_auto_without_method: 0,
             due_manual: 0,
+            lapsed: 0,
+            lapsed_never_paid: 0,
+            renewed_subscriptions: 0,
+            churn_rate: None,
             renewed: 0,
             renewed_auto: 0,
             renewed_manual: 0,
@@ -1112,19 +1151,31 @@ fn build_renewal_periods(
 
     for o in outlook {
         let key = row(&mut acc, o.expires);
+        let complete = acc[&key].complete;
         let e = acc.get_mut(&key).unwrap();
         e.due += 1;
         match (o.auto_renewal_enabled, o.has_payment_method) {
-            // Auto-renewal only actually fires when the worker has a method to
-            // charge; the flag on its own is not a prediction.
+            // Auto-renewal only fires when the worker has a method to charge;
+            // the flag on its own is not a prediction.
             (true, true) => e.due_auto_capable += 1,
             (true, false) => e.due_auto_without_method += 1,
             (false, _) => e.due_manual += 1,
         }
+        // Past expiry that is still the subscription's expiry = it never
+        // renewed. Renewal advances `expires`, so a renewed subscription has
+        // already moved out of this month.
+        if complete {
+            if o.is_setup {
+                e.lapsed += 1;
+            } else {
+                e.lapsed_never_paid += 1;
+            }
+        }
     }
 
-    for (created, source) in renewals {
+    for (sub_id, created, source) in renewals {
         let key = row(&mut acc, *created);
+        renewed_subs.entry(key.clone()).or_default().insert(*sub_id);
         let e = acc.get_mut(&key).unwrap();
         e.renewed += 1;
         match source {
@@ -1132,6 +1183,20 @@ fn build_renewal_periods(
             Some(RenewalSource::Manual) => e.renewed_manual += 1,
             None => e.renewed_unknown += 1,
         }
+    }
+
+    for (key, period) in acc.iter_mut() {
+        period.renewed_subscriptions = renewed_subs.get(key).map(|s| s.len() as u64).unwrap_or(0);
+        // Churn rate compares like with like: subscriptions that faced a
+        // renewal decision this month, and what share of them was lost. Payment
+        // counts are the wrong denominator — a subscription can renew twice in
+        // a month, which would understate churn.
+        let decided = period.lapsed + period.renewed_subscriptions;
+        period.churn_rate = if period.complete && decided > 0 {
+            Some((period.lapsed as f32 / decided as f32) * 100.0)
+        } else {
+            None
+        };
     }
 
     acc.into_values().collect()
@@ -1170,21 +1235,21 @@ async fn admin_renewals_report(
         .admin_list_subscription_renewal_outlook(start_dt, end_dt, params.company_id, region)
         .await?;
 
-    let renewals: Vec<(DateTime<Utc>, Option<RenewalSource>)> = this
+    let renewals: Vec<(u64, DateTime<Utc>, Option<RenewalSource>)> = this
         .db
         .admin_get_payments_with_company_info(start_dt, end_dt, params.company_id, None)
         .await?
         .into_iter()
         .filter(|p| p.payment_type == SubscriptionPaymentType::Renewal)
         .filter(|p| region.is_none_or(|rid| p.region_id == Some(rid)))
-        .map(|p| (p.created, p.renewal_source))
+        .map(|p| (p.subscription_id, p.created, p.renewal_source))
         .collect();
 
     ApiData::ok(RenewalsReport {
         start_date: params.start_date,
         end_date: params.end_date,
         source_tracking_since: Some(RENEWAL_SOURCE_TRACKED_FROM.to_string()),
-        periods: build_renewal_periods(&outlook, &renewals),
+        periods: build_renewal_periods(&outlook, &renewals, Utc::now()),
     })
 }
 
@@ -1214,41 +1279,108 @@ mod tests {
             auto_renewal_enabled: auto,
             has_payment_method: method,
             region_id: Some(1),
+            is_active: true,
+            is_setup: true,
         }
+    }
+
+    /// "Now" for the churn tests: mid-September 2026, so August is complete and
+    /// September is not.
+    fn now() -> DateTime<Utc> {
+        dt(2026, 9, 15)
     }
 
     #[test]
     fn test_renewal_periods_split_due_by_what_will_actually_charge() {
-        let sep = dt(2026, 9, 15);
+        let sep = dt(2026, 9, 20);
         let rows = vec![
             outlook(sep, true, true),   // will auto-renew
             outlook(sep, true, false),  // flag on, but nothing to charge
             outlook(sep, false, true),  // manual by choice
             outlook(sep, false, false), // manual
         ];
-        let p = build_renewal_periods(&rows, &[]);
+        let p = build_renewal_periods(&rows, &[], now());
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].period, "2026-09");
         assert_eq!(p[0].due, 4);
         assert_eq!(p[0].due_auto_capable, 1);
         assert_eq!(
             p[0].due_auto_without_method, 1,
-            "a subscription with auto-renewal on and no saved method is at risk, not safe"
+            "auto-renewal with no saved method is at risk, not safe"
         );
         assert_eq!(p[0].due_manual, 2);
-        // Nothing has renewed yet in a future month.
-        assert_eq!(p[0].renewed, 0);
+    }
+
+    #[test]
+    fn test_expiry_in_a_finished_month_is_churn() {
+        // Renewal advances `expires`, so a subscription still sitting in a past
+        // month never renewed.
+        let rows = vec![
+            outlook(dt(2026, 8, 3), false, false),
+            outlook(dt(2026, 8, 9), true, false),
+        ];
+        let p = build_renewal_periods(&rows, &[], now());
+        assert_eq!(p[0].period, "2026-08");
+        assert!(p[0].complete);
+        assert_eq!(p[0].lapsed, 2);
+        assert_eq!(p[0].churn_rate, Some(100.0), "nothing renewed, all lost");
+    }
+
+    #[test]
+    fn test_current_and_future_months_are_not_churn() {
+        // An expiry later this month has not been asked yet; a future one even
+        // less so. Counting either as lost would invent churn that has not
+        // happened.
+        let rows = vec![
+            outlook(dt(2026, 9, 30), false, false),
+            outlook(dt(2026, 10, 4), false, false),
+        ];
+        let p = build_renewal_periods(&rows, &[], now());
+        assert_eq!(p.len(), 2);
+        for row in &p {
+            assert!(!row.complete);
+            assert_eq!(row.lapsed, 0);
+            assert_eq!(row.churn_rate, None);
+            assert_eq!(row.due, 1);
+        }
+    }
+
+    #[test]
+    fn test_churn_rate_uses_distinct_subscriptions_not_payments() {
+        let mut lost = outlook(dt(2026, 8, 5), false, false);
+        lost.subscription_id = 99;
+        // One subscription renewing twice in the month is one retained
+        // customer, not two — counting payments would halve the churn rate.
+        let renewals = vec![
+            (7, dt(2026, 8, 6), Some(RenewalSource::Auto)),
+            (7, dt(2026, 8, 20), Some(RenewalSource::Auto)),
+        ];
+        let p = build_renewal_periods(&[lost], &renewals, now());
+        assert_eq!(p[0].renewed, 2, "two payments");
+        assert_eq!(p[0].renewed_subscriptions, 1, "one subscription");
+        assert_eq!(p[0].lapsed, 1);
+        assert_eq!(p[0].churn_rate, Some(50.0));
+    }
+
+    #[test]
+    fn test_never_paid_signups_are_not_counted_as_churn() {
+        let mut abandoned = outlook(dt(2026, 8, 2), false, false);
+        abandoned.is_setup = false;
+        let p = build_renewal_periods(&[abandoned], &[], now());
+        assert_eq!(p[0].lapsed, 0, "never paid, so no customer was lost");
+        assert_eq!(p[0].lapsed_never_paid, 1);
+        assert_eq!(p[0].churn_rate, None, "nothing reached a renewal decision");
     }
 
     #[test]
     fn test_renewal_periods_never_fold_unknown_into_manual() {
         let renewals = vec![
-            (dt(2026, 8, 2), Some(RenewalSource::Auto)),
-            (dt(2026, 8, 3), Some(RenewalSource::Manual)),
+            (1, dt(2026, 8, 2), Some(RenewalSource::Auto)),
+            (2, dt(2026, 8, 3), Some(RenewalSource::Manual)),
             // Pre-migration row: not attributable, must stay its own bucket.
-            (dt(2026, 8, 4), None),
+            (3, dt(2026, 8, 4), None),
         ];
-        let p = build_renewal_periods(&[], &renewals);
+        let p = build_renewal_periods(&[], &renewals, now());
         assert_eq!(p[0].renewed, 3);
         assert_eq!(p[0].renewed_auto, 1);
         assert_eq!(p[0].renewed_manual, 1);
@@ -1257,10 +1389,9 @@ mod tests {
 
     #[test]
     fn test_renewal_periods_cover_months_from_either_side() {
-        // July only renewed, September only due: both must appear, sorted.
-        let rows = vec![outlook(dt(2026, 9, 1), true, true)];
-        let renewals = vec![(dt(2026, 7, 9), Some(RenewalSource::Auto))];
-        let p = build_renewal_periods(&rows, &renewals);
+        let rows = vec![outlook(dt(2026, 9, 20), true, true)];
+        let renewals = vec![(1, dt(2026, 7, 9), Some(RenewalSource::Auto))];
+        let p = build_renewal_periods(&rows, &renewals, now());
         let keys: Vec<&str> = p.iter().map(|x| x.period.as_str()).collect();
         assert_eq!(keys, vec!["2026-07", "2026-09"]);
         assert_eq!(p[0].renewed, 1);

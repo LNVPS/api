@@ -4758,15 +4758,21 @@ Response:
 GET /api/admin/v1/reports/renewals
 ```
 
-Per calendar month, what is **due** to renew (from subscription expiry dates,
-forward looking) and what **did** renew (from paid renewal payments, backward
-looking). A future month has only `due_*` counts; a past month has both, and the
-gap between `due` and `renewed` is churn.
+Per calendar month: what is **due** to renew, what **renewed**, and what
+**churned**.
+
+Churn is derived from the subscription's own expiry. `subscription.expires`
+advances every time a subscription renews, so a subscription still carrying an
+expiry in a **finished** month is one that reached its renewal date and never
+came back — that is the churn event, dated by that expiry. In the current or a
+future month the same count is simply the renewal outlook: an expiry that has
+not been asked yet is not a loss.
 
 Query Parameters:
 
 - `start_date`: string (required) - YYYY-MM-DD
-- `end_date`: string (required) - YYYY-MM-DD
+- `end_date`: string (required) - YYYY-MM-DD. May be in the future: the `due_*`
+  half is an outlook.
 - `company_id`: number (**required**)
 - `region_id`: number (optional) - restrict to subscriptions whose VM is in this region; `0`/omitted = all
 
@@ -4777,20 +4783,25 @@ Response:
 ```json
 {
   "data": {
-    "start_date": "2026-08-01",
-    "end_date": "2026-12-31",
+    "start_date": "2026-05-01",
+    "end_date": "2027-02-28",
     "source_tracking_since": "2026-08-26",
     "periods": [
       {
-        "period": "2026-09",
-        "due": 96,
-        "due_auto_capable": 38,
-        "due_auto_without_method": 11,
-        "due_manual": 47,
-        "renewed": 12,
-        "renewed_auto": 5,
-        "renewed_manual": 7,
-        "renewed_unknown": 0
+        "period": "2026-08",
+        "complete": true,
+        "due": 64,
+        "due_auto_capable": 10,
+        "due_auto_without_method": 12,
+        "due_manual": 42,
+        "lapsed": 58,
+        "lapsed_never_paid": 6,
+        "renewed_subscriptions": 71,
+        "churn_rate": 44.96,
+        "renewed": 87,
+        "renewed_auto": 0,
+        "renewed_manual": 0,
+        "renewed_unknown": 87
       }
     ]
   }
@@ -4799,21 +4810,27 @@ Response:
 
 **Notes:**
 
-- `due` is counted **per subscription**, not per VM — one subscription may carry
-  several VMs.
-- `due_auto_capable` is the only bucket that will actually be charged
-  automatically: the worker requires `auto_renewal_enabled` **and** an enabled
-  saved payment method. `due_auto_without_method` is the trap — those
-  subscriptions look safe on their own record but fall through to a manual
-  expiry warning.
+- Counted **per subscription**, not per VM — one subscription may carry several VMs.
+- `complete` is false for the current and future months; `lapsed` is `0` and
+  `churn_rate` is `null` for those, because an expiry that has not arrived is not
+  a loss.
+- `churn_rate = lapsed / (lapsed + renewed_subscriptions)` as a percentage: of
+  the subscriptions that reached a renewal decision that month, the share that
+  walked. **`renewed` (payments) is deliberately not the denominator** — a
+  subscription can renew twice in a month, which would understate churn.
+- `lapsed_never_paid` is an expired subscription whose first payment was never
+  confirmed: an abandoned signup, not a lost customer. It is excluded from
+  `lapsed` and from the churn rate.
+- `due_auto_capable` is the only bucket the worker will actually charge: it
+  requires `auto_renewal_enabled` **and** an enabled saved payment method.
+  `due_auto_without_method` looks safe on the subscription record and is not —
+  it falls through to a manual expiry warning.
 - `renewed_unknown` counts renewal payments created before `renewal_source` was
-  recorded. It is never folded into `renewed_auto`/`renewed_manual`, because an
-  NWC auto-renewal settles a Lightning invoice indistinguishably from a customer
-  paying one by hand — the distinction is not recoverable after the fact.
-- `source_tracking_since` is the date the column was deployed; clients should
-  present the auto/manual split as unavailable before it rather than as zero.
-- Renewals are bucketed by payment **creation** date; `due` by subscription
-  expiry date.
+  recorded. It is never folded into `renewed_auto`/`renewed_manual`: an NWC
+  auto-renewal settles a Lightning invoice indistinguishably from a customer
+  paying one by hand, so it is not recoverable after the fact.
+- Renewals are bucketed by payment **creation** date; `due`/`lapsed` by
+  subscription expiry date.
 
 #### OSS (One-Stop Shop) VAT Report
 

@@ -7418,7 +7418,7 @@ impl AdminDb for LNVpsDbMysql {
         // the subscription's own company.
         let mut query = QueryBuilder::new(
             "SELECT s.id as subscription_id, s.user_id, s.expires,
-                    s.auto_renewal_enabled,
+                    s.auto_renewal_enabled, s.is_active, s.is_setup,
                     EXISTS (SELECT 1 FROM user_payment_method upm
                             WHERE upm.user_id = s.user_id AND upm.enabled = true)
                         as has_payment_method,

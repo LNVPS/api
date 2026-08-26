@@ -3097,6 +3097,10 @@ pub struct SubscriptionRenewalOutlook {
     pub has_payment_method: bool,
     /// Region of the subscription's VM, when it has one.
     pub region_id: Option<u64>,
+    pub is_active: bool,
+    /// Whether the first (purchase) payment was ever confirmed. A subscription
+    /// that expired without this is an abandoned signup, not a lost customer.
+    pub is_setup: bool,
 }
 
 /// Subscription payment with company info (for admin views and time-series reporting)
