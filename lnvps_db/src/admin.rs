@@ -439,7 +439,9 @@ pub trait AdminDb: Send + Sync {
 
     /// List cost records that are active at any point within `[start, end]`,
     /// for P/L reporting. Includes recurring costs whose active window overlaps
-    /// the range and one-time costs whose `billing_start` falls within it.
+    /// the range, and every one-time cost purchased on or before `end` — a cost
+    /// bought before the window may still be depreciating inside it, so the
+    /// caller filters by its `depreciation_months` schedule.
     async fn admin_list_resource_costs_active_between(
         &self,
         start: chrono::DateTime<chrono::Utc>,

@@ -8253,8 +8253,8 @@ impl AdminDb for LNVpsDbMysql {
         let result = sqlx::query(
             "INSERT INTO resource_cost \
              (resource_type, resource_id, label, cost_type, amount, currency, \
-              interval_amount, interval_type, billing_start, billing_end) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              interval_amount, interval_type, billing_start, billing_end, depreciation_months) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(cost.resource_type)
         .bind(cost.resource_id)
@@ -8266,6 +8266,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(cost.interval_type)
         .bind(cost.billing_start)
         .bind(cost.billing_end)
+        .bind(cost.depreciation_months)
         .execute(&self.db)
         .await?;
 
@@ -8276,7 +8277,8 @@ impl AdminDb for LNVpsDbMysql {
         sqlx::query(
             "UPDATE resource_cost SET \
              resource_type = ?, resource_id = ?, label = ?, cost_type = ?, amount = ?, currency = ?, \
-             interval_amount = ?, interval_type = ?, billing_start = ?, billing_end = ? \
+             interval_amount = ?, interval_type = ?, billing_start = ?, billing_end = ?, \
+             depreciation_months = ? \
              WHERE id = ?",
         )
         .bind(cost.resource_type)
@@ -8289,6 +8291,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(cost.interval_type)
         .bind(cost.billing_start)
         .bind(cost.billing_end)
+        .bind(cost.depreciation_months)
         .bind(cost.id)
         .execute(&self.db)
         .await?;
@@ -8311,6 +8314,10 @@ impl AdminDb for LNVpsDbMysql {
         end: chrono::DateTime<chrono::Utc>,
     ) -> DbResult<Vec<crate::ResourceCost>> {
         // cost_type: 0 = recurring, 1 = one_time
+        //
+        // One-time costs are matched on `billing_start <= end` only (no lower
+        // bound): a depreciating asset bought before the window still charges
+        // depreciation inside it, and the caller decides what falls in range.
         Ok(sqlx::query_as::<_, crate::ResourceCost>(
             "SELECT * FROM resource_cost WHERE \
              (cost_type = 0 \
@@ -8318,11 +8325,10 @@ impl AdminDb for LNVpsDbMysql {
                 AND (billing_end IS NULL OR billing_end >= ?)) \
              OR (cost_type = 1 \
                 AND billing_start IS NOT NULL \
-                AND billing_start >= ? AND billing_start <= ?) \
+                AND billing_start <= ?) \
              ORDER BY id",
         )
         .bind(end)
-        .bind(start)
         .bind(start)
         .bind(end)
         .fetch_all(&self.db)

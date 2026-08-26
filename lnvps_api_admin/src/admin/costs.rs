@@ -75,6 +75,7 @@ fn validate(
     cost_type: lnvps_db::CostType,
     interval_amount: Option<u64>,
     currency: &str,
+    depreciation_months: Option<u64>,
 ) -> Result<(), &'static str> {
     if currency.trim().is_empty() {
         return Err("Currency cannot be empty");
@@ -82,7 +83,13 @@ fn validate(
     if cost_type == lnvps_db::CostType::Recurring && interval_amount.is_none() {
         return Err("Recurring costs require an interval");
     }
-    Ok(())
+    match depreciation_months {
+        Some(_) if cost_type != lnvps_db::CostType::OneTime => {
+            Err("Depreciation only applies to one-time costs")
+        }
+        Some(0) => Err("depreciation_months must be greater than zero"),
+        _ => Ok(()),
+    }
 }
 
 async fn admin_create_resource_cost(
@@ -93,7 +100,12 @@ async fn admin_create_resource_cost(
     auth.require_permission(AdminResource::ResourceCost, AdminAction::Create)?;
 
     let cost_type: lnvps_db::CostType = req.cost_type.into();
-    if let Err(e) = validate(cost_type, req.interval_amount, &req.currency) {
+    if let Err(e) = validate(
+        cost_type,
+        req.interval_amount,
+        &req.currency,
+        req.depreciation_months,
+    ) {
         return ApiData::err(e);
     }
 
@@ -126,6 +138,7 @@ async fn admin_create_resource_cost(
         interval_type: req.interval_type.map(Into::into),
         billing_start: req.billing_start,
         billing_end: req.billing_end,
+        depreciation_months: req.depreciation_months,
         created: chrono::Utc::now(),
         updated: chrono::Utc::now(),
     };
@@ -183,8 +196,16 @@ async fn admin_update_resource_cost(
     if let Some(v) = req.billing_end {
         cost.billing_end = v;
     }
+    if let Some(v) = req.depreciation_months {
+        cost.depreciation_months = v;
+    }
 
-    if let Err(e) = validate(cost.cost_type, cost.interval_amount, &cost.currency) {
+    if let Err(e) = validate(
+        cost.cost_type,
+        cost.interval_amount,
+        &cost.currency,
+        cost.depreciation_months,
+    ) {
         return ApiData::err(e);
     }
 
@@ -202,4 +223,37 @@ async fn admin_delete_resource_cost(
 
     this.db.admin_delete_resource_cost(id).await?;
     ApiData::ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate;
+    use lnvps_db::CostType;
+
+    #[test]
+    fn test_validate_currency_and_interval() {
+        assert_eq!(
+            validate(CostType::Recurring, Some(1), "  ", None),
+            Err("Currency cannot be empty")
+        );
+        assert_eq!(
+            validate(CostType::Recurring, None, "EUR", None),
+            Err("Recurring costs require an interval")
+        );
+        assert_eq!(validate(CostType::Recurring, Some(1), "EUR", None), Ok(()));
+        assert_eq!(validate(CostType::OneTime, None, "EUR", None), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_depreciation_only_for_one_time_costs() {
+        assert_eq!(validate(CostType::OneTime, None, "EUR", Some(36)), Ok(()));
+        assert_eq!(
+            validate(CostType::Recurring, Some(1), "EUR", Some(36)),
+            Err("Depreciation only applies to one-time costs")
+        );
+        assert_eq!(
+            validate(CostType::OneTime, None, "EUR", Some(0)),
+            Err("depreciation_months must be greater than zero")
+        );
+    }
 }

@@ -4679,8 +4679,15 @@ Tracking*) into per-period profit/loss rows. **All amounts are converted into a
 single target currency** (the company's base currency by default) using current
 exchange rates, so each period yields one row. Recurring costs are normalized to
 each calendar month they are active; `ip_range` per-IP costs are multiplied by
-the range's current assigned-IP count; one-time (capital) costs are booked in
-the period containing their `billing_start`.
+the range's current assigned-IP count.
+
+**Capital expenditure is reported on an accrual basis.** A one-time cost with a
+`depreciation_months` useful life is capitalized and expensed straight-line over
+that many months from its `billing_start`, and it is the resulting depreciation
+— not the cash outlay — that enters `cost_total` and `profit`. The cash outlay is
+still reported separately as `cost_one_time` and feeds `cash_flow`. A one-time
+cost with no `depreciation_months` is expensed in full in its purchase period
+(the behaviour of every cost created before this field existed).
 
 Query Parameters:
 
@@ -4708,9 +4715,11 @@ Response:
         "revenue_net": 480000,
         "revenue_tax": 96000,
         "cost_recurring": 8000,
+        "cost_depreciation": 6944,
         "cost_one_time": 250000,
-        "cost_total": 258000,
-        "profit": 222000
+        "cost_total": 14944,
+        "profit": 465056,
+        "cash_flow": 222000
       }
     ]
   }
@@ -4724,7 +4733,16 @@ Response:
   step only applies when aggregating companies with different base currencies.
 - **Costs** have no stored rate, so they are converted into the report `currency`
   using current exchange rates (BTC-pivoted).
+- `cost_total = cost_recurring + cost_depreciation` — the accrual expense total.
+  `cost_one_time` is a cash figure and is deliberately **not** part of it.
 - `profit = revenue_net - cost_total` and may be negative.
+- `cash_flow = revenue_net - cost_recurring - cost_one_time`, i.e. the money that
+  actually moved. It differs from `profit` exactly when capex is being
+  depreciated, and is signed.
+- Depreciation is charged per calendar month starting with the purchase month
+  (the purchase day is ignored, so a mid-month purchase still charges a full
+  month). Assets bought **before** `start_date` still charge their remaining
+  depreciation inside the window.
 - **`revenue_net` and `revenue_tax` are net of refunds** recorded in the period, and are
   themselves signed (issue #193): a period that refunded more than it sold reports
   negative revenue. Refunds land in the period they were paid out in, not the period of
@@ -7588,9 +7606,16 @@ One-time capital cost (break-even) example:
   "cost_type": "one_time",
   "amount": 250000,
   "currency": "EUR",
-  "billing_start": "2025-11-15T00:00:00Z"
+  "billing_start": "2025-11-15T00:00:00Z",
+  "depreciation_months": 36
 }
 ```
+
+`depreciation_months` is the asset's useful life. With it set, the P/L report
+expenses €2,500.00 straight-line over 36 months from November 2025 rather than
+booking the whole €2,500.00 against that month. Omit it (or send `null`) to
+expense the purchase immediately. It is rejected on `recurring` costs and must be
+greater than zero.
 
 ### Update Resource Cost
 
@@ -7624,6 +7649,7 @@ field to leave it unchanged, or send `null` to clear it.
 | interval_type   | `day`\|`month`\|`year`\|null | Billing interval unit                           |
 | billing_start   | datetime \| null           | Cost start / one-time purchase date               |
 | billing_end     | datetime \| null           | Cost end date; null = still active/ongoing         |
+| depreciation_months | u64 \| null            | Useful life for a `one_time` cost; null = expensed immediately |
 | created         | datetime                   |                                                   |
 | updated         | datetime                   |                                                   |
 

@@ -1265,6 +1265,11 @@ pub struct ResourceCost {
     /// Date the recurring cost stops being paid. `None` = still active/ongoing.
     /// Only counts towards P/L while now() is within `[billing_start, billing_end)`.
     pub billing_end: Option<DateTime<Utc>>,
+    /// Useful life in months for a one-time (capital) cost. When set, the P/L
+    /// report expenses the cost straight-line over this many months starting at
+    /// `billing_start` instead of booking it all in the purchase period.
+    /// `None` = expensed immediately. Ignored for recurring costs.
+    pub depreciation_months: Option<u64>,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
 }

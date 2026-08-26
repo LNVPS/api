@@ -287,6 +287,10 @@ pub struct AdminResourceCostDetail {
     pub interval_type: Option<ApiIntervalType>,
     pub billing_start: Option<DateTime<Utc>>,
     pub billing_end: Option<DateTime<Utc>>,
+    /// Useful life in months for a one-time (capital) cost. When set, the P/L
+    /// report spreads the cost straight-line over this many months from
+    /// `billing_start`; null = expensed in full in the purchase period.
+    pub depreciation_months: Option<u64>,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
 }
@@ -305,6 +309,7 @@ impl From<lnvps_db::ResourceCost> for AdminResourceCostDetail {
             interval_type: c.interval_type.map(Into::into),
             billing_start: c.billing_start,
             billing_end: c.billing_end,
+            depreciation_months: c.depreciation_months,
             created: c.created,
             updated: c.updated,
         }
@@ -328,6 +333,9 @@ pub struct CreateResourceCostRequest {
     pub interval_type: Option<ApiIntervalType>,
     pub billing_start: Option<DateTime<Utc>>,
     pub billing_end: Option<DateTime<Utc>>,
+    /// Useful life in months for a one-time cost (straight-line depreciation).
+    /// Omit/null to expense the whole amount in the purchase period.
+    pub depreciation_months: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -349,6 +357,8 @@ pub struct UpdateResourceCostRequest {
     pub billing_start: Option<Option<DateTime<Utc>>>,
     #[serde(default, deserialize_with = "crate::admin::model::double_option")]
     pub billing_end: Option<Option<DateTime<Utc>>>,
+    #[serde(default, deserialize_with = "crate::admin::model::double_option")]
+    pub depreciation_months: Option<Option<u64>>,
 }
 
 /// Deserialize helper distinguishing an absent field (`None`) from an explicit

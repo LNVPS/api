@@ -361,14 +361,26 @@ struct ProfitLossPeriod {
     /// Tax collected, in smallest currency units, net of refunded tax. Negative
     /// under the same conditions as `revenue_net`.
     revenue_tax: i64,
-    /// Recurring costs attributable to this period (normalized), smallest units
+    /// Recurring operating costs attributable to this period (normalized),
+    /// smallest units
     cost_recurring: u64,
-    /// One-time (capital) costs booked in this period, smallest units
+    /// Depreciation charged in this period, smallest units. One-time costs with
+    /// a `depreciation_months` useful life are expensed straight-line over that
+    /// life from their purchase date; those without one are charged in full in
+    /// the purchase period.
+    cost_depreciation: u64,
+    /// Capital expenditure *paid* in this period, smallest units. This is a cash
+    /// figure and sits below the line — it is deliberately NOT part of
+    /// `cost_total` or `profit`, which are accrual measures.
     cost_one_time: u64,
-    /// cost_recurring + cost_one_time
+    /// cost_recurring + cost_depreciation (the accrual expense total)
     cost_total: u64,
-    /// revenue_net - cost_total (same currency only); may be negative
+    /// Accrual profit: revenue_net - cost_total (same currency only); may be
+    /// negative
     profit: i64,
+    /// Cash movement: revenue_net - cost_recurring - cost_one_time. Differs from
+    /// `profit` exactly when capex is being depreciated.
+    cash_flow: i64,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -390,6 +402,7 @@ struct PlAccumulator {
     revenue_net: i64,
     revenue_tax: i64,
     cost_recurring_f: f64,
+    cost_depreciation_f: f64,
     cost_one_time: u64,
 }
 
@@ -405,6 +418,46 @@ fn per_month_fraction(interval_amount: u64, interval_type: IntervalType) -> f64 
         IntervalType::Month => 1.0 / n,
         IntervalType::Year => 1.0 / (n * 12.0),
     }
+}
+
+/// Every calendar month start contained in `[start_date, end_date]`, inclusive
+/// of both endpoint months.
+fn window_months(start_date: NaiveDate, end_date: NaiveDate) -> Vec<DateTime<Utc>> {
+    let mut out = Vec::new();
+    let (mut y, mut m) = (start_date.year(), start_date.month());
+    loop {
+        out.push(Utc.with_ymd_and_hms(y, m, 1, 0, 0, 0).unwrap());
+        if (y, m) == (end_date.year(), end_date.month()) {
+            break;
+        }
+        (y, m) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
+    }
+    out
+}
+
+/// Whole months from `from` to `to` (negative when `to` precedes `from`),
+/// counting calendar months only — the day of month is ignored.
+fn months_between(from: DateTime<Utc>, to: DateTime<Utc>) -> i64 {
+    (to.year() as i64 - from.year() as i64) * 12 + (to.month() as i64 - from.month() as i64)
+}
+
+/// Straight-line depreciation charged in the calendar month starting at
+/// `month_start` for an `amount` asset purchased at `purchase` with a `life`
+/// month useful life. Zero outside the depreciation schedule.
+fn depreciation_for_month(
+    amount: u64,
+    purchase: DateTime<Utc>,
+    life: u64,
+    month_start: DateTime<Utc>,
+) -> f64 {
+    if life == 0 {
+        return 0.0;
+    }
+    let idx = months_between(purchase, month_start);
+    if idx < 0 || idx as u64 >= life {
+        return 0.0;
+    }
+    amount as f64 / life as f64
 }
 
 fn period_key(date: DateTime<Utc>, group_by_year: bool) -> String {
@@ -634,13 +687,40 @@ async fn admin_profit_loss_report(
         };
         match c.cost_type {
             CostType::OneTime => {
-                // Book the whole amount in the period containing billing_start.
-                if let Some(bs) = c.billing_start
-                    && bs >= start_dt
-                    && bs <= end_dt
-                {
+                let Some(bs) = c.billing_start else {
+                    continue;
+                };
+                if bs > end_dt {
+                    continue;
+                }
+                // Cash side: the whole outlay lands in the purchase period.
+                if bs >= start_dt {
                     let e = acc.entry(period_key(bs, group_by_year)).or_default();
                     e.cost_one_time = e.cost_one_time.saturating_add(amount_c);
+                }
+                // Accrual side: capitalise and expense over the useful life. No
+                // useful life set = expensed immediately (legacy behaviour).
+                match c.depreciation_months {
+                    None | Some(0) => {
+                        if bs >= start_dt {
+                            acc.entry(period_key(bs, group_by_year))
+                                .or_default()
+                                .cost_depreciation_f += amount_c as f64;
+                        }
+                    }
+                    Some(life) => {
+                        // Straight-line: 1/life of the cost per month for `life`
+                        // months from the purchase month. Assets bought before
+                        // the window still charge their remaining months into it.
+                        for month_start in window_months(start_date, end_date) {
+                            let charge = depreciation_for_month(amount_c, bs, life, month_start);
+                            if charge > 0.0 {
+                                acc.entry(period_key(month_start, group_by_year))
+                                    .or_default()
+                                    .cost_depreciation_f += charge;
+                            }
+                        }
+                    }
                 }
             }
             CostType::Recurring => {
@@ -656,12 +736,10 @@ async fn admin_profit_loss_report(
 
                 // Walk each calendar month in the report window and add the
                 // monthly-normalized cost for every month the cost is active.
-                let mut y = start_date.year();
-                let mut m = start_date.month();
-                loop {
-                    let month_start = Utc.with_ymd_and_hms(y, m, 1, 0, 0, 0).unwrap();
-                    let (ny, nm) = if m == 12 { (y + 1, 1) } else { (y, m + 1) };
-                    let month_end = Utc.with_ymd_and_hms(ny, nm, 1, 0, 0, 0).unwrap()
+                for month_start in window_months(start_date, end_date) {
+                    let month_end = month_start
+                        .checked_add_months(chrono::Months::new(1))
+                        .unwrap()
                         - chrono::Duration::seconds(1);
 
                     if active_start <= month_end && active_end >= month_start {
@@ -669,12 +747,6 @@ async fn admin_profit_loss_report(
                             .or_default()
                             .cost_recurring_f += monthly;
                     }
-
-                    if (y, m) == (end_date.year(), end_date.month()) {
-                        break;
-                    }
-                    y = ny;
-                    m = nm;
                 }
             }
         }
@@ -684,15 +756,20 @@ async fn admin_profit_loss_report(
         .into_iter()
         .map(|(period, a)| {
             let cost_recurring = a.cost_recurring_f.round() as u64;
-            let cost_total = cost_recurring.saturating_add(a.cost_one_time);
+            let cost_depreciation = a.cost_depreciation_f.round() as u64;
+            // Accrual expense: capex is represented by depreciation, never by
+            // the cash outlay.
+            let cost_total = cost_recurring.saturating_add(cost_depreciation);
             ProfitLossPeriod {
                 period,
                 revenue_net: a.revenue_net,
                 revenue_tax: a.revenue_tax,
                 cost_recurring,
+                cost_depreciation,
                 cost_one_time: a.cost_one_time,
                 cost_total,
                 profit: a.revenue_net - cost_total as i64,
+                cash_flow: a.revenue_net - cost_recurring as i64 - a.cost_one_time as i64,
             }
         })
         .collect();
@@ -964,6 +1041,73 @@ mod tests {
         assert_eq!(oss_period_key(dt(2025, 4, 1), false), "2025-Q2");
         assert_eq!(oss_period_key(dt(2025, 7, 1), false), "2025-Q3");
         assert_eq!(oss_period_key(dt(2025, 12, 31), false), "2025-Q4");
+    }
+
+    fn nd(y: i32, m: u32, d: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn test_window_months_inclusive_of_both_endpoints() {
+        let keys: Vec<String> = window_months(nd(2025, 11, 15), nd(2026, 2, 3))
+            .iter()
+            .map(|m| period_key(*m, false))
+            .collect();
+        assert_eq!(keys, vec!["2025-11", "2025-12", "2026-01", "2026-02"]);
+
+        // A window inside one month still yields that month.
+        let single: Vec<String> = window_months(nd(2026, 3, 2), nd(2026, 3, 28))
+            .iter()
+            .map(|m| period_key(*m, false))
+            .collect();
+        assert_eq!(single, vec!["2026-03"]);
+    }
+
+    #[test]
+    fn test_months_between() {
+        assert_eq!(months_between(dt(2025, 1, 31), dt(2025, 1, 1)), 0);
+        assert_eq!(months_between(dt(2025, 1, 1), dt(2025, 4, 1)), 3);
+        assert_eq!(months_between(dt(2025, 1, 1), dt(2024, 11, 1)), -2);
+        assert_eq!(months_between(dt(2024, 6, 1), dt(2026, 6, 1)), 24);
+    }
+
+    #[test]
+    fn test_depreciation_for_month_straight_line_window() {
+        let purchase = dt(2025, 6, 20);
+        // Purchase month is charged, as is the last month of the useful life.
+        assert_eq!(
+            depreciation_for_month(36_000, purchase, 36, dt(2025, 6, 1)),
+            1000.0
+        );
+        assert_eq!(
+            depreciation_for_month(36_000, purchase, 36, dt(2028, 5, 1)),
+            1000.0
+        );
+        // Before the purchase and after the life has run out: nothing.
+        assert_eq!(
+            depreciation_for_month(36_000, purchase, 36, dt(2025, 5, 1)),
+            0.0
+        );
+        assert_eq!(
+            depreciation_for_month(36_000, purchase, 36, dt(2028, 6, 1)),
+            0.0
+        );
+        // A zero life would divide by zero; treated as no depreciation (the
+        // caller expenses those immediately instead).
+        assert_eq!(
+            depreciation_for_month(36_000, purchase, 0, dt(2025, 6, 1)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn test_depreciation_sums_to_the_full_cost() {
+        let purchase = dt(2025, 1, 10);
+        let total: f64 = window_months(nd(2024, 1, 1), nd(2030, 12, 1))
+            .iter()
+            .map(|m| depreciation_for_month(120_000, purchase, 24, *m))
+            .sum();
+        assert!((total - 120_000.0).abs() < 1e-6);
     }
 
     #[test]
