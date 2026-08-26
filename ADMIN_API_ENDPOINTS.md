@@ -4752,6 +4752,69 @@ Response:
   the interval count directly for `month`, and ×12 for `year`.
 - Payments/costs in a currency with no available exchange rate are skipped.
 
+#### Renewals / Churn Report
+
+```
+GET /api/admin/v1/reports/renewals
+```
+
+Per calendar month, what is **due** to renew (from subscription expiry dates,
+forward looking) and what **did** renew (from paid renewal payments, backward
+looking). A future month has only `due_*` counts; a past month has both, and the
+gap between `due` and `renewed` is churn.
+
+Query Parameters:
+
+- `start_date`: string (required) - YYYY-MM-DD
+- `end_date`: string (required) - YYYY-MM-DD
+- `company_id`: number (**required**)
+- `region_id`: number (optional) - restrict to subscriptions whose VM is in this region; `0`/omitted = all
+
+Required Permission: `analytics::view`
+
+Response:
+
+```json
+{
+  "data": {
+    "start_date": "2026-08-01",
+    "end_date": "2026-12-31",
+    "source_tracking_since": "2026-08-26",
+    "periods": [
+      {
+        "period": "2026-09",
+        "due": 96,
+        "due_auto_capable": 38,
+        "due_auto_without_method": 11,
+        "due_manual": 47,
+        "renewed": 12,
+        "renewed_auto": 5,
+        "renewed_manual": 7,
+        "renewed_unknown": 0
+      }
+    ]
+  }
+}
+```
+
+**Notes:**
+
+- `due` is counted **per subscription**, not per VM — one subscription may carry
+  several VMs.
+- `due_auto_capable` is the only bucket that will actually be charged
+  automatically: the worker requires `auto_renewal_enabled` **and** an enabled
+  saved payment method. `due_auto_without_method` is the trap — those
+  subscriptions look safe on their own record but fall through to a manual
+  expiry warning.
+- `renewed_unknown` counts renewal payments created before `renewal_source` was
+  recorded. It is never folded into `renewed_auto`/`renewed_manual`, because an
+  NWC auto-renewal settles a Lightning invoice indistinguishably from a customer
+  paying one by hand — the distinction is not recoverable after the fact.
+- `source_tracking_since` is the date the column was deployed; clients should
+  present the auto/manual split as unavailable before it rather than as zero.
+- Renewals are bucketed by payment **creation** date; `due` by subscription
+  expiry date.
+
 #### OSS (One-Stop Shop) VAT Report
 
 ```

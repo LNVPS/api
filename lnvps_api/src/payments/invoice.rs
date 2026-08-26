@@ -212,6 +212,7 @@ mod tests {
             tax_evidence: None,
             tax_breakdown: None,
             refunded_payment_id: None,
+            renewal_source: None,
         };
         db.insert_subscription_payment(&payment).await?;
 
@@ -369,6 +370,7 @@ mod tests {
             tax_evidence: None,
             tax_breakdown: None,
             refunded_payment_id: None,
+            renewal_source: None,
         };
         db.insert_subscription_payment(&payment).await?;
         let sub = SubscriptionHandler::new(

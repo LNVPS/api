@@ -325,6 +325,9 @@ impl OnChainPaymentHandler {
             );
             let new_id: [u8; 32] = rand::random();
             let mut renewal = SubscriptionPayment {
+                // The customer sent coins to a reused address — their action,
+                // not the worker's.
+                renewal_source: Some(lnvps_db::RenewalSource::Manual),
                 id: new_id.to_vec(),
                 subscription_id: payment.subscription_id,
                 user_id: payment.user_id,
@@ -538,6 +541,7 @@ mod tests {
             tax_evidence: None,
             tax_breakdown: None,
             refunded_payment_id: None,
+            renewal_source: None,
         };
         db.insert_subscription_payment(&payment).await?;
 

@@ -9,7 +9,10 @@ use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, TaxLine, TaxTreatment,
     Ticker, TickerRate, resolve_traffic_range,
 };
-use lnvps_db::{AdminAction, AdminResource, CostResourceType, CostType, IntervalType};
+use lnvps_db::{
+    AdminAction, AdminResource, CostResourceType, CostType, IntervalType, RenewalSource,
+    SubscriptionPaymentType,
+};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -30,6 +33,7 @@ pub fn router() -> Router<RouterState> {
             get(admin_profit_loss_report),
         )
         .route("/api/admin/v1/reports/oss", get(admin_oss_report))
+        .route("/api/admin/v1/reports/renewals", get(admin_renewals_report))
         .route("/api/admin/v1/reports/traffic", get(admin_traffic_report))
 }
 
@@ -1025,6 +1029,169 @@ async fn admin_oss_report(
     })
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct RenewalsQuery {
+    start_date: String,
+    end_date: String,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str")]
+    company_id: u64,
+    #[serde(deserialize_with = "lnvps_api_common::deserialize_from_str")]
+    region_id: u64,
+}
+
+/// One month of renewal activity: what is due, and what happened.
+#[derive(Serialize, Deserialize)]
+struct RenewalsPeriod {
+    /// "2026-09"
+    period: String,
+
+    // --- Forward looking: subscriptions whose expiry falls in this month ---
+    /// Subscriptions expiring in this period, whether or not they have renewed.
+    due: u64,
+    /// Of `due`: auto-renewal enabled AND the user has an enabled saved payment
+    /// method — i.e. the worker will actually attempt a charge.
+    due_auto_capable: u64,
+    /// Of `due`: auto-renewal enabled but **no** saved payment method. These
+    /// look safe on the subscription record and are not: the worker falls
+    /// through to a manual expiry warning.
+    due_auto_without_method: u64,
+    /// Of `due`: auto-renewal off. Renews only if the customer acts.
+    due_manual: u64,
+
+    // --- Backward looking: renewal payments actually collected this month ---
+    /// Paid renewal payments created in this period.
+    renewed: u64,
+    /// Of `renewed`: charged by the worker against a saved method.
+    renewed_auto: u64,
+    /// Of `renewed`: paid by the customer.
+    renewed_manual: u64,
+    /// Of `renewed`: created before renewal source was recorded, so genuinely
+    /// unknown. Never folded into either bucket — see the `renewal_source`
+    /// migration.
+    renewed_unknown: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RenewalsReport {
+    start_date: String,
+    end_date: String,
+    /// Date from which `renewal_source` is recorded, so a client can grey out
+    /// the auto/manual split for earlier periods instead of showing zeroes that
+    /// look like "nothing auto-renewed".
+    source_tracking_since: Option<String>,
+    periods: Vec<RenewalsPeriod>,
+}
+
+/// Bucket subscriptions due to renew and renewal payments collected into one
+/// row per calendar month.
+///
+/// Pure so the classification is testable without a database: the two halves
+/// are independent (a future month has only `due`, a past month has both), and
+/// a month that appears on either side must appear in the output.
+fn build_renewal_periods(
+    outlook: &[lnvps_db::SubscriptionRenewalOutlook],
+    renewals: &[(DateTime<Utc>, Option<RenewalSource>)],
+) -> Vec<RenewalsPeriod> {
+    let mut acc: BTreeMap<String, RenewalsPeriod> = BTreeMap::new();
+    let mut row = |acc: &mut BTreeMap<String, RenewalsPeriod>, at: DateTime<Utc>| -> String {
+        let key = period_key(at, false);
+        acc.entry(key.clone()).or_insert_with(|| RenewalsPeriod {
+            period: key.clone(),
+            due: 0,
+            due_auto_capable: 0,
+            due_auto_without_method: 0,
+            due_manual: 0,
+            renewed: 0,
+            renewed_auto: 0,
+            renewed_manual: 0,
+            renewed_unknown: 0,
+        });
+        key
+    };
+
+    for o in outlook {
+        let key = row(&mut acc, o.expires);
+        let e = acc.get_mut(&key).unwrap();
+        e.due += 1;
+        match (o.auto_renewal_enabled, o.has_payment_method) {
+            // Auto-renewal only actually fires when the worker has a method to
+            // charge; the flag on its own is not a prediction.
+            (true, true) => e.due_auto_capable += 1,
+            (true, false) => e.due_auto_without_method += 1,
+            (false, _) => e.due_manual += 1,
+        }
+    }
+
+    for (created, source) in renewals {
+        let key = row(&mut acc, *created);
+        let e = acc.get_mut(&key).unwrap();
+        e.renewed += 1;
+        match source {
+            Some(RenewalSource::Auto) => e.renewed_auto += 1,
+            Some(RenewalSource::Manual) => e.renewed_manual += 1,
+            None => e.renewed_unknown += 1,
+        }
+    }
+
+    acc.into_values().collect()
+}
+
+/// Renewal outlook and churn, per month.
+///
+/// Two halves that must not be conflated: what is *due* to renew (from
+/// subscription expiry dates, forward looking) and what *did* renew (from paid
+/// renewal payments, backward looking). A month in the future has `due` counts
+/// and no renewals; a month in the past has both, and the gap between them is
+/// churn.
+async fn admin_renewals_report(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Query(params): Query<RenewalsQuery>,
+) -> ApiResult<RenewalsReport> {
+    auth.require_permission(AdminResource::Analytics, AdminAction::View)?;
+
+    let start_date = NaiveDate::parse_from_str(&params.start_date, "%Y-%m-%d")
+        .map_err(|_| anyhow::anyhow!("Invalid start_date format. Use YYYY-MM-DD"))?;
+    let end_date = NaiveDate::parse_from_str(&params.end_date, "%Y-%m-%d")
+        .map_err(|_| anyhow::anyhow!("Invalid end_date format. Use YYYY-MM-DD"))?;
+    if start_date >= end_date {
+        return Err(ApiError::bad_request("start_date must be before end_date"));
+    }
+    if params.company_id == 0 {
+        return Err(ApiError::bad_request("company_id is required"));
+    }
+    let start_dt = start_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+    let end_dt = end_date.and_hms_opt(23, 59, 59).unwrap().and_utc();
+    let region = (params.region_id != 0).then_some(params.region_id);
+
+    let outlook = this
+        .db
+        .admin_list_subscription_renewal_outlook(start_dt, end_dt, params.company_id, region)
+        .await?;
+
+    let renewals: Vec<(DateTime<Utc>, Option<RenewalSource>)> = this
+        .db
+        .admin_get_payments_with_company_info(start_dt, end_dt, params.company_id, None)
+        .await?
+        .into_iter()
+        .filter(|p| p.payment_type == SubscriptionPaymentType::Renewal)
+        .filter(|p| region.is_none_or(|rid| p.region_id == Some(rid)))
+        .map(|p| (p.created, p.renewal_source))
+        .collect();
+
+    ApiData::ok(RenewalsReport {
+        start_date: params.start_date,
+        end_date: params.end_date,
+        source_tracking_since: Some(RENEWAL_SOURCE_TRACKED_FROM.to_string()),
+        periods: build_renewal_periods(&outlook, &renewals),
+    })
+}
+
+/// Date the `renewal_source` column was deployed. Renewal payments created
+/// before this carry no source and are reported as unknown.
+const RENEWAL_SOURCE_TRACKED_FROM: &str = "2026-08-26";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,6 +1199,74 @@ mod tests {
 
     fn dt(y: i32, m: u32, d: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, m, d, 12, 0, 0).unwrap()
+    }
+
+    fn outlook(
+        expires: DateTime<Utc>,
+        auto: bool,
+        method: bool,
+    ) -> lnvps_db::SubscriptionRenewalOutlook {
+        lnvps_db::SubscriptionRenewalOutlook {
+            subscription_id: 1,
+            user_id: 1,
+            company_id: 1,
+            expires,
+            auto_renewal_enabled: auto,
+            has_payment_method: method,
+            region_id: Some(1),
+        }
+    }
+
+    #[test]
+    fn test_renewal_periods_split_due_by_what_will_actually_charge() {
+        let sep = dt(2026, 9, 15);
+        let rows = vec![
+            outlook(sep, true, true),   // will auto-renew
+            outlook(sep, true, false),  // flag on, but nothing to charge
+            outlook(sep, false, true),  // manual by choice
+            outlook(sep, false, false), // manual
+        ];
+        let p = build_renewal_periods(&rows, &[]);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].period, "2026-09");
+        assert_eq!(p[0].due, 4);
+        assert_eq!(p[0].due_auto_capable, 1);
+        assert_eq!(
+            p[0].due_auto_without_method, 1,
+            "a subscription with auto-renewal on and no saved method is at risk, not safe"
+        );
+        assert_eq!(p[0].due_manual, 2);
+        // Nothing has renewed yet in a future month.
+        assert_eq!(p[0].renewed, 0);
+    }
+
+    #[test]
+    fn test_renewal_periods_never_fold_unknown_into_manual() {
+        let renewals = vec![
+            (dt(2026, 8, 2), Some(RenewalSource::Auto)),
+            (dt(2026, 8, 3), Some(RenewalSource::Manual)),
+            // Pre-migration row: not attributable, must stay its own bucket.
+            (dt(2026, 8, 4), None),
+        ];
+        let p = build_renewal_periods(&[], &renewals);
+        assert_eq!(p[0].renewed, 3);
+        assert_eq!(p[0].renewed_auto, 1);
+        assert_eq!(p[0].renewed_manual, 1);
+        assert_eq!(p[0].renewed_unknown, 1);
+    }
+
+    #[test]
+    fn test_renewal_periods_cover_months_from_either_side() {
+        // July only renewed, September only due: both must appear, sorted.
+        let rows = vec![outlook(dt(2026, 9, 1), true, true)];
+        let renewals = vec![(dt(2026, 7, 9), Some(RenewalSource::Auto))];
+        let p = build_renewal_periods(&rows, &renewals);
+        let keys: Vec<&str> = p.iter().map(|x| x.period.as_str()).collect();
+        assert_eq!(keys, vec!["2026-07", "2026-09"]);
+        assert_eq!(p[0].renewed, 1);
+        assert_eq!(p[0].due, 0);
+        assert_eq!(p[1].due, 1);
+        assert_eq!(p[1].renewed, 0);
     }
 
     #[test]

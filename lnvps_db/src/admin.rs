@@ -252,6 +252,20 @@ pub trait AdminDb: Send + Sync {
         currency: Option<&str>,
     ) -> DbResult<Vec<crate::SubscriptionPaymentWithCompany>>;
 
+    /// Subscriptions whose expiry falls in `[start, end)`, for renewal/churn
+    /// reporting.
+    ///
+    /// Reports both `auto_renewal_enabled` and whether the user actually has an
+    /// enabled saved payment method, because the worker requires both before it
+    /// will attempt an automatic renewal.
+    async fn admin_list_subscription_renewal_outlook(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        company_id: u64,
+        region_id: Option<u64>,
+    ) -> DbResult<Vec<crate::SubscriptionRenewalOutlook>>;
+
     /// Get referral cost usage report within date range for a specific company
     async fn admin_get_referral_usage_by_date_range(
         &self,

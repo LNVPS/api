@@ -21,7 +21,7 @@ use lnvps_api_common::{
     WorkCommander, round_msat_to_sat,
 };
 use lnvps_db::{
-    LNVpsDb, PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    LNVpsDb, PaymentMethod, RenewalSource, Subscription, SubscriptionLineItem, SubscriptionPayment,
     SubscriptionPaymentType, SubscriptionType, User, UserPaymentMethod,
 };
 use log::{debug, info, warn};
@@ -508,6 +508,7 @@ impl SubscriptionHandler {
             intervals,
             RenewMode::default(),
             None,
+            RenewalSource::Manual,
         )
         .await
     }
@@ -522,8 +523,15 @@ impl SubscriptionHandler {
         intervals: u32,
         mode: RenewMode,
     ) -> Result<SubscriptionPayment> {
-        self.renew_subscription_inner(subscription_id, method, intervals, mode, None)
-            .await
+        self.renew_subscription_inner(
+            subscription_id,
+            method,
+            intervals,
+            mode,
+            None,
+            RenewalSource::Manual,
+        )
+        .await
     }
 
     /// Create a renewal/purchase payment, optionally applying a discount code.
@@ -538,8 +546,15 @@ impl SubscriptionHandler {
         mode: RenewMode,
         discount_code: Option<String>,
     ) -> Result<SubscriptionPayment> {
-        self.renew_subscription_inner(subscription_id, method, intervals, mode, discount_code)
-            .await
+        self.renew_subscription_inner(
+            subscription_id,
+            method,
+            intervals,
+            mode,
+            discount_code,
+            RenewalSource::Manual,
+        )
+        .await
     }
 
     /// Price a renewal **without creating anything**.
@@ -618,6 +633,7 @@ impl SubscriptionHandler {
         intervals: u32,
         mode: RenewMode,
         discount_code: Option<String>,
+        source: RenewalSource,
     ) -> Result<SubscriptionPayment> {
         let (quote, subscription, user) = match self
             .price_renewal(subscription_id, method, intervals, discount_code)
@@ -671,6 +687,7 @@ impl SubscriptionHandler {
                 &tax_summary,
                 tax_evidence,
                 tax_breakdown,
+                source,
             )
             .await?;
 
@@ -1017,6 +1034,7 @@ impl SubscriptionHandler {
         tax_summary: &lnvps_api_common::TaxSummary,
         tax_evidence: Option<serde_json::Value>,
         tax_breakdown: Option<serde_json::Value>,
+        source: RenewalSource,
     ) -> Result<SubscriptionPayment> {
         let subscription = &*subscription;
         Ok(match method {
@@ -1063,6 +1081,7 @@ impl SubscriptionHandler {
                     .await?;
 
                 SubscriptionPayment {
+                    renewal_source: Some(source),
                     id: hex::decode(invoice.payment_hash())?,
                     subscription_id,
                     user_id: subscription.user_id,
@@ -1165,6 +1184,7 @@ impl SubscriptionHandler {
 
                 let new_id: [u8; 32] = rand::random();
                 SubscriptionPayment {
+                    renewal_source: Some(source),
                     id: new_id.to_vec(),
                     subscription_id,
                     user_id: subscription.user_id,
@@ -1229,6 +1249,7 @@ impl SubscriptionHandler {
                     .await?;
 
                 SubscriptionPayment {
+                    renewal_source: Some(source),
                     id: new_id.to_vec(),
                     subscription_id,
                     user_id: subscription.user_id,
@@ -1420,6 +1441,9 @@ impl SubscriptionHandler {
                             })
                             .await?;
                         SubscriptionPayment {
+                            // Every caller here is a customer action (renew, upgrade, purchase);
+                            // worker-initiated renewals go through renew_subscription_inner.
+                            renewal_source: Some(RenewalSource::Manual),
                             id: hex::decode(invoice.payment_hash())?,
                             subscription_id,
                             user_id: user_id,
@@ -1502,6 +1526,9 @@ impl SubscriptionHandler {
                         };
                         let new_id: [u8; 32] = rand::random();
                         SubscriptionPayment {
+                            // Every caller here is a customer action (renew, upgrade, purchase);
+                            // worker-initiated renewals go through renew_subscription_inner.
+                            renewal_source: Some(RenewalSource::Manual),
                             id: new_id.to_vec(),
                             subscription_id,
                             user_id: user_id,
@@ -1544,6 +1571,9 @@ impl SubscriptionHandler {
                             .new_onchain_address(total_amount, desc, hex::encode(new_id))
                             .await?;
                         SubscriptionPayment {
+                            // Every caller here is a customer action (renew, upgrade, purchase);
+                            // worker-initiated renewals go through renew_subscription_inner.
+                            renewal_source: Some(RenewalSource::Manual),
                             id: new_id.to_vec(),
                             subscription_id,
                             user_id: user_id,
@@ -1703,11 +1733,16 @@ impl SubscriptionHandler {
     /// Attempt automatic renewal via the user's saved Nostr Wallet Connect method
     pub async fn auto_renew_via_nwc(&self, sub_id: u64) -> Result<SubscriptionPayment> {
         debug!("Attempting automatic renewal for sub {} via NWC", sub_id);
-        self.renew_subscription_with_mode(
+        // Not `renew_subscription_with_mode`: RenewMode::Saved is also what a
+        // customer pressing "renew with my saved wallet" uses, so the mode does
+        // not identify the initiator — only this call site does.
+        self.renew_subscription_inner(
             sub_id,
             PaymentMethod::Lightning,
             1,
             RenewMode::Saved { method_id: None },
+            None,
+            RenewalSource::Auto,
         )
         .await
     }
@@ -1730,6 +1765,7 @@ impl SubscriptionHandler {
                 1,
                 RenewMode::Saved { method_id: None },
                 None,
+                RenewalSource::Auto,
             )
             .await?;
         info!(
@@ -2593,6 +2629,7 @@ pub(crate) mod revolut_offline_tests {
             tax_evidence: None,
             tax_breakdown: None,
             refunded_payment_id: None,
+            renewal_source: None,
         }
     }
 

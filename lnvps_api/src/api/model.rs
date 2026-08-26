@@ -1707,6 +1707,7 @@ mod tests {
             tax_evidence: None,
             tax_breakdown: None,
             refunded_payment_id: None,
+            renewal_source: None,
         };
 
         // No deposit seen yet -> waiting for payment, no outpoint.

@@ -2855,6 +2855,32 @@ impl SubscriptionPaymentType {
     }
 }
 
+/// Who initiated a payment: the customer, or the worker renewing on their behalf.
+///
+/// An NWC auto-renewal settles a Lightning invoice indistinguishably from a
+/// customer paying one by hand, so the payment row cannot be classified after
+/// the fact — only the initiator knows. `None` on the column means the payment
+/// predates this being recorded and is genuinely unknown; it must never be
+/// folded into either bucket when reporting.
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum RenewalSource {
+    /// The customer paid: checkout, invoice scan, dashboard renew button.
+    #[default]
+    Manual = 0,
+    /// The worker charged a saved payment method in the expiry lead window.
+    Auto = 1,
+}
+
+impl Display for RenewalSource {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RenewalSource::Manual => write!(f, "Manual"),
+            RenewalSource::Auto => write!(f, "Auto"),
+        }
+    }
+}
+
 impl Display for SubscriptionPaymentType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -3045,6 +3071,32 @@ pub struct SubscriptionPayment {
     /// what the same service would cost now. `None` on every other row.
     #[sqlx(default)]
     pub refunded_payment_id: Option<Vec<u8>>,
+    /// Who initiated this payment. `None` for rows created before this was
+    /// recorded (and for rows where it is not meaningful); see
+    /// [`RenewalSource`].
+    #[sqlx(default)]
+    pub renewal_source: Option<RenewalSource>,
+}
+
+/// One subscription due to renew, with everything needed to say whether it
+/// *can* renew itself.
+///
+/// `auto_renewal_enabled` alone does not predict renewal: the worker also
+/// requires an enabled saved payment method, so a subscription with the flag on
+/// and no method silently falls through to a manual expiry warning (see the
+/// expiry lead window in the worker). Both are reported so the gap is visible
+/// rather than assumed.
+#[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
+pub struct SubscriptionRenewalOutlook {
+    pub subscription_id: u64,
+    pub user_id: u64,
+    pub company_id: u64,
+    pub expires: DateTime<Utc>,
+    pub auto_renewal_enabled: bool,
+    /// Whether the user has at least one enabled saved payment method.
+    pub has_payment_method: bool,
+    /// Region of the subscription's VM, when it has one.
+    pub region_id: Option<u64>,
 }
 
 /// Subscription payment with company info (for admin views and time-series reporting)
@@ -3089,6 +3141,9 @@ pub struct SubscriptionPaymentWithCompany {
     /// For a [`SubscriptionPaymentType::Refund`] row, the payment it reverses.
     #[sqlx(default)]
     pub refunded_payment_id: Option<Vec<u8>>,
+    /// Who initiated the payment; `None` for rows predating the column.
+    #[sqlx(default)]
+    pub renewal_source: Option<RenewalSource>,
     // Company information
     pub company_id: u64,
     pub company_name: String,

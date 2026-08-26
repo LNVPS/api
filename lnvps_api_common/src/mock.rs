@@ -3191,6 +3191,7 @@ impl LNVpsDbBase for MockDb {
             host_name: None,
             region_id: None,
             region_name: None,
+            renewal_source: None,
         })
     }
 
@@ -5932,6 +5933,16 @@ impl lnvps_db::AdminDb for MockDb {
     async fn admin_count_company_regions(&self, _company_id: u64) -> DbResult<u64> {
         Ok(0)
     }
+    async fn admin_list_subscription_renewal_outlook(
+        &self,
+        _start: chrono::DateTime<chrono::Utc>,
+        _end: chrono::DateTime<chrono::Utc>,
+        _company_id: u64,
+        _region_id: Option<u64>,
+    ) -> DbResult<Vec<lnvps_db::SubscriptionRenewalOutlook>> {
+        Ok(vec![])
+    }
+
     async fn admin_get_payments_with_company_info(
         &self,
         start_date: chrono::DateTime<chrono::Utc>,
@@ -6035,6 +6046,7 @@ impl lnvps_db::AdminDb for MockDb {
                     host_name,
                     region_id,
                     region_name,
+                    renewal_source: None,
                 });
             }
         }
@@ -7032,6 +7044,7 @@ mod tests {
             tax_evidence: None,
             tax_breakdown: None,
             refunded_payment_id: None,
+            renewal_source: None,
         }
     }
 
@@ -9587,6 +9600,7 @@ mod marketplace_tests {
             tax_evidence: None,
             tax_breakdown: None,
             refunded_payment_id: None,
+            renewal_source: None,
         };
         db.insert_subscription_payment(&payment).await.unwrap();
         (sub_id, payment.id.clone())

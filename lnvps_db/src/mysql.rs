@@ -3375,7 +3375,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()> {
         sqlx::query(
-            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, tax, processing_fee, time_value, metadata, paid_at, tax_rate, tax_country_code, tax_treatment, tax_evidence, tax_breakdown, refunded_payment_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, tax, processing_fee, time_value, metadata, paid_at, tax_rate, tax_country_code, tax_treatment, tax_evidence, tax_breakdown, refunded_payment_id, renewal_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&payment.id)
         .bind(payment.subscription_id)
@@ -3401,6 +3401,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&payment.tax_evidence)
         .bind(&payment.tax_breakdown)
         .bind(&payment.refunded_payment_id)
+        .bind(payment.renewal_source)
         .execute(&self.db)
         .await?;
 
@@ -7403,6 +7404,52 @@ impl AdminDb for LNVpsDbMysql {
                 .await?;
 
         Ok(count as u64)
+    }
+
+    async fn admin_list_subscription_renewal_outlook(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        company_id: u64,
+        region_id: Option<u64>,
+    ) -> DbResult<Vec<crate::SubscriptionRenewalOutlook>> {
+        // Company attribution mirrors `admin_get_payments_with_company_info`:
+        // the VM's region owns the subscription when there is a VM, otherwise
+        // the subscription's own company.
+        let mut query = QueryBuilder::new(
+            "SELECT s.id as subscription_id, s.user_id, s.expires,
+                    s.auto_renewal_enabled,
+                    EXISTS (SELECT 1 FROM user_payment_method upm
+                            WHERE upm.user_id = s.user_id AND upm.enabled = true)
+                        as has_payment_method,
+                    c.id as company_id,
+                    vhr.id as region_id
+             FROM subscription s
+             LEFT JOIN subscription_line_item sli ON sli.subscription_id = s.id
+                 AND sli.subscription_type = 3
+             LEFT JOIN vm v ON v.subscription_line_item_id = sli.id AND v.deleted = false
+             LEFT JOIN vm_host vh ON v.host_id = vh.id
+             LEFT JOIN region vhr ON vh.region_id = vhr.id
+             JOIN company c ON (CASE WHEN vhr.company_id IS NOT NULL
+                                     THEN vhr.company_id
+                                     ELSE s.company_id END) = c.id
+             WHERE s.expires >= ",
+        );
+        query.push_bind(start);
+        query.push(" AND s.expires < ");
+        query.push_bind(end);
+        query.push(" AND c.id = ");
+        query.push_bind(company_id);
+        if let Some(rid) = region_id {
+            query.push(" AND vhr.id = ");
+            query.push_bind(rid);
+        }
+        query.push(" ORDER BY s.expires");
+
+        Ok(query
+            .build_query_as::<crate::SubscriptionRenewalOutlook>()
+            .fetch_all(&self.db)
+            .await?)
     }
 
     async fn admin_get_payments_with_company_info(

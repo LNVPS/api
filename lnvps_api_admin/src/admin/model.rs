@@ -4937,6 +4937,7 @@ mod tests {
             tax_evidence: None,
             tax_breakdown: None,
             refunded_payment_id: None,
+            renewal_source: None,
         };
 
         let plain = AdminVmPaymentInfo::from_subscription_payment(&payment, 1, "EUR".to_string());
