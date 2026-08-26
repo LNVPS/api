@@ -57,6 +57,37 @@ impl OvhDedicatedServerVMacRouter {
     }
 }
 
+/// Decide what to do about an IP that OVH already has a virtual MAC for.
+///
+/// OVH allows exactly one virtual MAC per IP and rejects a second one with
+/// `403 A Virtual Mac already exists on <ip>!`, so the add has to be checked
+/// against the current state first:
+///
+/// - already bound to the MAC we want — nothing to do, report the existing
+///   entry so a retried or replayed job succeeds instead of failing fatally
+/// - bound to a different MAC — refuse, naming the MAC that holds it. Silently
+///   stealing the address would strand whatever is actually using it, and the
+///   binding has to be removed (by unassigning the other VM's IP) first
+/// - not bound — `None`, carry on with the add
+fn existing_binding(entries: &[ArpEntry], entry: &ArpEntry) -> OpResult<Option<ArpEntry>> {
+    let Some(existing) = entries.iter().find(|e| e.address == entry.address) else {
+        return Ok(None);
+    };
+    if existing
+        .mac_address
+        .eq_ignore_ascii_case(&entry.mac_address)
+    {
+        return Ok(Some(existing.clone()));
+    }
+    Err(OpError::Fatal(anyhow::anyhow!(
+        "Cannot add arp entry, {} already has virtual mac {} on this server (wanted {}). \
+         Remove that binding before assigning the address elsewhere.",
+        entry.address,
+        existing.mac_address,
+        entry.mac_address
+    )))
+}
+
 #[async_trait]
 impl Router for OvhDedicatedServerVMacRouter {
     async fn generate_mac(&self, ip: &str, comment: &str) -> Result<Option<ArpEntry>> {
@@ -122,6 +153,17 @@ impl Router for OvhDedicatedServerVMacRouter {
             #[serde(rename = "virtualMachineName")]
             pub comment: String,
         }
+        // OVH permits one virtual MAC per IP; adding a second is a hard 403, so
+        // a retry of a job that already succeeded (or a re-assign of an address
+        // the VM is already using) would fail forever without this check.
+        if let Some(existing) = existing_binding(&self.list_arp_entry().await?, entry)? {
+            info!(
+                "[OVH] Mac ip already present, nothing to do: {} {}",
+                existing.mac_address, existing.address
+            );
+            return Ok(existing);
+        }
+
         let id = format!("{}={}", &entry.mac_address, &entry.address);
         let task: OvhTaskResponse = self
             .api
@@ -231,6 +273,53 @@ enum OvhTaskStatus {
     Init,
     OvhError,
     Todo,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arp(mac: &str, ip: &str) -> ArpEntry {
+        ArpEntry {
+            id: Some(format!("{}={}", mac, ip)),
+            address: ip.to_string(),
+            mac_address: mac.to_string(),
+            interface: None,
+            comment: None,
+        }
+    }
+
+    #[test]
+    fn test_existing_binding_absent() {
+        let entries = vec![arp("02:00:00:aa:bb:cc", "51.68.216.1")];
+        let want = arp("02:00:00:cb:52:55", "51.68.216.208");
+        assert!(existing_binding(&entries, &want).unwrap().is_none());
+        assert!(existing_binding(&[], &want).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_existing_binding_same_mac_is_a_no_op() {
+        let entries = vec![arp("02:00:00:cb:52:55", "51.68.216.208")];
+        let want = arp("02:00:00:cb:52:55", "51.68.216.208");
+        let found = existing_binding(&entries, &want).unwrap().unwrap();
+        assert_eq!(found.mac_address, "02:00:00:cb:52:55");
+        assert_eq!(found.address, "51.68.216.208");
+
+        // OVH returns MACs lowercased, but don't depend on the caller matching.
+        let upper = arp("02:00:00:CB:52:55", "51.68.216.208");
+        assert!(existing_binding(&entries, &upper).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_existing_binding_other_mac_is_fatal() {
+        let entries = vec![arp("02:00:00:aa:bb:cc", "51.68.216.208")];
+        let want = arp("02:00:00:cb:52:55", "51.68.216.208");
+        let err = existing_binding(&entries, &want).unwrap_err();
+        assert!(matches!(err, OpError::Fatal(_)), "retrying cannot help");
+        let msg = err.to_string();
+        assert!(msg.contains("02:00:00:aa:bb:cc"), "names the holder: {msg}");
+        assert!(msg.contains("51.68.216.208"), "names the address: {msg}");
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
