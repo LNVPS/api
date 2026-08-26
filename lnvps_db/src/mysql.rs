@@ -1347,6 +1347,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .await?)
     }
 
+    async fn list_vms_by_mac(&self, mac_address: &str) -> DbResult<Vec<Vm>> {
+        Ok(
+            sqlx::query_as("select * from vm where deleted = 0 and mac_address = ?")
+                .bind(mac_address)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
     async fn insert_vm(&self, vm: &Vm) -> DbResult<u64> {
         Ok(sqlx::query("insert into vm(host_id,user_id,image_id,template_id,custom_template_id,subscription_line_item_id,ssh_key_id,disk_id,mac_address,ref_code) values(?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id")
             .bind(vm.host_id)

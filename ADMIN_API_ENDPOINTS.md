@@ -675,7 +675,8 @@ Body (all optional):
 ```json
 {
   "disabled": boolean,  // Enable/disable the VM
-  "admin_notes": "string | null"  // Set admin-only notes; null clears them, omit to leave unchanged
+  "admin_notes": "string | null",  // Set admin-only notes; null clears them, omit to leave unchanged
+  "mac_address": "string | null"  // Set the VM's NIC MAC address; null unsets it (deleted VMs only), omit to leave unchanged
 }
 ```
 
@@ -690,6 +691,10 @@ Response:
 ```
 
 **Note:** The `disabled` field allows admins to disable a VM without deleting it. When the disabled state changes, a reconfigure job is dispatched to update the VM on the host (e.g., setting `link_down=1` on the network interface). The `job_id` will be empty if no changes were made. The `admin_notes` field is free-form admin-only metadata (returned as `admin_notes` on the VM info responses, never exposed to the customer API); updating it alone persists immediately without dispatching a reconfigure job (empty `job_id`).
+
+**Deleted VMs:** database-only fields (`admin_notes`, `mac_address`) remain editable on a soft-deleted VM so its records can be cleaned up, and no job is ever dispatched for one. `disabled` is refused with `409` because it needs a host that no longer runs the VM.
+
+**MAC address override:** `mac_address` accepts `aa:bb:cc:dd:ee:ff`, `aa-bb-cc-dd-ee-ff`, `aabb.ccdd.eeff` or bare hex and is stored normalised as lowercase colon-separated. Multicast/broadcast addresses (low bit of the first octet set, including the `ff:ff:ff:ff:ff:ff` "not yet provisioned" sentinel) and the all-zero address are rejected with `400`; a MAC already held by another non-deleted VM is rejected with `409`. Explicit `null` unsets the address back to the `ff:ff:ff:ff:ff:ff` sentinel; this is allowed only on a deleted VM (unsetting a live VM's MAC would strand it, and is refused with `409`). Note that a deleted VM never blocks a MAC — the in-use check ignores deleted VMs — so releasing an address before reusing it elsewhere is housekeeping, not a prerequisite. On change an `UpdateVmIp` job is dispatched per IPv4 assignment so static-ARP routers are re-pointed at the new address, and a `ConfigureVm` job applies the NIC change on the host (the returned `job_id` is the `ConfigureVm` one). Existing IPv6 assignments are **not** recalculated — an address originally derived from the old MAC by SLAAC EUI-64 keeps its value, so the guest must be configured to use it statically or the assignment replaced by hand.
 
 #### Delete VM
 

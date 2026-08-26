@@ -486,6 +486,12 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Get a VM by id
     async fn get_vm(&self, vm_id: u64) -> DbResult<Vm>;
 
+    /// List non-deleted VM's using a given MAC address.
+    ///
+    /// A MAC must be unique on the L2 segment it is bridged onto, so this is
+    /// used to reject a manual MAC change that would collide with another VM.
+    async fn list_vms_by_mac(&self, mac_address: &str) -> DbResult<Vec<Vm>>;
+
     /// Insert a new VM record
     async fn insert_vm(&self, vm: &Vm) -> DbResult<u64>;
 

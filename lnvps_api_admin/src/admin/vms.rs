@@ -239,6 +239,62 @@ struct AdminPatchVmRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     admin_notes: Option<Option<String>>,
+    /// Manually override the VM's NIC MAC address.
+    ///
+    /// Accepts `aa:bb:cc:dd:ee:ff`, `aa-bb-cc-dd-ee-ff` or bare hex; it is
+    /// stored normalised as lowercase colon-separated. Explicit `null` unsets
+    /// the address back to the [`UNSET_MAC_ADDRESS`] sentinel, freeing it for
+    /// another VM; omitted leaves it unchanged.
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    mac_address: Option<Option<String>>,
+}
+
+/// The value this codebase stores for "this VM has no MAC yet".
+const UNSET_MAC_ADDRESS: &str = "ff:ff:ff:ff:ff:ff";
+
+/// Validate and normalise an admin-supplied MAC address.
+///
+/// Returns the canonical lowercase colon-separated form. Rejects anything that
+/// isn't a 6 byte unicast address: a multicast/broadcast MAC (low bit of the
+/// first octet set) or the all-zero address cannot be used by a guest NIC, and
+/// `ff:ff:ff:ff:ff:ff` in particular is the sentinel this codebase uses for
+/// "never provisioned".
+fn normalize_mac_address(mac: &str) -> Result<String, ApiError> {
+    let cleaned: String = mac
+        .trim()
+        .chars()
+        .filter(|c| *c != ':' && *c != '-' && *c != '.')
+        .collect();
+
+    if cleaned.len() != 12 || !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ApiError::bad_request(
+            "Invalid MAC address, expected 6 hex octets (eg. bc:24:11:00:00:01)",
+        ));
+    }
+
+    let octets: Vec<String> = cleaned
+        .as_bytes()
+        .chunks(2)
+        .map(|c| String::from_utf8_lossy(c).to_lowercase())
+        .collect();
+
+    let first = u8::from_str_radix(&octets[0], 16)
+        .map_err(|_| ApiError::bad_request("Invalid MAC address"))?;
+    if first & 0x01 != 0 {
+        return Err(ApiError::bad_request(
+            "Invalid MAC address, multicast/broadcast addresses cannot be assigned to a VM",
+        ));
+    }
+    if octets.iter().all(|o| o == "00") {
+        return Err(ApiError::bad_request(
+            "Invalid MAC address, the all-zero address cannot be assigned to a VM",
+        ));
+    }
+
+    Ok(octets.join(":"))
 }
 
 /// Patch (update) a VM
@@ -254,18 +310,67 @@ async fn admin_patch_vm(
     // Verify VM exists
     let mut vm = this.db.get_vm(id).await?;
 
-    if vm.deleted {
-        return Err(ApiError::conflict("Cannot update a deleted VM"));
+    // A deleted VM has no host VM and no router entries left, so nothing may be
+    // pushed to a host for it — but its row still holds a MAC, and freeing that
+    // address for reuse is exactly the kind of clean-up this endpoint is for.
+    // Database-only fields stay editable; anything needing a host is refused.
+    let deleted = vm.deleted;
+    if deleted && req.disabled.is_some() {
+        return Err(ApiError::conflict(
+            "Cannot change the disabled state of a deleted VM",
+        ));
     }
 
     let mut needs_reconfigure = false;
     let mut needs_save = false;
+    let mut mac_changed = false;
 
     // Handle disabled state change
     if let Some(disabled) = req.disabled {
         if vm.disabled != disabled {
             vm.disabled = disabled;
             needs_reconfigure = true;
+        }
+    }
+
+    // Handle a manual MAC address override. `null` unsets it back to the
+    // sentinel, which releases the address for another VM.
+    if let Some(mac_address) = &req.mac_address {
+        let mac_address = match mac_address {
+            Some(mac) => normalize_mac_address(mac)?,
+            None => {
+                // Unsetting a live VM's MAC would strand it: its ARP entries
+                // and NIC still reference the old address and nothing would
+                // re-derive a new one.
+                if !deleted {
+                    return Err(ApiError::conflict(
+                        "Cannot unset the MAC address of a live VM, set a replacement address instead",
+                    ));
+                }
+                UNSET_MAC_ADDRESS.to_string()
+            }
+        };
+        if vm.mac_address != mac_address {
+            // A duplicate MAC on the same L2 segment breaks both VMs, so refuse
+            // to hand one VM's address to another. Deleted VMs are not counted
+            // (`list_vms_by_mac` skips them), which is what makes unsetting a
+            // live VM's MAC unnecessary before reusing it elsewhere.
+            if mac_address != UNSET_MAC_ADDRESS
+                && this
+                    .db
+                    .list_vms_by_mac(&mac_address)
+                    .await?
+                    .iter()
+                    .any(|v| v.id != vm.id)
+            {
+                return Err(ApiError::conflict(
+                    "MAC address is already in use by another VM",
+                ));
+            }
+            vm.mac_address = mac_address;
+            mac_changed = true;
+            needs_reconfigure = !deleted;
+            needs_save = deleted;
         }
     }
 
@@ -277,10 +382,15 @@ async fn admin_patch_vm(
         needs_save = true;
     }
 
-    // Notes-only change: persist without reconfiguring the VM on the host.
+    // DB-only change (admin notes, or a MAC edit on a deleted VM): persist
+    // without touching the host. A deleted VM never reaches the job paths
+    // below, so no job can be queued against a machine that no longer exists.
     if needs_save && !needs_reconfigure {
         this.db.update_vm(&vm).await?;
-        info!("Admin {} updated VM {} admin_notes", auth.user_id, id);
+        info!(
+            "Admin {} updated VM {} (deleted={}): mac_address={}",
+            auth.user_id, id, deleted, vm.mac_address
+        );
         return ApiData::ok(JobResponse {
             job_id: String::new(),
         });
@@ -289,9 +399,36 @@ async fn admin_patch_vm(
     if needs_reconfigure {
         this.db.update_vm(&vm).await?;
         info!(
-            "Admin {} updated VM {}: disabled={}",
-            auth.user_id, id, vm.disabled
+            "Admin {} updated VM {}: disabled={} mac_address={}",
+            auth.user_id, id, vm.disabled, vm.mac_address
         );
+
+        if mac_changed {
+            // Static-ARP networks pin the VM's IPv4 to its MAC on the router,
+            // so every IPv4 assignment has to be re-pointed at the new address
+            // or the VM loses connectivity.
+            for assignment in this.db.list_vm_ip_assignments(id).await? {
+                if matches!(
+                    assignment.ip.parse::<std::net::IpAddr>(),
+                    Ok(std::net::IpAddr::V6(_))
+                ) {
+                    continue;
+                }
+                if let Err(e) = this
+                    .work_commander
+                    .send(WorkJob::UpdateVmIp {
+                        assignment_id: assignment.id,
+                        admin_user_id: Some(auth.user_id),
+                    })
+                    .await
+                {
+                    error!(
+                        "Failed to queue IP update job for assignment {}: {}",
+                        assignment.id, e
+                    );
+                }
+            }
+        }
 
         // Send work job to reconfigure the VM on the host
         let configure_job = WorkJob::ConfigureVm {
@@ -1812,6 +1949,344 @@ mod tests {
             serde_json::from_str(r#"{"disabled": true, "admin_notes": "x"}"#).unwrap();
         assert_eq!(req.disabled, Some(true));
         assert_eq!(req.admin_notes, Some(Some("x".to_string())));
+
+        // MAC override is optional and independent of the other fields
+        let req: AdminPatchVmRequest =
+            serde_json::from_str(r#"{"mac_address": "BC:24:11:00:00:01"}"#).unwrap();
+        assert_eq!(req.mac_address, Some(Some("BC:24:11:00:00:01".to_string())));
+        assert_eq!(req.disabled, None);
+
+        // Explicit null unsets the MAC; omitted leaves it unchanged
+        let req: AdminPatchVmRequest = serde_json::from_str(r#"{"mac_address": null}"#).unwrap();
+        assert_eq!(req.mac_address, Some(None));
+        let req: AdminPatchVmRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(req.mac_address, None);
+    }
+
+    #[test]
+    fn normalize_mac_address_accepts_and_rejects() {
+        // Canonical form, separators and case are all normalised
+        for input in [
+            "bc:24:11:00:00:01",
+            "BC:24:11:00:00:01",
+            "bc-24-11-00-00-01",
+            "bc24.1100.0001",
+            "BC2411000001",
+        ] {
+            assert_eq!(
+                normalize_mac_address(input).unwrap(),
+                "bc:24:11:00:00:01",
+                "{input}"
+            );
+        }
+        assert_eq!(
+            normalize_mac_address("  bc:24:11:00:00:01  ").unwrap(),
+            "bc:24:11:00:00:01"
+        );
+
+        // Wrong length / non-hex
+        for bad in [
+            "",
+            "bc:24:11:00:00",
+            "bc:24:11:00:00:01:02",
+            "zz:24:11:00:00:01",
+        ] {
+            let err = normalize_mac_address(bad).expect_err(bad);
+            assert!(err.error.contains("Invalid MAC address"), "{}", err.error);
+        }
+
+        // Multicast (low bit of first octet) and the provisioning sentinel
+        for bad in ["01:00:5e:00:00:01", "ff:ff:ff:ff:ff:ff"] {
+            let err = normalize_mac_address(bad).expect_err(bad);
+            assert!(err.error.contains("multicast"), "{}", err.error);
+        }
+
+        // All-zero address
+        let err = normalize_mac_address("00:00:00:00:00:00").expect_err("all zero");
+        assert!(err.error.contains("all-zero"), "{}", err.error);
+    }
+
+    /// A manual MAC change is persisted, re-points every IPv4 static-ARP entry
+    /// (`UpdateVmIp`) and reconfigures the NIC on the host (`ConfigureVm`).
+    #[tokio::test]
+    async fn admin_patch_vm_updates_mac_address() {
+        use crate::admin::model::Permission;
+        use lnvps_api_common::{
+            ChannelWorkCommander, MockDb, MockExchangeRate, VatClient, VmStateCache, WorkCommander,
+        };
+        use lnvps_db::LNVpsDbBase;
+        use std::sync::Arc;
+
+        crate::verbose_errors_for_tests();
+        let db = MockDb::default();
+        let user_id = db.upsert_user(&[9u8; 32]).await.unwrap();
+        let mut vm = MockDb::mock_vm();
+        vm.user_id = user_id;
+        vm.ssh_key_id = None;
+        let vm_id = db.insert_vm(&vm).await.unwrap();
+
+        // One IPv4 (re-pointed) and one IPv6 (SLAAC, no static ARP)
+        db.insert_vm_ip_assignment(&lnvps_db::VmIpAssignment {
+            id: 0,
+            vm_id,
+            ip_range_id: 1,
+            ip: "185.18.221.10".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        db.insert_vm_ip_assignment(&lnvps_db::VmIpAssignment {
+            id: 0,
+            vm_id,
+            ip_range_id: 1,
+            ip: "2001:db8::1".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // A second VM already holding the MAC we later try to steal
+        let mut other = MockDb::mock_vm();
+        other.user_id = user_id;
+        other.ssh_key_id = None;
+        other.mac_address = "bc:24:11:00:00:02".to_string();
+        let other_id = db.insert_vm(&other).await.unwrap();
+        let mut other = db.get_vm(other_id).await.unwrap();
+        other.mac_address = "bc:24:11:00:00:02".to_string();
+        db.update_vm(&other).await.unwrap();
+
+        let jobs = Arc::new(ChannelWorkCommander::new());
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(db);
+        let this = RouterState {
+            node_control: None,
+            db: db.clone(),
+            work_commander: jobs.clone(),
+            feedback: None,
+            vm_state_cache: VmStateCache::new(),
+            exchange: Arc::new(MockExchangeRate::default()),
+            vat: VatClient::new(),
+        };
+        let admin = || AdminAuth {
+            user_id: 1,
+            pubkey: vec![1u8; 32],
+            permissions: [Permission {
+                resource: AdminResource::VirtualMachines,
+                action: AdminAction::Update,
+            }]
+            .into_iter()
+            .collect(),
+            nip98_auth: None,
+        };
+
+        // Happy path: normalised and saved
+        let _ = admin_patch_vm(
+            admin(),
+            State(this.clone()),
+            Path(vm_id),
+            Json(AdminPatchVmRequest {
+                mac_address: Some(Some("BC-24-11-00-00-01".to_string())),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.get_vm(vm_id).await.unwrap().mac_address,
+            "bc:24:11:00:00:01"
+        );
+
+        // The IPv4 assignment is re-pointed, the IPv6 one is left alone, and
+        // the host NIC is reconfigured.
+        let mut queued = Vec::new();
+        while let Ok(Ok(msgs)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), jobs.recv()).await
+        {
+            queued.extend(msgs.into_iter().map(|m| m.job));
+        }
+        assert_eq!(
+            queued
+                .iter()
+                .filter(|j| matches!(j, WorkJob::UpdateVmIp { .. }))
+                .count(),
+            1,
+            "only the IPv4 assignment should be re-pointed: {queued:?}"
+        );
+        assert!(
+            queued
+                .iter()
+                .any(|j| matches!(j, WorkJob::ConfigureVm { vm_id: v, .. } if *v == vm_id)),
+            "{queued:?}"
+        );
+
+        // Same MAC again is a no-op (no job queued)
+        let out = admin_patch_vm(
+            admin(),
+            State(this.clone()),
+            Path(vm_id),
+            Json(AdminPatchVmRequest {
+                mac_address: Some(Some("bc:24:11:00:00:01".to_string())),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(out.0.data.job_id.is_empty());
+
+        // Invalid MAC is rejected before anything is written
+        let err = admin_patch_vm(
+            admin(),
+            State(this.clone()),
+            Path(vm_id),
+            Json(AdminPatchVmRequest {
+                mac_address: Some(Some("nope".to_string())),
+                ..Default::default()
+            }),
+        )
+        .await
+        .err()
+        .expect("invalid mac");
+        assert!(err.error.contains("Invalid MAC address"), "{}", err.error);
+
+        // Another VM's MAC is refused
+        let err = admin_patch_vm(
+            admin(),
+            State(this.clone()),
+            Path(vm_id),
+            Json(AdminPatchVmRequest {
+                mac_address: Some(Some("bc:24:11:00:00:02".to_string())),
+                ..Default::default()
+            }),
+        )
+        .await
+        .err()
+        .expect("duplicate mac");
+        assert!(err.error.contains("already in use"), "{}", err.error);
+        assert_eq!(
+            db.get_vm(vm_id).await.unwrap().mac_address,
+            "bc:24:11:00:00:01"
+        );
+
+        // Requires virtual_machines::update
+        assert!(
+            admin_patch_vm(
+                AdminAuth {
+                    user_id: 1,
+                    pubkey: vec![1u8; 32],
+                    permissions: Default::default(),
+                    nip98_auth: None,
+                },
+                State(this.clone()),
+                Path(vm_id),
+                Json(AdminPatchVmRequest::default()),
+            )
+            .await
+            .is_err()
+        );
+
+        // Unsetting a live VM's MAC would strand it
+        let err = admin_patch_vm(
+            admin(),
+            State(this.clone()),
+            Path(vm_id),
+            Json(AdminPatchVmRequest {
+                mac_address: Some(None),
+                ..Default::default()
+            }),
+        )
+        .await
+        .err()
+        .expect("unset on live vm");
+        assert!(err.error.contains("live VM"), "{}", err.error);
+
+        // A deleted VM stays editable (its MAC has to be releasable), but
+        // nothing may be pushed to a host that no longer runs it.
+        db.delete_vm(vm_id).await.unwrap();
+        let out = admin_patch_vm(
+            admin(),
+            State(this.clone()),
+            Path(vm_id),
+            Json(AdminPatchVmRequest {
+                mac_address: Some(Some("bc:24:11:00:00:03".to_string())),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(out.0.data.job_id.is_empty());
+        assert_eq!(
+            db.get_vm(vm_id).await.unwrap().mac_address,
+            "bc:24:11:00:00:03"
+        );
+
+        // ...including unsetting it entirely
+        let out = admin_patch_vm(
+            admin(),
+            State(this.clone()),
+            Path(vm_id),
+            Json(AdminPatchVmRequest {
+                mac_address: Some(None),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(out.0.data.job_id.is_empty());
+        assert_eq!(
+            db.get_vm(vm_id).await.unwrap().mac_address,
+            UNSET_MAC_ADDRESS
+        );
+
+        // A deleted VM's disabled state is still refused (it needs a host)
+        let err = admin_patch_vm(
+            admin(),
+            State(this.clone()),
+            Path(vm_id),
+            Json(AdminPatchVmRequest {
+                disabled: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await
+        .err()
+        .expect("deleted vm");
+        assert!(err.error.contains("deleted VM"), "{}", err.error);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), jobs.recv())
+                .await
+                .is_err(),
+            "no job may be queued for a deleted VM"
+        );
+    }
+
+    /// A deleted VM does not hold its MAC against a live one, so the address
+    /// can be reused without unsetting it first.
+    #[tokio::test]
+    async fn deleted_vm_does_not_hold_its_mac() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::LNVpsDbBase;
+
+        let db = MockDb::default();
+        let user_id = db.upsert_user(&[10u8; 32]).await.unwrap();
+        let mut vm = MockDb::mock_vm();
+        vm.user_id = user_id;
+        vm.ssh_key_id = None;
+        let vm_id = db.insert_vm(&vm).await.unwrap();
+        let mut vm = db.get_vm(vm_id).await.unwrap();
+        vm.mac_address = "bc:24:11:00:00:0a".to_string();
+        db.update_vm(&vm).await.unwrap();
+
+        assert_eq!(
+            db.list_vms_by_mac("bc:24:11:00:00:0a").await.unwrap().len(),
+            1
+        );
+        db.delete_vm(vm_id).await.unwrap();
+        assert!(
+            db.list_vms_by_mac("bc:24:11:00:00:0a")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The spec is flattened, so the body stays the same shape the customer

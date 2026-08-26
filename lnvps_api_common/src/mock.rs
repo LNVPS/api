@@ -1469,6 +1469,15 @@ impl LNVpsDbBase for MockDb {
         Ok(vms.get(&vm_id).ok_or(anyhow!("no vm"))?.clone())
     }
 
+    async fn list_vms_by_mac(&self, mac_address: &str) -> DbResult<Vec<Vm>> {
+        let vms = self.vms.lock().await;
+        Ok(vms
+            .values()
+            .filter(|v| !v.deleted && v.mac_address == mac_address)
+            .cloned()
+            .collect())
+    }
+
     async fn insert_vm(&self, vm: &Vm) -> DbResult<u64> {
         let mut vms = self.vms.lock().await;
         let max_id = *vms.keys().max().unwrap_or(&0);
