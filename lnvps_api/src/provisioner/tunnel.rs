@@ -85,14 +85,14 @@ fn bare_address(cidr: &str) -> String {
     cidr.split_once('/').map_or(cidr, |(a, _)| a).to_string()
 }
 
-/// A node holds a single address, not a link.
+/// A peer holds a single address, not a link.
 ///
-/// WireGuard needs no gateway on the node's side (`ip route add default dev
+/// WireGuard needs no gateway on the peer's side (`ip route add default dev
 /// wg0` is enough on a point-to-point layer 3 interface), so a /31 spent two
 /// addresses to describe something that needs one — and forced the route server
-/// to carry an address per node.
-const NODE_PREFIX_V4: u8 = 32;
-const NODE_PREFIX_V6: u8 = 128;
+/// to carry an address per peer.
+const PEER_PREFIX_V4: u8 = 32;
+const PEER_PREFIX_V6: u8 = 128;
 
 /// Fetch a node's existing data plane, if it has one.
 pub async fn get_node_tunnel(
@@ -264,10 +264,6 @@ fn peer_name(node: &MarketplaceNode) -> String {
 
 /// Carve the next free link out of `pool`, returning `(address4, address6)` in
 /// the peer's own form (`10.0.0.2/32`).
-///
-/// A pool with both blocks must supply both halves: a node given only one
-/// family would silently be single-stack, which is the kind of thing that is
-/// discovered by a customer rather than by us.
 async fn carve_link(
     db: &Arc<dyn LNVpsDb>,
     pool: &TunnelPool,
@@ -281,12 +277,36 @@ async fn carve_link(
         .filter_map(|a| a.parse::<IpNetwork>().ok())
         .collect();
 
-    let address4 = match pool.cidr4.as_deref() {
-        Some(cidr) => Some(carve_one(cidr, NODE_PREFIX_V4, &taken, pool)?),
+    carve_peer(
+        pool.cidr4.as_deref(),
+        pool.cidr6.as_deref(),
+        &taken,
+        &format!("Tunnel pool {}", pool.id),
+    )
+}
+
+/// Carve the next free peer address out of each block.
+///
+/// A block-holder with both families must supply both halves: a peer given only
+/// one would silently be single-stack, which is the kind of thing that is
+/// discovered by a customer rather than by us.
+///
+/// `owner` names whatever holds the blocks (`"Tunnel pool 3"`, `"VPN service
+/// 1"`) so an error points at the row an admin has to fix. That, and where the
+/// taken set was read from, is the only thing a marketplace link and a VPN
+/// device disagree about — the arithmetic is the same, so it is written once.
+pub(crate) fn carve_peer(
+    cidr4: Option<&str>,
+    cidr6: Option<&str>,
+    taken: &[IpNetwork],
+    owner: &str,
+) -> Result<(Option<String>, Option<String>)> {
+    let address4 = match cidr4 {
+        Some(cidr) => Some(carve_one(cidr, PEER_PREFIX_V4, taken, owner)?),
         None => None,
     };
-    let address6 = match pool.cidr6.as_deref() {
-        Some(cidr) => Some(carve_one(cidr, NODE_PREFIX_V6, &taken, pool)?),
+    let address6 = match cidr6 {
+        Some(cidr) => Some(carve_one(cidr, PEER_PREFIX_V6, taken, owner)?),
         None => None,
     };
     Ok((address4, address6))
@@ -315,21 +335,14 @@ pub fn reserved_addresses(cidr: &str) -> Vec<IpNetwork> {
     out
 }
 
-fn carve_one(cidr: &str, prefix: u8, taken: &[IpNetwork], pool: &TunnelPool) -> Result<String> {
-    let block: IpNetwork = cidr.parse().map_err(|e| {
-        anyhow!(
-            "Tunnel pool {} has an unparseable block {cidr}: {e}",
-            pool.id
-        )
-    })?;
+fn carve_one(cidr: &str, prefix: u8, taken: &[IpNetwork], owner: &str) -> Result<String> {
+    let block: IpNetwork = cidr
+        .parse()
+        .map_err(|e| anyhow!("{owner} has an unparseable block {cidr}: {e}"))?;
     let mut taken = taken.to_vec();
     taken.extend(reserved_addresses(cidr));
-    let addr = allocate_subnet(&block, prefix, &taken).ok_or_else(|| {
-        anyhow!(
-            "Tunnel pool {} has no free /{prefix} left in {cidr}",
-            pool.id
-        )
-    })?;
+    let addr = allocate_subnet(&block, prefix, &taken)
+        .ok_or_else(|| anyhow!("{owner} has no free /{prefix} left in {cidr}; widen the block"))?;
     Ok(addr.to_string())
 }
 

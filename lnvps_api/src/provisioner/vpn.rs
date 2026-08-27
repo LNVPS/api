@@ -21,18 +21,8 @@ use anyhow::{Result, anyhow, bail};
 use ipnetwork::IpNetwork;
 use lnvps_db::{LNVpsDb, VpnDevice, VpnService, VpnSubscription};
 
-use crate::provisioner::allocate_subnet;
-use crate::provisioner::tunnel::{PoolPlan, host_address, reserved_addresses, server_address};
+use crate::provisioner::tunnel::{PoolPlan, carve_peer, host_address, server_address};
 use crate::router::WireguardPeer;
-
-/// A device holds a single address, not a link.
-///
-/// WireGuard is layer 3 and point-to-point, so there is no on-link requirement
-/// and nothing for a wider prefix to describe. A /31 per device would spend two
-/// addresses to say what one says, and multiply the block by five again on a
-/// five-device plan.
-const DEVICE_PREFIX_V4: u8 = 32;
-const DEVICE_PREFIX_V6: u8 = 128;
 
 /// Register `peer_pubkey` as a device on `plan`.
 ///
@@ -109,16 +99,13 @@ fn next_free_slot(devices: &[VpnDevice], limit: u8) -> Result<u8> {
         })
 }
 
-/// Carve the next free address out of the service's blocks, in the device's own
-/// form (`10.64.0.7/32`).
+/// Carve the next free address out of the service's blocks.
 ///
-/// A service with both blocks supplies both halves. A device given only one
-/// family would silently be single-stack, which is discovered by a customer
-/// rather than by us.
-///
-/// The taken set is every device on the service, whatever its billing state:
-/// a lapsed customer's address is still theirs, and reissuing it would deliver
-/// their traffic to somebody else the moment they paid again.
+/// The only thing this does that carving a marketplace link does not is read
+/// the taken set from the service's devices rather than a pool's tunnels — and
+/// take *every* device, whatever its billing state, because a lapsed customer's
+/// address is still theirs and reissuing it would deliver their traffic to
+/// somebody else the moment they paid again.
 async fn carve_device_addresses(
     db: &Arc<dyn LNVpsDb>,
     service: &VpnService,
@@ -132,37 +119,12 @@ async fn carve_device_addresses(
         .filter_map(|a| a.parse::<IpNetwork>().ok())
         .collect();
 
-    let address4 = match service.device_cidr4.as_deref() {
-        Some(cidr) => Some(carve_one(cidr, DEVICE_PREFIX_V4, &taken, service)?),
-        None => None,
-    };
-    let address6 = match service.device_cidr6.as_deref() {
-        Some(cidr) => Some(carve_one(cidr, DEVICE_PREFIX_V6, &taken, service)?),
-        None => None,
-    };
-    Ok((address4, address6))
-}
-
-fn carve_one(cidr: &str, prefix: u8, taken: &[IpNetwork], service: &VpnService) -> Result<String> {
-    let block: IpNetwork = cidr.parse().map_err(|e| {
-        anyhow!(
-            "VPN service {} has an unparseable block {cidr}: {e}",
-            service.id
-        )
-    })?;
-    let mut taken = taken.to_vec();
-    // The route servers hold the whole block on-link, so what the block
-    // reserves is reserved here too: its network address, the servers' shared
-    // address just after it, and on IPv4 its broadcast address. Handing any of
-    // them to a device produces an address no route server will forward to.
-    taken.extend(reserved_addresses(cidr));
-    let addr = allocate_subnet(&block, prefix, &taken).ok_or_else(|| {
-        anyhow!(
-            "VPN service {} has no free /{prefix} left in {cidr}; widen the block",
-            service.id
-        )
-    })?;
-    Ok(addr.to_string())
+    carve_peer(
+        service.device_cidr4.as_deref(),
+        service.device_cidr6.as_deref(),
+        &taken,
+        &format!("VPN service {}", service.id),
+    )
 }
 
 /// What a device-terminating interface should have configured on its route
