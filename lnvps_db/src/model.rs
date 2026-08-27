@@ -2157,6 +2157,140 @@ impl TunnelPool {
     }
 }
 
+/// The address space a VPN device lives in, and the settings its config carries.
+///
+/// A marketplace node's tunnel is terminated by exactly one route server, so its
+/// addresses come from that one [`TunnelPool`]. A VPN device is the opposite:
+/// one key and one address valid on every region at once, with the region chosen
+/// client-side by dialling a different endpoint. Its block therefore cannot live
+/// on a pool, because two pools carving from their own blocks would hand one
+/// device two different addresses.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct VpnService {
+    /// Unique id of this service
+    pub id: u64,
+    /// Admin label. Not an identifier.
+    pub name: String,
+    /// IPv4 block device addresses are carved from, shared by every pool that
+    /// terminates this service
+    pub device_cidr4: Option<String>,
+    /// IPv6 block device addresses are carved from
+    pub device_cidr6: Option<String>,
+    /// Resolvers handed to clients in the generated config, comma-separated.
+    ///
+    /// A device reaches the internet through the route server's own NAT and has
+    /// no resolver of its own, so without this the client keeps using whatever
+    /// its local network gave it and leaks every lookup around the tunnel.
+    pub dns: Option<String>,
+    /// Devices an account here may register unless its own row says otherwise.
+    /// [`VpnSubscription::device_limit`] is what is enforced.
+    pub default_device_limit: u8,
+    /// Whether new subscriptions and devices may be created here
+    pub enabled: bool,
+    /// When this service was created
+    pub created: DateTime<Utc>,
+}
+
+impl VpnService {
+    /// The resolvers to write into a client config, split and trimmed.
+    ///
+    /// Empty when none are set, so a caller can omit the `DNS` line rather than
+    /// writing a blank one that `wg-quick` rejects.
+    pub fn dns_servers(&self) -> Vec<String> {
+        self.dns
+            .as_deref()
+            .map(|d| {
+                d.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// Which interfaces terminate a VPN service.
+///
+/// The association is recorded here rather than as a column on [`TunnelPool`]:
+/// a pool is an opaque managed WireGuard interface and is not concerned with
+/// what is carried over it, the same way a [`Tunnel`] has no purpose of its own
+/// and is pointed at by [`MarketplaceNode::tunnel_id`].
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct VpnServicePool {
+    /// The service whose devices this interface carries
+    pub vpn_service_id: u64,
+    /// The interface. Primary key: one interface terminates at most one
+    /// service, because two peer sets on one interface would reconcile against
+    /// each other, each removing the other's peers as unclaimed.
+    pub tunnel_pool_id: u64,
+    /// When the link was made
+    pub created: DateTime<Utc>,
+}
+
+/// A customer's VPN plan.
+///
+/// One per account, and the row is reused when a lapsed customer comes back, so
+/// their devices keep their keys and addresses across the gap.
+///
+/// There is no active or suspended field. Whether the plan is paid for is
+/// [`Subscription::is_setup`] and [`Subscription::expires`], reached through the
+/// line item; a copy here would be a second answer free to disagree with the
+/// first. Suspension is therefore not a write: the planner reads billing state,
+/// so a lapsed plan stops being configured on the next reconcile and a paid one
+/// returns without anything having to remember to re-enable it.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct VpnSubscription {
+    /// Unique id of this plan
+    pub id: u64,
+    /// Which service, and therefore which address block, its devices come from
+    pub vpn_service_id: u64,
+    /// The account this plan belongs to
+    pub user_id: u64,
+    /// The line item billing for this plan. Repointed, not duplicated, when a
+    /// lapsed plan is resubscribed.
+    pub subscription_line_item_id: u64,
+    /// How many devices this account may register. The thing being sold, so a
+    /// larger tier is a write here rather than a new product.
+    pub device_limit: u8,
+    /// When this plan was created
+    pub created: DateTime<Utc>,
+}
+
+/// One registered device: a phone, a laptop.
+///
+/// Not a [`Tunnel`]. That pins a peer to one route server and is correct for a
+/// marketplace node terminated in exactly one place; a device is a peer on every
+/// route server at once.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct VpnDevice {
+    /// Unique id of this device
+    pub id: u64,
+    /// The plan this device is registered against
+    pub vpn_subscription_id: u64,
+    /// Which of the plan's device slots this occupies, counted from zero.
+    ///
+    /// Exists to make the device limit unforgeable: counting rows and then
+    /// inserting is a race two concurrent registrations win together, while
+    /// claiming the lowest free slot against `uk_vpn_device_slot` means the
+    /// database rejects the loser.
+    pub slot: u8,
+    /// The customer's label for the device. Never sent to a route server.
+    pub name: String,
+    /// The device's public key. The customer generates the pair and presents
+    /// only this half, so the private key never exists here.
+    pub peer_pubkey: Vec<u8>,
+    /// Inner IPv4 address as a CIDR host prefix, identical on every region
+    pub address4: Option<String>,
+    /// Inner IPv6 address as a CIDR host prefix
+    pub address6: Option<String>,
+    /// Whether the customer wants this device configured. Their switch, not a
+    /// billing one.
+    pub enabled: bool,
+    /// When this device was registered
+    pub created: DateTime<Utc>,
+}
+
 /// A single machine offered by an operator.
 ///
 /// One probe's findings on a node.
@@ -3431,6 +3565,40 @@ mod tests {
         assert_eq!(v6.endpoint(), "[2a01:db8::1]:51820");
     }
 
+    /// A device has no resolver of its own behind the route server's NAT, so a
+    /// config with no `DNS` line leaks every lookup around the tunnel. The
+    /// stored value is a list, and an empty one has to be distinguishable from
+    /// a blank line, which `wg-quick` rejects.
+    #[test]
+    fn test_vpn_service_dns_servers() {
+        let none = VpnService::default();
+        assert!(none.dns_servers().is_empty());
+
+        let one = VpnService {
+            dns: Some("10.64.0.1".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(one.dns_servers(), vec!["10.64.0.1".to_string()]);
+
+        // Whitespace around a separator is an admin typing a list, not a
+        // resolver named " 2a01:db8::1".
+        let many = VpnService {
+            dns: Some("10.64.0.1, 2a01:db8::1".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            many.dns_servers(),
+            vec!["10.64.0.1".to_string(), "2a01:db8::1".to_string()]
+        );
+
+        // A trailing separator must not produce an empty resolver.
+        let trailing = VpnService {
+            dns: Some("10.64.0.1,".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(trailing.dns_servers(), vec!["10.64.0.1".to_string()]);
+    }
+
     #[test]
     fn test_marketplace_node_status_roundtrip() {
         for (text, status) in [
@@ -3969,15 +4137,6 @@ pub struct LndConfig {
     pub macaroon_path: PathBuf,
 }
 
-/// Lightning provider configuration - Bitvora
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BitvoraConfig {
-    /// API token
-    pub token: String,
-    /// Webhook secret for verifying callbacks
-    pub webhook_secret: String,
-}
-
 /// Revolut provider configuration
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RevolutProviderConfig {
@@ -4060,8 +4219,6 @@ pub struct PaypalProviderConfig {
 pub enum ProviderConfig {
     /// LND Lightning Network Daemon configuration
     Lnd(LndConfig),
-    /// Bitvora Lightning provider configuration
-    Bitvora(BitvoraConfig),
     /// Revolut fiat payment configuration
     Revolut(RevolutProviderConfig),
     /// Stripe fiat payment configuration
@@ -4078,7 +4235,6 @@ impl ProviderConfig {
     pub fn provider_type(&self) -> &'static str {
         match self {
             ProviderConfig::Lnd(_) => "lnd",
-            ProviderConfig::Bitvora(_) => "bitvora",
             ProviderConfig::Revolut(_) => "revolut",
             ProviderConfig::Stripe(_) => "stripe",
             ProviderConfig::Paypal(_) => "paypal",
@@ -4089,7 +4245,7 @@ impl ProviderConfig {
     /// Get the payment method for this provider config
     pub fn payment_method(&self) -> PaymentMethod {
         match self {
-            ProviderConfig::Lnd(_) | ProviderConfig::Bitvora(_) => PaymentMethod::Lightning,
+            ProviderConfig::Lnd(_) => PaymentMethod::Lightning,
             ProviderConfig::Revolut(_) => PaymentMethod::Revolut,
             ProviderConfig::Stripe(_) => PaymentMethod::Stripe,
             ProviderConfig::Paypal(_) => PaymentMethod::Paypal,
@@ -4101,14 +4257,6 @@ impl ProviderConfig {
     pub fn as_lnd(&self) -> Option<&LndConfig> {
         match self {
             ProviderConfig::Lnd(cfg) => Some(cfg),
-            _ => None,
-        }
-    }
-
-    /// Get Bitvora config if this is a Bitvora provider
-    pub fn as_bitvora(&self) -> Option<&BitvoraConfig> {
-        match self {
-            ProviderConfig::Bitvora(cfg) => Some(cfg),
             _ => None,
         }
     }
@@ -4160,7 +4308,7 @@ pub struct PaymentMethodConfig {
     pub name: String,
     /// Whether this payment method is enabled
     pub enabled: bool,
-    /// Provider type string (e.g., "lnd", "bitvora", "revolut")
+    /// Provider type string (e.g., "lnd", "revolut")
     pub provider_type: String,
     /// JSON configuration for the provider
     pub config: Option<serde_json::Value>,

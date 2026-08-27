@@ -1593,6 +1593,105 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Delete a pool. Fails while any tunnel is still carved out of it.
     async fn delete_tunnel_pool(&self, id: u64) -> DbResult<()>;
 
+    // ----- VPN -----
+
+    /// Get a VPN service by id
+    async fn get_vpn_service(&self, id: u64) -> DbResult<VpnService>;
+
+    /// List VPN services. `enabled_only` restricts to those still selling.
+    async fn list_vpn_services(&self, enabled_only: bool) -> DbResult<Vec<VpnService>>;
+
+    /// Create a VPN service, returning the new id
+    async fn insert_vpn_service(&self, service: &VpnService) -> DbResult<u64>;
+
+    /// Update a service's blocks, DNS, default limit and enabled flag.
+    /// `created` is immutable and is not written.
+    async fn update_vpn_service(&self, service: &VpnService) -> DbResult<()>;
+
+    /// Delete a service. Fails while any interface terminates it or any plan is
+    /// allocated from it.
+    async fn delete_vpn_service(&self, id: u64) -> DbResult<()>;
+
+    /// The service a tunnel pool terminates, if any.
+    ///
+    /// `None` is a marketplace pool: it carves point-to-point links out of its
+    /// own block and terminates one peer per node, exactly as before VPNs
+    /// existed. This is the only thing that distinguishes the two, because the
+    /// pool itself does not record what it is for.
+    async fn get_vpn_service_for_pool(&self, tunnel_pool_id: u64) -> DbResult<Option<VpnService>>;
+
+    /// The interfaces terminating a service, in pool id order. Every one of
+    /// them carries the same device peer set.
+    async fn list_vpn_service_pools(&self, vpn_service_id: u64) -> DbResult<Vec<TunnelPool>>;
+
+    /// Make a pool terminate a service. Replaces any existing link for that
+    /// pool, since an interface terminates at most one.
+    async fn link_vpn_service_pool(&self, vpn_service_id: u64, tunnel_pool_id: u64)
+    -> DbResult<()>;
+
+    /// Stop a pool terminating anything, returning it to a plain tunnel pool.
+    async fn unlink_vpn_service_pool(&self, tunnel_pool_id: u64) -> DbResult<()>;
+
+    /// Get a VPN plan by id
+    async fn get_vpn_subscription(&self, id: u64) -> DbResult<VpnSubscription>;
+
+    /// Get the VPN plan for an account, if it has ever had one.
+    ///
+    /// `None` rather than an error because "this user has no plan" is the
+    /// ordinary case on every request from everybody who has not bought one.
+    async fn get_vpn_subscription_for_user(
+        &self,
+        user_id: u64,
+    ) -> DbResult<Option<VpnSubscription>>;
+
+    /// Get the VPN plan billed by a line item, if any. This is how a settled
+    /// payment is resolved back to the plan it paid for.
+    async fn get_vpn_subscription_by_line_item(
+        &self,
+        subscription_line_item_id: u64,
+    ) -> DbResult<Option<VpnSubscription>>;
+
+    /// Create a VPN plan, returning the new id
+    async fn insert_vpn_subscription(&self, sub: &VpnSubscription) -> DbResult<u64>;
+
+    /// Update a plan's device limit and current line item. `user_id`,
+    /// `vpn_service_id` and `created` are immutable and are not written: moving
+    /// a plan to another service would strand every device's address.
+    async fn update_vpn_subscription(&self, sub: &VpnSubscription) -> DbResult<()>;
+
+    /// Get a device by id
+    async fn get_vpn_device(&self, id: u64) -> DbResult<VpnDevice>;
+
+    /// Get a device by its public key. This is how a route server's observed
+    /// peer is resolved back to what it should be.
+    async fn get_vpn_device_by_pubkey(&self, peer_pubkey: &[u8]) -> DbResult<Option<VpnDevice>>;
+
+    /// List the devices on one plan, in slot order. Includes disabled ones: a
+    /// disabled device still owns its slot and its address.
+    async fn list_vpn_devices(&self, vpn_subscription_id: u64) -> DbResult<Vec<VpnDevice>>;
+
+    /// Every device a pool's interface should carry: enabled, on a plan whose
+    /// subscription is paid and unexpired, on the service this pool terminates.
+    ///
+    /// One query rather than a walk over plans, because this runs on every
+    /// reconcile of every pool and the peer set is the whole customer base. It
+    /// is also where suspension is applied, which is why no code path has to
+    /// remember to disable a lapsed customer's devices.
+    async fn list_active_vpn_devices(&self, vpn_service_id: u64) -> DbResult<Vec<VpnDevice>>;
+
+    /// Register a device, returning the new id. The caller claims the slot;
+    /// `uk_vpn_device_slot` is what makes the limit unforgeable under
+    /// concurrent registrations.
+    async fn insert_vpn_device(&self, device: &VpnDevice) -> DbResult<u64>;
+
+    /// Update a device's name, key and enabled flag. `vpn_subscription_id`,
+    /// `slot`, the addresses and `created` are immutable and are not written:
+    /// an address that moved would strand a config the customer already holds.
+    async fn update_vpn_device(&self, device: &VpnDevice) -> DbResult<()>;
+
+    /// Delete a device, releasing its slot and addresses.
+    async fn delete_vpn_device(&self, id: u64) -> DbResult<()>;
+
     // ----- App catalog -----
 
     /// List catalog apps. When `enabled_only` is set, only apps offered in the

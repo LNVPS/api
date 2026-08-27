@@ -17,7 +17,8 @@ use lnvps_db::{
     SubscriptionPaymentWithCompany, Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm,
     VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy,
     VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment, VmOsImage,
-    VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, WebauthnCredential,
+    VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice, VpnService,
+    VpnSubscription, WebauthnCredential,
 };
 
 use async_trait::async_trait;
@@ -83,6 +84,12 @@ pub struct MockDb {
     pub marketplace_node_health: Arc<Mutex<HashMap<u64, MarketplaceNodeHealth>>>,
     pub tunnels: Arc<Mutex<HashMap<u64, Tunnel>>>,
     pub tunnel_pools: Arc<Mutex<HashMap<u64, TunnelPool>>>,
+    pub vpn_services: Arc<Mutex<HashMap<u64, VpnService>>>,
+    /// `vpn_service_pool`, keyed by pool id because an interface terminates at
+    /// most one service.
+    pub vpn_service_pools: Arc<Mutex<HashMap<u64, u64>>>,
+    pub vpn_subscriptions: Arc<Mutex<HashMap<u64, VpnSubscription>>>,
+    pub vpn_devices: Arc<Mutex<HashMap<u64, VpnDevice>>>,
     pub referral_payouts: Arc<Mutex<Vec<ReferralPayout>>>,
     pub router_tunnels: Arc<Mutex<HashMap<u64, RouterTunnel>>>,
     pub router_tunnel_traffic: Arc<Mutex<Vec<RouterTunnelTraffic>>>,
@@ -164,6 +171,41 @@ impl MockDb {
                 router_id
             )
             .into());
+        }
+        Ok(())
+    }
+
+    /// The `uk_vpn_device_*` unique keys: a slot on a plan, a public key, and an
+    /// inner address each belong to at most one device. The slot key is what
+    /// makes the device limit unforgeable under concurrent registration, so a
+    /// mock that did not enforce it would let a test pass that production loses.
+    fn check_vpn_device_uniqueness(
+        devices: &HashMap<u64, VpnDevice>,
+        candidate: &VpnDevice,
+        skip_id: Option<u64>,
+    ) -> DbResult<()> {
+        for other in devices.values() {
+            if Some(other.id) == skip_id {
+                continue;
+            }
+            if other.vpn_subscription_id == candidate.vpn_subscription_id
+                && other.slot == candidate.slot
+            {
+                return Err(anyhow!(
+                    "Slot {} is already taken on this plan (uk_vpn_device_slot)",
+                    candidate.slot
+                )
+                .into());
+            }
+            if other.peer_pubkey == candidate.peer_pubkey {
+                return Err(anyhow!("A device with that public key already exists").into());
+            }
+            if candidate.address4.is_some() && other.address4 == candidate.address4 {
+                return Err(anyhow!("Address {:?} is already assigned", candidate.address4).into());
+            }
+            if candidate.address6.is_some() && other.address6 == candidate.address6 {
+                return Err(anyhow!("Address {:?} is already assigned", candidate.address6).into());
+            }
         }
         Ok(())
     }
@@ -482,6 +524,10 @@ impl Default for MockDb {
             marketplace_node_health: Arc::new(Default::default()),
             tunnels: Arc::new(Default::default()),
             tunnel_pools: Arc::new(Default::default()),
+            vpn_services: Arc::new(Default::default()),
+            vpn_service_pools: Arc::new(Default::default()),
+            vpn_subscriptions: Arc::new(Default::default()),
+            vpn_devices: Arc::new(Default::default()),
             referral_payouts: Arc::new(Default::default()),
             router_tunnels: Arc::new(Default::default()),
             router_tunnel_traffic: Arc::new(Default::default()),
@@ -4860,6 +4906,390 @@ impl LNVpsDbBase for MockDb {
             return Err(anyhow!("Tunnel pool {} still has tunnels carved out of it", id).into());
         }
         self.tunnel_pools.lock().await.remove(&id);
+        Ok(())
+    }
+
+    // ----- VPN -----
+
+    async fn get_vpn_service(&self, id: u64) -> DbResult<VpnService> {
+        self.vpn_services
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("VPN service {} not found", id).into())
+    }
+
+    async fn list_vpn_services(&self, enabled_only: bool) -> DbResult<Vec<VpnService>> {
+        let services = self.vpn_services.lock().await;
+        let mut out: Vec<_> = services
+            .values()
+            .filter(|s| !enabled_only || s.enabled)
+            .cloned()
+            .collect();
+        out.sort_by_key(|s| s.id);
+        Ok(out)
+    }
+
+    async fn insert_vpn_service(&self, service: &VpnService) -> DbResult<u64> {
+        // ck_vpn_service_has_a_block: a service with neither block can allocate
+        // nothing, and would only be discovered with a customer waiting.
+        if service.device_cidr4.is_none() && service.device_cidr6.is_none() {
+            return Err(anyhow!(
+                "A VPN service must have a device address block (ck_vpn_service_has_a_block)"
+            )
+            .into());
+        }
+        let mut services = self.vpn_services.lock().await;
+        let new_id = services.keys().max().copied().unwrap_or(0) + 1;
+        services.insert(
+            new_id,
+            VpnService {
+                id: new_id,
+                created: Utc::now(),
+                ..service.clone()
+            },
+        );
+        Ok(new_id)
+    }
+
+    async fn update_vpn_service(&self, service: &VpnService) -> DbResult<()> {
+        if service.device_cidr4.is_none() && service.device_cidr6.is_none() {
+            return Err(anyhow!(
+                "A VPN service must have a device address block (ck_vpn_service_has_a_block)"
+            )
+            .into());
+        }
+        let mut services = self.vpn_services.lock().await;
+        let existing = services
+            .get(&service.id)
+            .ok_or_else(|| DbError::Other(anyhow!("VPN service {} not found", service.id)))?;
+        // `created` is immutable and is not written.
+        let created = existing.created;
+        services.insert(
+            service.id,
+            VpnService {
+                created,
+                ..service.clone()
+            },
+        );
+        Ok(())
+    }
+
+    async fn delete_vpn_service(&self, id: u64) -> DbResult<()> {
+        // FK vpn_service_pool.vpn_service_id
+        if self
+            .vpn_service_pools
+            .lock()
+            .await
+            .values()
+            .any(|s| *s == id)
+        {
+            return Err(anyhow!("VPN service {} is still terminated by an interface", id).into());
+        }
+        // FK vpn_subscription.vpn_service_id
+        if self
+            .vpn_subscriptions
+            .lock()
+            .await
+            .values()
+            .any(|s| s.vpn_service_id == id)
+        {
+            return Err(anyhow!("VPN service {} still has subscriptions", id).into());
+        }
+        self.vpn_services.lock().await.remove(&id);
+        Ok(())
+    }
+
+    async fn get_vpn_service_for_pool(&self, tunnel_pool_id: u64) -> DbResult<Option<VpnService>> {
+        let Some(service_id) = self
+            .vpn_service_pools
+            .lock()
+            .await
+            .get(&tunnel_pool_id)
+            .copied()
+        else {
+            return Ok(None);
+        };
+        Ok(self.vpn_services.lock().await.get(&service_id).cloned())
+    }
+
+    async fn list_vpn_service_pools(&self, vpn_service_id: u64) -> DbResult<Vec<TunnelPool>> {
+        let links = self.vpn_service_pools.lock().await;
+        let pools = self.tunnel_pools.lock().await;
+        let mut out: Vec<_> = links
+            .iter()
+            .filter(|(_, s)| **s == vpn_service_id)
+            .filter_map(|(pool_id, _)| pools.get(pool_id).cloned())
+            .collect();
+        out.sort_by_key(|p| p.id);
+        Ok(out)
+    }
+
+    async fn link_vpn_service_pool(
+        &self,
+        vpn_service_id: u64,
+        tunnel_pool_id: u64,
+    ) -> DbResult<()> {
+        if !self.vpn_services.lock().await.contains_key(&vpn_service_id) {
+            return Err(anyhow!("VPN service {} not found", vpn_service_id).into());
+        }
+        if !self.tunnel_pools.lock().await.contains_key(&tunnel_pool_id) {
+            return Err(anyhow!("Tunnel pool {} not found", tunnel_pool_id).into());
+        }
+        // Keyed by pool, so repointing replaces rather than adding a second
+        // peer set to one interface.
+        self.vpn_service_pools
+            .lock()
+            .await
+            .insert(tunnel_pool_id, vpn_service_id);
+        Ok(())
+    }
+
+    async fn unlink_vpn_service_pool(&self, tunnel_pool_id: u64) -> DbResult<()> {
+        self.vpn_service_pools.lock().await.remove(&tunnel_pool_id);
+        Ok(())
+    }
+
+    async fn get_vpn_subscription(&self, id: u64) -> DbResult<VpnSubscription> {
+        self.vpn_subscriptions
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("VPN subscription {} not found", id).into())
+    }
+
+    async fn get_vpn_subscription_for_user(
+        &self,
+        user_id: u64,
+    ) -> DbResult<Option<VpnSubscription>> {
+        Ok(self
+            .vpn_subscriptions
+            .lock()
+            .await
+            .values()
+            .find(|s| s.user_id == user_id)
+            .cloned())
+    }
+
+    async fn get_vpn_subscription_by_line_item(
+        &self,
+        subscription_line_item_id: u64,
+    ) -> DbResult<Option<VpnSubscription>> {
+        Ok(self
+            .vpn_subscriptions
+            .lock()
+            .await
+            .values()
+            .find(|s| s.subscription_line_item_id == subscription_line_item_id)
+            .cloned())
+    }
+
+    async fn insert_vpn_subscription(&self, sub: &VpnSubscription) -> DbResult<u64> {
+        // FKs: the service, the account and the line item all have to exist.
+        if !self
+            .vpn_services
+            .lock()
+            .await
+            .contains_key(&sub.vpn_service_id)
+        {
+            return Err(anyhow!("VPN service {} not found", sub.vpn_service_id).into());
+        }
+        if !self.users.lock().await.contains_key(&sub.user_id) {
+            return Err(anyhow!("User {} not found", sub.user_id).into());
+        }
+        if !self
+            .subscription_line_items
+            .lock()
+            .await
+            .contains_key(&sub.subscription_line_item_id)
+        {
+            return Err(anyhow!(
+                "Subscription line item {} not found",
+                sub.subscription_line_item_id
+            )
+            .into());
+        }
+        let mut subs = self.vpn_subscriptions.lock().await;
+        // uk_vpn_subscription_user: one plan per account. A lapsed customer
+        // coming back reuses their row rather than getting a second one.
+        if subs.values().any(|s| s.user_id == sub.user_id) {
+            return Err(anyhow!(
+                "User {} already has a VPN subscription (uk_vpn_subscription_user)",
+                sub.user_id
+            )
+            .into());
+        }
+        // uk_vpn_subscription_line_item: one line item bills for one plan.
+        if subs
+            .values()
+            .any(|s| s.subscription_line_item_id == sub.subscription_line_item_id)
+        {
+            return Err(anyhow!(
+                "Line item {} already bills for a VPN subscription",
+                sub.subscription_line_item_id
+            )
+            .into());
+        }
+        let new_id = subs.keys().max().copied().unwrap_or(0) + 1;
+        subs.insert(
+            new_id,
+            VpnSubscription {
+                id: new_id,
+                created: Utc::now(),
+                ..sub.clone()
+            },
+        );
+        Ok(new_id)
+    }
+
+    async fn update_vpn_subscription(&self, sub: &VpnSubscription) -> DbResult<()> {
+        let mut subs = self.vpn_subscriptions.lock().await;
+        let existing = subs
+            .get(&sub.id)
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow!("VPN subscription {} not found", sub.id)))?;
+        if subs
+            .values()
+            .any(|s| s.id != sub.id && s.subscription_line_item_id == sub.subscription_line_item_id)
+        {
+            return Err(anyhow!(
+                "Line item {} already bills for a VPN subscription",
+                sub.subscription_line_item_id
+            )
+            .into());
+        }
+        // `user_id`, `vpn_service_id` and `created` are immutable and are not
+        // written: moving a plan to another service would strand every device's
+        // address, which is carved from the service's block.
+        subs.insert(
+            sub.id,
+            VpnSubscription {
+                user_id: existing.user_id,
+                vpn_service_id: existing.vpn_service_id,
+                created: existing.created,
+                ..sub.clone()
+            },
+        );
+        Ok(())
+    }
+
+    async fn get_vpn_device(&self, id: u64) -> DbResult<VpnDevice> {
+        self.vpn_devices
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("VPN device {} not found", id).into())
+    }
+
+    async fn get_vpn_device_by_pubkey(&self, peer_pubkey: &[u8]) -> DbResult<Option<VpnDevice>> {
+        Ok(self
+            .vpn_devices
+            .lock()
+            .await
+            .values()
+            .find(|d| d.peer_pubkey == peer_pubkey)
+            .cloned())
+    }
+
+    async fn list_vpn_devices(&self, vpn_subscription_id: u64) -> DbResult<Vec<VpnDevice>> {
+        let devices = self.vpn_devices.lock().await;
+        let mut out: Vec<_> = devices
+            .values()
+            .filter(|d| d.vpn_subscription_id == vpn_subscription_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|d| d.slot);
+        Ok(out)
+    }
+
+    async fn list_active_vpn_devices(&self, vpn_service_id: u64) -> DbResult<Vec<VpnDevice>> {
+        let subs = self.vpn_subscriptions.lock().await;
+        let line_items = self.subscription_line_items.lock().await;
+        let subscriptions = self.subscriptions.lock().await;
+        let now = Utc::now();
+
+        // The same billing join the SQL does, which is where suspension is
+        // applied: an unpaid, deactivated or expired plan stops matching, so its
+        // devices simply leave the peer set.
+        let live: Vec<u64> = subs
+            .values()
+            .filter(|s| s.vpn_service_id == vpn_service_id)
+            .filter(|s| {
+                line_items
+                    .get(&s.subscription_line_item_id)
+                    .and_then(|li| subscriptions.get(&li.subscription_id))
+                    .is_some_and(|sub| {
+                        sub.is_active && sub.is_setup && sub.expires.is_none_or(|e| e > now)
+                    })
+            })
+            .map(|s| s.id)
+            .collect();
+
+        let devices = self.vpn_devices.lock().await;
+        let mut out: Vec<_> = devices
+            .values()
+            .filter(|d| d.enabled && live.contains(&d.vpn_subscription_id))
+            .cloned()
+            .collect();
+        out.sort_by_key(|d| d.id);
+        Ok(out)
+    }
+
+    async fn insert_vpn_device(&self, device: &VpnDevice) -> DbResult<u64> {
+        // FK vpn_device.vpn_subscription_id
+        if !self
+            .vpn_subscriptions
+            .lock()
+            .await
+            .contains_key(&device.vpn_subscription_id)
+        {
+            return Err(
+                anyhow!("VPN subscription {} not found", device.vpn_subscription_id).into(),
+            );
+        }
+        let mut devices = self.vpn_devices.lock().await;
+        Self::check_vpn_device_uniqueness(&devices, device, None)?;
+        let new_id = devices.keys().max().copied().unwrap_or(0) + 1;
+        devices.insert(
+            new_id,
+            VpnDevice {
+                id: new_id,
+                created: Utc::now(),
+                ..device.clone()
+            },
+        );
+        Ok(new_id)
+    }
+
+    async fn update_vpn_device(&self, device: &VpnDevice) -> DbResult<()> {
+        let mut devices = self.vpn_devices.lock().await;
+        let existing = devices
+            .get(&device.id)
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow!("VPN device {} not found", device.id)))?;
+        Self::check_vpn_device_uniqueness(&devices, device, Some(device.id))?;
+        // The plan, the slot, the addresses and `created` are immutable and are
+        // not written: an address that moved would strand a config the customer
+        // is already holding.
+        devices.insert(
+            device.id,
+            VpnDevice {
+                vpn_subscription_id: existing.vpn_subscription_id,
+                slot: existing.slot,
+                address4: existing.address4,
+                address6: existing.address6,
+                created: existing.created,
+                ..device.clone()
+            },
+        );
+        Ok(())
+    }
+
+    async fn delete_vpn_device(&self, id: u64) -> DbResult<()> {
+        self.vpn_devices.lock().await.remove(&id);
         Ok(())
     }
 
@@ -10834,5 +11264,559 @@ mod vm_traffic_tests {
             .unwrap();
         assert!(rows.is_empty());
         assert_eq!(total, 0);
+    }
+}
+
+#[cfg(test)]
+mod vpn_tests {
+    use super::*;
+    use lnvps_db::LNVpsDbBase;
+
+    /// A service with a block, and a paid plan on it, which is the starting
+    /// point for everything below.
+    async fn vpn_service(db: &MockDb) -> u64 {
+        db.insert_vpn_service(&VpnService {
+            name: "eu".to_string(),
+            device_cidr4: Some("10.64.0.0/12".to_string()),
+            default_device_limit: 5,
+            enabled: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// A subscription line item in the given billing state, for a fresh user.
+    async fn billed_line_item(
+        db: &MockDb,
+        seed: u8,
+        is_active: bool,
+        is_setup: bool,
+        expires: Option<DateTime<Utc>>,
+    ) -> (u64, u64) {
+        let uid = db.upsert_user(&[seed; 32]).await.unwrap();
+        let sub = Subscription {
+            id: 0,
+            user_id: uid,
+            company_id: 1,
+            name: "vpn".to_string(),
+            description: None,
+            created: Utc::now(),
+            expires,
+            is_active,
+            is_setup,
+            currency: "EUR".to_string(),
+            interval_amount: 1,
+            interval_type: lnvps_db::IntervalType::Month,
+            setup_fee: 0,
+            auto_renewal_enabled: false,
+            external_id: None,
+        };
+        let (_, items) = db
+            .insert_subscription_with_line_items(
+                &sub,
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: lnvps_db::SubscriptionType::Vps,
+                    name: "vpn".to_string(),
+                    description: None,
+                    amount: 500,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await
+            .unwrap();
+        (uid, items[0])
+    }
+
+    /// A plan on `service` for a fresh user, paid and unexpired.
+    async fn paid_plan(db: &MockDb, seed: u8, service_id: u64) -> u64 {
+        let (uid, line_item) = billed_line_item(db, seed, true, true, None).await;
+        db.insert_vpn_subscription(&VpnSubscription {
+            vpn_service_id: service_id,
+            user_id: uid,
+            subscription_line_item_id: line_item,
+            device_limit: 5,
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    fn device(plan: u64, slot: u8, seed: u8) -> VpnDevice {
+        VpnDevice {
+            vpn_subscription_id: plan,
+            slot,
+            name: format!("device-{seed}"),
+            peer_pubkey: vec![seed; 32],
+            address4: Some(format!("10.64.0.{seed}/32")),
+            address6: None,
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    /// A service that can allocate nothing is a service whose first customer
+    /// discovers the problem, so the check runs on write rather than on use.
+    #[tokio::test]
+    async fn a_vpn_service_must_have_a_block() {
+        let db = MockDb::default();
+
+        assert!(
+            db.insert_vpn_service(&VpnService {
+                name: "empty".to_string(),
+                ..Default::default()
+            })
+            .await
+            .is_err(),
+            "a service with neither block can allocate nothing"
+        );
+
+        let id = vpn_service(&db).await;
+        let mut svc = db.get_vpn_service(id).await.unwrap();
+        assert_eq!(db.list_vpn_services(true).await.unwrap().len(), 1);
+
+        svc.device_cidr4 = None;
+        assert!(
+            db.update_vpn_service(&svc).await.is_err(),
+            "a service cannot have its last block removed either"
+        );
+
+        // Disabling stops sales without touching what is already allocated.
+        let mut svc = db.get_vpn_service(id).await.unwrap();
+        svc.enabled = false;
+        svc.name = "eu-closed".to_string();
+        db.update_vpn_service(&svc).await.unwrap();
+        assert!(db.list_vpn_services(true).await.unwrap().is_empty());
+        assert_eq!(db.list_vpn_services(false).await.unwrap().len(), 1);
+        assert_eq!(db.get_vpn_service(id).await.unwrap().name, "eu-closed");
+    }
+
+    /// Deleting a service out from under a pool or a customer would strand
+    /// every device addressed from its block.
+    #[tokio::test]
+    async fn a_vpn_service_in_use_cannot_be_deleted() {
+        let db = MockDb::default();
+        let service = vpn_service(&db).await;
+
+        let plan = paid_plan(&db, 1, service).await;
+        assert!(
+            db.delete_vpn_service(service).await.is_err(),
+            "a service with subscriptions is still owed to somebody"
+        );
+
+        db.vpn_subscriptions.lock().await.remove(&plan);
+        db.tunnel_pools.lock().await.insert(
+            1,
+            TunnelPool {
+                id: 1,
+                ..Default::default()
+            },
+        );
+        db.link_vpn_service_pool(service, 1).await.unwrap();
+        assert!(
+            db.delete_vpn_service(service).await.is_err(),
+            "an interface is still configured to terminate it"
+        );
+
+        db.unlink_vpn_service_pool(1).await.unwrap();
+        db.delete_vpn_service(service).await.unwrap();
+        assert!(db.get_vpn_service(service).await.is_err());
+    }
+
+    /// A pool does not record what it is for, so the link is the only thing
+    /// that says an interface carries devices rather than per-node links. One
+    /// interface terminates at most one service: two peer sets on one interface
+    /// would reconcile against each other, each removing the other's peers.
+    #[tokio::test]
+    async fn an_interface_terminates_at_most_one_service() {
+        let db = MockDb::default();
+        let a = vpn_service(&db).await;
+        let b = db
+            .insert_vpn_service(&VpnService {
+                name: "b".to_string(),
+                device_cidr6: Some("fd00:64::/32".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        for id in [1u64, 2] {
+            db.tunnel_pools.lock().await.insert(
+                id,
+                TunnelPool {
+                    id,
+                    ..Default::default()
+                },
+            );
+        }
+
+        // An unlinked pool is a marketplace pool and behaves as it always has.
+        assert!(db.get_vpn_service_for_pool(1).await.unwrap().is_none());
+
+        db.link_vpn_service_pool(a, 1).await.unwrap();
+        db.link_vpn_service_pool(a, 2).await.unwrap();
+        assert_eq!(
+            db.get_vpn_service_for_pool(1).await.unwrap().map(|s| s.id),
+            Some(a)
+        );
+        assert_eq!(
+            db.list_vpn_service_pools(a)
+                .await
+                .unwrap()
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2],
+            "every interface on a service carries the same device peer set"
+        );
+
+        // Repointing replaces the link rather than adding a second one.
+        db.link_vpn_service_pool(b, 2).await.unwrap();
+        assert_eq!(
+            db.get_vpn_service_for_pool(2).await.unwrap().map(|s| s.id),
+            Some(b)
+        );
+        assert_eq!(
+            db.list_vpn_service_pools(a)
+                .await
+                .unwrap()
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        // Neither side may be invented.
+        assert!(db.link_vpn_service_pool(9999, 1).await.is_err());
+        assert!(db.link_vpn_service_pool(a, 9999).await.is_err());
+
+        // A service nothing terminates has no interfaces, not an error.
+        assert!(db.list_vpn_service_pools(9999).await.unwrap().is_empty());
+    }
+
+    /// One plan per account, and a lapsed customer coming back reuses the row
+    /// rather than getting a second one — which is what keeps their existing
+    /// device configs working once they pay.
+    #[tokio::test]
+    async fn one_vpn_plan_per_account() {
+        let db = MockDb::default();
+        let service = vpn_service(&db).await;
+        let plan = paid_plan(&db, 1, service).await;
+
+        let stored = db.get_vpn_subscription(plan).await.unwrap();
+        assert_eq!(
+            db.get_vpn_subscription_for_user(stored.user_id)
+                .await
+                .unwrap()
+                .map(|s| s.id),
+            Some(plan)
+        );
+        assert_eq!(
+            db.get_vpn_subscription_by_line_item(stored.subscription_line_item_id)
+                .await
+                .unwrap()
+                .map(|s| s.id),
+            Some(plan)
+        );
+        // Nobody else's account, and nobody else's line item.
+        assert!(
+            db.get_vpn_subscription_for_user(stored.user_id + 999)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_vpn_subscription_by_line_item(9999)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A second plan for the same account is rejected.
+        let (_, other_item) = billed_line_item(&db, 2, true, true, None).await;
+        assert!(
+            db.insert_vpn_subscription(&VpnSubscription {
+                vpn_service_id: service,
+                user_id: stored.user_id,
+                subscription_line_item_id: other_item,
+                device_limit: 5,
+                ..Default::default()
+            })
+            .await
+            .is_err()
+        );
+
+        // And a second plan cannot claim a line item that already bills for one.
+        let fresh = db.upsert_user(&[9u8; 32]).await.unwrap();
+        assert!(
+            db.insert_vpn_subscription(&VpnSubscription {
+                vpn_service_id: service,
+                user_id: fresh,
+                subscription_line_item_id: stored.subscription_line_item_id,
+                device_limit: 5,
+                ..Default::default()
+            })
+            .await
+            .is_err()
+        );
+    }
+
+    /// Resubscribing repoints the plan at the new line item and can resize the
+    /// tier, but must not be able to move it to another service: the devices'
+    /// addresses are carved from the one it has.
+    #[tokio::test]
+    async fn a_vpn_plan_is_repointed_not_moved() {
+        let db = MockDb::default();
+        let service = vpn_service(&db).await;
+        let other_service = db
+            .insert_vpn_service(&VpnService {
+                name: "other".to_string(),
+                device_cidr4: Some("10.80.0.0/12".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let plan = paid_plan(&db, 1, service).await;
+        let original = db.get_vpn_subscription(plan).await.unwrap();
+
+        let (_, renewed_item) = billed_line_item(&db, 2, true, true, None).await;
+        db.update_vpn_subscription(&VpnSubscription {
+            id: plan,
+            vpn_service_id: other_service,
+            user_id: 4242,
+            subscription_line_item_id: renewed_item,
+            device_limit: 10,
+            created: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+        let after = db.get_vpn_subscription(plan).await.unwrap();
+        assert_eq!(after.subscription_line_item_id, renewed_item);
+        assert_eq!(after.device_limit, 10, "the tier is what is being sold");
+        assert_eq!(after.vpn_service_id, original.vpn_service_id);
+        assert_eq!(after.user_id, original.user_id);
+        assert_eq!(after.created, original.created);
+
+        // A renewal cannot steal another plan's line item.
+        let second = paid_plan(&db, 3, service).await;
+        let mut clash = db.get_vpn_subscription(second).await.unwrap();
+        clash.subscription_line_item_id = renewed_item;
+        assert!(db.update_vpn_subscription(&clash).await.is_err());
+    }
+
+    /// The device limit has to be unforgeable: counting rows and then inserting
+    /// is a race two concurrent registrations win together, so the slot is what
+    /// the cap is actually made of.
+    #[tokio::test]
+    async fn a_device_slot_cannot_be_claimed_twice() {
+        let db = MockDb::default();
+        let service = vpn_service(&db).await;
+        let plan = paid_plan(&db, 1, service).await;
+
+        db.insert_vpn_device(&device(plan, 0, 1)).await.unwrap();
+        assert!(
+            db.insert_vpn_device(&device(plan, 0, 2)).await.is_err(),
+            "two devices in one slot is a sixth device on a five-device plan"
+        );
+
+        // A key belongs to one device, or a handshake authenticates the wrong
+        // customer.
+        assert!(
+            db.insert_vpn_device(&VpnDevice {
+                slot: 1,
+                ..device(plan, 1, 1)
+            })
+            .await
+            .is_err()
+        );
+
+        // An address belongs to one device, or their traffic is delivered to
+        // each other.
+        assert!(
+            db.insert_vpn_device(&VpnDevice {
+                address4: Some("10.64.0.1/32".to_string()),
+                ..device(plan, 1, 3)
+            })
+            .await
+            .is_err()
+        );
+        assert!(
+            db.insert_vpn_device(&VpnDevice {
+                address6: Some("fd00::1/128".to_string()),
+                ..device(plan, 1, 4)
+            })
+            .await
+            .is_ok(),
+            "a v6 address nobody else holds is fine"
+        );
+        assert!(
+            db.insert_vpn_device(&VpnDevice {
+                address6: Some("fd00::1/128".to_string()),
+                ..device(plan, 2, 5)
+            })
+            .await
+            .is_err()
+        );
+
+        // The slot is per plan, so another customer's slot 0 is free.
+        let other = paid_plan(&db, 2, service).await;
+        db.insert_vpn_device(&device(other, 0, 6)).await.unwrap();
+
+        // A device on a plan that does not exist has no owner to bill.
+        assert!(db.insert_vpn_device(&device(9999, 0, 7)).await.is_err());
+    }
+
+    /// Suspension is not a write. A plan that is unpaid, deactivated or expired
+    /// simply stops matching, so its devices leave the peer set on the next
+    /// reconcile and come back when it is paid, with nothing having had to
+    /// remember to toggle them.
+    #[tokio::test]
+    async fn only_paid_plans_are_configured() {
+        let db = MockDb::default();
+        let service = vpn_service(&db).await;
+
+        let paid = paid_plan(&db, 1, service).await;
+        db.insert_vpn_device(&device(paid, 0, 1)).await.unwrap();
+
+        // Never paid.
+        let (uid, item) = billed_line_item(&db, 2, true, false, None).await;
+        let unpaid = db
+            .insert_vpn_subscription(&VpnSubscription {
+                vpn_service_id: service,
+                user_id: uid,
+                subscription_line_item_id: item,
+                device_limit: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.insert_vpn_device(&device(unpaid, 0, 2)).await.unwrap();
+
+        // Paid once, then lapsed.
+        let (uid, item) =
+            billed_line_item(&db, 3, true, true, Some(Utc::now() - TimeDelta::days(1))).await;
+        let expired = db
+            .insert_vpn_subscription(&VpnSubscription {
+                vpn_service_id: service,
+                user_id: uid,
+                subscription_line_item_id: item,
+                device_limit: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.insert_vpn_device(&device(expired, 0, 3)).await.unwrap();
+
+        // Cancelled by an admin.
+        let (uid, item) = billed_line_item(&db, 4, false, true, None).await;
+        let cancelled = db
+            .insert_vpn_subscription(&VpnSubscription {
+                vpn_service_id: service,
+                user_id: uid,
+                subscription_line_item_id: item,
+                device_limit: 5,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.insert_vpn_device(&device(cancelled, 0, 4))
+            .await
+            .unwrap();
+
+        let active = db.list_active_vpn_devices(service).await.unwrap();
+        assert_eq!(
+            active.iter().map(|d| d.peer_pubkey[0]).collect::<Vec<_>>(),
+            vec![1],
+            "only the paid, unexpired, active plan is configured"
+        );
+
+        // A device the customer switched off is theirs to switch off, and is
+        // dropped for a different reason than non-payment.
+        let mut d = active[0].clone();
+        d.enabled = false;
+        db.update_vpn_device(&d).await.unwrap();
+        assert!(
+            db.list_active_vpn_devices(service)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // And another service's devices are not this one's.
+        assert!(db.list_active_vpn_devices(9999).await.unwrap().is_empty());
+    }
+
+    /// A device's addresses and slot are what its config already says, so a
+    /// rename or a key rotation must leave them exactly where they are.
+    #[tokio::test]
+    async fn renaming_a_device_leaves_its_address_alone() {
+        let db = MockDb::default();
+        let service = vpn_service(&db).await;
+        let plan = paid_plan(&db, 1, service).await;
+        let id = db.insert_vpn_device(&device(plan, 0, 1)).await.unwrap();
+        let before = db.get_vpn_device(id).await.unwrap();
+
+        db.update_vpn_device(&VpnDevice {
+            id,
+            vpn_subscription_id: 9999,
+            slot: 4,
+            name: "laptop".to_string(),
+            peer_pubkey: vec![42u8; 32],
+            address4: Some("10.99.0.1/32".to_string()),
+            address6: Some("fd00::99/128".to_string()),
+            enabled: true,
+            created: Utc::now(),
+        })
+        .await
+        .unwrap();
+
+        let after = db.get_vpn_device(id).await.unwrap();
+        assert_eq!(after.name, "laptop");
+        assert_eq!(after.peer_pubkey, vec![42u8; 32], "keys may be rotated");
+        assert_eq!(after.address4, before.address4, "the address must not move");
+        assert_eq!(after.address6, before.address6);
+        assert_eq!(after.slot, before.slot);
+        assert_eq!(after.vpn_subscription_id, before.vpn_subscription_id);
+        assert_eq!(after.created, before.created);
+
+        // The rotated key is how a route server's observed peer is resolved.
+        assert_eq!(
+            db.get_vpn_device_by_pubkey(&[42u8; 32])
+                .await
+                .unwrap()
+                .map(|d| d.id),
+            Some(id)
+        );
+        assert!(
+            db.get_vpn_device_by_pubkey(&[1u8; 32])
+                .await
+                .unwrap()
+                .is_none(),
+            "the old key must stop resolving"
+        );
+
+        // Rotating onto a key another device already holds is refused.
+        db.insert_vpn_device(&device(plan, 1, 7)).await.unwrap();
+        let mut clash = db.get_vpn_device(id).await.unwrap();
+        clash.peer_pubkey = vec![7u8; 32];
+        assert!(db.update_vpn_device(&clash).await.is_err());
+
+        // Listing is in slot order, and includes disabled devices because a
+        // disabled device still owns its slot and its address.
+        let listed = db.list_vpn_devices(plan).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|d| d.slot).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        db.delete_vpn_device(id).await.unwrap();
+        assert!(db.get_vpn_device(id).await.is_err());
+        assert_eq!(db.list_vpn_devices(plan).await.unwrap().len(), 1);
+
+        // Updating something that is gone is an error, not a silent insert.
+        assert!(db.update_vpn_device(&before).await.is_err());
     }
 }
