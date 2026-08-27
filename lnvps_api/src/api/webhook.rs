@@ -21,11 +21,6 @@ const MAX_WEBHOOK_BODY: usize = 256 * 1024;
 pub fn router() -> Router<RouterState> {
     let mut router = Router::new();
 
-    #[cfg(feature = "bitvora")]
-    {
-        router = router.route("/api/v1/webhook/bitvora", any(send_webhook));
-    }
-
     #[cfg(feature = "revolut")]
     {
         router = router.route("/api/v1/webhook/revolut", any(send_webhook));

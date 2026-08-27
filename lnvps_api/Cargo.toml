@@ -59,8 +59,6 @@ libvirt = ["lnvps_api_common/libvirt", "dep:uuid", "dep:quick-xml"]
 lnd = ["payments-rs/method-lnd"]
 # On-chain Bitcoin payments (LND wallet backend)
 onchain = ["payments-rs/method-lnd-onchain"]
-# bitvora is disabled - service has been shut down
-bitvora = ["payments-rs/method-bitvora"]
 cloudflare = []
 # OVH reverse DNS provider
 ovh = []

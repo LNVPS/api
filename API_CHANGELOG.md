@@ -6,11 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- **Bitvora payment provider** — the provider was disabled in February 2026 when the service shut down, and its remaining code has now been deleted: the `bitvora` cargo feature, the `POST /api/v1/webhook/bitvora` endpoint, and the `"type": "bitvora"` variant of `ProviderConfig` (create), `PartialProviderConfig` (update) and the sanitized config returned by the admin payment-method endpoints. Any `payment_method_config` row still holding a bitvora config is left in place as billing history; it now reads back with a `null` `config` and cannot be updated. Delete or ignore those rows.
+
 ### Security
 
 - **Admin job-feedback WebSocket was not authenticated** — `GET /api/admin/v1/jobs/feedback` accepted a `?auth=` NIP-98 event but only *parsed* it: `Event::from_json` verifies neither the signature nor the event id, so any caller could hand-craft an unsigned JSON event carrying an arbitrary `pubkey` and stream the internal worker job bus (provisioning detail for every VM on the platform). The signature is now verified and bound to the endpoint path, and the connection additionally requires `virtual_machines::view` — it previously required no permission at all.
 
-- **Unauthenticated request could crash the API process** — a payment-provider webhook (`/api/v1/webhook/{stripe,revolut,bitvora}`) carrying a header value with a non-UTF-8 byte panicked the handler. With `panic = "abort"` on the release profile that took down the whole process, so a single `curl` was a total outage, repeatable indefinitely. Header values are now decoded lossily. Separately, the webhook body was buffered into memory unbounded (taking the raw `Request` bypasses axum's `DefaultBodyLimit`); it is now capped at 256 KB.
+- **Unauthenticated request could crash the API process** — a payment-provider webhook (`/api/v1/webhook/*`) carrying a header value with a non-UTF-8 byte panicked the handler. With `panic = "abort"` on the release profile that took down the whole process, so a single `curl` was a total outage, repeatable indefinitely. Header values are now decoded lossily. Separately, the webhook body was buffered into memory unbounded (taking the raw `Request` bypasses axum's `DefaultBodyLimit`); it is now capped at 256 KB.
 
 - **Authenticated request could crash the API process** — `GET /api/v1/vm/{id}/renew` and `GET /api/v1/subscriptions/{id}/renew` accepted an unbounded `intervals`, which overflowed the projected-expiry arithmetic; `chrono` panics rather than saturating, so `?intervals=1000000000` aborted the process. `intervals` is now rejected outside `1..=120` with a 400, and every expiry calculation saturates. The `max_prepay_days` horizon check was no defence here — it ran *after* the panic point.
 

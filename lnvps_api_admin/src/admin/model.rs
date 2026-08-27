@@ -4479,15 +4479,6 @@ pub struct SanitizedOnChainConfig {
     pub min_confirmations: u32,
 }
 
-/// Sanitized Bitvora config (hides token and webhook_secret)
-#[derive(Serialize)]
-pub struct SanitizedBitvoraConfig {
-    /// Whether token is configured
-    pub has_token: bool,
-    /// Whether webhook secret is configured
-    pub has_webhook_secret: bool,
-}
-
 /// Sanitized Revolut config (hides token and webhook_secret)
 #[derive(Serialize)]
 pub struct SanitizedRevolutConfig {
@@ -4524,7 +4515,6 @@ pub struct SanitizedPaypalConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SanitizedProviderConfig {
     Lnd(SanitizedLndConfig),
-    Bitvora(SanitizedBitvoraConfig),
     Revolut(SanitizedRevolutConfig),
     Stripe(SanitizedStripeConfig),
     Paypal(SanitizedPaypalConfig),
@@ -4539,12 +4529,6 @@ impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
                     url: cfg.url.clone(),
                     cert_path: cfg.cert_path.display().to_string(),
                     macaroon_path: cfg.macaroon_path.display().to_string(),
-                })
-            }
-            lnvps_db::ProviderConfig::Bitvora(cfg) => {
-                SanitizedProviderConfig::Bitvora(SanitizedBitvoraConfig {
-                    has_token: !cfg.token.is_empty(),
-                    has_webhook_secret: !cfg.webhook_secret.is_empty(),
                 })
             }
             lnvps_db::ProviderConfig::Revolut(cfg) => {
@@ -4760,13 +4744,6 @@ pub struct PartialLndConfig {
     pub macaroon_path: Option<std::path::PathBuf>,
 }
 
-/// Partial Bitvora config for updates
-#[derive(Deserialize)]
-pub struct PartialBitvoraConfig {
-    pub token: Option<String>,
-    pub webhook_secret: Option<String>,
-}
-
 /// Partial Revolut config for updates
 #[derive(Deserialize)]
 pub struct PartialRevolutConfig {
@@ -4819,7 +4796,6 @@ pub struct PartialOnChainConfig {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PartialProviderConfig {
     Lnd(PartialLndConfig),
-    Bitvora(PartialBitvoraConfig),
     Revolut(PartialRevolutConfig),
     Stripe(PartialStripeConfig),
     Paypal(PartialPaypalConfig),
@@ -4846,14 +4822,6 @@ impl PartialProviderConfig {
                     macaroon_path: partial
                         .macaroon_path
                         .unwrap_or_else(|| existing.macaroon_path.clone()),
-                }))
-            }
-            (PartialProviderConfig::Bitvora(partial), ProviderConfig::Bitvora(existing)) => {
-                Ok(ProviderConfig::Bitvora(lnvps_db::BitvoraConfig {
-                    token: partial.token.unwrap_or_else(|| existing.token.clone()),
-                    webhook_secret: partial
-                        .webhook_secret
-                        .unwrap_or_else(|| existing.webhook_secret.clone()),
                 }))
             }
             (PartialProviderConfig::Revolut(partial), ProviderConfig::Revolut(existing)) => {
@@ -4926,7 +4894,6 @@ impl PartialProviderConfig {
     pub fn provider_type(&self) -> &'static str {
         match self {
             PartialProviderConfig::Lnd(_) => "lnd",
-            PartialProviderConfig::Bitvora(_) => "bitvora",
             PartialProviderConfig::Revolut(_) => "revolut",
             PartialProviderConfig::Stripe(_) => "stripe",
             PartialProviderConfig::Paypal(_) => "paypal",

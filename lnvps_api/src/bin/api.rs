@@ -357,7 +357,7 @@ async fn main() -> Result<(), Error> {
     //
     // This is deliberate, not just to avoid double-processing when API and
     // worker are separate processes:
-    //   * Revolut / Stripe / Bitvora settle via HTTP webhooks. The
+    //   * Revolut / Stripe settle via HTTP webhooks. The
     //     `/api/v1/webhook/*` endpoints hand messages to the payment handlers
     //     over an IN-PROCESS broadcast (`payments_rs::webhook::WEBHOOK_BRIDGE`),
     //     so the handler MUST live in the same process as the HTTP listener.

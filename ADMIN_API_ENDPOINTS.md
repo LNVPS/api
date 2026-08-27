@@ -7014,8 +7014,6 @@ Response: Paginated list of `AdminIpRangeSubscriptionInfo`
 Payment method configurations store provider settings for payment processing (Lightning/LND, Revolut, Stripe, PayPal).
 This allows payment provider settings to be managed in the database instead of static configuration files.
 
-> **Note:** Bitvora support has been removed as the service has been shut down.
-
 Each configuration belongs to a specific company, and multiple configurations can exist per company/payment method
 combination. This allows keeping disabled legacy configurations that are still referenced by historical payments while
 having newer active configurations.
@@ -7097,16 +7095,6 @@ LND (Lightning):
   "url": "https://lnd.example.com:8080",
   "cert_path": "/path/to/tls.cert",
   "macaroon_path": "/path/to/admin.macaroon"
-}
-```
-
-Bitvora (Lightning) - **DEPRECATED: Service shut down**:
-
-```json
-{
-  "type": "bitvora",
-  "token": "bv_api_token_here",
-  "webhook_secret": "webhook_secret_here"
 }
 ```
 
@@ -7453,18 +7441,6 @@ The `config` field of `AdminPaymentMethodConfigInfo` is a tagged union — the `
 }
 ```
 
-**Bitvora (`"type": "bitvora"`)**
-
-```json
-{
-  "type": "bitvora",
-  "has_token": boolean,
-  // Whether the API token is configured
-  "has_webhook_secret": boolean
-  // Whether the webhook secret is configured
-}
-```
-
 ### CreatePaymentMethodConfigRequest
 
 ```json
@@ -7535,7 +7511,6 @@ All fields except `webhook_secret` are required when creating:
 | Type          | Payment Method | Required Fields                                                       |
 |---------------|----------------|-----------------------------------------------------------------------|
 | `lnd`         | lightning      | `url`, `cert_path`, `macaroon_path`                                   |
-| ~~`bitvora`~~ | ~~lightning~~  | ~~`token`, `webhook_secret`~~ (service shut down)                     |
 | `revolut`     | revolut        | `url`, `token`, `api_version`, `public_key` (webhook_secret optional) |
 | `stripe`      | stripe         | `secret_key`, `publishable_key`, `webhook_secret`                     |
 | `paypal`      | paypal         | `client_id`, `client_secret`, `mode`                                  |
@@ -7549,7 +7524,6 @@ Only the `type` field is required; all other fields are optional and will keep t
 | Type          | Optional Fields                                               |
 |---------------|---------------------------------------------------------------|
 | `lnd`         | `url`, `cert_path`, `macaroon_path`                           |
-| ~~`bitvora`~~ | ~~`token`, `webhook_secret`~~ (service shut down)             |
 | `revolut`     | `url`, `token`, `api_version`, `public_key`, `webhook_secret` |
 | `stripe`      | `secret_key`, `publishable_key`, `webhook_secret`             |
 | `paypal`      | `client_id`, `client_secret`, `mode`                          |
@@ -7560,7 +7534,6 @@ Only the `type` field is required; all other fields are optional and will keep t
 **Provider Types:**
 
 - `lnd` - Lightning Network Daemon for Lightning payments
-- ~~`bitvora`~~ - ~~Bitvora API for Lightning payments~~ (service shut down)
 - `revolut` - Revolut Business API
 - `stripe` - Stripe Payments API
 - `paypal` - PayPal REST API

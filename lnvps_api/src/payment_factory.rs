@@ -86,17 +86,6 @@ impl PaymentMethodFactory {
                 .context("Failed to create LND node")?;
                 Ok(Arc::new(node))
             }
-            #[cfg(feature = "bitvora")]
-            ProviderConfig::Bitvora(bitvora_config) => {
-                // Webhook path is derived from provider type, not stored in DB
-                let webhook_path = "/api/v1/webhook/bitvora";
-                let node = payments_rs::lightning::BitvoraNode::new(
-                    &bitvora_config.token,
-                    &bitvora_config.webhook_secret,
-                    webhook_path,
-                );
-                Ok(Arc::new(node))
-            }
             #[allow(unreachable_patterns)]
             other => {
                 bail!(
@@ -144,7 +133,7 @@ impl PaymentMethodFactory {
                 // TODO: Implement PayPal factory when PayPal is supported
                 bail!("PayPal payment integration not yet implemented")
             }
-            ProviderConfig::Lnd(_) | ProviderConfig::Bitvora(_) => {
+            ProviderConfig::Lnd(_) => {
                 bail!("Cannot create fiat service from Lightning config")
             }
             #[allow(unreachable_patterns)]
@@ -318,7 +307,7 @@ impl PaymentMethodFactory {
 mod tests {
     use super::*;
     use lnvps_api_common::MockDb;
-    use lnvps_db::{BitvoraConfig, LndConfig, RevolutProviderConfig};
+    use lnvps_db::{LndConfig, RevolutProviderConfig};
     use std::path::PathBuf;
 
     #[allow(dead_code)]
@@ -332,10 +321,6 @@ mod tests {
                 url: "https://localhost:8080".to_string(),
                 cert_path: PathBuf::from("/path/to/cert"),
                 macaroon_path: PathBuf::from("/path/to/macaroon"),
-            }),
-            "bitvora" => ProviderConfig::Bitvora(BitvoraConfig {
-                token: "test-token".to_string(),
-                webhook_secret: "test-secret".to_string(),
             }),
             _ => panic!("Unknown provider: {}", provider),
         };
@@ -415,7 +400,7 @@ mod tests {
         let factory = PaymentMethodFactory::new(db);
 
         // Try to create fiat service from lightning config - should fail
-        let config = make_lightning_config("bitvora", true, 1);
+        let config = make_lightning_config("lnd", true, 1);
         let result = factory.create_fiat_service(&config).await;
 
         match result {
