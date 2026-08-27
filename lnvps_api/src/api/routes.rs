@@ -437,9 +437,7 @@ async fn v1_verify_email(
         );
     }
 
-    user.email_verified = true;
-    user.email_verify_token = String::new();
-    user.email_verify_sent = None;
+    mark_email_verified(&mut user);
     if let Err(e) = this.db.update_user(&user).await {
         error!("Failed to mark email verified: {}", e);
         return make_page(
@@ -453,6 +451,17 @@ async fn v1_verify_email(
         "Your email address has been successfully verified.",
         "#2ecc71",
     )
+}
+
+/// Apply the state change for a successfully verified email address.
+///
+/// Verifying the address is itself the opt-in to email, so notifications are
+/// switched on here instead of leaving the user to find a second toggle.
+fn mark_email_verified(user: &mut lnvps_db::User) {
+    user.email_verified = true;
+    user.email_verify_token = String::new();
+    user.email_verify_sent = None;
+    user.contact_email = true;
 }
 
 #[derive(serde::Deserialize)]
@@ -3445,6 +3454,26 @@ mod tests {
             Some(now - chrono::Duration::days(365)),
             now
         ));
+    }
+
+    /// Verifying an address enables email notifications and clears the pending
+    /// token, so a used link cannot be replayed.
+    #[test]
+    fn verifying_email_enables_notifications() {
+        let mut user = lnvps_db::User {
+            email_verified: false,
+            email_verify_token: lnvps_db::hash_verify_token("tok"),
+            email_verify_sent: Some(Utc::now()),
+            contact_email: false,
+            ..Default::default()
+        };
+
+        mark_email_verified(&mut user);
+
+        assert!(user.email_verified);
+        assert!(user.contact_email);
+        assert!(user.email_verify_token.is_empty());
+        assert!(user.email_verify_sent.is_none());
     }
 
     /// A token with no recorded issue time (minted before issue times were
