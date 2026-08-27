@@ -1068,11 +1068,18 @@ struct RenewalsPeriod {
     /// Of `due`: auto-renewal off. Renews only if the customer acts.
     due_manual: u64,
 
-    // --- Churn: only meaningful for a completed month ---
-    /// Subscriptions that expired in this month and have not renewed since.
-    /// Zero for the current and future months, where an expiry is not yet a
-    /// loss. Paid customers only.
+    // --- Churn, dated by expiry rather than by whether the month is over ---
+    /// Subscriptions that expired more than [`CHURN_CONFIRM_DAYS`] ago and have
+    /// not renewed since: the customer is gone.
+    ///
+    /// Counted per expiry date, not per finished month — waiting for the
+    /// calendar to turn would hide most of the current month's losses, which is
+    /// exactly the window worth watching.
     lapsed: u64,
+    /// Expired within the last [`CHURN_CONFIRM_DAYS`] and not yet renewed. The
+    /// decision is still in flight (the grace period runs 1-14 days depending
+    /// on subscription age), so these are neither retained nor lost.
+    pending: u64,
     /// Expired without the first payment ever being confirmed: an abandoned
     /// signup rather than a lost customer. Kept out of `lapsed` and out of the
     /// churn rate so it cannot flatter or inflate them.
@@ -1080,9 +1087,10 @@ struct RenewalsPeriod {
     /// Distinct subscriptions that renewed in this month.
     renewed_subscriptions: u64,
     /// `lapsed / (lapsed + renewed_subscriptions)` as a percentage: of the
-    /// subscriptions that reached a renewal decision this month, the share that
-    /// walked away. `None` for months that are not complete, or where nothing
-    /// was up for decision.
+    /// subscriptions that reached a settled renewal decision this month, the
+    /// share that walked. `None` when nothing has settled yet. For the current
+    /// month this is a running figure over the days elapsed, not a final one —
+    /// see `complete`.
     churn_rate: Option<f32>,
 
     // --- Renewal payments collected in this month ---
@@ -1124,6 +1132,10 @@ fn build_renewal_periods(
     now: DateTime<Utc>,
 ) -> Vec<RenewalsPeriod> {
     let current = period_key(now, false);
+    // Churn is decided per expiry date against this cutoff, not by whether the
+    // calendar month has ended. On the 27th, waiting for the month to close
+    // would report zero churn for 26 days that already happened.
+    let confirmed_before = now - chrono::Duration::days(CHURN_CONFIRM_DAYS);
     let mut acc: BTreeMap<String, RenewalsPeriod> = BTreeMap::new();
     let mut renewed_subs: BTreeMap<String, std::collections::HashSet<u64>> = BTreeMap::new();
 
@@ -1138,6 +1150,7 @@ fn build_renewal_periods(
             due_auto_without_method: 0,
             due_manual: 0,
             lapsed: 0,
+            pending: 0,
             lapsed_never_paid: 0,
             renewed_subscriptions: 0,
             churn_rate: None,
@@ -1151,7 +1164,6 @@ fn build_renewal_periods(
 
     for o in outlook {
         let key = row(&mut acc, o.expires);
-        let complete = acc[&key].complete;
         let e = acc.get_mut(&key).unwrap();
         e.due += 1;
         match (o.auto_renewal_enabled, o.has_payment_method) {
@@ -1161,15 +1173,16 @@ fn build_renewal_periods(
             (true, false) => e.due_auto_without_method += 1,
             (false, _) => e.due_manual += 1,
         }
-        // Past expiry that is still the subscription's expiry = it never
-        // renewed. Renewal advances `expires`, so a renewed subscription has
-        // already moved out of this month.
-        if complete {
+        // Renewal advances `expires`, so a subscription still carrying a past
+        // expiry never renewed. How far past decides whether that is settled.
+        if o.expires < confirmed_before {
             if o.is_setup {
                 e.lapsed += 1;
             } else {
                 e.lapsed_never_paid += 1;
             }
+        } else if o.expires <= now {
+            e.pending += 1;
         }
     }
 
@@ -1187,12 +1200,12 @@ fn build_renewal_periods(
 
     for (key, period) in acc.iter_mut() {
         period.renewed_subscriptions = renewed_subs.get(key).map(|s| s.len() as u64).unwrap_or(0);
-        // Churn rate compares like with like: subscriptions that faced a
-        // renewal decision this month, and what share of them was lost. Payment
-        // counts are the wrong denominator — a subscription can renew twice in
-        // a month, which would understate churn.
+        // Compare like with like: subscriptions whose renewal decision has
+        // settled this month, and what share of them was lost. Payment counts
+        // are the wrong denominator — a subscription can renew twice in a
+        // month, which would understate churn.
         let decided = period.lapsed + period.renewed_subscriptions;
-        period.churn_rate = if period.complete && decided > 0 {
+        period.churn_rate = if decided > 0 {
             Some((period.lapsed as f32 / decided as f32) * 100.0)
         } else {
             None
@@ -1201,6 +1214,12 @@ fn build_renewal_periods(
 
     acc.into_values().collect()
 }
+
+/// Days after expiry before a subscription counts as churned rather than
+/// pending. The worker's own grace period is 1-14 days depending on
+/// subscription age; a single window keeps the metric comparable month to month
+/// instead of varying with the mix of subscription ages.
+const CHURN_CONFIRM_DAYS: i64 = 7;
 
 /// Renewal outlook and churn, per month.
 ///
@@ -1312,37 +1331,50 @@ mod tests {
     }
 
     #[test]
-    fn test_expiry_in_a_finished_month_is_churn() {
-        // Renewal advances `expires`, so a subscription still sitting in a past
-        // month never renewed.
+    fn test_expiry_past_the_confirmation_window_is_churn() {
+        // Renewal advances `expires`, so a subscription still sitting on a past
+        // expiry never renewed.
         let rows = vec![
             outlook(dt(2026, 8, 3), false, false),
             outlook(dt(2026, 8, 9), true, false),
         ];
         let p = build_renewal_periods(&rows, &[], now());
         assert_eq!(p[0].period, "2026-08");
-        assert!(p[0].complete);
         assert_eq!(p[0].lapsed, 2);
+        assert_eq!(p[0].pending, 0);
         assert_eq!(p[0].churn_rate, Some(100.0), "nothing renewed, all lost");
     }
 
+    /// The August case: reporting churn only for finished months hides most of
+    /// the current month, which is the window actually worth watching.
     #[test]
-    fn test_current_and_future_months_are_not_churn() {
-        // An expiry later this month has not been asked yet; a future one even
-        // less so. Counting either as lost would invent churn that has not
-        // happened.
+    fn test_current_month_reports_the_churn_that_already_happened() {
         let rows = vec![
-            outlook(dt(2026, 9, 30), false, false),
-            outlook(dt(2026, 10, 4), false, false),
+            // Expired early in the month, well past the confirmation window.
+            outlook(dt(2026, 9, 2), false, false),
+            // Expired two days ago: still inside grace, not yet a loss.
+            outlook(dt(2026, 9, 13), false, false),
+            // Not due until later this month.
+            outlook(dt(2026, 9, 28), true, true),
         ];
         let p = build_renewal_periods(&rows, &[], now());
-        assert_eq!(p.len(), 2);
-        for row in &p {
-            assert!(!row.complete);
-            assert_eq!(row.lapsed, 0);
-            assert_eq!(row.churn_rate, None);
-            assert_eq!(row.due, 1);
-        }
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].period, "2026-09");
+        assert!(!p[0].complete, "month is still running");
+        assert_eq!(p[0].due, 3);
+        assert_eq!(p[0].lapsed, 1, "settled loss, even mid-month");
+        assert_eq!(p[0].pending, 1, "decision still in flight");
+        assert_eq!(p[0].churn_rate, Some(100.0));
+    }
+
+    #[test]
+    fn test_future_expiry_is_never_churn() {
+        let rows = vec![outlook(dt(2026, 10, 4), false, false)];
+        let p = build_renewal_periods(&rows, &[], now());
+        assert_eq!(p[0].due, 1);
+        assert_eq!(p[0].lapsed, 0);
+        assert_eq!(p[0].pending, 0);
+        assert_eq!(p[0].churn_rate, None);
     }
 
     #[test]

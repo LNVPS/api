@@ -4762,11 +4762,14 @@ Per calendar month: what is **due** to renew, what **renewed**, and what
 **churned**.
 
 Churn is derived from the subscription's own expiry. `subscription.expires`
-advances every time a subscription renews, so a subscription still carrying an
-expiry in a **finished** month is one that reached its renewal date and never
-came back — that is the churn event, dated by that expiry. In the current or a
-future month the same count is simply the renewal outlook: an expiry that has
-not been asked yet is not a loss.
+advances every time a subscription renews, so a subscription still carrying a
+**past** expiry is one that reached its renewal date and never came back.
+
+Churn is dated by that expiry against *now*, **not** by whether the calendar
+month has ended: on the 27th, waiting for the month to close would report zero
+churn for 26 days of losses that already happened. A subscription that expired
+within the last 7 days counts as `pending` rather than lapsed, because the
+worker's grace period (1-14 days by subscription age) may still collect.
 
 Query Parameters:
 
@@ -4795,7 +4798,8 @@ Response:
         "due_auto_without_method": 12,
         "due_manual": 42,
         "lapsed": 58,
-        "lapsed_never_paid": 6,
+        "pending": 4,
+        "lapsed_never_paid": 0,
         "renewed_subscriptions": 71,
         "churn_rate": 44.96,
         "renewed": 87,
@@ -4811,13 +4815,12 @@ Response:
 **Notes:**
 
 - Counted **per subscription**, not per VM — one subscription may carry several VMs.
-- `complete` is false for the current and future months; `lapsed` is `0` and
-  `churn_rate` is `null` for those, because an expiry that has not arrived is not
-  a loss.
-- `churn_rate = lapsed / (lapsed + renewed_subscriptions)` as a percentage: of
-  the subscriptions that reached a renewal decision that month, the share that
-  walked. **`renewed` (payments) is deliberately not the denominator** — a
-  subscription can renew twice in a month, which would understate churn.
+- `complete` is false for the current and future months. It does **not** gate
+  churn — the current month reports the churn that has already settled within
+  it, and `complete` only tells a client that the figure is still running.
+- `lapsed` counts expiries more than 7 days old that never renewed; `pending`
+  counts expiries inside that window, where the renewal decision is still in
+  flight. A future expiry is neither.
 - `lapsed_never_paid` is an expired subscription whose first payment was never
   confirmed: an abandoned signup, not a lost customer. It is excluded from
   `lapsed` and from the churn rate.
