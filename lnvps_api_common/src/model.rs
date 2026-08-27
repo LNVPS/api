@@ -1122,6 +1122,9 @@ pub enum ApiSubscriptionLineItemResource {
     /// A marketplace node's one-off listing fee.
     #[serde(rename = "marketplace_node")]
     MarketplaceNode { marketplace_node_id: u64 },
+    /// A consumer VPN plan.
+    #[serde(rename = "vpn")]
+    Vpn { vpn_subscription_id: u64 },
 }
 
 impl ApiSubscriptionLineItemResource {
@@ -1254,6 +1257,14 @@ impl ApiSubscriptionLineItemResource {
                 .ok()
                 .map(|n| Self::MarketplaceNode {
                     marketplace_node_id: n.id,
+                }),
+            LineItemType::Vpn => db
+                .get_vpn_subscription_by_line_item(line_item.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|p| Self::Vpn {
+                    vpn_subscription_id: p.id,
                 }),
             LineItemType::DnsHosting => None,
         }

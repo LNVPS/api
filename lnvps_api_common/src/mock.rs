@@ -4940,6 +4940,15 @@ impl LNVpsDbBase for MockDb {
             )
             .into());
         }
+        // FK vpn_service.company_id
+        if !self
+            .companies
+            .lock()
+            .await
+            .contains_key(&service.company_id)
+        {
+            return Err(anyhow!("Company {} not found", service.company_id).into());
+        }
         let mut services = self.vpn_services.lock().await;
         let new_id = services.keys().max().copied().unwrap_or(0) + 1;
         services.insert(
@@ -4964,11 +4973,14 @@ impl LNVpsDbBase for MockDb {
         let existing = services
             .get(&service.id)
             .ok_or_else(|| DbError::Other(anyhow!("VPN service {} not found", service.id)))?;
-        // `created` is immutable and is not written.
-        let created = existing.created;
+        // `company_id` and `created` are immutable and are not written: moving
+        // a service to another company would leave every plan sold on it booked
+        // against a company that no longer owns it.
+        let (company_id, created) = (existing.company_id, existing.created);
         services.insert(
             service.id,
             VpnService {
+                company_id,
                 created,
                 ..service.clone()
             },
@@ -11289,11 +11301,25 @@ mod vpn_tests {
     use super::*;
     use lnvps_db::LNVpsDbBase;
 
+    /// Every service is sold by a company, so one has to exist first.
+    async fn a_company(db: &MockDb) -> u64 {
+        db.companies.lock().await.entry(1).or_insert(Company {
+            id: 1,
+            name: "LNVPS".to_string(),
+            base_currency: "EUR".to_string(),
+            ..Default::default()
+        });
+        1
+    }
+
     /// A service with a block, and a paid plan on it, which is the starting
     /// point for everything below.
     async fn vpn_service(db: &MockDb) -> u64 {
+        let company_id = a_company(db).await;
         db.insert_vpn_service(&VpnService {
             name: "eu".to_string(),
+            company_id,
+            currency: "EUR".to_string(),
             device_cidr4: Some("10.64.0.0/12".to_string()),
             default_device_limit: 5,
             enabled: true,
@@ -11384,6 +11410,7 @@ mod vpn_tests {
         assert!(
             db.insert_vpn_service(&VpnService {
                 name: "empty".to_string(),
+                company_id: a_company(&db).await,
                 ..Default::default()
             })
             .await
@@ -11454,6 +11481,7 @@ mod vpn_tests {
         let b = db
             .insert_vpn_service(&VpnService {
                 name: "b".to_string(),
+                company_id: a_company(&db).await,
                 device_cidr6: Some("fd00:64::/32".to_string()),
                 ..Default::default()
             })
@@ -11590,6 +11618,7 @@ mod vpn_tests {
         let other_service = db
             .insert_vpn_service(&VpnService {
                 name: "other".to_string(),
+                company_id: a_company(&db).await,
                 device_cidr4: Some("10.80.0.0/12".to_string()),
                 ..Default::default()
             })

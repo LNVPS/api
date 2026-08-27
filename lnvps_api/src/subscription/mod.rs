@@ -38,6 +38,7 @@ mod app;
 mod ip_range;
 mod marketplace_node_fee;
 mod vm;
+mod vpn;
 
 use crate::provisioner::{IpRangeProvisioner, VmProvisioner};
 use crate::settings::Settings;
@@ -45,6 +46,7 @@ pub use app::AppLineItemHandler;
 pub use ip_range::IpRangeLineItemHandler;
 use lnvps_api_common::VmStateCache;
 pub use vm::VmLineItemHandler;
+pub use vpn::{VpnLineItemHandler, create_vpn_plan};
 
 // =========================================================================
 // Trait
@@ -276,6 +278,11 @@ impl SubscriptionHandler {
                 marketplace_node_fee::MarketplaceNodeFeeLineItemHandler::new(li.id),
             )),
             LineItemType::App => Ok(Box::new(AppLineItemHandler::new(
+                self.db.clone(),
+                li.id,
+                self.tx.clone(),
+            ))),
+            LineItemType::Vpn => Ok(Box::new(VpnLineItemHandler::new(
                 self.db.clone(),
                 li.id,
                 self.tx.clone(),

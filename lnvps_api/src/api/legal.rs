@@ -262,6 +262,19 @@ async fn v1_generate_lir_agreement_from_subscription(
             lnvps_db::LineItemType::DnsHosting => ("DNS Hosting".to_string(), "—".to_string()),
             lnvps_db::LineItemType::Vps => ("VPS".to_string(), "—".to_string()),
             lnvps_db::LineItemType::App => ("App".to_string(), "—".to_string()),
+            lnvps_db::LineItemType::Vpn => {
+                // The quantity is the device allowance, which is what the plan
+                // actually sells.
+                let devices = this
+                    .db
+                    .get_vpn_subscription_by_line_item(li.id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|p| p.device_limit.to_string())
+                    .unwrap_or_else(|| "—".to_string());
+                ("VPN".to_string(), devices)
+            }
             lnvps_db::LineItemType::MarketplaceNodeFee => {
                 ("Marketplace Node Listing Fee".to_string(), "—".to_string())
             }

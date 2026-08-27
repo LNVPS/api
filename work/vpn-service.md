@@ -2,7 +2,7 @@
 
 **Status:** in-progress
 **Started:** 2026-08-27
-**Last updated:** 2026-08-27 (increment 2 complete: device allocator and the `plan_pool` branch)
+**Last updated:** 2026-08-27 (increment 3 complete: billing)
 
 ## Goal
 
@@ -180,13 +180,36 @@ Notes:
   a race is refused rather than over-allocating, but the loser currently gets an error. Retrying
   belongs where the request is handled: pick it up in increment 4.
 
-### Increment 3 — billing  (next)
-- [ ] `LineItemType::Vpn` variant and Display/serde mappings
-- [ ] Purchase, renewal and expiry wiring; suspension disables the account's devices
-- [ ] Device-limit tier upgrade on the existing proration path
-- [ ] Unit tests
+### Increment 3 — billing  ✅ DONE
+- [x] Pricing on `vpn_service` (`company_id`, `amount`, `currency`, `interval_amount`,
+      `interval_type`, `setup_amount`), mirroring the `app` catalog table. Folded into the
+      unreleased `20260827160000` migration rather than added as a follow-up.
+- [x] `LineItemType::Vpn = 6` plus the four dispatch sites the exhaustive matches forced:
+      the handler factory, `ApiSubscriptionLineItemResource`, the discount engine's
+      `OrderProduct`, and the legal/resource listing
+- [x] `VpnLineItemHandler`: every billing event queues `ReconcileTunnelPeers` for each
+      interface on the service
+- [x] `create_vpn_plan`: unpaid at the service's price, idempotent while live, repoints a
+      lapsed plan at a fresh subscription and keeps its devices
+- [x] 8 unit tests; `subscription/vpn.rs` at 100% function and line coverage
 
-### Increment 4 — user API
+Notes:
+
+- **Suspension needed no wiring at all.** The planner joins billing state, so paying, lapsing
+  and cancelling change nothing that has to be written. The handler exists only for promptness:
+  it pushes the interfaces so a change lands now instead of at the next poll, and a queue
+  outage is logged rather than failing a payment the customer has already made.
+- **Grace period does not delete devices.** The plan row is reused on return, so keys and
+  addresses surviving is what makes coming back a payment rather than a re-setup.
+- **Device-limit tiers are descoped.** `device_limit` is per plan and can be raised, but there
+  is no per-tier price to charge for it, so there is nothing to prorate yet. One flat price per
+  service. Add a tier table when there is a reason to sell one.
+- `IntervalType` gained a `Default` of `Month`, matching every billing column's `DEFAULT 1`.
+
+### Increment 4 — user API  (next)
+- [ ] Retry slot contention here (see increment 2 note): `next_free_slot` proposes and the
+      unique key enforces, so a concurrent registration currently errors rather than taking
+      the next slot
 - [ ] `/api/v1/vpn`: subscribe, status, list/add/delete device, list regions
 - [ ] Config rendering per region (and QR), from `tunnel_pool` fields
 - [ ] `API_CHANGELOG.md` + `API_DOCUMENTATION.md` per `docs/agents/api-guidelines.md`

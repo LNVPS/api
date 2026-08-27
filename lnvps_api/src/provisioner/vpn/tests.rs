@@ -7,12 +7,31 @@ use lnvps_db::{
 
 use super::*;
 
+/// Every service is sold by a company, so one has to exist before any of this.
+async fn a_company(mock: &MockDb) -> u64 {
+    mock.companies
+        .lock()
+        .await
+        .entry(1)
+        .or_insert(lnvps_db::Company {
+            id: 1,
+            name: "LNVPS".to_string(),
+            base_currency: "EUR".to_string(),
+            ..Default::default()
+        });
+    1
+}
+
 /// A dual-stack service. `/28` and `/124` are deliberately tiny so exhaustion
 /// is reachable in a test rather than theoretical.
-async fn a_service(db: &Arc<dyn LNVpsDb>) -> Result<VpnService> {
+async fn a_service(db: &Arc<dyn LNVpsDb>, mock: &MockDb) -> Result<VpnService> {
+    let company_id = a_company(mock).await;
     let id = db
         .insert_vpn_service(&VpnService {
             name: "eu".to_string(),
+            company_id,
+            currency: "EUR".to_string(),
+            amount: 500,
             device_cidr4: Some("10.64.0.0/28".to_string()),
             device_cidr6: Some("fd00:64::/124".to_string()),
             dns: Some("10.64.0.1".to_string()),
@@ -133,8 +152,8 @@ fn key(seed: u8) -> Vec<u8> {
 #[tokio::test]
 async fn a_device_is_given_a_slot_and_an_address() -> Result<()> {
     let mock = MockDb::default();
-    let db: Arc<dyn LNVpsDb> = Arc::new(mock);
-    let service = a_service(&db).await?;
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
     let plan = a_plan(&db, &service, 1).await?;
 
     let device = register_vpn_device(&db, &plan, " phone ", &key(1)).await?;
@@ -160,8 +179,8 @@ async fn a_device_is_given_a_slot_and_an_address() -> Result<()> {
 #[tokio::test]
 async fn registering_the_same_key_twice_is_idempotent() -> Result<()> {
     let mock = MockDb::default();
-    let db: Arc<dyn LNVpsDb> = Arc::new(mock);
-    let service = a_service(&db).await?;
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
     let plan = a_plan(&db, &service, 1).await?;
 
     let first = register_vpn_device(&db, &plan, "phone", &key(1)).await?;
@@ -178,8 +197,8 @@ async fn registering_the_same_key_twice_is_idempotent() -> Result<()> {
 #[tokio::test]
 async fn a_key_registered_elsewhere_is_refused() -> Result<()> {
     let mock = MockDb::default();
-    let db: Arc<dyn LNVpsDb> = Arc::new(mock);
-    let service = a_service(&db).await?;
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
     let mine = a_plan(&db, &service, 1).await?;
     let theirs = a_plan(&db, &service, 2).await?;
 
@@ -197,8 +216,8 @@ async fn a_key_registered_elsewhere_is_refused() -> Result<()> {
 #[tokio::test]
 async fn a_key_that_is_not_a_key_is_refused() -> Result<()> {
     let mock = MockDb::default();
-    let db: Arc<dyn LNVpsDb> = Arc::new(mock);
-    let service = a_service(&db).await?;
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
     let plan = a_plan(&db, &service, 1).await?;
 
     let err = register_vpn_device(&db, &plan, "phone", &[1, 2, 3])
@@ -214,8 +233,8 @@ async fn a_key_that_is_not_a_key_is_refused() -> Result<()> {
 #[tokio::test]
 async fn a_disabled_service_takes_no_new_devices() -> Result<()> {
     let mock = MockDb::default();
-    let db: Arc<dyn LNVpsDb> = Arc::new(mock);
-    let service = a_service(&db).await?;
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
     let plan = a_plan(&db, &service, 1).await?;
     register_vpn_device(&db, &plan, "phone", &key(1)).await?;
 
@@ -240,8 +259,8 @@ async fn a_disabled_service_takes_no_new_devices() -> Result<()> {
 #[tokio::test]
 async fn the_device_limit_is_the_plan_limit() -> Result<()> {
     let mock = MockDb::default();
-    let db: Arc<dyn LNVpsDb> = Arc::new(mock);
-    let service = a_service(&db).await?;
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
     let plan = a_plan_with(&db, &service, 1, 2, true).await?;
 
     let a = register_vpn_device(&db, &plan, "a", &key(1)).await?;
@@ -281,8 +300,8 @@ fn the_limit_message_is_not_written_by_a_robot() {
 #[tokio::test]
 async fn an_unpaid_devices_address_is_not_reissued() -> Result<()> {
     let mock = MockDb::default();
-    let db: Arc<dyn LNVpsDb> = Arc::new(mock);
-    let service = a_service(&db).await?;
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
 
     let lapsed = a_plan_with(&db, &service, 1, 5, false).await?;
     let held = register_vpn_device(&db, &lapsed, "old", &key(1)).await?;
@@ -300,10 +319,11 @@ async fn an_unpaid_devices_address_is_not_reissued() -> Result<()> {
 #[tokio::test]
 async fn a_v6_only_service_gives_v6_only() -> Result<()> {
     let mock = MockDb::default();
-    let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
     let id = db
         .insert_vpn_service(&VpnService {
             name: "v6".to_string(),
+            company_id: a_company(&mock).await,
             device_cidr6: Some("fd00:99::/120".to_string()),
             enabled: true,
             ..Default::default()
@@ -323,11 +343,12 @@ async fn a_v6_only_service_gives_v6_only() -> Result<()> {
 #[tokio::test]
 async fn an_exhausted_block_says_so() -> Result<()> {
     let mock = MockDb::default();
-    let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
     // /30: network, server, broadcast and exactly one usable address.
     let id = db
         .insert_vpn_service(&VpnService {
             name: "tiny".to_string(),
+            company_id: a_company(&mock).await,
             device_cidr4: Some("10.70.0.0/30".to_string()),
             enabled: true,
             ..Default::default()
@@ -353,10 +374,11 @@ async fn an_exhausted_block_says_so() -> Result<()> {
 #[tokio::test]
 async fn an_unparseable_block_is_reported_as_one() -> Result<()> {
     let mock = MockDb::default();
-    let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
     let id = db
         .insert_vpn_service(&VpnService {
             name: "broken".to_string(),
+            company_id: a_company(&mock).await,
             device_cidr4: Some("not-a-cidr".to_string()),
             enabled: true,
             ..Default::default()
@@ -379,8 +401,8 @@ async fn an_unparseable_block_is_reported_as_one() -> Result<()> {
 #[tokio::test]
 async fn a_vpn_interface_carries_the_services_devices() -> Result<()> {
     let mock = MockDb::default();
-    let db: Arc<dyn LNVpsDb> = Arc::new(mock);
-    let service = a_service(&db).await?;
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
     let plan = a_plan(&db, &service, 1).await?;
     let device = register_vpn_device(&db, &plan, "phone", &key(1)).await?;
 
@@ -416,8 +438,8 @@ async fn a_vpn_interface_carries_the_services_devices() -> Result<()> {
 #[tokio::test]
 async fn an_unpaid_plans_devices_are_not_configured() -> Result<()> {
     let mock = MockDb::default();
-    let db: Arc<dyn LNVpsDb> = Arc::new(mock);
-    let service = a_service(&db).await?;
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
 
     let paid = a_plan(&db, &service, 1).await?;
     register_vpn_device(&db, &paid, "paid", &key(1)).await?;
@@ -438,8 +460,8 @@ async fn an_unpaid_plans_devices_are_not_configured() -> Result<()> {
 #[tokio::test]
 async fn a_device_with_no_address_is_not_a_peer() -> Result<()> {
     let mock = MockDb::default();
-    let db: Arc<dyn LNVpsDb> = Arc::new(mock);
-    let service = a_service(&db).await?;
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
     let plan = a_plan(&db, &service, 1).await?;
 
     db.insert_vpn_device(&VpnDevice {
@@ -465,7 +487,7 @@ async fn a_device_with_no_address_is_not_a_peer() -> Result<()> {
 async fn plan_pool_dispatches_on_the_service_link() -> Result<()> {
     let mock = MockDb::default();
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
-    let service = a_service(&db).await?;
+    let service = a_service(&db, &mock).await?;
     let plan = a_plan(&db, &service, 1).await?;
     register_vpn_device(&db, &plan, "phone", &key(1)).await?;
     let pool = a_pool(&db, &mock, &service).await?;

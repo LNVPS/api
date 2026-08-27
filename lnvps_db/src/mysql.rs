@@ -5279,10 +5279,18 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_vpn_service(&self, service: &VpnService) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO vpn_service (name, device_cidr4, device_cidr6, dns, \
-             default_device_limit, enabled) VALUES (?, ?, ?, ?, ?, ?) returning id",
+            "INSERT INTO vpn_service (name, company_id, amount, currency, interval_amount, \
+             interval_type, setup_amount, device_cidr4, device_cidr6, dns, \
+             default_device_limit, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(&service.name)
+        .bind(service.company_id)
+        .bind(service.amount)
+        .bind(&service.currency)
+        .bind(service.interval_amount)
+        .bind(service.interval_type)
+        .bind(service.setup_amount)
         .bind(&service.device_cidr4)
         .bind(&service.device_cidr6)
         .bind(&service.dns)
@@ -5295,10 +5303,17 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_vpn_service(&self, service: &VpnService) -> DbResult<()> {
         sqlx::query(
-            "UPDATE vpn_service SET name = ?, device_cidr4 = ?, device_cidr6 = ?, \
-             dns = ?, default_device_limit = ?, enabled = ? WHERE id = ?",
+            "UPDATE vpn_service SET name = ?, amount = ?, currency = ?, \
+             interval_amount = ?, interval_type = ?, setup_amount = ?, \
+             device_cidr4 = ?, device_cidr6 = ?, dns = ?, default_device_limit = ?, \
+             enabled = ? WHERE id = ?",
         )
         .bind(&service.name)
+        .bind(service.amount)
+        .bind(&service.currency)
+        .bind(service.interval_amount)
+        .bind(service.interval_type)
+        .bind(service.setup_amount)
         .bind(&service.device_cidr4)
         .bind(&service.device_cidr6)
         .bind(&service.dns)

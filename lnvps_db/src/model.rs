@@ -1155,10 +1155,12 @@ pub enum NetworkAccessPolicy {
     StaticArp = 0,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, sqlx::Type, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, sqlx::Type, Serialize, Deserialize, Default)]
 #[repr(u16)]
 pub enum IntervalType {
     Day = 0,
+    /// The default, matching every billing column's `DEFAULT 1`.
+    #[default]
     Month = 1,
     Year = 2,
 }
@@ -2171,6 +2173,19 @@ pub struct VpnService {
     pub id: u64,
     /// Admin label. Not an identifier.
     pub name: String,
+    /// The selling company. Named directly rather than taken from a region,
+    /// because a VPN plan has no region: a device works in all of them.
+    pub company_id: u64,
+    /// Recurring price of a plan on this service
+    pub amount: u64,
+    /// Currency of [`amount`](Self::amount) and [`setup_amount`](Self::setup_amount)
+    pub currency: String,
+    /// How many [`interval_type`](Self::interval_type) units one billing period is
+    pub interval_amount: u64,
+    /// The billing period unit
+    pub interval_type: IntervalType,
+    /// One-off amount charged on the first payment
+    pub setup_amount: u64,
     /// IPv4 block device addresses are carved from, shared by every pool that
     /// terminates this service
     pub device_cidr4: Option<String>,
@@ -3125,6 +3140,8 @@ pub enum LineItemType {
     DnsHosting = 2,    // DNS hosting services
     Vps = 3,           // VM (links to vm table via vm.subscription_line_item_id)
     App = 4, // Managed app deployment (links via app_deployment.subscription_line_item_id)
+    /// A consumer VPN plan (links via `vpn_subscription.subscription_line_item_id`).
+    Vpn = 6,
     /// One-off marketplace node listing fee (links via
     /// `marketplace_node.subscription_line_item_id`).
     ///
@@ -3142,6 +3159,7 @@ impl Display for LineItemType {
             LineItemType::DnsHosting => write!(f, "DNS Hosting"),
             LineItemType::Vps => write!(f, "VPS"),
             LineItemType::App => write!(f, "App"),
+            LineItemType::Vpn => write!(f, "VPN"),
             LineItemType::MarketplaceNodeFee => write!(f, "Marketplace Node Fee"),
         }
     }

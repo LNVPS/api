@@ -1604,8 +1604,10 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Create a VPN service, returning the new id
     async fn insert_vpn_service(&self, service: &VpnService) -> DbResult<u64>;
 
-    /// Update a service's blocks, DNS, default limit and enabled flag.
-    /// `created` is immutable and is not written.
+    /// Update a service's price, blocks, DNS, default limit and enabled flag.
+    /// `company_id` and `created` are immutable and are not written: moving a
+    /// service to another company would leave every plan sold on it booked
+    /// against a company that no longer owns it.
     async fn update_vpn_service(&self, service: &VpnService) -> DbResult<()>;
 
     /// Delete a service. Fails while any interface terminates it or any plan is

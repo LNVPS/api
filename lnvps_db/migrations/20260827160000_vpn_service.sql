@@ -25,6 +25,28 @@ CREATE TABLE vpn_service (
     -- Admin label. Not an identifier.
     name VARCHAR(100) NOT NULL,
 
+    -- The selling company. Every other product takes this from its region
+    -- (`app` via `region.company_id`, a VM via its host's), but a VPN plan has
+    -- no region: a device works in all of them, which is the point. So the
+    -- service names the company directly, and it is what the subscription,
+    -- its tax treatment and its invoice are booked against.
+    company_id INTEGER UNSIGNED NOT NULL,
+
+    -- What a plan on this service costs, in the same shape as `app`: the
+    -- recurring amount, its currency, and how long one interval is. Stored here
+    -- rather than on `vpn_subscription` so a price change applies to new
+    -- customers without rewriting anybody's existing plan, which is how the
+    -- catalog tables already behave.
+    --
+    -- One flat price per service, not one per device tier. A tier would need a
+    -- price of its own, and there is nothing to sell it against yet; see
+    -- `default_device_limit` below.
+    amount BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    currency VARCHAR(4) NOT NULL DEFAULT 'EUR',
+    interval_amount INTEGER UNSIGNED NOT NULL DEFAULT 1,
+    interval_type SMALLINT UNSIGNED NOT NULL DEFAULT 1, -- 0=Day, 1=Month, 2=Year
+    setup_amount BIGINT UNSIGNED NOT NULL DEFAULT 0,
+
     -- The blocks device addresses are carved from, shared by every interface
     -- that terminates this service. Both nullable so a service can be v4-only
     -- or v6-only, but one with neither can allocate nothing, which is enforced
@@ -59,8 +81,12 @@ CREATE TABLE vpn_service (
 
     PRIMARY KEY (id),
 
+    KEY ix_vpn_service_company (company_id),
+
     CONSTRAINT ck_vpn_service_has_a_block
-        CHECK (device_cidr4 IS NOT NULL OR device_cidr6 IS NOT NULL)
+        CHECK (device_cidr4 IS NOT NULL OR device_cidr6 IS NOT NULL),
+
+    FOREIGN KEY (company_id) REFERENCES company (id)
 );
 
 -- Which interfaces terminate a service.

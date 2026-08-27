@@ -154,6 +154,18 @@ pub enum OrderProduct {
     DnsHosting,
     /// A one-off marketplace node listing fee.
     MarketplaceNodeFee { node_id: Option<i64> },
+    /// A consumer VPN plan.
+    Vpn {
+        #[serde(default)]
+        vpn_subscription_id: Option<i64>,
+        /// Which service, and therefore which regions and address space.
+        #[serde(default)]
+        vpn_service_id: Option<i64>,
+        /// Devices the plan allows, which is the thing being sold and so the
+        /// only sensible thing for a rule to price against.
+        #[serde(default)]
+        device_limit: Option<i64>,
+    },
 }
 
 impl OrderLineItem {
@@ -196,6 +208,18 @@ impl OrderLineItem {
                     subscription_id: a.as_ref().map(|a| a.id as i64),
                     asn: a.as_ref().and_then(|a| a.asn).map(|n| n as i64),
                     registry: a.map(|a| a.registry.to_string().to_lowercase()),
+                }
+            }
+            LineItemType::Vpn => {
+                let p = db
+                    .get_vpn_subscription_by_line_item(line_item.id)
+                    .await
+                    .ok()
+                    .flatten();
+                OrderProduct::Vpn {
+                    vpn_subscription_id: p.as_ref().map(|p| p.id as i64),
+                    vpn_service_id: p.as_ref().map(|p| p.vpn_service_id as i64),
+                    device_limit: p.as_ref().map(|p| p.device_limit as i64),
                 }
             }
             LineItemType::DnsHosting => OrderProduct::DnsHosting,
