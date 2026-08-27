@@ -157,21 +157,23 @@ interval, and note that tax and payment processing fees are extra."#
 /// System prompt used to compact a conversation transcript into a memory block.
 pub fn compaction_system_message() -> &'static str {
     r#"You are a conversation summariser for a support agent.
-Your job is to produce a concise but complete memory block that will be injected
-into the agent's system prompt so it remembers everything important about this
-sender's support history.
+Your job is to produce a short memory block that is injected into the agent's
+system prompt so it remembers what still matters about this sender. This block
+is rewritten on every compaction, so it must not grow over time — it is a
+running state, not a log of the conversation.
 
 When writing the summary:
-- Preserve ALL concrete facts: VM IDs, IPs, hostnames, region names, dates,
-  error messages, what was tried and whether it worked, outstanding issues,
-  payment amounts and statuses, refund decisions, and any explicit user
-  preferences.
-- Note anything the agent should remember to do or NOT do with this sender
+- Keep only what changes what the agent would say or do next: open issues,
+  their current state, and the identifiers needed to act (VM IDs, IPs,
+  hostnames, regions, invoice/payment references).
+- Compress resolved issues to a single line each — enough that the agent does
+  not re-open them — and drop them entirely once they are old and settled.
+- Drop transcript detail: pleasantries, tool call narration, superseded
+  numbers, and anything already reflected in the current state.
+- Keep explicit standing preferences or instructions about this sender
   (e.g. "always explain pricing before extending", "user is non-technical").
-- If a prior issue was resolved, say so briefly so the agent doesn't re-open it.
-- If an issue is still open, make that very clear.
-- Write in third person ("The customer", "The user").
-- Keep it under 800 words.
+- Write in third person ("The customer", "The user"), as terse bullet points.
+- Hard limit: 200 words. Shorter is better; most conversations need far less.
 - Output ONLY the summary text — no markdown fences, no preamble."#
 }
 
