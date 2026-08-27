@@ -2061,6 +2061,162 @@ pub struct AdminCustomPricingDisk {
     pub min_disk_size: u64,
 }
 
+/// A single VM's custom spec, as stored in `vm_custom_template`.
+///
+/// One of these exists per custom VM (created when the VM is ordered with a
+/// custom spec, or when a standard VM is upgraded), so editing it edits that
+/// VM's hardware and its renewal price.
+#[derive(Serialize)]
+pub struct AdminCustomTemplateInfo {
+    pub id: u64,
+    pub cpu: u16,
+    /// Memory in bytes
+    pub memory: u64,
+    /// Disk size in bytes
+    pub disk_size: u64,
+    pub disk_type: ApiDiskType,
+    pub disk_interface: ApiDiskInterface,
+    pub pricing_id: u64,
+    pub pricing_name: String,
+    pub region_id: u64,
+    pub region_name: Option<String>,
+    /// Currency of `price`, from the pricing model
+    pub currency: String,
+    /// Monthly renewal cost in smallest currency units (cents/millisats).
+    /// Custom VMs are always billed monthly.
+    pub price: u64,
+    pub ip4_count: u16,
+    pub ip6_count: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_mfg: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_arch: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub cpu_features: Vec<String>,
+    /// Maximum disk read IOPS (None = uncapped)
+    pub disk_iops_read: Option<u32>,
+    /// Maximum disk write IOPS (None = uncapped)
+    pub disk_iops_write: Option<u32>,
+    /// Maximum disk read throughput in MB/s (None = uncapped)
+    pub disk_mbps_read: Option<u32>,
+    /// Maximum disk write throughput in MB/s (None = uncapped)
+    pub disk_mbps_write: Option<u32>,
+    /// Maximum network bandwidth in Mbit/s (None = uncapped)
+    pub network_mbps: Option<u32>,
+    /// Maximum CPU usage as a fraction of allocated cores (None = uncapped)
+    pub cpu_limit: Option<f32>,
+    /// Maximum user firewall rules for this VM (None = global default)
+    pub firewall_rule_limit: Option<u16>,
+    /// Monthly outbound transfer quota in GB (None = unmetered)
+    pub transfer_gb: Option<u32>,
+    /// VMs currently using this template. Normally exactly one; empty means the
+    /// template is orphaned and editing it changes nothing that is running.
+    pub vm_ids: Vec<u64>,
+}
+
+/// Patch a custom template. Every field is optional; only what is sent changes.
+///
+/// `cpu`, `memory` and `disk_size` may only increase — the host cannot shrink a
+/// live disk without destroying data, and the same rule is applied to CPU and
+/// memory so a spec change is never a silent partial downgrade.
+#[derive(Deserialize, Default)]
+pub struct UpdateCustomTemplateRequest {
+    pub cpu: Option<u16>,
+    /// Memory in bytes
+    pub memory: Option<u64>,
+    /// Disk size in bytes
+    pub disk_size: Option<u64>,
+    /// "hdd" or "ssd"
+    pub disk_type: Option<String>,
+    /// "sata", "scsi" or "pcie"
+    pub disk_interface: Option<String>,
+    /// Move the VM onto another custom pricing model. The new model must price
+    /// the template's disk type/interface and accept its size.
+    pub pricing_id: Option<u64>,
+    pub ip4_count: Option<u16>,
+    pub ip6_count: Option<u16>,
+    /// `null` clears back to "any"
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_mfg: Option<Option<String>>,
+    /// `null` clears back to "any"
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_arch: Option<Option<String>>,
+    /// `null` or `[]` clears all required features
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_features: Option<Option<Vec<String>>>,
+    /// `null` removes the cap
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub disk_iops_read: Option<Option<u32>>,
+    /// `null` removes the cap
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub disk_iops_write: Option<Option<u32>>,
+    /// `null` removes the cap
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub disk_mbps_read: Option<Option<u32>>,
+    /// `null` removes the cap
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub disk_mbps_write: Option<Option<u32>>,
+    /// `null` removes the cap
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub network_mbps: Option<Option<u32>>,
+    /// `null` removes the cap
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub cpu_limit: Option<Option<f32>>,
+    /// Maximum user firewall rules for this VM; `null` falls back to the
+    /// global default
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub firewall_rule_limit: Option<Option<u16>>,
+    /// `null` makes transfer unmetered
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub transfer_gb: Option<Option<u32>>,
+}
+
+/// The result of patching a custom template: the stored spec, plus the jobs
+/// queued to make the host and the subscription agree with it.
+#[derive(Serialize)]
+pub struct AdminCustomTemplateUpdateResult {
+    pub template: AdminCustomTemplateInfo,
+    /// New monthly renewal amount written to each VM's subscription line item,
+    /// in smallest units of `template.currency`.
+    pub renewal_amount: u64,
+    /// One job per VM using the template. Empty when nothing had to be applied
+    /// to a host (an orphaned template, or a spec-neutral edit).
+    pub job_ids: Vec<String>,
+}
+
 #[derive(Deserialize)]
 pub struct UpdateCustomPricingRequest {
     pub name: Option<String>,

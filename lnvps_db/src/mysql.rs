@@ -1883,7 +1883,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<u64> {
-        Ok(sqlx::query("insert into vm_custom_template(cpu,memory,disk_size,disk_type,disk_interface,pricing_id,ip4_count,ip6_count,cpu_mfg,cpu_arch,cpu_features,disk_iops_read,disk_iops_write,disk_mbps_read,disk_mbps_write,network_mbps,cpu_limit,transfer_gb) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) returning id")
+        Ok(sqlx::query("insert into vm_custom_template(cpu,memory,disk_size,disk_type,disk_interface,pricing_id,ip4_count,ip6_count,cpu_mfg,cpu_arch,cpu_features,disk_iops_read,disk_iops_write,disk_mbps_read,disk_mbps_write,network_mbps,cpu_limit,transfer_gb,firewall_rule_limit) values(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) returning id")
             .bind(template.cpu)
             .bind(template.memory)
             .bind(template.disk_size)
@@ -1902,13 +1902,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(template.network_mbps)
             .bind(template.cpu_limit)
             .bind(template.transfer_gb)
+            .bind(template.firewall_rule_limit)
             .fetch_one(&self.db)
             .await?
             .try_get(0)?)
     }
 
     async fn update_custom_vm_template(&self, template: &VmCustomTemplate) -> DbResult<()> {
-        sqlx::query("update vm_custom_template set cpu=?, memory=?, disk_size=?, disk_type=?, disk_interface=?, pricing_id=?, ip4_count=?, ip6_count=?, cpu_mfg=?, cpu_arch=?, cpu_features=?, disk_iops_read=?, disk_iops_write=?, disk_mbps_read=?, disk_mbps_write=?, network_mbps=?, cpu_limit=?, transfer_gb=? where id=?")
+        sqlx::query("update vm_custom_template set cpu=?, memory=?, disk_size=?, disk_type=?, disk_interface=?, pricing_id=?, ip4_count=?, ip6_count=?, cpu_mfg=?, cpu_arch=?, cpu_features=?, disk_iops_read=?, disk_iops_write=?, disk_mbps_read=?, disk_mbps_write=?, network_mbps=?, cpu_limit=?, transfer_gb=?, firewall_rule_limit=? where id=?")
             .bind(template.cpu)
             .bind(template.memory)
             .bind(template.disk_size)
@@ -1927,6 +1928,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(template.network_mbps)
             .bind(template.cpu_limit)
             .bind(template.transfer_gb)
+            .bind(template.firewall_rule_limit)
             .bind(template.id)
             .execute(&self.db)
             .await?;
@@ -7203,73 +7205,6 @@ impl AdminDb for LNVpsDbMysql {
         Ok((templates, total as u64))
     }
 
-    async fn insert_custom_template(&self, template: &VmCustomTemplate) -> DbResult<u64> {
-        let query = r#"
-            INSERT INTO vm_custom_template (cpu, memory, disk_size, disk_type, disk_interface, pricing_id,
-                ip4_count, ip6_count,
-                disk_iops_read, disk_iops_write, disk_mbps_read, disk_mbps_write, network_mbps, cpu_limit)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        "#;
-
-        let result = sqlx::query(query)
-            .bind(template.cpu)
-            .bind(template.memory)
-            .bind(template.disk_size)
-            .bind(template.disk_type as u16)
-            .bind(template.disk_interface as u16)
-            .bind(template.pricing_id)
-            .bind(template.ip4_count)
-            .bind(template.ip6_count)
-            .bind(template.disk_iops_read)
-            .bind(template.disk_iops_write)
-            .bind(template.disk_mbps_read)
-            .bind(template.disk_mbps_write)
-            .bind(template.network_mbps)
-            .bind(template.cpu_limit)
-            .execute(&self.db)
-            .await?;
-
-        Ok(result.last_insert_id())
-    }
-
-    async fn update_custom_template(&self, template: &VmCustomTemplate) -> DbResult<()> {
-        let query = r#"
-            UPDATE vm_custom_template 
-            SET cpu = ?, memory = ?, disk_size = ?, disk_type = ?, disk_interface = ?, pricing_id = ?,
-                ip4_count = ?, ip6_count = ?,
-                disk_iops_read = ?, disk_iops_write = ?, disk_mbps_read = ?, disk_mbps_write = ?,
-                network_mbps = ?, cpu_limit = ?
-            WHERE id = ?
-        "#;
-
-        let result = sqlx::query(query)
-            .bind(template.cpu)
-            .bind(template.memory)
-            .bind(template.disk_size)
-            .bind(template.disk_type as u16)
-            .bind(template.disk_interface as u16)
-            .bind(template.pricing_id)
-            .bind(template.ip4_count)
-            .bind(template.ip6_count)
-            .bind(template.disk_iops_read)
-            .bind(template.disk_iops_write)
-            .bind(template.disk_mbps_read)
-            .bind(template.disk_mbps_write)
-            .bind(template.network_mbps)
-            .bind(template.cpu_limit)
-            .bind(template.id)
-            .execute(&self.db)
-            .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(DbError::Source(
-                anyhow!("Custom template not found").into_boxed_dyn_error(),
-            ));
-        }
-
-        Ok(())
-    }
-
     async fn delete_custom_template(&self, id: u64) -> DbResult<()> {
         let query = "DELETE FROM vm_custom_template WHERE id = ?";
         let result = sqlx::query(query).bind(id).execute(&self.db).await?;
@@ -7281,6 +7216,15 @@ impl AdminDb for LNVpsDbMysql {
         }
 
         Ok(())
+    }
+
+    async fn list_vms_by_custom_template(&self, template_id: u64) -> DbResult<Vec<Vm>> {
+        Ok(sqlx::query_as::<_, Vm>(
+            "SELECT * FROM vm WHERE custom_template_id = ? AND deleted = false ORDER BY id",
+        )
+        .bind(template_id)
+        .fetch_all(&self.db)
+        .await?)
     }
 
     async fn count_vms_by_custom_template(&self, template_id: u64) -> DbResult<u64> {

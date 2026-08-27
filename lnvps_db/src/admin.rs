@@ -208,17 +208,18 @@ pub trait AdminDb: Send + Sync {
         offset: i64,
     ) -> DbResult<(Vec<crate::VmCustomTemplate>, u64)>;
 
-    /// Insert a custom template
-    async fn insert_custom_template(&self, template: &crate::VmCustomTemplate) -> DbResult<u64>;
-
-    /// Update a custom template
-    async fn update_custom_template(&self, template: &crate::VmCustomTemplate) -> DbResult<()>;
-
     /// Delete a custom template
     async fn delete_custom_template(&self, id: u64) -> DbResult<()>;
 
     /// Count VMs using a custom template
     async fn count_vms_by_custom_template(&self, template_id: u64) -> DbResult<u64>;
+
+    /// List the (non-deleted) VMs using a custom template.
+    ///
+    /// A custom template is created per VM, so this is normally 0 or 1 rows;
+    /// callers that mutate the template still have to handle more than one,
+    /// because nothing in the schema enforces the 1:1 relationship.
+    async fn list_vms_by_custom_template(&self, template_id: u64) -> DbResult<Vec<crate::Vm>>;
 
     // Company management methods
     /// List all companies with pagination

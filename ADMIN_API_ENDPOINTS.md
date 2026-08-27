@@ -2432,47 +2432,7 @@ Required Permission: `vm_custom_pricing::delete`
 Note: Custom pricing models that are referenced by existing VMs cannot be deleted and will be disabled instead to
 preserve billing consistency.
 
-#### List Custom Templates for Pricing Model
-
-```
-GET /api/admin/v1/custom_pricing/{pricing_id}/templates
-```
-
-Query Parameters:
-
-- `limit`: number (optional) - Items per page (max 100, default 50)
-- `offset`: number (optional) - Pagination offset
-
-Required Permission: `vm_custom_pricing::view`
-
-Returns paginated list of custom VM templates that use this pricing model.
-
-#### Create Custom VM Template
-
-```
-POST /api/admin/v1/custom_pricing/{pricing_id}/templates
-```
-
-Required Permission: `vm_custom_pricing::create`
-
-Body:
-
-```json
-{
-  "cpu": number,
-  // Number of CPU cores
-  "memory": number,
-  // Memory in bytes
-  "disk_size": number,
-  // Disk size in bytes
-  "disk_type": "string",
-  // "hdd" or "ssd"
-  "disk_interface": "string"
-  // "sata", "scsi", or "pcie"
-}
-```
-
-#### Get Custom VM Template Details
+#### Get Custom VM Template
 
 ```
 GET /api/admin/v1/custom_templates/{id}
@@ -2480,7 +2440,49 @@ GET /api/admin/v1/custom_templates/{id}
 
 Required Permission: `vm_custom_pricing::view`
 
-Returns detailed information about a specific custom VM template including calculated pricing breakdown.
+A custom template is a single VM's spec: it is created when a VM is ordered with a custom spec, or when a standard VM is
+upgraded. Editing it changes that VM's hardware and its renewal price.
+
+Returns:
+
+```json
+{
+  "id": number,
+  "cpu": number,
+  "memory": number,
+  // Memory in bytes
+  "disk_size": number,
+  // Disk size in bytes
+  "disk_type": "ssd",
+  // DiskType enum: "hdd", "ssd"
+  "disk_interface": "pcie",
+  // DiskInterface enum: "sata", "scsi", "pcie"
+  "pricing_id": number,
+  "pricing_name": "string",
+  "region_id": number,
+  "region_name": "string | null",
+  "currency": "string",
+  "price": number,
+  // Monthly renewal cost in smallest currency units (cents/millisats). 0 when the
+  // current plan cannot price this spec (a grandfathered VM).
+  "ip4_count": number,
+  "ip6_count": number,
+  "cpu_mfg": "string (omitted when any)",
+  "cpu_arch": "string (omitted when any)",
+  "cpu_features": ["string"],
+  "disk_iops_read": "number | null",
+  "disk_iops_write": "number | null",
+  "disk_mbps_read": "number | null",
+  "disk_mbps_write": "number | null",
+  "network_mbps": "number | null",
+  "cpu_limit": "number | null",
+  "firewall_rule_limit": "number | null",
+  "transfer_gb": "number | null",
+  "vm_ids": [number]
+  // VMs using this template — normally exactly one. Empty means the template is
+  // orphaned and editing it changes nothing that is running.
+}
+```
 
 #### Update Custom VM Template
 
@@ -2490,79 +2492,71 @@ PATCH /api/admin/v1/custom_templates/{id}
 
 Required Permission: `vm_custom_pricing::update`
 
-Body (all optional):
+Body (all optional; only the fields sent are changed):
 
 ```json
 {
   "cpu": number,
-  "memory": number,
-  "disk_size": number,
-  "disk_type": "string",
-  "disk_interface": "string",
-  "pricing_id": number
-  // Change pricing model
-}
-```
-
-#### Delete Custom VM Template
-
-```
-DELETE /api/admin/v1/custom_templates/{id}
-```
-
-Required Permission: `vm_custom_pricing::delete`
-
-Note: Custom templates that are referenced by existing VMs cannot be deleted.
-
-#### Calculate Custom Pricing
-
-```
-POST /api/admin/v1/custom_pricing/{pricing_id}/calculate
-```
-
-Required Permission: `vm_custom_pricing::view`
-
-Body:
-
-```json
-{
-  "cpu": number,
-  // Number of CPU cores
   "memory": number,
   // Memory in bytes
   "disk_size": number,
   // Disk size in bytes
-  "disk_type": "ssd",
-  // Enum: "hdd" or "ssd"
-  "disk_interface": "pcie",
-  // Enum: "sata", "scsi", or "pcie"
+  "disk_type": "string",
+  // "hdd" or "ssd"
+  "disk_interface": "string",
+  // "sata", "scsi" or "pcie"
+  "pricing_id": number,
+  // Move the VM onto another custom pricing model
   "ip4_count": number,
-  // Number of IPv4 addresses (optional, default 1)
-  "ip6_count": number
-  // Number of IPv6 addresses (optional, default 1)
+  "ip6_count": number,
+  "cpu_mfg": "string | null",
+  // null clears back to "any"
+  "cpu_arch": "string | null",
+  // null clears back to "any"
+  "cpu_features": ["string"],
+  // null or [] clears all required features
+  "disk_iops_read": "number | null",
+  "disk_iops_write": "number | null",
+  "disk_mbps_read": "number | null",
+  "disk_mbps_write": "number | null",
+  "network_mbps": "number | null",
+  "cpu_limit": "number | null",
+  // null removes the cap
+  "firewall_rule_limit": "number | null",
+  // Maximum user firewall rules for this VM; null falls back to the global default
+  "transfer_gb": "number | null"
+  // null makes transfer unmetered
 }
 ```
 
-Returns calculated pricing breakdown for the specified configuration without creating a template (all costs in smallest
-currency units - cents/millisats):
+`cpu`, `memory` and `disk_size` may only increase. Shrinking a virtual disk destroys the filesystem on the removed
+blocks, and CPU/memory follow the same rule so a spec change is never a partial downgrade; downgrade requests are
+rejected with 400. The resulting spec is validated against the pricing model's min/max limits and must have a disk price
+for its type/interface, so an out-of-range spec is a 400 rather than a VM that cannot be quoted.
+
+A successful patch also:
+
+1. Rewrites the subscription line item amount for every VM using the template, so the next renewal bills the new spec
+   (custom VMs are always billed monthly).
+2. Queues host work: a change to `cpu`, `memory` or `disk_size` runs the same upgrade pipeline a paid upgrade uses (stop,
+   resize disk, reconfigure, start); a change to disk type/interface or an IO/network/CPU cap queues a reconfigure only;
+   a change the API enforces on its own (`pricing_id`, IP counts, `transfer_gb`, `firewall_rule_limit`) queues nothing.
+
+Returns:
 
 ```json
 {
-  "currency": "string",
-  "cpu_cost": number,
-  // Cost for CPU cores in smallest currency units
-  "memory_cost": number,
-  // Cost for RAM in smallest currency units
-  "disk_cost": number,
-  // Cost for disk in smallest currency units
-  "ip4_cost": number,
-  // Cost for IPv4 addresses in smallest currency units
-  "ip6_cost": number,
-  // Cost for IPv6 addresses in smallest currency units
-  "total_monthly_cost": number
-  // Total monthly cost in smallest currency units
+  "template": { ... },
+  // The stored template, same shape as GET
+  "renewal_amount": number,
+  // New monthly renewal amount written to each VM's line item, in smallest currency units
+  "job_ids": ["string"]
+  // One job per VM that needed host work; empty when nothing had to be applied
 }
 ```
+
+Note: creating and deleting custom templates is not exposed. Templates are created by the custom-VM order and upgrade
+paths, and a template referenced by a VM cannot be deleted without orphaning that VM's billing.
 
 #### Get Region Pricing Models
 

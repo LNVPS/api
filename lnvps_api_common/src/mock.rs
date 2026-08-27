@@ -5858,26 +5858,6 @@ impl lnvps_db::AdminDb for MockDb {
         Ok((paginated, total))
     }
 
-    async fn insert_custom_template(&self, template: &VmCustomTemplate) -> DbResult<u64> {
-        let mut template_map = self.custom_template.lock().await;
-        let max_id = template_map.keys().max().unwrap_or(&0) + 1;
-        let mut new_template = template.clone();
-        new_template.id = max_id;
-        template_map.insert(max_id, new_template);
-        Ok(max_id)
-    }
-
-    async fn update_custom_template(&self, template: &VmCustomTemplate) -> DbResult<()> {
-        let mut template_map = self.custom_template.lock().await;
-        if let std::collections::hash_map::Entry::Occupied(mut e) = template_map.entry(template.id)
-        {
-            e.insert(template.clone());
-            Ok(())
-        } else {
-            Err(anyhow!("Custom template not found: {}", template.id).into())
-        }
-    }
-
     async fn delete_custom_template(&self, id: u64) -> DbResult<()> {
         let mut template_map = self.custom_template.lock().await;
         if template_map.remove(&id).is_some() {
@@ -5886,6 +5866,17 @@ impl lnvps_db::AdminDb for MockDb {
             Err(anyhow!("Custom template not found: {}", id).into())
         }
     }
+    async fn list_vms_by_custom_template(&self, template_id: u64) -> DbResult<Vec<Vm>> {
+        let vm_map = self.vms.lock().await;
+        let mut rows: Vec<Vm> = vm_map
+            .values()
+            .filter(|vm| vm.custom_template_id == Some(template_id) && !vm.deleted)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|vm| vm.id);
+        Ok(rows)
+    }
+
     async fn count_vms_by_custom_template(&self, template_id: u64) -> DbResult<u64> {
         let vm_map = self.vms.lock().await;
         let count = vm_map
