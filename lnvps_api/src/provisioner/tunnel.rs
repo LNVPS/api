@@ -355,6 +355,15 @@ pub struct PoolPlan {
 /// contributes nothing at all, not an empty peer: half-configuring it would
 /// give the node a link with no way to authenticate over it.
 pub async fn plan_pool(db: &Arc<dyn LNVpsDb>, pool: &TunnelPool) -> Result<PoolPlan> {
+    // A pool records nothing about what it is for, so what it should carry is
+    // decided by whichever table points at it. An interface terminating a VPN
+    // service carries that service's devices and none of the per-node links
+    // below: its peers are addressed from the service's block, not from this
+    // pool's, and there are no guest prefixes behind them.
+    if let Some(service) = db.get_vpn_service_for_pool(pool.id).await? {
+        return super::vpn::plan_vpn_pool(db, &service).await;
+    }
+
     let mut plan = PoolPlan::default();
 
     // One address for the whole pool, carrying the block's prefix so every
@@ -591,7 +600,7 @@ async fn guest_addresses(db: &Arc<dyn LNVpsDb>, tunnel: &Tunnel) -> Result<Vec<S
 ///
 /// Accepts either a bare address or one already carrying a prefix, because
 /// tunnel addresses are stored as CIDR and guest assignments as bare addresses.
-fn host_address(addr: Option<&str>) -> Option<String> {
+pub(crate) fn host_address(addr: Option<&str>) -> Option<String> {
     let addr = addr?;
     let ip: std::net::IpAddr = match addr.split_once('/') {
         Some((a, _)) => a.parse().ok()?,

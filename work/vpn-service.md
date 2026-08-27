@@ -2,7 +2,7 @@
 
 **Status:** in-progress
 **Started:** 2026-08-27
-**Last updated:** 2026-08-27 (increment 1 complete: schema and db layer)
+**Last updated:** 2026-08-27 (increment 2 complete: device allocator and the `plan_pool` branch)
 
 ## Goal
 
@@ -156,14 +156,27 @@ Migrations were applied against a real MariaDB and every constraint was probed:
 `uk_vpn_device_pubkey`, `uk_vpn_device_address4` all fire, and NULL addresses do not collide
 (so a v4-only or v6-only service works).
 
-### Increment 2 — device allocator
-- [ ] `lnvps_api/src/provisioner/vpn.rs`: slot claim, address carve from the global device block,
-      cap enforcement, idempotent re-registration of a rotated key
-- [ ] `plan_pool` branch for device-terminating pools; short-circuit `guest_addresses()` for
-      non-node peers
-- [ ] Unit tests
+### Increment 2 — device allocator  ✅ DONE
+- [x] `lnvps_api/src/provisioner/vpn.rs`: `register_vpn_device` (idempotent on key, refuses a key
+      held by another account), `next_free_slot` (lowest free, so removing and re-adding reuses),
+      `carve_device_addresses` / `carve_one` (from the service block, skipping what the block
+      reserves), `plan_vpn_pool`
+- [x] `plan_pool` dispatches on `get_vpn_service_for_pool`; an unlinked pool is unchanged
+- [x] `list_vpn_devices_in_service` added to the db layer: the allocator's taken-set must include
+      lapsed and disabled devices, so it cannot reuse `list_active_vpn_devices`
+- [x] 15 unit tests; `provisioner/vpn.rs` is at 100% function and 100% line coverage
 
-### Increment 3 — billing
+Notes:
+
+- `guest_addresses()` needed no short-circuit after all. A VPN pool never reaches the tunnel loop,
+  so the N+1 it would have caused does not exist. The marketplace path is untouched.
+- The taken-set deliberately includes unpaid and disabled devices. Reissuing a lapsed customer's
+  address would deliver their traffic to somebody else the moment they paid again.
+- **No retry on slot contention.** `next_free_slot` proposes and `uk_vpn_device_slot` enforces, so
+  a race is refused rather than over-allocating, but the loser currently gets an error. Retrying
+  belongs where the request is handled: pick it up in increment 4.
+
+### Increment 3 — billing  (next)
 - [ ] `SubscriptionType::Vpn` variant and Display/serde mappings
 - [ ] Purchase, renewal and expiry wiring; suspension disables the account's devices
 - [ ] Device-limit tier upgrade on the existing proration path

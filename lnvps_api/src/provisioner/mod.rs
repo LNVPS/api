@@ -7,6 +7,7 @@ mod probe_ssh;
 mod tunnel;
 mod vm;
 mod vm_network;
+mod vpn;
 
 #[cfg(test)]
 mod retry_tests;
@@ -27,3 +28,4 @@ pub use probe_ssh::*;
 pub use tunnel::*;
 pub use vm::*;
 pub use vm_network::*;
+pub use vpn::*;

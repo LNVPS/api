@@ -1670,6 +1670,14 @@ pub trait LNVpsDbBase: Send + Sync {
     /// disabled device still owns its slot and its address.
     async fn list_vpn_devices(&self, vpn_subscription_id: u64) -> DbResult<Vec<VpnDevice>>;
 
+    /// Every device allocated from a service, whatever its billing state.
+    ///
+    /// This is the allocator's view, not the route server's: a disabled or
+    /// unpaid device still owns its address, and handing that address to
+    /// somebody else would deliver one customer's traffic to another the moment
+    /// the first one paid again.
+    async fn list_vpn_devices_in_service(&self, vpn_service_id: u64) -> DbResult<Vec<VpnDevice>>;
+
     /// Every device a pool's interface should carry: enabled, on a plan whose
     /// subscription is paid and unexpired, on the service this pool terminates.
     ///

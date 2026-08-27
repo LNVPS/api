@@ -5452,6 +5452,17 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_vpn_devices_in_service(&self, vpn_service_id: u64) -> DbResult<Vec<VpnDevice>> {
+        Ok(sqlx::query_as(
+            "SELECT d.* FROM vpn_device d \
+             JOIN vpn_subscription vs ON vs.id = d.vpn_subscription_id \
+             WHERE vs.vpn_service_id = ? ORDER BY d.id",
+        )
+        .bind(vpn_service_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
     async fn list_active_vpn_devices(&self, vpn_service_id: u64) -> DbResult<Vec<VpnDevice>> {
         // The billing join is what applies suspension: an unpaid, deactivated or
         // expired plan simply stops matching, so its devices leave the next

@@ -5205,6 +5205,23 @@ impl LNVpsDbBase for MockDb {
         Ok(out)
     }
 
+    async fn list_vpn_devices_in_service(&self, vpn_service_id: u64) -> DbResult<Vec<VpnDevice>> {
+        let subs = self.vpn_subscriptions.lock().await;
+        let plans: Vec<u64> = subs
+            .values()
+            .filter(|s| s.vpn_service_id == vpn_service_id)
+            .map(|s| s.id)
+            .collect();
+        let devices = self.vpn_devices.lock().await;
+        let mut out: Vec<_> = devices
+            .values()
+            .filter(|d| plans.contains(&d.vpn_subscription_id))
+            .cloned()
+            .collect();
+        out.sort_by_key(|d| d.id);
+        Ok(out)
+    }
+
     async fn list_active_vpn_devices(&self, vpn_service_id: u64) -> DbResult<Vec<VpnDevice>> {
         let subs = self.vpn_subscriptions.lock().await;
         let line_items = self.subscription_line_items.lock().await;
