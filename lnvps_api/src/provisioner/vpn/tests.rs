@@ -604,3 +604,32 @@ async fn overlapping_service_blocks_fail_loudly() -> Result<()> {
     );
     Ok(())
 }
+/// A service fills its block from the bottom, so by the time it is busy the
+/// first free address is at position `n` and every earlier one has to be
+/// stepped over. This is the shape that made the allocator quadratic: at 20k
+/// devices a single registration cost 355ms of CPU, quadrupling with each
+/// doubling of `n`. The cursor in `allocate_subnet` brought that to 5.5ms.
+///
+/// Asserted on the answer rather than the clock, so it cannot flake on a busy
+/// machine; what it guards is that the cursor still steps over a dense block
+/// correctly, which is the part of that change with any risk in it.
+#[test]
+fn a_dense_block_allocates_the_first_free_address() {
+    use ipnetwork::IpNetwork;
+
+    const N: u32 = 20_000;
+    let block: IpNetwork = "10.64.0.0/12".parse().unwrap();
+    let mut taken = crate::provisioner::reserved_addresses("10.64.0.0/12");
+    taken.extend((0..N).map(|i| {
+        let a = std::net::Ipv4Addr::from(0x0a40_0000u32 + 2 + i);
+        IpNetwork::new(std::net::IpAddr::V4(a), 32).unwrap()
+    }));
+
+    // .0 is the network address and .1 the gateway, so N devices occupy
+    // .2 .. .2+N-1 and the next free address is .2+N.
+    let expected = std::net::Ipv4Addr::from(0x0a40_0000u32 + 2 + N);
+    assert_eq!(
+        crate::provisioner::allocate_subnet(&block, 32, &taken).map(|n| n.ip().to_string()),
+        Some(expected.to_string())
+    );
+}
