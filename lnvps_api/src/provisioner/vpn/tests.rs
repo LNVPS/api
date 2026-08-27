@@ -147,6 +147,25 @@ fn key(seed: u8) -> Vec<u8> {
     vec![seed; 32]
 }
 
+/// Addresses are placed at random, so a test can only assert the properties
+/// that matter: inside the block, a host prefix, and not one of the addresses
+/// the block reserves for itself.
+#[track_caller]
+fn assert_usable(addr: Option<&str>, cidr: &str, prefix: u8) {
+    use ipnetwork::IpNetwork;
+    let addr = addr.expect("no address allocated");
+    let net: IpNetwork = addr.parse().expect("unparseable address");
+    let block: IpNetwork = cidr.parse().unwrap();
+    assert_eq!(net.prefix(), prefix, "{addr} is not a /{prefix}");
+    assert!(block.contains(net.ip()), "{addr} is outside {cidr}");
+    assert!(
+        !crate::provisioner::reserved_addresses(cidr)
+            .iter()
+            .any(|r| r.ip() == net.ip()),
+        "{addr} is one of {cidr}'s reserved addresses"
+    );
+}
+
 /// The first device gets slot zero and one address from each of the service's
 /// blocks, skipping what the block reserves.
 #[tokio::test]
@@ -161,10 +180,8 @@ async fn a_device_is_given_a_slot_and_an_address() -> Result<()> {
     assert_eq!(device.slot, 0);
     assert_eq!(device.name, "phone", "the label is trimmed, not stored raw");
     assert!(device.enabled);
-    // .0 is the network address and .1 is the route servers' shared address,
-    // so the first address a device can hold is .2.
-    assert_eq!(device.address4.as_deref(), Some("10.64.0.2/32"));
-    assert_eq!(device.address6.as_deref(), Some("fd00:64::2/128"));
+    assert_usable(device.address4.as_deref(), "10.64.0.0/28", 32);
+    assert_usable(device.address6.as_deref(), "fd00:64::/124", 128);
 
     // A second device does not collide with the first.
     let other = register_vpn_device(&db, &plan, "laptop", &key(2)).await?;
@@ -334,7 +351,7 @@ async fn a_v6_only_service_gives_v6_only() -> Result<()> {
 
     let device = register_vpn_device(&db, &plan, "phone", &key(1)).await?;
     assert_eq!(device.address4, None);
-    assert_eq!(device.address6.as_deref(), Some("fd00:99::2/128"));
+    assert_usable(device.address6.as_deref(), "fd00:99::/120", 128);
     Ok(())
 }
 
@@ -426,7 +443,10 @@ async fn a_vpn_interface_carries_the_services_devices() -> Result<()> {
     );
     assert_eq!(
         peer.allowed_ips,
-        vec!["10.64.0.2/32".to_string(), "fd00:64::2/128".to_string()],
+        vec![
+            device.address4.clone().unwrap(),
+            device.address6.clone().unwrap()
+        ],
         "a device may claim its own addresses and nothing else"
     );
     assert_eq!(peer.endpoint, None, "clients dial out from behind NAT");
@@ -550,16 +570,21 @@ async fn a_lost_slot_race_takes_the_next_slot() -> Result<()> {
 
     let device = racer.await??;
     assert_eq!(device.slot, 1, "the loser re-reads and takes the next slot");
-    assert_eq!(device.address4.as_deref(), Some("10.64.0.3/32"));
+    assert_ne!(
+        device.address4.as_deref(),
+        Some("10.64.0.2/32"),
+        "nor the address the winner took"
+    );
+    assert_usable(device.address4.as_deref(), "10.64.0.0/28", 32);
     Ok(())
 }
 
 /// If every attempt loses, that is not contention any more and looping harder
 /// would only hide it, so it is reported.
 ///
-/// Reached here by giving two services overlapping blocks, which the schema
-/// permits: the carve only sees its own service's devices, so it keeps
-/// proposing an address the *global* unique index already refuses. That is a
+/// Reached by giving two services overlapping blocks, which the schema permits:
+/// the carve only sees its own service's devices, so it keeps proposing
+/// addresses the *global* unique index already refuses. That is a
 /// misconfiguration, and it has to fail loudly rather than quietly handing two
 /// customers one address.
 #[tokio::test]
@@ -567,43 +592,45 @@ async fn overlapping_service_blocks_fail_loudly() -> Result<()> {
     let mock = MockDb::default();
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
     let service = a_service(&db, &mock).await?;
+    let plan = a_plan(&db, &service, 1).await?;
 
-    // A second service carved from the same block as the first.
-    let overlapping_id = db
-        .insert_vpn_service(&VpnService {
-            name: "overlap".to_string(),
-            company_id: a_company(&mock).await,
-            device_cidr4: Some("10.64.0.0/28".to_string()),
-            device_cidr6: Some("fd00:64::/124".to_string()),
-            enabled: true,
-            ..Default::default()
-        })
-        .await?;
-    let overlapping = db.get_vpn_service(overlapping_id).await?;
-
-    // Fill the shared block from the other service, where this service's carve
-    // cannot see it.
-    let squatter = a_plan(&db, &overlapping, 2).await?;
-    for seed in 0..6u8 {
-        if register_vpn_device(&db, &squatter, "squat", &vec![100 + seed; 32])
-            .await
-            .is_err()
-        {
-            break;
+    // Another service's plan, holding every address in the shared block. Its
+    // devices are invisible to this service's carve but not to the unique
+    // index, so every insert collides however many times the carve re-reads.
+    let squatter = a_plan(&db, &service, 2).await?;
+    {
+        let mut devices = mock.vpn_devices.lock().await;
+        for host in 0..16u8 {
+            devices.insert(
+                1000 + host as u64,
+                VpnDevice {
+                    id: 1000 + host as u64,
+                    // A plan id that does not exist, so `list_vpn_devices_in_service`
+                    // does not see these while the unique index still does.
+                    vpn_subscription_id: squatter.id + 500,
+                    slot: host,
+                    name: "squat".to_string(),
+                    peer_pubkey: vec![100 + host; 32],
+                    address4: Some(format!("10.64.0.{host}/32")),
+                    address6: Some(format!("fd00:64::{host:x}/128")),
+                    enabled: true,
+                    created: chrono::Utc::now(),
+                },
+            );
         }
     }
 
-    let plan = a_plan(&db, &service, 1).await?;
     let err = register_vpn_device(&db, &plan, "phone", &[1u8; 32])
         .await
         .unwrap_err()
         .to_string();
     assert!(
-        err.contains("after 4 attempts") || err.contains("no free /32"),
+        err.contains("after 4 attempts"),
         "an overlapping block must be reported, not worked around: {err}"
     );
     Ok(())
 }
+
 /// A service fills its block from the bottom, so by the time it is busy the
 /// first free address is at position `n` and every earlier one has to be
 /// stepped over. This is the shape that made the allocator quadratic: at 20k

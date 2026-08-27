@@ -18,6 +18,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **Bitvora payment provider** — the provider was disabled in February 2026 when the service shut down, and its remaining code has now been deleted: the `bitvora` cargo feature, the `POST /api/v1/webhook/bitvora` endpoint, and the `"type": "bitvora"` variant of `ProviderConfig` (create), `PartialProviderConfig` (update) and the sanitized config returned by the admin payment-method endpoints. Any `payment_method_config` row still holding a bitvora config is left in place as billing history; it now reads back with a `null` `config` and cannot be updated. Delete or ignore those rows.
 
+### Fixed
+
+- **Address allocation was quadratic in the number of allocations** — the shared allocator restarted its overlap search at the first allocation for every candidate slot, so a densely packed range cost `O(n^2)`: 20k allocations took 355ms of CPU per call and quadrupled with each doubling. It is now linear, dominated by the sort, at 5.5ms for the same case. Affects VM IP assignment, marketplace tunnel links and VPN device registration, which share the allocator.
+
 ### Security
 
 - **Admin job-feedback WebSocket was not authenticated** — `GET /api/admin/v1/jobs/feedback` accepted a `?auth=` NIP-98 event but only *parsed* it: `Event::from_json` verifies neither the signature nor the event id, so any caller could hand-craft an unsigned JSON event carrying an arbitrary `pubkey` and stream the internal worker job bus (provisioning detail for every VM on the platform). The signature is now verified and bound to the endpoint path, and the connection additionally requires `virtual_machines::view` — it previously required no permission at all.

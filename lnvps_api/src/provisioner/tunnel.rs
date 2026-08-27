@@ -20,6 +20,8 @@ use anyhow::{Result, anyhow, bail};
 use ipnetwork::IpNetwork;
 use lnvps_db::{LNVpsDb, MarketplaceNode, RouterTunnelKind, Tunnel, TunnelPool};
 
+use lnvps_api_common::random_address;
+
 use crate::provisioner::allocate_subnet;
 use crate::router::WireguardPeer;
 
@@ -282,7 +284,26 @@ async fn carve_link(
         pool.cidr6.as_deref(),
         &taken,
         &format!("Tunnel pool {}", pool.id),
+        Placement::Sequential,
     )
+}
+
+/// Where in a block a new peer's address is taken from.
+///
+/// The same choice [`lnvps_db::IpRangeAllocationMode`] offers for guest
+/// addresses, and picked the same way: a random candidate tested against the
+/// taken set, as `NetworkProvisioner::pick_ip_from_range` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Placement {
+    /// The lowest free slot. Predictable, which is what a pool holding a
+    /// handful of nodes wants: an operator debugging one can reason about it.
+    Sequential,
+    /// A free slot chosen at random.
+    ///
+    /// For addresses handed to customers. A sequential address encodes roughly
+    /// when it was issued and how many came before it, so anybody who sees one
+    /// learns the size of the fleet and the age of the account behind it.
+    Random,
 }
 
 /// Carve the next free peer address out of each block.
@@ -300,13 +321,14 @@ pub(crate) fn carve_peer(
     cidr6: Option<&str>,
     taken: &[IpNetwork],
     owner: &str,
+    placement: Placement,
 ) -> Result<(Option<String>, Option<String>)> {
     let address4 = match cidr4 {
-        Some(cidr) => Some(carve_one(cidr, PEER_PREFIX_V4, taken, owner)?),
+        Some(cidr) => Some(carve_one(cidr, PEER_PREFIX_V4, taken, owner, placement)?),
         None => None,
     };
     let address6 = match cidr6 {
-        Some(cidr) => Some(carve_one(cidr, PEER_PREFIX_V6, taken, owner)?),
+        Some(cidr) => Some(carve_one(cidr, PEER_PREFIX_V6, taken, owner, placement)?),
         None => None,
     };
     Ok((address4, address6))
@@ -335,12 +357,47 @@ pub fn reserved_addresses(cidr: &str) -> Vec<IpNetwork> {
     out
 }
 
-fn carve_one(cidr: &str, prefix: u8, taken: &[IpNetwork], owner: &str) -> Result<String> {
+/// Random candidates tried before falling back to the deterministic scan.
+///
+/// A guest range probes until it succeeds, which is right there: it is checked
+/// for fullness first, so a free address exists to be found. A peer block gets
+/// no such check, and only the scan can tell a block with one address left from
+/// one with none. Eight probes clear a block up to about 85% full at better
+/// than even odds, and past that the scan is both cheap and the answer worth
+/// having.
+const RANDOM_PLACEMENT_ATTEMPTS: usize = 8;
+
+fn carve_one(
+    cidr: &str,
+    prefix: u8,
+    taken: &[IpNetwork],
+    owner: &str,
+    placement: Placement,
+) -> Result<String> {
     let block: IpNetwork = cidr
         .parse()
         .map_err(|e| anyhow!("{owner} has an unparseable block {cidr}: {e}"))?;
     let mut taken = taken.to_vec();
     taken.extend(reserved_addresses(cidr));
+
+    if placement == Placement::Random {
+        let ips: std::collections::HashSet<std::net::IpAddr> =
+            taken.iter().map(|n| n.ip()).collect();
+        for _ in 0..RANDOM_PLACEMENT_ATTEMPTS {
+            let Some(addr) = random_address(&block) else {
+                break;
+            };
+            if !ips.contains(&addr)
+                && let Ok(net) = IpNetwork::new(addr, prefix)
+            {
+                return Ok(net.to_string());
+            }
+        }
+    }
+
+    // Also where random placement lands once the block is crowded: only a full
+    // scan can tell a block with one address left from one with none, and that
+    // difference is what an admin needs to hear.
     let addr = allocate_subnet(&block, prefix, &taken)
         .ok_or_else(|| anyhow!("{owner} has no free /{prefix} left in {cidr}; widen the block"))?;
     Ok(addr.to_string())

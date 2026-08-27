@@ -156,6 +156,7 @@ async fn carve_device_addresses(
         service.device_cidr6.as_deref(),
         &taken,
         &format!("VPN service {}", service.id),
+        crate::provisioner::Placement::Random,
     )
 }
 
