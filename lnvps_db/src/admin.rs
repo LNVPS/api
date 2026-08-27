@@ -266,6 +266,19 @@ pub trait AdminDb: Send + Sync {
         region_id: Option<u64>,
     ) -> DbResult<Vec<crate::SubscriptionRenewalOutlook>>;
 
+    /// Subscriptions that *started* in `[start, end)`, for cohort retention.
+    ///
+    /// Ranged on `created` rather than `expires`: a cohort is defined by when
+    /// it arrived, and its members' expiries run arbitrarily far past the
+    /// window.
+    async fn admin_list_subscription_cohorts(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        company_id: u64,
+        region_id: Option<u64>,
+    ) -> DbResult<Vec<crate::SubscriptionCohortRow>>;
+
     /// Get referral cost usage report within date range for a specific company
     async fn admin_get_referral_usage_by_date_range(
         &self,

@@ -4812,6 +4812,26 @@ Response:
 }
 ```
 
+The response also carries `cohorts`: signup cohorts and how much of each is
+still paid up over time.
+
+```json
+"cohorts": [
+  { "cohort": "2026-06", "size": 18, "retained": [18, 14, 11, 9], "retained_pct": [100.0, 77.8, 61.1, 50.0] }
+]
+```
+
+- `retained[n]` is how many of that cohort are still paid through the end of
+  month `cohort + n`; `retained[0]` is always `size`.
+- Retention is read from the subscription's **paid-through date** (`expires`),
+  not from "renewed in month n" — the latter reports an annual subscription as
+  churned for eleven months out of twelve.
+- Curves are **truncated at the present month**, so a two-month-old cohort has
+  three entries rather than twelve zeroes: it has not failed to reach month six,
+  it has not got there yet.
+- Cohorts look back 12 months further than `start_date`, because a retention
+  curve needs the months that produced today's customers.
+
 **Notes:**
 
 - Counted **per subscription**, not per VM — one subscription may carry several VMs.

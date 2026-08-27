@@ -1106,6 +1106,23 @@ struct RenewalsPeriod {
     renewed_unknown: u64,
 }
 
+/// One signup cohort and how much of it is still paid up over time.
+#[derive(Serialize, Deserialize)]
+struct RetentionCohort {
+    /// Month the cohort started paying, "2026-02".
+    cohort: String,
+    /// Subscriptions that started in this month.
+    size: u64,
+    /// `retained[n]` is how many are still paid through the end of month
+    /// `cohort + n`. `retained[0]` is always `size`.
+    ///
+    /// Truncated at the present: a cohort two months old has three entries, not
+    /// twelve, so a client cannot mistake "not yet reached" for "churned".
+    retained: Vec<u64>,
+    /// `retained` as a percentage of `size`, to one decimal.
+    retained_pct: Vec<f32>,
+}
+
 #[derive(Serialize, Deserialize)]
 struct RenewalsReport {
     start_date: String,
@@ -1115,6 +1132,11 @@ struct RenewalsReport {
     /// look like "nothing auto-renewed".
     source_tracking_since: Option<String>,
     periods: Vec<RenewalsPeriod>,
+    /// Signup cohorts, oldest first. Answers whether renewals are the same
+    /// customers extending or a churning base masked by new arrivals — which
+    /// the monthly aggregate cannot show, because every cohort's losses are
+    /// mixed together in it.
+    cohorts: Vec<RetentionCohort>,
 }
 
 /// Bucket subscriptions and renewal payments into one row per calendar month.
@@ -1221,6 +1243,74 @@ fn build_renewal_periods(
 /// instead of varying with the mix of subscription ages.
 const CHURN_CONFIRM_DAYS: i64 = 7;
 
+/// Group subscriptions by the month they started and measure how much of each
+/// cohort is still paid up `n` months later.
+///
+/// Retention is read from `expires`, the paid-through date, rather than from
+/// "renewed in month n". Under the latter an annual subscription looks churned
+/// for eleven months of every twelve; under this it stays retained until the
+/// year it paid for runs out.
+///
+/// Offsets stop at the present month: a cohort that is two months old has not
+/// *failed* to reach month six, it has not got there yet, and padding it with
+/// zeroes would read as total churn.
+fn build_retention_cohorts(
+    rows: &[lnvps_db::SubscriptionCohortRow],
+    now: DateTime<Utc>,
+) -> Vec<RetentionCohort> {
+    let mut by_cohort: BTreeMap<String, Vec<&lnvps_db::SubscriptionCohortRow>> = BTreeMap::new();
+    for r in rows {
+        by_cohort
+            .entry(period_key(r.created, false))
+            .or_default()
+            .push(r);
+    }
+
+    by_cohort
+        .into_iter()
+        .map(|(cohort, members)| {
+            let start = members.iter().map(|m| m.created).min().unwrap_or(now);
+            let months_elapsed = months_between(start, now).max(0) as usize;
+            let size = members.len() as u64;
+
+            let retained: Vec<u64> = (0..=months_elapsed)
+                .map(|n| {
+                    // End of the cohort's month + n: a subscription counts as
+                    // retained if it is paid through that point.
+                    let boundary = month_start(start)
+                        .checked_add_months(chrono::Months::new(n as u32 + 1))
+                        .unwrap_or(now);
+                    members.iter().filter(|m| m.expires >= boundary).count() as u64
+                })
+                .collect();
+
+            let retained_pct = retained
+                .iter()
+                .map(|r| {
+                    if size == 0 {
+                        0.0
+                    } else {
+                        ((*r as f32 / size as f32) * 1000.0).round() / 10.0
+                    }
+                })
+                .collect();
+
+            RetentionCohort {
+                cohort,
+                size,
+                retained,
+                retained_pct,
+            }
+        })
+        .collect()
+}
+
+/// First instant of the calendar month containing `at`.
+fn month_start(at: DateTime<Utc>) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(at.year(), at.month(), 1, 0, 0, 0)
+        .unwrap()
+}
+
 /// Renewal outlook and churn, per month.
 ///
 /// Two halves that must not be conflated: what is *due* to renew (from
@@ -1264,11 +1354,24 @@ async fn admin_renewals_report(
         .map(|p| (p.subscription_id, p.created, p.renewal_source))
         .collect();
 
+    // Cohorts look back further than the report window on purpose: a retention
+    // curve needs the months that produced today's customers, not just the
+    // months on screen.
+    let cohort_start = start_dt - chrono::Duration::days(365);
+    let cohorts = build_retention_cohorts(
+        &this
+            .db
+            .admin_list_subscription_cohorts(cohort_start, end_dt, params.company_id, region)
+            .await?,
+        Utc::now(),
+    );
+
     ApiData::ok(RenewalsReport {
         start_date: params.start_date,
         end_date: params.end_date,
         source_tracking_since: Some(RENEWAL_SOURCE_TRACKED_FROM.to_string()),
         periods: build_renewal_periods(&outlook, &renewals, Utc::now()),
+        cohorts,
     })
 }
 
@@ -1430,6 +1533,69 @@ mod tests {
         assert_eq!(p[0].due, 0);
         assert_eq!(p[1].due, 1);
         assert_eq!(p[1].renewed, 0);
+    }
+
+    fn cohort_row(
+        created: DateTime<Utc>,
+        expires: DateTime<Utc>,
+    ) -> lnvps_db::SubscriptionCohortRow {
+        lnvps_db::SubscriptionCohortRow {
+            subscription_id: 1,
+            created,
+            expires,
+            region_id: Some(1),
+        }
+    }
+
+    #[test]
+    fn test_retention_curve_counts_paid_through_not_renewals() {
+        // Three signups in June 2026, measured in mid-September: paid through
+        // July, September and December respectively.
+        let rows = vec![
+            cohort_row(dt(2026, 6, 10), dt(2026, 7, 10)),
+            cohort_row(dt(2026, 6, 11), dt(2026, 9, 11)),
+            // An annual subscription: retained throughout, even though it has
+            // not renewed once.
+            cohort_row(dt(2026, 6, 12), dt(2027, 6, 12)),
+        ];
+        let c = build_retention_cohorts(&rows, now());
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].cohort, "2026-06");
+        assert_eq!(c[0].size, 3);
+        // Month 0 = paid through end of June: all three.
+        // Month 1 = end of July: the first expires on the 10th, so it is gone.
+        // Month 3 = end of September: only the annual one remains.
+        assert_eq!(c[0].retained, vec![3, 2, 2, 1]);
+        assert_eq!(c[0].retained_pct[0], 100.0);
+        assert_eq!(c[0].retained_pct[3], 33.3);
+    }
+
+    #[test]
+    fn test_retention_stops_at_the_present_rather_than_padding_zeroes() {
+        // A cohort one month old has not failed to reach month six.
+        let rows = vec![cohort_row(dt(2026, 8, 4), dt(2027, 8, 4))];
+        let c = build_retention_cohorts(&rows, now());
+        assert_eq!(
+            c[0].retained.len(),
+            2,
+            "August and September only, measured in September"
+        );
+        assert!(c[0].retained.iter().all(|r| *r == 1));
+    }
+
+    #[test]
+    fn test_retention_separates_cohorts() {
+        let rows = vec![
+            cohort_row(dt(2026, 7, 1), dt(2026, 8, 1)),
+            cohort_row(dt(2026, 8, 1), dt(2027, 8, 1)),
+        ];
+        let c = build_retention_cohorts(&rows, now());
+        let keys: Vec<&str> = c.iter().map(|x| x.cohort.as_str()).collect();
+        assert_eq!(keys, vec!["2026-07", "2026-08"]);
+        assert_eq!(c[0].size, 1);
+        assert_eq!(c[1].size, 1);
+        // July's single member lapsed at the start of August.
+        assert_eq!(c[0].retained[2], 0);
     }
 
     #[test]

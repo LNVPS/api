@@ -3103,6 +3103,23 @@ pub struct SubscriptionRenewalOutlook {
     pub is_setup: bool,
 }
 
+/// One subscription reduced to what a retention cohort needs: when it started
+/// paying, and how far it is paid through.
+///
+/// `expires` advances on every renewal and stops moving when the customer
+/// leaves, so it *is* the paid-through date — including for subscriptions that
+/// have already lapsed. That makes retention computable without replaying
+/// payment history, and it handles annual billing correctly, where "renewed
+/// this month" would report a healthy yearly subscription as churned eleven
+/// months out of twelve.
+#[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
+pub struct SubscriptionCohortRow {
+    pub subscription_id: u64,
+    pub created: DateTime<Utc>,
+    pub expires: DateTime<Utc>,
+    pub region_id: Option<u64>,
+}
+
 /// Subscription payment with company info (for admin views and time-series reporting)
 #[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
 pub struct SubscriptionPaymentWithCompany {

@@ -7452,6 +7452,45 @@ impl AdminDb for LNVpsDbMysql {
             .await?)
     }
 
+    async fn admin_list_subscription_cohorts(
+        &self,
+        start: chrono::DateTime<chrono::Utc>,
+        end: chrono::DateTime<chrono::Utc>,
+        company_id: u64,
+        region_id: Option<u64>,
+    ) -> DbResult<Vec<crate::SubscriptionCohortRow>> {
+        let mut query = QueryBuilder::new(
+            "SELECT s.id as subscription_id, s.created, s.expires, vhr.id as region_id
+             FROM subscription s
+             LEFT JOIN subscription_line_item sli ON sli.subscription_id = s.id
+                 AND sli.subscription_type = 3
+             LEFT JOIN vm v ON v.subscription_line_item_id = sli.id
+             LEFT JOIN vm_host vh ON v.host_id = vh.id
+             LEFT JOIN region vhr ON vh.region_id = vhr.id
+             JOIN company c ON (CASE WHEN vhr.company_id IS NOT NULL
+                                     THEN vhr.company_id
+                                     ELSE s.company_id END) = c.id
+             WHERE s.expires IS NOT NULL
+               AND s.is_setup = true
+               AND s.created >= ",
+        );
+        query.push_bind(start);
+        query.push(" AND s.created < ");
+        query.push_bind(end);
+        query.push(" AND c.id = ");
+        query.push_bind(company_id);
+        if let Some(rid) = region_id {
+            query.push(" AND vhr.id = ");
+            query.push_bind(rid);
+        }
+        query.push(" ORDER BY s.created");
+
+        Ok(query
+            .build_query_as::<crate::SubscriptionCohortRow>()
+            .fetch_all(&self.db)
+            .await?)
+    }
+
     async fn admin_get_payments_with_company_info(
         &self,
         start_date: chrono::DateTime<chrono::Utc>,

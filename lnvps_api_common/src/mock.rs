@@ -5943,6 +5943,16 @@ impl lnvps_db::AdminDb for MockDb {
         Ok(vec![])
     }
 
+    async fn admin_list_subscription_cohorts(
+        &self,
+        _start: chrono::DateTime<chrono::Utc>,
+        _end: chrono::DateTime<chrono::Utc>,
+        _company_id: u64,
+        _region_id: Option<u64>,
+    ) -> DbResult<Vec<lnvps_db::SubscriptionCohortRow>> {
+        Ok(vec![])
+    }
+
     async fn admin_get_payments_with_company_info(
         &self,
         start_date: chrono::DateTime<chrono::Utc>,
