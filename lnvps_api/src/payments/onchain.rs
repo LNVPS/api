@@ -422,7 +422,7 @@ mod tests {
         Ticker, VmStateCache,
     };
     use lnvps_db::{
-        IntervalType, LNVpsDbBase, Subscription, SubscriptionLineItem, SubscriptionType, Vm,
+        IntervalType, LNVpsDbBase, LineItemType, Subscription, SubscriptionLineItem, Vm,
     };
     use std::time::Duration;
 
@@ -488,7 +488,7 @@ mod tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::Vps,
+                    subscription_type: LineItemType::Vps,
                     name: "vm renewal".to_string(),
                     description: None,
                     amount: 1000,

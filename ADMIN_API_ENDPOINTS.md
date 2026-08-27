@@ -22,7 +22,7 @@ Admin API request/response format reference for LLM consumption.
 **AdminUserRole**: `"super_admin"`, `"admin"`, `"read_only"`
 **AdminUserStatus**: `"active"`, `"suspended"`, `"deleted"`
 **SubscriptionPaymentType**: `"purchase"`, `"renewal"`, `"upgrade"`
-**SubscriptionType**: `"ip_range"`, `"asn_sponsoring"`, `"dns_hosting"`, `"vps"`
+**LineItemType**: `"ip_range"`, `"asn_sponsoring"`, `"dns_hosting"`, `"vps"`
 **InternetRegistry**: `"arin"`, `"ripe"`, `"apnic"`, `"lacnic"`, `"afrinic"`
 **CpuMfg**: `"unknown"`, `"intel"`, `"amd"`, `"apple"`, `"nvidia"`, `"arm"`
 **CpuArch**: `"unknown"`, `"x86_64"`, `"arm64"`
@@ -1215,7 +1215,7 @@ Response:
 }
 ```
 
-`subscription_type` is the **SubscriptionType** discriminant identifying the kind of service this line item bills for.
+`subscription_type` is the **LineItemType** discriminant identifying the kind of service this line item bills for. It describes the line item, not the subscription: a subscription has no type of its own, and one subscription can carry line items of different kinds.
 
 `resource` is a typed, tagged reference to the linked resource, **resolved from `subscription_type`** by looking up the back-reference tables (e.g. `vm.subscription_line_item_id`, `ip_range_subscription.subscription_line_item_id`). Use it to resolve the linked resource directly. Current shapes:
 

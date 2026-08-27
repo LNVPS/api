@@ -501,7 +501,7 @@ impl Default for MockDb {
                     SubscriptionLineItem {
                         id: 1,
                         subscription_id: 1,
-                        subscription_type: lnvps_db::SubscriptionType::Vps,
+                        subscription_type: lnvps_db::LineItemType::Vps,
                         name: "mock vm renewal".to_string(),
                         description: None,
                         amount: 1000,
@@ -1703,13 +1703,13 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn get_vm_by_subscription(&self, subscription_id: u64) -> DbResult<Vm> {
-        use lnvps_db::SubscriptionType;
+        use lnvps_db::LineItemType;
         let items = self.subscription_line_items.lock().await;
         let line_item_id = items
             .values()
             .find(|li| {
                 li.subscription_id == subscription_id
-                    && matches!(li.subscription_type, SubscriptionType::Vps)
+                    && matches!(li.subscription_type, LineItemType::Vps)
             })
             .map(|li| li.id)
             .ok_or_else(|| {
@@ -8661,7 +8661,7 @@ mod tests {
             SubscriptionLineItem {
                 id: 50,
                 subscription_id: 1,
-                subscription_type: lnvps_db::SubscriptionType::AsnSponsoring,
+                subscription_type: lnvps_db::LineItemType::AsnSponsoring,
                 name: "ASN".to_string(),
                 description: None,
                 amount: 1000,
@@ -8774,7 +8774,7 @@ mod tests {
                 SubscriptionLineItem {
                     id,
                     subscription_id: id,
-                    subscription_type: lnvps_db::SubscriptionType::Vps,
+                    subscription_type: lnvps_db::LineItemType::Vps,
                     name: "vm".to_string(),
                     description: None,
                     amount: 1000,
@@ -9513,7 +9513,7 @@ mod tests {
             .insert_subscription_line_item(&SubscriptionLineItem {
                 id: 0,
                 subscription_id: sub_id,
-                subscription_type: lnvps_db::SubscriptionType::App,
+                subscription_type: lnvps_db::LineItemType::App,
                 name: "app".to_string(),
                 description: None,
                 amount: 1000,
@@ -9964,8 +9964,8 @@ impl crate::dns::DnsServer for MockDnsServer {
 mod marketplace_tests {
     use super::*;
     use lnvps_db::{
-        LNVpsDbBase, MarketplaceTrustTier, PayoutMode, RouterTunnelKind, Subscription,
-        SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType, SubscriptionType,
+        LNVpsDbBase, LineItemType, MarketplaceTrustTier, PayoutMode, RouterTunnelKind,
+        Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
     };
 
     /// Create a user, returning its id. The marketplace tables carry real FKs
@@ -10018,7 +10018,7 @@ mod marketplace_tests {
             .map(|(amount, setup_amount)| SubscriptionLineItem {
                 id: 0,
                 subscription_id: 0,
-                subscription_type: SubscriptionType::MarketplaceNodeFee,
+                subscription_type: LineItemType::MarketplaceNodeFee,
                 name: "item".to_string(),
                 description: None,
                 amount: *amount,
@@ -11335,7 +11335,7 @@ mod vpn_tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: lnvps_db::SubscriptionType::Vps,
+                    subscription_type: lnvps_db::LineItemType::Vps,
                     name: "vpn".to_string(),
                     description: None,
                     amount: 500,

@@ -5,7 +5,7 @@ use lnvps_api_common::{
     ChannelWorkCommander, GB, MockDb, MockExchangeRate, VatClient, VmStateCache,
 };
 use lnvps_db::{
-    AdminDb, IntervalType, LNVpsDbBase, Subscription, SubscriptionLineItem, SubscriptionType,
+    AdminDb, IntervalType, LNVpsDbBase, LineItemType, Subscription, SubscriptionLineItem,
     VmCustomPricing, VmCustomPricingDisk,
 };
 
@@ -94,7 +94,7 @@ async fn seed_vm(db: &MockDb, template_id: u64, amount: u64) -> (u64, u64) {
         .insert_subscription_line_item(&SubscriptionLineItem {
             id: 0,
             subscription_id: sub_id,
-            subscription_type: SubscriptionType::Vps,
+            subscription_type: LineItemType::Vps,
             name: "vm".to_string(),
             description: None,
             amount,

@@ -3104,11 +3104,22 @@ impl Subscription {
     }
 }
 
-/// Subscription Type - Type of service being sold
+/// What a line item bills for, and therefore which product table owns it.
+///
+/// This belongs to the **line item**, not to the subscription: a subscription
+/// has no type of its own, which is what lets one carry a VM and a VPN on a
+/// single renewal date and a single payment.
+///
+/// The column it is stored in is `subscription_line_item.subscription_type`,
+/// which is a misnomer inherited from `20260130000001_subscription_line_item_type.sql`
+/// (whose own filename, and whose `idx_line_item_type` index, say line item).
+/// The column keeps that name because renaming it buys nothing and would mean a
+/// migration plus a coordinated deploy across every crate that writes billing
+/// SQL by hand.
 #[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize, PartialEq, Eq)]
 #[repr(u16)]
 #[serde(rename_all = "snake_case")]
-pub enum SubscriptionType {
+pub enum LineItemType {
     IpRange = 0,       // IP range allocation/LIR services
     AsnSponsoring = 1, // ASN sponsoring services
     DnsHosting = 2,    // DNS hosting services
@@ -3123,15 +3134,15 @@ pub enum SubscriptionType {
     MarketplaceNodeFee = 5,
 }
 
-impl Display for SubscriptionType {
+impl Display for LineItemType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            SubscriptionType::IpRange => write!(f, "IP Range"),
-            SubscriptionType::AsnSponsoring => write!(f, "ASN Sponsoring"),
-            SubscriptionType::DnsHosting => write!(f, "DNS Hosting"),
-            SubscriptionType::Vps => write!(f, "VPS"),
-            SubscriptionType::App => write!(f, "App"),
-            SubscriptionType::MarketplaceNodeFee => write!(f, "Marketplace Node Fee"),
+            LineItemType::IpRange => write!(f, "IP Range"),
+            LineItemType::AsnSponsoring => write!(f, "ASN Sponsoring"),
+            LineItemType::DnsHosting => write!(f, "DNS Hosting"),
+            LineItemType::Vps => write!(f, "VPS"),
+            LineItemType::App => write!(f, "App"),
+            LineItemType::MarketplaceNodeFee => write!(f, "Marketplace Node Fee"),
         }
     }
 }
@@ -3141,8 +3152,9 @@ impl Display for SubscriptionType {
 pub struct SubscriptionLineItem {
     pub id: u64,
     pub subscription_id: u64,
-    /// Discriminant indicating which product table owns this line item
-    pub subscription_type: SubscriptionType,
+    /// What this line item bills for, and therefore which product table owns
+    /// it. Named for its column, which is misnamed; see [`LineItemType`].
+    pub subscription_type: LineItemType,
     pub name: String,
     pub description: Option<String>,
     pub amount: u64,
@@ -3152,7 +3164,7 @@ pub struct SubscriptionLineItem {
     /// This stores upgrade configuration only (e.g. `UpgradeConfig` —
     /// `new_cpu` / `new_memory` / `new_disk`) recorded when a VM's specs are
     /// changed. It is NOT a link to the resource this line item bills for:
-    /// the linked resource is resolved from [`SubscriptionType`] via the
+    /// the linked resource is resolved from [`LineItemType`] via the
     /// back-reference tables (`vm.subscription_line_item_id`,
     /// `ip_range_subscription.subscription_line_item_id`, ...), never by
     /// parsing this column.
@@ -4638,7 +4650,7 @@ pub struct AppDeploymentVolumeUsage {
 /// A customer's running instance of an [`App`].
 ///
 /// Billed via the subscription engine: `subscription_line_item_id` links to a
-/// [`SubscriptionLineItem`] of type [`SubscriptionType::App`], mirroring how
+/// [`SubscriptionLineItem`] of type [`LineItemType::App`], mirroring how
 /// `vm.subscription_line_item_id` works. Reconciled into its own Kubernetes
 /// namespace (`namespace`) by `lnvps_operator`.
 #[derive(FromRow, Clone, Debug)]

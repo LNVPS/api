@@ -10,8 +10,8 @@ use lnvps_api_common::{
     ApiSubscriptionLineItemResource, ApiVmTrafficSummary, VmRunningState, quota_period,
 };
 use lnvps_db::{
-    AdminAction, AdminResource, AdminRole, IpRangeAllocationMode, NetworkAccessPolicy,
-    OsDistribution, PaymentMethod, RouterKind, SubscriptionPayment, SubscriptionType, VmHistory,
+    AdminAction, AdminResource, AdminRole, IpRangeAllocationMode, LineItemType,
+    NetworkAccessPolicy, OsDistribution, PaymentMethod, RouterKind, SubscriptionPayment, VmHistory,
     VmHistoryActionType, VmHostKind,
 };
 
@@ -3921,7 +3921,7 @@ impl AdminCreateSubscriptionRequest {
 pub struct AdminSubscriptionLineItemInfo {
     pub id: u64,
     pub subscription_id: u64,
-    pub subscription_type: SubscriptionType,
+    pub subscription_type: LineItemType,
     pub name: String,
     pub description: Option<String>,
     pub amount: u64,
@@ -3937,7 +3937,7 @@ pub struct AdminSubscriptionLineItemInfo {
 #[derive(Deserialize)]
 pub struct AdminCreateSubscriptionLineItemRequest {
     pub subscription_id: u64,
-    pub subscription_type: SubscriptionType,
+    pub subscription_type: LineItemType,
     pub name: String,
     pub description: Option<String>,
     pub amount: u64,

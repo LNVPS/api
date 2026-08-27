@@ -2121,7 +2121,7 @@ async fn invoice_line_for_item(
 ) -> InvoiceLine {
     let duration = duration.map(|d| d.to_string());
     match item.subscription_type {
-        lnvps_db::SubscriptionType::Vps => {
+        lnvps_db::LineItemType::Vps => {
             let Ok(vm) = db.get_vm_by_line_item(item.id).await else {
                 return InvoiceLine {
                     description: item.name.clone(),
@@ -2159,7 +2159,7 @@ async fn first_vps_vm_id(
     line_items: &[lnvps_db::SubscriptionLineItem],
 ) -> Option<u64> {
     for item in line_items {
-        if item.subscription_type == lnvps_db::SubscriptionType::Vps
+        if item.subscription_type == lnvps_db::LineItemType::Vps
             && let Ok(vm) = db.get_vm_by_line_item(item.id).await
         {
             return Some(vm.id);
@@ -2194,7 +2194,7 @@ async fn v1_get_payment_invoice(
     // bill for a VPS, an IP range, a managed app, etc. Ownership, the selling
     // company and the invoice lines are all resolved from the subscription so
     // every line item type renders (previously this looked up
-    // `get_vm_by_subscription`, which only matches `SubscriptionType::Vps` and
+    // `get_vm_by_subscription`, which only matches `LineItemType::Vps` and
     // so failed with "VM not found" for every other subscription).
     let subscription = this
         .db
@@ -3225,7 +3225,7 @@ mod tests {
     async fn insert_line_item(
         mock: &lnvps_api_common::MockDb,
         id: u64,
-        subscription_type: lnvps_db::SubscriptionType,
+        subscription_type: lnvps_db::LineItemType,
         name: &str,
         description: Option<&str>,
     ) -> lnvps_db::SubscriptionLineItem {
@@ -3249,14 +3249,14 @@ mod tests {
     #[tokio::test]
     async fn test_invoice_line_for_app_line_item_renders_without_vm() {
         // Regression: invoice generation resolved the payment's VM via
-        // get_vm_by_subscription, which only matches SubscriptionType::Vps, so
+        // get_vm_by_subscription, which only matches LineItemType::Vps, so
         // every non-VPS subscription (managed app, IP range, ...) failed with
         // "VM not found". A non-VPS line must render from the line item itself.
         let mock = std::sync::Arc::new(lnvps_api_common::MockDb::default());
         let item = insert_line_item(
             &mock,
             77,
-            lnvps_db::SubscriptionType::App,
+            lnvps_db::LineItemType::App,
             "Managed App",
             Some("nostr relay"),
         )
@@ -3272,14 +3272,8 @@ mod tests {
     async fn test_invoice_line_for_non_vps_without_description() {
         // No line item description => bare name, no trailing separator.
         let mock = std::sync::Arc::new(lnvps_api_common::MockDb::default());
-        let item = insert_line_item(
-            &mock,
-            78,
-            lnvps_db::SubscriptionType::IpRange,
-            "IP Range",
-            None,
-        )
-        .await;
+        let item =
+            insert_line_item(&mock, 78, lnvps_db::LineItemType::IpRange, "IP Range", None).await;
         let db: Arc<dyn LNVpsDb> = mock;
 
         let line = invoice_line_for_item(&db, &item, false, None).await;
@@ -3298,7 +3292,7 @@ mod tests {
         let item = insert_line_item(
             &mock,
             1,
-            lnvps_db::SubscriptionType::Vps,
+            lnvps_db::LineItemType::Vps,
             "mock vm renewal",
             None,
         )
@@ -3350,14 +3344,8 @@ mod tests {
         // A VPS line whose VM row is gone must still render (degrades to the
         // line item name) instead of failing the whole invoice.
         let mock = std::sync::Arc::new(lnvps_api_common::MockDb::default());
-        let item = insert_line_item(
-            &mock,
-            91,
-            lnvps_db::SubscriptionType::Vps,
-            "orphaned vps",
-            None,
-        )
-        .await;
+        let item =
+            insert_line_item(&mock, 91, lnvps_db::LineItemType::Vps, "orphaned vps", None).await;
         let db: Arc<dyn LNVpsDb> = mock;
 
         let line = invoice_line_for_item(&db, &item, false, Some("1 month")).await;
@@ -3370,7 +3358,7 @@ mod tests {
     #[tokio::test]
     async fn test_first_vps_vm_id_none_for_non_vps_lines() {
         let mock = std::sync::Arc::new(lnvps_api_common::MockDb::default());
-        let item = insert_line_item(&mock, 92, lnvps_db::SubscriptionType::App, "App", None).await;
+        let item = insert_line_item(&mock, 92, lnvps_db::LineItemType::App, "App", None).await;
         let db: Arc<dyn LNVpsDb> = mock;
         assert_eq!(first_vps_vm_id(&db, &[item]).await, None);
     }

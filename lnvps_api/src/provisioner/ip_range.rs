@@ -493,7 +493,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use lnvps_api_common::{ChannelWorkCommander, MockDb, RegistryRef};
-    use lnvps_db::{LNVpsDbBase, PaymentMethod, SubscriptionPaymentType, SubscriptionType};
+    use lnvps_db::{LNVpsDbBase, LineItemType, PaymentMethod, SubscriptionPaymentType};
     use std::sync::Mutex as StdMutex;
 
     fn net(s: &str) -> IpNetwork {
@@ -656,7 +656,7 @@ mod tests {
         let li = SubscriptionLineItem {
             id: 500,
             subscription_id: 1,
-            subscription_type: SubscriptionType::IpRange,
+            subscription_type: LineItemType::IpRange,
             name: "IP Range".to_string(),
             description: None,
             amount: 1000,
@@ -843,7 +843,7 @@ mod tests {
         let li2 = SubscriptionLineItem {
             id: 501,
             subscription_id: 1,
-            subscription_type: SubscriptionType::IpRange,
+            subscription_type: LineItemType::IpRange,
             name: "no config".to_string(),
             description: None,
             amount: 1000,

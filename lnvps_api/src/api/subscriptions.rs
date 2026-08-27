@@ -11,7 +11,7 @@ use chrono::Utc;
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, Nip98Auth, PageQuery,
 };
-use lnvps_db::{IntervalType, Subscription, SubscriptionLineItem, SubscriptionType};
+use lnvps_db::{IntervalType, LineItemType, Subscription, SubscriptionLineItem};
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -256,7 +256,7 @@ async fn v1_create_subscription(
                     )),
                     pricing.price_per_month as u64,
                     pricing.setup_fee as u64,
-                    SubscriptionType::IpRange,
+                    LineItemType::IpRange,
                     Some(serde_json::json!({
                         "ip_space_pricing_id": pricing.id,
                         "available_ip_space_id": ip_space.id,

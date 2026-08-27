@@ -1667,7 +1667,7 @@ mod tests {
                 SubscriptionLineItem {
                     id,
                     subscription_id: id,
-                    subscription_type: lnvps_db::SubscriptionType::App,
+                    subscription_type: lnvps_db::LineItemType::App,
                     name: format!("app deployment {id}"),
                     description: None,
                     amount: 1000,

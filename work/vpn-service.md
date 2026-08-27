@@ -98,6 +98,10 @@ sale, and before any claim is made about what is or is not retained.
 
 ## Design decisions
 
+0. **There is no subscription type.** `subscription` has no column describing what is sold; the
+   discriminant is `subscription_line_item.subscription_type`, typed as `LineItemType`. That is
+   what lets one subscription carry a VM line item and a VPN line item on one renewal date and
+   one payment.
 1. **One `vpn_subscription` row per account, reused on resubscribe.** MySQL has no partial unique
    index, so a plain `UNIQUE (user_id)` would permanently block a returning customer. Reusing the
    row also means their existing device configs keep working after payment.
@@ -177,7 +181,7 @@ Notes:
   belongs where the request is handled: pick it up in increment 4.
 
 ### Increment 3 — billing  (next)
-- [ ] `SubscriptionType::Vpn` variant and Display/serde mappings
+- [ ] `LineItemType::Vpn` variant and Display/serde mappings
 - [ ] Purchase, renewal and expiry wiring; suspension disables the account's devices
 - [ ] Device-limit tier upgrade on the existing proration path
 - [ ] Unit tests

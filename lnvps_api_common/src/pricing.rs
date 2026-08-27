@@ -2155,7 +2155,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscription_cost_by_amount() -> Result<()> {
-        use lnvps_db::{Subscription, SubscriptionLineItem, SubscriptionType};
+        use lnvps_db::{LineItemType, Subscription, SubscriptionLineItem};
 
         let db = MockDb::default();
         let rates = Arc::new(MockExchangeRate::new());
@@ -2184,7 +2184,7 @@ mod tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::IpRange,
+                    subscription_type: LineItemType::IpRange,
                     name: "ip".to_string(),
                     description: None,
                     amount: 1000, // €10.00 / month
@@ -2228,7 +2228,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscription_cost_by_amount_treats_input_as_gross() -> Result<()> {
-        use lnvps_db::{Subscription, SubscriptionLineItem, SubscriptionType};
+        use lnvps_db::{LineItemType, Subscription, SubscriptionLineItem};
 
         let db = MockDb::default();
         let rates = Arc::new(MockExchangeRate::new());
@@ -2264,7 +2264,7 @@ mod tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::IpRange,
+                    subscription_type: LineItemType::IpRange,
                     name: "ip".to_string(),
                     description: None,
                     amount: 1000,
@@ -4525,7 +4525,7 @@ mod tests {
                 lnvps_db::SubscriptionLineItem {
                     id: 1,
                     subscription_id: 1,
-                    subscription_type: lnvps_db::SubscriptionType::App,
+                    subscription_type: lnvps_db::LineItemType::App,
                     name: "relay".to_string(),
                     description: None,
                     amount: 1000 * multiplier as u64,

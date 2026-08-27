@@ -2,8 +2,7 @@
 
 use lnvps_api_common::MockDb;
 use lnvps_db::{
-    IntervalType, Router, RouterKind, Subscription, SubscriptionLineItem, SubscriptionType,
-    TunnelPool,
+    IntervalType, LineItemType, Router, RouterKind, Subscription, SubscriptionLineItem, TunnelPool,
 };
 
 use super::*;
@@ -60,7 +59,7 @@ async fn a_plan_with(
             vec![SubscriptionLineItem {
                 id: 0,
                 subscription_id: 0,
-                subscription_type: SubscriptionType::Vps,
+                subscription_type: LineItemType::Vps,
                 name: "vpn".to_string(),
                 description: None,
                 amount: 500,

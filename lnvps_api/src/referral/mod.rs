@@ -1441,8 +1441,8 @@ mod tests {
     /// than one currency.
     async fn add_referred_payment(db: &MockDb, id: u64, code: &str, currency: &str, amount: u64) {
         use lnvps_db::{
-            EncryptedString, PaymentMethod, SubscriptionLineItem, SubscriptionPayment,
-            SubscriptionPaymentType, SubscriptionType,
+            EncryptedString, LineItemType, PaymentMethod, SubscriptionLineItem,
+            SubscriptionPayment, SubscriptionPaymentType,
         };
 
         db.vms.lock().await.insert(
@@ -1459,7 +1459,7 @@ mod tests {
             SubscriptionLineItem {
                 id,
                 subscription_id: id,
-                subscription_type: SubscriptionType::Vps,
+                subscription_type: LineItemType::Vps,
                 name: "vm".to_string(),
                 description: None,
                 amount,

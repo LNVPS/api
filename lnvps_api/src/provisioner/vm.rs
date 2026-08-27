@@ -14,9 +14,9 @@ use lnvps_api_common::{
 };
 use lnvps_api_common::{ExchangeRateService, op_fatal};
 use lnvps_db::{
-    CpuArch, IntervalType, IpRange, IpRangeAllocationMode, LNVpsDb, PaymentMethod, PaymentType,
-    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
-    SubscriptionType, Vm, VmCustomTemplate, VmIpAssignment, VmTemplate,
+    CpuArch, IntervalType, IpRange, IpRangeAllocationMode, LNVpsDb, LineItemType, PaymentMethod,
+    PaymentType, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
+    Vm, VmCustomTemplate, VmIpAssignment, VmTemplate,
 };
 
 /// Ensure an OS image's CPU architecture is compatible with the target
@@ -196,7 +196,7 @@ impl VmProvisioner {
         let line_item = SubscriptionLineItem {
             id: 0,
             subscription_id: 0,
-            subscription_type: SubscriptionType::Vps,
+            subscription_type: LineItemType::Vps,
             name: template.name.clone(),
             description: None,
             amount: cost_plan.amount,
@@ -331,7 +331,7 @@ impl VmProvisioner {
         let line_item = SubscriptionLineItem {
             id: 0,
             subscription_id: 0,
-            subscription_type: SubscriptionType::Vps,
+            subscription_type: LineItemType::Vps,
             name: pricing.name.clone(),
             description: None,
             // Recorded base monthly amount; the exact charge is recomputed from
@@ -513,7 +513,7 @@ impl VmProvisioner {
         let line_item = SubscriptionLineItem {
             id: 0,
             subscription_id: 0,
-            subscription_type: SubscriptionType::Vps,
+            subscription_type: LineItemType::Vps,
             name: pricing.name.clone(),
             description: None,
             amount: 0,
@@ -916,7 +916,7 @@ impl VmProvisioner {
         // Update the line item: mark as VmRenewal (no longer VmUpgrade), store the new config,
         // and update the renewal amount to the new template's base-currency cost.
         let mut updated_line_item = line_item;
-        updated_line_item.subscription_type = SubscriptionType::Vps;
+        updated_line_item.subscription_type = LineItemType::Vps;
         updated_line_item.configuration = Some(serde_json::to_value(cfg)?);
         updated_line_item.amount = new_price.total();
         self.db
@@ -1656,7 +1656,7 @@ mod tests {
                 vec![lnvps_db::SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: lnvps_db::SubscriptionType::Vps,
+                    subscription_type: lnvps_db::LineItemType::Vps,
                     name: "test item".to_string(),
                     description: None,
                     amount: 1000,
@@ -2370,7 +2370,7 @@ mod tests {
         let line_item = db
             .get_subscription_line_item(vm.subscription_line_item_id)
             .await?;
-        assert_eq!(line_item.subscription_type, lnvps_db::SubscriptionType::Vps);
+        assert_eq!(line_item.subscription_type, lnvps_db::LineItemType::Vps);
 
         // Subscription must exist and have interval from cost_plan
         let sub = db.get_subscription(line_item.subscription_id).await?;
@@ -2415,7 +2415,7 @@ mod tests {
         let line_item = db
             .get_subscription_line_item(vm.subscription_line_item_id)
             .await?;
-        assert_eq!(line_item.subscription_type, lnvps_db::SubscriptionType::Vps);
+        assert_eq!(line_item.subscription_type, lnvps_db::LineItemType::Vps);
         // Regression: the recorded line item amount must reflect the base monthly
         // cost of the custom template, not zero.
         assert!(

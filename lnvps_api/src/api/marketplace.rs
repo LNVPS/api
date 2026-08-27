@@ -22,8 +22,8 @@ use lnvps_api_common::{
     issue_node_token, session_auth_enabled,
 };
 use lnvps_db::{
-    IntervalType, MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator,
-    MarketplaceTrustTier, Subscription, SubscriptionLineItem, SubscriptionType,
+    IntervalType, LineItemType, MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator,
+    MarketplaceTrustTier, Subscription, SubscriptionLineItem,
 };
 
 use crate::api::RouterState;
@@ -478,7 +478,7 @@ pub(crate) async fn start_node_fee(
     let line_item = SubscriptionLineItem {
         id: 0,
         subscription_id: 0,
-        subscription_type: SubscriptionType::MarketplaceNodeFee,
+        subscription_type: LineItemType::MarketplaceNodeFee,
         name: format!("Node listing fee: {}", node.name),
         description: None,
         amount: 0,
@@ -882,10 +882,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].amount, 0, "listing fee must not bill recurring");
         assert_eq!(items[0].setup_amount, 5000);
-        assert_eq!(
-            items[0].subscription_type,
-            SubscriptionType::MarketplaceNodeFee
-        );
+        assert_eq!(items[0].subscription_type, LineItemType::MarketplaceNodeFee);
 
         let sub = db.get_subscription(fee.subscription_id).await.unwrap();
         assert_eq!(sub.expires, None);

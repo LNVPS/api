@@ -104,8 +104,8 @@ mod tests {
     use chrono::Utc;
     use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, WorkJob};
     use lnvps_db::{
-        IntervalType, LNVpsDbBase, Subscription, SubscriptionLineItem, SubscriptionPayment,
-        SubscriptionPaymentType, SubscriptionType, Vm,
+        IntervalType, LNVpsDbBase, LineItemType, Subscription, SubscriptionLineItem,
+        SubscriptionPayment, SubscriptionPaymentType, Vm,
     };
     use std::sync::Arc;
 
@@ -159,7 +159,7 @@ mod tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::Vps,
+                    subscription_type: LineItemType::Vps,
                     name: "vm renewal".to_string(),
                     description: None,
                     amount: 1000,
@@ -335,7 +335,7 @@ mod tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::IpRange,
+                    subscription_type: LineItemType::IpRange,
                     name: "ip range".to_string(),
                     description: None,
                     amount: 500,
@@ -474,7 +474,7 @@ mod tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::Vps,
+                    subscription_type: LineItemType::Vps,
                     name: "vm1 renewal".to_string(),
                     description: None,
                     amount: 1000,
@@ -506,7 +506,7 @@ mod tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::Vps,
+                    subscription_type: LineItemType::Vps,
                     name: "vm2 renewal".to_string(),
                     description: None,
                     amount: 1000,

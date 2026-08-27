@@ -16,8 +16,8 @@ use lnvps_api_common::{
     retry::{OpError, Pipeline, RetryPolicy},
 };
 use lnvps_db::{
-    BulkMessageTarget, CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, PaymentMethod,
-    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionType,
+    BulkMessageTarget, CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, LineItemType,
+    PaymentMethod, RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
     Vm, VmHistoryActionType, VmHost, VmHostKind, VmIpAssignment, VmOsImage,
 };
 use log::{debug, error, info, warn};
@@ -616,7 +616,7 @@ impl Worker {
         };
         let mut has_vps = false;
         for li in line_items {
-            if li.subscription_type != SubscriptionType::Vps {
+            if li.subscription_type != LineItemType::Vps {
                 continue;
             }
             has_vps = true;
@@ -648,7 +648,7 @@ impl Worker {
     ) -> String {
         if line_items
             .iter()
-            .all(|l| l.subscription_type == SubscriptionType::Vps)
+            .all(|l| l.subscription_type == LineItemType::Vps)
         {
             if let Ok(vm) = self.db.get_vm_by_subscription(sub.id).await {
                 return format!("VM{}", vm.id);
@@ -4591,7 +4591,7 @@ mod tests {
     use crate::subscription::SubscriptionHandler;
     use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate};
     use lnvps_db::{
-        LNVpsDbBase, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionType,
+        LNVpsDbBase, LineItemType, Subscription, SubscriptionLineItem, SubscriptionPayment,
         UserSshKey, Vm,
     };
 
@@ -5060,7 +5060,7 @@ mod tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::Vps,
+                    subscription_type: LineItemType::Vps,
                     name: "test item".to_string(),
                     description: None,
                     amount: 1000,

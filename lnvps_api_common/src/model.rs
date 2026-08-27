@@ -7,9 +7,9 @@ use chrono::{DateTime, Days, NaiveDate, Utc};
 use futures::future::join_all;
 use ipnetwork::IpNetwork;
 use lnvps_db::{
-    CpuArch, CpuFeature, CpuMfg, IpRange, LNVpsDb, LNVpsDbBase, Region, Subscription,
-    SubscriptionLineItem, SubscriptionType, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
-    VmCustomTemplate, VmHost, VmTemplate,
+    CpuArch, CpuFeature, CpuMfg, IpRange, LNVpsDb, LNVpsDbBase, LineItemType, Region, Subscription,
+    SubscriptionLineItem, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmHost, VmTemplate,
 };
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::{Deserialize, Serialize};
@@ -1100,7 +1100,7 @@ pub struct ApiCustomTemplateDiskParam {
 
 /// Typed reference to the resource a subscription line item bills for.
 ///
-/// This is resolved from the line item's [`SubscriptionType`] discriminant by
+/// This is resolved from the line item's [`LineItemType`] discriminant by
 /// looking up the back-reference tables (`vm.subscription_line_item_id`,
 /// `ip_range_subscription.subscription_line_item_id`, ...). It is NOT derived
 /// from the line item's `configuration` column, which stores upgrade data only.
@@ -1140,7 +1140,7 @@ impl ApiSubscriptionLineItemResource {
         db: &D,
         line_items: &[SubscriptionLineItem],
     ) -> HashMap<u64, Self> {
-        let ids_of = |t: SubscriptionType| -> Vec<u64> {
+        let ids_of = |t: LineItemType| -> Vec<u64> {
             line_items
                 .iter()
                 .filter(|li| li.subscription_type == t)
@@ -1149,14 +1149,14 @@ impl ApiSubscriptionLineItemResource {
         };
         let mut out = HashMap::new();
 
-        let vps = ids_of(SubscriptionType::Vps);
+        let vps = ids_of(LineItemType::Vps);
         if !vps.is_empty() {
             for vm in db.list_vms_by_line_items(&vps).await.unwrap_or_default() {
                 out.insert(vm.subscription_line_item_id, Self::Vps { vm_id: vm.id });
             }
         }
 
-        let ip_ranges = ids_of(SubscriptionType::IpRange);
+        let ip_ranges = ids_of(LineItemType::IpRange);
         if !ip_ranges.is_empty() {
             for sub in db
                 .list_ip_range_subscriptions_by_line_items(&ip_ranges)
@@ -1170,7 +1170,7 @@ impl ApiSubscriptionLineItemResource {
             }
         }
 
-        let asns = ids_of(SubscriptionType::AsnSponsoring);
+        let asns = ids_of(LineItemType::AsnSponsoring);
         if !asns.is_empty() {
             for sub in db
                 .list_asn_subscriptions_by_line_items(&asns)
@@ -1184,7 +1184,7 @@ impl ApiSubscriptionLineItemResource {
             }
         }
 
-        let apps = ids_of(SubscriptionType::App);
+        let apps = ids_of(LineItemType::App);
         if !apps.is_empty() {
             for d in db
                 .list_app_deployments_by_line_items(&apps)
@@ -1197,7 +1197,7 @@ impl ApiSubscriptionLineItemResource {
             }
         }
 
-        let nodes = ids_of(SubscriptionType::MarketplaceNodeFee);
+        let nodes = ids_of(LineItemType::MarketplaceNodeFee);
         if !nodes.is_empty() {
             for n in db
                 .list_marketplace_nodes_by_line_items(&nodes)
@@ -1220,12 +1220,12 @@ impl ApiSubscriptionLineItemResource {
         line_item: &SubscriptionLineItem,
     ) -> Option<Self> {
         match line_item.subscription_type {
-            SubscriptionType::Vps => db
+            LineItemType::Vps => db
                 .get_vm_by_line_item(line_item.id)
                 .await
                 .ok()
                 .map(|vm| Self::Vps { vm_id: vm.id }),
-            SubscriptionType::IpRange => db
+            LineItemType::IpRange => db
                 .list_ip_range_subscriptions_by_line_item(line_item.id)
                 .await
                 .ok()
@@ -1233,7 +1233,7 @@ impl ApiSubscriptionLineItemResource {
                 .map(|sub| Self::IpRange {
                     ip_range_subscription_id: sub.id,
                 }),
-            SubscriptionType::AsnSponsoring => db
+            LineItemType::AsnSponsoring => db
                 .list_asn_subscriptions_by_line_item(line_item.id)
                 .await
                 .ok()
@@ -1241,21 +1241,21 @@ impl ApiSubscriptionLineItemResource {
                 .map(|sub| Self::Asn {
                     asn_subscription_id: sub.id,
                 }),
-            SubscriptionType::App => db
+            LineItemType::App => db
                 .get_app_deployment_by_line_item(line_item.id)
                 .await
                 .ok()
                 .map(|d| Self::App {
                     app_deployment_id: d.id,
                 }),
-            SubscriptionType::MarketplaceNodeFee => db
+            LineItemType::MarketplaceNodeFee => db
                 .get_marketplace_node_by_line_item(line_item.id)
                 .await
                 .ok()
                 .map(|n| Self::MarketplaceNode {
                     marketplace_node_id: n.id,
                 }),
-            SubscriptionType::DnsHosting => None,
+            LineItemType::DnsHosting => None,
         }
     }
 }
@@ -1294,17 +1294,17 @@ mod tests {
             .await
             .unwrap();
 
-        let mut ids: Vec<(SubscriptionType, u64)> = Vec::new();
-        let id_of = |ids: &[(SubscriptionType, u64)], t: SubscriptionType| -> u64 {
+        let mut ids: Vec<(LineItemType, u64)> = Vec::new();
+        let id_of = |ids: &[(LineItemType, u64)], t: LineItemType| -> u64 {
             ids.iter().find(|(k, _)| *k == t).unwrap().1
         };
         for t in [
-            SubscriptionType::Vps,
-            SubscriptionType::IpRange,
-            SubscriptionType::AsnSponsoring,
-            SubscriptionType::App,
-            SubscriptionType::MarketplaceNodeFee,
-            SubscriptionType::DnsHosting,
+            LineItemType::Vps,
+            LineItemType::IpRange,
+            LineItemType::AsnSponsoring,
+            LineItemType::App,
+            LineItemType::MarketplaceNodeFee,
+            LineItemType::DnsHosting,
         ] {
             let id = db
                 .insert_subscription_line_item(&SubscriptionLineItem {
@@ -1327,7 +1327,7 @@ mod tests {
         let mut vm = MockDb::mock_vm();
         vm.user_id = user_id;
         vm.ssh_key_id = None;
-        vm.subscription_line_item_id = id_of(&ids, SubscriptionType::Vps);
+        vm.subscription_line_item_id = id_of(&ids, LineItemType::Vps);
         let vm_id = db.insert_vm(&vm).await.unwrap();
 
         let line_items = db
@@ -1338,15 +1338,15 @@ mod tests {
 
         let resolved = ApiSubscriptionLineItemResource::resolve_many(&db, &line_items).await;
         assert_eq!(
-            resolved.get(&id_of(&ids, SubscriptionType::Vps)),
+            resolved.get(&id_of(&ids, LineItemType::Vps)),
             Some(&ApiSubscriptionLineItemResource::Vps { vm_id })
         );
         for t in [
-            SubscriptionType::IpRange,
-            SubscriptionType::AsnSponsoring,
-            SubscriptionType::App,
-            SubscriptionType::MarketplaceNodeFee,
-            SubscriptionType::DnsHosting,
+            LineItemType::IpRange,
+            LineItemType::AsnSponsoring,
+            LineItemType::App,
+            LineItemType::MarketplaceNodeFee,
+            LineItemType::DnsHosting,
         ] {
             assert!(
                 !resolved.contains_key(&id_of(&ids, t)),

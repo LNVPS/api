@@ -21,8 +21,8 @@ use lnvps_api_common::{
     WorkCommander, round_msat_to_sat,
 };
 use lnvps_db::{
-    LNVpsDb, PaymentMethod, RenewalSource, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentType, SubscriptionType, User, UserPaymentMethod,
+    LNVpsDb, LineItemType, PaymentMethod, RenewalSource, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionPaymentType, User, UserPaymentMethod,
 };
 use log::{debug, info, warn};
 use payments_rs::currency::{Currency, CurrencyAmount};
@@ -255,7 +255,7 @@ impl SubscriptionHandler {
         li: &SubscriptionLineItem,
     ) -> Result<Box<dyn SubscriptionLineItemHandler>> {
         match li.subscription_type {
-            SubscriptionType::Vps => {
+            LineItemType::Vps => {
                 let vm = self.db.get_vm_by_line_item(li.id).await?;
                 Ok(Box::new(
                     VmLineItemHandler::new(
@@ -268,25 +268,25 @@ impl SubscriptionHandler {
                     .await?,
                 ))
             }
-            SubscriptionType::IpRange => Ok(Box::new(IpRangeLineItemHandler::new(
+            LineItemType::IpRange => Ok(Box::new(IpRangeLineItemHandler::new(
                 self.ip_range_provisioner.clone(),
                 li.id,
             ))),
-            SubscriptionType::MarketplaceNodeFee => Ok(Box::new(
+            LineItemType::MarketplaceNodeFee => Ok(Box::new(
                 marketplace_node_fee::MarketplaceNodeFeeLineItemHandler::new(li.id),
             )),
-            SubscriptionType::App => Ok(Box::new(AppLineItemHandler::new(
+            LineItemType::App => Ok(Box::new(AppLineItemHandler::new(
                 self.db.clone(),
                 li.id,
                 self.tx.clone(),
             ))),
-            // Exhaustive on purpose (no catch-all): adding a new SubscriptionType
+            // Exhaustive on purpose (no catch-all): adding a new LineItemType
             // must fail to compile until a handler is wired here, rather than
             // silently falling through. These variants have no ordering flow yet,
             // so reaching this is a wiring bug — fail loud instead of a swallowed
             // Err (the callers only `warn!` on Err, which is how a missing App
             // handler previously went unnoticed).
-            t @ (SubscriptionType::AsnSponsoring | SubscriptionType::DnsHosting) => {
+            t @ (LineItemType::AsnSponsoring | LineItemType::DnsHosting) => {
                 panic!("no subscription line item handler implemented for {t:?}")
             }
         }
@@ -761,7 +761,7 @@ impl SubscriptionHandler {
         let mut non_vm_interval_cost: u64 = 0;
 
         for item in &line_items {
-            if item.subscription_type == SubscriptionType::Vps {
+            if item.subscription_type == LineItemType::Vps {
                 let vm = self.db.get_vm_by_line_item(item.id).await?;
                 // Block renewals on a host that is being sunset once the VM's
                 // current expiry has reached the sunset date. Users can renew
@@ -1997,7 +1997,7 @@ mod revolut_autorenew_tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::IpRange,
+                    subscription_type: LineItemType::IpRange,
                     name: "hosting".to_string(),
                     description: None,
                     amount: 999, // €9.99
@@ -2165,7 +2165,7 @@ pub(crate) mod revolut_offline_tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::IpRange,
+                    subscription_type: LineItemType::IpRange,
                     name: "hosting".to_string(),
                     description: None,
                     amount: 999,
@@ -2242,7 +2242,7 @@ pub(crate) mod revolut_offline_tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::IpRange,
+                    subscription_type: LineItemType::IpRange,
                     name: "hosting".to_string(),
                     description: None,
                     amount: 100_000,
@@ -2320,7 +2320,7 @@ pub(crate) mod revolut_offline_tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::App,
+                    subscription_type: LineItemType::App,
                     name: "relay".to_string(),
                     description: None,
                     amount: 100, // 1.00 EUR
@@ -2395,7 +2395,7 @@ pub(crate) mod revolut_offline_tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::IpRange,
+                    subscription_type: LineItemType::IpRange,
                     name: "hosting".to_string(),
                     description: None,
                     amount: 100_000,
@@ -2690,8 +2690,8 @@ mod sunset_tests {
     use crate::settings::mock_settings;
     use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VmStateCache};
     use lnvps_db::{
-        IntervalType, LNVpsDbBase, PaymentMethod, Subscription, SubscriptionLineItem,
-        SubscriptionType, Vm,
+        IntervalType, LNVpsDbBase, LineItemType, PaymentMethod, Subscription, SubscriptionLineItem,
+        Vm,
     };
 
     /// Build a VPS subscription + VM on host 1, then mark host 1 as sunset in the
@@ -2722,7 +2722,7 @@ mod sunset_tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::Vps,
+                    subscription_type: LineItemType::Vps,
                     name: "vm renewal".to_string(),
                     description: None,
                     amount: 1000,
@@ -2864,7 +2864,7 @@ mod discount_tests {
     use crate::mocks::{MockNode, MockOnChainProvider};
     use crate::settings::mock_settings;
     use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VmStateCache};
-    use lnvps_db::{Discount, IntervalType, LNVpsDbBase, SubscriptionType};
+    use lnvps_db::{Discount, IntervalType, LNVpsDbBase, LineItemType};
 
     /// A 10.00 EUR/month subscription, paid in EUR (Revolut) so the amounts in
     /// these tests are cents and not exchange-rate dependent.
@@ -2893,7 +2893,7 @@ mod discount_tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::IpRange,
+                    subscription_type: LineItemType::IpRange,
                     name: "hosting".to_string(),
                     description: None,
                     amount: 1_000,
