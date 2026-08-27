@@ -261,6 +261,8 @@ impl ApiApp {
 pub struct ApiAppRegion {
     pub id: u64,
     pub name: String,
+    /// ISO 3166-1 alpha-2 country code of the region's location, if known
+    pub country_code: Option<String>,
     /// Whether a cluster in this region currently has enough free capacity for
     /// this app. `false` regions can be shown-but-disabled in the picker.
     pub available: bool,
@@ -562,6 +564,7 @@ async fn v1_list_app_regions(
             out.push(ApiAppRegion {
                 id: region.id,
                 name: region.name,
+                country_code: region.country_code,
                 available: r.available,
                 ingress_domain: r.ingress_domain,
             });

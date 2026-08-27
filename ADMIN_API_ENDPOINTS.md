@@ -1791,7 +1791,7 @@ Query Parameters:
 Required Permission: `hosts::view`
 
 Returns paginated list of VM host regions with configuration details, host counts, and statistics (only active VMs are
-counted).
+counted). Each region carries `country_code` (ISO 3166-1 alpha-2, or `null` if not set).
 
 #### Get Region Details
 
@@ -1816,9 +1816,12 @@ Body:
 ```json
 {
   "name": "string",
-  "company_id": "number | null"
+  "company_id": "number | null",
+  "country_code": "string | null"
 }
 ```
+
+`country_code` is an ISO 3166-1 alpha-2 code (e.g. `"NL"`), case-insensitive and stored upper-case. Anything other than two letters is rejected.
 
 #### Update Region Configuration
 
@@ -1834,9 +1837,12 @@ Body parameters (all optional):
 {
   "name": "string",
   "enabled": boolean,
-  "company_id": "number | null"
+  "company_id": "number | null",
+  "country_code": "string | null"
 }
 ```
+
+Send `country_code` as an empty string to clear it.
 
 #### Delete Region
 

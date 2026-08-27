@@ -402,6 +402,7 @@ interface CustomVmPrice {
 interface VmHostRegion {
   id: number;
   name: string;
+  country_code: string | null; // ISO 3166-1 alpha-2, e.g. "NL". Render the flag/country from this rather than parsing the name
   company_id: number; // Seller company id; match against account.tax[].company_id for the applicable VAT rate
 }
 ```
@@ -1603,7 +1604,7 @@ The catalog + read endpoints below are unauthenticated-safe views of what you ca
 #### List Deployable Regions for an App
 - **GET** `/api/v1/apps/{id}/regions`
 - **Auth**: None (public)
-- **Response**: `{ id: number, name: string, available: boolean, ingress_domain: string }[]`
+- **Response**: `{ id: number, name: string, country_code: string | null, available: boolean, ingress_domain: string }[]`
   — every region with an enabled app cluster. `available` is `true` when a
   cluster there currently has enough free capacity for this app; `false` regions
   can be shown-but-disabled in a deploy-form region picker. `ingress_domain` is

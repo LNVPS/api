@@ -860,7 +860,7 @@ mod tests {
             })
             .await
             .unwrap();
-        db.admin_create_region("other", true, company_id)
+        db.admin_create_region("other", true, company_id, None)
             .await
             .unwrap()
     }

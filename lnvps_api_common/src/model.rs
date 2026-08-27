@@ -169,6 +169,7 @@ impl ApiVmTemplate {
             region: ApiVmHostRegion {
                 id: region.id,
                 name: region.name,
+                country_code: region.country_code,
                 company_id: region.company_id,
             },
             ip4_count: template.ip4_count,
@@ -235,6 +236,7 @@ impl ApiVmTemplate {
             region: ApiVmHostRegion {
                 id: region.id,
                 name: region.name.clone(),
+                country_code: region.country_code.clone(),
                 company_id: region.company_id,
             },
             ip4_count: template.ip4_count,
@@ -762,6 +764,9 @@ pub struct ApiVmCostPlan {
 pub struct ApiVmHostRegion {
     pub id: u64,
     pub name: String,
+    /// ISO 3166-1 alpha-2 country code of the region's location, if known.
+    /// Clients should render the flag/country from this instead of parsing the name.
+    pub country_code: Option<String>,
     /// Seller company id for this region; use with the account `tax` info to
     /// determine the VAT rate that applies to payments for VMs in this region.
     pub company_id: u64,
@@ -1043,6 +1048,7 @@ impl ApiCustomTemplateParams {
             region: ApiVmHostRegion {
                 id: region.id,
                 name: region.name.clone(),
+                country_code: region.country_code.clone(),
                 company_id: region.company_id,
             },
             cpu_features: pricing

@@ -272,6 +272,7 @@ impl Default for MockDb {
                 name: "Mock".to_string(),
                 enabled: true,
                 company_id: 1, // Link to default company
+                country_code: Some("IE".to_string()),
             },
         );
         // Default mock DNS server (forward records via the shared MockDnsServer).
@@ -5638,6 +5639,7 @@ impl lnvps_db::AdminDb for MockDb {
         name: &str,
         enabled: bool,
         company_id: u64,
+        country_code: Option<&str>,
     ) -> DbResult<u64> {
         // A real insert, not a stubbed `Ok(1)`: anything that derives a
         // company from a region — marketplace listing fees, IP space pricing —
@@ -5655,11 +5657,16 @@ impl lnvps_db::AdminDb for MockDb {
                 name: name.to_string(),
                 enabled,
                 company_id,
+                country_code: country_code.map(|c| c.to_string()),
             },
         );
         Ok(id)
     }
-    async fn admin_update_region(&self, _region: &Region) -> DbResult<()> {
+    async fn admin_update_region(&self, region: &Region) -> DbResult<()> {
+        let mut regions = self.regions.lock().await;
+        if let Some(r) = regions.get_mut(&region.id) {
+            *r = region.clone();
+        }
         Ok(())
     }
     async fn admin_delete_region(&self, _region_id: u64) -> DbResult<()> {
@@ -5782,6 +5789,7 @@ impl lnvps_db::AdminDb for MockDb {
                 region_name: region.name,
                 region_enabled: region.enabled,
                 region_company_id: region.company_id,
+                region_country_code: region.country_code,
                 disks,
                 active_vm_count: active_vm_count as _,
             };

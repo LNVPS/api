@@ -676,6 +676,8 @@ pub struct Region {
     pub name: String,
     pub enabled: bool,
     pub company_id: u64,
+    /// ISO 3166-1 alpha-2 country code of the region's location, if known
+    pub country_code: Option<String>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
@@ -759,6 +761,8 @@ pub struct AdminVmHost {
     pub region_enabled: bool,
     #[sqlx(rename = "region_company_id")]
     pub region_company_id: u64,
+    #[sqlx(rename = "region_country_code")]
+    pub region_country_code: Option<String>,
 
     // Disk information (populated separately, not from SQL)
     #[sqlx(skip)]

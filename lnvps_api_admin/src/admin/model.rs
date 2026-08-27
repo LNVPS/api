@@ -1237,6 +1237,8 @@ pub struct AdminHostRegion {
     pub id: u64,
     pub name: String,
     pub enabled: bool,
+    /// ISO 3166-1 alpha-2 country code of the region's location, if known
+    pub country_code: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1304,6 +1306,8 @@ pub struct AdminRegionInfo {
     pub name: String,
     pub enabled: bool,
     pub company_id: u64,
+    /// ISO 3166-1 alpha-2 country code of the region's location, if known
+    pub country_code: Option<String>,
     pub host_count: u64,
     pub total_vms: u64,
     pub total_cpu_cores: u64,
@@ -1324,6 +1328,8 @@ pub struct CreateRegionRequest {
     pub name: String,
     pub enabled: bool,
     pub company_id: u64,
+    /// ISO 3166-1 alpha-2 country code, e.g. "NL". Case-insensitive.
+    pub country_code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1331,6 +1337,9 @@ pub struct UpdateRegionRequest {
     pub name: Option<String>,
     pub enabled: Option<bool>,
     pub company_id: Option<u64>,
+    /// ISO 3166-1 alpha-2 country code, e.g. "NL". Case-insensitive. Send an
+    /// empty string to clear it.
+    pub country_code: Option<String>,
 }
 
 impl AdminHostInfo {
@@ -1344,6 +1353,7 @@ impl AdminHostInfo {
                 id: region.id,
                 name: region.name,
                 enabled: region.enabled,
+                country_code: region.country_code,
             },
             ip: host.ip,
             cpu: host.cpu,
@@ -1397,6 +1407,7 @@ impl AdminHostInfo {
                 id: region.id,
                 name: region.name,
                 enabled: region.enabled,
+                country_code: region.country_code,
             },
             ip: host.ip,
             cpu: host.cpu,
@@ -1451,6 +1462,7 @@ impl AdminHostInfo {
                 id: region.id,
                 name: region.name,
                 enabled: region.enabled,
+                country_code: region.country_code,
             },
             ip: capacity.host.ip.clone(),
             cpu: capacity.host.cpu,
@@ -1510,6 +1522,7 @@ impl AdminHostInfo {
                 id: admin_host.region_id,
                 name: admin_host.region_name,
                 enabled: admin_host.region_enabled,
+                country_code: admin_host.region_country_code,
             },
             ip: admin_host.host.ip.clone(),
             cpu: admin_host.host.cpu,
@@ -1575,6 +1588,7 @@ impl AdminHostInfo {
                         id: admin_host.region_id,
                         name: admin_host.region_name,
                         enabled: admin_host.region_enabled,
+                        country_code: admin_host.region_country_code,
                     },
                     ip: capacity.host.ip.clone(),
                     cpu: capacity.host.cpu,

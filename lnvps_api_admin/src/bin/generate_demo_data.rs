@@ -217,27 +217,33 @@ async fn create_companies(db: &LNVpsDbMysql) -> Result<Vec<Company>> {
 
 async fn create_regions(db: &LNVpsDbMysql, companies: &[Company]) -> Result<Vec<Region>> {
     let regions_data = vec![
-        ("US-East-1 (Virginia)", companies[0].id),
-        ("US-West-1 (California)", companies[0].id),
-        ("EU-Central-1 (Frankfurt)", companies[1].id),
-        ("EU-West-1 (London)", companies[1].id),
-        ("Asia-Pacific-1 (Singapore)", companies[2].id),
-        ("Canada-Central-1 (Toronto)", companies[0].id),
-        ("US-Central-1 (Chicago)", companies[0].id),
-        ("EU-North-1 (Stockholm)", companies[2].id),
+        ("US-East-1 (Virginia)", companies[0].id, "US"),
+        ("US-West-1 (California)", companies[0].id, "US"),
+        ("EU-Central-1 (Frankfurt)", companies[1].id, "DE"),
+        ("EU-West-1 (London)", companies[1].id, "GB"),
+        ("Asia-Pacific-1 (Singapore)", companies[2].id, "SG"),
+        ("Canada-Central-1 (Toronto)", companies[0].id, "CA"),
+        ("US-Central-1 (Chicago)", companies[0].id, "US"),
+        ("EU-North-1 (Stockholm)", companies[2].id, "SE"),
     ];
 
     let mut regions = Vec::new();
-    for (name, company_id) in regions_data {
+    for (name, company_id, country_code) in regions_data {
         let region = Region {
             id: 0, // Will be auto-generated
             name: name.to_string(),
             enabled: true,
             company_id,
+            country_code: Some(country_code.to_string()),
         };
 
         let id = db
-            .admin_create_region(&region.name, region.enabled, region.company_id)
+            .admin_create_region(
+                &region.name,
+                region.enabled,
+                region.company_id,
+                region.country_code.as_deref(),
+            )
             .await?;
 
         let mut created_region = region;

@@ -93,6 +93,7 @@ async fn admin_get_host(
         region_id: region.id,
         region_name: region.name.clone(),
         region_enabled: region.enabled,
+        region_country_code: region.country_code.clone(),
         region_company_id: region.company_id,
         disks,
         active_vm_count: this.db.count_active_vms_on_host(id).await.unwrap_or(0) as _,
@@ -193,6 +194,7 @@ async fn admin_update_host(
         region_id: region.id,
         region_name: region.name.clone(),
         region_enabled: region.enabled,
+        region_country_code: region.country_code.clone(),
         region_company_id: region.company_id,
         disks,
         active_vm_count: this.db.count_active_vms_on_host(id).await.unwrap_or(0) as _,
@@ -282,6 +284,7 @@ async fn admin_create_host(
         region_id: region.id,
         region_name: region.name.clone(),
         region_enabled: region.enabled,
+        region_country_code: region.country_code.clone(),
         region_company_id: region.company_id,
         disks,
         active_vm_count: 0, // New host has no VMs

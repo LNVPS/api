@@ -1382,6 +1382,7 @@ mod tests {
             region: ApiVmHostRegion {
                 id: 1,
                 name: "test-region".to_string(),
+                country_code: Some("IE".to_string()),
                 company_id: 1,
             },
             cpu_features: vec![],

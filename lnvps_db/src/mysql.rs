@@ -755,7 +755,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
         // Get paginated results with region info
         let rows = sqlx::query(
-            "SELECT h.*, hr.id as region_id, hr.name as region_name, hr.enabled as region_enabled, hr.company_id as region_company_id 
+            "SELECT h.*, hr.id as region_id, hr.name as region_name, hr.enabled as region_enabled, hr.company_id as region_company_id, hr.country_code as region_country_code 
              FROM vm_host h, region hr 
              WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1 
              ORDER BY h.name LIMIT ? OFFSET ?"
@@ -796,6 +796,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 name: row.get("region_name"),
                 enabled: row.get("region_enabled"),
                 company_id: row.get("region_company_id"),
+                country_code: row.get("region_country_code"),
             };
 
             results.push((host, region));
@@ -6660,13 +6661,15 @@ impl AdminDb for LNVpsDbMysql {
         name: &str,
         enabled: bool,
         company_id: u64,
+        country_code: Option<&str>,
     ) -> DbResult<u64> {
         let id = sqlx::query_scalar::<_, u64>(
-            "INSERT INTO region (name, enabled, company_id) VALUES (?, ?, ?) RETURNING id",
+            "INSERT INTO region (name, enabled, company_id, country_code) VALUES (?, ?, ?, ?) RETURNING id",
         )
         .bind(name)
         .bind(enabled)
         .bind(company_id)
+        .bind(country_code)
         .fetch_one(&self.db)
         .await?;
 
@@ -6674,10 +6677,13 @@ impl AdminDb for LNVpsDbMysql {
     }
 
     async fn admin_update_region(&self, region: &Region) -> DbResult<()> {
-        sqlx::query("UPDATE region SET name = ?, enabled = ?, company_id = ? WHERE id = ?")
+        sqlx::query(
+            "UPDATE region SET name = ?, enabled = ?, company_id = ?, country_code = ? WHERE id = ?",
+        )
             .bind(&region.name)
             .bind(region.enabled)
             .bind(region.company_id)
+            .bind(region.country_code.as_deref())
             .bind(region.id)
             .execute(&self.db)
             .await?;
@@ -7003,6 +7009,7 @@ impl AdminDb for LNVpsDbMysql {
                     hr.name as region_name, 
                     hr.enabled as region_enabled, 
                     hr.company_id as region_company_id,
+                    hr.country_code as region_country_code,
                     COALESCE(vm_counts.active_vm_count, 0) as active_vm_count
              FROM vm_host h 
              JOIN region hr ON h.region_id = hr.id 

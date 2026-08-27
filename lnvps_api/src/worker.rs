@@ -6062,6 +6062,7 @@ mod tests {
                 name: "Mock".to_string(),
                 enabled: true,
                 company_id: 1,
+                country_code: Some("IE".to_string()),
             });
         }
         let keys = generate_wireguard_keypair()?;

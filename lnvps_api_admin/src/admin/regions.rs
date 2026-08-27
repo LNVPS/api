@@ -5,12 +5,31 @@ use anyhow::Result;
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
+use isocountry::CountryCode;
 use lnvps_api_common::{
     ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, IPRangeCapacity, PageQuery,
 };
 use lnvps_db::{AdminAction, AdminResource, LNVpsDb, Region};
 use serde::Serialize;
 use std::sync::Arc;
+
+/// Validate and normalise an ISO 3166-1 alpha-2 country code.
+///
+/// Accepts any case and surrounding whitespace, returning the upper-case form.
+/// An empty (or whitespace-only) input means "no country", i.e. clear the value.
+/// Note this is alpha-2 (what flag rendering needs), whereas `user.country_code`
+/// is alpha-3.
+fn normalize_country_code(input: &str) -> Result<Option<String>, &'static str> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    if CountryCode::for_alpha2(&upper).is_err() {
+        return Err("Invalid country code, expected ISO 3166-1 alpha-2 (e.g. \"NL\")");
+    }
+    Ok(Some(upper))
+}
 
 /// Build the API view of a region, including its resource and IP statistics.
 async fn region_info(db: &Arc<dyn LNVpsDb>, region: Region) -> Result<AdminRegionInfo> {
@@ -22,6 +41,7 @@ async fn region_info(db: &Arc<dyn LNVpsDb>, region: Region) -> Result<AdminRegio
         name: region.name,
         enabled: region.enabled,
         company_id: region.company_id,
+        country_code: region.country_code,
         host_count: stats.host_count,
         total_vms: stats.total_vms,
         total_cpu_cores: stats.total_cpu_cores,
@@ -120,9 +140,20 @@ async fn admin_create_region(
     // Check permission
     auth.require_permission(AdminResource::Hosts, AdminAction::Create)?;
 
+    let country_code = match req.country_code.as_deref().map(normalize_country_code) {
+        Some(Ok(cc)) => cc,
+        Some(Err(err)) => return ApiData::err(err),
+        None => None,
+    };
+
     let region_id = this
         .db
-        .admin_create_region(&req.name, req.enabled, req.company_id)
+        .admin_create_region(
+            &req.name,
+            req.enabled,
+            req.company_id,
+            country_code.as_deref(),
+        )
         .await?;
 
     // Get the created region
@@ -132,6 +163,7 @@ async fn admin_create_region(
         name: region.name,
         enabled: region.enabled,
         company_id: region.company_id,
+        country_code: region.country_code,
         host_count: 0, // New region has no hosts
         total_vms: 0,
         total_cpu_cores: 0,
@@ -168,6 +200,12 @@ async fn admin_update_region(
     if let Some(company_id) = req.company_id {
         region.company_id = company_id;
     }
+    if let Some(country_code) = &req.country_code {
+        match normalize_country_code(country_code) {
+            Ok(cc) => region.country_code = cc,
+            Err(err) => return ApiData::err(err),
+        }
+    }
 
     // Save changes
     this.db.admin_update_region(&region).await?;
@@ -203,7 +241,7 @@ struct RegionDeleteResponse {
 mod tests {
     use super::*;
     use lnvps_api_common::MockDb;
-    use lnvps_db::VmIpAssignment;
+    use lnvps_db::{AdminDb, VmIpAssignment};
 
     /// The mock region 1 has one enabled IPv4 /24 (gateway inside the range,
     /// `use_full_range = false`) and one IPv6 range: 256 - 1 gateway - 2
@@ -215,6 +253,48 @@ mod tests {
         let db = MockDb::default();
         let dyn_db: Arc<dyn LNVpsDb> = Arc::new(db.clone());
         (db, dyn_db)
+    }
+
+    #[test]
+    fn country_code_is_normalized_and_validated() {
+        assert_eq!(normalize_country_code("nl").unwrap().as_deref(), Some("NL"));
+        assert_eq!(
+            normalize_country_code(" ie ").unwrap().as_deref(),
+            Some("IE")
+        );
+        // An empty value clears the country
+        assert_eq!(normalize_country_code("").unwrap(), None);
+        assert_eq!(normalize_country_code("   ").unwrap(), None);
+        // Anything that is not two ASCII letters is rejected
+        assert!(normalize_country_code("NLD").is_err());
+        assert!(normalize_country_code("N").is_err());
+        assert!(normalize_country_code("N1").is_err());
+        // Two letters that are not a real country are rejected too
+        assert!(normalize_country_code("ZZ").is_err());
+    }
+
+    #[tokio::test]
+    async fn region_country_code_round_trips_through_create_and_update() {
+        let (_db, dyn_db) = mock_db().await;
+        let id = dyn_db
+            .admin_create_region("Amsterdam", true, 1, Some("NL"))
+            .await
+            .unwrap();
+
+        let mut region = dyn_db.get_host_region(id).await.unwrap();
+        assert_eq!(region.country_code.as_deref(), Some("NL"));
+        assert_eq!(
+            region_info(&dyn_db, region.clone())
+                .await
+                .unwrap()
+                .country_code
+                .as_deref(),
+            Some("NL")
+        );
+
+        region.country_code = None;
+        dyn_db.admin_update_region(&region).await.unwrap();
+        assert_eq!(dyn_db.get_host_region(id).await.unwrap().country_code, None);
     }
 
     #[tokio::test]
