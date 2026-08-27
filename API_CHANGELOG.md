@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **VPN plans** — a customer can buy one VPN plan, register up to their device allowance of WireGuard public keys, and download one config per region. `GET /api/v1/vpn/services` lists what is for sale and where it exits; `GET`/`POST /api/v1/vpn` reads and buys a plan; `GET`/`POST /api/v1/vpn/devices`, `POST /api/v1/vpn/devices/{id}/enabled` and `DELETE /api/v1/vpn/devices/{id}` manage devices; `GET /api/v1/vpn/devices/{id}/configs` returns one ready-to-use `wg-quick` file per region.
+
+  Region is a client-side choice, not an allocation: a device holds one keypair and one inner address that are valid in every region at once, so every config it is given shares an identical `[Interface]` block and differs only in the `[Peer]` endpoint and public key. The client generates the keypair and sends only the public half, so the rendered config carries the placeholder `<your private key>` rather than a key LNVPS never had.
+
+  Registering a device is idempotent on the public key, so a client retrying a request whose response it lost does not consume a second slot; a key already registered to another account is refused. Devices cannot be registered until the plan's subscription is paid, and adding a line item of the new `vpn` type to a subscription is what bills for it — one subscription can carry a VPN alongside a VM on a single renewal date and payment.
+
 ### Removed
 
 - **Bitvora payment provider** — the provider was disabled in February 2026 when the service shut down, and its remaining code has now been deleted: the `bitvora` cargo feature, the `POST /api/v1/webhook/bitvora` endpoint, and the `"type": "bitvora"` variant of `ProviderConfig` (create), `PartialProviderConfig` (update) and the sanitized config returned by the admin payment-method endpoints. Any `payment_method_config` row still holding a bitvora config is left in place as billing history; it now reads back with a `null` `config` and cannot be updated. Delete or ignore those rows.

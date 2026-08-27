@@ -508,3 +508,99 @@ async fn plan_pool_dispatches_on_the_service_link() -> Result<()> {
     assert!(unlinked.peers.is_empty());
     Ok(())
 }
+
+/// Losing a race for a slot must not surface as an error to a customer whose
+/// next slot is free. The interleave is forced rather than hoped for: holding
+/// the plans lock stops the allocator inside its address carve, *after* it has
+/// proposed a slot, so a device inserted in the meantime takes the slot it was
+/// about to use.
+#[tokio::test]
+async fn a_lost_slot_race_takes_the_next_slot() -> Result<()> {
+    let mock = MockDb::default();
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
+    let plan = a_plan(&db, &service, 1).await?;
+
+    // Block the allocator part-way through: it has listed the devices (none)
+    // and proposed slot 0, and is now waiting to read the service's devices.
+    let plans = mock.vpn_subscriptions.lock().await;
+    let racer = {
+        let db = db.clone();
+        let plan = plan.clone();
+        tokio::spawn(async move { register_vpn_device(&db, &plan, "phone", &[1u8; 32]).await })
+    };
+    tokio::task::yield_now().await;
+
+    // Somebody else takes slot 0 and the first address out from under it.
+    mock.vpn_devices.lock().await.insert(
+        99,
+        VpnDevice {
+            id: 99,
+            vpn_subscription_id: plan.id,
+            slot: 0,
+            name: "raced".to_string(),
+            peer_pubkey: vec![9u8; 32],
+            address4: Some("10.64.0.2/32".to_string()),
+            address6: Some("fd00:64::2/128".to_string()),
+            enabled: true,
+            created: chrono::Utc::now(),
+        },
+    );
+    drop(plans);
+
+    let device = racer.await??;
+    assert_eq!(device.slot, 1, "the loser re-reads and takes the next slot");
+    assert_eq!(device.address4.as_deref(), Some("10.64.0.3/32"));
+    Ok(())
+}
+
+/// If every attempt loses, that is not contention any more and looping harder
+/// would only hide it, so it is reported.
+///
+/// Reached here by giving two services overlapping blocks, which the schema
+/// permits: the carve only sees its own service's devices, so it keeps
+/// proposing an address the *global* unique index already refuses. That is a
+/// misconfiguration, and it has to fail loudly rather than quietly handing two
+/// customers one address.
+#[tokio::test]
+async fn overlapping_service_blocks_fail_loudly() -> Result<()> {
+    let mock = MockDb::default();
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
+
+    // A second service carved from the same block as the first.
+    let overlapping_id = db
+        .insert_vpn_service(&VpnService {
+            name: "overlap".to_string(),
+            company_id: a_company(&mock).await,
+            device_cidr4: Some("10.64.0.0/28".to_string()),
+            device_cidr6: Some("fd00:64::/124".to_string()),
+            enabled: true,
+            ..Default::default()
+        })
+        .await?;
+    let overlapping = db.get_vpn_service(overlapping_id).await?;
+
+    // Fill the shared block from the other service, where this service's carve
+    // cannot see it.
+    let squatter = a_plan(&db, &overlapping, 2).await?;
+    for seed in 0..6u8 {
+        if register_vpn_device(&db, &squatter, "squat", &vec![100 + seed; 32])
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+
+    let plan = a_plan(&db, &service, 1).await?;
+    let err = register_vpn_device(&db, &plan, "phone", &[1u8; 32])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("after 4 attempts") || err.contains("no free /32"),
+        "an overlapping block must be reported, not worked around: {err}"
+    );
+    Ok(())
+}

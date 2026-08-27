@@ -57,26 +57,58 @@ pub async fn register_vpn_device(
         return Ok(existing);
     }
 
-    let devices = db.list_vpn_devices(plan.id).await?;
-    let slot = next_free_slot(&devices, plan.device_limit)?;
-    let (address4, address6) = carve_device_addresses(db, &service).await?;
+    // Both the slot and the address are proposed from a read and enforced by a
+    // unique key, so a simultaneous registration on the same plan can take
+    // either between the two. Losing that race is not the customer's problem:
+    // re-read and take the next one instead of handing back an error for
+    // something that will succeed immediately.
+    //
+    // A full plan or an exhausted block is *not* contention and is not retried:
+    // both propagate on the first attempt, because trying again cannot help.
+    for attempt in 1..=REGISTER_ATTEMPTS {
+        let devices = db.list_vpn_devices(plan.id).await?;
+        let slot = next_free_slot(&devices, plan.device_limit)?;
+        let (address4, address6) = carve_device_addresses(db, &service).await?;
 
-    let id = db
-        .insert_vpn_device(&VpnDevice {
-            id: 0,
-            vpn_subscription_id: plan.id,
-            slot,
-            name: name.trim().to_string(),
-            peer_pubkey: peer_pubkey.to_vec(),
-            address4,
-            address6,
-            enabled: true,
-            created: chrono::Utc::now(),
-        })
-        .await?;
+        match db
+            .insert_vpn_device(&VpnDevice {
+                id: 0,
+                vpn_subscription_id: plan.id,
+                slot,
+                name: name.trim().to_string(),
+                peer_pubkey: peer_pubkey.to_vec(),
+                address4,
+                address6,
+                enabled: true,
+                created: chrono::Utc::now(),
+            })
+            .await
+        {
+            Ok(id) => return Ok(db.get_vpn_device(id).await?),
+            // The last attempt's failure is the answer. Returning it here,
+            // rather than remembering one and reporting it after the loop,
+            // keeps "we ran out of attempts but recorded no error" from being
+            // a state that has to exist and be handled.
+            Err(e) if attempt == REGISTER_ATTEMPTS => {
+                return Err(anyhow::Error::from(e).context(format!(
+                    "Could not register a device after {REGISTER_ATTEMPTS} attempts"
+                )));
+            }
+            Err(_) => continue,
+        }
+    }
 
-    db.get_vpn_device(id).await.map_err(Into::into)
+    unreachable!("the loop returns on its last attempt")
 }
+
+/// How many times a registration re-reads and tries again after losing a race
+/// for a slot or an address.
+///
+/// Small on purpose. Contention is between the devices of one account, so the
+/// realistic case is a customer double-clicking or a client retrying, not a
+/// stampede; if four attempts in a row all lose, something other than
+/// contention is wrong and looping harder would only hide it.
+const REGISTER_ATTEMPTS: usize = 4;
 
 /// The lowest unused slot below `limit`.
 ///

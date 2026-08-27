@@ -2,7 +2,7 @@
 
 **Status:** in-progress
 **Started:** 2026-08-27
-**Last updated:** 2026-08-27 (increment 3 complete: billing)
+**Last updated:** 2026-08-27 (increment 4 complete: user API)
 
 ## Goal
 
@@ -206,14 +206,33 @@ Notes:
   service. Add a tier table when there is a reason to sell one.
 - `IntervalType` gained a `Default` of `Month`, matching every billing column's `DEFAULT 1`.
 
-### Increment 4 — user API  (next)
-- [ ] Retry slot contention here (see increment 2 note): `next_free_slot` proposes and the
-      unique key enforces, so a concurrent registration currently errors rather than taking
-      the next slot
-- [ ] `/api/v1/vpn`: subscribe, status, list/add/delete device, list regions
-- [ ] Config rendering per region (and QR), from `tunnel_pool` fields
-- [ ] `API_CHANGELOG.md` + `API_DOCUMENTATION.md` per `docs/agents/api-guidelines.md`
-- [ ] Unit tests
+### Increment 4 — user API  ✅ DONE
+- [x] Slot contention retried in `register_vpn_device` rather than in the handler: every
+      caller wants the same behaviour, and the loop returns the last attempt's error directly
+      so "ran out of attempts but recorded nothing" is not a state that has to exist
+- [x] `/api/v1/vpn/services`, `/api/v1/vpn` (GET/POST), `/api/v1/vpn/devices` (GET/POST),
+      `/api/v1/vpn/devices/{id}` (DELETE), `/api/v1/vpn/devices/{id}/enabled`,
+      `/api/v1/vpn/devices/{id}/configs`
+- [x] Config rendering per region, structured fields plus a `wg-quick` file
+- [x] `API_CHANGELOG.md` and `API_DOCUMENTATION.md`
+- [x] 6 unit tests in `api/vpn`, 2 more in `provisioner/vpn` for the race and the give-up
+
+Notes:
+
+- **No server-side QR.** It needs a barcode encoder as a dependency to produce something the
+  client renders better from the `config` string. Dropped, and said so in the docs.
+- **Handler coverage comes from e2e, not unit tests.** That is the existing pattern here:
+  `api/subscriptions.rs` and `api/ip_space.rs` are at 0% under `cargo llvm-cov -p lnvps_api`.
+  The unit tests cover config rendering and the ownership/billing predicates; **increment 9
+  must cover the endpoints themselves**, or they ship untested.
+- The slot race is covered deterministically rather than hopefully: holding the plans lock
+  stops the allocator inside its address carve, after it has proposed a slot, so a device
+  inserted meanwhile takes the slot it was about to use.
+- Two services with overlapping device blocks now fail loudly (the carve only sees its own
+  service, the unique index is global). That is a misconfiguration worth an error rather than
+  two customers on one address.
+- `provisioner/vpn.rs` 100% functions / 99% lines; the one uncovered region is a read-back
+  failing immediately after a successful insert.
 
 ### Increment 5 — agent router backend
 - [ ] `RouterKind::LnvpsAgent` + `router/agent.rs` implementing the read half of `TunnelRouter`
@@ -239,6 +258,8 @@ Notes:
 ### Increment 9 — end-to-end
 - [ ] Extend the netns harness: one device reaching two pools with the same inner address
 - [ ] Script entry alongside `scripts/tunnel-e2e.sh`
+- [ ] **Cover the `/api/v1/vpn/*` endpoints** — they have no unit-test coverage by design
+      (see increment 4), so without this they ship untested
 
 ### Increment 10 — admin API
 - [ ] `AdminResource` variant, RBAC migration, admin CRUD for VPN subscriptions and devices
