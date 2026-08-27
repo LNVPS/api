@@ -40,10 +40,16 @@ RUN cargo build --release --locked --bins \
 # Pinned: the image is ko-built and upstream moved the binary from
 # /ko-app/crane to /crane, which broke every build here the moment it was
 # published. A tag we bump deliberately beats :latest changing layout under us.
+#
+# The move happened *after* v0.22.0, so the pinned image still keeps the binary
+# at /ko-app/crane. Copying /crane here failed for months without anyone
+# noticing: the stage was served from the gha build cache on every run, and only
+# surfaced once that cache entry was evicted. Bumping the pin means checking
+# this path again — `crane export <image> - | tar t | grep crane`.
 FROM gcr.io/go-containerregistry/crane:v0.22.0 AS crane-bin
 FROM debian:trixie-slim AS crane
 RUN apt update && apt install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=crane-bin /crane /usr/local/bin/crane
+COPY --from=crane-bin /ko-app/crane /usr/local/bin/crane
 
 ARG HOST_INFO_IMAGE
 ARG REGISTRY_USER
