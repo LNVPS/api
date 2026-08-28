@@ -646,6 +646,27 @@ where the image allows it.
 
 ---
 
+## AppWeaver — AI-powered app hub
+
+- **Image:** `ghcr.io/getappweaver/core:alpine` — published from
+  <https://github.com/getappweaver/core>. The Alpine runtime includes Bun,
+  OpenCode, ngit and Piper, but deliberately excludes Chromium, Playwright
+  browsers, Cursor Agent and VNC.
+- **Repo:** <https://github.com/getappweaver/core> — the entrypoint clones the
+  core repository into the persistent workspace on first boot, installs its
+  locked dependencies and starts the setup web UI on port `5551`. The workspace
+  volume retains configuration, credentials, installed apps and app data across
+  image upgrades.
+- **Authentication:** API-key and device-code OpenCode providers work through
+  the setup web UI. A provider that requires a callback to the user's localhost
+  cannot be authenticated without a separate tunnel and should not be selected
+  for a managed deployment.
+
+**Document:** [`catalog/appweaver.yaml`](../catalog/appweaver.yaml) —
+`scripts/app-catalog-test.sh catalog/appweaver.yaml` starts it locally.
+
+---
+
 ## Notes on other apps
 
 - **zap-stream-core** — needs raw TCP/UDP ingest (RTMP `1935/tcp`, SRT), i.e.
