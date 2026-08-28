@@ -364,14 +364,19 @@ impl Worker {
         let sub_notification_descr = Self::sub_notification_message(sub, &line_items);
 
         // --- Expiring soon ---
-        // Only subscriptions that have NOT yet expired can be "expiring soon".
-        // The `expires > now` guard is important: without it, an already-expired
-        // subscription would wrongly match this branch whenever `last_check` is
-        // stale (e.g. a freshly-started worker whose last check defaults to the
-        // unix epoch), starving the expired/grace branches below.
+        // Users are warned at each reminder milestone that fits inside the
+        // billing interval (7 days, 3 days, 1 day out for a monthly VM), so
+        // there is time to act before the VM stops. Only subscriptions that have
+        // NOT yet expired can be "expiring soon"; `due_reminder` enforces that,
+        // which matters when `last_check` is stale (e.g. a freshly-started worker
+        // whose last check defaults to the unix epoch) and would otherwise starve
+        // the expired/grace branches below.
         let now = Utc::now();
-        let expiry_window = now.add(lead);
-        if expires > now && expires < expiry_window && expires > last_check.add(lead) {
+        if let Some(due) = due_reminder(sub, now, last_check) {
+            // The final reminder is the one that also drives auto-renewal; the
+            // earlier ones are notice only.
+            let is_final_reminder = due <= lead;
+
             // Attempt auto-renewal using the user's default saved payment method
             // (NWC Lightning wallet or Revolut card), dispatched by provider.
             let mut auto_renewed = false;
@@ -383,6 +388,11 @@ impl Worker {
                     .await
                     .map(|m| m.iter().any(|pm| pm.enabled))
                     .unwrap_or(false);
+                if has_method && !is_final_reminder {
+                    // It will renew itself before it expires; an "expiring soon"
+                    // warning a week out would just be wrong.
+                    return Ok(());
+                }
                 if has_method {
                     info!("Attempting auto-renewal for subscription {}", sub.id);
                     match self.subscription_handler.auto_renew(sub.id).await {
@@ -415,13 +425,21 @@ impl Worker {
             // Send a plain expiry warning whenever auto-renewal was not attempted
             // (auto_renewal off, or no saved payment method).
             if !auto_renewed {
+                let grace = self.grace_period_days(sub);
                 self.queue_notification(
                     sub.user_id,
                     format!(
-                        "Your subscription will expire soon. Please renew manually in the next {}.\n{}",
-                        lead_descr, sub_notification_descr
+                        "Your subscription expires in {} ({}).\nPlease renew before then to avoid interruption.\n{}\n{}",
+                        format_lead_window(due),
+                        format_timestamp(expires),
+                        deletion_warning(expires, grace),
+                        sub_notification_descr
                     ),
-                    Some(format!("[{}] Expiring Soon", sub_notification_subject)),
+                    Some(format!(
+                        "[{}] Expires in {}",
+                        sub_notification_subject,
+                        format_lead_window(due)
+                    )),
                 )
                 .await;
             }
@@ -467,10 +485,15 @@ impl Worker {
             let already_handled = self
                 .subscription_expiry_already_handled(sub, &line_items, last_check)
                 .await;
+            let grace = self.grace_period_days(sub);
             if !already_handled {
                 self.queue_notification(
                     sub.user_id,
-                    format!("Your subscription has expired.\n{}", sub_notification_descr),
+                    format!(
+                        "Your subscription has expired.\n{}\n{}",
+                        deletion_warning(expires, grace),
+                        sub_notification_descr
+                    ),
                     Some(format!("[{}] Expired", sub_notification_subject)),
                 )
                 .await;
@@ -484,11 +507,118 @@ impl Worker {
                         Err(e) => warn!("Failed to build handler for line item {}: {}", li.id, e),
                     }
                 }
+            } else if let Some(days_expired) = post_expiry_reminder_due(expires, now, last_check) {
+                // Daily countdown for the whole grace period, so a user who
+                // missed the expiry notice still has a running clock in front of
+                // them until the data is gone.
+                let days_left = days_until_deletion(expires, grace, now);
+                self.queue_notification(
+                    sub.user_id,
+                    format!(
+                        "Your subscription expired {} ago and your services are suspended.\n{}\nRenew now to restore them.\n{}",
+                        format_days(days_expired),
+                        deletion_warning(expires, grace),
+                        sub_notification_descr
+                    ),
+                    Some(format!(
+                        "[{}] Deletion in {}",
+                        sub_notification_subject,
+                        format_days(days_left)
+                    )),
+                )
+                .await;
             }
         }
 
         Ok(())
     }
+}
+
+/// Pre-expiry reminder offsets, longest first.
+///
+/// A single warning one day out was not enough notice: users on holiday or with
+/// a slow payment method lost VMs they intended to keep. Each milestone that
+/// fits inside the billing interval produces one notification.
+const REMINDER_MILESTONES: [TimeDelta; 3] =
+    [TimeDelta::days(7), TimeDelta::days(3), TimeDelta::days(1)];
+
+/// Reminder offsets applicable to `sub`, nearest-to-expiry first.
+///
+/// Milestones longer than half the billing interval are dropped (a 3-day
+/// subscription should not be warned 7 days out, it did not exist yet), and the
+/// auto-renewal lead window is always included as the final reminder.
+fn reminder_milestones(sub: &Subscription) -> Vec<TimeDelta> {
+    let lead = expiry_lead_window(sub);
+    let half = subscription_interval(sub) / 2;
+    let mut out: Vec<TimeDelta> = REMINDER_MILESTONES
+        .into_iter()
+        .filter(|m| *m <= half && *m > lead)
+        .collect();
+    out.push(lead);
+    out.sort();
+    out
+}
+
+/// The reminder milestone crossed in `(last_check, now]`, if any.
+///
+/// Returns the nearest-to-expiry crossed milestone so that a worker resuming
+/// after downtime sends one accurate reminder rather than a burst of stale ones.
+fn due_reminder(
+    sub: &Subscription,
+    now: DateTime<Utc>,
+    last_check: DateTime<Utc>,
+) -> Option<TimeDelta> {
+    let expires = sub.expires?;
+    if expires <= now {
+        return None;
+    }
+    reminder_milestones(sub).into_iter().find(|m| {
+        let at = expires - *m;
+        at <= now && at > last_check
+    })
+}
+
+/// Whole days since expiry when a daily post-expiry reminder is due this tick,
+/// i.e. when a day boundary after `expires` was crossed in `(last_check, now]`.
+fn post_expiry_reminder_due(
+    expires: DateTime<Utc>,
+    now: DateTime<Utc>,
+    last_check: DateTime<Utc>,
+) -> Option<i64> {
+    let days = (now - expires).num_days();
+    if days < 1 {
+        return None;
+    }
+    if last_check < expires + TimeDelta::days(days) {
+        Some(days)
+    } else {
+        None
+    }
+}
+
+/// Whole days left before deletion, rounded up so any remaining time reads as at
+/// least one day, floored at zero. The exact deletion timestamp is in the
+/// message body, so the rounding is only for the headline.
+fn days_until_deletion(expires: DateTime<Utc>, grace_days: u16, now: DateTime<Utc>) -> i64 {
+    const DAY: i64 = 24 * 60 * 60;
+    let secs = (expires + TimeDelta::days(grace_days as i64) - now).num_seconds();
+    if secs <= 0 { 0 } else { (secs + DAY - 1) / DAY }
+}
+
+/// One-line warning naming the date the services are deleted.
+fn deletion_warning(expires: DateTime<Utc>, grace_days: u16) -> String {
+    format!(
+        "If it is not renewed, your services and all their data are permanently deleted on {}.",
+        format_timestamp(expires + TimeDelta::days(grace_days as i64))
+    )
+}
+
+fn format_timestamp(t: DateTime<Utc>) -> String {
+    t.format("%Y-%m-%d %H:%M UTC").to_string()
+}
+
+fn format_days(days: i64) -> String {
+    format!("{} day{}", days, if days == 1 { "" } else { "s" })
 }
 
 /// Grace period (days) for a subscription, tiered by subscription age. Lives in
@@ -5401,6 +5531,205 @@ mod tests {
         assert_eq!(expiry_lead_window(&sub), TimeDelta::days(1));
     }
 
+    /// Build a bare monthly subscription for the milestone unit tests.
+    fn make_test_sub() -> Subscription {
+        Subscription {
+            id: 0,
+            user_id: 0,
+            company_id: 1,
+            name: "s".to_string(),
+            description: None,
+            created: Utc::now(),
+            expires: None,
+            is_active: true,
+            is_setup: true,
+            currency: "EUR".to_string(),
+            interval_amount: 1,
+            interval_type: IntervalType::Month,
+            setup_fee: 0,
+            auto_renewal_enabled: false,
+            external_id: None,
+        }
+    }
+
+    #[test]
+    fn test_reminder_milestones_scale_with_interval() {
+        let mut sub = make_test_sub();
+        // Monthly: full 7/3/1 day schedule, nearest-to-expiry first.
+        assert_eq!(
+            reminder_milestones(&sub),
+            vec![TimeDelta::days(1), TimeDelta::days(3), TimeDelta::days(7)]
+        );
+
+        // Weekly: 7 days out is more than half the interval, so it is dropped.
+        sub.interval_type = IntervalType::Day;
+        sub.interval_amount = 7;
+        assert_eq!(
+            reminder_milestones(&sub),
+            vec![TimeDelta::days(1), TimeDelta::days(3)]
+        );
+
+        // Daily: only the (capped) lead window survives.
+        sub.interval_amount = 1;
+        assert_eq!(reminder_milestones(&sub), vec![TimeDelta::hours(12)]);
+
+        // A 4-day interval keeps a single 1-day reminder (the lead window),
+        // never duplicated.
+        sub.interval_amount = 4;
+        assert_eq!(reminder_milestones(&sub), vec![TimeDelta::days(1)]);
+    }
+
+    #[test]
+    fn test_due_reminder_fires_once_per_milestone() {
+        let now = Utc::now();
+        let mut sub = make_test_sub();
+        sub.expires = Some(now.add(TimeDelta::days(7)));
+
+        // The 7-day milestone falls in (last_check, now].
+        assert_eq!(
+            due_reminder(&sub, now, now.sub(TimeDelta::minutes(1))),
+            Some(TimeDelta::days(7))
+        );
+        // Already past on the previous tick: no repeat.
+        assert_eq!(
+            due_reminder(&sub, now, now.add(TimeDelta::minutes(1))),
+            None
+        );
+        // Nothing crossed yet.
+        sub.expires = Some(now.add(TimeDelta::days(9)));
+        assert_eq!(due_reminder(&sub, now, now.sub(TimeDelta::days(1))), None);
+
+        // Worker downtime: 7-day and 3-day milestones both crossed since the
+        // last check, but only the nearest-to-expiry one is sent.
+        sub.expires = Some(now.add(TimeDelta::days(2)));
+        assert_eq!(
+            due_reminder(&sub, now, now.sub(TimeDelta::days(10))),
+            Some(TimeDelta::days(3))
+        );
+
+        // Already expired: handled by the expired/grace branches instead.
+        sub.expires = Some(now.sub(TimeDelta::hours(1)));
+        assert_eq!(due_reminder(&sub, now, now.sub(TimeDelta::days(10))), None);
+
+        // No expiry at all.
+        sub.expires = None;
+        assert_eq!(due_reminder(&sub, now, now.sub(TimeDelta::days(10))), None);
+    }
+
+    #[test]
+    fn test_post_expiry_reminder_due() {
+        let now = Utc::now();
+        let expires = now.sub(TimeDelta::days(3));
+
+        // Day 3 boundary crossed since the last check.
+        assert_eq!(
+            post_expiry_reminder_due(expires, now, now.sub(TimeDelta::hours(2))),
+            Some(3)
+        );
+        // Same day already notified: the day-3 boundary is behind `last_check`.
+        assert_eq!(
+            post_expiry_reminder_due(
+                now.sub(TimeDelta::days(3)).sub(TimeDelta::hours(2)),
+                now,
+                now.sub(TimeDelta::minutes(1))
+            ),
+            None
+        );
+        // Less than a day since expiry: the one-shot "Expired" notice covers it.
+        assert_eq!(
+            post_expiry_reminder_due(now.sub(TimeDelta::hours(5)), now, DateTime::UNIX_EPOCH),
+            None
+        );
+    }
+
+    #[test]
+    fn test_deletion_countdown_helpers() {
+        let now = Utc::now();
+        let expires = now.sub(TimeDelta::days(10));
+        assert_eq!(days_until_deletion(expires, 14, now), 4);
+        // Never negative, even past the deletion date.
+        assert_eq!(days_until_deletion(expires, 2, now), 0);
+
+        let warning = deletion_warning(expires, 14);
+        assert!(warning.contains(&format_timestamp(expires.add(TimeDelta::days(14)))));
+        assert!(warning.contains("permanently deleted"));
+
+        assert_eq!(format_days(1), "1 day");
+        assert_eq!(format_days(0), "0 days");
+        assert_eq!(format_days(4), "4 days");
+        assert_eq!(
+            format_timestamp(DateTime::from_timestamp(1_700_000_000, 0).unwrap()),
+            "2023-11-14 22:13 UTC"
+        );
+    }
+
+    /// A monthly subscription must be warned a week out, not only the day
+    /// before, and the warning must not repeat on the next tick.
+    #[tokio::test]
+    async fn test_seven_day_expiry_reminder() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        // Created 23 days ago on a 30-day interval => expires in ~7 days.
+        let created = Utc::now().sub(TimeDelta::days(23));
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, created, true).await?;
+        let sub = db.get_subscription(subscription_id).await?;
+        let worker = setup_worker_with_delete_after(db.clone(), 30).await?;
+
+        let last_check = Utc::now().sub(TimeDelta::minutes(1));
+        worker.handle_subscription_state(&sub, last_check).await?;
+        assert_eq!(
+            count_notifications(&worker, "Expires in 7 days").await,
+            1,
+            "a 7-day expiry reminder must be sent"
+        );
+
+        // Next tick: the milestone is behind `last_check` now, so it is silent.
+        worker.handle_subscription_state(&sub, Utc::now()).await?;
+        assert_eq!(
+            count_notifications(&worker, "Expires in").await,
+            0,
+            "expiry reminders must not repeat within the same milestone"
+        );
+        Ok(())
+    }
+
+    /// Once expired, the user gets a daily reminder counting down to deletion
+    /// for the whole grace period.
+    #[tokio::test]
+    async fn test_daily_deletion_countdown_within_grace() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        // Created 40 days ago => expired ~10 days ago, 14-day grace period.
+        let created = Utc::now().sub(TimeDelta::days(40));
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, created, true).await?;
+        let sub = db.get_subscription(subscription_id).await?;
+        let worker = setup_worker_with_delete_after(db.clone(), 30).await?;
+
+        // First tick fires the one-shot "Expired" handling.
+        let expires = sub.expires.unwrap();
+        worker
+            .handle_subscription_state(&sub, expires.sub(TimeDelta::days(1)))
+            .await?;
+        count_notifications(&worker, "").await;
+
+        // Later tick within the grace period: a countdown reminder.
+        worker
+            .handle_subscription_state(&sub, expires.add(TimeDelta::minutes(1)))
+            .await?;
+        assert_eq!(
+            count_notifications(&worker, "Deletion in 4 days").await,
+            1,
+            "an expired subscription must get a daily deletion countdown"
+        );
+
+        // Same day, already notified: silent.
+        worker.handle_subscription_state(&sub, Utc::now()).await?;
+        assert_eq!(
+            count_notifications(&worker, "Deletion in").await,
+            0,
+            "the countdown must fire at most once per day"
+        );
+        Ok(())
+    }
+
     #[test]
     fn test_format_lead_window() {
         assert_eq!(format_lead_window(TimeDelta::days(1)), "1 day");
@@ -5437,7 +5766,7 @@ mod tests {
             .handle_subscription_state(&sub, Utc::now().sub(TimeDelta::minutes(1)))
             .await?;
 
-        let notes = count_notifications(&worker, "Expiring Soon").await
+        let notes = count_notifications(&worker, "Expires in").await
             + count_notifications(&worker, "Auto-Renewed").await;
         assert_eq!(
             notes, 0,
@@ -5469,7 +5798,7 @@ mod tests {
             .handle_subscription_state(&sub, Utc::now().sub(TimeDelta::days(1)))
             .await?;
 
-        let notes = count_notifications(&worker, "Expiring Soon").await;
+        let notes = count_notifications(&worker, "Expires in").await;
         assert!(
             notes >= 1,
             "a daily sub within the 12h lead window must warn/auto-renew (got {notes})"
