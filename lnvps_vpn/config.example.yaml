@@ -1,0 +1,43 @@
+# lvd — the LNVPS VPN route server daemon.
+#
+# Everything here is outbound. Nothing dials this machine, so it needs no
+# inbound port, no port forward, no dynamic DNS and no TLS certificate of its
+# own. It asks LNVPS what its interfaces should be and applies the answer.
+#
+# Install at /etc/lvd/config.yaml and run `lvd check` before starting.
+
+# Base URL of the LNVPS API.
+api-url: "https://api.lnvps.net"
+
+# This route server's credential, as <router_id>.<secret>.
+#
+# Provisioned by hand with everything else about the machine; there is nothing
+# to register. The router row exists in LNVPS before this machine is ever
+# switched on, and rotating the secret there takes out this route server and no
+# other.
+#
+# Treat the file as a secret: it is also, indirectly, the peer list.
+token: "7.replace-me"
+
+# Seconds to ask LNVPS to hold a fetch open waiting for something to change.
+#
+# This is what makes a pull as fast as a push: a revoked device stops being
+# honoured about one round trip after somebody clicks the button, rather than on
+# the next poll. LNVPS caps it, so a larger number here is capped rather than
+# refused. Zero turns it into an ordinary poll.
+wait-secs: 25
+
+# Seconds to wait before trying again after a failed fetch or apply.
+#
+# Short on purpose. The daemon is idle almost all of the time, so retrying costs
+# nothing, and what is being delayed is a revocation.
+retry-secs: 5
+
+# Seconds a peer may go without a handshake before the address it was last heard
+# from is scrubbed out of the kernel.
+#
+# WireGuard records that address so a roaming client can be found, which for a
+# customer device is their real address. This cannot stop it being recorded
+# while they are connected; it stops it being kept afterwards. Ten minutes is
+# long enough that a laptop closing its lid does not have to renegotiate.
+scrub-after-secs: 600

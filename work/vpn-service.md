@@ -339,11 +339,40 @@ Notes:
 - The desired-document types, `apply`, `observe` and `DataPlaneState` stayed behind: bridges,
   guests and libvirt are a marketplace node's vocabulary, not a data plane's.
 
-### Increment 8 — `lnvps_vpn` daemon
-- [ ] New crate `lnvps_vpn`, binary `lvd`: pull loop, batch peer apply (`wg syncconf` equivalent over netlink),
-      600s endpoint scrub, inbound control listener for immediate re-pull
-- [ ] Config, packaging, `config.example.yaml`
-- [ ] Unit tests
+### Increment 8 — `lnvps_vpn` daemon  ✅ DONE (bar packaging)
+- [x] New crate `lnvps_vpn`, binary `lvd`. Root workspace member, released on the API's tag.
+- [x] `client.rs`: the long-polling fetch. Its own copy of the document types rather than a
+      shared crate, because a route server must not compile the database and the payment
+      stack to parse four structs, and because a daemon that tolerates fields it does not
+      know can be upgraded in either order.
+- [x] `apply.rs`: convergent, and **peer-at-a-time**. The kernel's only way to state a
+      device's configuration replaces its peer set with it, so a whole-interface apply would
+      reset every established session — one customer registering a phone becoming a stampede
+      of renegotiation across thousands of peers. The interface is re-keyed only when the key
+      or port is actually wrong.
+- [x] `scrub.rs`: the 600s endpoint scrub, and the reason it exists spelled out where the
+      code is.
+- [x] `Kernel::host()` in `lnvps_netlink`, plus `set_wireguard_peer` /
+      `configure_wireguard_interface`, and `WgObserved` carrying port, key, per-peer allowed
+      IPs, endpoint and byte counters.
+- [x] `config.example.yaml`, with a test asserting this build accepts it.
+- [x] 26 unit tests. `client.rs`, `config.rs` and `scrub.rs` at 100% function coverage.
+
+**No inbound control listener.** The original sketch had one for immediate re-pull. It is not
+needed and it is not wanted: long-poll already delivers a change in one round trip, and an
+inbound listener would need a port, a certificate for LNVPS to pin, and reachability that a
+route server behind somebody else's NAT does not have. Outbound-only means the daemon has no
+listening socket at all.
+
+Notes:
+
+- **An interface the document does not mention is left alone.** A route server is not
+  necessarily only a route server, and tearing down what LNVPS has not heard of would let a
+  bug here take out the operator's own networking.
+- **`main.rs` is uncovered**, as `lnvps_node`'s is: it is the loop and the CLI. Increment 9
+  must exercise it.
+- Still open from increment 6: `POST /api/v1/routeserver/counters`. The counters are read
+  from the kernel now (`WgPeerState::rx_bytes`/`tx_bytes`); nothing reports them yet.
 
 ### Increment 9 — end-to-end
 - [ ] Extend the netns harness: one device reaching two pools with the same inner address

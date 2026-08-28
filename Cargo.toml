@@ -14,6 +14,7 @@ members = [
     "lnvps_agent",
     "lnvps_node",
     "lnvps_netlink",
+    "lnvps_vpn",
 ]
 # Both are separate workspaces with their own lockfile and are built in their
 # own Docker context: lnvps_fw because the eBPF datapath needs its own
