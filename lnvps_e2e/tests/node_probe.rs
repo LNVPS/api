@@ -263,7 +263,7 @@ async fn a_probe_proves_a_node_can_carry_a_customer() -> Result<()> {
 
     // Both ends are configured from the database by production code. The node
     // generates its own key and LNVPS allocates it a tunnel; the route server is
-    // then configured by plan_pool, and the node by the same document the API
+    // then configured by plan_interface, and the node by the same document the API
     // would have served it. A harness that built either side by hand could
     // configure them more helpfully than the API does — which is how a probe
     // that fails in production passes in here.

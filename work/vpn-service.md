@@ -166,9 +166,24 @@ lost its resubscribe branch entirely — renewal is a payment against the existi
 a new line item, so a returning customer renews what they already have and nothing needs
 repointing.
 
-**Follow-up:** `provisioner/tunnel.rs` now holds both the generic planner and the marketplace
-allocator. It should split into a generic WireGuard planning module and a marketplace one; the
-file is the only thing still mixing them.
+**Structure (done).** `provisioner/tunnel.rs` was 1,483 lines holding four unrelated concerns,
+with the apply half stranded in `worker.rs` and two public types both called `Tunnel`. Split into:
+
+| module | owns | knows about |
+|---|---|---|
+| `provisioner/wg/address.rs` | block arithmetic: reserved addresses, carving, placement | nothing, pure |
+| `provisioner/wg/plan.rs` | `InterfacePlan`, the desired state of one interface | db, pool, tunnel |
+| `provisioner/wg/apply.rs` | `TunnelRealiser`: observed vs desired, drift, push | plan, `TunnelRouter` |
+| `provisioner/marketplace_tunnel.rs` | node allocation, dataplane document, route maintenance | nodes, hosts, guests |
+| `provisioner/vpn.rs` | device registration | plans, services |
+
+Also renamed: `PoolPlan` to `InterfacePlan` (a pool no longer decides it alone, since a VPN
+interface is addressed from its service), and `router::Tunnel` to `router::ObservedInterface`,
+which had been colliding with `lnvps_db::Tunnel` — a desired-state row and an observed interface
+sharing one name in files that import both.
+
+`worker.rs` lost 340 lines and now delegates through a `tunnels()` accessor, matching how
+`NetworkProvisioner` is used elsewhere.
 
 ## Increments
 

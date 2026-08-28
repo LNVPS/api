@@ -21,7 +21,7 @@ use anyhow::{Result, anyhow, bail};
 use ipnetwork::IpNetwork;
 use lnvps_db::{LNVpsDb, RouterTunnelKind, Tunnel, VpnDevice, VpnService, VpnSubscription};
 
-use crate::provisioner::tunnel::{Placement, carve_peer};
+use crate::provisioner::wg::address::{Placement, carve_peer};
 
 /// Register `peer_pubkey` as a device on `plan`.
 ///

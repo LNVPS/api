@@ -115,7 +115,7 @@ async fn a_plan_with(
     Ok(db.get_vpn_subscription(id).await?)
 }
 
-/// An interface terminating `service`, so `plan_pool` has something to dispatch
+/// An interface terminating `service`, so `plan_interface` has something to dispatch
 /// on.
 async fn a_pool(db: &Arc<dyn LNVpsDb>, mock: &MockDb, service: &VpnService) -> Result<TunnelPool> {
     let router_id = {
@@ -467,7 +467,7 @@ async fn a_vpn_interface_carries_the_services_devices() -> Result<()> {
     let device = register_vpn_device(&db, &plan, "phone", &key(1)).await?;
     let p = peer(&db, &device).await?;
 
-    let out = crate::provisioner::plan_pool(&db, &pool).await?;
+    let out = crate::provisioner::plan_interface(&db, &pool).await?;
 
     assert_eq!(
         out.addresses,
@@ -508,7 +508,7 @@ async fn an_unpaid_plans_devices_are_not_configured() -> Result<()> {
     let unpaid = a_plan_with(&db, &service, 2, 5, false).await?;
     register_vpn_device(&db, &unpaid, "unpaid", &key(2)).await?;
 
-    let out = crate::provisioner::plan_pool(&db, &pool).await?;
+    let out = crate::provisioner::plan_interface(&db, &pool).await?;
     assert_eq!(out.peers.len(), 1);
     assert_eq!(
         out.peers[0].public_key,
@@ -529,7 +529,7 @@ async fn a_vpn_peer_carries_nothing_behind_it() -> Result<()> {
     let device = register_vpn_device(&db, &plan, "phone", &key(1)).await?;
     let p = peer(&db, &device).await?;
 
-    let out = crate::provisioner::plan_pool(&db, &pool).await?;
+    let out = crate::provisioner::plan_interface(&db, &pool).await?;
     assert_eq!(out.peers[0].allowed_ips.len(), 2);
     // In particular no probe address: that is a marketplace node's, derived by
     // offsetting its v6 address, and with random placement it could land on
@@ -559,7 +559,7 @@ async fn plan_pool_dispatches_on_the_service_link() -> Result<()> {
     register_vpn_device(&db, &plan, "phone", &key(1)).await?;
     let pool = a_pool(&db, &mock, &service).await?;
 
-    let linked = crate::provisioner::plan_pool(&db, &pool).await?;
+    let linked = crate::provisioner::plan_interface(&db, &pool).await?;
     assert_eq!(
         linked.addresses,
         vec!["10.64.0.1/28".to_string(), "fd00:64::1/124".to_string()],
@@ -570,7 +570,7 @@ async fn plan_pool_dispatches_on_the_service_link() -> Result<()> {
     // Unlinking returns it to an ordinary pool, addressed from its own block
     // and carrying the tunnels carved out of it — of which there are none.
     db.unlink_vpn_service_pool(pool.id).await?;
-    let unlinked = crate::provisioner::plan_pool(&db, &pool).await?;
+    let unlinked = crate::provisioner::plan_interface(&db, &pool).await?;
     assert_eq!(unlinked.addresses, vec!["10.200.0.1/24".to_string()]);
     assert!(unlinked.peers.is_empty());
     Ok(())
