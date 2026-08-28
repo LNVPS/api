@@ -22,8 +22,8 @@ use lnvps_api_common::{
     issue_node_token, session_auth_enabled,
 };
 use lnvps_db::{
-    IntervalType, MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator,
-    MarketplaceTrustTier, Subscription, SubscriptionLineItem, SubscriptionType,
+    IntervalType, LineItemType, MarketplaceNode, MarketplaceNodeStatus, MarketplaceOperator,
+    MarketplaceTrustTier, Subscription, SubscriptionLineItem,
 };
 
 use crate::api::RouterState;
@@ -478,7 +478,7 @@ pub(crate) async fn start_node_fee(
     let line_item = SubscriptionLineItem {
         id: 0,
         subscription_id: 0,
-        subscription_type: SubscriptionType::MarketplaceNodeFee,
+        subscription_type: LineItemType::MarketplaceNodeFee,
         name: format!("Node listing fee: {}", node.name),
         description: None,
         amount: 0,
@@ -580,7 +580,8 @@ async fn v1_node_request_tunnel(
     Json(req): Json<RequestTunnelRequest>,
 ) -> ApiResult<ApiNodeTunnel> {
     let key = parse_32_bytes(&req.public_key, "public_key")?;
-    let allocation = crate::provisioner::allocate_node_tunnel(&this.db, &auth.node, &key)
+    let allocation = crate::provisioner::MarketplaceTunnels::new(this.db.clone())
+        .allocate(&auth.node, &key)
         .await
         .map_err(|e| ApiError::new(e.to_string()))?;
 
@@ -611,7 +612,8 @@ async fn v1_node_get_tunnel(
     auth: NodeAuth,
     State(this): State<RouterState>,
 ) -> ApiResult<ApiNodeTunnel> {
-    let allocation = crate::provisioner::get_node_tunnel(&this.db, &auth.node)
+    let allocation = crate::provisioner::MarketplaceTunnels::new(this.db.clone())
+        .get_tunnel(&auth.node)
         .await
         .map_err(|e| ApiError::new(e.to_string()))?
         .ok_or_else(|| ApiError::not_found("This node has no tunnel allocated yet"))?;
@@ -779,7 +781,8 @@ async fn v1_node_dataplane(
     auth: NodeAuth,
     State(this): State<RouterState>,
 ) -> ApiResult<ApiNodeDataPlane> {
-    let plane = crate::provisioner::node_dataplane(&this.db, &auth.node)
+    let plane = crate::provisioner::MarketplaceTunnels::new(this.db.clone())
+        .dataplane(&auth.node)
         .await
         .map_err(|e| ApiError::new(e.to_string()))?
         .ok_or_else(|| ApiError::not_found("This node has no tunnel allocated yet"))?;
@@ -882,10 +885,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].amount, 0, "listing fee must not bill recurring");
         assert_eq!(items[0].setup_amount, 5000);
-        assert_eq!(
-            items[0].subscription_type,
-            SubscriptionType::MarketplaceNodeFee
-        );
+        assert_eq!(items[0].subscription_type, LineItemType::MarketplaceNodeFee);
 
         let sub = db.get_subscription(fee.subscription_id).await.unwrap();
         assert_eq!(sub.expires, None);

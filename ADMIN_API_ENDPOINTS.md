@@ -22,7 +22,7 @@ Admin API request/response format reference for LLM consumption.
 **AdminUserRole**: `"super_admin"`, `"admin"`, `"read_only"`
 **AdminUserStatus**: `"active"`, `"suspended"`, `"deleted"`
 **SubscriptionPaymentType**: `"purchase"`, `"renewal"`, `"upgrade"`
-**SubscriptionType**: `"ip_range"`, `"asn_sponsoring"`, `"dns_hosting"`, `"vps"`
+**LineItemType**: `"ip_range"`, `"asn_sponsoring"`, `"dns_hosting"`, `"vps"`
 **InternetRegistry**: `"arin"`, `"ripe"`, `"apnic"`, `"lacnic"`, `"afrinic"`
 **CpuMfg**: `"unknown"`, `"intel"`, `"amd"`, `"apple"`, `"nvidia"`, `"arm"`
 **CpuArch**: `"unknown"`, `"x86_64"`, `"arm64"`
@@ -1215,7 +1215,7 @@ Response:
 }
 ```
 
-`subscription_type` is the **SubscriptionType** discriminant identifying the kind of service this line item bills for.
+`subscription_type` is the **LineItemType** discriminant identifying the kind of service this line item bills for. It describes the line item, not the subscription: a subscription has no type of its own, and one subscription can carry line items of different kinds.
 
 `resource` is a typed, tagged reference to the linked resource, **resolved from `subscription_type`** by looking up the back-reference tables (e.g. `vm.subscription_line_item_id`, `ip_range_subscription.subscription_line_item_id`). Use it to resolve the linked resource directly. Current shapes:
 
@@ -7014,8 +7014,6 @@ Response: Paginated list of `AdminIpRangeSubscriptionInfo`
 Payment method configurations store provider settings for payment processing (Lightning/LND, Revolut, Stripe, PayPal).
 This allows payment provider settings to be managed in the database instead of static configuration files.
 
-> **Note:** Bitvora support has been removed as the service has been shut down.
-
 Each configuration belongs to a specific company, and multiple configurations can exist per company/payment method
 combination. This allows keeping disabled legacy configurations that are still referenced by historical payments while
 having newer active configurations.
@@ -7097,16 +7095,6 @@ LND (Lightning):
   "url": "https://lnd.example.com:8080",
   "cert_path": "/path/to/tls.cert",
   "macaroon_path": "/path/to/admin.macaroon"
-}
-```
-
-Bitvora (Lightning) - **DEPRECATED: Service shut down**:
-
-```json
-{
-  "type": "bitvora",
-  "token": "bv_api_token_here",
-  "webhook_secret": "webhook_secret_here"
 }
 ```
 
@@ -7453,18 +7441,6 @@ The `config` field of `AdminPaymentMethodConfigInfo` is a tagged union — the `
 }
 ```
 
-**Bitvora (`"type": "bitvora"`)**
-
-```json
-{
-  "type": "bitvora",
-  "has_token": boolean,
-  // Whether the API token is configured
-  "has_webhook_secret": boolean
-  // Whether the webhook secret is configured
-}
-```
-
 ### CreatePaymentMethodConfigRequest
 
 ```json
@@ -7535,7 +7511,6 @@ All fields except `webhook_secret` are required when creating:
 | Type          | Payment Method | Required Fields                                                       |
 |---------------|----------------|-----------------------------------------------------------------------|
 | `lnd`         | lightning      | `url`, `cert_path`, `macaroon_path`                                   |
-| ~~`bitvora`~~ | ~~lightning~~  | ~~`token`, `webhook_secret`~~ (service shut down)                     |
 | `revolut`     | revolut        | `url`, `token`, `api_version`, `public_key` (webhook_secret optional) |
 | `stripe`      | stripe         | `secret_key`, `publishable_key`, `webhook_secret`                     |
 | `paypal`      | paypal         | `client_id`, `client_secret`, `mode`                                  |
@@ -7549,7 +7524,6 @@ Only the `type` field is required; all other fields are optional and will keep t
 | Type          | Optional Fields                                               |
 |---------------|---------------------------------------------------------------|
 | `lnd`         | `url`, `cert_path`, `macaroon_path`                           |
-| ~~`bitvora`~~ | ~~`token`, `webhook_secret`~~ (service shut down)             |
 | `revolut`     | `url`, `token`, `api_version`, `public_key`, `webhook_secret` |
 | `stripe`      | `secret_key`, `publishable_key`, `webhook_secret`             |
 | `paypal`      | `client_id`, `client_secret`, `mode`                          |
@@ -7560,7 +7534,6 @@ Only the `type` field is required; all other fields are optional and will keep t
 **Provider Types:**
 
 - `lnd` - Lightning Network Daemon for Lightning payments
-- ~~`bitvora`~~ - ~~Bitvora API for Lightning payments~~ (service shut down)
 - `revolut` - Revolut Business API
 - `stripe` - Stripe Payments API
 - `paypal` - PayPal REST API

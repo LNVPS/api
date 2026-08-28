@@ -436,9 +436,16 @@ fn make_net(start: u128, prefix: u8, v4: bool) -> Option<IpNetwork> {
 /// not overlap any CIDR in `taken`. Returns `None` if the parameters are
 /// invalid (wrong family / bad length) or the block is fully allocated.
 ///
-/// Runs in time proportional to the number of `taken` allocations, not the size
-/// of the address space: it walks candidates in order and jumps past occupied
-/// ranges, so a mostly-empty block is served from its first free slot instantly.
+/// Runs in `O(n log n)` for `n` allocations, dominated by the sort, and is
+/// independent of the size of the address space: it walks candidates in order
+/// and jumps past occupied ranges, so a mostly-empty block is served from its
+/// first free slot instantly.
+///
+/// The walk keeps a cursor into the sorted allocations rather than searching
+/// them from the start for each candidate. That matters for a densely packed
+/// block, where the first free slot is at position `n` and the naive form costs
+/// `O(n^2)`: at 20k allocations it took 355ms per call, and quadrupled with each
+/// doubling of `n`.
 pub fn allocate_subnet(
     block: &IpNetwork,
     target_len: u8,
@@ -465,6 +472,13 @@ pub fn allocate_subnet(
     taken_bounds.sort_unstable();
 
     let mut cur = block_start;
+    // Index of the first allocation that could still overlap the cursor.
+    //
+    // `cur` only ever moves forward and `taken_bounds` is sorted by start, so an
+    // allocation that ends before the cursor can never overlap again and is
+    // skipped for good. Without this the search restarts at zero for every
+    // candidate, which is what made a dense block quadratic.
+    let mut first = 0usize;
     loop {
         if cur > block_end {
             return None;
@@ -473,17 +487,22 @@ pub fn allocate_subnet(
         if cand_end > block_end {
             return None;
         }
-        // Does the candidate overlap any taken range?
-        if let Some((_, te)) = taken_bounds
-            .iter()
-            .find(|(ts, te)| cur <= *te && *ts <= cand_end)
-        {
-            // Jump to the next size-aligned slot after the occupied range.
-            let after = te.checked_add(1)?;
-            let aligned = (after + size - 1) & !(size - 1);
-            cur = if aligned <= cur { cur + size } else { aligned };
-        } else {
-            return make_net(cur, target_len, v4);
+
+        while first < taken_bounds.len() && taken_bounds[first].1 < cur {
+            first += 1;
+        }
+
+        // `taken_bounds[first]` ends at or after the cursor, and everything
+        // after it starts later still, so it is the only candidate for an
+        // overlap: if it starts beyond this slot, nothing occupies the slot.
+        match taken_bounds.get(first) {
+            Some(&(_, te)) if taken_bounds[first].0 <= cand_end => {
+                // Jump to the next size-aligned slot after the occupied range.
+                let after = te.checked_add(1)?;
+                let aligned = (after + size - 1) & !(size - 1);
+                cur = if aligned <= cur { cur + size } else { aligned };
+            }
+            _ => return make_net(cur, target_len, v4),
         }
     }
 }
@@ -493,7 +512,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use lnvps_api_common::{ChannelWorkCommander, MockDb, RegistryRef};
-    use lnvps_db::{LNVpsDbBase, PaymentMethod, SubscriptionPaymentType, SubscriptionType};
+    use lnvps_db::{LNVpsDbBase, LineItemType, PaymentMethod, SubscriptionPaymentType};
     use std::sync::Mutex as StdMutex;
 
     fn net(s: &str) -> IpNetwork {
@@ -656,7 +675,7 @@ mod tests {
         let li = SubscriptionLineItem {
             id: 500,
             subscription_id: 1,
-            subscription_type: SubscriptionType::IpRange,
+            subscription_type: LineItemType::IpRange,
             name: "IP Range".to_string(),
             description: None,
             amount: 1000,
@@ -843,7 +862,7 @@ mod tests {
         let li2 = SubscriptionLineItem {
             id: 501,
             subscription_id: 1,
-            subscription_type: SubscriptionType::IpRange,
+            subscription_type: LineItemType::IpRange,
             name: "no config".to_string(),
             description: None,
             amount: 1000,

@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
 
-use lnvps_db::{Subscription, SubscriptionType};
+use lnvps_db::{LineItemType, Subscription};
 
 use super::{DbToolExecutor, required_u64, tag};
 
@@ -47,13 +47,13 @@ impl DbToolExecutor {
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             let resource = match item.subscription_type {
-                SubscriptionType::Vps => self
+                LineItemType::Vps => self
                     .db
                     .get_vm_by_subscription(subscription.id)
                     .await
                     .ok()
                     .map(|vm| json!({ "kind": "vm", "vm_id": vm.id })),
-                SubscriptionType::App => self
+                LineItemType::App => self
                     .db
                     .get_app_deployment_by_line_item(item.id)
                     .await
@@ -65,14 +65,14 @@ impl DbToolExecutor {
                             "name": d.name,
                         })
                     }),
-                SubscriptionType::IpRange => self
+                LineItemType::IpRange => self
                     .db
                     .list_ip_range_subscriptions_by_line_item(item.id)
                     .await
                     .ok()
                     .and_then(|r| r.into_iter().next())
                     .map(|r| json!({ "kind": "ip_range", "cidr": r.cidr })),
-                SubscriptionType::AsnSponsoring => self
+                LineItemType::AsnSponsoring => self
                     .db
                     .list_asn_subscriptions_by_line_item(item.id)
                     .await
@@ -230,7 +230,7 @@ mod tests {
             SubscriptionLineItem {
                 id,
                 subscription_id: id,
-                subscription_type: SubscriptionType::Vps,
+                subscription_type: LineItemType::Vps,
                 name: "VPS".to_string(),
                 description: None,
                 amount: 599,

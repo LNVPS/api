@@ -7,8 +7,9 @@ use lnvps_api_common::retry::OpResult;
 use lnvps_api_common::{op_fatal, op_transient};
 
 use crate::router::{
-    ArpEntry, BgpPeer, BgpPeerDirection, BgpRoute, BgpRouter, BgpSession, GreConfig, Router,
-    Tunnel, TunnelConfig, TunnelRouter, TunnelTraffic, VxlanConfig, WireguardConfig, WireguardPeer,
+    ArpEntry, BgpPeer, BgpPeerDirection, BgpRoute, BgpRouter, BgpSession, GreConfig,
+    ObservedInterface, Router, TunnelConfig, TunnelRouter, TunnelTraffic, VxlanConfig,
+    WireguardConfig, WireguardPeer,
 };
 use crate::ssh_client::SshClient;
 
@@ -504,12 +505,12 @@ fn value_to_gre_key(v: &serde_json::Value) -> Option<u32> {
 }
 
 impl LinuxSshRouter {
-    /// Build a [`Tunnel`] from a parsed `ip` link entry, optionally augmented
+    /// Build a [`ObservedInterface`] from a parsed `ip` link entry, optionally augmented
     /// with WireGuard details from `wg show all dump`.
     fn link_to_tunnel(
         link: &IpLink,
         wg: &std::collections::HashMap<String, WireguardConfig>,
-    ) -> Option<Tunnel> {
+    ) -> Option<ObservedInterface> {
         let info = link.linkinfo.as_ref()?;
         let mapped = kind_from_info(&info.info_kind)?;
         // Skip the kernel fallback GRE devices (`gre0`, `gretap0`). These are
@@ -533,7 +534,7 @@ impl LinuxSshRouter {
             }
             _ => return None,
         };
-        Some(Tunnel {
+        Some(ObservedInterface {
             id: Some(link.ifname.clone()),
             name: link.ifname.clone(),
             local_addr: data.local.clone(),
@@ -546,7 +547,7 @@ impl LinuxSshRouter {
 
 #[async_trait]
 impl TunnelRouter for LinuxSshRouter {
-    async fn list_tunnels(&self) -> OpResult<Vec<Tunnel>> {
+    async fn list_tunnels(&self) -> OpResult<Vec<ObservedInterface>> {
         let out = self.exec_checked("ip -s -d -j link show").await?;
         let links: Vec<IpLink> = match serde_json::from_str(&out) {
             Ok(l) => l,
@@ -571,7 +572,7 @@ impl TunnelRouter for LinuxSshRouter {
             .collect())
     }
 
-    async fn add_tunnel(&self, tunnel: &Tunnel) -> OpResult<Tunnel> {
+    async fn add_tunnel(&self, tunnel: &ObservedInterface) -> OpResult<ObservedInterface> {
         let name = &tunnel.name;
         let mut script = String::new();
         match &tunnel.config {
@@ -611,7 +612,7 @@ impl TunnelRouter for LinuxSshRouter {
         script.push_str(&format!(" && ip link set {} up", shq(name)));
         self.exec_checked(&format!("sh -c {}", shq(&script)))
             .await?;
-        Ok(Tunnel {
+        Ok(ObservedInterface {
             id: Some(name.clone()),
             enabled: true,
             ..tunnel.clone()
@@ -624,7 +625,7 @@ impl TunnelRouter for LinuxSshRouter {
         Ok(())
     }
 
-    async fn update_tunnel(&self, tunnel: &Tunnel) -> OpResult<Tunnel> {
+    async fn update_tunnel(&self, tunnel: &ObservedInterface) -> OpResult<ObservedInterface> {
         // Recreate the interface to apply config changes deterministically.
         // `ip link del` is ignored if the interface does not yet exist.
         let _ = self
@@ -1066,7 +1067,7 @@ mod tests {
         ]"#;
         let links: Vec<IpLink> = serde_json::from_str(json).unwrap();
         let wg = std::collections::HashMap::new();
-        let tuns: Vec<Tunnel> = links
+        let tuns: Vec<ObservedInterface> = links
             .iter()
             .filter_map(|l| LinuxSshRouter::link_to_tunnel(l, &wg))
             .collect();

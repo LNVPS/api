@@ -8,6 +8,22 @@ use std::collections::HashSet;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 
+/// A uniformly random address from `block`.
+///
+/// Says nothing about whether it is free: what to do about a collision is the
+/// caller's policy, and the two callers want different things. This is only the
+/// part they genuinely share.
+///
+/// `nth` is arithmetic on the network address rather than a walk of the range,
+/// so the cost does not depend on where in the block the address lands.
+pub fn random_address(block: &IpNetwork) -> Option<IpAddr> {
+    let mut rng = rand::rng();
+    Some(match block {
+        IpNetwork::V4(v4) => IpAddr::V4(v4.nth(rng.random_range(0..v4.size()))?),
+        IpNetwork::V6(v6) => IpAddr::V6(v6.nth(rng.random_range(0..v6.size()))?),
+    })
+}
+
 /// Parse gateway string as IpNetwork, with backward compatibility for plain IP addresses.
 /// If the string is a plain IP address without CIDR notation, it will be converted to:
 /// - /32 for IPv4 addresses
@@ -265,29 +281,14 @@ impl NetworkProvisioner {
                     .iter()
                     .find(|i| !ips.contains(i))
                     .and_then(|i| IpNetwork::new(i, max_net).ok()),
-                IpRangeAllocationMode::Random => {
-                    let mut rng = rand::rng();
-                    match range_cidr {
-                        IpNetwork::V4(v4) => loop {
-                            let n = rng.random_range(0..v4.size());
-                            let addr = IpAddr::V4(v4.nth(n).unwrap());
-                            if !ips.contains(&addr) {
-                                break IpNetwork::new(addr, max_net).ok();
-                            } else {
-                                continue;
-                            }
-                        },
-                        IpNetwork::V6(v6) => loop {
-                            let n = rng.random_range(0..v6.size());
-                            let addr = IpAddr::V6(v6.nth(n).unwrap());
-                            if !ips.contains(&addr) {
-                                break IpNetwork::new(addr, max_net).ok();
-                            } else {
-                                continue;
-                            }
-                        },
+                IpRangeAllocationMode::Random => loop {
+                    let Some(addr) = random_address(&range_cidr) else {
+                        break None;
+                    };
+                    if !ips.contains(&addr) {
+                        break IpNetwork::new(addr, max_net).ok();
                     }
-                }
+                },
                 IpRangeAllocationMode::SlaacEui64 => {
                     if range_cidr.network().is_ipv4() {
                         bail!("Cannot create EUI-64 from IPv4 address")

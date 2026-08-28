@@ -1,7 +1,7 @@
 use crate::router::{
-    ArpEntry, BgpPeer, BgpPeerDirection, BgpRoute, BgpRouter, BgpSession, GreConfig, Router,
-    Tunnel, TunnelConfig, TunnelKind, TunnelRouter, TunnelTraffic, VxlanConfig, WireguardConfig,
-    WireguardPeer,
+    ArpEntry, BgpPeer, BgpPeerDirection, BgpRoute, BgpRouter, BgpSession, GreConfig,
+    ObservedInterface, Router, TunnelConfig, TunnelKind, TunnelRouter, TunnelTraffic, VxlanConfig,
+    WireguardConfig, WireguardPeer,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -320,7 +320,7 @@ fn mt_enabled(disabled: &Option<String>) -> bool {
 
 #[async_trait]
 impl TunnelRouter for MikrotikRouter {
-    async fn list_tunnels(&self) -> OpResult<Vec<Tunnel>> {
+    async fn list_tunnels(&self) -> OpResult<Vec<ObservedInterface>> {
         let mut out = Vec::new();
 
         let gres: Vec<MtGre> = self
@@ -328,7 +328,7 @@ impl TunnelRouter for MikrotikRouter {
             .req::<_, ()>(Method::GET, "/rest/interface/gre", None)
             .await?;
         for g in gres {
-            out.push(Tunnel {
+            out.push(ObservedInterface {
                 id: Some(format!("gre:{}", g.id.clone().unwrap_or_default())),
                 name: g.name,
                 local_addr: g.local_address,
@@ -343,7 +343,7 @@ impl TunnelRouter for MikrotikRouter {
             .req::<_, ()>(Method::GET, "/rest/interface/vxlan", None)
             .await?;
         for v in vxlans {
-            out.push(Tunnel {
+            out.push(ObservedInterface {
                 id: Some(format!("vxlan:{}", v.id.clone().unwrap_or_default())),
                 name: v.name,
                 local_addr: v.local_address,
@@ -385,7 +385,7 @@ impl TunnelRouter for MikrotikRouter {
                         })
                         .collect(),
                 };
-                out.push(Tunnel {
+                out.push(ObservedInterface {
                     id: Some(format!("wireguard:{}", w.id.clone().unwrap_or_default())),
                     name: w.name,
                     local_addr: None,
@@ -399,7 +399,7 @@ impl TunnelRouter for MikrotikRouter {
         Ok(out)
     }
 
-    async fn add_tunnel(&self, tunnel: &Tunnel) -> OpResult<Tunnel> {
+    async fn add_tunnel(&self, tunnel: &ObservedInterface) -> OpResult<ObservedInterface> {
         let endpoint = tunnel_endpoint(tunnel.kind());
         let path = format!("/rest/interface/{}", endpoint);
         let created: MtCreated = match &tunnel.config {
@@ -445,7 +445,7 @@ impl TunnelRouter for MikrotikRouter {
                 created
             }
         };
-        Ok(Tunnel {
+        Ok(ObservedInterface {
             id: Some(format!("{}:{}", endpoint, created.id.unwrap_or_default())),
             enabled: true,
             ..tunnel.clone()
@@ -470,7 +470,7 @@ impl TunnelRouter for MikrotikRouter {
         Ok(())
     }
 
-    async fn update_tunnel(&self, tunnel: &Tunnel) -> OpResult<Tunnel> {
+    async fn update_tunnel(&self, tunnel: &ObservedInterface) -> OpResult<ObservedInterface> {
         let id = tunnel
             .id
             .as_deref()

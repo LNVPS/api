@@ -132,7 +132,8 @@ impl ProbeSpec {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Node {} has no host to probe", node.id))?;
 
-        let tunnel = super::get_node_tunnel(db, node)
+        let tunnel = crate::provisioner::MarketplaceTunnels::new(db.clone())
+            .get_tunnel(node)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Node {} has no tunnel", node.id))?;
         let address = probe_address(&tunnel.tunnel)

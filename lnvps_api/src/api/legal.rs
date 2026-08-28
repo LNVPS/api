@@ -241,7 +241,7 @@ async fn v1_generate_lir_agreement_from_subscription(
     let mut resources: Vec<ResourceRequest> = Vec::with_capacity(line_items.len());
     for li in &line_items {
         let (resource_type, quantity) = match li.subscription_type {
-            lnvps_db::SubscriptionType::IpRange => {
+            lnvps_db::LineItemType::IpRange => {
                 // Look up the allocated CIDR via ip_range_subscription
                 let cidr = this
                     .db
@@ -258,11 +258,25 @@ async fn v1_generate_lir_agreement_from_subscription(
                 .to_string();
                 (resource_type, cidr.unwrap_or_else(|| "—".to_string()))
             }
-            lnvps_db::SubscriptionType::AsnSponsoring => ("AS Number".to_string(), "—".to_string()),
-            lnvps_db::SubscriptionType::DnsHosting => ("DNS Hosting".to_string(), "—".to_string()),
-            lnvps_db::SubscriptionType::Vps => ("VPS".to_string(), "—".to_string()),
-            lnvps_db::SubscriptionType::App => ("App".to_string(), "—".to_string()),
-            lnvps_db::SubscriptionType::MarketplaceNodeFee => {
+            lnvps_db::LineItemType::AsnSponsoring => ("AS Number".to_string(), "—".to_string()),
+            lnvps_db::LineItemType::DnsHosting => ("DNS Hosting".to_string(), "—".to_string()),
+            lnvps_db::LineItemType::Vps => ("VPS".to_string(), "—".to_string()),
+            lnvps_db::LineItemType::App => ("App".to_string(), "—".to_string()),
+            lnvps_db::LineItemType::Vpn => {
+                // The quantity is the device allowance, which is what the plan
+                // actually sells.
+                let devices = match this.db.get_vpn_subscription_by_line_item(li.id).await {
+                    Ok(Some(p)) => this
+                        .db
+                        .get_vpn_service(p.vpn_service_id)
+                        .await
+                        .map(|s| s.default_device_limit.to_string())
+                        .unwrap_or_else(|_| "—".to_string()),
+                    _ => "—".to_string(),
+                };
+                ("VPN".to_string(), devices)
+            }
+            lnvps_db::LineItemType::MarketplaceNodeFee => {
                 ("Marketplace Node Listing Fee".to_string(), "—".to_string())
             }
         };

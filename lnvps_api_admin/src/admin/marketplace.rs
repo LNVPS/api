@@ -716,7 +716,7 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use lnvps_api_common::MockDb;
-    use lnvps_db::{Company, IntervalType, Subscription, SubscriptionLineItem, SubscriptionType};
+    use lnvps_db::{Company, IntervalType, LineItemType, Subscription, SubscriptionLineItem};
 
     use crate::admin::model::Permission;
     use lnvps_api_common::node_control::NodeStatus;
@@ -824,7 +824,7 @@ mod tests {
                 vec![SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: SubscriptionType::MarketplaceNodeFee,
+                    subscription_type: LineItemType::MarketplaceNodeFee,
                     name: "fee".to_string(),
                     description: None,
                     amount: 0,

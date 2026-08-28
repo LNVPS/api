@@ -1728,7 +1728,7 @@ mod tests {
     #[tokio::test]
     async fn admin_vm_batch_renders_every_per_vm_table() {
         use lnvps_api_common::MockDb;
-        use lnvps_db::{LNVpsDbBase, SubscriptionType};
+        use lnvps_db::{LNVpsDbBase, LineItemType};
 
         let db = MockDb::default();
         let user_id = db.upsert_user(&[2u8; 32]).await.unwrap();
@@ -1767,7 +1767,7 @@ mod tests {
             .insert_subscription_line_item(&lnvps_db::SubscriptionLineItem {
                 id: 0,
                 subscription_id: sub_id,
-                subscription_type: SubscriptionType::Vps,
+                subscription_type: LineItemType::Vps,
                 name: "vps".to_string(),
                 description: None,
                 amount: 999,

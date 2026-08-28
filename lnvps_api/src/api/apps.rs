@@ -16,7 +16,7 @@ use lnvps_api_common::{
 };
 use lnvps_db::{
     App, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus, AppTag, EncryptedString,
-    LNVpsDb, PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionType,
+    LNVpsDb, LineItemType, PaymentMethod, Subscription, SubscriptionLineItem,
 };
 use payments_rs::currency::CurrencyAmount;
 use serde::{Deserialize, Serialize};
@@ -713,7 +713,7 @@ async fn v1_create_app_deployment(
     let line_item = SubscriptionLineItem {
         id: 0,
         subscription_id: 0,
-        subscription_type: SubscriptionType::App,
+        subscription_type: LineItemType::App,
         name: app.display_name.clone(),
         description: None,
         amount: app.amount,
@@ -1312,14 +1312,14 @@ mod tests {
         // Line item 1 has a subscription; line item 2 deliberately has none, so
         // its lookup fails the way a broken billing back-reference does.
         async fn seed_sub(db: &MockDb, is_setup: bool, expires: Option<DateTime<Utc>>) {
-            use lnvps_db::{IntervalType, Subscription, SubscriptionLineItem, SubscriptionType};
+            use lnvps_db::{IntervalType, LineItemType, Subscription, SubscriptionLineItem};
             let mut items = db.subscription_line_items.lock().await;
             items.insert(
                 1,
                 SubscriptionLineItem {
                     id: 1,
                     subscription_id: 1,
-                    subscription_type: SubscriptionType::App,
+                    subscription_type: LineItemType::App,
                     name: "app".to_string(),
                     description: None,
                     amount: 1000,

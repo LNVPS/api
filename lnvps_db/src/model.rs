@@ -1155,10 +1155,12 @@ pub enum NetworkAccessPolicy {
     StaticArp = 0,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, sqlx::Type, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, sqlx::Type, Serialize, Deserialize, Default)]
 #[repr(u16)]
 pub enum IntervalType {
     Day = 0,
+    /// The default, matching every billing column's `DEFAULT 1`.
+    #[default]
     Month = 1,
     Year = 2,
 }
@@ -2157,6 +2159,169 @@ impl TunnelPool {
     }
 }
 
+/// The address space a VPN device lives in, and the settings its config carries.
+///
+/// A device is addressed from the block on the interfaces terminating it, like
+/// every other peer. What is specific to a VPN is that every one of those
+/// interfaces shares a single block, so a device keeps one address in every
+/// region; that is enforced when a pool is linked to a service.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct VpnService {
+    /// Unique id of this service
+    pub id: u64,
+    /// Admin label. Not an identifier.
+    pub name: String,
+    /// The selling company. Named directly rather than taken from a region,
+    /// because a VPN plan has no region: a device works in all of them.
+    pub company_id: u64,
+    /// Recurring price of a plan on this service
+    pub amount: u64,
+    /// Currency of [`amount`](Self::amount) and [`setup_amount`](Self::setup_amount)
+    pub currency: String,
+    /// How many [`interval_type`](Self::interval_type) units one billing period is
+    pub interval_amount: u64,
+    /// The billing period unit
+    pub interval_type: IntervalType,
+    /// One-off amount charged on the first payment
+    pub setup_amount: u64,
+    /// Resolvers handed to clients in the generated config, comma-separated.
+    ///
+    /// A device reaches the internet through the route server's own NAT and has
+    /// no resolver of its own, so without this the client keeps using whatever
+    /// its local network gave it and leaks every lookup around the tunnel.
+    pub dns: Option<String>,
+    /// Devices an account here may register unless its own row says otherwise.
+    /// [`VpnSubscription::device_limit`] is what is enforced.
+    pub default_device_limit: u8,
+    /// Whether new subscriptions and devices may be created here
+    pub enabled: bool,
+    /// When this service was created
+    pub created: DateTime<Utc>,
+}
+
+impl VpnService {
+    /// The resolvers to write into a client config, split and trimmed.
+    ///
+    /// Empty when none are set, so a caller can omit the `DNS` line rather than
+    /// writing a blank one that `wg-quick` rejects.
+    pub fn dns_servers(&self) -> Vec<String> {
+        self.dns
+            .as_deref()
+            .map(|d| {
+                d.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// A prefix routed behind a tunnel's peer.
+///
+/// A peer's `AllowedIPs` is its own addresses plus whatever lives behind it,
+/// and this is the second part. Recording it keeps the planner from having to
+/// ask what a tunnel is for: a marketplace node has its guests' addresses here,
+/// a VPN device has nothing, and neither case is special to the code that reads
+/// it.
+///
+/// A cache of desired state, not an authority. Whoever owns a tunnel's purpose
+/// recomputes these before a reconcile, so a missed write is corrected on the
+/// next pass rather than silently black-holing a customer.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct TunnelRoute {
+    /// The tunnel whose peer carries this prefix
+    pub tunnel_id: u64,
+    /// The prefix, as CIDR
+    pub prefix: String,
+    /// When it was first recorded
+    pub created: DateTime<Utc>,
+}
+
+/// Which interfaces terminate a VPN service.
+///
+/// The association is recorded here rather than as a column on [`TunnelPool`]:
+/// a pool is an opaque managed WireGuard interface and is not concerned with
+/// what is carried over it, the same way a [`Tunnel`] has no purpose of its own
+/// and is pointed at by [`MarketplaceNode::tunnel_id`].
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct VpnServicePool {
+    /// The service whose devices this interface carries
+    pub vpn_service_id: u64,
+    /// The interface. Primary key: one interface terminates at most one
+    /// service, because two peer sets on one interface would reconcile against
+    /// each other, each removing the other's peers as unclaimed.
+    pub tunnel_pool_id: u64,
+    /// When the link was made
+    pub created: DateTime<Utc>,
+}
+
+/// A customer's VPN plan.
+///
+/// One per account. The device allowance is the service's
+/// ([`VpnService::default_device_limit`]): one flat price per service is what
+/// is sold, so a per-plan number would have no price attached to it.
+///
+/// There is no active or suspended field. Whether the plan is paid for is
+/// [`Subscription::is_setup`] and [`Subscription::expires`], reached through the
+/// line item; a copy here would be a second answer free to disagree with the
+/// first. Suspension is therefore not a write: the planner reads billing state,
+/// so a lapsed plan stops being configured on the next reconcile and a paid one
+/// returns without anything having to remember to re-enable it.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct VpnSubscription {
+    /// Unique id of this plan
+    pub id: u64,
+    /// Which service, and therefore which address block, its devices come from
+    pub vpn_service_id: u64,
+    /// The account this plan belongs to
+    pub user_id: u64,
+    /// The line item billing for this plan.
+    ///
+    /// Stable for its life: a renewal is a payment against the existing
+    /// subscription, not a new line item, so a customer who lapses and returns
+    /// renews what they already have and their devices need no repointing.
+    pub subscription_line_item_id: u64,
+    /// When this plan was created
+    pub created: DateTime<Utc>,
+}
+
+/// One registered device: a phone, a laptop.
+///
+/// The key and addresses are not here: a device is a WireGuard peer, and a peer
+/// is a [`Tunnel`] — the same table as a marketplace node's, terminated by the
+/// same interfaces, planned by the same code and protected by the same unique
+/// indexes. One set of indexes across every peer is what makes it impossible
+/// for a device and a node to be handed the same address.
+///
+/// What is left is only what makes it a device: which plan, which slot, and
+/// what the customer calls it. The tunnel it points at has a NULL `pool_id`,
+/// which is the case [`Tunnel::pool_id`] already describes for a VPN — a device
+/// is a peer on every interface terminating its service at once, so pinning it
+/// to one would be false.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct VpnDevice {
+    /// Unique id of this device
+    pub id: u64,
+    /// The plan this device is registered against
+    pub vpn_subscription_id: u64,
+    /// Which of the plan's device slots this occupies, counted from zero.
+    ///
+    /// Exists to make the device limit unforgeable: counting rows and then
+    /// inserting is a race two concurrent registrations win together, while
+    /// claiming the lowest free slot against `uk_vpn_device_slot` means the
+    /// database rejects the loser.
+    pub slot: u8,
+    /// The customer's label. Never sent to a route server; [`Tunnel::name`] is
+    /// what the route server sees.
+    pub name: String,
+    /// The peer this device is
+    pub tunnel_id: u64,
+    /// When this device was registered
+    pub created: DateTime<Utc>,
+}
+
 /// A single machine offered by an operator.
 ///
 /// One probe's findings on a node.
@@ -2970,16 +3135,29 @@ impl Subscription {
     }
 }
 
-/// Subscription Type - Type of service being sold
+/// What a line item bills for, and therefore which product table owns it.
+///
+/// This belongs to the **line item**, not to the subscription: a subscription
+/// has no type of its own, which is what lets one carry a VM and a VPN on a
+/// single renewal date and a single payment.
+///
+/// The column it is stored in is `subscription_line_item.subscription_type`,
+/// which is a misnomer inherited from `20260130000001_subscription_line_item_type.sql`
+/// (whose own filename, and whose `idx_line_item_type` index, say line item).
+/// The column keeps that name because renaming it buys nothing and would mean a
+/// migration plus a coordinated deploy across every crate that writes billing
+/// SQL by hand.
 #[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize, PartialEq, Eq)]
 #[repr(u16)]
 #[serde(rename_all = "snake_case")]
-pub enum SubscriptionType {
+pub enum LineItemType {
     IpRange = 0,       // IP range allocation/LIR services
     AsnSponsoring = 1, // ASN sponsoring services
     DnsHosting = 2,    // DNS hosting services
     Vps = 3,           // VM (links to vm table via vm.subscription_line_item_id)
     App = 4, // Managed app deployment (links via app_deployment.subscription_line_item_id)
+    /// A consumer VPN plan (links via `vpn_subscription.subscription_line_item_id`).
+    Vpn = 6,
     /// One-off marketplace node listing fee (links via
     /// `marketplace_node.subscription_line_item_id`).
     ///
@@ -2989,15 +3167,16 @@ pub enum SubscriptionType {
     MarketplaceNodeFee = 5,
 }
 
-impl Display for SubscriptionType {
+impl Display for LineItemType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            SubscriptionType::IpRange => write!(f, "IP Range"),
-            SubscriptionType::AsnSponsoring => write!(f, "ASN Sponsoring"),
-            SubscriptionType::DnsHosting => write!(f, "DNS Hosting"),
-            SubscriptionType::Vps => write!(f, "VPS"),
-            SubscriptionType::App => write!(f, "App"),
-            SubscriptionType::MarketplaceNodeFee => write!(f, "Marketplace Node Fee"),
+            LineItemType::IpRange => write!(f, "IP Range"),
+            LineItemType::AsnSponsoring => write!(f, "ASN Sponsoring"),
+            LineItemType::DnsHosting => write!(f, "DNS Hosting"),
+            LineItemType::Vps => write!(f, "VPS"),
+            LineItemType::App => write!(f, "App"),
+            LineItemType::Vpn => write!(f, "VPN"),
+            LineItemType::MarketplaceNodeFee => write!(f, "Marketplace Node Fee"),
         }
     }
 }
@@ -3007,8 +3186,9 @@ impl Display for SubscriptionType {
 pub struct SubscriptionLineItem {
     pub id: u64,
     pub subscription_id: u64,
-    /// Discriminant indicating which product table owns this line item
-    pub subscription_type: SubscriptionType,
+    /// What this line item bills for, and therefore which product table owns
+    /// it. Named for its column, which is misnamed; see [`LineItemType`].
+    pub subscription_type: LineItemType,
     pub name: String,
     pub description: Option<String>,
     pub amount: u64,
@@ -3018,7 +3198,7 @@ pub struct SubscriptionLineItem {
     /// This stores upgrade configuration only (e.g. `UpgradeConfig` —
     /// `new_cpu` / `new_memory` / `new_disk`) recorded when a VM's specs are
     /// changed. It is NOT a link to the resource this line item bills for:
-    /// the linked resource is resolved from [`SubscriptionType`] via the
+    /// the linked resource is resolved from [`LineItemType`] via the
     /// back-reference tables (`vm.subscription_line_item_id`,
     /// `ip_range_subscription.subscription_line_item_id`, ...), never by
     /// parsing this column.
@@ -3429,6 +3609,40 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(v6.endpoint(), "[2a01:db8::1]:51820");
+    }
+
+    /// A device has no resolver of its own behind the route server's NAT, so a
+    /// config with no `DNS` line leaks every lookup around the tunnel. The
+    /// stored value is a list, and an empty one has to be distinguishable from
+    /// a blank line, which `wg-quick` rejects.
+    #[test]
+    fn test_vpn_service_dns_servers() {
+        let none = VpnService::default();
+        assert!(none.dns_servers().is_empty());
+
+        let one = VpnService {
+            dns: Some("10.64.0.1".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(one.dns_servers(), vec!["10.64.0.1".to_string()]);
+
+        // Whitespace around a separator is an admin typing a list, not a
+        // resolver named " 2a01:db8::1".
+        let many = VpnService {
+            dns: Some("10.64.0.1, 2a01:db8::1".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            many.dns_servers(),
+            vec!["10.64.0.1".to_string(), "2a01:db8::1".to_string()]
+        );
+
+        // A trailing separator must not produce an empty resolver.
+        let trailing = VpnService {
+            dns: Some("10.64.0.1,".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(trailing.dns_servers(), vec!["10.64.0.1".to_string()]);
     }
 
     #[test]
@@ -3969,15 +4183,6 @@ pub struct LndConfig {
     pub macaroon_path: PathBuf,
 }
 
-/// Lightning provider configuration - Bitvora
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BitvoraConfig {
-    /// API token
-    pub token: String,
-    /// Webhook secret for verifying callbacks
-    pub webhook_secret: String,
-}
-
 /// Revolut provider configuration
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RevolutProviderConfig {
@@ -4060,8 +4265,6 @@ pub struct PaypalProviderConfig {
 pub enum ProviderConfig {
     /// LND Lightning Network Daemon configuration
     Lnd(LndConfig),
-    /// Bitvora Lightning provider configuration
-    Bitvora(BitvoraConfig),
     /// Revolut fiat payment configuration
     Revolut(RevolutProviderConfig),
     /// Stripe fiat payment configuration
@@ -4078,7 +4281,6 @@ impl ProviderConfig {
     pub fn provider_type(&self) -> &'static str {
         match self {
             ProviderConfig::Lnd(_) => "lnd",
-            ProviderConfig::Bitvora(_) => "bitvora",
             ProviderConfig::Revolut(_) => "revolut",
             ProviderConfig::Stripe(_) => "stripe",
             ProviderConfig::Paypal(_) => "paypal",
@@ -4089,7 +4291,7 @@ impl ProviderConfig {
     /// Get the payment method for this provider config
     pub fn payment_method(&self) -> PaymentMethod {
         match self {
-            ProviderConfig::Lnd(_) | ProviderConfig::Bitvora(_) => PaymentMethod::Lightning,
+            ProviderConfig::Lnd(_) => PaymentMethod::Lightning,
             ProviderConfig::Revolut(_) => PaymentMethod::Revolut,
             ProviderConfig::Stripe(_) => PaymentMethod::Stripe,
             ProviderConfig::Paypal(_) => PaymentMethod::Paypal,
@@ -4101,14 +4303,6 @@ impl ProviderConfig {
     pub fn as_lnd(&self) -> Option<&LndConfig> {
         match self {
             ProviderConfig::Lnd(cfg) => Some(cfg),
-            _ => None,
-        }
-    }
-
-    /// Get Bitvora config if this is a Bitvora provider
-    pub fn as_bitvora(&self) -> Option<&BitvoraConfig> {
-        match self {
-            ProviderConfig::Bitvora(cfg) => Some(cfg),
             _ => None,
         }
     }
@@ -4160,7 +4354,7 @@ pub struct PaymentMethodConfig {
     pub name: String,
     /// Whether this payment method is enabled
     pub enabled: bool,
-    /// Provider type string (e.g., "lnd", "bitvora", "revolut")
+    /// Provider type string (e.g., "lnd", "revolut")
     pub provider_type: String,
     /// JSON configuration for the provider
     pub config: Option<serde_json::Value>,
@@ -4490,7 +4684,7 @@ pub struct AppDeploymentVolumeUsage {
 /// A customer's running instance of an [`App`].
 ///
 /// Billed via the subscription engine: `subscription_line_item_id` links to a
-/// [`SubscriptionLineItem`] of type [`SubscriptionType::App`], mirroring how
+/// [`SubscriptionLineItem`] of type [`LineItemType::App`], mirroring how
 /// `vm.subscription_line_item_id` works. Reconciled into its own Kubernetes
 /// namespace (`namespace`) by `lnvps_operator`.
 #[derive(FromRow, Clone, Debug)]

@@ -200,8 +200,7 @@ mod tests {
     use lnvps_api_common::MockDb;
     use lnvps_db::{
         AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus, EncryptedString,
-        LNVpsDbBase, PaymentMethod, SubscriptionLineItem, SubscriptionPaymentType,
-        SubscriptionType,
+        LNVpsDbBase, LineItemType, PaymentMethod, SubscriptionLineItem, SubscriptionPaymentType,
     };
 
     fn payment() -> SubscriptionPayment {
@@ -263,7 +262,7 @@ mod tests {
         SubscriptionLineItem {
             id,
             subscription_id: 1,
-            subscription_type: SubscriptionType::App,
+            subscription_type: LineItemType::App,
             name: "app".to_string(),
             description: None,
             amount: 1000,

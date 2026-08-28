@@ -255,7 +255,7 @@ mod tests {
     use crate::agent::ToolExecutor;
     use chrono::Utc;
     use lnvps_api_common::{GB, MockDb};
-    use lnvps_db::{AppCluster, AppDeploymentStatus, AppTag, IntervalType, SubscriptionType};
+    use lnvps_db::{AppCluster, AppDeploymentStatus, AppTag, IntervalType, LineItemType};
     use std::sync::Arc;
 
     /// Seed one catalogue app (`nostr-relay`, €5/month) with a tag and a
@@ -320,7 +320,7 @@ mod tests {
             lnvps_db::SubscriptionLineItem {
                 id: 100 + id,
                 subscription_id: 1,
-                subscription_type: SubscriptionType::App,
+                subscription_type: LineItemType::App,
                 name: "App".to_string(),
                 description: None,
                 amount: 500,

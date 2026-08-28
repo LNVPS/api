@@ -400,7 +400,7 @@ mod tests {
                 vec![lnvps_db::SubscriptionLineItem {
                     id: 0,
                     subscription_id: 0,
-                    subscription_type: lnvps_db::SubscriptionType::Vps,
+                    subscription_type: lnvps_db::LineItemType::Vps,
                     name: "vm".to_string(),
                     description: None,
                     amount: 100,

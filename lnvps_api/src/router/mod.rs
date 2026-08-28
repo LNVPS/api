@@ -21,7 +21,7 @@ pub trait Router: Send + Sync {
     async fn remove_arp_entry(&self, id: &str) -> OpResult<()>;
     async fn update_arp_entry(&self, entry: &ArpEntry) -> OpResult<ArpEntry>;
 
-    /// Tunnel-management capability, if this router supports it.
+    /// ObservedInterface-management capability, if this router supports it.
     ///
     /// Returns `None` for routers that cannot manage GRE/VXLAN/WireGuard tunnels.
     fn tunnel(&self) -> Option<&dyn TunnelRouter> {
@@ -150,13 +150,13 @@ pub struct BgpRoute {
 #[async_trait]
 pub trait TunnelRouter: Send + Sync {
     /// List all tunnels currently configured on the router
-    async fn list_tunnels(&self) -> OpResult<Vec<Tunnel>>;
+    async fn list_tunnels(&self) -> OpResult<Vec<ObservedInterface>>;
     /// Create a new tunnel
-    async fn add_tunnel(&self, tunnel: &Tunnel) -> OpResult<Tunnel>;
+    async fn add_tunnel(&self, tunnel: &ObservedInterface) -> OpResult<ObservedInterface>;
     /// Remove a tunnel by its backend id (interface name on Linux)
     async fn remove_tunnel(&self, id: &str) -> OpResult<()>;
     /// Update an existing tunnel
-    async fn update_tunnel(&self, tunnel: &Tunnel) -> OpResult<Tunnel>;
+    async fn update_tunnel(&self, tunnel: &ObservedInterface) -> OpResult<ObservedInterface>;
     /// Enable or disable a tunnel by its backend id (interface name on Linux,
     /// `"<kind>:<.id>"` on Mikrotik).
     async fn set_tunnel_enabled(&self, id: &str, enabled: bool) -> OpResult<()>;
@@ -224,7 +224,7 @@ pub enum TunnelKind {
 
 /// A tunnel interface (GRE, VXLAN or WireGuard)
 #[derive(Debug, Clone, PartialEq)]
-pub struct Tunnel {
+pub struct ObservedInterface {
     /// Backend identifier (interface name on Linux, `.id` on Mikrotik)
     pub id: Option<String>,
     /// Interface name
@@ -239,7 +239,7 @@ pub struct Tunnel {
     pub config: TunnelConfig,
 }
 
-impl Tunnel {
+impl ObservedInterface {
     /// The kind of this tunnel, derived from its config
     pub fn kind(&self) -> TunnelKind {
         match self.config {
@@ -299,7 +299,7 @@ pub struct WireguardPeer {
 /// Per-tunnel traffic counters
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelTraffic {
-    /// Tunnel interface name
+    /// ObservedInterface interface name
     pub name: String,
     /// Bytes received
     pub rx_bytes: u64,
@@ -317,7 +317,7 @@ impl From<TunnelKind> for lnvps_db::RouterTunnelKind {
     }
 }
 
-impl Tunnel {
+impl ObservedInterface {
     /// Build a cacheable DB row for this tunnel under the given router.
     pub fn to_db(&self, router_id: u64) -> lnvps_db::RouterTunnel {
         lnvps_db::RouterTunnel {
@@ -455,8 +455,8 @@ mod tests {
     use super::*;
     use crate::mocks::MockRouter;
 
-    fn sample_tunnel(name: &str) -> Tunnel {
-        Tunnel {
+    fn sample_tunnel(name: &str) -> ObservedInterface {
+        ObservedInterface {
             id: None,
             name: name.to_string(),
             local_addr: Some("10.0.0.1".to_string()),

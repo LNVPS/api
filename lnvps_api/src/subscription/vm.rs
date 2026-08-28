@@ -8,8 +8,8 @@ use lnvps_api_common::{
     WorkJob,
 };
 use lnvps_db::{
-    LNVpsDb, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
-    SubscriptionType, Vm, VmHistoryActionType,
+    LNVpsDb, LineItemType, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentType, Vm, VmHistoryActionType,
 };
 use log::{error, info, warn};
 use std::sync::Arc;
@@ -233,7 +233,7 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
 
     async fn on_expired(&self, sub: &Subscription, line_item: &SubscriptionLineItem) -> Result<()> {
         // skip anything that isn't the vm line item (skip upgrade lines)
-        if line_item.subscription_type != SubscriptionType::Vps {
+        if line_item.subscription_type != LineItemType::Vps {
             return Ok(());
         }
         let grace_days = crate::worker::grace_period_days_for_sub(
@@ -272,7 +272,7 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
         line_item: &SubscriptionLineItem,
     ) -> Result<()> {
         // skip anything that isn't the vm line item (skip upgrade lines)
-        if line_item.subscription_type != SubscriptionType::Vps {
+        if line_item.subscription_type != LineItemType::Vps {
             return Ok(());
         }
         let vm_id = self.vm.id;

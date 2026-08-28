@@ -335,7 +335,7 @@ impl Stack {
     /// harness whose ends disagree fails as a production bug.
     pub async fn bring_up(&self, index: u8, guests: &[String]) -> Result<DataPlane> {
         use lnvps_api::router::{
-            Tunnel, TunnelConfig, TunnelRouter, WireguardConfig, WireguardPeer,
+            ObservedInterface, TunnelConfig, TunnelRouter, WireguardConfig, WireguardPeer,
         };
 
         let state = tempfile::TempDir::new().context("node state directory")?;
@@ -344,7 +344,7 @@ impl Stack {
         let rs = self.route_server();
         let rs_interface = format!("wgln{index}");
 
-        rs.add_tunnel(&Tunnel {
+        rs.add_tunnel(&ObservedInterface {
             id: None,
             name: rs_interface.clone(),
             local_addr: None,
@@ -445,7 +445,7 @@ impl Stack {
     }
 
     /// Configure the route server from the database, exactly as the worker's
-    /// reconcile does: `plan_pool` decides the addresses, routes and peers, and
+    /// reconcile does: `plan_interface` decides the addresses, routes and peers, and
     /// this applies them.
     ///
     /// Used where a test has a real database — it is the production path on the
@@ -461,13 +461,15 @@ impl Stack {
         db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
         pool: &lnvps_db::TunnelPool,
     ) -> Result<String> {
-        use lnvps_api::router::{Tunnel, TunnelConfig, TunnelRouter, WireguardConfig};
+        use lnvps_api::router::{ObservedInterface, TunnelConfig, TunnelRouter, WireguardConfig};
 
-        let plan = lnvps_api::provisioner::plan_pool(db, pool).await?;
+        let plan = lnvps_api::provisioner::wg::TunnelProvisioner::new(db.clone())
+            .plan(pool)
+            .await?;
         let interface = format!("wgln{}", pool.id);
         let rs = self.route_server();
 
-        rs.add_tunnel(&Tunnel {
+        rs.add_tunnel(&ObservedInterface {
             id: None,
             name: interface.clone(),
             local_addr: None,

@@ -45,7 +45,7 @@
 //! and use `order.amount` — the actual net being charged — for a minimum-spend
 //! threshold.
 
-use lnvps_db::{LNVpsDb, SubscriptionLineItem, SubscriptionType};
+use lnvps_db::{LNVpsDb, LineItemType, SubscriptionLineItem};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -154,6 +154,14 @@ pub enum OrderProduct {
     DnsHosting,
     /// A one-off marketplace node listing fee.
     MarketplaceNodeFee { node_id: Option<i64> },
+    /// A consumer VPN plan.
+    Vpn {
+        #[serde(default)]
+        vpn_subscription_id: Option<i64>,
+        /// Which service, and therefore which regions and address space.
+        #[serde(default)]
+        vpn_service_id: Option<i64>,
+    },
 }
 
 impl OrderLineItem {
@@ -165,8 +173,8 @@ impl OrderLineItem {
     /// why a missing product row must not remove the line.
     pub async fn resolve(db: &Arc<dyn LNVpsDb>, line_item: &SubscriptionLineItem) -> Self {
         let product = match line_item.subscription_type {
-            SubscriptionType::Vps => Self::vm_product(db, line_item.id).await,
-            SubscriptionType::App => {
+            LineItemType::Vps => Self::vm_product(db, line_item.id).await,
+            LineItemType::App => {
                 let d = db.get_app_deployment_by_line_item(line_item.id).await.ok();
                 OrderProduct::App {
                     deployment_id: d.as_ref().map(|d| d.id as i64),
@@ -175,7 +183,7 @@ impl OrderLineItem {
                     resource_multiplier: d.as_ref().map(|d| d.resource_multiplier as i64),
                 }
             }
-            SubscriptionType::IpRange => {
+            LineItemType::IpRange => {
                 let r = db
                     .list_ip_range_subscriptions_by_line_item(line_item.id)
                     .await
@@ -186,7 +194,7 @@ impl OrderLineItem {
                     cidr: r.map(|r| r.cidr),
                 }
             }
-            SubscriptionType::AsnSponsoring => {
+            LineItemType::AsnSponsoring => {
                 let a = db
                     .list_asn_subscriptions_by_line_item(line_item.id)
                     .await
@@ -198,8 +206,19 @@ impl OrderLineItem {
                     registry: a.map(|a| a.registry.to_string().to_lowercase()),
                 }
             }
-            SubscriptionType::DnsHosting => OrderProduct::DnsHosting,
-            SubscriptionType::MarketplaceNodeFee => OrderProduct::MarketplaceNodeFee {
+            LineItemType::Vpn => {
+                let p = db
+                    .get_vpn_subscription_by_line_item(line_item.id)
+                    .await
+                    .ok()
+                    .flatten();
+                OrderProduct::Vpn {
+                    vpn_subscription_id: p.as_ref().map(|p| p.id as i64),
+                    vpn_service_id: p.as_ref().map(|p| p.vpn_service_id as i64),
+                }
+            }
+            LineItemType::DnsHosting => OrderProduct::DnsHosting,
+            LineItemType::MarketplaceNodeFee => OrderProduct::MarketplaceNodeFee {
                 node_id: db
                     .get_marketplace_node_by_line_item(line_item.id)
                     .await
@@ -335,7 +354,7 @@ mod tests {
     use super::*;
     use crate::MockDb;
     use lnvps_db::{
-        AsnSubscription, LNVpsDbBase, Subscription, SubscriptionType, Vm, VmCustomTemplate,
+        AsnSubscription, LNVpsDbBase, LineItemType, Subscription, Vm, VmCustomTemplate,
     };
 
     async fn db_with_user() -> (Arc<dyn LNVpsDb>, u64) {
@@ -348,7 +367,7 @@ mod tests {
     async fn line(
         db: &Arc<dyn LNVpsDb>,
         user_id: u64,
-        kind: SubscriptionType,
+        kind: LineItemType,
         name: &str,
     ) -> SubscriptionLineItem {
         let (_sub_id, ids) = db
@@ -409,7 +428,7 @@ mod tests {
     #[tokio::test]
     async fn a_template_vm_reports_its_plan() {
         let (db, user_id) = db_with_user().await;
-        let li = line(&db, user_id, SubscriptionType::Vps, "VPS").await;
+        let li = line(&db, user_id, LineItemType::Vps, "VPS").await;
         let vm_id = db.insert_vm(&vm(user_id, li.id, Some(1))).await.unwrap();
 
         let item = OrderLineItem::resolve(&db, &li).await;
@@ -446,7 +465,7 @@ mod tests {
     #[tokio::test]
     async fn a_custom_vm_reports_its_build_and_has_no_template() {
         let (db, user_id) = db_with_user().await;
-        let li = line(&db, user_id, SubscriptionType::Vps, "Custom VPS").await;
+        let li = line(&db, user_id, LineItemType::Vps, "Custom VPS").await;
         let custom_id = db
             .insert_custom_vm_template(&VmCustomTemplate {
                 id: 0,
@@ -491,12 +510,12 @@ mod tests {
         let (db, user_id) = db_with_user().await;
 
         // DNS hosting has no product row at all — the line item is the record.
-        let dns = line(&db, user_id, SubscriptionType::DnsHosting, "DNS").await;
+        let dns = line(&db, user_id, LineItemType::DnsHosting, "DNS").await;
         let item = OrderLineItem::resolve(&db, &dns).await;
         assert_eq!(item.product, OrderProduct::DnsHosting);
         assert_eq!(item.name, "DNS");
 
-        let asn_line = line(&db, user_id, SubscriptionType::AsnSponsoring, "ASN").await;
+        let asn_line = line(&db, user_id, LineItemType::AsnSponsoring, "ASN").await;
         db.insert_asn_subscription(&AsnSubscription {
             id: 0,
             subscription_line_item_id: asn_line.id,
@@ -527,7 +546,7 @@ mod tests {
     #[tokio::test]
     async fn a_line_with_no_product_row_yet_still_reports_its_type() {
         let (db, user_id) = db_with_user().await;
-        let ip = line(&db, user_id, SubscriptionType::IpRange, "IPv4 /24").await;
+        let ip = line(&db, user_id, LineItemType::IpRange, "IPv4 /24").await;
         let item = OrderLineItem::resolve(&db, &ip).await;
         assert_eq!(item.name, "IPv4 /24");
         assert_eq!(
@@ -540,7 +559,7 @@ mod tests {
         );
 
         // Same for a VPS line whose VM row cannot be read.
-        let orphan = line(&db, user_id, SubscriptionType::Vps, "VPS with no VM").await;
+        let orphan = line(&db, user_id, LineItemType::Vps, "VPS with no VM").await;
         let items = OrderLineItem::resolve_all(&db, &[orphan, ip]).await;
         assert_eq!(items.len(), 2, "no line is ever dropped");
         assert!(matches!(
@@ -559,7 +578,7 @@ mod tests {
     async fn resolved_products_carry_their_detail() {
         let (db, user_id) = db_with_user().await;
 
-        let ip = line(&db, user_id, SubscriptionType::IpRange, "IPv4 /24").await;
+        let ip = line(&db, user_id, LineItemType::IpRange, "IPv4 /24").await;
         db.insert_ip_range_subscription(&lnvps_db::IpRangeSubscription {
             id: 0,
             subscription_line_item_id: ip.id,
@@ -585,7 +604,7 @@ mod tests {
             other => panic!("expected an ip range, got {other:?}"),
         }
 
-        let app_line = line(&db, user_id, SubscriptionType::App, "Managed app").await;
+        let app_line = line(&db, user_id, LineItemType::App, "Managed app").await;
         db.insert_app_deployment(&lnvps_db::AppDeployment {
             id: 0,
             user_id,
@@ -629,7 +648,7 @@ mod tests {
         let fee = line(
             &db,
             user_id,
-            SubscriptionType::MarketplaceNodeFee,
+            LineItemType::MarketplaceNodeFee,
             "Node listing",
         )
         .await;

@@ -2385,3 +2385,106 @@ View all subscriptions for a specific IP space.
 
 
 This documentation is optimized for LLM code generation and provides all necessary type definitions and endpoint specifications for building TypeScript frontend applications.
+## VPN
+
+A customer buys one VPN plan, registers up to their device allowance of WireGuard
+public keys, and downloads one config per region.
+
+Region is a client-side choice, not an allocation. A device gets one keypair and one
+inner address that are valid in every region at once, so every config it is given
+shares an identical `[Interface]` block and differs only in the `[Peer]` endpoint and
+public key. Switching region means pointing the tunnel somewhere else; nothing on the
+server changes and no reconnection ceremony is needed beyond bringing the interface
+back up.
+
+The client generates the keypair and sends only the public half. LNVPS never holds a
+private key for a machine it does not own, which is why the rendered config contains
+the placeholder `<your private key>` for the client to fill in.
+
+### Data Types
+
+```typescript
+interface VpnService {
+  id: number;
+  name: string;
+  amount: number;          // recurring price, in cents of `currency`
+  setup_amount: number;    // one-off, charged on the first payment
+  currency: string;
+  interval_amount: number;
+  interval_type: IntervalType;
+  device_limit: number;    // devices a plan on this service may register
+  ipv4: boolean;           // whether devices get an IPv4 address
+  ipv6: boolean;
+  regions: VpnRegion[];    // every region accepts every device
+}
+
+interface VpnRegion {
+  region_id: number;
+  name: string;
+  country_code: string | null;
+}
+
+interface VpnPlan {
+  id: number;
+  service_id: number;
+  device_limit: number;
+  device_count: number;
+  subscription_id: number;         // pay this to activate the plan
+  billing_state: 'unpaid' | 'active' | 'expired';
+  expires: string | null;          // ISO 8601
+  created: string;
+}
+
+interface VpnDevice {
+  id: number;
+  name: string;
+  public_key: string;              // base64, as `wg` writes it
+  address4: string | null;         // identical in every region
+  address6: string | null;
+  enabled: boolean;
+  created: string;
+}
+
+interface VpnDeviceConfig {
+  region_id: number;
+  region_name: string;
+  endpoint: string;                // host:port to dial
+  public_key: string;              // the route server's key for this region
+  address: string[];               // the device's own addresses
+  dns: string[];
+  mtu: number;                     // not 1500
+  persistent_keepalive: number | null;
+  allowed_ips: string[];           // full tunnel, per family the device holds
+  config: string;                  // ready-to-use wg-quick file
+}
+```
+
+### Endpoints
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| GET | `/api/v1/vpn/services` | none | Plans for sale and the regions they exit through |
+| GET | `/api/v1/vpn` | NIP-98 | Your plan. 404 if you have never bought one |
+| POST | `/api/v1/vpn` | NIP-98 | Buy a plan, or restart a lapsed one |
+| GET | `/api/v1/vpn/devices` | NIP-98 | Your registered devices |
+| POST | `/api/v1/vpn/devices` | NIP-98 | Register a device by public key |
+| POST | `/api/v1/vpn/devices/{id}/enabled` | NIP-98 | Turn a device off or on |
+| DELETE | `/api/v1/vpn/devices/{id}` | NIP-98 | Remove a device, releasing its slot and addresses |
+| GET | `/api/v1/vpn/devices/{id}/configs` | NIP-98 | One config per region |
+
+`POST /api/v1/vpn` takes `{ "service_id": number }` and returns the plan with the
+`subscription_id` to pay through the ordinary subscription flow. Nothing is configured
+on a route server until that payment lands, so registering devices before paying is
+refused with a message saying so.
+
+`POST /api/v1/vpn/devices` takes `{ "name": string, "public_key": string }` where
+`public_key` is base64. It is idempotent on the key: sending the same one twice returns
+the device it already made rather than consuming another slot, so a client that retries
+a request whose response it lost is safe. A key already registered to another account is
+refused.
+
+Removing a device frees its slot and its addresses for reuse. Disabling one keeps both,
+which is the difference between "not right now" and "gone".
+
+No QR code is generated server-side. Rendering one from the `config` string is a job the
+client does better, and it avoids shipping a barcode encoder in the API.

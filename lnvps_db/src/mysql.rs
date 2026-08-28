@@ -9,10 +9,10 @@ use crate::{
     PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout, Region,
     RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic,
     Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany,
-    Tunnel, TunnelPool, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing,
-    VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost,
-    VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample,
-    VmTrafficTotal, WebauthnCredential,
+    Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
+    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily,
+    VmTrafficSample, VmTrafficTotal, VpnDevice, VpnService, VpnSubscription, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -5227,6 +5227,30 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn update_tunnel_pool(&self, pool: &TunnelPool) -> DbResult<()> {
+        // The same invariant from the other side: a pool already terminating a
+        // service cannot have its block edited away from its siblings'.
+        let mismatch: Option<u64> = sqlx::query_as::<_, (u64,)>(
+            "SELECT other.id FROM vpn_service_pool mine \
+             JOIN vpn_service_pool sib ON sib.vpn_service_id = mine.vpn_service_id \
+             JOIN tunnel_pool other ON other.id = sib.tunnel_pool_id \
+             WHERE mine.tunnel_pool_id = ? AND other.id <> ? \
+             AND (NOT (other.cidr4 <=> ?) OR NOT (other.cidr6 <=> ?)) LIMIT 1",
+        )
+        .bind(pool.id)
+        .bind(pool.id)
+        .bind(&pool.cidr4)
+        .bind(&pool.cidr6)
+        .fetch_optional(&self.db)
+        .await?
+        .map(|r| r.0);
+        if let Some(other_id) = mismatch {
+            return Err(DbError::Other(anyhow!(
+                "Tunnel pool {} terminates a VPN service, so its block must stay the same as \
+                 pool {}'s: a device holds one address in every region",
+                pool.id,
+                other_id
+            )));
+        }
         sqlx::query(
             "UPDATE tunnel_pool \
              SET region_id = ?, name = ?, listen_addr = ?, listen_port = ?, \
@@ -5256,6 +5280,345 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(id)
             .execute(&self.db)
             .await?;
+        Ok(())
+    }
+
+    // ----- VPN -----
+
+    async fn get_vpn_service(&self, id: u64) -> DbResult<VpnService> {
+        Ok(sqlx::query_as("SELECT * FROM vpn_service WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn list_vpn_services(&self, enabled_only: bool) -> DbResult<Vec<VpnService>> {
+        let sql = if enabled_only {
+            "SELECT * FROM vpn_service WHERE enabled = 1 ORDER BY id"
+        } else {
+            "SELECT * FROM vpn_service ORDER BY id"
+        };
+        Ok(sqlx::query_as(sql).fetch_all(&self.db).await?)
+    }
+
+    async fn insert_vpn_service(&self, service: &VpnService) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO vpn_service (name, company_id, amount, currency, interval_amount, \
+             interval_type, setup_amount, dns, default_device_limit, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
+        )
+        .bind(&service.name)
+        .bind(service.company_id)
+        .bind(service.amount)
+        .bind(&service.currency)
+        .bind(service.interval_amount)
+        .bind(service.interval_type)
+        .bind(service.setup_amount)
+        .bind(&service.dns)
+        .bind(service.default_device_limit)
+        .bind(service.enabled)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn update_vpn_service(&self, service: &VpnService) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE vpn_service SET name = ?, amount = ?, currency = ?, \
+             interval_amount = ?, interval_type = ?, setup_amount = ?, \
+             dns = ?, default_device_limit = ?, enabled = ? WHERE id = ?",
+        )
+        .bind(&service.name)
+        .bind(service.amount)
+        .bind(&service.currency)
+        .bind(service.interval_amount)
+        .bind(service.interval_type)
+        .bind(service.setup_amount)
+        .bind(&service.dns)
+        .bind(service.default_device_limit)
+        .bind(service.enabled)
+        .bind(service.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_vpn_service(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM vpn_service WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_vpn_service_for_pool(&self, tunnel_pool_id: u64) -> DbResult<Option<VpnService>> {
+        Ok(sqlx::query_as(
+            "SELECT s.* FROM vpn_service s \
+             JOIN vpn_service_pool p ON p.vpn_service_id = s.id \
+             WHERE p.tunnel_pool_id = ?",
+        )
+        .bind(tunnel_pool_id)
+        .fetch_optional(&self.db)
+        .await?)
+    }
+
+    async fn list_vpn_service_pools(&self, vpn_service_id: u64) -> DbResult<Vec<TunnelPool>> {
+        Ok(sqlx::query_as(
+            "SELECT tp.* FROM tunnel_pool tp \
+             JOIN vpn_service_pool p ON p.tunnel_pool_id = tp.id \
+             WHERE p.vpn_service_id = ? ORDER BY tp.id",
+        )
+        .bind(vpn_service_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn link_vpn_service_pool(
+        &self,
+        vpn_service_id: u64,
+        tunnel_pool_id: u64,
+    ) -> DbResult<()> {
+        // Repointing an interface at another service is an update, not a second
+        // row: `tunnel_pool_id` is the primary key precisely so it cannot carry
+        // two peer sets.
+        // Every interface on a service shares one block, because a device holds
+        // one address in every region. A pool carrying a different block would
+        // route a subset of the devices and black-hole the rest.
+        let mismatch: Option<(u64, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT other.id, other.cidr4, other.cidr6 FROM tunnel_pool other \
+             JOIN vpn_service_pool link ON link.tunnel_pool_id = other.id \
+             JOIN tunnel_pool me ON me.id = ? \
+             WHERE link.vpn_service_id = ? AND other.id <> me.id \
+             AND (NOT (other.cidr4 <=> me.cidr4) OR NOT (other.cidr6 <=> me.cidr6)) LIMIT 1",
+        )
+        .bind(tunnel_pool_id)
+        .bind(vpn_service_id)
+        .fetch_optional(&self.db)
+        .await?;
+        if let Some((other_id, c4, c6)) = mismatch {
+            return Err(DbError::Other(anyhow!(
+                "Tunnel pool {tunnel_pool_id} cannot terminate VPN service {vpn_service_id}: \
+                 pool {other_id} on it carries {c4:?}/{c6:?}, and every interface on a service \
+                 must share one block so a device keeps one address in every region"
+            )));
+        }
+        sqlx::query(
+            "INSERT INTO vpn_service_pool (vpn_service_id, tunnel_pool_id) VALUES (?, ?) \
+             ON DUPLICATE KEY UPDATE vpn_service_id = VALUES(vpn_service_id)",
+        )
+        .bind(vpn_service_id)
+        .bind(tunnel_pool_id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn unlink_vpn_service_pool(&self, tunnel_pool_id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM vpn_service_pool WHERE tunnel_pool_id = ?")
+            .bind(tunnel_pool_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_vpn_subscription(&self, id: u64) -> DbResult<VpnSubscription> {
+        Ok(
+            sqlx::query_as("SELECT * FROM vpn_subscription WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_vpn_subscription_for_user(
+        &self,
+        user_id: u64,
+    ) -> DbResult<Option<VpnSubscription>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM vpn_subscription WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_vpn_subscription_by_line_item(
+        &self,
+        subscription_line_item_id: u64,
+    ) -> DbResult<Option<VpnSubscription>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM vpn_subscription WHERE subscription_line_item_id = ?")
+                .bind(subscription_line_item_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn insert_vpn_subscription(&self, sub: &VpnSubscription) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO vpn_subscription (vpn_service_id, user_id, \
+             subscription_line_item_id) VALUES (?, ?, ?) returning id",
+        )
+        .bind(sub.vpn_service_id)
+        .bind(sub.user_id)
+        .bind(sub.subscription_line_item_id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn update_vpn_subscription(&self, sub: &VpnSubscription) -> DbResult<()> {
+        sqlx::query("UPDATE vpn_subscription SET subscription_line_item_id = ? WHERE id = ?")
+            .bind(sub.subscription_line_item_id)
+            .bind(sub.id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_vpn_device(&self, id: u64) -> DbResult<VpnDevice> {
+        Ok(sqlx::query_as("SELECT * FROM vpn_device WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn get_vpn_device_by_pubkey(&self, peer_pubkey: &[u8]) -> DbResult<Option<VpnDevice>> {
+        Ok(sqlx::query_as(
+            "SELECT d.* FROM vpn_device d \
+             JOIN tunnel t ON t.id = d.tunnel_id WHERE t.peer_pubkey = ?",
+        )
+        .bind(peer_pubkey)
+        .fetch_optional(&self.db)
+        .await?)
+    }
+
+    async fn list_vpn_devices(&self, vpn_subscription_id: u64) -> DbResult<Vec<VpnDevice>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM vpn_device WHERE vpn_subscription_id = ? ORDER BY slot")
+                .bind(vpn_subscription_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn list_vpn_tunnels_in_service(&self, vpn_service_id: u64) -> DbResult<Vec<Tunnel>> {
+        Ok(sqlx::query_as(
+            "SELECT t.* FROM tunnel t \
+             JOIN vpn_device d ON d.tunnel_id = t.id \
+             JOIN vpn_subscription vs ON vs.id = d.vpn_subscription_id \
+             WHERE vs.vpn_service_id = ? ORDER BY t.id",
+        )
+        .bind(vpn_service_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_active_vpn_tunnels(&self, vpn_service_id: u64) -> DbResult<Vec<Tunnel>> {
+        // The billing join is what applies suspension: an unpaid, deactivated or
+        // expired plan simply stops matching, so its peers leave the next
+        // reconcile's set without any code path having had to disable them.
+        Ok(sqlx::query_as(
+            "SELECT t.* FROM tunnel t \
+             JOIN vpn_device d ON d.tunnel_id = t.id \
+             JOIN vpn_subscription vs ON vs.id = d.vpn_subscription_id \
+             JOIN subscription_line_item sli ON sli.id = vs.subscription_line_item_id \
+             JOIN subscription s ON s.id = sli.subscription_id \
+             WHERE vs.vpn_service_id = ? AND t.enabled = 1 \
+             AND s.is_active = 1 AND s.is_setup = 1 \
+             AND (s.expires IS NULL OR s.expires > NOW()) \
+             ORDER BY t.id",
+        )
+        .bind(vpn_service_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_tunnel_routes(&self, tunnel_ids: &[u64]) -> DbResult<Vec<TunnelRoute>> {
+        if tunnel_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        // Batched on purpose: this runs for every peer on a pool, and a query
+        // per peer is what made the old guest lookup a storm.
+        let ids = tunnel_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        Ok(sqlx::query_as(&format!(
+            "SELECT * FROM tunnel_route WHERE tunnel_id IN ({ids}) ORDER BY tunnel_id, prefix"
+        ))
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn replace_tunnel_routes(&self, tunnel_id: u64, prefixes: &[String]) -> DbResult<()> {
+        let mut tx = self.db.begin().await?;
+        sqlx::query("DELETE FROM tunnel_route WHERE tunnel_id = ?")
+            .bind(tunnel_id)
+            .execute(&mut *tx)
+            .await?;
+        for prefix in prefixes {
+            sqlx::query("INSERT INTO tunnel_route (tunnel_id, prefix) VALUES (?, ?)")
+                .bind(tunnel_id)
+                .bind(prefix)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn insert_vpn_device(&self, device: &VpnDevice) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO vpn_device (vpn_subscription_id, slot, name, tunnel_id) \
+             VALUES (?, ?, ?, ?) returning id",
+        )
+        .bind(device.vpn_subscription_id)
+        .bind(device.slot)
+        .bind(&device.name)
+        .bind(device.tunnel_id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn update_vpn_device(&self, device: &VpnDevice) -> DbResult<()> {
+        sqlx::query("UPDATE vpn_device SET name = ? WHERE id = ?")
+            .bind(&device.name)
+            .bind(device.id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_vpn_device(&self, id: u64) -> DbResult<()> {
+        // The tunnel goes with the device. Only this row knows which tunnel
+        // belongs to the customer -- every query reaches one through the other
+        // -- so deleting the link alone leaves a tunnel that no query can see,
+        // holding a public key, forever.
+        //
+        // A transaction because a foreign key cannot express ownership in this
+        // direction, and the two deletes must be ordered: `vpn_device.tunnel_id`
+        // is RESTRICT, so the link goes first. `tunnel_route` cascades off
+        // `tunnel` and needs no help.
+        let mut tx = self.db.begin().await?;
+        let tunnel_id: Option<(u64,)> =
+            sqlx::query_as("SELECT tunnel_id FROM vpn_device WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        sqlx::query("DELETE FROM vpn_device WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        if let Some((tunnel_id,)) = tunnel_id {
+            sqlx::query("DELETE FROM tunnel WHERE id = ?")
+                .bind(tunnel_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 

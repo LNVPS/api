@@ -4,7 +4,8 @@ use crate::host::{
     FullVmInfo, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient, VmHostInfo,
 };
 use crate::router::{
-    ArpEntry, BgpPeer, BgpRoute, BgpRouter, BgpSession, Router, Tunnel, TunnelRouter, TunnelTraffic,
+    ArpEntry, BgpPeer, BgpRoute, BgpRouter, BgpSession, ObservedInterface, Router, TunnelRouter,
+    TunnelTraffic,
 };
 pub use lnvps_api_common::MockDnsServer;
 
@@ -49,7 +50,7 @@ use tokio::sync::Mutex;
 #[derive(Debug, Clone)]
 pub struct MockRouter {
     arp: Arc<Mutex<HashMap<u64, ArpEntry>>>,
-    tunnels: Arc<Mutex<HashMap<String, Tunnel>>>,
+    tunnels: Arc<Mutex<HashMap<String, ObservedInterface>>>,
     sessions: Arc<Mutex<HashMap<String, BgpSession>>>,
     default_route: Arc<Mutex<Option<BgpRoute>>>,
     /// Addresses configured per tunnel interface
@@ -75,7 +76,7 @@ impl MockRouter {
         thread_local! {
             static TL_ARP: Arc<Mutex<HashMap<u64, ArpEntry>>> =
                 Arc::new(Mutex::new(HashMap::new()));
-            static TL_TUNNELS: Arc<Mutex<HashMap<String, Tunnel>>> =
+            static TL_TUNNELS: Arc<Mutex<HashMap<String, ObservedInterface>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             static TL_SESSIONS: Arc<Mutex<HashMap<String, BgpSession>>> =
                 Arc::new(Mutex::new(HashMap::new()));
@@ -245,20 +246,20 @@ impl Router for MockRouter {
 
 #[async_trait]
 impl TunnelRouter for MockRouter {
-    async fn list_tunnels(&self) -> OpResult<Vec<Tunnel>> {
+    async fn list_tunnels(&self) -> OpResult<Vec<ObservedInterface>> {
         let tunnels = self.tunnels.lock().await;
         Ok(tunnels.values().cloned().collect())
     }
 
-    async fn add_tunnel(&self, tunnel: &Tunnel) -> OpResult<Tunnel> {
+    async fn add_tunnel(&self, tunnel: &ObservedInterface) -> OpResult<ObservedInterface> {
         let mut tunnels = self.tunnels.lock().await;
         if tunnels.contains_key(&tunnel.name) {
             return Err(OpError::Fatal(anyhow::anyhow!(
-                "Tunnel already exists: {}",
+                "ObservedInterface already exists: {}",
                 tunnel.name
             )));
         }
-        let stored = Tunnel {
+        let stored = ObservedInterface {
             id: Some(tunnel.name.clone()),
             enabled: true,
             ..tunnel.clone()
@@ -273,9 +274,9 @@ impl TunnelRouter for MockRouter {
         Ok(())
     }
 
-    async fn update_tunnel(&self, tunnel: &Tunnel) -> OpResult<Tunnel> {
+    async fn update_tunnel(&self, tunnel: &ObservedInterface) -> OpResult<ObservedInterface> {
         let mut tunnels = self.tunnels.lock().await;
-        let stored = Tunnel {
+        let stored = ObservedInterface {
             id: Some(tunnel.name.clone()),
             ..tunnel.clone()
         };
