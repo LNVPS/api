@@ -15,8 +15,11 @@
 //! resolves `${…}` references. The Kubernetes object mapping lives elsewhere.
 
 use anyhow::{Result, anyhow, bail};
+use chrono::{DateTime, Utc};
+use croner::Cron;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::str::FromStr;
 
 /// A parsed app compose document.
 #[derive(Debug, Clone, Deserialize)]
@@ -30,7 +33,127 @@ pub struct Compose {
     /// Customer-provided configuration fields (the deploy form).
     #[serde(default)]
     pub config: Vec<ConfigField>,
+    /// Automatic backup policy for the whole app. Omit for an app that is only
+    /// backed up when the customer asks.
+    #[serde(default)]
+    pub backup: Option<BackupPolicy>,
 }
+
+/// How often the operator runs an app's backups, and how many runs it keeps.
+///
+/// The policy is app-wide while the *method* is per service, because a run has
+/// to be a single point in time across the whole app: a relay's database dump
+/// and its blob volume taken hours apart do not restore into a consistent
+/// instance.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BackupPolicy {
+    /// When runs start, as a standard 5-field cron expression
+    /// (`minute hour day-of-month month day-of-week`) interpreted in **UTC**.
+    /// `0 3 * * *` is the common case: every day at 03:00.
+    ///
+    /// UTC rather than a customer timezone because the deployment has no
+    /// timezone of its own, and a schedule that silently shifted by an hour
+    /// twice a year is worse than one that is always where it was written.
+    pub schedule: String,
+    /// How many completed runs to keep; older ones are pruned with their
+    /// artifacts. Defaults to [`DEFAULT_BACKUP_RETENTION`].
+    #[serde(default)]
+    pub retention: Option<u32>,
+}
+
+impl BackupPolicy {
+    /// Declared retention, or [`DEFAULT_BACKUP_RETENTION`].
+    pub fn retention_or_default(&self) -> u32 {
+        self.retention.unwrap_or(DEFAULT_BACKUP_RETENTION)
+    }
+
+    /// The parsed schedule.
+    ///
+    /// Parsing at every use rather than caching one: a `Compose` is
+    /// deserialised from a stored row and cloned around, and the operator
+    /// evaluates this once per deployment per sweep, which is nowhere near
+    /// often enough to be worth a lazily-initialised field.
+    pub fn cron(&self) -> Result<Cron> {
+        Cron::from_str(&self.schedule).map_err(|e| {
+            anyhow!(
+                "backup schedule '{}' is not a valid cron: {e}",
+                self.schedule
+            )
+        })
+    }
+
+    /// The first run due strictly after `after`, in UTC.
+    pub fn next_run_after(&self, after: DateTime<Utc>) -> Result<DateTime<Utc>> {
+        self.cron()?
+            .find_next_occurrence(&after, false)
+            .map_err(|e| {
+                anyhow!(
+                    "backup schedule '{}' has no next occurrence after {after}: {e}",
+                    self.schedule
+                )
+            })
+    }
+
+    /// Whether a run is due now, given when the schedule last ran.
+    ///
+    /// `since` is the last scheduled run, or the deployment's creation time
+    /// when the schedule has never run — so a deployment does not get a backup
+    /// the instant it is created, and one that has been down past several
+    /// occurrences gets a single catch-up run rather than one per missed slot.
+    pub fn is_due(&self, since: DateTime<Utc>, now: DateTime<Utc>) -> Result<bool> {
+        Ok(self.next_run_after(since)? <= now)
+    }
+
+    /// Reject a schedule that fires faster than [`MIN_BACKUP_INTERVAL_MINUTES`].
+    ///
+    /// `* * * * *` is a valid cron and a way to fill a bucket with a copy of a
+    /// customer's data every minute, so the floor is enforced where the catalog
+    /// entry is written rather than discovered in a storage bill. Checked over
+    /// several consecutive occurrences because a pattern can be sparse in one
+    /// place and dense in another (`0,1 3 * * *` fires twice a minute apart).
+    fn validate_frequency(&self) -> Result<()> {
+        let cron = self.cron()?;
+        // A fixed reference instant, so the check does not depend on when it
+        // runs: 1 Jan, which every calendar-based pattern reaches.
+        let mut at = DateTime::<Utc>::from_timestamp(1_735_689_600, 0)
+            .ok_or_else(|| anyhow!("internal: bad reference time"))?;
+        for _ in 0..SCHEDULE_SAMPLES {
+            let next = cron.find_next_occurrence(&at, false).map_err(|e| {
+                anyhow!(
+                    "backup schedule '{}' has no next occurrence after {at}: {e}",
+                    self.schedule
+                )
+            })?;
+            if (next - at).num_minutes() < MIN_BACKUP_INTERVAL_MINUTES as i64 {
+                bail!(
+                    "backup schedule '{}' fires more often than every \
+                     {MIN_BACKUP_INTERVAL_MINUTES} minutes — each run stores a full copy of the \
+                     app's data",
+                    self.schedule
+                );
+            }
+            at = next;
+        }
+        Ok(())
+    }
+}
+
+/// How many consecutive occurrences [`BackupPolicy::validate_frequency`]
+/// inspects. Enough to catch a pattern that is dense in one part of the day
+/// and sparse elsewhere, without walking a year of a rare expression.
+const SCHEDULE_SAMPLES: usize = 24;
+
+/// Closest two scheduled runs may be. A full copy of the app's data is stored
+/// per run, so this is a storage floor, not a scheduling nicety.
+pub const MIN_BACKUP_INTERVAL_MINUTES: u32 = 60;
+
+/// Runs kept for an app whose `backup:` policy does not say.
+pub const DEFAULT_BACKUP_RETENTION: u32 = 7;
+
+/// Most runs an app may retain. Each retained run holds a full copy of every
+/// backed-up volume, so retention is storage the customer did not buy; a
+/// customer who wants a deeper history downloads the artifacts.
+pub const MAX_BACKUP_RETENTION: u32 = 30;
 
 /// A single service/container within an app.
 #[derive(Debug, Clone, Deserialize)]
@@ -608,6 +731,31 @@ fn compile_pattern(pattern: &str) -> Result<regex::Regex> {
         .map_err(|e| anyhow!("pattern '{pattern}' is not a valid regex: {e}"))
 }
 
+/// Longest accepted `backup.artifact` filename.
+const MAX_ARTIFACT_NAME_LEN: usize = 64;
+
+/// A `backup.artifact` is a filename, not a path.
+fn validate_artifact_name(service: &str, name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_LEN {
+        bail!(
+            "service '{service}': backup artifact name must be 1-{MAX_ARTIFACT_NAME_LEN} characters"
+        );
+    }
+    if name.starts_with('.') {
+        bail!("service '{service}': backup artifact '{name}' must not start with a dot");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        bail!(
+            "service '{service}': backup artifact '{name}' may only contain letters, digits, \
+             '.', '-' and '_'"
+        );
+    }
+    Ok(())
+}
+
 /// Config field input type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -976,7 +1124,9 @@ impl Compose {
                 }
             }
 
-            // A backup entry is exactly one of command | volume.
+            // A backup entry is exactly one of command | volume, and the
+            // artifact name is a filename we control the shape of (it becomes
+            // the tail of an object key).
             if let Some(b) = &svc.backup {
                 match (&b.command, &b.volume) {
                     (Some(_), Some(_)) => {
@@ -991,6 +1141,12 @@ impl Compose {
                         }
                     }
                     _ => {}
+                }
+                // The artifact name is appended to a server-derived object key
+                // and shown as a download filename, so it is a plain filename:
+                // no directory separators, no traversal, no leading dot.
+                if let Some(a) = &b.artifact {
+                    validate_artifact_name(sname, a)?;
                 }
             }
 
@@ -1063,7 +1219,38 @@ impl Compose {
                 compile_pattern(pattern).map_err(|e| anyhow!("config field '{}': {e}", f.name))?;
             }
         }
+
+        // A schedule with nothing to run would bill storage and produce empty
+        // runs forever, and reads in the catalog as if the app were protected.
+        if let Some(policy) = &self.backup {
+            if !self.services.values().any(|s| s.backup.is_some()) {
+                bail!(
+                    "backup schedule is set but no service declares a `backup:` method — there \
+                     would be nothing to capture"
+                );
+            }
+            let retention = policy.retention_or_default();
+            if !(1..=MAX_BACKUP_RETENTION).contains(&retention) {
+                bail!(
+                    "backup retention must be between 1 and {MAX_BACKUP_RETENTION} (got \
+                     {retention})"
+                );
+            }
+            policy.validate_frequency()?;
+        }
         Ok(())
+    }
+
+    /// Services that declare a backup method, in a stable order so a run's
+    /// artifacts are created the same way every time.
+    pub fn backup_services(&self) -> Vec<(&str, &Backup)> {
+        let mut out: Vec<(&str, &Backup)> = self
+            .services
+            .iter()
+            .filter_map(|(name, svc)| svc.backup.as_ref().map(|b| (name.as_str(), b)))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(b.0));
+        out
     }
 
     /// Every distinct env var name referenced as `${…}` across all services —
@@ -2380,6 +2567,128 @@ config:
             Compose::parse("services:\n  a:\n    image: x\n    backup: { volume: nope }\n")
                 .is_err()
         );
+    }
+
+    /// The app-wide `backup:` policy: what it accepts, and the two ways it can
+    /// be written such that a customer would believe they had backups when
+    /// they did not.
+    #[test]
+    fn backup_policy_grammar() {
+        let with = |policy: &str, method: &str| {
+            Compose::parse(&format!(
+                "services:\n  db:\n    image: x\n    volumes:\n      - {{ name: data, path: \
+                 /data, size: 5Gi }}\n{method}{policy}"
+            ))
+        };
+        let method = "    backup: { volume: data }\n";
+
+        let c = with("backup: { schedule: \"0 3 * * *\" }\n", method).unwrap();
+        let policy = c.backup.as_ref().unwrap();
+        assert_eq!(policy.schedule, "0 3 * * *");
+        // Unset retention is the default, not "keep nothing".
+        assert_eq!(policy.retention_or_default(), DEFAULT_BACKUP_RETENTION);
+        assert_eq!(c.backup_services().len(), 1);
+        assert_eq!(c.backup_services()[0].0, "db");
+
+        assert_eq!(
+            with(
+                "backup: { schedule: \"0 4 * * 0\", retention: 2 }\n",
+                method
+            )
+            .unwrap()
+            .backup
+            .unwrap()
+            .retention_or_default(),
+            2
+        );
+
+        // A schedule with no service method captures nothing, but would read
+        // in the catalog as if the app were protected.
+        assert!(with("backup: { schedule: \"0 3 * * *\" }\n", "").is_err());
+        // Retention outside the accepted range, in both directions.
+        assert!(
+            with(
+                "backup: { schedule: \"0 3 * * *\", retention: 0 }\n",
+                method
+            )
+            .is_err()
+        );
+        assert!(
+            with(
+                "backup: { schedule: \"0 3 * * *\", retention: 31 }\n",
+                method
+            )
+            .is_err()
+        );
+        // Not a cron expression at all.
+        assert!(with("backup: { schedule: daily }\n", method).is_err());
+        assert!(with("backup: { schedule: \"0 3 * *\" }\n", method).is_err());
+        // Faster than the floor: every minute, and twice a minute apart within
+        // an otherwise daily pattern.
+        assert!(with("backup: { schedule: \"* * * * *\" }\n", method).is_err());
+        assert!(with("backup: { schedule: \"0,1 3 * * *\" }\n", method).is_err());
+        assert!(with("backup: { schedule: \"*/30 * * * *\" }\n", method).is_err());
+        // Exactly at the floor is allowed.
+        assert!(with("backup: { schedule: \"0 * * * *\" }\n", method).is_ok());
+        // No policy at all stays valid: on-demand backups need no schedule.
+        assert!(with("", method).unwrap().backup.is_none());
+    }
+
+    /// The operator asks one question of a schedule: is a run due? Answered
+    /// from the last run, so a deployment that was down through several
+    /// occurrences gets one catch-up run rather than one per missed slot.
+    #[test]
+    fn backup_schedule_due_from_last_run() {
+        let c = Compose::parse(
+            "services:\n  db:\n    image: x\n    backup: { command: [\"sh\"] }\nbackup: { \
+             schedule: \"0 3 * * *\" }\n",
+        )
+        .unwrap();
+        let policy = c.backup.as_ref().unwrap();
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+
+        // Next 03:00 UTC after a mid-morning run.
+        assert_eq!(
+            policy.next_run_after(at("2026-03-01T09:15:00Z")).unwrap(),
+            at("2026-03-02T03:00:00Z")
+        );
+
+        // Ran this morning, so nothing is due until tomorrow.
+        assert!(
+            !policy
+                .is_due(at("2026-03-01T03:00:00Z"), at("2026-03-01T23:00:00Z"))
+                .unwrap()
+        );
+        assert!(
+            policy
+                .is_due(at("2026-03-01T03:00:00Z"), at("2026-03-02T03:00:00Z"))
+                .unwrap()
+        );
+        // Down for a week: due, once.
+        assert!(
+            policy
+                .is_due(at("2026-03-01T03:00:00Z"), at("2026-03-08T12:00:00Z"))
+                .unwrap()
+        );
+    }
+
+    /// `artifact:` becomes the tail of an object key and the download
+    /// filename, so it is a filename and nothing else.
+    #[test]
+    fn backup_artifact_must_be_a_plain_filename() {
+        let app = |artifact: &str| {
+            Compose::parse(&format!(
+                "services:\n  db:\n    image: x\n    backup:\n      command: [\"sh\"]\n      \
+                 artifact: {artifact}\n"
+            ))
+        };
+        assert!(app("dump.sql").is_ok());
+        assert!(app("route96_db-1.sql").is_ok());
+        assert!(app("\"../../etc/passwd\"").is_err());
+        assert!(app("\"sub/dir.sql\"").is_err());
+        assert!(app("\".hidden\"").is_err());
+        assert!(app("\"\"").is_err());
+        assert!(app(&format!("\"{}\"", "a".repeat(65))).is_err());
     }
 
     #[test]
