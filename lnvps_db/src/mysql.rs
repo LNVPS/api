@@ -1,18 +1,19 @@
 use crate::{
     AccessPolicy, AgentConversation, AgentConversationFilter, AgentConversationOverview,
-    AgentMessage, App, AppCluster, AppDeployment, AppDeploymentFilter, AppDeploymentServiceUsage,
-    AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
-    BulkMessageTarget, Company, DbError, DbResult, Discount, DiscountRedemption,
-    DiscountRedemptionWithCode, DnsServer, EncryptedString, IntervalType, IpRange,
-    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth,
-    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, PaymentMethod,
-    PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout, Region,
-    RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic,
-    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany,
-    Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
-    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily,
-    VmTrafficSample, VmTrafficTotal, VpnDevice, VpnService, VpnSubscription, WebauthnCredential,
+    AgentMessage, App, AppBackupState, AppCluster, AppDeployment, AppDeploymentBackup,
+    AppDeploymentFilter, AppDeploymentServiceUsage, AppDeploymentVolumeUsage, AppTag,
+    AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, BulkMessageTarget, Company, DbError,
+    DbResult, Discount, DiscountRedemption, DiscountRedemptionWithCode, DnsServer, EncryptedString,
+    IntervalType, IpRange, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode,
+    MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage,
+    PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
+    Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
+    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentWithCompany, Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod,
+    UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage,
+    VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice, VpnService,
+    VpnSubscription, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -6255,6 +6256,109 @@ impl LNVpsDbBase for LNVpsDbMysql {
             services.fetch_all(&self.db).await?,
             volumes.fetch_all(&self.db).await?,
         ))
+    }
+
+    async fn list_app_deployment_backups(
+        &self,
+        deployment_id: u64,
+    ) -> DbResult<Vec<AppDeploymentBackup>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM app_deployment_backup WHERE deployment_id = ? AND deleted = 0 \
+             ORDER BY created DESC, id DESC",
+        )
+        .bind(deployment_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn get_app_deployment_backup(&self, id: u64) -> DbResult<AppDeploymentBackup> {
+        Ok(
+            sqlx::query_as("SELECT * FROM app_deployment_backup WHERE id = ? AND deleted = 0")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn insert_app_deployment_backup(&self, backup: &AppDeploymentBackup) -> DbResult<u64> {
+        Ok(sqlx::query(
+            "INSERT INTO app_deployment_backup (deployment_id, run_id, service, method, artifact, \
+             object_key, size_bytes, state, message, scheduled, started, completed) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(backup.deployment_id)
+        .bind(&backup.run_id)
+        .bind(&backup.service)
+        .bind(backup.method)
+        .bind(&backup.artifact)
+        .bind(&backup.object_key)
+        .bind(backup.size_bytes)
+        .bind(backup.state)
+        .bind(&backup.message)
+        .bind(backup.scheduled)
+        .bind(backup.started)
+        .bind(backup.completed)
+        .execute(&self.db)
+        .await?
+        .last_insert_id())
+    }
+
+    async fn update_app_deployment_backup(&self, backup: &AppDeploymentBackup) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE app_deployment_backup SET object_key = ?, size_bytes = ?, state = ?, \
+             message = ?, started = ?, completed = ? WHERE id = ?",
+        )
+        .bind(&backup.object_key)
+        .bind(backup.size_bytes)
+        .bind(backup.state)
+        .bind(&backup.message)
+        .bind(backup.started)
+        .bind(backup.completed)
+        .bind(backup.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_active_app_deployment_backups(
+        &self,
+        cluster_id: u64,
+    ) -> DbResult<Vec<AppDeploymentBackup>> {
+        Ok(sqlx::query_as(
+            "SELECT b.* FROM app_deployment_backup b \
+             JOIN app_deployment d ON d.id = b.deployment_id \
+             WHERE d.cluster_id = ? AND b.deleted = 0 AND b.state IN (?, ?) \
+             ORDER BY b.id",
+        )
+        .bind(cluster_id)
+        .bind(AppBackupState::Pending)
+        .bind(AppBackupState::Running)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn last_scheduled_app_deployment_backup(
+        &self,
+        deployment_id: u64,
+    ) -> DbResult<Option<DateTime<Utc>>> {
+        // Deleted rows count: retention prunes old runs, and forgetting that a
+        // run happened because its artifact was pruned would restart the
+        // schedule from zero on every sweep.
+        Ok(sqlx::query_scalar(
+            "SELECT MAX(created) FROM app_deployment_backup \
+             WHERE deployment_id = ? AND scheduled = 1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&self.db)
+        .await?)
+    }
+
+    async fn delete_app_deployment_backup(&self, id: u64) -> DbResult<()> {
+        sqlx::query("UPDATE app_deployment_backup SET deleted = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
     }
 
     async fn delete_app_deployment(&self, id: u64) -> DbResult<()> {

@@ -4,16 +4,16 @@ use chrono::{DateTime, Days, Months, NaiveDate, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, AgentConversation, AgentConversationFilter, AgentConversationOverview,
-    AgentMessage, App, AppCluster, AppDeployment, AppDeploymentDesiredState, AppDeploymentFilter,
-    AppDeploymentServiceUsage, AppDeploymentStatus, AppDeploymentVolumeUsage, AppTag,
-    AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, BulkMessageTarget, Company, CpuArch,
-    CpuMfg, DbError, DbResult, Discount, DiscountRedemption, DiskInterface, DiskType, DnsServer,
-    DnsServerKind, EncryptedString, IntervalType, IpRange, IpRangeAllocationMode,
-    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth,
-    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, NostrDomain, NostrDomainHandle,
-    OsDistribution, PaymentMethod, PaymentMethodConfig, Referral, ReferralCostUsage,
-    ReferralPayout, Region, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
-    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    AgentMessage, App, AppBackupState, AppCluster, AppDeployment, AppDeploymentBackup,
+    AppDeploymentDesiredState, AppDeploymentFilter, AppDeploymentServiceUsage, AppDeploymentStatus,
+    AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
+    BulkMessageTarget, Company, CpuArch, CpuMfg, DbError, DbResult, Discount, DiscountRedemption,
+    DiskInterface, DiskType, DnsServer, DnsServerKind, EncryptedString, IntervalType, IpRange,
+    IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode,
+    MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage,
+    NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
+    ReferralCostUsage, ReferralPayout, Region, Router, RouterBgpRoute, RouterBgpSession,
+    RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
     SubscriptionPaymentWithCompany, Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod,
     UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
     VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment,
@@ -112,6 +112,7 @@ pub struct MockDb {
     pub app_tag_assignments: Arc<Mutex<Vec<(u64, u64)>>>,
     pub app_clusters: Arc<Mutex<HashMap<u64, AppCluster>>>,
     pub app_deployments: Arc<Mutex<HashMap<u64, AppDeployment>>>,
+    pub app_deployment_backups: Arc<Mutex<HashMap<u64, AppDeploymentBackup>>>,
     #[allow(clippy::type_complexity)]
     pub app_deployment_usage_breakdown: Arc<
         Mutex<
@@ -538,6 +539,7 @@ impl Default for MockDb {
             app_tag_assignments: Arc::new(Default::default()),
             app_clusters: Arc::new(Default::default()),
             app_deployments: Arc::new(Default::default()),
+            app_deployment_backups: Arc::new(Default::default()),
             app_deployment_usage_breakdown: Arc::new(Default::default()),
             failing_usage_writes: Arc::new(Default::default()),
             failing_usage_breakdown_writes: Arc::new(Default::default()),
@@ -5927,6 +5929,98 @@ impl LNVpsDbBase for MockDb {
         Ok((services, volumes))
     }
 
+    async fn list_app_deployment_backups(
+        &self,
+        deployment_id: u64,
+    ) -> DbResult<Vec<AppDeploymentBackup>> {
+        let b = self.app_deployment_backups.lock().await;
+        let mut out: Vec<AppDeploymentBackup> = b
+            .values()
+            .filter(|x| x.deployment_id == deployment_id && !x.deleted)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.created.cmp(&a.created).then(b.id.cmp(&a.id)));
+        Ok(out)
+    }
+
+    async fn get_app_deployment_backup(&self, id: u64) -> DbResult<AppDeploymentBackup> {
+        self.app_deployment_backups
+            .lock()
+            .await
+            .get(&id)
+            .filter(|b| !b.deleted)
+            .cloned()
+            .ok_or_else(|| anyhow!("app deployment backup not found").into())
+    }
+
+    async fn insert_app_deployment_backup(&self, backup: &AppDeploymentBackup) -> DbResult<u64> {
+        let mut b = self.app_deployment_backups.lock().await;
+        let new_id = b.keys().max().copied().unwrap_or(0) + 1;
+        b.insert(
+            new_id,
+            AppDeploymentBackup {
+                id: new_id,
+                ..backup.clone()
+            },
+        );
+        Ok(new_id)
+    }
+
+    async fn update_app_deployment_backup(&self, backup: &AppDeploymentBackup) -> DbResult<()> {
+        let mut b = self.app_deployment_backups.lock().await;
+        if let Some(x) = b.get_mut(&backup.id) {
+            // Mirrors the UPDATE's column list: everything else is immutable
+            // once the row exists.
+            x.object_key = backup.object_key.clone();
+            x.size_bytes = backup.size_bytes;
+            x.state = backup.state;
+            x.message = backup.message.clone();
+            x.started = backup.started;
+            x.completed = backup.completed;
+        }
+        Ok(())
+    }
+
+    async fn list_active_app_deployment_backups(
+        &self,
+        cluster_id: u64,
+    ) -> DbResult<Vec<AppDeploymentBackup>> {
+        let deployments = self.app_deployments.lock().await;
+        let b = self.app_deployment_backups.lock().await;
+        let mut out: Vec<AppDeploymentBackup> = b
+            .values()
+            .filter(|x| {
+                !x.deleted
+                    && matches!(x.state, AppBackupState::Pending | AppBackupState::Running)
+                    && deployments
+                        .get(&x.deployment_id)
+                        .is_some_and(|d| d.cluster_id == cluster_id)
+            })
+            .cloned()
+            .collect();
+        out.sort_by_key(|x| x.id);
+        Ok(out)
+    }
+
+    async fn last_scheduled_app_deployment_backup(
+        &self,
+        deployment_id: u64,
+    ) -> DbResult<Option<DateTime<Utc>>> {
+        let b = self.app_deployment_backups.lock().await;
+        Ok(b.values()
+            .filter(|x| x.deployment_id == deployment_id && x.scheduled)
+            .map(|x| x.created)
+            .max())
+    }
+
+    async fn delete_app_deployment_backup(&self, id: u64) -> DbResult<()> {
+        let mut b = self.app_deployment_backups.lock().await;
+        if let Some(x) = b.get_mut(&id) {
+            x.deleted = true;
+        }
+        Ok(())
+    }
+
     async fn delete_app_deployment(&self, id: u64) -> DbResult<()> {
         let mut d = self.app_deployments.lock().await;
         if let Some(x) = d.get_mut(&id) {
@@ -7017,8 +7111,10 @@ impl LNVPSNostrDb for MockDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
     use lnvps_db::{
-        AgentChannel, AgentMessageRole, IntervalType, LNVpsDbBase, SubscriptionPaymentType,
+        AgentChannel, AgentMessageRole, AppBackupMethod, IntervalType, LNVpsDbBase,
+        SubscriptionPaymentType,
     };
 
     fn user_msg(text: &str, channel: AgentChannel) -> NewAgentMessage {
@@ -9292,6 +9388,159 @@ mod tests {
         assert_eq!(db.list_user_app_deployments(1).await.unwrap().len(), 1);
         assert_eq!(db.list_all_app_deployments().await.unwrap().len(), 2);
         assert!(db.get_app_deployment(d1).await.unwrap().deleted);
+    }
+
+    #[tokio::test]
+    async fn test_app_deployment_backup_crud() {
+        let db = MockDb::default();
+        let app_id = db.insert_app(&mk_app("relay")).await.unwrap();
+        let cluster_a = db.insert_app_cluster(&mk_cluster("a", 1)).await.unwrap();
+        let cluster_b = db.insert_app_cluster(&mk_cluster("b", 1)).await.unwrap();
+
+        let mk_dep = |cluster_id: u64, li: u64, name: &str| AppDeployment {
+            id: 0,
+            user_id: 1,
+            app_id,
+            cluster_id,
+            resource_multiplier: 1,
+            subscription_line_item_id: li,
+            name: name.to_string(),
+            namespace: format!("app-{name}"),
+            hostname: None,
+            custom_domain: None,
+            custom_domain_verified: false,
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Running,
+            status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
+            created: Utc::now(),
+            deleted: false,
+        };
+        let here = db
+            .insert_app_deployment(&mk_dep(cluster_a, 10, "here"))
+            .await
+            .unwrap();
+        let elsewhere = db
+            .insert_app_deployment(&mk_dep(cluster_b, 11, "elsewhere"))
+            .await
+            .unwrap();
+
+        let mk_backup =
+            |deployment_id: u64, service: &str, scheduled: bool, created: DateTime<Utc>| {
+                AppDeploymentBackup {
+                    id: 0,
+                    deployment_id,
+                    run_id: "run-1".to_string(),
+                    service: service.to_string(),
+                    method: AppBackupMethod::Command,
+                    artifact: format!("{service}.sql.gz"),
+                    object_key: None,
+                    size_bytes: None,
+                    state: AppBackupState::Pending,
+                    message: None,
+                    scheduled,
+                    created,
+                    started: None,
+                    completed: None,
+                    deleted: false,
+                }
+            };
+
+        let older = Utc::now() - Duration::hours(2);
+        let db_backup = db
+            .insert_app_deployment_backup(&mk_backup(here, "db", true, older))
+            .await
+            .unwrap();
+        let blobs = db
+            .insert_app_deployment_backup(&mk_backup(here, "blobs", false, Utc::now()))
+            .await
+            .unwrap();
+        let other = db
+            .insert_app_deployment_backup(&mk_backup(elsewhere, "db", false, Utc::now()))
+            .await
+            .unwrap();
+
+        // Listed newest first, and scoped to the deployment.
+        let listed = db.list_app_deployment_backups(here).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![blobs, db_backup]
+        );
+
+        // The operator only sees the backups on its own cluster.
+        let active = db
+            .list_active_app_deployment_backups(cluster_a)
+            .await
+            .unwrap();
+        assert_eq!(
+            active.iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![db_backup, blobs]
+        );
+        assert_eq!(
+            db.list_active_app_deployment_backups(cluster_b)
+                .await
+                .unwrap()
+                .iter()
+                .map(|b| b.id)
+                .collect::<Vec<_>>(),
+            vec![other]
+        );
+
+        // Progress write-back, and a completed backup drops out of the sweep.
+        let mut b = db.get_app_deployment_backup(db_backup).await.unwrap();
+        b.state = AppBackupState::Completed;
+        b.object_key = Some("deployments/1/run-1/db.sql.gz".to_string());
+        b.size_bytes = Some(4096);
+        b.completed = Some(Utc::now());
+        db.update_app_deployment_backup(&b).await.unwrap();
+        let reloaded = db.get_app_deployment_backup(db_backup).await.unwrap();
+        assert_eq!(reloaded.state, AppBackupState::Completed);
+        assert_eq!(reloaded.size_bytes, Some(4096));
+        assert_eq!(
+            db.list_active_app_deployment_backups(cluster_a)
+                .await
+                .unwrap()
+                .iter()
+                .map(|b| b.id)
+                .collect::<Vec<_>>(),
+            vec![blobs]
+        );
+
+        // Only scheduled runs answer "when did the schedule last run" — an
+        // on-demand backup must not push the automatic one back.
+        assert_eq!(
+            db.last_scheduled_app_deployment_backup(here).await.unwrap(),
+            Some(older)
+        );
+        assert_eq!(
+            db.last_scheduled_app_deployment_backup(elsewhere)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Soft delete hides the row from both reads.
+        db.delete_app_deployment_backup(blobs).await.unwrap();
+        assert_eq!(
+            db.list_app_deployment_backups(here)
+                .await
+                .unwrap()
+                .iter()
+                .map(|b| b.id)
+                .collect::<Vec<_>>(),
+            vec![db_backup]
+        );
+        assert!(db.get_app_deployment_backup(blobs).await.is_err());
+        assert!(
+            db.list_active_app_deployment_backups(cluster_a)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     fn mk_cluster(name: &str, region_id: u64) -> AppCluster {
