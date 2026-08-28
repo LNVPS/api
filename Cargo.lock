@@ -3780,6 +3780,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lnvps_netlink"
+version = "0.4.7"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "defguard_wireguard_rs",
+ "futures-util",
+ "ipnetwork",
+ "log 0.4.32",
+ "netlink-packet-route 0.30.0",
+ "nix 0.30.1",
+ "rtnetlink",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "lnvps_node"
 version = "0.4.7"
 dependencies = [
@@ -3798,6 +3816,7 @@ dependencies = [
  "if-addrs",
  "ipnetwork",
  "lnvps_host_util",
+ "lnvps_netlink",
  "log 0.4.32",
  "netlink-packet-route 0.30.0",
  "nftables",

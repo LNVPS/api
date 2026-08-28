@@ -8,6 +8,7 @@ name = "lnvps-node"
 path = "src/main.rs"
 
 [dependencies]
+lnvps_netlink = { path = "../lnvps_netlink" }
 # Detection is shared with the `lnvps-host-info` binary so an operator's
 # pre-flight check and the daemon's report cannot disagree about the machine.
 # Built without the vendor libraries: a node must start on a host that has

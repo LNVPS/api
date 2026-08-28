@@ -31,6 +31,9 @@ pub mod fw;
 pub mod inventory;
 pub mod libvirt;
 pub mod net;
-pub mod netns;
+// Entering the data plane's network namespace. Lives in `lnvps_netlink` with
+// the netlink code that needs it, and is re-exported because a node's firewall
+// and libvirt config reach for it by this path.
+pub use lnvps_netlink::netns;
 pub mod tls;
 pub mod wgkey;
