@@ -5091,6 +5091,32 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn admin_list_vpn_subscriptions_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        vpn_service_id: Option<u64>,
+    ) -> DbResult<(Vec<VpnSubscription>, u64)> {
+        let subs = self.vpn_subscriptions.lock().await;
+        let mut matched: Vec<VpnSubscription> = subs
+            .values()
+            .filter(|s| user_id.is_none_or(|u| s.user_id == u))
+            .filter(|s| vpn_service_id.is_none_or(|v| s.vpn_service_id == v))
+            .cloned()
+            .collect();
+        matched.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = matched.len() as u64;
+        Ok((
+            matched
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
     async fn get_vpn_subscription(&self, id: u64) -> DbResult<VpnSubscription> {
         self.vpn_subscriptions
             .lock()

@@ -2273,7 +2273,8 @@ pub struct VpnServicePool {
 pub struct VpnSubscription {
     /// Unique id of this plan
     pub id: u64,
-    /// Which service, and therefore which address block, its devices come from
+    /// Which service its devices belong to, and so which interfaces terminate
+    /// them and what they cost
     pub vpn_service_id: u64,
     /// The account this plan belongs to
     pub user_id: u64,
@@ -2745,6 +2746,21 @@ pub enum AdminResource {
     /// authority to give money away — a pricing decision, not payment
     /// administration.
     Discount = 31,
+    /// The VPN product itself: price, DNS, device allowance, and which
+    /// interfaces terminate it.
+    ///
+    /// Separate from [`AdminResource::VpnSubscription`] because changing what
+    /// the product costs, or which regions it is sold in, is a pricing decision
+    /// that everyone who has bought it is subject to. Revoking one customer's
+    /// stolen laptop is not, and should not require it.
+    VpnService = 32,
+    /// Customer VPN plans and the devices registered against them: reading who
+    /// has what, and revoking a device.
+    ///
+    /// Revocation is the operational half of the product -- a lost phone, or a
+    /// key that has to stop working now -- so support needs it without also
+    /// being able to reprice the service.
+    VpnSubscription = 33,
 }
 
 /// Actions that can be performed on administrative resources
@@ -2791,6 +2807,8 @@ impl Display for AdminResource {
             AdminResource::ResourceCost => write!(f, "resource_cost"),
             AdminResource::Referral => write!(f, "referral"),
             AdminResource::Discount => write!(f, "discount"),
+            AdminResource::VpnService => write!(f, "vpn_service"),
+            AdminResource::VpnSubscription => write!(f, "vpn_subscription"),
             AdminResource::App => write!(f, "app"),
             AdminResource::AppDeployment => write!(f, "app_deployment"),
             AdminResource::MarketplaceNode => write!(f, "marketplace_node"),
@@ -2839,6 +2857,8 @@ impl FromStr for AdminResource {
             }
             "support_agent" => Ok(AdminResource::SupportAgent),
             "discount" | "discounts" => Ok(AdminResource::Discount),
+            "vpn_service" | "vpn_services" => Ok(AdminResource::VpnService),
+            "vpn_subscription" | "vpn_subscriptions" => Ok(AdminResource::VpnSubscription),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -2881,6 +2901,8 @@ impl TryFrom<u16> for AdminResource {
             29 => Ok(AdminResource::MarketplaceOperator),
             30 => Ok(AdminResource::SupportAgent),
             31 => Ok(AdminResource::Discount),
+            32 => Ok(AdminResource::VpnService),
+            33 => Ok(AdminResource::VpnSubscription),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -2922,6 +2944,8 @@ impl AdminResource {
             AdminResource::MarketplaceOperator,
             AdminResource::SupportAgent,
             AdminResource::Discount,
+            AdminResource::VpnService,
+            AdminResource::VpnSubscription,
         ]
     }
 }

@@ -39,6 +39,8 @@ mod vm_ip_assignments;
 mod vm_os_images;
 mod vm_templates;
 mod vms;
+mod vpn_services;
+mod vpn_subscriptions;
 mod websocket;
 
 #[derive(Clone, FromRef)]
@@ -95,6 +97,8 @@ pub fn admin_router(
         .merge(referrals::router())
         .merge(marketplace::router())
         .merge(tunnel_pools::router())
+        .merge(vpn_services::router())
+        .merge(vpn_subscriptions::router())
         .merge(apps::router())
         .merge(reports::router())
         .merge(websocket::router())

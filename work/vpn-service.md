@@ -327,8 +327,17 @@ Notes:
 - [ ] **Cover the `/api/v1/vpn/*` endpoints** — they have no unit-test coverage by design
       (see increment 4), so without this they ship untested
 
-### Increment 10 — admin API
-- [ ] `AdminResource` variant, RBAC migration, admin CRUD for VPN subscriptions and devices
+### Increment 10 — admin API  ✅ DONE
+- [x] `AdminResource::VpnService = 32` and `VpnSubscription = 33`, granted to `super_admin` by
+      `20260828120000_vpn_rbac_permissions.sql`. Two resources, not one: revoking a lost phone is
+      support work and must not require the ability to reprice a product everyone else has bought.
+- [x] `vpn_services.rs` — CRUD plus link/unlink an interface. Created off sale by default, since a
+      service with no interfaces has no region to connect to. Delete refused while it has
+      subscribers; retiring is `enabled: false`.
+- [x] `vpn_subscriptions.rs` — list/get plans with their devices, and revoke a device. No create:
+      a plan exists because a line item was paid for, and a device is a keypair whose private half
+      never leaves the customer's machine.
+- [x] `admin_list_vpn_subscriptions_filtered` in the db layer.
 - [ ] Aggregate counter reporting
 
 ## Notes

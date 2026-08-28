@@ -4566,6 +4566,137 @@ push is corrected without an admin doing anything. A peer on an LNVPS-managed
 interface that no allocation accounts for is **removed**: `wgln*` interfaces are
 LNVPS's, so an unclaimed key there is either a revoked node or somebody else's.
 
+### VPN Services
+
+The VPN product an account subscribes to, and the interfaces that terminate it.
+A service is one price, one device allowance, and a set of regions.
+
+What a customer buys is the whole set. A device holds one keypair and one inner
+address that is valid on **every** interface linked to the service, and choosing
+a region is a client-side choice of which endpoint to dial. That is why linking
+an interface is an operation on the service rather than an edit to the pool: a
+pool does not record what it is for, and adding one changes what every existing
+device can reach.
+
+Under its own `vpn_service` resource rather than `router`, because the price and
+the device allowance are pricing decisions that everyone who has already bought
+the service is subject to. Revoking one customer's device is not. See
+[VPN Subscriptions](#vpn-subscriptions).
+
+#### List VPN Services
+
+```
+GET /api/admin/v1/vpn_services
+```
+
+Required Permission: `vpn_service::view`
+
+Query Parameters: `limit` (default 50, max 100), `offset`, `include_disabled`
+(default true, because an admin listing exists to show what a customer cannot see).
+
+Returns a paginated list of `AdminVpnServiceInfo`. Each carries its `regions`
+(one per linked interface, with the endpoint and public key a client dials) and
+`subscriptions`, the number of plans sold against it.
+
+#### Get, Create, Update and Delete
+
+```
+GET    /api/admin/v1/vpn_services/{id}
+POST   /api/admin/v1/vpn_services
+PATCH  /api/admin/v1/vpn_services/{id}
+DELETE /api/admin/v1/vpn_services/{id}
+```
+
+Required Permissions: `vpn_service::view`, `::create`, `::update`, `::delete`.
+
+Create takes `company_id`, `name`, `currency` and `amount`; `interval_amount`
+defaults to 1 `month`, `setup_amount` to 0, and `default_device_limit` to 5. A
+service is created **off sale** unless `enabled` is passed, because one with no
+interfaces linked has no region to connect to.
+
+Update cannot change `company_id`: it decides who is billing, and moving a
+service between companies would leave existing plans invoiced by one and priced
+by another. Lowering `default_device_limit` does not disconnect anyone already
+over the new limit; it stops them adding more.
+
+Delete is **refused while the service has subscribers**: what is owed to
+somebody cannot be deleted to tidy up. Retiring a service is `enabled: false`,
+which stops new plans without touching paid ones. Deleting one that has no
+subscribers unlinks its interfaces (they survive, and stop terminating
+anything) and re-pushes each so it stops serving devices whose service is gone.
+
+#### Link and Unlink an Interface
+
+```
+POST   /api/admin/v1/vpn_services/{id}/pools/{pool_id}
+DELETE /api/admin/v1/vpn_services/{id}/pools/{pool_id}
+```
+
+Required Permission: `vpn_service::update`
+
+Linking makes a tunnel pool's region available to **every** device on the
+service, and queues a sync so the interface is configured with them.
+
+The interface must carry the **same address block** as the service's others,
+which the database enforces: a device holds one address in every region, so an
+interface with a different block would route some devices and black-hole the
+rest. An interface already terminating another service is refused rather than
+silently repointed, because an interface carries one peer set.
+
+Unlinking withdraws the region and re-pushes the interface. Devices keep their
+addresses and every other region; the address belongs to the service, and this
+only stops one endpoint terminating them.
+
+### VPN Subscriptions
+
+Customer plans and the devices registered against them. Read, and revoke.
+
+There is deliberately **no way to create a plan** here: a plan exists because a
+line item was paid for, and one conjured by an admin would be a subscription
+nobody is billed for. Nor is there a way to register a device, because a device
+is a keypair whose private half never leaves the customer's machine, so an
+admin-created one would be a key the customer does not hold.
+
+#### List and Get
+
+```
+GET /api/admin/v1/vpn_subscriptions
+GET /api/admin/v1/vpn_subscriptions/{id}
+```
+
+Required Permission: `vpn_subscription::view`
+
+Query Parameters: `limit` (default 50, max 100), `offset`, `user_id`,
+`vpn_service_id`.
+
+Returns `AdminVpnSubscriptionInfo`, including every device with its slot, label,
+public key and the address it holds in every region. `active` is whether the
+plan is currently paid for, read from the subscription rather than stored: a
+plan has no `active` column because lapsing and paying should not need a write.
+Devices on an unpaid plan stay allocated and keep their addresses. They are
+simply not configured on any interface, so the customer gets them all back on
+payment rather than having to re-register each one.
+
+#### Revoke a Device
+
+```
+DELETE /api/admin/v1/vpn_subscriptions/{id}/devices/{device_id}
+```
+
+Required Permission: `vpn_subscription::delete`
+
+Body: optional `reason`, which is written to the log. The reason is the point of
+doing this from an admin console rather than leaving it to the customer.
+
+This is what a stolen laptop needs. The device's tunnel is deleted with it, so
+the key stops being configured anywhere, and **every** interface on the service
+is re-pushed, because a peer removed from the database but left on one route
+server would keep working, which is the failure mode that matters here. The slot is
+freed, so the customer can register a replacement immediately.
+
+A device id belonging to a different plan is refused rather than revoked
+through the plan in the path.
+
 ### Reports
 
 #### Time Series Report

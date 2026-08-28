@@ -1640,6 +1640,18 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn unlink_vpn_service_pool(&self, tunnel_pool_id: u64) -> DbResult<()>;
 
     /// Get a VPN plan by id
+    /// List VPN plans across accounts, newest first, for administration.
+    ///
+    /// Filtered rather than listed whole because a plan is only ever looked at
+    /// for a reason: one customer, or one service being wound down.
+    async fn admin_list_vpn_subscriptions_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        vpn_service_id: Option<u64>,
+    ) -> DbResult<(Vec<VpnSubscription>, u64)>;
+
     async fn get_vpn_subscription(&self, id: u64) -> DbResult<VpnSubscription>;
 
     /// Get the VPN plan for an account, if it has ever had one.

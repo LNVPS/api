@@ -5421,6 +5421,23 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn admin_list_vpn_subscriptions_filtered(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        vpn_service_id: Option<u64>,
+    ) -> DbResult<(Vec<VpnSubscription>, u64)> {
+        let mut query = FilteredQuery::new("vpn_subscription");
+        if let Some(user_id) = user_id {
+            query.eq("user_id", user_id);
+        }
+        if let Some(vpn_service_id) = vpn_service_id {
+            query.eq("vpn_service_id", vpn_service_id);
+        }
+        query.fetch(&self.db, "id DESC", limit, offset).await
+    }
+
     async fn get_vpn_subscription(&self, id: u64) -> DbResult<VpnSubscription> {
         Ok(
             sqlx::query_as("SELECT * FROM vpn_subscription WHERE id = ?")

@@ -14,6 +14,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
   Registering a device is idempotent on the public key, so a client retrying a request whose response it lost does not consume a second slot; a key already registered to another account is refused. Devices cannot be registered until the plan's subscription is paid, and adding a line item of the new `vpn` type to a subscription is what bills for it — one subscription can carry a VPN alongside a VM on a single renewal date and payment.
 
+- **VPN administration**: `GET`/`POST /api/admin/v1/vpn_services`, `GET`/`PATCH`/`DELETE /api/admin/v1/vpn_services/{id}` and `POST`/`DELETE /api/admin/v1/vpn_services/{id}/pools/{pool_id}` manage the product and the regions it is sold in; `GET /api/admin/v1/vpn_subscriptions`, `GET /api/admin/v1/vpn_subscriptions/{id}` and `DELETE /api/admin/v1/vpn_subscriptions/{id}/devices/{device_id}` read customer plans and revoke a device.
+
+  Two new RBAC resources, `vpn_service` (32) and `vpn_subscription` (33), granted to `super_admin` by migration. They are separate because revoking a lost phone is support work and should not require the ability to reprice a product everyone else has already bought.
+
+  Linking an interface requires it to carry the same address block as the service's others, which the database enforces: a device holds one address in every region, so an interface with a different block would route some devices and black-hole the rest. Deleting a service is refused while it has subscribers; retiring one is `enabled: false`. Revoking a device deletes its tunnel and re-pushes every interface on the service, because a key left configured on one route server still works.
+
 ### Removed
 
 - **Bitvora payment provider** — the provider was disabled in February 2026 when the service shut down, and its remaining code has now been deleted: the `bitvora` cargo feature, the `POST /api/v1/webhook/bitvora` endpoint, and the `"type": "bitvora"` variant of `ProviderConfig` (create), `PartialProviderConfig` (update) and the sanitized config returned by the admin payment-method endpoints. Any `payment_method_config` row still holding a bitvora config is left in place as billing history; it now reads back with a `null` `config` and cannot be updated. Delete or ignore those rows.
