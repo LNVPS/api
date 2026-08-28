@@ -1511,6 +1511,28 @@ GET /api/admin/v1/hosts/{id}
 
 Required Permission: `hosts::view`
 
+#### Delete Host
+
+```
+DELETE /api/admin/v1/hosts/{id}
+```
+
+Required Permission: `hosts::delete`
+
+Deletes the host and its disk records. Refused while any VM row still
+references the host: active VMs must be moved or deleted first, and a host that
+only has soft-deleted VMs kept as billing history cannot be removed at all, so
+disable it instead (`PATCH` with `"enabled": false`).
+
+Response:
+
+```json
+{
+  "success": true,
+  "message": "Host deleted successfully"
+}
+```
+
 #### Update Host Configuration
 
 ```

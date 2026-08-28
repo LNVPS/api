@@ -7226,6 +7226,59 @@ impl AdminDb for LNVpsDbMysql {
         Ok(count as u64)
     }
 
+    async fn admin_delete_host(&self, host_id: u64) -> DbResult<()> {
+        // The host must exist, so deleting an unknown id is an error rather
+        // than a silent no-op.
+        let _host = self.get_host(host_id).await?;
+
+        let active_vms: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vm WHERE host_id = ? AND deleted = false")
+                .bind(host_id)
+                .fetch_one(&self.db)
+                .await?;
+
+        if active_vms > 0 {
+            return Err(DbError::Source(
+                anyhow!("Cannot delete host with {} active VMs", active_vms).into_boxed_dyn_error(),
+            ));
+        }
+
+        // Soft-deleted VMs still hold foreign keys into vm_host and
+        // vm_host_disk, so the delete below would fail on the constraint.
+        // Report that clearly instead: those rows are billing history and
+        // removing them is a separate, deliberate operation.
+        let historic_vms: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vm WHERE host_id = ?")
+            .bind(host_id)
+            .fetch_one(&self.db)
+            .await?;
+
+        if historic_vms > 0 {
+            return Err(DbError::Source(
+                anyhow!(
+                    "Cannot delete host with {} deleted VM records still referencing it, disable the host instead",
+                    historic_vms
+                )
+                .into_boxed_dyn_error(),
+            ));
+        }
+
+        let mut tx = self.db.begin().await?;
+
+        sqlx::query("DELETE FROM vm_host_disk WHERE host_id = ?")
+            .bind(host_id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM vm_host WHERE id = ?")
+            .bind(host_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(())
+    }
+
     async fn admin_get_region_stats(&self, region_id: u64) -> DbResult<RegionStats> {
         // Get comprehensive region statistics with a single efficient query
         // Use CAST to ensure we get the right SQL types for Rust compatibility

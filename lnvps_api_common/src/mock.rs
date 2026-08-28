@@ -6341,6 +6341,36 @@ impl lnvps_db::AdminDb for MockDb {
     async fn admin_count_region_hosts(&self, _region_id: u64) -> DbResult<u64> {
         Ok(0)
     }
+    async fn admin_delete_host(&self, host_id: u64) -> DbResult<()> {
+        let mut hosts = self.hosts.lock().await;
+        if !hosts.contains_key(&host_id) {
+            return Err(anyhow!("no host").into());
+        }
+
+        let vms = self.vms.lock().await;
+        let active_vms = vms
+            .values()
+            .filter(|v| v.host_id == host_id && !v.deleted)
+            .count();
+        if active_vms > 0 {
+            return Err(anyhow!("Cannot delete host with {} active VMs", active_vms).into());
+        }
+        let historic_vms = vms.values().filter(|v| v.host_id == host_id).count();
+        if historic_vms > 0 {
+            return Err(anyhow!(
+                "Cannot delete host with {} deleted VM records still referencing it, disable the host instead",
+                historic_vms
+            )
+            .into());
+        }
+
+        hosts.remove(&host_id);
+        self.host_disks
+            .lock()
+            .await
+            .retain(|_, d| d.host_id != host_id);
+        Ok(())
+    }
     async fn admin_get_region_stats(&self, region_id: u64) -> DbResult<RegionStats> {
         let hosts = self.hosts.lock().await;
         let region_hosts: Vec<&VmHost> = hosts
