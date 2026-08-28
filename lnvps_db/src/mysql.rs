@@ -7296,7 +7296,23 @@ impl AdminDb for LNVpsDbMysql {
         // with identical cpu/memory were counted once. Compute host totals and
         // VM/IP counts in separate subqueries to avoid both the value-dedup bug
         // and row multiplication from the joins.
-        let row: (i64, i64, Option<u64>, Option<u64>, i64, i64, i64) = sqlx::query_as(
+        #[allow(clippy::type_complexity)]
+        let row: (
+            i64,
+            i64,
+            Option<u64>,
+            Option<u64>,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(
             r#"
             SELECT
                 (SELECT COUNT(*) FROM vm_host WHERE region_id = ? AND deleted = 0) as host_count,
@@ -7321,9 +7337,40 @@ impl AdminDb for LNVpsDbMysql {
                     JOIN vm_host h ON v.host_id = h.id
                     JOIN ip_range r ON ip.ip_range_id = r.id
                     WHERE h.region_id = ? AND v.deleted = 0 AND ip.deleted = 0
-                      AND r.cidr LIKE '%:%') as ipv6_assignments
+                      AND r.cidr LIKE '%:%') as ipv6_assignments,
+                (SELECT COUNT(*) FROM ip_range WHERE region_id = ?) as ip_ranges,
+                (SELECT COUNT(*) FROM vm_template WHERE region_id = ?) as vm_templates,
+                (SELECT COUNT(*) FROM app_cluster WHERE region_id = ?) as app_clusters,
+                (SELECT COUNT(*) FROM app_deployment d
+                    JOIN app_cluster c ON d.cluster_id = c.id
+                    WHERE c.region_id = ? AND d.deleted = 0) as app_deployments,
+                (SELECT COUNT(*) FROM tunnel_pool WHERE region_id = ?) as tunnel_pools,
+                -- Distinct, because one service may terminate on several
+                -- interfaces in the same region.
+                (SELECT COUNT(DISTINCT p.vpn_service_id) FROM vpn_service_pool p
+                    JOIN tunnel_pool t ON p.tunnel_pool_id = t.id
+                    WHERE t.region_id = ?) as vpn_services,
+                -- A router carries no region of its own, so it belongs to a
+                -- region through the tunnel pools terminating there and the
+                -- access policies its IP ranges use. UNION de-duplicates a
+                -- router reached both ways.
+                (SELECT COUNT(*) FROM (
+                    SELECT router_id FROM tunnel_pool WHERE region_id = ?
+                    UNION
+                    SELECT a.router_id FROM ip_range r
+                        JOIN access_policy a ON r.access_policy_id = a.id
+                        WHERE r.region_id = ? AND a.router_id IS NOT NULL
+                ) routers) as routers
             "#,
         )
+        .bind(region_id)
+        .bind(region_id)
+        .bind(region_id)
+        .bind(region_id)
+        .bind(region_id)
+        .bind(region_id)
+        .bind(region_id)
+        .bind(region_id)
         .bind(region_id)
         .bind(region_id)
         .bind(region_id)
@@ -7342,6 +7389,13 @@ impl AdminDb for LNVpsDbMysql {
             total_ip_assignments: row.4 as u64,
             ipv4_assignments: row.5 as u64,
             ipv6_assignments: row.6 as u64,
+            ip_ranges: row.7 as u64,
+            vm_templates: row.8 as u64,
+            app_clusters: row.9 as u64,
+            app_deployments: row.10 as u64,
+            tunnel_pools: row.11 as u64,
+            vpn_services: row.12 as u64,
+            routers: row.13 as u64,
         })
     }
 

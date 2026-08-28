@@ -1329,6 +1329,23 @@ pub struct AdminRegionInfo {
     /// Active IPv6 assignments in this region. There is no matching "available"
     /// figure: an IPv6 range's free space is effectively unbounded.
     pub ipv6_assignments: u64,
+    /// IP ranges configured here, enabled or not.
+    pub ip_ranges: u64,
+    /// VM templates sold here, enabled or not.
+    pub vm_templates: u64,
+    /// App clusters here.
+    pub app_clusters: u64,
+    /// Live app deployments on those clusters.
+    pub app_deployments: u64,
+    /// Tunnel pools terminating here.
+    pub tunnel_pools: u64,
+    /// VPN services sold here, counted once each however many interfaces they
+    /// terminate on in this region.
+    pub vpn_services: u64,
+    /// Routers serving the region, through the tunnel pools that terminate here
+    /// and the access policies its IP ranges use. A router has no region column,
+    /// so this is what "routers in a region" can mean.
+    pub routers: u64,
 }
 
 #[derive(Deserialize)]

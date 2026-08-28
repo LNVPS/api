@@ -1819,6 +1819,24 @@ Required Permission: `hosts::view`
 Returns paginated list of VM host regions with configuration details, host counts, and statistics (only active VMs are
 counted). Each region carries `country_code` (ISO 3166-1 alpha-2, or `null` if not set).
 
+Each region also carries counts of what else is configured there, so an operator
+can see what a region holds before touching it:
+
+| Field | Counts |
+|---|---|
+| `ip_ranges` | IP ranges in the region, enabled or not |
+| `vm_templates` | VM templates sold in the region, enabled or not |
+| `app_clusters` | App clusters in the region |
+| `app_deployments` | Live deployments on those clusters (soft-deleted ones are excluded) |
+| `tunnel_pools` | Tunnel pools terminating in the region |
+| `vpn_services` | VPN services sold there, counted once each however many interfaces they terminate on |
+| `routers` | Routers serving the region |
+
+`routers` is derived rather than stored: a router has no region column, so it is
+counted through the tunnel pools that terminate in the region and the access
+policies its IP ranges use, de-duplicated so a router reached both ways counts
+once.
+
 #### Get Region Details
 
 ```

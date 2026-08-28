@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Regions report what else is in them** — `GET /api/admin/v1/regions` and `GET /api/admin/v1/regions/{id}` now also return `ip_ranges`, `vm_templates`, `app_clusters`, `app_deployments`, `tunnel_pools`, `vpn_services` and `routers` alongside the existing host, VM and IP figures, so an admin can see what a region holds without opening six other pages first.
+
+  `routers` is derived: a router has no region column, so it is counted through the tunnel pools terminating in the region and the access policies its IP ranges use, de-duplicated so a router reached both ways counts once. `vpn_services` is likewise distinct, because one service may terminate on several interfaces in the same region, and `app_deployments` excludes soft-deleted rows since a deleted deployment is not running there.
+
 - **Host deletion**: `DELETE /api/admin/v1/hosts/{id}`, guarded by `hosts::delete`. Refused while the host has active VMs. A host that never ran a VM is removed along with its disk records; one that did keeps its row, now flagged `deleted` and forced `enabled: false`, because `vm.host_id` and `vm.disk_id` are foreign keys and those VMs are billing history.
 
   Deleted hosts are excluded from `GET /api/admin/v1/hosts`, from the region host counts and from region stats, but `GET /api/admin/v1/hosts/{id}` still returns one so admin views resolving a host from a historical VM keep working. Host responses carry a new `deleted` boolean.

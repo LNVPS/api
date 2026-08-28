@@ -6413,6 +6413,50 @@ impl lnvps_db::AdminDb for MockDb {
             }
         }
 
+        let region_ranges: Vec<&IpRange> = ranges
+            .values()
+            .filter(|r| r.region_id == region_id)
+            .collect();
+
+        let templates = self.templates.lock().await;
+        let clusters = self.app_clusters.lock().await;
+        let region_clusters: Vec<u64> = clusters
+            .values()
+            .filter(|c| c.region_id == region_id)
+            .map(|c| c.id)
+            .collect();
+        let deployments = self.app_deployments.lock().await;
+        let app_deployments = deployments
+            .values()
+            .filter(|d| !d.deleted && region_clusters.contains(&d.cluster_id))
+            .count() as u64;
+
+        let pools = self.tunnel_pools.lock().await;
+        let region_pools: Vec<&TunnelPool> = pools
+            .values()
+            .filter(|p| p.region_id == region_id)
+            .collect();
+        let service_pools = self.vpn_service_pools.lock().await;
+        let vpn_services: HashSet<u64> = region_pools
+            .iter()
+            .filter_map(|p| service_pools.get(&p.id).copied())
+            .collect();
+
+        // A router has no region of its own, so it belongs to one through the
+        // pools terminating here and the access policies the region's ranges
+        // use. A set, because a router reached both ways is still one router.
+        let policies = self.access_policy.lock().await;
+        let mut routers: HashSet<u64> = region_pools.iter().map(|p| p.router_id).collect();
+        for range in &region_ranges {
+            if let Some(router_id) = range
+                .access_policy_id
+                .and_then(|id| policies.get(&id))
+                .and_then(|p| p.router_id)
+            {
+                routers.insert(router_id);
+            }
+        }
+
         Ok(RegionStats {
             host_count: region_hosts.len() as u64,
             total_vms: region_vms.len() as u64,
@@ -6421,6 +6465,16 @@ impl lnvps_db::AdminDb for MockDb {
             total_ip_assignments,
             ipv4_assignments,
             ipv6_assignments,
+            ip_ranges: region_ranges.len() as u64,
+            vm_templates: templates
+                .values()
+                .filter(|t| t.region_id == region_id)
+                .count() as u64,
+            app_clusters: region_clusters.len() as u64,
+            app_deployments,
+            tunnel_pools: region_pools.len() as u64,
+            vpn_services: vpn_services.len() as u64,
+            routers: routers.len() as u64,
         })
     }
     async fn admin_transfer_vm(&self, vm_id: u64, new_user_id: u64) -> DbResult<()> {

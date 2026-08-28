@@ -50,6 +50,13 @@ async fn region_info(db: &Arc<dyn LNVpsDb>, region: Region) -> Result<AdminRegio
         ipv4_assignments: stats.ipv4_assignments,
         ipv4_available,
         ipv6_assignments: stats.ipv6_assignments,
+        ip_ranges: stats.ip_ranges,
+        vm_templates: stats.vm_templates,
+        app_clusters: stats.app_clusters,
+        app_deployments: stats.app_deployments,
+        tunnel_pools: stats.tunnel_pools,
+        vpn_services: stats.vpn_services,
+        routers: stats.routers,
     })
 }
 
@@ -156,7 +163,8 @@ async fn admin_create_region(
         )
         .await?;
 
-    // Get the created region
+    // Get the created region. Everything hangs off it, so a region that was
+    // created a moment ago has none of it and the counts are all zero.
     let region = this.db.get_host_region(region_id).await?;
     let region_info = AdminRegionInfo {
         id: region.id,
@@ -164,7 +172,7 @@ async fn admin_create_region(
         enabled: region.enabled,
         company_id: region.company_id,
         country_code: region.country_code,
-        host_count: 0, // New region has no hosts
+        host_count: 0,
         total_vms: 0,
         total_cpu_cores: 0,
         total_memory_bytes: 0,
@@ -172,6 +180,13 @@ async fn admin_create_region(
         ipv4_assignments: 0,
         ipv4_available: 0,
         ipv6_assignments: 0,
+        ip_ranges: 0,
+        vm_templates: 0,
+        app_clusters: 0,
+        app_deployments: 0,
+        tunnel_pools: 0,
+        vpn_services: 0,
+        routers: 0,
     };
 
     ApiData::ok(region_info)
@@ -240,6 +255,7 @@ struct RegionDeleteResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
     use lnvps_api_common::MockDb;
     use lnvps_db::{AdminDb, VmIpAssignment};
 
@@ -373,5 +389,111 @@ mod tests {
         assert_eq!(info.ipv4_assignments, 1);
         assert_eq!(info.ipv6_assignments, 1);
         assert_eq!(info.ipv4_available, MOCK_REGION_IPV4_USABLE - 1);
+    }
+
+    /// The related-resource counts, which are what an operator reads to answer
+    /// "what else is in this region" before touching it.
+    #[tokio::test]
+    async fn region_info_counts_related_resources() {
+        let (db, dyn_db) = mock_db().await;
+
+        let cluster_id = dyn_db
+            .insert_app_cluster(&lnvps_db::AppCluster {
+                id: 0,
+                name: "eu-1".to_string(),
+                region_id: 1,
+                ingress_domain: "apps.example.com".to_string(),
+                enabled: true,
+                capacity_cpu_milli: 1000,
+                capacity_memory_bytes: 1024,
+                capacity_storage_bytes: 1024,
+                created: Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        {
+            let mut deployments = db.app_deployments.lock().await;
+            for (id, deleted) in [(1u64, false), (2, false), (3, true)] {
+                deployments.insert(
+                    id,
+                    lnvps_db::AppDeployment {
+                        id,
+                        user_id: 1,
+                        app_id: 1,
+                        cluster_id,
+                        resource_multiplier: 1,
+                        subscription_line_item_id: 0,
+                        name: format!("d{id}"),
+                        namespace: format!("app-d{id}"),
+                        hostname: None,
+                        custom_domain: None,
+                        custom_domain_verified: false,
+                        config: None,
+                        desired_state: Default::default(),
+                        status: Default::default(),
+                        status_message: None,
+                        usage_cpu_milli: None,
+                        usage_memory_bytes: None,
+                        usage_storage_bytes: None,
+                        usage_collected: None,
+                        created: Utc::now(),
+                        deleted,
+                    },
+                );
+            }
+        }
+
+        {
+            // Two interfaces on one route server, both in region 1, so the pool
+            // count is two but the router count is one.
+            let mut pools = db.tunnel_pools.lock().await;
+            for id in [1u64, 2] {
+                pools.insert(
+                    id,
+                    lnvps_db::TunnelPool {
+                        id,
+                        router_id: 7,
+                        region_id: 1,
+                        name: format!("pool{id}"),
+                        ..Default::default()
+                    },
+                );
+            }
+            // One service terminating on both of them is still one service.
+            let mut links = db.vpn_service_pools.lock().await;
+            links.insert(1, 42);
+            links.insert(2, 42);
+        }
+
+        let info = region_info(&dyn_db, dyn_db.get_host_region(1).await.unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(info.app_clusters, 1);
+        // The soft-deleted deployment is not running anywhere, so it is not counted
+        assert_eq!(info.app_deployments, 2);
+        assert_eq!(info.tunnel_pools, 2);
+        assert_eq!(info.vpn_services, 1);
+        assert_eq!(info.routers, 1);
+        assert_eq!(
+            info.ip_ranges,
+            dyn_db.list_ip_range_in_region(1).await.unwrap().len() as u64
+        );
+
+        // A region with nothing attached reports zero rather than the totals
+        let empty_id = dyn_db
+            .admin_create_region("Nowhere", true, 1, None)
+            .await
+            .unwrap();
+        let empty = region_info(&dyn_db, dyn_db.get_host_region(empty_id).await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(empty.app_clusters, 0);
+        assert_eq!(empty.app_deployments, 0);
+        assert_eq!(empty.tunnel_pools, 0);
+        assert_eq!(empty.vpn_services, 0);
+        assert_eq!(empty.routers, 0);
+        assert_eq!(empty.ip_ranges, 0);
     }
 }
