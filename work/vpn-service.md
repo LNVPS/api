@@ -301,13 +301,13 @@ Notes:
   failing immediately after a successful insert.
 
 ### Increment 5 — agent router backend
-- [ ] `RouterKind::LnvpsAgent` + `router/agent.rs` implementing the read half of `TunnelRouter`
+- [ ] `RouterKind::Lvd` + `router/agent.rs` implementing the read half of `TunnelRouter`
 - [ ] Split `reconcile_tunnel_peers` into drift detection and push; gate push on backend
 - [ ] Digest-based drift comparison; summarised peer view
 - [ ] Unit tests
 
 ### Increment 6 — route-server-facing API
-- [x] `RouterKind::LnvpsAgent = 3`: the one kind LNVPS never dials.
+- [x] `RouterKind::Lvd = 3`: the one kind LNVPS never dials.
 - [x] `GET /api/v1/routeserver/dataplane`, authenticated by a static `<router_id>.<secret>`
       bearer compared against `router.token`. No JWT: unlike a marketplace node there is
       nothing to mint, since a route server is provisioned by hand.

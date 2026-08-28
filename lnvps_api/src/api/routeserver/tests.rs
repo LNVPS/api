@@ -112,8 +112,8 @@ async fn a_route_server_is_told_only_about_its_own_interfaces() -> Result<()> {
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
     let service = a_service(&db, &mock).await?;
 
-    let mine = a_route_server(&mock, RouterKind::LnvpsAgent).await;
-    let theirs = a_route_server(&mock, RouterKind::LnvpsAgent).await;
+    let mine = a_route_server(&mock, RouterKind::Lvd).await;
+    let theirs = a_route_server(&mock, RouterKind::Lvd).await;
     let a = a_pool(&db, &service, mine, 51820, true).await?;
     a_pool(&db, &service, theirs, 51821, true).await?;
 
@@ -127,7 +127,7 @@ async fn a_disabled_interface_is_withheld_rather_than_flagged() -> Result<()> {
     let mock = MockDb::default();
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
     let service = a_service(&db, &mock).await?;
-    let rs = a_route_server(&mock, RouterKind::LnvpsAgent).await;
+    let rs = a_route_server(&mock, RouterKind::Lvd).await;
     let pool = a_pool(&db, &service, rs, 51820, true).await?;
 
     assert_eq!(route_server_pools(&db, rs).await.unwrap().len(), 1);
@@ -148,7 +148,7 @@ async fn the_generation_moves_when_the_peer_set_does() -> Result<()> {
     let mock = MockDb::default();
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
     let service = a_service(&db, &mock).await?;
-    let rs = a_route_server(&mock, RouterKind::LnvpsAgent).await;
+    let rs = a_route_server(&mock, RouterKind::Lvd).await;
     let pool = a_pool(&db, &service, rs, 51820, true).await?;
 
     let before = current_generation(&route_server_pools(&db, rs).await.unwrap());
@@ -168,7 +168,7 @@ async fn the_document_says_nothing_about_who_a_peer_is() -> Result<()> {
     let mock = MockDb::default();
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
     let service = a_service(&db, &mock).await?;
-    let rs = a_route_server(&mock, RouterKind::LnvpsAgent).await;
+    let rs = a_route_server(&mock, RouterKind::Lvd).await;
     let pool = a_pool(&db, &service, rs, 51820, true).await?;
 
     let iface = desired_interface(&db, &pool).await.unwrap();

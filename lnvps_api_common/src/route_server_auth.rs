@@ -94,7 +94,7 @@ where
             // MikroTik's token is a management password, and honouring it here
             // would turn every router credential into a way to read the peer
             // set of the machines it has nothing to do with.
-            if !matches!(router.kind, RouterKind::LnvpsAgent) {
+            if !matches!(router.kind, RouterKind::Lvd) {
                 return Err(unauthorized("Invalid route server token"));
             }
             if !router.enabled {

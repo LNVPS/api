@@ -144,7 +144,7 @@ impl TunnelProvisioner {
     async fn publishes_own_state(&self, router_id: u64) -> Result<bool> {
         Ok(matches!(
             self.db.get_router(router_id).await?.kind,
-            lnvps_db::RouterKind::LnvpsAgent
+            lnvps_db::RouterKind::Lvd
         ))
     }
 
