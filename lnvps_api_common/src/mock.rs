@@ -4872,6 +4872,28 @@ impl LNVpsDbBase for MockDb {
             )
             .into());
         }
+        // A pool already terminating a VPN service cannot have its block edited
+        // away from its siblings': every interface on a service shares one
+        // block, because a device holds one address in every region.
+        {
+            let links = self.vpn_service_pools.lock().await;
+            if let Some(service_id) = links.get(&pool.id).copied()
+                && let Some(other_id) = links
+                    .iter()
+                    .filter(|(pid, sid)| **sid == service_id && **pid != pool.id)
+                    .filter_map(|(pid, _)| pools.get(pid).map(|p| (pid, p)))
+                    .find(|(_, p)| p.cidr4 != pool.cidr4 || p.cidr6 != pool.cidr6)
+                    .map(|(pid, _)| *pid)
+            {
+                return Err(anyhow!(
+                    "Tunnel pool {} terminates a VPN service, so its block must stay the same \
+                     as pool {}'s",
+                    pool.id,
+                    other_id
+                )
+                .into());
+            }
+        }
         let existing = pools
             .get_mut(&pool.id)
             .ok_or_else(|| DbError::Other(anyhow!("Tunnel pool {} not found", pool.id)))?;
@@ -4930,14 +4952,6 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn insert_vpn_service(&self, service: &VpnService) -> DbResult<u64> {
-        // ck_vpn_service_has_a_block: a service with neither block can allocate
-        // nothing, and would only be discovered with a customer waiting.
-        if service.device_cidr4.is_none() && service.device_cidr6.is_none() {
-            return Err(anyhow!(
-                "A VPN service must have a device address block (ck_vpn_service_has_a_block)"
-            )
-            .into());
-        }
         // FK vpn_service.company_id
         if !self
             .companies
@@ -4961,12 +4975,6 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn update_vpn_service(&self, service: &VpnService) -> DbResult<()> {
-        if service.device_cidr4.is_none() && service.device_cidr6.is_none() {
-            return Err(anyhow!(
-                "A VPN service must have a device address block (ck_vpn_service_has_a_block)"
-            )
-            .into());
-        }
         let mut services = self.vpn_services.lock().await;
         let existing = services
             .get(&service.id)
@@ -5046,6 +5054,31 @@ impl LNVpsDbBase for MockDb {
         }
         if !self.tunnel_pools.lock().await.contains_key(&tunnel_pool_id) {
             return Err(anyhow!("Tunnel pool {} not found", tunnel_pool_id).into());
+        }
+        // Every interface on a service shares one block, because a device holds
+        // one address in every region. A pool with a different block would
+        // route a subset of the devices and black-hole the rest.
+        {
+            let pools = self.tunnel_pools.lock().await;
+            let links = self.vpn_service_pools.lock().await;
+            let me = pools.get(&tunnel_pool_id);
+            if let Some(me) = me
+                && let Some((other_id, other)) = links
+                    .iter()
+                    .filter(|(pid, sid)| **sid == vpn_service_id && **pid != tunnel_pool_id)
+                    .filter_map(|(pid, _)| pools.get(pid).map(|p| (pid, p)))
+                    .find(|(_, p)| p.cidr4 != me.cidr4 || p.cidr6 != me.cidr6)
+            {
+                return Err(anyhow!(
+                    "Tunnel pool {} cannot terminate VPN service {}: pool {} on it carries {:?}/{:?}",
+                    tunnel_pool_id,
+                    vpn_service_id,
+                    other_id,
+                    other.cidr4,
+                    other.cidr6
+                )
+                .into());
+            }
         }
         // Keyed by pool, so repointing replaces rather than adding a second
         // peer set to one interface.
@@ -11360,7 +11393,6 @@ mod vpn_tests {
             name: "eu".to_string(),
             company_id,
             currency: "EUR".to_string(),
-            device_cidr4: Some("10.64.0.0/12".to_string()),
             default_device_limit: 5,
             enabled: true,
             ..Default::default()
@@ -11457,34 +11489,63 @@ mod vpn_tests {
         }
     }
 
-    /// A service that can allocate nothing is a service whose first customer
-    /// discovers the problem, so the check runs on write rather than on use.
+    /// A service has no block of its own: a device is addressed from the block
+    /// on the interfaces terminating it, like every other peer. What is
+    /// specific to a VPN is that they all carry the same one, which is enforced
+    /// when a pool is linked.
     #[tokio::test]
-    async fn a_vpn_service_must_have_a_block() {
+    async fn every_interface_on_a_service_shares_one_block() {
         let db = MockDb::default();
+        let service = vpn_service(&db).await;
 
-        assert!(
-            db.insert_vpn_service(&VpnService {
-                name: "empty".to_string(),
-                company_id: a_company(&db).await,
-                ..Default::default()
-            })
+        let mut pools = db.tunnel_pools.lock().await;
+        for (id, cidr) in [
+            (1u64, "10.64.0.0/12"),
+            (2, "10.64.0.0/12"),
+            (3, "10.99.0.0/16"),
+        ] {
+            pools.insert(
+                id,
+                TunnelPool {
+                    id,
+                    cidr4: Some(cidr.to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        drop(pools);
+
+        db.link_vpn_service_pool(service, 1).await.unwrap();
+        db.link_vpn_service_pool(service, 2)
             .await
-            .is_err(),
-            "a service with neither block can allocate nothing"
-        );
+            .expect("a second interface with the same block is fine");
+        let err = db
+            .link_vpn_service_pool(service, 3)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot terminate VPN service"), "{err}");
 
+        // And the same from the other side: a linked pool's block cannot be
+        // edited away from its siblings'.
+        let mut drifting = db.get_tunnel_pool(1).await.unwrap();
+        drifting.cidr4 = Some("10.99.0.0/16".to_string());
+        drifting.listen_port = 51821;
+        let err = db
+            .update_tunnel_pool(&drifting)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must stay the same"), "{err}");
+    }
+
+    /// Disabling a service stops sales without touching what is allocated.
+    #[tokio::test]
+    async fn a_service_can_be_taken_off_sale() {
+        let db = MockDb::default();
         let id = vpn_service(&db).await;
-        let mut svc = db.get_vpn_service(id).await.unwrap();
         assert_eq!(db.list_vpn_services(true).await.unwrap().len(), 1);
 
-        svc.device_cidr4 = None;
-        assert!(
-            db.update_vpn_service(&svc).await.is_err(),
-            "a service cannot have its last block removed either"
-        );
-
-        // Disabling stops sales without touching what is already allocated.
         let mut svc = db.get_vpn_service(id).await.unwrap();
         svc.enabled = false;
         svc.name = "eu-closed".to_string();
@@ -11538,7 +11599,6 @@ mod vpn_tests {
             .insert_vpn_service(&VpnService {
                 name: "b".to_string(),
                 company_id: a_company(&db).await,
-                device_cidr6: Some("fd00:64::/32".to_string()),
                 ..Default::default()
             })
             .await
@@ -11673,7 +11733,6 @@ mod vpn_tests {
             .insert_vpn_service(&VpnService {
                 name: "other".to_string(),
                 company_id: a_company(&db).await,
-                device_cidr4: Some("10.80.0.0/12".to_string()),
                 ..Default::default()
             })
             .await

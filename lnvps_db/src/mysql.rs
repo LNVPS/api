@@ -5227,6 +5227,30 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn update_tunnel_pool(&self, pool: &TunnelPool) -> DbResult<()> {
+        // The same invariant from the other side: a pool already terminating a
+        // service cannot have its block edited away from its siblings'.
+        let mismatch: Option<u64> = sqlx::query_as::<_, (u64,)>(
+            "SELECT other.id FROM vpn_service_pool mine \
+             JOIN vpn_service_pool sib ON sib.vpn_service_id = mine.vpn_service_id \
+             JOIN tunnel_pool other ON other.id = sib.tunnel_pool_id \
+             WHERE mine.tunnel_pool_id = ? AND other.id <> ? \
+             AND (NOT (other.cidr4 <=> ?) OR NOT (other.cidr6 <=> ?)) LIMIT 1",
+        )
+        .bind(pool.id)
+        .bind(pool.id)
+        .bind(&pool.cidr4)
+        .bind(&pool.cidr6)
+        .fetch_optional(&self.db)
+        .await?
+        .map(|r| r.0);
+        if let Some(other_id) = mismatch {
+            return Err(DbError::Other(anyhow!(
+                "Tunnel pool {} terminates a VPN service, so its block must stay the same as \
+                 pool {}'s: a device holds one address in every region",
+                pool.id,
+                other_id
+            )));
+        }
         sqlx::query(
             "UPDATE tunnel_pool \
              SET region_id = ?, name = ?, listen_addr = ?, listen_port = ?, \
@@ -5280,9 +5304,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn insert_vpn_service(&self, service: &VpnService) -> DbResult<u64> {
         let res = sqlx::query(
             "INSERT INTO vpn_service (name, company_id, amount, currency, interval_amount, \
-             interval_type, setup_amount, device_cidr4, device_cidr6, dns, \
-             default_device_limit, enabled) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
+             interval_type, setup_amount, dns, default_device_limit, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(&service.name)
         .bind(service.company_id)
@@ -5291,8 +5314,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(service.interval_amount)
         .bind(service.interval_type)
         .bind(service.setup_amount)
-        .bind(&service.device_cidr4)
-        .bind(&service.device_cidr6)
         .bind(&service.dns)
         .bind(service.default_device_limit)
         .bind(service.enabled)
@@ -5305,8 +5326,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         sqlx::query(
             "UPDATE vpn_service SET name = ?, amount = ?, currency = ?, \
              interval_amount = ?, interval_type = ?, setup_amount = ?, \
-             device_cidr4 = ?, device_cidr6 = ?, dns = ?, default_device_limit = ?, \
-             enabled = ? WHERE id = ?",
+             dns = ?, default_device_limit = ?, enabled = ? WHERE id = ?",
         )
         .bind(&service.name)
         .bind(service.amount)
@@ -5314,8 +5334,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(service.interval_amount)
         .bind(service.interval_type)
         .bind(service.setup_amount)
-        .bind(&service.device_cidr4)
-        .bind(&service.device_cidr6)
         .bind(&service.dns)
         .bind(service.default_device_limit)
         .bind(service.enabled)
@@ -5363,6 +5381,27 @@ impl LNVpsDbBase for LNVpsDbMysql {
         // Repointing an interface at another service is an update, not a second
         // row: `tunnel_pool_id` is the primary key precisely so it cannot carry
         // two peer sets.
+        // Every interface on a service shares one block, because a device holds
+        // one address in every region. A pool carrying a different block would
+        // route a subset of the devices and black-hole the rest.
+        let mismatch: Option<(u64, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT other.id, other.cidr4, other.cidr6 FROM tunnel_pool other \
+             JOIN vpn_service_pool link ON link.tunnel_pool_id = other.id \
+             JOIN tunnel_pool me ON me.id = ? \
+             WHERE link.vpn_service_id = ? AND other.id <> me.id \
+             AND (NOT (other.cidr4 <=> me.cidr4) OR NOT (other.cidr6 <=> me.cidr6)) LIMIT 1",
+        )
+        .bind(tunnel_pool_id)
+        .bind(vpn_service_id)
+        .fetch_optional(&self.db)
+        .await?;
+        if let Some((other_id, c4, c6)) = mismatch {
+            return Err(DbError::Other(anyhow!(
+                "Tunnel pool {tunnel_pool_id} cannot terminate VPN service {vpn_service_id}: \
+                 pool {other_id} on it carries {c4:?}/{c6:?}, and every interface on a service \
+                 must share one block so a device keeps one address in every region"
+            )));
+        }
         sqlx::query(
             "INSERT INTO vpn_service_pool (vpn_service_id, tunnel_pool_id) VALUES (?, ?) \
              ON DUPLICATE KEY UPDATE vpn_service_id = VALUES(vpn_service_id)",

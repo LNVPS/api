@@ -2161,12 +2161,10 @@ impl TunnelPool {
 
 /// The address space a VPN device lives in, and the settings its config carries.
 ///
-/// A marketplace node's tunnel is terminated by exactly one route server, so its
-/// addresses come from that one [`TunnelPool`]. A VPN device is the opposite:
-/// one key and one address valid on every region at once, with the region chosen
-/// client-side by dialling a different endpoint. Its block therefore cannot live
-/// on a pool, because two pools carving from their own blocks would hand one
-/// device two different addresses.
+/// A device is addressed from the block on the interfaces terminating it, like
+/// every other peer. What is specific to a VPN is that every one of those
+/// interfaces shares a single block, so a device keeps one address in every
+/// region; that is enforced when a pool is linked to a service.
 #[derive(FromRow, Clone, Debug, Default)]
 pub struct VpnService {
     /// Unique id of this service
@@ -2186,11 +2184,6 @@ pub struct VpnService {
     pub interval_type: IntervalType,
     /// One-off amount charged on the first payment
     pub setup_amount: u64,
-    /// IPv4 block device addresses are carved from, shared by every pool that
-    /// terminates this service
-    pub device_cidr4: Option<String>,
-    /// IPv6 block device addresses are carved from
-    pub device_cidr6: Option<String>,
     /// Resolvers handed to clients in the generated config, comma-separated.
     ///
     /// A device reaches the internet through the route server's own NAT and has

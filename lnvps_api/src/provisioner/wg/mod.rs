@@ -1,7 +1,6 @@
 //! WireGuard interface management, independent of what is carried over it.
 //!
 //! - [`address`] — the arithmetic of a block: reserved addresses, carving.
-//! - [`block`] — what a peer address is carved out of.
 //! - [`plan`] — the desired state of one interface.
 //! - [`provisioner`] — `TunnelProvisioner`: planning, carving and reconciling.
 //!
@@ -10,11 +9,9 @@
 //! `tunnel_route`.
 
 pub mod address;
-pub mod block;
 pub mod plan;
 pub mod provisioner;
 
 pub use address::*;
-pub use block::*;
 pub use plan::*;
 pub use provisioner::*;

@@ -9,7 +9,7 @@
 //! each device — and they differ only in where the block comes from and what is
 //! already taken.
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use ipnetwork::IpNetwork;
 use lnvps_api_common::random_address;
 
@@ -85,13 +85,22 @@ pub enum Placement {
 /// 1"`) so an error points at the row an admin has to fix. That, and where the
 /// taken set was read from, is the only thing a marketplace link and a VPN
 /// device disagree about — the arithmetic is the same, so it is written once.
-pub(super) fn carve_peer(
+pub(crate) fn carve_peer(
     cidr4: Option<&str>,
     cidr6: Option<&str>,
     taken: &[IpNetwork],
     owner: &str,
     placement: Placement,
 ) -> Result<(Option<String>, Option<String>)> {
+    // The invariant `ck_tunnel_pool_has_a_block` used to hold, moved here when
+    // a VPN pool stopped needing a block of its own. The schema cannot state it
+    // any more, because whether a row may have no block depends on another
+    // table. Failing beats returning a peer with no addresses, which looks
+    // configured and carries nothing.
+    if cidr4.is_none() && cidr6.is_none() {
+        bail!("{owner} has no address block, so there is nothing to carve a peer from");
+    }
+
     let address4 = match cidr4 {
         Some(cidr) => Some(carve_one(cidr, PEER_PREFIX_V4, taken, owner, placement)?),
         None => None,
@@ -186,4 +195,19 @@ pub(crate) fn host_address(addr: Option<&str>) -> Option<String> {
         std::net::IpAddr::V4(v4) => format!("{v4}/32"),
         std::net::IpAddr::V6(v6) => format!("{v6}/128"),
     })
+}
+
+/// Every address already carved out of a block, as the allocator wants them.
+///
+/// Unparseable values are dropped rather than failing the allocation: a
+/// malformed stored address is a row to fix, not a reason to refuse every
+/// subsequent customer, and it cannot collide with anything the allocator
+/// produces because the allocator only produces parseable ones.
+pub(crate) fn taken_addresses(tunnels: &[lnvps_db::Tunnel]) -> Vec<IpNetwork> {
+    tunnels
+        .iter()
+        .flat_map(|t| [t.address4.as_deref(), t.address6.as_deref()])
+        .flatten()
+        .filter_map(|a| a.parse::<IpNetwork>().ok())
+        .collect()
 }

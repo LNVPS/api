@@ -1604,7 +1604,7 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Create a VPN service, returning the new id
     async fn insert_vpn_service(&self, service: &VpnService) -> DbResult<u64>;
 
-    /// Update a service's price, blocks, DNS, default limit and enabled flag.
+    /// Update a service's price, DNS, default limit and enabled flag.
     /// `company_id` and `created` are immutable and are not written: moving a
     /// service to another company would leave every plan sold on it booked
     /// against a company that no longer owns it.
@@ -1628,6 +1628,11 @@ pub trait LNVpsDbBase: Send + Sync {
 
     /// Make a pool terminate a service. Replaces any existing link for that
     /// pool, since an interface terminates at most one.
+    ///
+    /// Fails if the pool's block differs from that of the service's other
+    /// pools. Every interface on a service shares one block, because a device
+    /// holds one address in every region; a pool carrying a different block
+    /// would route a subset of the devices and black-hole the rest.
     async fn link_vpn_service_pool(&self, vpn_service_id: u64, tunnel_pool_id: u64)
     -> DbResult<()>;
 

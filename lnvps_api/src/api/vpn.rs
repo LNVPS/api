@@ -206,6 +206,10 @@ async fn v1_list_vpn_services(State(this): State<RouterState>) -> ApiResult<Vec<
     let mut out = Vec::new();
     for service in this.db.list_vpn_services(true).await? {
         let mut regions = Vec::new();
+        // Which families a device gets is a property of the block its
+        // interfaces carry, and they all carry the same one.
+        let mut ipv4 = false;
+        let mut ipv6 = false;
         for pool in this.db.list_vpn_service_pools(service.id).await? {
             // A disabled interface is one that is not carrying anybody, so
             // advertising it would sell a region that does not answer.
@@ -216,6 +220,8 @@ async fn v1_list_vpn_services(State(this): State<RouterState>) -> ApiResult<Vec<
             if !region.enabled {
                 continue;
             }
+            ipv4 |= pool.cidr4.is_some();
+            ipv6 |= pool.cidr6.is_some();
             regions.push(ApiVpnRegion {
                 region_id: region.id,
                 name: region.name,
@@ -234,8 +240,8 @@ async fn v1_list_vpn_services(State(this): State<RouterState>) -> ApiResult<Vec<
             interval_amount: service.interval_amount,
             interval_type: service.interval_type.into(),
             device_limit: service.default_device_limit,
-            ipv4: service.device_cidr4.is_some(),
-            ipv6: service.device_cidr6.is_some(),
+            ipv4,
+            ipv6,
             regions,
         });
     }

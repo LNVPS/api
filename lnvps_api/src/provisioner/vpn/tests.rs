@@ -22,20 +22,39 @@ async fn a_company(mock: &MockDb) -> u64 {
     1
 }
 
-/// A dual-stack service. `/28` and `/124` are deliberately tiny so exhaustion
-/// is reachable in a test rather than theoretical.
+/// A dual-stack service with one interface. The block lives on the interface,
+/// as it does for every pool, so a service without one cannot allocate at all.
+/// `/28` and `/124` are deliberately tiny so exhaustion is reachable in a test
+/// rather than theoretical.
 async fn a_service(db: &Arc<dyn LNVpsDb>, mock: &MockDb) -> Result<VpnService> {
+    let service = a_bare_service(db, mock, "eu", 5).await?;
+    a_pool_with(
+        db,
+        mock,
+        &service,
+        Some("10.64.0.0/28"),
+        Some("fd00:64::/124"),
+    )
+    .await?;
+    Ok(service)
+}
+
+/// A service with no interface yet.
+async fn a_bare_service(
+    db: &Arc<dyn LNVpsDb>,
+    mock: &MockDb,
+    name: &str,
+    limit: u8,
+) -> Result<VpnService> {
     let company_id = a_company(mock).await;
     let id = db
         .insert_vpn_service(&VpnService {
-            name: "eu".to_string(),
+            name: name.to_string(),
             company_id,
             currency: "EUR".to_string(),
             amount: 500,
-            device_cidr4: Some("10.64.0.0/28".to_string()),
-            device_cidr6: Some("fd00:64::/124".to_string()),
             dns: Some("10.64.0.1".to_string()),
-            default_device_limit: 5,
+            default_device_limit: limit,
             enabled: true,
             ..Default::default()
         })
@@ -50,19 +69,9 @@ async fn a_plan(db: &Arc<dyn LNVpsDb>, service: &VpnService, seed: u8) -> Result
 
 /// A service whose allowance is `limit`, since the allowance is per service.
 async fn a_service_limited(db: &Arc<dyn LNVpsDb>, mock: &MockDb, limit: u8) -> Result<VpnService> {
-    let company_id = a_company(mock).await;
-    let id = db
-        .insert_vpn_service(&VpnService {
-            name: "small".to_string(),
-            company_id,
-            currency: "EUR".to_string(),
-            device_cidr4: Some("10.65.0.0/28".to_string()),
-            default_device_limit: limit,
-            enabled: true,
-            ..Default::default()
-        })
-        .await?;
-    Ok(db.get_vpn_service(id).await?)
+    let service = a_bare_service(db, mock, "small", limit).await?;
+    a_pool_with(db, mock, &service, Some("10.65.0.0/28"), None).await?;
+    Ok(service)
 }
 
 async fn a_plan_with(
@@ -118,6 +127,28 @@ async fn a_plan_with(
 /// An interface terminating `service`, so `plan_interface` has something to dispatch
 /// on.
 async fn a_pool(db: &Arc<dyn LNVpsDb>, mock: &MockDb, service: &VpnService) -> Result<TunnelPool> {
+    let existing = db.list_vpn_service_pools(service.id).await?;
+    if let Some(p) = existing.into_iter().next() {
+        return Ok(p);
+    }
+    a_pool_with(
+        db,
+        mock,
+        service,
+        Some("10.64.0.0/28"),
+        Some("fd00:64::/124"),
+    )
+    .await
+}
+
+/// An interface for `service` carrying `cidr4`/`cidr6`.
+async fn a_pool_with(
+    db: &Arc<dyn LNVpsDb>,
+    mock: &MockDb,
+    service: &VpnService,
+    cidr4: Option<&str>,
+    cidr6: Option<&str>,
+) -> Result<TunnelPool> {
     let router_id = {
         let mut routers = mock.router.lock().await;
         let id = routers.keys().max().copied().unwrap_or(0) + 1;
@@ -140,15 +171,13 @@ async fn a_pool(db: &Arc<dyn LNVpsDb>, mock: &MockDb, service: &VpnService) -> R
             region_id: 1,
             name: "vpn-ams".to_string(),
             listen_addr: "rs.example".to_string(),
-            listen_port: 51820,
+            listen_port: 51820 + db.list_vpn_service_pools(service.id).await?.len() as u16,
             private_key: lnvps_api_common::generate_wireguard_keypair()?
                 .private_key
                 .into(),
             public_key: vec![0x33; 32],
-            // A VPN pool still carries its own block, because it is an ordinary
-            // interface. It is simply not what devices are addressed from.
-            cidr4: Some("10.200.0.0/24".to_string()),
-            cidr6: None,
+            cidr4: cidr4.map(str::to_string),
+            cidr6: cidr6.map(str::to_string),
             keepalive: Some(25),
             mtu: 1420,
             enabled: true,
@@ -372,17 +401,8 @@ async fn an_unpaid_devices_address_is_not_reissued() -> Result<()> {
 async fn a_v6_only_service_gives_v6_only() -> Result<()> {
     let mock = MockDb::default();
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
-    let id = db
-        .insert_vpn_service(&VpnService {
-            name: "v6".to_string(),
-            company_id: a_company(&mock).await,
-            default_device_limit: 5,
-            device_cidr6: Some("fd00:99::/120".to_string()),
-            enabled: true,
-            ..Default::default()
-        })
-        .await?;
-    let service = db.get_vpn_service(id).await?;
+    let service = a_bare_service(&db, &mock, "v6", 5).await?;
+    a_pool_with(&db, &mock, &service, None, Some("fd00:99::/120")).await?;
     let plan = a_plan(&db, &service, 1).await?;
 
     let p = peer(
@@ -402,17 +422,8 @@ async fn an_exhausted_block_says_so() -> Result<()> {
     let mock = MockDb::default();
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
     // /30: network, server, broadcast and exactly one usable address.
-    let id = db
-        .insert_vpn_service(&VpnService {
-            name: "tiny".to_string(),
-            company_id: a_company(&mock).await,
-            default_device_limit: 5,
-            device_cidr4: Some("10.70.0.0/30".to_string()),
-            enabled: true,
-            ..Default::default()
-        })
-        .await?;
-    let service = db.get_vpn_service(id).await?;
+    let service = a_bare_service(&db, &mock, "tiny", 5).await?;
+    a_pool_with(&db, &mock, &service, Some("10.70.0.0/30"), None).await?;
     let plan = a_plan(&db, &service, 1).await?;
 
     let only = peer(&db, &register_vpn_device(&db, &plan, "a", &key(1)).await?).await?;
@@ -433,17 +444,8 @@ async fn an_exhausted_block_says_so() -> Result<()> {
 async fn an_unparseable_block_is_reported_as_one() -> Result<()> {
     let mock = MockDb::default();
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
-    let id = db
-        .insert_vpn_service(&VpnService {
-            name: "broken".to_string(),
-            company_id: a_company(&mock).await,
-            default_device_limit: 5,
-            device_cidr4: Some("not-a-cidr".to_string()),
-            enabled: true,
-            ..Default::default()
-        })
-        .await?;
-    let service = db.get_vpn_service(id).await?;
+    let service = a_bare_service(&db, &mock, "broken", 5).await?;
+    a_pool_with(&db, &mock, &service, Some("not-a-cidr"), None).await?;
     let plan = a_plan(&db, &service, 1).await?;
 
     let err = register_vpn_device(&db, &plan, "a", &key(1))
@@ -571,18 +573,22 @@ async fn plan_pool_dispatches_on_the_service_link() -> Result<()> {
     assert_eq!(
         linked.addresses,
         vec!["10.64.0.1/28".to_string(), "fd00:64::1/124".to_string()],
-        "a VPN interface is addressed from the service, not from its own block"
+        "the interface is addressed from its own block, as every interface is"
     );
     assert_eq!(linked.peers.len(), 1);
 
-    // Unlinking returns it to an ordinary pool, addressed from its own block
-    // and carrying the tunnels carved out of it — of which there are none.
+    // The link decides which peers it carries, not how it is addressed.
+    // Unlinking leaves the same addresses and the tunnels carved out of the
+    // pool itself, of which there are none.
     db.unlink_vpn_service_pool(pool.id).await?;
     let unlinked = crate::provisioner::wg::TunnelProvisioner::new(db.clone())
         .plan(&pool)
         .await?;
-    assert_eq!(unlinked.addresses, vec!["10.200.0.1/24".to_string()]);
-    assert!(unlinked.peers.is_empty());
+    assert_eq!(unlinked.addresses, linked.addresses);
+    assert!(
+        unlinked.peers.is_empty(),
+        "a device is a peer on its service's interfaces, not on this pool"
+    );
     Ok(())
 }
 

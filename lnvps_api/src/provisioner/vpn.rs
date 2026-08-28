@@ -21,8 +21,7 @@ use anyhow::{Result, anyhow, bail};
 use ipnetwork::IpNetwork;
 use lnvps_db::{LNVpsDb, RouterTunnelKind, Tunnel, VpnDevice, VpnService, VpnSubscription};
 
-use crate::provisioner::wg::address::Placement;
-use crate::provisioner::wg::block::{PeerBlock, taken_addresses};
+use crate::provisioner::wg::address::{Placement, carve_peer, taken_addresses};
 
 /// Register `peer_pubkey` as a device on `plan`.
 ///
@@ -68,7 +67,7 @@ pub async fn register_vpn_device(
     for attempt in 1..=REGISTER_ATTEMPTS {
         let devices = db.list_vpn_devices(plan.id).await?;
         let slot = next_free_slot(&devices, service.default_device_limit)?;
-        let (address4, address6) = service.carve(db).await?;
+        let (address4, address6) = carve_device_addresses(db, &service).await?;
 
         // The peer is a tunnel, the same as a marketplace node's. `pool_id` and
         // `router_id` stay NULL: a device is a peer on every interface
@@ -172,7 +171,10 @@ fn next_free_slot(devices: &[VpnDevice], limit: u8) -> Result<u8> {
         })
 }
 
-/// A service's peers are the devices addressed from its block.
+#[cfg(test)]
+mod tests;
+
+/// Carve the next free address out of a service's block.
 ///
 /// Random placement: a sequential address encodes roughly when it was issued
 /// and how many came before it, so anybody who sees one learns the size of the
@@ -181,26 +183,34 @@ fn next_free_slot(devices: &[VpnDevice], limit: u8) -> Result<u8> {
 /// The taken set is every peer on the service, whatever its billing state. A
 /// lapsed customer's address is still theirs, and reissuing it would deliver
 /// their traffic to somebody else the moment they paid again.
-#[async_trait::async_trait]
-impl PeerBlock for VpnService {
-    fn blocks(&self) -> (Option<&str>, Option<&str>) {
-        (self.device_cidr4.as_deref(), self.device_cidr6.as_deref())
-    }
+async fn carve_device_addresses(
+    db: &Arc<dyn LNVpsDb>,
+    service: &VpnService,
+) -> Result<(Option<String>, Option<String>)> {
+    // The block belongs to the interfaces, and every interface on a service
+    // carries the same one — enforced when a pool is linked — so any of them
+    // answers. A service with no interface has nowhere for a device to connect,
+    // which is worth saying plainly rather than allocating an address into
+    // nothing.
+    let pool = db
+        .list_vpn_service_pools(service.id)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            anyhow!(
+                "VPN service {} has no interface, so there is no block to carve from \
+                 and nowhere for a device to connect",
+                service.id
+            )
+        })?;
 
-    fn describe(&self) -> String {
-        format!("VPN service {}", self.id)
-    }
-
-    fn placement(&self) -> Placement {
-        Placement::Random
-    }
-
-    async fn taken(&self, db: &Arc<dyn LNVpsDb>) -> Result<Vec<ipnetwork::IpNetwork>> {
-        Ok(taken_addresses(
-            &db.list_vpn_tunnels_in_service(self.id).await?,
-        ))
-    }
+    let taken = taken_addresses(&db.list_vpn_tunnels_in_service(service.id).await?);
+    carve_peer(
+        pool.cidr4.as_deref(),
+        pool.cidr6.as_deref(),
+        &taken,
+        &format!("VPN service {}", service.id),
+        Placement::Random,
+    )
 }
-
-#[cfg(test)]
-mod tests;

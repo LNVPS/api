@@ -70,7 +70,6 @@ async fn a_service(db: &Arc<dyn LNVpsDb>, mock: &MockDb) -> Result<VpnService> {
             interval_amount: 1,
             interval_type: IntervalType::Month,
             setup_amount: 0,
-            device_cidr4: Some("10.64.0.0/24".to_string()),
             default_device_limit: 5,
             enabled: true,
             ..Default::default()
@@ -110,7 +109,7 @@ async fn two_pools(db: &Arc<dyn LNVpsDb>, mock: &MockDb, service: &VpnService) -
                     .private_key
                     .into(),
                 public_key: vec![0x33; 32],
-                cidr4: Some(format!("10.20{}.0.0/24", out.len())),
+                cidr4: Some("10.64.0.0/24".to_string()),
                 mtu: 1420,
                 enabled: true,
                 ..Default::default()
@@ -229,6 +228,7 @@ async fn a_lapsed_plan_is_repointed_and_keeps_its_devices() -> Result<()> {
     let service = a_service(&db, &mock).await?;
     let uid = db.upsert_user(&[1u8; 32]).await?;
 
+    two_pools(&db, &mock, &service).await?;
     let plan = create_vpn_plan(&db, uid, &service).await?;
     let device = crate::provisioner::register_vpn_device(&db, &plan, "phone", &[7u8; 32]).await?;
     let peer = db.get_tunnel(device.tunnel_id).await?;

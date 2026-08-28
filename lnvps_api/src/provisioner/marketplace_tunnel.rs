@@ -19,8 +19,8 @@ use anyhow::{Result, anyhow, bail};
 use ipnetwork::IpNetwork;
 use lnvps_db::{LNVpsDb, MarketplaceNode, RouterTunnelKind, Tunnel, TunnelPool};
 
+use crate::provisioner::wg::TunnelProvisioner;
 use crate::provisioner::wg::address::{bare_address, host_address, server_address};
-use crate::provisioner::wg::block::PeerBlock;
 
 /// A node's tunnel and the pool it came from.
 ///
@@ -115,6 +115,12 @@ impl MarketplaceTunnels {
         Self { db }
     }
 
+    /// The generic interface service, for the parts of a node's data plane that
+    /// are not marketplace-specific.
+    fn tunnels(&self) -> TunnelProvisioner {
+        TunnelProvisioner::new(self.db.clone())
+    }
+
     /// Fetch a node's existing data plane, if it has one.
     pub async fn get_tunnel(&self, node: &MarketplaceNode) -> Result<Option<NodeTunnel>> {
         let Some(tunnel_id) = node.tunnel_id else {
@@ -200,7 +206,7 @@ impl MarketplaceTunnels {
         // would leave neither drainable.
         let mut last_error = None;
         for pool in pools {
-            match pool.carve(&self.db).await {
+            match self.tunnels().carve_from_pool(&pool).await {
                 Ok((address4, address6)) => {
                     let tunnel_id = self
                         .db

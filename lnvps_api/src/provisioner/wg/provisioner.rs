@@ -18,8 +18,9 @@ use anyhow::{Context, Result, anyhow, bail};
 use lnvps_db::LNVpsDb;
 use log::{info, warn};
 
-use crate::provisioner::wg::address::{host_address, server_address};
-use crate::provisioner::wg::block::PeerBlock;
+use crate::provisioner::wg::address::{
+    Placement, carve_peer, host_address, server_address, taken_addresses,
+};
 use crate::provisioner::wg::plan::InterfacePlan;
 use crate::router::WireguardPeer;
 use lnvps_db::TunnelPool;
@@ -412,18 +413,15 @@ impl TunnelProvisioner {
         // for: an interface terminating a VPN service carries that service's
         // devices, addressed from the service's block so a device keeps one address
         // in every region, and any other pool carries the links carved from its own.
-        let (cidr4, cidr6, tunnels) = match self.db.get_vpn_service_for_pool(pool.id).await? {
-            Some(service) => (
-                service.device_cidr4.clone(),
-                service.device_cidr6.clone(),
-                self.db.list_active_vpn_tunnels(service.id).await?,
-            ),
-            None => (
-                pool.cidr4.clone(),
-                pool.cidr6.clone(),
-                self.db.list_tunnels_in_pool(pool.id).await?,
-            ),
+        // The block is the pool's, as it is for every interface. Only which
+        // peers it carries differs: an interface terminating a VPN service
+        // carries that service's devices, which are peers on every one of its
+        // interfaces at once and so belong to no single pool.
+        let tunnels = match self.db.get_vpn_service_for_pool(pool.id).await? {
+            Some(service) => self.db.list_active_vpn_tunnels(service.id).await?,
+            None => self.db.list_tunnels_in_pool(pool.id).await?,
         };
+        let (cidr4, cidr6) = (pool.cidr4.clone(), pool.cidr6.clone());
 
         // One address for the whole block, carrying its prefix so every peer is
         // on-link. A per-peer address would put one address on this interface for
@@ -499,12 +497,22 @@ impl TunnelProvisioner {
         Ok(plan)
     }
 
-    /// Carve the next free peer address out of `block`.
+    /// Carve the next free peer address out of `pool`'s own block.
     ///
-    /// A thin forward to [`PeerBlock::carve`], so callers never hold the
-    /// database themselves: `tunnels.carve(&pool)` rather than
-    /// `pool.carve(&db)`.
-    pub async fn carve(&self, block: &dyn PeerBlock) -> Result<(Option<String>, Option<String>)> {
-        block.carve(&self.db).await
+    /// Sequential placement: a pool holds a handful of nodes, and an operator
+    /// debugging one benefits from addresses they can reason about. The
+    /// argument for scattering customer addresses does not apply here.
+    pub async fn carve_from_pool(
+        &self,
+        pool: &TunnelPool,
+    ) -> Result<(Option<String>, Option<String>)> {
+        let taken = taken_addresses(&self.db.list_tunnels_in_pool(pool.id).await?);
+        carve_peer(
+            pool.cidr4.as_deref(),
+            pool.cidr6.as_deref(),
+            &taken,
+            &format!("Tunnel pool {}", pool.id),
+            Placement::Sequential,
+        )
     }
 }

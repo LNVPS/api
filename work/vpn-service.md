@@ -136,6 +136,14 @@ sale, and before any claim is made about what is or is not retained.
 Increments 1-4 were rebuilt on three corrections, all of them the same mistake: inventing a
 parallel structure instead of using the one already there.
 
+0. **The block lives on the pool, not the service.** `vpn_service` has no `device_cidr` of its
+   own: `tunnel_pool.cidr4` already means "the block this interface's peers come from", and a
+   second column meaning the same thing in another table is one more place for the answer to
+   differ. What is specific to a VPN is that every interface on a service shares one block, so a
+   device keeps one address in every region, and that is enforced on `vpn_service_pool` — a pool
+   cannot be linked to a service whose other pools carry a different block, and a linked pool's
+   block cannot be edited away from theirs. `ck_tunnel_pool_has_a_block` therefore stays.
+
 1. **A VPN device is a `tunnel` row**, with `pool_id` and `router_id` NULL. The original
    `20260805130000_tunnel.sql` already names this case ("a hand-configured peering, or a VPN on
    a router with no pool"); the earlier objection that the unique indexes forbade it was wrong,
@@ -155,10 +163,6 @@ parallel structure instead of using the one already there.
    Without this, every VPN device would have been handed a probe address derived by offsetting
    its own v6 address by `0x8000` — which, with random placement, can be another customer's
    real address.
-
-3. **`ck_tunnel_pool_has_a_block` is dropped.** A VPN pool is addressed from its service's block,
-   so requiring one it never reads was a column that must be set and must be ignored. The
-   invariant moves to the allocator, which fails naming the pool.
 
 `vpn_subscription` also lost `device_limit`: one flat price per service means a per-plan number
 with no price attached. The allowance is `vpn_service.default_device_limit`. And `create_vpn_plan`
@@ -200,10 +204,8 @@ whether a row may have no block depends on another table.
 Each is L or smaller and lands as its own PR.
 
 ### Increment 1 — schema and db layer  ✅ DONE
-- [x] `20260827160000_vpn_service.sql`: `vpn_service` (device blocks, DNS, default limit)
-      plus `tunnel_pool.vpn_service_id`
-- [x] `20260827160100_vpn_subscription.sql`: `vpn_subscription` and `vpn_device`, with
-      `UNIQUE (vpn_subscription_id, slot)` as the race-free device cap
+- [x] `20260827160000_vpn.sql`: one migration for the whole feature — `tunnel_route`,
+      `vpn_service`, `vpn_service_pool`, `vpn_subscription` and `vpn_device`
 - [x] `lnvps_db` models (`VpnService`, `VpnSubscription`, `VpnDevice`,
       `TunnelPool::terminates_devices`, `VpnService::dns_servers`)
 - [x] 17 `LNVpsDb` trait methods + MySQL impl + `MockDb` impl enforcing every constraint

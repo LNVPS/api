@@ -28,8 +28,6 @@ async fn a_service(db: &Arc<dyn LNVpsDb>, mock: &MockDb) -> Result<VpnService> {
             currency: "EUR".to_string(),
             interval_amount: 1,
             interval_type: IntervalType::Month,
-            device_cidr4: Some("10.64.0.0/24".to_string()),
-            device_cidr6: Some("fd00:64::/64".to_string()),
             dns: Some("10.64.0.1, fd00:64::1".to_string()),
             default_device_limit: 5,
             enabled: true,
@@ -47,6 +45,7 @@ async fn a_pool(
     region_id: u64,
     region_name: &str,
     port: u16,
+    cidr6: Option<&str>,
 ) -> Result<TunnelPool> {
     mock.regions
         .lock()
@@ -86,7 +85,8 @@ async fn a_pool(
                 .private_key
                 .into(),
             public_key: vec![0x33; 32],
-            cidr4: Some("10.200.0.0/24".to_string()),
+            cidr4: Some("10.64.0.0/24".to_string()),
+            cidr6: cidr6.map(str::to_string),
             keepalive: Some(25),
             mtu: 1420,
             enabled: true,
@@ -100,9 +100,15 @@ async fn a_pool(
 /// A paid plan with one device.
 async fn a_paid_plan_with_device(
     db: &Arc<dyn LNVpsDb>,
+    mock: &MockDb,
     service: &VpnService,
     uid: u64,
 ) -> Result<(VpnSubscription, lnvps_db::Tunnel)> {
+    // A device is addressed from the block on the service's interfaces, so
+    // there has to be one.
+    if db.list_vpn_service_pools(service.id).await?.is_empty() {
+        a_pool(db, mock, service, 1, "ams", 51820, Some("fd00:64::/64")).await?;
+    }
     let plan = crate::subscription::create_vpn_plan(db, uid, service).await?;
     let mut sub = db
         .get_subscription_by_line_item_id(plan.subscription_line_item_id)
@@ -123,10 +129,10 @@ async fn every_region_shares_one_interface_block() -> Result<()> {
     let mock = MockDb::default();
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
     let service = a_service(&db, &mock).await?;
-    let ams = a_pool(&db, &mock, &service, 1, "ams", 51820).await?;
-    let dub = a_pool(&db, &mock, &service, 2, "dub", 51820).await?;
+    let ams = a_pool(&db, &mock, &service, 1, "ams", 51820, Some("fd00:64::/64")).await?;
+    let dub = a_pool(&db, &mock, &service, 2, "dub", 51820, Some("fd00:64::/64")).await?;
     let uid = db.upsert_user(&[1u8; 32]).await?;
-    let (_, device) = a_paid_plan_with_device(&db, &service, uid).await?;
+    let (_, device) = a_paid_plan_with_device(&db, &mock, &service, uid).await?;
 
     let mut configs = Vec::new();
     for pool in [&ams, &dub] {
@@ -167,7 +173,7 @@ async fn the_rendered_config_is_a_wg_quick_file() -> Result<()> {
     let mock = MockDb::default();
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
     let service = a_service(&db, &mock).await?;
-    let pool = a_pool(&db, &mock, &service, 1, "ams", 51820).await?;
+    let pool = a_pool(&db, &mock, &service, 1, "ams", 51820, Some("fd00:64::/64")).await?;
 
     let mut cfg = ApiVpnDeviceConfig {
         region_id: 1,
@@ -243,15 +249,16 @@ async fn a_v4_only_device_is_not_offered_a_v6_default_route() -> Result<()> {
             name: "v4".to_string(),
             company_id: 1,
             currency: "EUR".to_string(),
-            device_cidr4: Some("10.64.0.0/24".to_string()),
             default_device_limit: 5,
             enabled: true,
             ..Default::default()
         })
         .await?;
     let service = db.get_vpn_service(id).await?;
+    // A single-stack interface, so the devices on it are single-stack.
+    a_pool(&db, &mock, &service, 1, "ams", 51820, None).await?;
     let uid = db.upsert_user(&[1u8; 32]).await?;
-    let (_, device) = a_paid_plan_with_device(&db, &service, uid).await?;
+    let (_, device) = a_paid_plan_with_device(&db, &mock, &service, uid).await?;
 
     assert!(device.address4.is_some());
     assert!(device.address6.is_none());
@@ -302,7 +309,7 @@ async fn another_customers_device_does_not_exist() -> Result<()> {
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
     let service = a_service(&db, &mock).await?;
     let mine = db.upsert_user(&[1u8; 32]).await?;
-    let (_, device) = a_paid_plan_with_device(&db, &service, mine).await?;
+    let (_, device) = a_paid_plan_with_device(&db, &mock, &service, mine).await?;
 
     let theirs = db.upsert_user(&[2u8; 32]).await?;
     let their_plan = crate::subscription::create_vpn_plan(&db, theirs, &service).await?;
