@@ -382,6 +382,7 @@ impl Default for MockDb {
                 ssh_key: None,
                 sunset_date: None,
                 marketplace_node_id: None,
+                deleted: false,
             },
         );
         let mut host_disks = HashMap::new();
@@ -1009,6 +1010,7 @@ impl LNVpsDbBase for MockDb {
             .values()
             .filter(|h| {
                 h.enabled
+                    && !h.deleted
                     && regions
                         .get(&h.region_id)
                         .map(|r| r.enabled)
@@ -1020,12 +1022,16 @@ impl LNVpsDbBase for MockDb {
 
     async fn list_hosts_all(&self) -> DbResult<Vec<VmHost>> {
         let hosts = self.hosts.lock().await;
-        Ok(hosts.values().cloned().collect())
+        Ok(hosts.values().filter(|h| !h.deleted).cloned().collect())
     }
 
     async fn list_hosts_paginated(&self, limit: u64, offset: u64) -> DbResult<(Vec<VmHost>, u64)> {
         let hosts = self.hosts.lock().await;
-        let filtered_hosts: Vec<VmHost> = hosts.values().filter(|h| h.enabled).cloned().collect();
+        let filtered_hosts: Vec<VmHost> = hosts
+            .values()
+            .filter(|h| h.enabled && !h.deleted)
+            .cloned()
+            .collect();
         let total = filtered_hosts.len() as u64;
         let paginated: Vec<VmHost> = filtered_hosts
             .into_iter()
@@ -1042,7 +1048,11 @@ impl LNVpsDbBase for MockDb {
     ) -> DbResult<(Vec<(VmHost, Region)>, u64)> {
         let hosts = self.hosts.lock().await;
         let regions = self.regions.lock().await;
-        let filtered_hosts: Vec<VmHost> = hosts.values().filter(|h| h.enabled).cloned().collect();
+        let filtered_hosts: Vec<VmHost> = hosts
+            .values()
+            .filter(|h| h.enabled && !h.deleted)
+            .cloned()
+            .collect();
         let total = filtered_hosts.len() as u64;
 
         let mut hosts_with_regions = Vec::new();
@@ -6343,8 +6353,9 @@ impl lnvps_db::AdminDb for MockDb {
     }
     async fn admin_delete_host(&self, host_id: u64) -> DbResult<()> {
         let mut hosts = self.hosts.lock().await;
-        if !hosts.contains_key(&host_id) {
-            return Err(anyhow!("no host").into());
+        let host = hosts.get_mut(&host_id).ok_or(anyhow!("no host"))?;
+        if host.deleted {
+            return Err(anyhow!("Host is already deleted").into());
         }
 
         let vms = self.vms.lock().await;
@@ -6355,13 +6366,11 @@ impl lnvps_db::AdminDb for MockDb {
         if active_vms > 0 {
             return Err(anyhow!("Cannot delete host with {} active VMs", active_vms).into());
         }
-        let historic_vms = vms.values().filter(|v| v.host_id == host_id).count();
-        if historic_vms > 0 {
-            return Err(anyhow!(
-                "Cannot delete host with {} deleted VM records still referencing it, disable the host instead",
-                historic_vms
-            )
-            .into());
+        // A host that ever ran a VM keeps its row so history still resolves.
+        if vms.values().any(|v| v.host_id == host_id) {
+            host.deleted = true;
+            host.enabled = false;
+            return Ok(());
         }
 
         hosts.remove(&host_id);

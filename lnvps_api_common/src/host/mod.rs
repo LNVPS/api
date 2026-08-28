@@ -529,6 +529,7 @@ mod tests {
                 ssh_key: None,
                 sunset_date: None,
                 marketplace_node_id: None,
+                deleted: false,
             },
             disk: VmHostDisk {
                 id: 1,

@@ -8,7 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- **Host deletion**: `DELETE /api/admin/v1/hosts/{id}` removes a host and its disk records, guarded by `hosts::delete`. It is refused while any VM row still references the host, so a decommissioned host that kept soft-deleted VMs as billing history must still be disabled rather than deleted.
+- **Host deletion**: `DELETE /api/admin/v1/hosts/{id}`, guarded by `hosts::delete`. Refused while the host has active VMs. A host that never ran a VM is removed along with its disk records; one that did keeps its row, now flagged `deleted` and forced `enabled: false`, because `vm.host_id` and `vm.disk_id` are foreign keys and those VMs are billing history.
+
+  Deleted hosts are excluded from `GET /api/admin/v1/hosts`, from the region host counts and from region stats, but `GET /api/admin/v1/hosts/{id}` still returns one so admin views resolving a host from a historical VM keep working. Host responses carry a new `deleted` boolean.
 
 - **VPN plans** — a customer can buy one VPN plan, register up to their device allowance of WireGuard public keys, and download one config per region. `GET /api/v1/vpn/services` lists what is for sale and where it exits; `GET`/`POST /api/v1/vpn` reads and buys a plan; `GET`/`POST /api/v1/vpn/devices`, `POST /api/v1/vpn/devices/{id}/enabled` and `DELETE /api/v1/vpn/devices/{id}` manage devices; `GET /api/v1/vpn/devices/{id}/configs` returns one ready-to-use `wg-quick` file per region.
 

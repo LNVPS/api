@@ -1217,6 +1217,9 @@ pub struct AdminHostInfo {
     /// renewals are capped at this date.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sunset_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// Host has been deleted: hidden from host listings, kept only so the VMs
+    /// that ran on it still resolve their host.
+    pub deleted: bool,
 }
 
 #[derive(Serialize)]
@@ -1393,6 +1396,7 @@ impl AdminHostInfo {
             ssh_user: host.ssh_user,
             ssh_key_configured,
             sunset_date: host.sunset_date,
+            deleted: host.deleted,
         }
     }
 
@@ -1447,6 +1451,7 @@ impl AdminHostInfo {
             ssh_user: host.ssh_user,
             ssh_key_configured,
             sunset_date: host.sunset_date,
+            deleted: host.deleted,
         }
     }
 
@@ -1507,6 +1512,7 @@ impl AdminHostInfo {
             ssh_user: capacity.host.ssh_user.clone(),
             ssh_key_configured,
             sunset_date: capacity.host.sunset_date,
+            deleted: capacity.host.deleted,
         }
     }
 
@@ -1567,6 +1573,7 @@ impl AdminHostInfo {
             ssh_user: admin_host.host.ssh_user,
             ssh_key_configured,
             sunset_date: admin_host.host.sunset_date,
+            deleted: admin_host.host.deleted,
         }
     }
 
@@ -1633,6 +1640,7 @@ impl AdminHostInfo {
                     ssh_user: capacity.host.ssh_user.clone(),
                     ssh_key_configured,
                     sunset_date: capacity.host.sunset_date,
+                    deleted: capacity.host.deleted,
                 }
             }
             Err(_) => {

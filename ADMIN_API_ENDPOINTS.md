@@ -1519,10 +1519,14 @@ DELETE /api/admin/v1/hosts/{id}
 
 Required Permission: `hosts::delete`
 
-Deletes the host and its disk records. Refused while any VM row still
-references the host: active VMs must be moved or deleted first, and a host that
-only has soft-deleted VMs kept as billing history cannot be removed at all, so
-disable it instead (`PATCH` with `"enabled": false`).
+Refused while the host has active VMs: move or delete those first.
+
+A host that never ran a VM is removed outright along with its disk records. A
+host that did keeps its row, flagged `deleted` and forced `enabled: false`,
+because its VMs are billing history that still has to resolve the host it ran
+on. Deleted hosts disappear from `GET /api/admin/v1/hosts`, region host counts
+and region stats, but `GET /api/admin/v1/hosts/{id}` still returns one (with
+`"deleted": true`) so views built from historical VMs keep working.
 
 Response:
 

@@ -726,6 +726,10 @@ pub struct VmHost {
     /// hardware rather than LNVPS's. `None` for every LNVPS-owned host.
     #[sqlx(default)]
     pub marketplace_node_id: Option<u64>,
+    /// Host has been decommissioned and is hidden from every listing. The row
+    /// stays so historical VMs still resolve their host.
+    #[sqlx(default)]
+    pub deleted: bool,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

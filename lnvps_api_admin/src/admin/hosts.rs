@@ -106,9 +106,10 @@ async fn admin_get_host(
 
 /// Delete a host
 ///
-/// Refused while any VM row still references the host, including soft-deleted
-/// ones, because those rows are billing history and hold foreign keys into the
-/// host and its disks. A host with history can only be disabled.
+/// Refused while the host has active VMs. A host that ever ran a VM keeps its
+/// row (flagged deleted, hidden from listings) because those VMs are billing
+/// history that still has to resolve its host; one that never did is removed
+/// outright along with its disks.
 async fn admin_delete_host(
     auth: AdminAuth,
     State(this): State<RouterState>,
@@ -297,6 +298,7 @@ async fn admin_create_host(
         sunset_date: req.sunset_date,
         // Only node approval creates a marketplace-backed host (guarded above).
         marketplace_node_id: None,
+        deleted: false,
     };
 
     // Create host in database
@@ -693,7 +695,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_host_removes_the_host_and_its_disks() {
+    async fn delete_host_without_history_removes_the_host_and_its_disks() {
         let db = MockDb::default();
         let dyn_db: Arc<dyn LNVpsDb> = Arc::new(db.clone());
         dyn_db.admin_delete_host(1).await.unwrap();
@@ -703,24 +705,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_host_is_refused_while_vms_reference_it() {
+    async fn delete_host_is_refused_while_the_host_has_active_vms() {
         let db = MockDb::default();
         let dyn_db: Arc<dyn LNVpsDb> = Arc::new(db.clone());
         insert_vm_on_host(&db, 1, 1, false).await;
 
         let err = dyn_db.admin_delete_host(1).await.unwrap_err().to_string();
         assert!(err.contains("1 active VMs"), "unexpected error: {err}");
-        assert!(dyn_db.get_host(1).await.is_ok());
 
-        // A soft-deleted VM still holds a foreign key into the host, so the
-        // host can only be disabled, not removed.
+        let host = dyn_db.get_host(1).await.unwrap();
+        assert!(!host.deleted);
+        assert!(host.enabled);
+    }
+
+    #[tokio::test]
+    async fn delete_host_with_history_is_flagged_rather_than_removed() {
+        let db = MockDb::default();
+        let dyn_db: Arc<dyn LNVpsDb> = Arc::new(db.clone());
+        // A soft-deleted VM still points at the host and its disk, so the row
+        // has to stay for that history to resolve.
         insert_vm_on_host(&db, 1, 1, true).await;
-        let err = dyn_db.admin_delete_host(1).await.unwrap_err().to_string();
-        assert!(
-            err.contains("1 deleted VM records"),
-            "unexpected error: {err}"
-        );
-        assert!(dyn_db.get_host(1).await.is_ok());
+
+        dyn_db.admin_delete_host(1).await.unwrap();
+
+        let host = dyn_db.get_host(1).await.unwrap();
+        assert!(host.deleted);
+        assert!(!host.enabled);
+        assert!(!dyn_db.list_host_disks(1).await.unwrap().is_empty());
+
+        // Deleting it twice is an error rather than a silent no-op
+        assert!(dyn_db.admin_delete_host(1).await.is_err());
     }
 
     #[tokio::test]

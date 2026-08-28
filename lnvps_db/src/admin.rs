@@ -127,7 +127,8 @@ pub trait AdminDb: Send + Sync {
     /// Count hosts in a region
     async fn admin_count_region_hosts(&self, region_id: u64) -> DbResult<u64>;
 
-    /// Delete a host and its disks (only if no VM rows reference it)
+    /// Delete a host: hard delete (with its disks) when no VM ever ran on it,
+    /// otherwise flag it deleted. Refused while the host has active VMs.
     async fn admin_delete_host(&self, host_id: u64) -> DbResult<()>;
 
     /// Get comprehensive region statistics
