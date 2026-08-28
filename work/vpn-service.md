@@ -374,11 +374,48 @@ Notes:
 - Still open from increment 6: `POST /api/v1/routeserver/counters`. The counters are read
   from the kernel now (`WgPeerState::rx_bytes`/`tx_bytes`); nothing reports them yet.
 
-### Increment 9 — end-to-end
-- [ ] Extend the netns harness: one device reaching two pools with the same inner address
-- [ ] Script entry alongside `scripts/tunnel-e2e.sh`
-- [ ] **Cover the `/api/v1/vpn/*` endpoints** — they have no unit-test coverage by design
-      (see increment 4), so without this they ship untested
+### Increment 9 — end-to-end  ✅ DONE
+- [x] `lnvps_e2e/tests/vpn_lvd.rs`: **LNVPS and `lvd` together**, on real namespaces, carrying
+      real packets. Nothing is hand-written: the service and its two interfaces are created
+      through the admin API, the plan is paid over Lightning, the device is registered through
+      the user API with a keypair generated in the test, and two `lvd` processes are started
+      with nothing but an API address and a token. They discover the rest themselves.
+- [x] `scripts/vpn-e2e.sh`, plus `--setup-only` on `run-e2e.sh`. This harness needs a running
+      stack *and* root, which no existing script gave it at once.
+- [x] `lnvps_e2e/src/vpn.rs`: the HTTP surface, run against a live stack (11 tests).
+
+**The first attempt was wrong and was thrown away.** `vpn_netns.rs` hand-wrote the document,
+called `apply()` as a function and pinged. That proves "given a correct document, WireGuard
+works", and WireGuard working is not ours to test. Worse, the document being correct was
+*assumed*: the multi-region property it claimed to prove was written into the fixture by hand.
+The seam that actually carries risk is the one it skipped — the document is defined twice, by
+the API that publishes it and the daemon that parses it, with JSON in between and nothing
+forcing them to agree.
+
+What the real harness asserts:
+
+- every region's config carries the **same** device address, checked against what the
+  allocator did rather than against a fixture, and the configs differ only in their endpoint;
+- both `lvd` instances install the customer's key unprompted, having been told only where
+  LNVPS is;
+- the device reaches **both** regions on the one address it holds, by switching peers the way
+  a client switches region;
+- revoking through the admin API removes the key from **every** region within a round trip,
+  and the device then cannot reach the route server;
+- the rendered `wg-quick` file carries the placeholder, because LNVPS never had the key.
+
+It also subsumes the connected-route regression: with that bug, `apply` fails and no peer is
+ever installed, so the harness fails at the first assertion.
+
+Notes:
+
+- The two `lvd` processes are real processes with real config files, started under
+  `ip netns exec`. Nothing dials them, which is what makes this arrangement possible at all.
+- Lost with `vpn_netns.rs`: the only test of `sync_routes` add-and-remove against a real
+  kernel. A VPN interface asks for no routes, so that path is now covered by unit tests
+  against the fake kernel and by the marketplace harness, not on real netlink.
+- `scripts/run-e2e.sh` writes its generated configs to fixed `/tmp` paths, so two runs on one
+  machine overwrite each other's. Not fixed here; it cost an hour to diagnose.
 
 ### Increment 10 — admin API  ✅ DONE
 - [x] `AdminResource::VpnService = 32` and `VpnSubscription = 33`, granted to `super_admin` by

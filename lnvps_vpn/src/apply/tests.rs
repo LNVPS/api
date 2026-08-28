@@ -415,3 +415,52 @@ impl std::fmt::Debug for FakeKernel {
             .finish()
     }
 }
+
+#[tokio::test]
+async fn the_connected_route_of_an_interface_address_is_not_drift() {
+    let kernel = FakeKernel::default();
+    let mut doc = a_document(vec![]);
+    doc.interfaces[0].addresses = vec!["10.64.0.1/24".to_string(), "fd00:64::1/64".to_string()];
+    apply(&kernel, &doc).await.unwrap();
+
+    // As the kernel does: an address brings its own connected route with it.
+    kernel
+        .add_route("10.64.0.0/24".parse().unwrap(), "wgln7")
+        .await
+        .unwrap();
+    kernel
+        .add_route("fd00:64::/64".parse().unwrap(), "wgln7")
+        .await
+        .unwrap();
+    kernel.calls.lock().unwrap().clear();
+
+    let applied = apply(&kernel, &doc).await.unwrap();
+
+    // That route is the kernel's, not ours. Deleting it is a fight we lose on
+    // every apply: it comes back with the address, and the delete itself fails
+    // with ESRCH once two addresses imply the same prefix. Found by the netns
+    // harness, where it stopped a route server coming up at all.
+    assert!(applied.is_empty(), "{applied:?}");
+    assert!(kernel.calls.lock().unwrap().is_empty(), "{kernel:?}");
+}
+
+#[tokio::test]
+async fn a_route_nobody_asked_for_is_still_removed() {
+    let kernel = FakeKernel::default();
+    let mut doc = a_document(vec![]);
+    doc.interfaces[0].addresses = vec!["10.64.0.1/24".to_string()];
+    apply(&kernel, &doc).await.unwrap();
+    // Not implied by any address: a leftover from a block that was withdrawn.
+    kernel
+        .add_route("10.99.0.0/24".parse().unwrap(), "wgln7")
+        .await
+        .unwrap();
+    kernel.calls.lock().unwrap().clear();
+
+    apply(&kernel, &doc).await.unwrap();
+
+    assert_eq!(
+        kernel.calls.lock().unwrap().clone(),
+        vec!["route- wgln7 10.99.0.0/24".to_string()]
+    );
+}
