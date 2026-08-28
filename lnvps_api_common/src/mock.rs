@@ -1022,7 +1022,7 @@ impl LNVpsDbBase for MockDb {
 
     async fn list_hosts_all(&self) -> DbResult<Vec<VmHost>> {
         let hosts = self.hosts.lock().await;
-        Ok(hosts.values().filter(|h| !h.deleted).cloned().collect())
+        Ok(hosts.values().cloned().collect())
     }
 
     async fn list_hosts_paginated(&self, limit: u64, offset: u64) -> DbResult<(Vec<VmHost>, u64)> {

@@ -1674,6 +1674,42 @@ mod tests {
         assert!(!infos[0].region_name.is_empty());
     }
 
+    /// Regression: a deleted host must still resolve for admin VM listings.
+    /// Deleting a host that has history flags it rather than removing the row
+    /// precisely so its VMs keep rendering, and listing VMs with
+    /// `include_deleted` returns exactly those VMs, so the batch's
+    /// `list_hosts_all()` must not filter deleted hosts out.
+    #[tokio::test]
+    async fn admin_vm_batch_resolves_deleted_host() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::{AdminDb, LNVpsDbBase};
+
+        let db = MockDb::default();
+        let user_id = db.upsert_user(&[1u8; 32]).await.unwrap();
+        let mut vm = MockDb::mock_vm();
+        vm.user_id = user_id;
+        vm.ssh_key_id = None;
+        let vm_id = db.insert_vm(&vm).await.unwrap();
+        db.delete_vm(vm_id).await.unwrap();
+        // The host has VM history, so this flags it instead of removing it
+        db.admin_delete_host(1).await.unwrap();
+
+        let db: std::sync::Arc<dyn lnvps_db::LNVpsDb> = std::sync::Arc::new(db);
+        assert!(
+            db.list_hosts_all().await.unwrap().iter().any(|h| h.id == 1),
+            "precondition: list_hosts_all() keeps deleted hosts"
+        );
+
+        let vms = vec![db.get_vm(vm_id).await.unwrap()];
+        let infos = load_admin_vm_infos(&db, &VmStateCache::new(), &vms)
+            .await
+            .unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].host_id, 1);
+        assert!(!infos[0].host_name.is_empty());
+        assert!(!infos[0].region_name.is_empty());
+    }
+
     /// The list, single-VM and bulk-status endpoints all build their payload
     /// through [`AdminVmBatch`], which bulk-loads each table once.
     #[tokio::test]

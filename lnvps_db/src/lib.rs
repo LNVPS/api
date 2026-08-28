@@ -287,12 +287,16 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List VM's owned by a specific user
     async fn list_hosts(&self) -> DbResult<Vec<VmHost>>;
 
-    /// List every host, including disabled hosts and hosts in disabled regions.
+    /// List every host, including disabled and deleted hosts and hosts in
+    /// disabled regions.
     ///
-    /// `enabled` is a scheduling flag — "place no new VMs here" — not a claim
-    /// that the host has stopped existing. Reconciliation observes physical
-    /// reality and must see every host; only placement/capacity paths should
-    /// use the filtered [LNVpsDbBase::list_hosts].
+    /// `enabled` is a scheduling flag - "place no new VMs here" - not a claim
+    /// that the host has stopped existing, and `deleted` only hides the host
+    /// from listings. Reconciliation observes physical reality and must see
+    /// every host, and bulk VM loads resolve `vm.host_id` through this list, so
+    /// it must never filter: a deleted VM on a deleted host still has to render.
+    /// Only placement/capacity paths should use the filtered
+    /// [LNVpsDbBase::list_hosts].
     async fn list_hosts_all(&self) -> DbResult<Vec<VmHost>>;
 
     /// List hosts with pagination
