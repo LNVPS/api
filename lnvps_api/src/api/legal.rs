@@ -265,14 +265,15 @@ async fn v1_generate_lir_agreement_from_subscription(
             lnvps_db::LineItemType::Vpn => {
                 // The quantity is the device allowance, which is what the plan
                 // actually sells.
-                let devices = this
-                    .db
-                    .get_vpn_subscription_by_line_item(li.id)
-                    .await
-                    .ok()
-                    .flatten()
-                    .map(|p| p.device_limit.to_string())
-                    .unwrap_or_else(|| "—".to_string());
+                let devices = match this.db.get_vpn_subscription_by_line_item(li.id).await {
+                    Ok(Some(p)) => this
+                        .db
+                        .get_vpn_service(p.vpn_service_id)
+                        .await
+                        .map(|s| s.default_device_limit.to_string())
+                        .unwrap_or_else(|_| "—".to_string()),
+                    _ => "—".to_string(),
+                };
                 ("VPN".to_string(), devices)
             }
             lnvps_db::LineItemType::MarketplaceNodeFee => {

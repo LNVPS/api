@@ -115,7 +115,6 @@ pub async fn create_vpn_plan(
                 vpn_service_id: service.id,
                 user_id,
                 subscription_line_item_id: line_item_id,
-                device_limit: service.default_device_limit,
                 created: Utc::now(),
             })
             .await?

@@ -67,10 +67,12 @@ CREATE TABLE vpn_service (
     -- local network gave it, which leaks every lookup around the tunnel.
     dns VARCHAR(255) NULL DEFAULT NULL,
 
-    -- How many devices an account on this service may register unless its own
-    -- row says otherwise. Five matches what customers expect from this kind of
-    -- product; `vpn_subscription.device_limit` is what is actually enforced, so
-    -- a larger tier is sold by writing that column and not by changing this one.
+    -- How many devices an account on this service may register.
+    --
+    -- Per service, not per plan, because one flat price per service is what is
+    -- sold and a per-plan allowance would be a number with no price attached.
+    -- A tier is a second service, or a column on `vpn_subscription` once there
+    -- is something to charge for it.
     default_device_limit TINYINT UNSIGNED NOT NULL DEFAULT 5,
 
     -- Whether new subscriptions and devices may be created here. Disabling

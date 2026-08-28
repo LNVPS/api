@@ -2,7 +2,7 @@
 
 **Status:** in-progress
 **Started:** 2026-08-27
-**Last updated:** 2026-08-27 (increment 4 complete: user API)
+**Last updated:** 2026-08-27 (increments 1-4 restructured: a VPN device is a `tunnel`)
 
 ## Goal
 
@@ -130,6 +130,45 @@ sale, and before any claim is made about what is or is not retained.
    account id, no device name. A seized route server yields the key-to-address map and nothing else.
 10. **600-second endpoint scrub** on the agent, copied from Mullvad, so customer source IPs do not
     sit in kernel memory.
+
+## Restructure (2026-08-27, after review)
+
+Increments 1-4 were rebuilt on three corrections, all of them the same mistake: inventing a
+parallel structure instead of using the one already there.
+
+1. **A VPN device is a `tunnel` row**, with `pool_id` and `router_id` NULL. The original
+   `20260805130000_tunnel.sql` already names this case ("a hand-configured peering, or a VPN on
+   a router with no pool"); the earlier objection that the unique indexes forbade it was wrong,
+   because a device is one key and one address. `vpn_device` is now a link row carrying only the
+   plan, the slot and the customer's label, exactly like `marketplace_node.tunnel_id`.
+
+   This also closes a hole: `vpn_device.address4` and `tunnel.address4` were separately unique,
+   so overlapping blocks could hand a device and a node the same address. One table, one index,
+   impossible.
+
+2. **`plan_pool` no longer knows what a tunnel is for.** It read guest addresses and probe
+   addresses per tunnel, which is marketplace vocabulary in the generic planner and a query per
+   peer per reconcile. Prefixes behind a peer now live in `tunnel_route`, refreshed by
+   `refresh_node_routes` before a reconcile and read by the planner in one batched query. A VPN
+   device has no rows there, so it needs no special case.
+
+   Without this, every VPN device would have been handed a probe address derived by offsetting
+   its own v6 address by `0x8000` — which, with random placement, can be another customer's
+   real address.
+
+3. **`ck_tunnel_pool_has_a_block` is dropped.** A VPN pool is addressed from its service's block,
+   so requiring one it never reads was a column that must be set and must be ignored. The
+   invariant moves to the allocator, which fails naming the pool.
+
+`vpn_subscription` also lost `device_limit`: one flat price per service means a per-plan number
+with no price attached. The allowance is `vpn_service.default_device_limit`. And `create_vpn_plan`
+lost its resubscribe branch entirely — renewal is a payment against the existing subscription, not
+a new line item, so a returning customer renews what they already have and nothing needs
+repointing.
+
+**Follow-up:** `provisioner/tunnel.rs` now holds both the generic planner and the marketplace
+allocator. It should split into a generic WireGuard planning module and a marketplace one; the
+file is the only thing still mixing them.
 
 ## Increments
 

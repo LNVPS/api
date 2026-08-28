@@ -161,10 +161,6 @@ pub enum OrderProduct {
         /// Which service, and therefore which regions and address space.
         #[serde(default)]
         vpn_service_id: Option<i64>,
-        /// Devices the plan allows, which is the thing being sold and so the
-        /// only sensible thing for a rule to price against.
-        #[serde(default)]
-        device_limit: Option<i64>,
     },
 }
 
@@ -219,7 +215,6 @@ impl OrderLineItem {
                 OrderProduct::Vpn {
                     vpn_subscription_id: p.as_ref().map(|p| p.id as i64),
                     vpn_service_id: p.as_ref().map(|p| p.vpn_service_id as i64),
-                    device_limit: p.as_ref().map(|p| p.device_limit as i64),
                 }
             }
             LineItemType::DnsHosting => OrderProduct::DnsHosting,

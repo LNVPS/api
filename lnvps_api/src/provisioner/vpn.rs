@@ -19,10 +19,9 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use ipnetwork::IpNetwork;
-use lnvps_db::{LNVpsDb, VpnDevice, VpnService, VpnSubscription};
+use lnvps_db::{LNVpsDb, RouterTunnelKind, Tunnel, VpnDevice, VpnService, VpnSubscription};
 
-use crate::provisioner::tunnel::{PoolPlan, carve_peer, host_address, server_address};
-use crate::router::WireguardPeer;
+use crate::provisioner::tunnel::{Placement, carve_peer};
 
 /// Register `peer_pubkey` as a device on `plan`.
 ///
@@ -67,24 +66,32 @@ pub async fn register_vpn_device(
     // both propagate on the first attempt, because trying again cannot help.
     for attempt in 1..=REGISTER_ATTEMPTS {
         let devices = db.list_vpn_devices(plan.id).await?;
-        let slot = next_free_slot(&devices, plan.device_limit)?;
+        let slot = next_free_slot(&devices, service.default_device_limit)?;
         let (address4, address6) = carve_device_addresses(db, &service).await?;
 
-        match db
-            .insert_vpn_device(&VpnDevice {
-                id: 0,
-                vpn_subscription_id: plan.id,
-                slot,
-                name: name.trim().to_string(),
-                peer_pubkey: peer_pubkey.to_vec(),
-                address4,
-                address6,
-                enabled: true,
-                created: chrono::Utc::now(),
-            })
-            .await
-        {
-            Ok(id) => return Ok(db.get_vpn_device(id).await?),
+        // The peer is a tunnel, the same as a marketplace node's. `pool_id` and
+        // `router_id` stay NULL: a device is a peer on every interface
+        // terminating its service at once, so naming one would be false.
+        let tunnel = Tunnel {
+            id: 0,
+            kind: RouterTunnelKind::Wireguard,
+            user_id: plan.user_id,
+            router_id: None,
+            pool_id: None,
+            name: peer_name(plan, slot),
+            peer_pubkey: Some(peer_pubkey.to_vec()),
+            // Clients dial out from behind NAT, so the endpoint is learned from
+            // the handshake.
+            peer_endpoint: None,
+            address4,
+            address6,
+            keepalive: None,
+            enabled: true,
+            created: chrono::Utc::now(),
+        };
+
+        let tunnel_id = match db.insert_tunnel(&tunnel).await {
+            Ok(id) => id,
             // The last attempt's failure is the answer. Returning it here,
             // rather than remembering one and reporting it after the loop,
             // keeps "we ran out of attempts but recorded no error" from being
@@ -95,10 +102,43 @@ pub async fn register_vpn_device(
                 )));
             }
             Err(_) => continue,
+        };
+
+        match db
+            .insert_vpn_device(&VpnDevice {
+                id: 0,
+                vpn_subscription_id: plan.id,
+                slot,
+                name: name.trim().to_string(),
+                tunnel_id,
+                created: chrono::Utc::now(),
+            })
+            .await
+        {
+            Ok(id) => return Ok(db.get_vpn_device(id).await?),
+            Err(e) => {
+                // The tunnel is this registration's, and nothing points at it
+                // yet, so a failed link leaves an address allocated to nobody
+                // unless it goes back now.
+                let _ = db.delete_tunnel(tunnel_id).await;
+                if attempt == REGISTER_ATTEMPTS {
+                    return Err(anyhow::Error::from(e).context(format!(
+                        "Could not register a device after {REGISTER_ATTEMPTS} attempts"
+                    )));
+                }
+            }
         }
     }
 
     unreachable!("the loop returns on its last attempt")
+}
+
+/// The peer name configured on the route servers.
+///
+/// Derived from the plan and slot so it is stable across a rename and unique
+/// across the fleet, which the customer's own label for the device is neither.
+fn peer_name(plan: &VpnSubscription, slot: u8) -> String {
+    format!("vpn-{}-{}", plan.id, slot)
 }
 
 /// How many times a registration re-reads and tries again after losing a race
@@ -142,11 +182,10 @@ async fn carve_device_addresses(
     db: &Arc<dyn LNVpsDb>,
     service: &VpnService,
 ) -> Result<(Option<String>, Option<String>)> {
-    let taken: Vec<IpNetwork> = db
-        .list_vpn_devices_in_service(service.id)
-        .await?
+    let tunnels = db.list_vpn_tunnels_in_service(service.id).await?;
+    let taken: Vec<IpNetwork> = tunnels
         .iter()
-        .flat_map(|d| [d.address4.clone(), d.address6.clone()])
+        .flat_map(|t| [t.address4.clone(), t.address6.clone()])
         .flatten()
         .filter_map(|a| a.parse::<IpNetwork>().ok())
         .collect();
@@ -156,85 +195,8 @@ async fn carve_device_addresses(
         service.device_cidr6.as_deref(),
         &taken,
         &format!("VPN service {}", service.id),
-        crate::provisioner::Placement::Random,
+        Placement::Random,
     )
-}
-
-/// What a device-terminating interface should have configured on its route
-/// server.
-///
-/// Every interface on a service gets the *same* plan: the same peers, the same
-/// addresses, the same routes. That is the whole design. It also means this is
-/// computed per pool but depends on nothing about the pool beyond which service
-/// it terminates, so two route servers that disagree are drift rather than a
-/// difference of opinion.
-pub async fn plan_vpn_pool(db: &Arc<dyn LNVpsDb>, service: &VpnService) -> Result<PoolPlan> {
-    let mut plan = PoolPlan::default();
-
-    // One address for the whole service, carrying the block's prefix so every
-    // device is on-link. Shared by every route server, because a device's
-    // gateway must not change when it switches region.
-    plan.addresses.extend(
-        [
-            server_address(service.device_cidr4.as_deref()),
-            server_address(service.device_cidr6.as_deref()),
-        ]
-        .into_iter()
-        .flatten(),
-    );
-
-    // An address on a point-to-point interface gives the kernel no route to the
-    // rest of its prefix, so without this the route server holds `10.64.0.1/12`
-    // and still answers "network is unreachable" for every device in it.
-    plan.routes.extend(
-        [
-            service.device_cidr4.as_deref(),
-            service.device_cidr6.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .map(str::to_string),
-    );
-
-    // Suspension is applied by this query, not by a flag anybody has to
-    // remember to set: an unpaid, expired or deactivated plan stops matching
-    // and its devices simply leave the peer set.
-    for device in db.list_active_vpn_devices(service.id).await? {
-        // AllowedIPs is both the route to this peer and the anti-spoof
-        // boundary: WireGuard drops an inbound packet whose source is not
-        // listed, so one customer cannot claim another's address. A device gets
-        // its own addresses and nothing else, which is what makes a VPN peer
-        // different from a node peer carrying guest prefixes behind it.
-        let allowed_ips: Vec<String> = [
-            host_address(device.address4.as_deref()),
-            host_address(device.address6.as_deref()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-
-        // A device with no address is not configurable, and a peer with an
-        // empty AllowedIPs would be a peer that can send nothing — worse than
-        // absent, because it looks configured.
-        if allowed_ips.is_empty() {
-            continue;
-        }
-
-        plan.peers.push(WireguardPeer {
-            public_key: lnvps_api_common::wireguard_key_to_base64(&device.peer_pubkey),
-            // Clients dial out from behind NAT, so the endpoint is learned from
-            // the handshake. Configuring one would pin a device to whichever
-            // address it last connected from.
-            endpoint: None,
-            allowed_ips,
-            // Per interface, not per device: it is a property of the link the
-            // route server offers, and every interface on a service offers the
-            // same one.
-            persistent_keepalive: None,
-        });
-    }
-
-    Ok(plan)
 }
 
 #[cfg(test)]

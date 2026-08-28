@@ -48,11 +48,28 @@ async fn a_plan(db: &Arc<dyn LNVpsDb>, service: &VpnService, seed: u8) -> Result
     a_plan_with(db, service, seed, 5, true).await
 }
 
+/// A service whose allowance is `limit`, since the allowance is per service.
+async fn a_service_limited(db: &Arc<dyn LNVpsDb>, mock: &MockDb, limit: u8) -> Result<VpnService> {
+    let company_id = a_company(mock).await;
+    let id = db
+        .insert_vpn_service(&VpnService {
+            name: "small".to_string(),
+            company_id,
+            currency: "EUR".to_string(),
+            device_cidr4: Some("10.65.0.0/28".to_string()),
+            default_device_limit: limit,
+            enabled: true,
+            ..Default::default()
+        })
+        .await?;
+    Ok(db.get_vpn_service(id).await?)
+}
+
 async fn a_plan_with(
     db: &Arc<dyn LNVpsDb>,
     service: &VpnService,
     seed: u8,
-    device_limit: u8,
+    _device_limit: u8,
     paid: bool,
 ) -> Result<VpnSubscription> {
     let user_id = db.upsert_user(&[seed; 32]).await?;
@@ -92,7 +109,6 @@ async fn a_plan_with(
             vpn_service_id: service.id,
             user_id,
             subscription_line_item_id: items[0],
-            device_limit,
             ..Default::default()
         })
         .await?;
@@ -147,6 +163,12 @@ fn key(seed: u8) -> Vec<u8> {
     vec![seed; 32]
 }
 
+/// A device's peer. The key and addresses live on the tunnel now, because a
+/// device *is* a WireGuard peer and there is one table for those.
+async fn peer(db: &Arc<dyn LNVpsDb>, device: &VpnDevice) -> Result<lnvps_db::Tunnel> {
+    Ok(db.get_tunnel(device.tunnel_id).await?)
+}
+
 /// Addresses are placed at random, so a test can only assert the properties
 /// that matter: inside the block, a host prefix, and not one of the addresses
 /// the block reserves for itself.
@@ -179,15 +201,20 @@ async fn a_device_is_given_a_slot_and_an_address() -> Result<()> {
 
     assert_eq!(device.slot, 0);
     assert_eq!(device.name, "phone", "the label is trimmed, not stored raw");
-    assert!(device.enabled);
-    assert_usable(device.address4.as_deref(), "10.64.0.0/28", 32);
-    assert_usable(device.address6.as_deref(), "fd00:64::/124", 128);
+    let p = peer(&db, &device).await?;
+    assert!(p.enabled);
+    assert_usable(p.address4.as_deref(), "10.64.0.0/28", 32);
+    assert_usable(p.address6.as_deref(), "fd00:64::/124", 128);
+    assert_eq!(p.peer_pubkey.as_deref(), Some(&key(1)[..]));
+    assert_eq!(p.pool_id, None, "a device is a peer on every interface");
+    assert_eq!(p.router_id, None);
 
     // A second device does not collide with the first.
     let other = register_vpn_device(&db, &plan, "laptop", &key(2)).await?;
+    let op = peer(&db, &other).await?;
     assert_eq!(other.slot, 1);
-    assert_ne!(other.address4, device.address4);
-    assert_ne!(other.address6, device.address6);
+    assert_ne!(op.address4, p.address4);
+    assert_ne!(op.address6, p.address6);
     Ok(())
 }
 
@@ -204,7 +231,7 @@ async fn registering_the_same_key_twice_is_idempotent() -> Result<()> {
     let again = register_vpn_device(&db, &plan, "phone", &key(1)).await?;
 
     assert_eq!(first.id, again.id);
-    assert_eq!(first.address4, again.address4);
+    assert_eq!(first.tunnel_id, again.tunnel_id);
     assert_eq!(db.list_vpn_devices(plan.id).await?.len(), 1);
     Ok(())
 }
@@ -277,8 +304,8 @@ async fn a_disabled_service_takes_no_new_devices() -> Result<()> {
 async fn the_device_limit_is_the_plan_limit() -> Result<()> {
     let mock = MockDb::default();
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
-    let service = a_service(&db, &mock).await?;
-    let plan = a_plan_with(&db, &service, 1, 2, true).await?;
+    let service = a_service_limited(&db, &mock, 2).await?;
+    let plan = a_plan(&db, &service, 1).await?;
 
     let a = register_vpn_device(&db, &plan, "a", &key(1)).await?;
     let b = register_vpn_device(&db, &plan, "b", &key(2)).await?;
@@ -321,10 +348,18 @@ async fn an_unpaid_devices_address_is_not_reissued() -> Result<()> {
     let service = a_service(&db, &mock).await?;
 
     let lapsed = a_plan_with(&db, &service, 1, 5, false).await?;
-    let held = register_vpn_device(&db, &lapsed, "old", &key(1)).await?;
+    let held = peer(
+        &db,
+        &register_vpn_device(&db, &lapsed, "old", &key(1)).await?,
+    )
+    .await?;
 
     let paying = a_plan(&db, &service, 2).await?;
-    let fresh = register_vpn_device(&db, &paying, "new", &key(2)).await?;
+    let fresh = peer(
+        &db,
+        &register_vpn_device(&db, &paying, "new", &key(2)).await?,
+    )
+    .await?;
 
     assert_ne!(fresh.address4, held.address4);
     assert_ne!(fresh.address6, held.address6);
@@ -341,6 +376,7 @@ async fn a_v6_only_service_gives_v6_only() -> Result<()> {
         .insert_vpn_service(&VpnService {
             name: "v6".to_string(),
             company_id: a_company(&mock).await,
+            default_device_limit: 5,
             device_cidr6: Some("fd00:99::/120".to_string()),
             enabled: true,
             ..Default::default()
@@ -349,9 +385,13 @@ async fn a_v6_only_service_gives_v6_only() -> Result<()> {
     let service = db.get_vpn_service(id).await?;
     let plan = a_plan(&db, &service, 1).await?;
 
-    let device = register_vpn_device(&db, &plan, "phone", &key(1)).await?;
-    assert_eq!(device.address4, None);
-    assert_usable(device.address6.as_deref(), "fd00:99::/120", 128);
+    let p = peer(
+        &db,
+        &register_vpn_device(&db, &plan, "phone", &key(1)).await?,
+    )
+    .await?;
+    assert_eq!(p.address4, None);
+    assert_usable(p.address6.as_deref(), "fd00:99::/120", 128);
     Ok(())
 }
 
@@ -366,6 +406,7 @@ async fn an_exhausted_block_says_so() -> Result<()> {
         .insert_vpn_service(&VpnService {
             name: "tiny".to_string(),
             company_id: a_company(&mock).await,
+            default_device_limit: 5,
             device_cidr4: Some("10.70.0.0/30".to_string()),
             enabled: true,
             ..Default::default()
@@ -374,7 +415,7 @@ async fn an_exhausted_block_says_so() -> Result<()> {
     let service = db.get_vpn_service(id).await?;
     let plan = a_plan(&db, &service, 1).await?;
 
-    let only = register_vpn_device(&db, &plan, "a", &key(1)).await?;
+    let only = peer(&db, &register_vpn_device(&db, &plan, "a", &key(1)).await?).await?;
     assert_eq!(only.address4.as_deref(), Some("10.70.0.2/32"));
 
     let err = register_vpn_device(&db, &plan, "b", &key(2))
@@ -396,6 +437,7 @@ async fn an_unparseable_block_is_reported_as_one() -> Result<()> {
         .insert_vpn_service(&VpnService {
             name: "broken".to_string(),
             company_id: a_company(&mock).await,
+            default_device_limit: 5,
             device_cidr4: Some("not-a-cidr".to_string()),
             enabled: true,
             ..Default::default()
@@ -420,36 +462,35 @@ async fn a_vpn_interface_carries_the_services_devices() -> Result<()> {
     let mock = MockDb::default();
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
     let service = a_service(&db, &mock).await?;
+    let pool = a_pool(&db, &mock, &service).await?;
     let plan = a_plan(&db, &service, 1).await?;
     let device = register_vpn_device(&db, &plan, "phone", &key(1)).await?;
+    let p = peer(&db, &device).await?;
 
-    let plan_out = plan_vpn_pool(&db, &service).await?;
+    let out = crate::provisioner::plan_pool(&db, &pool).await?;
 
     assert_eq!(
-        plan_out.addresses,
+        out.addresses,
         vec!["10.64.0.1/28".to_string(), "fd00:64::1/124".to_string()],
         "one shared gateway per family, carrying the block's prefix"
     );
     assert_eq!(
-        plan_out.routes,
+        out.routes,
         vec!["10.64.0.0/28".to_string(), "fd00:64::/124".to_string()],
         "an address alone gives the kernel no route to the rest of the prefix"
     );
-    assert_eq!(plan_out.peers.len(), 1);
-    let peer = &plan_out.peers[0];
+    assert_eq!(out.peers.len(), 1);
+    let wg = &out.peers[0];
     assert_eq!(
-        peer.public_key,
-        lnvps_api_common::wireguard_key_to_base64(&device.peer_pubkey)
+        wg.public_key,
+        lnvps_api_common::wireguard_key_to_base64(&key(1))
     );
     assert_eq!(
-        peer.allowed_ips,
-        vec![
-            device.address4.clone().unwrap(),
-            device.address6.clone().unwrap()
-        ],
+        wg.allowed_ips,
+        vec![p.address4.clone().unwrap(), p.address6.clone().unwrap()],
         "a device may claim its own addresses and nothing else"
     );
-    assert_eq!(peer.endpoint, None, "clients dial out from behind NAT");
+    assert_eq!(wg.endpoint, None, "clients dial out from behind NAT");
     Ok(())
 }
 
@@ -460,13 +501,14 @@ async fn an_unpaid_plans_devices_are_not_configured() -> Result<()> {
     let mock = MockDb::default();
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
     let service = a_service(&db, &mock).await?;
+    let pool = a_pool(&db, &mock, &service).await?;
 
     let paid = a_plan(&db, &service, 1).await?;
     register_vpn_device(&db, &paid, "paid", &key(1)).await?;
     let unpaid = a_plan_with(&db, &service, 2, 5, false).await?;
     register_vpn_device(&db, &unpaid, "unpaid", &key(2)).await?;
 
-    let out = plan_vpn_pool(&db, &service).await?;
+    let out = crate::provisioner::plan_pool(&db, &pool).await?;
     assert_eq!(out.peers.len(), 1);
     assert_eq!(
         out.peers[0].public_key,
@@ -475,28 +517,33 @@ async fn an_unpaid_plans_devices_are_not_configured() -> Result<()> {
     Ok(())
 }
 
-/// A peer with an empty AllowedIPs can send nothing and is worse than absent,
-/// because it looks configured.
+/// A VPN device has nothing behind it, so its AllowedIPs is exactly its own
+/// addresses. Anything else would be a route the customer was never given.
 #[tokio::test]
-async fn a_device_with_no_address_is_not_a_peer() -> Result<()> {
+async fn a_vpn_peer_carries_nothing_behind_it() -> Result<()> {
     let mock = MockDb::default();
     let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
     let service = a_service(&db, &mock).await?;
+    let pool = a_pool(&db, &mock, &service).await?;
     let plan = a_plan(&db, &service, 1).await?;
+    let device = register_vpn_device(&db, &plan, "phone", &key(1)).await?;
+    let p = peer(&db, &device).await?;
 
-    db.insert_vpn_device(&VpnDevice {
-        vpn_subscription_id: plan.id,
-        slot: 0,
-        name: "stranded".to_string(),
-        peer_pubkey: key(9),
-        address4: None,
-        address6: None,
-        enabled: true,
-        ..Default::default()
-    })
-    .await?;
-
-    assert!(plan_vpn_pool(&db, &service).await?.peers.is_empty());
+    let out = crate::provisioner::plan_pool(&db, &pool).await?;
+    assert_eq!(out.peers[0].allowed_ips.len(), 2);
+    // In particular no probe address: that is a marketplace node's, derived by
+    // offsetting its v6 address, and with random placement it could land on
+    // another customer's real address.
+    assert!(
+        !out.peers[0]
+            .allowed_ips
+            .iter()
+            .any(|a| a != p.address4.as_deref().unwrap() && a != p.address6.as_deref().unwrap()),
+        "{:?}",
+        out.peers[0].allowed_ips
+    );
+    // And the block itself is routed, but no per-peer routes beyond it.
+    assert_eq!(out.routes.len(), 2);
     Ok(())
 }
 
@@ -551,7 +598,7 @@ async fn a_lost_slot_race_takes_the_next_slot() -> Result<()> {
     };
     tokio::task::yield_now().await;
 
-    // Somebody else takes slot 0 and the first address out from under it.
+    // Somebody else takes slot 0 out from under it.
     mock.vpn_devices.lock().await.insert(
         99,
         VpnDevice {
@@ -559,10 +606,7 @@ async fn a_lost_slot_race_takes_the_next_slot() -> Result<()> {
             vpn_subscription_id: plan.id,
             slot: 0,
             name: "raced".to_string(),
-            peer_pubkey: vec![9u8; 32],
-            address4: Some("10.64.0.2/32".to_string()),
-            address6: Some("fd00:64::2/128".to_string()),
-            enabled: true,
+            tunnel_id: 12345,
             created: chrono::Utc::now(),
         },
     );
@@ -570,12 +614,11 @@ async fn a_lost_slot_race_takes_the_next_slot() -> Result<()> {
 
     let device = racer.await??;
     assert_eq!(device.slot, 1, "the loser re-reads and takes the next slot");
-    assert_ne!(
-        device.address4.as_deref(),
-        Some("10.64.0.2/32"),
-        "nor the address the winner took"
+    assert_usable(
+        peer(&db, &device).await?.address4.as_deref(),
+        "10.64.0.0/28",
+        32,
     );
-    assert_usable(device.address4.as_deref(), "10.64.0.0/28", 32);
     Ok(())
 }
 
@@ -594,30 +637,22 @@ async fn overlapping_service_blocks_fail_loudly() -> Result<()> {
     let service = a_service(&db, &mock).await?;
     let plan = a_plan(&db, &service, 1).await?;
 
-    // Another service's plan, holding every address in the shared block. Its
-    // devices are invisible to this service's carve but not to the unique
-    // index, so every insert collides however many times the carve re-reads.
-    let squatter = a_plan(&db, &service, 2).await?;
-    {
-        let mut devices = mock.vpn_devices.lock().await;
-        for host in 0..16u8 {
-            devices.insert(
-                1000 + host as u64,
-                VpnDevice {
-                    id: 1000 + host as u64,
-                    // A plan id that does not exist, so `list_vpn_devices_in_service`
-                    // does not see these while the unique index still does.
-                    vpn_subscription_id: squatter.id + 500,
-                    slot: host,
-                    name: "squat".to_string(),
-                    peer_pubkey: vec![100 + host; 32],
-                    address4: Some(format!("10.64.0.{host}/32")),
-                    address6: Some(format!("fd00:64::{host:x}/128")),
-                    enabled: true,
-                    created: chrono::Utc::now(),
-                },
-            );
-        }
+    // Every address in the shared block, held as peers this service's carve
+    // cannot see but the unique index still can, so every insert collides
+    // however many times the carve re-reads.
+    for host in 0..16u8 {
+        let _ = db
+            .insert_tunnel(&lnvps_db::Tunnel {
+                kind: lnvps_db::RouterTunnelKind::Wireguard,
+                user_id: plan.user_id,
+                name: format!("squat-{host}"),
+                peer_pubkey: Some(vec![100 + host; 32]),
+                address4: Some(format!("10.64.0.{host}/32")),
+                address6: Some(format!("fd00:64::{host:x}/128")),
+                enabled: true,
+                ..Default::default()
+            })
+            .await;
     }
 
     let err = register_vpn_device(&db, &plan, "phone", &[1u8; 32])

@@ -1158,6 +1158,10 @@ impl Worker {
             _ => bail!("Tunnel pool {pool_id}'s interface {interface} is not a WireGuard tunnel"),
         };
 
+        // What is behind each node peer is recomputed from the guest
+        // assignments before the plan is built, so the planner can read it
+        // without knowing that marketplace nodes exist.
+        crate::provisioner::refresh_node_routes(&self.db, &pool).await?;
         let plan = crate::provisioner::plan_pool(&self.db, &pool).await?;
         let mut drift = TunnelPeerDrift::default();
 
@@ -1228,6 +1232,7 @@ impl Worker {
         // calculation of what one tunnel needs: the addresses and routes are
         // per-interface, so one node's change is applied by re-stating the
         // whole interface's addressing, and only its own peer is pushed.
+        crate::provisioner::refresh_node_routes(&self.db, &pool).await?;
         let plan = crate::provisioner::plan_pool(&self.db, &pool).await?;
         let key = tunnel
             .peer_pubkey

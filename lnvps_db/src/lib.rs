@@ -1656,9 +1656,9 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Create a VPN plan, returning the new id
     async fn insert_vpn_subscription(&self, sub: &VpnSubscription) -> DbResult<u64>;
 
-    /// Update a plan's device limit and current line item. `user_id`,
-    /// `vpn_service_id` and `created` are immutable and are not written: moving
-    /// a plan to another service would strand every device's address.
+    /// Update a plan's current line item. `user_id`, `vpn_service_id` and
+    /// `created` are immutable and are not written: moving a plan to another
+    /// service would strand every device's address.
     async fn update_vpn_subscription(&self, sub: &VpnSubscription) -> DbResult<()>;
 
     /// Get a device by id
@@ -1672,31 +1672,44 @@ pub trait LNVpsDbBase: Send + Sync {
     /// disabled device still owns its slot and its address.
     async fn list_vpn_devices(&self, vpn_subscription_id: u64) -> DbResult<Vec<VpnDevice>>;
 
-    /// Every device allocated from a service, whatever its billing state.
+    /// Every peer allocated from a service, whatever its billing state.
     ///
-    /// This is the allocator's view, not the route server's: a disabled or
-    /// unpaid device still owns its address, and handing that address to
-    /// somebody else would deliver one customer's traffic to another the moment
-    /// the first one paid again.
-    async fn list_vpn_devices_in_service(&self, vpn_service_id: u64) -> DbResult<Vec<VpnDevice>>;
+    /// The allocator's view, not the route server's: a disabled or unpaid
+    /// device still owns its address, and reissuing it would deliver one
+    /// customer's traffic to another the moment the first one paid again.
+    async fn list_vpn_tunnels_in_service(&self, vpn_service_id: u64) -> DbResult<Vec<Tunnel>>;
 
-    /// Every device a pool's interface should carry: enabled, on a plan whose
+    /// Every peer a pool's interface should carry: enabled, on a plan whose
     /// subscription is paid and unexpired, on the service this pool terminates.
     ///
     /// One query rather than a walk over plans, because this runs on every
     /// reconcile of every pool and the peer set is the whole customer base. It
     /// is also where suspension is applied, which is why no code path has to
-    /// remember to disable a lapsed customer's devices.
-    async fn list_active_vpn_devices(&self, vpn_service_id: u64) -> DbResult<Vec<VpnDevice>>;
+    /// remember to disable a lapsed customer's peers.
+    async fn list_active_vpn_tunnels(&self, vpn_service_id: u64) -> DbResult<Vec<Tunnel>>;
+
+    /// The prefixes routed behind each of `tunnel_ids`.
+    ///
+    /// Batched because the planner needs them for every peer on a pool, and a
+    /// query per peer is what made the marketplace guest lookup a storm once
+    /// the peer set was the whole customer base.
+    async fn list_tunnel_routes(&self, tunnel_ids: &[u64]) -> DbResult<Vec<TunnelRoute>>;
+
+    /// Make the prefixes behind `tunnel_id` exactly `prefixes`.
+    ///
+    /// Declarative, and recomputed before a reconcile rather than written at
+    /// each point a route changes: a missed write would black-hole a customer
+    /// until somebody noticed, while a recompute is self-correcting.
+    async fn replace_tunnel_routes(&self, tunnel_id: u64, prefixes: &[String]) -> DbResult<()>;
 
     /// Register a device, returning the new id. The caller claims the slot;
     /// `uk_vpn_device_slot` is what makes the limit unforgeable under
     /// concurrent registrations.
     async fn insert_vpn_device(&self, device: &VpnDevice) -> DbResult<u64>;
 
-    /// Update a device's name, key and enabled flag. `vpn_subscription_id`,
-    /// `slot`, the addresses and `created` are immutable and are not written:
-    /// an address that moved would strand a config the customer already holds.
+    /// Update a device's label. `vpn_subscription_id`, `slot`, `tunnel_id` and
+    /// `created` are immutable and are not written: the peer behind a device is
+    /// the thing the customer's config points at.
     async fn update_vpn_device(&self, device: &VpnDevice) -> DbResult<()>;
 
     /// Delete a device, releasing its slot and addresses.

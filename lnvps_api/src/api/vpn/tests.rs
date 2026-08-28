@@ -102,7 +102,7 @@ async fn a_paid_plan_with_device(
     db: &Arc<dyn LNVpsDb>,
     service: &VpnService,
     uid: u64,
-) -> Result<(VpnSubscription, VpnDevice)> {
+) -> Result<(VpnSubscription, lnvps_db::Tunnel)> {
     let plan = crate::subscription::create_vpn_plan(db, uid, service).await?;
     let mut sub = db
         .get_subscription_by_line_item_id(plan.subscription_line_item_id)
@@ -111,7 +111,9 @@ async fn a_paid_plan_with_device(
     sub.expires = Some(Utc::now() + chrono::TimeDelta::days(30));
     db.update_subscription(&sub).await?;
     let device = register_vpn_device(db, &plan, "phone", &[7u8; 32]).await?;
-    Ok((plan, device))
+    // The peer is what a config is built from; the device row is just the label
+    // and the slot.
+    Ok((plan, db.get_tunnel(device.tunnel_id).await?))
 }
 
 /// The `[Interface]` block is identical everywhere and only the `[Peer]`

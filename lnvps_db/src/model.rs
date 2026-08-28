@@ -2225,6 +2225,27 @@ impl VpnService {
     }
 }
 
+/// A prefix routed behind a tunnel's peer.
+///
+/// A peer's `AllowedIPs` is its own addresses plus whatever lives behind it,
+/// and this is the second part. Recording it keeps the planner from having to
+/// ask what a tunnel is for: a marketplace node has its guests' addresses here,
+/// a VPN device has nothing, and neither case is special to the code that reads
+/// it.
+///
+/// A cache of desired state, not an authority. Whoever owns a tunnel's purpose
+/// recomputes these before a reconcile, so a missed write is corrected on the
+/// next pass rather than silently black-holing a customer.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct TunnelRoute {
+    /// The tunnel whose peer carries this prefix
+    pub tunnel_id: u64,
+    /// The prefix, as CIDR
+    pub prefix: String,
+    /// When it was first recorded
+    pub created: DateTime<Utc>,
+}
+
 /// Which interfaces terminate a VPN service.
 ///
 /// The association is recorded here rather than as a column on [`TunnelPool`]:
@@ -2245,8 +2266,9 @@ pub struct VpnServicePool {
 
 /// A customer's VPN plan.
 ///
-/// One per account, and the row is reused when a lapsed customer comes back, so
-/// their devices keep their keys and addresses across the gap.
+/// One per account. The device allowance is the service's
+/// ([`VpnService::default_device_limit`]): one flat price per service is what
+/// is sold, so a per-plan number would have no price attached to it.
 ///
 /// There is no active or suspended field. Whether the plan is paid for is
 /// [`Subscription::is_setup`] and [`Subscription::expires`], reached through the
@@ -2262,21 +2284,29 @@ pub struct VpnSubscription {
     pub vpn_service_id: u64,
     /// The account this plan belongs to
     pub user_id: u64,
-    /// The line item billing for this plan. Repointed, not duplicated, when a
-    /// lapsed plan is resubscribed.
+    /// The line item billing for this plan.
+    ///
+    /// Stable for its life: a renewal is a payment against the existing
+    /// subscription, not a new line item, so a customer who lapses and returns
+    /// renews what they already have and their devices need no repointing.
     pub subscription_line_item_id: u64,
-    /// How many devices this account may register. The thing being sold, so a
-    /// larger tier is a write here rather than a new product.
-    pub device_limit: u8,
     /// When this plan was created
     pub created: DateTime<Utc>,
 }
 
 /// One registered device: a phone, a laptop.
 ///
-/// Not a [`Tunnel`]. That pins a peer to one route server and is correct for a
-/// marketplace node terminated in exactly one place; a device is a peer on every
-/// route server at once.
+/// The key and addresses are not here: a device is a WireGuard peer, and a peer
+/// is a [`Tunnel`] — the same table as a marketplace node's, terminated by the
+/// same interfaces, planned by the same code and protected by the same unique
+/// indexes. One set of indexes across every peer is what makes it impossible
+/// for a device and a node to be handed the same address.
+///
+/// What is left is only what makes it a device: which plan, which slot, and
+/// what the customer calls it. The tunnel it points at has a NULL `pool_id`,
+/// which is the case [`Tunnel::pool_id`] already describes for a VPN — a device
+/// is a peer on every interface terminating its service at once, so pinning it
+/// to one would be false.
 #[derive(FromRow, Clone, Debug, Default)]
 pub struct VpnDevice {
     /// Unique id of this device
@@ -2290,18 +2320,11 @@ pub struct VpnDevice {
     /// claiming the lowest free slot against `uk_vpn_device_slot` means the
     /// database rejects the loser.
     pub slot: u8,
-    /// The customer's label for the device. Never sent to a route server.
+    /// The customer's label. Never sent to a route server; [`Tunnel::name`] is
+    /// what the route server sees.
     pub name: String,
-    /// The device's public key. The customer generates the pair and presents
-    /// only this half, so the private key never exists here.
-    pub peer_pubkey: Vec<u8>,
-    /// Inner IPv4 address as a CIDR host prefix, identical on every region
-    pub address4: Option<String>,
-    /// Inner IPv6 address as a CIDR host prefix
-    pub address6: Option<String>,
-    /// Whether the customer wants this device configured. Their switch, not a
-    /// billing one.
-    pub enabled: bool,
+    /// The peer this device is
+    pub tunnel_id: u64,
     /// When this device was registered
     pub created: DateTime<Utc>,
 }

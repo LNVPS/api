@@ -176,8 +176,8 @@ async fn a_plan_is_sold_unpaid_at_the_services_price() -> Result<()> {
     assert_eq!(plan.user_id, uid);
     assert_eq!(plan.vpn_service_id, service.id);
     assert_eq!(
-        plan.device_limit, 5,
-        "the plan takes the service's default allowance"
+        service.default_device_limit, 5,
+        "the allowance is the service's; a plan has no number of its own"
     );
 
     let sub = db
@@ -231,6 +231,7 @@ async fn a_lapsed_plan_is_repointed_and_keeps_its_devices() -> Result<()> {
 
     let plan = create_vpn_plan(&db, uid, &service).await?;
     let device = crate::provisioner::register_vpn_device(&db, &plan, "phone", &[7u8; 32]).await?;
+    let peer = db.get_tunnel(device.tunnel_id).await?;
 
     // Pay it, then let it lapse.
     let mut sub = db
@@ -252,7 +253,8 @@ async fn a_lapsed_plan_is_repointed_and_keeps_its_devices() -> Result<()> {
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].id, device.id);
     assert_eq!(
-        kept[0].address4, device.address4,
+        db.get_tunnel(kept[0].tunnel_id).await?.address4,
+        peer.address4,
         "the customer's config still works once they pay"
     );
     Ok(())

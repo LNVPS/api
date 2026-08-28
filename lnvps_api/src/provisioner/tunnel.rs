@@ -425,44 +425,59 @@ pub struct PoolPlan {
 /// contributes nothing at all, not an empty peer: half-configuring it would
 /// give the node a link with no way to authenticate over it.
 pub async fn plan_pool(db: &Arc<dyn LNVpsDb>, pool: &TunnelPool) -> Result<PoolPlan> {
-    // A pool records nothing about what it is for, so what it should carry is
-    // decided by whichever table points at it. An interface terminating a VPN
-    // service carries that service's devices and none of the per-node links
-    // below: its peers are addressed from the service's block, not from this
-    // pool's, and there are no guest prefixes behind them.
-    if let Some(service) = db.get_vpn_service_for_pool(pool.id).await? {
-        return super::vpn::plan_vpn_pool(db, &service).await;
-    }
-
     let mut plan = PoolPlan::default();
 
-    // One address for the whole pool, carrying the block's prefix so every
-    // node in it is on-link. A per-node address would put one address on this
-    // interface for every node on the route server — thousands, on a /16 — to
-    // describe links that WireGuard, being layer 3 and point-to-point, does
-    // not need described.
+    // Where this interface's peers are addressed from, and which peers they
+    // are. A pool records neither, because it records nothing about what it is
+    // for: an interface terminating a VPN service carries that service's
+    // devices, addressed from the service's block so a device keeps one address
+    // in every region, and any other pool carries the links carved from its own.
+    let (cidr4, cidr6, tunnels) = match db.get_vpn_service_for_pool(pool.id).await? {
+        Some(service) => (
+            service.device_cidr4.clone(),
+            service.device_cidr6.clone(),
+            db.list_active_vpn_tunnels(service.id).await?,
+        ),
+        None => (
+            pool.cidr4.clone(),
+            pool.cidr6.clone(),
+            db.list_tunnels_in_pool(pool.id).await?,
+        ),
+    };
+
+    // One address for the whole block, carrying its prefix so every peer is
+    // on-link. A per-peer address would put one address on this interface for
+    // every peer on the route server to describe links that WireGuard, being
+    // layer 3 and point-to-point, does not need described.
     plan.addresses.extend(
         [
-            server_address(pool.cidr4.as_deref()),
-            server_address(pool.cidr6.as_deref()),
+            server_address(cidr4.as_deref()),
+            server_address(cidr6.as_deref()),
         ]
         .into_iter()
         .flatten(),
     );
 
-    // The pool's own blocks are routed down the interface as well. An address
-    // on a point-to-point interface does not give the kernel a route to the
-    // rest of its prefix, so without this the route server holds
-    // `10.66.0.1/16` and still answers "network is unreachable" for every node
-    // in it. Found by the end-to-end harness rather than by reading the code.
+    // The block itself is routed down the interface as well. An address on a
+    // point-to-point interface does not give the kernel a route to the rest of
+    // its prefix, so without this the route server holds `10.66.0.1/16` and
+    // still answers "network is unreachable" for every peer in it. Found by the
+    // end-to-end harness rather than by reading the code.
     plan.routes.extend(
-        [pool.cidr4.as_deref(), pool.cidr6.as_deref()]
+        [cidr4.as_deref(), cidr6.as_deref()]
             .into_iter()
             .flatten()
             .map(str::to_string),
     );
 
-    for tunnel in db.list_tunnels_in_pool(pool.id).await? {
+    // What is behind each peer, in one query rather than one per peer. The
+    // planner does not know or care why anything is behind a peer: a
+    // marketplace node has its guests here, a VPN device has nothing, and
+    // whoever owns that meaning wrote these rows before the reconcile ran.
+    let ids: Vec<u64> = tunnels.iter().map(|t| t.id).collect();
+    let routes = db.list_tunnel_routes(&ids).await?;
+
+    for tunnel in tunnels {
         if !tunnel.enabled {
             continue;
         }
@@ -472,7 +487,7 @@ pub async fn plan_pool(db: &Arc<dyn LNVpsDb>, pool: &TunnelPool) -> Result<PoolP
 
         // AllowedIPs is both the routing table for this peer and the
         // anti-spoof boundary: WireGuard drops an inbound packet whose source
-        // is not listed, so a node cannot claim another node's guest address.
+        // is not listed, so one peer cannot claim another's address.
         let mut allowed_ips: Vec<String> = [
             host_address(tunnel.address4.as_deref()),
             host_address(tunnel.address6.as_deref()),
@@ -481,20 +496,21 @@ pub async fn plan_pool(db: &Arc<dyn LNVpsDb>, pool: &TunnelPool) -> Result<PoolP
         .flatten()
         .collect();
 
-        let mut guests = guest_addresses(db, &tunnel).await?;
-        // The node's probe address, always — a probe is created and destroyed
-        // between polls, and reconfiguring the route server for the few minutes
-        // one exists would mean a probe that fails because the routing had not
-        // caught up. It costs one host route on a peer that already has one.
-        guests.extend(super::probe_address(&tunnel));
-        allowed_ips.extend(guests.iter().cloned());
-        plan.routes.extend(guests);
+        let behind: Vec<String> = routes
+            .iter()
+            .filter(|r| r.tunnel_id == tunnel.id)
+            .map(|r| r.prefix.clone())
+            .collect();
+        allowed_ips.extend(behind.iter().cloned());
+        // A route as well as an AllowedIPs entry: AllowedIPs picks the peer for
+        // a packet already headed down the tunnel, it does not put it there.
+        plan.routes.extend(behind);
 
         plan.peers.push(WireguardPeer {
             public_key: lnvps_api_common::wireguard_key_to_base64(key),
-            // Nodes dial out from behind NAT; the endpoint is learned from the
-            // handshake. Configuring a stale one would stop the peer from
-            // being reachable after the node's address changes.
+            // Peers dial out from behind NAT; the endpoint is learned from the
+            // handshake. Configuring a stale one would stop the peer from being
+            // reachable after its address changes.
             endpoint: tunnel.peer_endpoint.clone(),
             allowed_ips,
             persistent_keepalive: tunnel.keepalive,
@@ -629,6 +645,30 @@ pub async fn node_guests(
     }
     out.sort_by(|a, b| a.address.cmp(&b.address));
     Ok(out)
+}
+
+/// Recompute what is routed behind every marketplace node peer in `pool`.
+///
+/// The planner reads `tunnel_route` and asks no questions; this is where the
+/// answers come from for a node. Run before a reconcile rather than written at
+/// each point a guest address changes: a missed write would black-hole a
+/// customer's VM until somebody noticed, while a recompute is corrected on the
+/// next pass, in the same way the rest of the reconcile is.
+///
+/// A pool terminating a VPN service has no tunnels of its own — a device's peer
+/// has a NULL `pool_id` — so this is a no-op there without needing to ask what
+/// kind of pool it is.
+pub async fn refresh_node_routes(db: &Arc<dyn LNVpsDb>, pool: &TunnelPool) -> Result<()> {
+    for tunnel in db.list_tunnels_in_pool(pool.id).await? {
+        let mut prefixes = guest_addresses(db, &tunnel).await?;
+        // The node's probe address, always — a probe is created and destroyed
+        // between polls, and reconfiguring the route server for the few minutes
+        // one exists would mean a probe that fails because the routing had not
+        // caught up. It costs one host route on a peer that already has one.
+        prefixes.extend(super::probe_address(&tunnel));
+        db.replace_tunnel_routes(tunnel.id, &prefixes).await?;
+    }
+    Ok(())
 }
 
 /// The public addresses assigned to the guests running on `tunnel`'s node.
@@ -1157,6 +1197,9 @@ mod tests {
         add_guest(&db, &mock, host.id, &["203.0.113.5", "2001:db8::5"]).await;
 
         let pool = db.get_tunnel_pool(pool_id).await.unwrap();
+        // What is behind a node peer is recomputed before planning, exactly as
+        // the worker does it: the planner itself knows nothing about guests.
+        refresh_node_routes(&db, &pool).await.unwrap();
         let plan = plan_pool(&db, &pool).await.unwrap();
 
         assert_eq!(plan.peers.len(), 1);
@@ -1239,6 +1282,7 @@ mod tests {
             }
         }
         let pool = db.get_tunnel_pool(pool_id).await.unwrap();
+        refresh_node_routes(&db, &pool).await.unwrap();
         let plan = plan_pool(&db, &pool).await.unwrap();
         assert!(!plan.routes.iter().any(|r| r.starts_with("203.0.113")));
         assert_eq!(
@@ -1258,6 +1302,7 @@ mod tests {
                 vm.deleted = true;
             }
         }
+        refresh_node_routes(&db, &pool).await.unwrap();
         let plan = plan_pool(&db, &pool).await.unwrap();
         assert!(!plan.routes.iter().any(|r| r.starts_with("203.0.113")));
     }
@@ -1282,6 +1327,7 @@ mod tests {
             },
         ] {
             db.update_tunnel(&broken).await.unwrap();
+            refresh_node_routes(&db, &pool).await.unwrap();
             let plan = plan_pool(&db, &pool).await.unwrap();
             assert!(plan.peers.is_empty());
             // The pool's blocks are routed whether or not anything is placed
@@ -1314,6 +1360,7 @@ mod tests {
         .unwrap();
 
         let pool = db.get_tunnel_pool(pool_id).await.unwrap();
+        refresh_node_routes(&db, &pool).await.unwrap();
         let plan = plan_pool(&db, &pool).await.unwrap();
         assert_eq!(plan.peers.len(), 1);
         assert_eq!(plan.peers[0].allowed_ips, vec!["10.66.9.1/32".to_string()]);

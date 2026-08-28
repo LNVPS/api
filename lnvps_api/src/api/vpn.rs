@@ -103,16 +103,22 @@ pub struct ApiVpnDevice {
     pub created: DateTime<Utc>,
 }
 
-impl From<VpnDevice> for ApiVpnDevice {
-    fn from(d: VpnDevice) -> Self {
+impl ApiVpnDevice {
+    /// A device and the peer it is. The key and addresses live on the tunnel,
+    /// because a device *is* a WireGuard peer and there is one table for those.
+    fn new(device: VpnDevice, tunnel: &lnvps_db::Tunnel) -> Self {
         Self {
-            id: d.id,
-            name: d.name,
-            public_key: wireguard_key_to_base64(&d.peer_pubkey),
-            address4: d.address4,
-            address6: d.address6,
-            enabled: d.enabled,
-            created: d.created,
+            id: device.id,
+            name: device.name,
+            public_key: tunnel
+                .peer_pubkey
+                .as_deref()
+                .map(wireguard_key_to_base64)
+                .unwrap_or_default(),
+            address4: tunnel.address4.clone(),
+            address6: tunnel.address6.clone(),
+            enabled: tunnel.enabled,
+            created: device.created,
         }
     }
 }
@@ -274,8 +280,12 @@ async fn v1_list_vpn_devices(
 ) -> ApiResult<Vec<ApiVpnDevice>> {
     let uid = this.db.upsert_user(&auth.pubkey()).await?;
     let plan = my_plan(&this, uid).await?;
-    let devices = this.db.list_vpn_devices(plan.id).await?;
-    ApiData::ok(devices.into_iter().map(Into::into).collect())
+    let mut out = Vec::new();
+    for device in this.db.list_vpn_devices(plan.id).await? {
+        let tunnel = this.db.get_tunnel(device.tunnel_id).await?;
+        out.push(ApiVpnDevice::new(device, &tunnel));
+    }
+    ApiData::ok(out)
 }
 
 /// Register a device.
@@ -308,7 +318,8 @@ async fn v1_add_vpn_device(
     // the customer holds a config for a region that will not answer.
     push_service(&this, plan.vpn_service_id).await;
 
-    ApiData::ok(device.into())
+    let tunnel = this.db.get_tunnel(device.tunnel_id).await?;
+    ApiData::ok(ApiVpnDevice::new(device, &tunnel))
 }
 
 /// Turn a device off without giving up its slot, key or address.
@@ -322,15 +333,21 @@ async fn v1_set_vpn_device_enabled(
     let plan = my_plan(&this, uid).await?;
     let device = my_device(&this, &plan, id).await?;
 
+    // The switch is on the peer, not on the device row: what a route server
+    // carries is tunnels, and a second copy of "is this on" would be free to
+    // disagree with the one the planner reads.
+    let tunnel = this.db.get_tunnel(device.tunnel_id).await?;
     this.db
-        .update_vpn_device(&VpnDevice {
+        .update_tunnel(&lnvps_db::Tunnel {
             enabled: req.enabled,
-            ..device
+            ..tunnel
         })
         .await?;
     push_service(&this, plan.vpn_service_id).await;
 
-    ApiData::ok(this.db.get_vpn_device(id).await?.into())
+    let device = this.db.get_vpn_device(id).await?;
+    let tunnel = this.db.get_tunnel(device.tunnel_id).await?;
+    ApiData::ok(ApiVpnDevice::new(device, &tunnel))
 }
 
 /// Remove a device, releasing its slot and its addresses.
@@ -341,9 +358,11 @@ async fn v1_delete_vpn_device(
 ) -> ApiResult<()> {
     let uid = this.db.upsert_user(&auth.pubkey()).await?;
     let plan = my_plan(&this, uid).await?;
-    my_device(&this, &plan, id).await?;
-
+    let device = my_device(&this, &plan, id).await?;
     this.db.delete_vpn_device(id).await?;
+    // The device was the only thing pointing at the peer, so the peer and its
+    // address go back with it.
+    this.db.delete_tunnel(device.tunnel_id).await?;
     // Removal is the direction that matters most: until the route servers are
     // told, a revoked key still authenticates.
     push_service(&this, plan.vpn_service_id).await;
@@ -360,19 +379,20 @@ async fn v1_vpn_device_configs(
     let uid = this.db.upsert_user(&auth.pubkey()).await?;
     let plan = my_plan(&this, uid).await?;
     let device = my_device(&this, &plan, id).await?;
+    let tunnel = this.db.get_tunnel(device.tunnel_id).await?;
     let service = this.db.get_vpn_service(plan.vpn_service_id).await?;
 
     // A full tunnel, for the families this device actually holds. Offering
     // `::/0` to a v4-only device would black-hole its IPv6 rather than leaving
     // it alone.
     let mut allowed_ips = Vec::new();
-    if device.address4.is_some() {
+    if tunnel.address4.is_some() {
         allowed_ips.push("0.0.0.0/0".to_string());
     }
-    if device.address6.is_some() {
+    if tunnel.address6.is_some() {
         allowed_ips.push("::/0".to_string());
     }
-    let address: Vec<String> = [device.address4.clone(), device.address6.clone()]
+    let address: Vec<String> = [tunnel.address4.clone(), tunnel.address6.clone()]
         .into_iter()
         .flatten()
         .collect();
@@ -491,10 +511,11 @@ async fn to_api_plan(this: &RouterState, plan: &VpnSubscription) -> Result<ApiVp
         .get_subscription_by_line_item_id(plan.subscription_line_item_id)
         .await?;
     let device_count = this.db.list_vpn_devices(plan.id).await?.len() as u8;
+    let service = this.db.get_vpn_service(plan.vpn_service_id).await?;
     Ok(ApiVpnPlan {
         id: plan.id,
         service_id: plan.vpn_service_id,
-        device_limit: plan.device_limit,
+        device_limit: service.default_device_limit,
         device_count,
         subscription_id: sub.id,
         billing_state: sub.billing_state(Utc::now()),
