@@ -717,7 +717,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn list_hosts_all(&self) -> DbResult<Vec<VmHost>> {
-        Ok(sqlx::query_as("select * from vm_host where deleted = 0")
+        Ok(sqlx::query_as("select * from vm_host")
             .fetch_all(&self.db)
             .await?)
     }
