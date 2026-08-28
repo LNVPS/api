@@ -3879,6 +3879,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "lnvps_vpn"
+version = "0.4.7"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "env_logger",
+ "ipnetwork",
+ "lnvps_netlink",
+ "log 0.4.32",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tokio",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use ipnetwork::IpNetwork;
 
 use crate::netns;
-use crate::ops::{NetOps, WgObserved, WgSettings};
+use crate::ops::{NetOps, WgObserved, WgPeer, WgPeerState, WgSettings};
 use crate::sysctl::{PROC_SYS, read_sysctl, write_sysctl};
 
 use defguard_wireguard_rs::key::Key;
@@ -25,15 +25,24 @@ use netlink_packet_route::link::LinkFlags;
 use netlink_packet_route::route::{RouteAddress, RouteAttribute, RouteHeader};
 use rtnetlink::{Handle, LinkBridge, LinkUnspec, RouteMessageBuilder, new_connection};
 
-/// Talks to the kernel, inside the data plane's own network namespace.
+/// Talks to the kernel, optionally inside a network namespace of its own.
 ///
-/// The namespace is why this type exists at all: a marketplace node is
-/// often not only a marketplace node, and configuring routes, forwarding
-/// and proxy ARP in the machine's own namespace would be configuring the
-/// operator's network for them. See [`crate::netns`].
+/// The two daemons want opposite things here, and both are right.
+///
+/// A marketplace node is often not *only* a marketplace node: it is somebody
+/// else's machine, running somebody else's workloads, and configuring routes,
+/// forwarding and proxy ARP in its own namespace would be configuring the
+/// operator's network for them. So it gets a namespace. See [`crate::netns`].
+///
+/// A VPN route server is a machine LNVPS runs for exactly this and nothing
+/// else. Its interfaces, its routes and its forwarding *are* the host's, and
+/// hiding them in a namespace would mean an operator debugging it could not see
+/// them from a plain shell.
 pub struct Kernel {
     handle: Handle,
-    namespace: netns::Handle,
+    /// The namespace everything is configured in, or `None` for the machine's
+    /// own.
+    namespace: Option<netns::Handle>,
 }
 
 impl Kernel {
@@ -41,6 +50,42 @@ impl Kernel {
     /// creating the namespace if this is the first run.
     pub fn new() -> Result<Self> {
         Self::in_namespace(netns::ensure_default()?)
+    }
+
+    /// Configure the machine this is running on, with no namespace.
+    ///
+    /// For a daemon whose whole job is the host's network. Nothing is hidden,
+    /// so `ip link` in a plain shell shows what the daemon built, which is what
+    /// an operator will reach for first when it is not working.
+    pub fn host() -> Result<Self> {
+        let (connection, handle, _) = new_connection().context("Cannot open a netlink socket")?;
+        tokio::spawn(connection);
+        Ok(Self {
+            handle,
+            namespace: None,
+        })
+    }
+
+    /// Run `f` where this kernel's interfaces live.
+    ///
+    /// A netlink socket, and `/proc/sys/net`, belong to the namespace of the
+    /// thread that opened or read them. Without this, a namespaced kernel
+    /// reports "no such device" about an interface that plainly exists, and
+    /// reads the operator's forwarding setting as its own.
+    ///
+    /// Public because a daemon has its own things to do in the same place: a
+    /// node reads the tunnel's addresses and binds its control listener there,
+    /// and both would otherwise have to ask whether there is a namespace before
+    /// they could ask the question they actually had.
+    pub fn here<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce() -> Result<T> + Send,
+        T: Send,
+    {
+        match &self.namespace {
+            Some(ns) => ns.enter(f),
+            None => f(),
+        }
     }
 
     /// Same, for an already-open namespace. Used by the end-to-end harness,
@@ -61,12 +106,16 @@ impl Kernel {
             new_connection().context("Cannot open a netlink socket")
         })?;
         tokio::spawn(connection);
-        Ok(Self { handle, namespace })
+        Ok(Self {
+            handle,
+            namespace: Some(namespace),
+        })
     }
 
-    /// The namespace this configures.
-    pub fn namespace(&self) -> &netns::Handle {
-        &self.namespace
+    /// The namespace this configures, or `None` when it configures the machine
+    /// itself.
+    pub fn namespace(&self) -> Option<&netns::Handle> {
+        self.namespace.as_ref()
     }
 
     async fn index(&self, name: &str) -> Result<Option<u32>> {
@@ -311,12 +360,12 @@ impl NetOps for Kernel {
         // namespace of the thread that opens it. Configuring from outside
         // reports "no such device" about an interface that plainly exists.
         let (name, settings) = (name.to_string(), settings.clone());
-        self.namespace.enter(move || configure(&name, &settings))
+        self.here(move || configure(&name, &settings))
     }
 
     async fn remove_wireguard_peer(&self, name: &str, public_key: &str) -> Result<()> {
         let (name, public_key) = (name.to_string(), public_key.to_string());
-        self.namespace.enter(move || {
+        self.here(move || {
             let api = WGApi::<WgKernel>::new(name.clone())
                 .with_context(|| format!("Cannot address WireGuard interface {name}"))?;
             let key = Key::from_str(&public_key).context("Not a WireGuard key")?;
@@ -325,14 +374,66 @@ impl NetOps for Kernel {
         })
     }
 
+    async fn configure_wireguard_interface(
+        &self,
+        name: &str,
+        private_key: &str,
+        listen_port: u16,
+    ) -> Result<()> {
+        let (name, private_key) = (name.to_string(), private_key.to_string());
+        self.here(move || {
+            let api = WGApi::<WgKernel>::new(name.clone())
+                .with_context(|| format!("Cannot address WireGuard interface {name}"))?;
+            // Addresses are left empty and managed over netlink, so that one
+            // code path owns them. Note that this call flushes them, which is
+            // the other reason it is only made when the key or port is wrong.
+            let config = InterfaceConfiguration {
+                name: name.clone(),
+                prvkey: private_key,
+                addresses: vec![],
+                port: listen_port,
+                peers: vec![],
+                mtu: None,
+                fwmark: None,
+            };
+            api.configure_interface(&config)
+                .with_context(|| format!("Cannot configure WireGuard interface {name}"))
+        })
+    }
+
+    async fn set_wireguard_peer(&self, name: &str, peer: &WgPeer) -> Result<()> {
+        let (name, peer) = (name.to_string(), peer.clone());
+        self.here(move || {
+            let api = WGApi::<WgKernel>::new(name.clone())
+                .with_context(|| format!("Cannot address WireGuard interface {name}"))?;
+            let endpoint = match &peer.endpoint {
+                Some(e) => {
+                    Some(resolve(e).with_context(|| format!("Cannot resolve peer endpoint {e}"))?)
+                }
+                None => None,
+            };
+            let p = Peer {
+                public_key: Key::from_str(&peer.public_key).context("Not a WireGuard key")?,
+                endpoint,
+                persistent_keepalive_interval: peer.persistent_keepalive,
+                allowed_ips: peer
+                    .allowed_ips
+                    .iter()
+                    .map(|n| IpAddrMask::new(n.ip(), n.prefix()))
+                    .collect(),
+                ..Default::default()
+            };
+            api.configure_peer(&p)
+                .with_context(|| format!("Cannot configure peer {} on {name}", peer.public_key))
+        })
+    }
+
     async fn wireguard_state(&self, name: &str) -> Result<Option<WgObserved>> {
         if !self.link_exists(name).await? {
             return Ok(None);
         }
         let name = name.to_string();
-        self.namespace
-            .enter(move || observe_wireguard(&name))
-            .map(Some)
+        self.here(move || observe_wireguard(&name)).map(Some)
     }
 
     async fn sysctl(&self, key: &str) -> Result<Option<String>> {
@@ -340,14 +441,12 @@ impl NetOps for Kernel {
         // has to be read from inside — otherwise the node would report the
         // operator's forwarding setting as its own.
         let key = key.to_string();
-        self.namespace
-            .enter(move || read_sysctl(Path::new(PROC_SYS), &key))
+        self.here(move || read_sysctl(Path::new(PROC_SYS), &key))
     }
 
     async fn set_sysctl(&self, key: &str, value: &str) -> Result<()> {
         let (key, value) = (key.to_string(), value.to_string());
-        self.namespace
-            .enter(move || write_sysctl(Path::new(PROC_SYS), &key, &value))
+        self.here(move || write_sysctl(Path::new(PROC_SYS), &key, &value))
     }
 }
 
@@ -395,19 +494,32 @@ fn observe_wireguard(name: &str) -> Result<WgObserved> {
         .with_context(|| format!("Cannot read WireGuard interface {name}"))?;
     let now = std::time::SystemTime::now();
     Ok(WgObserved {
+        listen_port: host.listen_port,
+        public_key: host
+            .private_key
+            .as_ref()
+            .map(|k| k.public_key().to_string()),
         peers: host
             .peers
             .values()
-            .map(|p| {
-                let age = p
+            .map(|p| WgPeerState {
+                public_key: p.public_key.to_string(),
+                last_handshake_secs: p
                     .last_handshake
                     // The zero time means "never", not 1970: reporting
                     // an age of half a century would look like a stale
                     // tunnel rather than one that has never worked.
                     .filter(|t| *t != std::time::UNIX_EPOCH)
                     .and_then(|t| now.duration_since(t).ok())
-                    .map(|d| d.as_secs());
-                (p.public_key.to_string(), age)
+                    .map(|d| d.as_secs()),
+                allowed_ips: p
+                    .allowed_ips
+                    .iter()
+                    .filter_map(|a| IpNetwork::new(a.address, a.cidr).ok())
+                    .collect(),
+                endpoint: p.endpoint.map(|e| e.to_string()),
+                rx_bytes: p.rx_bytes,
+                tx_bytes: p.tx_bytes,
             })
             .collect(),
     })
@@ -420,6 +532,11 @@ impl Kernel {
     /// Uses a second netlink socket, opened in the machine's own namespace,
     /// because the move is asked of the namespace the interface is *in*.
     async fn move_into_namespace(&self, name: &str) -> Result<()> {
+        // Nothing to move: this kernel's interfaces are the machine's, and
+        // they are already where they belong.
+        let Some(namespace) = &self.namespace else {
+            return Ok(());
+        };
         let (connection, handle, _) = new_connection().context("Cannot open a netlink socket")?;
         tokio::spawn(connection);
 
@@ -433,7 +550,7 @@ impl Kernel {
             .link()
             .set(
                 LinkUnspec::new_with_index(link.header.index)
-                    .setns_by_fd(self.namespace.as_raw_fd())
+                    .setns_by_fd(namespace.as_raw_fd())
                     .build(),
             )
             .execute()

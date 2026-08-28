@@ -195,9 +195,7 @@ async fn run(config_path: &Path) -> Result<()> {
     // against the interface itself — inside the data plane namespace, which is
     // the only place that interface exists.
     let interface = control.tunnel_interface.clone();
-    let addrs = kernel
-        .namespace()
-        .enter(move || config::interface_addresses(&interface))?;
+    let addrs = kernel.here(move || config::interface_addresses(&interface))?;
     config::validate_listen_address(control.listen, &addrs)?;
 
     let tls = tls::load_or_generate(&config.state_dir, Some(control.listen))?;
@@ -233,7 +231,7 @@ async fn run(config_path: &Path) -> Result<()> {
     // Bound inside the namespace, because that is where the tunnel address
     // lives. The socket keeps that namespace while the rest of the daemon stays
     // in the machine's own, which is what lets it go on reaching LNVPS.
-    let listener = kernel.namespace().enter(move || {
+    let listener = kernel.here(move || {
         std::net::TcpListener::bind(addr)
             .with_context(|| format!("Cannot bind the control API to {addr}"))
     })?;
