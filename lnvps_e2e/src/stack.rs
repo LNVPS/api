@@ -463,7 +463,9 @@ impl Stack {
     ) -> Result<String> {
         use lnvps_api::router::{ObservedInterface, TunnelConfig, TunnelRouter, WireguardConfig};
 
-        let plan = lnvps_api::provisioner::plan_interface(db, pool).await?;
+        let plan = lnvps_api::provisioner::wg::TunnelProvisioner::new(db.clone())
+            .plan(pool)
+            .await?;
         let interface = format!("wgln{}", pool.id);
         let rs = self.route_server();
 

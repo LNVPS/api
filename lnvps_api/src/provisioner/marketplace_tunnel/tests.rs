@@ -1,8 +1,13 @@
 //! Allocating and planning a marketplace node's data plane.
 
 use super::*;
+
+/// The service under test, built per call: it holds only the database.
+fn mkt(db: &Arc<dyn LNVpsDb>) -> MarketplaceTunnels {
+    MarketplaceTunnels::new(db.clone())
+}
+use crate::provisioner::wg::TunnelProvisioner;
 use crate::provisioner::wg::address::reserved_addresses;
-use crate::provisioner::wg::plan::plan_interface;
 use lnvps_api_common::MockDb;
 use lnvps_db::{
     MarketplaceNodeStatus, MarketplaceOperator, Router, RouterKind, TunnelPool, VmHost, VmHostKind,
@@ -109,7 +114,7 @@ async fn pool(
 async fn allocating_takes_the_first_free_address_in_both_families() {
     let (db, _mock, node, pool_id) = fixture().await;
 
-    let allocation = allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+    let allocation = mkt(&db).allocate(&node, &NODE_KEY).await.unwrap();
     assert_eq!(allocation.tunnel.address4.as_deref(), Some("10.66.0.2/32"));
     assert_eq!(
         allocation.tunnel.address6.as_deref(),
@@ -146,7 +151,7 @@ async fn allocating_takes_the_first_free_address_in_both_families() {
 #[tokio::test]
 async fn a_second_node_gets_the_next_address() {
     let (db, _mock, first, _) = fixture().await;
-    allocate_node_tunnel(&db, &first, &NODE_KEY).await.unwrap();
+    mkt(&db).allocate(&first, &NODE_KEY).await.unwrap();
 
     let second_id = db
         .insert_marketplace_node(&MarketplaceNode {
@@ -170,9 +175,7 @@ async fn a_second_node_gets_the_next_address() {
     .unwrap();
     let second = db.get_marketplace_node(second_id).await.unwrap();
 
-    let allocation = allocate_node_tunnel(&db, &second, &OTHER_KEY)
-        .await
-        .unwrap();
+    let allocation = mkt(&db).allocate(&second, &OTHER_KEY).await.unwrap();
     assert_eq!(allocation.tunnel.address4.as_deref(), Some("10.66.0.3/32"));
     assert_eq!(
         allocation.tunnel.address6.as_deref(),
@@ -185,10 +188,10 @@ async fn a_second_node_gets_the_next_address() {
 #[tokio::test]
 async fn asking_twice_returns_the_same_allocation() {
     let (db, _mock, node, _) = fixture().await;
-    let first = allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+    let first = mkt(&db).allocate(&node, &NODE_KEY).await.unwrap();
 
     let node = db.get_marketplace_node(node.id).await.unwrap();
-    let second = allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+    let second = mkt(&db).allocate(&node, &NODE_KEY).await.unwrap();
     assert_eq!(first.tunnel.id, second.tunnel.id);
     assert_eq!(db.list_tunnels().await.unwrap().len(), 1);
 }
@@ -199,10 +202,10 @@ async fn asking_twice_returns_the_same_allocation() {
 #[tokio::test]
 async fn a_regenerated_key_is_re_pinned_without_moving_the_addresses() {
     let (db, _mock, node, _) = fixture().await;
-    let first = allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+    let first = mkt(&db).allocate(&node, &NODE_KEY).await.unwrap();
 
     let node = db.get_marketplace_node(node.id).await.unwrap();
-    let rotated = allocate_node_tunnel(&db, &node, &OTHER_KEY).await.unwrap();
+    let rotated = mkt(&db).allocate(&node, &OTHER_KEY).await.unwrap();
     assert_eq!(rotated.tunnel.id, first.tunnel.id);
     assert_eq!(rotated.tunnel.address4, first.tunnel.address4);
     assert_eq!(
@@ -217,7 +220,7 @@ async fn a_regenerated_key_is_re_pinned_without_moving_the_addresses() {
 #[tokio::test]
 async fn two_nodes_cannot_share_a_key() {
     let (db, _mock, first, _) = fixture().await;
-    allocate_node_tunnel(&db, &first, &NODE_KEY).await.unwrap();
+    mkt(&db).allocate(&first, &NODE_KEY).await.unwrap();
 
     let second_id = db
         .insert_marketplace_node(&MarketplaceNode {
@@ -241,7 +244,7 @@ async fn two_nodes_cannot_share_a_key() {
     let second = db.get_marketplace_node(second_id).await.unwrap();
 
     assert!(
-        allocate_node_tunnel(&db, &second, &NODE_KEY).await.is_err(),
+        mkt(&db).allocate(&second, &NODE_KEY).await.is_err(),
         "two nodes were allowed to share a WireGuard key"
     );
 }
@@ -257,7 +260,8 @@ async fn a_node_that_is_not_approved_gets_no_data_plane() {
     db.update_marketplace_node(&pending).await.unwrap();
     let pending = db.get_marketplace_node(pending.id).await.unwrap();
 
-    let err = allocate_node_tunnel(&db, &pending, &NODE_KEY)
+    let err = mkt(&db)
+        .allocate(&pending, &NODE_KEY)
         .await
         .expect_err("a pending node was given a data plane");
     assert!(format!("{err}").contains("approved"), "{err}");
@@ -268,7 +272,7 @@ async fn a_node_that_is_not_approved_gets_no_data_plane() {
 #[tokio::test]
 async fn a_malformed_key_is_refused() {
     let (db, _mock, node, _) = fixture().await;
-    assert!(allocate_node_tunnel(&db, &node, &[1u8; 16]).await.is_err());
+    assert!(mkt(&db).allocate(&node, &[1u8; 16]).await.is_err());
 }
 
 /// A region with no pool cannot carry guest traffic. Saying so beats
@@ -278,7 +282,8 @@ async fn a_region_with_no_pool_is_reported_not_guessed() {
     let (db, _mock, node, pool_id) = fixture().await;
     db.delete_tunnel_pool(pool_id).await.unwrap();
 
-    let err = allocate_node_tunnel(&db, &node, &NODE_KEY)
+    let err = mkt(&db)
+        .allocate(&node, &NODE_KEY)
         .await
         .expect_err("a node was allocated a tunnel from nowhere");
     assert!(format!("{err}").contains("No enabled tunnel pool"), "{err}");
@@ -292,7 +297,7 @@ async fn a_disabled_pool_takes_no_new_allocations() {
     pool.enabled = false;
     db.update_tunnel_pool(&pool).await.unwrap();
 
-    assert!(allocate_node_tunnel(&db, &node, &NODE_KEY).await.is_err());
+    assert!(mkt(&db).allocate(&node, &NODE_KEY).await.is_err());
 }
 
 /// A full pool is not a silent failure: the next pool in the region takes
@@ -325,7 +330,7 @@ async fn a_full_pool_falls_through_to_the_next_one() {
     .unwrap();
 
     let spare = pool(&db, &mock, "10.77.0.0/24", None, "wg-mkt1").await;
-    let allocation = allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+    let allocation = mkt(&db).allocate(&node, &NODE_KEY).await.unwrap();
     assert_eq!(allocation.tunnel.pool_id, Some(spare));
     assert_eq!(allocation.tunnel.address4.as_deref(), Some("10.77.0.2/32"));
 }
@@ -367,7 +372,7 @@ async fn an_ipv6_only_pool_gives_a_bracketed_control_address() {
     v6_only.cidr4 = None;
     db.update_tunnel_pool(&v6_only).await.unwrap();
 
-    let allocation = allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+    let allocation = mkt(&db).allocate(&node, &NODE_KEY).await.unwrap();
     assert_eq!(allocation.tunnel.address4, None);
     assert_eq!(allocation.control_address().unwrap(), "[fd00:66::2]");
     let host = db
@@ -383,11 +388,11 @@ async fn an_ipv6_only_pool_gives_a_bracketed_control_address() {
 #[tokio::test]
 async fn a_node_can_read_back_its_allocation() {
     let (db, _mock, node, _) = fixture().await;
-    assert!(get_node_tunnel(&db, &node).await.unwrap().is_none());
+    assert!(mkt(&db).get_tunnel(&node).await.unwrap().is_none());
 
-    let allocated = allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+    let allocated = mkt(&db).allocate(&node, &NODE_KEY).await.unwrap();
     let node = db.get_marketplace_node(node.id).await.unwrap();
-    let read = get_node_tunnel(&db, &node).await.unwrap().unwrap();
+    let read = mkt(&db).get_tunnel(&node).await.unwrap().unwrap();
     assert_eq!(read.tunnel.id, allocated.tunnel.id);
     assert_eq!(read.pool.endpoint(), "rs.example:51820");
     assert_eq!(read.pool.mtu, 1420);
@@ -453,7 +458,8 @@ async fn an_unparseable_block_is_reported() {
     broken.cidr4 = Some("not-a-cidr".to_string());
     db.update_tunnel_pool(&broken).await.unwrap();
 
-    let err = allocate_node_tunnel(&db, &node, &NODE_KEY)
+    let err = mkt(&db)
+        .allocate(&node, &NODE_KEY)
         .await
         .expect_err("an unparseable block allocated an address");
     assert!(format!("{err}").contains("unparseable block"), "{err}");
@@ -465,7 +471,7 @@ async fn an_unparseable_block_is_reported() {
 #[tokio::test]
 async fn a_peer_allows_the_node_its_own_addresses_and_its_guests() {
     let (db, mock, node, pool_id) = fixture().await;
-    let allocation = allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+    let allocation = mkt(&db).allocate(&node, &NODE_KEY).await.unwrap();
     let host = db
         .get_marketplace_node_host(node.id)
         .await
@@ -476,8 +482,11 @@ async fn a_peer_allows_the_node_its_own_addresses_and_its_guests() {
     let pool = db.get_tunnel_pool(pool_id).await.unwrap();
     // What is behind a node peer is recomputed before planning, exactly as
     // the worker does it: the planner itself knows nothing about guests.
-    refresh_node_routes(&db, &pool).await.unwrap();
-    let plan = plan_interface(&db, &pool).await.unwrap();
+    mkt(&db).refresh_routes(&pool).await.unwrap();
+    let plan = TunnelProvisioner::new(db.clone())
+        .plan(&pool)
+        .await
+        .unwrap();
 
     assert_eq!(plan.peers.len(), 1);
     let peer = &plan.peers[0];
@@ -543,7 +552,7 @@ async fn a_peer_allows_the_node_its_own_addresses_and_its_guests() {
 #[tokio::test]
 async fn a_released_guest_address_is_not_routed() {
     let (db, mock, node, pool_id) = fixture().await;
-    allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+    mkt(&db).allocate(&node, &NODE_KEY).await.unwrap();
     let host = db
         .get_marketplace_node_host(node.id)
         .await
@@ -559,8 +568,11 @@ async fn a_released_guest_address_is_not_routed() {
         }
     }
     let pool = db.get_tunnel_pool(pool_id).await.unwrap();
-    refresh_node_routes(&db, &pool).await.unwrap();
-    let plan = plan_interface(&db, &pool).await.unwrap();
+    mkt(&db).refresh_routes(&pool).await.unwrap();
+    let plan = TunnelProvisioner::new(db.clone())
+        .plan(&pool)
+        .await
+        .unwrap();
     assert!(!plan.routes.iter().any(|r| r.starts_with("203.0.113")));
     assert_eq!(
         plan.peers[0].allowed_ips.len(),
@@ -579,8 +591,11 @@ async fn a_released_guest_address_is_not_routed() {
             vm.deleted = true;
         }
     }
-    refresh_node_routes(&db, &pool).await.unwrap();
-    let plan = plan_interface(&db, &pool).await.unwrap();
+    mkt(&db).refresh_routes(&pool).await.unwrap();
+    let plan = TunnelProvisioner::new(db.clone())
+        .plan(&pool)
+        .await
+        .unwrap();
     assert!(!plan.routes.iter().any(|r| r.starts_with("203.0.113")));
 }
 
@@ -590,7 +605,7 @@ async fn a_released_guest_address_is_not_routed() {
 #[tokio::test]
 async fn an_unrealisable_tunnel_is_left_out_entirely() {
     let (db, _mock, node, pool_id) = fixture().await;
-    let allocation = allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+    let allocation = mkt(&db).allocate(&node, &NODE_KEY).await.unwrap();
     let pool = db.get_tunnel_pool(pool_id).await.unwrap();
 
     for broken in [
@@ -604,8 +619,11 @@ async fn an_unrealisable_tunnel_is_left_out_entirely() {
         },
     ] {
         db.update_tunnel(&broken).await.unwrap();
-        refresh_node_routes(&db, &pool).await.unwrap();
-        let plan = plan_interface(&db, &pool).await.unwrap();
+        mkt(&db).refresh_routes(&pool).await.unwrap();
+        let plan = TunnelProvisioner::new(db.clone())
+            .plan(&pool)
+            .await
+            .unwrap();
         assert!(plan.peers.is_empty());
         // The pool's blocks are routed whether or not anything is placed
         // in it; the interface exists either way.
@@ -637,8 +655,11 @@ async fn a_tunnel_with_no_node_behind_it_is_still_a_peer() {
     .unwrap();
 
     let pool = db.get_tunnel_pool(pool_id).await.unwrap();
-    refresh_node_routes(&db, &pool).await.unwrap();
-    let plan = plan_interface(&db, &pool).await.unwrap();
+    mkt(&db).refresh_routes(&pool).await.unwrap();
+    let plan = TunnelProvisioner::new(db.clone())
+        .plan(&pool)
+        .await
+        .unwrap();
     assert_eq!(plan.peers.len(), 1);
     assert_eq!(plan.peers[0].allowed_ips, vec!["10.66.9.1/32".to_string()]);
     // The pool's own blocks, and nothing a guest brought.
@@ -653,7 +674,7 @@ async fn a_tunnel_with_no_node_behind_it_is_still_a_peer() {
 #[tokio::test]
 async fn the_data_plane_document_describes_the_whole_node() {
     let (db, mock, node, _) = fixture().await;
-    allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+    mkt(&db).allocate(&node, &NODE_KEY).await.unwrap();
     let node = db.get_marketplace_node(node.id).await.unwrap();
     let host = db
         .get_marketplace_node_host(node.id)
@@ -662,7 +683,7 @@ async fn the_data_plane_document_describes_the_whole_node() {
         .unwrap();
     add_guest(&db, &mock, host.id, &["203.0.113.5", "2001:db8::5"]).await;
 
-    let plane = node_dataplane(&db, &node).await.unwrap().unwrap();
+    let plane = mkt(&db).dataplane(&node).await.unwrap().unwrap();
     assert_eq!(
         plane.tunnel.tunnel.address4.as_deref(),
         Some("10.66.0.2/32")
@@ -698,7 +719,7 @@ async fn the_data_plane_document_describes_the_whole_node() {
 #[tokio::test]
 async fn a_node_without_a_tunnel_has_no_document() {
     let (db, _mock, node, _) = fixture().await;
-    assert!(node_dataplane(&db, &node).await.unwrap().is_none());
+    assert!(mkt(&db).dataplane(&node).await.unwrap().is_none());
 }
 
 /// A node with no guests yet is still configured: it is realised before it
@@ -706,10 +727,10 @@ async fn a_node_without_a_tunnel_has_no_document() {
 #[tokio::test]
 async fn a_node_with_no_guests_still_has_a_document() {
     let (db, _mock, node, _) = fixture().await;
-    allocate_node_tunnel(&db, &node, &NODE_KEY).await.unwrap();
+    mkt(&db).allocate(&node, &NODE_KEY).await.unwrap();
     let node = db.get_marketplace_node(node.id).await.unwrap();
 
-    let plane = node_dataplane(&db, &node).await.unwrap().unwrap();
+    let plane = mkt(&db).dataplane(&node).await.unwrap().unwrap();
     // Not empty: a node with no customers still carries its probe address,
     // so LNVPS can find out whether it could carry one.
     assert_eq!(plane.guests.len(), 1);

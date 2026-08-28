@@ -269,7 +269,9 @@ async fn a_probe_proves_a_node_can_carry_a_customer() -> Result<()> {
     // that fails in production passes in here.
     let state = tempfile::TempDir::new()?;
     let node_key = lnvps_node::wgkey::load_or_generate(state.path())?;
-    lnvps_api::provisioner::allocate_node_tunnel(&db, &node, &node_key.public_bytes()).await?;
+    lnvps_api::provisioner::MarketplaceTunnels::new(db.clone())
+        .allocate(&node, &node_key.public_bytes())
+        .await?;
     let node = db.get_marketplace_node(node.id).await?;
 
     let pool = db.get_tunnel_pool(1).await?;
@@ -278,7 +280,8 @@ async fn a_probe_proves_a_node_can_carry_a_customer() -> Result<()> {
     // The node applies exactly what the API serves it, carried across the wire
     // format both ends actually use. Serialising LNVPS's document and parsing
     // the node's is the only thing that proves those two types agree.
-    let document = lnvps_api::provisioner::node_dataplane(&db, &node)
+    let document = lnvps_api::provisioner::MarketplaceTunnels::new(db.clone())
+        .dataplane(&node)
         .await?
         .context("the node has no data plane")?;
     let api_document: lnvps_api::api::marketplace::ApiNodeDataPlane = document.into();
@@ -348,7 +351,8 @@ async fn a_probe_proves_a_node_can_carry_a_customer() -> Result<()> {
     // read after the probe tore its VM down, which is the one moment the
     // interesting state no longer exists.
     let probe_address = lnvps_api::provisioner::probe_address(
-        &lnvps_api::provisioner::get_node_tunnel(&db, &node)
+        &lnvps_api::provisioner::MarketplaceTunnels::new(db.clone())
+            .get_tunnel(&node)
             .await?
             .context("the node has no tunnel")?
             .tunnel,

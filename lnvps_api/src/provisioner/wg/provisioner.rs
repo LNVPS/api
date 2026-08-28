@@ -18,7 +18,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use lnvps_db::LNVpsDb;
 use log::{info, warn};
 
-use crate::provisioner::wg::plan::plan_interface;
+use crate::provisioner::wg::address::{host_address, server_address};
+use crate::provisioner::wg::block::PeerBlock;
+use crate::provisioner::wg::plan::InterfacePlan;
+use crate::router::WireguardPeer;
+use lnvps_db::TunnelPool;
 
 /// What a tunnel pool's route server disagreed with the database about.
 ///
@@ -67,22 +71,27 @@ impl std::fmt::Display for TunnelPeerDrift {
     }
 }
 
-/// Applies interface plans to route servers.
+/// Managing the WireGuard interfaces LNVPS terminates.
 ///
-/// Holds only the database, like [`lnvps_api_common::NetworkProvisioner`]: the
-/// router for a given pool is resolved per call, because which route server an
-/// interface lives on is a property of the pool and not of this service.
-pub struct TunnelRealiser {
+/// Holds the database once, like [`lnvps_api_common::NetworkProvisioner`],
+/// rather than taking it as an argument to every function. The router for a
+/// given pool is resolved per call, because which route server an interface
+/// lives on is a property of the pool and not of this service.
+///
+/// Knows nothing about what a peer is for. Whatever is routed behind one is
+/// read from `tunnel_route`, and whoever owns that peer's purpose put it
+/// there.
+pub struct TunnelProvisioner {
     db: Arc<dyn LNVpsDb>,
 }
 
-impl TunnelRealiser {
+impl TunnelProvisioner {
     pub fn new(db: Arc<dyn LNVpsDb>) -> Self {
         Self { db }
     }
 
     /// Enable/disable a tunnel on a router and refresh its cached state.
-    pub async fn toggle_tunnel(&self, router_id: u64, name: &str, enabled: bool) -> Result<()> {
+    pub async fn set_enabled(&self, router_id: u64, name: &str, enabled: bool) -> Result<()> {
         let router = crate::router::get_router(&self.db, router_id)
             .await
             .map_err(|e| anyhow!("failed to load router {}: {}", router_id, e))?;
@@ -122,7 +131,7 @@ impl TunnelRealiser {
     /// interface should be. Without it a pool could only describe an interface
     /// somebody configured by hand, and bringing up a new route server would be
     /// a manual job with a database row bolted on afterwards.
-    pub async fn sync_tunnel_pool(&self, pool_id: u64) -> Result<()> {
+    pub async fn sync_pool(&self, pool_id: u64) -> Result<()> {
         let pool = self.db.get_tunnel_pool(pool_id).await?;
         let router = crate::router::get_router(&self.db, pool.router_id)
             .await
@@ -233,7 +242,7 @@ impl TunnelRealiser {
         // push above just created or re-applied it: on Linux that is a fresh
         // interface with no peers at all, and every node on it is cut until
         // they are put back.
-        self.reconcile_tunnel_peers(pool.id).await?;
+        self.reconcile_peers(pool.id).await?;
         Ok(())
     }
 
@@ -248,7 +257,7 @@ impl TunnelRealiser {
     ///
     /// Returns what had drifted, so a caller running this on a schedule can say
     /// whether anything was wrong rather than only that it ran.
-    pub async fn reconcile_tunnel_peers(&self, pool_id: u64) -> Result<TunnelPeerDrift> {
+    pub async fn reconcile_peers(&self, pool_id: u64) -> Result<TunnelPeerDrift> {
         let pool = self.db.get_tunnel_pool(pool_id).await?;
         let router = crate::router::get_router(&self.db, pool.router_id)
             .await
@@ -280,8 +289,10 @@ impl TunnelRealiser {
         // What is behind each node peer is recomputed from the guest
         // assignments before the plan is built, so the planner can read it
         // without knowing that marketplace nodes exist.
-        crate::provisioner::refresh_node_routes(&self.db, &pool).await?;
-        let plan = crate::provisioner::plan_interface(&self.db, &pool).await?;
+        crate::provisioner::MarketplaceTunnels::new(self.db.clone())
+            .refresh_routes(&pool)
+            .await?;
+        let plan = self.plan(&pool).await?;
         let mut drift = TunnelPeerDrift::default();
 
         for want in &plan.peers {
@@ -335,7 +346,7 @@ impl TunnelRealiser {
     /// Used when a single allocation changes — a node asking for its tunnel, a
     /// guest getting an address — so it does not wait behind a reconcile of
     /// every other node on the same route server.
-    pub async fn sync_node_tunnel(&self, tunnel_id: u64) -> Result<()> {
+    pub async fn sync_peer(&self, tunnel_id: u64) -> Result<()> {
         let tunnel = self.db.get_tunnel(tunnel_id).await?;
         let pool_id = tunnel.pool_id.ok_or_else(|| {
             anyhow!("Tunnel {tunnel_id} was not allocated from a pool, so there is no interface")
@@ -351,8 +362,10 @@ impl TunnelRealiser {
         // calculation of what one tunnel needs: the addresses and routes are
         // per-interface, so one node's change is applied by re-stating the
         // whole interface's addressing, and only its own peer is pushed.
-        crate::provisioner::refresh_node_routes(&self.db, &pool).await?;
-        let plan = crate::provisioner::plan_interface(&self.db, &pool).await?;
+        crate::provisioner::MarketplaceTunnels::new(self.db.clone())
+            .refresh_routes(&pool)
+            .await?;
+        let plan = self.plan(&pool).await?;
         let key = tunnel
             .peer_pubkey
             .as_deref()
@@ -385,5 +398,113 @@ impl TunnelRealiser {
             .await
             .map_err(|e| anyhow!("failed to configure routes on {interface}: {}", e))?;
         Ok(())
+    }
+    /// Work out what `pool`'s interface should look like.
+    ///
+    /// A tunnel that cannot be realised — disabled, or with no key presented yet —
+    /// contributes nothing at all, not an empty peer: half-configuring it would
+    /// give the node a link with no way to authenticate over it.
+    pub async fn plan(&self, pool: &TunnelPool) -> Result<InterfacePlan> {
+        let mut plan = InterfacePlan::default();
+
+        // Where this interface's peers are addressed from, and which peers they
+        // are. A pool records neither, because it records nothing about what it is
+        // for: an interface terminating a VPN service carries that service's
+        // devices, addressed from the service's block so a device keeps one address
+        // in every region, and any other pool carries the links carved from its own.
+        let (cidr4, cidr6, tunnels) = match self.db.get_vpn_service_for_pool(pool.id).await? {
+            Some(service) => (
+                service.device_cidr4.clone(),
+                service.device_cidr6.clone(),
+                self.db.list_active_vpn_tunnels(service.id).await?,
+            ),
+            None => (
+                pool.cidr4.clone(),
+                pool.cidr6.clone(),
+                self.db.list_tunnels_in_pool(pool.id).await?,
+            ),
+        };
+
+        // One address for the whole block, carrying its prefix so every peer is
+        // on-link. A per-peer address would put one address on this interface for
+        // every peer on the route server to describe links that WireGuard, being
+        // layer 3 and point-to-point, does not need described.
+        plan.addresses.extend(
+            [
+                server_address(cidr4.as_deref()),
+                server_address(cidr6.as_deref()),
+            ]
+            .into_iter()
+            .flatten(),
+        );
+
+        // The block itself is routed down the interface as well. An address on a
+        // point-to-point interface does not give the kernel a route to the rest of
+        // its prefix, so without this the route server holds `10.66.0.1/16` and
+        // still answers "network is unreachable" for every peer in it. Found by the
+        // end-to-end harness rather than by reading the code.
+        plan.routes.extend(
+            [cidr4.as_deref(), cidr6.as_deref()]
+                .into_iter()
+                .flatten()
+                .map(str::to_string),
+        );
+
+        // What is behind each peer, in one query rather than one per peer. The
+        // planner does not know or care why anything is behind a peer: a
+        // marketplace node has its guests here, a VPN device has nothing, and
+        // whoever owns that meaning wrote these rows before the reconcile ran.
+        let ids: Vec<u64> = tunnels.iter().map(|t| t.id).collect();
+        let routes = self.db.list_tunnel_routes(&ids).await?;
+
+        for tunnel in tunnels {
+            if !tunnel.enabled {
+                continue;
+            }
+            let Some(key) = tunnel.peer_pubkey.as_deref() else {
+                continue;
+            };
+
+            // AllowedIPs is both the routing table for this peer and the
+            // anti-spoof boundary: WireGuard drops an inbound packet whose source
+            // is not listed, so one peer cannot claim another's address.
+            let mut allowed_ips: Vec<String> = [
+                host_address(tunnel.address4.as_deref()),
+                host_address(tunnel.address6.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+
+            let behind: Vec<String> = routes
+                .iter()
+                .filter(|r| r.tunnel_id == tunnel.id)
+                .map(|r| r.prefix.clone())
+                .collect();
+            allowed_ips.extend(behind.iter().cloned());
+            // A route as well as an AllowedIPs entry: AllowedIPs picks the peer for
+            // a packet already headed down the tunnel, it does not put it there.
+            plan.routes.extend(behind);
+
+            plan.peers.push(WireguardPeer {
+                public_key: lnvps_api_common::wireguard_key_to_base64(key),
+                // Peers dial out from behind NAT; the endpoint is learned from the
+                // handshake. Configuring a stale one would stop the peer from being
+                // reachable after its address changes.
+                endpoint: tunnel.peer_endpoint.clone(),
+                allowed_ips,
+                persistent_keepalive: tunnel.keepalive,
+            });
+        }
+        Ok(plan)
+    }
+
+    /// Carve the next free peer address out of `block`.
+    ///
+    /// A thin forward to [`PeerBlock::carve`], so callers never hold the
+    /// database themselves: `tunnels.carve(&pool)` rather than
+    /// `pool.carve(&db)`.
+    pub async fn carve(&self, block: &dyn PeerBlock) -> Result<(Option<String>, Option<String>)> {
+        block.carve(&self.db).await
     }
 }

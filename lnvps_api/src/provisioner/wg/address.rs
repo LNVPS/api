@@ -85,7 +85,7 @@ pub enum Placement {
 /// 1"`) so an error points at the row an admin has to fix. That, and where the
 /// taken set was read from, is the only thing a marketplace link and a VPN
 /// device disagree about — the arithmetic is the same, so it is written once.
-pub(crate) fn carve_peer(
+pub(super) fn carve_peer(
     cidr4: Option<&str>,
     cidr6: Option<&str>,
     taken: &[IpNetwork],

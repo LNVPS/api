@@ -173,7 +173,8 @@ with the apply half stranded in `worker.rs` and two public types both called `Tu
 |---|---|---|
 | `provisioner/wg/address.rs` | block arithmetic: reserved addresses, carving, placement | nothing, pure |
 | `provisioner/wg/plan.rs` | `InterfacePlan`, the desired state of one interface | db, pool, tunnel |
-| `provisioner/wg/apply.rs` | `TunnelRealiser`: observed vs desired, drift, push | plan, `TunnelRouter` |
+| `provisioner/wg/block.rs` | `PeerBlock`: what an address is carved out of | blocks, placement |
+| `provisioner/wg/provisioner.rs` | `TunnelProvisioner`: plan, carve, reconcile, push | plan, block, `TunnelRouter` |
 | `provisioner/marketplace_tunnel.rs` | node allocation, dataplane document, route maintenance | nodes, hosts, guests |
 | `provisioner/vpn.rs` | device registration | plans, services |
 
@@ -182,8 +183,17 @@ interface is addressed from its service), and `router::Tunnel` to `router::Obser
 which had been colliding with `lnvps_db::Tunnel` — a desired-state row and an observed interface
 sharing one name in files that import both.
 
-`worker.rs` lost 340 lines and now delegates through a `tunnels()` accessor, matching how
-`NetworkProvisioner` is used elsewhere.
+Both halves are services holding the database once, matching `NetworkProvisioner`:
+`TunnelProvisioner` (plan, carve, reconcile, push) and `MarketplaceTunnels` (allocate, dataplane,
+refresh routes). Nothing in `provisioner/` takes `db: &Arc<dyn LNVpsDb>` as an argument any more.
+`worker.rs` lost 340 lines and delegates through a `tunnels()` accessor.
+
+`PeerBlock` is what removed the last duplicated function. Carving from a pool's own block and
+carving from a VPN service's block were the same eight lines twice, differing only in which
+columns hold the block, what is already taken, where to place a new address and what to call the
+row in an error. Those four are the trait; carving is a default method. It also carries the
+invariant `ck_tunnel_pool_has_a_block` used to hold, which the schema can no longer state because
+whether a row may have no block depends on another table.
 
 ## Increments
 

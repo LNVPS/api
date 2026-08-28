@@ -541,8 +541,8 @@ impl Worker {
     /// A thin accessor rather than a field: the realiser holds only the
     /// database, so constructing one per call costs an `Arc` clone and keeps
     /// the worker from carrying a service it uses in four places.
-    fn tunnels(&self) -> crate::provisioner::wg::apply::TunnelRealiser {
-        crate::provisioner::wg::apply::TunnelRealiser::new(self.db.clone())
+    fn tunnels(&self) -> crate::provisioner::wg::TunnelProvisioner {
+        crate::provisioner::wg::TunnelProvisioner::new(self.db.clone())
     }
 
     /// Grace period (in days) for a subscription, tiered by subscription age.
@@ -819,7 +819,7 @@ impl Worker {
                         .iter()
                         .filter(|p| p.router_id == router_id && p.enabled)
                     {
-                        if let Err(e) = self.tunnels().reconcile_tunnel_peers(pool.id).await {
+                        if let Err(e) = self.tunnels().reconcile_peers(pool.id).await {
                             warn!("Failed to reconcile tunnel pool {}: {}", pool.id, e);
                         }
                     }
@@ -2839,11 +2839,11 @@ impl Worker {
                 enabled,
             } => {
                 self.tunnels()
-                    .toggle_tunnel(*router_id, name, *enabled)
+                    .set_enabled(*router_id, name, *enabled)
                     .await?;
             }
             WorkJob::SyncTunnelPool { pool_id } => {
-                self.tunnels().sync_tunnel_pool(*pool_id).await?;
+                self.tunnels().sync_pool(*pool_id).await?;
             }
             WorkJob::RemoveTunnelInterface {
                 router_id,
@@ -2852,10 +2852,10 @@ impl Worker {
                 self.remove_tunnel_interface(*router_id, interface).await?;
             }
             WorkJob::ReconcileTunnelPeers { pool_id } => {
-                self.tunnels().reconcile_tunnel_peers(*pool_id).await?;
+                self.tunnels().reconcile_peers(*pool_id).await?;
             }
             WorkJob::SyncNodeTunnel { tunnel_id } => {
-                self.tunnels().sync_node_tunnel(*tunnel_id).await?;
+                self.tunnels().sync_peer(*tunnel_id).await?;
             }
             WorkJob::DeleteVm {
                 vm_id,
@@ -5691,7 +5691,7 @@ mod tests {
             .unwrap();
 
         let worker = setup_worker(db.clone()).await?;
-        worker.tunnels().toggle_tunnel(1, "gre1", false).await?;
+        worker.tunnels().set_enabled(1, "gre1", false).await?;
 
         // The cached tunnel should reflect the disabled state after refresh.
         let tunnels = db.list_router_tunnels(1).await?;
@@ -5803,8 +5803,9 @@ mod tests {
         .await?;
 
         let node = dbt.get_marketplace_node(node_id).await?;
-        let allocation =
-            crate::provisioner::allocate_node_tunnel(&dbt, &node, &[0x11u8; 32]).await?;
+        let allocation = crate::provisioner::MarketplaceTunnels::new(dbt.clone())
+            .allocate(&node, &[0x11u8; 32])
+            .await?;
         assert_eq!(allocation.tunnel.pool_id, Some(pool_id));
         Ok(allocation.tunnel)
     }
@@ -5823,7 +5824,7 @@ mod tests {
         mr.clear().await;
 
         let worker = setup_worker(db.clone()).await?;
-        worker.tunnels().sync_tunnel_pool(pool_id).await?;
+        worker.tunnels().sync_pool(pool_id).await?;
 
         let interface = format!("wgln{pool_id}");
         let peers = mr.peers(&interface).await;
@@ -5874,19 +5875,19 @@ mod tests {
         let mr = MockRouter::new();
         mr.clear().await;
         let worker = setup_worker(db.clone()).await?;
-        worker.tunnels().sync_tunnel_pool(pool_id).await?;
+        worker.tunnels().sync_pool(pool_id).await?;
         let interface = format!("wgln{pool_id}");
 
         // Nothing changed: a working peer must not be rewritten on every poll,
         // and `wg` reports allowed IPs in its own order.
-        let drift = worker.tunnels().reconcile_tunnel_peers(pool_id).await?;
+        let drift = worker.tunnels().reconcile_peers(pool_id).await?;
         assert!(drift.is_empty(), "{drift}");
 
         // The route server lost the peer (a reboot without persistence).
         let tr = mr.tunnel().unwrap();
         let key = lnvps_api_common::wireguard_key_to_base64(&[0x11u8; 32]);
         tr.remove_tunnel_peer(&interface, &key).await.unwrap();
-        let drift = worker.tunnels().reconcile_tunnel_peers(pool_id).await?;
+        let drift = worker.tunnels().reconcile_peers(pool_id).await?;
         assert_eq!(drift.missing, vec![key.clone()]);
         assert_eq!(mr.peers(&interface).await.len(), 1, "not put back");
 
@@ -5902,7 +5903,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let drift = worker.tunnels().reconcile_tunnel_peers(pool_id).await?;
+        let drift = worker.tunnels().reconcile_peers(pool_id).await?;
         assert_eq!(drift.changed, vec![key.clone()]);
         assert_eq!(
             mr.peers(&interface).await[0].allowed_ips,
@@ -5920,7 +5921,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let drift = worker.tunnels().reconcile_tunnel_peers(pool_id).await?;
+        let drift = worker.tunnels().reconcile_peers(pool_id).await?;
         assert_eq!(drift.unclaimed, vec!["c3RyYXk=".to_string()]);
         assert_eq!(mr.peers(&interface).await.len(), 1);
 
@@ -5942,7 +5943,7 @@ mod tests {
 
         let err = worker
             .tunnels()
-            .reconcile_tunnel_peers(pool_id)
+            .reconcile_peers(pool_id)
             .await
             .expect_err("peers were reconciled onto an interface that is not there");
         assert!(format!("{err}").contains("SyncTunnelPool"), "{err}");
@@ -5967,13 +5968,13 @@ mod tests {
         let worker = setup_worker(db.clone()).await?;
         // The interface exists but has no peers, which is exactly the state
         // right after a node asks for its tunnel.
-        worker.tunnels().sync_tunnel_pool(pool_id).await?;
+        worker.tunnels().sync_pool(pool_id).await?;
         let interface = format!("wgln{pool_id}");
         let tr = mr.tunnel().unwrap();
         let key = lnvps_api_common::wireguard_key_to_base64(&[0x11u8; 32]);
         tr.remove_tunnel_peer(&interface, &key).await.unwrap();
 
-        worker.tunnels().sync_node_tunnel(tunnel.id).await?;
+        worker.tunnels().sync_peer(tunnel.id).await?;
         assert_eq!(mr.peers(&interface).await.len(), 1);
 
         // Disabling the allocation is a statement in the other direction: the
@@ -5984,7 +5985,7 @@ mod tests {
             ..tunnel.clone()
         })
         .await?;
-        worker.tunnels().sync_node_tunnel(tunnel.id).await?;
+        worker.tunnels().sync_peer(tunnel.id).await?;
         assert!(mr.peers(&interface).await.is_empty());
 
         mr.clear().await;
@@ -6010,7 +6011,7 @@ mod tests {
         let worker = setup_worker(db.clone()).await?;
         let err = worker
             .tunnels()
-            .sync_node_tunnel(tunnel_id)
+            .sync_peer(tunnel_id)
             .await
             .expect_err("a pool-less tunnel was pushed to an interface");
         assert!(
@@ -6033,7 +6034,7 @@ mod tests {
         mr.clear().await;
 
         let worker = setup_worker(db.clone()).await?;
-        worker.tunnels().sync_tunnel_pool(pool_id).await?;
+        worker.tunnels().sync_pool(pool_id).await?;
 
         let tunnels = mr.tunnel().unwrap().list_tunnels().await.unwrap();
         assert_eq!(tunnels.len(), 1);
@@ -6061,7 +6062,7 @@ mod tests {
         // Syncing again is a no-op rather than a recreate: re-applying drops
         // every peer with the interface, so a working node must not be cut by
         // a routine sync.
-        worker.tunnels().sync_tunnel_pool(pool_id).await?;
+        worker.tunnels().sync_pool(pool_id).await?;
         let after = mr.tunnel().unwrap().list_tunnels().await.unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, tunnels[0].id);
@@ -6088,7 +6089,7 @@ mod tests {
         mr.clear().await;
         let worker = setup_worker(db.clone()).await?;
 
-        assert!(worker.tunnels().sync_tunnel_pool(pool_id).await.is_err());
+        assert!(worker.tunnels().sync_pool(pool_id).await.is_err());
         assert!(
             mr.tunnel()
                 .unwrap()
@@ -6116,7 +6117,7 @@ mod tests {
         mr.clear().await;
 
         let worker = setup_worker(db.clone()).await?;
-        worker.tunnels().sync_tunnel_pool(pool_id).await?;
+        worker.tunnels().sync_pool(pool_id).await?;
         assert_eq!(mr.tunnel().unwrap().list_tunnels().await.unwrap().len(), 1);
 
         let interface = db.get_tunnel_pool(pool_id).await?.interface();

@@ -580,7 +580,8 @@ async fn v1_node_request_tunnel(
     Json(req): Json<RequestTunnelRequest>,
 ) -> ApiResult<ApiNodeTunnel> {
     let key = parse_32_bytes(&req.public_key, "public_key")?;
-    let allocation = crate::provisioner::allocate_node_tunnel(&this.db, &auth.node, &key)
+    let allocation = crate::provisioner::MarketplaceTunnels::new(this.db.clone())
+        .allocate(&auth.node, &key)
         .await
         .map_err(|e| ApiError::new(e.to_string()))?;
 
@@ -611,7 +612,8 @@ async fn v1_node_get_tunnel(
     auth: NodeAuth,
     State(this): State<RouterState>,
 ) -> ApiResult<ApiNodeTunnel> {
-    let allocation = crate::provisioner::get_node_tunnel(&this.db, &auth.node)
+    let allocation = crate::provisioner::MarketplaceTunnels::new(this.db.clone())
+        .get_tunnel(&auth.node)
         .await
         .map_err(|e| ApiError::new(e.to_string()))?
         .ok_or_else(|| ApiError::not_found("This node has no tunnel allocated yet"))?;
@@ -779,7 +781,8 @@ async fn v1_node_dataplane(
     auth: NodeAuth,
     State(this): State<RouterState>,
 ) -> ApiResult<ApiNodeDataPlane> {
-    let plane = crate::provisioner::node_dataplane(&this.db, &auth.node)
+    let plane = crate::provisioner::MarketplaceTunnels::new(this.db.clone())
+        .dataplane(&auth.node)
         .await
         .map_err(|e| ApiError::new(e.to_string()))?
         .ok_or_else(|| ApiError::not_found("This node has no tunnel allocated yet"))?;

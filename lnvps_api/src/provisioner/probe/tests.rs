@@ -161,7 +161,9 @@ async fn a_node(db: &Arc<dyn LNVpsDb>) -> Result<MarketplaceNode> {
     })
     .await?;
     let node = db.get_marketplace_node(node_id).await?;
-    super::super::allocate_node_tunnel(db, &node, &[7u8; 32]).await?;
+    crate::provisioner::MarketplaceTunnels::new(db.clone())
+        .allocate(&node, &[7u8; 32])
+        .await?;
     db.get_marketplace_node(node_id).await.map_err(Into::into)
 }
 
