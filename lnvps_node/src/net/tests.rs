@@ -12,6 +12,20 @@ use async_trait::async_trait;
 
 use super::*;
 
+/// A peer as the kernel would report it. Only the key and the handshake matter
+/// to anything the node decides, so the rest is left empty rather than
+/// invented.
+fn a_peer(public_key: &str, last_handshake_secs: Option<u64>) -> lnvps_netlink::WgPeerState {
+    lnvps_netlink::WgPeerState {
+        public_key: public_key.to_string(),
+        last_handshake_secs,
+        allowed_ips: vec![],
+        endpoint: None,
+        rx_bytes: 0,
+        tx_bytes: 0,
+    }
+}
+
 /// A machine with a working nftables, already carrying the ruleset for the
 /// guests below, for the tests that are about the network rather than the
 /// filter. The filter's own decisions are tested in [`crate::fw::tests`].
@@ -178,26 +192,56 @@ impl NetOps for FakeKernel {
             .entry(name.to_string())
             .or_default()
             .peers
-            .retain(|(k, _)| *k != settings.peer_public_key);
+            .retain(|p| p.public_key != settings.peer_public_key);
         self.wireguard
             .lock()
             .unwrap()
             .entry(name.to_string())
             .or_default()
             .peers
-            .push((settings.peer_public_key.clone(), None));
+            .push(a_peer(&settings.peer_public_key, None));
         Ok(())
     }
 
     async fn remove_wireguard_peer(&self, name: &str, public_key: &str) -> Result<()> {
         if let Some(state) = self.wireguard.lock().unwrap().get_mut(name) {
-            state.peers.retain(|(k, _)| k != public_key);
+            state.peers.retain(|p| p.public_key != public_key);
         }
         Ok(())
     }
 
     async fn wireguard_state(&self, name: &str) -> Result<Option<WgObserved>> {
         Ok(self.wireguard.lock().unwrap().get(name).cloned())
+    }
+
+    async fn configure_wireguard_interface(
+        &self,
+        name: &str,
+        _private_key: &str,
+        listen_port: u16,
+    ) -> Result<()> {
+        // As the kernel does: stating a device's configuration replaces its
+        // peer set with it.
+        let mut wg = self.wireguard.lock().unwrap();
+        let state = wg.entry(name.to_string()).or_default();
+        state.listen_port = listen_port;
+        state.peers.clear();
+        Ok(())
+    }
+
+    async fn set_wireguard_peer(&self, name: &str, peer: &lnvps_netlink::WgPeer) -> Result<()> {
+        let mut wg = self.wireguard.lock().unwrap();
+        let state = wg.entry(name.to_string()).or_default();
+        state.peers.retain(|p| p.public_key != peer.public_key);
+        state.peers.push(lnvps_netlink::WgPeerState {
+            public_key: peer.public_key.clone(),
+            last_handshake_secs: None,
+            allowed_ips: peer.allowed_ips.clone(),
+            endpoint: peer.endpoint.clone(),
+            rx_bytes: 0,
+            tx_bytes: 0,
+        });
+        Ok(())
     }
 
     async fn sysctl(&self, key: &str) -> Result<Option<String>> {
@@ -347,7 +391,7 @@ async fn a_stale_peer_is_removed() {
         .get_mut(TUNNEL_INTERFACE)
         .unwrap()
         .peers
-        .push(("c3RyYXk=".to_string(), None));
+        .push(a_peer("c3RyYXk=", None));
 
     let changed = apply(&kernel, &fw().await, &desired(), &key())
         .await
@@ -505,7 +549,7 @@ async fn observation_reports_what_the_machine_has() {
         .unwrap()
         .get_mut(TUNNEL_INTERFACE)
         .unwrap()
-        .peers = vec![("peer".to_string(), Some(12))];
+        .peers = vec![a_peer("peer", Some(12))];
     let state = observe(&kernel, &fw().await).await.unwrap();
     assert_eq!(state.last_handshake_secs, Some(12));
     assert!(state.healthy());

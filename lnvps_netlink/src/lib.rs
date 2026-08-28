@@ -25,5 +25,5 @@ pub mod ops;
 pub mod sysctl;
 
 pub use kernel::Kernel;
-pub use ops::{NetOps, UnavailableKernel, WgObserved, WgSettings};
+pub use ops::{NetOps, UnavailableKernel, WgObserved, WgPeer, WgPeerState, WgSettings};
 pub use sysctl::{PROC_SYS, read_sysctl, write_sysctl};

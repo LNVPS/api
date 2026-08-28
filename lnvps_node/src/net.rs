@@ -211,8 +211,13 @@ async fn apply_tunnel(
     // It would most likely be a stale key from a re-key, still able to send
     // traffic that the node treats as coming from LNVPS.
     if let Some(observed) = ops.wireguard_state(TUNNEL_INTERFACE).await? {
-        for (stale, _) in observed.peers.iter().filter(|(k, _)| *k != peer_key) {
-            ops.remove_wireguard_peer(TUNNEL_INTERFACE, stale).await?;
+        for stale in observed
+            .peers
+            .iter()
+            .filter(|p| p.public_key != peer_key)
+            .map(|p| p.public_key.clone())
+        {
+            ops.remove_wireguard_peer(TUNNEL_INTERFACE, &stale).await?;
             changed.push(format!("removed stale peer {stale}"));
         }
     }
@@ -418,10 +423,12 @@ fn is_link_local(address: &IpNetwork) -> bool {
 pub async fn observe(ops: &dyn NetOps, fw: &dyn crate::fw::FirewallOps) -> Result<DataPlaneState> {
     let (tunnel_up, tunnel_mtu) = ops.link_state(TUNNEL_INTERFACE).await?;
     let (bridge_up, _) = ops.link_state(GUEST_BRIDGE).await?;
-    let last_handshake_secs = ops
-        .wireguard_state(TUNNEL_INTERFACE)
-        .await?
-        .and_then(|w| w.peers.into_iter().filter_map(|(_, age)| age).min());
+    let last_handshake_secs = ops.wireguard_state(TUNNEL_INTERFACE).await?.and_then(|w| {
+        w.peers
+            .into_iter()
+            .filter_map(|p| p.last_handshake_secs)
+            .min()
+    });
     Ok(DataPlaneState {
         tunnel_up,
         tunnel_mtu,
