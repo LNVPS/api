@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
 # tunnel-e2e.sh — Run the marketplace tunnel harness: both ends, real kernel.
 #
-# The harness (lnvps_e2e/tests/tunnel_netns.rs) builds a route server and a node
-# out of network namespaces, configures each end with the real production code
-# paths, and pings across the tunnel — including to a guest sitting behind the
-# node, which is the path a customer's traffic takes.
+# tunnel_netns builds a route server and a node out of network namespaces,
+# configures each end with the real production code paths, and pings across the
+# tunnel, including to a guest sitting behind the node, which is the path a
+# customer's traffic takes.
+#
+# vpn_netns builds two VPN regions and one customer device, and proves the
+# property the VPN design exists to have: one keypair and one inner address that
+# work in every region, so switching region moves nothing on the server side.
 #
 # It needs root (namespaces, veth, WireGuard), so the tests are #[ignore]d and
 # only run from here.
@@ -16,7 +20,7 @@ set -euo pipefail
 
 # Every harness that needs a real kernel. Listed once: a test added here and
 # nowhere else is one nobody ever runs.
-TESTS=(tunnel_netns node_libvirt node_probe)
+TESTS=(tunnel_netns vpn_netns node_libvirt node_probe)
 TEST_ARGS=()
 for t in "${TESTS[@]}"; do TEST_ARGS+=(--test "$t"); done
 

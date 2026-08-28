@@ -88,7 +88,7 @@ async fn apply_interface(
     }
 
     sync_addresses(ops, &name, &desired.addresses, applied).await?;
-    sync_routes(ops, &name, &desired.routes, applied).await?;
+    sync_routes(ops, &name, &desired.routes, &desired.addresses, applied).await?;
     sync_peers(ops, &name, desired, applied).await?;
     Ok(())
 }
@@ -133,16 +133,35 @@ async fn sync_routes(
     ops: &dyn NetOps,
     name: &str,
     desired: &[String],
+    addresses: &[String],
     applied: &mut Applied,
 ) -> Result<()> {
     let want = parse_all(desired).context("LNVPS sent a route that is not a CIDR")?;
     let have = ops.routes(name).await?;
 
+    // Giving an interface `10.64.0.1/24` makes the kernel write a connected
+    // route for `10.64.0.0/24` into the main table, and that route is the
+    // kernel's, not ours. Deleting it would be a fight we lose on every apply:
+    // it comes straight back with the address, and the delete fails with
+    // ESRCH the moment two addresses in one block imply the same prefix.
+    //
+    // A node never hit this because its addresses are `/32` and `/128`, which
+    // only produce entries in the *local* table. A route server is addressed
+    // from the block itself, so this is new here.
+    let implied: Vec<IpNetwork> = parse_all(addresses)
+        .context("LNVPS sent an address that is not a CIDR")?
+        .into_iter()
+        .filter_map(|a| IpNetwork::new(a.network(), a.prefix()).ok())
+        .collect();
+
     for route in want.iter().filter(|r| !have.contains(r)) {
         ops.add_route(*route, name).await?;
         applied.note(format!("routed {route} down {name}"));
     }
-    for route in have.iter().filter(|r| !want.contains(r)) {
+    for route in have
+        .iter()
+        .filter(|r| !want.contains(r) && !implied.contains(r))
+    {
         ops.del_route(*route, name).await?;
         applied.note(format!("stopped routing {route} down {name}"));
     }

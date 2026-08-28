@@ -26,5 +26,6 @@ pub mod soft_authenticator;
 /// A disposable marketplace-node stack on real namespaces.
 pub mod stack;
 mod user_api;
+mod vpn;
 mod webauthn;
 pub mod worker;

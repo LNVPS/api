@@ -374,11 +374,32 @@ Notes:
 - Still open from increment 6: `POST /api/v1/routeserver/counters`. The counters are read
   from the kernel now (`WgPeerState::rx_bytes`/`tx_bytes`); nothing reports them yet.
 
-### Increment 9 — end-to-end
-- [ ] Extend the netns harness: one device reaching two pools with the same inner address
-- [ ] Script entry alongside `scripts/tunnel-e2e.sh`
-- [ ] **Cover the `/api/v1/vpn/*` endpoints** — they have no unit-test coverage by design
-      (see increment 4), so without this they ship untested
+### Increment 9 — end-to-end  ✅ DONE
+- [x] `lnvps_e2e/tests/vpn_netns.rs`: two regions and one device on real namespaces, with the
+      interfaces built by `lvd`'s own `apply`. Proves the property the design exists to have,
+      that one keypair and one address work in every region; that a revoked device stops
+      reaching the route server; and that a route the daemon added it can remove.
+- [x] Added to `scripts/tunnel-e2e.sh`.
+- [x] `lnvps_e2e/src/vpn.rs`: the `/api/v1/vpn/*` and admin VPN endpoints over HTTP, plus
+      `/api/v1/routeserver/dataplane` and its auth.
+
+**It found a real bug, which was the point.** `sync_routes` treated the kernel's *connected*
+route as drift: giving an interface `10.64.0.1/24` makes the kernel write `10.64.0.0/24` into
+the main table, and `lvd` tried to delete it on every apply. The delete fails with `ESRCH`, so
+a dual-stack route server never came up at all. `lnvps_node` never hit it because its addresses
+are `/32` and `/128`, which only produce entries in the *local* table; a route server is
+addressed from the block itself. Fixed, with two unit tests that would have caught it.
+
+Notes:
+
+- A VPN interface asks for **no routes**. Its devices sit inside the block the interface is
+  addressed from, so the connected route already carries them, and `tunnel_route` has no rows
+  for a device. The harness tests the route path anyway, because `sync_routes` is shared with
+  the marketplace case.
+- The harness creates each region's link itself. A namespaced `Kernel` creates a WireGuard
+  interface in the machine's own namespace and moves it in, because a node's outer UDP has to
+  leave by the operator's uplink; `lvd` uses `Kernel::host()`, where there is no move. Faking
+  two machines with two namespaces means creating each link where that machine's would be.
 
 ### Increment 10 — admin API  ✅ DONE
 - [x] `AdminResource::VpnService = 32` and `VpnSubscription = 33`, granted to `super_admin` by
