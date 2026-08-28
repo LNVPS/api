@@ -1,6 +1,6 @@
 services:
   db:
-    image: mariadb:11
+    image: mariadb:11@sha256:2439dcd7d14010ecd1ff7a4e1c5abe8e208c34fe35290744deeeaac3569043c3
     user: root    # mariadb's entrypoint starts as root, then drops to `mysql`
     resources: { cpu: 500m, memory: 512Mi }
     # No ports, no Service, no DNS name — `db:3306` in route96's config would
@@ -21,7 +21,7 @@ services:
       command: ["sh", "-c", "exec mariadb-dump --all-databases -uroot -p\"$MARIADB_ROOT_PASSWORD\""]
       artifact: route96.sql
   route96:
-    image: voidic/route96:latest
+    image: voidic/route96:latest@sha256:90712a96eed391b43bd82280d22ed909899c9b94a5ff162178ca78803d46d4d5
     user: "1000"    # image declares no USER, so it would run as root and be refused
     resources: { cpu: 500m, memory: 512Mi }
     depends_on: [db]

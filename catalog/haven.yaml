@@ -1,6 +1,6 @@
 services:
   haven:
-    image: holgerhatgarkeinenode/haven-docker:v1.2.2
+    image: holgerhatgarkeinenode/haven-docker:v1.2.2@sha256:df1826b7124150510a174d64385a1137ab58610310a67d1c8cff432f16302835
     # The image sets `USER nonroot` (a name), which the kubelet cannot verify
     # under runAsNonRoot. `nonroot` is uid 1000 in this image (Alpine
     # `adduser -D nonroot`), and 1000 also becomes the fsGroup so the db and

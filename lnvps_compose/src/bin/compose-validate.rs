@@ -43,6 +43,11 @@ fn check(source: &str) -> Result<String, String> {
     compose
         .validate_declarations()
         .map_err(|e| format!("validation error: {e}"))?;
+    // Likewise admission-only: a catalog document must pin every image by
+    // digest, so the CI run over `catalog/*.yaml` fails on an unpinned entry.
+    compose
+        .validate_pinned_images()
+        .map_err(|e| format!("validation error: {e}"))?;
     let f = compose
         .footprint()
         .map_err(|e| format!("footprint error: {e}"))?;
@@ -121,7 +126,7 @@ mod tests {
 
     #[test]
     fn check_ok_reports_footprint_and_vars() {
-        let yaml = "services:\n  a:\n    image: x\n    resources: { cpu: 250m, memory: 256Mi }\n    env:\n      URL: \"${host}\"\nconfig:\n  - { name: host, type: string }\n";
+        let yaml = "services:\n  a:\n    image: x@sha256:0000000000000000000000000000000000000000000000000000000000000001\n    resources: { cpu: 250m, memory: 256Mi }\n    env:\n      URL: \"${host}\"\nconfig:\n  - { name: host, type: string }\n";
         let summary = check(yaml).expect("valid");
         assert!(summary.contains("1 service(s)"));
         assert!(summary.contains("cpu=250m"));
@@ -136,5 +141,7 @@ mod tests {
         // Parses but fails validation: ingress on a non-http port.
         let bad = "services:\n  a:\n    image: x\n    ports:\n      - { name: p, container: 5432, protocol: tcp, expose: ingress }\n";
         assert!(check(bad).is_err());
+        // Parses and validates, but the image is not pinned to a digest.
+        assert!(check("services:\n  a:\n    image: x:latest\n").is_err());
     }
 }

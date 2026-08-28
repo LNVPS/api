@@ -1,6 +1,6 @@
 services:
   pyramid:
-    image: ghcr.io/fiatjaf/pyramid:latest
+    image: ghcr.io/fiatjaf/pyramid:latest@sha256:314b5310bad096a61c6bb72789952f84c030c461d546c1d708b7555a6b04fddb
     user: "1000"    # image declares no USER, so it would run as root and be refused
     resources: { cpu: 500m, memory: 512Mi }
     ports:

@@ -107,6 +107,13 @@ fn validate_app_fields(
                     "invalid compose: {e}"
                 )));
             }
+            // Also authoring-time only: every image must be digest-pinned, so
+            // an upstream re-push cannot change what a deployment runs.
+            if let Err(e) = c.validate_pinned_images() {
+                return Err(lnvps_api_common::ApiError::new(format!(
+                    "invalid compose: {e}"
+                )));
+            }
         }
     }
     if currency.trim().is_empty() {
@@ -1044,7 +1051,8 @@ async fn admin_delete_app_cluster(
 mod tests {
     use super::*;
 
-    const VALID_COMPOSE: &str = "services:\n  relay:\n    image: example/relay:latest\n";
+    const VALID_COMPOSE: &str = "services:\n  relay:\n    image: \
+         example/relay:v1@sha256:0000000000000000000000000000000000000000000000000000000000000001\n";
 
     #[test]
     fn test_validate_app_fields() {
@@ -1074,6 +1082,15 @@ mod tests {
                 "USD"
             )
             .is_err()
+        );
+
+        // An image on a bare tag is refused: the publisher could re-push it and
+        // change what every deployment of this app runs.
+        let unpinned = "services:\n  relay:\n    image: example/relay:latest\n";
+        let err = validate_app_fields("relay", "R", unpinned, "USD").unwrap_err();
+        assert!(
+            format!("{err:?}").contains("not pinned to a digest"),
+            "{err:?}"
         );
     }
 
