@@ -309,16 +309,21 @@ mod tests {
     #[tokio::test]
     async fn the_vpn_endpoints_refuse_an_unauthenticated_caller() {
         let user = crate::client::user_client_no_auth();
-        for (method, path) in [
-            ("GET", "/api/v1/vpn"),
-            ("GET", "/api/v1/vpn/devices"),
-            ("GET", "/api/v1/vpn/devices/1/configs"),
+        for path in [
+            "/api/v1/vpn",
+            "/api/v1/vpn/devices",
+            "/api/v1/vpn/devices/1/configs",
         ] {
             let resp = user.get(path).await.unwrap();
-            assert_eq!(
-                resp.status(),
-                StatusCode::UNAUTHORIZED,
-                "{method} {path} should need authentication"
+            // The user API answers a missing NIP-98 header with 403, which is
+            // the convention the rest of it already uses. Both are accepted
+            // here for the same reason `user_api.rs` accepts both: what matters
+            // is that an anonymous caller is refused, not which of the two
+            // codes says so.
+            assert!(
+                resp.status() == StatusCode::FORBIDDEN || resp.status() == StatusCode::UNAUTHORIZED,
+                "GET {path} answered {} to an anonymous caller",
+                resp.status()
             );
         }
         // The catalogue is the exception: what is for sale, and where it exits,
@@ -457,8 +462,10 @@ mod tests {
 
     #[tokio::test]
     async fn admin_vpn_endpoints_need_their_own_permission() {
-        // A user key with no admin role at all.
-        let nobody = user_client_with_keys(Keys::generate());
+        // Against the *admin* API, with a key that has no admin role at all.
+        // Pointing a user client at these paths only proves the user API does
+        // not serve them, which is a different and much weaker statement.
+        let nobody = crate::client::admin_client_with_keys(Keys::generate());
         for path in [
             "/api/admin/v1/vpn_services",
             "/api/admin/v1/vpn_subscriptions",
