@@ -318,8 +318,11 @@ Notes:
       everywhere it was tested and fail on the one machine nobody thought about, and that
       failure surfaces as a revoked device that keeps working. `?generation=N&wait=25` holds
       the request until the generation moves, so a change lands in one round trip over a
-      connection the route server opened. The handler re-reads the generation once a second
-      rather than waiting on a broadcast, because the API runs more than one instance.
+      connection the route server opened. A held request wakes on Redis pub/sub, over the
+      existing `WorkFeedback`, on one channel per interface it terminates. The message is
+      only a hint: the database is re-read regardless, because pub/sub is fire-and-forget
+      and a message published while an instance was reconnecting is simply gone. A 5s
+      re-read bounds that loss, and is the whole mechanism when no Redis is configured.
 - [x] 5 unit tests, including one asserting the serialised document carries no identity.
 - [ ] `POST /api/v1/routeserver/counters`
 

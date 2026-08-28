@@ -187,3 +187,37 @@ async fn the_document_says_nothing_about_who_a_peer_is() -> Result<()> {
     assert_eq!(iface.listen_port, 51820);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_bump_is_announced_where_a_waiting_route_server_is_listening() -> Result<()> {
+    let mock = MockDb::default();
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
+    let rs = a_route_server(&mock, RouterKind::Lvd).await;
+    let pool = a_pool(&db, &service, rs, 51820, true).await?;
+
+    // The two ends compute the channel from the same constructor, which is the
+    // whole reason that constructor exists: a bump announced where nobody is
+    // subscribed is a route server that waits out its deadline for a change
+    // that already happened.
+    let announced = lnvps_api_common::JobFeedback::channel_name(
+        &lnvps_api_common::JobFeedback::tunnel_pool_job_id(pool.id),
+    );
+    assert_eq!(
+        announced,
+        format!("worker:feedback:tunnel_pool:{}", pool.id)
+    );
+
+    let listening = route_server_pools(&db, rs)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|p| {
+            lnvps_api_common::JobFeedback::channel_name(
+                &lnvps_api_common::JobFeedback::tunnel_pool_job_id(p.id),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(listening, vec![announced]);
+    Ok(())
+}

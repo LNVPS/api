@@ -26,9 +26,11 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::{Query, State};
 use axum::routing::get;
+use futures::StreamExt;
+use futures::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
-use lnvps_api_common::{ApiData, ApiError, ApiResult, RouteServerAuth};
+use lnvps_api_common::{ApiData, ApiError, ApiResult, JobFeedback, RouteServerAuth};
 use std::sync::Arc;
 
 use lnvps_db::{LNVpsDb, TunnelPool};
@@ -48,13 +50,17 @@ pub fn router() -> Router<RouterState> {
 /// proxies without being cut off mid-wait.
 const MAX_WAIT_SECS: u64 = 25;
 
-/// How often a held request re-reads the generation.
+/// How often a held request re-reads the generation when nothing has woken it.
 ///
-/// Polling rather than an in-process notification, because the API runs more
-/// than one instance and a broadcast reaches only the one that did the write.
-/// One query per waiting route server per second is nothing next to being wrong
-/// on whichever instance the daemon happened to connect to.
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// A backstop, not the mechanism. Redis pub/sub is fire-and-forget: a message
+/// published while this instance was reconnecting is simply gone, and a route
+/// server that waited on it alone would wait out its whole deadline for a
+/// change that had already happened. Re-reading on a slow timer bounds that at
+/// a few seconds instead.
+///
+/// It is also the whole mechanism when no Redis is configured, which is how the
+/// API runs in development and in tests.
+const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
@@ -127,12 +133,28 @@ async fn v1_dataplane(
     let wait = params.wait.unwrap_or(0).min(MAX_WAIT_SECS);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
+
+    // Subscribed before the first read, not after: a bump landing in between
+    // would be announced to nobody, and this request would then wait out its
+    // whole deadline for a change that had already happened.
+    let mut changes = subscribe_to_changes(&this, router_id).await;
+
     let pools = loop {
         let pools = route_server_pools(&this.db, router_id).await?;
-        if current_generation(&pools) != known || tokio::time::Instant::now() >= deadline {
+        let now = tokio::time::Instant::now();
+        if current_generation(&pools) != known || now >= deadline {
             break pools;
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        // Whichever comes first. The message is only ever a hint that it is
+        // worth looking again -- what it says is never trusted, because the
+        // database is what the route server is actually being told.
+        let backstop = POLL_INTERVAL.min(deadline - now);
+        match changes.as_mut() {
+            Some(stream) => {
+                let _ = tokio::time::timeout(backstop, stream.next()).await;
+            }
+            None => tokio::time::sleep(backstop).await,
+        }
     };
 
     // The document is built once the answer is known to have changed, rather
@@ -147,6 +169,38 @@ async fn v1_dataplane(
         generation: current_generation(&pools),
         interfaces,
     })
+}
+
+/// Listen for any of this route server's interfaces being announced as moved.
+///
+/// One subscription per interface rather than a single channel for the router,
+/// because a pool announces itself and does not know which machine is asking.
+/// The payload is discarded: it says which generation was published, but a
+/// message is not proof and the database is re-read regardless. All it does is
+/// save the wait.
+///
+/// `None` when there is no Redis, or when subscribing fails. Both fall back to
+/// re-reading on the backstop timer, which is slower and still correct -- a
+/// route server that is late is better than one that is refused.
+async fn subscribe_to_changes<'a>(
+    this: &'a RouterState,
+    router_id: u64,
+) -> Option<BoxStream<'a, ()>> {
+    let feedback = this.feedback.as_ref()?;
+    let pools = route_server_pools(&this.db, router_id).await.ok()?;
+
+    let mut streams = Vec::with_capacity(pools.len());
+    for pool in pools {
+        let channel = JobFeedback::channel_name(&JobFeedback::tunnel_pool_job_id(pool.id));
+        match feedback.subscribe(&channel).await {
+            Ok(stream) => streams.push(stream),
+            Err(e) => {
+                log::warn!("Could not subscribe to {channel}, falling back to polling: {e}");
+                return None;
+            }
+        }
+    }
+    Some(futures::stream::select_all(streams).map(|_| ()).boxed())
 }
 
 /// The interfaces a route server terminates.
