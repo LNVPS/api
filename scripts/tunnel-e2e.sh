@@ -6,9 +6,8 @@
 # tunnel, including to a guest sitting behind the node, which is the path a
 # customer's traffic takes.
 #
-# vpn_netns builds two VPN regions and one customer device, and proves the
-# property the VPN design exists to have: one keypair and one inner address that
-# work in every region, so switching region moves nothing on the server side.
+# The VPN harness is not here: it needs a running stack as well as root, so it
+# lives in scripts/vpn-e2e.sh.
 #
 # It needs root (namespaces, veth, WireGuard), so the tests are #[ignore]d and
 # only run from here.
@@ -20,7 +19,7 @@ set -euo pipefail
 
 # Every harness that needs a real kernel. Listed once: a test added here and
 # nowhere else is one nobody ever runs.
-TESTS=(tunnel_netns vpn_netns node_libvirt node_probe)
+TESTS=(tunnel_netns node_libvirt node_probe)
 TEST_ARGS=()
 for t in "${TESTS[@]}"; do TEST_ARGS+=(--test "$t"); done
 

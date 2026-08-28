@@ -6,6 +6,7 @@
 #
 # Options:
 #   --no-build       Skip cargo build step
+#   --setup-only     Bring the stack up and stop, printing how to reach it
 #   --no-cleanup     Leave API servers and DB running after the run
 #   --filter FILTER  Pass a test-name filter to cargo test (e.g. lifecycle)
 #   --ignored        Run only #[ignore]d tests (the model-dependent agent suite)
@@ -32,12 +33,14 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 SKIP_BUILD=0
 SKIP_CLEANUP=0
+SETUP_ONLY=0
 FILTER=""
 RUN_IGNORED=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --no-build)    SKIP_BUILD=1;   shift ;;
+        --setup-only)  SETUP_ONLY=1;   shift ;;
         --no-cleanup)  SKIP_CLEANUP=1; shift ;;
         --filter)      FILTER="$2";    shift 2 ;;
         --ignored)     RUN_IGNORED=1;  shift ;;
@@ -371,6 +374,16 @@ done
 # ---------------------------------------------------------------------------
 # 9. Run E2E tests
 # ---------------------------------------------------------------------------
+if [[ "$SETUP_ONLY" -eq 1 ]]; then
+    # For harnesses that need the stack *and* root, which cargo cannot give
+    # them at once: this leaves everything running for another process to drive.
+    echo "=== Stack ready ==="
+    echo "LNVPS_API_URL=${LNVPS_API_URL:-http://localhost:8000}"
+    echo "LNVPS_ADMIN_API_URL=${LNVPS_ADMIN_API_URL:-http://localhost:8001}"
+    echo "LNVPS_DB_URL=${DB_URL}"
+    exit 0
+fi
+
 echo "=== Running E2E tests ==="
 # --nocapture so a test that skips itself (no data, or a third-party endpoint
 # down) says so in the CI log instead of passing silently.

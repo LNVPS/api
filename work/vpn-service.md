@@ -375,31 +375,47 @@ Notes:
   from the kernel now (`WgPeerState::rx_bytes`/`tx_bytes`); nothing reports them yet.
 
 ### Increment 9 — end-to-end  ✅ DONE
-- [x] `lnvps_e2e/tests/vpn_netns.rs`: two regions and one device on real namespaces, with the
-      interfaces built by `lvd`'s own `apply`. Proves the property the design exists to have,
-      that one keypair and one address work in every region; that a revoked device stops
-      reaching the route server; and that a route the daemon added it can remove.
-- [x] Added to `scripts/tunnel-e2e.sh`.
-- [x] `lnvps_e2e/src/vpn.rs`: the `/api/v1/vpn/*` and admin VPN endpoints over HTTP, plus
-      `/api/v1/routeserver/dataplane` and its auth.
+- [x] `lnvps_e2e/tests/vpn_lvd.rs`: **LNVPS and `lvd` together**, on real namespaces, carrying
+      real packets. Nothing is hand-written: the service and its two interfaces are created
+      through the admin API, the plan is paid over Lightning, the device is registered through
+      the user API with a keypair generated in the test, and two `lvd` processes are started
+      with nothing but an API address and a token. They discover the rest themselves.
+- [x] `scripts/vpn-e2e.sh`, plus `--setup-only` on `run-e2e.sh`. This harness needs a running
+      stack *and* root, which no existing script gave it at once.
+- [x] `lnvps_e2e/src/vpn.rs`: the HTTP surface, run against a live stack (11 tests).
 
-**It found a real bug, which was the point.** `sync_routes` treated the kernel's *connected*
-route as drift: giving an interface `10.64.0.1/24` makes the kernel write `10.64.0.0/24` into
-the main table, and `lvd` tried to delete it on every apply. The delete fails with `ESRCH`, so
-a dual-stack route server never came up at all. `lnvps_node` never hit it because its addresses
-are `/32` and `/128`, which only produce entries in the *local* table; a route server is
-addressed from the block itself. Fixed, with two unit tests that would have caught it.
+**The first attempt was wrong and was thrown away.** `vpn_netns.rs` hand-wrote the document,
+called `apply()` as a function and pinged. That proves "given a correct document, WireGuard
+works", and WireGuard working is not ours to test. Worse, the document being correct was
+*assumed*: the multi-region property it claimed to prove was written into the fixture by hand.
+The seam that actually carries risk is the one it skipped — the document is defined twice, by
+the API that publishes it and the daemon that parses it, with JSON in between and nothing
+forcing them to agree.
+
+What the real harness asserts:
+
+- every region's config carries the **same** device address, checked against what the
+  allocator did rather than against a fixture, and the configs differ only in their endpoint;
+- both `lvd` instances install the customer's key unprompted, having been told only where
+  LNVPS is;
+- the device reaches **both** regions on the one address it holds, by switching peers the way
+  a client switches region;
+- revoking through the admin API removes the key from **every** region within a round trip,
+  and the device then cannot reach the route server;
+- the rendered `wg-quick` file carries the placeholder, because LNVPS never had the key.
+
+It also subsumes the connected-route regression: with that bug, `apply` fails and no peer is
+ever installed, so the harness fails at the first assertion.
 
 Notes:
 
-- A VPN interface asks for **no routes**. Its devices sit inside the block the interface is
-  addressed from, so the connected route already carries them, and `tunnel_route` has no rows
-  for a device. The harness tests the route path anyway, because `sync_routes` is shared with
-  the marketplace case.
-- The harness creates each region's link itself. A namespaced `Kernel` creates a WireGuard
-  interface in the machine's own namespace and moves it in, because a node's outer UDP has to
-  leave by the operator's uplink; `lvd` uses `Kernel::host()`, where there is no move. Faking
-  two machines with two namespaces means creating each link where that machine's would be.
+- The two `lvd` processes are real processes with real config files, started under
+  `ip netns exec`. Nothing dials them, which is what makes this arrangement possible at all.
+- Lost with `vpn_netns.rs`: the only test of `sync_routes` add-and-remove against a real
+  kernel. A VPN interface asks for no routes, so that path is now covered by unit tests
+  against the fake kernel and by the marketplace harness, not on real netlink.
+- `scripts/run-e2e.sh` writes its generated configs to fixed `/tmp` paths, so two runs on one
+  machine overwrite each other's. Not fixed here; it cost an hour to diagnose.
 
 ### Increment 10 — admin API  ✅ DONE
 - [x] `AdminResource::VpnService = 32` and `VpnSubscription = 33`, granted to `super_admin` by
