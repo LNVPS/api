@@ -1900,6 +1900,37 @@ pub trait LNVpsDbBase: Send + Sync {
         Vec<AppDeploymentServiceUsage>,
         Vec<AppDeploymentVolumeUsage>,
     )>;
+    /// A deployment's backups, newest first, excluding deleted ones.
+    async fn list_app_deployment_backups(
+        &self,
+        deployment_id: u64,
+    ) -> DbResult<Vec<AppDeploymentBackup>>;
+    /// One backup by id. Callers check ownership through its deployment.
+    async fn get_app_deployment_backup(&self, id: u64) -> DbResult<AppDeploymentBackup>;
+    /// Record a backup artifact; returns its id. `id` on the input is ignored.
+    async fn insert_app_deployment_backup(&self, backup: &AppDeploymentBackup) -> DbResult<u64>;
+    /// Write back progress: state, object key, size, message and timestamps.
+    /// Everything else on the row is immutable once recorded.
+    async fn update_app_deployment_backup(&self, backup: &AppDeploymentBackup) -> DbResult<()>;
+    /// Backups still owing work (pending or running) across one cluster's
+    /// deployments — the operator's sweep, which is scoped to its own cluster
+    /// because only that operator can create the Jobs.
+    async fn list_active_app_deployment_backups(
+        &self,
+        cluster_id: u64,
+    ) -> DbResult<Vec<AppDeploymentBackup>>;
+    /// When the last *scheduled* run for a deployment started, so the operator
+    /// can tell whether the next one is due. `None` when the schedule has never
+    /// run. Customer-requested runs are excluded on purpose: an on-demand
+    /// backup must not silently cancel the automatic one.
+    async fn last_scheduled_app_deployment_backup(
+        &self,
+        deployment_id: u64,
+    ) -> DbResult<Option<DateTime<Utc>>>;
+    /// Soft-delete a backup (sets `deleted = 1`). The row outlives the object
+    /// so a pruned backup cannot be listed again while its object is still
+    /// being removed.
+    async fn delete_app_deployment_backup(&self, id: u64) -> DbResult<()>;
     /// Soft-delete a deployment (sets `deleted = 1`); the operator tears down
     /// the Kubernetes resources on its next reconcile.
     async fn delete_app_deployment(&self, id: u64) -> DbResult<()>;

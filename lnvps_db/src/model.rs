@@ -3459,6 +3459,22 @@ impl InternetRegistry {
 mod tests {
     use super::*;
 
+    /// The backup enums are rendered into API responses and log lines, and
+    /// their numeric values are the stored column, so both are pinned.
+    #[test]
+    fn test_app_backup_enum_rendering() {
+        assert_eq!(AppBackupMethod::Command.to_string(), "command");
+        assert_eq!(AppBackupMethod::Volume.to_string(), "volume");
+        assert_eq!(AppBackupState::Pending.to_string(), "pending");
+        assert_eq!(AppBackupState::Running.to_string(), "running");
+        assert_eq!(AppBackupState::Completed.to_string(), "completed");
+        assert_eq!(AppBackupState::Failed.to_string(), "failed");
+        assert_eq!(AppBackupMethod::default(), AppBackupMethod::Command);
+        assert_eq!(AppBackupState::default(), AppBackupState::Pending);
+        assert_eq!(AppBackupMethod::Volume as u8, 1);
+        assert_eq!(AppBackupState::Failed as u8, 3);
+    }
+
     /// A subscription's billing state is what the customer API reports and what
     /// the operator gates on, so the three cases have to be exactly the two
     /// columns and nothing else (issue #253).
@@ -4660,6 +4676,91 @@ impl Display for AppDeploymentStatus {
             AppDeploymentStatus::Deleting => write!(f, "deleting"),
         }
     }
+}
+
+/// How an artifact was captured, mirroring the compose `backup:` method.
+#[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum AppBackupMethod {
+    /// App-native logical dump, captured from the command's stdout.
+    #[default]
+    Command = 0,
+    /// Raw tar of a persistent volume.
+    Volume = 1,
+}
+
+impl Display for AppBackupMethod {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppBackupMethod::Command => write!(f, "command"),
+            AppBackupMethod::Volume => write!(f, "volume"),
+        }
+    }
+}
+
+/// Lifecycle of one backup artifact.
+///
+/// `Completed` is the only state in which an object exists to download; a
+/// `Failed` row is kept so the customer can see that a scheduled run did not
+/// produce the backup they are counting on.
+#[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum AppBackupState {
+    /// Recorded, waiting for the operator to create the Job.
+    #[default]
+    Pending = 0,
+    /// The Job exists and is capturing or uploading.
+    Running = 1,
+    /// Uploaded; downloadable.
+    Completed = 2,
+    /// The capture or the upload failed; see `message`.
+    Failed = 3,
+}
+
+impl Display for AppBackupState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppBackupState::Pending => write!(f, "pending"),
+            AppBackupState::Running => write!(f, "running"),
+            AppBackupState::Completed => write!(f, "completed"),
+            AppBackupState::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+/// One captured artifact from one compose service.
+///
+/// A backup *run* covers the whole deployment, but each service that declares
+/// a `backup:` method produces its own artifact from its own Job, so the run is
+/// represented as the set of rows sharing a `run_id` rather than as a row of
+/// its own.
+#[derive(FromRow, Clone, Debug, PartialEq, Eq)]
+pub struct AppDeploymentBackup {
+    pub id: u64,
+    pub deployment_id: u64,
+    /// Groups the artifacts captured by the same run.
+    pub run_id: String,
+    /// Compose service the artifact came from.
+    pub service: String,
+    pub method: AppBackupMethod,
+    /// Download filename.
+    pub artifact: String,
+    /// Object storage key. Server-derived: the customer addresses a backup by
+    /// `id` and never supplies any part of a path.
+    pub object_key: Option<String>,
+    /// Uploaded size, once the object has been observed.
+    pub size_bytes: Option<u64>,
+    pub state: AppBackupState,
+    /// Failure detail, when there is one.
+    pub message: Option<String>,
+    /// Started by the app's schedule rather than by the customer.
+    pub scheduled: bool,
+    pub created: DateTime<Utc>,
+    pub started: Option<DateTime<Utc>>,
+    pub completed: Option<DateTime<Utc>>,
+    pub deleted: bool,
 }
 
 /// One compose service's last observed CPU and memory use.
