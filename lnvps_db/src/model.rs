@@ -2593,6 +2593,23 @@ pub struct RegionStats {
     pub ipv4_assignments: u64,
     /// Active IPv6 assignments (assignments whose `ip_range` is an IPv6 CIDR)
     pub ipv6_assignments: u64,
+    /// IP ranges configured in the region, enabled or not.
+    pub ip_ranges: u64,
+    /// VM templates sold in the region, enabled or not.
+    pub vm_templates: u64,
+    /// App clusters in the region.
+    pub app_clusters: u64,
+    /// Live (non-deleted) app deployments on those clusters.
+    pub app_deployments: u64,
+    /// Tunnel pools terminating in the region.
+    pub tunnel_pools: u64,
+    /// Distinct VPN services sold in the region, i.e. those with a pool here.
+    pub vpn_services: u64,
+    /// Distinct routers serving the region, counted through the tunnel pools
+    /// that terminate here and the access policies its IP ranges use. A router
+    /// has no region of its own, so this is the only thing "routers in a
+    /// region" can mean.
+    pub routers: u64,
 }
 
 #[derive(Clone, Debug, sqlx::Type)]
