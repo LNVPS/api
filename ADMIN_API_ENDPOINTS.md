@@ -1511,6 +1511,32 @@ GET /api/admin/v1/hosts/{id}
 
 Required Permission: `hosts::view`
 
+#### Delete Host
+
+```
+DELETE /api/admin/v1/hosts/{id}
+```
+
+Required Permission: `hosts::delete`
+
+Refused while the host has active VMs: move or delete those first.
+
+A host that never ran a VM is removed outright along with its disk records. A
+host that did keeps its row, flagged `deleted` and forced `enabled: false`,
+because its VMs are billing history that still has to resolve the host it ran
+on. Deleted hosts disappear from `GET /api/admin/v1/hosts`, region host counts
+and region stats, but `GET /api/admin/v1/hosts/{id}` still returns one (with
+`"deleted": true`) so views built from historical VMs keep working.
+
+Response:
+
+```json
+{
+  "success": true,
+  "message": "Host deleted successfully"
+}
+```
+
 #### Update Host Configuration
 
 ```

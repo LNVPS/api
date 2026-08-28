@@ -711,13 +711,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn list_hosts(&self) -> DbResult<Vec<VmHost>> {
-        Ok(sqlx::query_as("select h.* from vm_host h,region hr where h.enabled = 1 and h.region_id = hr.id and hr.enabled = 1")
+        Ok(sqlx::query_as("select h.* from vm_host h,region hr where h.enabled = 1 and h.deleted = 0 and h.region_id = hr.id and hr.enabled = 1")
             .fetch_all(&self.db)
             .await?)
     }
 
     async fn list_hosts_all(&self) -> DbResult<Vec<VmHost>> {
-        Ok(sqlx::query_as("select * from vm_host")
+        Ok(sqlx::query_as("select * from vm_host where deleted = 0")
             .fetch_all(&self.db)
             .await?)
     }
@@ -725,14 +725,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn list_hosts_paginated(&self, limit: u64, offset: u64) -> DbResult<(Vec<VmHost>, u64)> {
         // Get total count
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vm_host h, region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1"
+            "SELECT COUNT(*) FROM vm_host h, region hr WHERE h.enabled = 1 AND h.deleted = 0 AND h.region_id = hr.id AND hr.enabled = 1"
         )
         .fetch_one(&self.db)
         .await?;
 
         // Get paginated results
         let hosts = sqlx::query_as(
-            "SELECT h.* FROM vm_host h, region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1 ORDER BY h.name LIMIT ? OFFSET ?"
+            "SELECT h.* FROM vm_host h, region hr WHERE h.enabled = 1 AND h.deleted = 0 AND h.region_id = hr.id AND hr.enabled = 1 ORDER BY h.name LIMIT ? OFFSET ?"
         )
         .bind(limit)
         .bind(offset)
@@ -749,7 +749,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     ) -> DbResult<(Vec<(VmHost, Region)>, u64)> {
         // Get total count
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vm_host h, region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1"
+            "SELECT COUNT(*) FROM vm_host h, region hr WHERE h.enabled = 1 AND h.deleted = 0 AND h.region_id = hr.id AND hr.enabled = 1"
         )
         .fetch_one(&self.db)
         .await?;
@@ -758,7 +758,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         let rows = sqlx::query(
             "SELECT h.*, hr.id as region_id, hr.name as region_name, hr.enabled as region_enabled, hr.company_id as region_company_id, hr.country_code as region_country_code 
              FROM vm_host h, region hr 
-             WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1 
+             WHERE h.enabled = 1 AND h.deleted = 0 AND h.region_id = hr.id AND hr.enabled = 1 
              ORDER BY h.name LIMIT ? OFFSET ?"
         )
         .bind(limit)
@@ -790,6 +790,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 ssh_key: row.get("ssh_key"),
                 sunset_date: row.get("sunset_date"),
                 marketplace_node_id: row.get("marketplace_node_id"),
+                deleted: row.get("deleted"),
             };
 
             let region = Region {
@@ -4911,12 +4912,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn get_marketplace_node_host(&self, node_id: u64) -> DbResult<Option<VmHost>> {
-        Ok(
-            sqlx::query_as::<_, VmHost>("SELECT * FROM vm_host WHERE marketplace_node_id = ?")
-                .bind(node_id)
-                .fetch_optional(&self.db)
-                .await?,
+        Ok(sqlx::query_as::<_, VmHost>(
+            "SELECT * FROM vm_host WHERE marketplace_node_id = ? AND deleted = 0",
         )
+        .bind(node_id)
+        .fetch_optional(&self.db)
+        .await?)
     }
 
     async fn get_marketplace_node_by_tunnel(
@@ -7195,7 +7196,7 @@ impl AdminDb for LNVpsDbMysql {
     async fn admin_delete_region(&self, region_id: u64) -> DbResult<()> {
         // First check if any hosts are assigned to this region
         let host_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM vm_host WHERE region_id = ?")
+            sqlx::query_scalar("SELECT COUNT(*) FROM vm_host WHERE region_id = ? AND deleted = 0")
                 .bind(region_id)
                 .fetch_one(&self.db)
                 .await?;
@@ -7218,12 +7219,73 @@ impl AdminDb for LNVpsDbMysql {
     }
 
     async fn admin_count_region_hosts(&self, region_id: u64) -> DbResult<u64> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vm_host WHERE region_id = ?")
-            .bind(region_id)
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vm_host WHERE region_id = ? AND deleted = 0")
+                .bind(region_id)
+                .fetch_one(&self.db)
+                .await?;
+
+        Ok(count as u64)
+    }
+
+    /// Delete a host: removed outright when no VM ever ran on it, otherwise
+    /// flagged `deleted` so historical VMs keep resolving their host.
+    async fn admin_delete_host(&self, host_id: u64) -> DbResult<()> {
+        // The host must exist, so deleting an unknown id is an error rather
+        // than a silent no-op.
+        let host = self.get_host(host_id).await?;
+        if host.deleted {
+            return Err(DbError::Source(
+                anyhow!("Host is already deleted").into_boxed_dyn_error(),
+            ));
+        }
+
+        let active_vms: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vm WHERE host_id = ? AND deleted = false")
+                .bind(host_id)
+                .fetch_one(&self.db)
+                .await?;
+
+        if active_vms > 0 {
+            return Err(DbError::Source(
+                anyhow!("Cannot delete host with {} active VMs", active_vms).into_boxed_dyn_error(),
+            ));
+        }
+
+        // Soft-deleted VMs still hold foreign keys into vm_host and
+        // vm_host_disk, and those rows are billing history that must be kept,
+        // so a host that ever ran a VM can only be flagged as deleted. A host
+        // with no history at all (added by mistake, or never used) is removed
+        // outright so the table does not accumulate junk.
+        let historic_vms: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vm WHERE host_id = ?")
+            .bind(host_id)
             .fetch_one(&self.db)
             .await?;
 
-        Ok(count as u64)
+        if historic_vms > 0 {
+            sqlx::query("UPDATE vm_host SET deleted = 1, enabled = 0 WHERE id = ?")
+                .bind(host_id)
+                .execute(&self.db)
+                .await?;
+
+            return Ok(());
+        }
+
+        let mut tx = self.db.begin().await?;
+
+        sqlx::query("DELETE FROM vm_host_disk WHERE host_id = ?")
+            .bind(host_id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM vm_host WHERE id = ?")
+            .bind(host_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(())
     }
 
     async fn admin_get_region_stats(&self, region_id: u64) -> DbResult<RegionStats> {
@@ -7237,12 +7299,12 @@ impl AdminDb for LNVpsDbMysql {
         let row: (i64, i64, Option<u64>, Option<u64>, i64, i64, i64) = sqlx::query_as(
             r#"
             SELECT
-                (SELECT COUNT(*) FROM vm_host WHERE region_id = ?) as host_count,
+                (SELECT COUNT(*) FROM vm_host WHERE region_id = ? AND deleted = 0) as host_count,
                 (SELECT COUNT(*) FROM vm v
                     JOIN vm_host h ON v.host_id = h.id
                     WHERE h.region_id = ? AND v.deleted = 0) as total_vms,
-                CAST((SELECT COALESCE(SUM(cpu), 0) FROM vm_host WHERE region_id = ?) AS UNSIGNED) as total_cpu_cores,
-                CAST((SELECT COALESCE(SUM(memory), 0) FROM vm_host WHERE region_id = ?) AS UNSIGNED) as total_memory_bytes,
+                CAST((SELECT COALESCE(SUM(cpu), 0) FROM vm_host WHERE region_id = ? AND deleted = 0) AS UNSIGNED) as total_cpu_cores,
+                CAST((SELECT COALESCE(SUM(memory), 0) FROM vm_host WHERE region_id = ? AND deleted = 0) AS UNSIGNED) as total_memory_bytes,
                 (SELECT COUNT(*) FROM vm_ip_assignment ip
                     JOIN vm v ON ip.vm_id = v.id
                     JOIN vm_host h ON v.host_id = h.id
@@ -7498,7 +7560,7 @@ impl AdminDb for LNVpsDbMysql {
     ) -> DbResult<(Vec<AdminVmHost>, u64)> {
         // Get total count (including disabled hosts)
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vm_host h JOIN region hr ON h.region_id = hr.id",
+            "SELECT COUNT(*) FROM vm_host h JOIN region hr ON h.region_id = hr.id WHERE h.deleted = 0",
         )
         .fetch_one(&self.db)
         .await?;
@@ -7520,6 +7582,7 @@ impl AdminDb for LNVpsDbMysql {
                  WHERE deleted = 0 
                  GROUP BY host_id
              ) vm_counts ON h.id = vm_counts.host_id
+             WHERE h.deleted = 0
              ORDER BY h.name 
              LIMIT ? OFFSET ?",
         )

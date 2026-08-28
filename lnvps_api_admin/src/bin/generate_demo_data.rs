@@ -393,6 +393,7 @@ async fn create_hosts(db: &LNVpsDbMysql, regions: &[Region]) -> Result<Vec<VmHos
             ssh_key: None,
             sunset_date: None,
             marketplace_node_id: None,
+            deleted: false,
         };
 
         let id = db.create_host(&host).await?;
