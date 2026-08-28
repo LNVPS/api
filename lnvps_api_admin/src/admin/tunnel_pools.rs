@@ -307,6 +307,8 @@ pub(crate) async fn create_tunnel_pool(
 
     let id = db
         .insert_tunnel_pool(&TunnelPool {
+            // Set by the database, and never by a caller.
+            generation: 0,
             id: 0,
             router_id: req.router_id,
             region_id: req.region_id,

@@ -438,6 +438,14 @@ pub async fn get_router(db: &Arc<dyn LNVpsDb>, router_id: u64) -> OpResult<Arc<d
         RouterKind::LinuxSsh => Err(lnvps_api_common::retry::OpError::Fatal(anyhow::anyhow!(
             "LinuxSsh router support is not enabled in this build"
         ))),
+        // Never dialled: an `lvd` route server is often behind a NAT nothing
+        // here can traverse, which is the whole reason it asks rather than
+        // being told. Its desired state is published at
+        // `/api/v1/routeserver/dataplane` and it applies that itself.
+        RouterKind::Lvd => Err(lnvps_api_common::retry::OpError::Fatal(anyhow::anyhow!(
+            "Router {} runs lvd and configures itself, so LNVPS does not connect to it",
+            cfg.name
+        ))),
         RouterKind::MockRouter => {
             #[cfg(test)]
             return Ok(Arc::new(crate::mocks::MockRouter::new()));

@@ -5226,6 +5226,23 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(res.try_get(0)?)
     }
 
+    async fn bump_tunnel_pool_generation(&self, id: u64) -> DbResult<u64> {
+        // Incremented in the database rather than read, added and written back,
+        // so two changes landing together cannot settle on the same number and
+        // leave a route server believing it is current.
+        sqlx::query("UPDATE tunnel_pool SET generation = generation + 1 WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(
+            sqlx::query_as::<_, (u64,)>("SELECT generation FROM tunnel_pool WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?
+                .0,
+        )
+    }
+
     async fn update_tunnel_pool(&self, pool: &TunnelPool) -> DbResult<()> {
         // The same invariant from the other side: a pool already terminating a
         // service cannot have its block edited away from its siblings'.

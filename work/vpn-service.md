@@ -301,22 +301,46 @@ Notes:
   failing immediately after a successful insert.
 
 ### Increment 5 — agent router backend
-- [ ] `RouterKind::LnvpsAgent` + `router/agent.rs` implementing the read half of `TunnelRouter`
+- [ ] `RouterKind::Lvd` + `router/agent.rs` implementing the read half of `TunnelRouter`
 - [ ] Split `reconcile_tunnel_peers` into drift detection and push; gate push on backend
 - [ ] Digest-based drift comparison; summarised peer view
 - [ ] Unit tests
 
 ### Increment 6 — route-server-facing API
-- [ ] `/api/v1/routeserver/dataplane` (versioned/ETagged) and `/counters`, per-router token auth
-- [ ] Generation counter on `tunnel_pool`; poke-on-change
-- [ ] Unit tests
+- [x] `RouterKind::Lvd = 3`: the one kind LNVPS never dials.
+- [x] `GET /api/v1/routeserver/dataplane`, authenticated by a static `<router_id>.<secret>`
+      bearer compared against `router.token`. No JWT: unlike a marketplace node there is
+      nothing to mint, since a route server is provisioned by hand.
+- [x] `tunnel_pool.generation`, bumped in `sync_pool`/`reconcile_peers` where a pushed pool
+      would have been pushed, so there is one list of things that change an interface.
+- [x] **Long-poll instead of poke-on-change.** An `lvd` instance runs wherever its region is,
+      which means behind a NAT nothing here can traverse; dialling out to it would work
+      everywhere it was tested and fail on the one machine nobody thought about, and that
+      failure surfaces as a revoked device that keeps working. `?generation=N&wait=25` holds
+      the request until the generation moves, so a change lands in one round trip over a
+      connection the route server opened. A held request wakes on Redis pub/sub, over the
+      existing `WorkFeedback`, on one channel per interface it terminates. The message is
+      only a hint: the database is re-read regardless, because pub/sub is fire-and-forget
+      and a message published while an instance was reconnecting is simply gone. A 5s
+      re-read bounds that loss, and is the whole mechanism when no Redis is configured.
+- [x] 5 unit tests, including one asserting the serialised document carries no identity.
+- [ ] `POST /api/v1/routeserver/counters`
 
-### Increment 7 — extract the netlink layer
-- [ ] Lift `lnvps_node/src/net.rs` (`NetOps` trait and impl) into a shared crate
-- [ ] Repoint `lnvps_node` at it, no behaviour change
+### Increment 7 — extract the netlink layer  ✅ DONE
+- [x] `lnvps_netlink`: `NetOps`, `WgSettings`/`WgObserved`, the netlink `Kernel`,
+      `UnavailableKernel`, `netns` and the `/proc/sys` helpers
+- [x] `lnvps_node` repointed, re-exporting from `net::` and `lnvps_node::netns` so no call
+      site moved and the e2e harness is untouched. No behaviour change.
+
+Notes:
+
+- `Kernel` is still namespace-bound, which is right for a node and wrong for a route server.
+  A host-namespace constructor is additive and belongs with the daemon that needs it.
+- The desired-document types, `apply`, `observe` and `DataPlaneState` stayed behind: bridges,
+  guests and libvirt are a marketplace node's vocabulary, not a data plane's.
 
 ### Increment 8 — `lnvps_vpn` daemon
-- [ ] New crate: pull loop, batch peer apply (`wg syncconf` equivalent over netlink),
+- [ ] New crate `lnvps_vpn`, binary `lvd`: pull loop, batch peer apply (`wg syncconf` equivalent over netlink),
       600s endpoint scrub, inbound control listener for immediate re-pull
 - [ ] Config, packaging, `config.example.yaml`
 - [ ] Unit tests

@@ -109,6 +109,9 @@ pub enum AdminRouterKind {
     Mikrotik,
     OvhAdditionalIp,
     LinuxSsh,
+    /// A route server running `lvd`, the LNVPS VPN daemon, which asks LNVPS
+    /// what to be rather than being told. Serialised as `lvd`.
+    Lvd,
 }
 
 impl From<RouterKind> for AdminRouterKind {
@@ -117,6 +120,7 @@ impl From<RouterKind> for AdminRouterKind {
             RouterKind::Mikrotik => AdminRouterKind::Mikrotik,
             RouterKind::OvhAdditionalIp => AdminRouterKind::OvhAdditionalIp,
             RouterKind::LinuxSsh => AdminRouterKind::LinuxSsh,
+            RouterKind::Lvd => AdminRouterKind::Lvd,
             // MockRouter is a test-only variant and should never appear in production.
             // Map it to Mikrotik as a safe fallback rather than panicking.
             RouterKind::MockRouter => AdminRouterKind::Mikrotik,
@@ -130,6 +134,7 @@ impl From<AdminRouterKind> for RouterKind {
             AdminRouterKind::Mikrotik => RouterKind::Mikrotik,
             AdminRouterKind::OvhAdditionalIp => RouterKind::OvhAdditionalIp,
             AdminRouterKind::LinuxSsh => RouterKind::LinuxSsh,
+            AdminRouterKind::Lvd => RouterKind::Lvd,
         }
     }
 }

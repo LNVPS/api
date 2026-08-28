@@ -8,6 +8,8 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use async_trait::async_trait;
+
 use super::*;
 
 /// A machine with a working nftables, already carrying the ruleset for the

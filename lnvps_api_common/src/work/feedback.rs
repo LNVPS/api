@@ -68,6 +68,20 @@ impl JobFeedback {
         "worker:feedback".to_string()
     }
 
+    /// The job id under which a tunnel pool's desired state is announced.
+    ///
+    /// A subject rather than one invocation, unlike every other job id here.
+    /// The listeners are route servers waiting to be told their configuration
+    /// moved, and they know which pool they are running, not which sync run
+    /// moved it -- a per-invocation id would be a channel nobody could
+    /// subscribe to before the thing they are waiting for had already happened.
+    ///
+    /// Its own constructor so that the side announcing and the side waiting
+    /// cannot format it differently.
+    pub fn tunnel_pool_job_id(pool_id: u64) -> String {
+        format!("tunnel_pool:{pool_id}")
+    }
+
     /// Create a job feedback with started status
     pub fn create_job_started_feedback(job_id: String, job_type: String) -> Self {
         Self::new(job_id, job_type, JobFeedbackStatus::Started)

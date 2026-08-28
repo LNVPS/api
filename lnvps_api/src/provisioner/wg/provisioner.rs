@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use lnvps_api_common::{JobFeedback, WorkFeedback};
 use lnvps_db::LNVpsDb;
 use log::{info, warn};
 
@@ -84,11 +85,53 @@ impl std::fmt::Display for TunnelPeerDrift {
 /// there.
 pub struct TunnelProvisioner {
     db: Arc<dyn LNVpsDb>,
+    /// Where generation bumps are announced, when there is anywhere to announce
+    /// them. See [`TunnelProvisioner::with_feedback`].
+    feedback: Option<Arc<dyn WorkFeedback>>,
 }
 
 impl TunnelProvisioner {
     pub fn new(db: Arc<dyn LNVpsDb>) -> Self {
-        Self { db }
+        Self { db, feedback: None }
+    }
+
+    /// Announce generation bumps, so a route server holding a request open is
+    /// told at once instead of on its next re-read.
+    ///
+    /// Optional because most callers only plan: a bump happens where a pushed
+    /// pool would have been pushed, which is the worker. A provisioner without
+    /// one still bumps -- the database is what a route server reads -- it just
+    /// does not say so out loud, and the waiter falls back to re-reading.
+    pub fn with_feedback(mut self, feedback: Arc<dyn WorkFeedback>) -> Self {
+        self.feedback = Some(feedback);
+        self
+    }
+
+    /// Record that this interface's desired state moved, and say so.
+    ///
+    /// The database is written first and announced second, in that order: a
+    /// route server woken by the message immediately re-reads, and being woken
+    /// before the new state is readable would send it back to sleep on the old
+    /// generation. A message that never arrives costs one wait cycle, because
+    /// the waiter has a deadline; a message that arrives early would cost the
+    /// full round trip it exists to save.
+    async fn publish_generation(&self, pool_id: u64) -> Result<u64> {
+        let generation = self.db.bump_tunnel_pool_generation(pool_id).await?;
+        if let Some(feedback) = &self.feedback
+            && let Err(e) = feedback
+                .publish(JobFeedback::create_job_completed_feedback(
+                    JobFeedback::tunnel_pool_job_id(pool_id),
+                    "SyncTunnelPool".to_string(),
+                    Some(generation.to_string()),
+                ))
+                .await
+        {
+            // Not an error: the generation is in the database, which is what a
+            // route server actually reads. Losing the announcement delays it by
+            // one wait cycle rather than losing the change.
+            log::warn!("Could not announce tunnel pool {pool_id} generation {generation}: {e}");
+        }
+        Ok(generation)
     }
 
     /// Enable/disable a tunnel on a router and refresh its cached state.
@@ -132,8 +175,32 @@ impl TunnelProvisioner {
     /// interface should be. Without it a pool could only describe an interface
     /// somebody configured by hand, and bringing up a new route server would be
     /// a manual job with a database row bolted on afterwards.
+    /// Whether this route server fetches its own configuration instead of being
+    /// given it.
+    ///
+    /// The one fork between the two backends, and it is here rather than in the
+    /// `TunnelRouter` trait because what differs is not *how* to push but
+    /// whether to push at all. An `lvd` route server is often behind a NAT
+    /// nothing here can traverse, so the desired state is published and the
+    /// machine comes and gets it; recording that it moved is the whole of what
+    /// LNVPS does.
+    async fn publishes_own_state(&self, router_id: u64) -> Result<bool> {
+        Ok(matches!(
+            self.db.get_router(router_id).await?.kind,
+            lnvps_db::RouterKind::Lvd
+        ))
+    }
+
     pub async fn sync_pool(&self, pool_id: u64) -> Result<()> {
         let pool = self.db.get_tunnel_pool(pool_id).await?;
+        if self.publishes_own_state(pool.router_id).await? {
+            let generation = self.publish_generation(pool_id).await?;
+            log::info!(
+                "Tunnel pool {pool_id} is on a self-configuring route server; \
+                 published generation {generation}"
+            );
+            return Ok(());
+        }
         let router = crate::router::get_router(&self.db, pool.router_id)
             .await
             .map_err(|e| anyhow!("failed to load router {}: {}", pool.router_id, e))?;
@@ -260,6 +327,18 @@ impl TunnelProvisioner {
     /// whether anything was wrong rather than only that it ran.
     pub async fn reconcile_peers(&self, pool_id: u64) -> Result<TunnelPeerDrift> {
         let pool = self.db.get_tunnel_pool(pool_id).await?;
+        // Nothing to compare against yet: reading back what an `lvd` route
+        // server actually applied is its own piece of work. Until then this
+        // records that the peer set moved, which is what makes the machine
+        // fetch it.
+        if self.publishes_own_state(pool.router_id).await? {
+            let generation = self.publish_generation(pool_id).await?;
+            log::info!(
+                "Tunnel pool {pool_id} is on a self-configuring route server; \
+                 published generation {generation}"
+            );
+            return Ok(TunnelPeerDrift::default());
+        }
         let router = crate::router::get_router(&self.db, pool.router_id)
             .await
             .map_err(|e| anyhow!("failed to load router {}: {}", pool.router_id, e))?;

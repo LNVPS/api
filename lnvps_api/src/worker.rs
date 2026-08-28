@@ -543,6 +543,7 @@ impl Worker {
     /// the worker from carrying a service it uses in four places.
     fn tunnels(&self) -> crate::provisioner::wg::TunnelProvisioner {
         crate::provisioner::wg::TunnelProvisioner::new(self.db.clone())
+            .with_feedback(self.feedback.clone())
     }
 
     /// Grace period (in days) for a subscription, tiered by subscription age.

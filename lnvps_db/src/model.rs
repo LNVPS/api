@@ -994,6 +994,17 @@ pub enum RouterKind {
     OvhAdditionalIp = 1,
     /// A Linux machine managed over SSH (BIRD/Pathvector routing, iproute2 tunnels)
     LinuxSsh = 2,
+    /// A machine running `lvd`, the LNVPS VPN daemon, which configures itself.
+    ///
+    /// The only kind LNVPS never dials: a VPN route server lives wherever its
+    /// region is, which is often behind a NAT nothing here can traverse. It
+    /// asks what it should be and applies the answer, authenticating with
+    /// [`Router::token`] -- the same secret that column already means, sent the
+    /// other way.
+    ///
+    /// So the peer mutators on `TunnelRouter` are unavailable for this kind,
+    /// and the desired state is published rather than pushed.
+    Lvd = 3,
     /// Mock router access in tests
     MockRouter = u16::MAX,
 }
@@ -2125,6 +2136,14 @@ pub struct TunnelPool {
     /// Whether new allocations may be made from this pool. Disabling stops new
     /// placements without touching what is already carved out of it.
     pub enabled: bool,
+    /// How many times this interface's desired state has changed.
+    ///
+    /// Only meaningful for a pool on a [`RouterKind::Lvd`] router, which
+    /// asks for its configuration rather than being given it: the route server
+    /// sends the generation it last applied and is answered `304` when nothing
+    /// has moved. Bumped where a pushed pool would have been pushed, so there
+    /// is one list of things that change an interface rather than two.
+    pub generation: u64,
     /// When this pool was created
     pub created: DateTime<Utc>,
 }

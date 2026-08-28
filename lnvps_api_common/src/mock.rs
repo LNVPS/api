@@ -4854,6 +4854,15 @@ impl LNVpsDbBase for MockDb {
         Ok(id)
     }
 
+    async fn bump_tunnel_pool_generation(&self, id: u64) -> DbResult<u64> {
+        let mut pools = self.tunnel_pools.lock().await;
+        let pool = pools
+            .get_mut(&id)
+            .ok_or_else(|| DbError::Other(anyhow!("Tunnel pool {} not found", id)))?;
+        pool.generation += 1;
+        Ok(pool.generation)
+    }
+
     async fn update_tunnel_pool(&self, pool: &TunnelPool) -> DbResult<()> {
         if pool.cidr4.is_none() && pool.cidr6.is_none() {
             return Err(anyhow!(
