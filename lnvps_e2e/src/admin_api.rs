@@ -756,7 +756,7 @@ mod tests {
             "description": "test relay app",
             "repo_url": "https://github.com/example/relay",
             "category": "Nostr relay",
-            "compose": "services:\n  relay:\n    image: example/relay:latest\n    ports:\n      - { name: ws, container: 7777, protocol: http, expose: ingress }\n",
+            "compose": "services:\n  relay:\n    image: example/relay:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    ports:\n      - { name: ws, container: 7777, protocol: http, expose: ingress }\n",
             "amount": 1000,
             "currency": "usd",
             "interval_amount": 1,
@@ -791,6 +791,38 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(resp.status(), StatusCode::OK, "duplicate app name rejected");
+
+        // An image on a bare tag is rejected: the tag is a mutable pointer, so
+        // admitting one lets the publisher change what every deployment runs.
+        let unpinned = serde_json::json!({
+            "name": "e2e-relay-unpinned",
+            "display_name": "E2E Relay Unpinned",
+            "description": "test relay app",
+            "repo_url": "https://github.com/example/relay",
+            "category": "Nostr relay",
+            "compose": "services:\n  relay:\n    image: example/relay:latest\n    ports:\n      - { name: ws, container: 7777, protocol: http, expose: ingress }\n",
+            "amount": 1000,
+            "currency": "usd",
+            "interval_amount": 1,
+            "interval_type": "month",
+            "setup_amount": 0
+        });
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &unpinned)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "unpinned image rejected"
+        );
+        assert!(
+            resp.text()
+                .await
+                .unwrap()
+                .contains("is not pinned to a digest"),
+            "the error names the reason"
+        );
 
         // Invalid slug rejected.
         // `category` is present so the request reaches slug validation: making
@@ -936,11 +968,11 @@ mod tests {
 
         let compose = |name: &str, cmd: &str| {
             format!(
-                "services:\n  s3:\n    image: rustfs/rustfs:latest\n    ports:\n      \
+                "services:\n  s3:\n    image: rustfs/rustfs:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    ports:\n      \
                  - {{ name: s3, container: 9000, protocol: http, expose: none }}\n  \
-                 app:\n    image: example/app:latest\n    depends_on: [s3]\n    ports:\n      \
+                 app:\n    image: example/app:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    depends_on: [s3]\n    ports:\n      \
                  - {{ name: http, container: 3000, protocol: http, expose: ingress }}\n    \
-                 init:\n      - name: {name}\n        image: minio/mc:latest\n        \
+                 init:\n      - name: {name}\n        image: minio/mc:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n        \
                  env:\n          MC_HOST_s3: http://k:${{S3_KEY}}@s3:9000\n        \
                  command: [\"sh\", \"-c\", \"{cmd}\"]\n\
                  secrets:\n  - {{ name: S3_KEY, generate: token }}\n"
@@ -1029,10 +1061,10 @@ mod tests {
 
         let compose = |scratch: &str| {
             format!(
-                "services:\n  db:\n    image: mariadb:11\n    user: \"999\"\n    \
+                "services:\n  db:\n    image: mariadb:11@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    user: \"999\"\n    \
                  volumes:\n      - {{ name: data, path: /var/lib/mysql, size: 5Gi }}\n    \
                  scratch:\n{scratch}  \
-                 app:\n    image: example/app:latest\n    user: \"1000\"\n    \
+                 app:\n    image: example/app:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    user: \"1000\"\n    \
                  depends_on: [db]\n    ports:\n      \
                  - {{ name: http, container: 3000, protocol: http, expose: ingress }}\n"
             )
@@ -1121,7 +1153,7 @@ mod tests {
 
         let compose = |config: &str| {
             format!(
-                "services:\n  web:\n    image: example/web:latest\n    user: \"1000\"\n    \
+                "services:\n  web:\n    image: example/web:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    user: \"1000\"\n    \
                  ports:\n      - {{ name: http, container: 80, protocol: http, expose: ingress }}\n    \
                  env:\n      V: ${{v}}\n\
                  config:\n  - {config}\n"
@@ -1209,8 +1241,8 @@ mod tests {
 
         let compose = |db_ports: &str| {
             format!(
-                "services:\n  db:\n    image: postgres:17-alpine\n    user: root\n{db_ports}  \
-                 relay:\n    image: example/relay:latest\n    user: \"1000\"\n    \
+                "services:\n  db:\n    image: postgres:17-alpine@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    user: root\n{db_ports}  \
+                 relay:\n    image: example/relay:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    user: \"1000\"\n    \
                  ports:\n      - {{ name: http, container: 3000, protocol: http, expose: ingress }}\n    \
                  env:\n      DATABASE_URL: \"postgres://buzz:pw@db:5432/buzz\"\n"
             )
@@ -1278,7 +1310,7 @@ mod tests {
 
         let compose = |user: &str| {
             format!(
-                "services:\n  web:\n    image: example/web:latest\n{user}    \
+                "services:\n  web:\n    image: example/web:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n{user}    \
                  ports:\n      - {{ name: http, container: 80, protocol: http, expose: ingress }}\n    \
                  volumes:\n      - {{ name: data, path: /data, size: 1Gi }}\n"
             )
@@ -1342,7 +1374,7 @@ mod tests {
 
         let compose = |vol: &str| {
             format!(
-                "services:\n  db:\n    image: example/db:latest\n    user: \"1000\"\n    \
+                "services:\n  db:\n    image: example/db:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    user: \"1000\"\n    \
                  volumes:\n      - {vol}\n"
             )
         };
@@ -1384,7 +1416,7 @@ mod tests {
             .patch_auth(
                 &path,
                 &serde_json::json!({
-                    "compose": "services:\n  db:\n    image: example/db:latest\n"
+                    "compose": "services:\n  db:\n    image: example/db:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n"
                 }),
             )
             .await
@@ -1429,7 +1461,7 @@ mod tests {
 
         let compose = |bytes: &str| {
             format!(
-                "services:\n  relay:\n    image: example/relay:latest\n    env:\n      \
+                "services:\n  relay:\n    image: example/relay:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    env:\n      \
                  KEY: ${{RELAY_KEY}}\nsecrets:\n  - {{ name: RELAY_KEY, generate: token{bytes} }}\n"
             )
         };
@@ -1514,7 +1546,7 @@ mod tests {
             let mut v = serde_json::json!({
                 "name": slug,
                 "display_name": "SEO Relay",
-                "compose": "services:\n  relay:\n    image: example/relay:latest\n",
+                "compose": "services:\n  relay:\n    image: example/relay:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n",
                 "amount": 1000,
                 "currency": "usd",
                 "interval_amount": 1,
@@ -1809,7 +1841,7 @@ mod tests {
                 "name": format!("e2e-tags-{suffix}"),
                 "display_name": "E2E Tagged",
                 "category": "Nostr relay",
-                "compose": "services:\n  relay:\n    image: example/relay:latest\n",
+                "compose": "services:\n  relay:\n    image: example/relay:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n",
                 "amount": 1000,
                 "currency": "usd",
                 "interval_amount": 1,

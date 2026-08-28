@@ -405,7 +405,7 @@ mod tests {
             "name": "e2e-rbac-seo",
             "display_name": "RBAC SEO",
             "category": "Nostr relay",
-            "compose": "services:\n  relay:\n    image: example/relay:latest\n",
+            "compose": "services:\n  relay:\n    image: example/relay:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n",
             "amount": 1000,
             "currency": "usd",
             "interval_amount": 1,

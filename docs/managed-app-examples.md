@@ -267,6 +267,41 @@ when the tag moves.** Nothing in validation can catch this: the compose is
 well-formed, and the operator only learns the image's `USER` when the kubelet
 refuses the pod.
 
+**Every image must be pinned to a digest** (`repo:tag@sha256:...`), services and
+`init:` steps alike, and app create/update refuses one that is not. A tag is a
+mutable pointer: the publisher can re-push it and change the code running in
+every deployment, with nobody here having approved anything. Kubernetes makes
+that likelier rather than less likely, because `imagePullPolicy` defaults to
+`Always` for a `:latest` tag, so new bytes land on the next pod creation. The
+operator now sets `IfNotPresent` explicitly, and a digest means a cached layer
+set can only be the right one.
+
+Keep the tag in front of the digest. The tag is what a human reads in a diff;
+the digest is what the runtime honours.
+
+```bash
+# Resolve the tag to the digest to pin. Use the index digest (not a
+# per-platform manifest digest) so the pin still works on every architecture.
+docker buildx imagetools inspect voidic/route96:latest --format '{{.Manifest.Digest}}'
+```
+
+```yaml
+image: voidic/route96:latest@sha256:90712a96eed391b43bd82280d22ed909899c9b94a5ff162178ca78803d46d4d5
+```
+
+This buys immutability, not trust. An image that is hostile the day you pin it
+is pinned hostile, and a pinned base stops receiving CVE fixes until somebody
+bumps it. That is the trade being made deliberately: the bump becomes a
+reviewable change instead of a silent rollout. `scripts/catalog-digest-drift.sh`
+resolves every pinned tag and reports the ones that have moved, and the weekly
+`app-catalog.yml` run does the same, so an upstream release arrives as something
+to review, test and re-pin.
+
+A pin also cannot help with an image that fetches its own code at runtime. If
+the entrypoint clones a repository or installs dependencies on boot, the digest
+fixes the wrapper and nothing that matters. Such an image needs its application
+baked in at build time before it belongs in the catalog.
+
 ### Checking an image, and proving the choice works
 
 ```bash

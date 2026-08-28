@@ -65,6 +65,23 @@ jobs:
           path: target/release/compose-to-docker
           retention-days: 1
 
+  # Catalog images are pinned by digest, so an upstream re-push no longer
+  # reaches a deployment on its own. That also makes a new upstream release
+  # invisible, so resolve every tag and report the ones that have moved.
+  #
+  # Not run on pull_request: drift is a property of the registry on the day, not
+  # of the change under review, and a red check nobody can fix in their branch is
+  # a check people learn to ignore.
+  digests:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check pinned digests against current tags
+        run: ./scripts/catalog-digest-drift.sh
+
   app:
     needs: build
     runs-on: ubuntu-latest

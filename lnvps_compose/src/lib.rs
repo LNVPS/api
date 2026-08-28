@@ -804,6 +804,43 @@ impl Compose {
             .collect()
     }
 
+    /// Every image must be pinned to a content digest (`@sha256:...`).
+    ///
+    /// **An authoring rule, checked at admission only**, for the same reason as
+    /// [`Self::validate_declarations`]: the operator re-parses the stored
+    /// compose on every reconcile, and an app admitted before this rule existed
+    /// must keep reconciling rather than go offline.
+    ///
+    /// A tag is a mutable pointer. `voidic/route96:latest` is whatever that
+    /// name resolved to the last time a node pulled it, so a publisher (or
+    /// anyone who takes their account) can change the code running in every
+    /// deployment by re-pushing, with nobody here having approved anything.
+    /// Kubernetes makes that worse rather than better: `imagePullPolicy`
+    /// defaults to `Always` for a `:latest` tag, so the new bytes arrive on the
+    /// next pod creation.
+    ///
+    /// A digest is the content address of the image, so the deployment keeps
+    /// running the exact artifact that was reviewed. Keep the tag as well and
+    /// pin behind it (`repo:v1.2.3@sha256:...`): the tag stays readable to a
+    /// human, and the digest is what the container runtime honours.
+    ///
+    /// This buys immutability, not trust. A hostile image pinned on day one is
+    /// pinned hostile, and a pinned base stops receiving CVE fixes until
+    /// somebody bumps it. That is the point: the bump is then a reviewable
+    /// change rather than a silent rollout.
+    pub fn validate_pinned_images(&self) -> Result<()> {
+        for (sname, svc) in &self.services {
+            validate_image_digest(&format!("service '{sname}'"), &svc.image)?;
+            for init in &svc.init {
+                validate_image_digest(
+                    &format!("service '{sname}': init '{}'", init.name),
+                    &init.image,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// Every `${...}` must be declared in `config:`/`secrets:` or be a builtin.
     ///
     /// **An authoring rule, checked at admission only** — deliberately *not*
@@ -1658,6 +1695,37 @@ fn addresses_host(text: &str, host: &str) -> bool {
 /// which Kubernetes rejects outright if it is not one — and a rejected pod spec
 /// is a deployment that never becomes ready, with the reason buried in the
 /// operator's log rather than returned to whoever typed the name.
+/// Require one image reference to carry a `@sha256:<64 hex>` digest.
+///
+/// The digest is checked for shape only. Whether it exists in the registry is
+/// the puller's problem, and a wrong one fails loudly at pull time rather than
+/// silently running something else, which is the whole point of pinning.
+fn validate_image_digest(context: &str, image: &str) -> Result<()> {
+    let Some((name, digest)) = image.split_once("@sha256:") else {
+        bail!(
+            "{context}: image '{image}' is not pinned to a digest. A tag is a mutable pointer: the \
+             publisher can re-push it and change what every deployment runs. Resolve it once \
+             (`docker buildx imagetools inspect {image} --format '{{{{.Manifest.Digest}}}}'`) and \
+             keep the tag for readability, e.g. `{image}@sha256:<digest>`"
+        );
+    };
+    if name.is_empty() {
+        bail!("{context}: image '{image}' has a digest but no image name");
+    }
+    if digest.len() != 64
+        || !digest
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+    {
+        bail!(
+            "{context}: image '{image}' has a malformed digest: expected 64 lower-case hex \
+             characters after `@sha256:`, got {} character(s)",
+            digest.len()
+        );
+    }
+    Ok(())
+}
+
 fn validate_init_name(service: &str, name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 40 {
         bail!("service '{service}': init name '{name}' must be 1–40 characters");
@@ -1760,6 +1828,10 @@ fn substitute(s: &str, vars: &HashMap<String, String>) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A syntactically valid digest, for fixtures that only care that an image
+    /// is pinned.
+    const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+
     use super::*;
 
     const ROUTE96: &str = r#"
@@ -2968,5 +3040,73 @@ config:
             )
             .is_err()
         );
+    }
+
+    /// A digest-pinned document passes, tag and all.
+    #[test]
+    fn accepts_digest_pinned_images() {
+        let c = Compose::parse(&format!(
+            "services:\n  app:\n    image: example/app:v1.2.3@{DIGEST}\n    user: \"1000\"\n    \
+             init:\n      - name: setup\n        image: busybox:1.36@{DIGEST}\n        command: \
+             [\"true\"]\n"
+        ))
+        .unwrap();
+        c.validate_pinned_images().unwrap();
+    }
+
+    /// An unpinned service image is refused, and the message names the service
+    /// and the image rather than saying "invalid compose".
+    #[test]
+    fn rejects_unpinned_service_image() {
+        let c = Compose::parse("services:\n  app:\n    image: example/app:latest\n").unwrap();
+        let err = c.validate_pinned_images().unwrap_err().to_string();
+        assert!(err.contains("service 'app'"), "{err}");
+        assert!(err.contains("example/app:latest"), "{err}");
+        assert!(err.contains("not pinned to a digest"), "{err}");
+    }
+
+    /// An init step is an image the cluster runs too, so it is held to the same
+    /// rule as the service that declares it.
+    #[test]
+    fn rejects_unpinned_init_image() {
+        let c = Compose::parse(&format!(
+            "services:\n  app:\n    image: example/app:v1@{DIGEST}\n    init:\n      - name: \
+             setup\n        image: minio/mc:latest\n        command: [\"true\"]\n"
+        ))
+        .unwrap();
+        let err = c.validate_pinned_images().unwrap_err().to_string();
+        assert!(err.contains("init 'setup'"), "{err}");
+        assert!(err.contains("minio/mc:latest"), "{err}");
+    }
+
+    /// A digest that is not 64 lower-case hex characters is a typo, not a pin.
+    /// Accepting one would give the appearance of pinning while failing at pull
+    /// time, or (for an upper-case variant) not matching what the registry
+    /// serves.
+    #[test]
+    fn rejects_malformed_digest() {
+        for image in [
+            "example/app:v1@sha256:abc123",
+            "example/app:v1@sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            &format!("example/app:v1@{}", DIGEST.to_uppercase()),
+            &format!("@{DIGEST}"),
+        ] {
+            let c =
+                Compose::parse(&format!("services:\n  app:\n    image: \"{image}\"\n")).unwrap();
+            assert!(
+                c.validate_pinned_images().is_err(),
+                "accepted malformed image '{image}'"
+            );
+        }
+    }
+
+    /// The rule is admission-only: `parse`/`validate` must keep accepting an
+    /// unpinned document, or the operator would stop reconciling every app
+    /// admitted before the rule existed.
+    #[test]
+    fn pinning_is_not_enforced_by_validate() {
+        let c = Compose::parse("services:\n  app:\n    image: example/app:latest\n").unwrap();
+        c.validate().unwrap();
+        assert!(c.validate_pinned_images().is_err());
     }
 }

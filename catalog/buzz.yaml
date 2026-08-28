@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
     user: root    # postgres' entrypoint starts as root, then drops to `postgres`
     resources: { cpu: 500m, memory: 1Gi }
     # A port block is what gives the service a DNS name inside the namespace:
@@ -24,7 +24,7 @@ services:
       command: ["sh", "-c", "exec pg_dumpall -U buzz"]
       artifact: buzz.sql
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     user: root    # redis' entrypoint starts as root, then drops to `redis`
     resources: { cpu: 250m, memory: 512Mi }
     ports:
@@ -34,7 +34,7 @@ services:
       # refuses writes with MISCONF
       - { name: data, path: /data, size: 2Gi }
   s3:
-    image: rustfs/rustfs:1.0.0-beta.11
+    image: rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c
     user: "10001"    # image sets `USER rustfs` (a name); uid 10001 per its Dockerfile
     resources: { cpu: 500m, memory: 1Gi }
     ports:
@@ -55,7 +55,7 @@ services:
     backup:
       volume: blobs
   relay:
-    image: ghcr.io/block/buzz:latest
+    image: ghcr.io/block/buzz:latest@sha256:4e31b7c7abb7d00b6f513dc559e58d2b980416f1dc400aa01bcf762cf2989cfc
     user: "1000"    # image sets `USER buzz:buzz` (a name); uid 1000 per its Dockerfile
     resources: { cpu: 1, memory: 2Gi }
     depends_on: [db, redis, s3]
@@ -67,7 +67,7 @@ services:
     # the relay cannot start before the bucket exists.
     init:
       - name: create-media-bucket
-        image: minio/mc:latest
+        image: minio/mc:latest@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
         user: "65534"    # only talks to the in-namespace S3 service
         env:
           MC_HOST_s3: "http://${S3_ACCESS_KEY}:${S3_SECRET_KEY}@s3:9000"

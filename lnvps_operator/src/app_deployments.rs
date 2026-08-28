@@ -457,6 +457,20 @@ fn container_security_context_for(
 const INIT_TMP_DIR: &str = "/tmp";
 const INIT_TMP_VOLUME: &str = "init-tmp";
 
+/// Pull policy for every app container, set explicitly rather than inherited.
+///
+/// Kubernetes infers the default from the tag: `Always` when the reference ends
+/// in `:latest` or names no tag, `IfNotPresent` otherwise. That makes the policy
+/// an accident of how the catalog document happens to be written, and it means a
+/// `:latest` entry re-pulls on every pod creation, so a re-pushed tag rolls into
+/// running deployments unreviewed.
+///
+/// Catalog images are pinned by digest (`Compose::validate_pinned_images`), so
+/// a cached layer set can only be the right one and re-pulling buys nothing.
+/// `IfNotPresent` also keeps a restart working when the registry is down or
+/// rate-limiting, which `Always` does not.
+const IMAGE_PULL_POLICY: &str = "IfNotPresent";
+
 /// Pod-local name for a `scratch:` path's `emptyDir` (#264).
 ///
 /// The declaration index makes it unique — slugging the path alone does not,
@@ -520,6 +534,7 @@ pub fn build_init_container(init: &ResolvedInit, mounts: &[VolumeMount]) -> Cont
     Container {
         name: init.name.clone(),
         image: Some(init.image.clone()),
+        image_pull_policy: Some(IMAGE_PULL_POLICY.to_string()),
         command: init.command.clone(),
         args: init.args.clone(),
         env: Some(
@@ -809,6 +824,7 @@ pub fn build_deployment(
     let container = Container {
         name: service_name.to_string(),
         image: Some(svc.image.clone()),
+        image_pull_policy: Some(IMAGE_PULL_POLICY.to_string()),
         env: Some(
             env.iter()
                 .map(|(k, v)| EnvVar {
@@ -2906,6 +2922,18 @@ config:
         assert_eq!(
             inits.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
             vec!["wait-s3", "make-bucket"]
+        );
+
+        // Both container kinds carry an explicit pull policy. Left unset,
+        // Kubernetes would infer `Always` from these `:latest` tags and re-pull
+        // on every pod creation, which is how a re-pushed tag reaches a running
+        // deployment unreviewed.
+        assert!(
+            app.containers
+                .iter()
+                .chain(inits.iter())
+                .all(|c| c.image_pull_policy.as_deref() == Some("IfNotPresent")),
+            "every container must set imagePullPolicy explicitly"
         );
 
         let wait = &inits[0];
