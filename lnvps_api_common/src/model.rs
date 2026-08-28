@@ -674,7 +674,7 @@ impl From<&VmCustomPricing> for ApiVmTemplateLimits {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiIntervalType {
     Day = 0,
