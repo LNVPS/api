@@ -5593,10 +5593,32 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn delete_vpn_device(&self, id: u64) -> DbResult<()> {
+        // The tunnel goes with the device. Only this row knows which tunnel
+        // belongs to the customer -- every query reaches one through the other
+        // -- so deleting the link alone leaves a tunnel that no query can see,
+        // holding a public key, forever.
+        //
+        // A transaction because a foreign key cannot express ownership in this
+        // direction, and the two deletes must be ordered: `vpn_device.tunnel_id`
+        // is RESTRICT, so the link goes first. `tunnel_route` cascades off
+        // `tunnel` and needs no help.
+        let mut tx = self.db.begin().await?;
+        let tunnel_id: Option<(u64,)> =
+            sqlx::query_as("SELECT tunnel_id FROM vpn_device WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
         sqlx::query("DELETE FROM vpn_device WHERE id = ?")
             .bind(id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await?;
+        if let Some((tunnel_id,)) = tunnel_id {
+            sqlx::query("DELETE FROM tunnel WHERE id = ?")
+                .bind(tunnel_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 

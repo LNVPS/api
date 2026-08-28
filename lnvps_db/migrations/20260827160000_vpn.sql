@@ -166,8 +166,13 @@ CREATE TABLE vpn_service_pool (
     PRIMARY KEY (tunnel_pool_id),
     KEY ix_vpn_service_pool_service (vpn_service_id),
 
-    FOREIGN KEY (vpn_service_id) REFERENCES vpn_service (id),
-    FOREIGN KEY (tunnel_pool_id) REFERENCES tunnel_pool (id)
+    -- Both sides cascade, because this row is pure association: it owns
+    -- nothing, and nothing is identified by it. Decommissioning an interface
+    -- should drop the link rather than be refused by it, and the guard against
+    -- deleting a service out from under paying customers belongs on
+    -- `vpn_subscription`, which is the row that represents them.
+    FOREIGN KEY (vpn_service_id) REFERENCES vpn_service (id) ON DELETE CASCADE,
+    FOREIGN KEY (tunnel_pool_id) REFERENCES tunnel_pool (id) ON DELETE CASCADE
 );
 
 -- A customer's VPN plan, and the devices registered against it.
@@ -222,6 +227,9 @@ CREATE TABLE vpn_subscription (
 
     KEY ix_vpn_subscription_service (vpn_service_id),
 
+    -- RESTRICT, deliberately: a service with subscribers cannot be deleted.
+    -- Taking one off sale is `enabled = 0`, which stops new plans without
+    -- touching the ones already paid for.
     FOREIGN KEY (vpn_service_id) REFERENCES vpn_service (id),
     FOREIGN KEY (user_id) REFERENCES users (id),
     FOREIGN KEY (subscription_line_item_id) REFERENCES subscription_line_item (id)
@@ -293,8 +301,17 @@ CREATE TABLE vpn_device (
     -- two machines answering to a single key and address.
     UNIQUE KEY uk_vpn_device_tunnel (tunnel_id),
 
+    -- RESTRICT on both, deliberately.
+    --
+    -- A plan cannot be deleted while it has devices, because this row is the
+    -- only thing that knows which `tunnel` belongs to the customer: cascading
+    -- it away would leave that tunnel orphaned, invisible to every query that
+    -- reaches it through this table, and still holding a public key. Removing
+    -- a device deletes both, in `delete_vpn_device`, which is a transaction
+    -- because a foreign key cannot express ownership in that direction.
+    --
+    -- The tunnel side matches `marketplace_node.tunnel_id`: a tunnel still
+    -- carrying a customer's traffic cannot be deleted out from under it.
     FOREIGN KEY (vpn_subscription_id) REFERENCES vpn_subscription (id),
-    -- RESTRICT (the default), matching `marketplace_node.tunnel_id`: a tunnel
-    -- still carrying a customer's traffic cannot be deleted out from under it.
     FOREIGN KEY (tunnel_id) REFERENCES tunnel (id)
 );

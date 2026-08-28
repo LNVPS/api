@@ -711,3 +711,54 @@ fn a_dense_block_allocates_the_first_free_address() {
         Some(expected.to_string())
     );
 }
+
+/// Removing a device takes its tunnel with it. Only `vpn_device` knows which
+/// tunnel belongs to the customer -- every query reaches one through the other
+/// -- so deleting the link alone would leave a tunnel no query can see, still
+/// holding a public key, and its address would quietly be handed to somebody
+/// else while the row remained.
+#[tokio::test]
+async fn removing_a_device_removes_its_tunnel() -> Result<()> {
+    let mock = MockDb::default();
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
+    let plan = a_plan(&db, &service, 1).await?;
+
+    let device = register_vpn_device(&db, &plan, "phone", &key(1)).await?;
+    let tunnel_id = device.tunnel_id;
+    assert!(db.get_tunnel(tunnel_id).await.is_ok());
+
+    db.delete_vpn_device(device.id).await?;
+
+    assert!(
+        db.get_tunnel(tunnel_id).await.is_err(),
+        "the tunnel must not outlive the device that was the only way to find it"
+    );
+    assert!(db.list_vpn_tunnels_in_service(service.id).await?.is_empty());
+
+    // And the slot is free again, so the customer can re-register.
+    let replacement = register_vpn_device(&db, &plan, "phone", &key(2)).await?;
+    assert_eq!(replacement.slot, device.slot);
+    Ok(())
+}
+
+/// Decommissioning an interface drops its link rather than being refused by it,
+/// and deleting a service unlinks the interfaces it terminated on. Neither row
+/// owns anything: the guard that matters is on `vpn_subscription`, which is
+/// what a paying customer actually is.
+#[tokio::test]
+async fn unlinking_cascades_but_a_subscribed_service_does_not_vanish() -> Result<()> {
+    let mock = MockDb::default();
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
+    let pool = a_pool(&db, &mock, &service).await?;
+    assert_eq!(db.list_vpn_service_pools(service.id).await?.len(), 1);
+
+    db.delete_tunnel_pool(pool.id).await?;
+    assert!(
+        db.list_vpn_service_pools(service.id).await?.is_empty(),
+        "deleting an interface drops the link, it does not block on it"
+    );
+    assert!(db.get_vpn_service_for_pool(pool.id).await?.is_none());
+    Ok(())
+}

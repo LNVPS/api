@@ -4915,6 +4915,9 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn delete_tunnel_pool(&self, id: u64) -> DbResult<()> {
+        // ON DELETE CASCADE: decommissioning an interface drops the link rather
+        // than being refused by it.
+        self.vpn_service_pools.lock().await.remove(&id);
         // FK tunnel.pool_id
         if self
             .tunnels
@@ -4995,16 +4998,6 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn delete_vpn_service(&self, id: u64) -> DbResult<()> {
-        // FK vpn_service_pool.vpn_service_id
-        if self
-            .vpn_service_pools
-            .lock()
-            .await
-            .values()
-            .any(|s| *s == id)
-        {
-            return Err(anyhow!("VPN service {} is still terminated by an interface", id).into());
-        }
         // FK vpn_subscription.vpn_service_id
         if self
             .vpn_subscriptions
@@ -5015,6 +5008,10 @@ impl LNVpsDbBase for MockDb {
         {
             return Err(anyhow!("VPN service {} still has subscriptions", id).into());
         }
+        // ON DELETE CASCADE on vpn_service_pool.vpn_service_id, after the guard
+        // above and not before it: a refused delete must not have unlinked
+        // anything. The link row is pure association, so it does not block.
+        self.vpn_service_pools.lock().await.retain(|_, s| *s != id);
         self.vpn_services.lock().await.remove(&id);
         Ok(())
     }
@@ -5391,7 +5388,15 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn delete_vpn_device(&self, id: u64) -> DbResult<()> {
-        self.vpn_devices.lock().await.remove(&id);
+        // The tunnel goes with the device: only this row knows which tunnel
+        // belongs to the customer, so deleting the link alone leaves a tunnel
+        // no query can see, still holding a public key.
+        let removed = self.vpn_devices.lock().await.remove(&id);
+        if let Some(device) = removed {
+            self.tunnels.lock().await.remove(&device.tunnel_id);
+            // ON DELETE CASCADE off `tunnel`.
+            self.tunnel_routes.lock().await.remove(&device.tunnel_id);
+        }
         Ok(())
     }
 
@@ -11568,7 +11573,9 @@ mod vpn_tests {
             "a service with subscriptions is still owed to somebody"
         );
 
-        db.vpn_subscriptions.lock().await.remove(&plan);
+        // An interface, on the other hand, does not block: the link row is pure
+        // association and cascades away with the service. What is owed to
+        // somebody is the subscription, not the row that says where they connect.
         db.tunnel_pools.lock().await.insert(
             1,
             TunnelPool {
@@ -11579,12 +11586,21 @@ mod vpn_tests {
         db.link_vpn_service_pool(service, 1).await.unwrap();
         assert!(
             db.delete_vpn_service(service).await.is_err(),
-            "an interface is still configured to terminate it"
+            "the subscription still blocks, and the refusal must not have unlinked anything"
+        );
+        assert_eq!(
+            db.get_vpn_service_for_pool(1).await.unwrap().map(|s| s.id),
+            Some(service),
+            "a delete that was refused must not have had side effects"
         );
 
-        db.unlink_vpn_service_pool(1).await.unwrap();
+        db.vpn_subscriptions.lock().await.remove(&plan);
         db.delete_vpn_service(service).await.unwrap();
         assert!(db.get_vpn_service(service).await.is_err());
+        assert!(
+            db.get_vpn_service_for_pool(1).await.unwrap().is_none(),
+            "and the link cascaded away with it"
+        );
     }
 
     /// A pool does not record what it is for, so the link is the only thing
