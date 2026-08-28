@@ -132,8 +132,32 @@ impl TunnelProvisioner {
     /// interface should be. Without it a pool could only describe an interface
     /// somebody configured by hand, and bringing up a new route server would be
     /// a manual job with a database row bolted on afterwards.
+    /// Whether this route server fetches its own configuration instead of being
+    /// given it.
+    ///
+    /// The one fork between the two backends, and it is here rather than in the
+    /// `TunnelRouter` trait because what differs is not *how* to push but
+    /// whether to push at all. An `lvd` route server is often behind a NAT
+    /// nothing here can traverse, so the desired state is published and the
+    /// machine comes and gets it; recording that it moved is the whole of what
+    /// LNVPS does.
+    async fn publishes_own_state(&self, router_id: u64) -> Result<bool> {
+        Ok(matches!(
+            self.db.get_router(router_id).await?.kind,
+            lnvps_db::RouterKind::LnvpsAgent
+        ))
+    }
+
     pub async fn sync_pool(&self, pool_id: u64) -> Result<()> {
         let pool = self.db.get_tunnel_pool(pool_id).await?;
+        if self.publishes_own_state(pool.router_id).await? {
+            let generation = self.db.bump_tunnel_pool_generation(pool_id).await?;
+            log::info!(
+                "Tunnel pool {pool_id} is on a self-configuring route server; \
+                 published generation {generation}"
+            );
+            return Ok(());
+        }
         let router = crate::router::get_router(&self.db, pool.router_id)
             .await
             .map_err(|e| anyhow!("failed to load router {}: {}", pool.router_id, e))?;
@@ -260,6 +284,18 @@ impl TunnelProvisioner {
     /// whether anything was wrong rather than only that it ran.
     pub async fn reconcile_peers(&self, pool_id: u64) -> Result<TunnelPeerDrift> {
         let pool = self.db.get_tunnel_pool(pool_id).await?;
+        // Nothing to compare against yet: reading back what an `lvd` route
+        // server actually applied is its own piece of work. Until then this
+        // records that the peer set moved, which is what makes the machine
+        // fetch it.
+        if self.publishes_own_state(pool.router_id).await? {
+            let generation = self.db.bump_tunnel_pool_generation(pool_id).await?;
+            log::info!(
+                "Tunnel pool {pool_id} is on a self-configuring route server; \
+                 published generation {generation}"
+            );
+            return Ok(TunnelPeerDrift::default());
+        }
         let router = crate::router::get_router(&self.db, pool.router_id)
             .await
             .map_err(|e| anyhow!("failed to load router {}: {}", pool.router_id, e))?;

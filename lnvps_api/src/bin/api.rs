@@ -478,6 +478,7 @@ async fn main() -> Result<(), Error> {
             .merge(marketplace_router())
             .merge(apps_router())
             .merge(vpn_router())
+            .merge(routeserver_router())
             .merge(legal_router())
             .merge(oauth_router())
             .merge(webauthn_router());

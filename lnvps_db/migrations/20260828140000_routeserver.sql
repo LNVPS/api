@@ -1,0 +1,34 @@
+-- Route servers that configure themselves.
+--
+-- A MikroTik or a Linux-over-SSH route server is configured by LNVPS reaching
+-- out and telling it what to be. That works because those boxes are reachable:
+-- they sit in a rack LNVPS can route to, on an address that does not move.
+--
+-- A VPN route server is not that. It runs wherever the region is, which means
+-- behind somebody else's NAT, on a residential-grade uplink, or on a provider
+-- that filters inbound. Reaching out to it would work everywhere it was tested
+-- and fail on the one machine nobody thought about, and the way that failure
+-- surfaces is a revoked device that keeps working. How fast a customer's key
+-- stops being honoured must not depend on the network the machine sits in.
+--
+-- So the direction reverses: the route server asks what it should be, and
+-- LNVPS answers. It authenticates with `router.token`, which is the same
+-- meaning that column already carries -- the secret shared between LNVPS and
+-- this router -- travelling the other way. Rotating it is a column update, and
+-- it takes out one route server rather than all of them.
+
+-- How many times this interface's desired state has changed.
+--
+-- The route server sends the generation it last applied; an unchanged one is
+-- answered `304` without building the document or waking anything up. That is
+-- what makes it affordable for the daemon to hold a request open and be told
+-- the instant a peer moves, instead of finding out on its next poll.
+--
+-- Bumped in exactly one place -- the worker, where an SSH pool would have been
+-- pushed -- so anything that already asks for a sync gets this for free and
+-- there is no second list of "things that must remember to bump".
+--
+-- Starts at 1 rather than 0 so that a daemon which has applied nothing can send
+-- 0 and always be given the document.
+ALTER TABLE tunnel_pool
+    ADD COLUMN generation BIGINT UNSIGNED NOT NULL DEFAULT 1;

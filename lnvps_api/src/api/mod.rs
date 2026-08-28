@@ -12,7 +12,10 @@ mod model;
 mod nostr_domain;
 mod oauth;
 mod referral;
+// Public for the same reason `marketplace` is: the e2e harness carries the
+// document across the wire format both ends actually use.
 mod routes;
+pub mod routeserver;
 mod subscriptions;
 #[cfg(feature = "agent")]
 mod support;
@@ -38,6 +41,7 @@ pub use nostr_domain::router as nostr_domain_router;
 pub use oauth::router as oauth_router;
 pub use referral::router as referral_router;
 pub use routes::routes as main_router;
+pub use routeserver::router as routeserver_router;
 use serde::Deserialize;
 use std::sync::Arc;
 pub use subscriptions::router as subscriptions_router;

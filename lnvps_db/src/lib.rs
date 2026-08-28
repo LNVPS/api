@@ -1593,6 +1593,16 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Delete a pool. Fails while any tunnel is still carved out of it.
     async fn delete_tunnel_pool(&self, id: u64) -> DbResult<()>;
 
+    /// Record that this interface's desired state has changed, and return the
+    /// new generation.
+    ///
+    /// Its own method rather than a field on [`Self::update_tunnel_pool`]
+    /// because most of what moves an interface is not an edit to its row: a
+    /// device registered, a plan lapsed, a service linked. A caller changing
+    /// the MTU should not be able to state a generation at all, let alone an
+    /// older one.
+    async fn bump_tunnel_pool_generation(&self, id: u64) -> DbResult<u64>;
+
     // ----- VPN -----
 
     /// Get a VPN service by id
