@@ -184,10 +184,17 @@ Design (see "Backup execution" below for the detail):
       `last_scheduled_app_deployment_backup`, soft delete) + mysql impl + MockDb + unit tests.
 
 #### 6b — Object storage client
-- [ ] `lnvps_api_common::object_store`: S3-compatible SigV4 presign (`hmac`/`sha2` are already
-      dependencies — no SDK), `presign_put` / `presign_get`, signed `HEAD` (artifact size) and
-      `DELETE` (retention). Config: endpoint, region, bucket, keys, path-style.
-- [ ] Unit tests against the AWS SigV4 published test vectors.
+- [x] `lnvps_api_common::object_store`: S3-compatible SigV4 presign (`hmac`/`sha2` were already
+      dependencies — no SDK), `presign_put` / `presign_get` (signed download filename), `size`
+      (HEAD) and `delete` (retention). Config: endpoint, region, bucket, keys, path-style
+      (defaulting to path style, which is what self-hosted MinIO/Garage accept).
+- [x] **Every** operation goes out as a presigned URL, including the ones the operator issues
+      itself. Signing one way for everything means the signer is exercised by every call, not
+      only by the rare one.
+- [x] Unit tests: the published AWS SigV4 presign vector, path vs virtual-hosted signing, method
+      and key separation, filename sanitising, and wiremock coverage of `size`/`delete`
+      (missing object → `None`, absent object → delete still succeeds, 403 → error).
+- [ ] Config wiring lands with its consumers: the operator in 6c, the API in 6d.
 
 #### 6c — Operator: run the backups
 - [ ] Build a per-artifact Job in the deployment namespace: `volume:` tars the PVC mounted
