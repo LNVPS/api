@@ -1710,14 +1710,26 @@ pub trait LNVpsDbBase: Send + Sync {
     /// customer's traffic to another the moment the first one paid again.
     async fn list_vpn_tunnels_in_service(&self, vpn_service_id: u64) -> DbResult<Vec<Tunnel>>;
 
-    /// Every peer a pool's interface should carry: enabled, on a plan whose
-    /// subscription is paid and unexpired, on the service this pool terminates.
+    /// Every peer **this interface** should carry: the rows allocated to this
+    /// pool, enabled, on a plan whose subscription is paid and unexpired.
+    ///
+    /// Keyed on the pool rather than the service because a device now has one
+    /// peer per interface, so the pool already selects its own. What it cannot
+    /// select on its own is billing: a lapsed customer's rows still exist and
+    /// still own their addresses, and this is where suspension is applied. That
+    /// is why the planner cannot simply call `list_tunnels_in_pool`.
     ///
     /// One query rather than a walk over plans, because this runs on every
-    /// reconcile of every pool and the peer set is the whole customer base. It
-    /// is also where suspension is applied, which is why no code path has to
-    /// remember to disable a lapsed customer's peers.
-    async fn list_active_vpn_tunnels(&self, vpn_service_id: u64) -> DbResult<Vec<Tunnel>>;
+    /// reconcile of every pool and the peer set is the whole customer base.
+    async fn list_active_vpn_tunnels_in_pool(&self, tunnel_pool_id: u64) -> DbResult<Vec<Tunnel>>;
+
+    /// A device's peers: one per interface its service terminates, all holding
+    /// the same key and the same addresses.
+    ///
+    /// Identical by construction, so a caller that only wants the key or the
+    /// address -- rendering a config, showing a device in an admin list -- can
+    /// take the first and be right.
+    async fn list_vpn_device_tunnels(&self, vpn_device_id: u64) -> DbResult<Vec<Tunnel>>;
 
     /// The prefixes routed behind each of `tunnel_ids`.
     ///
@@ -1733,17 +1745,35 @@ pub trait LNVpsDbBase: Send + Sync {
     /// until somebody noticed, while a recompute is self-correcting.
     async fn replace_tunnel_routes(&self, tunnel_id: u64, prefixes: &[String]) -> DbResult<()>;
 
-    /// Register a device, returning the new id. The caller claims the slot;
-    /// `uk_vpn_device_slot` is what makes the limit unforgeable under
-    /// concurrent registrations.
-    async fn insert_vpn_device(&self, device: &VpnDevice) -> DbResult<u64>;
+    /// Register a device **and its peers**, returning the new id.
+    ///
+    /// One `tunnel` per interface the plan's service terminates, each carrying
+    /// `peer`'s key and addresses, plus the link rows joining them to the
+    /// device. In one transaction, because a device whose peers appeared on
+    /// some interfaces and not others is a customer whose VPN works in some
+    /// regions and not others, with nothing to indicate why.
+    ///
+    /// The caller claims the slot; `uk_vpn_device_slot` is what makes the limit
+    /// unforgeable under concurrent registrations, and
+    /// `uk_tunnel_pool_address4`/`6` do the same for addresses within an
+    /// interface.
+    async fn insert_vpn_device_with_peers(
+        &self,
+        device: &VpnDevice,
+        peer: &VpnPeerTemplate,
+    ) -> DbResult<u64>;
 
-    /// Update a device's label. `vpn_subscription_id`, `slot`, `tunnel_id` and
-    /// `created` are immutable and are not written: the peer behind a device is
-    /// the thing the customer's config points at.
+    /// Update a device's label. `vpn_subscription_id`, `slot` and `created` are
+    /// immutable and are not written: the peers behind a device are what the
+    /// customer's configs point at.
     async fn update_vpn_device(&self, device: &VpnDevice) -> DbResult<()>;
 
-    /// Delete a device, releasing its slot and addresses.
+    /// Delete a device, releasing its slot and every address it held.
+    ///
+    /// Its peers go with it, in one transaction and in foreign-key order. A
+    /// tunnel left behind is a key still configured on a route server after
+    /// LNVPS has forgotten it exists, which is the one failure that matters
+    /// when a device is revoked.
     async fn delete_vpn_device(&self, id: u64) -> DbResult<()>;
 
     // ----- App catalog -----

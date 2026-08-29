@@ -195,7 +195,7 @@ fn key(seed: u8) -> Vec<u8> {
 /// A device's peer. The key and addresses live on the tunnel now, because a
 /// device *is* a WireGuard peer and there is one table for those.
 async fn peer(db: &Arc<dyn LNVpsDb>, device: &VpnDevice) -> Result<lnvps_db::Tunnel> {
-    Ok(db.get_tunnel(device.tunnel_id).await?)
+    Ok(db.list_vpn_device_tunnels(device.id).await?.remove(0))
 }
 
 /// Addresses are placed at random, so a test can only assert the properties
@@ -235,8 +235,25 @@ async fn a_device_is_given_a_slot_and_an_address() -> Result<()> {
     assert_usable(p.address4.as_deref(), "10.64.0.0/28", 32);
     assert_usable(p.address6.as_deref(), "fd00:64::/124", 128);
     assert_eq!(p.peer_pubkey.as_deref(), Some(&key(1)[..]));
-    assert_eq!(p.pool_id, None, "a device is a peer on every interface");
-    assert_eq!(p.router_id, None);
+    // One peer per interface, each naming its own: a `tunnel` row means a peer
+    // on an interface, and this service has one.
+    let peers = db.list_vpn_device_tunnels(device.id).await?;
+    let pools = db.list_vpn_service_pools(service.id).await?;
+    assert_eq!(peers.len(), pools.len());
+    assert_eq!(
+        peers.iter().map(|t| t.pool_id).collect::<Vec<_>>(),
+        pools.iter().map(|p| Some(p.id)).collect::<Vec<_>>()
+    );
+    assert!(
+        peers.iter().all(|t| t.router_id.is_some()),
+        "a peer names the route server carrying it"
+    );
+    assert!(
+        peers
+            .iter()
+            .all(|t| t.address4 == p.address4 && t.peer_pubkey == p.peer_pubkey),
+        "every region gets the same address and key, which is the product"
+    );
 
     // A second device does not collide with the first.
     let other = register_vpn_device(&db, &plan, "laptop", &key(2)).await?;
@@ -260,7 +277,19 @@ async fn registering_the_same_key_twice_is_idempotent() -> Result<()> {
     let again = register_vpn_device(&db, &plan, "phone", &key(1)).await?;
 
     assert_eq!(first.id, again.id);
-    assert_eq!(first.tunnel_id, again.tunnel_id);
+    assert_eq!(
+        db.list_vpn_device_tunnels(first.id)
+            .await?
+            .iter()
+            .map(|t| t.id)
+            .collect::<Vec<_>>(),
+        db.list_vpn_device_tunnels(again.id)
+            .await?
+            .iter()
+            .map(|t| t.id)
+            .collect::<Vec<_>>(),
+        "a retried registration returns the same device and the same peers"
+    );
     assert_eq!(db.list_vpn_devices(plan.id).await?.len(), 1);
     Ok(())
 }
@@ -622,7 +651,6 @@ async fn a_lost_slot_race_takes_the_next_slot() -> Result<()> {
             vpn_subscription_id: plan.id,
             slot: 0,
             name: "raced".to_string(),
-            tunnel_id: 12345,
             created: chrono::Utc::now(),
         },
     );
@@ -653,14 +681,18 @@ async fn overlapping_service_blocks_fail_loudly() -> Result<()> {
     let service = a_service(&db, &mock).await?;
     let plan = a_plan(&db, &service, 1).await?;
 
-    // Every address in the shared block, held as peers this service's carve
-    // cannot see but the unique index still can, so every insert collides
-    // however many times the carve re-reads.
+    // Every address in the block, held as peers *on this service's own
+    // interface* that its carve cannot see. Uniqueness is per interface now, so
+    // that is where a collision happens: a squatter on some other route server
+    // is not a conflict and should not be treated as one.
+    let pool = db.list_vpn_service_pools(service.id).await?.remove(0);
     for host in 0..16u8 {
         let _ = db
             .insert_tunnel(&lnvps_db::Tunnel {
                 kind: lnvps_db::RouterTunnelKind::Wireguard,
                 user_id: plan.user_id,
+                router_id: Some(pool.router_id),
+                pool_id: Some(pool.id),
                 name: format!("squat-{host}"),
                 peer_pubkey: Some(vec![100 + host; 32]),
                 address4: Some(format!("10.64.0.{host}/32")),
@@ -725,15 +757,25 @@ async fn removing_a_device_removes_its_tunnel() -> Result<()> {
     let plan = a_plan(&db, &service, 1).await?;
 
     let device = register_vpn_device(&db, &plan, "phone", &key(1)).await?;
-    let tunnel_id = device.tunnel_id;
-    assert!(db.get_tunnel(tunnel_id).await.is_ok());
+    let peer_ids: Vec<u64> = db
+        .list_vpn_device_tunnels(device.id)
+        .await?
+        .iter()
+        .map(|t| t.id)
+        .collect();
+    assert!(!peer_ids.is_empty());
+    for id in &peer_ids {
+        assert!(db.get_tunnel(*id).await.is_ok());
+    }
 
     db.delete_vpn_device(device.id).await?;
 
-    assert!(
-        db.get_tunnel(tunnel_id).await.is_err(),
-        "the tunnel must not outlive the device that was the only way to find it"
-    );
+    for id in &peer_ids {
+        assert!(
+            db.get_tunnel(*id).await.is_err(),
+            "no peer may outlive the device that was the only way to find it"
+        );
+    }
     assert!(db.list_vpn_tunnels_in_service(service.id).await?.is_empty());
 
     // And the slot is free again, so the customer can re-register.

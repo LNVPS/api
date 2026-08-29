@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use ipnetwork::IpNetwork;
-use lnvps_db::{LNVpsDb, RouterTunnelKind, Tunnel, VpnDevice, VpnService, VpnSubscription};
+use lnvps_db::{LNVpsDb, VpnDevice, VpnPeerTemplate, VpnService, VpnSubscription};
 
 use crate::provisioner::wg::address::{Placement, carve_peer, taken_addresses};
 
@@ -69,64 +69,48 @@ pub async fn register_vpn_device(
         let slot = next_free_slot(&devices, service.default_device_limit)?;
         let (address4, address6) = carve_device_addresses(db, &service).await?;
 
-        // The peer is a tunnel, the same as a marketplace node's. `pool_id` and
-        // `router_id` stay NULL: a device is a peer on every interface
-        // terminating its service at once, so naming one would be false.
-        let tunnel = Tunnel {
+        // One peer per interface the service terminates, all carrying this key
+        // and these addresses -- a `tunnel` row means a peer on an interface,
+        // and a device reachable in three regions is three peers. The database
+        // writes them with the device in one transaction, because a device
+        // whose peers landed on some interfaces and not others is a customer
+        // whose VPN works in some regions and not others.
+        let device = VpnDevice {
             id: 0,
-            kind: RouterTunnelKind::Wireguard,
-            user_id: plan.user_id,
-            router_id: None,
-            pool_id: None,
-            name: peer_name(plan, slot),
-            peer_pubkey: Some(peer_pubkey.to_vec()),
-            // Clients dial out from behind NAT, so the endpoint is learned from
-            // the handshake.
-            peer_endpoint: None,
-            address4,
-            address6,
-            keepalive: None,
-            enabled: true,
+            vpn_subscription_id: plan.id,
+            slot,
+            name: name.trim().to_string(),
             created: chrono::Utc::now(),
         };
+        let peer = VpnPeerTemplate {
+            user_id: plan.user_id,
+            name: peer_name(plan, slot),
+            peer_pubkey: peer_pubkey.to_vec(),
+            address4,
+            address6,
+        };
 
-        let tunnel_id = match db.insert_tunnel(&tunnel).await {
-            Ok(id) => id,
+        // Both the slot and the address are proposed from a read and enforced
+        // by a unique key, so a simultaneous registration on the same plan can
+        // take either between the two. Losing that race is not the customer's
+        // problem: re-read and take the next one instead of handing back an
+        // error for something that will succeed immediately.
+        //
+        // A full plan or an exhausted block is *not* contention and is not
+        // retried: both propagate from `next_free_slot` and
+        // `carve_device_addresses` above, because trying again cannot help.
+        match db.insert_vpn_device_with_peers(&device, &peer).await {
+            Ok(id) => return Ok(db.get_vpn_device(id).await?),
             // The last attempt's failure is the answer. Returning it here,
             // rather than remembering one and reporting it after the loop,
-            // keeps "we ran out of attempts but recorded no error" from being
-            // a state that has to exist and be handled.
+            // keeps "we ran out of attempts but recorded no error" from being a
+            // state that has to exist and be handled.
             Err(e) if attempt == REGISTER_ATTEMPTS => {
                 return Err(anyhow::Error::from(e).context(format!(
                     "Could not register a device after {REGISTER_ATTEMPTS} attempts"
                 )));
             }
             Err(_) => continue,
-        };
-
-        match db
-            .insert_vpn_device(&VpnDevice {
-                id: 0,
-                vpn_subscription_id: plan.id,
-                slot,
-                name: name.trim().to_string(),
-                tunnel_id,
-                created: chrono::Utc::now(),
-            })
-            .await
-        {
-            Ok(id) => return Ok(db.get_vpn_device(id).await?),
-            Err(e) => {
-                // The tunnel is this registration's, and nothing points at it
-                // yet, so a failed link leaves an address allocated to nobody
-                // unless it goes back now.
-                let _ = db.delete_tunnel(tunnel_id).await;
-                if attempt == REGISTER_ATTEMPTS {
-                    return Err(anyhow::Error::from(e).context(format!(
-                        "Could not register a device after {REGISTER_ATTEMPTS} attempts"
-                    )));
-                }
-            }
         }
     }
 

@@ -487,18 +487,14 @@ impl TunnelProvisioner {
     pub async fn plan(&self, pool: &TunnelPool) -> Result<InterfacePlan> {
         let mut plan = InterfacePlan::default();
 
-        // Where this interface's peers are addressed from, and which peers they
-        // are. A pool records neither, because it records nothing about what it is
-        // for: an interface terminating a VPN service carries that service's
-        // devices, addressed from the service's block so a device keeps one address
-        // in every region, and any other pool carries the links carved from its own.
-        // The block is the pool's, as it is for every interface. Only which
-        // peers it carries differs: an interface terminating a VPN service
-        // carries that service's devices, which are peers on every one of its
-        // interfaces at once and so belong to no single pool.
-        let tunnels = match self.db.get_vpn_service_for_pool(pool.id).await? {
-            Some(service) => self.db.list_active_vpn_tunnels(service.id).await?,
-            None => self.db.list_tunnels_in_pool(pool.id).await?,
+        // Which peers this interface carries. Both branches now select on
+        // `pool_id`, because a VPN device has a row per interface like anything
+        // else; what a VPN pool needs on top is the billing join, which is
+        // where suspension is applied. A lapsed customer's rows still exist and
+        // still own their addresses, and they simply stop matching.
+        let tunnels = match self.db.get_vpn_service_for_pool(pool.id).await?.is_some() {
+            true => self.db.list_active_vpn_tunnels_in_pool(pool.id).await?,
+            false => self.db.list_tunnels_in_pool(pool.id).await?,
         };
         let (cidr4, cidr6) = (pool.cidr4.clone(), pool.cidr6.clone());
 

@@ -2059,9 +2059,13 @@ pub struct Tunnel {
     /// Route server terminating this tunnel. `None` until one is chosen.
     pub router_id: Option<u64>,
     /// The pool this tunnel's inner addresses were carved from, and therefore
-    /// which interface its peer belongs to. `None` for a tunnel allocated
-    /// outside a pool — a hand-configured peering, or a VPN on a router with no
-    /// pool — which is why [`router_id`](Self::router_id) is still here.
+    /// which interface its peer belongs to. `None` only for a tunnel allocated
+    /// outside a pool at all — a hand-configured peering — which is why
+    /// [`router_id`](Self::router_id) is still here.
+    ///
+    /// A VPN device is *not* such a case, despite being reachable in every
+    /// region: it has one row per interface, each naming its own pool. See
+    /// [`VpnDevice`].
     ///
     /// The database enforces `(pool_id, router_id)` against the pool's own
     /// `(id, router_id)`, so the two copies of "which router" cannot disagree.
@@ -2313,17 +2317,20 @@ pub struct VpnSubscription {
 
 /// One registered device: a phone, a laptop.
 ///
-/// The key and addresses are not here: a device is a WireGuard peer, and a peer
-/// is a [`Tunnel`] — the same table as a marketplace node's, terminated by the
-/// same interfaces, planned by the same code and protected by the same unique
-/// indexes. One set of indexes across every peer is what makes it impossible
-/// for a device and a node to be handed the same address.
+/// The key and addresses are not here: a device is a set of WireGuard peers,
+/// and a peer is a [`Tunnel`] -- the same table as a marketplace node's,
+/// terminated by the same interfaces and planned by the same code.
 ///
-/// What is left is only what makes it a device: which plan, which slot, and
-/// what the customer calls it. The tunnel it points at has a NULL `pool_id`,
-/// which is the case [`Tunnel::pool_id`] already describes for a VPN — a device
-/// is a peer on every interface terminating its service at once, so pinning it
-/// to one would be false.
+/// One peer **per interface**, not one per device. A `tunnel` row means a peer
+/// on an interface, which is what its `pool_id`, `router_id` and their
+/// composite foreign key are for. A device carried in three regions is three
+/// rows, all holding the same key and the same addresses, because that identity
+/// working everywhere is the product. Modelling it as a single row left
+/// `pool_id` NULL and made every question a pool can be asked -- what do you
+/// carry, is your block still big enough -- return the wrong answer.
+///
+/// What is left here is only what makes it a device: which plan, which slot,
+/// and what the customer calls it.
 #[derive(FromRow, Clone, Debug, Default)]
 pub struct VpnDevice {
     /// Unique id of this device
@@ -2340,8 +2347,11 @@ pub struct VpnDevice {
     /// The customer's label. Never sent to a route server; [`Tunnel::name`] is
     /// what the route server sees.
     pub name: String,
-    /// The peer this device is
-    pub tunnel_id: u64,
+    /// Its peers are `vpn_device_tunnel` rows, one per interface the service
+    /// terminates, all carrying the same key and the same addresses. There is
+    /// no single `tunnel_id`: a device carried in three regions is three peers,
+    /// because a `tunnel` row means a peer on an interface.
+    ///
     /// When this device was registered
     pub created: DateTime<Utc>,
 }
@@ -5348,4 +5358,23 @@ mod bulk_message_tests {
         assert!(!some.is_empty());
         assert!(!some.is_explicitly_empty());
     }
+}
+
+/// What every peer of one device is made of.
+///
+/// A device's rows differ only in which interface they sit on: the key and the
+/// addresses are the same in all of them, because a device working everywhere
+/// on one identity is the product. Passing them once, rather than building each
+/// `Tunnel` at the call site, is what stops the copies drifting apart.
+#[derive(Clone, Debug, Default)]
+pub struct VpnPeerTemplate {
+    /// The account this allocation belongs to.
+    pub user_id: u64,
+    /// The interface name a route server sees, not the customer's label.
+    pub name: String,
+    /// The public half the client generated. LNVPS never holds the other.
+    pub peer_pubkey: Vec<u8>,
+    /// The one address, valid on every interface the service terminates.
+    pub address4: Option<String>,
+    pub address6: Option<String>,
 }

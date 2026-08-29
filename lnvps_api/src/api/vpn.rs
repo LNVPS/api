@@ -288,7 +288,7 @@ async fn v1_list_vpn_devices(
     let plan = my_plan(&this, uid).await?;
     let mut out = Vec::new();
     for device in this.db.list_vpn_devices(plan.id).await? {
-        let tunnel = this.db.get_tunnel(device.tunnel_id).await?;
+        let tunnel = a_peer_of(&this, &device).await?;
         out.push(ApiVpnDevice::new(device, &tunnel));
     }
     ApiData::ok(out)
@@ -324,7 +324,7 @@ async fn v1_add_vpn_device(
     // the customer holds a config for a region that will not answer.
     push_service(&this, plan.vpn_service_id).await;
 
-    let tunnel = this.db.get_tunnel(device.tunnel_id).await?;
+    let tunnel = a_peer_of(&this, &device).await?;
     ApiData::ok(ApiVpnDevice::new(device, &tunnel))
 }
 
@@ -339,20 +339,23 @@ async fn v1_set_vpn_device_enabled(
     let plan = my_plan(&this, uid).await?;
     let device = my_device(&this, &plan, id).await?;
 
-    // The switch is on the peer, not on the device row: what a route server
+    // The switch is on the peers, not on the device row: what a route server
     // carries is tunnels, and a second copy of "is this on" would be free to
-    // disagree with the one the planner reads.
-    let tunnel = this.db.get_tunnel(device.tunnel_id).await?;
-    this.db
-        .update_tunnel(&lnvps_db::Tunnel {
-            enabled: req.enabled,
-            ..tunnel
-        })
-        .await?;
+    // disagree with the one the planner reads. Every peer, because a device
+    // disabled in one region and live in another is not a state the customer
+    // asked for.
+    for tunnel in this.db.list_vpn_device_tunnels(device.id).await? {
+        this.db
+            .update_tunnel(&lnvps_db::Tunnel {
+                enabled: req.enabled,
+                ..tunnel
+            })
+            .await?;
+    }
     push_service(&this, plan.vpn_service_id).await;
 
     let device = this.db.get_vpn_device(id).await?;
-    let tunnel = this.db.get_tunnel(device.tunnel_id).await?;
+    let tunnel = a_peer_of(&this, &device).await?;
     ApiData::ok(ApiVpnDevice::new(device, &tunnel))
 }
 
@@ -364,16 +367,41 @@ async fn v1_delete_vpn_device(
 ) -> ApiResult<()> {
     let uid = this.db.upsert_user(&auth.pubkey()).await?;
     let plan = my_plan(&this, uid).await?;
-    let device = my_device(&this, &plan, id).await?;
+    my_device(&this, &plan, id).await?;
+    // The peers go with it, in one transaction: the device was the only thing
+    // pointing at them, so an orphan would be a key still configured on a route
+    // server that no query could find again.
     this.db.delete_vpn_device(id).await?;
-    // The device was the only thing pointing at the peer, so the peer and its
-    // address go back with it.
-    this.db.delete_tunnel(device.tunnel_id).await?;
     // Removal is the direction that matters most: until the route servers are
     // told, a revoked key still authenticates.
     push_service(&this, plan.vpn_service_id).await;
 
     ApiData::ok(())
+}
+
+/// Any one of a device's peers.
+///
+/// A device has one per interface its service terminates, and they are
+/// identical in everything a customer sees: same key, same addresses, same
+/// enabled flag. Anything rendering a device or a config wants those, not a
+/// particular interface's row.
+async fn a_peer_of(
+    this: &RouterState,
+    device: &lnvps_db::VpnDevice,
+) -> Result<lnvps_db::Tunnel, ApiError> {
+    this.db
+        .list_vpn_device_tunnels(device.id)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            // Only reachable if the service has no interfaces, which is also
+            // the state in which nothing could connect anyway.
+            ApiError::new(format!(
+                "Device {} has no peers, because its service terminates on no interface",
+                device.id
+            ))
+        })
 }
 
 /// One config per region, all sharing this device's `[Interface]`.
@@ -385,7 +413,7 @@ async fn v1_vpn_device_configs(
     let uid = this.db.upsert_user(&auth.pubkey()).await?;
     let plan = my_plan(&this, uid).await?;
     let device = my_device(&this, &plan, id).await?;
-    let tunnel = this.db.get_tunnel(device.tunnel_id).await?;
+    let tunnel = a_peer_of(&this, &device).await?;
     let service = this.db.get_vpn_service(plan.vpn_service_id).await?;
 
     // A full tunnel, for the families this device actually holds. Offering

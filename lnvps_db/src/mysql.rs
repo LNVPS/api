@@ -7,13 +7,13 @@ use crate::{
     IntervalType, IpRange, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode,
     MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage,
     PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
-    Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
+    Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelKind,
     RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
     SubscriptionPaymentWithCompany, Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod,
     UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
     VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage,
-    VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice, VpnService,
-    VpnSubscription, WebauthnCredential,
+    VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice, VpnPeerTemplate,
+    VpnService, VpnSubscription, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -5421,22 +5421,101 @@ impl LNVpsDbBase for LNVpsDbMysql {
                  must share one block so a device keeps one address in every region"
             )));
         }
+        // Linking an interface and giving it the service's devices is one
+        // operation. A link without the peers is a region a customer can select
+        // and cannot reach, with nothing to indicate why.
+        let mut tx = self.db.begin().await?;
         sqlx::query(
             "INSERT INTO vpn_service_pool (vpn_service_id, tunnel_pool_id) VALUES (?, ?) \
              ON DUPLICATE KEY UPDATE vpn_service_id = VALUES(vpn_service_id)",
         )
         .bind(vpn_service_id)
         .bind(tunnel_pool_id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
+
+        let router_id: (u64,) = sqlx::query_as("SELECT router_id FROM tunnel_pool WHERE id = ?")
+            .bind(tunnel_pool_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        // Every existing device gains a peer here, copied from one it already
+        // has: same key, same addresses, because that identity working in every
+        // region is the product. `LIMIT 1` per device because its rows are
+        // identical by construction.
+        let devices: Vec<(u64, Vec<u8>, Option<String>, Option<String>, String)> = sqlx::query_as(
+            "SELECT d.id, t.peer_pubkey, t.address4, t.address6, t.name FROM vpn_device d \
+                 JOIN vpn_subscription vs ON vs.id = d.vpn_subscription_id \
+                 JOIN vpn_device_tunnel dt ON dt.vpn_device_id = d.id \
+                 JOIN tunnel t ON t.id = dt.tunnel_id \
+                 WHERE vs.vpn_service_id = ? \
+                 GROUP BY d.id",
+        )
+        .bind(vpn_service_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        for (device_id, peer_pubkey, address4, address6, name) in devices {
+            let tunnel_id: u64 = sqlx::query(
+                "INSERT INTO tunnel (kind, user_id, router_id, pool_id, name, peer_pubkey, \
+                 address4, address6, enabled) \
+                 SELECT ?, vs.user_id, ?, ?, ?, ?, ?, ?, 1 FROM vpn_device d \
+                 JOIN vpn_subscription vs ON vs.id = d.vpn_subscription_id WHERE d.id = ?",
+            )
+            .bind(RouterTunnelKind::Wireguard)
+            .bind(router_id.0)
+            .bind(tunnel_pool_id)
+            .bind(&name)
+            .bind(&peer_pubkey)
+            .bind(&address4)
+            .bind(&address6)
+            .bind(device_id)
+            .execute(&mut *tx)
+            .await?
+            .last_insert_id();
+
+            sqlx::query("INSERT INTO vpn_device_tunnel (vpn_device_id, tunnel_id) VALUES (?, ?)")
+                .bind(device_id)
+                .bind(tunnel_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 
     async fn unlink_vpn_service_pool(&self, tunnel_pool_id: u64) -> DbResult<()> {
+        // Withdrawing a region takes its peers with it. Leaving them would mean
+        // rows still claiming an interface that no longer terminates the
+        // service, which the planner would then configure -- an unlinked region
+        // that keeps working.
+        //
+        // The devices keep every other region and their addresses: what is
+        // withdrawn is one interface, not the customer's identity.
+        let mut tx = self.db.begin().await?;
+        let tunnel_ids: Vec<(u64,)> = sqlx::query_as(
+            "SELECT dt.tunnel_id FROM vpn_device_tunnel dt \
+             JOIN tunnel t ON t.id = dt.tunnel_id WHERE t.pool_id = ?",
+        )
+        .bind(tunnel_pool_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (tunnel_id,) in tunnel_ids {
+            sqlx::query("DELETE FROM vpn_device_tunnel WHERE tunnel_id = ?")
+                .bind(tunnel_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM tunnel WHERE id = ?")
+                .bind(tunnel_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query("DELETE FROM vpn_service_pool WHERE tunnel_pool_id = ?")
             .bind(tunnel_pool_id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -5522,7 +5601,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn get_vpn_device_by_pubkey(&self, peer_pubkey: &[u8]) -> DbResult<Option<VpnDevice>> {
         Ok(sqlx::query_as(
             "SELECT d.* FROM vpn_device d \
-             JOIN tunnel t ON t.id = d.tunnel_id WHERE t.peer_pubkey = ?",
+             JOIN vpn_device_tunnel dt ON dt.vpn_device_id = d.id \
+             JOIN tunnel t ON t.id = dt.tunnel_id WHERE t.peer_pubkey = ? LIMIT 1",
         )
         .bind(peer_pubkey)
         .fetch_optional(&self.db)
@@ -5541,7 +5621,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn list_vpn_tunnels_in_service(&self, vpn_service_id: u64) -> DbResult<Vec<Tunnel>> {
         Ok(sqlx::query_as(
             "SELECT t.* FROM tunnel t \
-             JOIN vpn_device d ON d.tunnel_id = t.id \
+             JOIN vpn_device_tunnel dt ON dt.tunnel_id = t.id \
+             JOIN vpn_device d ON d.id = dt.vpn_device_id \
              JOIN vpn_subscription vs ON vs.id = d.vpn_subscription_id \
              WHERE vs.vpn_service_id = ? ORDER BY t.id",
         )
@@ -5550,22 +5631,35 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
-    async fn list_active_vpn_tunnels(&self, vpn_service_id: u64) -> DbResult<Vec<Tunnel>> {
-        // The billing join is what applies suspension: an unpaid, deactivated or
-        // expired plan simply stops matching, so its peers leave the next
-        // reconcile's set without any code path having had to disable them.
+    async fn list_vpn_device_tunnels(&self, vpn_device_id: u64) -> DbResult<Vec<Tunnel>> {
         Ok(sqlx::query_as(
             "SELECT t.* FROM tunnel t \
-             JOIN vpn_device d ON d.tunnel_id = t.id \
+             JOIN vpn_device_tunnel dt ON dt.tunnel_id = t.id \
+             WHERE dt.vpn_device_id = ? ORDER BY t.id",
+        )
+        .bind(vpn_device_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_active_vpn_tunnels_in_pool(&self, tunnel_pool_id: u64) -> DbResult<Vec<Tunnel>> {
+        // `t.pool_id` selects this interface's own rows; the billing join is
+        // what applies suspension. An unpaid, deactivated or expired plan simply
+        // stops matching, so its peers leave the next reconcile's set without
+        // any code path having had to disable them.
+        Ok(sqlx::query_as(
+            "SELECT t.* FROM tunnel t \
+             JOIN vpn_device_tunnel dt ON dt.tunnel_id = t.id \
+             JOIN vpn_device d ON d.id = dt.vpn_device_id \
              JOIN vpn_subscription vs ON vs.id = d.vpn_subscription_id \
              JOIN subscription_line_item sli ON sli.id = vs.subscription_line_item_id \
              JOIN subscription s ON s.id = sli.subscription_id \
-             WHERE vs.vpn_service_id = ? AND t.enabled = 1 \
+             WHERE t.pool_id = ? AND t.enabled = 1 \
              AND s.is_active = 1 AND s.is_setup = 1 \
              AND (s.expires IS NULL OR s.expires > NOW()) \
              ORDER BY t.id",
         )
-        .bind(vpn_service_id)
+        .bind(tunnel_pool_id)
         .fetch_all(&self.db)
         .await?)
     }
@@ -5605,18 +5699,63 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn insert_vpn_device(&self, device: &VpnDevice) -> DbResult<u64> {
-        let res = sqlx::query(
-            "INSERT INTO vpn_device (vpn_subscription_id, slot, name, tunnel_id) \
-             VALUES (?, ?, ?, ?) returning id",
+    async fn insert_vpn_device_with_peers(
+        &self,
+        device: &VpnDevice,
+        peer: &VpnPeerTemplate,
+    ) -> DbResult<u64> {
+        let mut tx = self.db.begin().await?;
+
+        let device_id: u64 = sqlx::query(
+            "INSERT INTO vpn_device (vpn_subscription_id, slot, name) VALUES (?, ?, ?)",
         )
         .bind(device.vpn_subscription_id)
         .bind(device.slot)
         .bind(&device.name)
-        .bind(device.tunnel_id)
-        .fetch_one(&self.db)
+        .execute(&mut *tx)
+        .await?
+        .last_insert_id();
+
+        // Every interface the plan's service terminates gets a peer, all
+        // carrying the same key and addresses. Read inside the transaction so a
+        // region linked concurrently is either in this device's set or not,
+        // rather than half of it.
+        let pools: Vec<(u64, u64)> = sqlx::query_as(
+            "SELECT tp.id, tp.router_id FROM tunnel_pool tp \
+             JOIN vpn_service_pool vsp ON vsp.tunnel_pool_id = tp.id \
+             JOIN vpn_subscription vs ON vs.vpn_service_id = vsp.vpn_service_id \
+             WHERE vs.id = ? ORDER BY tp.id",
+        )
+        .bind(device.vpn_subscription_id)
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(res.try_get(0)?)
+
+        for (pool_id, router_id) in pools {
+            let tunnel_id: u64 = sqlx::query(
+                "INSERT INTO tunnel (kind, user_id, router_id, pool_id, name, peer_pubkey, \
+                 address4, address6, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            )
+            .bind(RouterTunnelKind::Wireguard)
+            .bind(peer.user_id)
+            .bind(router_id)
+            .bind(pool_id)
+            .bind(&peer.name)
+            .bind(&peer.peer_pubkey)
+            .bind(&peer.address4)
+            .bind(&peer.address6)
+            .execute(&mut *tx)
+            .await?
+            .last_insert_id();
+
+            sqlx::query("INSERT INTO vpn_device_tunnel (vpn_device_id, tunnel_id) VALUES (?, ?)")
+                .bind(device_id)
+                .bind(tunnel_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        Ok(device_id)
     }
 
     async fn update_vpn_device(&self, device: &VpnDevice) -> DbResult<()> {
@@ -5629,26 +5768,26 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn delete_vpn_device(&self, id: u64) -> DbResult<()> {
-        // The tunnel goes with the device. Only this row knows which tunnel
-        // belongs to the customer -- every query reaches one through the other
-        // -- so deleting the link alone leaves a tunnel that no query can see,
-        // holding a public key, forever.
+        // The peers go with the device. Only these rows know which tunnels
+        // belong to the customer -- every query reaches one through the other --
+        // so deleting the device alone would leave tunnels no query can see,
+        // still holding a public key and still configured on a route server.
         //
-        // A transaction because a foreign key cannot express ownership in this
-        // direction, and the two deletes must be ordered: `vpn_device.tunnel_id`
-        // is RESTRICT, so the link goes first. `tunnel_route` cascades off
-        // `tunnel` and needs no help.
+        // Ordered: the link rows cascade off `vpn_device`, but
+        // `vpn_device_tunnel.tunnel_id` is RESTRICT, so the tunnel ids have to
+        // be read before the device goes and deleted after. `tunnel_route`
+        // cascades off `tunnel` and needs no help.
         let mut tx = self.db.begin().await?;
-        let tunnel_id: Option<(u64,)> =
-            sqlx::query_as("SELECT tunnel_id FROM vpn_device WHERE id = ?")
+        let tunnel_ids: Vec<(u64,)> =
+            sqlx::query_as("SELECT tunnel_id FROM vpn_device_tunnel WHERE vpn_device_id = ?")
                 .bind(id)
-                .fetch_optional(&mut *tx)
+                .fetch_all(&mut *tx)
                 .await?;
         sqlx::query("DELETE FROM vpn_device WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        if let Some((tunnel_id,)) = tunnel_id {
+        for (tunnel_id,) in tunnel_ids {
             sqlx::query("DELETE FROM tunnel WHERE id = ?")
                 .bind(tunnel_id)
                 .execute(&mut *tx)

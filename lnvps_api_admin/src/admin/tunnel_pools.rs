@@ -1504,21 +1504,9 @@ mod tests {
         let pool = db.get_tunnel_pool(pool_id).await?;
         assert_eq!(pool_info(&db, pool).await.unwrap().links_used, 0);
 
-        // A real device: a tunnel that deliberately belongs to no pool, plus
-        // the plan and link row that put it on this service. The tunnel alone
-        // is not "in" the service, which is the whole reason the count has to
-        // go through the service rather than the pool.
+        // A real device. The database creates one peer per interface the
+        // service terminates, which is what the count has to find.
         let user_id = db.upsert_user(&[1u8; 32]).await?;
-        let tunnel_id = db
-            .insert_tunnel(&Tunnel {
-                user_id,
-                name: "device".to_string(),
-                peer_pubkey: Some(vec![7u8; 32]),
-                address4: Some("10.21.74.165/32".to_string()),
-                enabled: true,
-                ..Default::default()
-            })
-            .await?;
         let plan_id = db
             .insert_vpn_subscription(&lnvps_db::VpnSubscription {
                 vpn_service_id: service_id,
@@ -1527,13 +1515,21 @@ mod tests {
                 ..Default::default()
             })
             .await?;
-        db.insert_vpn_device(&lnvps_db::VpnDevice {
-            vpn_subscription_id: plan_id,
-            slot: 0,
-            name: "laptop".to_string(),
-            tunnel_id,
-            ..Default::default()
-        })
+        db.insert_vpn_device_with_peers(
+            &lnvps_db::VpnDevice {
+                vpn_subscription_id: plan_id,
+                slot: 0,
+                name: "laptop".to_string(),
+                ..Default::default()
+            },
+            &lnvps_db::VpnPeerTemplate {
+                user_id,
+                name: "device".to_string(),
+                peer_pubkey: vec![7u8; 32],
+                address4: Some("10.21.74.165/32".to_string()),
+                address6: None,
+            },
+        )
         .await?;
 
         let pool = db.get_tunnel_pool(pool_id).await?;

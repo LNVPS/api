@@ -13,12 +13,12 @@ use lnvps_db::{
     MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage,
     NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
     ReferralCostUsage, ReferralPayout, Region, Router, RouterBgpRoute, RouterBgpSession,
-    RouterTunnel, RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod,
-    UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment,
-    VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice, VpnService,
-    VpnSubscription, WebauthnCredential,
+    RouterTunnel, RouterTunnelKind, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, SubscriptionPaymentWithCompany, Tunnel, TunnelPool, TunnelRoute, User,
+    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
+    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind,
+    VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal,
+    VpnDevice, VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
 };
 
 use async_trait::async_trait;
@@ -90,6 +90,9 @@ pub struct MockDb {
     pub vpn_service_pools: Arc<Mutex<HashMap<u64, u64>>>,
     pub vpn_subscriptions: Arc<Mutex<HashMap<u64, VpnSubscription>>>,
     pub vpn_devices: Arc<Mutex<HashMap<u64, VpnDevice>>>,
+    /// A device's peers, one per interface its service terminates. Mirrors
+    /// `vpn_device_tunnel`: device id -> tunnel ids.
+    pub vpn_device_tunnels: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     /// `tunnel_route`, keyed by tunnel: the prefixes behind that peer.
     pub tunnel_routes: Arc<Mutex<HashMap<u64, Vec<String>>>>,
     pub referral_payouts: Arc<Mutex<Vec<ReferralPayout>>>,
@@ -200,9 +203,6 @@ impl MockDb {
                     candidate.slot
                 )
                 .into());
-            }
-            if other.tunnel_id == candidate.tunnel_id {
-                return Err(anyhow!("That tunnel already terminates a device").into());
             }
         }
         Ok(())
@@ -527,6 +527,7 @@ impl Default for MockDb {
             vpn_service_pools: Arc::new(Default::default()),
             vpn_subscriptions: Arc::new(Default::default()),
             vpn_devices: Arc::new(Default::default()),
+            vpn_device_tunnels: Arc::new(Default::default()),
             tunnel_routes: Arc::new(Default::default()),
             referral_payouts: Arc::new(Default::default()),
             router_tunnels: Arc::new(Default::default()),
@@ -5104,10 +5105,94 @@ impl LNVpsDbBase for MockDb {
             .lock()
             .await
             .insert(tunnel_pool_id, vpn_service_id);
+
+        // Linking an interface and giving it the service's devices is one
+        // operation: a link without the peers is a region a customer can select
+        // and cannot reach.
+        let router_id = self
+            .tunnel_pools
+            .lock()
+            .await
+            .get(&tunnel_pool_id)
+            .map(|p| p.router_id);
+        let plans: Vec<u64> = self
+            .vpn_subscriptions
+            .lock()
+            .await
+            .values()
+            .filter(|s| s.vpn_service_id == vpn_service_id)
+            .map(|s| s.id)
+            .collect();
+        let devices: Vec<u64> = self
+            .vpn_devices
+            .lock()
+            .await
+            .values()
+            .filter(|d| plans.contains(&d.vpn_subscription_id))
+            .map(|d| d.id)
+            .collect();
+
+        for device_id in devices {
+            // Copied from a peer it already has: same key, same addresses,
+            // because that identity working in every region is the product.
+            let existing = {
+                let links = self.vpn_device_tunnels.lock().await;
+                let tunnels = self.tunnels.lock().await;
+                links
+                    .get(&device_id)
+                    .and_then(|ids| ids.first().and_then(|id| tunnels.get(id).cloned()))
+            };
+            let Some(existing) = existing else { continue };
+            let new_id = {
+                let mut tunnels = self.tunnels.lock().await;
+                let new_id = tunnels.keys().max().copied().unwrap_or(0) + 1;
+                tunnels.insert(
+                    new_id,
+                    Tunnel {
+                        id: new_id,
+                        router_id,
+                        pool_id: Some(tunnel_pool_id),
+                        created: Utc::now(),
+                        ..existing
+                    },
+                );
+                new_id
+            };
+            self.vpn_device_tunnels
+                .lock()
+                .await
+                .entry(device_id)
+                .or_default()
+                .push(new_id);
+        }
         Ok(())
     }
 
     async fn unlink_vpn_service_pool(&self, tunnel_pool_id: u64) -> DbResult<()> {
+        // Withdrawing a region takes its peers with it: rows still claiming an
+        // interface that no longer terminates the service would be configured
+        // by the planner, so an unlinked region would keep working. The devices
+        // keep every other region and their addresses.
+        let doomed: Vec<u64> = {
+            let tunnels = self.tunnels.lock().await;
+            tunnels
+                .values()
+                .filter(|t| t.pool_id == Some(tunnel_pool_id))
+                .map(|t| t.id)
+                .collect()
+        };
+        {
+            let mut links = self.vpn_device_tunnels.lock().await;
+            let mut tunnels = self.tunnels.lock().await;
+            let mut routes = self.tunnel_routes.lock().await;
+            for id in &doomed {
+                for peers in links.values_mut() {
+                    peers.retain(|t| t != id);
+                }
+                tunnels.remove(id);
+                routes.remove(id);
+            }
+        }
         self.vpn_service_pools.lock().await.remove(&tunnel_pool_id);
         Ok(())
     }
@@ -5279,13 +5364,15 @@ impl LNVpsDbBase for MockDb {
         else {
             return Ok(None);
         };
-        Ok(self
-            .vpn_devices
-            .lock()
-            .await
-            .values()
-            .find(|d| d.tunnel_id == tunnel.id)
-            .cloned())
+        let links = self.vpn_device_tunnels.lock().await;
+        let device_id = links
+            .iter()
+            .find(|(_, tunnel_ids)| tunnel_ids.contains(&tunnel.id))
+            .map(|(device_id, _)| *device_id);
+        Ok(match device_id {
+            Some(id) => self.vpn_devices.lock().await.get(&id).cloned(),
+            None => None,
+        })
     }
 
     async fn list_vpn_devices(&self, vpn_subscription_id: u64) -> DbResult<Vec<VpnDevice>> {
@@ -5308,16 +5395,23 @@ impl LNVpsDbBase for MockDb {
             .collect();
         let devices = self.vpn_devices.lock().await;
         let tunnels = self.tunnels.lock().await;
+        let links = self.vpn_device_tunnels.lock().await;
         let mut out: Vec<Tunnel> = devices
             .values()
             .filter(|d| plans.contains(&d.vpn_subscription_id))
-            .filter_map(|d| tunnels.get(&d.tunnel_id).cloned())
+            .flat_map(|d| {
+                links
+                    .get(&d.id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tid| tunnels.get(tid).cloned())
+            })
             .collect();
         out.sort_by_key(|t| t.id);
         Ok(out)
     }
 
-    async fn list_active_vpn_tunnels(&self, vpn_service_id: u64) -> DbResult<Vec<Tunnel>> {
+    async fn list_active_vpn_tunnels_in_pool(&self, tunnel_pool_id: u64) -> DbResult<Vec<Tunnel>> {
         let subs = self.vpn_subscriptions.lock().await;
         let line_items = self.subscription_line_items.lock().await;
         let subscriptions = self.subscriptions.lock().await;
@@ -5328,7 +5422,6 @@ impl LNVpsDbBase for MockDb {
         // its peers simply leave the set.
         let live: Vec<u64> = subs
             .values()
-            .filter(|s| s.vpn_service_id == vpn_service_id)
             .filter(|s| {
                 line_items
                     .get(&s.subscription_line_item_id)
@@ -5342,11 +5435,32 @@ impl LNVpsDbBase for MockDb {
 
         let devices = self.vpn_devices.lock().await;
         let tunnels = self.tunnels.lock().await;
+        let links = self.vpn_device_tunnels.lock().await;
         let mut out: Vec<Tunnel> = devices
             .values()
             .filter(|d| live.contains(&d.vpn_subscription_id))
-            .filter_map(|d| tunnels.get(&d.tunnel_id).cloned())
-            .filter(|t| t.enabled)
+            .flat_map(|d| {
+                links
+                    .get(&d.id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tid| tunnels.get(tid).cloned())
+            })
+            // The pool selects its own rows; a device has one per interface.
+            .filter(|t| t.pool_id == Some(tunnel_pool_id) && t.enabled)
+            .collect();
+        out.sort_by_key(|t| t.id);
+        Ok(out)
+    }
+
+    async fn list_vpn_device_tunnels(&self, vpn_device_id: u64) -> DbResult<Vec<Tunnel>> {
+        let links = self.vpn_device_tunnels.lock().await;
+        let tunnels = self.tunnels.lock().await;
+        let mut out: Vec<Tunnel> = links
+            .get(&vpn_device_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|tid| tunnels.get(tid).cloned())
             .collect();
         out.sort_by_key(|t| t.id);
         Ok(out)
@@ -5385,33 +5499,101 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn insert_vpn_device(&self, device: &VpnDevice) -> DbResult<u64> {
+    async fn insert_vpn_device_with_peers(
+        &self,
+        device: &VpnDevice,
+        peer: &VpnPeerTemplate,
+    ) -> DbResult<u64> {
         // FK vpn_device.vpn_subscription_id
-        if !self
-            .vpn_subscriptions
+        let service_id = {
+            let subs = self.vpn_subscriptions.lock().await;
+            match subs.get(&device.vpn_subscription_id) {
+                Some(s) => s.vpn_service_id,
+                None => {
+                    return Err(anyhow!(
+                        "VPN subscription {} not found",
+                        device.vpn_subscription_id
+                    )
+                    .into());
+                }
+            }
+        };
+
+        let device_id = {
+            let mut devices = self.vpn_devices.lock().await;
+            Self::check_vpn_device_uniqueness(&devices, device, None)?;
+            let new_id = devices.keys().max().copied().unwrap_or(0) + 1;
+            devices.insert(
+                new_id,
+                VpnDevice {
+                    id: new_id,
+                    created: Utc::now(),
+                    ..device.clone()
+                },
+            );
+            new_id
+        };
+
+        // One peer per interface the service terminates, all carrying the same
+        // key and addresses.
+        let pool_ids: Vec<u64> = {
+            let links = self.vpn_service_pools.lock().await;
+            let mut ids: Vec<u64> = links
+                .iter()
+                .filter(|(_, sid)| **sid == service_id)
+                .map(|(pool_id, _)| *pool_id)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+
+        let mut tunnel_ids = Vec::with_capacity(pool_ids.len());
+        for pool_id in pool_ids {
+            let router_id = {
+                let pools = self.tunnel_pools.lock().await;
+                pools.get(&pool_id).map(|p| p.router_id)
+            };
+            let mut tunnels = self.tunnels.lock().await;
+            // uk_tunnel_pool_address4/6 and uk_tunnel_pool_peer_pubkey: unique
+            // within an interface, not globally.
+            if tunnels.values().any(|t| {
+                t.pool_id == Some(pool_id)
+                    && (t.peer_pubkey.as_deref() == Some(peer.peer_pubkey.as_slice())
+                        || (t.address4.is_some() && t.address4 == peer.address4)
+                        || (t.address6.is_some() && t.address6 == peer.address6))
+            }) {
+                return Err(anyhow!(
+                    "A peer with that key or address already exists on tunnel pool {pool_id}"
+                )
+                .into());
+            }
+            let new_id = tunnels.keys().max().copied().unwrap_or(0) + 1;
+            tunnels.insert(
+                new_id,
+                Tunnel {
+                    id: new_id,
+                    kind: RouterTunnelKind::Wireguard,
+                    user_id: peer.user_id,
+                    router_id,
+                    pool_id: Some(pool_id),
+                    name: peer.name.clone(),
+                    peer_pubkey: Some(peer.peer_pubkey.clone()),
+                    peer_endpoint: None,
+                    address4: peer.address4.clone(),
+                    address6: peer.address6.clone(),
+                    keepalive: None,
+                    enabled: true,
+                    created: Utc::now(),
+                },
+            );
+            tunnel_ids.push(new_id);
+        }
+
+        self.vpn_device_tunnels
             .lock()
             .await
-            .contains_key(&device.vpn_subscription_id)
-        {
-            return Err(
-                anyhow!("VPN subscription {} not found", device.vpn_subscription_id).into(),
-            );
-        }
-        if !self.tunnels.lock().await.contains_key(&device.tunnel_id) {
-            return Err(anyhow!("Tunnel {} not found", device.tunnel_id).into());
-        }
-        let mut devices = self.vpn_devices.lock().await;
-        Self::check_vpn_device_uniqueness(&devices, device, None)?;
-        let new_id = devices.keys().max().copied().unwrap_or(0) + 1;
-        devices.insert(
-            new_id,
-            VpnDevice {
-                id: new_id,
-                created: Utc::now(),
-                ..device.clone()
-            },
-        );
-        Ok(new_id)
+            .insert(device_id, tunnel_ids);
+        Ok(device_id)
     }
 
     async fn update_vpn_device(&self, device: &VpnDevice) -> DbResult<()> {
@@ -5435,14 +5617,18 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn delete_vpn_device(&self, id: u64) -> DbResult<()> {
-        // The tunnel goes with the device: only this row knows which tunnel
-        // belongs to the customer, so deleting the link alone leaves a tunnel
-        // no query can see, still holding a public key.
-        let removed = self.vpn_devices.lock().await.remove(&id);
-        if let Some(device) = removed {
-            self.tunnels.lock().await.remove(&device.tunnel_id);
-            // ON DELETE CASCADE off `tunnel`.
-            self.tunnel_routes.lock().await.remove(&device.tunnel_id);
+        // The peers go with the device: only the link rows know which tunnels
+        // belong to the customer, so deleting the device alone would leave
+        // tunnels no query can see, still holding a public key.
+        self.vpn_devices.lock().await.remove(&id);
+        if let Some(tunnel_ids) = self.vpn_device_tunnels.lock().await.remove(&id) {
+            let mut tunnels = self.tunnels.lock().await;
+            let mut routes = self.tunnel_routes.lock().await;
+            for tunnel_id in tunnel_ids {
+                tunnels.remove(&tunnel_id);
+                // ON DELETE CASCADE off `tunnel`.
+                routes.remove(&tunnel_id);
+            }
         }
         Ok(())
     }
@@ -11769,18 +11955,57 @@ mod vpn_tests {
 
     /// A service with a block, and a paid plan on it, which is the starting
     /// point for everything below.
-    async fn vpn_service(db: &MockDb) -> u64 {
+    /// A service and the one interface terminating it.
+    ///
+    /// The interface is not optional scenery: a device is a peer *on* an
+    /// interface, so a service with none has no peers to allocate and no block
+    /// to allocate them from.
+    async fn vpn_service(db: &MockDb) -> (u64, u64) {
         let company_id = a_company(db).await;
-        db.insert_vpn_service(&VpnService {
-            name: "eu".to_string(),
-            company_id,
-            currency: "EUR".to_string(),
-            default_device_limit: 5,
-            enabled: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap()
+        let service = db
+            .insert_vpn_service(&VpnService {
+                name: "eu".to_string(),
+                company_id,
+                currency: "EUR".to_string(),
+                default_device_limit: 5,
+                enabled: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let router_id = {
+            let mut routers = db.router.lock().await;
+            let id = routers.keys().max().copied().unwrap_or(0) + 1;
+            routers.insert(
+                id,
+                Router {
+                    id,
+                    name: format!("rs{id}"),
+                    enabled: true,
+                    kind: lnvps_db::RouterKind::MockRouter,
+                    url: "mock://rs".to_string(),
+                    token: "t".into(),
+                },
+            );
+            id
+        };
+        let pool = db
+            .insert_tunnel_pool(&TunnelPool {
+                router_id,
+                region_id: 1,
+                name: "eu-1".to_string(),
+                listen_addr: "rs.example".to_string(),
+                listen_port: 51820 + service as u16,
+                public_key: vec![0x33; 32],
+                cidr4: Some("10.64.0.0/24".to_string()),
+                mtu: 1420,
+                enabled: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.link_vpn_service_pool(service, pool).await.unwrap();
+        (service, pool)
     }
 
     /// A subscription line item in the given billing state, for a fresh user.
@@ -11842,33 +12067,25 @@ mod vpn_tests {
     }
 
     /// A device is a link from a plan to a peer, so a peer has to exist first.
-    async fn device(db: &MockDb, plan: u64, slot: u8, seed: u8) -> VpnDevice {
-        let user_id = db
-            .vpn_subscriptions
-            .lock()
-            .await
-            .get(&plan)
-            .map(|p| p.user_id)
-            .unwrap_or(1);
-        let tunnel_id = db
-            .insert_tunnel(&Tunnel {
-                kind: lnvps_db::RouterTunnelKind::Wireguard,
-                user_id,
-                name: format!("vpn-{plan}-{slot}"),
-                peer_pubkey: Some(vec![seed; 32]),
-                address4: Some(format!("10.64.0.{seed}/32")),
-                enabled: true,
+    /// Register a device, letting the database fan its peer out over every
+    /// interface the service terminates.
+    async fn device(db: &MockDb, plan: u64, slot: u8, seed: u8) -> DbResult<u64> {
+        db.insert_vpn_device_with_peers(
+            &VpnDevice {
+                vpn_subscription_id: plan,
+                slot,
+                name: format!("device-{seed}"),
                 ..Default::default()
-            })
-            .await
-            .unwrap();
-        VpnDevice {
-            vpn_subscription_id: plan,
-            slot,
-            name: format!("device-{seed}"),
-            tunnel_id,
-            ..Default::default()
-        }
+            },
+            &VpnPeerTemplate {
+                user_id: 1,
+                name: format!("device-{seed}"),
+                peer_pubkey: vec![seed; 32],
+                address4: Some(format!("10.64.0.{seed}/32")),
+                address6: None,
+            },
+        )
+        .await
     }
 
     /// A service has no block of its own: a device is addressed from the block
@@ -11878,7 +12095,7 @@ mod vpn_tests {
     #[tokio::test]
     async fn every_interface_on_a_service_shares_one_block() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
 
         let mut pools = db.tunnel_pools.lock().await;
         for (id, cidr) in [
@@ -11925,7 +12142,7 @@ mod vpn_tests {
     #[tokio::test]
     async fn a_service_can_be_taken_off_sale() {
         let db = MockDb::default();
-        let id = vpn_service(&db).await;
+        let (id, _pool) = vpn_service(&db).await;
         assert_eq!(db.list_vpn_services(true).await.unwrap().len(), 1);
 
         let mut svc = db.get_vpn_service(id).await.unwrap();
@@ -11942,7 +12159,7 @@ mod vpn_tests {
     #[tokio::test]
     async fn a_vpn_service_in_use_cannot_be_deleted() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
 
         let plan = paid_plan(&db, 1, service).await;
         assert!(
@@ -11987,32 +12204,43 @@ mod vpn_tests {
     #[tokio::test]
     async fn an_interface_terminates_at_most_one_service() {
         let db = MockDb::default();
-        let a = vpn_service(&db).await;
-        let b = db
-            .insert_vpn_service(&VpnService {
-                name: "b".to_string(),
-                company_id: a_company(&db).await,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        for id in [1u64, 2] {
+        // Bare services, not the `vpn_service` fixture: that links an interface
+        // of its own, and this test is about which interfaces end up linked.
+        let company_id = a_company(&db).await;
+        let mut bare = Vec::new();
+        for name in ["a", "b"] {
+            bare.push(
+                db.insert_vpn_service(&VpnService {
+                    name: name.to_string(),
+                    company_id,
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            );
+        }
+        let (a, b) = (bare[0], bare[1]);
+        for id in [90u64, 91] {
             db.tunnel_pools.lock().await.insert(
                 id,
                 TunnelPool {
                     id,
+                    // The same block the fixture's interfaces carry: every
+                    // interface on a service shares one, so a block-less pool
+                    // is refused by the rule this test is not about.
+                    cidr4: Some("10.64.0.0/24".to_string()),
                     ..Default::default()
                 },
             );
         }
 
         // An unlinked pool is a marketplace pool and behaves as it always has.
-        assert!(db.get_vpn_service_for_pool(1).await.unwrap().is_none());
+        assert!(db.get_vpn_service_for_pool(90).await.unwrap().is_none());
 
-        db.link_vpn_service_pool(a, 1).await.unwrap();
-        db.link_vpn_service_pool(a, 2).await.unwrap();
+        db.link_vpn_service_pool(a, 90).await.unwrap();
+        db.link_vpn_service_pool(a, 91).await.unwrap();
         assert_eq!(
-            db.get_vpn_service_for_pool(1).await.unwrap().map(|s| s.id),
+            db.get_vpn_service_for_pool(90).await.unwrap().map(|s| s.id),
             Some(a)
         );
         assert_eq!(
@@ -12022,14 +12250,14 @@ mod vpn_tests {
                 .iter()
                 .map(|p| p.id)
                 .collect::<Vec<_>>(),
-            vec![1, 2],
+            vec![90, 91],
             "every interface on a service carries the same device peer set"
         );
 
         // Repointing replaces the link rather than adding a second one.
-        db.link_vpn_service_pool(b, 2).await.unwrap();
+        db.link_vpn_service_pool(b, 91).await.unwrap();
         assert_eq!(
-            db.get_vpn_service_for_pool(2).await.unwrap().map(|s| s.id),
+            db.get_vpn_service_for_pool(91).await.unwrap().map(|s| s.id),
             Some(b)
         );
         assert_eq!(
@@ -12039,7 +12267,7 @@ mod vpn_tests {
                 .iter()
                 .map(|p| p.id)
                 .collect::<Vec<_>>(),
-            vec![1]
+            vec![90]
         );
 
         // Neither side may be invented.
@@ -12056,7 +12284,7 @@ mod vpn_tests {
     #[tokio::test]
     async fn one_vpn_plan_per_account() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
         let plan = paid_plan(&db, 1, service).await;
 
         let stored = db.get_vpn_subscription(plan).await.unwrap();
@@ -12121,7 +12349,7 @@ mod vpn_tests {
     #[tokio::test]
     async fn a_vpn_plan_is_repointed_not_moved() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
         let other_service = db
             .insert_vpn_service(&VpnService {
                 name: "other".to_string(),
@@ -12168,51 +12396,21 @@ mod vpn_tests {
     #[tokio::test]
     async fn a_device_slot_cannot_be_claimed_twice() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
         let plan = paid_plan(&db, 1, service).await;
 
-        db.insert_vpn_device(&device(&db, plan, 0, 1).await)
-            .await
-            .unwrap();
+        device(&db, plan, 0, 1).await.unwrap();
         assert!(
-            db.insert_vpn_device(&device(&db, plan, 0, 2).await)
-                .await
-                .is_err(),
+            device(&db, plan, 0, 2).await.is_err(),
             "two devices in one slot is a sixth device on a five-device plan"
-        );
-
-        // A tunnel terminates one peer, so two devices cannot share one.
-        let first = db.list_vpn_devices(plan).await.unwrap()[0].clone();
-        assert!(
-            db.insert_vpn_device(&VpnDevice {
-                slot: 1,
-                tunnel_id: first.tunnel_id,
-                ..device(&db, plan, 1, 3).await
-            })
-            .await
-            .is_err()
         );
 
         // The slot is per plan, so another customer's slot 0 is free.
         let other = paid_plan(&db, 2, service).await;
-        db.insert_vpn_device(&device(&db, other, 0, 6).await)
-            .await
-            .unwrap();
+        device(&db, other, 0, 6).await.unwrap();
 
         // Neither a plan nor a peer may be invented.
-        assert!(
-            db.insert_vpn_device(&device(&db, 9999, 0, 7).await)
-                .await
-                .is_err()
-        );
-        assert!(
-            db.insert_vpn_device(&VpnDevice {
-                tunnel_id: 9999,
-                ..device(&db, plan, 2, 8).await
-            })
-            .await
-            .is_err()
-        );
+        assert!(device(&db, 9999, 0, 7).await.is_err());
     }
 
     /// Suspension is not a write. A plan that is unpaid, deactivated or expired
@@ -12222,12 +12420,10 @@ mod vpn_tests {
     #[tokio::test]
     async fn only_paid_plans_are_configured() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
 
         let paid = paid_plan(&db, 1, service).await;
-        db.insert_vpn_device(&device(&db, paid, 0, 1).await)
-            .await
-            .unwrap();
+        device(&db, paid, 0, 1).await.unwrap();
 
         // Never paid.
         let (uid, item) = billed_line_item(&db, 2, true, false, None).await;
@@ -12240,9 +12436,7 @@ mod vpn_tests {
             })
             .await
             .unwrap();
-        db.insert_vpn_device(&device(&db, unpaid, 0, 2).await)
-            .await
-            .unwrap();
+        device(&db, unpaid, 0, 2).await.unwrap();
 
         // Paid once, then lapsed.
         let (uid, item) =
@@ -12256,9 +12450,7 @@ mod vpn_tests {
             })
             .await
             .unwrap();
-        db.insert_vpn_device(&device(&db, expired, 0, 3).await)
-            .await
-            .unwrap();
+        device(&db, expired, 0, 3).await.unwrap();
 
         // Cancelled by an admin.
         let (uid, item) = billed_line_item(&db, 4, false, true, None).await;
@@ -12271,11 +12463,9 @@ mod vpn_tests {
             })
             .await
             .unwrap();
-        db.insert_vpn_device(&device(&db, cancelled, 0, 4).await)
-            .await
-            .unwrap();
+        device(&db, cancelled, 0, 4).await.unwrap();
 
-        let active = db.list_active_vpn_tunnels(service).await.unwrap();
+        let active = db.list_active_vpn_tunnels_in_pool(pool).await.unwrap();
         assert_eq!(
             active
                 .iter()
@@ -12291,14 +12481,19 @@ mod vpn_tests {
         t.enabled = false;
         db.update_tunnel(&t).await.unwrap();
         assert!(
-            db.list_active_vpn_tunnels(service)
+            db.list_active_vpn_tunnels_in_pool(pool)
                 .await
                 .unwrap()
                 .is_empty()
         );
 
         // And another service's peers are not this one's.
-        assert!(db.list_active_vpn_tunnels(9999).await.unwrap().is_empty());
+        assert!(
+            db.list_active_vpn_tunnels_in_pool(9999)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A device row carries only the customer's label; its slot, its plan and
@@ -12306,20 +12501,23 @@ mod vpn_tests {
     #[tokio::test]
     async fn renaming_a_device_leaves_everything_else_alone() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
         let plan = paid_plan(&db, 1, service).await;
-        let id = db
-            .insert_vpn_device(&device(&db, plan, 0, 1).await)
-            .await
-            .unwrap();
+        let id = device(&db, plan, 0, 1).await.unwrap();
         let before = db.get_vpn_device(id).await.unwrap();
+        let peers_before: Vec<u64> = db
+            .list_vpn_device_tunnels(id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
 
         db.update_vpn_device(&VpnDevice {
             id,
             vpn_subscription_id: 9999,
             slot: 4,
             name: "laptop".to_string(),
-            tunnel_id: 9999,
             created: Utc::now(),
         })
         .await
@@ -12327,7 +12525,14 @@ mod vpn_tests {
 
         let after = db.get_vpn_device(id).await.unwrap();
         assert_eq!(after.name, "laptop");
-        assert_eq!(after.tunnel_id, before.tunnel_id, "the peer must not move");
+        let peers_after: Vec<u64> = db
+            .list_vpn_device_tunnels(id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(peers_after, peers_before, "the peers must not move");
         assert_eq!(after.slot, before.slot);
         assert_eq!(after.vpn_subscription_id, before.vpn_subscription_id);
         assert_eq!(after.created, before.created);
@@ -12350,9 +12555,7 @@ mod vpn_tests {
 
         // Listing is in slot order, and includes devices whose peer is disabled
         // because a disabled peer still owns its slot and its address.
-        db.insert_vpn_device(&device(&db, plan, 1, 7).await)
-            .await
-            .unwrap();
+        device(&db, plan, 1, 7).await.unwrap();
         let listed = db.list_vpn_devices(plan).await.unwrap();
         assert_eq!(
             listed.iter().map(|d| d.slot).collect::<Vec<_>>(),
@@ -12372,18 +12575,20 @@ mod vpn_tests {
     #[tokio::test]
     async fn tunnel_routes_are_replaced_not_merged() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
         let plan = paid_plan(&db, 1, service).await;
-        let d = device(&db, plan, 0, 1).await;
-        db.insert_vpn_device(&d).await.unwrap();
+        let device_id = device(&db, plan, 0, 1).await.unwrap();
+        // Routes hang off a peer, and a device has one per interface; this
+        // service has a single interface, so it has a single peer.
+        let peer = db.list_vpn_device_tunnels(device_id).await.unwrap()[0].id;
 
         db.replace_tunnel_routes(
-            d.tunnel_id,
+            peer,
             &["203.0.113.0/24".to_string(), "198.51.100.5/32".to_string()],
         )
         .await
         .unwrap();
-        let routes = db.list_tunnel_routes(&[d.tunnel_id]).await.unwrap();
+        let routes = db.list_tunnel_routes(&[peer]).await.unwrap();
         assert_eq!(
             routes.iter().map(|r| r.prefix.as_str()).collect::<Vec<_>>(),
             vec!["198.51.100.5/32", "203.0.113.0/24"]
@@ -12391,21 +12596,13 @@ mod vpn_tests {
 
         // Replacing with a shorter set drops what is no longer behind the peer,
         // which is what stops a released address staying routed.
-        db.replace_tunnel_routes(d.tunnel_id, &["203.0.113.0/24".to_string()])
+        db.replace_tunnel_routes(peer, &["203.0.113.0/24".to_string()])
             .await
             .unwrap();
-        assert_eq!(
-            db.list_tunnel_routes(&[d.tunnel_id]).await.unwrap().len(),
-            1
-        );
+        assert_eq!(db.list_tunnel_routes(&[peer]).await.unwrap().len(), 1);
 
-        db.replace_tunnel_routes(d.tunnel_id, &[]).await.unwrap();
-        assert!(
-            db.list_tunnel_routes(&[d.tunnel_id])
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        db.replace_tunnel_routes(peer, &[]).await.unwrap();
+        assert!(db.list_tunnel_routes(&[peer]).await.unwrap().is_empty());
 
         // Nothing to fetch for a peer nobody asked about, and no such peer.
         assert!(db.list_tunnel_routes(&[]).await.unwrap().is_empty());

@@ -231,7 +231,7 @@ async fn a_lapsed_plan_is_repointed_and_keeps_its_devices() -> Result<()> {
     two_pools(&db, &mock, &service).await?;
     let plan = create_vpn_plan(&db, uid, &service).await?;
     let device = crate::provisioner::register_vpn_device(&db, &plan, "phone", &[7u8; 32]).await?;
-    let peer = db.get_tunnel(device.tunnel_id).await?;
+    let peer = db.list_vpn_device_tunnels(device.id).await?.remove(0);
 
     // Pay it, then let it lapse.
     let mut sub = db
@@ -253,7 +253,7 @@ async fn a_lapsed_plan_is_repointed_and_keeps_its_devices() -> Result<()> {
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].id, device.id);
     assert_eq!(
-        db.get_tunnel(kept[0].tunnel_id).await?.address4,
+        db.list_vpn_device_tunnels(kept[0].id).await?[0].address4,
         peer.address4,
         "the customer's config still works once they pay"
     );

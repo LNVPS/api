@@ -48,7 +48,9 @@ pub struct AdminVpnDeviceInfo {
     pub slot: u8,
     /// The customer's label for it. Not an identifier.
     pub name: String,
-    pub tunnel_id: u64,
+    /// Its peers, one per region it is carried in. A device is a peer on every
+    /// interface of its service, so this is a list rather than one id.
+    pub tunnel_ids: Vec<u64>,
     /// The device's public key, hex. The private half is generated on the
     /// customer's machine and has never been seen here.
     ///
@@ -123,16 +125,22 @@ async fn subscription_info(
 
     let mut devices = Vec::new();
     for device in db.list_vpn_devices(plan.id).await? {
-        let tunnel = db.get_tunnel(device.tunnel_id).await?;
+        // A device has one peer per region, identical in everything shown
+        // here, so the first is as good as any.
+        let peers = db.list_vpn_device_tunnels(device.id).await?;
+        let tunnel = peers.first();
         devices.push(AdminVpnDeviceInfo {
             id: device.id,
             slot: device.slot,
             name: device.name,
-            tunnel_id: device.tunnel_id,
-            public_key: tunnel.peer_pubkey.as_deref().map(hex::encode),
-            address4: tunnel.address4,
-            address6: tunnel.address6,
-            enabled: tunnel.enabled,
+            tunnel_ids: peers.iter().map(|t| t.id).collect(),
+            public_key: tunnel
+                .and_then(|t| t.peer_pubkey.as_deref())
+                .map(hex::encode),
+            address4: tunnel.and_then(|t| t.address4.clone()),
+            address6: tunnel.and_then(|t| t.address6.clone()),
+            // A device with no peers has no interface to be enabled on.
+            enabled: tunnel.is_some_and(|t| t.enabled),
             created: device.created,
         });
     }
