@@ -73,7 +73,14 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["secrets"]
-  verbs: ["get", "create", "patch"]
+  # `delete` removes a finished backup's upload URL, so a leaked one stops
+  # being useful as soon as the run it belonged to is over.
+  verbs: ["get", "create", "patch", "delete"]
+# Backup Jobs live and die inside the deployment's own namespace: created to
+# capture an artifact, read once to learn the outcome, then removed.
+- apiGroups: ["batch"]
+  resources: ["jobs"]
+  verbs: ["get", "create", "patch", "delete"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -110,6 +117,17 @@ data:
     ingress-namespace: "ingress-nginx"
     # Encryption key: supplied via the LNVPS_ENCRYPTION_KEY env var below (must
     # match the API's key) so the operator can decrypt app_deployment.config.
+    # --- Backups (omit the whole block to disable them) ---
+    # backups:
+    #   endpoint: "https://s3.example.com"
+    #   region: "eu-central-1"
+    #   bucket: "lnvps-app-backups"
+    #   access-key: "..."
+    #   secret-key: "..."
+    #   # Override to pin the uploader by digest or point at an internal mirror.
+    #   # uploader-image: "curlimages/curl:8.11.1"
+    #   # upload-url-expiry-hours: 6
+    #   # job-deadline-hours: 5
 ---
 apiVersion: apps/v1
 kind: Deployment

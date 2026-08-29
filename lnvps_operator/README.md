@@ -196,9 +196,10 @@ environment wins when both are set.
 
 It reads nostr domains, apps, app clusters, app deployments and the
 subscription rows that decide whether a deployment is paid for, and it writes
-to three: the status and usage totals on `app_deployment`, and the per-service
-and per-volume usage breakdown, which it rewrites each pass rather than
-accumulating. It never runs migrations, so it needs no DDL:
+to four: the status and usage totals on `app_deployment`, the per-service and
+per-volume usage breakdown, which it rewrites each pass rather than
+accumulating, and `app_deployment_backup`, where it records the runs it starts
+and their outcome. It never runs migrations, so it needs no DDL:
 
 ```sql
 CREATE USER 'lnvps_operator'@'%' IDENTIFIED BY '<password>';
@@ -206,6 +207,9 @@ GRANT SELECT ON lnvps.* TO 'lnvps_operator'@'%';
 GRANT UPDATE ON lnvps.app_deployment TO 'lnvps_operator'@'%';
 GRANT INSERT, DELETE ON lnvps.app_deployment_service_usage TO 'lnvps_operator'@'%';
 GRANT INSERT, DELETE ON lnvps.app_deployment_volume_usage TO 'lnvps_operator'@'%';
+-- Backups: the operator inserts scheduled runs, updates their state, and marks
+-- pruned ones deleted. Rows are soft-deleted, so no DELETE is needed.
+GRANT INSERT, UPDATE ON lnvps.app_deployment_backup TO 'lnvps_operator'@'%';
 ```
 
 ```bash

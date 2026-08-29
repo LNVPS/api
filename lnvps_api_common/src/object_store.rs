@@ -43,7 +43,13 @@ pub struct ObjectStoreConfig {
     #[serde(default = "default_region")]
     pub region: String,
     pub bucket: String,
+    /// Credentials. Defaulted so a deployment can keep them out of a config
+    /// file that lives in a ConfigMap and supply them from a Secret through the
+    /// environment instead; `ObjectStore::new` rejects a pair that is still
+    /// empty by then.
+    #[serde(default)]
     pub access_key: String,
+    #[serde(default)]
     pub secret_key: String,
     /// Address the bucket as a path (`endpoint/bucket/key`) rather than as a
     /// subdomain. Defaults to true, because that is what self-hosted services
@@ -71,6 +77,9 @@ impl ObjectStore {
     pub fn new(config: ObjectStoreConfig) -> Result<Self> {
         if config.endpoint.trim().is_empty() || config.bucket.trim().is_empty() {
             bail!("object storage needs an endpoint and a bucket");
+        }
+        if config.access_key.trim().is_empty() || config.secret_key.trim().is_empty() {
+            bail!("object storage needs an access key and a secret key");
         }
         if !config.endpoint.starts_with("http://") && !config.endpoint.starts_with("https://") {
             bail!(
@@ -471,6 +480,12 @@ mod tests {
         cfg.endpoint = "https://s3.example.com".to_string();
         cfg.bucket = String::new();
         assert!(ObjectStore::new(cfg.clone()).is_err(), "bucket is required");
+        cfg.bucket = "backups".to_string();
+        cfg.secret_key = String::new();
+        assert!(
+            ObjectStore::new(cfg.clone()).is_err(),
+            "credentials left to the environment must actually arrive"
+        );
 
         let store = test_store();
         assert!(store.presign_put("", Duration::from_secs(60)).is_err());
@@ -486,13 +501,19 @@ mod tests {
     /// Defaults exist so a config only has to carry what is site-specific.
     #[test]
     fn config_defaults_cover_the_self_hosted_case() {
-        let cfg: ObjectStoreConfig = serde_yaml_ng::from_str(
-            "endpoint: https://minio.internal:9000\nbucket: backups\naccess-key: k\nsecret-key: s\n",
-        )
-        .unwrap();
+        let cfg: ObjectStoreConfig =
+            serde_yaml_ng::from_str("endpoint: https://minio.internal:9000\nbucket: backups\n")
+                .unwrap();
         assert_eq!(cfg.region, "us-east-1");
+        // Credentials may arrive from the environment rather than the file.
+        assert!(cfg.access_key.is_empty());
         assert!(cfg.path_style, "self-hosted services need path style");
-        let store = ObjectStore::new(cfg).unwrap();
+        let store = ObjectStore::new(ObjectStoreConfig {
+            access_key: "k".to_string(),
+            secret_key: "s".to_string(),
+            ..cfg
+        })
+        .unwrap();
         assert_eq!(store.bucket(), "backups");
     }
 

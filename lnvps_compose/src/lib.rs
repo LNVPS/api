@@ -770,9 +770,21 @@ pub enum FieldType {
 }
 
 /// A service's backup method.
+///
+/// Whichever is used, the capture runs in a **separate pod**, not in the
+/// service's own container: the operator creates a Job per artifact, so a
+/// backup is not tied to a running app pod and cannot disturb it.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Backup {
     /// App-consistent dump command; stdout is captured as the artifact.
+    ///
+    /// It runs on this service's **image**, with this service's resolved env,
+    /// in its own pod. So it must reach the service **over the network**, by
+    /// the compose service name (`pg_dumpall -h db`, `mariadb-dump -h db`): a
+    /// tool left to its default connects to a unix socket that exists only
+    /// inside the service's own container, and fails there with a message
+    /// about a missing socket file. Addressing a service by name also means
+    /// that service must declare `ports:`, which is what gives it a DNS name.
     #[serde(default)]
     pub command: Option<Vec<String>>,
     /// Alternatively, raw tar of this named volume (append-only data only).
