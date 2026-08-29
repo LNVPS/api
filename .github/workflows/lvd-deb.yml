@@ -4,22 +4,19 @@ name: Build lvd .deb
 # systemd unit and the example config. On a tag the .deb is attached to the
 # GitHub release.
 #
-# Triggers on the main `v*` API tags, not on a prefix of its own. That follows
-# from lnvps_vpn being a root workspace member: it inherits
-# `[workspace.package] version`, so it has no version to tag independently, and
-# a separate tag would have to carry the same number as the API release it was
-# cut from.
+# Triggers on a dedicated tag prefix (lvd-v*), the same convention as
+# lnvps_fw-v* and nixos-image-v*, so it does NOT run on the main `v*` API
+# release tags. A route server's upgrade cadence has nothing to do with the
+# API's: these are machines in other countries, upgraded deliberately, and a
+# package published on every API release would leave an operator unable to tell
+# from the version whether an upgrade mattered.
 #
-# The trade-off, stated because it is a real one: two lvd versions can be
-# identical binaries when a release changed only the API. Nothing breaks --
-# there is no self-upgrade check comparing versions, unlike lnvps_fw -- but an
-# operator cannot tell from the version alone whether an upgrade matters. If
-# route servers ever need their own cadence, give lnvps_vpn its own `version`
-# instead of inheriting, and move this to an `lvd-v*` trigger.
+# `lnvps_vpn` therefore does not inherit the workspace version. See its
+# Cargo.toml.
 on:
   push:
     tags:
-      - "v*"
+      - "lvd-v*"
   workflow_dispatch:
 
 permissions:
@@ -35,6 +32,21 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
+
+      - name: Assert Cargo.toml version matches the release tag
+        # A .deb whose version disagrees with the release it is attached to is
+        # worse than no .deb: `dpkg -l` would report something that cannot be
+        # found in any release, and the next upgrade would be decided against a
+        # number nobody wrote.
+        if: startsWith(github.ref, 'refs/tags/lvd-v')
+        run: |
+          TAG="${GITHUB_REF_NAME#lvd-v}"
+          VER=$(awk '/^\[package\]/{f=1} f&&/^version[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/,"");print;exit}' lnvps_vpn/Cargo.toml)
+          echo "tag=$TAG  lnvps_vpn/Cargo.toml=$VER"
+          if [ "$VER" != "$TAG" ]; then
+            echo "::error::lnvps_vpn/Cargo.toml version ($VER) != release tag ($TAG). Bump it before tagging lvd-v$VER."
+            exit 1
+          fi
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -76,7 +88,7 @@ jobs:
 
       - name: Attach to release
         # Only on a tag: a manual dispatch build is an artifact, never a release.
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/lvd-v')
         uses: softprops/action-gh-release@v3
         with:
           files: target/debian/*.deb

@@ -1,6 +1,16 @@
 [package]
 name = "lnvps_vpn"
-version.workspace = true
+# Deliberately *not* `version.workspace = true`, unlike every other member of
+# this workspace. `lvd` releases on its own `lvd-v*` tag, the same convention as
+# lnvps_fw and the NixOS image, because a route server's upgrade cadence has
+# nothing to do with the API's: inheriting the workspace version would publish a
+# new package on every API release, and two consecutive versions could be
+# identical binaries with no way for an operator to tell whether an upgrade
+# mattered.
+#
+# Bump this when the daemon changes; leave it alone when it does not. The
+# release workflow fails if it disagrees with the tag.
+version = "0.1.0"
 edition.workspace = true
 # Both required by `cargo deb`, which builds a package with neither rather than
 # refusing, so the omission only shows up in the installed metadata.

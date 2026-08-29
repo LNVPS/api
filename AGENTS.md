@@ -62,9 +62,21 @@ When the user asks to create a release:
 4. **Create an annotated tag** — `git tag -a vX.Y.Z -m "Release vX.Y.Z"`
 5. **Push commit and tag** — `git push https://github.com/LNVPS/api.git && git push https://github.com/LNVPS/api.git vX.Y.Z`
 
-The `vX.Y.Z` tag covers the API, its images, and the `lvd` Debian package. `lnvps_fw` and the NixOS cloud image are **separate artifacts on their own tags**: releasing the API neither builds nor publishes them.
+The `vX.Y.Z` tag covers the API and its images only. `lnvps_fw`, `lvd` and the NixOS cloud image are **separate artifacts on their own tags**: releasing the API neither builds nor publishes them.
 
-`lvd` (the VPN route server daemon, `lnvps_vpn`) rides the API tag because it is a root workspace member and inherits `[workspace.package] version`, so it has no version of its own to tag. `.github/workflows/lvd-deb.yml` builds `lnvps-lvd_<version>_amd64.deb` and attaches it to the release. Consequence worth knowing: consecutive `lvd` versions can be identical binaries when a release changed only the API. Nothing breaks, since there is no self-upgrade check comparing versions, but an operator cannot tell from the version alone whether an upgrade matters. If route servers ever need their own cadence, give `lnvps_vpn` an explicit `version` instead of inheriting and move the workflow to an `lvd-v*` trigger.
+## `lvd` Release Procedure
+
+`lvd` is the VPN route server daemon (crate `lnvps_vpn`). It is a root workspace member, sharing the lockfile and CI, but it releases on its own `lvd-v*` tag: a route server's upgrade cadence has nothing to do with the API's. These are machines in other countries, upgraded deliberately, and a package published on every API release would leave an operator unable to tell from the version whether an upgrade mattered.
+
+For that reason `lnvps_vpn/Cargo.toml` carries an explicit `version` and does **not** inherit `[workspace.package]`. Its version is independent of the API's: bump it when the daemon changes, leave it alone when it does not.
+
+1. **Bump `lnvps_vpn/Cargo.toml`** — the `version` field.
+2. **Commit** — `git commit -m "chore(lvd): release lvd-vX.Y.Z"`
+3. **Tag and push** — `git tag -a lvd-vX.Y.Z -m "lvd vX.Y.Z"` then `git push https://github.com/LNVPS/api.git && git push https://github.com/LNVPS/api.git lvd-vX.Y.Z`
+
+Pushing the tag triggers `.github/workflows/lvd-deb.yml`, which builds `lnvps-lvd_<version>_amd64.deb` with `cargo deb` and attaches it to the GitHub release. The workflow **fails the build** if `lnvps_vpn/Cargo.toml` does not match the tag, so do step 1 before tagging: a package whose version disagrees with the release it hangs off is worse than no package, because `dpkg -l` then reports something that exists in no release.
+
+Unlike `lnvps_fw` there is no self-upgrade endpoint, so nothing on a route server compares its version against the newest release. Upgrading is `apt install ./lnvps-lvd_*.deb` on a box LNVPS already has access to.
 
 ## Installing a route server
 

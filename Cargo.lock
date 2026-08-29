@@ -3895,7 +3895,7 @@ dependencies = [
 
 [[package]]
 name = "lnvps_vpn"
-version = "0.4.7"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",

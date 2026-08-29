@@ -357,8 +357,11 @@ Notes:
       IPs, endpoint and byte counters.
 - [x] `config.example.yaml`, with a test asserting this build accepts it.
 - [x] **Packaging**: `cargo deb` metadata, a systemd unit, maintainer scripts, and
-      `.github/workflows/lvd-deb.yml` building `lnvps-lvd_<version>_amd64.deb` on the API's
-      `v*` tag. Built, installed, started, upgraded and purged on a real machine.
+      `.github/workflows/lvd-deb.yml` building `lnvps-lvd_<version>_amd64.deb` on its own
+      `lvd-v*` tag. Built, installed, started, upgraded and purged on a real machine.
+      `lnvps_vpn` carries an explicit `version` rather than inheriting the workspace's, so a
+      route server's upgrade cadence is its own: publishing a package on every API release
+      would leave an operator unable to tell from the version whether an upgrade mattered.
 - [x] 26 unit tests. `client.rs`, `config.rs` and `scrub.rs` at 100% function coverage.
 
 **No self-upgrade**, unlike `lnvps_fw`. That exists because firewall daemons run on many hosts,
