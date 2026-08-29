@@ -1135,6 +1135,124 @@ mod tests {
         assert!(startable(&queue, 0).is_empty());
     }
 
+    /// The uploader's script, run for real: the exact command line the Job
+    /// gives the uploader image, in that image, against a real S3 server.
+    ///
+    /// The builder tests assert what the script *says*. They cannot catch a
+    /// `tar` flag busybox does not take, a `curl` invocation that sends chunked
+    /// transfer encoding (which S3 rejects on a presigned `PUT`), or a URL the
+    /// server will not accept -- each of which is a backup that silently never
+    /// existed until a customer asked to restore one.
+    ///
+    /// Runs against the `rustfs` service in `docker-compose.e2e.yaml`; skipped
+    /// when the e2e stack is not up.
+    #[tokio::test]
+    async fn the_uploader_script_really_uploads() {
+        let Some(store) = test_store() else {
+            eprintln!("skipping: LNVPS_TEST_S3_ENDPOINT / _ACCESS_KEY / _SECRET_KEY not set");
+            return;
+        };
+        if !docker_available() {
+            eprintln!("skipping: docker is not available");
+            return;
+        }
+        store.create_bucket().await.expect("create bucket");
+
+        // A volume backup's data, as the PVC would present it.
+        let data = tempfile::tempdir().expect("tempdir");
+        std::fs::write(data.path().join("blob.bin"), vec![7u8; 4096]).unwrap();
+        std::fs::create_dir(data.path().join("nested")).unwrap();
+        std::fs::write(data.path().join("nested/inner.txt"), b"inner").unwrap();
+
+        let c = compose();
+        let env = BTreeMap::new();
+        let artifact = "blobs-files.tar.gz";
+        let job = build_backup_job(&spec(&c, "blobs", &env, artifact)).unwrap();
+        let script = job.spec.unwrap().template.spec.unwrap().containers[0]
+            .command
+            .as_ref()
+            .unwrap()[2]
+            .clone();
+
+        let key = backup_object_key(12, "run-live", artifact);
+        let url = store
+            .presign_put(&key, std::time::Duration::from_secs(300))
+            .unwrap();
+
+        // `--network host` so the container reaches the rustfs published on the
+        // host; the data mount is read-only exactly as the Job mounts the PVC,
+        // and /work is the emptyDir the Job stages into.
+        let out = std::process::Command::new("docker")
+            .args(["run", "--rm", "--network", "host"])
+            .arg("-v")
+            .arg(format!("{}:{DATA_DIR}:ro", data.path().display()))
+            .args(["--tmpfs", WORK_DIR])
+            .arg("-e")
+            .arg(format!("{UPLOAD_URL_ENV}={url}"))
+            .arg(DEFAULT_UPLOADER_IMAGE)
+            .args(["/bin/sh", "-c", &script])
+            .output()
+            .expect("run the uploader");
+        assert!(
+            out.status.success(),
+            "uploader failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // The artifact is in the bucket, and it is the archive it claims to be.
+        let size = store.size(&key).await.expect("head").expect("no artifact");
+        assert!(size > 0, "an empty artifact is not a backup");
+
+        let get = store
+            .presign_get(&key, std::time::Duration::from_secs(300), Some(artifact))
+            .unwrap();
+        let body = reqwest::get(&get)
+            .await
+            .expect("download")
+            .bytes()
+            .await
+            .expect("body");
+        let listing = tempfile::tempdir().unwrap();
+        let tarball = listing.path().join(artifact);
+        std::fs::write(&tarball, &body).unwrap();
+        let listed = std::process::Command::new("tar")
+            .arg("-tzf")
+            .arg(&tarball)
+            .output()
+            .expect("list the archive");
+        assert!(
+            listed.status.success(),
+            "the artifact is not a valid tar.gz"
+        );
+        let names = String::from_utf8_lossy(&listed.stdout);
+        assert!(names.contains("blob.bin"), "{names}");
+        assert!(names.contains("nested/inner.txt"), "{names}");
+
+        store.delete(&key).await.expect("cleanup");
+    }
+
+    fn test_store() -> Option<ObjectStore> {
+        ObjectStore::new(lnvps_api_common::ObjectStoreConfig {
+            endpoint: std::env::var("LNVPS_TEST_S3_ENDPOINT").ok()?,
+            region: "us-east-1".to_string(),
+            bucket: "lnvps-backup-uploader-test".to_string(),
+            access_key: std::env::var("LNVPS_TEST_S3_ACCESS_KEY").ok()?,
+            secret_key: std::env::var("LNVPS_TEST_S3_SECRET_KEY").ok()?,
+            path_style: true,
+        })
+        .ok()
+    }
+
+    fn docker_available() -> bool {
+        std::process::Command::new("docker")
+            .arg("info")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
     /// A failure message is stored in a bounded column, so a Job condition with
     /// a wall of text cannot fail the write that records the failure.
     #[test]

@@ -417,3 +417,36 @@ echo "=== Running SshClient integration tests ==="
 LNVPS_TEST_SSH_ADDR="${LNVPS_TEST_SSH_ADDR:-localhost:2222}" \
 LNVPS_TEST_SSH_KEY="$SSH_KEY" \
     cargo test -p lnvps_api_common --features linux-ssh --test ssh_client
+
+# ---------------------------------------------------------------------------
+# 11. ObjectStore integration tests against the compose rustfs
+#
+# The unit tests pin our SigV4 output against AWS's published vector, which
+# proves the arithmetic but not that a server accepts it: a canonical request
+# that differs by one byte of path encoding fails as an opaque 403 at the
+# bucket. rustfs is the same S3 implementation the app catalog ships, so backup
+# uploads are exercised against a real one here.
+# ---------------------------------------------------------------------------
+echo "=== Running ObjectStore integration tests ==="
+# An unauthenticated request to the root is a 403, which is a healthy S3 and
+# not a failure — what matters is that something answered at all.
+if [[ "$(curl -s -o /dev/null -w '%{http_code}' \
+    "${LNVPS_TEST_S3_ENDPOINT:-http://localhost:9400}")" == "000" ]]; then
+    # The tests skip themselves without these variables, so an unreachable
+    # rustfs would otherwise pass the run without a single upload happening.
+    echo "ERROR: rustfs is not answering on ${LNVPS_TEST_S3_ENDPOINT:-http://localhost:9400}" >&2
+    docker compose -f "$COMPOSE_FILE" logs --tail=40 rustfs >&2 || true
+    exit 1
+fi
+export LNVPS_TEST_S3_ENDPOINT="${LNVPS_TEST_S3_ENDPOINT:-http://localhost:9400}"
+export LNVPS_TEST_S3_ACCESS_KEY="${LNVPS_TEST_S3_ACCESS_KEY:-e2eaccesskey}"
+export LNVPS_TEST_S3_SECRET_KEY="${LNVPS_TEST_S3_SECRET_KEY:-e2esecretkey}"
+cargo test -p lnvps_api_common --test object_store -- --test-threads=1
+
+# The backup uploader's own command line, run in the image the operator names,
+# against the same rustfs. The builder unit tests assert what the script says;
+# only this catches a busybox `tar` flag or a `curl` invocation that a real S3
+# server refuses -- a backup that silently never existed until somebody tries
+# to restore it.
+echo "=== Running backup uploader integration test ==="
+cargo test -p lnvps_operator the_uploader_script_really_uploads -- --test-threads=1

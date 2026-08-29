@@ -43,7 +43,12 @@ docker compose up -d
 cargo test --workspace --exclude lnvps_e2e -- --test-threads=1
 ```
 
-After the `lnvps_e2e` suite, `run-e2e.sh` also runs `cargo test -p lnvps_api_common --features linux-ssh --test ssh_client`: `SshClient` talks SSH rather than HTTP, so it is covered against the `sshd` service in `docker-compose.e2e.yaml` (command exec, SFTP upload, unix-socket tunnel, auth failure) instead of through the API. Those tests skip themselves when `LNVPS_TEST_SSH_ADDR` / `LNVPS_TEST_SSH_KEY` are unset, so a plain `cargo test --workspace` does not need the stack.
+After the `lnvps_e2e` suite, `run-e2e.sh` runs two more suites that use the libraries directly rather than over HTTP. Both skip themselves when their environment variables are unset, so a plain `cargo test --workspace` does not need the stack — and `run-e2e.sh` checks the service is reachable first, since a skipped suite would otherwise pass the run without testing anything.
+
+- `cargo test -p lnvps_api_common --features linux-ssh --test ssh_client` — `SshClient` talks SSH, so it is covered against the `sshd` service in `docker-compose.e2e.yaml` (command exec, SFTP upload, unix-socket tunnel, auth failure). Needs `LNVPS_TEST_SSH_ADDR` / `LNVPS_TEST_SSH_KEY`.
+- `cargo test -p lnvps_api_common --test object_store` and the operator's `the_uploader_script_really_uploads` — backup artifact storage against the `rustfs` service (the same S3 implementation the app catalog ships). Needs `LNVPS_TEST_S3_ENDPOINT` / `LNVPS_TEST_S3_ACCESS_KEY` / `LNVPS_TEST_S3_SECRET_KEY`.
+
+  The unit tests pin our SigV4 output against AWS's published vector, which proves the arithmetic but not that a *server* accepts it: a canonical request that differs by a byte fails as an opaque 403 at the bucket. These cover the presigned round trip (upload, size, download with the signed filename, delete), that an upload URL grants nothing beyond its own key or method, and that expiry is enforced. The operator test then runs the uploader's **actual command line** in the image the Job names, so a busybox `tar` flag or a `curl` invocation a real S3 server refuses is caught here rather than by a customer with no backup.
 
 The user API is built and run with `--features agent` so the live-chat support websocket exists for `agent_chat.rs`; it is not a default feature.
 
@@ -72,6 +77,9 @@ The API servers must be configured to connect to the same per-run database. In C
 | `LNVPS_NO_DEV_SETUP` | *(unset)* | Set to any value to suppress `dev_setup.sql` on startup (debug builds only). Always set by `run-e2e.sh`. |
 | `LNVPS_TEST_SSH_ADDR` | *(unset)* | `host:port` of the compose `sshd` service; set by `run-e2e.sh` to `localhost:2222`. |
 | `LNVPS_TEST_SSH_KEY` | *(unset)* | Client private key for that sshd, generated into `volumes/e2e-sshd/` on first start. |
+| `LNVPS_TEST_S3_ENDPOINT` | *(unset)* | S3 endpoint for the object-store tests; set by `run-e2e.sh` to `http://localhost:9400` (the compose `rustfs`). |
+| `LNVPS_TEST_S3_ACCESS_KEY` | *(unset)* | Access key for that endpoint; `e2eaccesskey` in the compose file. |
+| `LNVPS_TEST_S3_SECRET_KEY` | *(unset)* | Secret key for that endpoint; `e2esecretkey` in the compose file. |
 | `NOSTR_SECRET_KEY` | *(random)* | Hex Nostr secret key for user identity |
 | `ADMIN_NOSTR_SECRET_KEY` | *(random)* | Hex Nostr secret key for admin identity |
 

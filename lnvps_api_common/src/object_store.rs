@@ -99,8 +99,34 @@ impl ObjectStore {
         &self.config.bucket
     }
 
+    /// Create the bucket, tolerating one that already exists.
+    ///
+    /// For provisioning a fresh store (and for tests against a real
+    /// S3-compatible server). Deliberately **not** called on the operator's
+    /// startup path: creating buckets is a permission the operator's key should
+    /// not need to hold just to write objects into a bucket somebody else made.
+    pub async fn create_bucket(&self) -> Result<()> {
+        let url = self.presign("PUT", "", Duration::from_secs(60), &[], Utc::now())?;
+        let resp = self
+            .client
+            .put(&url)
+            .send()
+            .await
+            .with_context(|| format!("could not create bucket '{}'", self.config.bucket))?;
+        // 409 is the bucket already existing, which is the desired end state.
+        if resp.status().is_success() || resp.status() == reqwest::StatusCode::CONFLICT {
+            return Ok(());
+        }
+        bail!(
+            "creating bucket '{}' returned {}",
+            self.config.bucket,
+            resp.status()
+        )
+    }
+
     /// A URL the holder may upload exactly one object to.
     pub fn presign_put(&self, key: &str, expires_in: Duration) -> Result<String> {
+        check_key(key)?;
         self.presign("PUT", key, expires_in, &[], Utc::now())
     }
 
@@ -122,6 +148,7 @@ impl ObjectStore {
                 format!("attachment; filename=\"{}\"", sanitise_filename(f)),
             )
         });
+        check_key(key)?;
         let extra: Vec<(String, String)> = disposition.into_iter().collect();
         self.presign("GET", key, expires_in, &extra, Utc::now())
     }
@@ -132,6 +159,7 @@ impl ObjectStore {
     /// stock `curl` container with nothing to report back through, so the
     /// authoritative size is whatever the bucket ended up holding.
     pub async fn size(&self, key: &str) -> Result<Option<u64>> {
+        check_key(key)?;
         let url = self.presign("HEAD", key, Duration::from_secs(60), &[], Utc::now())?;
         let resp = self
             .client
@@ -157,6 +185,7 @@ impl ObjectStore {
     /// Remove an object. Deleting one that is already gone succeeds: retention
     /// pruning has to be safe to retry.
     pub async fn delete(&self, key: &str) -> Result<()> {
+        check_key(key)?;
         let url = self.presign("DELETE", key, Duration::from_secs(60), &[], Utc::now())?;
         let resp = self
             .client
@@ -182,9 +211,6 @@ impl ObjectStore {
         extra_query: &[(String, String)],
         now: DateTime<Utc>,
     ) -> Result<String> {
-        if key.is_empty() {
-            bail!("object key is empty");
-        }
         if expires_in.is_zero() || expires_in > MAX_PRESIGN_EXPIRY {
             bail!(
                 "presign expiry must be between 1 second and {} seconds",
@@ -273,7 +299,8 @@ impl ObjectStore {
                     self.config.endpoint
                 )
             })?;
-        // Each path segment is encoded, but the separators are not.
+        // Each path segment is encoded, but the separators are not. An empty
+        // key addresses the bucket itself, which is what creating one does.
         let encoded_key = key.split('/').map(uri_encode).collect::<Vec<_>>().join("/");
         if self.config.path_style {
             Ok((
@@ -297,6 +324,14 @@ fn hmac(key: &[u8], data: &str) -> Result<HmacSha256> {
 
 fn hmac_key(key: &[u8]) -> Result<HmacSha256> {
     HmacSha256::new_from_slice(key).map_err(|e| anyhow!("invalid HMAC key: {e}"))
+}
+
+/// An object is always addressed by a key; only bucket-level calls have none.
+fn check_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        bail!("object key is empty");
+    }
+    Ok(())
 }
 
 /// RFC 3986 percent-encoding as SigV4 defines it: everything outside the
