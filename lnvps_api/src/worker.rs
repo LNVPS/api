@@ -215,6 +215,26 @@ impl From<&Settings> for WorkerSettings {
     }
 }
 
+/// Whether LNVPS polls this router to refresh its cached state.
+///
+/// Not every enabled router is one LNVPS connects to. An `lvd` route server
+/// fetches its own configuration and is often behind a NAT nothing here can
+/// traverse, so building a client for it is a fatal error *by design*. Polling
+/// one anyway logged that error every minute, forever, about a machine that was
+/// working perfectly -- and a log that cries wolf once a minute is the first
+/// thing blamed when something real breaks.
+///
+/// There is nothing to refresh either: the tunnel, BGP session and route state
+/// the sampler caches is all read *from* the router, and this kind is never
+/// asked.
+///
+/// A predicate rather than an inline filter because the sampler swallows and
+/// logs its errors, so a test driving the loop cannot tell a skipped router
+/// from a failed one. This can be asserted directly.
+pub fn is_pollable(router: &lnvps_db::Router) -> bool {
+    router.enabled && !matches!(router.kind, lnvps_db::RouterKind::Lvd)
+}
+
 impl Worker {
     const CHECK_VMS_SECONDS: u64 = 30;
 
@@ -880,6 +900,7 @@ impl Worker {
         Ok(())
     }
 
+    // (see `is_pollable` below for which routers this skips)
     /// Poll every enabled router to refresh cached tunnel/BGP session/route state
     /// and record per-tunnel traffic samples.
     ///
@@ -888,7 +909,7 @@ impl Worker {
     /// for BGP). All route/tunnel queries used here are bounded and full-table safe.
     pub async fn sync_router_state(&self) -> Result<()> {
         let routers = self.db.list_routers().await?;
-        for router in routers.iter().filter(|r| r.enabled) {
+        for router in routers.iter().filter(|r| is_pollable(r)) {
             if let Err(e) = self.sync_one_router(router.id).await {
                 error!("Failed to sync router {}: {}", router.id, e);
             }
@@ -5804,6 +5825,40 @@ mod tests {
             "a daily sub within the 12h lead window must warn/auto-renew (got {notes})"
         );
         Ok(())
+    }
+
+    /// A route server that configures itself is not polled.
+    ///
+    /// Asserted on the predicate rather than by driving the sampler: that loop
+    /// logs and swallows its errors, so it returns `Ok` whether a router was
+    /// skipped or dialled and failed. A test around it passes either way, which
+    /// is worse than no test.
+    #[test]
+    fn only_routers_lnvps_dials_are_polled() {
+        use lnvps_db::{Router, RouterKind};
+
+        let router = |kind, enabled| Router {
+            id: 1,
+            name: "r".to_string(),
+            enabled,
+            kind,
+            url: String::new(),
+            token: "".into(),
+        };
+
+        // An lvd route server refuses to be dialled by design, so polling it
+        // reports a fault that does not exist.
+        assert!(!super::is_pollable(&router(RouterKind::Lvd, true)));
+        // Every other kind is asked, when it is enabled.
+        assert!(super::is_pollable(&router(RouterKind::Mikrotik, true)));
+        assert!(super::is_pollable(&router(RouterKind::LinuxSsh, true)));
+        assert!(super::is_pollable(&router(
+            RouterKind::OvhAdditionalIp,
+            true
+        )));
+        // Disabled still means disabled.
+        assert!(!super::is_pollable(&router(RouterKind::Mikrotik, false)));
+        assert!(!super::is_pollable(&router(RouterKind::Lvd, false)));
     }
 
     #[tokio::test]
