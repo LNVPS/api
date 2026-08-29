@@ -134,10 +134,33 @@ impl Display for RecordType {
 }
 
 impl BasicRecord {
+    /// The A/AAAA record for an assignment.
+    ///
+    /// `dns_forward` names the record when it is set, so an assignment that has
+    /// been given a name keeps it. It used to be derived from the VM id alone,
+    /// which meant the admin API could store a name that DNS never received and
+    /// a hand-edited record was renamed back on the next sync.
+    ///
+    /// A stored name is a full FQDN, as the reverse path already requires: this
+    /// is what a create writes back, since providers return the record's
+    /// resolved name. A bare label would be expanded against the zone, so
+    /// accepting one would silently produce `host.example.com.example.com` on
+    /// every record in a shared zone. Falling back to the derived `vm-{id}`
+    /// label is the one place a label is still correct, because there is no
+    /// stored name for the zone to disagree with.
     pub fn forward(ip: &VmIpAssignment, zone: DnsRef) -> Result<Self> {
         let addr = IpAddr::from_str(&ip.ip)?;
+        let name = match ip.dns_forward.as_deref() {
+            Some(name) => {
+                if !is_valid_fqdn(name) {
+                    bail!("Forward DNS name {name:?} is not a valid FQDN");
+                }
+                name.to_string()
+            }
+            None => format!("vm-{}", &ip.vm_id),
+        };
         Ok(Self {
-            name: format!("vm-{}", &ip.vm_id),
+            name,
             value: addr.to_string(),
             id: ip.dns_forward_ref.clone().map(DnsRef::Id),
             kind: match addr {
@@ -258,6 +281,52 @@ mod tests {
             dns_reverse: Some("host.example.com".to_string()),
             ..Default::default()
         }
+    }
+
+    /// A named assignment gets the name it was given.
+    ///
+    /// `PATCH /vm_ip_assignments/{id}` stored `dns_forward` and DNS never saw
+    /// it: the record name was derived from the VM id, so the row said
+    /// `ie-01.vpn.lnvps.cloud` while the nameserver still answered for
+    /// `vm-1940.lnvps.cloud` and nothing resolved the new name.
+    #[test]
+    fn a_forward_record_is_named_by_the_assignment() -> anyhow::Result<()> {
+        let zone = DnsRef::Id("z".to_string());
+
+        // Unnamed: derived from the VM id, as it always was.
+        let mut ip = v4_assignment();
+        ip.dns_forward = None;
+        assert_eq!(BasicRecord::forward(&ip, zone.clone())?.name, "vm-42");
+
+        // Named: the stored name wins, and the record keeps its provider
+        // reference so the existing record is renamed rather than duplicated.
+        ip.dns_forward = Some("ie-01.vpn.example.com".to_string());
+        ip.dns_forward_ref = Some("rec-1".to_string());
+        let rec = BasicRecord::forward(&ip, zone.clone())?;
+        assert_eq!(rec.name, "ie-01.vpn.example.com");
+        assert_eq!(rec.id, Some(DnsRef::Id("rec-1".to_string())));
+        assert_eq!(rec.value, "10.0.0.5");
+        assert!(matches!(rec.kind, RecordType::A));
+
+        // The name every un-renamed row already holds, which must keep
+        // producing the record it produces today: `vm-42` expanded by the zone
+        // and `vm-42.lnvps.cloud` are the same record.
+        ip.dns_forward = Some("vm-42.lnvps.cloud".to_string());
+        assert_eq!(
+            BasicRecord::forward(&ip, zone.clone())?.name,
+            "vm-42.lnvps.cloud"
+        );
+
+        // A bare label is refused rather than sent. Cloudflare would expand it
+        // against the zone into `host.lnvps.cloud.lnvps.cloud`.
+        ip.dns_forward = Some("host".to_string());
+        assert!(
+            BasicRecord::forward(&ip, zone)
+                .unwrap_err()
+                .to_string()
+                .contains("not a valid FQDN")
+        );
+        Ok(())
     }
 
     #[test]

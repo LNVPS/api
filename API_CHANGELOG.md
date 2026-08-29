@@ -34,6 +34,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **`dns_forward` now reaches DNS.** `PATCH /api/admin/v1/vm_ip_assignments/{id}` accepted a forward name, wrote it to the database and never sent it on: the A/AAAA record was named from the VM id, so the row said one thing and the nameserver answered for another. Setting `dns_forward` now renames the record, and the old name stops resolving. Clearing it returns to the derived `vm-{id}` name.
+
+  A stored name must be a full FQDN, as reverse names already must. A bare label would be expanded against the zone, turning `host` into `host.example.com.example.com`.
+
 - **Address allocation was quadratic in the number of allocations** — the shared allocator restarted its overlap search at the first allocation for every candidate slot, so a densely packed range cost `O(n^2)`: 20k allocations took 355ms of CPU per call and quadrupled with each doubling. It is now linear, dominated by the sort, at 5.5ms for the same case. Affects VM IP assignment, marketplace tunnel links and VPN device registration, which share the allocator.
 
 ### Security
