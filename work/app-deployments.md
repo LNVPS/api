@@ -194,7 +194,11 @@ Design (see "Backup execution" below for the detail):
 - [x] Unit tests: the published AWS SigV4 presign vector, path vs virtual-hosted signing, method
       and key separation, filename sanitising, and wiremock coverage of `size`/`delete`
       (missing object → `None`, absent object → delete still succeeds, 403 → error).
-- [ ] Config wiring lands with its consumers: the operator in 6c, the API in 6d.
+- [x] Config wiring lands with its consumers: the operator in 6c, the API in 6d.
+- [x] Checked against a **real** S3 server (the compose `rustfs`, the same implementation the app
+      catalog ships): presigned round trip, an upload URL granting nothing beyond its own key or
+      method, and expiry actually being enforced. The AWS vector proves the arithmetic; only a
+      server proves the canonical request. Run by `scripts/run-e2e.sh`, skipped without the stack.
 
 #### 6c — Operator: run the backups
 - [x] `lnvps_operator/src/app_backups.rs`: per-artifact Job in the deployment namespace.
@@ -213,6 +217,10 @@ Design (see "Backup execution" below for the detail):
 - [x] Operator config (`backups:` block, credentials overridable from the environment because the
       config file lives in a ConfigMap), RBAC for `batch/jobs` and Secret `delete` in the
       per-namespace role, and the DB grant on `app_deployment_backup`.
+- [x] The uploader's **actual command line** is run in the image the Job names, against rustfs,
+      and the artifact is downloaded back and checked to be the archive it claims to be. A
+      busybox `tar` flag or a `curl` invocation a real S3 server refuses would otherwise be a
+      backup that silently never existed until somebody tried to restore it.
 - [x] **A `command:` runs in its own pod**, so it must address its service over the network
       (`-h db`) rather than the default unix socket. Documented in the compose grammar and fixed
       in `catalog/route96.yaml` and `catalog/buzz.yaml`, which both now carry a daily schedule.
