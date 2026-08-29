@@ -661,6 +661,10 @@ where the image allows it.
   the setup web UI. A provider that requires a callback to the user's localhost
   cannot be authenticated without a separate tunnel and should not be selected
   for a managed deployment.
+- **Setup access:** the order form requires the owner's 64-character lowercase
+  hex Nostr pubkey. AppWeaver receives it as `BOT_MASTER_PUBKEY`; `/setup`
+  requires a matching NIP-98 signature before issuing an in-memory setup
+  session, so the customer does not need access to container logs.
 
 **Document:** [`catalog/appweaver.yaml`](../catalog/appweaver.yaml) —
 `scripts/app-catalog-test.sh catalog/appweaver.yaml` starts it locally.
