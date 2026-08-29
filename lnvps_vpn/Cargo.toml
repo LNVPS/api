@@ -10,7 +10,7 @@ name = "lnvps_vpn"
 #
 # Bump this when the daemon changes; leave it alone when it does not. The
 # release workflow fails if it disagrees with the tag.
-version = "0.1.0"
+version = "0.1.0-rc1"
 edition.workspace = true
 # Both required by `cargo deb`, which builds a package with neither rather than
 # refusing, so the omission only shows up in the installed metadata.

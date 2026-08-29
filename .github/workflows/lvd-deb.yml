@@ -66,13 +66,38 @@ jobs:
       - name: Install cargo-deb
         run: command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
 
+      - name: Work out the Debian version
+        # Semver and Debian disagree about pre-releases, and the disagreement is
+        # silent until the final release fails to install.
+        #
+        # Cargo says 0.1.0-rc1 comes *before* 0.1.0. dpkg says it comes after,
+        # because a hyphen carries no special meaning to it and a longer string
+        # sorts higher. `~` is the only character that sorts before nothing at
+        # all, so a Debian pre-release is 0.1.0~rc1. Shipping the semver spelling
+        # would mean apt refusing to "upgrade" from rc1 to the release it is a
+        # candidate for.
+        #
+        # Only the first hyphen is rewritten, which is exactly the semver
+        # pre-release separator; a plain 0.1.0 has none and passes through.
+        id: version
+        run: |
+          VER=$(awk '/^\[package\]/{f=1} f&&/^version[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/,"");print;exit}' lnvps_vpn/Cargo.toml)
+          DEB_VER=$(echo "$VER" | sed 's/-/~/')
+          echo "cargo=$VER  deb=${DEB_VER}-1"
+          echo "deb_version=${DEB_VER}-1" >> "$GITHUB_OUTPUT"
+          # A semver pre-release is what marks the GitHub release as one.
+          case "$VER" in
+            *-*) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
       - name: Build .deb
         # From the package directory: cargo-deb resolves the workspace target
         # dir itself, which is why the asset path is spelled "target/release/lvd"
         # rather than "../target/release/lvd" (the latter is not recognised as a
         # Cargo target and would package whatever happened to be on disk).
         working-directory: lnvps_vpn
-        run: cargo deb
+        run: cargo deb --deb-version "${{ steps.version.outputs.deb_version }}"
 
       - name: Show package contents
         run: |
@@ -92,3 +117,4 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: target/debian/*.deb
+          prerelease: ${{ steps.version.outputs.prerelease }}
