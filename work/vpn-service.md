@@ -356,7 +356,18 @@ Notes:
       `configure_wireguard_interface`, and `WgObserved` carrying port, key, per-peer allowed
       IPs, endpoint and byte counters.
 - [x] `config.example.yaml`, with a test asserting this build accepts it.
+- [x] **Packaging**: `cargo deb` metadata, a systemd unit, maintainer scripts, and
+      `.github/workflows/lvd-deb.yml` building `lnvps-lvd_<version>_amd64.deb` on its own
+      `lvd-v*` tag. Built, installed, started, upgraded and purged on a real machine.
+      `lnvps_vpn` carries an explicit `version` rather than inheriting the workspace's, so a
+      route server's upgrade cadence is its own: publishing a package on every API release
+      would leave an operator unable to tell from the version whether an upgrade mattered.
 - [x] 26 unit tests. `client.rs`, `config.rs` and `scrub.rs` at 100% function coverage.
+
+**No self-upgrade**, unlike `lnvps_fw`. That exists because firewall daemons run on many hosts,
+some of which LNVPS does not administer. Route servers are few and ours, and a daemon that can
+replace its own binary on a machine terminating customer traffic is a bigger thing to own than
+`apt upgrade` on a box we already have access to.
 
 **No inbound control listener.** The original sketch had one for immediate re-pull. It is not
 needed and it is not wanted: long-poll already delivers a change in one round trip, and an
@@ -369,8 +380,16 @@ Notes:
 - **An interface the document does not mention is left alone.** A route server is not
   necessarily only a route server, and tearing down what LNVPS has not heard of would let a
   bug here take out the operator's own networking.
-- **`main.rs` is uncovered**, as `lnvps_node`'s is: it is the loop and the CLI. Increment 9
-  must exercise it.
+- **`main.rs` is uncovered** by unit tests, as `lnvps_node`'s is; the netns harness runs it as
+  a real process instead.
+- Installing the package surfaced a fault nothing else would have: `env_logger` defaults to
+  errors only, so the unit ran green and silent while failing every fetch. Every way this
+  daemon fails in the field is logged at `warn` or `info`. The unit sets `RUST_LOG=info`.
+- The unit runs as root but with `CapabilityBoundingSet=CAP_NET_ADMIN` and `ProtectSystem=strict`.
+  Verified under `systemd-run` with the same properties that creating a WireGuard interface,
+  addressing it and routing through it all still work.
+- No `StateDirectory`: the daemon holds nothing across restarts, so a rebuilt route server needs
+  only its config file.
 - Still open from increment 6: `POST /api/v1/routeserver/counters`. The counters are read
   from the kernel now (`WgPeerState::rx_bytes`/`tx_bytes`); nothing reports them yet.
 

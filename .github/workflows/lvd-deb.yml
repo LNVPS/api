@@ -1,0 +1,120 @@
+name: Build lvd .deb
+
+# Builds the LNVPS VPN route server daemon into a Debian package: the binary, a
+# systemd unit and the example config. On a tag the .deb is attached to the
+# GitHub release.
+#
+# Triggers on a dedicated tag prefix (lvd-v*), the same convention as
+# lnvps_fw-v* and nixos-image-v*, so it does NOT run on the main `v*` API
+# release tags. A route server's upgrade cadence has nothing to do with the
+# API's: these are machines in other countries, upgraded deliberately, and a
+# package published on every API release would leave an operator unable to tell
+# from the version whether an upgrade mattered.
+#
+# `lnvps_vpn` therefore does not inherit the workspace version. See its
+# Cargo.toml.
+on:
+  push:
+    tags:
+      - "lvd-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Assert Cargo.toml version matches the release tag
+        # A .deb whose version disagrees with the release it is attached to is
+        # worse than no .deb: `dpkg -l` would report something that cannot be
+        # found in any release, and the next upgrade would be decided against a
+        # number nobody wrote.
+        if: startsWith(github.ref, 'refs/tags/lvd-v')
+        run: |
+          TAG="${GITHUB_REF_NAME#lvd-v}"
+          VER=$(awk '/^\[package\]/{f=1} f&&/^version[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/,"");print;exit}' lnvps_vpn/Cargo.toml)
+          echo "tag=$TAG  lnvps_vpn/Cargo.toml=$VER"
+          if [ "$VER" != "$TAG" ]; then
+            echo "::error::lnvps_vpn/Cargo.toml version ($VER) != release tag ($TAG). Bump it before tagging lvd-v$VER."
+            exit 1
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: lvddeb-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lvddeb-${{ runner.os }}-
+
+      - name: Install cargo-deb
+        run: command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
+
+      - name: Work out the Debian version
+        # Semver and Debian disagree about pre-releases, and the disagreement is
+        # silent until the final release fails to install.
+        #
+        # Cargo says 0.1.0-rc1 comes *before* 0.1.0. dpkg says it comes after,
+        # because a hyphen carries no special meaning to it and a longer string
+        # sorts higher. `~` is the only character that sorts before nothing at
+        # all, so a Debian pre-release is 0.1.0~rc1. Shipping the semver spelling
+        # would mean apt refusing to "upgrade" from rc1 to the release it is a
+        # candidate for.
+        #
+        # Only the first hyphen is rewritten, which is exactly the semver
+        # pre-release separator; a plain 0.1.0 has none and passes through.
+        id: version
+        run: |
+          VER=$(awk '/^\[package\]/{f=1} f&&/^version[[:space:]]*=/{gsub(/.*=[[:space:]]*"|".*/,"");print;exit}' lnvps_vpn/Cargo.toml)
+          DEB_VER=$(echo "$VER" | sed 's/-/~/')
+          echo "cargo=$VER  deb=${DEB_VER}-1"
+          echo "deb_version=${DEB_VER}-1" >> "$GITHUB_OUTPUT"
+          # A semver pre-release is what marks the GitHub release as one.
+          case "$VER" in
+            *-*) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Build .deb
+        # From the package directory: cargo-deb resolves the workspace target
+        # dir itself, which is why the asset path is spelled "target/release/lvd"
+        # rather than "../target/release/lvd" (the latter is not recognised as a
+        # Cargo target and would package whatever happened to be on disk).
+        working-directory: lnvps_vpn
+        run: cargo deb --deb-version "${{ steps.version.outputs.deb_version }}"
+
+      - name: Show package contents
+        run: |
+          DEB=$(ls target/debian/*.deb | head -1)
+          dpkg-deb --info "$DEB"
+          dpkg-deb --contents "$DEB"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: lvd-deb
+          path: target/debian/*.deb
+
+      - name: Attach to release
+        # Only on a tag: a manual dispatch build is an artifact, never a release.
+        if: startsWith(github.ref, 'refs/tags/lvd-v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: target/debian/*.deb
+          prerelease: ${{ steps.version.outputs.prerelease }}

@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+# The WireGuard interfaces lvd built are left alone: removing the package
+# should not drop every customer on a route server that is only being upgraded
+# by hand. `ip link del wgln<id>` is the deliberate act.
+
+exit 0

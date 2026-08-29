@@ -1,0 +1,45 @@
+[Unit]
+Description=LNVPS VPN route server daemon
+Documentation=https://github.com/LNVPS/api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lvd --config /etc/lvd/config.yaml run
+# Always, not on-failure: the daemon's whole job is to keep asking LNVPS what
+# this machine should be. A clean exit is still a route server that has stopped
+# hearing about revocations.
+Restart=always
+RestartSec=5
+
+# Without this the unit is silent. env_logger defaults to errors only, and
+# every way this daemon fails in the field -- a rejected token, an unreachable
+# API, a refused apply -- is logged at warn or info. The unit would sit there
+# green, doing nothing, saying nothing. Override per-machine with
+# `systemctl edit lvd` if a quieter or noisier level is wanted.
+Environment=RUST_LOG=info
+
+# No StateDirectory, deliberately. lvd holds nothing across restarts: the
+# interface keys, the addresses and the peer set are all fetched, and the one
+# thing it does not fetch is its own config. A rebuilt route server needs that
+# file and nothing else.
+
+# Creating WireGuard interfaces, addressing them and routing through them is
+# all CAP_NET_ADMIN. It runs as root because the config file holds the
+# credential and is root-only, but nothing beyond networking is reachable.
+User=root
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+# The config is the only thing it reads and it never writes anywhere.
+ReadOnlyPaths=/etc/lvd
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
