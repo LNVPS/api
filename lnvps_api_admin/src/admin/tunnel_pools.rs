@@ -206,13 +206,12 @@ async fn pool_info(
 ) -> Result<AdminTunnelPoolInfo, ApiError> {
     let router = db.get_router(pool.router_id).await?;
     let region = db.get_host_region(pool.region_id).await?;
-    // Whichever question this interface's addresses actually answer. The
-    // service-wide list is the allocator's view: a disabled or unpaid device
-    // still owns its address, so it is still consuming the block.
-    let links_used = match db.get_vpn_service_for_pool(pool.id).await? {
-        Some(service) => db.list_vpn_tunnels_in_service(service.id).await?.len() as u64,
-        None => db.list_tunnels_in_pool(pool.id).await?.len() as u64,
-    };
+    // No VPN special case: a device has one peer per interface, so a pool's own
+    // rows are the answer for every kind of tunnel. Asking the *service* -- as
+    // this did while a device was a single row -- counts that device once per
+    // region, so a three-region service reported 3 against every interface for
+    // one customer.
+    let links_used = db.list_tunnels_in_pool(pool.id).await?.len() as u64;
 
     // The binding constraint, not the roomier block: a dual-stack pool hands
     // out both families together.
@@ -1454,36 +1453,18 @@ mod tests {
         assert!(db.delete_tunnel_pool(pool.id).await.is_err());
     }
 
-    /// A VPN interface reports the devices it actually carries.
+    /// A VPN interface reports the devices it actually carries: its own, once.
     ///
-    /// It used to report zero however many customers were on it. `links_used`
-    /// counted tunnel rows pointing at this pool, and a VPN device points at
-    /// none: it is a peer on *every* interface of its service at once, holding
-    /// one address valid in all of them, so its row carries no `pool_id`. The
-    /// admin page showed `0/65533` for an interface with a live customer.
+    /// Two interfaces on purpose. With one, a count that asks the *service*
+    /// rather than the pool gives the same answer as a correct one, which is
+    /// how the first version of this test passed while the admin page showed
+    /// `3/65533` on every interface of a three-region service carrying one
+    /// customer.
     #[tokio::test]
     async fn a_vpn_interface_counts_the_devices_on_its_service() -> anyhow::Result<()> {
         use lnvps_db::{IntervalType, VpnService};
 
         let (db, router_id) = db().await;
-
-        let pool_id = db
-            .insert_tunnel_pool(&lnvps_db::TunnelPool {
-                router_id,
-                region_id: 1,
-                name: "vpn-ie-01".to_string(),
-                listen_addr: "ie-01.example".to_string(),
-                listen_port: 51820,
-                private_key: PRIVATE_KEY.into(),
-                public_key: lnvps_api_common::wireguard_public_key(PRIVATE_KEY)?,
-                cidr4: Some("10.21.0.0/16".to_string()),
-                cidr6: None,
-                keepalive: Some(25),
-                mtu: 1420,
-                enabled: true,
-                ..Default::default()
-            })
-            .await?;
 
         let service_id = db
             .insert_vpn_service(&VpnService {
@@ -1498,14 +1479,37 @@ mod tests {
                 ..Default::default()
             })
             .await?;
-        db.link_vpn_service_pool(service_id, pool_id).await?;
 
-        // No devices yet.
-        let pool = db.get_tunnel_pool(pool_id).await?;
-        assert_eq!(pool_info(&db, pool).await.unwrap().links_used, 0);
+        // Two regions on one service, sharing one block as the rule requires.
+        let mut pool_ids = Vec::new();
+        for n in 0..2u16 {
+            let pool_id = db
+                .insert_tunnel_pool(&lnvps_db::TunnelPool {
+                    router_id,
+                    region_id: 1,
+                    name: format!("vpn-{n}"),
+                    listen_addr: format!("rs{n}.example"),
+                    listen_port: 51820 + n,
+                    private_key: PRIVATE_KEY.into(),
+                    public_key: lnvps_api_common::wireguard_public_key(PRIVATE_KEY)?,
+                    cidr4: Some("10.21.0.0/16".to_string()),
+                    cidr6: None,
+                    keepalive: Some(25),
+                    mtu: 1420,
+                    enabled: true,
+                    ..Default::default()
+                })
+                .await?;
+            db.link_vpn_service_pool(service_id, pool_id).await?;
+            pool_ids.push(pool_id);
+        }
 
-        // A real device. The database creates one peer per interface the
-        // service terminates, which is what the count has to find.
+        for pool_id in &pool_ids {
+            let pool = db.get_tunnel_pool(*pool_id).await?;
+            assert_eq!(pool_info(&db, pool).await.unwrap().links_used, 0);
+        }
+
+        // One device, which the database gives a peer on each interface.
         let user_id = db.upsert_user(&[1u8; 32]).await?;
         let plan_id = db
             .insert_vpn_subscription(&lnvps_db::VpnSubscription {
@@ -1515,29 +1519,37 @@ mod tests {
                 ..Default::default()
             })
             .await?;
-        db.insert_vpn_device_with_peers(
-            &lnvps_db::VpnDevice {
-                vpn_subscription_id: plan_id,
-                slot: 0,
-                name: "laptop".to_string(),
-                ..Default::default()
-            },
-            &lnvps_db::VpnPeerTemplate {
-                user_id,
-                name: "device".to_string(),
-                peer_pubkey: vec![7u8; 32],
-                address4: Some("10.21.74.165/32".to_string()),
-                address6: None,
-            },
-        )
-        .await?;
-
-        let pool = db.get_tunnel_pool(pool_id).await?;
-        let used = pool_info(&db, pool).await.unwrap().links_used;
+        let device_id = db
+            .insert_vpn_device_with_peers(
+                &lnvps_db::VpnDevice {
+                    vpn_subscription_id: plan_id,
+                    slot: 0,
+                    name: "laptop".to_string(),
+                    ..Default::default()
+                },
+                &lnvps_db::VpnPeerTemplate {
+                    user_id,
+                    name: "device".to_string(),
+                    peer_pubkey: vec![7u8; 32],
+                    address4: Some("10.21.74.165/32".to_string()),
+                    address6: None,
+                },
+            )
+            .await?;
         assert_eq!(
-            used, 1,
-            "a VPN interface carrying one device must not report an empty pool"
+            db.list_vpn_device_tunnels(device_id).await?.len(),
+            2,
+            "one peer per interface"
         );
+
+        for pool_id in &pool_ids {
+            let pool = db.get_tunnel_pool(*pool_id).await?;
+            assert_eq!(
+                pool_info(&db, pool).await.unwrap().links_used,
+                1,
+                "an interface carries the device once, not once per region"
+            );
+        }
         Ok(())
     }
 }
