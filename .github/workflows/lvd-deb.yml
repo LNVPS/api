@@ -1,0 +1,82 @@
+name: Build lvd .deb
+
+# Builds the LNVPS VPN route server daemon into a Debian package: the binary, a
+# systemd unit and the example config. On a tag the .deb is attached to the
+# GitHub release.
+#
+# Triggers on the main `v*` API tags, not on a prefix of its own. That follows
+# from lnvps_vpn being a root workspace member: it inherits
+# `[workspace.package] version`, so it has no version to tag independently, and
+# a separate tag would have to carry the same number as the API release it was
+# cut from.
+#
+# The trade-off, stated because it is a real one: two lvd versions can be
+# identical binaries when a release changed only the API. Nothing breaks --
+# there is no self-upgrade check comparing versions, unlike lnvps_fw -- but an
+# operator cannot tell from the version alone whether an upgrade matters. If
+# route servers ever need their own cadence, give lnvps_vpn its own `version`
+# instead of inheriting, and move this to an `lvd-v*` trigger.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: lvddeb-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            lvddeb-${{ runner.os }}-
+
+      - name: Install cargo-deb
+        run: command -v cargo-deb >/dev/null || cargo install cargo-deb --locked
+
+      - name: Build .deb
+        # From the package directory: cargo-deb resolves the workspace target
+        # dir itself, which is why the asset path is spelled "target/release/lvd"
+        # rather than "../target/release/lvd" (the latter is not recognised as a
+        # Cargo target and would package whatever happened to be on disk).
+        working-directory: lnvps_vpn
+        run: cargo deb
+
+      - name: Show package contents
+        run: |
+          DEB=$(ls target/debian/*.deb | head -1)
+          dpkg-deb --info "$DEB"
+          dpkg-deb --contents "$DEB"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: lvd-deb
+          path: target/debian/*.deb
+
+      - name: Attach to release
+        # Only on a tag: a manual dispatch build is an artifact, never a release.
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: target/debian/*.deb

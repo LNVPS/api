@@ -62,7 +62,24 @@ When the user asks to create a release:
 4. **Create an annotated tag** — `git tag -a vX.Y.Z -m "Release vX.Y.Z"`
 5. **Push commit and tag** — `git push https://github.com/LNVPS/api.git && git push https://github.com/LNVPS/api.git vX.Y.Z`
 
-The `vX.Y.Z` tag covers the API and its images only. `lnvps_fw` and the NixOS cloud image are **separate artifacts on their own tags** — releasing the API neither builds nor publishes them.
+The `vX.Y.Z` tag covers the API, its images, and the `lvd` Debian package. `lnvps_fw` and the NixOS cloud image are **separate artifacts on their own tags**: releasing the API neither builds nor publishes them.
+
+`lvd` (the VPN route server daemon, `lnvps_vpn`) rides the API tag because it is a root workspace member and inherits `[workspace.package] version`, so it has no version of its own to tag. `.github/workflows/lvd-deb.yml` builds `lnvps-lvd_<version>_amd64.deb` and attaches it to the release. Consequence worth knowing: consecutive `lvd` versions can be identical binaries when a release changed only the API. Nothing breaks, since there is no self-upgrade check comparing versions, but an operator cannot tell from the version alone whether an upgrade matters. If route servers ever need their own cadence, give `lnvps_vpn` an explicit `version` instead of inheriting and move the workflow to an `lvd-v*` trigger.
+
+## Installing a route server
+
+```
+apt install ./lnvps-lvd_<version>_amd64.deb
+cp /etc/lvd/config.example.yaml /etc/lvd/config.yaml
+# api-url, and token as <router_id>.<secret> from the router row
+chmod 600 /etc/lvd/config.yaml
+lvd --config /etc/lvd/config.yaml check
+systemctl enable --now lvd
+```
+
+The daemon holds no state: interface keys, addresses and the peer set are all
+fetched, so a rebuilt route server needs its config file and nothing else. It
+also opens no listening socket, so no inbound port or firewall rule is required.
 
 ## `lnvps_fw` Release Procedure
 

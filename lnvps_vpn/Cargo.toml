@@ -2,10 +2,47 @@
 name = "lnvps_vpn"
 version.workspace = true
 edition.workspace = true
+# Both required by `cargo deb`, which builds a package with neither rather than
+# refusing, so the omission only shows up in the installed metadata.
+license = "MIT"
+description = "LNVPS VPN route server daemon"
 
 [[bin]]
 name = "lvd"
 path = "src/main.rs"
+
+# Packaged with `cargo deb`, run from this directory. Route servers are Debian
+# boxes LNVPS runs, so a .deb plus a systemd unit is the whole deployment: no
+# container, no orchestrator, nothing to schedule.
+#
+# There is no self-upgrade, unlike lnvps_fw. That exists because firewall
+# daemons are installed on many hosts, some of which LNVPS does not administer.
+# Route servers are few and ours, and a daemon that can replace its own binary
+# on a machine terminating customer traffic is a bigger thing to own than
+# `apt upgrade` on a box we already have access to.
+[package.metadata.deb]
+name = "lnvps-lvd"
+maintainer = "LNVPS <admin@lnvps.net>"
+copyright = "LNVPS"
+section = "net"
+priority = "optional"
+extended-description = """\
+The LNVPS VPN route server daemon. Asks LNVPS which WireGuard interfaces this \
+machine should carry and which customer devices are peers on them, and \
+configures the kernel to match. Outbound only: nothing connects to it, so it \
+runs behind any NAT with no inbound port and no certificate of its own."""
+depends = "$auto"
+maintainer-scripts = "debian/"
+assets = [
+    # Exactly "target/release/..." so cargo-deb recognises it as a Cargo
+    # target and builds it; it resolves the workspace target dir itself. Any
+    # other spelling silently packages whatever happens to be on disk.
+    ["target/release/lvd", "usr/bin/lvd", "755"],
+    ["systemd/lvd.service", "lib/systemd/system/lvd.service", "644"],
+    # The example only. The real config carries this route server's credential,
+    # so it is written by hand at 0600 rather than shipped in a package.
+    ["config.example.yaml", "etc/lvd/config.example.yaml", "644"],
+]
 
 [dependencies]
 # How to make a kernel carry a WireGuard data plane. Shared with lnvps_node so

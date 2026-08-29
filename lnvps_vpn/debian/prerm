@@ -1,0 +1,9 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "remove" ]; then
+    systemctl stop lvd.service >/dev/null 2>&1 || true
+    systemctl disable lvd.service >/dev/null 2>&1 || true
+fi
+
+exit 0
