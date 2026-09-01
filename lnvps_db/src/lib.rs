@@ -943,6 +943,18 @@ pub trait LNVpsDbBase: Send + Sync {
     /// This filters out: inactive subscriptions, subscriptions never paid (expires IS NULL).
     async fn list_lifecycle_subscriptions(&self) -> DbResult<Vec<Subscription>>;
 
+    /// Subscriptions whose purchase payment was never confirmed (`is_setup = 0`)
+    /// and which were created more than `older_than_seconds` ago.
+    ///
+    /// The complement of [`Self::list_lifecycle_subscriptions`], which cannot
+    /// see these: a never-paid subscription has a NULL `expires` and (since the
+    /// customer never paid) `is_active = 0`, so both of that query's filters
+    /// exclude it and nothing would ever revisit an abandoned checkout.
+    async fn list_never_paid_subscriptions(
+        &self,
+        older_than_seconds: u64,
+    ) -> DbResult<Vec<Subscription>>;
+
     /// Deactivate a subscription: set `is_active = false`.
     /// Also sets `ended_at = NOW()` on all linked `ip_range_subscription` rows.
     async fn deactivate_subscription(&self, id: u64) -> DbResult<()>;
@@ -1691,6 +1703,15 @@ pub trait LNVpsDbBase: Send + Sync {
     /// `created` are immutable and are not written: moving a plan to another
     /// service would strand every device's address.
     async fn update_vpn_subscription(&self, sub: &VpnSubscription) -> DbResult<()>;
+
+    /// Permanently remove a plan, along with every device on it and each
+    /// device's tunnel.
+    ///
+    /// This is for a plan that was never paid for, which by definition was
+    /// never configured on a route server. A lapsed plan is *kept*, devices and
+    /// all, so that a returning customer only has to pay again — see the module
+    /// docs on `subscription::vpn`.
+    async fn delete_vpn_subscription(&self, id: u64) -> DbResult<()>;
 
     /// Get a device by id
     async fn get_vpn_device(&self, id: u64) -> DbResult<VpnDevice>;

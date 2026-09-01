@@ -57,21 +57,27 @@ fn get_host_info_path_for_arch(arch: CpuArch) -> Option<std::path::PathBuf> {
     Some(exe_dir.join(binary_name))
 }
 
-/// Whether an unpaid payment should still block deletion of a never-paid VM.
+/// Whether an unpaid payment should still block deletion of a never-paid
+/// resource, or of the subscription that would bill it.
 ///
 /// A payment blocks deletion while its invoice is unexpired, but also — for
 /// on-chain payments — once a deposit has been detected in the mempool
 /// (`external_id` holds the deposit outpoint `{txid}:{vout}`): confirmation
-/// can land well after the 1h quote expiry, and purging the VM in that window
+/// can land well after the 1h quote expiry, and purging in that window
 /// would lose the customer's payment (issue #194).
-pub(crate) fn payment_blocks_unpaid_vm_deletion(
-    p: &SubscriptionPayment,
-    now: DateTime<Utc>,
-) -> bool {
+pub(crate) fn payment_blocks_unpaid_deletion(p: &SubscriptionPayment, now: DateTime<Utc>) -> bool {
     !p.is_paid
         && (p.expires > now
             || (p.payment_method == PaymentMethod::OnChain && p.external_id.is_some()))
 }
+
+/// How long a never-paid subscription is kept before it is purged.
+///
+/// Generous on purpose. A lightning invoice has expired many times over by
+/// then, but a bank transfer or a late on-chain send has not, and the cost of
+/// waiting is a dead row while the cost of being early is deleting an order the
+/// customer is still paying for.
+const NEVER_PAID_SUBSCRIPTION_TTL: TimeDelta = TimeDelta::hours(24);
 
 /// How long to wait before scanning a VM's host keys again while the capture is
 /// still missing keys.
@@ -1193,7 +1199,126 @@ impl Worker {
             }
         }
 
+        if let Err(e) = self.check_never_paid_subscriptions().await {
+            error!("Failed to sweep never-paid subscriptions: {}", e);
+        }
+
         self.set_last_check_subscriptions(Utc::now()).await?;
+        Ok(())
+    }
+
+    /// Purge subscriptions whose first payment never arrived.
+    ///
+    /// Nothing else revisits these. `handle_subscription_state` reads
+    /// `list_lifecycle_subscriptions`, which is active-with-an-expiry, and an
+    /// abandoned checkout is neither, so without this an order that was never
+    /// paid for lives in the database for good. For a VPN plan that is worse
+    /// than clutter: `create_vpn_plan` returns an existing plan whenever its
+    /// state is not `Expired`, and `Unpaid` is not `Expired`, so the customer
+    /// stays pinned to a subscription at the price it was created at with no
+    /// way to get a current one.
+    ///
+    /// VMs are deliberately not touched here. `check_vms` already purges
+    /// never-paid ones on its own (shorter) clock, and it has to — it has a
+    /// hypervisor to talk to, which this does not.
+    pub async fn check_never_paid_subscriptions(&self) -> Result<()> {
+        let now = Utc::now();
+        let subs = self
+            .db
+            .list_never_paid_subscriptions(NEVER_PAID_SUBSCRIPTION_TTL.num_seconds() as u64)
+            .await?;
+        for sub in &subs {
+            if let Err(e) = self.purge_never_paid_subscription(sub, now).await {
+                error!("Failed to purge never-paid subscription {}: {}", sub.id, e);
+                self.queue_admin_notification(
+                    format!("Failed to purge never-paid subscription {}:\n{}", sub.id, e),
+                    Some(format!("Subscription {} Purge Failed", sub.id)),
+                )
+                .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Release one never-paid subscription's product rows, then the subscription.
+    ///
+    /// Never paid means never provisioned, for every product: the operator's
+    /// gate gives a `BillingState::Unpaid` deployment no cluster objects at
+    /// all, and the VPN planner's peer set is joined through `is_setup`. So
+    /// there is nothing running to tear down here, only rows to remove.
+    async fn purge_never_paid_subscription(
+        &self,
+        sub: &Subscription,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        // Re-read: a payment may have settled between the listing snapshot and
+        // now, and purging then would delete a subscription the customer has
+        // just paid for.
+        let current = self.db.get_subscription(sub.id).await?;
+        if current.is_setup {
+            info!(
+                "Subscription {} was paid since last check, keeping it",
+                sub.id
+            );
+            return Ok(());
+        }
+
+        let payments = self.db.list_subscription_payments(sub.id).await?;
+        if payments
+            .iter()
+            .any(|p| payment_blocks_unpaid_deletion(p, now))
+        {
+            info!(
+                "Subscription {} has pending or detected unpaid payments, keeping it",
+                sub.id
+            );
+            return Ok(());
+        }
+
+        let line_items = self.db.list_subscription_line_items(sub.id).await?;
+        if line_items
+            .iter()
+            .any(|li| li.subscription_type == LineItemType::Vps)
+        {
+            return Ok(());
+        }
+
+        // Whether the subscription row itself still needs removing at the end.
+        // `hard_delete_app_deployment` takes it with the deployment when it
+        // bills nothing else, so a second delete would be pointless.
+        let mut purged_with_product = false;
+        for li in &line_items {
+            match li.subscription_type {
+                LineItemType::Vpn => {
+                    if let Some(plan) = self.db.get_vpn_subscription_by_line_item(li.id).await? {
+                        info!("Purging never-paid VPN plan {}", plan.id);
+                        self.db.delete_vpn_subscription(plan.id).await?;
+                    }
+                }
+                LineItemType::App => {
+                    let deployment = self.db.get_app_deployment_by_line_item(li.id).await?;
+                    info!("Purging never-paid app deployment {}", deployment.id);
+                    self.db.hard_delete_app_deployment(deployment.id).await?;
+                    purged_with_product = true;
+                }
+                LineItemType::MarketplaceNodeFee => {
+                    // The node itself is not the customer's order here, the fee
+                    // is: unlisting it would destroy an operator's registration
+                    // over an unpaid listing fee. Only the billing link goes.
+                    let mut node = self.db.get_marketplace_node_by_line_item(li.id).await?;
+                    node.subscription_line_item_id = None;
+                    self.db.update_marketplace_node(&node).await?;
+                }
+                // IP range and ASN subscriptions cascade off the line item, and
+                // DNS hosting has no product row at all.
+                _ => {}
+            }
+        }
+
+        if !purged_with_product {
+            self.db.hard_delete_subscription(sub.id).await?;
+        }
+        info!("Purged never-paid subscription {}", sub.id);
         Ok(())
     }
 
@@ -1720,7 +1845,7 @@ impl Worker {
                 .db
                 .list_vm_subscription_payments(vm.id)
                 .await
-                .map(|ps| ps.iter().any(|p| payment_blocks_unpaid_vm_deletion(p, now)))
+                .map(|ps| ps.iter().any(|p| payment_blocks_unpaid_deletion(p, now)))
                 .unwrap_or(false)
             {
                 info!(
@@ -5400,7 +5525,7 @@ mod tests {
     }
 
     #[test]
-    fn test_payment_blocks_unpaid_vm_deletion() {
+    fn test_payment_blocks_unpaid_deletion() {
         let now = Utc::now();
         let base = make_subscription_payment(
             1,
@@ -5411,35 +5536,35 @@ mod tests {
         );
 
         // Expired lightning payment: does not block.
-        assert!(!payment_blocks_unpaid_vm_deletion(&base, now));
+        assert!(!payment_blocks_unpaid_deletion(&base, now));
 
         // Unexpired payment: blocks.
         let mut p = base.clone();
         p.expires = now.add(TimeDelta::minutes(10));
-        assert!(payment_blocks_unpaid_vm_deletion(&p, now));
+        assert!(payment_blocks_unpaid_deletion(&p, now));
 
         // Expired on-chain with detected deposit: blocks (#194).
         let mut p = base.clone();
         p.payment_method = lnvps_db::PaymentMethod::OnChain;
         p.external_id = Some("txid:0".to_string());
-        assert!(payment_blocks_unpaid_vm_deletion(&p, now));
+        assert!(payment_blocks_unpaid_deletion(&p, now));
 
         // Expired on-chain without detected deposit: does not block.
         let mut p = base.clone();
         p.payment_method = lnvps_db::PaymentMethod::OnChain;
-        assert!(!payment_blocks_unpaid_vm_deletion(&p, now));
+        assert!(!payment_blocks_unpaid_deletion(&p, now));
 
         // Expired lightning with external_id (not on-chain): does not block.
         let mut p = base.clone();
         p.external_id = Some("abc".to_string());
-        assert!(!payment_blocks_unpaid_vm_deletion(&p, now));
+        assert!(!payment_blocks_unpaid_deletion(&p, now));
 
         // Paid payment never blocks, even with detected deposit.
         let mut p = base.clone();
         p.payment_method = lnvps_db::PaymentMethod::OnChain;
         p.external_id = Some("txid:0".to_string());
         p.is_paid = true;
-        assert!(!payment_blocks_unpaid_vm_deletion(&p, now));
+        assert!(!payment_blocks_unpaid_deletion(&p, now));
     }
 
     /// Drain all currently-queued work jobs without blocking, returning the count of
@@ -6609,6 +6734,348 @@ mod tests {
             .process_bulk_message("Nobody home".to_string(), "text".to_string(), admin, None)
             .await?;
         assert!(summary.contains("matched no recipients"), "{summary}");
+        Ok(())
+    }
+
+    // ----- never-paid subscription sweep -----
+
+    /// A never-paid subscription of the given type, created `age` ago, with a
+    /// single line item. Returns `(subscription_id, line_item_id)`.
+    async fn add_never_paid_subscription(
+        db: &Arc<MockDb>,
+        user_id: u64,
+        kind: LineItemType,
+        age: TimeDelta,
+    ) -> Result<(u64, u64)> {
+        let (sub_id, line_items) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "abandoned".to_string(),
+                    description: None,
+                    created: Utc::now() - age,
+                    expires: None,
+                    is_active: false,
+                    is_setup: false,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: lnvps_db::IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: true,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: kind,
+                    name: "abandoned".to_string(),
+                    description: None,
+                    amount: 500,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await?;
+        Ok((sub_id, line_items[0]))
+    }
+
+    /// An order nobody paid for is removed once it is past the TTL. Nothing
+    /// else ever revisits it: `list_lifecycle_subscriptions` is
+    /// active-with-an-expiry, and an abandoned checkout is neither.
+    #[tokio::test]
+    async fn test_never_paid_subscription_is_purged() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[1u8; 32]).await?;
+        let (sub_id, _) =
+            add_never_paid_subscription(&db, user_id, LineItemType::DnsHosting, TimeDelta::days(2))
+                .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_never_paid_subscriptions().await?;
+
+        assert!(
+            db.get_subscription(sub_id).await.is_err(),
+            "a never-paid subscription past the TTL must be purged"
+        );
+        Ok(())
+    }
+
+    /// The TTL is what stops the sweep racing a customer who is still at the
+    /// checkout page.
+    #[tokio::test]
+    async fn test_never_paid_subscription_within_ttl_is_kept() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[2u8; 32]).await?;
+        let (sub_id, _) = add_never_paid_subscription(
+            &db,
+            user_id,
+            LineItemType::DnsHosting,
+            TimeDelta::minutes(5),
+        )
+        .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_never_paid_subscriptions().await?;
+
+        assert!(db.get_subscription(sub_id).await.is_ok());
+        Ok(())
+    }
+
+    /// An unexpired invoice, or an on-chain deposit seen but not confirmed,
+    /// means the money may still be on its way. Purging then would take the
+    /// order out from under a customer who has already paid for it (#194).
+    #[tokio::test]
+    async fn test_never_paid_subscription_with_pending_payment_is_kept() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[3u8; 32]).await?;
+        let (sub_id, _) =
+            add_never_paid_subscription(&db, user_id, LineItemType::DnsHosting, TimeDelta::days(2))
+                .await?;
+        db.insert_subscription_payment(&make_subscription_payment(
+            sub_id,
+            user_id,
+            Utc::now(),
+            Utc::now() + TimeDelta::minutes(30),
+            1,
+        ))
+        .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_never_paid_subscriptions().await?;
+
+        assert!(
+            db.get_subscription(sub_id).await.is_ok(),
+            "a subscription with an unexpired invoice must survive the sweep"
+        );
+        Ok(())
+    }
+
+    /// A VM's subscription belongs to `check_vms`, which purges never-paid VMs
+    /// on its own clock and has a hypervisor to talk to. Deleting the
+    /// subscription here would orphan the VM row.
+    #[tokio::test]
+    async fn test_never_paid_vm_subscription_is_left_to_check_vms() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, sub_id) =
+            add_vm_with_subscription(&db, Utc::now() - TimeDelta::days(2), false).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_never_paid_subscriptions().await?;
+
+        assert!(db.get_subscription(sub_id).await.is_ok());
+        assert!(db.get_vm(vm_id).await.is_ok());
+        Ok(())
+    }
+
+    /// A never-paid VPN plan goes with its subscription, devices and all.
+    ///
+    /// Those devices were never configured on a route server (the peer set is
+    /// joined through `is_setup`), so nothing is being cut off. Leaving the
+    /// plan behind is what pins the customer: `create_vpn_plan` returns an
+    /// existing plan whenever its state is not `Expired`, and `Unpaid` is not
+    /// `Expired`, so they could never get one at current pricing.
+    #[tokio::test]
+    async fn test_never_paid_vpn_plan_is_purged_with_its_devices() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let dyn_db: Arc<dyn LNVpsDb> = db.clone();
+        let user_id = db.upsert_user(&[4u8; 32]).await?;
+        let (sub_id, line_item_id) =
+            add_never_paid_subscription(&db, user_id, LineItemType::Vpn, TimeDelta::days(2))
+                .await?;
+        let service_id = db
+            .insert_vpn_service(&lnvps_db::VpnService {
+                name: "eu".to_string(),
+                company_id: 1,
+                amount: 500,
+                currency: "EUR".to_string(),
+                interval_amount: 1,
+                interval_type: lnvps_db::IntervalType::Month,
+                setup_amount: 0,
+                default_device_limit: 5,
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let plan_id = db
+            .insert_vpn_subscription(&lnvps_db::VpnSubscription {
+                id: 0,
+                vpn_service_id: service_id,
+                user_id,
+                subscription_line_item_id: line_item_id,
+                created: Utc::now() - TimeDelta::days(2),
+            })
+            .await?;
+        // A device is a peer on every interface terminating the service, so
+        // the service needs one before there is anywhere to connect.
+        let router_id = {
+            let mut routers = db.router.lock().await;
+            let id = routers.keys().max().copied().unwrap_or(0) + 1;
+            routers.insert(
+                id,
+                lnvps_db::Router {
+                    id,
+                    name: "rs".to_string(),
+                    enabled: true,
+                    kind: lnvps_db::RouterKind::MockRouter,
+                    url: "mock://rs".to_string(),
+                    token: "t".into(),
+                },
+            );
+            id
+        };
+        let pool_id = db
+            .insert_tunnel_pool(&lnvps_db::TunnelPool {
+                router_id,
+                region_id: 1,
+                name: "vpn".to_string(),
+                listen_addr: "rs.example".to_string(),
+                listen_port: 51820,
+                private_key: lnvps_api_common::generate_wireguard_keypair()?
+                    .private_key
+                    .into(),
+                public_key: vec![0x33; 32],
+                cidr4: Some("10.64.0.0/24".to_string()),
+                mtu: 1420,
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        db.link_vpn_service_pool(service_id, pool_id).await?;
+
+        let plan = db.get_vpn_subscription(plan_id).await?;
+        let device =
+            crate::provisioner::register_vpn_device(&dyn_db, &plan, "phone", &[7u8; 32]).await?;
+        let tunnels = db.list_vpn_device_tunnels(device.id).await?;
+        assert_eq!(tunnels.len(), 1, "precondition: the device is a peer");
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_never_paid_subscriptions().await?;
+
+        assert!(db.get_subscription(sub_id).await.is_err());
+        assert!(
+            db.get_vpn_subscription_for_user(user_id).await?.is_none(),
+            "the plan must go, or the customer stays pinned to it"
+        );
+        assert!(
+            db.list_vpn_devices(plan_id).await?.is_empty(),
+            "a device is only reachable through its plan; leaving it strands a tunnel"
+        );
+        assert!(db.get_tunnel(tunnels[0].id).await.is_err());
+        Ok(())
+    }
+
+    /// The listing fee is the order, not the node. An operator who never paid
+    /// one keeps their registration; only the billing link goes, so they can
+    /// start a fee again at current pricing.
+    #[tokio::test]
+    async fn test_never_paid_marketplace_fee_keeps_the_node() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[5u8; 32]).await?;
+        let (sub_id, line_item_id) = add_never_paid_subscription(
+            &db,
+            user_id,
+            LineItemType::MarketplaceNodeFee,
+            TimeDelta::days(2),
+        )
+        .await?;
+        let operator_id = db
+            .insert_marketplace_operator(&lnvps_db::MarketplaceOperator {
+                user_id,
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let node_id = db
+            .insert_marketplace_node(&lnvps_db::MarketplaceNode {
+                operator_id,
+                name: "rack 1".to_string(),
+                subscription_line_item_id: Some(line_item_id),
+                ..Default::default()
+            })
+            .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_never_paid_subscriptions().await?;
+
+        assert!(db.get_subscription(sub_id).await.is_err());
+        let node = db.get_marketplace_node(node_id).await?;
+        assert_eq!(
+            node.subscription_line_item_id, None,
+            "the node survives an unpaid listing fee, unlinked"
+        );
+        Ok(())
+    }
+
+    /// A never-paid deployment has no Kubernetes objects at all — the
+    /// operator's gate gives `BillingState::Unpaid` nothing — so the row and
+    /// its billing go together.
+    #[tokio::test]
+    async fn test_never_paid_app_deployment_is_purged() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[6u8; 32]).await?;
+        let (sub_id, line_item_id) =
+            add_never_paid_subscription(&db, user_id, LineItemType::App, TimeDelta::days(2))
+                .await?;
+        let deployment_id = db
+            .insert_app_deployment(&lnvps_db::AppDeployment {
+                id: 0,
+                user_id,
+                app_id: 1,
+                cluster_id: 1,
+                resource_multiplier: 1,
+                subscription_line_item_id: line_item_id,
+                name: "blog".to_string(),
+                namespace: "app-1".to_string(),
+                hostname: None,
+                custom_domain: None,
+                custom_domain_verified: false,
+                config: None,
+                desired_state: lnvps_db::AppDeploymentDesiredState::Running,
+                status: lnvps_db::AppDeploymentStatus::Pending,
+                status_message: None,
+                usage_cpu_milli: None,
+                usage_memory_bytes: None,
+                usage_storage_bytes: None,
+                usage_collected: None,
+                created: Utc::now() - TimeDelta::days(2),
+                deleted: false,
+            })
+            .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_never_paid_subscriptions().await?;
+
+        assert!(db.get_app_deployment(deployment_id).await.is_err());
+        assert!(db.get_subscription(sub_id).await.is_err());
+        Ok(())
+    }
+
+    /// A payment settling between the listing snapshot and the purge must win.
+    #[tokio::test]
+    async fn test_never_paid_sweep_rereads_before_purging() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[7u8; 32]).await?;
+        let (sub_id, _) =
+            add_never_paid_subscription(&db, user_id, LineItemType::DnsHosting, TimeDelta::days(2))
+                .await?;
+        let stale = db.get_subscription(sub_id).await?;
+
+        let mut paid = stale.clone();
+        paid.is_setup = true;
+        paid.is_active = true;
+        db.update_subscription(&paid).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .purge_never_paid_subscription(&stale, Utc::now())
+            .await?;
+
+        assert!(
+            db.get_subscription(sub_id).await.is_ok(),
+            "a subscription paid since the snapshot must not be purged"
+        );
         Ok(())
     }
 }
