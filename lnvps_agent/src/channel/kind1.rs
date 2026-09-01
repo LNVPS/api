@@ -10,11 +10,12 @@ use crate::channel::{IncomingSupportRequest, SupportChannel, SupportReply};
 use crate::identity::{SenderIdentity, SupportChannelKind};
 use crate::settings::Kind1Config;
 
-/// Kind 1 Nostr support channel.
+/// Nostr note/comment support channel.
 ///
-/// Connects to relays, subscribes for kind 1 events that mention the bot's
-/// pubkey, and receives them in real-time via `handle_notifications`.
-/// Replies are published as NIP-10 kind 1 replies.
+/// Connects to relays, subscribes for kind 1 (NIP-10 text note) and kind 1111
+/// (NIP-22 comment) events that mention the bot's pubkey, and receives them in
+/// real-time via `handle_notifications`. Replies are published in the same kind
+/// as the event they answer.
 pub struct Kind1SupportChannel {
     client: Client,
     /// Receive end of the channel fed by the notification handler.
@@ -52,9 +53,9 @@ impl Kind1SupportChannel {
         client.connect().await;
         log::info!("Kind1 channel connected to {} relays", config.relays.len());
 
-        // Subscribe to kind 1 events that mention any of our monitored pubkeys
+        // Subscribe to kind 1 / 1111 events that mention any of our monitored pubkeys
         let filter = Filter::new()
-            .kind(Kind::TextNote)
+            .kinds([Kind::TextNote, Kind::Comment])
             .pubkeys(mention_pubkeys.clone())
             .since(Timestamp::now());
 
@@ -119,7 +120,8 @@ impl Kind1SupportChannel {
                                 let author_hex = event.pubkey.to_string();
 
                                 log::info!(
-                                    "Kind1 mention from {} (event {}): {}",
+                                    "Kind {} mention from {} (event {}): {}",
+                                    event.kind.as_u16(),
                                     &author_hex[..16.min(author_hex.len())],
                                     event.id,
                                     event.content.chars().take(100).collect::<String>()
@@ -166,8 +168,8 @@ impl SupportChannel for Kind1SupportChannel {
     }
 
     fn channel_prompt(&self) -> &str {
-        r#"Format your responses for a Nostr kind 1 post:
-- Keep it SHORT — Nostr kind 1 events should be concise (under ~500 chars is ideal, max ~2000)
+        r#"Format your responses for a Nostr post:
+- Keep it SHORT - Nostr notes should be concise (under ~500 chars is ideal, max ~2000)
 - You may use Nostr-style formatting: **bold**, _italic_, and `code`
 - Be friendly and direct — social media tone, not corporate email
 - Include relevant links if helpful (e.g. https://lnvps.net)
@@ -201,13 +203,7 @@ impl SupportChannel for Kind1SupportChannel {
         let original_event =
             Event::from_json(event_json).context("Failed to parse original event JSON")?;
 
-        // Build a NIP-10 text note reply
-        let builder = EventBuilder::text_note_reply(
-            &reply.response,
-            &original_event,
-            None::<&Event>,   // root = same as reply_to (top-level reply)
-            None::<RelayUrl>, // no specific relay URL
-        );
+        let builder = build_reply(&reply.response, &original_event);
 
         let output = self
             .client
@@ -216,7 +212,7 @@ impl SupportChannel for Kind1SupportChannel {
             .context("Failed to publish kind 1 reply")?;
 
         log::info!(
-            "Kind1 reply published for event {}: {}",
+            "Nostr reply published for event {}: {}",
             event_id_hex,
             output.val
         );
@@ -225,9 +221,62 @@ impl SupportChannel for Kind1SupportChannel {
     }
 }
 
+/// Build the reply event for `original`, matching its kind.
+fn build_reply(response: &str, original: &Event) -> EventBuilder {
+    if original.kind == Kind::Comment {
+        // NIP-22: keep the original thread root, parent is the comment
+        let parent = CommentTarget::from(original);
+        let root = nip22::extract_root(original).unwrap_or_else(|| CommentTarget::from(original));
+        EventBuilder::comment(response, parent, Some(root))
+    } else {
+        // NIP-10 text note reply
+        EventBuilder::text_note_reply(
+            response,
+            original,
+            None::<&Event>,   // root = same as reply_to (top-level reply)
+            None::<RelayUrl>, // no specific relay URL
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reply_kind_matches_original() {
+        let keys = Keys::generate();
+        let note = EventBuilder::text_note("hello")
+            .sign_with_keys(&keys)
+            .unwrap();
+        assert_eq!(
+            build_reply("hi", &note).sign_with_keys(&keys).unwrap().kind,
+            Kind::TextNote
+        );
+
+        let comment = EventBuilder::comment(
+            "hello",
+            CommentTarget::from(&note),
+            Some(CommentTarget::from(&note)),
+        )
+        .sign_with_keys(&keys)
+        .unwrap();
+        let reply = build_reply("hi", &comment).sign_with_keys(&keys).unwrap();
+        assert_eq!(reply.kind, Kind::Comment);
+        // parent is the comment, root stays the original note
+        assert!(
+            reply
+                .tags
+                .iter()
+                .any(|t| t.as_slice()[0] == "e" && t.as_slice()[1] == comment.id.to_hex())
+        );
+        assert!(
+            reply
+                .tags
+                .iter()
+                .any(|t| t.as_slice()[0] == "E" && t.as_slice()[1] == note.id.to_hex())
+        );
+    }
 
     #[test]
     fn parse_nsec_and_derive_pubkey() {
