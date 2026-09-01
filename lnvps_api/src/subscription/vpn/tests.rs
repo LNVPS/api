@@ -199,6 +199,33 @@ async fn a_plan_is_sold_unpaid_at_the_services_price() -> Result<()> {
     Ok(())
 }
 
+/// Regression: the plan's subscription was created `is_active = 1`, so an
+/// unpaid plan was reported as an active subscription while `billing_state` on
+/// the same object said `unpaid`. Payment is what sets both flags.
+#[tokio::test]
+async fn test_vpn_plan_subscription_is_inactive_until_paid() -> Result<()> {
+    let mock = MockDb::default();
+    let db: Arc<dyn LNVpsDb> = Arc::new(mock.clone());
+    let service = a_service(&db, &mock).await?;
+    let uid = db.upsert_user(&[1u8; 32]).await?;
+
+    let plan = create_vpn_plan(&db, uid, &service).await?;
+    let sub = db
+        .get_subscription_by_line_item_id(plan.subscription_line_item_id)
+        .await?;
+
+    assert!(
+        !sub.is_active,
+        "an unpaid plan is not an active subscription"
+    );
+    assert!(!sub.is_setup);
+    assert!(
+        db.list_subscriptions_active(uid).await?.is_empty(),
+        "and it must not appear in the customer's active subscriptions"
+    );
+    Ok(())
+}
+
 /// A customer has one plan. Asking again while theirs is live must not sell a
 /// second one, or they would be billed twice for one allowance.
 #[tokio::test]

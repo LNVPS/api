@@ -2907,6 +2907,19 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_never_paid_subscriptions(
+        &self,
+        older_than_seconds: u64,
+    ) -> DbResult<Vec<Subscription>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM subscription WHERE is_setup = 0 \
+             AND created < DATE_SUB(NOW(), INTERVAL ? SECOND)",
+        )
+        .bind(older_than_seconds)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
     async fn deactivate_subscription(&self, id: u64) -> DbResult<()> {
         let mut tx = self.db.begin().await?;
         sqlx::query("UPDATE subscription SET is_active = 0 WHERE id = ?")
@@ -5764,6 +5777,39 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(device.id)
             .execute(&self.db)
             .await?;
+        Ok(())
+    }
+
+    async fn delete_vpn_subscription(&self, id: u64) -> DbResult<()> {
+        // Ordered by the FKs, which are RESTRICT in both directions: the
+        // devices hold the plan, and each device holds the tunnel that is the
+        // only record of the customer's key. Read the tunnel ids first, drop
+        // the devices, then the tunnels, then the plan. `vpn_device_tunnel`
+        // cascades off `vpn_device` and `tunnel_route` off `tunnel`.
+        let mut tx = self.db.begin().await?;
+        let tunnel_ids: Vec<(u64,)> = sqlx::query_as(
+            "SELECT dt.tunnel_id FROM vpn_device_tunnel dt \
+             JOIN vpn_device d ON d.id = dt.vpn_device_id \
+             WHERE d.vpn_subscription_id = ?",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM vpn_device WHERE vpn_subscription_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for (tunnel_id,) in tunnel_ids {
+            sqlx::query("DELETE FROM tunnel WHERE id = ?")
+                .bind(tunnel_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("DELETE FROM vpn_subscription WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(())
     }
 

@@ -41,9 +41,10 @@ use crate::subscription::SubscriptionLineItemHandler;
 /// being replaced, so the customer's devices keep their keys and addresses and
 /// paying is all it takes to be working again.
 ///
-/// The plan is created unpaid. `is_setup` stays false until the subscription is
-/// paid through the ordinary flow, and the planner only configures devices on a
-/// paid plan, so nothing reaches a route server before the money does.
+/// The plan is created unpaid: `is_active` and `is_setup` both stay false until
+/// the subscription is paid through the ordinary flow, which sets them
+/// together. The planner only configures devices on a paid plan, so nothing
+/// reaches a route server before the money does.
 pub async fn create_vpn_plan(
     db: &Arc<dyn LNVpsDb>,
     user_id: u64,
@@ -75,7 +76,7 @@ pub async fn create_vpn_plan(
                 description: None,
                 created: Utc::now(),
                 expires: None,
-                is_active: true,
+                is_active: false,
                 is_setup: false,
                 currency: service.currency.clone(),
                 interval_amount: service.interval_amount,

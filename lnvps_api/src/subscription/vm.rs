@@ -292,7 +292,7 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
             .await
             .map(|ps| {
                 ps.iter()
-                    .any(|p| crate::worker::payment_blocks_unpaid_vm_deletion(p, now))
+                    .any(|p| crate::worker::payment_blocks_unpaid_deletion(p, now))
             })
             .unwrap_or(false)
         {

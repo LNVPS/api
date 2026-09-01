@@ -34,6 +34,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **A VPN plan was reported active before it was paid for** — `POST /api/v1/vpn` created its subscription with `is_active: true`, so an unpaid plan appeared in `GET /api/v1/subscriptions` and serialised `is_active: true` while `billing_state` on the same object said `unpaid`. It is now created inactive, like every other product; payment sets both flags together. No service was ever configured early: a device only enters a route server's peer set once the subscription is set up.
+
+- **Abandoned orders are now cleaned up** — a subscription whose first payment never arrived was never revisited by anything. The lifecycle sweep reads active subscriptions with an expiry, and a never-paid one is neither, so an abandoned checkout lived in the database for good. They are now purged 24 hours after creation, unless an invoice is still unexpired or an on-chain deposit has been detected but not confirmed.
+
+  The order's product rows go with it: an app deployment (which, being unpaid, was never given any Kubernetes objects) and a VPN plan with its devices and keys. A marketplace node keeps its registration and only loses the billing link, since the unpaid order is the listing fee rather than the node. VMs are untouched here — never-paid ones are already deleted an hour after creation.
+
+  For VPN customers this also unsticks re-ordering: `POST /api/v1/vpn` returns the existing plan whenever it is not expired, and an unpaid plan is not expired, so an abandoned one used to pin the customer to it at the price it was created at.
+
 - **`dns_forward` now reaches DNS.** `PATCH /api/admin/v1/vm_ip_assignments/{id}` accepted a forward name, wrote it to the database and never sent it on: the A/AAAA record was named from the VM id, so the row said one thing and the nameserver answered for another. Setting `dns_forward` now renames the record, and the old name stops resolving. Clearing it returns to the derived `vm-{id}` name.
 
   A stored name must be a full FQDN, as reverse names already must. A bare label would be expanded against the zone, turning `host` into `host.example.com.example.com`.

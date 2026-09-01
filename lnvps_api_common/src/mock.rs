@@ -2853,6 +2853,19 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
+    async fn list_never_paid_subscriptions(
+        &self,
+        older_than_seconds: u64,
+    ) -> DbResult<Vec<Subscription>> {
+        let cutoff = Utc::now() - chrono::Duration::seconds(older_than_seconds as i64);
+        let subscriptions = self.subscriptions.lock().await;
+        Ok(subscriptions
+            .values()
+            .filter(|s| !s.is_setup && s.created < cutoff)
+            .cloned()
+            .collect())
+    }
+
     async fn deactivate_subscription(&self, id: u64) -> DbResult<()> {
         let mut subscriptions = self.subscriptions.lock().await;
         if let Some(sub) = subscriptions.get_mut(&id) {
@@ -5613,6 +5626,22 @@ impl LNVpsDbBase for MockDb {
                 ..existing
             },
         );
+        Ok(())
+    }
+
+    async fn delete_vpn_subscription(&self, id: u64) -> DbResult<()> {
+        let device_ids: Vec<u64> = self
+            .vpn_devices
+            .lock()
+            .await
+            .values()
+            .filter(|d| d.vpn_subscription_id == id)
+            .map(|d| d.id)
+            .collect();
+        for device_id in device_ids {
+            self.delete_vpn_device(device_id).await?;
+        }
+        self.vpn_subscriptions.lock().await.remove(&id);
         Ok(())
     }
 
