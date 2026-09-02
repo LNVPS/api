@@ -101,12 +101,44 @@ pub fn xdp_lnvps(ctx: XdpContext) -> u32 {
     }
 }
 
+/// 802.1Q / 802.1ad tag EtherTypes, in the raw (network-order) form the
+/// `EthHdr::ether_type` field carries.
+const ETH_P_8021Q_BE: u16 = 0x8100u16.to_be();
+const ETH_P_8021AD_BE: u16 = 0x88A8u16.to_be();
+const ETH_P_IP_BE: u16 = ETH_P_IP.to_be();
+const ETH_P_IPV6_BE: u16 = ETH_P_IPV6.to_be();
+
+/// Skip up to two VLAN tags (802.1ad outer + 802.1Q inner) after the Ethernet
+/// header, returning the L2 length and the encapsulated EtherType (raw,
+/// network order). A filter hook on a VLAN trunk port sees tagged frames
+/// whenever the NIC is not stripping tags in hardware; without this every
+/// tagged frame would fall through as "not IP" and pass unfiltered.
+#[inline(always)]
+fn skip_vlan_tags(ctx: &XdpContext) -> Result<(usize, u16), ()> {
+    let eth = ptr_at::<EthHdr>(ctx, 0)?;
+    let mut off = EthHdr::LEN;
+    let mut ty = eth.ether_type;
+    // Bounded: at most two tags are ever consumed.
+    let mut i = 0;
+    while i < 2 && (ty == ETH_P_8021Q_BE || ty == ETH_P_8021AD_BE) {
+        // 802.1Q tag: 2 bytes TCI, 2 bytes encapsulated EtherType.
+        let tag = ptr_at::<[u8; 4]>(ctx, off)?;
+        ty = u16::from_ne_bytes([tag[2], tag[3]]);
+        off += 4;
+        i += 1;
+    }
+    Ok((off, ty))
+}
+
 #[inline(always)]
 fn try_handle(ctx: &XdpContext) -> Result<u32, ()> {
-    let eth_hdr = ptr_at::<EthHdr>(ctx, 0)?;
-    match eth_hdr.ether_type() {
-        Ok(EtherType::Ipv4) => handle_outer_ipv4(ctx),
-        Ok(EtherType::Ipv6) => handle_ipv6(ctx, EthHdr::LEN, true),
+    let (l2_len, ty) = skip_vlan_tags(ctx)?;
+    // The SYN-proxy tail-call program re-parses from fixed untagged L2
+    // offsets and XDP_TXes a reply, so it is only offered to untagged frames.
+    let plain = l2_len == EthHdr::LEN;
+    match ty {
+        ETH_P_IP_BE => handle_outer_ipv4(ctx, l2_len, plain),
+        ETH_P_IPV6_BE => handle_ipv6(ctx, l2_len, plain),
         _ => Ok(XDP_PASS),
     }
 }
@@ -119,10 +151,10 @@ fn try_handle(ctx: &XdpContext) -> Result<u32, ()> {
 /// tail-call program re-parses from fixed L2 offsets and cannot re-encapsulate
 /// a reply).
 #[inline(always)]
-fn handle_outer_ipv4(ctx: &XdpContext) -> Result<u32, ()> {
-    let ip = ptr_at::<Ipv4Hdr>(ctx, EthHdr::LEN)?;
+fn handle_outer_ipv4(ctx: &XdpContext, l2_len: usize, allow_syn_proxy: bool) -> Result<u32, ()> {
+    let ip = ptr_at::<Ipv4Hdr>(ctx, l2_len)?;
     if ip.proto == PROTO_GRE && ip.ihl() as usize == Ipv4Hdr::LEN && ip.frag_offset() == 0 {
-        let gre_off = EthHdr::LEN + Ipv4Hdr::LEN;
+        let gre_off = l2_len + Ipv4Hdr::LEN;
         let gre = ptr_at::<[u8; 4]>(ctx, gre_off)?;
         let flags0 = gre[0];
         let version = gre[1] & 0x07;
@@ -142,7 +174,7 @@ fn handle_outer_ipv4(ctx: &XdpContext) -> Result<u32, ()> {
             }
         }
     }
-    handle_ipv4(ctx, EthHdr::LEN, true)
+    handle_ipv4(ctx, l2_len, allow_syn_proxy)
 }
 
 /// Parse the TCP/UDP destination port and SYN flag into `meta`, if the packet
@@ -520,12 +552,30 @@ fn tc_ptr_at<T>(ctx: &TcContext, offset: usize) -> Result<*const T, ()> {
     Ok((start + offset) as *const T)
 }
 
+/// TC twin of [`skip_vlan_tags`]: a learn hook on a VLAN trunk (or an egress
+/// hook emitting tagged frames) sees the tag inline whenever it is not carried
+/// as skb metadata.
+#[inline(always)]
+fn tc_skip_vlan_tags(ctx: &TcContext) -> Result<(usize, u16), ()> {
+    let eth = unsafe { &*tc_ptr_at::<EthHdr>(ctx, 0)? };
+    let mut off = EthHdr::LEN;
+    let mut ty = eth.ether_type;
+    let mut i = 0;
+    while i < 2 && (ty == ETH_P_8021Q_BE || ty == ETH_P_8021AD_BE) {
+        let tag = unsafe { &*tc_ptr_at::<[u8; 4]>(ctx, off)? };
+        ty = u16::from_ne_bytes([tag[2], tag[3]]);
+        off += 4;
+        i += 1;
+    }
+    Ok((off, ty))
+}
+
 #[inline(always)]
 fn try_learn(ctx: &TcContext) -> Result<i32, ()> {
-    let eth = unsafe { &*tc_ptr_at::<EthHdr>(ctx, 0)? };
-    match eth.ether_type() {
-        Ok(EtherType::Ipv4) => learn_ipv4(ctx),
-        Ok(EtherType::Ipv6) => learn_ipv6(ctx),
+    let (l2_len, ty) = tc_skip_vlan_tags(ctx)?;
+    match ty {
+        ETH_P_IP_BE => learn_ipv4(ctx, l2_len),
+        ETH_P_IPV6_BE => learn_ipv6(ctx, l2_len),
         _ => Ok(TC_ACT_OK),
     }
 }
@@ -736,8 +786,8 @@ fn sni_ext_blocked(ctx: &TcContext, off: usize, len: usize) -> Result<bool, ()> 
 }
 
 #[inline(always)]
-fn learn_ipv4(ctx: &TcContext) -> Result<i32, ()> {
-    let ip = unsafe { &*tc_ptr_at::<Ipv4Hdr>(ctx, EthHdr::LEN)? };
+fn learn_ipv4(ctx: &TcContext, l2_len: usize) -> Result<i32, ()> {
+    let ip = unsafe { &*tc_ptr_at::<Ipv4Hdr>(ctx, l2_len)? };
     let cfg = global_cfg();
     // Only account/learn for protected servers (keeps state clean on a router
     // that forwards for many networks). The SNI blocklist honours the same
@@ -750,7 +800,7 @@ fn learn_ipv4(ctx: &TcContext) -> Result<i32, ()> {
     let plain_l4 = ip.ihl() as usize == Ipv4Hdr::LEN && ip.frag_offset() == 0;
     // SNI egress block first: a shot packet is neither accounted nor learned
     // (its flow never completes, so there is no service to remember).
-    if plain_l4 && sni_blocked(ctx, &cfg, ip.proto, EthHdr::LEN + Ipv4Hdr::LEN) {
+    if plain_l4 && sni_blocked(ctx, &cfg, ip.proto, l2_len + Ipv4Hdr::LEN) {
         return Ok(TC_ACT_SHOT);
     }
     // TX accounting for every outbound packet from this source (before the
@@ -761,7 +811,7 @@ fn learn_ipv4(ctx: &TcContext) -> Result<i32, ()> {
     if !plain_l4 {
         return Ok(TC_ACT_OK);
     }
-    if let Some(svc) = egress_service(ctx, ip.proto, EthHdr::LEN + Ipv4Hdr::LEN)? {
+    if let Some(svc) = egress_service(ctx, ip.proto, l2_len + Ipv4Hdr::LEN)? {
         let key = PortKeyV4 {
             addr: ip.src_addr,
             port: svc.port,
@@ -774,8 +824,8 @@ fn learn_ipv4(ctx: &TcContext) -> Result<i32, ()> {
 }
 
 #[inline(always)]
-fn learn_ipv6(ctx: &TcContext) -> Result<i32, ()> {
-    let ip = unsafe { &*tc_ptr_at::<Ipv6Hdr>(ctx, EthHdr::LEN)? };
+fn learn_ipv6(ctx: &TcContext, l2_len: usize) -> Result<i32, ()> {
+    let ip = unsafe { &*tc_ptr_at::<Ipv6Hdr>(ctx, l2_len)? };
     let cfg = global_cfg();
     if cfg.scoped != 0 && !protected_v6(ip.src_addr) {
         return Ok(TC_ACT_OK);
@@ -783,7 +833,7 @@ fn learn_ipv6(ctx: &TcContext) -> Result<i32, ()> {
     // SNI egress block (see `learn_ipv4`). As with learning, only packets whose
     // first next-header is directly TCP are inspected; extension-header chains
     // are passed.
-    if sni_blocked(ctx, &cfg, ip.next_hdr, EthHdr::LEN + Ipv6Hdr::LEN) {
+    if sni_blocked(ctx, &cfg, ip.next_hdr, l2_len + Ipv6Hdr::LEN) {
         return Ok(TC_ACT_SHOT);
     }
     // TX accounting for every outbound packet from this source.
@@ -791,7 +841,7 @@ fn learn_ipv6(ctx: &TcContext) -> Result<i32, ()> {
         tx_account(c, ctx.len() as u64, ip.next_hdr, PROTO_ICMPV6);
     }
     // Only inspect packets whose first next-header is directly TCP/UDP.
-    if let Some(svc) = egress_service(ctx, ip.next_hdr, EthHdr::LEN + Ipv6Hdr::LEN)? {
+    if let Some(svc) = egress_service(ctx, ip.next_hdr, l2_len + Ipv6Hdr::LEN)? {
         let key = PortKeyV6 {
             addr: ip.src_addr,
             port: svc.port,

@@ -160,6 +160,16 @@ A normal `cargo test` (unprivileged) stays green: the harness tests are
 - `port_learning_survives_sni_blocking` — regression: passive port learning
   still runs on the same hook with a blocklist installed.
 
+`tests/vlan.rs` (802.1Q / 802.1ad trunk ports):
+- `vlan_tagged_closed_port_dropped` / `vlan_tagged_open_port_passed` — a
+  single-tagged SYN (raw `AF_PACKET` frame, tag inline) to a mitigating VM is
+  filtered on the header behind the tag.
+- `qinq_tagged_closed_port_dropped` — same through 802.1ad + 802.1Q.
+- `vlan_tagged_non_ip_is_ignored` — tagged ARP is passed and not counted.
+- `vlan_tagged_egress_is_learned` — a datagram from a VLAN sub-interface of
+  the uplink (TX VLAN offload off, tag in the frame) still teaches the TC
+  learner its source port.
+
 `tests/scoping.rs` (destination scoping to `protected`):
 - `unprotected_destination_is_passed_and_uncounted` / 
   `protected_destination_is_still_mitigated` — with scoping on, a destination
@@ -168,7 +178,7 @@ A normal `cargo test` (unprivileged) stays green: the harness tests are
 
 Run a single binary with `scripts/fw-e2e.sh --test learning` (or `--test
 mitigation`, `--test escalation`, `--test carpet_bomb`, `--test syn_proxy`,
-`--test gre_decap`, `--test scoping`, `--test sni_block`, `--test smoke`).
+`--test gre_decap`, `--test scoping`, `--test sni_block`, `--test vlan`, `--test smoke`).
 
 ### Note on writing datapath tests that parse packet payload
 
