@@ -787,6 +787,11 @@ async fn main() -> anyhow::Result<()> {
         name: "demo0".into(),
         speed_mbps: Some(10_000),
         role: "host".into(),
+        driver: Some("virtio_net".into()),
+        mtu: Some(1500),
+        xdp_mode: Some("native".into()),
+        hooks: vec!["xdp".into(), "tc-egress".into()],
+        ..Default::default()
     }]);
     let ports = learned_ports(0);
     let total = ports.len();

@@ -115,6 +115,58 @@ impl MitTracker {
     }
 }
 
+/// Rate-less event (rule changes carry no traffic sample).
+fn rule_event(kind: EventKind, cidr: &str, flags: u32) -> PendingEvent {
+    PendingEvent {
+        kind,
+        cidr: cidr.to_string(),
+        flags,
+        pps: 0,
+        bps: 0,
+        syn_pps: 0,
+    }
+}
+
+/// Events for a manual-override reconcile: `ManualStart` for every override
+/// that is new or whose flags changed, `ManualStop` for every one removed.
+/// Both maps are keyed by the canonical CIDR string.
+pub fn override_events(
+    prev: &HashMap<String, u32>,
+    cur: &HashMap<String, u32>,
+) -> Vec<PendingEvent> {
+    let mut out: Vec<PendingEvent> = cur
+        .iter()
+        .filter(|(c, f)| prev.get(*c) != Some(*f))
+        .map(|(c, f)| rule_event(EventKind::ManualStart, c, *f))
+        .collect();
+    out.extend(
+        prev.iter()
+            .filter(|(c, _)| !cur.contains_key(*c))
+            .map(|(c, f)| rule_event(EventKind::ManualStop, c, *f)),
+    );
+    out.sort_by(|a, b| a.cidr.cmp(&b.cidr));
+    out
+}
+
+/// Events for a plain set reconcile (source blocks, SNI hostnames): `start`
+/// for every entry only in `cur`, `stop` for every entry only in `prev`.
+pub fn set_events<'a>(
+    prev: impl IntoIterator<Item = &'a String>,
+    cur: impl IntoIterator<Item = &'a String>,
+    start: EventKind,
+    stop: EventKind,
+) -> Vec<PendingEvent> {
+    let prev: std::collections::HashSet<&String> = prev.into_iter().collect();
+    let cur: std::collections::HashSet<&String> = cur.into_iter().collect();
+    let mut out: Vec<PendingEvent> = cur
+        .difference(&prev)
+        .map(|c| rule_event(start, c, 0))
+        .chain(prev.difference(&cur).map(|c| rule_event(stop, c, 0)))
+        .collect();
+    out.sort_by(|a, b| a.cidr.cmp(&b.cidr));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -159,5 +211,41 @@ mod tests {
         assert_eq!(ev[0].kind, EventKind::Stop);
         assert_eq!(ev[0].flags, 3);
         assert_eq!((ev[0].pps, ev[0].bps, ev[0].syn_pps), (10, 20, 5));
+    }
+
+    #[test]
+    fn override_events_report_new_changed_and_removed() {
+        let prev: HashMap<String, u32> = [("a/32".to_string(), 1), ("b/24".to_string(), 8)].into();
+        let cur: HashMap<String, u32> = [("a/32".to_string(), 3), ("c/32".to_string(), 1)].into();
+        let ev = override_events(&prev, &cur);
+        let kinds: Vec<(&str, EventKind, u32)> = ev
+            .iter()
+            .map(|e| (e.cidr.as_str(), e.kind, e.flags))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("a/32", EventKind::ManualStart, 3),
+                ("b/24", EventKind::ManualStop, 8),
+                ("c/32", EventKind::ManualStart, 1),
+            ]
+        );
+        assert!(override_events(&cur, &cur).is_empty());
+    }
+
+    #[test]
+    fn set_events_diff_plain_sets() {
+        let prev = vec!["x.example".to_string(), "y.example".to_string()];
+        let cur = vec!["y.example".to_string(), "z.example".to_string()];
+        let ev = set_events(&prev, &cur, EventKind::SniStart, EventKind::SniStop);
+        let kinds: Vec<(&str, EventKind)> = ev.iter().map(|e| (e.cidr.as_str(), e.kind)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("x.example", EventKind::SniStop),
+                ("z.example", EventKind::SniStart)
+            ]
+        );
+        assert!(set_events(&cur, &cur, EventKind::BlockStart, EventKind::BlockStop).is_empty());
     }
 }

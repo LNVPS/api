@@ -170,12 +170,31 @@ pub enum InterfaceSpec {
     Full(InterfaceFull),
 }
 
+/// Which XDP attach mode to request for a filtering interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum XdpModeCfg {
+    /// Let the kernel pick native when the driver supports it, and fall back
+    /// to the generic (SKB) path if the native attach is refused. Default.
+    #[default]
+    Auto,
+    /// Require the driver (native) path; fail startup rather than silently
+    /// degrade to generic XDP (which linearises every skb and drops the large
+    /// GRO/TSO ones it cannot copy).
+    Native,
+    /// Force the generic (SKB) path (veth, drivers without XDP support).
+    Generic,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct InterfaceFull {
     pub name: String,
     #[serde(default)]
     pub role: IfaceRole,
+    /// XDP attach mode for `host` / `filter` roles (ignored for `learn`).
+    #[serde(default)]
+    pub xdp_mode: XdpModeCfg,
 }
 
 impl InterfaceSpec {
@@ -189,6 +208,12 @@ impl InterfaceSpec {
         match self {
             Self::Bare(_) => IfaceRole::Host,
             Self::Full(f) => f.role,
+        }
+    }
+    pub fn xdp_mode(&self) -> XdpModeCfg {
+        match self {
+            Self::Bare(_) => XdpModeCfg::Auto,
+            Self::Full(f) => f.xdp_mode,
         }
     }
 }
@@ -436,8 +461,10 @@ pub struct Escalation {
     /// **0 disables the SYN-proxy entirely** — required for tunneled /
     /// asymmetric-routed routers (GRE-backed VMs, non-GRE tunnels, reply on a
     /// different NIC) where the XDP_TX cookie reply cannot reach the client.
-    #[serde(default = "default_syn_proxy_syn_pps")]
-    pub syn_proxy_syn_pps: u64,
+    /// Unset = 5000 on a single-NIC host, **0 on a router** (any `filter` /
+    /// `learn` role); see [`Config::syn_proxy_syn_pps`].
+    #[serde(default)]
+    pub syn_proxy_syn_pps: Option<u64>,
     /// Per-destination budget of new distinct-port probes/second the port
     /// filter leaks through while mitigating (first-touch: each unknown TCP
     /// port probed once, grace window for the reply, then assumed closed and
@@ -460,7 +487,7 @@ impl Default for Escalation {
             block_ttl_secs: default_block_ttl_secs(),
             escalate_pass_pps: default_escalate_pass_pps(),
             max_real_sources: default_max_real_sources(),
-            syn_proxy_syn_pps: default_syn_proxy_syn_pps(),
+            syn_proxy_syn_pps: None,
             learn_leak_pps: default_learn_leak_pps(),
         }
     }
@@ -574,7 +601,43 @@ impl Config {
             !self.sni_ports.contains(&0),
             "sni-ports must not contain port 0"
         );
+        // Not a hard error (an existing config must keep loading across a
+        // self-upgrade), but this is the documented foot-gun for routers.
+        if self.is_router()
+            && let Some(pps) = self.escalation.syn_proxy_syn_pps
+            && pps != 0
+        {
+            log::warn!(
+                "escalation.syn-proxy-syn-pps is {pps} on a router (filter/learn roles): the \
+                 SYN-proxy XDP_TXs its cookie SYN-ACK out the ingress NIC and cannot \
+                 re-encapsulate or steer it, so on a tunneled/asymmetric path it black-holes \
+                 real services. Set it to 0 (or unset it) unless every filter NIC is \
+                 symmetric plain L2."
+            );
+        }
         Ok(())
+    }
+
+    /// True when any interface carries a router role (`filter` / `learn`), i.e.
+    /// this box forwards for the protected IPs rather than hosting them on
+    /// one NIC.
+    pub fn is_router(&self) -> bool {
+        self.interfaces
+            .iter()
+            .any(|s| matches!(s.role(), IfaceRole::Filter | IfaceRole::Learn))
+    }
+
+    /// Effective SYN-proxy trigger: the explicit value if set, otherwise 0 on
+    /// a router (where the XDP_TX cookie reply generally cannot reach the
+    /// client) and the classic 5000 SYNs/s on a single-NIC host.
+    pub fn syn_proxy_syn_pps(&self) -> u64 {
+        self.escalation
+            .syn_proxy_syn_pps
+            .unwrap_or(if self.is_router() {
+                0
+            } else {
+                default_syn_proxy_syn_pps()
+            })
     }
 
     /// Learned-port TTL as a `Duration`.
@@ -661,7 +724,7 @@ impl Config {
             src_rate_pps: self.escalation.src_rate_pps,
             src_cooldown_ns: self.escalation.src_cooldown_secs * 1_000_000_000,
             escalate_pass_pps: self.escalation.escalate_pass_pps,
-            syn_proxy_pps: self.escalation.syn_proxy_syn_pps,
+            syn_proxy_pps: self.syn_proxy_syn_pps(),
             learn_leak_pps: self.escalation.learn_leak_pps,
         })
     }
@@ -712,6 +775,43 @@ mod tests {
         assert_eq!(cfg.interfaces[0].role(), IfaceRole::Host);
         assert_eq!(cfg.interfaces[1].role(), IfaceRole::Filter);
         assert_eq!(cfg.interfaces[2].role(), IfaceRole::Learn);
+        assert!(cfg.is_router());
+        assert_eq!(cfg.interfaces[1].xdp_mode(), XdpModeCfg::Auto);
+    }
+
+    #[test]
+    fn parses_interface_xdp_mode() {
+        let cfg: Config = serde_yaml_ng::from_str(
+            "interfaces:\n  - { name: ens19, role: filter, xdp-mode: native }\n  \
+             - { name: veth0, xdp-mode: generic }\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.interfaces[0].xdp_mode(), XdpModeCfg::Native);
+        assert_eq!(cfg.interfaces[1].xdp_mode(), XdpModeCfg::Generic);
+    }
+
+    /// The SYN-proxy trigger defaults to 5000 on a host but 0 on a router: the
+    /// XDP_TX cookie reply cannot be re-encapsulated or steered to another
+    /// egress NIC, so it black-holes real services on a tunneled/asymmetric
+    /// path. An explicit value is always honoured (with a warning on a router).
+    #[test]
+    fn syn_proxy_defaults_off_on_routers() {
+        let host: Config = serde_yaml_ng::from_str("interfaces: [eno1]\n").unwrap();
+        assert!(!host.is_router());
+        assert_eq!(host.syn_proxy_syn_pps(), 5_000);
+        assert_eq!(host.runtime_config().unwrap().syn_proxy_pps, 5_000);
+
+        let router: Config =
+            serde_yaml_ng::from_str("interfaces:\n  - { name: ens19, role: filter }\n").unwrap();
+        assert_eq!(router.syn_proxy_syn_pps(), 0);
+        assert_eq!(router.runtime_config().unwrap().syn_proxy_pps, 0);
+
+        let explicit: Config = serde_yaml_ng::from_str(
+            "interfaces:\n  - { name: ens19, role: filter }\nescalation:\n  syn-proxy-syn-pps: 2000\n",
+        )
+        .unwrap();
+        assert_eq!(explicit.syn_proxy_syn_pps(), 2_000);
+        explicit.validate().unwrap();
     }
 
     #[test]

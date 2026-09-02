@@ -21,10 +21,11 @@ use lnvps_fw_service::api::{
     SharedState, SourceBlock, Totals, TrackedIp, TrackedSource, parse_cidr, sni_block_infos,
 };
 use lnvps_fw_service::cidr::{mask_v4, mask_v6};
-use lnvps_fw_service::config::{Config, IfaceRole};
+use lnvps_fw_service::config::{Config, IfaceRole, XdpModeCfg};
 use lnvps_fw_service::detect::{DestTracker, DetectionConfig, Rates};
 use lnvps_fw_service::gc;
-use lnvps_fw_service::publish::{MitInput, MitTracker};
+use lnvps_fw_service::netdev::{self, NicInfo};
+use lnvps_fw_service::publish::{self, MitInput, MitTracker, PendingEvent};
 use lnvps_fw_service::runtime::{self, DetectionState, RuntimeConfig, run_control, scan_plain};
 
 /// A NORMAL (unblocked) source state idle for this long is swept from the
@@ -74,13 +75,55 @@ fn load_config() -> Result<Config> {
     Ok(Config::from_interfaces(interfaces))
 }
 
+/// Attach the XDP program to `iface` in the configured mode. `Auto` asks the
+/// kernel for its default (native where the driver has `ndo_bpf`) and falls
+/// back to the generic SKB path if that is refused; `Native` refuses the
+/// fallback so a driver that cannot run us natively fails startup instead of
+/// silently degrading.
+fn attach_xdp(xdp: &mut Xdp, iface: &str, mode: XdpModeCfg) -> Result<()> {
+    match mode {
+        XdpModeCfg::Native => {
+            xdp.attach(iface, XdpMode::Driver).with_context(|| {
+                format!(
+                    "failed to attach XDP to {iface} in native mode (xdp-mode: native \
+                     refuses the generic fallback; check MTU/frags support and dmesg)"
+                )
+            })?;
+        }
+        XdpModeCfg::Generic => {
+            xdp.attach(iface, XdpMode::Skb)
+                .with_context(|| format!("failed to attach XDP to {iface} in generic mode"))?;
+        }
+        XdpModeCfg::Auto => {
+            if let Err(e) = xdp.attach(iface, XdpMode::default()) {
+                warn!("XDP default attach failed on {iface} ({e}), trying SKB mode");
+                xdp.attach(iface, XdpMode::Skb)
+                    .with_context(|| format!("failed to attach XDP to {iface}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Load the eBPF object and attach both the XDP ingress and TC egress programs
-/// to every configured interface.
-fn attach_programs(cfg: &Config) -> Result<Ebpf> {
+/// to every configured interface. Returns the loaded object plus what the
+/// kernel/driver did with each NIC: the XDP mode actually installed and any
+/// offload feature the attach flipped (virtio_net clears guest TSO/GRO-HW/CSUM,
+/// a refused native attach lands on the slow generic path). The datapath
+/// cannot see any of that, so it is diffed here and logged loudly.
+fn attach_programs(cfg: &Config) -> Result<(Ebpf, Vec<NicInfo>)> {
     let mut bpf = Ebpf::load(include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/lnvps_ebpf"
     )))?;
+
+    // Offload features before we touch anything, for the post-attach diff.
+    let before: Vec<_> = cfg
+        .interfaces
+        .iter()
+        .map(|spec| netdev::features(spec.name()).unwrap_or_default())
+        .collect();
+    let mut hooks: Vec<Vec<String>> = vec![Vec::new(); cfg.interfaces.len()];
 
     // XDP ingress protection -- attached to host + filter roles. The program is
     // GRE-decap-aware, so a `filter` interface on a router underlay drops
@@ -91,18 +134,10 @@ fn attach_programs(cfg: &Config) -> Result<Ebpf> {
             .context("xdp_lnvps program not found")?
             .try_into()?;
         xdp.load()?;
-        for spec in &cfg.interfaces {
+        for (i, spec) in cfg.interfaces.iter().enumerate() {
             if matches!(spec.role(), IfaceRole::Host | IfaceRole::Filter) {
-                let iface = spec.name();
-                match xdp.attach(iface, XdpMode::default()) {
-                    Ok(_) => info!("XDP attached to {iface} ({:?}, default mode)", spec.role()),
-                    Err(e) => {
-                        warn!("XDP default attach failed on {iface} ({e}), trying SKB mode");
-                        xdp.attach(iface, XdpMode::Skb)
-                            .with_context(|| format!("failed to attach XDP to {iface}"))?;
-                        info!("XDP attached to {iface} ({:?}, skb mode)", spec.role());
-                    }
-                }
+                attach_xdp(xdp, spec.name(), spec.xdp_mode())?;
+                hooks[i].push("xdp".to_string());
             }
         }
     }
@@ -115,7 +150,7 @@ fn attach_programs(cfg: &Config) -> Result<Ebpf> {
             .context("tc_lnvps_egress program not found")?
             .try_into()?;
         tc.load()?;
-        for spec in &cfg.interfaces {
+        for (i, spec) in cfg.interfaces.iter().enumerate() {
             let (iface, hook) = match spec.role() {
                 IfaceRole::Host => (spec.name(), TcAttachType::Egress),
                 IfaceRole::Learn => (spec.name(), TcAttachType::Ingress),
@@ -126,8 +161,51 @@ fn attach_programs(cfg: &Config) -> Result<Ebpf> {
             let _ = qdisc_add_clsact(iface);
             tc.attach(iface, hook)
                 .with_context(|| format!("failed to attach TC {hook:?} to {iface}"))?;
-            info!("TC {hook:?} learning attached to {iface}");
+            hooks[i].push(
+                match hook {
+                    TcAttachType::Ingress => "tc-ingress",
+                    TcAttachType::Egress => "tc-egress",
+                    TcAttachType::Custom(_) => "tc",
+                }
+                .to_string(),
+            );
         }
+    }
+
+    // What the kernel actually did with each NIC.
+    let mut nics = Vec::with_capacity(cfg.interfaces.len());
+    for ((spec, before), hooks) in cfg.interfaces.iter().zip(before).zip(hooks) {
+        let iface = spec.name();
+        let mut nic = NicInfo::snapshot(iface);
+        nic.hooks = hooks;
+        nic.record_flips(&before);
+        info!(
+            "{iface} ({:?}): hooks={:?} xdp={} driver={} mtu={} speed={}",
+            spec.role(),
+            nic.hooks,
+            nic.xdp_mode.as_deref().unwrap_or("?"),
+            nic.driver.as_deref().unwrap_or("?"),
+            nic.mtu.map_or("?".to_string(), |m| m.to_string()),
+            nic.speed_mbps
+                .map_or("?".to_string(), |s| format!("{s}Mbit/s")),
+        );
+        if nic.hooks.iter().any(|h| h == "xdp") && nic.xdp_mode.as_deref() != Some("native") {
+            warn!(
+                "{iface}: XDP is running in {} mode, not native. Generic XDP copies/linearises \
+                 every skb and DROPS the large GRO/TSO ones it cannot copy (throughput collapses \
+                 for exactly the flows that arrive coalesced). Fix the native attach (kernel \
+                 >= 6.3 with multi-buffer support for this driver, MTU, dmesg) or pin \
+                 `xdp-mode: generic` and turn off rx-gro-hw/gro on this NIC.",
+                nic.xdp_mode.as_deref().unwrap_or("an unknown")
+            );
+        }
+        if !nic.offloads_changed_by_attach.is_empty() {
+            warn!(
+                "{iface}: attaching changed NIC offloads: {}",
+                nic.offloads_changed_by_attach.join(", ")
+            );
+        }
+        nics.push(nic);
     }
 
     // SYN-proxy tail-call programs (v4 + v6): load them (not attached to an
@@ -155,7 +233,7 @@ fn attach_programs(cfg: &Config) -> Result<Ebpf> {
     // Seed an initial SYN-cookie secret from the CSPRNG.
     rotate_cookie_secret(&mut bpf, fresh_cookie_secret())?;
 
-    Ok(bpf)
+    Ok((bpf, nics))
 }
 
 /// Expire verified sources whose verification is older than `ttl_ns` (both
@@ -213,16 +291,6 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-/// Read an interface's link speed (Mbit/s) from sysfs. Returns `None` when the
-/// driver doesn't report it (virtual NICs report -1 / error).
-fn read_link_speed(name: &str) -> Option<u64> {
-    let raw = std::fs::read_to_string(format!("/sys/class/net/{name}/speed")).ok()?;
-    match raw.trim().parse::<i64>() {
-        Ok(mbps) if mbps > 0 => Some(mbps as u64),
-        _ => None,
-    }
 }
 
 /// Percentage of packets being dropped (drop_pps as a share of pps), clamped
@@ -433,8 +501,16 @@ fn collect_sources(det: &DetectionState, now_ns: u64) -> Vec<TrackedSource> {
 }
 
 /// Apply live-edited thresholds from the control API into the runtime config
-/// (applied to both the per-destination and per-prefix detectors).
-fn apply_limits(rt: &mut RuntimeConfig, l: &Limits) {
+/// (applied to both the per-destination and per-prefix detectors). `router`
+/// only drives the SYN-proxy warning (see `Config::syn_proxy_syn_pps`).
+fn apply_limits(rt: &mut RuntimeConfig, l: &Limits, router: bool) {
+    if router && l.syn_proxy_pps != 0 && rt.syn_proxy_pps == 0 {
+        warn!(
+            "limits: syn_proxy_pps set to {} on a router — the SYN-proxy cannot reach \
+             clients over tunneled/asymmetric paths and will black-hole real services there",
+            l.syn_proxy_pps
+        );
+    }
     let cooldown_ns = l.cooldown_secs.saturating_mul(1_000_000_000);
     rt.detection.pps = l.pps;
     rt.detection.syn_pps = l.syn_pps;
@@ -736,11 +812,11 @@ fn remove_dest_state(bpf: &mut Ebpf, key: CidrKey) -> Result<()> {
 fn apply_rules(
     bpf: &mut Ebpf,
     rules: &RuleSet,
-    applied: &mut HashMap<String, CidrKey>,
+    applied: &mut HashMap<String, (CidrKey, u32)>,
     applied_blocks: &mut HashMap<String, CidrKey>,
     rt: &mut RuntimeConfig,
     now_ns: u64,
-) -> Result<()> {
+) -> Result<Vec<PendingEvent>> {
     let mut pv4 = Vec::new();
     let mut pv6 = Vec::new();
     for c in &rules.protected {
@@ -766,19 +842,31 @@ fn apply_rules(
             desired.insert(o.cidr.clone(), (k, o.flags));
         }
     }
+    // Every change to what the datapath enforces is logged and recorded as an
+    // event: an override or block takes effect with no traffic-side signal
+    // (no MITIGATION line), so this is the only trail a throughput complaint
+    // can be lined up against.
+    let flags_of = |m: &HashMap<String, (CidrKey, u32)>| -> HashMap<String, u32> {
+        m.iter().map(|(c, (_, f))| (c.clone(), *f)).collect()
+    };
+    let mut events = publish::override_events(&flags_of(applied), &flags_of(&desired));
     let gone: Vec<String> = applied
         .keys()
         .filter(|c| !desired.contains_key(*c))
         .cloned()
         .collect();
     for c in gone {
-        if let Some(k) = applied.remove(&c) {
+        if let Some((k, _)) = applied.remove(&c) {
             remove_dest_state(bpf, k)?;
+            info!("OVERRIDE CLEARED cidr={c}");
         }
     }
     for (c, (k, flags)) in &desired {
+        // Re-written unconditionally: idempotent, and self-heals a partial write.
         write_dest_state(bpf, *k, *flags, now_ns)?;
-        applied.insert(c.clone(), *k);
+        if applied.insert(c.clone(), (*k, *flags)).map(|(_, f)| f) != Some(*flags) {
+            info!("OVERRIDE SET cidr={c} flags={flags:#06b}");
+        }
     }
 
     // Manual source blocks -> MANUAL_BLOCK tries (unconditional drops).
@@ -791,6 +879,7 @@ fn apply_rules(
             None => warn!("ignoring bad source-block cidr {c}"),
         }
     }
+    let prev_blocks: Vec<String> = applied_blocks.keys().cloned().collect();
     let gone_blocks: Vec<String> = applied_blocks
         .keys()
         .filter(|c| !want.contains_key(*c))
@@ -799,17 +888,73 @@ fn apply_rules(
     for c in gone_blocks {
         if let Some(k) = applied_blocks.remove(&c) {
             manual_block(bpf, k, false)?;
+            info!("SOURCE BLOCK REMOVED cidr={c}");
         }
     }
     for (c, k) in &want {
         manual_block(bpf, *k, true)?;
-        applied_blocks.insert(c.clone(), *k);
+        if applied_blocks.insert(c.clone(), *k).is_none() {
+            info!("SOURCE BLOCK ADDED cidr={c}");
+        }
     }
+    let cur_blocks: Vec<String> = applied_blocks.keys().cloned().collect();
+    events.extend(publish::set_events(
+        &prev_blocks,
+        &cur_blocks,
+        api::EventKind::BlockStart,
+        api::EventKind::BlockStop,
+    ));
     // Let the XDP fast-path skip the per-packet MANUAL_BLOCK LPM lookup unless
     // at least one block is installed.
     let have_blocks = !applied_blocks.is_empty();
     runtime::update_global_cfg(bpf, |c| c.manual_blocks = u32::from(have_blocks))?;
-    Ok(())
+    Ok(events)
+}
+
+/// Keys of one LPM trie map as `<tag>:<addr>/<len>` strings (empty if the map
+/// is missing or of another type).
+fn trie_entries<K, V>(bpf: &Ebpf, name: &str, tag: &str, addr: impl Fn(K) -> String) -> Vec<String>
+where
+    K: aya::Pod,
+    V: aya::Pod,
+{
+    bpf.map(name)
+        .and_then(|m| LpmTrie::<_, K, V>::try_from(m).ok())
+        .map(|t| {
+            t.keys()
+                .flatten()
+                .map(|k| format!("{tag}:{}/{}", addr(k.data()), k.prefix_len()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every entry currently in the dest-state and manual-block tries. Only
+/// consulted when drops are seen with nothing known to be mitigating (a
+/// userspace/kernel desync), so cost is irrelevant.
+fn enforcing_entries(bpf: &Ebpf) -> Vec<String> {
+    let v4 = |a: [u8; 4]| Ipv4Addr::from(a).to_string();
+    let v6 = |a: [u8; 16]| Ipv6Addr::from(a).to_string();
+    let mut out = trie_entries::<[u8; 4], DestState>(bpf, "V4_DEST_STATE", "dest", v4);
+    out.extend(trie_entries::<[u8; 16], DestState>(
+        bpf,
+        "V6_DEST_STATE",
+        "dest",
+        v6,
+    ));
+    out.extend(trie_entries::<[u8; 4], u8>(
+        bpf,
+        "MANUAL_BLOCK_V4",
+        "block",
+        v4,
+    ));
+    out.extend(trie_entries::<[u8; 16], u8>(
+        bpf,
+        "MANUAL_BLOCK_V6",
+        "block",
+        v6,
+    ));
+    out
 }
 
 /// Add (`set`) or remove a manual source-CIDR block in the MANUAL_BLOCK tries.
@@ -940,9 +1085,29 @@ fn sync_protected(
     Ok(())
 }
 
+/// Publish the attached interfaces (role, link speed, XDP mode, offloads, XDP
+/// counters) to the control API. Called at startup and on every stats tick.
+fn publish_nics(st: &SharedState, cfg: &Config, nics: &[NicInfo]) {
+    st.set_nics(
+        cfg.interfaces
+            .iter()
+            .zip(nics)
+            .map(|(spec, nic)| InterfaceInfo {
+                role: match spec.role() {
+                    IfaceRole::Host => "host",
+                    IfaceRole::Filter => "filter",
+                    IfaceRole::Learn => "learn",
+                }
+                .to_string(),
+                ..InterfaceInfo::from(nic.clone())
+            })
+            .collect(),
+    );
+}
+
 /// Build the API shared state and spawn the HTTPS server; returns the shared
 /// handle the control loop publishes into.
-fn start_api(cfg: &Config) -> Result<Option<std::sync::Arc<SharedState>>> {
+fn start_api(cfg: &Config, nics: &[NicInfo]) -> Result<Option<std::sync::Arc<SharedState>>> {
     let Some(api_cfg) = &cfg.api else {
         return Ok(None);
     };
@@ -1039,26 +1204,7 @@ fn start_api(cfg: &Config) -> Result<Option<std::sync::Arc<SharedState>>> {
     });
     // Publish the attached interfaces + their link speeds and roles (for
     // line-rate hints; only ingress/filter NICs count toward the ceiling).
-    state.set_nics(
-        cfg.interfaces
-            .iter()
-            .map(|spec| {
-                let name = spec.name().to_string();
-                let speed_mbps = read_link_speed(&name);
-                let role = match spec.role() {
-                    IfaceRole::Host => "host",
-                    IfaceRole::Filter => "filter",
-                    IfaceRole::Learn => "learn",
-                }
-                .to_string();
-                InterfaceInfo {
-                    name,
-                    speed_mbps,
-                    role,
-                }
-            })
-            .collect(),
-    );
+    publish_nics(&state, cfg, nics);
     info!("Control API (HTTPS) listening on https://{addr}");
     Ok(Some(state))
 }
@@ -1078,19 +1224,27 @@ async fn main() -> Result<()> {
         cfg.interfaces
     );
 
-    let mut bpf = attach_programs(&cfg)?;
+    let (mut bpf, mut nics) = attach_programs(&cfg)?;
 
     let ttl_ns = cfg.port_ttl().as_nanos() as u64;
     let udp_ttl_ns = cfg.udp_port_ttl().as_nanos() as u64;
     let mut runtime_cfg = cfg.runtime_config()?;
     let mut detection_state = DetectionState::default();
+    let router = cfg.is_router();
+    if router && runtime_cfg.syn_proxy_pps != 0 {
+        warn!(
+            "SYN-proxy trigger is {} SYN/s on a router: it black-holes real services on \
+             tunneled/asymmetric paths — set escalation.syn-proxy-syn-pps: 0",
+            runtime_cfg.syn_proxy_pps
+        );
+    }
 
     // Control API (increment 7): HTTPS server + shared state the loop publishes
     // into. Rules are pushed by lnvps_api and reconciled below on change.
-    let api_state = start_api(&cfg)?;
+    let api_state = start_api(&cfg, &nics)?;
     let mut rules_version = 0u64;
     let mut limits_version = 0u64;
-    let mut applied_overrides: HashMap<String, CidrKey> = HashMap::new();
+    let mut applied_overrides: HashMap<String, (CidrKey, u32)> = HashMap::new();
     let mut applied_blocks: HashMap<String, CidrKey> = HashMap::new();
     let mut applied_protected_v4: Vec<(u32, [u8; 4])> = Vec::new();
     let mut applied_protected_v6: Vec<(u32, [u8; 16])> = Vec::new();
@@ -1152,15 +1306,29 @@ async fn main() -> Result<()> {
     let mut sni_hostnames: Vec<String> = cfg.sni_blocklist().into_iter().map(|b| b.sni).collect();
     match runtime::sync_sni_blocks(&mut bpf, &sni_hostnames) {
         Ok(_) if sni_hostnames.is_empty() => {}
-        Ok(_) => info!(
-            "SNI egress blocklist: {} hostname(s) on port(s) {:?}",
-            sni_hostnames.len(),
-            cfg.sni_ports
-        ),
+        Ok(_) => {
+            info!(
+                "SNI egress blocklist: {} hostname(s) on port(s) {:?}",
+                sni_hostnames.len(),
+                cfg.sni_ports
+            );
+            for sni in &sni_hostnames {
+                info!("SNI BLOCK ADDED sni={sni} (config)");
+                if let Some(st) = &api_state {
+                    st.record_event(api::EventKind::SniStart, sni.clone(), 0, 0, 0, 0);
+                }
+            }
+        }
         Err(e) => warn!("writing SNI blocklist failed: {e}"),
     }
     let mut detect_timer = tokio::time::interval(cfg.sample_interval());
     let mut gc_timer = tokio::time::interval(cfg.gc_interval());
+    // Periodic one-line health summary (`learning.stats-interval-secs`, 0 =
+    // off). The interval is also where the driver-level XDP counters are
+    // re-read and the "drops with nothing mitigating" desync check runs.
+    let stats_every = cfg.learning.stats_interval_secs;
+    let mut stats_timer = tokio::time::interval(Duration::from_secs(stats_every.max(1)));
+    let mut nic_xdp_drops: HashMap<String, u64> = HashMap::new();
     // Rotate the SYN-cookie secret periodically; cookies issued in the previous
     // window still validate against the prev slot.
     let mut cookie_timer = tokio::time::interval(Duration::from_secs(120));
@@ -1184,9 +1352,14 @@ async fn main() -> Result<()> {
         cfg.thresholds.cooldown_secs
     );
 
+    // systemd stops us with SIGTERM: handle it like ^C so the shutdown path
+    // below runs (an abrupt exit detaches the programs but leaves whatever the
+    // attach did to the NIC offloads in place).
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
+            _ = sigterm.recv() => break,
             _ = detect_timer.tick() => {
                 let now = gc::monotonic_now_ns();
                 // Reconcile any newly-pushed rules before detecting.
@@ -1195,7 +1368,7 @@ async fn main() -> Result<()> {
                     if v != rules_version {
                         rules_version = v;
                         let rules = st.rules();
-                        if let Err(e) = apply_rules(
+                        match apply_rules(
                             &mut bpf,
                             &rules,
                             &mut applied_overrides,
@@ -1203,7 +1376,12 @@ async fn main() -> Result<()> {
                             &mut runtime_cfg,
                             now,
                         ) {
-                            warn!("apply rules failed: {e}");
+                            Ok(events) => {
+                                for ev in events {
+                                    st.record_event(ev.kind, ev.cidr, ev.flags, 0, 0, 0);
+                                }
+                            }
+                            Err(e) => warn!("apply rules failed: {e}"),
                         }
                         if let Err(e) = sync_protected(
                             &mut bpf,
@@ -1216,8 +1394,21 @@ async fn main() -> Result<()> {
                         }
                         // Reconcile the SNI egress blocklist (API add/remove or
                         // a full rules push) into the datapath.
-                        sni_hostnames =
+                        let new_sni: Vec<String> =
                             rules.sni_blocks.iter().map(|b| b.sni.clone()).collect();
+                        for ev in publish::set_events(
+                            &sni_hostnames,
+                            &new_sni,
+                            api::EventKind::SniStart,
+                            api::EventKind::SniStop,
+                        ) {
+                            match ev.kind {
+                                api::EventKind::SniStart => info!("SNI BLOCK ADDED sni={}", ev.cidr),
+                                _ => info!("SNI BLOCK REMOVED sni={}", ev.cidr),
+                            }
+                            st.record_event(ev.kind, ev.cidr, 0, 0, 0, 0);
+                        }
+                        sni_hostnames = new_sni;
                         match runtime::sync_sni_blocks(&mut bpf, &sni_hostnames) {
                             Ok((0, 0)) => {}
                             Ok((added, removed)) => info!(
@@ -1234,7 +1425,7 @@ async fn main() -> Result<()> {
                     let v = st.limits_version();
                     if v != limits_version {
                         limits_version = v;
-                        apply_limits(&mut runtime_cfg, &st.limits());
+                        apply_limits(&mut runtime_cfg, &st.limits(), router);
                         // Push the per-source limits into the kernel rate
                         // machine (it owns per-source blocking now).
                         if let Err(e) = runtime::write_src_rate_cfg(&mut bpf, &runtime_cfg) {
@@ -1366,6 +1557,84 @@ async fn main() -> Result<()> {
                     warn!("cookie rotation failed: {e}");
                 }
             }
+            _ = stats_timer.tick(), if stats_every > 0 => {
+                // Rates from the most recent detection tick (the trackers are
+                // stamped with that tick's timestamp).
+                let totals = collect_totals(&detection_state, detection_state.last_sample_ns);
+                let mitigating = collect_active(&detection_state).len();
+                // Driver-side XDP drops since the last stats tick, per NIC.
+                let mut driver_drops = 0u64;
+                for nic in &mut nics {
+                    nic.refresh();
+                    let cur = nic.xdp_stats.get("rx_xdp_drops").copied().unwrap_or(0);
+                    let prev = nic_xdp_drops.insert(nic.name.clone(), cur).unwrap_or(cur);
+                    driver_drops += cur.saturating_sub(prev);
+                }
+                info!(
+                    "STATS rx_pps={} rx_bps={} drop_pps={} tx_pps={} dests={} mitigating={} \
+                     overrides={} blocks={} sni={} nic_xdp_drops_delta={driver_drops}",
+                    totals.rx_pps,
+                    totals.rx_bps,
+                    totals.rx_drop_pps,
+                    totals.tx_pps,
+                    detection_state.v4.len() + detection_state.v6.len(),
+                    mitigating,
+                    applied_overrides.len(),
+                    applied_blocks.len(),
+                    sni_hostnames.len(),
+                );
+                // The datapath only drops under a dest flag or a manual block,
+                // so drops with none of those known to userspace mean the
+                // kernel tries hold entries we don't know about.
+                if totals.rx_drop_pps > 0
+                    && mitigating == 0
+                    && applied_overrides.is_empty()
+                    && applied_blocks.is_empty()
+                {
+                    warn!(
+                        "dropping {} pps with no mitigation, override or block active — \
+                         enforcing trie entries: {:?}",
+                        totals.rx_drop_pps,
+                        enforcing_entries(&bpf)
+                    );
+                }
+                // Drops the driver counted while our program could not have
+                // issued any (nothing mitigating, no override, no block):
+                // XDP_ABORTED, a failed linearise on the generic path, ...
+                // Gated on the enforcing state rather than `drop_pps` because
+                // the detection window and the driver-counter delta do not
+                // line up under a real mitigation.
+                if driver_drops > 0
+                    && mitigating == 0
+                    && applied_overrides.is_empty()
+                    && applied_blocks.is_empty()
+                {
+                    warn!(
+                        "NIC driver reports {driver_drops} XDP drop(s) this interval while the \
+                         program dropped nothing — a driver/kernel-level drop, not a verdict"
+                    );
+                }
+                for nic in &nics {
+                    if nic.hooks.iter().any(|h| h == "xdp") && nic.xdp_mode.as_deref() == Some("none") {
+                        warn!("{}: XDP program is no longer attached", nic.name);
+                    }
+                }
+                if let Some(st) = &api_state {
+                    publish_nics(st, &cfg, &nics);
+                }
+            }
+        }
+    }
+    // Detach first (dropping the object closes the program/link fds), then
+    // undo the offload flips: a generic-XDP install turns `rx-gro-hw` off and
+    // the kernel never turns it back on, so without this a stopped firewall
+    // would leave the NIC (and, on virtio, the hypervisor's tap) degraded.
+    drop(bpf);
+    for nic in &nics {
+        match nic.restore_offloads() {
+            Ok(v) if v.is_empty() => {}
+            Ok(v) => info!("{}: restored NIC offloads: {}", nic.name, v.join(", ")),
+            Err(e) => warn!("{}: restoring NIC offloads failed: {e}", nic.name),
         }
     }
     info!("Shutdown complete.");

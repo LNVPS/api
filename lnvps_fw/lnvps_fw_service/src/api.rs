@@ -215,16 +215,34 @@ pub struct Mitigation {
     pub geo: GeoInfo,
 }
 
-/// Kind of mitigation event.
+/// Kind of event. `Start`/`Flags`/`Stop` are auto-detected mitigations; the
+/// rest record operator rule changes (which otherwise take effect silently)
+/// so a throughput complaint can be lined up against them.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum EventKind {
     Start,
     Flags,
     Stop,
+    /// Manual override set or its flags changed (`cidr`, `flags`).
+    #[serde(rename = "manual_start")]
+    ManualStart,
+    /// Manual override cleared.
+    #[serde(rename = "manual_stop")]
+    ManualStop,
+    /// Manual source block added (`cidr`).
+    #[serde(rename = "block_start")]
+    BlockStart,
+    #[serde(rename = "block_stop")]
+    BlockStop,
+    /// TLS-SNI egress block added (`cidr` carries the hostname).
+    #[serde(rename = "sni_start")]
+    SniStart,
+    #[serde(rename = "sni_stop")]
+    SniStop,
 }
 
-/// A mitigation start/flags/stop event, buffered for polling.
+/// A mitigation or rule-change event, buffered for polling.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Event {
     /// Monotonic sequence number (the poll cursor).
@@ -523,8 +541,10 @@ pub struct LearnedPort {
     pub age_secs: u64,
 }
 
-/// An attached interface and its link speed (for line-rate hints).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// An attached interface: its role, link speed (for line-rate hints), and what
+/// the kernel/driver did with our attach (XDP mode, offloads, XDP counters) so
+/// a driver-level throughput problem is visible without shell access.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InterfaceInfo {
     pub name: String,
     /// Link speed in Mbit/s reported by the driver, if known (`None` when the
@@ -535,6 +555,44 @@ pub struct InterfaceInfo {
     /// line-rate ceiling); `"learn"` is the VM-facing NIC (internal, excluded).
     #[serde(default)]
     pub role: String,
+    /// Kernel driver bound to the device (`virtio_net`, `mlx5_core`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub driver: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mtu: Option<u32>,
+    /// XDP mode the kernel actually installed (`native` / `generic` / `none`);
+    /// `generic` means the slow SKB path with per-packet linearisation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xdp_mode: Option<String>,
+    /// Hooks the daemon attached here: `xdp`, `tc-ingress`, `tc-egress`.
+    #[serde(default)]
+    pub hooks: Vec<String>,
+    /// Offload features of interest and whether each is active.
+    #[serde(default)]
+    pub offloads: std::collections::BTreeMap<String, bool>,
+    /// Features the attach itself flipped (`rx-gro-hw on->off`, ...).
+    #[serde(default)]
+    pub offloads_changed_by_attach: Vec<String>,
+    /// Driver XDP counters summed across queues (e.g. `rx_xdp_drops`).
+    #[serde(default)]
+    pub xdp_stats: std::collections::BTreeMap<String, u64>,
+}
+
+impl From<crate::netdev::NicInfo> for InterfaceInfo {
+    fn from(n: crate::netdev::NicInfo) -> Self {
+        Self {
+            name: n.name,
+            speed_mbps: n.speed_mbps,
+            role: String::new(),
+            driver: n.driver,
+            mtu: n.mtu,
+            xdp_mode: n.xdp_mode,
+            hooks: n.hooks,
+            offloads: n.offloads,
+            offloads_changed_by_attach: n.offloads_changed_by_attach,
+            xdp_stats: n.xdp_stats,
+        }
+    }
 }
 
 /// Daemon status.
