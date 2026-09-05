@@ -61,6 +61,40 @@ prometheus:
   # best-effort and must not hold up a reconcile pass.
   timeout-seconds: 10
 
+# --- App deployment backups -------------------------------------------------
+# Where backup artifacts are stored (optional). Omit the whole block to disable
+# backups: nothing is scheduled and nothing runs, which is how the operator
+# behaved before backups existed. An app opts in with a `backup:` schedule in
+# its catalog compose; the operator signs a one-key, one-method upload URL per
+# run, so the pod that captures the data never holds a bucket credential.
+backups:
+  endpoint: "https://s3.example.com"
+  # Signing region. S3-compatible services without regions still sign with one
+  # (optional, defaults to "us-east-1").
+  region: "eu-central-1"
+  bucket: "lnvps-app-backups"
+  # Credentials (optional here). Prefer the LNVPS_BACKUP_ACCESS_KEY and
+  # LNVPS_BACKUP_SECRET_KEY environment variables, which override these: this
+  # file usually lives in a ConfigMap, which is no place for a bucket key.
+  access-key: "example-access-key"
+  secret-key: "example-secret-key"
+  # Address the bucket as a path rather than a subdomain (optional, defaults to
+  # true, which is what self-hosted MinIO/Garage accept without wildcard DNS).
+  path-style: true
+  # Image that tars, compresses and uploads (optional). A stock curl image,
+  # whose busybox userland has tar and gzip. Override to pin by digest or to
+  # point at an internal mirror.
+  uploader-image: "curlimages/curl:8.11.1"
+  # How long a signed upload URL is valid, in hours (optional, defaults to 6).
+  upload-url-expiry-hours: 6
+  # How long a backup Job may run, in hours (optional, defaults to 5). Capped
+  # at the URL's life, so a Job cannot outlive the URL it was given.
+  job-deadline-hours: 5
+  # How many backup Jobs may run at once on this cluster (optional, defaults to
+  # 3). Every app on the same daily schedule comes due in the same minute, and
+  # each Job reads a whole volume on a node that is also serving apps.
+  max-concurrent: 2
+
 # Namespace the ingress controller runs in (optional, defaults to
 # "ingress-nginx"). The per-deployment isolation NetworkPolicy allows inbound
 # traffic from this namespace; it must match that namespace's

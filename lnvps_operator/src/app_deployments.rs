@@ -64,7 +64,7 @@ pub const MANAGED_BY: &str = "lnvps-operator";
 pub const APP_NAMESPACE_CLUSTER_ROLE: &str = "lnvps-operator-appns";
 
 /// Common labels applied to every object of a deployment.
-fn labels(deployment_id: u64) -> BTreeMap<String, String> {
+pub(crate) fn labels(deployment_id: u64) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("managed-by".to_string(), MANAGED_BY.to_string()),
         (
@@ -75,7 +75,7 @@ fn labels(deployment_id: u64) -> BTreeMap<String, String> {
 }
 
 /// Per-service selector/labels (adds the compose service name).
-fn service_labels(deployment_id: u64, service: &str) -> BTreeMap<String, String> {
+pub(crate) fn service_labels(deployment_id: u64, service: &str) -> BTreeMap<String, String> {
     let mut l = labels(deployment_id);
     l.insert(
         "app.kubernetes.io/component".to_string(),
@@ -317,7 +317,7 @@ fn scale_bytes(value: &str, multiplier: u32) -> String {
 /// Container requests == limits (Guaranteed QoS, 1:1 — no overcommit) from a
 /// compose service's `resources`, scaled by the deployment's resource
 /// multiplier (1 = the catalog app's base size).
-fn build_resource_requirements(
+pub(crate) fn build_resource_requirements(
     r: &lnvps_compose::Resources,
     multiplier: u32,
 ) -> ResourceRequirements {
@@ -387,7 +387,7 @@ async fn delete_custom_domain_ingress(client: &Client, deployment_id: u64) -> Re
 /// kubelet chowns mounted volumes to that group. Without it a freshly
 /// provisioned PVC is root-owned `0755` and a non-root process cannot write to
 /// it — the app starts and then fails on its first write.
-fn pod_security_context_for(fs_group: Option<i64>) -> PodSecurityContext {
+pub(crate) fn pod_security_context_for(fs_group: Option<i64>) -> PodSecurityContext {
     PodSecurityContext {
         run_as_non_root: Some(true),
         fs_group,
@@ -424,7 +424,7 @@ fn pod_security_context_for(fs_group: Option<i64>) -> PodSecurityContext {
 /// verifies `runAsNonRoot` against the image config and cannot resolve a name,
 /// so without an explicit UID the container is refused with "image has
 /// non-numeric user ... cannot verify user is non-root".
-fn container_security_context_for(
+pub(crate) fn container_security_context_for(
     run_as_non_root: bool,
     run_as_user: Option<i64>,
 ) -> SecurityContext {
@@ -469,7 +469,7 @@ const INIT_TMP_VOLUME: &str = "init-tmp";
 /// a cached layer set can only be the right one and re-pulling buys nothing.
 /// `IfNotPresent` also keeps a restart working when the registry is down or
 /// rate-limiting, which `Always` does not.
-const IMAGE_PULL_POLICY: &str = "IfNotPresent";
+pub(crate) const IMAGE_PULL_POLICY: &str = "IfNotPresent";
 
 /// Pod-local name for a `scratch:` path's `emptyDir` (#264).
 ///
@@ -1246,6 +1246,28 @@ pub fn build_vars(
     vars
 }
 
+/// Resolve one existing deployment's env exactly as the reconcile loop does,
+/// for callers that need to run a container beside it — a backup Job runs the
+/// service's own image and has to see the same `DATABASE_URL` and generated
+/// password the service does, or the dump command cannot authenticate.
+///
+/// Deliberately **reads** the generated secrets rather than ensuring them:
+/// this runs against a deployment that already exists, and minting a value
+/// here would hand the container a password the running app does not have.
+pub(crate) async fn resolved_env(
+    ctx: &Context,
+    deployment: &AppDeployment,
+    compose: &Compose,
+    ingress_domain: &str,
+) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, String>>> {
+    let generated = read_generated(&ctx.client, deployment.id).await?;
+    let hostname = deployment_hostname(&deployment.name, ingress_domain);
+    let public = public_hostname(&hostname, deployment);
+    let config = parse_config(&deployment.config);
+    let vars = build_vars(compose, &generated, &config, &public);
+    compose.resolve_env(&vars)
+}
+
 /// Ensure every declared secret has a value, generating any that are missing
 /// (preserving existing ones so values are stable across reconciles).
 pub fn ensure_secrets(
@@ -1270,7 +1292,7 @@ pub fn ensure_secrets(
 
 /// Server-side apply a namespaced Kubernetes object, creating or updating it
 /// idempotently.
-async fn apply<K>(client: &Client, obj: &K) -> Result<()>
+pub(crate) async fn apply<K>(client: &Client, obj: &K) -> Result<()>
 where
     K: Resource<Scope = NamespaceResourceScope> + Serialize + DeserializeOwned + Clone + Debug,
     K::DynamicType: Default,

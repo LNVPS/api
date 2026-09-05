@@ -21,7 +21,10 @@ services:
       # writable dir, but not a persistent one
       - { path: /var/run/postgresql, size: 32Mi }
     backup:
-      command: ["sh", "-c", "exec pg_dumpall -U buzz"]
+      # Runs in its own pod on this image, so it connects to the service over
+      # the network (-h db); the default unix socket exists only inside
+      # postgres' own container. PGPASSWORD comes from the service's env.
+      command: ["sh", "-c", "PGPASSWORD=$POSTGRES_PASSWORD exec pg_dumpall -h db -U buzz"]
       artifact: buzz.sql
   redis:
     image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
@@ -134,3 +137,6 @@ secrets:
 config:
   - { name: owner_pubkey, label: "Owner pubkey (64-char hex)", type: string, required: true,
       pattern: "[0-9a-fA-F]{64}" }
+# Daily at 03:00 UTC, keeping a week of restore points. Each run captures
+# every service that declares a `backup:` method above, at one point in time.
+backup: { schedule: "0 3 * * *", retention: 7 }

@@ -58,6 +58,34 @@ read-only, mounted via subPath), `depends_on`, `backup`, `user`,
 resolves to `{deployment-name}.{cluster-ingress-domain}`; a service name
 resolves to its in-namespace DNS (e.g. `db:3306`).
 
+**`backup`** — per service, either `command:` (an app-native dump, whose stdout
+becomes the artifact) or `volume:` (a raw tar of one named volume), plus an
+optional `artifact:` filename. A top-level `backup: { schedule, retention }`
+turns it into an automatic run: a 5-field cron expression in **UTC** (no faster
+than hourly) and how many runs to keep. A run captures every service that
+declares a method, at one point in time.
+
+The capture runs in its **own pod**, not in the app's container, so a
+`command:` must reach its service over the network by the compose service name:
+
+```yaml
+  db:
+    ports:                      # a service with no ports has no DNS name
+      - { name: postgres, container: 5432, protocol: tcp, expose: none }
+    backup:
+      command: ["sh", "-c", "PGPASSWORD=$POSTGRES_PASSWORD exec pg_dumpall -h db -U buzz"]
+      artifact: buzz.sql
+  blobs:
+    backup:
+      volume: media             # tarred from a read-only mount of the PVC
+backup: { schedule: "0 3 * * *", retention: 7 }
+```
+
+`pg_dumpall` or `mariadb-dump` left to its default connects to a unix socket
+that exists only inside the service's own container, and fails there. The dump
+sees the service's resolved env, so a generated password is available to it as
+the app has it.
+
 **`volumes[].label`** — optional, and what a **buyer** gets from that volume:
 `events`, `media`, `database`, `files`. Surfaced per volume on
 `GET /api/v1/apps`, so a listing can say "10 GB events + 20 GB media" instead of

@@ -35,3 +35,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 [dev-dependencies]
 wiremock = "0.6"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# The uploader-script test stages a data directory and downloads the artifact
+# back to check it really is the archive it claims to be.
+tempfile = "3"
