@@ -1,0 +1,19 @@
+services:
+  appweaver:
+    image: ghcr.io/getappweaver/core:alpine
+    user: "1000"
+    resources: { cpu: 1, memory: 2Gi }
+    ports:
+      - { name: http, container: 5551, protocol: http, expose: ingress }
+    env:
+      BOT_SETUP_UI_ORIGIN: "https://${HOSTNAME}"
+      BOT_MASTER_PUBKEY: "${master_pubkey}"
+    volumes:
+      - { name: workspace, path: /workspace/appweaver, size: 20Gi, label: files }
+    scratch:
+      - { path: /tmp, size: 256Mi }
+    backup:
+      volume: workspace
+config:
+  - { name: master_pubkey, label: "Master pubkey (64-character lowercase hex)", type: string,
+      required: true, pattern: "[0-9a-f]{64}" }
