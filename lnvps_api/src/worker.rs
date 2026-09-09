@@ -1,3 +1,4 @@
+use crate::chain::{ChainExplorer, OutPoint};
 use crate::host::{FullVmInfo, VmHostClient, get_host_client};
 use crate::notifications::{Notification, NotificationChannel, build_channels, send_email};
 use crate::provisioner::{VmLocation, VmProvisioner};
@@ -69,6 +70,39 @@ pub(crate) fn payment_blocks_unpaid_deletion(p: &SubscriptionPayment, now: DateT
     !p.is_paid
         && (p.expires > now
             || (p.payment_method == PaymentMethod::OnChain && p.external_id.is_some()))
+}
+
+/// Why a detected deposit can no longer confirm.
+#[derive(Debug, PartialEq, Eq)]
+enum DepositDead {
+    /// No longer known to the network: replaced and evicted everywhere.
+    Evicted,
+    /// The coins it spends were taken by this other, confirmed transaction.
+    Replaced(String),
+}
+
+/// Whether a detected deposit transaction can still confirm.
+///
+/// Two ways to be sure it cannot. It is gone from the network, which is what a
+/// replaced transaction looks like from outside; or one of the coins it spends
+/// has since been spent by a *different* transaction that has confirmed. The
+/// confirmation requirement matters: a conflicting spend sitting in the mempool
+/// can itself be replaced, and clearing on that would race the customer's
+/// wallet.
+async fn deposit_dead(explorer: &dyn ChainExplorer, txid: &str) -> Result<Option<DepositDead>> {
+    let Some(inputs) = explorer.tx_inputs(txid).await? else {
+        return Ok(Some(DepositDead::Evicted));
+    };
+    for input in &inputs {
+        let spend = explorer.outspend(input).await?;
+        match spend.spent_by {
+            Some(by) if by != txid && spend.confirmed => {
+                return Ok(Some(DepositDead::Replaced(by)));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
 }
 
 /// How long a never-paid subscription is kept before it is purged.
@@ -159,6 +193,7 @@ pub struct Worker {
     http_client: reqwest::Client,
     referral_payouts: crate::referral::ReferralPayoutHandler,
     refunds: crate::refund::VmRefundHandler,
+    chain_explorer: Option<Arc<dyn crate::chain::ChainExplorer>>,
 }
 
 #[derive(Clone)]
@@ -186,6 +221,8 @@ pub struct WorkerSettings {
     pub referral_min_fiat_payout_sats: Option<u64>,
     /// Source of the on-chain fee-rate estimate for the cap above.
     pub referral_fee_estimator: crate::settings::FeeEstimatorConfig,
+    /// Source of chain lookups used to spot replaced deposits.
+    pub chain_explorer: crate::settings::ChainExplorerConfig,
 }
 
 impl From<&Settings> for WorkerSettings {
@@ -217,6 +254,7 @@ impl From<&Settings> for WorkerSettings {
                 .as_ref()
                 .map(|r| r.fee_estimator.clone())
                 .unwrap_or_default(),
+            chain_explorer: val.chain_explorer.clone(),
         }
     }
 }
@@ -295,8 +333,10 @@ impl Worker {
             .build()?;
 
         let notification_channels = build_channels(&settings, nostr.as_ref(), &http_client);
+        let chain_explorer = crate::chain::build_chain_explorer(&settings.chain_explorer);
 
         Ok(Self {
+            chain_explorer,
             db,
             subscription_handler,
             vm_state_cache,
@@ -1774,6 +1814,12 @@ impl Worker {
             return Ok(());
         }
 
+        // Runs before the deletion pass below so a deposit found to be replaced
+        // stops blocking its VM on this same sweep. Gates itself internally.
+        if let Err(e) = self.check_conflicted_deposits().await {
+            error!("Failed to check for replaced deposits: {}", e);
+        }
+
         // check VM status from db vm list
         let db_vms = self.db.list_vms().await?;
         let provisioner = self.subscription_handler.vm_provisioner();
@@ -1897,6 +1943,13 @@ impl Worker {
     /// Not every VM sweep: the sweep is every 30 seconds, the figures move
     /// slowly, and the check costs an aggregate query per metered VM.
     const CHECK_TRANSFER_SECONDS: i64 = 3600;
+
+    /// How often unconfirmed deposits are checked for replacement.
+    ///
+    /// Costs an explorer lookup per input of every unconfirmed deposit, and a
+    /// replaced transaction stays replaced, so there is nothing to be gained
+    /// from asking more often.
+    const CHECK_DEPOSITS_SECONDS: i64 = 3600;
 
     /// Key marking a warning as already sent, scoped to the VM, the quota month
     /// and the threshold.
@@ -2051,6 +2104,90 @@ impl Worker {
         self.kv
             .store("worker-last-check-transfer", &t.to_le_bytes())
             .await?;
+        Ok(())
+    }
+
+    pub async fn get_last_check_deposits(&self) -> Result<DateTime<Utc>> {
+        let Some(v) = self.kv.get("worker-last-check-deposits").await? else {
+            return Ok(DateTime::UNIX_EPOCH);
+        };
+        let timestamp = if v.len() == 8 {
+            u64::from_le_bytes(v.as_slice().try_into()?)
+        } else {
+            0
+        };
+        Ok(DateTime::from_timestamp(timestamp as _, 0).unwrap_or(DateTime::UNIX_EPOCH))
+    }
+
+    pub async fn set_last_check_deposits(&self, ts: DateTime<Utc>) -> Result<()> {
+        let t = ts.timestamp() as u64;
+        self.kv
+            .store("worker-last-check-deposits", &t.to_le_bytes())
+            .await?;
+        Ok(())
+    }
+
+    /// Forget the deposit outpoint on unpaid on-chain payments whose deposit
+    /// transaction can no longer confirm.
+    ///
+    /// A detected deposit blocks deletion of the resource it was meant to pay
+    /// for, because confirmation can land long after the quote expires
+    /// (issue #194). When the customer's wallet replaces that transaction with
+    /// one that does not pay us, nothing ever arrives for the watched address
+    /// and the block would last forever. Clearing `external_id` puts the
+    /// payment back to plain unpaid, and the ordinary never-paid sweep then
+    /// deletes the VM or subscription as it would have all along.
+    ///
+    /// Only quotes that have already expired are examined: inside the quote
+    /// window, a transaction the explorer has not heard of is far more likely
+    /// to have just been broadcast than to be dead.
+    ///
+    /// Nothing is settled or refunded here: if the deposit somehow does confirm
+    /// later, it is still matched by receive address and credited.
+    async fn check_conflicted_deposits(&self) -> Result<()> {
+        let Some(explorer) = self.chain_explorer.clone() else {
+            return Ok(());
+        };
+        let last_check = self.get_last_check_deposits().await?;
+        let now = Utc::now();
+        if now.signed_duration_since(last_check).num_seconds() < Self::CHECK_DEPOSITS_SECONDS {
+            return Ok(());
+        }
+
+        let payments = self
+            .db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        for mut payment in payments
+            .into_iter()
+            .filter(|p| !p.is_paid && p.external_id.is_some() && p.expires < now)
+        {
+            let Some(deposit) = payment.external_id.as_deref().and_then(OutPoint::parse) else {
+                continue;
+            };
+            match deposit_dead(explorer.as_ref(), &deposit.txid).await {
+                Ok(Some(reason)) => {
+                    info!(
+                        "Deposit {} for payment {} cannot confirm ({:?}), clearing it",
+                        deposit,
+                        hex::encode(&payment.id),
+                        reason
+                    );
+                    payment.external_id = None;
+                    if let Err(e) = self.db.update_subscription_payment(&payment).await {
+                        error!(
+                            "Failed to clear dead deposit on payment {}: {}",
+                            hex::encode(&payment.id),
+                            e
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => warn!("Failed to check deposit {}: {}", deposit, e),
+            }
+        }
+
+        self.set_last_check_deposits(Utc::now()).await?;
         Ok(())
     }
 
@@ -4526,7 +4663,7 @@ pub(crate) async fn download_images_on_hosts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mocks::{MockNode, MockOnChainProvider};
+    use crate::mocks::{MockChainExplorer, MockNode, MockOnChainProvider};
     use crate::settings::mock_settings;
     use crate::subscription::SubscriptionHandler;
     use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate};
@@ -5490,6 +5627,229 @@ mod tests {
             !deleted,
             "Unpaid VM with a detected (unconfirmed) on-chain deposit must not be purged"
         );
+        Ok(())
+    }
+
+    /// Build an unpaid VM whose on-chain deposit was detected in the mempool and
+    /// whose deposit transaction spends `input`.
+    async fn add_vm_with_detected_deposit(db: &Arc<MockDb>, txid: &str) -> Result<u64> {
+        let old = Utc::now().sub(TimeDelta::hours(2));
+        let (vm_id, subscription_id) = add_vm_with_subscription(db, old, false).await?;
+        let user_id = db.get_vm(vm_id).await?.user_id;
+
+        let mut payment = make_subscription_payment(
+            subscription_id,
+            user_id,
+            old,
+            old.add(TimeDelta::hours(1)),
+            9,
+        );
+        payment.payment_method = PaymentMethod::OnChain;
+        payment.external_id = Some(format!("{txid}:0"));
+        db.insert_subscription_payment(&payment).await?;
+        Ok(vm_id)
+    }
+
+    /// A deposit whose coins were spent by another confirmed transaction is
+    /// dead: its outpoint is dropped and the VM it was paying for is purged by
+    /// the same sweep.
+    #[tokio::test]
+    async fn test_check_vms_purges_vm_whose_deposit_was_replaced() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let vm_id = add_vm_with_detected_deposit(&db, "deadtx").await?;
+
+        let explorer = Arc::new(MockChainExplorer::default());
+        explorer.set_inputs("deadtx", &["parent:12"]).await;
+        explorer
+            .set_outspend("parent:12", Some("replacement"), true)
+            .await;
+        let mut worker = setup_worker(db.clone()).await?;
+        worker.chain_explorer = Some(explorer);
+        worker.check_vms().await?;
+
+        let payment = db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        assert!(
+            payment.iter().all(|p| p.external_id.is_none()),
+            "a replaced deposit must not keep its outpoint"
+        );
+        assert!(
+            !db.vms.lock().await.contains_key(&vm_id),
+            "VM whose deposit was replaced should be purged"
+        );
+        Ok(())
+    }
+
+    /// A deposit transaction the network has forgotten was replaced by one that
+    /// does not pay us: it can never confirm, so it must stop holding the VM.
+    #[tokio::test]
+    async fn test_check_vms_purges_vm_whose_deposit_was_evicted() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let vm_id = add_vm_with_detected_deposit(&db, "evictedtx").await?;
+
+        let mut worker = setup_worker(db.clone()).await?;
+        worker.chain_explorer = Some(Arc::new(MockChainExplorer::default()));
+        worker.check_vms().await?;
+
+        let payments = db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        assert!(payments.iter().all(|p| p.external_id.is_none()));
+        assert!(!db.vms.lock().await.contains_key(&vm_id));
+        Ok(())
+    }
+
+    /// An unexpired quote is left alone: an explorer that has not seen the
+    /// transaction yet is the normal state right after a broadcast.
+    #[tokio::test]
+    async fn test_check_conflicted_deposits_skips_unexpired_quote() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let old = Utc::now().sub(TimeDelta::hours(2));
+        let (vm_id, subscription_id) = add_vm_with_subscription(&db, old, false).await?;
+        let user_id = db.get_vm(vm_id).await?.user_id;
+        let mut payment = make_subscription_payment(
+            subscription_id,
+            user_id,
+            Utc::now(),
+            Utc::now().add(TimeDelta::minutes(30)),
+            8,
+        );
+        payment.payment_method = PaymentMethod::OnChain;
+        payment.external_id = Some("freshtx:0".to_string());
+        db.insert_subscription_payment(&payment).await?;
+
+        let mut worker = setup_worker(db.clone()).await?;
+        worker.chain_explorer = Some(Arc::new(MockChainExplorer::default()));
+        worker.check_conflicted_deposits().await?;
+
+        let payments = db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        assert!(payments.iter().all(|p| p.external_id.is_some()));
+        Ok(())
+    }
+
+    /// A deposit still sitting unspent in the mempool keeps its outpoint, and
+    /// keeps holding the VM.
+    #[tokio::test]
+    async fn test_check_vms_keeps_vm_whose_deposit_is_live() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let vm_id = add_vm_with_detected_deposit(&db, "livetx").await?;
+
+        let explorer = Arc::new(MockChainExplorer::default());
+        explorer.set_inputs("livetx", &["parent:0"]).await;
+        explorer
+            .set_outspend("parent:0", Some("livetx"), false)
+            .await;
+        let mut worker = setup_worker(db.clone()).await?;
+        worker.chain_explorer = Some(explorer);
+        worker.check_vms().await?;
+
+        let payments = db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        assert!(payments.iter().all(|p| p.external_id.is_some()));
+        assert!(db.vms.lock().await.contains_key(&vm_id));
+        Ok(())
+    }
+
+    /// An explorer that cannot answer must leave the deposit alone: clearing on
+    /// no information would purge a VM whose payment is still on its way.
+    #[tokio::test]
+    async fn test_check_conflicted_deposits_keeps_deposit_when_explorer_fails() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let vm_id = add_vm_with_detected_deposit(&db, "unknowntx").await?;
+
+        let explorer = Arc::new(MockChainExplorer::default());
+        *explorer.fail.lock().await = true;
+        let mut worker = setup_worker(db.clone()).await?;
+        worker.chain_explorer = Some(explorer);
+        worker.check_conflicted_deposits().await?;
+
+        let payments = db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        assert!(payments.iter().all(|p| p.external_id.is_some()));
+        assert!(db.vms.lock().await.contains_key(&vm_id));
+        Ok(())
+    }
+
+    /// Without a configured explorer the sweep is a no-op, and its timestamp is
+    /// never advanced.
+    #[tokio::test]
+    async fn test_check_conflicted_deposits_without_explorer_is_noop() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        add_vm_with_detected_deposit(&db, "deadtx").await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_conflicted_deposits().await?;
+
+        let payments = db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        assert!(payments.iter().all(|p| p.external_id.is_some()));
+        assert_eq!(
+            worker.get_last_check_deposits().await?,
+            DateTime::UNIX_EPOCH
+        );
+        Ok(())
+    }
+
+    /// The sweep is hourly: a second call inside the window does no work.
+    #[tokio::test]
+    async fn test_check_conflicted_deposits_is_rate_limited() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        add_vm_with_detected_deposit(&db, "deadtx").await?;
+
+        let mut worker = setup_worker(db.clone()).await?;
+        worker.chain_explorer = Some(Arc::new(MockChainExplorer::default()));
+        worker.set_last_check_deposits(Utc::now()).await?;
+        worker.check_conflicted_deposits().await?;
+
+        let payments = db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        assert!(
+            payments.iter().all(|p| p.external_id.is_some()),
+            "rate-limited sweep must not have run"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deposit_dead_requires_a_confirmed_conflict() -> Result<()> {
+        let explorer = MockChainExplorer::default();
+        explorer.set_inputs("tx", &["parent:1"]).await;
+
+        // Unspent.
+        assert_eq!(deposit_dead(&explorer, "tx").await?, None);
+
+        // Spent by the deposit transaction itself.
+        explorer.set_outspend("parent:1", Some("tx"), true).await;
+        assert_eq!(deposit_dead(&explorer, "tx").await?, None);
+
+        // Conflicting spend, but unconfirmed: it could itself be replaced.
+        explorer
+            .set_outspend("parent:1", Some("other"), false)
+            .await;
+        assert_eq!(deposit_dead(&explorer, "tx").await?, None);
+
+        // Conflicting spend, confirmed.
+        explorer.set_outspend("parent:1", Some("other"), true).await;
+        assert_eq!(
+            deposit_dead(&explorer, "tx").await?,
+            Some(DepositDead::Replaced("other".to_string()))
+        );
+
+        // Not known to the explorer at all.
+        assert_eq!(
+            deposit_dead(&explorer, "never-seen").await?,
+            Some(DepositDead::Evicted)
+        );
+
+        *explorer.fail.lock().await = true;
+        assert!(deposit_dead(&explorer, "tx").await.is_err());
         Ok(())
     }
 

@@ -67,6 +67,12 @@ pub struct Settings {
     /// Captcha config
     pub captcha: Option<CaptchaConfig>,
 
+    /// Read-only chain lookups used to spot on-chain deposits whose transaction
+    /// was replaced (RBF), so a payment that will never confirm stops blocking
+    /// deletion of the resource it was for. Defaults to mempool.space.
+    #[serde(default)]
+    pub chain_explorer: ChainExplorerConfig,
+
     /// Path to a MaxMind GeoLite2/GeoIP2 Country database (`.mmdb`) used to
     /// resolve client IPs to a country as VAT place-of-supply evidence. When
     /// unset, IP geolocation is disabled.
@@ -421,6 +427,29 @@ pub struct ReferralConfig {
     pub fee_estimator: FeeEstimatorConfig,
 }
 
+/// Source of read-only chain lookups used to spot replaced (RBF'd) deposits.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChainExplorerConfig {
+    /// Query a mempool.space/esplora-compatible instance at `url`.
+    #[serde(rename_all = "kebab-case")]
+    Mempool {
+        #[serde(default = "default_mempool_url")]
+        url: String,
+    },
+    /// No explorer: replaced deposits are not detected, and a detected deposit
+    /// keeps blocking deletion of the resource it paid for.
+    None,
+}
+
+impl Default for ChainExplorerConfig {
+    fn default() -> Self {
+        ChainExplorerConfig::Mempool {
+            url: default_mempool_url(),
+        }
+    }
+}
+
 /// Source of on-chain fee-rate estimates for referral payouts.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -671,6 +700,7 @@ pub fn mock_settings() -> Settings {
         #[cfg(feature = "agent")]
         agent: None,
         rate_limit: Default::default(),
+        chain_explorer: ChainExplorerConfig::None,
         db: "".to_string(),
         encryption: None,
         public_url: "http://localhost:8000".to_string(),
@@ -730,6 +760,24 @@ mod tests {
             balloon_min_pct: pct,
             firewall_config: None,
         }
+    }
+
+    #[test]
+    fn test_chain_explorer_config_parses() {
+        let cfg: ChainExplorerConfig =
+            serde_json::from_value(serde_json::json!({"mempool": {"url": "https://example.com"}}))
+                .unwrap();
+        assert!(
+            matches!(cfg, ChainExplorerConfig::Mempool { url } if url == "https://example.com")
+        );
+        assert!(matches!(
+            serde_json::from_value::<ChainExplorerConfig>(serde_json::json!("none")).unwrap(),
+            ChainExplorerConfig::None
+        ));
+        assert!(matches!(
+            ChainExplorerConfig::default(),
+            ChainExplorerConfig::Mempool { .. }
+        ));
     }
 
     #[test]

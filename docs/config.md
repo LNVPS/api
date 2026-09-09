@@ -226,6 +226,26 @@ back at that same quote. The floor applied to those rows is the higher of
 `min-fiat-payout-sats` and `min-onchain-payout-sats`, because an on-chain payout
 must also clear the mempool fee it pays.
 
+### Chain explorer (optional)
+
+```yaml
+# Defaults to mempool.space; set `none` to switch the check off.
+chain-explorer:
+  mempool:
+    url: "https://mempool.space"
+```
+
+Used only to tell a live on-chain deposit from a replaced one. An hourly sweep
+takes every unpaid deposit whose quote has expired and asks whether its
+transaction is still known to the network, and whether the coins it spends have
+since been taken by a different, confirmed transaction. Either answer means the
+customer replaced (RBF'd) the payment away and it can never confirm, so its
+outpoint is dropped and the unpaid VM is deleted by the usual sweep instead of
+being held forever.
+
+With `none`, or a self-hosted esplora that is unreachable, deposits still settle
+normally; a replaced one just keeps blocking deletion of the VM it was for.
+
 ### DNS — Cloudflare (optional)
 
 ```yaml
