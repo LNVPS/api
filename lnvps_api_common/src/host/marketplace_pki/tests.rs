@@ -81,6 +81,28 @@ fn the_client_key_is_owner_only() {
     assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
 }
 
+/// A key left permissive by an earlier build, a restored backup or a crash is
+/// repaired on the next poll even though its contents did not change. The
+/// short-circuit that makes re-presenting a certificate cheap must not also
+/// skip the mode.
+#[test]
+#[cfg(unix)]
+fn a_permissive_existing_key_is_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let cfg = config(&dir);
+    let path = materialise(&cfg, 9, "node-cert").unwrap();
+
+    // Same contents, looser mode, as a restore or an older build would leave it.
+    let key = path.join("clientkey.pem");
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+    materialise(&cfg, 9, "node-cert").unwrap();
+
+    let mode = fs::metadata(&key).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+}
+
 /// Re-presenting the same certificate rewrites nothing. Nodes do this on every
 /// poll, so the common case has to be cheap and has to leave a running
 /// connection's files alone.

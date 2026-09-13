@@ -72,12 +72,19 @@ impl ProbeResult {
         self.failure.is_none()
     }
 
+    /// The failure text as stored: cut to what its column holds.
+    fn failure_text(&self) -> Option<String> {
+        self.failure
+            .as_deref()
+            .map(|f| truncate(f, MAX_FAILURE_LEN))
+    }
+
     /// The row this becomes, with the shape it was measured at.
     pub fn into_health(self, node_id: u64, spec: &ProbeSpec) -> MarketplaceNodeHealth {
         MarketplaceNodeHealth {
             node_id,
             passed: self.passed(),
-            failure: self.failure,
+            failure: self.failure_text(),
             provision_ms: self.provision_ms,
             memory_mb: self.memory_mb,
             disk_write_mb: self.disk_write_mb,
@@ -85,10 +92,35 @@ impl ProbeResult {
             cpu: spec.template.cpu,
             memory_bytes: spec.template.memory,
             disk_bytes: spec.template.disk_size,
-            image: spec.image.url.clone(),
+            image: truncate(&spec.image.url, MAX_IMAGE_LEN),
             ..Default::default()
         }
     }
+}
+
+/// The longest failure text stored. The column is `TEXT` (65535 bytes) and a
+/// node or guest controls this string: over the cap a strict-mode MySQL rejects
+/// the whole row, so the probe that failed is the one whose result is lost.
+const MAX_FAILURE_LEN: usize = 1024;
+
+/// The longest image URL stored (`image VARCHAR(255)`).
+const MAX_IMAGE_LEN: usize = 255;
+
+/// Cut node- or guest-controlled text to what its column can hold.
+///
+/// A rejected row is not a cosmetic loss: a node with no health row has no
+/// cooldown, so it is re-probed on the next sweep and builds another VM each
+/// time.
+fn truncate(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+    // Cut on a char boundary, or the string stops being UTF-8.
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 /// Everything needed to build one probe VM, held in memory only.
@@ -113,6 +145,11 @@ pub struct ProbeSpec {
     /// after it. A long-lived key that opened a shell on every operator's
     /// hardware would be the most valuable secret LNVPS holds.
     pub ssh_public_key: String,
+    /// The storage pool the probe's disk is built in: the node's own registered
+    /// pool name, not a constant. A node whose disk is registered under another
+    /// name would otherwise fail the probe, or measure a pool no customer is
+    /// placed on.
+    pub disk_name: String,
 }
 
 impl ProbeSpec {
@@ -170,6 +207,17 @@ impl ProbeSpec {
             .max_by_key(|i| i.release_date)
             .ok_or_else(|| anyhow::anyhow!("No enabled OS image to probe with"))?;
 
+        // The pool the node's own libvirt was configured with. Hardcoding a name
+        // here would make the probe either fail or measure a disk customers are
+        // never placed on.
+        let disk_name = db
+            .list_host_disks(host.id)
+            .await?
+            .into_iter()
+            .next()
+            .map(|d| d.name)
+            .unwrap_or_else(|| "default".to_string());
+
         Ok(Self {
             node_id: node.id,
             host,
@@ -179,6 +227,7 @@ impl ProbeSpec {
             gateway,
             range_cidr,
             ssh_public_key,
+            disk_name,
         })
     }
 
@@ -211,7 +260,7 @@ impl ProbeSpec {
                 host_id: self.host.id,
                 // The pool the node's libvirt was configured with. A probe that
                 // wrote somewhere else would measure a disk no customer gets.
-                name: "default".to_string(),
+                name: self.disk_name.clone(),
                 size: self.template.disk_size,
                 kind: DiskType::SSD,
                 interface: DiskInterface::PCIe,
@@ -423,7 +472,7 @@ pub async fn record_unspecified(
     db.insert_marketplace_node_health(&MarketplaceNodeHealth {
         node_id,
         passed: result.passed(),
-        failure: result.failure,
+        failure: result.failure_text(),
         ..Default::default()
     })
     .await

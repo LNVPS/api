@@ -146,7 +146,8 @@ pub struct UpdateNodeRequest {
 /// The certificate a node serves libvirt with.
 #[derive(Deserialize)]
 pub struct NodeLibvirtCertRequest {
-    /// PEM, self-signed and CA-capable so it can be its own trust anchor.
+    /// PEM of exactly one certificate: the node's own trust anchor for the
+    /// libvirtd LNVPS drives.
     pub cert_pem: String,
 }
 
@@ -742,18 +743,43 @@ async fn v1_node_libvirt_cert(
 }
 
 /// Store a node's libvirt certificate and place it where libvirt will read it.
+/// The largest certificate body this endpoint will store.
+///
+/// A CA certificate is a couple of kilobytes. The cap stops a registered node
+/// from using the API host's PKI directory as free storage.
+const MAX_LIBVIRT_CERT_PEM: usize = 16 * 1024;
+
 async fn store_libvirt_cert(
     db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
     settings: &crate::settings::Settings,
     node: MarketplaceNode,
     cert_pem: &str,
 ) -> Result<(), ApiError> {
+    // The same gate the tunnel path applies. Registration is free and open, so
+    // without it any NIP-98 key can hold a node in `pending` and rewrite files
+    // under the API host's PKI directory on every poll.
+    if !node.status.accepts_placement() {
+        return Err(ApiError::forbidden(format!(
+            "Node {} is {}; it must be approved before it can register a libvirt certificate",
+            node.id, node.status
+        )));
+    }
+
     let cert = cert_pem.trim();
     // Checked here rather than at connection time: a malformed certificate
     // stored now is a VM that fails to provision later, at which point the
     // failing thing is a long way from the thing that was wrong.
-    if !cert.starts_with("-----BEGIN CERTIFICATE-----")
-        || !cert.ends_with("-----END CERTIFICATE-----")
+    //
+    // Exactly one block, not merely a body that starts and ends with the
+    // markers: several concatenated certificates satisfy the latter, and each
+    // one becomes a trust anchor for that node.
+    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
+    const END: &str = "-----END CERTIFICATE-----";
+    if cert.len() > MAX_LIBVIRT_CERT_PEM
+        || !cert.starts_with(BEGIN)
+        || !cert.ends_with(END)
+        || cert.matches(BEGIN).count() != 1
+        || cert.matches(END).count() != 1
     {
         return Err(ApiError::bad_request(
             "cert_pem must be a single PEM certificate",
@@ -770,9 +796,17 @@ async fn store_libvirt_cert(
     // from a directory rather than from us. Doing it on every registration —
     // which is every poll — is what lets a deployment that lost that directory
     // repair itself without anyone noticing.
-    if let Some(cfg) = settings.provisioner.marketplace.as_ref() {
-        lnvps_api_common::host::marketplace_pki::materialise(cfg, updated.id, cert)
-            .map_err(|e| ApiError::new(format!("Storing the node certificate failed: {e}")))?;
+    //
+    // Blocking file IO, so it runs off the async worker.
+    if let Some(cfg) = settings.provisioner.marketplace.clone() {
+        let node_id = updated.id;
+        let cert = cert.to_string();
+        tokio::task::spawn_blocking(move || {
+            lnvps_api_common::host::marketplace_pki::materialise(&cfg, node_id, &cert)
+        })
+        .await
+        .map_err(|e| ApiError::internal(format!("Storing the node certificate failed: {e}")))?
+        .map_err(|e| ApiError::internal(format!("Storing the node certificate failed: {e}")))?;
     }
     Ok(())
 }
@@ -1284,7 +1318,21 @@ mod libvirt_tests {
         settings
     }
 
+    /// A node in the state a successful registration review leaves it in:
+    /// storing a libvirt certificate is gated on approval, so the positive
+    /// tests need a node that has been approved.
     async fn a_node(db: &Arc<dyn lnvps_db::LNVpsDb>) -> MarketplaceNode {
+        a_node_with_status(db, MarketplaceNodeStatus::Approved).await
+    }
+
+    async fn a_pending_node(db: &Arc<dyn lnvps_db::LNVpsDb>) -> MarketplaceNode {
+        a_node_with_status(db, MarketplaceNodeStatus::Pending).await
+    }
+
+    async fn a_node_with_status(
+        db: &Arc<dyn lnvps_db::LNVpsDb>,
+        status: MarketplaceNodeStatus,
+    ) -> MarketplaceNode {
         let user_id = db.upsert_user(&[7u8; 32]).await.unwrap();
         let operator_id = db
             .insert_marketplace_operator(&MarketplaceOperator {
@@ -1298,6 +1346,7 @@ mod libvirt_tests {
             .insert_marketplace_node(&MarketplaceNode {
                 operator_id,
                 name: "rack 1".to_string(),
+                status,
                 ..Default::default()
             })
             .await
@@ -1368,6 +1417,51 @@ mod libvirt_tests {
 
         assert!(
             store_libvirt_cert(&db, &settings, node.clone(), "not a certificate")
+                .await
+                .is_err()
+        );
+        let stored = db.get_marketplace_node(node.id).await.unwrap();
+        assert!(stored.libvirt_cert.is_none(), "nothing must be stored");
+    }
+
+    /// A node that is not approved cannot write into the API host's PKI
+    /// directory. Registration is free and open, so without this any NIP-98 key
+    /// could hold a node in `pending` and make the API host rewrite that
+    /// directory on every poll.
+    #[tokio::test]
+    async fn an_unapproved_node_cannot_register_a_certificate() {
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(MockDb::empty());
+        let dir = TempDir::new().unwrap();
+        let settings = settings(Some(&dir));
+        let node = a_pending_node(&db).await;
+
+        let err = store_libvirt_cert(&db, &settings, node.clone(), CERT)
+            .await
+            .unwrap_err();
+        assert!(err.error.contains("approved"), "{}", err.error);
+        assert_eq!(err.code.as_u16(), 403, "{}", err.error);
+
+        let stored = db.get_marketplace_node(node.id).await.unwrap();
+        assert!(stored.libvirt_cert.is_none(), "nothing must be stored");
+        assert!(
+            !dir.path().join("pki").join(node.id.to_string()).exists(),
+            "nothing must be written"
+        );
+    }
+
+    /// Several concatenated certificates satisfy a check that only looks at the
+    /// first and last markers, and each block becomes a trust anchor for that
+    /// node. One block, or nothing.
+    #[tokio::test]
+    async fn a_concatenated_pem_is_refused() {
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(MockDb::empty());
+        let dir = TempDir::new().unwrap();
+        let settings = settings(Some(&dir));
+        let node = a_node(&db).await;
+
+        let two = format!("{CERT}\n{CERT}");
+        assert!(
+            store_libvirt_cert(&db, &settings, node.clone(), &two)
                 .await
                 .is_err()
         );

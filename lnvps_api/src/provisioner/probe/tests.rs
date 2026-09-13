@@ -261,6 +261,59 @@ async fn the_probe_vm_is_addressed_as_the_node_expects() -> Result<()> {
     Ok(())
 }
 
+/// The probe builds its disk in the pool the node registered, not a constant. A
+/// node whose pool has another name would otherwise fail the probe, or measure
+/// a pool no customer is placed on.
+#[tokio::test]
+async fn the_probe_uses_the_nodes_own_storage_pool() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+    let node = a_node(&db).await?;
+    let host = db.get_marketplace_node_host(node.id).await?.unwrap();
+
+    // No pool of its own yet: libvirt's default is the fallback.
+    let spec = ProbeSpec::build(&db, &node, KEY.to_string()).await?;
+    assert_eq!(spec.disk_name, "default");
+
+    db.create_host_disk(&VmHostDisk {
+        id: 0,
+        host_id: host.id,
+        name: "nvme".to_string(),
+        size: 1_000_000_000_000,
+        kind: DiskType::SSD,
+        interface: DiskInterface::PCIe,
+        enabled: true,
+    })
+    .await?;
+
+    let spec = ProbeSpec::build(&db, &node, KEY.to_string()).await?;
+    assert_eq!(spec.disk_name, "nvme");
+    assert_eq!(spec.vm_info().disk.name, "nvme");
+    Ok(())
+}
+
+/// Node- and guest-controlled text is cut to what its column holds. Over the
+/// cap a strict-mode MySQL rejects the whole row, so the probe that failed is
+/// the one whose result is never recorded — and a node with no health row has
+/// no cooldown, so it is re-probed on the next sweep and builds another VM.
+#[tokio::test]
+async fn long_health_text_is_cut_to_the_column() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+    let node = a_node(&db).await?;
+    let mut spec = dummy_spec(&db, &node).await?;
+    spec.image.url = "u".repeat(1000);
+
+    let health = ProbeResult::failed("f".repeat(70_000)).into_health(node.id, &spec);
+    assert_eq!(health.failure.as_deref().unwrap().len(), MAX_FAILURE_LEN);
+    assert_eq!(health.image.len(), MAX_IMAGE_LEN);
+    Ok(())
+}
+
 /// Cloud-init is rendered by the same code a customer's VM uses, from these
 /// rows. A probe configured by a separate path would prove that path works.
 #[tokio::test]

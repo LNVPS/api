@@ -27,9 +27,17 @@ COPY --from=planner /app/src/recipe.json recipe.json
 # enough; it is small and changes rarely, so the cost to layer caching is
 # negligible.
 COPY lnvps_host_util lnvps_host_util
-RUN cargo chef cook --release --recipe-path recipe.json
+# `libvirt` carries the LibVirt and marketplace-node host clients. Cook it in
+# as well, so virt/libvirt-sys are cached with the rest of the deps rather than
+# recompiled on every build.
+RUN cargo chef cook --release --recipe-path recipe.json --features lnvps_api/libvirt
 COPY . .
+# Without `libvirt`, `get_host_client` has no arm for `VmHostKind::MarketplaceNode`
+# and every operation on a marketplace host fails with "Unknown host config
+# marketplace_node". Per-package spelling: the other four packages have no such
+# feature, so a bare `--features libvirt` is rejected.
 RUN cargo build --release --locked --bins \
+      --features lnvps_api/libvirt \
       -p lnvps_api -p lnvps_api_admin -p lnvps_operator -p lnvps_nostr -p lnvps_agent \
     && mkdir -p /out \
     && cp target/release/lnvps_api target/release/fix_lnurlp_topups \
@@ -70,6 +78,9 @@ RUN apt update && \
 
 # --- per-service images (buildx bake targets, one per published image) ---
 FROM runtime AS lnvps-api
+# The binary links libvirt.so.0 once the `libvirt` feature is on. The runtime
+# base has no libvirt, so without this the image builds and then cannot start.
+RUN apt update && apt install -y libvirt0 && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/lnvps_api /out/fix_lnurlp_topups ./bin/
 COPY --from=crane /lnvps-host-info-amd64 ./bin/lnvps-host-info
 COPY --from=crane /lnvps-host-info-arm64 ./bin/lnvps-host-info-arm64
@@ -91,5 +102,7 @@ COPY --from=build /out/lnvps_nostr ./bin/
 ENTRYPOINT ["./bin/lnvps_nostr"]
 
 FROM runtime AS lnvps-agent
+# lnvps_agent calls `get_host_client` (agent/db/vms.rs) and so links libvirt too.
+RUN apt update && apt install -y libvirt0 && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/lnvps_agent ./bin/
 ENTRYPOINT ["./bin/lnvps_agent"]

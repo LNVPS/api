@@ -49,6 +49,11 @@ pub fn materialise(
     // own certificate failed validation ... hasn't got a known issuer" — an
     // error that names the client's certificate and says nothing about the node.
     // The node's daemon has the mirror image of this, for the same reason.
+    //
+    // The consequence is that this file holds **two** trust anchors, not one:
+    // gnutls accepts any chain that validates to either. The per-node pinning
+    // is therefore conditional on the LNVPS CA never signing a server-capable
+    // certificate. The node side states the same invariant (libvirt.rs, `trust`).
     let lnvps_ca = fs::read_to_string(&cfg.ca_cert)
         .with_context(|| format!("reading {}", cfg.ca_cert.display()))?;
     let bundle = format!("{}\n{}", node_cert_pem.trim(), lnvps_ca.trim());
@@ -90,16 +95,55 @@ fn copy_if_changed(from: &Path, to: &Path) -> Result<bool> {
 /// host is one that can drive every marketplace node in the fleet.
 fn copy_private_if_changed(from: &Path, to: &Path) -> Result<bool> {
     let contents = fs::read(from).with_context(|| format!("reading {}", from.display()))?;
-    if !write_if_changed(to, &contents)? {
-        return Ok(false);
-    }
+    write_private_if_changed(to, &contents)
+}
+
+/// Write a file only its owner can read.
+///
+/// The mode is applied even when the contents did not change: `materialise`
+/// runs on every poll and short-circuits an unchanged file, so a copy left
+/// permissive by an earlier build, a restored backup or a crash between the
+/// write and the `chmod` would otherwise never be repaired.
+fn write_private_if_changed(path: &Path, contents: &[u8]) -> Result<bool> {
+    let changed = if fs::read(path).is_ok_and(|existing| existing == contents) {
+        false
+    } else {
+        write_private(path, contents)?;
+        true
+    };
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(to, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("restricting {}", to.display()))?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting {}", path.display()))?;
     }
-    Ok(true)
+    Ok(changed)
+}
+
+/// Create the file owner-only rather than tightening it afterwards: `fs::write`
+/// creates with `0666 & ~umask`, so the key would be readable by anything on
+/// the host until the `chmod` that follows it.
+fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

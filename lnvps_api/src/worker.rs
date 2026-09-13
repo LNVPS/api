@@ -1483,6 +1483,13 @@ impl Worker {
                 // Outside the managed id range, not importable
                 continue;
             };
+            // A probe is LNVPS's own VM on the operator's machine, not something
+            // to offer for import. Its domain name parses to an id past any
+            // AUTO_INCREMENT column, which is what keeps the two apart — but
+            // parsing is not enough of a guard on its own.
+            if crate::provisioner::is_probe(mapped) {
+                continue;
+            }
             match self.db.get_vm(mapped).await {
                 Ok(vm) if !vm.deleted => continue, // already tracked
                 _ => unmanaged.push(spec),
@@ -4838,6 +4845,61 @@ mod tests {
             // so the max possible is the number of hosts
             assert!(max_active.load(Ordering::SeqCst) <= 3);
         }
+    }
+
+    /// Regression test: a probe is LNVPS's own VM on the operator's machine and
+    /// must not be offered as an importable one. Its domain name parses to an
+    /// id past any `AUTO_INCREMENT` column, so it reaches discovery looking
+    /// exactly like an untracked customer VM.
+    #[tokio::test]
+    async fn test_list_unmanaged_vms_hides_probes() -> Result<()> {
+        use crate::host::dummy_host::DummyVmHost;
+        use lnvps_api_common::HostVmSpec;
+
+        fn spec(id: u64, name: &str) -> HostVmSpec {
+            HostVmSpec {
+                host_vm_id: id as i64,
+                mapped_vm_id: Some(id),
+                name: Some(name.to_string()),
+                cpu: 1,
+                memory: 1_000_000_000,
+                disk_size: 10_000_000_000,
+                disk_storage: None,
+                mac_address: None,
+                running: false,
+            }
+        }
+
+        let db = Arc::new(MockDb::default());
+        db.create_host(&VmHost {
+            kind: VmHostKind::Dummy,
+            region_id: 1,
+            name: "dummy-host".to_string(),
+            ip: "http://localhost".to_string(),
+            enabled: true,
+            ..Default::default()
+        })
+        .await?;
+
+        let probe = crate::provisioner::probe_vm_id(1);
+        DummyVmHost::set_host_vms(vec![spec(probe, "probe"), spec(101, "VM101")]).await;
+
+        let worker = setup_worker(db.clone()).await?;
+        let listed: Vec<u64> = worker
+            .list_unmanaged_vms(1)
+            .await?
+            .iter()
+            .filter_map(|s| s.mapped_vm_id)
+            .collect();
+
+        assert!(!listed.contains(&probe), "a probe must not be importable");
+        assert!(
+            listed.contains(&101),
+            "a real untracked VM must still be listed"
+        );
+
+        DummyVmHost::clear_host_vms().await;
+        Ok(())
     }
 
     async fn setup_worker(db: Arc<MockDb>) -> Result<Worker> {

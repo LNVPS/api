@@ -225,6 +225,14 @@ pub fn get_host_client(
                 .marketplace_node_id
                 .ok_or_else(|| anyhow::anyhow!("Host {} is not backed by a node", host.id))?;
             let pki = marketplace_pki::node_pki_path(&marketplace, node_id);
+            // The control endpoint is the node's tunnel address, filled in when
+            // its tunnel is allocated. A node can register its certificate
+            // before that, so the anchor can exist while the address is still
+            // blank; dialling it would fail later as an opaque libvirt connect
+            // error rather than the named one.
+            if host.ip.trim().is_empty() {
+                bail!("Node {node_id} has no tunnel address yet, so there is nothing to dial");
+            }
             // Written when the node presents its certificate. Absent means it
             // never has, and connecting without it would mean not checking
             // which machine answered.
@@ -718,5 +726,29 @@ mod marketplace_client_tests {
         cfg.marketplace = None;
 
         assert!(get_host_client(&host(Some(9)), &cfg).is_err());
+    }
+
+    /// A node can register its certificate before its tunnel is allocated, so
+    /// the anchor can exist while the host's address is still blank. Dialling
+    /// that would fail later as an opaque libvirt connect error rather than the
+    /// named one the design calls for.
+    #[test]
+    fn a_node_with_no_tunnel_address_is_not_dialled() {
+        let dir = TempDir::new().unwrap();
+        let cfg = config(&dir);
+
+        // The anchor the node would have written, so only the blank address can
+        // be what refuses it.
+        let pki = dir.path().join("pki").join("9");
+        std::fs::create_dir_all(&pki).unwrap();
+        std::fs::write(pki.join("cacert.pem"), b"node-ca").unwrap();
+
+        let mut host = host(Some(9));
+        host.ip = String::new();
+
+        let err = get_host_client(&host, &cfg)
+            .err()
+            .expect("a node with no address must not produce a client");
+        assert!(err.to_string().contains("no tunnel address"), "{err}");
     }
 }
