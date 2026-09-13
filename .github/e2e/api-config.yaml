@@ -3,6 +3,11 @@ db: "mysql://root:root@localhost:3377/lnvps"
 # payment_method_config table by scripts/run-e2e.sh, not configured here.
 delete-after: 3
 public-url: "http://localhost:8000"
+# The operator's own hostnames, which a customer may not register as a NIP-05
+# or custom domain. Listed explicitly here because the derived ones come from
+# public-url, and in the harness that is localhost.
+reserved-domains:
+  - "lnvps.net"
 read-only: true
 redis:
   url: "redis://localhost:6399"

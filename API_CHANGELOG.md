@@ -34,6 +34,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **NIP-05 domains were stored without being checked** — `POST /api/v1/nostr/domain` accepted whatever string it was sent. Pasted URLs, `host:port`, email addresses and names like `localhost` all became rows, and a row becomes an Ingress rule in the cluster, so none of them could ever serve a NIP-05 document. The name is now validated as a public DNS hostname and stored in a canonical form (trimmed, lowercased, trailing root dot removed), which also stops one domain being registered twice under two spellings. Rejections are `400` and name the offending part.
+
+  More importantly, the operator's own hostnames were accepted: `api.lnvps.net` was registered by a customer. The name becomes an Ingress rule claiming that host in LNVPS's own cluster, and the unique index on the name means whoever registers it also denies it to everyone else. Names under the deployment's own domains are now refused, derived from `public-url` and `nostr-address-host` plus their parent domain, and extended by the new optional `reserved-domains` config list. The same check now applies to app deployment custom domains (`PATCH /api/v1/app/deployments/{id}`), where it matters more: a custom domain is held until the operator sees it resolve to us, and the operator's own hostnames already do.
+
+  Existing rows are untouched. Anything already stored that would now be refused stays until someone removes it.
+
 - **A VPN plan was reported active before it was paid for** — `POST /api/v1/vpn` created its subscription with `is_active: true`, so an unpaid plan appeared in `GET /api/v1/subscriptions` and serialised `is_active: true` while `billing_state` on the same object said `unpaid`. It is now created inactive, like every other product; payment sets both flags together. No service was ever configured early: a device only enters a route server's peer set once the subscription is set up.
 
 - **Abandoned orders are now cleaned up** — a subscription whose first payment never arrived was never revisited by anything. The lifecycle sweep reads active subscriptions with an expiry, and a never-paid one is neither, so an abandoned checkout lived in the database for good. They are now purged 24 hours after creation, unless an invoice is still unexpired or an on-chain deposit has been detected but not confirmed.

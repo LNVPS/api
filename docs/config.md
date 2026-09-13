@@ -338,6 +338,22 @@ no rates are known and VAT falls back to 0%.
 nostr-address-host: "nostr.example.com"
 ```
 
+### Reserved domains (optional)
+
+```yaml
+# Domains customers may not register, each covering everything below it
+reserved-domains:
+  - "lnvps.com"
+  - "lnvps.cloud"
+```
+
+A customer-registered NIP-05 domain or app custom domain becomes an Ingress
+rule claiming that hostname in the operator's cluster, so the operator's own
+hostnames have to be refused. The hosts in `public-url` and
+`nostr-address-host` are reserved automatically, along with their parent domain
+(`api.lnvps.net` reserves all of `lnvps.net`). List here anything the operator
+serves that those two do not cover.
+
 ### Captcha (optional)
 
 ```yaml

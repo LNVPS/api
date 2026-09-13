@@ -57,6 +57,16 @@ pub struct Settings {
     /// public host of lnvps_nostr service
     pub nostr_address_host: Option<String>,
 
+    /// Extra domains customers may not register a NIP-05 domain under, on top
+    /// of the ones derived from `public_url` and `nostr_address_host`. Each
+    /// entry covers itself and everything below it.
+    ///
+    /// A registered domain becomes an Ingress rule claiming that hostname in
+    /// the operator's own cluster, so anything the operator serves that is not
+    /// in this config has to be listed here.
+    #[serde(default)]
+    pub reserved_domains: Vec<String>,
+
     /// Redis configuration for shared VM state cache
     pub redis: Option<RedisConfig>,
 
@@ -734,6 +744,7 @@ pub fn mock_settings() -> Settings {
         telegram: None,
         whatsapp: None,
         nostr_address_host: None,
+        reserved_domains: vec![],
         redis: None,
         captcha: None,
         geoip_database: None,
