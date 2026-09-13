@@ -1009,6 +1009,7 @@ impl Compose {
         }
 
         for (sname, svc) in &self.services {
+            validate_service_name(sname)?;
             if svc.image.trim().is_empty() {
                 bail!("service '{sname}': image is required");
             }
@@ -1770,6 +1771,29 @@ fn check_abs_no_traversal(service: &str, label: &str, path: &str) -> Result<()> 
     Ok(())
 }
 
+/// A service name is a DNS-safe slug.
+///
+/// It is a Kubernetes object name (`<service>-secret`, the PVC, the Service),
+/// and it is also the default artifact filename, which the operator
+/// interpolates into the backup Job's shell. The API server would reject a bad
+/// object name late, in a reconcile; the shell would not reject anything.
+fn validate_service_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 40
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if !ok {
+        bail!(
+            "service '{name}': name must be a DNS-safe label (lowercase letters, digits and \
+             hyphens, not starting or ending with a hyphen)"
+        );
+    }
+    Ok(())
+}
+
 /// Validate a volume mount: name is a slug, path is absolute/non-traversal.
 fn validate_mount_path(service: &str, name: &str, path: &str) -> Result<()> {
     if name.is_empty()
@@ -2290,6 +2314,25 @@ config:
         // An undeclared size falls back rather than being unbounded: an
         // emptyDir with no sizeLimit can fill the node's disk.
         assert_eq!(s[1].size_or_default(), DEFAULT_SCRATCH_SIZE);
+    }
+
+    /// A service name reaches a Kubernetes object name and the backup Job's
+    /// shell, where the default artifact filename is built from it. Neither
+    /// place can be trusted to reject one that is not a plain slug.
+    #[test]
+    fn validate_rejects_a_service_name_that_is_not_a_slug() {
+        let app = |name: &str| {
+            Compose::parse(&format!("services:\n  \"{name}\":\n    image: x\n"))
+                .and_then(|c| c.validate())
+        };
+        assert!(app("db").is_ok());
+        assert!(app("route96-db").is_ok());
+        assert!(app("db; rm -rf /").is_err());
+        assert!(app("db data").is_err());
+        assert!(app("Db").is_err());
+        assert!(app("db_1").is_err());
+        assert!(app("-db").is_err());
+        assert!(app("").is_err());
     }
 
     /// Scratch paths are bounded, absolute, and may not overlap anything that

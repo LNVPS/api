@@ -26,7 +26,7 @@ use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
     Affinity, Container, EmptyDirVolumeSource, EnvVar, EnvVarSource,
     PersistentVolumeClaimVolumeSource, PodAffinity, PodAffinityTerm, PodSpec, PodTemplateSpec,
-    Secret, SecretKeySelector, Volume as K8sVolume, VolumeMount,
+    ResourceRequirements, Secret, SecretKeySelector, Volume as K8sVolume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
@@ -41,8 +41,9 @@ use lnvps_db::{AppBackupMethod, AppBackupState, AppDeployment, AppDeploymentBack
 
 use crate::Context;
 use crate::app_deployments::{
-    GateReason, IMAGE_PULL_POLICY, apply, container_security_context_for, gate_running, labels,
-    pod_security_context_for, resolved_env, service_labels,
+    GateReason, IMAGE_PULL_POLICY, apply, build_resource_requirements,
+    container_security_context_for, gate_running, labels, pod_security_context_for, resolved_env,
+    service_labels,
 };
 
 /// Where the artifact is staged inside the Job's pod before it is uploaded.
@@ -85,6 +86,13 @@ pub const DEFAULT_MAX_CONCURRENT_BACKUPS: usize = 3;
 /// Staging space for a service whose dump size cannot be inferred from its
 /// volumes.
 const DEFAULT_WORK_SIZE_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// What the uploader is given: `tar`, `gzip` and one HTTP `PUT`, none of which
+/// scale with the size of the deployment. Requests equal limits, as every
+/// customer container here does, so a backup is not the first thing evicted
+/// when the node it was pinned to comes under pressure.
+const UPLOADER_CPU: &str = "500m";
+const UPLOADER_MEMORY: &str = "256Mi";
 
 /// Kubernetes object name for a backup's Job.
 pub fn backup_job_name(backup_id: u64) -> String {
@@ -227,6 +235,12 @@ pub fn build_backup_job(spec: &BackupJobSpec) -> Result<Job> {
                 ]),
                 env: Some(env_vars(spec.env)),
                 volume_mounts: Some(vec![work_mount.clone()]),
+                // The dump runs the app's own image, so it is sized like the
+                // app, plus the staging space it writes into.
+                resources: Some(with_ephemeral(
+                    build_resource_requirements(&spec.service.resources, spec.multiplier),
+                    work_size,
+                )),
                 security_context: Some(container_security_context_for(
                     !spec.service.runs_as_root(),
                     spec.service.run_as_user(),
@@ -234,8 +248,8 @@ pub fn build_backup_job(spec: &BackupJobSpec) -> Result<Job> {
                 ..Default::default()
             });
             format!(
-                "set -e; gzip -n {WORK_DIR}/{payload}; \
-                 curl -fsS --upload-file {WORK_DIR}/{} \"${UPLOAD_URL_ENV}\"",
+                "set -e; gzip -n '{WORK_DIR}/{payload}'; \
+                 curl -fsS --upload-file '{WORK_DIR}/{}' \"${UPLOAD_URL_ENV}\"",
                 spec.artifact
             )
         }
@@ -282,8 +296,8 @@ pub fn build_backup_job(spec: &BackupJobSpec) -> Result<Job> {
                 ..Default::default()
             });
             format!(
-                "set -e; tar -czf {WORK_DIR}/{artifact} -C {DATA_DIR} .; \
-                 curl -fsS --upload-file {WORK_DIR}/{artifact} \"${UPLOAD_URL_ENV}\"",
+                "set -e; tar -czf '{WORK_DIR}/{artifact}' -C {DATA_DIR} .; \
+                 curl -fsS --upload-file '{WORK_DIR}/{artifact}' \"${UPLOAD_URL_ENV}\"",
                 artifact = spec.artifact
             )
         }
@@ -313,6 +327,16 @@ pub fn build_backup_job(spec: &BackupJobSpec) -> Result<Job> {
             ..Default::default()
         }]),
         volume_mounts: Some(upload_mounts),
+        resources: Some(with_ephemeral(
+            build_resource_requirements(
+                &lnvps_compose::Resources {
+                    cpu: UPLOADER_CPU.to_string(),
+                    memory: UPLOADER_MEMORY.to_string(),
+                },
+                1,
+            ),
+            work_size,
+        )),
         // Runs as whoever owns the data: the files on a PVC belong to the uid
         // the service writes them as, and a read-only mount gets no `fsGroup`
         // remap, so any other uid would tar an unreadable tree.
@@ -377,6 +401,24 @@ fn staging_size(service: &ComposeService, multiplier: u32) -> u64 {
     };
     base.saturating_mul(multiplier.max(1) as u64)
         .saturating_mul(2)
+}
+
+/// Add an `ephemeral-storage` request and limit covering the staging emptyDir.
+///
+/// Without it the pod is scheduled onto a node without asking for the disk it
+/// is about to fill: a volume backup stages the whole volume, twice over for a
+/// dump, on a node that is also running customers' apps. The effective pod
+/// request is the larger of the init container's and the sum of the others', so
+/// putting the same figure on both books it once rather than twice.
+fn with_ephemeral(mut r: ResourceRequirements, bytes: u64) -> ResourceRequirements {
+    let q = Quantity(bytes.to_string());
+    r.requests
+        .get_or_insert_with(Default::default)
+        .insert("ephemeral-storage".to_string(), q.clone());
+    r.limits
+        .get_or_insert_with(Default::default)
+        .insert("ephemeral-storage".to_string(), q);
+    r
 }
 
 fn env_vars(env: &BTreeMap<String, String>) -> Vec<EnvVar> {
@@ -744,23 +786,54 @@ async fn prune_backups(ctx: &Context, store: &ObjectStore, cluster_id: u64) -> R
     Ok(())
 }
 
-/// The rows belonging to runs older than the newest `retention` **finished**
-/// runs. Rows are newest-first, as the listing returns them.
+/// The rows belonging to runs past the newest `retention` **restorable** runs.
+/// Rows are newest-first, as the listing returns them.
+///
+/// Only a run that produced an artifact counts against the limit. A failed run
+/// is not a restore point, so counting it would let a bad night evict a good
+/// one: on "keep 3", two failures would leave the customer one real backup.
+/// Failures are still shown while the window has room, and drop out with the
+/// runs around them once it is full.
 ///
 /// Runs still in flight are never counted or pruned: an in-progress run is not
-/// yet a restore point, and counting it would drop an older one that is.
+/// yet a restore point either, and counting it would drop an older one that is.
 fn rows_past_retention(rows: &[AppDeploymentBackup], retention: u32) -> Vec<&AppDeploymentBackup> {
-    let mut seen: Vec<&str> = Vec::new();
+    let restorable: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.state == AppBackupState::Completed)
+        .map(|r| r.run_id.as_str())
+        .collect();
+
+    let limit = retention as usize;
+    let mut keep: BTreeMap<&str, bool> = BTreeMap::new();
+    let mut runs = 0usize;
+    let mut points = 0usize;
     let mut out = Vec::new();
     for row in rows {
         if matches!(row.state, AppBackupState::Pending | AppBackupState::Running) {
             continue;
         }
-        if !seen.iter().any(|r| *r == row.run_id) {
-            seen.push(&row.run_id);
-        }
-        let position = seen.iter().position(|r| *r == row.run_id).unwrap_or(0);
-        if position >= retention as usize {
+        let run = row.run_id.as_str();
+        let decided = match keep.get(run) {
+            Some(d) => *d,
+            None => {
+                let is_point = restorable.contains(&run);
+                // Kept as one of the newest `retention` restore points, or as
+                // one of the newest `retention` runs of any outcome. The second
+                // clause is what shows a customer whose backups are all failing
+                // that they are failing, and what bounds those rows: an app
+                // that has never succeeded keeps `retention` failures, not one
+                // row per night forever.
+                let d = (is_point && points < limit) || runs < limit;
+                if is_point {
+                    points += 1;
+                }
+                runs += 1;
+                keep.insert(run, d);
+                d
+            }
+        };
+        if !decided {
             out.push(row);
         }
     }
@@ -851,9 +924,10 @@ mod tests {
         let upload = &pod.containers[0];
         assert_eq!(upload.image.as_deref(), Some(DEFAULT_UPLOADER_IMAGE));
         let script = upload.command.as_ref().unwrap()[2].clone();
-        assert!(script.contains("gzip -n /work/route96.sql"), "{script}");
+        // Quoted: the staging path is built from a catalog-supplied name.
+        assert!(script.contains("gzip -n '/work/route96.sql'"), "{script}");
         assert!(
-            script.contains("--upload-file /work/route96.sql.gz \"$LNVPS_UPLOAD_URL\""),
+            script.contains("--upload-file '/work/route96.sql.gz' \"$LNVPS_UPLOAD_URL\""),
             "{script}"
         );
         // No data volume is mounted: a dump reads through the service, not off
@@ -899,7 +973,7 @@ mod tests {
 
         let script = pod.containers[0].command.as_ref().unwrap()[2].clone();
         assert!(
-            script.contains("tar -czf /work/blobs-files.tar.gz -C /data ."),
+            script.contains("tar -czf '/work/blobs-files.tar.gz' -C /data ."),
             "{script}"
         );
 
@@ -1026,6 +1100,35 @@ mod tests {
         );
     }
 
+    /// Every backup container asks for what it uses. Without a request the pod
+    /// is BestEffort -- first evicted under node pressure -- and is scheduled
+    /// onto a node without declaring the staging space it is about to fill.
+    #[test]
+    fn backup_containers_request_cpu_memory_and_staging_space() {
+        let c = compose();
+        let env = BTreeMap::new();
+        let job = build_backup_job(&spec(&c, "blobs", &env, "blobs-files.tar.gz")).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+
+        let res = pod.containers[0].resources.as_ref().unwrap();
+        let requests = res.requests.as_ref().unwrap();
+        let limits = res.limits.as_ref().unwrap();
+        assert_eq!(
+            requests.get("cpu"),
+            Some(&Quantity(UPLOADER_CPU.to_string()))
+        );
+        assert_eq!(
+            requests.get("memory"),
+            Some(&Quantity(UPLOADER_MEMORY.to_string()))
+        );
+        // The staging emptyDir's size limit, asked for as ephemeral storage:
+        // 20Gi of volume, doubled for the write-then-compress staging.
+        let staging = Quantity((20 * 1024 * 1024 * 1024u64 * 2).to_string());
+        assert_eq!(requests.get("ephemeral-storage"), Some(&staging));
+        assert_eq!(limits.get("ephemeral-storage"), Some(&staging));
+        assert_eq!(requests, limits, "requests == limits, as the apps are");
+    }
+
     /// A catalog command is quoted, never re-parsed, so an argument containing
     /// a quote or a shell metacharacter cannot escape into the redirect.
     #[test]
@@ -1037,9 +1140,9 @@ mod tests {
         );
     }
 
-    /// Retention counts runs, keeps the newest, and never counts a run that is
-    /// still in flight -- doing so would drop a finished restore point in
-    /// favour of one that does not exist yet.
+    /// Retention counts restore points, keeps the newest, and never counts a
+    /// run that is still in flight -- doing so would drop a finished restore
+    /// point in favour of one that does not exist yet.
     #[test]
     fn retention_counts_finished_runs_newest_first() {
         let row = |id: u64, run: &str, state: AppBackupState| AppDeploymentBackup {
@@ -1068,18 +1171,69 @@ mod tests {
             row(5, "a", AppBackupState::Completed),
         ];
 
-        // Keeping two runs drops only run "a" -- "d" is not yet a restore point
-        // and does not count against the limit.
+        // Keeping two restore points keeps "c" and "a". The failed run "b" sits
+        // between them and is shown, but does not use up a slot: "d" is not yet
+        // a restore point and does not count either.
         let pruned: Vec<u64> = rows_past_retention(&rows, 2).iter().map(|r| r.id).collect();
-        assert_eq!(pruned, vec![5]);
+        assert!(pruned.is_empty(), "{pruned:?}");
 
-        // Keeping one drops both older finished runs, both artifacts of "c"
-        // surviving as the newest.
+        // Keeping one keeps run "c", both of its artifacts, and drops the rest.
         let pruned: Vec<u64> = rows_past_retention(&rows, 1).iter().map(|r| r.id).collect();
         assert_eq!(pruned, vec![4, 5]);
 
         // Retention larger than the history prunes nothing.
         assert!(rows_past_retention(&rows, 7).is_empty());
+    }
+
+    /// Regression test: a failed run is not a restore point, so it must not
+    /// evict one. On "keep 2" with two failures, counting failures would leave
+    /// the customer a single backup and delete a good one to do it.
+    #[test]
+    fn a_failed_run_does_not_evict_a_restore_point() {
+        let row = |id: u64, run: &str, state: AppBackupState| AppDeploymentBackup {
+            id,
+            deployment_id: 1,
+            run_id: run.to_string(),
+            service: "db".to_string(),
+            method: AppBackupMethod::Volume,
+            artifact: "a.tar.gz".to_string(),
+            object_key: Some(format!("deployments/1/{run}/a.tar.gz")),
+            size_bytes: Some(1),
+            state,
+            message: None,
+            scheduled: true,
+            created: Utc::now(),
+            started: None,
+            completed: None,
+            deleted: false,
+        };
+        // Newest first: two failed nights on top of two good ones.
+        let rows = vec![
+            row(1, "d", AppBackupState::Failed),
+            row(2, "c", AppBackupState::Failed),
+            row(3, "b", AppBackupState::Completed),
+            row(4, "a", AppBackupState::Completed),
+        ];
+
+        // Both restore points survive; the failures are inside the window and
+        // are kept as the record of what went wrong.
+        assert!(rows_past_retention(&rows, 4).is_empty());
+
+        // On "keep 2" both failures are recent enough to show, and both restore
+        // points survive: neither failure spends a restore point's slot.
+        let pruned: Vec<u64> = rows_past_retention(&rows, 2).iter().map(|r| r.id).collect();
+        assert!(pruned.is_empty(), "a restore point was evicted: {pruned:?}");
+
+        // On "keep 1" the newest run is shown whatever its outcome, and the
+        // newest run that is actually restorable is kept with it.
+        let pruned: Vec<u64> = rows_past_retention(&rows, 1).iter().map(|r| r.id).collect();
+        assert_eq!(pruned, vec![2, 4]);
+
+        // An app that has never succeeded does not accumulate a row per night.
+        let failures: Vec<AppDeploymentBackup> = (1..=10)
+            .map(|i| row(i, &format!("r{i}"), AppBackupState::Failed))
+            .collect();
+        assert_eq!(rows_past_retention(&failures, 3).len(), 7);
     }
 
     /// Every app on the same daily schedule comes due in the same minute, so
