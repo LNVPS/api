@@ -43,7 +43,13 @@ pub struct ObjectStoreConfig {
     #[serde(default = "default_region")]
     pub region: String,
     pub bucket: String,
+    /// Credentials. Defaulted so a deployment can keep them out of a config
+    /// file that lives in a ConfigMap and supply them from a Secret through the
+    /// environment instead; `ObjectStore::new` rejects a pair that is still
+    /// empty by then.
+    #[serde(default)]
     pub access_key: String,
+    #[serde(default)]
     pub secret_key: String,
     /// Address the bucket as a path (`endpoint/bucket/key`) rather than as a
     /// subdomain. Defaults to true, because that is what self-hosted services
@@ -72,6 +78,9 @@ impl ObjectStore {
         if config.endpoint.trim().is_empty() || config.bucket.trim().is_empty() {
             bail!("object storage needs an endpoint and a bucket");
         }
+        if config.access_key.trim().is_empty() || config.secret_key.trim().is_empty() {
+            bail!("object storage needs an access key and a secret key");
+        }
         if !config.endpoint.starts_with("http://") && !config.endpoint.starts_with("https://") {
             bail!(
                 "object storage endpoint '{}' must include a scheme",
@@ -90,8 +99,34 @@ impl ObjectStore {
         &self.config.bucket
     }
 
+    /// Create the bucket, tolerating one that already exists.
+    ///
+    /// For provisioning a fresh store (and for tests against a real
+    /// S3-compatible server). Deliberately **not** called on the operator's
+    /// startup path: creating buckets is a permission the operator's key should
+    /// not need to hold just to write objects into a bucket somebody else made.
+    pub async fn create_bucket(&self) -> Result<()> {
+        let url = self.presign("PUT", "", Duration::from_secs(60), &[], Utc::now())?;
+        let resp = self
+            .client
+            .put(&url)
+            .send()
+            .await
+            .with_context(|| format!("could not create bucket '{}'", self.config.bucket))?;
+        // 409 is the bucket already existing, which is the desired end state.
+        if resp.status().is_success() || resp.status() == reqwest::StatusCode::CONFLICT {
+            return Ok(());
+        }
+        bail!(
+            "creating bucket '{}' returned {}",
+            self.config.bucket,
+            resp.status()
+        )
+    }
+
     /// A URL the holder may upload exactly one object to.
     pub fn presign_put(&self, key: &str, expires_in: Duration) -> Result<String> {
+        check_key(key)?;
         self.presign("PUT", key, expires_in, &[], Utc::now())
     }
 
@@ -113,6 +148,7 @@ impl ObjectStore {
                 format!("attachment; filename=\"{}\"", sanitise_filename(f)),
             )
         });
+        check_key(key)?;
         let extra: Vec<(String, String)> = disposition.into_iter().collect();
         self.presign("GET", key, expires_in, &extra, Utc::now())
     }
@@ -123,6 +159,7 @@ impl ObjectStore {
     /// stock `curl` container with nothing to report back through, so the
     /// authoritative size is whatever the bucket ended up holding.
     pub async fn size(&self, key: &str) -> Result<Option<u64>> {
+        check_key(key)?;
         let url = self.presign("HEAD", key, Duration::from_secs(60), &[], Utc::now())?;
         let resp = self
             .client
@@ -148,6 +185,7 @@ impl ObjectStore {
     /// Remove an object. Deleting one that is already gone succeeds: retention
     /// pruning has to be safe to retry.
     pub async fn delete(&self, key: &str) -> Result<()> {
+        check_key(key)?;
         let url = self.presign("DELETE", key, Duration::from_secs(60), &[], Utc::now())?;
         let resp = self
             .client
@@ -173,9 +211,6 @@ impl ObjectStore {
         extra_query: &[(String, String)],
         now: DateTime<Utc>,
     ) -> Result<String> {
-        if key.is_empty() {
-            bail!("object key is empty");
-        }
         if expires_in.is_zero() || expires_in > MAX_PRESIGN_EXPIRY {
             bail!(
                 "presign expiry must be between 1 second and {} seconds",
@@ -264,7 +299,8 @@ impl ObjectStore {
                     self.config.endpoint
                 )
             })?;
-        // Each path segment is encoded, but the separators are not.
+        // Each path segment is encoded, but the separators are not. An empty
+        // key addresses the bucket itself, which is what creating one does.
         let encoded_key = key.split('/').map(uri_encode).collect::<Vec<_>>().join("/");
         if self.config.path_style {
             Ok((
@@ -288,6 +324,14 @@ fn hmac(key: &[u8], data: &str) -> Result<HmacSha256> {
 
 fn hmac_key(key: &[u8]) -> Result<HmacSha256> {
     HmacSha256::new_from_slice(key).map_err(|e| anyhow!("invalid HMAC key: {e}"))
+}
+
+/// An object is always addressed by a key; only bucket-level calls have none.
+fn check_key(key: &str) -> Result<()> {
+    if key.is_empty() {
+        bail!("object key is empty");
+    }
+    Ok(())
 }
 
 /// RFC 3986 percent-encoding as SigV4 defines it: everything outside the
@@ -471,6 +515,12 @@ mod tests {
         cfg.endpoint = "https://s3.example.com".to_string();
         cfg.bucket = String::new();
         assert!(ObjectStore::new(cfg.clone()).is_err(), "bucket is required");
+        cfg.bucket = "backups".to_string();
+        cfg.secret_key = String::new();
+        assert!(
+            ObjectStore::new(cfg.clone()).is_err(),
+            "credentials left to the environment must actually arrive"
+        );
 
         let store = test_store();
         assert!(store.presign_put("", Duration::from_secs(60)).is_err());
@@ -486,13 +536,19 @@ mod tests {
     /// Defaults exist so a config only has to carry what is site-specific.
     #[test]
     fn config_defaults_cover_the_self_hosted_case() {
-        let cfg: ObjectStoreConfig = serde_yaml_ng::from_str(
-            "endpoint: https://minio.internal:9000\nbucket: backups\naccess-key: k\nsecret-key: s\n",
-        )
-        .unwrap();
+        let cfg: ObjectStoreConfig =
+            serde_yaml_ng::from_str("endpoint: https://minio.internal:9000\nbucket: backups\n")
+                .unwrap();
         assert_eq!(cfg.region, "us-east-1");
+        // Credentials may arrive from the environment rather than the file.
+        assert!(cfg.access_key.is_empty());
         assert!(cfg.path_style, "self-hosted services need path style");
-        let store = ObjectStore::new(cfg).unwrap();
+        let store = ObjectStore::new(ObjectStoreConfig {
+            access_key: "k".to_string(),
+            secret_key: "s".to_string(),
+            ..cfg
+        })
+        .unwrap();
         assert_eq!(store.bucket(), "backups");
     }
 

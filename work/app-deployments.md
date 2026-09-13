@@ -194,14 +194,36 @@ Design (see "Backup execution" below for the detail):
 - [x] Unit tests: the published AWS SigV4 presign vector, path vs virtual-hosted signing, method
       and key separation, filename sanitising, and wiremock coverage of `size`/`delete`
       (missing object → `None`, absent object → delete still succeeds, 403 → error).
-- [ ] Config wiring lands with its consumers: the operator in 6c, the API in 6d.
+- [x] Config wiring lands with its consumers: the operator in 6c, the API in 6d.
+- [x] Checked against a **real** S3 server (the compose `rustfs`, the same implementation the app
+      catalog ships): presigned round trip, an upload URL granting nothing beyond its own key or
+      method, and expiry actually being enforced. The AWS vector proves the arithmetic; only a
+      server proves the canonical request. Run by `scripts/run-e2e.sh`, skipped without the stack.
 
 #### 6c — Operator: run the backups
-- [ ] Build a per-artifact Job in the deployment namespace: `volume:` tars the PVC mounted
-      **read-only**; `command:` runs the dump in an init container on the app image with the
-      service's env, into a shared `emptyDir`; an uploader container `PUT`s the file.
-- [ ] Schedule evaluation + retention pruning (delete the object, tombstone the row).
-- [ ] Job status → DB write-back (size from a signed `HEAD`), and GC of finished Jobs.
+- [x] `lnvps_operator/src/app_backups.rs`: per-artifact Job in the deployment namespace.
+      `volume:` tars the PVC mounted **read-only**, pinned by pod affinity to the node already
+      holding the RWO claim (without it the Job schedules anywhere and sits in `Multi-Attach
+      error`). `command:` runs the dump in an init container on the app's own image with the
+      service's resolved env into a shared `emptyDir`; the uploader container gzips and `PUT`s it.
+- [x] The upload URL arrives as an env var from a Secret, never on a command line where every
+      other process in the pod could read it, and the Secret is deleted with the Job.
+- [x] Schedule evaluation + retention pruning (delete the object, then tombstone the row; a
+      failed delete keeps the row, or the object is orphaned with nothing pointing at it).
+- [x] Job status → DB write-back (size from a signed `HEAD`; a Job that "succeeded" with nothing
+      in the bucket is recorded as failed rather than offered as a restore point).
+- [x] Concurrency cap (default 3/cluster): every app on the same daily schedule comes due in the
+      same minute, and the pending rows are the queue, so waiting a sweep loses nothing.
+- [x] Operator config (`backups:` block, credentials overridable from the environment because the
+      config file lives in a ConfigMap), RBAC for `batch/jobs` and Secret `delete` in the
+      per-namespace role, and the DB grant on `app_deployment_backup`.
+- [x] The uploader's **actual command line** is run in the image the Job names, against rustfs,
+      and the artifact is downloaded back and checked to be the archive it claims to be. A
+      busybox `tar` flag or a `curl` invocation a real S3 server refuses would otherwise be a
+      backup that silently never existed until somebody tried to restore it.
+- [x] **A `command:` runs in its own pod**, so it must address its service over the network
+      (`-h db`) rather than the default unix socket. Documented in the compose grammar and fixed
+      in `catalog/route96.yaml` and `catalog/buzz.yaml`, which both now carry a daily schedule.
 
 #### 6d — Customer API + docs
 - [ ] `POST /api/v1/app-deployments/{id}/backups` (start a run), `GET .../backups` (list),

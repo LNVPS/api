@@ -18,7 +18,10 @@ services:
       - { path: /tmp }
       - { path: /run/mysqld, size: 32Mi }
     backup:
-      command: ["sh", "-c", "exec mariadb-dump --all-databases -uroot -p\"$MARIADB_ROOT_PASSWORD\""]
+      # Runs in its own pod on this image, so it connects to the service over
+      # the network (-h db); the default unix socket exists only inside the
+      # database's own container.
+      command: ["sh", "-c", "exec mariadb-dump -h db --all-databases -uroot -p\"$MARIADB_ROOT_PASSWORD\""]
       artifact: route96.sql
   route96:
     image: voidic/route96:latest@sha256:90712a96eed391b43bd82280d22ed909899c9b94a5ff162178ca78803d46d4d5
@@ -41,3 +44,6 @@ services:
       volume: blobs
 secrets:
   - { name: DB_ROOT_PASSWORD, generate: password }
+# Daily at 03:00 UTC, keeping a week of restore points. Each run captures
+# every service that declares a `backup:` method above, at one point in time.
+backup: { schedule: "0 3 * * *", retention: 7 }
