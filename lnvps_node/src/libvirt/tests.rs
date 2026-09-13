@@ -262,6 +262,28 @@ fn the_key_is_owner_only() {
     assert_eq!(mode & 0o777, 0o600, "key mode {mode:o}");
 }
 
+/// A key left permissive is tightened on the next apply even though its
+/// contents did not change: the short-circuit is about not rewriting the file,
+/// not about skipping the mode.
+#[test]
+#[cfg(unix)]
+fn a_permissive_existing_key_is_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let p = paths(&dir);
+    let id = generate_identity(params().listen).unwrap();
+    apply(&p, &params(), &id).unwrap();
+
+    // Same contents, looser mode, as a restore or an older build would leave it.
+    let key = p.key();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+    apply(&p, &params(), &id).unwrap();
+
+    let mode = fs::metadata(&key).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "key mode {mode:o}");
+}
+
 /// A failing systemctl is reported rather than swallowed: a node that believes
 /// it is serving VMs while its libvirtd is dead is one LNVPS keeps placing
 /// customers on.

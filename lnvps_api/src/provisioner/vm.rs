@@ -401,6 +401,13 @@ impl VmProvisioner {
     /// `vmid = db_id + 100`) so that all subsequent lifecycle operations target
     /// the correct host VM.
     pub async fn import_vm(&self, host_id: u64, host_vm_id: i64, user_id: u64) -> Result<Vm> {
+        // A probe's domain name parses to an id past `i64::MAX`, so it arrives
+        // here as a negative number: comparing the unsigned interpretation is
+        // what catches it. Left to the database's unsigned range it would be an
+        // accident rather than a guard, and only after a row was attempted.
+        if crate::provisioner::is_probe(host_vm_id as u64) {
+            bail!("Host VM {host_vm_id} is an LNVPS probe and is not importable");
+        }
         let user = self.db.get_user(user_id).await?;
         let host = self.db.get_host(host_id).await?;
 
@@ -3346,6 +3353,18 @@ mod tests {
             "unexpected error: {}",
             err
         );
+
+        // --- Scenario 5: a probe id is refused, not imported
+        //
+        // A probe domain is named from an id no customer VM can have, so it
+        // parses cleanly and would otherwise be imported; the failure would
+        // come from the column's range, as an accident rather than a guard.
+        let probe = crate::provisioner::probe_vm_id(1) as i64;
+        let err = provisioner
+            .import_vm(1, probe, user.id)
+            .await
+            .expect_err("a probe must not be importable");
+        assert!(err.to_string().contains("probe"), "unexpected: {}", err);
 
         Ok(())
     }

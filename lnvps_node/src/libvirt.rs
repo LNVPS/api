@@ -610,25 +610,52 @@ fn write_if_changed(path: &Path, contents: &[u8]) -> Result<bool> {
 }
 
 fn write_private_if_changed(path: &Path, contents: &[u8]) -> Result<bool> {
-    if fs::read(path).is_ok_and(|existing| existing == contents) {
-        return Ok(false);
-    }
-    write_private(path, contents)?;
-    Ok(true)
-}
-
-/// Write a file only its owner can read. The key authenticates this node's
-/// libvirtd, and the machine has users the operator has given accounts to.
-fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
+    let changed = if fs::read(path).is_ok_and(|existing| existing == contents) {
+        false
+    } else {
+        write_private(path, contents)?;
+        true
+    };
+    // Applied even when nothing was written: an unchanged file short-circuits
+    // the write, so a key left permissive by an earlier build, a restore or a
+    // crash between the write and the chmod would otherwise never be repaired.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
             .with_context(|| format!("restricting {}", path.display()))?;
+    }
+    Ok(changed)
+}
+
+/// Write a file only its owner can read. The key authenticates this node's
+/// libvirtd, and the machine has users the operator has given accounts to.
+///
+/// Created owner-only rather than tightened afterwards: `fs::write` creates
+/// with `0666 & ~umask`, so the key would be readable by anything on the host
+/// until the `chmod` that follows it.
+fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, contents).with_context(|| format!("writing {}", path.display()))?;
     }
     Ok(())
 }

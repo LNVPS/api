@@ -4510,14 +4510,12 @@ impl LNVpsDbBase for MockDb {
             id,
             MarketplaceNodeHealth {
                 id,
-                // The column defaults to now; rows written without one would
-                // otherwise all sort equal and a "most recent first" list would
-                // return them in whatever order the map happened to hold.
-                created: if health.created == DateTime::<Utc>::default() {
-                    Utc::now()
-                } else {
-                    health.created
-                },
+                // The real insert names neither column, so the table's
+                // `DEFAULT CURRENT_TIMESTAMP` wins and a caller-supplied
+                // `created` is ignored. Matching that here keeps a test from
+                // backdating a row against the mock and finding the real
+                // database cannot reproduce it.
+                created: Utc::now(),
                 ..health.clone()
             },
         );
@@ -11384,6 +11382,44 @@ mod marketplace_tests {
 
         // A tunnel cannot be allocated to a user who does not exist.
         assert!(db.insert_tunnel(&tunnel(999, "wg-ghost")).await.is_err());
+    }
+
+    /// A caller-supplied `created` is ignored, as the real insert ignores it.
+    ///
+    /// MySQL takes the column's `DEFAULT CURRENT_TIMESTAMP` because the insert
+    /// never names it. A mock that honoured the field would let a test backdate
+    /// a health row to exercise trend or retention logic and pass, while the
+    /// real database could not reproduce it.
+    #[tokio::test]
+    async fn a_health_rows_created_time_is_its_own() {
+        let db = MockDb::default();
+        let u = user(&db, 1).await;
+        let op = db.insert_marketplace_operator(&operator(u)).await.unwrap();
+        let node_id = db.insert_marketplace_node(&node(op, "a")).await.unwrap();
+
+        let backdated = Utc::now() - chrono::Duration::days(30);
+        db.insert_marketplace_node_health(&MarketplaceNodeHealth {
+            id: 0,
+            node_id,
+            created: backdated,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let (rows, _) = db
+            .list_marketplace_node_health(node_id, 1, 0)
+            .await
+            .unwrap();
+        let created = rows.first().unwrap().created;
+        assert!(
+            created > backdated,
+            "the caller's timestamp must not be stored"
+        );
+        assert!(
+            Utc::now() - created < chrono::Duration::minutes(1),
+            "created should be now, got {created}"
+        );
     }
 }
 

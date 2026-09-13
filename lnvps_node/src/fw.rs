@@ -530,6 +530,22 @@ pub fn ruleset(policy: &Policy) -> Nftables<'static> {
         ],
         None,
     ));
+    // Before the conntrack accept, and for the same reason the `forward`
+    // chain puts it there: conntrack matches the flow, not the interface, so a
+    // guest that spoofs the route server's address and lands on an existing
+    // LNVPS flow would be accepted by the rule below without ever reaching the
+    // source check, and could inject into or reset a live control-API or
+    // libvirt session.
+    batch.add(rule(
+        "input",
+        vec![
+            iif(GUEST_BRIDGE),
+            Statement::Jump(JumpTarget {
+                target: SOURCE_CHAIN.into(),
+            }),
+        ],
+        None,
+    ));
     batch.add(rule(
         "input",
         vec![
@@ -546,16 +562,6 @@ pub fn ruleset(policy: &Policy) -> Nftables<'static> {
                 op: Operator::IN,
             }),
             Statement::Accept(None),
-        ],
-        None,
-    ));
-    batch.add(rule(
-        "input",
-        vec![
-            iif(GUEST_BRIDGE),
-            Statement::Jump(JumpTarget {
-                target: SOURCE_CHAIN.into(),
-            }),
         ],
         None,
     ));

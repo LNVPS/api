@@ -72,15 +72,15 @@ pub fn network_config(value: &FullVmInfo) -> Result<NetworkConfig> {
         }
         let range: IpNetwork = ip_range.cidr.parse()?;
         let range_gw: IpNetwork = parse_gateway(&ip_range.gateway)?;
-        // Take the shorter prefix so an off-subnet gateway stays directly
-        // reachable without needing an explicit on-link route.
+        // The shorter of the two prefixes, so an off-subnet gateway falls
+        // inside the guest's own prefix and is therefore on-link. Without it the
+        // guest would send its default route to an address it believes is
+        // somewhere else, and the explicit `on-link` route below would be the
+        // only thing making it reachable.
         //
-        // A guest whose prefix covers its gateway also treats everything else
-        // in that prefix as on-link, and will resolve those addresses on the
-        // link rather than sending them to the router. That is fine on a
-        // customer range, where the node proxies for the addresses in it, and
-        // wrong on a routed block, where the machine at the other end is up a
-        // tunnel and nothing on the link answers for it.
+        // That route is what covers a gateway the widening cannot reach, such as
+        // a `/128` range (a probe's own address). The same widening is in the
+        // `ipconfig` path a single-address customer VM uses, so the two agree.
         let prefix = range.prefix().min(range_gw.prefix());
         let cidr = IpNetwork::new(addr, prefix)?.to_string();
         if addr.is_ipv4() {
@@ -343,6 +343,38 @@ mod tests {
         // A bad row must not abort the whole config and leave the VM offline.
         let net = network_config(&cfg)?;
         assert!(!net.yaml.contains("not-an-ip"));
+        Ok(())
+    }
+
+    /// A gateway the widened prefix cannot cover is routed `on-link`, and one it
+    /// can is not. Without the first, the guest sends every packet to an address
+    /// it believes is somewhere else; with the second, it would ARP for the whole
+    /// prefix on the link.
+    #[test]
+    fn an_uncovered_gateway_is_routed_on_link() -> Result<()> {
+        let mut cfg = mock_full_vm();
+        cfg.ips.truncate(1);
+        cfg.ips[0].ip = "203.0.113.2".to_string();
+        cfg.ranges.truncate(1);
+        cfg.ranges[0].cidr = "203.0.113.0/24".to_string();
+        cfg.ranges[0].gateway = "203.0.114.1/32".to_string();
+
+        let off_subnet = network_config(&cfg)?;
+        assert!(
+            off_subnet.yaml.contains("on-link: true"),
+            "a gateway outside the guest's prefix needs an on-link route:\n{}",
+            off_subnet.yaml
+        );
+
+        // Inside the prefix: no on-link, or the guest treats the whole prefix as
+        // local and resolves addresses on the link that nothing answers for.
+        cfg.ranges[0].gateway = "203.0.113.1/32".to_string();
+        let on_subnet = network_config(&cfg)?;
+        assert!(
+            !on_subnet.yaml.contains("on-link: true"),
+            "an on-subnet gateway must not widen the link:\n{}",
+            on_subnet.yaml
+        );
         Ok(())
     }
 
