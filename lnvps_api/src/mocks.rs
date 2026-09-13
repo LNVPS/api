@@ -491,6 +491,67 @@ impl LightningNode for MockNode {
     }
 }
 
+/// Mock chain explorer: scripted transaction inputs and outspends.
+///
+/// A txid with no scripted inputs is reported as unknown, i.e. evicted.
+/// `fail` makes every lookup error, so tests can assert that an unreachable
+/// explorer never clears a deposit.
+#[derive(Clone, Debug, Default)]
+pub struct MockChainExplorer {
+    /// Inputs returned for a given deposit txid.
+    pub inputs: Arc<Mutex<HashMap<String, Vec<crate::chain::OutPoint>>>>,
+    /// Spender recorded against an outpoint (`{txid}:{vout}`).
+    pub outspends: Arc<Mutex<HashMap<String, crate::chain::Outspend>>>,
+    pub fail: Arc<Mutex<bool>>,
+}
+
+impl MockChainExplorer {
+    pub async fn set_inputs(&self, txid: &str, inputs: &[&str]) {
+        self.inputs.lock().await.insert(
+            txid.to_string(),
+            inputs
+                .iter()
+                .filter_map(|s| crate::chain::OutPoint::parse(s))
+                .collect(),
+        );
+    }
+
+    pub async fn set_outspend(&self, outpoint: &str, spent_by: Option<&str>, confirmed: bool) {
+        self.outspends.lock().await.insert(
+            outpoint.to_string(),
+            crate::chain::Outspend {
+                spent_by: spent_by.map(|s| s.to_string()),
+                confirmed,
+            },
+        );
+    }
+}
+
+#[async_trait]
+impl crate::chain::ChainExplorer for MockChainExplorer {
+    async fn tx_inputs(&self, txid: &str) -> anyhow::Result<Option<Vec<crate::chain::OutPoint>>> {
+        ensure!(!*self.fail.lock().await, "explorer unavailable");
+        Ok(self.inputs.lock().await.get(txid).cloned())
+    }
+
+    async fn outspend(
+        &self,
+        outpoint: &crate::chain::OutPoint,
+    ) -> anyhow::Result<crate::chain::Outspend> {
+        ensure!(!*self.fail.lock().await, "explorer unavailable");
+        Ok(self
+            .outspends
+            .lock()
+            .await
+            .get(&outpoint.to_string())
+            .cloned()
+            .unwrap_or(crate::chain::Outspend {
+                spent_by: None,
+                confirmed: false,
+            }))
+    }
+}
+
 /// Mock on-chain provider, mirrors [`MockNode`] for on-chain payments.
 ///
 /// Derives unique fake bech32-style addresses and records every request.

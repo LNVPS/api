@@ -1,4 +1,5 @@
 pub mod api;
+pub mod chain;
 pub mod data_migration;
 pub mod fee_estimate;
 pub mod notifications;
