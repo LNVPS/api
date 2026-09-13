@@ -122,7 +122,7 @@ services:
       - { name: http, container: 3000, protocol: http, expose: ingress }
     init:
       - name: create-bucket           # DNS label, unique within the service
-        image: minio/mc:latest
+        image: quay.io/minio/mc:latest
         env:                          # ${…} is resolved here, and only here
           MC_HOST_s3: http://${S3_ACCESS_KEY}:${S3_SECRET_KEY}@s3:9000
           MC_CONFIG_DIR: /tmp/mc
