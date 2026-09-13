@@ -29,12 +29,23 @@ fn store() -> Option<ObjectStore> {
         region: "us-east-1".to_string(),
         // One bucket per run: a test that deletes objects must not race another
         // run's, and creating it is part of what is being checked.
-        bucket: format!("lnvps-backup-test-{}", run_id()),
+        bucket: format!("lnvps-backup-test-{}", bucket_suffix()),
         access_key,
         secret_key,
         path_style: true,
     })
     .ok()
+}
+
+/// The run ID as a bucket name can hold it. S3 names are lowercase letters,
+/// digits and hyphens only, so the CI run ID's `<run>_<attempt>` underscore
+/// would be rejected with a 400 before any signature was checked.
+fn bucket_suffix() -> String {
+    run_id()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 fn run_id() -> String {
