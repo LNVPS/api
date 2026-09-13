@@ -205,10 +205,13 @@ jobs:
           shared-key: unit-tests
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+        # libvirt-dev, because these are tested with the feature set the images
+        # are built with: `libvirt` carries the marketplace host client, and a
+        # build without it is the one that shipped unable to dial a node.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config libssl-dev libvirt-dev
 
       - name: Run unit tests
-        run: cargo test --locked --package lnvps_api --package lnvps_agent -- --test-threads=1
+        run: cargo test --locked --package lnvps_api --package lnvps_agent --features lnvps_api/libvirt -- --test-threads=1
 
   # Build all 5 main images from the single shared Dockerfile via buildx bake:
   # the workspace is compiled ONCE and each image just packages its binary.
