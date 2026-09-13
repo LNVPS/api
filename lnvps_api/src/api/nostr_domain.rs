@@ -4,11 +4,12 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use lnvps_api_common::{ApiData, ApiError, ApiResult};
+use lnvps_api_common::{ApiData, ApiError, ApiResult, dns_name};
 use lnvps_db::{NostrDomain, NostrDomainHandle};
 
 use crate::Nip98Auth;
 use crate::api::RouterState;
+use crate::settings::Settings;
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -48,9 +49,10 @@ async fn v1_create_nostr_domain(
     let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
+    let name = validate_domain(&this.settings, &data.name)?;
     let mut dom = NostrDomain {
         owner_id: uid,
-        name: data.name.clone(),
+        name,
         activation_hash: Some(uuid::Uuid::new_v4().to_string()),
         ..Default::default()
     };
@@ -124,6 +126,128 @@ async fn v1_delete_nostr_domain_handle(
     }
     this.db.delete_handle(handle).await?;
     ApiData::ok(())
+}
+
+/// Check a customer-supplied NIP-05 domain before it becomes a row.
+///
+/// Two failures were reaching the database: names that are not domains at all
+/// (a pasted URL, a host with a port, `localhost`), which can never be pointed
+/// at us and leave an Ingress rule that serves nothing, and the operator's own
+/// hostnames. The second is the one that matters: the name becomes an Ingress
+/// rule in LNVPS's cluster claiming that host, and the unique index means
+/// whoever registers it also denies it to everyone else.
+fn validate_domain(settings: &Settings, name: &str) -> Result<String, ApiError> {
+    let name =
+        dns_name::validate_public_domain(name).map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    for suffix in reserved_domains(settings) {
+        if dns_name::is_under(&name, &suffix) {
+            return Err(ApiError::bad_request(format!(
+                "'{name}' is not available: '{suffix}' is reserved"
+            )));
+        }
+    }
+    Ok(name)
+}
+
+/// Everything this deployment refuses to serve a customer's NIP-05 document
+/// from: its own hostnames and their parent domain, plus the operator's list.
+pub(crate) fn reserved_domains(settings: &Settings) -> Vec<String> {
+    let configured: Vec<String> = [
+        dns_name::host_of(&settings.public_url),
+        settings
+            .nostr_address_host
+            .as_deref()
+            .and_then(dns_name::host_of),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let mut out = dns_name::reserved_suffixes(configured.iter().map(String::as_str));
+    for extra in &settings.reserved_domains {
+        if let Ok(d) = dns_name::validate_public_domain(extra)
+            && !out.contains(&d)
+        {
+            out.push(d);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::mock_settings;
+
+    fn settings() -> Settings {
+        let mut s = mock_settings();
+        s.public_url = "https://api.lnvps.net".to_string();
+        s.nostr_address_host = Some("nostr.lnvps.net".to_string());
+        s
+    }
+
+    #[test]
+    fn a_customer_domain_is_stored_in_its_canonical_form() {
+        assert_eq!(
+            validate_domain(&settings(), " Nostr.MyRelay.COM. ").unwrap(),
+            "nostr.myrelay.com"
+        );
+    }
+
+    /// Regression test: `api.lnvps.net` was accepted. The row becomes an
+    /// Ingress rule claiming that host in LNVPS's own cluster, and the unique
+    /// index on the name means registering it also denies it to everyone else.
+    #[test]
+    fn an_internal_domain_is_refused() {
+        let s = settings();
+        for internal in [
+            "api.lnvps.net",
+            "API.LNVPS.NET",
+            "nostr.lnvps.net",
+            "lnvps.net",
+            "anything.at.all.lnvps.net",
+        ] {
+            let err = validate_domain(&s, internal)
+                .err()
+                .unwrap_or_else(|| panic!("'{internal}' was accepted"));
+            assert_eq!(err.code.as_u16(), 400, "{}", err.error);
+            assert!(err.error.contains("reserved"), "{}", err.error);
+        }
+        // A name that merely looks similar is still the customer's to register.
+        assert!(validate_domain(&s, "notlnvps.net").is_ok());
+    }
+
+    /// The operator's list covers hostnames that are not in the config, which
+    /// is most of them.
+    #[test]
+    fn the_operator_can_reserve_more() {
+        let mut s = settings();
+        s.reserved_domains = vec!["lnvps.com".to_string()];
+        assert!(validate_domain(&s, "shop.lnvps.com").is_err());
+        assert!(validate_domain(&s, "shop.lnvps.cloud").is_ok());
+    }
+
+    /// Regression test: a pasted URL, a host with a port and `localhost` were
+    /// all stored verbatim, leaving an Ingress rule that can never serve.
+    #[test]
+    fn a_name_that_is_not_a_domain_is_refused() {
+        let s = settings();
+        for bad in [
+            "https://nostr.myrelay.com",
+            "nostr.myrelay.com:8080",
+            "user@myrelay.com",
+            "localhost",
+            "myrelay",
+            "192.168.1.1",
+            "",
+        ] {
+            let err = validate_domain(&s, bad)
+                .err()
+                .unwrap_or_else(|| panic!("'{bad}' was accepted"));
+            assert_eq!(err.code.as_u16(), 400, "{}", err.error);
+        }
+    }
 }
 
 #[derive(Deserialize)]

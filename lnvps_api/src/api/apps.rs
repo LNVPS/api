@@ -5,6 +5,7 @@
 
 use crate::api::model::{ApiPrice, ApiSubscriptionPayment};
 use crate::api::{PaymentMethodQuery, RouterState};
+use crate::settings::Settings;
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
@@ -821,11 +822,23 @@ pub struct PatchAppDeploymentRequest {
     pub custom_domain: Option<Option<String>>,
 }
 
-/// Validate a customer-supplied custom domain: lowercase DNS hostname, one or
-/// more labels, no scheme/port/path. Returns the normalized (trimmed, lowercase)
-/// domain.
-fn validate_custom_domain(d: &str) -> Result<String, ApiError> {
-    lnvps_compose::validate_custom_domain(d).map_err(|e| ApiError::new(e.to_string()))
+/// Validate a customer-supplied custom domain: a public DNS hostname that is
+/// not one of the operator's own. Returns the normalised form to store.
+///
+/// The reserved check matters more here than the syntax one: a custom domain
+/// is held until the operator sees it resolve to us, and the operator's own
+/// hostnames already do.
+fn validate_custom_domain(settings: &Settings, d: &str) -> Result<String, ApiError> {
+    let d = lnvps_api_common::dns_name::validate_public_domain(d)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    for suffix in crate::api::nostr_domain::reserved_domains(settings) {
+        if lnvps_api_common::dns_name::is_under(&d, &suffix) {
+            return Err(ApiError::bad_request(format!(
+                "'{d}' is not available: '{suffix}' is reserved"
+            )));
+        }
+    }
+    Ok(d)
 }
 
 /// Update a deployment's name and/or config. The operator re-applies the change
@@ -876,7 +889,7 @@ async fn v1_patch_app_deployment(
     // flag only survives a no-op edit that resubmits the same domain.
     if let Some(cd) = &req.custom_domain {
         let new_domain = match cd {
-            Some(d) if !d.trim().is_empty() => Some(validate_custom_domain(d)?),
+            Some(d) if !d.trim().is_empty() => Some(validate_custom_domain(&this.settings, d)?),
             _ => None,
         };
         if new_domain != deployment.custom_domain {
@@ -1137,34 +1150,45 @@ mod tests {
 
     #[test]
     fn test_validate_custom_domain() {
+        let mut settings = crate::settings::mock_settings();
+        settings.public_url = "https://api.lnvps.net".to_string();
+        let s = &settings;
+
         // Valid hostnames normalize (trim, lowercase, strip trailing dot).
         assert_eq!(
-            validate_custom_domain("blog.example.com").ok().as_deref(),
-            Some("blog.example.com")
-        );
-        assert_eq!(
-            validate_custom_domain(" Blog.Example.COM. ")
+            validate_custom_domain(s, "blog.myrelay.com")
                 .ok()
                 .as_deref(),
-            Some("blog.example.com")
+            Some("blog.myrelay.com")
         );
         assert_eq!(
-            validate_custom_domain("a-b.co.uk").ok().as_deref(),
+            validate_custom_domain(s, " Blog.MyRelay.COM. ")
+                .ok()
+                .as_deref(),
+            Some("blog.myrelay.com")
+        );
+        assert_eq!(
+            validate_custom_domain(s, "a-b.co.uk").ok().as_deref(),
             Some("a-b.co.uk")
         );
 
         // Invalid: no dot (bare label/TLD), bad chars, scheme/port/path, empties.
-        assert!(validate_custom_domain("").is_err());
-        assert!(validate_custom_domain("localhost").is_err());
-        assert!(validate_custom_domain("example").is_err());
-        assert!(validate_custom_domain("https://blog.example.com").is_err());
-        assert!(validate_custom_domain("blog.example.com:8443").is_err());
-        assert!(validate_custom_domain("blog.example.com/path").is_err());
-        assert!(validate_custom_domain("-bad.example.com").is_err());
-        assert!(validate_custom_domain("bad-.example.com").is_err());
-        assert!(validate_custom_domain("bl og.example.com").is_err());
-        assert!(validate_custom_domain("a..com").is_err());
-        assert!(validate_custom_domain(&format!("{}.com", "a".repeat(64))).is_err());
+        assert!(validate_custom_domain(s, "").is_err());
+        assert!(validate_custom_domain(s, "localhost").is_err());
+        assert!(validate_custom_domain(s, "myrelay").is_err());
+        assert!(validate_custom_domain(s, "https://blog.myrelay.com").is_err());
+        assert!(validate_custom_domain(s, "blog.myrelay.com:8443").is_err());
+        assert!(validate_custom_domain(s, "blog.myrelay.com/path").is_err());
+        assert!(validate_custom_domain(s, "-bad.myrelay.com").is_err());
+        assert!(validate_custom_domain(s, "bad-.myrelay.com").is_err());
+        assert!(validate_custom_domain(s, "bl og.myrelay.com").is_err());
+        assert!(validate_custom_domain(s, "a..com").is_err());
+        assert!(validate_custom_domain(s, &format!("{}.com", "a".repeat(64))).is_err());
+
+        // The operator's own hostnames: a custom domain is held until it
+        // resolves to us, and these already do.
+        assert!(validate_custom_domain(s, "api.lnvps.net").is_err());
+        assert!(validate_custom_domain(s, "anything.lnvps.net").is_err());
     }
 
     #[test]
