@@ -1,6 +1,6 @@
 services:
   appweaver:
-    image: ghcr.io/getappweaver/core:alpine
+    image: ghcr.io/getappweaver/core:alpine-3e4b413@sha256:de1d200aba4cfc908eb1466fe3a1fea750f07ee9c79edb793b6174212a36613a
     user: "1000"
     resources: { cpu: 1, memory: 2Gi }
     ports:
