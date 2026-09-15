@@ -1,6 +1,6 @@
 services:
   blossom:
-    image: ghcr.io/hzrd149/blossom-server:master@sha256:3d791cef0bb87d4e94d6f14ca55cecb0bea5929070153b31ae3365b8ee07ad74
+    image: ghcr.io/hzrd149/blossom-server:master@sha256:034c1eeffa1384ddc99f0be78fe029866bb4c31518984376b2066cbd9484d1d7
     user: "1000"    # image declares no USER, so it would run as root and be refused
     resources: { cpu: 250m, memory: 256Mi }
     ports:

@@ -1,6 +1,6 @@
 services:
   strfry:
-    image: dockurr/strfry:latest@sha256:e81d238db13507f6ef24c49d47cd0b0ea58ff207961f10581fa2a7c901054df4
+    image: dockurr/strfry:latest@sha256:599ab3500dbfbe6cb78c668e1892cd9802c192d066df4660e8e3175034a8344d
     user: "1000"    # image declares no USER, so it would run as root and be refused
     resources: { cpu: 500m, memory: 512Mi }
     ports:
