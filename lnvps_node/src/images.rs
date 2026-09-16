@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha384, Sha512};
 use tokio::io::AsyncWriteExt;
 
 /// The largest image the node will write.
@@ -36,9 +36,11 @@ pub struct FetchRequest {
     /// HTTP fetch also reveals to the operator's network which image is being
     /// downloaded for whom.
     pub url: String,
-    /// Lowercase hex SHA-256 of the file. Without one there is nothing to check
-    /// the download against, so there is no request.
-    pub sha256: String,
+    /// Lowercase hex SHA-2 digest of the file: SHA-256, SHA-384 or SHA-512,
+    /// told apart by length, because that is what distributions publish and
+    /// LNVPS passes on whichever one it found. Without a digest there is
+    /// nothing to check the download against, so there is no request.
+    pub sha2: String,
     /// The volume file name, as LNVPS's libvirt client will look it up.
     pub name: String,
 }
@@ -56,7 +58,7 @@ pub enum FetchOutcome {
 /// Fetch `req` into `pool_dir`, unless it is already there and correct.
 pub async fn fetch(pool_dir: &Path, req: &FetchRequest) -> Result<FetchOutcome> {
     let target = pool_dir.join(volume_file_name(&req.name)?);
-    let expected = checksum(&req.sha256)?;
+    let expected = Digestion::parse(&req.sha2)?;
     if !req.url.starts_with("https://") {
         bail!("An image URL must be https");
     }
@@ -66,7 +68,7 @@ pub async fn fetch(pool_dir: &Path, req: &FetchRequest) -> Result<FetchOutcome> 
         // interrupted run is the case this exists to catch, and it is
         // indistinguishable from a good one by size alone once the pool has
         // been written to since.
-        if digest_file(&target).await? == expected {
+        if expected.matches_file(&target).await? {
             return Ok(FetchOutcome::Present);
         }
         tokio::fs::remove_file(&target)
@@ -90,7 +92,7 @@ pub async fn fetch(pool_dir: &Path, req: &FetchRequest) -> Result<FetchOutcome> 
 }
 
 /// Stream `url` into `part`, hashing as it goes, and fail unless it matches.
-async fn download(url: &str, part: &Path, expected: &[u8; 32]) -> Result<u64> {
+async fn download(url: &str, part: &Path, expected: &Digestion) -> Result<u64> {
     let response = reqwest::Client::builder()
         .build()?
         .get(url)
@@ -104,7 +106,7 @@ async fn download(url: &str, part: &Path, expected: &[u8; 32]) -> Result<u64> {
     let mut file = tokio::fs::File::create(part)
         .await
         .with_context(|| format!("creating {}", part.display()))?;
-    let mut hasher = Sha256::new();
+    let mut hasher = expected.hasher();
     let mut total: u64 = 0;
     let mut response = response;
     while let Some(chunk) = response.chunk().await.context("reading the image")? {
@@ -117,34 +119,85 @@ async fn download(url: &str, part: &Path, expected: &[u8; 32]) -> Result<u64> {
     }
     file.flush().await.context("flushing the image")?;
 
-    if hasher.finalize().as_slice() != expected {
+    if !expected.matches(hasher) {
         bail!("{url} does not match the digest LNVPS asked for");
     }
     Ok(total)
 }
 
-async fn digest_file(path: &Path) -> Result<[u8; 32]> {
-    use tokio::io::AsyncReadExt;
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .with_context(|| format!("reading {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; 1024 * 1024];
-    loop {
-        let read = file.read(&mut buf).await.context("reading the image")?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buf[..read]);
-    }
-    Ok(hasher.finalize().into())
+/// The digest to check a download against, and the algorithm to do it with.
+///
+/// The algorithm comes from the length rather than from a field: that is how
+/// every SHASUMS file LNVPS reads states it, so a separate field would be a
+/// second thing that could disagree with the digest itself.
+enum Digestion {
+    Sha256([u8; 32]),
+    Sha384(Box<[u8; 48]>),
+    Sha512(Box<[u8; 64]>),
 }
 
-fn checksum(hex_digest: &str) -> Result<[u8; 32]> {
-    let raw = hex::decode(hex_digest.trim()).context("The digest is not hex")?;
-    raw.as_slice()
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("A SHA-256 digest is 32 bytes, got {}", raw.len()))
+/// The running hash for one of the three algorithms.
+enum Hashing {
+    Sha256(Sha256),
+    Sha384(Sha384),
+    Sha512(Sha512),
+}
+
+impl Hashing {
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Self::Sha256(h) => h.update(data),
+            Self::Sha384(h) => h.update(data),
+            Self::Sha512(h) => h.update(data),
+        }
+    }
+}
+
+impl Digestion {
+    fn parse(hex_digest: &str) -> Result<Self> {
+        let raw = hex::decode(hex_digest.trim()).context("The digest is not hex")?;
+        Ok(match raw.len() {
+            32 => Self::Sha256(raw.try_into().unwrap()),
+            48 => Self::Sha384(Box::new(raw.try_into().unwrap())),
+            64 => Self::Sha512(Box::new(raw.try_into().unwrap())),
+            other => bail!("A SHA-2 digest is 32, 48 or 64 bytes, got {other}"),
+        })
+    }
+
+    fn hasher(&self) -> Hashing {
+        match self {
+            Self::Sha256(_) => Hashing::Sha256(Sha256::new()),
+            Self::Sha384(_) => Hashing::Sha384(Sha384::new()),
+            Self::Sha512(_) => Hashing::Sha512(Sha512::new()),
+        }
+    }
+
+    fn matches(&self, hashing: Hashing) -> bool {
+        match (self, hashing) {
+            (Self::Sha256(want), Hashing::Sha256(h)) => h.finalize().as_slice() == want,
+            (Self::Sha384(want), Hashing::Sha384(h)) => h.finalize().as_slice() == want.as_slice(),
+            (Self::Sha512(want), Hashing::Sha512(h)) => h.finalize().as_slice() == want.as_slice(),
+            // Unreachable: the hasher is built from this digest.
+            _ => false,
+        }
+    }
+
+    async fn matches_file(&self, path: &Path) -> Result<bool> {
+        use tokio::io::AsyncReadExt;
+        let mut file = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("reading {}", path.display()))?;
+        let mut hashing = self.hasher();
+        let mut buf = vec![0u8; 1024 * 1024];
+        loop {
+            let read = file.read(&mut buf).await.context("reading the image")?;
+            if read == 0 {
+                break;
+            }
+            hashing.update(&buf[..read]);
+        }
+        Ok(self.matches(hashing))
+    }
 }
 
 /// A volume name the node is willing to write.
@@ -192,11 +245,17 @@ mod tests {
         );
     }
 
+    /// All three lengths, because LNVPS passes on whichever digest the
+    /// distribution published: Debian and Alpine publish SHA-512, Ubuntu
+    /// SHA-256. Rejecting the long ones meant those images always took the slow
+    /// upload path.
     #[test]
-    fn a_digest_must_be_thirty_two_bytes() {
-        assert!(checksum("aabb").is_err());
-        assert!(checksum("zz".repeat(32).as_str()).is_err());
-        assert!(checksum(&"ab".repeat(32)).is_ok());
+    fn a_digest_is_sha256_sha384_or_sha512() {
+        assert!(Digestion::parse(&"ab".repeat(32)).is_ok());
+        assert!(Digestion::parse(&"ab".repeat(48)).is_ok());
+        assert!(Digestion::parse(&"ab".repeat(64)).is_ok());
+        assert!(Digestion::parse("aabb").is_err());
+        assert!(Digestion::parse(&"zz".repeat(32)).is_err());
     }
 
     /// An image already in the pool is not fetched again, and one whose bytes
@@ -205,7 +264,7 @@ mod tests {
     async fn a_correct_image_is_left_alone() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let body = b"an image";
-        let sha = hex::encode(Sha256::digest(body));
+        let sha = hex::encode(Sha512::digest(body));
         tokio::fs::write(dir.path().join("os-image-1.raw"), body).await?;
 
         let outcome = fetch(
@@ -213,7 +272,7 @@ mod tests {
             &FetchRequest {
                 // Never dialled: the file is already right.
                 url: "https://example.invalid/image".to_string(),
-                sha256: sha,
+                sha2: sha,
                 name: "os-image-1.raw".to_string(),
             },
         )
@@ -229,7 +288,7 @@ mod tests {
             dir.path(),
             &FetchRequest {
                 url: "http://example.invalid/image".to_string(),
-                sha256: "ab".repeat(32),
+                sha2: "ab".repeat(32),
                 name: "os-image-1.raw".to_string(),
             },
         )

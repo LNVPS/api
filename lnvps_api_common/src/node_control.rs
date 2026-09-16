@@ -100,10 +100,11 @@ const IMAGE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeImageFetch {
     pub url: String,
-    /// Lowercase hex SHA-256. Required: without it the node has nothing to
-    /// check the download against, and LNVPS has no reason to believe the
-    /// volume holds the image it asked for.
-    pub sha256: String,
+    /// Lowercase hex SHA-2 digest: SHA-256, SHA-384 or SHA-512, as published.
+    /// Required, because without it the node has nothing to check the download
+    /// against and LNVPS has no reason to believe the volume holds the image it
+    /// asked for.
+    pub sha2: String,
     /// The volume file name LNVPS will look the image up by.
     pub name: String,
 }

@@ -143,7 +143,7 @@ async fn lnvps_can_ask_a_node_to_fetch_an_image() -> Result<()> {
             &host_row(node.addr),
             &lnvps_api_common::node_control::NodeImageFetch {
                 url: "http://example.invalid/image.img".to_string(),
-                sha256: "ab".repeat(32),
+                sha2: "ab".repeat(32),
                 name: "os-image-1.raw".to_string(),
             },
         )

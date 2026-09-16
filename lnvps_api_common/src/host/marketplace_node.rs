@@ -61,15 +61,38 @@ impl MarketplaceNodeHost {
 /// the download against — a fetch nobody can verify is a volume LNVPS has no
 /// reason to believe holds the image it asked for. Either way the bytes go the
 /// slow way instead of going unchecked.
-fn fetch_request(volume: Option<String>, image: &VmOsImage) -> Option<NodeImageFetch> {
-    // 64 hex characters: SHA-256, which is what the node verifies. A SHA-512
-    // from a distro's SUMS file is a digest the node cannot check.
-    let sha256 = image.sha2.clone().filter(|s| s.len() == 64)?;
+fn fetch_request(
+    volume: Option<String>,
+    image: &VmOsImage,
+    sha2: Option<String>,
+) -> Option<NodeImageFetch> {
+    // Any digest the node can compute: SHA-256, SHA-384 or SHA-512, told apart
+    // by length. Same set the SSH path verifies with, because distributions
+    // publish all three and an image is not the node's to fetch only because
+    // Debian publishes SHA-512.
+    let sha2 = sha2.filter(|s| crate::shasum::ShasumAlgorithm::from_hex_len(s.len()).is_some())?;
     Some(NodeImageFetch {
         url: image.url.clone(),
-        sha256,
+        sha2,
         name: volume?,
     })
+}
+
+/// The digest to hold a download to, resolved the way the SSH path resolves it.
+///
+/// `sha2_url` first and the stored `sha2` only as a fallback, because a rolling
+/// URL like Ubuntu's `current/` serves new bytes without anybody editing the
+/// catalog: the stored digest then describes an image that no longer exists,
+/// and a node fetching the real one is refused for being correct.
+async fn expected_digest(image: &VmOsImage) -> Option<String> {
+    if let Some(sha2_url) = image.sha2_url.as_ref().filter(|s| !s.is_empty()) {
+        let filename = image.url_filename().ok()?;
+        match crate::shasum::fetch_checksum_for_file(sha2_url, &filename).await {
+            Ok(entry) => return Some(entry.checksum.to_lowercase()),
+            Err(e) => warn!("Failed to fetch sha2 from {sha2_url}: {e}"),
+        }
+    }
+    image.sha2.clone()
 }
 
 #[async_trait]
@@ -80,7 +103,9 @@ impl VmHostClient for MarketplaceNodeHost {
     /// told a digest or it is told nothing, because a fetch nobody can check is
     /// a volume LNVPS has no reason to believe holds the image it asked for.
     async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()> {
-        let Some(request) = fetch_request(self.inner.os_image_volume_name(image), image) else {
+        let sha2 = expected_digest(image).await;
+        let Some(request) = fetch_request(self.inner.os_image_volume_name(image), image, sha2)
+        else {
             warn!(
                 "Image {} has no volume name or no sha256, uploading it to node {} instead",
                 image.url, self.host.name
@@ -219,32 +244,51 @@ mod tests {
     #[test]
     fn an_image_with_a_digest_is_fetched_by_the_node() {
         let sha = "ab".repeat(32);
-        let request = fetch_request(Some("os-image-1.raw".to_string()), &image(Some(&sha)))
-            .expect("a verifiable image is the node's to fetch");
-        assert_eq!(request.sha256, sha);
+        let request = fetch_request(
+            Some("os-image-1.raw".to_string()),
+            &image(Some(&sha)),
+            Some(sha.clone()),
+        )
+        .expect("a verifiable image is the node's to fetch");
+        assert_eq!(request.sha2, sha);
         assert_eq!(request.name, "os-image-1.raw");
         assert_eq!(request.url, "https://example.com/image.img");
     }
 
-    /// Without a digest the node has nothing to verify against, and a SHA-512
-    /// is a digest it cannot check, so both go the slow way.
+    /// Without a digest the node has nothing to verify against, so the bytes
+    /// go the slow way rather than going unchecked. A SHA-384 or SHA-512 is
+    /// fine: the node checks all three, as the SSH path does.
     #[test]
     fn an_unverifiable_image_is_uploaded_instead() {
-        assert!(fetch_request(Some("os-image-1.raw".to_string()), &image(None)).is_none());
+        assert!(fetch_request(Some("os-image-1.raw".to_string()), &image(None), None).is_none());
         assert!(
             fetch_request(
                 Some("os-image-1.raw".to_string()),
-                &image(Some(&"ab".repeat(64)))
+                &image(None),
+                Some("nonsense".to_string())
             )
-            .is_none(),
-            "a sha512 is not something the node checks"
+            .is_none()
         );
+        for len in [32, 48, 64] {
+            let sha = "ab".repeat(len);
+            assert!(
+                fetch_request(
+                    Some("os-image-1.raw".to_string()),
+                    &image(Some(&sha)),
+                    Some(sha)
+                )
+                .is_some(),
+                "a sha2 of {len} bytes is one the node checks"
+            );
+        }
     }
 
     /// A host that does not cache images as named volumes has nothing to ask
     /// for.
     #[test]
     fn a_host_with_no_volume_name_is_not_asked() {
-        assert!(fetch_request(None, &image(Some(&"ab".repeat(32)))).is_none());
+        assert!(
+            fetch_request(None, &image(Some(&"ab".repeat(32))), Some("ab".repeat(32))).is_none()
+        );
     }
 }
