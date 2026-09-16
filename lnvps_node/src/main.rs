@@ -239,6 +239,14 @@ async fn run(config_path: &Path) -> Result<()> {
     // The pool the daemon built for LNVPS's libvirtd: where a fetched OS image
     // lands, so LNVPS can ask for one instead of pushing it down the tunnel.
     let pool_dir = lnvps_node::libvirt::Paths::new(&config.state_dir).pool_dir();
+    // Gigabytes of interrupted downloads, on hardware LNVPS does not own. A
+    // restart is the only chance to clear the ones whose request died with the
+    // process it was being served by.
+    match lnvps_node::images::sweep_partials(&pool_dir).await {
+        Ok(0) => {}
+        Ok(n) => log::info!("Cleared {n} interrupted image download(s)"),
+        Err(e) => log::warn!("Could not clear interrupted image downloads: {e}"),
+    }
 
     control::serve_on(
         Arc::new(ControlState::new(control_pubkey, addr, kernel, fw).with_pool_dir(pool_dir)),

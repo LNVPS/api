@@ -71,24 +71,67 @@ pub async fn fetch(pool_dir: &Path, req: &FetchRequest) -> Result<FetchOutcome> 
         if expected.matches_file(&target).await? {
             return Ok(FetchOutcome::Present);
         }
-        tokio::fs::remove_file(&target)
-            .await
-            .with_context(|| format!("removing the bad image at {}", target.display()))?;
     }
 
     // A sibling temp file, so an interrupted transfer is never mistaken for a
     // complete image by the pool listing.
+    //
+    // Removed first rather than resumed: LNVPS drops this request when it times
+    // out waiting, which drops the handler on this side mid-download, and a
+    // dropped future runs no cleanup — so the leftover of the last attempt is
+    // here, and appending to it would hash to nothing recognisable.
     let part = target.with_extension("part");
+    remove_if_present(&part).await?;
     let bytes = download(&req.url, &part, &expected)
         .await
         .inspect_err(|_| {
             let _ = std::fs::remove_file(&part);
         })?;
 
+    // Replaced only now, with a verified file in hand. Deleting the old volume
+    // before fetching left a node with no image at all whenever the replacement
+    // failed — and the usual reason the digest stopped matching is a catalog
+    // entry LNVPS cannot resolve, which is a fetch that was never going to
+    // succeed.
     tokio::fs::rename(&part, &target)
         .await
         .with_context(|| format!("moving the image into {}", target.display()))?;
     Ok(FetchOutcome::Fetched { bytes })
+}
+
+/// Delete the leftovers of interrupted fetches.
+///
+/// Called at startup as well as per fetch, because a node that was restarted
+/// mid-download has no request to hang the cleanup off, and these are gigabytes
+/// on somebody else's root filesystem.
+pub async fn sweep_partials(pool_dir: &Path) -> Result<u64> {
+    let mut removed = 0;
+    let mut entries = match tokio::fs::read_dir(pool_dir).await {
+        Ok(e) => e,
+        // No pool yet is not a failure: libvirt has not been configured.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", pool_dir.display())),
+    };
+    while let Some(entry) = entries.next_entry().await.context("reading the pool")? {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "part") {
+            removed += 1;
+            log::info!(
+                "Removing the leftover of an interrupted fetch: {}",
+                path.display()
+            );
+            remove_if_present(&path).await?;
+        }
+    }
+    Ok(removed)
+}
+
+async fn remove_if_present(path: &Path) -> Result<()> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("removing {}", path.display())),
+    }
 }
 
 /// Stream `url` into `part`, hashing as it goes, and fail unless it matches.
@@ -279,6 +322,62 @@ mod tests {
         .await?;
         assert_eq!(outcome, FetchOutcome::Present);
         Ok(())
+    }
+
+    /// LNVPS gives up waiting and drops the request, which drops the handler
+    /// mid-download, and a dropped future runs no cleanup. So the leftovers
+    /// accumulate on the operator's filesystem until something clears them, and
+    /// the next fetch must not try to continue one.
+    #[tokio::test]
+    async fn interrupted_downloads_are_cleared() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        tokio::fs::write(dir.path().join("os-image-2.part"), b"half an image").await?;
+        tokio::fs::write(dir.path().join("os-image-3.part"), b"half an image").await?;
+        tokio::fs::write(dir.path().join("os-image-4.raw"), b"a whole image").await?;
+
+        assert_eq!(sweep_partials(dir.path()).await?, 2);
+        assert!(
+            dir.path().join("os-image-4.raw").exists(),
+            "a volume is not a leftover"
+        );
+        assert!(!dir.path().join("os-image-2.part").exists());
+
+        // A pool that does not exist yet is not a failure.
+        assert_eq!(sweep_partials(&dir.path().join("nope")).await?, 0);
+        Ok(())
+    }
+
+    /// An image whose digest no longer matches is replaced only once the
+    /// replacement is in hand. Deleting it first left the node with no image at
+    /// all, and the usual reason a digest stops matching is a catalog entry
+    /// LNVPS cannot resolve — a fetch that was never going to succeed.
+    #[tokio::test]
+    async fn a_failed_refetch_keeps_the_image_it_has() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("os-image-1.raw");
+        std::fs::write(&target, b"the image we have").unwrap();
+
+        fetch(
+            dir.path(),
+            &FetchRequest {
+                // Unreachable, so the refetch fails after the digest mismatch.
+                url: "https://localhost:1/image".to_string(),
+                sha2: "ab".repeat(32),
+                name: "os-image-1.raw".to_string(),
+            },
+        )
+        .await
+        .expect_err("an unreachable URL must fail");
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"the image we have",
+            "the image it had must still be there"
+        );
+        assert!(
+            !dir.path().join("os-image-1.part").exists(),
+            "and the failed attempt must not be left behind"
+        );
     }
 
     #[tokio::test]
