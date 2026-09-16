@@ -17,9 +17,10 @@ use lnvps_api_common::{
     retry::{OpError, Pipeline, RetryPolicy},
 };
 use lnvps_db::{
-    BulkMessageTarget, CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, LineItemType,
-    PaymentMethod, RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    Vm, VmHistoryActionType, VmHost, VmHostKind, VmIpAssignment, VmOsImage,
+    BulkMessageTarget, CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, IntervalType, LNVpsDb,
+    LineItemType, PaymentMethod, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, Vm, VmHistoryActionType, VmHost, VmHostDisk, VmHostKind, VmIpAssignment,
+    VmOsImage,
 };
 use log::{debug, error, info, warn};
 use nostr_sdk::Client;
@@ -223,6 +224,10 @@ pub struct WorkerSettings {
     pub referral_fee_estimator: crate::settings::FeeEstimatorConfig,
     /// Source of chain lookups used to spot replaced deposits.
     pub chain_explorer: crate::settings::ChainExplorerConfig,
+    /// LNVPS's control identity, for calling marketplace nodes. `None` in a
+    /// deployment with no nostr key: such a worker patches its own hosts and
+    /// leaves nodes' hardware as last reported.
+    pub node_control: Option<lnvps_api_common::node_control::NodeControl>,
 }
 
 impl From<&Settings> for WorkerSettings {
@@ -255,6 +260,15 @@ impl From<&Settings> for WorkerSettings {
                 .map(|r| r.fee_estimator.clone())
                 .unwrap_or_default(),
             chain_explorer: val.chain_explorer.clone(),
+            node_control: val.nostr.as_ref().and_then(|n| {
+                match lnvps_api_common::node_control::NodeControl::new(&n.nsec) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        error!("The marketplace control key is unusable: {e}");
+                        None
+                    }
+                }
+            }),
         }
     }
 }
@@ -2409,8 +2423,43 @@ impl Worker {
             );
         }
 
+        self.reconcile_host_disks(host, &info.disks).await?;
+
+        // A marketplace node reports its own hardware over the control API. It
+        // has no SSH account to give LNVPS and no reason to — the detection is
+        // the same code, running on the machine that knows the answer.
+        if host.kind == VmHostKind::MarketplaceNode {
+            if let Err(e) = self.read_node_inventory(host).await {
+                warn!("Failed to read inventory from node {}: {:?}", host.name, e);
+            }
+        } else {
+            // Run host-info utility to detect CPU/GPU features (only if binary exists)
+            match get_host_info_path() {
+                Some(p) if p.exists() => {
+                    if let Err(e) = self.run_host_info(host).await {
+                        warn!("Failed to run host-info on {}: {:?}", host.name, e);
+                    }
+                }
+                _ => {
+                    warn!(
+                        "Host-info detection disabled: binary not found (expected at {:?})",
+                        get_host_info_path()
+                    );
+                }
+            }
+        }
+
+        self.patch_host_vms(host, client.as_ref()).await
+    }
+
+    /// Bring `vm_host_disk` in line with the pools the host reports.
+    async fn reconcile_host_disks(
+        &self,
+        host: &VmHost,
+        reported: &[lnvps_api_common::host::VmHostDiskInfo],
+    ) -> Result<()> {
         let mut host_disks = self.db.list_host_disks(host.id).await?;
-        for disk in &info.disks {
+        for disk in reported {
             if let Some(hd) = host_disks.iter_mut().find(|d| d.name == disk.name) {
                 if hd.size != disk.size {
                     hd.size = disk.size;
@@ -2420,27 +2469,46 @@ impl Worker {
                         hd.name, hd.size, hd.kind, hd.interface
                     );
                 }
+            } else if host.kind == VmHostKind::MarketplaceNode {
+                // A marketplace node's pools are the ones its own daemon
+                // created, so every pool it exposes is ours to sell and there
+                // is no admin to map them by hand — a node is enrolled by its
+                // operator, and approval is the gate. On an LNVPS-owned host
+                // the opposite holds: `local` and `backups` are pools nobody
+                // means to sell, so those still only warn.
+                //
+                // Type and interface are not in what libvirt reports about a
+                // pool, and the capacity is the filesystem's. Both are what an
+                // admin edits afterwards; the row exists so the node can be
+                // placed on at all.
+                let mut new_disk = VmHostDisk {
+                    id: 0,
+                    host_id: host.id,
+                    name: disk.name.clone(),
+                    size: disk.size,
+                    kind: DiskType::SSD,
+                    interface: DiskInterface::PCIe,
+                    enabled: true,
+                };
+                new_disk.id = self.db.create_host_disk(&new_disk).await?;
+                info!(
+                    "Imported host disk {} on {}: size={},type={},interface={}",
+                    new_disk.name, host.name, new_disk.size, new_disk.kind, new_disk.interface
+                );
+                host_disks.push(new_disk);
             } else {
                 warn!("Un-mapped host disk {}", disk.name);
             }
         }
+        Ok(())
+    }
 
-        // Run host-info utility to detect CPU/GPU features (only if binary exists)
-        match get_host_info_path() {
-            Some(p) if p.exists() => {
-                if let Err(e) = self.run_host_info(host).await {
-                    warn!("Failed to run host-info on {}: {:?}", host.name, e);
-                }
-            }
-            _ => {
-                warn!(
-                    "Host-info detection disabled: binary not found (expected at {:?})",
-                    get_host_info_path()
-                );
-            }
-        }
-
-        // Patch config + firewall configuration for all VMs on this host
+    /// Re-apply config and firewall to every live VM on a host.
+    async fn patch_host_vms(
+        &self,
+        host: &VmHost,
+        client: &dyn lnvps_api_common::host::VmHostClient,
+    ) -> Result<()> {
         let vms = self.db.list_vms_on_host(host.id).await?;
         for vm in &vms {
             // Sweep up orphaned/unused disks for every live VM. Repeated
@@ -2613,6 +2681,41 @@ impl Worker {
             .filter_map(|f| f.parse().ok())
             .collect();
 
+        self.store_cpu_info(host, cpu_mfg, cpu_arch, cpu_features)
+            .await
+    }
+
+    /// Read a marketplace node's own hardware report, over the tunnel.
+    async fn read_node_inventory(&self, host: &mut VmHost) -> Result<()> {
+        let control = self
+            .settings
+            .node_control
+            .as_ref()
+            .context("No marketplace control key is configured, so nodes cannot be called")?;
+        let node_id = host
+            .marketplace_node_id
+            .context("Host is a marketplace node with no node behind it")?;
+        let node = self.db.get_marketplace_node(node_id).await?;
+        let status = control.status(&node, host).await?;
+
+        let cpu = status.inventory.cpu;
+        let cpu_mfg = CpuMfg::from_str(&cpu.mfg).unwrap_or(CpuMfg::Unknown);
+        let cpu_arch = CpuArch::from_str(&cpu.arch).unwrap_or(CpuArch::Unknown);
+        let cpu_features: Vec<CpuFeature> =
+            cpu.features.iter().filter_map(|f| f.parse().ok()).collect();
+
+        self.store_cpu_info(host, cpu_mfg, cpu_arch, cpu_features)
+            .await
+    }
+
+    /// Write detected CPU facts to the host, if they changed.
+    async fn store_cpu_info(
+        &self,
+        host: &mut VmHost,
+        cpu_mfg: CpuMfg,
+        cpu_arch: CpuArch,
+        cpu_features: Vec<CpuFeature>,
+    ) -> Result<()> {
         let features_changed = host.cpu_mfg != cpu_mfg
             || host.cpu_arch != cpu_arch
             || host.cpu_features.0 != cpu_features;
@@ -4940,6 +5043,95 @@ mod tests {
             .try_job(&WorkJob::PatchHosts)
             .await
             .expect("a single unpatchable host must not fail the whole sweep");
+        Ok(())
+    }
+
+    /// A marketplace node's pools are created by its own daemon, and nobody at
+    /// LNVPS maps them by hand. Until they were imported, an approved node had
+    /// no `vm_host_disk` row at all, so no VM could be placed on it and the
+    /// only sign was a warning per patch.
+    #[tokio::test]
+    async fn a_marketplace_pool_is_imported_as_a_host_disk() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let host_id = db
+            .create_host(&VmHost {
+                kind: VmHostKind::MarketplaceNode,
+                region_id: 1,
+                name: "node-7".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let host = db.get_host(host_id).await?;
+        let worker = setup_worker(db.clone()).await?;
+
+        let reported = vec![lnvps_api_common::host::VmHostDiskInfo {
+            name: "default".to_string(),
+            size: 1024,
+            used: 0,
+        }];
+        worker.reconcile_host_disks(&host, &reported).await?;
+
+        let disks = db.list_host_disks(host_id).await?;
+        assert_eq!(disks.len(), 1, "the node's pool must become a disk");
+        assert_eq!(disks[0].name, "default");
+        assert_eq!(disks[0].size, 1024);
+        assert!(
+            disks[0].enabled,
+            "approval is the gate, not a second switch"
+        );
+
+        // The capacity is re-read like cpu and memory are, and importing is
+        // idempotent: a second sweep must not add the pool again.
+        worker
+            .reconcile_host_disks(
+                &host,
+                &[lnvps_api_common::host::VmHostDiskInfo {
+                    name: "default".to_string(),
+                    size: 2048,
+                    used: 0,
+                }],
+            )
+            .await?;
+        let disks = db.list_host_disks(host_id).await?;
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0].size, 2048);
+        Ok(())
+    }
+
+    /// An LNVPS-owned host's pools are not all for guests: `local` and
+    /// `backups` on a Proxmox host are Proxmox's own. Importing them would put
+    /// the operator's backup space up for sale.
+    #[tokio::test]
+    async fn a_proxmox_pool_is_not_imported() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let host_id = db
+            .create_host(&VmHost {
+                kind: VmHostKind::Proxmox,
+                region_id: 1,
+                name: "pve".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let host = db.get_host(host_id).await?;
+        let worker = setup_worker(db.clone()).await?;
+
+        worker
+            .reconcile_host_disks(
+                &host,
+                &[lnvps_api_common::host::VmHostDiskInfo {
+                    name: "backups".to_string(),
+                    size: 1024,
+                    used: 0,
+                }],
+            )
+            .await?;
+
+        assert!(
+            db.list_host_disks(host_id).await?.is_empty(),
+            "an unmapped pool on an LNVPS host stays unmapped"
+        );
         Ok(())
     }
 

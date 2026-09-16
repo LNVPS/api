@@ -109,6 +109,15 @@ async fn lnvps_can_read_a_nodes_status() -> Result<()> {
     // An unconfigured machine, reported as one rather than as an error.
     assert!(!status.dataplane.tunnel_up);
     assert!(!status.dataplane.firewall.available);
+
+    // The hardware report LNVPS records instead of running host-info over SSH.
+    // A node has no SSH account to hand out, so if this arrives empty the host
+    // silently keeps whatever CPU features it was last given.
+    assert!(
+        !status.inventory.cpu.arch.is_empty(),
+        "a node reports the architecture it is running on"
+    );
+    assert!(status.inventory.memory.total_bytes > 0);
     Ok(())
 }
 

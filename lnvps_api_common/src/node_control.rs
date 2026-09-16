@@ -99,8 +99,51 @@ pub struct NodeStatus {
     /// Daemon version, so LNVPS can tell what a node is running.
     #[serde(default)]
     pub version: String,
+    /// What the machine is, as the node's own detection reports it.
+    ///
+    /// The same code as the `lnvps-host-info` binary LNVPS runs over SSH on its
+    /// own hypervisors — which is why marketplace nodes are not asked over SSH:
+    /// they have no account to give out, and the answer is already here.
+    #[serde(default)]
+    pub inventory: NodeInventory,
     #[serde(default)]
     pub dataplane: NodeDataPlaneState,
+}
+
+/// The part of a node's inventory LNVPS records, as `lnvps_node::inventory`
+/// states it. Deliberately a subset: fields nothing reads would be fields free
+/// to drift.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct NodeInventory {
+    #[serde(default)]
+    pub cpu: NodeCpu,
+    #[serde(default)]
+    pub memory: NodeMemory,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct NodeCpu {
+    /// Vendor: `amd`, `intel`, ...
+    #[serde(default)]
+    pub mfg: String,
+    /// Architecture: `x86_64`, `arm64`, ...
+    #[serde(default)]
+    pub arch: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Canonical LNVPS feature names.
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(default)]
+    pub threads: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct NodeMemory {
+    #[serde(default)]
+    pub total_bytes: u64,
+    #[serde(default)]
+    pub available_bytes: u64,
 }
 
 /// The node's view of its own network, as `lnvps_node::net::DataPlaneState`
