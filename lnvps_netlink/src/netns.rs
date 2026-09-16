@@ -57,7 +57,20 @@ pub fn path(root: &Path, name: &str) -> PathBuf {
 pub fn ensure(root: &Path, name: &str) -> Result<Handle> {
     let pinned = path(root, name);
     if pinned.exists() {
-        return Handle::open(&pinned);
+        if is_pinned_namespace(&pinned) {
+            return Handle::open(&pinned);
+        }
+        // An empty file where the pin should be: the bind mount is gone but the
+        // mount point it was made on is not. That is what a daemon holding the
+        // mount in a mount namespace of its own leaves behind (systemd's
+        // PrivateTmp and friends), and setns on it is EINVAL forever, so re-pin
+        // rather than crash-loop.
+        fs::remove_file(&pinned).with_context(|| {
+            format!(
+                "Cannot remove the stale namespace mount point {}",
+                pinned.display()
+            )
+        })?;
     }
 
     fs::create_dir_all(root)
@@ -96,7 +109,13 @@ pub fn ensure(root: &Path, name: &str) -> Result<Handle> {
         Ok(())
     })
     .join()
-    .map_err(|_| anyhow::anyhow!("The thread creating the namespace panicked"))??;
+    .map_err(|_| anyhow::anyhow!("The thread creating the namespace panicked"))
+    .and_then(|joined| joined)
+    .inspect_err(|_| {
+        // Otherwise every later start fails on the stale mount point instead of
+        // on whatever actually went wrong here.
+        let _ = fs::remove_file(&pinned);
+    })?;
 
     Handle::open(&pinned)
 }
@@ -170,6 +189,14 @@ impl Handle {
                 .map_err(|_| anyhow::anyhow!("A thread entering the namespace panicked"))?
         })
     }
+}
+
+/// Whether a pinned path is a namespace, rather than the empty file a lost bind
+/// mount leaves behind.
+fn is_pinned_namespace(pinned: &Path) -> bool {
+    nix::sys::statfs::statfs(pinned)
+        .map(|s| s.filesystem_type() == nix::sys::statfs::NSFS_MAGIC)
+        .unwrap_or(false)
 }
 
 /// `setns` on a raw fd, restricted to the network namespace.
