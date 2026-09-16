@@ -22,7 +22,7 @@ use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use nostr::PublicKey;
 use serde::Serialize;
@@ -62,6 +62,10 @@ pub struct ControlState {
     pub net: Arc<dyn crate::net::NetOps>,
     /// How the node reads its packet filter back, for the same reason.
     pub fw: Arc<dyn crate::fw::FirewallOps>,
+    /// The libvirt storage pool directory, when this node has one. `None`
+    /// before libvirt has been configured, which is when there is nowhere to
+    /// put an image rather than when fetching one is forbidden.
+    pub pool_dir: Option<std::path::PathBuf>,
 }
 
 impl ControlState {
@@ -78,7 +82,14 @@ impl ControlState {
             base_url: format!("https://{addr}"),
             net,
             fw,
+            pool_dir: None,
         }
+    }
+
+    /// Where OS images land, once libvirt is configured.
+    pub fn with_pool_dir(mut self, pool_dir: std::path::PathBuf) -> Self {
+        self.pool_dir = Some(pool_dir);
+        self
     }
 
     /// The data plane as this machine actually has it.
@@ -107,6 +118,7 @@ pub struct NodeStatus {
 pub fn router(state: Arc<ControlState>) -> Router {
     Router::new()
         .route("/api/v1/status", get(get_status))
+        .route("/api/v1/images", post(fetch_image))
         // Order matters: the body limit is outermost so an oversized body is
         // rejected before authentication reads it into memory.
         .layer(middleware::from_fn_with_state(state.clone(), authenticate))
@@ -236,6 +248,36 @@ async fn get_status(State(state): State<Arc<ControlState>>) -> Json<NodeStatus> 
         // configured, which is a truthful answer and one the gate can act on.
         dataplane: state.observe().await,
     })
+}
+
+/// Fetch an OS image onto this node, over the operator's own connection.
+///
+/// LNVPS names the URL and the digest; the bytes never cross the tunnel. A file
+/// that does not hash to what was asked for is not written, so delegating the
+/// download costs nothing in trust.
+async fn fetch_image(
+    State(state): State<Arc<ControlState>>,
+    Json(req): Json<crate::images::FetchRequest>,
+) -> Response {
+    let Some(pool_dir) = state.pool_dir.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "This node has no libvirt storage pool yet, so there is nowhere \
+                          to put an image"
+            })),
+        )
+            .into_response();
+    };
+
+    match crate::images::fetch(&pool_dir, &req).await {
+        Ok(outcome) => (StatusCode::OK, Json(outcome)).into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": format!("{e:#}") })),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]

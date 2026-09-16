@@ -131,6 +131,21 @@ pub trait VmHostClient: Send + Sync {
     /// that are detached from the running config (e.g. Proxmox `unused[n]`
     /// entries accumulated by repeated reinstalls). Defaults to a no-op for
     /// hosts that don't support the concept.
+    /// The volume name this host caches an OS image under, when it caches them
+    /// as named volumes. `None` for hosts that do not, which is how a caller
+    /// asks whether the image can be written by something other than us.
+    fn os_image_volume_name(&self, _image: &VmOsImage) -> Option<String> {
+        None
+    }
+
+    /// Re-read the image pool, after something other than this client wrote to
+    /// it — a marketplace node fetching an image itself. libvirt lists a
+    /// directory pool from its own cache, so without this the file is on disk
+    /// and the volume does not exist.
+    async fn refresh_image_pool(&self) -> OpResult<()> {
+        Ok(())
+    }
+
     async fn delete_unused_disks(&self, _vm: &Vm) -> OpResult<()> {
         Ok(())
     }

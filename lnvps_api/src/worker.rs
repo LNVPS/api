@@ -4094,20 +4094,95 @@ impl Worker {
         }
 
         let hosts = self.reconcile_hosts().await?;
-        let clients: Vec<(String, Arc<dyn VmHostClient>)> = hosts
-            .iter()
-            .filter_map(
-                |host| match get_host_client(host, &self.settings.provisioner_config) {
-                    Ok(c) => Some((host.name.clone(), c)),
-                    Err(e) => {
-                        warn!("Failed to get client for host {}: {}", host.name, e);
-                        None
-                    }
-                },
-            )
-            .collect();
+        let mut clients: Vec<(String, Arc<dyn VmHostClient>)> = Vec::new();
+        for host in &hosts {
+            let client = match get_host_client(host, &self.settings.provisioner_config) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Failed to get client for host {}: {}", host.name, e);
+                    continue;
+                }
+            };
+            // A marketplace node fetches for itself. Uploading would mean
+            // pulling every image into LNVPS and pushing it back out over the
+            // node's tunnel: the same gigabyte paid for twice, at tunnel speed,
+            // to a machine with its own connection.
+            if host.kind == VmHostKind::MarketplaceNode
+                && self.settings.node_control.is_some()
+                && let Err(e) = self
+                    .fetch_images_on_node(host, client.as_ref(), &images)
+                    .await
+            {
+                warn!("Failed to fetch images on node {}: {:?}", host.name, e);
+            } else if host.kind != VmHostKind::MarketplaceNode {
+                clients.push((host.name.clone(), client));
+            }
+        }
 
         download_images_on_hosts(clients, &images).await;
+        Ok(())
+    }
+
+    /// Ask a node to fetch each image itself, then make the pool show them.
+    ///
+    /// An image with no checksum is uploaded the old way instead: the node is
+    /// told a digest or it is told nothing, because a fetch nobody can check is
+    /// a volume LNVPS has no reason to believe holds the image it asked for.
+    async fn fetch_images_on_node(
+        &self,
+        host: &VmHost,
+        client: &dyn VmHostClient,
+        images: &[VmOsImage],
+    ) -> Result<()> {
+        let control = self
+            .settings
+            .node_control
+            .as_ref()
+            .context("No marketplace control key is configured")?;
+        let node_id = host
+            .marketplace_node_id
+            .context("Host is a marketplace node with no node behind it")?;
+        let node = self.db.get_marketplace_node(node_id).await?;
+
+        let mut fetched = false;
+        for image in images {
+            let volume = client.os_image_volume_name(image);
+            let checksum = image.sha2.clone().filter(|s| s.len() == 64);
+            let (Some(name), Some(sha256)) = (volume, checksum) else {
+                info!(
+                    "Image {} has no volume name or no sha256, uploading it to {} instead",
+                    image.url, host.name
+                );
+                if let Err(e) = client.download_os_image(image).await {
+                    warn!(
+                        "Failed to upload image {} to node {}: {}",
+                        image.url, host.name, e
+                    );
+                }
+                continue;
+            };
+
+            let request = lnvps_api_common::node_control::NodeImageFetch {
+                url: image.url.clone(),
+                sha256,
+                name,
+            };
+            info!("Asking node {} to fetch {}", host.name, image.url);
+            match control.fetch_image(&node, host, &request).await {
+                Ok(()) => fetched = true,
+                Err(e) => warn!(
+                    "Node {} could not fetch image {}: {}",
+                    host.name, image.url, e
+                ),
+            }
+        }
+
+        // Once, after the whole set: libvirt lists a directory pool from its
+        // own cache, so until this runs the files are on the node's disk and
+        // the volumes do not exist.
+        if fetched {
+            client.refresh_image_pool().await?;
+        }
         Ok(())
     }
 

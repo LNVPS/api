@@ -37,15 +37,18 @@ async fn start_node(control_pubkey: nostr::PublicKey, address: &str) -> Result<N
     let tls = lnvps_node::tls::load_or_generate(state_dir.path(), Some(addr.ip()))?;
     let fingerprint = hex::decode(&tls.fingerprint)?;
 
-    let state = Arc::new(lnvps_node::control::ControlState::new(
-        control_pubkey,
-        addr,
-        // This test is about who may call the node and whether its answer can
-        // be trusted, not about what it reports, so an unconfigured machine is
-        // the honest thing to report.
-        Arc::new(lnvps_node::net::UnavailableKernel),
-        Arc::new(lnvps_node::fw::UnavailableFirewall),
-    ));
+    let state = Arc::new(
+        lnvps_node::control::ControlState::new(
+            control_pubkey,
+            addr,
+            // This test is about who may call the node and whether its answer can
+            // be trusted, not about what it reports, so an unconfigured machine is
+            // the honest thing to report.
+            Arc::new(lnvps_node::net::UnavailableKernel),
+            Arc::new(lnvps_node::fw::UnavailableFirewall),
+        )
+        .with_pool_dir(state_dir.path().join("images")),
+    );
     tokio::spawn(async move { lnvps_node::control::serve(state, addr, tls).await });
 
     for _ in 0..100 {
@@ -118,6 +121,35 @@ async fn lnvps_can_read_a_nodes_status() -> Result<()> {
         "a node reports the architecture it is running on"
     );
     assert!(status.inventory.memory.total_bytes > 0);
+    Ok(())
+}
+
+/// The image endpoint: LNVPS signs a POST over its body, the node verifies it
+/// and runs the fetch itself. This is the call that replaces uploading a
+/// gigabyte down the tunnel, so the two halves agreeing on the route, the body
+/// and the payload tag is the whole point.
+#[tokio::test]
+async fn lnvps_can_ask_a_node_to_fetch_an_image() -> Result<()> {
+    let lnvps = Keys::generate();
+    let node = start_node(lnvps.public_key(), "127.0.0.4").await?;
+    let control = NodeControl::new(&lnvps.secret_key().to_secret_hex())?;
+
+    // Refused by the node's own rule, which is the proof the request arrived
+    // authenticated and was read as a request rather than rejected as one:
+    // an unauthenticated call never reaches this message.
+    let err = control
+        .fetch_image(
+            &node_row(node.fingerprint.clone()),
+            &host_row(node.addr),
+            &lnvps_api_common::node_control::NodeImageFetch {
+                url: "http://example.invalid/image.img".to_string(),
+                sha256: "ab".repeat(32),
+                name: "os-image-1.raw".to_string(),
+            },
+        )
+        .await
+        .expect_err("a plain http URL must be refused");
+    assert!(err.to_string().contains("https"), "{err}");
     Ok(())
 }
 

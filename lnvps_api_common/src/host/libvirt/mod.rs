@@ -344,6 +344,24 @@ impl VmHostClient for LibVirtHost {
         Ok(())
     }
 
+    fn os_image_volume_name(&self, image: &VmOsImage) -> Option<String> {
+        Some(os_image_volume(
+            image.id,
+            VolumeFormat::from_url(&image.url),
+        ))
+    }
+
+    async fn refresh_image_pool(&self) -> OpResult<()> {
+        let pool_name = self.image_pool();
+        self.conn
+            .run(move |c| {
+                let pool = storage::find_pool(c, &pool_name)?;
+                pool.refresh(0)
+                    .map_err(|e| map_virt_error("refresh_storage_pool", e))
+            })
+            .await
+    }
+
     async fn generate_mac(&self, _vm: &Vm) -> OpResult<String> {
         // 52:54:00 is the QEMU/KVM assigned OUI.
         Ok(format!(

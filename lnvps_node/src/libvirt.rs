@@ -193,7 +193,7 @@ impl Paths {
     }
 
     /// Where the pool's volumes are written.
-    fn pool_dir(&self) -> PathBuf {
+    pub fn pool_dir(&self) -> PathBuf {
         self.root.join(POOL_DIR)
     }
 

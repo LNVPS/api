@@ -236,8 +236,12 @@ async fn run(config_path: &Path) -> Result<()> {
             .with_context(|| format!("Cannot bind the control API to {addr}"))
     })?;
 
+    // The pool the daemon built for LNVPS's libvirtd: where a fetched OS image
+    // lands, so LNVPS can ask for one instead of pushing it down the tunnel.
+    let pool_dir = lnvps_node::libvirt::Paths::new(&config.state_dir).pool_dir();
+
     control::serve_on(
-        Arc::new(ControlState::new(control_pubkey, addr, kernel, fw)),
+        Arc::new(ControlState::new(control_pubkey, addr, kernel, fw).with_pool_dir(pool_dir)),
         listener,
         tls,
     )

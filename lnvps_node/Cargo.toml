@@ -30,6 +30,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # approach as lnvps_fw's control API.
 rcgen = "0.13"
 base64 = "0.22"
+# Verifying an image the node fetched against the digest LNVPS named.
+sha2 = "0.10"
 clap = { version = "4.5", features = ["derive"] }
 
 # Control API: axum over rustls. HTTPS is not optional — LNVPS pins the
