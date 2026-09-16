@@ -1434,7 +1434,8 @@ impl Worker {
                 );
                 let moved = self.db.get_vm(vm.id).await?;
                 let host = self.db.get_host(moved.host_id).await?;
-                let client = get_host_client(&host, &self.settings.provisioner_config)?;
+                let client =
+                    get_host_client(&self.db, &host, &self.settings.provisioner_config).await?;
                 match client.get_vm_state(&moved).await {
                     Ok(s) => self.vm_state_cache.set_state(moved.id, s).await?,
                     Err(e) => warn!(
@@ -1488,7 +1489,7 @@ impl Worker {
     /// are omitted.
     async fn list_unmanaged_vms(&self, host_id: u64) -> Result<Vec<lnvps_api_common::HostVmSpec>> {
         let host = self.db.get_host(host_id).await?;
-        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.settings.provisioner_config).await?;
         let all = client.list_host_vms().await?;
 
         let mut unmanaged = Vec::new();
@@ -1517,7 +1518,7 @@ impl Worker {
     async fn check_vm(&self, vm: &Vm) -> Result<()> {
         debug!("Checking VM: {}", vm.id);
         let host = self.db.get_host(vm.host_id).await?;
-        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.settings.provisioner_config).await?;
         self.handle_vm_state(
             client
                 .get_vm_state(vm)
@@ -1708,7 +1709,7 @@ impl Worker {
     async fn check_vms_on_host(&self, host_id: u64, vms: &[&Vm]) -> Result<()> {
         debug!("Checking {} VMs on host {}", vms.len(), host_id);
         let host = self.db.get_host(host_id).await?;
-        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.settings.provisioner_config).await?;
 
         let states = client.get_all_vm_states().await?;
         let state_map: HashMap<u64, VmRunningState> = states.into_iter().collect();
@@ -2407,7 +2408,8 @@ impl Worker {
         if host.kind == VmHostKind::Dummy {
             return Ok(());
         }
-        let client = match get_host_client(host, &self.settings.provisioner_config) {
+        let client = match get_host_client(&self.db, host, &self.settings.provisioner_config).await
+        {
             Ok(h) => h,
             Err(e) => bail!("Failed to get host client: {} {}", host.name, e),
         };
@@ -4096,93 +4098,13 @@ impl Worker {
         let hosts = self.reconcile_hosts().await?;
         let mut clients: Vec<(String, Arc<dyn VmHostClient>)> = Vec::new();
         for host in &hosts {
-            let client = match get_host_client(host, &self.settings.provisioner_config) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!("Failed to get client for host {}: {}", host.name, e);
-                    continue;
-                }
-            };
-            // A marketplace node fetches for itself. Uploading would mean
-            // pulling every image into LNVPS and pushing it back out over the
-            // node's tunnel: the same gigabyte paid for twice, at tunnel speed,
-            // to a machine with its own connection.
-            if host.kind == VmHostKind::MarketplaceNode
-                && self.settings.node_control.is_some()
-                && let Err(e) = self
-                    .fetch_images_on_node(host, client.as_ref(), &images)
-                    .await
-            {
-                warn!("Failed to fetch images on node {}: {:?}", host.name, e);
-            } else if host.kind != VmHostKind::MarketplaceNode {
-                clients.push((host.name.clone(), client));
+            match get_host_client(&self.db, host, &self.settings.provisioner_config).await {
+                Ok(c) => clients.push((host.name.clone(), c)),
+                Err(e) => warn!("Failed to get client for host {}: {}", host.name, e),
             }
         }
 
         download_images_on_hosts(clients, &images).await;
-        Ok(())
-    }
-
-    /// Ask a node to fetch each image itself, then make the pool show them.
-    ///
-    /// An image with no checksum is uploaded the old way instead: the node is
-    /// told a digest or it is told nothing, because a fetch nobody can check is
-    /// a volume LNVPS has no reason to believe holds the image it asked for.
-    async fn fetch_images_on_node(
-        &self,
-        host: &VmHost,
-        client: &dyn VmHostClient,
-        images: &[VmOsImage],
-    ) -> Result<()> {
-        let control = self
-            .settings
-            .node_control
-            .as_ref()
-            .context("No marketplace control key is configured")?;
-        let node_id = host
-            .marketplace_node_id
-            .context("Host is a marketplace node with no node behind it")?;
-        let node = self.db.get_marketplace_node(node_id).await?;
-
-        let mut fetched = false;
-        for image in images {
-            let volume = client.os_image_volume_name(image);
-            let checksum = image.sha2.clone().filter(|s| s.len() == 64);
-            let (Some(name), Some(sha256)) = (volume, checksum) else {
-                info!(
-                    "Image {} has no volume name or no sha256, uploading it to {} instead",
-                    image.url, host.name
-                );
-                if let Err(e) = client.download_os_image(image).await {
-                    warn!(
-                        "Failed to upload image {} to node {}: {}",
-                        image.url, host.name, e
-                    );
-                }
-                continue;
-            };
-
-            let request = lnvps_api_common::node_control::NodeImageFetch {
-                url: image.url.clone(),
-                sha256,
-                name,
-            };
-            info!("Asking node {} to fetch {}", host.name, image.url);
-            match control.fetch_image(&node, host, &request).await {
-                Ok(()) => fetched = true,
-                Err(e) => warn!(
-                    "Node {} could not fetch image {}: {}",
-                    host.name, image.url, e
-                ),
-            }
-        }
-
-        // Once, after the whole set: libvirt lists a directory pool from its
-        // own cache, so until this runs the files are on the node's disk and
-        // the volumes do not exist.
-        if fetched {
-            client.refresh_image_pool().await?;
-        }
         Ok(())
     }
 
@@ -4406,7 +4328,7 @@ impl Worker {
                 Box::pin(async move {
                     let vm = ctx.db.get_vm(ctx.vm_id).await?;
                     let host = ctx.db.get_host(vm.host_id).await?;
-                    let client = get_host_client(&host, &ctx.settings.provisioner_config)?;
+                    let client = get_host_client(&ctx.db, &host, &ctx.settings.provisioner_config).await?;
 
                     info!("Stopping VM {} for upgrade", ctx.vm_id);
                     if let Err(e) = client.stop_vm(&vm).await {
@@ -4421,7 +4343,7 @@ impl Worker {
                     if ctx.cfg.new_disk.is_some() {
                         let full_info = FullVmInfo::load(ctx.vm_id, ctx.db.clone()).await?;
                         let host = ctx.db.get_host(full_info.host.id).await?;
-                        let client = get_host_client(&host, &ctx.settings.provisioner_config)?;
+                        let client = get_host_client(&ctx.db, &host, &ctx.settings.provisioner_config).await?;
 
                         info!("Resizing disk for VM {}", ctx.vm_id);
                         client.resize_disk(&full_info).await?;
@@ -4434,7 +4356,7 @@ impl Worker {
                     if ctx.cfg.new_cpu.is_some() || ctx.cfg.new_memory.is_some() {
                         let full_info = FullVmInfo::load(ctx.vm_id, ctx.db.clone()).await?;
                         let host = ctx.db.get_host(full_info.host.id).await?;
-                        let client = get_host_client(&host, &ctx.settings.provisioner_config)?;
+                        let client = get_host_client(&ctx.db, &host, &ctx.settings.provisioner_config).await?;
 
                         info!("Updating CPU/memory configuration for VM {}", ctx.vm_id);
                         client.configure_vm(&full_info).await?;
@@ -4446,7 +4368,7 @@ impl Worker {
                 Box::pin(async move {
                     let vm = ctx.db.get_vm(ctx.vm_id).await?;
                     let host = ctx.db.get_host(vm.host_id).await?;
-                    let client = get_host_client(&host, &ctx.settings.provisioner_config)?;
+                    let client = get_host_client(&ctx.db, &host, &ctx.settings.provisioner_config).await?;
 
                     info!("Starting VM {} after upgrade", ctx.vm_id);
                     client.start_vm(&vm).await?;
@@ -4493,7 +4415,7 @@ impl Worker {
 
         let full_info = FullVmInfo::load(vm_id, self.db.clone()).await?;
         let host = self.db.get_host(full_info.host.id).await?;
-        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.settings.provisioner_config).await?;
 
         client.configure_vm(&full_info).await?;
 
@@ -4515,7 +4437,7 @@ impl Worker {
 
         let full_info = FullVmInfo::load(vm_id, self.db.clone()).await?;
         let host = self.db.get_host(full_info.host.id).await?;
-        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.settings.provisioner_config).await?;
 
         client.patch_firewall(&full_info).await?;
 

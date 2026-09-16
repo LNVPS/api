@@ -20,6 +20,7 @@ pub mod cloud_init;
 pub mod config;
 #[cfg(feature = "libvirt")]
 mod libvirt;
+pub mod marketplace_node;
 pub mod marketplace_pki;
 #[cfg(feature = "proxmox")]
 mod proxmox;
@@ -195,11 +196,11 @@ pub async fn get_vm_host_client(
 ) -> Result<Arc<dyn VmHostClient>> {
     let vm = db.get_vm(vm_id).await?;
     let host = db.get_host(vm.host_id).await?;
-    let client = get_host_client(&host, cfg)?;
-    Ok(client)
+    get_host_client(db, &host, cfg).await
 }
 
-pub fn get_host_client(
+pub async fn get_host_client(
+    db: &Arc<dyn LNVpsDb>,
     host: &VmHost,
     // Only read by the hypervisor-specific arms below, so it is unused when the
     // crate is built with neither `proxmox` nor `libvirt` enabled.
@@ -258,7 +259,20 @@ pub fn get_host_client(
                 );
             }
             let uri = marketplace_pki::connection_uri(&host.ip, &pki);
-            Arc::new(libvirt::LibVirtHost::new(&uri, libvirt)?)
+            let inner: Arc<dyn VmHostClient> = Arc::new(libvirt::LibVirtHost::new(&uri, libvirt)?);
+            // With a control key the node can be asked to fetch its own OS
+            // images, which is the difference between LNVPS paying for every
+            // gigabyte twice and the machine using the connection it has.
+            // Without one it is still driven, just fed.
+            match marketplace.control_key.as_deref() {
+                Some(key) => Arc::new(marketplace_node::MarketplaceNodeHost::new(
+                    inner,
+                    crate::node_control::NodeControl::new(key)?,
+                    db.get_marketplace_node(node_id).await?,
+                    host.clone(),
+                )),
+                None => inner,
+            }
         }
         VmHostKind::Dummy => {
             if cfg!(test) {
@@ -663,6 +677,13 @@ mod marketplace_client_tests {
     use super::config::{MarketplaceLibvirtConfig, ProvisionerConfig, QemuConfig};
     use super::*;
 
+    /// A database the marketplace arm can read a node row from. None of these
+    /// tests get far enough to need one that has the node in it: they all fail
+    /// before the lookup, which is the point.
+    fn db() -> Arc<dyn LNVpsDb> {
+        Arc::new(crate::MockDb::default())
+    }
+
     fn host(node_id: Option<u64>) -> VmHost {
         VmHost {
             id: 1,
@@ -701,6 +722,7 @@ mod marketplace_client_tests {
                 client_cert: dir.path().join("client.pem"),
                 client_key: dir.path().join("client.key"),
                 pki_dir: dir.path().join("pki"),
+                control_key: None,
             }),
         }
     }
@@ -709,10 +731,11 @@ mod marketplace_client_tests {
     /// dialled. Connecting without one would mean not checking which machine
     /// answered — and the machine is the operator's, on an address their own
     /// guests share a namespace with.
-    #[test]
-    fn an_unverifiable_node_is_not_dialled() {
+    #[tokio::test]
+    async fn an_unverifiable_node_is_not_dialled() {
         let dir = TempDir::new().unwrap();
-        let err = get_host_client(&host(Some(9)), &config(&dir))
+        let err = get_host_client(&db(), &host(Some(9)), &config(&dir))
+            .await
             .err()
             .expect("an unverifiable node must not produce a client");
 
@@ -721,10 +744,11 @@ mod marketplace_client_tests {
 
     /// A marketplace host with no node behind it is a broken row, and is named
     /// as such rather than producing a connection to nowhere.
-    #[test]
-    fn a_host_with_no_node_is_an_error() {
+    #[tokio::test]
+    async fn a_host_with_no_node_is_an_error() {
         let dir = TempDir::new().unwrap();
-        let err = get_host_client(&host(None), &config(&dir))
+        let err = get_host_client(&db(), &host(None), &config(&dir))
+            .await
             .err()
             .expect("a host with no node must not produce a client");
 
@@ -734,21 +758,21 @@ mod marketplace_client_tests {
     /// Without a client identity, no VM is placed on a node at all. The
     /// alternative is an unauthenticated hypervisor connection over the tunnel,
     /// which is worse than not having the feature.
-    #[test]
-    fn no_client_identity_means_no_marketplace_hosts() {
+    #[tokio::test]
+    async fn no_client_identity_means_no_marketplace_hosts() {
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
         cfg.marketplace = None;
 
-        assert!(get_host_client(&host(Some(9)), &cfg).is_err());
+        assert!(get_host_client(&db(), &host(Some(9)), &cfg).await.is_err());
     }
 
     /// A node can register its certificate before its tunnel is allocated, so
     /// the anchor can exist while the host's address is still blank. Dialling
     /// that would fail later as an opaque libvirt connect error rather than the
     /// named one the design calls for.
-    #[test]
-    fn a_node_with_no_tunnel_address_is_not_dialled() {
+    #[tokio::test]
+    async fn a_node_with_no_tunnel_address_is_not_dialled() {
         let dir = TempDir::new().unwrap();
         let cfg = config(&dir);
 
@@ -761,7 +785,8 @@ mod marketplace_client_tests {
         let mut host = host(Some(9));
         host.ip = String::new();
 
-        let err = get_host_client(&host, &cfg)
+        let err = get_host_client(&db(), &host, &cfg)
+            .await
             .err()
             .expect("a node with no address must not produce a client");
         assert!(err.to_string().contains("no tunnel address"), "{err}");

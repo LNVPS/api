@@ -1313,6 +1313,7 @@ mod libvirt_tests {
                 client_cert: dir.path().join("client.pem"),
                 client_key: dir.path().join("client.key"),
                 pki_dir: dir.path().join("pki"),
+                control_key: None,
             }
         });
         settings

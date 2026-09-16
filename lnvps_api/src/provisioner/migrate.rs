@@ -299,7 +299,7 @@ impl VmProvisioner {
             &capacity,
         )?;
 
-        let source_client = get_host_client(&source_host, self.config())?;
+        let source_client = get_host_client(self.db(), &source_host, self.config()).await?;
         let was_running = matches!(
             source_client.get_vm_state(&vm).await.map(|s| s.state),
             Ok(VmRunningStates::Running)
@@ -339,7 +339,7 @@ impl VmProvisioner {
 
         // Start it again where it now lives; an online migration never stopped.
         if was_running && !live {
-            let target_client = get_host_client(&target_host, self.config())?;
+            let target_client = get_host_client(self.db(), &target_host, self.config()).await?;
             if let Err(e) = target_client.start_vm(&vm).await {
                 warn!(
                     "VM {} migrated to host {} but failed to start: {}",
@@ -389,7 +389,7 @@ impl VmProvisioner {
         let mut observed: HashMap<u64, Vec<HostVmSpec>> = HashMap::new();
         let mut unreachable = 0;
         for host in &hosts {
-            let client = match get_host_client(host, self.config()) {
+            let client = match get_host_client(self.db(), host, self.config()).await {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("Skipping host {} in placement check: {}", host.id, e);

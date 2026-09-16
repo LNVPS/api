@@ -1085,7 +1085,7 @@ async fn v1_patch_vm(
     if host_config {
         let info = FullVmInfo::load(vm.id, this.db.clone()).await?;
         let host = this.db.get_host(vm.host_id).await?;
-        let client = get_host_client(&host, &this.settings.provisioner)?;
+        let client = get_host_client(&this.db, &host, &this.settings.provisioner).await?;
         client.configure_vm(&info).await?;
 
         // Log VM configuration change
@@ -1653,7 +1653,7 @@ async fn v1_start_vm(
 ) -> ApiResult<()> {
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
     let host = this.db.get_host(vm.host_id).await?;
-    let client = get_host_client(&host, &this.settings.provisioner)?;
+    let client = get_host_client(&this.db, &host, &this.settings.provisioner).await?;
     client.start_vm(&vm).await?;
 
     // Log VM start
@@ -1673,7 +1673,7 @@ async fn v1_stop_vm(
 ) -> ApiResult<()> {
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
     let host = this.db.get_host(vm.host_id).await?;
-    let client = get_host_client(&host, &this.settings.provisioner)?;
+    let client = get_host_client(&this.db, &host, &this.settings.provisioner).await?;
     client.stop_vm(&vm).await?;
 
     // Log VM stop
@@ -1693,7 +1693,7 @@ async fn v1_restart_vm(
 ) -> ApiResult<()> {
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
     let host = this.db.get_host(vm.host_id).await?;
-    let client = get_host_client(&host, &this.settings.provisioner)?;
+    let client = get_host_client(&this.db, &host, &this.settings.provisioner).await?;
     // Hard reset (restart) the VM — previously this only issued a stop, leaving
     // the VM powered off.
     client.reset_vm(&vm).await?;
@@ -1832,7 +1832,7 @@ async fn v1_time_series(
 ) -> ApiResult<Vec<TimeSeriesData>> {
     let (_, vm) = get_user_vm(&auth, &this, id).await?;
     let host = this.db.get_host(vm.host_id).await?;
-    let client = get_host_client(&host, &this.settings.provisioner)?;
+    let client = get_host_client(&this.db, &host, &this.settings.provisioner).await?;
     ApiData::ok(client.get_time_series_data(&vm, TimeSeries::Hourly).await?)
 }
 
@@ -1859,7 +1859,8 @@ async fn v1_terminal_proxy(
         .get_host(vm.host_id)
         .await
         .map_err(|_| "VM host not found")?;
-    let client = get_host_client(&host, &this.settings.provisioner)
+    let client = get_host_client(&this.db, &host, &this.settings.provisioner)
+        .await
         .map_err(|_| "Failed to get host client")?;
 
     let mut terminal = client.connect_terminal(&vm).await.map_err(|e| {

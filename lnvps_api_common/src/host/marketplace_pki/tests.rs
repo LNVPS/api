@@ -17,6 +17,7 @@ fn config(dir: &TempDir) -> MarketplaceLibvirtConfig {
         client_cert: cert,
         client_key: key,
         pki_dir: dir.path().join("pki"),
+        control_key: None,
     }
 }
 

@@ -503,7 +503,7 @@ async fn a_probe_cleans_up_after_itself() -> Result<()> {
     // waits for is the whole thing, not the part that thought to measure itself.
     assert!(result.provision_ms.is_some());
 
-    let client = lnvps_api_common::host::get_host_client(&spec.host, &dummy_cfg())?;
+    let client = lnvps_api_common::host::get_host_client(&db, &spec.host, &dummy_cfg()).await?;
     assert!(
         client.get_vm_state(&spec.vm_info().vm).await.is_err(),
         "the probe VM outlived its probe"
@@ -536,7 +536,7 @@ async fn a_failed_measurement_still_destroys_the_vm() -> Result<()> {
             .contains("could not log in")
     );
 
-    let client = lnvps_api_common::host::get_host_client(&spec.host, &dummy_cfg())?;
+    let client = lnvps_api_common::host::get_host_client(&db, &spec.host, &dummy_cfg()).await?;
     assert!(client.get_vm_state(&spec.vm_info().vm).await.is_err());
     Ok(())
 }
@@ -554,7 +554,7 @@ async fn a_stale_probe_is_cleared_first() -> Result<()> {
     let spec = dummy_spec(&db, &node).await?;
 
     // A probe VM from a run that never finished.
-    let client = lnvps_api_common::host::get_host_client(&spec.host, &dummy_cfg())?;
+    let client = lnvps_api_common::host::get_host_client(&db, &spec.host, &dummy_cfg()).await?;
     client.create_vm(&spec.vm_info()).await?;
     assert!(client.get_vm_state(&spec.vm_info().vm).await.is_ok());
 

@@ -169,6 +169,7 @@ fn lnvps_pki(dir: &std::path::Path) -> Result<MarketplaceLibvirtConfig> {
         client_cert: dir.join("client.pem"),
         client_key: dir.join("client.key"),
         pki_dir: dir.join("pki"),
+        control_key: None,
     })
 }
 
@@ -517,7 +518,7 @@ async fn a_probe_proves_a_node_can_carry_a_customer() -> Result<()> {
             .enable_all()
             .build()?
             .block_on(async {
-                let client = lnvps_api_common::host::get_host_client(&host, &cfg)?;
+                let client = lnvps_api_common::host::get_host_client(&db, &host, &cfg).await?;
                 Ok(client.get_vm_state(&probe_vm).await.is_ok())
             })
     })?;

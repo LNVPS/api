@@ -84,6 +84,12 @@ impl VmProvisioner {
         &self.provisioner_config
     }
 
+    /// The database, for the host-client factory: a marketplace node's client
+    /// is built from the node row as well as the config.
+    pub fn db(&self) -> &Arc<dyn LNVpsDb> {
+        &self.db
+    }
+
     /// Do any necessary initialization
     pub async fn init(&self) -> Result<()> {
         Ok(())
@@ -412,7 +418,7 @@ impl VmProvisioner {
         let host = self.db.get_host(host_id).await?;
 
         // Discover the VM on the host
-        let client = get_host_client(&host, &self.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.provisioner_config).await?;
         let spec = client
             .list_host_vms()
             .await?
@@ -579,7 +585,7 @@ impl VmProvisioner {
     /// Apply vm config to host
     pub async fn apply_vm_config_to_host(&self, vm_id: u64) -> OpResult<()> {
         let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
-        let client = get_host_client(&info.host, &self.provisioner_config)?;
+        let client = get_host_client(&self.db, &info.host, &self.provisioner_config).await?;
         client.configure_vm(&info).await
     }
 
@@ -597,7 +603,7 @@ impl VmProvisioner {
         let ctx = SpawnVmContext {
             db: self.db.clone(),
             network: self.network.clone(),
-            host_client: get_host_client(&info.host, &self.provisioner_config)?,
+            host_client: get_host_client(&self.db, &info.host, &self.provisioner_config).await?,
             generated_mac: None,
             created_ips: vec![],
             // What the row held before this run touched anything, so a rollback
@@ -777,7 +783,7 @@ impl VmProvisioner {
         let line_item_id = vm.subscription_line_item_id;
         let host = self.db.get_host(vm.host_id).await?;
 
-        let client = get_host_client(&host, &self.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.provisioner_config).await?;
         let pipeline = Pipeline::new((self.db.clone(), client, self.network.clone()))
             .step("host_delete_vm", |ctx| Box::pin(ctx.1.delete_vm(&vm)))
             .step("delete_ips", |ctx| {
@@ -820,7 +826,7 @@ impl VmProvisioner {
         }
 
         let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
-        let host_client = get_host_client(&info.host, &self.provisioner_config)?;
+        let host_client = get_host_client(&self.db, &info.host, &self.provisioner_config).await?;
 
         struct ReinstallContext {
             vm_id: u64,
@@ -874,7 +880,7 @@ impl VmProvisioner {
         let vm = self.db.get_vm(vm_id).await?;
         let host = self.db.get_host(vm.host_id).await?;
 
-        let client = get_host_client(&host, &self.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.provisioner_config).await?;
         client.start_vm(&vm).await?;
         Ok(())
     }
@@ -884,7 +890,7 @@ impl VmProvisioner {
         let vm = self.db.get_vm(vm_id).await?;
         let host = self.db.get_host(vm.host_id).await?;
 
-        let client = get_host_client(&host, &self.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.provisioner_config).await?;
         client.stop_vm(&vm).await?;
         Ok(())
     }

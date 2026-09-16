@@ -383,7 +383,7 @@ where
     Fut: std::future::Future<Output = Result<ProbeResult>>,
 {
     let _ = db;
-    let client = match get_host_client(&spec.host, cfg) {
+    let client = match get_host_client(db, &spec.host, cfg).await {
         Ok(c) => c,
         Err(e) => return ProbeResult::failed(format!("cannot reach the node: {e}")),
     };

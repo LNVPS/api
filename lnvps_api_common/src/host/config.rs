@@ -52,6 +52,13 @@ pub struct MarketplaceLibvirtConfig {
     /// within one poll interval instead of needing an operator to act.
     #[serde(default = "default_marketplace_pki_dir")]
     pub pki_dir: PathBuf,
+    /// LNVPS's control key (`nsec…` or hex), the same identity the API signs
+    /// node calls with. A copy rather than a reference to `nostr.nsec`, because
+    /// this config is what a host client is built from and it has no way to
+    /// reach the rest of the settings. Without it a node is still driven over
+    /// libvirt, but cannot be asked to fetch its own OS images.
+    #[serde(default)]
+    pub control_key: Option<String>,
 }
 
 fn default_marketplace_pki_dir() -> PathBuf {
