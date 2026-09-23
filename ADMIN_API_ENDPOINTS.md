@@ -5088,11 +5088,78 @@ Response:
   `out_of_scope` sales are excluded (domestic sales belong on the national VAT
   return, not the OSS return).
 - Uses each payment's frozen per-line `tax_breakdown` when present, else the
-  payment's summary tax fields when the whole payment was treated as `oss_b2c`.
+  payment's summary tax fields when the whole payment was treated as `oss_b2c`,
+  with the payment `amount` as the net.
+- Payments with no recorded treatment are left out; `GET /api/admin/v1/reports/vat`
+  reports them with an inferred country.
 - `country_code` is the destination member state (ISO 3166-1 alpha-3).
 - Amounts are in smallest currency units (cents for fiat, millisats for BTC).
 - Payments whose currency cannot be converted to the company base currency are
   skipped.
+
+#### VAT Report
+
+```
+GET /api/admin/v1/reports/vat
+```
+
+Every paid sale bucketed by tax treatment, so one call covers both the national
+VAT return (the `domestic` rows) and the OSS return (the `oss_b2c` rows). Takes
+the same query parameters as the OSS report and follows the same rules: amounts
+are in each company's base currency at the rate frozen on the payment, refunds
+net off against the bucket they reverse, and `net_total`/`tax_total` are signed.
+
+Rows are keyed by `(period, company, treatment, country, VAT rate, inferred)`.
+
+Query Parameters:
+
+- `start_date`: string (required) - YYYY-MM-DD
+- `end_date`: string (required) - YYYY-MM-DD
+- `company_id`: number (optional) - filter to one seller company; `0`/omitted = all companies.
+- `period`: `quarter` (default) | `bimonthly`.
+
+Required Permission: `analytics::view`
+
+Response:
+
+```json
+{
+  "data": {
+    "start_date": "2026-01-01",
+    "end_date": "2026-02-28",
+    "period": "bimonthly",
+    "rows": [
+      {
+        "period": "2026-B1",
+        "company_id": 1,
+        "company_name": "LNVPS",
+        "currency": "EUR",
+        "treatment": "domestic",
+        "country_code": "IRL",
+        "vat_rate": 23.0,
+        "net_total": 480000,
+        "tax_total": 110400,
+        "transaction_count": 41,
+        "inferred": false
+      }
+    ]
+  }
+}
+```
+
+**Notes:**
+
+- `treatment` is one of `domestic`, `oss_b2c`, `reverse_charge`,
+  `out_of_scope` or `undetermined_default`.
+- `inferred: true` marks a payment that recorded no tax treatment, which is
+  every payment from before tax calculation shipped. Its country and treatment
+  are worked out now from the customer's **current** declared country, IP
+  country and VAT number, using the same rules checkout applies, so they may not
+  match where the customer was at the time. `vat_rate` and `tax_total` are what
+  was actually charged, normally `0`.
+- A customer with no country at all lands in `undetermined_default` under the
+  seller's country.
+- `country_code` is null only for a seller outside the EU VAT area.
 
 #### Fleet Traffic Report
 

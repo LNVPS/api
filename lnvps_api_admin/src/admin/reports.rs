@@ -7,11 +7,11 @@ use axum::routing::get;
 use chrono::{DateTime, Datelike, NaiveDate, TimeZone, Utc};
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, TaxLine, TaxTreatment,
-    Ticker, TickerRate, resolve_traffic_range,
+    Ticker, TickerRate, place_of_supply, resolve_traffic_range, seller_country,
 };
 use lnvps_db::{
     AdminAction, AdminResource, CostResourceType, CostType, IntervalType, RenewalSource,
-    SubscriptionPaymentType,
+    SubscriptionPaymentType, SubscriptionPaymentWithCompany,
 };
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,7 @@ pub fn router() -> Router<RouterState> {
             get(admin_profit_loss_report),
         )
         .route("/api/admin/v1/reports/oss", get(admin_oss_report))
+        .route("/api/admin/v1/reports/vat", get(admin_vat_report))
         .route("/api/admin/v1/reports/renewals", get(admin_renewals_report))
         .route("/api/admin/v1/reports/traffic", get(admin_traffic_report))
 }
@@ -542,6 +543,27 @@ fn convert_amount(
     Some(out.value())
 }
 
+fn payment_revenue(
+    p: &SubscriptionPaymentWithCompany,
+    target: Currency,
+    rates: &HashMap<Currency, f32>,
+) -> Option<(i64, i64)> {
+    let pay_cur = Currency::from_str(&p.currency).ok()?;
+    let base_cur = Currency::from_str(&p.company_base_currency).ok()?;
+    // 1) payment -> its company base currency using the stored historical rate
+    let net_base = payment_base_amount(p.amount, pay_cur, base_cur, p.rate)?;
+    let tax_base = payment_base_amount(p.tax, pay_cur, base_cur, p.rate)?;
+    // 2) base -> report target (no-op when they match; live rate only
+    //    needed when aggregating companies with differing base currencies)
+    let net = convert_amount(net_base, base_cur, target, rates)?;
+    let tax = convert_amount(tax_base, base_cur, target, rates)?;
+    // A refund row stores the magnitude returned, so it subtracts here
+    // rather than adding — the columns are unsigned and the sign lives
+    // in the payment type (issue #193).
+    let sign = p.payment_type.signum();
+    Some((sign * net as i64, sign * tax as i64))
+}
+
 async fn admin_profit_loss_report(
     auth: AdminAuth,
     State(this): State<RouterState>,
@@ -615,35 +637,12 @@ async fn admin_profit_loss_report(
             if params.region_id != 0 && p.region_id != Some(params.region_id) {
                 continue;
             }
-            let (Ok(pay_cur), Ok(base_cur)) = (
-                Currency::from_str(&p.currency),
-                Currency::from_str(&p.company_base_currency),
-            ) else {
+            let Some((net, tax)) = payment_revenue(&p, target, &rates) else {
                 continue;
             };
-            let net = p.amount.saturating_sub(p.tax);
-            // 1) payment -> its company base currency using the stored historical rate
-            let (Some(net_base), Some(tax_base)) = (
-                payment_base_amount(net, pay_cur, base_cur, p.rate),
-                payment_base_amount(p.tax, pay_cur, base_cur, p.rate),
-            ) else {
-                continue;
-            };
-            // 2) base -> report target (no-op when they match; live rate only
-            //    needed when aggregating companies with differing base currencies)
-            let (Some(net_c), Some(tax_c)) = (
-                convert_amount(net_base, base_cur, target, &rates),
-                convert_amount(tax_base, base_cur, target, &rates),
-            ) else {
-                continue;
-            };
-            // A refund row stores the magnitude returned, so it subtracts here
-            // rather than adding — the columns are unsigned and the sign lives
-            // in the payment type (issue #193).
-            let sign = p.payment_type.signum();
             let e = acc.entry(period_key(p.created, group_by_year)).or_default();
-            e.revenue_net = e.revenue_net.saturating_add(sign * net_c as i64);
-            e.revenue_tax = e.revenue_tax.saturating_add(sign * tax_c as i64);
+            e.revenue_net = e.revenue_net.saturating_add(net);
+            e.revenue_tax = e.revenue_tax.saturating_add(tax);
         }
     }
 
@@ -789,7 +788,7 @@ async fn admin_profit_loss_report(
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
-struct OssReportQuery {
+struct TaxReportQuery {
     start_date: String,
     end_date: String,
     /// Optional company filter; 0 / omitted = all companies. Each company is a
@@ -848,20 +847,41 @@ fn oss_period_key(date: DateTime<Utc>, bimonthly: bool) -> String {
     }
 }
 
-/// Accumulator key for one OSS declaration line: a distinct
-/// (period, company, destination country, VAT rate) bucket.
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct OssKey {
+#[derive(Serialize, Deserialize)]
+struct VatReportRow {
     period: String,
     company_id: u64,
-    country_code: String,
-    /// VAT rate stored as raw bits so it can be a map key.
+    company_name: String,
+    currency: String,
+    treatment: TaxTreatment,
+    country_code: Option<String>,
+    vat_rate: f32,
+    net_total: i64,
+    tax_total: i64,
+    transaction_count: u32,
+    inferred: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct VatReport {
+    start_date: String,
+    end_date: String,
+    period: String,
+    rows: Vec<VatReportRow>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TaxBucket {
+    period: String,
+    company_id: u64,
+    treatment: TaxTreatment,
+    country_code: Option<String>,
     rate_bits: u32,
+    inferred: bool,
 }
 
 #[derive(Default)]
-struct OssAcc {
-    /// Signed: refund rows subtract (see `SubscriptionPaymentType::signum`).
+struct TaxBucketTotals {
     net_total: i64,
     tax_total: i64,
     transaction_count: u32,
@@ -869,20 +889,165 @@ struct OssAcc {
     currency: String,
 }
 
-/// OSS (One-Stop Shop) VAT report.
-///
-/// Aggregates cross-border EU B2C sales (`tax_treatment = oss_b2c`) by filing
-/// period and destination member state, so the totals can be transcribed onto a
-/// quarterly (or bi-monthly) OSS VAT return. Only paid payments are included;
-/// amounts are expressed in each seller company's base currency using the
-/// exchange rate frozen on the payment at sale time.
-async fn admin_oss_report(
-    auth: AdminAuth,
-    State(this): State<RouterState>,
-    Query(params): Query<OssReportQuery>,
-) -> ApiResult<OssReport> {
-    auth.require_permission(AdminResource::Analytics, AdminAction::View)?;
+fn recorded_tax_lines(
+    p: &SubscriptionPaymentWithCompany,
+) -> Result<Option<Vec<TaxLine>>, serde_json::Error> {
+    if let Some(bd) = &p.tax_breakdown {
+        return serde_json::from_value(bd.clone()).map(Some);
+    }
+    let treatment = p
+        .tax_treatment
+        .as_deref()
+        .and_then(|t| TaxTreatment::from_str(t).ok());
+    Ok(treatment.map(|treatment| {
+        vec![TaxLine {
+            net: p.amount,
+            tax: p.tax,
+            rate: p.tax_rate.unwrap_or(0.0),
+            country_code: p.tax_country_code.clone(),
+            treatment,
+        }]
+    }))
+}
 
+fn inferred_tax_line(p: &SubscriptionPaymentWithCompany, seller_cc: Option<&str>) -> TaxLine {
+    let supply = place_of_supply(
+        p.user_country_code.as_deref(),
+        p.user_geo_country_code.as_deref(),
+        p.user_billing_tax_id.as_deref(),
+        seller_cc,
+    );
+    TaxLine {
+        net: p.amount,
+        tax: p.tax,
+        rate: p.tax_rate.unwrap_or(0.0),
+        country_code: supply.country_code,
+        treatment: supply.treatment,
+    }
+}
+
+fn build_vat_rows(
+    payments: &[SubscriptionPaymentWithCompany],
+    sellers: &HashMap<u64, Option<String>>,
+    bimonthly: bool,
+) -> Vec<VatReportRow> {
+    let mut acc: HashMap<TaxBucket, TaxBucketTotals> = HashMap::new();
+
+    for p in payments {
+        let (Ok(pay_cur), Ok(base_cur)) = (
+            Currency::from_str(&p.currency),
+            Currency::from_str(&p.company_base_currency),
+        ) else {
+            continue;
+        };
+        let (lines, inferred) = match recorded_tax_lines(p) {
+            Ok(Some(lines)) => (lines, false),
+            Ok(None) => {
+                let seller_cc = sellers.get(&p.company_id).and_then(|s| s.as_deref());
+                (vec![inferred_tax_line(p, seller_cc)], true)
+            }
+            Err(_) => continue,
+        };
+
+        let period = oss_period_key(p.created, bimonthly);
+        // Refund rows carry the same frozen country/rate as the payment
+        // they reverse, so they net against exactly the bucket that
+        // declared the VAT (issue #193).
+        let sign = p.payment_type.signum();
+        let mut per_payment: HashMap<TaxBucket, (i64, i64)> = HashMap::new();
+        for l in lines {
+            let (Some(net_base), Some(tax_base)) = (
+                payment_base_amount(l.net, pay_cur, base_cur, p.rate),
+                payment_base_amount(l.tax, pay_cur, base_cur, p.rate),
+            ) else {
+                continue;
+            };
+            let key = TaxBucket {
+                period: period.clone(),
+                company_id: p.company_id,
+                treatment: l.treatment,
+                country_code: l.country_code,
+                rate_bits: l.rate.to_bits(),
+                inferred,
+            };
+            let e = per_payment.entry(key).or_default();
+            e.0 = e.0.saturating_add(sign * net_base as i64);
+            e.1 = e.1.saturating_add(sign * tax_base as i64);
+        }
+
+        for (key, (net, tax)) in per_payment {
+            let e = acc.entry(key).or_default();
+            e.net_total = e.net_total.saturating_add(net);
+            e.tax_total = e.tax_total.saturating_add(tax);
+            e.transaction_count = e.transaction_count.saturating_add(1);
+            e.company_name = p.company_name.clone();
+            e.currency = p.company_base_currency.clone();
+        }
+    }
+
+    let mut rows: Vec<VatReportRow> = acc
+        .into_iter()
+        .map(|(key, a)| VatReportRow {
+            period: key.period,
+            company_id: key.company_id,
+            company_name: a.company_name,
+            currency: a.currency,
+            treatment: key.treatment,
+            country_code: key.country_code,
+            vat_rate: f32::from_bits(key.rate_bits),
+            net_total: a.net_total,
+            tax_total: a.tax_total,
+            transaction_count: a.transaction_count,
+            inferred: key.inferred,
+        })
+        .collect();
+
+    rows.sort_by(|a, b| {
+        a.period
+            .cmp(&b.period)
+            .then(a.company_id.cmp(&b.company_id))
+            .then(a.treatment.as_str().cmp(b.treatment.as_str()))
+            .then(a.country_code.cmp(&b.country_code))
+            .then(a.vat_rate.total_cmp(&b.vat_rate))
+            .then(a.inferred.cmp(&b.inferred))
+    });
+    rows
+}
+
+fn build_oss_rows(
+    payments: &[SubscriptionPaymentWithCompany],
+    bimonthly: bool,
+) -> Vec<OssReportRow> {
+    build_vat_rows(payments, &HashMap::new(), bimonthly)
+        .into_iter()
+        .filter(|r| r.treatment == TaxTreatment::OssB2c && !r.inferred)
+        .filter_map(|r| {
+            Some(OssReportRow {
+                period: r.period,
+                company_id: r.company_id,
+                company_name: r.company_name,
+                currency: r.currency,
+                country_code: r.country_code?,
+                vat_rate: r.vat_rate,
+                net_total: r.net_total,
+                tax_total: r.tax_total,
+                transaction_count: r.transaction_count,
+            })
+        })
+        .collect()
+}
+
+struct TaxReportInput {
+    period: String,
+    bimonthly: bool,
+    payments: Vec<SubscriptionPaymentWithCompany>,
+    sellers: HashMap<u64, Option<String>>,
+}
+
+async fn load_tax_report(
+    this: &RouterState,
+    params: &TaxReportQuery,
+) -> Result<TaxReportInput, ApiError> {
     let period = params
         .period
         .clone()
@@ -908,124 +1073,65 @@ async fn admin_oss_report(
     let start_dt = start_date.and_hms_opt(0, 0, 0).unwrap().and_utc();
     let end_dt = end_date.and_hms_opt(23, 59, 59).unwrap().and_utc();
 
-    // Resolve the set of companies to report on.
-    let company_ids: Vec<u64> = if params.company_id != 0 {
-        vec![params.company_id]
+    let companies = if params.company_id != 0 {
+        vec![this.db.admin_get_company(params.company_id).await?]
     } else {
-        let (companies, _) = this.db.admin_list_companies(10_000, 0).await?;
-        companies.into_iter().map(|c| c.id).collect()
+        this.db.admin_list_companies(10_000, 0).await?.0
     };
 
-    let mut acc: HashMap<OssKey, OssAcc> = HashMap::new();
-
-    for cid in company_ids {
-        let payments = this
-            .db
-            .admin_get_payments_with_company_info(start_dt, end_dt, cid, None)
-            .await?;
-        for p in payments {
-            let (Ok(pay_cur), Ok(base_cur)) = (
-                Currency::from_str(&p.currency),
-                Currency::from_str(&p.company_base_currency),
-            ) else {
-                continue;
-            };
-
-            // Extract the OSS B2C lines for this payment: prefer the frozen
-            // per-line breakdown, else synthesise a single line from the
-            // summary fields when the whole payment was treated as oss_b2c.
-            let lines: Vec<TaxLine> = if let Some(bd) = &p.tax_breakdown {
-                match serde_json::from_value::<Vec<TaxLine>>(bd.clone()) {
-                    Ok(lines) => lines
-                        .into_iter()
-                        .filter(|l| l.treatment == TaxTreatment::OssB2c)
-                        .collect(),
-                    Err(_) => continue,
-                }
-            } else if p.tax_treatment.as_deref() == Some(TaxTreatment::OssB2c.as_str()) {
-                vec![TaxLine {
-                    net: p.amount.saturating_sub(p.tax),
-                    tax: p.tax,
-                    rate: p.tax_rate.unwrap_or(0.0),
-                    country_code: p.tax_country_code.clone(),
-                    treatment: TaxTreatment::OssB2c,
-                }]
-            } else {
-                continue;
-            };
-
-            // Fold this payment's OSS lines into per-bucket contributions,
-            // converting to the company base currency using the frozen rate.
-            let period_key = oss_period_key(p.created, bimonthly);
-            // Refund rows carry the same frozen country/rate as the payment
-            // they reverse, so they net against exactly the bucket that
-            // declared the VAT (issue #193).
-            let sign = p.payment_type.signum();
-            let mut per_payment: HashMap<OssKey, (i64, i64)> = HashMap::new();
-            for l in lines {
-                let Some(country) = l.country_code.clone() else {
-                    continue;
-                };
-                let (Some(net_base), Some(tax_base)) = (
-                    payment_base_amount(l.net, pay_cur, base_cur, p.rate),
-                    payment_base_amount(l.tax, pay_cur, base_cur, p.rate),
-                ) else {
-                    continue;
-                };
-                let key = OssKey {
-                    period: period_key.clone(),
-                    company_id: p.company_id,
-                    country_code: country,
-                    rate_bits: l.rate.to_bits(),
-                };
-                let e = per_payment.entry(key).or_default();
-                e.0 = e.0.saturating_add(sign * net_base as i64);
-                e.1 = e.1.saturating_add(sign * tax_base as i64);
-            }
-
-            for (key, (net, tax)) in per_payment {
-                let e = acc.entry(key).or_default();
-                e.net_total = e.net_total.saturating_add(net);
-                e.tax_total = e.tax_total.saturating_add(tax);
-                e.transaction_count = e.transaction_count.saturating_add(1);
-                e.company_name = p.company_name.clone();
-                e.currency = p.company_base_currency.clone();
-            }
-        }
+    let mut payments = Vec::new();
+    let mut sellers = HashMap::new();
+    for company in companies {
+        payments.extend(
+            this.db
+                .admin_get_payments_with_company_info(start_dt, end_dt, company.id, None)
+                .await?,
+        );
+        sellers.insert(company.id, seller_country(&company));
     }
 
-    let mut rows: Vec<OssReportRow> = acc
-        .into_iter()
-        .map(|(key, a)| OssReportRow {
-            period: key.period,
-            company_id: key.company_id,
-            company_name: a.company_name,
-            currency: a.currency,
-            country_code: key.country_code,
-            vat_rate: f32::from_bits(key.rate_bits),
-            net_total: a.net_total,
-            tax_total: a.tax_total,
-            transaction_count: a.transaction_count,
-        })
-        .collect();
+    Ok(TaxReportInput {
+        period,
+        bimonthly,
+        payments,
+        sellers,
+    })
+}
 
-    rows.sort_by(|a, b| {
-        a.period
-            .cmp(&b.period)
-            .then(a.company_id.cmp(&b.company_id))
-            .then(a.country_code.cmp(&b.country_code))
-            .then(
-                a.vat_rate
-                    .partial_cmp(&b.vat_rate)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-            )
-    });
-
+/// OSS (One-Stop Shop) VAT report.
+///
+/// Aggregates cross-border EU B2C sales (`tax_treatment = oss_b2c`) by filing
+/// period and destination member state, so the totals can be transcribed onto a
+/// quarterly (or bi-monthly) OSS VAT return. Only paid payments are included;
+/// amounts are expressed in each seller company's base currency using the
+/// exchange rate frozen on the payment at sale time.
+async fn admin_oss_report(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Query(params): Query<TaxReportQuery>,
+) -> ApiResult<OssReport> {
+    auth.require_permission(AdminResource::Analytics, AdminAction::View)?;
+    let input = load_tax_report(&this, &params).await?;
     ApiData::ok(OssReport {
         start_date: params.start_date,
         end_date: params.end_date,
-        period,
-        rows,
+        rows: build_oss_rows(&input.payments, input.bimonthly),
+        period: input.period,
+    })
+}
+
+async fn admin_vat_report(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Query(params): Query<TaxReportQuery>,
+) -> ApiResult<VatReport> {
+    auth.require_permission(AdminResource::Analytics, AdminAction::View)?;
+    let input = load_tax_report(&this, &params).await?;
+    ApiData::ok(VatReport {
+        start_date: params.start_date,
+        end_date: params.end_date,
+        rows: build_vat_rows(&input.payments, &input.sellers, input.bimonthly),
+        period: input.period,
     })
 }
 
@@ -1672,6 +1778,284 @@ mod tests {
             .map(|m| depreciation_for_month(120_000, purchase, 24, *m))
             .sum();
         assert!((total - 120_000.0).abs() < 1e-6);
+    }
+
+    fn sale(amount: u64, tax: u64) -> SubscriptionPaymentWithCompany {
+        SubscriptionPaymentWithCompany {
+            created: dt(2026, 2, 10),
+            amount,
+            tax,
+            currency: "EUR".to_string(),
+            rate: 1.0,
+            company_id: 1,
+            company_name: "LNVPS IE".to_string(),
+            company_base_currency: "EUR".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn taxed(
+        amount: u64,
+        rate: f32,
+        country: &str,
+        treatment: TaxTreatment,
+    ) -> SubscriptionPaymentWithCompany {
+        let tax = (amount as f32 * rate / 100.0) as u64;
+        SubscriptionPaymentWithCompany {
+            tax_rate: Some(rate),
+            tax_country_code: Some(country.to_string()),
+            tax_treatment: Some(treatment.as_str().to_string()),
+            tax_breakdown: Some(serde_json::json!([{
+                "net": amount,
+                "tax": tax,
+                "rate": rate,
+                "country_code": country,
+                "treatment": treatment.as_str(),
+            }])),
+            ..sale(amount, tax)
+        }
+    }
+
+    fn refund_of(p: &SubscriptionPaymentWithCompany) -> SubscriptionPaymentWithCompany {
+        SubscriptionPaymentWithCompany {
+            payment_type: SubscriptionPaymentType::Refund,
+            tax_breakdown: None,
+            ..p.clone()
+        }
+    }
+
+    fn irish_seller() -> HashMap<u64, Option<String>> {
+        HashMap::from([(1, Some("IRL".to_string()))])
+    }
+
+    #[test]
+    fn test_profit_loss_revenue_net_is_the_payment_amount() {
+        let p = taxed(10_000, 23.0, "IRL", TaxTreatment::Domestic);
+        let rates = HashMap::new();
+        assert_eq!(
+            payment_revenue(&p, Currency::EUR, &rates),
+            Some((10_000, 2_300))
+        );
+        assert_eq!(
+            payment_revenue(&refund_of(&p), Currency::EUR, &rates),
+            Some((-10_000, -2_300))
+        );
+    }
+
+    #[test]
+    fn test_oss_refund_without_breakdown_reverses_the_full_net() {
+        let p = taxed(10_000, 19.0, "DEU", TaxTreatment::OssB2c);
+        let rows = build_oss_rows(&[p.clone(), refund_of(&p)], false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].country_code, "DEU");
+        assert_eq!(rows[0].net_total, 0);
+        assert_eq!(rows[0].tax_total, 0);
+        assert_eq!(rows[0].transaction_count, 2);
+    }
+
+    #[test]
+    fn test_vat_report_buckets_every_treatment() {
+        let payments = vec![
+            taxed(10_000, 23.0, "IRL", TaxTreatment::Domestic),
+            taxed(5_000, 23.0, "IRL", TaxTreatment::Domestic),
+            taxed(10_000, 19.0, "DEU", TaxTreatment::OssB2c),
+            taxed(8_000, 0.0, "FRA", TaxTreatment::ReverseCharge),
+            taxed(4_000, 0.0, "USA", TaxTreatment::OutOfScope),
+        ];
+        let rows = build_vat_rows(&payments, &irish_seller(), false);
+        let got: Vec<(TaxTreatment, Option<&str>, i64, i64, u32)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.treatment,
+                    r.country_code.as_deref(),
+                    r.net_total,
+                    r.tax_total,
+                    r.transaction_count,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (TaxTreatment::Domestic, Some("IRL"), 15_000, 3_450, 2),
+                (TaxTreatment::OssB2c, Some("DEU"), 10_000, 1_900, 1),
+                (TaxTreatment::OutOfScope, Some("USA"), 4_000, 0, 1),
+                (TaxTreatment::ReverseCharge, Some("FRA"), 8_000, 0, 1),
+            ]
+        );
+        assert!(rows.iter().all(|r| !r.inferred && r.period == "2026-Q1"));
+    }
+
+    #[test]
+    fn test_vat_report_infers_place_of_supply_for_untaxed_history() {
+        let declared = SubscriptionPaymentWithCompany {
+            user_country_code: Some("irl".to_string()),
+            user_geo_country_code: Some("DEU".to_string()),
+            ..sale(10_000, 0)
+        };
+        let geo_only = SubscriptionPaymentWithCompany {
+            user_geo_country_code: Some("DEU".to_string()),
+            ..sale(6_000, 0)
+        };
+        let business = SubscriptionPaymentWithCompany {
+            user_country_code: Some("FRA".to_string()),
+            user_billing_tax_id: Some("FR12345678901".to_string()),
+            ..sale(7_000, 0)
+        };
+        let unknown = sale(3_000, 0);
+        let rows = build_vat_rows(
+            &[
+                declared.clone(),
+                refund_of(&declared),
+                geo_only,
+                business,
+                unknown,
+            ],
+            &irish_seller(),
+            false,
+        );
+        let got: Vec<(TaxTreatment, Option<&str>, i64, u32)> = rows
+            .iter()
+            .map(|r| {
+                (
+                    r.treatment,
+                    r.country_code.as_deref(),
+                    r.net_total,
+                    r.transaction_count,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (TaxTreatment::Domestic, Some("IRL"), 0, 2),
+                (TaxTreatment::OssB2c, Some("DEU"), 6_000, 1),
+                (TaxTreatment::ReverseCharge, Some("FRA"), 7_000, 1),
+                (TaxTreatment::UndeterminedDefault, Some("IRL"), 3_000, 1),
+            ]
+        );
+        assert!(rows.iter().all(|r| r.inferred && r.tax_total == 0));
+    }
+
+    #[test]
+    fn test_oss_report_leaves_out_inferred_rows() {
+        let untaxed = SubscriptionPaymentWithCompany {
+            user_country_code: Some("DEU".to_string()),
+            ..sale(6_000, 0)
+        };
+        let recorded = taxed(10_000, 19.0, "DEU", TaxTreatment::OssB2c);
+        let rows = build_oss_rows(&[untaxed, recorded], false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].net_total, 10_000);
+    }
+
+    async fn untaxed_german_sale() -> RouterState {
+        use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VmStateCache};
+        use lnvps_db::{LNVpsDb, SubscriptionPayment};
+        use std::sync::Arc;
+
+        let mock = MockDb::default();
+        {
+            let mut companies = mock.companies.lock().await;
+            let company = companies.get_mut(&1).unwrap();
+            company.country_code = Some("IRL".to_string());
+            company.tax_id = None;
+            company.base_currency = "EUR".to_string();
+        }
+        mock.vms.lock().await.insert(1, MockDb::mock_vm());
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let user_id = db.upsert_user(&[9u8; 32]).await.unwrap();
+        let mut user = db.get_user(user_id).await.unwrap();
+        user.country_code = Some("DEU".to_string());
+        db.update_user(&user).await.unwrap();
+        db.insert_subscription_payment(&SubscriptionPayment {
+            id: vec![1u8; 16],
+            subscription_id: 1,
+            user_id,
+            created: dt(2026, 2, 10),
+            expires: dt(2026, 3, 10),
+            amount: 10_000,
+            currency: "EUR".to_string(),
+            payment_method: lnvps_db::PaymentMethod::Revolut,
+            payment_type: SubscriptionPaymentType::Renewal,
+            external_data: "".to_string().into(),
+            external_id: None,
+            is_paid: true,
+            rate: 1.0,
+            time_value: None,
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: Some(dt(2026, 2, 10)),
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+            renewal_source: None,
+        })
+        .await
+        .unwrap();
+
+        RouterState {
+            node_control: None,
+            db,
+            work_commander: Arc::new(ChannelWorkCommander::new()),
+            feedback: None,
+            vm_state_cache: VmStateCache::new(),
+            exchange: Arc::new(MockExchangeRate::default()),
+            vat: Default::default(),
+        }
+    }
+
+    fn analytics_auth() -> AdminAuth {
+        AdminAuth {
+            user_id: 1,
+            pubkey: vec![1u8; 32],
+            permissions: [crate::admin::model::Permission {
+                resource: AdminResource::Analytics,
+                action: AdminAction::View,
+            }]
+            .into_iter()
+            .collect(),
+            nip98_auth: None,
+        }
+    }
+
+    fn q1_2026(period: Option<&str>) -> Query<TaxReportQuery> {
+        Query(TaxReportQuery {
+            start_date: "2026-01-01".to_string(),
+            end_date: "2026-03-31".to_string(),
+            company_id: 1,
+            period: period.map(str::to_string),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_vat_report_endpoint_places_untaxed_sales_by_customer_country()
+    -> Result<(), ApiError> {
+        let state = untaxed_german_sale().await;
+
+        let vat = admin_vat_report(analytics_auth(), State(state.clone()), q1_2026(None)).await?;
+        let rows = &vat.0.data.rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].treatment, TaxTreatment::OssB2c);
+        assert_eq!(rows[0].country_code.as_deref(), Some("DEU"));
+        assert_eq!(rows[0].net_total, 10_000);
+        assert!(rows[0].inferred);
+
+        let oss = admin_oss_report(analytics_auth(), State(state), q1_2026(None)).await?;
+        assert!(oss.0.data.rows.is_empty(), "nothing was declared under OSS");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_vat_report_endpoint_rejects_an_unknown_period() {
+        let state = untaxed_german_sale().await;
+        let got = admin_vat_report(analytics_auth(), State(state), q1_2026(Some("month"))).await;
+        assert!(got.is_err());
     }
 
     #[test]

@@ -8257,9 +8257,13 @@ impl AdminDb for LNVpsDbMysql {
              c.id as company_id, c.name as company_name, c.base_currency as company_base_currency,
              v.id as vm_id,
              vh.id as host_id, vh.name as host_name,
-             vhr.id as region_id, vhr.name as region_name
+             vhr.id as region_id, vhr.name as region_name,
+             u.country_code as user_country_code,
+             u.geo_country_code as user_geo_country_code,
+             u.billing_tax_id as user_billing_tax_id
              FROM subscription_payment sp
              JOIN subscription s ON sp.subscription_id = s.id
+             LEFT JOIN users u ON u.id = sp.user_id
              LEFT JOIN subscription_line_item sli ON sli.subscription_id = s.id
                  AND sli.subscription_type = 3
              LEFT JOIN vm v ON v.subscription_line_item_id = sli.id

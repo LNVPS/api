@@ -3263,6 +3263,9 @@ impl LNVpsDbBase for MockDb {
             region_id: None,
             region_name: None,
             renewal_source: None,
+            user_country_code: None,
+            user_geo_country_code: None,
+            user_billing_tax_id: None,
         })
     }
 
@@ -6937,6 +6940,7 @@ impl lnvps_db::AdminDb for MockDb {
         let hosts = self.hosts.lock().await;
         let regions = self.regions.lock().await;
         let companies = self.companies.lock().await;
+        let users = self.users.lock().await;
 
         let mut result = Vec::new();
 
@@ -6994,6 +6998,7 @@ impl lnvps_db::AdminDb for MockDb {
                 continue;
             }
             if let Some(company) = companies.get(&cid) {
+                let user = users.get(&payment.user_id);
                 result.push(SubscriptionPaymentWithCompany {
                     id: payment.id.clone(),
                     subscription_id: payment.subscription_id,
@@ -7028,6 +7033,9 @@ impl lnvps_db::AdminDb for MockDb {
                     region_id,
                     region_name,
                     renewal_source: None,
+                    user_country_code: user.and_then(|u| u.country_code.clone()),
+                    user_geo_country_code: user.and_then(|u| u.geo_country_code.clone()),
+                    user_billing_tax_id: user.and_then(|u| u.billing_tax_id.clone()),
                 });
             }
         }

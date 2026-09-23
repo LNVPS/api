@@ -28,11 +28,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
   Linking an interface requires it to carry the same address block as the service's others, which the database enforces: a device holds one address in every region, so an interface with a different block would route some devices and black-hole the rest. Deleting a service is refused while it has subscribers; retiring one is `enabled: false`. Revoking a device deletes its tunnel and re-pushes every interface on the service, because a key left configured on one route server still works.
 
+- **VAT report** (issue #419): `GET /api/admin/v1/reports/vat` buckets every paid sale by filing period, company, tax treatment, country and rate, in the company base currency. The `domestic` rows are the national VAT return and the `oss_b2c` rows the OSS return, so neither has to be rebuilt from `reports/time-series` by hand. Same query parameters as `reports/oss`, and requires `analytics::view`.
+
+  Payments from before tax calculation shipped recorded no country or treatment. They are placed using the customer's current declared country, IP country and VAT number under the same rules checkout applies, and flagged `inferred: true` so they can be told apart from what was determined at sale time.
+
 ### Removed
 
 - **Bitvora payment provider** — the provider was disabled in February 2026 when the service shut down, and its remaining code has now been deleted: the `bitvora` cargo feature, the `POST /api/v1/webhook/bitvora` endpoint, and the `"type": "bitvora"` variant of `ProviderConfig` (create), `PartialProviderConfig` (update) and the sanitized config returned by the admin payment-method endpoints. Any `payment_method_config` row still holding a bitvora config is left in place as billing history; it now reads back with a `null` `config` and cannot be updated. Delete or ignore those rows.
 
 ### Fixed
+
+- **Reports subtracted VAT from a figure that was already net** (issue #419): a payment's `amount` is the net price and `tax` sits on top of it, but `GET /api/admin/v1/reports/profit-loss` computed `revenue_net` as `amount - tax`, understating revenue on every taxed payment. `GET /api/admin/v1/reports/oss` did the same for payments with no per-line breakdown, which includes every refund, so a refund reversed less net than its sale had declared. Both now use `amount`.
 
 - **NIP-05 domains were stored without being checked** — `POST /api/v1/nostr/domain` accepted whatever string it was sent. Pasted URLs, `host:port`, email addresses and names like `localhost` all became rows, and a row becomes an Ingress rule in the cluster, so none of them could ever serve a NIP-05 document. The name is now validated as a public DNS hostname and stored in a canonical form (trimmed, lowercased, trailing root dot removed), which also stops one domain being registered twice under two spellings. Rejections are `400` and name the offending part.
 

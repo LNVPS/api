@@ -3379,7 +3379,7 @@ pub struct SubscriptionCohortRow {
 }
 
 /// Subscription payment with company info (for admin views and time-series reporting)
-#[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
+#[derive(FromRow, Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SubscriptionPaymentWithCompany {
     pub id: Vec<u8>,
     pub subscription_id: u64,
@@ -3435,6 +3435,12 @@ pub struct SubscriptionPaymentWithCompany {
     // Region information
     pub region_id: Option<u64>,
     pub region_name: Option<String>,
+    #[sqlx(default)]
+    pub user_country_code: Option<String>,
+    #[sqlx(default)]
+    pub user_geo_country_code: Option<String>,
+    #[sqlx(default)]
+    pub user_billing_tax_id: Option<String>,
 }
 
 /// Internet Registry - Regional Internet Registry

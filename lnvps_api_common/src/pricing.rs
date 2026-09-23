@@ -102,8 +102,73 @@ pub fn vat_number_country_alpha3(vat: &str) -> Option<String> {
         .map(|c| c.alpha3().to_string())
 }
 
+pub fn seller_country(company: &lnvps_db::Company) -> Option<String> {
+    company
+        .tax_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(vat_number_country_alpha3)
+        .or_else(|| company.country_code.as_ref().map(|cc| cc.to_uppercase()))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaceOfSupply {
+    pub country_code: Option<String>,
+    pub treatment: TaxTreatment,
+    pub vat_number: Option<String>,
+}
+
+pub fn place_of_supply(
+    declared_country: Option<&str>,
+    geo_country: Option<&str>,
+    vat_number: Option<&str>,
+    seller_cc: Option<&str>,
+) -> PlaceOfSupply {
+    let supply =
+        |country_code: Option<String>, treatment, vat_number: Option<&str>| PlaceOfSupply {
+            country_code,
+            treatment,
+            vat_number: vat_number.map(str::to_string),
+        };
+
+    if !seller_cc.map(is_eu_vat_country).unwrap_or(false) {
+        return supply(None, TaxTreatment::OutOfScope, None);
+    }
+
+    if let Some(vat) = vat_number.map(str::trim).filter(|s| !s.is_empty())
+        && let Some(vat_cc) = vat_number_country_alpha3(vat)
+    {
+        let treatment = if seller_cc == Some(vat_cc.as_str()) {
+            TaxTreatment::Domestic
+        } else if is_eu_vat_country(&vat_cc) {
+            TaxTreatment::ReverseCharge
+        } else {
+            TaxTreatment::OutOfScope
+        };
+        return supply(Some(vat_cc), treatment, Some(vat));
+    }
+
+    match declared_country.or(geo_country).map(str::to_uppercase) {
+        Some(cc) if is_eu_vat_country(&cc) => {
+            let treatment = if seller_cc == Some(cc.as_str()) {
+                TaxTreatment::Domestic
+            } else {
+                TaxTreatment::OssB2c
+            };
+            supply(Some(cc), treatment, None)
+        }
+        Some(cc) => supply(Some(cc), TaxTreatment::OutOfScope, None),
+        None => supply(
+            seller_cc.map(str::to_string),
+            TaxTreatment::UndeterminedDefault,
+            None,
+        ),
+    }
+}
+
 /// Which rate branch was selected for a payment. Recorded on the payment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaxTreatment {
     /// Customer country equals the seller country: seller-country rate applied.
@@ -128,6 +193,23 @@ impl TaxTreatment {
             TaxTreatment::OutOfScope => "out_of_scope",
             TaxTreatment::UndeterminedDefault => "undetermined_default",
         }
+    }
+}
+
+impl FromStr for TaxTreatment {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        [
+            TaxTreatment::Domestic,
+            TaxTreatment::OssB2c,
+            TaxTreatment::ReverseCharge,
+            TaxTreatment::OutOfScope,
+            TaxTreatment::UndeterminedDefault,
+        ]
+        .into_iter()
+        .find(|t| t.as_str() == s)
+        .ok_or_else(|| anyhow!("Unknown tax treatment: {s}"))
     }
 }
 
@@ -1000,14 +1082,12 @@ impl PricingEngine {
         // (`company.tax_id`) when present — that number is our VIES registration
         // and identifies the country we are registered in — and otherwise from
         // the company's configured country.
-        let seller_cc = self.db.get_company(company_id).await.ok().and_then(|c| {
-            c.tax_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .and_then(vat_number_country_alpha3)
-                .or_else(|| c.country_code.map(|cc| cc.to_uppercase()))
-        });
+        let seller_cc = self
+            .db
+            .get_company(company_id)
+            .await
+            .ok()
+            .and_then(|c| seller_country(&c));
 
         // Record the raw country signals observed now, even when only one of
         // them drives the decision.
@@ -1029,69 +1109,21 @@ impl PricingEngine {
         amount: u64,
         seller_cc: Option<String>,
     ) -> TaxDetermination {
-        // Only sellers in the EU VAT area select a rate here.
-        if !seller_cc.as_deref().map(is_eu_vat_country).unwrap_or(false) {
-            return TaxDetermination::zero(None, TaxTreatment::OutOfScope, None);
-        }
-
-        // 1. Customer supplied a VAT number (validated when it was saved).
-        if let Some(vat) = user
-            .billing_tax_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            && let Some(vat_cc) = vat_number_country_alpha3(vat)
-        {
-            if seller_cc.as_deref() == Some(vat_cc.as_str()) {
-                let rate = self.rate_for_country(&vat_cc);
-                return TaxDetermination::taxed(
-                    amount,
-                    rate,
-                    Some(vat_cc),
-                    TaxTreatment::Domestic,
-                    Some(vat.to_string()),
-                );
-            }
-            let treatment = if is_eu_vat_country(&vat_cc) {
-                TaxTreatment::ReverseCharge
-            } else {
-                TaxTreatment::OutOfScope
-            };
-            return TaxDetermination::zero(Some(vat_cc), treatment, Some(vat.to_string()));
-        }
-
-        // 2. No VAT number: pick the customer country from available signals.
-        let customer_cc = user
-            .country_code
-            .clone()
-            .or_else(|| user.geo_country_code.clone())
-            .map(|c| c.to_uppercase());
-        match customer_cc {
-            Some(cc) if is_eu_vat_country(&cc) => {
+        let supply = place_of_supply(
+            user.country_code.as_deref(),
+            user.geo_country_code.as_deref(),
+            user.billing_tax_id.as_deref(),
+            seller_cc.as_deref(),
+        );
+        match (supply.treatment, supply.country_code) {
+            (
+                TaxTreatment::Domestic | TaxTreatment::OssB2c | TaxTreatment::UndeterminedDefault,
+                Some(cc),
+            ) => {
                 let rate = self.rate_for_country(&cc);
-                let treatment = if seller_cc.as_deref() == Some(cc.as_str()) {
-                    TaxTreatment::Domestic
-                } else {
-                    TaxTreatment::OssB2c
-                };
-                TaxDetermination::taxed(amount, rate, Some(cc), treatment, None)
+                TaxDetermination::taxed(amount, rate, Some(cc), supply.treatment, supply.vat_number)
             }
-            Some(cc) => TaxDetermination::zero(Some(cc), TaxTreatment::OutOfScope, None),
-            // 3. No customer country available: fall back to the seller country
-            //    (guaranteed in the EU list by the gate above).
-            None => match seller_cc {
-                Some(scc) => {
-                    let rate = self.rate_for_country(&scc);
-                    TaxDetermination::taxed(
-                        amount,
-                        rate,
-                        Some(scc),
-                        TaxTreatment::UndeterminedDefault,
-                        None,
-                    )
-                }
-                None => TaxDetermination::zero(None, TaxTreatment::OutOfScope, None),
-            },
+            (treatment, cc) => TaxDetermination::zero(cc, treatment, supply.vat_number),
         }
     }
 
