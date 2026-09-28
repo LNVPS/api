@@ -212,6 +212,11 @@ pub trait TunnelRouter: Send + Sync {
         let _ = (interface, prefixes);
         op_fatal!("This router backend cannot manage tunnel routes")
     }
+
+    async fn sync_peer_isolation(&self, blocks: &[String]) -> OpResult<()> {
+        let _ = blocks;
+        op_fatal!("This router backend cannot isolate tunnel peers from each other")
+    }
 }
 
 /// The kind of a tunnel interface

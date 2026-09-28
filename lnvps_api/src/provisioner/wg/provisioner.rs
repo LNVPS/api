@@ -411,6 +411,14 @@ impl TunnelProvisioner {
         tr.sync_tunnel_routes(&interface, &plan.routes)
             .await
             .map_err(|e| anyhow!("failed to configure routes on {interface}: {}", e))?;
+        let blocks = self.node_blocks(pool.router_id).await?;
+        tr.sync_peer_isolation(&blocks).await.map_err(|e| {
+            anyhow!(
+                "failed to isolate tunnel peers on router {}: {}",
+                pool.router_id,
+                e
+            )
+        })?;
 
         if !drift.is_empty() {
             warn!(
@@ -419,6 +427,23 @@ impl TunnelProvisioner {
             );
         }
         Ok(drift)
+    }
+
+    async fn node_blocks(&self, router_id: u64) -> Result<Vec<String>> {
+        let mut blocks = Vec::new();
+        for pool in self
+            .db
+            .list_tunnel_pools(None)
+            .await?
+            .into_iter()
+            .filter(|p| p.router_id == router_id)
+        {
+            if self.db.get_vpn_service_for_pool(pool.id).await?.is_some() {
+                continue;
+            }
+            blocks.extend([pool.cidr4, pool.cidr6].into_iter().flatten());
+        }
+        Ok(blocks)
     }
 
     /// Push one node's peer onto its route server.

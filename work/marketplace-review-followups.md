@@ -63,7 +63,10 @@ open.
 
 ## Remaining
 
-- **#373** is open, blocked on the source-address decision recorded above.
+- **#373** fixed on the route server only: `TunnelRouter::sync_peer_isolation` (Linux-SSH) drops
+  forwarding from any `wgln*` to a marketplace pool block, run on every `reconcile_peers`.
+  Guest-to-guest between nodes stays open. No node-side source filter: the control API and
+  libvirtd already authenticate every request.
 - **#376** closed the approval gate, the blocking file IO and the multi-block
   PEM hole, and capped the body. Still unverified, and deliberately left to a
   follow-up because it needs an X.509 parser dependency and the node's tunnel

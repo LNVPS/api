@@ -732,6 +732,28 @@ impl TunnelRouter for LinuxSshRouter {
         Ok(())
     }
 
+    async fn sync_peer_isolation(&self, blocks: &[String]) -> OpResult<()> {
+        let blocks = match isolation_blocks(blocks) {
+            Ok(b) => b,
+            Err(e) => op_fatal!("{}", e),
+        };
+        let tag = isolation_tag(&blocks);
+        let loaded = self
+            .exec_checked(&format!(
+                "nft -j list table inet {ISOLATION_TABLE} 2>/dev/null || true"
+            ))
+            .await?;
+        if loaded_isolation_tag(&loaded).as_deref() == Some(tag.as_str()) {
+            return Ok(());
+        }
+        self.exec_checked(&format!(
+            "printf '%s\\n' {} | nft -f -",
+            shq(&isolation_ruleset(&blocks, &tag))
+        ))
+        .await?;
+        Ok(())
+    }
+
     async fn tunnel_traffic(&self) -> OpResult<Vec<TunnelTraffic>> {
         let out = self.exec_checked("ip -s -d -j link show").await?;
         let links: Vec<IpLink> = match serde_json::from_str(&out) {
@@ -790,6 +812,83 @@ fn sync_set_script(
     } else {
         Some(parts.join(" && "))
     }
+}
+
+const ISOLATION_TABLE: &str = "lnvps_isolation";
+const ISOLATION_TAG_PREFIX: &str = "lnvps:";
+
+fn isolation_blocks(blocks: &[String]) -> Result<Vec<ipnetwork::IpNetwork>, String> {
+    let mut parsed = Vec::new();
+    for block in blocks {
+        let net: ipnetwork::IpNetwork = block
+            .parse()
+            .map_err(|e| format!("{block} is not a CIDR: {e}"))?;
+        parsed.push(
+            ipnetwork::IpNetwork::new(net.network(), net.prefix()).map_err(|e| e.to_string())?,
+        );
+    }
+    parsed.sort_by_key(|b| (b.is_ipv6(), b.prefix(), b.network()));
+    let mut kept: Vec<ipnetwork::IpNetwork> = Vec::new();
+    for block in parsed {
+        if !kept
+            .iter()
+            .any(|k| k.is_ipv6() == block.is_ipv6() && k.contains(block.network()))
+        {
+            kept.push(block);
+        }
+    }
+    kept.sort_by_key(|b| (b.is_ipv6(), b.network(), b.prefix()));
+    Ok(kept)
+}
+
+fn isolation_tag(blocks: &[ipnetwork::IpNetwork]) -> String {
+    use bitcoin::hashes::{Hash, sha256};
+    let joined = blocks
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let digest = sha256::Hash::hash(joined.as_bytes()).to_string();
+    format!("{ISOLATION_TAG_PREFIX}{}", &digest[..16])
+}
+
+fn isolation_ruleset(blocks: &[ipnetwork::IpNetwork], tag: &str) -> String {
+    let set = |name: &str, kind: &str, v6: bool| {
+        let elements: Vec<String> = blocks
+            .iter()
+            .filter(|b| b.is_ipv6() == v6)
+            .map(ToString::to_string)
+            .collect();
+        let elements = match elements.is_empty() {
+            true => String::new(),
+            false => format!(" elements = {{ {} }};", elements.join(", ")),
+        };
+        format!("  set {name} {{ type {kind}; flags interval;{elements} }}\n")
+    };
+    let rule = |family: &str, set: &str| {
+        format!("    iifname \"wgln*\" {family} daddr @{set} counter drop comment \"{tag}\"\n")
+    };
+    format!(
+        "table inet {t} {{}}\ndelete table inet {t}\ntable inet {t} {{\n{s4}{s6}  chain forward {{\n    type filter hook forward priority filter; policy accept;\n{r4}{r6}  }}\n}}",
+        t = ISOLATION_TABLE,
+        s4 = set("peers4", "ipv4_addr", false),
+        s6 = set("peers6", "ipv6_addr", true),
+        r4 = rule("ip", "peers4"),
+        r6 = rule("ip6", "peers6"),
+    )
+}
+
+fn loaded_isolation_tag(json: &str) -> Option<String> {
+    let listed: serde_json::Value = serde_json::from_str(json).ok()?;
+    listed
+        .get("nftables")?
+        .as_array()?
+        .iter()
+        .filter_map(|o| o.get("rule"))
+        .filter(|r| r.get("table").and_then(|t| t.as_str()) == Some(ISOLATION_TABLE))
+        .filter_map(|r| r.get("comment").and_then(|c| c.as_str()))
+        .find(|c| c.starts_with(ISOLATION_TAG_PREFIX))
+        .map(str::to_string)
 }
 
 /// Build the `wg set` command for a single peer.
@@ -1423,6 +1522,107 @@ mod tests {
         assert!(applied.contains("ip route del"), "{applied}");
         assert!(applied.contains("198.51.100.9/32"), "{applied}");
         assert!(!applied.contains("10.66.0.0/31"), "{applied}");
+    }
+
+    fn answering_nft(listing: String) -> (LinuxSshRouter, std::sync::Arc<Mutex<Vec<String>>>) {
+        let log = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = log.clone();
+        let r = LinuxSshRouter::with_exec(std::sync::Arc::new(move |cmd: &str| {
+            sink.lock().unwrap().push(cmd.to_string());
+            Ok(if cmd.starts_with("nft -j list") {
+                listing.clone()
+            } else {
+                String::new()
+            })
+        }));
+        (r, log)
+    }
+
+    #[tokio::test]
+    async fn test_sync_peer_isolation_loads_the_node_blocks() {
+        let (r, log) = answering_nft(String::new());
+        r.sync_peer_isolation(&[
+            "10.66.0.1/16".to_string(),
+            "fd66::/64".to_string(),
+            "10.66.4.0/24".to_string(),
+        ])
+        .await
+        .unwrap();
+
+        let ran = log.lock().unwrap().clone();
+        assert_eq!(ran.len(), 2, "{ran:?}");
+        let load = &ran[1];
+        assert!(load.ends_with("| nft -f -"), "{load}");
+        assert!(load.contains("hook forward"), "{load}");
+        assert!(load.contains("policy accept"), "{load}");
+        assert!(load.contains("delete table inet lnvps_isolation"), "{load}");
+        assert!(
+            load.contains(r#"iifname "wgln*" ip daddr @peers4"#),
+            "{load}"
+        );
+        assert!(
+            load.contains(r#"iifname "wgln*" ip6 daddr @peers6"#),
+            "{load}"
+        );
+        assert!(load.contains("elements = { 10.66.0.0/16 }"), "{load}");
+        assert!(load.contains("elements = { fd66::/64 }"), "{load}");
+        assert!(!load.contains("10.66.4.0"), "{load}");
+    }
+
+    #[tokio::test]
+    async fn test_sync_peer_isolation_is_silent_when_loaded() {
+        let blocks = isolation_blocks(&["10.66.0.0/16".to_string()]).unwrap();
+        let listing = serde_json::json!({"nftables": [
+            {"metainfo": {"json_schema_version": 1}},
+            {"table": {"family": "inet", "name": "lnvps_isolation"}},
+            {"rule": {"family": "inet", "table": "lnvps_isolation", "chain": "forward",
+                "comment": isolation_tag(&blocks)}}
+        ]})
+        .to_string();
+        let (r, log) = answering_nft(listing);
+
+        r.sync_peer_isolation(&["10.66.0.0/16".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(log.lock().unwrap().len(), 1, "only the query");
+    }
+
+    #[tokio::test]
+    async fn test_sync_peer_isolation_reloads_a_stale_filter() {
+        let old = isolation_blocks(&["10.66.0.0/16".to_string()]).unwrap();
+        let listing = serde_json::json!({"nftables": [
+            {"rule": {"family": "inet", "table": "lnvps_isolation", "chain": "forward",
+                "comment": isolation_tag(&old)}}
+        ]})
+        .to_string();
+        let (r, log) = answering_nft(listing);
+
+        r.sync_peer_isolation(&["10.66.0.0/16".to_string(), "10.67.0.0/24".to_string()])
+            .await
+            .unwrap();
+
+        let ran = log.lock().unwrap().clone();
+        assert_eq!(ran.len(), 2, "{ran:?}");
+        assert!(ran[1].contains("10.67.0.0/24"), "{}", ran[1]);
+    }
+
+    #[tokio::test]
+    async fn test_sync_peer_isolation_refuses_what_is_not_a_cidr() {
+        let (r, log) = answering_nft(String::new());
+        let err = r
+            .sync_peer_isolation(&["10.66.0.0/16; reboot".to_string()])
+            .await
+            .unwrap_err();
+        assert!(format!("{err}").contains("not a CIDR"), "{err}");
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_isolation_ruleset_with_no_blocks_still_loads() {
+        let script = isolation_ruleset(&[], &isolation_tag(&[]));
+        assert!(!script.contains("elements"), "{script}");
+        assert!(script.contains("hook forward"), "{script}");
     }
 
     #[test]

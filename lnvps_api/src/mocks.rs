@@ -57,6 +57,7 @@ pub struct MockRouter {
     addresses: Arc<Mutex<HashMap<String, Vec<String>>>>,
     /// Routes pointing down each tunnel interface
     routes: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    isolated: Arc<Mutex<Option<Vec<String>>>>,
 }
 
 impl Default for MockRouter {
@@ -84,6 +85,7 @@ impl MockRouter {
                 Arc::new(Mutex::new(HashMap::new()));
             static TL_ROUTES: Arc<Mutex<HashMap<String, Vec<String>>>> =
                 Arc::new(Mutex::new(HashMap::new()));
+            static TL_ISOLATED: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
             static TL_DEFAULT_ROUTE: Arc<Mutex<Option<BgpRoute>>> =
                 Arc::new(Mutex::new(Some(BgpRoute {
                     prefix: "0.0.0.0/0".to_string(),
@@ -98,6 +100,7 @@ impl MockRouter {
             default_route: TL_DEFAULT_ROUTE.with(|d| d.clone()),
             addresses: TL_ADDRESSES.with(|a| a.clone()),
             routes: TL_ROUTES.with(|r| r.clone()),
+            isolated: TL_ISOLATED.with(|i| i.clone()),
         }
     }
 
@@ -113,6 +116,11 @@ impl MockRouter {
         addresses.clear();
         let mut routes = self.routes.lock().await;
         routes.clear();
+        *self.isolated.lock().await = None;
+    }
+
+    pub async fn isolated_blocks(&self) -> Option<Vec<String>> {
+        self.isolated.lock().await.clone()
     }
 
     /// Addresses configured on a tunnel interface
@@ -332,6 +340,11 @@ impl TunnelRouter for MockRouter {
     async fn sync_tunnel_routes(&self, interface: &str, prefixes: &[String]) -> OpResult<()> {
         let mut map = self.routes.lock().await;
         map.insert(interface.to_string(), prefixes.to_vec());
+        Ok(())
+    }
+
+    async fn sync_peer_isolation(&self, blocks: &[String]) -> OpResult<()> {
+        *self.isolated.lock().await = Some(blocks.to_vec());
         Ok(())
     }
 

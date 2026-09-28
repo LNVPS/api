@@ -29,7 +29,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use lnvps_e2e::stack::{Addrs, Stack, run};
+use lnvps_e2e::stack::{Addrs, Stack, ip, run};
 use lnvps_node::net::{DesiredDataPlane, DesiredTunnel};
 
 /// A route server whose commands run inside a namespace instead of over SSH.
@@ -69,22 +69,7 @@ fn requirements_met() -> bool {
     true
 }
 
-/// The whole path: LNVPS's route server, the node's daemon code, and a guest
-/// behind it — with packets crossing all of it.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires root and network namespaces; run with scripts/tunnel-e2e.sh"]
-async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()> {
-    if !requirements_met() {
-        return Ok(());
-    }
-    let stack = Stack::new("guest", 1)?;
-
-    // ---- both ends, built by production code from one shared description
-    let guest_cidr = format!("{}/32", &stack.addrs.guest);
-    let dataplane = stack.bring_up(1, std::slice::from_ref(&guest_cidr)).await?;
-    let (kernel, firewall) = (&dataplane.kernel, &dataplane.firewall);
-
-    // ---- a guest on the node's bridge, addressed as a customer's VM is
+fn attach_guest(stack: &Stack) -> Result<()> {
     run(
         "ip",
         &[
@@ -143,17 +128,6 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
         "dev",
         &stack.names.guest_peer,
     ])?;
-    // A second address the guest simply gave itself. Nothing stops a customer
-    // doing this — root in their own VM is the whole product — so the filter is
-    // what has to stop the packets.
-    stack.in_guest(&[
-        "ip",
-        "addr",
-        "add",
-        &format!("{}/24", &stack.addrs.guest_spoof),
-        "dev",
-        &stack.names.guest_peer,
-    ])?;
     stack.in_guest(&["ip", "link", "set", &stack.names.guest_peer, "up"])?;
     // The guest is configured with its range's gateway and believes it is
     // on-link — which is exactly why the node holds that address and answers
@@ -165,6 +139,37 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
         "default",
         "via",
         &stack.addrs.guest_gateway,
+    ])?;
+
+    Ok(())
+}
+
+/// The whole path: LNVPS's route server, the node's daemon code, and a guest
+/// behind it — with packets crossing all of it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires root and network namespaces; run with scripts/tunnel-e2e.sh"]
+async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()> {
+    if !requirements_met() {
+        return Ok(());
+    }
+    let stack = Stack::new("guest", 1)?;
+
+    // ---- both ends, built by production code from one shared description
+    let guest_cidr = format!("{}/32", &stack.addrs.guest);
+    let dataplane = stack.bring_up(1, std::slice::from_ref(&guest_cidr)).await?;
+    let (kernel, firewall) = (&dataplane.kernel, &dataplane.firewall);
+
+    attach_guest(&stack)?;
+    // A second address the guest simply gave itself. Nothing stops a customer
+    // doing this — root in their own VM is the whole product — so the filter is
+    // what has to stop the packets.
+    stack.in_guest(&[
+        "ip",
+        "addr",
+        "add",
+        &format!("{}/24", &stack.addrs.guest_spoof),
+        "dev",
+        &stack.names.guest_peer,
     ])?;
 
     // ---- the tunnel itself
@@ -370,4 +375,198 @@ fn both_ends_agree_on_the_bridge() {
         lnvps_api::provisioner::NODE_BRIDGE,
         lnvps_node::net::GUEST_BRIDGE
     );
+}
+
+struct OtherNode {
+    ns: String,
+}
+
+impl OtherNode {
+    const WG: &'static str = "wgother";
+    const UNDERLAY_RS: &'static str = "192.0.2.1";
+    const UNDERLAY: &'static str = "192.0.2.2";
+
+    fn build(
+        stack: &Stack,
+        index: u8,
+        keys: &lnvps_api_common::WireguardKeypair,
+        rs_public_key: &str,
+        addresses: &[String],
+    ) -> Result<Self> {
+        let node = Self {
+            ns: format!("{}-ot-{index}", lnvps_e2e::stack::PREFIX),
+        };
+        node.teardown();
+        let (rs_end, own_end) = (format!("e2e{index}or"), format!("e2e{index}ot"));
+        ip(&["netns", "add", &node.ns])?;
+        ip(&[
+            "link", "add", &rs_end, "type", "veth", "peer", "name", &own_end,
+        ])?;
+        ip(&["link", "set", &rs_end, "netns", &stack.names.rs_ns])?;
+        ip(&["link", "set", &own_end, "netns", &node.ns])?;
+        stack.in_rs(&[
+            "ip",
+            "addr",
+            "add",
+            &format!("{}/24", Self::UNDERLAY_RS),
+            "dev",
+            &rs_end,
+        ])?;
+        stack.in_rs(&["ip", "link", "set", &rs_end, "up"])?;
+        node.exec(&[
+            "ip",
+            "addr",
+            "add",
+            &format!("{}/24", Self::UNDERLAY),
+            "dev",
+            &own_end,
+        ])?;
+        node.exec(&["ip", "link", "set", &own_end, "up"])?;
+        node.exec(&["ip", "link", "set", "lo", "up"])?;
+
+        let key_file = tempfile::NamedTempFile::new()?;
+        std::fs::write(key_file.path(), &keys.private_key)?;
+        node.exec(&["ip", "link", "add", Self::WG, "type", "wireguard"])?;
+        node.exec(&[
+            "wg",
+            "set",
+            Self::WG,
+            "private-key",
+            &key_file.path().to_string_lossy(),
+            "peer",
+            rs_public_key,
+            "endpoint",
+            &format!("{}:{}", Self::UNDERLAY_RS, stack.addrs.listen_port),
+            "allowed-ips",
+            "0.0.0.0/0",
+            "persistent-keepalive",
+            "1",
+        ])?;
+        for address in addresses {
+            node.exec(&["ip", "addr", "add", address, "dev", Self::WG])?;
+        }
+        node.exec(&["ip", "link", "set", Self::WG, "mtu", "1420", "up"])?;
+        node.exec(&["ip", "route", "add", "default", "dev", Self::WG])?;
+        Ok(node)
+    }
+
+    fn exec(&self, argv: &[&str]) -> Result<String> {
+        let mut full = vec!["netns", "exec", self.ns.as_str()];
+        full.extend_from_slice(argv);
+        ip(&full)
+    }
+
+    fn ping(&self, from: &str, to: &str) -> Result<String> {
+        self.exec(&["ping", "-c", "2", "-W", "3", "-I", from, to])
+    }
+
+    fn teardown(&self) {
+        let _ = Command::new("ip")
+            .args(["netns", "delete", &self.ns])
+            .output();
+    }
+}
+
+impl Drop for OtherNode {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires root and network namespaces; run with scripts/tunnel-e2e.sh"]
+async fn another_node_cannot_reach_a_node_through_the_route_server() -> Result<()> {
+    use lnvps_api::router::{TunnelRouter, WireguardPeer};
+
+    if !requirements_met() {
+        return Ok(());
+    }
+    let index = 4;
+    let stack = Stack::new("hairpin", index)?;
+    let guest_cidr = format!("{}/32", &stack.addrs.guest);
+    let dataplane = stack
+        .bring_up(index, std::slice::from_ref(&guest_cidr))
+        .await?;
+    attach_guest(&stack)?;
+    stack.in_rs(&["sysctl", "-qw", "net.ipv4.ip_forward=1"])?;
+
+    let other_inner = format!("10.66.{index}.3");
+    let other_guest = format!("203.0.{index}.77");
+    let other_keys = lnvps_api_common::generate_wireguard_keypair()?;
+    let rs = stack.route_server();
+    rs.set_tunnel_peer(
+        &dataplane.rs_interface,
+        &WireguardPeer {
+            public_key: lnvps_api_common::wireguard_key_to_base64(&other_keys.public_key),
+            endpoint: None,
+            allowed_ips: vec![format!("{other_inner}/32"), format!("{other_guest}/32")],
+            persistent_keepalive: None,
+        },
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    rs.sync_tunnel_routes(
+        &dataplane.rs_interface,
+        &[
+            stack.addrs.pool_block.clone(),
+            guest_cidr.clone(),
+            format!("{other_guest}/32"),
+        ],
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let other = OtherNode::build(
+        &stack,
+        index,
+        &other_keys,
+        &lnvps_api_common::wireguard_key_to_base64(&dataplane.server_key.public_key),
+        &[format!("{other_inner}/32"), format!("{other_guest}/32")],
+    )?;
+
+    let node_inner = Addrs::bare(&stack.addrs.node_inner);
+    other.ping(&other_inner, node_inner).with_context(|| {
+        format!(
+            "the hairpin this test closes was not open to begin with\n{}\n{}\n{}\n{}\n{}",
+            stack.in_rs(&["wg", "show"]).unwrap_or_default(),
+            stack.in_rs(&["ip", "route"]).unwrap_or_default(),
+            other.exec(&["wg", "show"]).unwrap_or_default(),
+            stack
+                .in_dataplane(&["nft", "list", "ruleset"])
+                .unwrap_or_default(),
+            stack
+                .in_rs(&["sysctl", "net.ipv4.ip_forward"])
+                .unwrap_or_default(),
+        )
+    })?;
+
+    rs.sync_peer_isolation(&[
+        stack.addrs.pool_block.clone(),
+        stack.addrs.pool_block6.clone(),
+    ])
+    .await
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    assert!(
+        other.ping(&other_inner, node_inner).is_err(),
+        "another node reached this node's inner address through the route server:\n{}",
+        stack.in_rs(&["nft", "list", "ruleset"]).unwrap_or_default()
+    );
+    let ruleset = stack.in_rs(&["nft", "list", "table", "inet", "lnvps_isolation"])?;
+    let v4_drop = ruleset
+        .lines()
+        .find(|l| l.contains("@peers4"))
+        .unwrap_or_default();
+    assert!(
+        v4_drop.contains("counter packets") && !v4_drop.contains("counter packets 0 "),
+        "nothing was counted, so the drop was not ours:\n{ruleset}"
+    );
+
+    other
+        .ping(&other_guest, &stack.addrs.guest)
+        .context("guest-to-guest traffic between nodes was blocked as well")?;
+    stack
+        .in_rs(&["ping", "-c", "2", "-W", "3", node_inner])
+        .context("the route server itself lost the node")?;
+    Ok(())
 }

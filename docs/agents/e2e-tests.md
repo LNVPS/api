@@ -393,6 +393,11 @@ nobody assigned it — which any customer with root in their own VM can do — a
 counter is asserted to move. The counter, not the ping's exit status: a spoofed packet gets no
 reply in any case, for want of a return route.
 
+It also proves the route server isolates nodes from each other: a second node peers with the
+same route server and pings the first node's inner address through it, which works until
+`sync_peer_isolation` loads the `inet lnvps_isolation` table and then fails with the drop
+counter moving. Guest-to-guest traffic between the two nodes still passes.
+
 Coverage note: the netlink implementation (`lnvps_node::net::kernel`) and
 `lnvps_node::netns`, along with `lnvps_node::fw`'s `SystemFirewall`, are exercised here rather
 than by the normal test run, the

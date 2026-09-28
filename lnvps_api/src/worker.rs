@@ -7050,6 +7050,76 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_reconcile_isolates_every_node_block_on_the_router() -> Result<()> {
+        use crate::mocks::MockRouter;
+        use lnvps_db::TunnelPool;
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        setup_node_tunnel(&db, pool_id).await?;
+        let pool = |router_id: u64, port: u16, cidr4: &str, cidr6: Option<&str>, enabled| {
+            let keys = lnvps_api_common::generate_wireguard_keypair().unwrap();
+            TunnelPool {
+                router_id,
+                region_id: 1,
+                name: format!("pool{port}"),
+                listen_addr: "192.0.2.1".to_string(),
+                listen_port: port,
+                private_key: keys.private_key.into(),
+                public_key: keys.public_key,
+                cidr4: Some(cidr4.to_string()),
+                cidr6: cidr6.map(str::to_string),
+                mtu: 1420,
+                enabled,
+                ..Default::default()
+            }
+        };
+        db.insert_tunnel_pool(&pool(1, 51821, "10.67.0.0/24", Some("fd67::/64"), false))
+            .await?;
+        let vpn_pool = db
+            .insert_tunnel_pool(&pool(1, 51822, "10.68.0.0/24", None, true))
+            .await?;
+        db.vpn_service_pools.lock().await.insert(vpn_pool, 1);
+        db.vpn_services.lock().await.insert(
+            1,
+            lnvps_db::VpnService {
+                id: 1,
+                ..Default::default()
+            },
+        );
+        db.router.lock().await.insert(
+            2,
+            lnvps_db::Router {
+                id: 2,
+                name: "rs2".to_string(),
+                enabled: true,
+                kind: lnvps_db::RouterKind::MockRouter,
+                url: "mock://".to_string(),
+                token: "".into(),
+            },
+        );
+        db.insert_tunnel_pool(&pool(2, 51823, "10.69.0.0/24", None, true))
+            .await?;
+
+        let mr = MockRouter::new();
+        mr.clear().await;
+        let worker = setup_worker(db.clone()).await?;
+        worker.tunnels().sync_pool(pool_id).await?;
+
+        assert_eq!(
+            mr.isolated_blocks().await,
+            Some(vec![
+                "10.66.0.0/24".to_string(),
+                "10.67.0.0/24".to_string(),
+                "fd67::/64".to_string(),
+            ])
+        );
+
+        mr.clear().await;
+        Ok(())
+    }
+
     /// Peers are configured *on* an interface. Creating it here would duplicate
     /// the pool sync and hide the fact that it never ran.
     #[tokio::test]
