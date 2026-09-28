@@ -303,6 +303,15 @@ async fn admin_create_tunnel_pool(
     ApiData::ok(pool_info(&this.db, pool).await?)
 }
 
+fn tunnel_mtu(mtu: u16) -> Result<u16, ApiError> {
+    if mtu < 1280 {
+        return Err(ApiError::bad_request(format!(
+            "mtu {mtu} is below 1280, where Linux turns IPv6 off on the interface"
+        )));
+    }
+    Ok(mtu)
+}
+
 pub(crate) async fn create_tunnel_pool(
     db: &std::sync::Arc<dyn LNVpsDb>,
     req: &CreateTunnelPoolRequest,
@@ -337,7 +346,7 @@ pub(crate) async fn create_tunnel_pool(
             cidr4,
             cidr6,
             keepalive: req.keepalive,
-            mtu: req.mtu.unwrap_or(1420),
+            mtu: tunnel_mtu(req.mtu.unwrap_or(1420))?,
             enabled: req.enabled.unwrap_or(true),
             created: Utc::now(),
         })
@@ -444,7 +453,7 @@ pub(crate) async fn update_tunnel_pool(
         pool.keepalive = keepalive;
     }
     if let Some(mtu) = req.mtu {
-        pool.mtu = mtu;
+        pool.mtu = tunnel_mtu(mtu)?;
     }
     if let Some(enabled) = req.enabled {
         pool.enabled = enabled;
@@ -998,6 +1007,35 @@ mod tests {
         let (db, router_id) = db().await;
         create_tunnel_pool(&db, &create(router_id)).await.unwrap();
         assert!(create_tunnel_pool(&db, &create(router_id)).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_pool_mtu_below_the_ipv6_minimum_is_refused() {
+        let (db, router_id) = db().await;
+        let err = create_tunnel_pool(
+            &db,
+            &CreateTunnelPoolRequest {
+                mtu: Some(1240),
+                ..create(router_id)
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.error.contains("1280"), "{}", err.error);
+
+        let pool = create_tunnel_pool(&db, &create(router_id)).await.unwrap();
+        let err = update_tunnel_pool(
+            &db,
+            pool.id,
+            &UpdateTunnelPoolRequest {
+                mtu: Some(1279),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.error.contains("1280"), "{}", err.error);
+        assert_eq!(db.get_tunnel_pool(pool.id).await.unwrap().mtu, 1420);
     }
 
     #[tokio::test]

@@ -58,6 +58,7 @@ pub struct MockRouter {
     /// Routes pointing down each tunnel interface
     routes: Arc<Mutex<HashMap<String, Vec<String>>>>,
     isolated: Arc<Mutex<Option<Vec<String>>>>,
+    mtus: Arc<Mutex<HashMap<String, u16>>>,
 }
 
 impl Default for MockRouter {
@@ -86,6 +87,7 @@ impl MockRouter {
             static TL_ROUTES: Arc<Mutex<HashMap<String, Vec<String>>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             static TL_ISOLATED: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
+            static TL_MTUS: Arc<Mutex<HashMap<String, u16>>> = Arc::new(Mutex::new(HashMap::new()));
             static TL_DEFAULT_ROUTE: Arc<Mutex<Option<BgpRoute>>> =
                 Arc::new(Mutex::new(Some(BgpRoute {
                     prefix: "0.0.0.0/0".to_string(),
@@ -101,6 +103,7 @@ impl MockRouter {
             addresses: TL_ADDRESSES.with(|a| a.clone()),
             routes: TL_ROUTES.with(|r| r.clone()),
             isolated: TL_ISOLATED.with(|i| i.clone()),
+            mtus: TL_MTUS.with(|m| m.clone()),
         }
     }
 
@@ -117,6 +120,11 @@ impl MockRouter {
         let mut routes = self.routes.lock().await;
         routes.clear();
         *self.isolated.lock().await = None;
+        self.mtus.lock().await.clear();
+    }
+
+    pub async fn interface_mtu(&self, interface: &str) -> Option<u16> {
+        self.mtus.lock().await.get(interface).copied()
     }
 
     pub async fn isolated_blocks(&self) -> Option<Vec<String>> {
@@ -340,6 +348,11 @@ impl TunnelRouter for MockRouter {
     async fn sync_tunnel_routes(&self, interface: &str, prefixes: &[String]) -> OpResult<()> {
         let mut map = self.routes.lock().await;
         map.insert(interface.to_string(), prefixes.to_vec());
+        Ok(())
+    }
+
+    async fn sync_tunnel_mtu(&self, interface: &str, mtu: u16) -> OpResult<()> {
+        self.mtus.lock().await.insert(interface.to_string(), mtu);
         Ok(())
     }
 

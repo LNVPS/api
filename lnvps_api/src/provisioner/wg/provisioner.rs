@@ -369,9 +369,9 @@ impl TunnelProvisioner {
         // What is behind each node peer is recomputed from the guest
         // assignments before the plan is built, so the planner can read it
         // without knowing that marketplace nodes exist.
-        crate::provisioner::MarketplaceTunnels::new(self.db.clone())
-            .refresh_routes(&pool)
-            .await?;
+        let marketplace = crate::provisioner::MarketplaceTunnels::new(self.db.clone());
+        marketplace.refresh_routes(&pool).await?;
+        marketplace.sync_host_mtus(&pool).await?;
         let plan = self.plan(&pool).await?;
         let mut drift = TunnelPeerDrift::default();
 
@@ -411,6 +411,9 @@ impl TunnelProvisioner {
         tr.sync_tunnel_routes(&interface, &plan.routes)
             .await
             .map_err(|e| anyhow!("failed to configure routes on {interface}: {}", e))?;
+        tr.sync_tunnel_mtu(&interface, pool.mtu)
+            .await
+            .map_err(|e| anyhow!("failed to set the MTU of {interface}: {}", e))?;
         let blocks = self.node_blocks(pool.router_id).await?;
         tr.sync_peer_isolation(&blocks).await.map_err(|e| {
             anyhow!(

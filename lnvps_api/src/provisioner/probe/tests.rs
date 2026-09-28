@@ -1045,3 +1045,24 @@ async fn a_panicking_probe_still_destroys_its_vm() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn an_underlay_that_cannot_carry_the_pool_mtu_is_rejected() {
+    let pool = lnvps_db::TunnelPool {
+        listen_addr: "185.18.221.1".to_string(),
+        mtu: 1420,
+        ..Default::default()
+    };
+    assert_eq!(underlay_shortfall(&pool, Some(1480)), None);
+    let short = underlay_shortfall(&pool, Some(1476)).unwrap();
+    assert!(short.contains("1476") && short.contains("1480"), "{short}");
+    assert!(underlay_shortfall(&pool, None).is_some());
+
+    let v6 = lnvps_db::TunnelPool {
+        listen_addr: "2001:db8::1".to_string(),
+        mtu: 1420,
+        ..Default::default()
+    };
+    assert!(underlay_shortfall(&v6, Some(1480)).is_some());
+    assert_eq!(underlay_shortfall(&v6, Some(1500)), None);
+}

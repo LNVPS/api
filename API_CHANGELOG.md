@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Tunnel pool MTU has a floor of 1280** — `POST`/`PATCH /api/admin/v1/tunnel_pools` refuse an `mtu` below 1280, where Linux turns IPv6 off on the interface. A pool's MTU is now also applied to its route server interface and to the marketplace hosts in it, and a marketplace node whose measured path to the route server cannot carry the pool MTU plus WireGuard's overhead fails its probe.
+
 ### Fixed
 
 - **Guests on libvirt hosts get DNS resolvers and the host's MTU** — the NoCloud network config now carries `nameservers` and, when the host has one set, `mtu`. Images that resolve through systemd-resolved (Debian 13 among them) ignored the resolvers in user-data and booted with no DNS at all.

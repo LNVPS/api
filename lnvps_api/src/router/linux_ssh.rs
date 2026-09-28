@@ -732,6 +732,22 @@ impl TunnelRouter for LinuxSshRouter {
         Ok(())
     }
 
+    async fn sync_tunnel_mtu(&self, interface: &str, mtu: u16) -> OpResult<()> {
+        let out = self
+            .exec_checked(&format!("ip -j link show dev {}", shq(interface)))
+            .await?;
+        let links: Vec<IpLinkMtu> = match serde_json::from_str(&out) {
+            Ok(l) => l,
+            Err(e) => op_fatal!("Failed to parse ip link output: {}", e),
+        };
+        if links.iter().any(|l| l.mtu == Some(mtu as u32)) {
+            return Ok(());
+        }
+        self.exec_checked(&format!("ip link set dev {} mtu {mtu}", shq(interface)))
+            .await?;
+        Ok(())
+    }
+
     async fn sync_peer_isolation(&self, blocks: &[String]) -> OpResult<()> {
         let blocks = match isolation_blocks(blocks) {
             Ok(b) => b,
@@ -1056,6 +1072,11 @@ struct IpLink {
     flags: Vec<String>,
     linkinfo: Option<IpLinkInfo>,
     stats64: Option<IpStats64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct IpLinkMtu {
+    mtu: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1536,6 +1557,19 @@ mod tests {
             })
         }));
         (r, log)
+    }
+
+    #[tokio::test]
+    async fn test_sync_tunnel_mtu_sets_only_a_wrong_mtu() {
+        let (r, log) = recorded(r#"[{"ifname":"wgln1","mtu":1420}]"#);
+        r.sync_tunnel_mtu("wgln1", 1280).await.unwrap();
+        let ran = log.lock().unwrap().clone();
+        assert_eq!(ran.len(), 2, "{ran:?}");
+        assert_eq!(ran[1], "ip link set dev 'wgln1' mtu 1280");
+
+        let (r, log) = recorded(r#"[{"ifname":"wgln1","mtu":1280}]"#);
+        r.sync_tunnel_mtu("wgln1", 1280).await.unwrap();
+        assert_eq!(log.lock().unwrap().len(), 1, "only the query");
     }
 
     #[tokio::test]

@@ -32,7 +32,8 @@ use lnvps_api_common::host::config::ProvisionerConfig;
 use lnvps_api_common::host::{FullVmInfo, get_host_client};
 use lnvps_db::{
     CpuArch, DiskInterface, DiskType, IpRange, LNVpsDb, MarketplaceNode, MarketplaceNodeHealth,
-    OsDistribution, UserSshKey, Vm, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
+    OsDistribution, TunnelPool, UserSshKey, Vm, VmHost, VmHostDisk, VmIpAssignment, VmOsImage,
+    VmTemplate,
 };
 
 use super::{probe_address, probe_mac};
@@ -447,7 +448,7 @@ where
 }
 
 impl ProbeResult {
-    pub(super) fn failed(why: String) -> Self {
+    pub fn failed(why: String) -> Self {
         Self {
             failure: Some(why),
             ..Default::default()
@@ -476,6 +477,26 @@ pub async fn record(
 /// Written down anyway, because the alternative was writing nothing, and a node
 /// with no rows is indistinguishable from a node nobody probed. It is also what
 /// starts the cooldown that stops this node monopolising every sweep.
+pub fn underlay_shortfall(pool: &TunnelPool, measured: Option<u32>) -> Option<String> {
+    let overhead = match pool.listen_addr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => 60,
+        _ => 80,
+    };
+    let needed = u32::from(pool.mtu) + overhead;
+    match measured {
+        None => Some(format!(
+            "the node could not measure its path to {}; a {}-byte tunnel needs {needed} bytes \
+             unfragmented",
+            pool.listen_addr, pool.mtu
+        )),
+        Some(mtu) if mtu < needed => Some(format!(
+            "the node's path to {} carries {mtu} bytes; a {}-byte tunnel needs {needed}",
+            pool.listen_addr, pool.mtu
+        )),
+        Some(_) => None,
+    }
+}
+
 pub async fn record_unspecified(
     db: &Arc<dyn LNVpsDb>,
     node_id: u64,

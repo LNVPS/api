@@ -911,6 +911,16 @@ impl Worker {
             return Ok(());
         };
         let proven_before = self.has_passed_a_probe(node.id).await?;
+        if let Some(failure) = self.underlay_failure(&node).await? {
+            warn!("Marketplace node {} failed its probe: {}", node.id, failure);
+            crate::provisioner::record_unspecified(
+                &self.db,
+                node.id,
+                crate::provisioner::ProbeResult::failed(failure),
+            )
+            .await?;
+            return Ok(());
+        }
 
         // A probe that could not be run at all must not abort the sweep: this
         // runs from `handle_job`, whose error stops the rest of the batch, so
@@ -972,6 +982,25 @@ impl Worker {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn underlay_failure(&self, node: &lnvps_db::MarketplaceNode) -> Result<Option<String>> {
+        let Some(control) = self.settings.node_control.as_ref() else {
+            return Ok(None);
+        };
+        let Some(tunnel) = crate::provisioner::MarketplaceTunnels::new(self.db.clone())
+            .get_tunnel(node)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(host) = self.db.get_marketplace_node_host(node.id).await? else {
+            return Ok(None);
+        };
+        Ok(match control.status(node, &host).await {
+            Ok(status) => crate::provisioner::underlay_shortfall(&tunnel.pool, status.underlay_mtu),
+            Err(e) => Some(format!("could not read the node's status: {e:#}")),
+        })
     }
 
     async fn has_passed_a_probe(&self, node_id: u64) -> Result<bool> {
@@ -4121,10 +4150,11 @@ impl Worker {
             self.db.list_os_image().await?
         };
 
-        // Resolve and persist sha2/sha2_url for any image that is missing them
+        // Resolve and persist sha2/sha2_url for any image that is missing them,
+        // and refresh any pin whose published checksum has moved on.
         let mut images = images;
         for image in &mut images {
-            if image.sha2.is_none() {
+            if image.sha2.is_none() || image.sha2_url.is_some() {
                 self.resolve_and_persist_sha2(image).await;
             }
         }
@@ -4191,7 +4221,18 @@ impl Worker {
         };
 
         if let Some((checksum, sums_url)) = resolved {
-            info!("Resolved sha2 for {}: {}", image.url, checksum);
+            if image.sha2.as_deref() == Some(checksum.as_str())
+                && image.sha2_url.as_deref() == Some(sums_url.as_str())
+            {
+                return;
+            }
+            match &image.sha2 {
+                Some(old) => info!(
+                    "Published sha2 for {} moved from {} to {}",
+                    image.url, old, checksum
+                ),
+                None => info!("Resolved sha2 for {}: {}", image.url, checksum),
+            }
             image.sha2 = Some(checksum);
             image.sha2_url = Some(sums_url);
             if let Err(e) = self.db.update_os_image(image).await {
@@ -5252,6 +5293,59 @@ mod tests {
             })
             .await?;
         Ok((node_id, host_id))
+    }
+
+    #[tokio::test]
+    async fn a_pinned_checksum_follows_the_published_one() -> Result<()> {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let fresh = "d3".repeat(64);
+        Mock::given(path("/SHA512SUMS"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!("{fresh}  debian-13-genericcloud-amd64.raw\n")),
+            )
+            .mount(&server)
+            .await;
+
+        let mock = Arc::new(MockDb::empty());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let image = lnvps_db::VmOsImage {
+            id: 6,
+            distribution: lnvps_db::OsDistribution::Debian,
+            flavour: "server".to_string(),
+            version: "13".to_string(),
+            enabled: true,
+            release_date: chrono::Utc::now(),
+            url: format!("{}/debian-13-genericcloud-amd64.raw", server.uri()),
+            cpu_arch: lnvps_db::CpuArch::X86_64,
+            default_username: Some("debian".to_string()),
+            sha2: Some("cb".repeat(64)),
+            sha2_url: Some(format!("{}/SHA512SUMS", server.uri())),
+        };
+        mock.os_images.lock().await.insert(6, image.clone());
+        let worker = setup_worker(mock.clone()).await?;
+
+        worker.download_os_images(Some(6)).await?;
+        assert_eq!(db.get_os_image(6).await?.sha2, Some(fresh.clone()));
+
+        worker.download_os_images(Some(6)).await?;
+        assert_eq!(db.get_os_image(6).await?.sha2, Some(fresh));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_underlay_is_not_judged_without_a_control_key() -> Result<()> {
+        let mock = Arc::new(MockDb::empty());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let (node_id, _) = a_marketplace_host(&db).await?;
+        let worker = setup_worker(mock.clone()).await?;
+        let node = db.get_marketplace_node(node_id).await?;
+
+        assert_eq!(worker.underlay_failure(&node).await?, None);
+        Ok(())
     }
 
     #[tokio::test]
@@ -7169,6 +7263,30 @@ mod tests {
         let drift = worker.tunnels().reconcile_peers(pool_id).await?;
         assert_eq!(drift.unclaimed, vec!["c3RyYXk=".to_string()]);
         assert_eq!(mr.peers(&interface).await.len(), 1);
+
+        mr.clear().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_carries_the_pool_mtu_to_the_route_server() -> Result<()> {
+        use crate::mocks::MockRouter;
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        setup_node_tunnel(&db, pool_id).await?;
+        let mr = MockRouter::new();
+        mr.clear().await;
+        let worker = setup_worker(db.clone()).await?;
+        worker.tunnels().sync_pool(pool_id).await?;
+        let interface = format!("wgln{pool_id}");
+        assert_eq!(mr.interface_mtu(&interface).await, Some(1420));
+
+        let mut pool = db.get_tunnel_pool(pool_id).await?;
+        pool.mtu = 1280;
+        db.update_tunnel_pool(&pool).await?;
+        worker.tunnels().reconcile_peers(pool_id).await?;
+        assert_eq!(mr.interface_mtu(&interface).await, Some(1280));
 
         mr.clear().await;
         Ok(())

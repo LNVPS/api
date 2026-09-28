@@ -129,6 +129,8 @@ pub struct NodeStatus {
     pub inventory: NodeInventory,
     #[serde(default)]
     pub dataplane: NodeDataPlaneState,
+    #[serde(default)]
+    pub underlay_mtu: Option<u32>,
 }
 
 /// The part of a node's inventory LNVPS records, as `lnvps_node::inventory`

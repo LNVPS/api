@@ -336,6 +336,30 @@ async fn a_full_pool_falls_through_to_the_next_one() {
 }
 
 #[tokio::test]
+async fn a_node_host_takes_its_pools_mtu() {
+    let (db, _mock, node, pool_id) = fixture().await;
+    let allocation = mkt(&db).allocate(&node, &NODE_KEY).await.unwrap();
+    let host = db
+        .get_marketplace_node_host(node.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(host.mtu, Some(allocation.pool.mtu));
+
+    let mut pool = db.get_tunnel_pool(pool_id).await.unwrap();
+    pool.mtu = 1280;
+    db.update_tunnel_pool(&pool).await.unwrap();
+    mkt(&db).sync_host_mtus(&pool).await.unwrap();
+
+    let host = db
+        .get_marketplace_node_host(node.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(host.mtu, Some(1280));
+}
+
+#[tokio::test]
 async fn a_node_is_never_given_an_address_a_probe_needs() {
     let (db, mock, node, first_pool) = fixture().await;
     let mut small = db.get_tunnel_pool(first_pool).await.unwrap();

@@ -249,6 +249,7 @@ impl MarketplaceTunnels {
                     let control_address = allocation.control_address()?;
                     let mut host = host;
                     host.ip = control_address;
+                    host.mtu = Some(allocation.pool.mtu);
                     self.db.update_host(&host).await?;
 
                     return Ok(allocation);
@@ -326,6 +327,26 @@ impl MarketplaceTunnels {
         }
         out.sort_by(|a, b| a.address.cmp(&b.address));
         Ok(out)
+    }
+
+    pub async fn sync_host_mtus(&self, pool: &TunnelPool) -> Result<()> {
+        for tunnel in self.db.list_tunnels_in_pool(pool.id).await? {
+            let Some(node) = self.db.get_marketplace_node_by_tunnel(tunnel.id).await? else {
+                continue;
+            };
+            let Some(host) = self.db.get_marketplace_node_host(node.id).await? else {
+                continue;
+            };
+            if host.mtu != Some(pool.mtu) {
+                self.db
+                    .update_host(&lnvps_db::VmHost {
+                        mtu: Some(pool.mtu),
+                        ..host
+                    })
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     /// Recompute what is routed behind every marketplace node peer in `pool`.
