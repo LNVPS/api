@@ -33,6 +33,9 @@ env:
   REGISTRY: registry.v0l.io
   HOST_INFO_IMAGE: registry.v0l.io/lnvps-host-info
 
+permissions:
+  contents: read
+
 jobs:
   # Decide, once, what tag to publish and whether to push:
   #   * master push        -> :latest        (rolling dev images)

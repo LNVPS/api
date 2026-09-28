@@ -36,6 +36,9 @@ env:
   # a dependency on dnsmasq and iptables.
   LNVPS_LIBVIRT_BRIDGE: lnvps-br0
 
+permissions:
+  contents: read
+
 jobs:
   libvirt:
     runs-on: ubuntu-latest

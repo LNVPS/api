@@ -137,6 +137,7 @@ async fn remove_if_present(path: &Path) -> Result<()> {
 /// Stream `url` into `part`, hashing as it goes, and fail unless it matches.
 async fn download(url: &str, part: &Path, expected: &Digestion) -> Result<u64> {
     let response = reqwest::Client::builder()
+        .redirect(https_only_redirects())
         .build()?
         .get(url)
         .send()
@@ -166,6 +167,18 @@ async fn download(url: &str, part: &Path, expected: &Digestion) -> Result<u64> {
         bail!("{url} does not match the digest LNVPS asked for");
     }
     Ok(total)
+}
+
+fn https_only_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.url().scheme() != "https" {
+            attempt.error("An image URL may not redirect off https")
+        } else if attempt.previous().len() >= 10 {
+            attempt.error("Too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
 }
 
 /// The digest to check a download against, and the algorithm to do it with.
@@ -394,5 +407,32 @@ mod tests {
         .await
         .expect_err("http must be refused");
         assert!(err.to_string().contains("https"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_redirect_to_plain_http_is_refused() {
+        use tokio::io::AsyncReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://{addr}/image\r\nContent-Length: 0\r\n\r\n"
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let err = download(
+            &format!("http://{addr}/start"),
+            &dir.path().join("image.part"),
+            &Digestion::parse(&"ab".repeat(32)).unwrap(),
+        )
+        .await
+        .expect_err("a redirect off https must be refused");
+        assert!(format!("{err:#}").contains("redirect off https"), "{err:#}");
     }
 }

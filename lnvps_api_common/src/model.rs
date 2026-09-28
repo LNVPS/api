@@ -953,11 +953,11 @@ impl CustomVmSpec {
     /// An unknown enum spelling is an error rather than a default: a silently
     /// downgraded disk or architecture is worse than a rejected request.
     pub fn to_template(&self) -> Result<VmCustomTemplate> {
-        let mut cpu_features = Vec::with_capacity(self.cpu_feature.len());
-        for f in &self.cpu_feature {
-            cpu_features
-                .push(CpuFeature::from_str(f).map_err(|_| anyhow!("unknown cpu feature {}", f))?);
-        }
+        let cpu_features = self
+            .cpu_feature
+            .iter()
+            .map(|f| CpuFeature::from_str(f).map_err(|_| anyhow!("unknown cpu feature {}", f)))
+            .collect::<Result<Vec<_>>>()?;
         Ok(VmCustomTemplate {
             id: 0,
             cpu: self.cpu,
