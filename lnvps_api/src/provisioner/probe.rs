@@ -175,10 +175,12 @@ impl ProbeSpec {
             .ok_or_else(|| anyhow::anyhow!("Node {} has no tunnel", node.id))?;
         let address = probe_address(&tunnel.tunnel, &tunnel.pool)
             .ok_or_else(|| anyhow::anyhow!("Node {} has no IPv4 address to probe on", node.id))?;
-        let gateway = super::PROBE_GATEWAY.to_string();
-        // Its own address as the range, so the guest's prefix covers nothing
-        // but itself.
-        let range_cidr = address.clone();
+        let range = super::probe_range(&tunnel.pool)
+            .ok_or_else(|| anyhow::anyhow!("Node {}'s pool is too small to probe", node.id))?;
+        let gateway = super::probe_gateway(&tunnel.pool)
+            .ok_or_else(|| anyhow::anyhow!("Node {}'s pool is too small to probe", node.id))?
+            .to_string();
+        let range_cidr = range.to_string();
 
         let mut templates: Vec<VmTemplate> = db
             .list_vm_templates()

@@ -35,8 +35,6 @@ pub fn probe_mac(node_id: u64) -> String {
     format!("52:54:01:{:02x}:{:02x}:{:02x}", id[5], id[6], id[7])
 }
 
-pub const PROBE_GATEWAY: Ipv4Addr = Ipv4Addr::new(169, 254, 0, 1);
-
 pub fn probe_address(tunnel: &Tunnel, pool: &TunnelPool) -> Option<String> {
     let block = pool_block4(pool)?;
     let bare = tunnel.address4.as_deref()?.split('/').next()?;
@@ -48,26 +46,36 @@ pub fn probe_address(tunnel: &Tunnel, pool: &TunnelPool) -> Option<String> {
     }
     let size = block_size(&block);
     let offset = u64::from(u32::from(node) - u32::from(block.network()));
-    if offset < 2 || offset >= size / 2 {
+    if offset < 2 || offset > size / 2 - 2 {
         return None;
     }
     let probe = u64::from(u32::from(block.network())) + size - offset;
     Some(format!("{}/32", Ipv4Addr::from(u32::try_from(probe).ok()?)))
 }
 
-pub fn probe_half(pool: &TunnelPool) -> Option<IpNetwork> {
+pub fn probe_range(pool: &TunnelPool) -> Option<Ipv4Network> {
     let block = pool_block4(pool)?;
-    if block.prefix() >= 31 {
+    if block.prefix() > 29 {
         return None;
     }
-    let half = block_size(&block) / 2;
-    let start = u64::from(u32::from(block.network())) + half;
+    let start = u64::from(u32::from(block.network())) + block_size(&block) / 2;
     Ipv4Network::new(
         Ipv4Addr::from(u32::try_from(start).ok()?),
         block.prefix() + 1,
     )
     .ok()
-    .map(IpNetwork::V4)
+}
+
+pub fn probe_gateway(pool: &TunnelPool) -> Option<Ipv4Addr> {
+    Some(Ipv4Addr::from(u32::from(probe_range(pool)?.network()) + 1))
+}
+
+pub fn probe_reserved(pool: &TunnelPool) -> Vec<IpNetwork> {
+    let Some(range) = probe_range(pool) else {
+        return vec![];
+    };
+    let last_node = Ipv4Addr::from(u32::from(range.network()) - 1);
+    vec![IpNetwork::V4(range), IpNetwork::from(IpAddr::V4(last_node))]
 }
 
 fn pool_block4(pool: &TunnelPool) -> Option<Ipv4Network> {

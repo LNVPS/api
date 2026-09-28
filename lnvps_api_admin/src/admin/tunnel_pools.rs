@@ -197,7 +197,7 @@ fn link_capacity(cidr: Option<&str>, probes: bool) -> Option<u64> {
     // network address, the route server's address after it, and — on IPv4 —
     // the broadcast address are not the pool's to hand out.
     if net.is_ipv4() && probes {
-        return Some((total / 2).saturating_sub(2));
+        return Some((total / 2).saturating_sub(3));
     }
     let reserved = if net.is_ipv4() { 3 } else { 2 };
     Some(total.saturating_sub(reserved))
@@ -664,7 +664,7 @@ mod tests {
         let info = pool_info(&db, pool).await.unwrap();
         assert_eq!(info.router_name, "rs1");
         assert_eq!(info.links_used, 0);
-        assert_eq!(info.links_total, 126);
+        assert_eq!(info.links_total, 125);
     }
 
     /// Capacity has to reflect what can be handed out, not the roomier of the
@@ -684,7 +684,7 @@ mod tests {
         .unwrap();
 
         let info = pool_info(&db, pool).await.unwrap();
-        assert_eq!(info.links_total, 6, "the /28 limits the pool to 6 nodes");
+        assert_eq!(info.links_total, 5, "the /28 limits the pool to 5 nodes");
     }
 
     /// Capacity is what can actually be placed: the block's own reserved
@@ -713,9 +713,9 @@ mod tests {
 
     #[test]
     fn a_marketplace_pool_keeps_the_top_half_of_its_v4_block_for_probes() {
-        assert_eq!(link_capacity(Some("10.0.0.0/24"), true), Some(126));
-        assert_eq!(link_capacity(Some("10.95.0.0/16"), true), Some(32766));
-        assert_eq!(link_capacity(Some("10.0.0.0/29"), true), Some(2));
+        assert_eq!(link_capacity(Some("10.0.0.0/24"), true), Some(125));
+        assert_eq!(link_capacity(Some("10.95.0.0/16"), true), Some(32765));
+        assert_eq!(link_capacity(Some("10.0.0.0/29"), true), Some(1));
         assert_eq!(link_capacity(Some("10.0.0.0/30"), true), Some(0));
         assert_eq!(link_capacity(Some("fd00::/126"), true), Some(2));
     }

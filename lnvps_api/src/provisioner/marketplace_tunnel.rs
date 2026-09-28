@@ -276,10 +276,13 @@ impl MarketplaceTunnels {
         //
         // It costs one address in an anti-spoof list. What it buys is that the
         // check LNVPS makes on an operator's machine never depends on timing.
-        if let Some(address) = super::probe_address(&tunnel.tunnel, &tunnel.pool) {
+        if let (Some(address), Some(gateway)) = (
+            super::probe_address(&tunnel.tunnel, &tunnel.pool),
+            super::probe_gateway(&tunnel.pool),
+        ) {
             guests.push(GuestAddress {
                 address,
-                gateway: super::PROBE_GATEWAY.to_string(),
+                gateway: gateway.to_string(),
                 mac: Some(super::probe_mac(node.id)),
             });
         }

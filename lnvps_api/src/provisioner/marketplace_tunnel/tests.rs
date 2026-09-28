@@ -750,7 +750,7 @@ async fn the_data_plane_document_describes_the_whole_node() {
     // configured specially proves nothing about a customer.
     assert_eq!(
         plane.gateways(),
-        vec!["10.0.0.1".to_string(), "169.254.0.1".to_string()],
+        vec!["10.0.0.1".to_string(), "10.66.0.129".to_string()],
         "the probe's gateway is the node's own, not the route server's"
     );
 }
@@ -784,7 +784,7 @@ async fn a_node_with_no_guests_still_has_a_document() {
     // holds its guests' gateways itself, and sharing that address with the
     // route server means every reply is delivered to the node instead.
     assert_eq!(
-        plane.guests[0].gateway, "169.254.0.1",
+        plane.guests[0].gateway, "10.66.0.129",
         "the probe's gateway collides with the route server"
     );
 }

@@ -761,19 +761,15 @@ async fn a_probe_can_reach_its_gateway() -> Result<()> {
     let info = spec.vm_info();
     let network = lnvps_api_common::host::cloud_init::network_config(&info)?;
 
-    // A host prefix: the guest's own address and nothing else is on-link, so
-    // everything it sends goes to the node — the only thing on that bridge that
-    // can route. A wider prefix would make the route server look on-link, and
-    // the guest would resolve it on a link where nothing answers.
+    assert!(network.yaml.contains("10.66.0.254/25"), "{}", network.yaml);
     assert!(
-        network.yaml.contains(&format!("{}/32", spec.ip())),
+        network.yaml.contains("via: \"10.66.0.129\""),
         "{}",
         network.yaml
     );
-    // ...which requires the gateway to be marked reachable anyway.
     assert!(
-        network.yaml.contains("on-link: true"),
-        "a gateway outside the guest's prefix is unusable without this:\n{}",
+        !network.yaml.contains("on-link"),
+        "cloud-init's networkd renderer drops on-link, so a probe must not need it:\n{}",
         network.yaml
     );
     Ok(())

@@ -44,8 +44,9 @@ fn no_two_addresses_in_a_full_pool_collide() {
         "10.66.0.0/32".to_string(),
         "10.66.0.1/32".to_string(),
         "10.66.0.255/32".to_string(),
+        format!("{}/32", probe_gateway(&p).unwrap()),
     ];
-    for n in 2..128u32 {
+    for n in 2..=126u32 {
         let node = format!("10.66.0.{n}/32");
         let probe = probe_address(&tunnel(Some(&node)), &p).unwrap();
         taken.push(node);
@@ -58,15 +59,34 @@ fn no_two_addresses_in_a_full_pool_collide() {
 }
 
 #[test]
-fn every_probe_lies_in_the_half_the_allocator_keeps_back() {
+fn every_probe_and_its_gateway_share_the_reserved_upper_half() {
     let p = pool(Some("10.66.0.0/24"));
-    let half = probe_half(&p).unwrap();
-    assert_eq!(half.to_string(), "10.66.0.128/25");
-    for n in 2..128u32 {
+    let range = probe_range(&p).unwrap();
+    assert_eq!(range.to_string(), "10.66.0.128/25");
+    let gateway = probe_gateway(&p).unwrap();
+    assert_eq!(gateway, Ipv4Addr::new(10, 66, 0, 129));
+    for n in 2..=126u32 {
         let probe = probe_address(&tunnel(Some(&format!("10.66.0.{n}/32"))), &p).unwrap();
-        let ip: IpAddr = probe.split('/').next().unwrap().parse().unwrap();
-        assert!(half.contains(ip), "{probe} is outside {half}");
+        let ip: Ipv4Addr = probe.split('/').next().unwrap().parse().unwrap();
+        assert!(range.contains(ip), "{probe} is outside {range}");
+        assert_ne!(ip, gateway);
+        assert_ne!(ip, range.broadcast());
     }
+}
+
+#[test]
+fn the_production_pool_probes_where_expected() {
+    let p = pool(Some("10.95.0.0/16"));
+    assert_eq!(probe_range(&p).unwrap().to_string(), "10.95.128.0/17");
+    assert_eq!(probe_gateway(&p).unwrap(), Ipv4Addr::new(10, 95, 128, 1));
+}
+
+#[test]
+fn the_allocator_is_kept_off_every_probe_and_the_gateway() {
+    let p = pool(Some("10.66.0.0/24"));
+    let reserved: Vec<String> = probe_reserved(&p).iter().map(|n| n.to_string()).collect();
+    assert_eq!(reserved, ["10.66.0.128/25", "10.66.0.127/32"]);
+    assert!(probe_address(&tunnel(Some("10.66.0.127/32")), &p).is_none());
 }
 
 #[test]
@@ -80,7 +100,9 @@ fn a_node_in_the_upper_half_has_no_probe() {
 fn no_v4_block_means_no_probe() {
     assert!(probe_address(&tunnel(Some("10.66.0.2/32")), &pool(None)).is_none());
     assert!(probe_address(&tunnel(None), &pool(Some("10.66.0.0/24"))).is_none());
-    assert!(probe_half(&pool(None)).is_none());
+    assert!(probe_range(&pool(None)).is_none());
+    assert!(probe_gateway(&pool(None)).is_none());
+    assert!(probe_reserved(&pool(None)).is_empty());
 }
 
 #[test]
@@ -93,9 +115,11 @@ fn a_broken_or_foreign_address_is_not_guessed_at() {
 }
 
 #[test]
-fn a_block_too_small_to_split_has_no_probe_half() {
-    assert!(probe_half(&pool(Some("10.66.0.0/31"))).is_none());
-    assert!(probe_half(&pool(Some("10.66.0.0/32"))).is_none());
+fn a_block_too_small_to_split_has_no_probe_range() {
+    assert!(probe_range(&pool(Some("10.66.0.0/30"))).is_none());
+    assert!(probe_range(&pool(Some("10.66.0.0/31"))).is_none());
+    assert!(probe_reserved(&pool(Some("10.66.0.0/30"))).is_empty());
+    assert!(probe_address(&tunnel(Some("10.66.0.2/32")), &pool(Some("10.66.0.0/30"))).is_none());
 }
 
 #[test]
@@ -103,9 +127,4 @@ fn a_probes_mac_is_stable_and_its_own() {
     assert_eq!(probe_mac(7), probe_mac(7));
     assert_ne!(probe_mac(7), probe_mac(8));
     assert!(probe_mac(7).starts_with("52:54:"), "{}", probe_mac(7));
-}
-
-#[test]
-fn a_probes_gateway_is_not_in_any_pool() {
-    assert!(PROBE_GATEWAY.is_link_local());
 }
