@@ -1186,7 +1186,8 @@ node job protocol:
 
 ### Increment 7 — Placement, capacity and templates (M)
 - Feed node telemetry into the existing load factors; overcommit policy per trust tier.
-- Marketplace-eligible templates/regions; user-visible "community compute" flag on offers.
+- Dropped: marketplace-only templates and a "community compute" flag. A marketplace node is a
+  regular host in its region and is invisible to the VM purchase; the probe gate is what admits it.
 - Drain/cordon: stop new placements, optionally migrate or expire existing VMs.
 
 ### Increment 8 — SLA, uptime accounting and enforcement (M)

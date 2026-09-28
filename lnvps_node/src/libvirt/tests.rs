@@ -426,6 +426,34 @@ fn the_instance_defines_the_pool_lnvps_builds_in() {
     );
 }
 
+#[test]
+fn qemu_can_reach_the_pool_through_an_owner_only_state_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let secrets = dir.path().join("tls");
+    fs::create_dir_all(&secrets).unwrap();
+    fs::set_permissions(&secrets, fs::Permissions::from_mode(0o700)).unwrap();
+    let p = paths(&dir);
+    let id = generate_identity(params().listen).unwrap();
+
+    apply(&p, &params(), &id).unwrap();
+
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    for path in [dir.path(), p.root.as_path(), p.pool_dir().as_path()] {
+        assert_eq!(
+            mode(path) & 0o001,
+            0o001,
+            "{} is {:o}",
+            path.display(),
+            mode(path)
+        );
+    }
+    assert_eq!(mode(dir.path()), 0o711);
+    assert_eq!(mode(&secrets), 0o700);
+    assert_eq!(mode(&p.key()) & 0o077, 0, "the libvirt key became readable");
+}
+
 /// The pool starts with libvirtd. A pool that has to be started by hand is a
 /// node that works until it reboots, which is the worst kind of node to own.
 #[test]

@@ -524,6 +524,10 @@ pub fn apply(paths: &Paths, params: &Params, identity: &Identity) -> Result<bool
     fs::create_dir_all(paths.root.join("etc/storage/autostart"))
         .context("libvirt storage config")?;
     changed |= write_if_changed(&paths.pool_xml(), render_pool_xml(paths).as_bytes())?;
+    let state_dir = paths.root.parent().unwrap_or(&paths.root);
+    for dir in [state_dir, &paths.root, &paths.pool_dir()] {
+        let_qemu_through(dir)?;
+    }
     // Autostart is a symlink into the definitions directory, which is how
     // libvirt itself records it — a copy would be a second definition to drift.
     if !paths.pool_autostart().exists() {
@@ -533,6 +537,19 @@ pub fn apply(paths: &Paths, params: &Params, identity: &Identity) -> Result<bool
     }
 
     Ok(changed)
+}
+
+fn let_qemu_through(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .permissions()
+        .mode();
+    if mode & 0o011 != 0o011 {
+        fs::set_permissions(dir, fs::Permissions::from_mode((mode | 0o011) & 0o7777))
+            .with_context(|| format!("letting QEMU traverse {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 /// Copy the machine's stock nwfilter definitions into the instance.
