@@ -4099,6 +4099,9 @@ impl Worker {
             WorkJob::DownloadOsImages { image_id } => {
                 self.download_os_images(*image_id).await?;
             }
+            WorkJob::RefreshOsImageChecksums => {
+                self.refresh_os_image_checksums().await?;
+            }
             WorkJob::PatchIpRangeDns {
                 ip_range_id,
                 admin_user_id: _,
@@ -4150,14 +4153,8 @@ impl Worker {
             self.db.list_os_image().await?
         };
 
-        // Resolve and persist sha2/sha2_url for any image that is missing them,
-        // and refresh any pin whose published checksum has moved on.
         let mut images = images;
-        for image in &mut images {
-            if image.sha2.is_none() || image.sha2_url.is_some() {
-                self.resolve_and_persist_sha2(image).await;
-            }
-        }
+        self.refresh_checksums(&mut images).await;
 
         let hosts = self.reconcile_hosts().await?;
         let mut clients: Vec<(String, Arc<dyn VmHostClient>)> = Vec::new();
@@ -4170,6 +4167,20 @@ impl Worker {
 
         download_images_on_hosts(clients, &images).await;
         Ok(())
+    }
+
+    async fn refresh_os_image_checksums(&self) -> Result<()> {
+        let mut images = self.db.list_os_image().await?;
+        self.refresh_checksums(&mut images).await;
+        Ok(())
+    }
+
+    async fn refresh_checksums(&self, images: &mut [VmOsImage]) {
+        for image in images {
+            if image.sha2.is_none() || image.sha2_url.is_some() {
+                self.resolve_and_persist_sha2(image).await;
+            }
+        }
     }
 
     /// Hosts that reconciliation sweeps must visit.
@@ -5331,7 +5342,13 @@ mod tests {
         worker.download_os_images(Some(6)).await?;
         assert_eq!(db.get_os_image(6).await?.sha2, Some(fresh.clone()));
 
-        worker.download_os_images(Some(6)).await?;
+        worker.refresh_os_image_checksums().await?;
+        assert_eq!(db.get_os_image(6).await?.sha2, Some(fresh.clone()));
+
+        let mut stale = db.get_os_image(6).await?;
+        stale.sha2 = Some("cb".repeat(64));
+        mock.os_images.lock().await.insert(6, stale);
+        worker.refresh_os_image_checksums().await?;
         assert_eq!(db.get_os_image(6).await?.sha2, Some(fresh));
         Ok(())
     }

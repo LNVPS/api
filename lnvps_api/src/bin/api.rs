@@ -332,6 +332,9 @@ async fn main() -> Result<(), Error> {
         // #66). Every 10 minutes: it lists the VMs on every host, and a stale
         // host_id breaks that VM's lifecycle operations until it is corrected.
         tasks.push(worker.spawn_job_interval(WorkJob::ReconcileVmHosts, Duration::from_secs(600)));
+        tasks.push(
+            worker.spawn_job_interval(WorkJob::RefreshOsImageChecksums, Duration::from_secs(21600)),
+        );
         // Automated referral payouts are opt-in (config-gated); run hourly.
         if settings.referral.is_some() {
             tasks.push(

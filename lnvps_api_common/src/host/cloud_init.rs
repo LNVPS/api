@@ -403,7 +403,10 @@ mod tests {
     #[test]
     fn network_config_hands_the_guest_its_resolvers() -> Result<()> {
         let out = network_config(&mock_full_vm())?.yaml;
-        assert!(out.contains("    nameservers:\n      addresses:\n"), "{out}");
+        assert!(
+            out.contains("    nameservers:\n      addresses:\n"),
+            "{out}"
+        );
         for server in GUEST_DNS_SERVERS {
             assert!(out.contains(&format!("        - \"{server}\"")), "{out}");
         }
