@@ -147,6 +147,10 @@ impl NetOps for FakeKernel {
     }
 
     async fn add_address(&self, name: &str, address: IpNetwork) -> Result<()> {
+        let mtu = self.links.lock().unwrap().get(name).and_then(|(_, m)| *m);
+        if address.is_ipv6() && mtu.is_some_and(|m| m < 1280) {
+            anyhow::bail!("{name} has IPv6 disabled at mtu {mtu:?}");
+        }
         self.addresses
             .lock()
             .unwrap()
@@ -634,4 +638,62 @@ async fn a_gateway_this_node_answers_for_is_not_unrouted() -> Result<()> {
         "the guest is not routed: {bridge:?}"
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn a_tunnel_too_small_for_ipv6_is_refused_before_touching_the_machine() {
+    let kernel = FakeKernel::new();
+    let mut small = desired();
+    small.tunnel.mtu = 1240;
+
+    let err = apply(&kernel, &fw().await, &small, &key())
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("1280"), "{err}");
+    assert!(!kernel.link_exists(TUNNEL_INTERFACE).await.unwrap());
+}
+
+#[tokio::test]
+async fn a_tunnel_left_below_the_ipv6_minimum_recovers() {
+    let kernel = FakeKernel::new();
+    kernel.create_wireguard(TUNNEL_INTERFACE).await.unwrap();
+    kernel.set_up(TUNNEL_INTERFACE, 1240).await.unwrap();
+
+    apply(&kernel, &fw().await, &desired(), &key())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        kernel.link_state(TUNNEL_INTERFACE).await.unwrap(),
+        (true, Some(1420))
+    );
+    assert!(
+        kernel
+            .addresses_of(TUNNEL_INTERFACE)
+            .contains(&cidr("fd00:66::2/128"))
+    );
+}
+
+#[tokio::test]
+async fn a_gateway_no_longer_sent_is_removed_from_the_bridge() {
+    let kernel = FakeKernel::new();
+    apply(&kernel, &fw().await, &desired(), &key())
+        .await
+        .unwrap();
+    kernel
+        .add_address(GUEST_BRIDGE, cidr("169.254.0.1/32"))
+        .await
+        .unwrap();
+
+    apply(&kernel, &fw().await, &desired(), &key())
+        .await
+        .unwrap();
+
+    let addresses = kernel.addresses_of(GUEST_BRIDGE);
+    assert!(
+        !addresses.contains(&cidr("169.254.0.1/32")),
+        "{addresses:?}"
+    );
+    assert!(addresses.contains(&cidr("203.0.113.1/32")), "{addresses:?}");
 }

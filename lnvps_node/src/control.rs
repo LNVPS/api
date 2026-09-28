@@ -92,6 +92,22 @@ impl ControlState {
         self
     }
 
+    pub async fn underlay_mtu(&self) -> Option<u32> {
+        let observed = self
+            .net
+            .wireguard_state(crate::net::TUNNEL_INTERFACE)
+            .await
+            .ok()
+            .flatten()?;
+        let endpoint: SocketAddr = observed
+            .peers
+            .iter()
+            .find_map(|p| p.endpoint.as_deref())?
+            .parse()
+            .ok()?;
+        crate::underlay::path_mtu(endpoint.ip()).await
+    }
+
     /// The data plane as this machine actually has it.
     pub async fn observe(&self) -> crate::net::DataPlaneState {
         crate::net::observe(self.net.as_ref(), self.fw.as_ref())
@@ -112,6 +128,7 @@ pub struct NodeStatus {
     /// health gate checks, so a node that quietly lost its tunnel has to be
     /// able to say so.
     pub dataplane: crate::net::DataPlaneState,
+    pub underlay_mtu: Option<u32>,
 }
 
 /// The control router, with authentication layered over everything.
@@ -247,6 +264,7 @@ async fn get_status(State(state): State<Arc<ControlState>>) -> Json<NodeStatus> 
         // must not accept. A machine this cannot be read from reports nothing
         // configured, which is a truthful answer and one the gate can act on.
         dataplane: state.observe().await,
+        underlay_mtu: state.underlay_mtu().await,
     })
 }
 

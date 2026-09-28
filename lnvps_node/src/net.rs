@@ -26,7 +26,7 @@
 use std::collections::HashSet;
 use std::net::IpAddr;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize};
 
@@ -57,6 +57,8 @@ pub const TUNNEL_INTERFACE: &str = "wgln0";
 /// would leave the node holding two answers to one question. LNVPS holds the
 /// same constant, and the end-to-end harness asserts the two agree.
 pub const GUEST_BRIDGE: &str = "br-lnvps";
+
+pub const MIN_TUNNEL_MTU: u16 = 1280;
 
 /// The desired data plane, as LNVPS states it.
 ///
@@ -167,6 +169,12 @@ pub async fn apply(
     desired: &DesiredDataPlane,
     key: &NodeKey,
 ) -> Result<Vec<String>> {
+    if desired.tunnel.mtu < MIN_TUNNEL_MTU {
+        bail!(
+            "LNVPS asked for a {}-byte tunnel; Linux turns IPv6 off below {MIN_TUNNEL_MTU}",
+            desired.tunnel.mtu
+        );
+    }
     let mut changed = Vec::new();
     apply_tunnel(ops, desired, key, &mut changed).await?;
     apply_bridge(ops, desired, &mut changed).await?;
@@ -222,13 +230,13 @@ async fn apply_tunnel(
         }
     }
 
-    let want = tunnel_addresses(desired)?;
-    sync_addresses(ops, TUNNEL_INTERFACE, &want, changed).await?;
-
     // Not 1500: WireGuard's overhead comes off it, and guessing wrong hangs
     // large transfers rather than failing outright.
     ops.set_up(TUNNEL_INTERFACE, desired.tunnel.mtu as u32)
         .await?;
+
+    let want = tunnel_addresses(desired)?;
+    sync_addresses(ops, TUNNEL_INTERFACE, &want, changed).await?;
 
     // No gateway: the tunnel is point-to-point, so the interface names the next
     // hop by itself, and naming one would be a second copy of the route
@@ -340,7 +348,7 @@ async fn sync_addresses(
     for address in &existing {
         // A link-local address is the kernel's, not ours. Removing it would
         // remove the interface's ability to talk to itself, on every refresh.
-        if is_link_local(address) || want.contains(address) {
+        if is_kernel_address(address) || want.contains(address) {
             continue;
         }
         ops.del_address(name, *address).await?;
@@ -412,6 +420,13 @@ fn host_prefix(address: &str) -> Result<IpNetwork> {
 }
 
 /// Addresses the kernel manages for itself.
+fn is_kernel_address(address: &IpNetwork) -> bool {
+    match address.ip() {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => (v6.segments()[0] & 0xffc0) == 0xfe80 || v6.is_loopback(),
+    }
+}
+
 fn is_link_local(address: &IpNetwork) -> bool {
     match address.ip() {
         IpAddr::V4(v4) => v4.is_link_local() || v4.is_loopback(),

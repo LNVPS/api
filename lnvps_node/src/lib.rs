@@ -39,4 +39,5 @@ pub mod net;
 // and libvirt config reach for it by this path.
 pub use lnvps_netlink::netns;
 pub mod tls;
+pub mod underlay;
 pub mod wgkey;

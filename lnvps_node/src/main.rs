@@ -37,6 +37,8 @@ enum Command {
         #[command(subcommand)]
         action: DataplaneAction,
     },
+    /// Measure the largest packet the path to a host carries unfragmented.
+    Underlay { target: std::net::IpAddr },
     /// Print the node's TLS fingerprint, the value LNVPS pins at registration.
     Fingerprint {
         /// State directory holding the identity (defaults to the configured one).
@@ -90,6 +92,10 @@ async fn main() -> Result<()> {
             }
         }
         Command::Dataplane { action } => dataplane(&cli.config, action).await?,
+        Command::Underlay { target } => match lnvps_node::underlay::path_mtu(target).await {
+            Some(mtu) => println!("{mtu}"),
+            None => anyhow::bail!("{target} did not answer an ICMP echo"),
+        },
         Command::Fingerprint { state_dir } => {
             let state_dir = match state_dir {
                 Some(dir) => dir,
