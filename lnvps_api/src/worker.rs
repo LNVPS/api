@@ -3809,16 +3809,18 @@ impl Worker {
                 ref_code,
                 admin_user_id,
                 reason,
+                host_id,
             } => {
                 info!("Admin {} creating VM for user {}", admin_user_id, user_id);
                 let provisioner = self.subscription_handler.vm_provisioner();
                 let vm = provisioner
-                    .provision(
+                    .provision_on_host(
                         *user_id,
                         *template_id,
                         *image_id,
                         *ssh_key_id,
                         ref_code.clone(),
+                        *host_id,
                     )
                     .await?;
 

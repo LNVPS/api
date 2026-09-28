@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Pin an admin-created VM to a host** — `POST /api/admin/v1/vms` accepts an optional `host_id`. The VM is placed on that host instead of the least-loaded one in the template's region; the host must be enabled, in that region, and have room for the template.
+
 - **Regions report what else is in them** — `GET /api/admin/v1/regions` and `GET /api/admin/v1/regions/{id}` now also return `ip_ranges`, `vm_templates`, `app_clusters`, `app_deployments`, `tunnel_pools`, `vpn_services` and `routers` alongside the existing host, VM and IP figures, so an admin can see what a region holds without opening six other pages first.
 
   `routers` is derived: a router has no region column, so it is counted through the tunnel pools terminating in the region and the access policies its IP ranges use, de-duplicated so a router reached both ways counts once. `vpn_services` is likewise distinct, because one service may terminate on several interfaces in the same region, and `app_deployments` excludes soft-deleted rows since a deleted deployment is not running there.

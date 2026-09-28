@@ -3690,6 +3690,8 @@ pub struct AdminCreateVmRequest {
     pub ssh_key_id: u64,
     pub ref_code: Option<String>,
     pub reason: Option<String>,
+    #[serde(default)]
+    pub host_id: Option<u64>,
 }
 
 /// Create a VM from a custom spec, priced against a custom pricing plan.

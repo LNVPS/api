@@ -197,6 +197,8 @@ pub enum WorkJob {
         ref_code: Option<String>,
         admin_user_id: u64,
         reason: Option<String>,
+        #[serde(default)]
+        host_id: Option<u64>,
     },
     /// Create a VM from a custom spec for a specific user (admin action).
     CreateCustomVm {
@@ -402,6 +404,15 @@ impl fmt::Display for WorkJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_create_vm_job_queued_before_host_pinning_still_parses() {
+        let json = r#"{"CreateVm":{"user_id":1,"template_id":2,"image_id":3,"ssh_key_id":4,"ref_code":null,"admin_user_id":1,"reason":null}}"#;
+        match serde_json::from_str::<WorkJob>(json).unwrap() {
+            WorkJob::CreateVm { host_id, .. } => assert_eq!(host_id, None),
+            other => panic!("unexpected job: {other}"),
+        }
+    }
 
     #[test]
     fn test_patch_host_job_display_and_roundtrip() {

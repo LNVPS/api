@@ -142,6 +142,19 @@ impl VmProvisioner {
         ssh_key_id: u64,
         ref_code: Option<String>,
     ) -> Result<Vm> {
+        self.provision_on_host(user_id, template_id, image_id, ssh_key_id, ref_code, None)
+            .await
+    }
+
+    pub async fn provision_on_host(
+        &self,
+        user_id: u64,
+        template_id: u64,
+        image_id: u64,
+        ssh_key_id: u64,
+        ref_code: Option<String>,
+        host_id: Option<u64>,
+    ) -> Result<Vm> {
         let user = self.db.get_user(user_id).await?;
         let template = self.db.get_vm_template(template_id).await?;
         let image = self.db.get_os_image(image_id).await?;
@@ -166,7 +179,7 @@ impl VmProvisioner {
         // TODO: cache capacity somewhere
         let cap = HostCapacityService::new(self.db.clone());
         let host = cap
-            .get_host_for_template(template.region_id, &template)
+            .get_host_for_template_on(template.region_id, &template, host_id)
             .await?;
 
         let pick_disk = if let Some(hd) = host.disks.first() {

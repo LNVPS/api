@@ -1474,7 +1474,19 @@ async fn admin_create_vm(
     let _user = this.db.get_user(req.user_id).await?;
 
     // Verify template exists
-    let _template = this.db.get_vm_template(req.template_id).await?;
+    let template = this.db.get_vm_template(req.template_id).await?;
+    if let Some(host_id) = req.host_id {
+        let host = this.db.get_host(host_id).await?;
+        if host.region_id != template.region_id {
+            return Err(ApiError::bad_request(format!(
+                "Host {host_id} is not in template {}'s region",
+                template.id
+            )));
+        }
+        if !host.enabled {
+            return Err(ApiError::bad_request(format!("Host {host_id} is disabled")));
+        }
+    }
 
     // Verify image exists
     let _image = this.db.get_os_image(req.image_id).await?;
@@ -1493,6 +1505,7 @@ async fn admin_create_vm(
         ref_code: req.ref_code,
         admin_user_id: auth.user_id,
         reason: req.reason,
+        host_id: req.host_id,
     };
 
     match this.work_commander.send(create_job).await {
@@ -2348,5 +2361,94 @@ mod tests {
         let t = req.spec.to_template().unwrap();
         assert_eq!(t.pricing_id, 2);
         assert_eq!(t.disk_type, lnvps_db::DiskType::SSD);
+    }
+
+    #[tokio::test]
+    async fn admin_create_vm_pins_a_host_only_in_the_templates_region() {
+        use crate::admin::model::Permission;
+        use lnvps_api_common::{
+            ChannelWorkCommander, MockDb, MockExchangeRate, VatClient, VmStateCache, WorkCommander,
+        };
+        use lnvps_db::LNVpsDbBase;
+        use std::sync::Arc;
+
+        let mock = MockDb::default();
+        let user_id = mock.upsert_user(&[9u8; 32]).await.unwrap();
+        let key_id = mock
+            .insert_user_ssh_key(&lnvps_db::UserSshKey {
+                user_id,
+                name: "k".to_string(),
+                key_data: "ssh-ed25519 AAAA".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut elsewhere = mock.hosts.lock().await.get(&1).unwrap().clone();
+        elsewhere.id = 2;
+        elsewhere.region_id = 2;
+        mock.hosts.lock().await.insert(2, elsewhere);
+        let mut off = mock.hosts.lock().await.get(&1).unwrap().clone();
+        off.id = 3;
+        off.enabled = false;
+        mock.hosts.lock().await.insert(3, off);
+
+        let jobs = Arc::new(ChannelWorkCommander::new());
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(mock);
+        let this = RouterState {
+            node_control: None,
+            db,
+            work_commander: jobs.clone(),
+            feedback: None,
+            vm_state_cache: VmStateCache::new(),
+            exchange: Arc::new(MockExchangeRate::default()),
+            vat: VatClient::new(),
+        };
+        let admin = || AdminAuth {
+            user_id: 1,
+            pubkey: vec![1u8; 32],
+            permissions: [Permission {
+                resource: AdminResource::VirtualMachines,
+                action: AdminAction::Create,
+            }]
+            .into_iter()
+            .collect(),
+            nip98_auth: None,
+        };
+        let request = |host_id| AdminCreateVmRequest {
+            user_id,
+            template_id: 1,
+            image_id: 1,
+            ssh_key_id: key_id,
+            ref_code: None,
+            reason: None,
+            host_id,
+        };
+
+        for host_id in [2, 3] {
+            assert!(
+                admin_create_vm(admin(), State(this.clone()), Json(request(Some(host_id))))
+                    .await
+                    .is_err(),
+                "host {host_id} was accepted"
+            );
+        }
+
+        admin_create_vm(admin(), State(this.clone()), Json(request(Some(1))))
+            .await
+            .unwrap();
+        let queued = tokio::time::timeout(std::time::Duration::from_millis(200), jobs.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            queued.iter().any(|m| matches!(
+                m.job,
+                WorkJob::CreateVm {
+                    host_id: Some(1),
+                    ..
+                }
+            )),
+            "the pinned host was not passed to the job"
+        );
     }
 }

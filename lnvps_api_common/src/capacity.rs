@@ -1,6 +1,6 @@
 use crate::Template;
 use crate::network::parse_gateway;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::Utc;
 use futures::future::join_all;
 use ipnetwork::{IpNetwork, NetworkSize};
@@ -71,16 +71,28 @@ impl HostCapacityService {
         region_id: u64,
         template: &impl Template,
     ) -> Result<HostCapacity> {
+        self.get_host_for_template_on(region_id, template, None)
+            .await
+    }
+
+    pub async fn get_host_for_template_on(
+        &self,
+        region_id: u64,
+        template: &impl Template,
+        host_id: Option<u64>,
+    ) -> Result<HostCapacity> {
         let hosts = self.db.list_hosts().await?;
-        let caps: Vec<Result<HostCapacity>> =
-            join_all(hosts.iter().filter(|h| h.region_id == region_id).map(|h| {
-                self.get_host_capacity(
-                    h,
-                    Some(template.disk_type()),
-                    Some(template.disk_interface()),
-                )
-            }))
-            .await;
+        let eligible = hosts
+            .iter()
+            .filter(|h| h.region_id == region_id && host_id.is_none_or(|id| h.id == id));
+        let caps: Vec<Result<HostCapacity>> = join_all(eligible.map(|h| {
+            self.get_host_capacity(
+                h,
+                Some(template.disk_type()),
+                Some(template.disk_interface()),
+            )
+        }))
+        .await;
         let mut host_cap: Vec<HostCapacity> = caps
             .into_iter()
             .filter_map(|v| v.ok())
@@ -95,10 +107,12 @@ impl HostCapacityService {
         // simply never the least-loaded pick.
         host_cap.sort_by(|a, b| a.load().total_cmp(&b.load()));
 
-        if let Some(f) = host_cap.into_iter().next() {
-            Ok(f)
-        } else {
-            Err(CapacityError::NoAvailableHosts.into())
+        match (host_cap.into_iter().next(), host_id) {
+            (Some(f), _) => Ok(f),
+            (None, Some(id)) => bail!(
+                "Host {id} is not an enabled host in region {region_id} with room for this template"
+            ),
+            (None, None) => Err(CapacityError::NoAvailableHosts.into()),
         }
     }
 
@@ -965,6 +979,54 @@ mod tests {
         let templates = hc.list_available_vm_templates().await?;
         assert_eq!(templates.len(), db.list_vm_templates().await?.len());
 
+        Ok(())
+    }
+
+    async fn a_second_host(db: &MockDb, enabled: bool, region_id: u64) {
+        let mut host = db.hosts.lock().await.get(&1).unwrap().clone();
+        host.id = 2;
+        host.name = "second".to_string();
+        host.enabled = enabled;
+        host.region_id = region_id;
+        db.hosts.lock().await.insert(2, host);
+        let mut disk = db.host_disks.lock().await.get(&1).unwrap().clone();
+        disk.id = 2;
+        disk.host_id = 2;
+        db.host_disks.lock().await.insert(2, disk);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_host_is_the_one_used() -> Result<()> {
+        let mock = MockDb::default();
+        a_second_host(&mock, true, 1).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let hc = HostCapacityService::new(db.clone());
+        let template = db.get_vm_template(1).await?;
+
+        for id in [1, 2] {
+            let host = hc
+                .get_host_for_template_on(template.region_id, &template, Some(id))
+                .await?;
+            assert_eq!(host.host.id, id);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pinned_host_must_be_enabled_and_in_the_region() -> Result<()> {
+        for (enabled, region_id) in [(false, 1), (true, 2)] {
+            let mock = MockDb::default();
+            a_second_host(&mock, enabled, region_id).await;
+            let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+            let hc = HostCapacityService::new(db.clone());
+            let template = db.get_vm_template(1).await?;
+
+            let err = hc
+                .get_host_for_template_on(template.region_id, &template, Some(2))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("Host 2"), "{err}");
+        }
         Ok(())
     }
 
