@@ -33,9 +33,13 @@ use tokio::time::sleep;
 /// Comment prefix used to tag user-defined firewall rules (#36) on Proxmox so
 /// they can be identified and re-synced without disturbing system rules.
 const USER_FW_MARKER: &str = "lnvps-fw";
+const ISO_DIR: &str = "/var/lib/vz/template/iso";
+
+pub type SshExecFn = Arc<dyn Fn(&str) -> Result<(i32, String)> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct ProxmoxClient {
+    ssh_exec: Option<SshExecFn>,
     api: JsonApi,
     config: QemuConfig,
     ssh: Option<SshConfig>,
@@ -75,6 +79,7 @@ impl ProxmoxClient {
         ssh: Option<SshConfig>,
     ) -> Self {
         Self {
+            ssh_exec: None,
             api: JsonApi::token(base.as_str(), &format!("PVEAPIToken={}", token), true).unwrap(),
             config,
             ssh,
@@ -84,6 +89,11 @@ impl ProxmoxClient {
             ssh_node: Arc::new(OnceCell::new()),
             written_snippets: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_ssh_exec(mut self, exec: SshExecFn) -> Self {
+        self.ssh_exec = Some(exec);
+        self
     }
 
     /// Get version info
@@ -1882,21 +1892,10 @@ impl VmHostClient for ProxmoxClient {
                 return Ok(());
             }
 
-            // Delete the stale image (and any source-checksum sidecar) first.
-            info!("Deleting stale image {} from {}", storage_name, &self.node);
-            if let Err(e) = self
-                .delete_storage_file(&self.node, &iso_storage, &storage_name)
-                .await
-            {
-                warn!("Failed to delete stale image {}: {}", storage_name, e);
-            }
-            let sidecar = Self::image_source_checksum_path(&storage_name);
-            if let Err(e) = self.ssh_run(format!("rm -f '{sidecar}'")).await {
-                warn!(
-                    "Failed to delete source checksum sidecar for {}: {}",
-                    storage_name, e
-                );
-            }
+            info!(
+                "Replacing stale image {} on {} once its replacement verifies",
+                storage_name, &self.node
+            );
         }
 
         // Fetch the image directly on the host over SSH (wget/curl). We no longer
@@ -1906,7 +1905,8 @@ impl VmHostClient for ProxmoxClient {
         // wget/curl follow redirects natively; integrity is verified via SSH
         // below (see verify_image_checksum) and compressed images are decompressed
         // by us afterwards.
-        self.download_image_ssh(&image.url, &download_name)
+        let part_name = format!("{download_name}.part");
+        self.download_image_ssh(&image.url, &part_name)
             .await
             .map_err(OpError::Fatal)?;
 
@@ -1915,7 +1915,7 @@ impl VmHostClient for ProxmoxClient {
         // images), matching the SHASUMS entry.
         if let (Some(expected), Some(algo)) = (&expected_sha2, &checksum_algorithm) {
             match self
-                .verify_image_checksum(&download_name, &iso_storage, expected, algo)
+                .verify_image_checksum(&part_name, &iso_storage, expected, algo)
                 .await
             {
                 Ok(true) => {
@@ -1927,11 +1927,8 @@ impl VmHostClient for ProxmoxClient {
                         "Post-download checksum mismatch for {}, deleting corrupt file",
                         download_name
                     );
-                    if let Err(e) = self
-                        .delete_storage_file(&self.node, &iso_storage, &download_name)
-                        .await
-                    {
-                        warn!("Failed to delete corrupt image {}: {}", download_name, e);
+                    if let Err(e) = self.ssh_run(format!("rm -f '{ISO_DIR}/{part_name}'")).await {
+                        warn!("Failed to delete corrupt image {}: {}", part_name, e);
                     }
                     return Err(OpError::Fatal(anyhow::anyhow!(
                         "Checksum mismatch after download of {}",
@@ -1946,6 +1943,11 @@ impl VmHostClient for ProxmoxClient {
                 }
             }
         }
+        self.ssh_run(format!(
+            "mv -f '{ISO_DIR}/{part_name}' '{ISO_DIR}/{download_name}'"
+        ))
+        .await
+        .map_err(OpError::Fatal)?;
 
         // Decompress compressed images into the final storage_name and remove
         // the compressed source. Must happen after checksum verification.
@@ -2573,6 +2575,9 @@ impl ProxmoxClient {
     ///
     /// Delegates to [`SshClient::run_command`], which opens a session per call.
     async fn ssh_run(&self, command: String) -> Result<(i32, String)> {
+        if let Some(exec) = &self.ssh_exec {
+            return exec(&command);
+        }
         let ssh_cfg = match &self.ssh {
             Some(s) => s,
             None => anyhow::bail!("SSH not configured"),
@@ -2684,14 +2689,11 @@ impl ProxmoxClient {
     ///
     /// Fetches `url` into `filename` under `/var/lib/vz/template/iso/` using
     /// `wget` (falling back to `curl`), both of which follow HTTP redirects
-    /// natively. The download goes to a `.part` temp file that is atomically
-    /// moved into place on success, so an interrupted download never leaves a
-    /// truncated file at the final path. Used for compressed images, whose real
-    /// filename (e.g. `foo.qcow2.xz`) Proxmox's download-url API rejects.
+    /// natively. Used for compressed images, whose real filename (e.g.
+    /// `foo.qcow2.xz`) Proxmox's download-url API rejects.
     pub async fn download_image_ssh(&self, url: &str, filename: &str) -> Result<()> {
-        let dir = "/var/lib/vz/template/iso";
-        let dst = format!("{dir}/{filename}");
-        let tmp = format!("{dst}.part");
+        let dir = ISO_DIR;
+        let tmp = format!("{dir}/{filename}");
         // Prefer wget; fall back to curl. `-fL`/redirect-following ensures CDN
         // redirects (common for release mirrors) are handled on the host.
         let cmd = format!(
@@ -2700,7 +2702,7 @@ impl ProxmoxClient {
                  wget -q -O '{tmp}' '{url}'; \
              else \
                  curl -fLsS -o '{tmp}' '{url}'; \
-             fi && mv -f '{tmp}' '{dst}'"
+             fi"
         );
 
         let (exit_code, output) = self.ssh_run(cmd).await?;
@@ -3764,6 +3766,91 @@ mod tests {
         assert!(
             !ProxmoxClient::removed_keys(&current, &keeps_balloon).contains(&"balloon".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn a_stale_image_survives_a_replacement_that_fails_to_download() -> Result<()> {
+        use wiremock::matchers::path;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/storage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "storage": "local", "content": "iso", "type": "dir" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api2/json/nodes/pve/storage/local/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{
+                    "format": "iso",
+                    "size": 1,
+                    "volid": "local:iso/plucky-server-cloudimg-amd64.img"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let ran = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = ran.clone();
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        let client = ProxmoxClient::new(server.uri().parse()?, "pve", "", None, q_cfg, None)
+            .with_ssh_exec(Arc::new(move |cmd: &str| {
+                log.lock().unwrap().push(cmd.to_string());
+                if cmd.starts_with("sha256sum") {
+                    Ok((0, format!("{}  x", "0".repeat(64))))
+                } else if cmd.contains("wget") {
+                    Ok((8, "404 Not Found".to_string()))
+                } else {
+                    Ok((0, String::new()))
+                }
+            }));
+        let image = VmOsImage {
+            id: 7,
+            distribution: lnvps_db::OsDistribution::Ubuntu,
+            flavour: "server".to_string(),
+            version: "25.04".to_string(),
+            enabled: true,
+            release_date: chrono::Utc::now(),
+            url: "https://cloud-images.ubuntu.com/plucky/current/plucky-server-cloudimg-amd64.img"
+                .to_string(),
+            cpu_arch: lnvps_db::CpuArch::X86_64,
+            default_username: None,
+            sha2: Some("5".repeat(64)),
+            sha2_url: None,
+        };
+
+        assert!(client.download_os_image(&image).await.is_err());
+
+        let ran = ran.lock().unwrap().clone();
+        assert!(
+            !ran.iter().any(|c| c.contains("mv -f")
+                || c.starts_with(
+                    "rm -f '/var/lib/vz/template/iso/plucky-server-cloudimg-amd64.img'"
+                )),
+            "the stale image was replaced or removed before its replacement existed: {ran:?}"
+        );
+        assert!(
+            ran.iter()
+                .any(|c| c.contains("plucky-server-cloudimg-amd64.img.part")),
+            "{ran:?}"
+        );
+        Ok(())
     }
 
     /// The snippet storage lookup must survive exactly one round-trip per
