@@ -606,7 +606,8 @@ impl TunnelProvisioner {
         &self,
         pool: &TunnelPool,
     ) -> Result<(Option<String>, Option<String>)> {
-        let taken = taken_addresses(&self.db.list_tunnels_in_pool(pool.id).await?);
+        let mut taken = taken_addresses(&self.db.list_tunnels_in_pool(pool.id).await?);
+        taken.extend(crate::provisioner::probe_half(pool));
         carve_peer(
             pool.cidr4.as_deref(),
             pool.cidr6.as_deref(),

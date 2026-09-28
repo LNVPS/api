@@ -351,14 +351,13 @@ async fn a_probe_proves_a_node_can_carry_a_customer() -> Result<()> {
     // A look inside while the guest is still alive. Everything so far has been
     // read after the probe tore its VM down, which is the one moment the
     // interesting state no longer exists.
-    let probe_address = lnvps_api::provisioner::probe_address(
-        &lnvps_api::provisioner::MarketplaceTunnels::new(db.clone())
-            .get_tunnel(&node)
-            .await?
-            .context("the node has no tunnel")?
-            .tunnel,
-    )
-    .context("the node has no probe address")?;
+    let node_tunnel = lnvps_api::provisioner::MarketplaceTunnels::new(db.clone())
+        .get_tunnel(&node)
+        .await?
+        .context("the node has no tunnel")?;
+    let probe_address =
+        lnvps_api::provisioner::probe_address(&node_tunnel.tunnel, &node_tunnel.pool)
+            .context("the node has no probe address")?;
     let live = {
         let names = stack.names.clone();
         let images = libvirtd.paths.root.join("images");

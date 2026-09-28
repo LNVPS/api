@@ -335,6 +335,42 @@ async fn a_full_pool_falls_through_to_the_next_one() {
     assert_eq!(allocation.tunnel.address4.as_deref(), Some("10.77.0.2/32"));
 }
 
+#[tokio::test]
+async fn a_node_is_never_given_an_address_a_probe_needs() {
+    let (db, mock, node, first_pool) = fixture().await;
+    let mut small = db.get_tunnel_pool(first_pool).await.unwrap();
+    small.cidr4 = Some("10.66.0.0/29".to_string());
+    small.cidr6 = None;
+    db.update_tunnel_pool(&small).await.unwrap();
+    let user_id = db
+        .get_marketplace_operator(node.operator_id)
+        .await
+        .unwrap()
+        .user_id;
+    for (name, address) in [("a", "10.66.0.2/32"), ("b", "10.66.0.3/32")] {
+        db.insert_tunnel(&Tunnel {
+            kind: RouterTunnelKind::Wireguard,
+            user_id,
+            router_id: Some(small.router_id),
+            pool_id: Some(small.id),
+            name: name.to_string(),
+            address4: Some(address.to_string()),
+            enabled: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    let spare = pool(&db, &mock, "10.77.0.0/24", None, "wg-mkt1").await;
+    let allocation = mkt(&db).allocate(&node, &NODE_KEY).await.unwrap();
+    assert_eq!(allocation.tunnel.pool_id, Some(spare));
+    assert_eq!(
+        crate::provisioner::probe_address(&allocation.tunnel, &allocation.pool).as_deref(),
+        Some("10.77.0.254/32")
+    );
+}
+
 /// A pool on a different router than the tunnel claims is a peer
 /// configured on an interface that is not there. The database rejects it
 /// through the composite key; the mock mirrors that.
@@ -499,7 +535,7 @@ async fn a_peer_allows_the_node_its_own_addresses_and_its_guests() {
     // server around that window would mean probes that fail because the
     // routing had not caught up yet.
     assert!(
-        peer.allowed_ips.contains(&"fd00:66::8002/128".to_string()),
+        peer.allowed_ips.contains(&"10.66.0.254/32".to_string()),
         "{:?}",
         peer.allowed_ips
     );
@@ -508,9 +544,9 @@ async fn a_peer_allows_the_node_its_own_addresses_and_its_guests() {
         vec![
             "10.66.0.2/32".to_string(),
             "fd00:66::2/128".to_string(),
+            "10.66.0.254/32".to_string(),
             "2001:db8::5/128".to_string(),
             "203.0.113.5/32".to_string(),
-            "fd00:66::8002/128".to_string(),
         ]
     );
     assert_eq!(peer.persistent_keepalive, Some(25));
@@ -696,12 +732,17 @@ async fn the_data_plane_document_describes_the_whole_node() {
             .collect::<Vec<_>>(),
         // The customer's two addresses, and the node's probe address, which
         // is present whether or not a probe is running.
-        ["2001:db8::5/128", "203.0.113.5/32", "fd00:66::8002/128"]
+        ["10.66.0.254/32", "2001:db8::5/128", "203.0.113.5/32"]
     );
+    let customer = plane
+        .guests
+        .iter()
+        .find(|g| g.address == "203.0.113.5/32")
+        .unwrap();
     // Bare, even though the range stores it with a prefix: the node holds
     // it as a host address on the bridge.
-    assert_eq!(plane.guests[0].gateway, "10.0.0.1");
-    assert_eq!(plane.guests[0].mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
+    assert_eq!(customer.gateway, "10.0.0.1");
+    assert_eq!(customer.mac.as_deref(), Some("aa:bb:cc:dd:ee:ff"));
     // Deduplicated: two guests from one range give the node one address to
     // answer for, not two identical ones. The probe's gateway is the route
     // server, which the node answers for on the bridge the same way — a
@@ -709,7 +750,7 @@ async fn the_data_plane_document_describes_the_whole_node() {
     // configured specially proves nothing about a customer.
     assert_eq!(
         plane.gateways(),
-        vec!["10.0.0.1".to_string(), "fd00:66::c002".to_string()],
+        vec!["10.0.0.1".to_string(), "169.254.0.1".to_string()],
         "the probe's gateway is the node's own, not the route server's"
     );
 }
@@ -734,7 +775,7 @@ async fn a_node_with_no_guests_still_has_a_document() {
     // Not empty: a node with no customers still carries its probe address,
     // so LNVPS can find out whether it could carry one.
     assert_eq!(plane.guests.len(), 1);
-    assert_eq!(plane.guests[0].address, "fd00:66::8002/128");
+    assert_eq!(plane.guests[0].address, "10.66.0.254/32");
     assert_eq!(
         plane.guests[0].mac.as_deref(),
         Some(&*super::super::probe_mac(node.id))
@@ -743,7 +784,7 @@ async fn a_node_with_no_guests_still_has_a_document() {
     // holds its guests' gateways itself, and sharing that address with the
     // route server means every reply is delivered to the node instead.
     assert_eq!(
-        plane.guests[0].gateway, "fd00:66::c002",
+        plane.guests[0].gateway, "169.254.0.1",
         "the probe's gateway collides with the route server"
     );
 }

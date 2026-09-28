@@ -1038,8 +1038,10 @@ for a few minutes, measured over SSH, and destroyed. It looks like a regular VM 
 because it is one — which means the probe tests provisioning, the thing a customer hits first
 and the thing a ping says nothing about.
 
-- **IPv6 only.** There is plenty of it and none to spare of v4, and a node that cannot carry a
-  v6 guest cannot carry a dual-stack one either.
+- **IPv4 from the pool's own private block**, not a customer range. The first cut was IPv6 only,
+  but the k8s cluster the worker runs in is IPv4-only and could never reach it. A node at offset
+  `k` in the v4 block gets its probe at offset `size - k`, so marketplace pools only place nodes
+  in the lower half. The gateway is `169.254.0.1`, held by the node on the bridge.
 - **Nothing about a probe VM is stored.** It lives in LNVPS's memory and in the node's desired
   state, nowhere else. That is the failure model, not a shortcut: if the API restarts mid-probe
   the VM is simply absent from the next document the node fetches, and the node tears it down as

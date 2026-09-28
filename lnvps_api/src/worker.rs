@@ -6958,7 +6958,11 @@ mod tests {
         // this list is the anti-spoof boundary, not just a routing hint.
         assert_eq!(
             peers[0].allowed_ips,
-            vec!["10.66.0.2/32".to_string(), "203.0.113.5/32".to_string()]
+            vec![
+                "10.66.0.2/32".to_string(),
+                "10.66.0.254/32".to_string(),
+                "203.0.113.5/32".to_string()
+            ]
         );
         // One address for the pool, carrying the block's prefix: every node in
         // it is on-link, so the route server does not carry an address per
@@ -6974,7 +6978,11 @@ mod tests {
         // point-to-point interface does not route the rest of its prefix.
         assert_eq!(
             mr.interface_routes(&interface).await,
-            vec!["10.66.0.0/24".to_string(), "203.0.113.5/32".to_string()]
+            vec![
+                "10.66.0.0/24".to_string(),
+                "10.66.0.254/32".to_string(),
+                "203.0.113.5/32".to_string()
+            ]
         );
         assert_eq!(tunnel.pool_id, Some(pool_id));
 
@@ -7028,7 +7036,11 @@ mod tests {
         assert_eq!(drift.changed, vec![key.clone()]);
         assert_eq!(
             mr.peers(&interface).await[0].allowed_ips,
-            vec!["10.66.0.2/32".to_string(), "203.0.113.5/32".to_string()]
+            vec![
+                "10.66.0.2/32".to_string(),
+                "10.66.0.254/32".to_string(),
+                "203.0.113.5/32".to_string()
+            ]
         );
 
         // LNVPS owns `wgln*` outright, so a key no allocation accounts for is

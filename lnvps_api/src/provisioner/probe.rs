@@ -173,14 +173,9 @@ impl ProbeSpec {
             .get_tunnel(node)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Node {} has no tunnel", node.id))?;
-        let address = probe_address(&tunnel.tunnel)
-            .ok_or_else(|| anyhow::anyhow!("Node {} has no IPv6 address to probe on", node.id))?;
-        // The node's own probe gateway, which it answers for on the bridge —
-        // not the route server's address, which the node also holds and would
-        // therefore swallow every reply to.
-        let gateway = super::probe_gateway(&tunnel.tunnel)
-            .and_then(|g| g.split('/').next().map(str::to_string))
-            .ok_or_else(|| anyhow::anyhow!("Node {} has no IPv6 gateway", node.id))?;
+        let address = probe_address(&tunnel.tunnel, &tunnel.pool)
+            .ok_or_else(|| anyhow::anyhow!("Node {} has no IPv4 address to probe on", node.id))?;
+        let gateway = super::PROBE_GATEWAY.to_string();
         // Its own address as the range, so the guest's prefix covers nothing
         // but itself.
         let range_cidr = address.clone();

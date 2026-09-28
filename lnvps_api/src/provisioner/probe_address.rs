@@ -18,14 +18,11 @@
 //! offset from it. Nothing has to be written down for both ends to agree, there
 //! is no allocation to leak if the API dies mid-probe, and a node's probe
 //! address is a pure function of a row that already exists.
-//!
-//! It is **IPv6 only**. IPv4 is the scarce resource the marketplace exists to
-//! stretch, spending one to check a machine is exactly backwards — and a node
-//! that cannot carry a v6 guest cannot carry a dual-stack one either.
 
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr};
 
-use lnvps_db::Tunnel;
+use ipnetwork::{IpNetwork, Ipv4Network};
+use lnvps_db::{Tunnel, TunnelPool};
 
 /// The MAC a probe VM's NIC gets.
 ///
@@ -38,50 +35,50 @@ pub fn probe_mac(node_id: u64) -> String {
     format!("52:54:01:{:02x}:{:02x}:{:02x}", id[5], id[6], id[7])
 }
 
-/// The gateway a probe VM is given, as a host prefix.
-///
-/// **Not the route server's address.** The node holds its guests' gateway on the
-/// bridge so they can reach it on-link, and the route server holds its own
-/// address on the same pool — so making the route server the probe's gateway
-/// gives two machines the same address. The guest's replies then arrive at the
-/// node, which delivers them to itself, and the route server sees nothing at
-/// all. A probe on a working node looks exactly like a node that cannot carry
-/// traffic.
-///
-/// Derived at a different offset from the probe's own address so the two can
-/// never collide, and per-node so two nodes never claim the same gateway.
-pub fn probe_gateway(tunnel: &Tunnel) -> Option<String> {
-    offset_address(tunnel, 0xC000)
-}
+pub const PROBE_GATEWAY: Ipv4Addr = Ipv4Addr::new(169, 254, 0, 1);
 
-/// The address a probe VM on this node gets, as a host prefix.
-///
-/// The node's own inner v6 address with its last group offset, which keeps the
-/// probe inside the pool's block — already routed to this peer — while never
-/// colliding with the node itself.
-///
-/// `None` when the tunnel has no v6 address: a pool without a v6 block cannot
-/// carry a probe, and inventing a v4 one instead would spend the resource this
-/// deliberately avoids.
-pub fn probe_address(tunnel: &Tunnel) -> Option<String> {
-    offset_address(tunnel, 0x8000)
-}
-
-/// The node's own v6 address with its last group offset.
-///
-/// The offsets are large enough that they cannot land on another node's address
-/// in any pool we would allocate: nodes are handed consecutive addresses from
-/// the bottom of the block.
-fn offset_address(tunnel: &Tunnel, offset: u16) -> Option<String> {
-    let addr = tunnel.address6.as_deref()?;
-    let bare = addr.split('/').next()?;
-    let IpAddr::V6(v6) = bare.parse::<IpAddr>().ok()? else {
+pub fn probe_address(tunnel: &Tunnel, pool: &TunnelPool) -> Option<String> {
+    let block = pool_block4(pool)?;
+    let bare = tunnel.address4.as_deref()?.split('/').next()?;
+    let IpAddr::V4(node) = bare.parse().ok()? else {
         return None;
     };
+    if !block.contains(node) {
+        return None;
+    }
+    let size = block_size(&block);
+    let offset = u64::from(u32::from(node) - u32::from(block.network()));
+    if offset < 2 || offset >= size / 2 {
+        return None;
+    }
+    let probe = u64::from(u32::from(block.network())) + size - offset;
+    Some(format!("{}/32", Ipv4Addr::from(u32::try_from(probe).ok()?)))
+}
 
-    let mut groups = v6.segments();
-    groups[7] = groups[7].checked_add(offset)?;
-    Some(format!("{}/128", Ipv6Addr::from(groups)))
+pub fn probe_half(pool: &TunnelPool) -> Option<IpNetwork> {
+    let block = pool_block4(pool)?;
+    if block.prefix() >= 31 {
+        return None;
+    }
+    let half = block_size(&block) / 2;
+    let start = u64::from(u32::from(block.network())) + half;
+    Ipv4Network::new(
+        Ipv4Addr::from(u32::try_from(start).ok()?),
+        block.prefix() + 1,
+    )
+    .ok()
+    .map(IpNetwork::V4)
+}
+
+fn pool_block4(pool: &TunnelPool) -> Option<Ipv4Network> {
+    match pool.cidr4.as_deref()?.parse::<IpNetwork>().ok()? {
+        IpNetwork::V4(v4) => Ipv4Network::new(v4.network(), v4.prefix()).ok(),
+        IpNetwork::V6(_) => None,
+    }
+}
+
+fn block_size(block: &Ipv4Network) -> u64 {
+    1u64 << (32 - u32::from(block.prefix()))
 }
 
 #[cfg(test)]

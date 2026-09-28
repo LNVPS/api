@@ -277,8 +277,8 @@ async fn the_probe_vm_is_addressed_as_the_node_expects() -> Result<()> {
     // an address and silently drops anything carrying a prefix, which boots a
     // guest with no network on a node that is perfectly fine.
     assert_eq!(info.ips[0].ip, spec.ip());
-    assert_eq!(spec.address, format!("{}/128", spec.ip()));
-    assert!(spec.address.contains(':'), "probes are IPv6 only");
+    assert_eq!(spec.address, format!("{}/32", spec.ip()));
+    assert_eq!(spec.address, "10.66.0.254/32");
     assert_eq!(info.vm.id, probe_vm_id(node.id));
     Ok(())
 }
@@ -766,7 +766,7 @@ async fn a_probe_can_reach_its_gateway() -> Result<()> {
     // can route. A wider prefix would make the route server look on-link, and
     // the guest would resolve it on a link where nothing answers.
     assert!(
-        network.yaml.contains(&format!("{}/128", spec.ip())),
+        network.yaml.contains(&format!("{}/32", spec.ip())),
         "{}",
         network.yaml
     );
