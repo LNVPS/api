@@ -293,6 +293,10 @@ pub fn is_pollable(router: &lnvps_db::Router) -> bool {
     router.enabled && !matches!(router.kind, lnvps_db::RouterKind::Lvd)
 }
 
+pub const NODE_QUIET_AFTER: chrono::Duration = chrono::Duration::minutes(10);
+const NODE_QUIET_SWEEP: chrono::Duration = chrono::Duration::minutes(5);
+pub const PROBE_FAILURES_TO_CORDON: u64 = 3;
+
 impl Worker {
     const CHECK_VMS_SECONDS: u64 = 30;
 
@@ -905,6 +909,35 @@ impl Worker {
     /// and a sweep that probed the whole fleet at once would arrive as a
     /// thundering herd on the operators least able to absorb it.
     #[cfg(feature = "linux-ssh")]
+    pub async fn alert_quiet_marketplace_nodes(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<u64>> {
+        let mut alerted = Vec::new();
+        for node in self
+            .db
+            .list_all_marketplace_nodes(Some(lnvps_db::MarketplaceNodeStatus::Approved))
+            .await?
+        {
+            let Some(seen) = node.last_seen else {
+                continue;
+            };
+            let quiet = now - seen;
+            if quiet > NODE_QUIET_AFTER && quiet <= NODE_QUIET_AFTER + NODE_QUIET_SWEEP {
+                self.queue_admin_notification(
+                    format!(
+                        "Marketplace node {} ({}) has not called LNVPS since {seen}",
+                        node.id, node.name
+                    ),
+                    Some("Marketplace node quiet".to_string()),
+                )
+                .await;
+                alerted.push(node.id);
+            }
+        }
+        Ok(alerted)
+    }
+
     pub async fn probe_marketplace_node(&self) -> Result<()> {
         let due = crate::provisioner::probe_candidates(&self.db, chrono::Utc::now()).await?;
         let Some(node) = due.into_iter().next() else {
@@ -919,6 +952,7 @@ impl Worker {
                 crate::provisioner::ProbeResult::failed(failure),
             )
             .await?;
+            self.cordon_if_failing(node.id).await?;
             return Ok(());
         }
 
@@ -957,6 +991,7 @@ impl Worker {
                 node_id,
                 result.failure.as_deref().unwrap_or("unknown")
             );
+            self.cordon_if_failing(node_id).await?;
             return Ok(());
         }
 
@@ -1001,6 +1036,44 @@ impl Worker {
             Ok(status) => crate::provisioner::underlay_shortfall(&tunnel.pool, status.underlay_mtu),
             Err(e) => Some(format!("could not read the node's status: {e:#}")),
         })
+    }
+
+    async fn cordon_if_failing(&self, node_id: u64) -> Result<bool> {
+        let (recent, _) = self
+            .db
+            .list_marketplace_node_health(node_id, PROBE_FAILURES_TO_CORDON, 0)
+            .await?;
+        if recent.len() < PROBE_FAILURES_TO_CORDON as usize || recent.iter().any(|h| h.passed) {
+            return Ok(false);
+        }
+        let Some(host) = self.db.get_marketplace_node_host(node_id).await? else {
+            return Ok(false);
+        };
+        if !host.enabled {
+            return Ok(false);
+        }
+        warn!(
+            "Marketplace node {node_id} failed {PROBE_FAILURES_TO_CORDON} probes in a row; \
+             disabling host {}",
+            host.id
+        );
+        let host_id = host.id;
+        self.db
+            .update_host(&VmHost {
+                enabled: false,
+                ..host
+            })
+            .await?;
+        self.queue_admin_notification(
+            format!(
+                "Marketplace node {node_id} failed its last {PROBE_FAILURES_TO_CORDON} probes; \
+                 host {host_id} is disabled until an admin re-enables it. Latest: {}",
+                recent[0].failure.as_deref().unwrap_or("unknown")
+            ),
+            Some("Marketplace node cordoned".to_string()),
+        )
+        .await;
+        Ok(true)
     }
 
     async fn has_passed_a_probe(&self, node_id: u64) -> Result<bool> {
@@ -3394,10 +3467,14 @@ impl Worker {
             }
             #[cfg(feature = "linux-ssh")]
             WorkJob::ProbeMarketplaceNode => {
+                self.alert_quiet_marketplace_nodes(chrono::Utc::now())
+                    .await?;
                 self.probe_marketplace_node().await?;
             }
             #[cfg(not(feature = "linux-ssh"))]
             WorkJob::ProbeMarketplaceNode => {
+                self.alert_quiet_marketplace_nodes(chrono::Utc::now())
+                    .await?;
                 // A build without SSH cannot log into a probe VM, and a probe
                 // that only created and destroyed one would report a node
                 // healthy on the strength of nothing.
@@ -5350,6 +5427,60 @@ mod tests {
         mock.os_images.lock().await.insert(6, stale);
         worker.refresh_os_image_checksums().await?;
         assert_eq!(db.get_os_image(6).await?.sha2, Some(fresh));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_node_failing_probes_in_a_row_is_cordoned() -> Result<()> {
+        let mock = Arc::new(MockDb::empty());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let (node_id, host_id) = a_marketplace_host(&db).await?;
+        let mut host = db.get_host(host_id).await?;
+        host.enabled = true;
+        db.update_host(&host).await?;
+        let worker = setup_worker(mock.clone()).await?;
+        let failed = || lnvps_db::MarketplaceNodeHealth {
+            node_id,
+            failure: Some("no".to_string()),
+            ..Default::default()
+        };
+
+        db.insert_marketplace_node_health(&lnvps_db::MarketplaceNodeHealth {
+            node_id,
+            passed: true,
+            ..Default::default()
+        })
+        .await?;
+        for _ in 1..PROBE_FAILURES_TO_CORDON {
+            db.insert_marketplace_node_health(&failed()).await?;
+            assert!(!worker.cordon_if_failing(node_id).await?);
+            assert!(db.get_host(host_id).await?.enabled);
+        }
+
+        db.insert_marketplace_node_health(&failed()).await?;
+        assert!(worker.cordon_if_failing(node_id).await?);
+        assert!(!db.get_host(host_id).await?.enabled);
+        assert!(!worker.cordon_if_failing(node_id).await?, "cordoned twice");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_node_gone_quiet_is_reported_once() -> Result<()> {
+        let mock = Arc::new(MockDb::empty());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let (node_id, _) = a_marketplace_host(&db).await?;
+        let worker = setup_worker(mock.clone()).await?;
+        let seen = chrono::Utc::now();
+        db.touch_marketplace_node(node_id, seen).await?;
+
+        for (after, expect) in [
+            (chrono::Duration::minutes(2), false),
+            (NODE_QUIET_AFTER + chrono::Duration::minutes(1), true),
+            (NODE_QUIET_AFTER + chrono::Duration::minutes(7), false),
+        ] {
+            let alerted = worker.alert_quiet_marketplace_nodes(seen + after).await?;
+            assert_eq!(alerted.contains(&node_id), expect, "quiet for {after}");
+        }
         Ok(())
     }
 

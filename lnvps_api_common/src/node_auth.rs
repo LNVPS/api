@@ -70,7 +70,16 @@ where
                 ));
             }
 
-            Ok(NodeAuth { node })
+            let seen = chrono::Utc::now();
+            if let Err(e) = db.touch_marketplace_node(node.id, seen).await {
+                log::warn!("Could not record marketplace node {} as seen: {e}", node.id);
+            }
+            Ok(NodeAuth {
+                node: MarketplaceNode {
+                    last_seen: Some(seen),
+                    ..node
+                },
+            })
         })
     }
 }
@@ -144,6 +153,34 @@ mod tests {
 
     /// The reason `token_version` exists. A signed token cannot be withdrawn,
     /// so revocation has to be a check against current state on every request.
+    #[tokio::test]
+    async fn an_authenticated_request_marks_the_node_as_seen() {
+        let (node, state) = node_and_state().await;
+        assert_eq!(
+            state
+                .0
+                .get_marketplace_node(node.id)
+                .await
+                .unwrap()
+                .last_seen,
+            None
+        );
+        let token = issue_node_token(node.id, node.token_version, NODE_TOKEN_TTL_SECS).unwrap();
+
+        let before = chrono::Utc::now();
+        authenticate(&state, Some(&format!("Bearer {token}")))
+            .await
+            .unwrap();
+
+        let seen = state
+            .0
+            .get_marketplace_node(node.id)
+            .await
+            .unwrap()
+            .last_seen;
+        assert!(seen.is_some_and(|s| s >= before), "{seen:?}");
+    }
+
     #[tokio::test]
     async fn a_revoked_token_stops_working() {
         let (node, state) = node_and_state().await;
