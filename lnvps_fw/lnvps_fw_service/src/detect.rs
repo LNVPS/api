@@ -6,6 +6,9 @@
 //! machine with entry thresholds, exit hysteresis, and a cooldown. Keeping this
 //! logic free of I/O and BPF handles makes it fully unit-testable.
 
+use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
+
 use lnvps_fw_common::{DEST_MODE_NORMAL, DEST_MODE_PORT_FILTER, DestCounters};
 
 /// Traffic rates for a single destination over the last sample window.
@@ -197,6 +200,12 @@ pub fn process_sample(
     (transition, rates)
 }
 
+pub fn prune_idle<K: Eq + Hash>(trackers: &mut HashMap<K, DestTracker>, seen: &HashSet<K>) {
+    trackers.retain(|k, t| {
+        seen.contains(k) || t.mode != DEST_MODE_NORMAL || t.flags != DEST_MODE_NORMAL
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,6 +369,40 @@ mod tests {
         let (mode, _) = evaluate(DEST_MODE_PORT_FILTER, &high, &CFG, 500, &mut below);
         assert_eq!(mode, DEST_MODE_PORT_FILTER);
         assert_eq!(below, None);
+    }
+
+    #[test]
+    fn prune_idle_keeps_seen_and_mitigating_only() {
+        let mitigating = DestTracker {
+            mode: DEST_MODE_PORT_FILTER,
+            flags: DEST_MODE_PORT_FILTER,
+            ..Default::default()
+        };
+        let mut trackers = HashMap::from([
+            (1u32, DestTracker::default()),
+            (2, DestTracker::default()),
+            (3, mitigating),
+        ]);
+        prune_idle(&mut trackers, &HashSet::from([1]));
+        let mut kept: Vec<_> = trackers.keys().copied().collect();
+        kept.sort();
+        assert_eq!(kept, vec![1, 3]);
+    }
+
+    #[test]
+    fn pruned_tracker_resumes_with_identical_rates() {
+        let mut old = DestTracker::default();
+        process_sample(counters(5_000, 0, 0), &mut old, &CFG, 0, 1_000_000_000);
+        let mut fresh = DestTracker::default();
+        let delta = counters(300, 10, 9_000);
+        let old_cur = counters(
+            old.prev.packets + delta.packets,
+            old.prev.syn_packets + delta.syn_packets,
+            old.prev.bytes + delta.bytes,
+        );
+        let (_, a) = process_sample(old_cur, &mut old, &CFG, 1, 1_000_000_000);
+        let (_, b) = process_sample(delta, &mut fresh, &CFG, 1, 1_000_000_000);
+        assert_eq!(a, b);
     }
 
     #[test]

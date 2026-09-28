@@ -32,7 +32,7 @@ use lnvps_fw_common::{
 
 use crate::cidr::{mask_v4, mask_v6};
 use crate::detect::{
-    DestTracker, DetectionConfig, Rates, Transition, compute_rates, process_sample,
+    DestTracker, DetectionConfig, Rates, Transition, compute_rates, process_sample, prune_idle,
 };
 
 /// Runtime configuration for one control tick.
@@ -373,6 +373,7 @@ fn detect_family<K>(
             &fmt_ip,
         );
     }
+    prune_idle(trackers, &seen);
 }
 
 /// Aggregate per-destination counters over one protected prefix and run the
