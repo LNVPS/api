@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Guests on libvirt hosts get DNS resolvers and the host's MTU** — the NoCloud network config now carries `nameservers` and, when the host has one set, `mtu`. Images that resolve through systemd-resolved (Debian 13 among them) ignored the resolvers in user-data and booted with no DNS at all.
+
 ### Added
 
 - **Pin an admin-created VM to a host** — `POST /api/admin/v1/vms` accepts an optional `host_id`. The VM is placed on that host instead of the least-loaded one in the template's region; the host must be in that region, not deleted, and have room for the template. It may be disabled, so an admin can place a VM on a host kept out of customer placement.

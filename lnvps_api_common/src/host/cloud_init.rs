@@ -109,6 +109,9 @@ pub fn network_config(value: &FullVmInfo) -> Result<NetworkConfig> {
     if accept_ra {
         cfg.push_str("    accept-ra: true\n");
     }
+    if let Some(mtu) = value.host.mtu {
+        cfg.push_str(&format!("    mtu: {mtu}\n"));
+    }
     cfg.push_str("    addresses:\n");
     for a in v4.iter().chain(v6.iter()) {
         // Quoted for the same reason as the MAC: an address is a value with
@@ -142,6 +145,12 @@ pub fn network_config(value: &FullVmInfo) -> Result<NetworkConfig> {
         for r in &routes {
             cfg.push_str(r);
             cfg.push('\n');
+        }
+    }
+    if !GUEST_DNS_SERVERS.is_empty() {
+        cfg.push_str("    nameservers:\n      addresses:\n");
+        for server in GUEST_DNS_SERVERS {
+            cfg.push_str(&format!("        - \"{server}\"\n"));
         }
     }
 
@@ -388,6 +397,26 @@ mod tests {
         assert_eq!(a, b);
         assert!(a.contains("instance-id: lnvps-vm-1"), "got {a}");
         assert!(a.contains("local-hostname: VM1"), "got {a}");
+        Ok(())
+    }
+
+    #[test]
+    fn network_config_hands_the_guest_its_resolvers() -> Result<()> {
+        let out = network_config(&mock_full_vm())?.yaml;
+        assert!(out.contains("    nameservers:\n      addresses:\n"), "{out}");
+        for server in GUEST_DNS_SERVERS {
+            assert!(out.contains(&format!("        - \"{server}\"")), "{out}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn network_config_carries_the_hosts_mtu() -> Result<()> {
+        let mut cfg = mock_full_vm();
+        assert!(!network_config(&cfg)?.yaml.contains("mtu:"));
+        cfg.host.mtu = Some(1280);
+        let out = network_config(&cfg)?.yaml;
+        assert!(out.contains("    mtu: 1280\n"), "{out}");
         Ok(())
     }
 
