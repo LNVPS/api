@@ -123,7 +123,7 @@ fn the_memory_test_cleans_up_in_the_same_breath() {
 #[test]
 fn the_disk_write_is_not_measuring_the_page_cache() {
     assert!(
-        write_command(256).contains("conv=fdatasync"),
+        write_command(256).contains("conv=fsync"),
         "{}",
         write_command(256)
     );

@@ -32,7 +32,7 @@ use lnvps_api_common::host::config::ProvisionerConfig;
 use lnvps_api_common::host::{FullVmInfo, get_host_client};
 use lnvps_db::{
     CpuArch, DiskInterface, DiskType, IpRange, LNVpsDb, MarketplaceNode, MarketplaceNodeHealth,
-    UserSshKey, Vm, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
+    OsDistribution, UserSshKey, Vm, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
 };
 
 use super::{probe_address, probe_mac};
@@ -205,7 +205,7 @@ impl ProbeSpec {
             .await?
             .into_iter()
             .filter(|i| i.enabled && (wanted_arch == CpuArch::Unknown || i.cpu_arch == wanted_arch))
-            .max_by_key(|i| i.release_date)
+            .max_by_key(|i| (i.distribution == OsDistribution::Alpine, i.release_date))
             .ok_or_else(|| {
                 anyhow::anyhow!("No enabled OS image to probe with for {wanted_arch}")
             })?;

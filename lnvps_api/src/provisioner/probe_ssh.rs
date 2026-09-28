@@ -194,7 +194,7 @@ fn touch_command(mb: u64) -> String {
 
 /// Sequential write, MB/s.
 ///
-/// `conv=fdatasync` so the rate is the disk's rather than the guest's page
+/// `conv=fsync` so the rate is the disk's rather than the guest's page
 /// cache: without it a node with a slow disk and plenty of RAM reports a
 /// gigabyte a second.
 async fn measure_disk_write(client: &mut SshClient) -> Result<u32> {
@@ -230,11 +230,11 @@ async fn measure_disk_read(client: &mut SshClient) -> Result<u32> {
     Ok(rate_mb_s(DISK_MB, started.elapsed()))
 }
 
-/// `conv=fdatasync` so the rate is the disk's and not the guest's page cache:
+/// `conv=fsync` so the rate is the disk's and not the guest's page cache:
 /// without it a node with a slow disk and plenty of RAM reports a gigabyte a
 /// second.
 fn write_command(mb: u64) -> String {
-    format!("dd if=/dev/zero of=/var/tmp/probe bs=1M count={mb} conv=fdatasync 2>&1")
+    format!("dd if=/dev/zero of=/var/tmp/probe bs=1M count={mb} conv=fsync 2>&1")
 }
 
 /// Read back and remove, so a probe cannot leave a quarter of a gigabyte behind

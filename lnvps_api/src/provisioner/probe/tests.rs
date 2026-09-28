@@ -237,6 +237,41 @@ async fn a_probe_uses_what_customers_buy() -> Result<()> {
 }
 
 #[tokio::test]
+async fn a_probe_boots_alpine_when_the_catalogue_has_it() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+    let alpine = |id: u64, arch: lnvps_db::CpuArch, age_days: i64| lnvps_db::VmOsImage {
+        id,
+        distribution: lnvps_db::OsDistribution::Alpine,
+        flavour: "cloudinit".to_string(),
+        version: "3.24".to_string(),
+        enabled: true,
+        release_date: chrono::Utc::now() - chrono::Duration::days(age_days),
+        url: format!("https://example.com/alpine-{id}.qcow2"),
+        cpu_arch: arch,
+        default_username: Some("alpine".to_string()),
+        sha2: None,
+        sha2_url: None,
+    };
+    mock.os_images
+        .lock()
+        .await
+        .insert(3, alpine(3, lnvps_db::CpuArch::X86_64, 400));
+    mock.os_images
+        .lock()
+        .await
+        .insert(4, alpine(4, lnvps_db::CpuArch::ARM64, 1));
+    let node = a_node(&db).await?;
+
+    let spec = ProbeSpec::build(&db, &node, KEY.to_string()).await?;
+
+    assert_eq!(spec.image.id, 3);
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_template_with_no_architecture_falls_back_to_the_hosts() -> Result<()> {
     let mock = Arc::new(MockDb::empty());
     let db: Arc<dyn LNVpsDb> = mock.clone();
