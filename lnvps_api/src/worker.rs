@@ -910,6 +910,7 @@ impl Worker {
         let Some(node) = due.into_iter().next() else {
             return Ok(());
         };
+        let proven_before = self.has_passed_a_probe(node.id).await?;
 
         // A probe that could not be run at all must not abort the sweep: this
         // runs from `handle_job`, whose error stops the rest of the batch, so
@@ -926,6 +927,16 @@ impl Worker {
                     return Ok(());
                 }
             };
+        self.admit_after_probe(node.id, proven_before, &result)
+            .await
+    }
+
+    async fn admit_after_probe(
+        &self,
+        node_id: u64,
+        proven_before: bool,
+        result: &crate::provisioner::ProbeResult,
+    ) -> Result<()> {
         if !result.passed() {
             // Recorded, not acted on. One bad probe is a bad afternoon — a
             // backup job, a noisy neighbour — and taking a node out of service
@@ -933,20 +944,23 @@ impl Worker {
             // Suspension on a trend is increment 12's job.
             warn!(
                 "Marketplace node {} failed its probe: {}",
-                node.id,
+                node_id,
                 result.failure.as_deref().unwrap_or("unknown")
             );
             return Ok(());
         }
 
         // The gate: a host is only enabled once a VM has actually run on it.
-        let Some(host) = self.db.get_marketplace_node_host(node.id).await? else {
+        if proven_before {
+            return Ok(());
+        }
+        let Some(host) = self.db.get_marketplace_node_host(node_id).await? else {
             return Ok(());
         };
         if !host.enabled {
             info!(
                 "Marketplace node {} carried a probe VM in {}ms; enabling host {}",
-                node.id,
+                node_id,
                 result.provision_ms.unwrap_or_default(),
                 host.id
             );
@@ -958,6 +972,24 @@ impl Worker {
                 .await?;
         }
         Ok(())
+    }
+
+    async fn has_passed_a_probe(&self, node_id: u64) -> Result<bool> {
+        const PAGE: u64 = 500;
+        let mut offset = 0;
+        loop {
+            let (rows, total) = self
+                .db
+                .list_marketplace_node_health(node_id, PAGE, offset)
+                .await?;
+            if rows.iter().any(|h| h.passed) {
+                return Ok(true);
+            }
+            offset += rows.len() as u64;
+            if rows.is_empty() || offset >= total as u64 {
+                return Ok(false);
+            }
+        }
     }
 
     // (see `is_pollable` below for which routers this skips)
@@ -5190,6 +5222,84 @@ mod tests {
     /// open it is a VM having actually run there. A gate that opened on a
     /// failure — or on nothing at all — would put customers on hardware nobody
     /// has tested.
+    async fn a_marketplace_host(db: &Arc<dyn LNVpsDb>) -> Result<(u64, u64)> {
+        let user_id = db.upsert_user(&[5u8; 32]).await?;
+        let operator_id = db
+            .insert_marketplace_operator(&lnvps_db::MarketplaceOperator {
+                user_id,
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let node_id = db
+            .insert_marketplace_node(&lnvps_db::MarketplaceNode {
+                operator_id,
+                name: "node".to_string(),
+                status: lnvps_db::MarketplaceNodeStatus::Approved,
+                ..Default::default()
+            })
+            .await?;
+        let host_id = db
+            .create_host(&VmHost {
+                kind: lnvps_db::VmHostKind::MarketplaceNode,
+                region_id: 1,
+                name: "node".to_string(),
+                enabled: false,
+                marketplace_node_id: Some(node_id),
+                ..Default::default()
+            })
+            .await?;
+        Ok((node_id, host_id))
+    }
+
+    #[tokio::test]
+    async fn a_first_passing_probe_enables_the_host() -> Result<()> {
+        let mock = Arc::new(MockDb::empty());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let (node_id, host_id) = a_marketplace_host(&db).await?;
+        let worker = setup_worker(mock.clone()).await?;
+
+        assert!(!worker.has_passed_a_probe(node_id).await?);
+        worker
+            .admit_after_probe(node_id, false, &crate::provisioner::ProbeResult::default())
+            .await?;
+
+        assert!(db.get_host(host_id).await?.enabled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_later_passing_probe_leaves_a_disabled_host_alone() -> Result<()> {
+        let mock = Arc::new(MockDb::empty());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let (node_id, host_id) = a_marketplace_host(&db).await?;
+        db.insert_marketplace_node_health(&lnvps_db::MarketplaceNodeHealth {
+            node_id,
+            failure: Some("no".to_string()),
+            ..Default::default()
+        })
+        .await?;
+        db.insert_marketplace_node_health(&lnvps_db::MarketplaceNodeHealth {
+            node_id,
+            passed: true,
+            ..Default::default()
+        })
+        .await?;
+        let worker = setup_worker(mock.clone()).await?;
+
+        let proven = worker.has_passed_a_probe(node_id).await?;
+        worker
+            .admit_after_probe(node_id, proven, &crate::provisioner::ProbeResult::default())
+            .await?;
+
+        assert!(proven);
+        assert!(
+            !db.get_host(host_id).await?.enabled,
+            "a host an admin disabled was re-enabled by a routine probe"
+        );
+        Ok(())
+    }
+
     #[cfg(feature = "linux-ssh")]
     #[tokio::test]
     async fn a_host_is_not_enabled_without_a_passing_probe() -> Result<()> {
