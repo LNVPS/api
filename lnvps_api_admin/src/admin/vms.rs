@@ -1483,8 +1483,8 @@ async fn admin_create_vm(
                 template.id
             )));
         }
-        if !host.enabled {
-            return Err(ApiError::bad_request(format!("Host {host_id} is disabled")));
+        if host.deleted {
+            return Err(ApiError::bad_request(format!("Host {host_id} is deleted")));
         }
     }
 
@@ -2364,7 +2364,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admin_create_vm_pins_a_host_only_in_the_templates_region() {
+    async fn admin_create_vm_pins_any_live_host_in_the_templates_region() {
         use crate::admin::model::Permission;
         use lnvps_api_common::{
             ChannelWorkCommander, MockDb, MockExchangeRate, VatClient, VmStateCache, WorkCommander,
@@ -2387,10 +2387,14 @@ mod tests {
         elsewhere.id = 2;
         elsewhere.region_id = 2;
         mock.hosts.lock().await.insert(2, elsewhere);
+        let mut gone = mock.hosts.lock().await.get(&1).unwrap().clone();
+        gone.id = 3;
+        gone.deleted = true;
+        mock.hosts.lock().await.insert(3, gone);
         let mut off = mock.hosts.lock().await.get(&1).unwrap().clone();
-        off.id = 3;
+        off.id = 4;
         off.enabled = false;
-        mock.hosts.lock().await.insert(3, off);
+        mock.hosts.lock().await.insert(4, off);
 
         let jobs = Arc::new(ChannelWorkCommander::new());
         let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(mock);
@@ -2433,7 +2437,7 @@ mod tests {
             );
         }
 
-        admin_create_vm(admin(), State(this.clone()), Json(request(Some(1))))
+        admin_create_vm(admin(), State(this.clone()), Json(request(Some(4))))
             .await
             .unwrap();
         let queued = tokio::time::timeout(std::time::Duration::from_millis(200), jobs.recv())
@@ -2444,11 +2448,11 @@ mod tests {
             queued.iter().any(|m| matches!(
                 m.job,
                 WorkJob::CreateVm {
-                    host_id: Some(1),
+                    host_id: Some(4),
                     ..
                 }
             )),
-            "the pinned host was not passed to the job"
+            "the pinned disabled host was not passed to the job"
         );
     }
 }

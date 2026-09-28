@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- **Pin an admin-created VM to a host** — `POST /api/admin/v1/vms` accepts an optional `host_id`. The VM is placed on that host instead of the least-loaded one in the template's region; the host must be enabled, in that region, and have room for the template.
+- **Pin an admin-created VM to a host** — `POST /api/admin/v1/vms` accepts an optional `host_id`. The VM is placed on that host instead of the least-loaded one in the template's region; the host must be in that region, not deleted, and have room for the template. It may be disabled, so an admin can place a VM on a host kept out of customer placement.
 
 - **Regions report what else is in them** — `GET /api/admin/v1/regions` and `GET /api/admin/v1/regions/{id}` now also return `ip_ranges`, `vm_templates`, `app_clusters`, `app_deployments`, `tunnel_pools`, `vpn_services` and `routers` alongside the existing host, VM and IP figures, so an admin can see what a region holds without opening six other pages first.
 

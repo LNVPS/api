@@ -483,7 +483,7 @@ Response:
 - Template must exist
 - Image must exist
 - SSH key must exist and belong to the specified user
-- `host_id`, when given, must be an enabled host in the template's region. The job still fails if that host has no room for the template.
+- `host_id`, when given, must be a host in the template's region that is not deleted. It may be disabled: pinning is how an admin places a VM on a host kept out of customer placement. The job still fails if that host has no room for the template.
 
 **Asynchronous Processing:** This endpoint dispatches a `CreateVm` work job for distributed processing. The operation
 returns immediately with a job ID. The VM creation is handled by the provisioner and includes full audit logging with

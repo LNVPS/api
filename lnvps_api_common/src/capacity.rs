@@ -81,10 +81,14 @@ impl HostCapacityService {
         template: &impl Template,
         host_id: Option<u64>,
     ) -> Result<HostCapacity> {
-        let hosts = self.db.list_hosts().await?;
-        let eligible = hosts
-            .iter()
-            .filter(|h| h.region_id == region_id && host_id.is_none_or(|id| h.id == id));
+        let hosts = match host_id {
+            Some(id) => vec![self.db.get_host(id).await?]
+                .into_iter()
+                .filter(|h| !h.deleted)
+                .collect(),
+            None => self.db.list_hosts().await?,
+        };
+        let eligible = hosts.iter().filter(|h| h.region_id == region_id);
         let caps: Vec<Result<HostCapacity>> = join_all(eligible.map(|h| {
             self.get_host_capacity(
                 h,
@@ -110,7 +114,7 @@ impl HostCapacityService {
         match (host_cap.into_iter().next(), host_id) {
             (Some(f), _) => Ok(f),
             (None, Some(id)) => bail!(
-                "Host {id} is not an enabled host in region {region_id} with room for this template"
+                "Host {id} is deleted, outside region {region_id}, or has no room for this template"
             ),
             (None, None) => Err(CapacityError::NoAvailableHosts.into()),
         }
@@ -1013,10 +1017,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pinned_host_must_be_enabled_and_in_the_region() -> Result<()> {
-        for (enabled, region_id) in [(false, 1), (true, 2)] {
+    async fn a_pinned_host_may_be_disabled() -> Result<()> {
+        let mock = MockDb::default();
+        a_second_host(&mock, false, 1).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let hc = HostCapacityService::new(db.clone());
+        let template = db.get_vm_template(1).await?;
+
+        let pinned = hc
+            .get_host_for_template_on(template.region_id, &template, Some(2))
+            .await?;
+        assert_eq!(pinned.host.id, 2);
+        let placed = hc
+            .get_host_for_template(template.region_id, &template)
+            .await?;
+        assert_eq!(placed.host.id, 1, "normal placement used a disabled host");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pinned_host_must_be_live_and_in_the_region() -> Result<()> {
+        for (deleted, region_id) in [(true, 1), (false, 2)] {
             let mock = MockDb::default();
-            a_second_host(&mock, enabled, region_id).await;
+            a_second_host(&mock, true, region_id).await;
+            mock.hosts.lock().await.get_mut(&2).unwrap().deleted = deleted;
             let db: Arc<dyn LNVpsDb> = Arc::new(mock);
             let hc = HostCapacityService::new(db.clone());
             let template = db.get_vm_template(1).await?;
