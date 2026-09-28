@@ -201,6 +201,10 @@ pub fn build_domain(
             kind: Some("serial".to_string()),
         }),
     }));
+    devices.push(DomainDevice::MemBalloon(MemBalloon {
+        model: "virtio".to_string(),
+        stats: Some(MemBalloonStats { period: 10 }),
+    }));
 
     Ok(DomainXML {
         kind: if qemu.kvm {
@@ -731,8 +735,26 @@ pub enum DomainDevice {
     Serial(SerialDevice),
     #[serde(rename = "console")]
     Console(ConsoleDevice),
+    #[serde(rename = "memballoon")]
+    MemBalloon(MemBalloon),
     #[serde(other)]
     Other,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[serde(rename = "memballoon")]
+pub struct MemBalloon {
+    #[serde(rename = "@model")]
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<MemBalloonStats>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[serde(rename = "stats")]
+pub struct MemBalloonStats {
+    #[serde(rename = "@period")]
+    pub period: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -1339,6 +1361,10 @@ mod tests {
         assert!(!xml.contains("default-pool:vm-1-disk0"), "got {xml}");
         assert!(xml.contains(r#"<memory unit="bytes">"#), "got {xml}");
         assert!(xml.contains("<serial"), "serial console missing: {xml}");
+        assert!(
+            xml.contains(r#"<memballoon model="virtio"><stats period="10"/></memballoon>"#),
+            "got {xml}"
+        );
         assert!(xml.contains(r#"<model type="virtio"/>"#), "got {xml}");
         // The runtime domain id is assigned by libvirt; sending one is invalid.
         assert!(!xml.contains("<domain type=\"kvm\" id="), "got {xml}");

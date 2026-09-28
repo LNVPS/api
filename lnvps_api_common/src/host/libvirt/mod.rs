@@ -42,7 +42,6 @@ use error::{is_not_found, map_virt_error};
 use lnvps_db::{Vm, VmOsImage};
 use log::{debug, info, warn};
 use rand::random;
-use stats::CpuSampler;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use virt::connect::Connect;
@@ -61,7 +60,6 @@ use xml::{
 pub struct LibVirtHost {
     conn: LibVirtConn,
     cfg: LibVirtConfig,
-    cpu: CpuSampler,
 }
 
 impl LibVirtHost {
@@ -69,7 +67,6 @@ impl LibVirtHost {
         Ok(Self {
             conn: LibVirtConn::open(url)?,
             cfg,
-            cpu: CpuSampler::default(),
         })
     }
 
@@ -596,7 +593,7 @@ impl VmHostClient for LibVirtHost {
         // domain was defined.
         self.delete_primary_disk(vm_id).await?;
         self.delete_volume_everywhere(seed_volume(vm_id)).await?;
-        self.cpu.forget(vm_id);
+        stats::CPU.forget(vm_id);
         info!("deleted domain {}", domain_name(vm_id));
         Ok(())
     }
@@ -676,47 +673,14 @@ impl VmHostClient for LibVirtHost {
 
     async fn get_vm_state(&self, vm: &Vm) -> OpResult<VmRunningState> {
         let vm_id = vm.id;
-        let sampler = &self.cpu;
-        let domain_state = self
+        let sample = self
             .conn
             .run(move |c| {
                 let domain = LibVirtHost::require_domain(c, vm_id)?;
-                let info = domain
-                    .info()
-                    .map_err(|e| map_virt_error("domain_info", e))?;
-                let xml = domain.xml_desc(0).ok();
-                let counters = xml
-                    .as_deref()
-                    .and_then(|x| parse_live_devices(x).ok())
-                    .map(|devices| {
-                        let mut net = (0u64, 0u64);
-                        let mut disk = (0u64, 0u64);
-                        for iface in &devices.interface_targets {
-                            if let Ok(s) = domain.interface_stats(iface) {
-                                net.0 += s.rx_bytes.max(0) as u64;
-                                net.1 += s.tx_bytes.max(0) as u64;
-                            }
-                        }
-                        for dev in &devices.disk_targets {
-                            if let Ok(s) = domain.block_stats(dev) {
-                                disk.0 += s.rd_bytes.max(0) as u64;
-                                disk.1 += s.wr_bytes.max(0) as u64;
-                            }
-                        }
-                        (net, disk)
-                    })
-                    .unwrap_or_default();
-                Ok((info, counters))
+                sample_domain(&domain)
             })
             .await?;
-
-        let (info, ((net_in, net_out), (disk_read, disk_write))) = domain_state;
-        let mut state = stats::state_from_info(&info, vm_id, sampler);
-        state.net_in = net_in;
-        state.net_out = net_out;
-        state.disk_read = disk_read;
-        state.disk_write = disk_write;
-        Ok(state)
+        Ok(sample.into_state(vm_id))
     }
 
     async fn get_all_vm_states(&self) -> OpResult<Vec<(u64, VmRunningState)>> {
@@ -734,8 +698,10 @@ impl VmHostClient for LibVirtHost {
                     let Some(vm_id) = vm_id_from_domain_name(&name) else {
                         continue;
                     };
-                    let Ok(info) = domain.info() else { continue };
-                    out.push((vm_id, info));
+                    let Ok(sample) = sample_domain(&domain) else {
+                        continue;
+                    };
+                    out.push((vm_id, sample));
                 }
                 Ok(out)
             })
@@ -743,7 +709,7 @@ impl VmHostClient for LibVirtHost {
 
         Ok(raw
             .into_iter()
-            .map(|(vm_id, info)| (vm_id, stats::state_from_info(&info, vm_id, &self.cpu)))
+            .map(|(vm_id, sample)| (vm_id, sample.into_state(vm_id)))
             .collect())
     }
 
@@ -854,14 +820,65 @@ impl VmHostClient for LibVirtHost {
     ) -> OpResult<Vec<TimeSeriesData>> {
         // Unlike Proxmox, libvirt keeps no RRD history — historical series need
         // an external store (Prometheus) rather than a host query.
-        Err(OpError::Fatal(anyhow!(
-            "libvirt does not store historical resource usage"
-        )))
+        Ok(Vec::new())
     }
 
     async fn connect_terminal(&self, vm: &Vm) -> OpResult<TerminalStream> {
         console::connect(self.conn.handle()?, vm.id)
     }
+}
+
+struct DomainSample {
+    info: virt::domain::DomainInfo,
+    net: (u64, u64),
+    disk: (u64, u64),
+    memory: Vec<(u32, u64)>,
+}
+
+impl DomainSample {
+    fn into_state(self, vm_id: u64) -> VmRunningState {
+        let mut state = stats::state_from_info(&self.info, vm_id, &stats::CPU);
+        state.mem_usage = stats::memory_usage(&self.info, &self.memory);
+        state.net_in = self.net.0;
+        state.net_out = self.net.1;
+        state.disk_read = self.disk.0;
+        state.disk_write = self.disk.1;
+        state
+    }
+}
+
+fn sample_domain(domain: &virt::domain::Domain) -> OpResult<DomainSample> {
+    let info = domain
+        .info()
+        .map_err(|e| map_virt_error("domain_info", e))?;
+    let mut sample = DomainSample {
+        info,
+        net: (0, 0),
+        disk: (0, 0),
+        memory: domain
+            .memory_stats(0)
+            .map(|m| m.into_iter().map(|s| (s.tag, s.val)).collect())
+            .unwrap_or_default(),
+    };
+    let devices = domain
+        .xml_desc(0)
+        .ok()
+        .and_then(|x| parse_live_devices(&x).ok());
+    if let Some(devices) = devices {
+        for iface in &devices.interface_targets {
+            if let Ok(s) = domain.interface_stats(iface) {
+                sample.net.0 += s.rx_bytes.max(0) as u64;
+                sample.net.1 += s.tx_bytes.max(0) as u64;
+            }
+        }
+        for dev in &devices.disk_targets {
+            if let Ok(s) = domain.block_stats(dev) {
+                sample.disk.0 += s.rd_bytes.max(0) as u64;
+                sample.disk.1 += s.wr_bytes.max(0) as u64;
+            }
+        }
+    }
+    Ok(sample)
 }
 
 #[cfg(test)]
@@ -1010,11 +1027,13 @@ mod tests {
         let host = host()?;
         let vm = vm_info().vm;
 
-        // Previously `todo!()` — a panic reachable from an HTTP handler.
-        assert!(matches!(
-            host.get_time_series_data(&vm, TimeSeries::Hourly).await,
-            Err(OpError::Fatal(_))
-        ));
+        // Previously `todo!()` — a panic reachable from an HTTP handler, then a
+        // fatal error the customer saw as a 500 on every graph.
+        assert!(
+            host.get_time_series_data(&vm, TimeSeries::Hourly)
+                .await?
+                .is_empty()
+        );
         assert!(matches!(
             host.connect_terminal(&vm).await,
             Err(OpError::Fatal(_))

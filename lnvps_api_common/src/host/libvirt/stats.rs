@@ -18,6 +18,53 @@ pub fn map_state(state: DomainState) -> VmRunningStates {
     }
 }
 
+pub static CPU: std::sync::LazyLock<CpuSampler> = std::sync::LazyLock::new(CpuSampler::default);
+pub static UPTIME: std::sync::LazyLock<UptimeTracker> =
+    std::sync::LazyLock::new(UptimeTracker::default);
+
+const MEMORY_STAT_UNUSED: u32 = 4;
+const MEMORY_STAT_AVAILABLE: u32 = 5;
+const MEMORY_STAT_USABLE: u32 = 8;
+
+pub fn memory_usage(info: &DomainInfo, stats: &[(u32, u64)]) -> f32 {
+    let stat = |tag| stats.iter().find(|(t, _)| *t == tag).map(|(_, v)| *v);
+    if let Some(available) = stat(MEMORY_STAT_AVAILABLE).filter(|a| *a > 0)
+        && let Some(free) = stat(MEMORY_STAT_USABLE).or_else(|| stat(MEMORY_STAT_UNUSED))
+    {
+        return (1.0 - free.min(available) as f64 / available as f64) as f32;
+    }
+    if info.max_mem > 0 {
+        (info.memory as f64 / info.max_mem as f64) as f32
+    } else {
+        0.0
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct UptimeTracker {
+    seen: Mutex<HashMap<u64, (i64, u64)>>,
+}
+
+impl UptimeTracker {
+    pub fn observe(&self, vm_id: u64, running: bool, cpu_time_ns: u64) -> u64 {
+        let now = Utc::now().timestamp();
+        let mut guard = match self.seen.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        if !running {
+            guard.remove(&vm_id);
+            return 0;
+        }
+        let started = match guard.get(&vm_id) {
+            Some((started, last_cpu)) if cpu_time_ns >= *last_cpu => *started,
+            _ => now,
+        };
+        guard.insert(vm_id, (started, cpu_time_ns));
+        (now - started).max(0) as u64
+    }
+}
+
 /// Previous CPU-time readings, used to turn libvirt's monotonic counter into a
 /// usage percentage.
 ///
@@ -89,22 +136,15 @@ pub fn state_from_info(info: &DomainInfo, vm_id: u64, sampler: &CpuSampler) -> V
     let state = map_state(info.state.unwrap_or(DomainState::NoState));
     let cpu_usage = sampler.observe(vm_id, info.cpu_time, info.nr_virt_cpu);
 
-    // `memory` is the balloon's current allocation in KiB; without a balloon
-    // driver in the guest it equals max_mem, which is still the honest answer
-    // for "how much RAM is committed to this VM".
-    let mem_usage = if info.max_mem > 0 {
-        (info.memory as f64 / info.max_mem as f64) as f32
-    } else {
-        0.0
-    };
+    let mem_usage = memory_usage(info, &[]);
+    let uptime = UPTIME.observe(vm_id, state == VmRunningStates::Running, info.cpu_time);
 
     VmRunningState {
         timestamp: Utc::now().timestamp() as u64,
         state,
         cpu_usage,
         mem_usage,
-        // libvirt exposes no domain uptime; the caller tracks start times.
-        uptime: 0,
+        uptime,
         net_in: 0,
         net_out: 0,
         disk_write: 0,
@@ -115,6 +155,62 @@ pub fn state_from_info(info: &DomainInfo, vm_id: u64, sampler: &CpuSampler) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info(memory: u64, max_mem: u64, cpu_time: u64) -> DomainInfo {
+        DomainInfo {
+            state: DomainState::Running.into(),
+            max_mem,
+            memory,
+            nr_virt_cpu: 1,
+            cpu_time,
+        }
+    }
+
+    #[test]
+    fn memory_usage_comes_from_the_guest_when_it_reports() {
+        let i = info(1024, 1024, 0);
+        assert_eq!(memory_usage(&i, &[]), 1.0);
+        let used = memory_usage(
+            &i,
+            &[(MEMORY_STAT_AVAILABLE, 1000), (MEMORY_STAT_USABLE, 750)],
+        );
+        assert!((used - 0.25).abs() < 1e-6, "{used}");
+        let used = memory_usage(
+            &i,
+            &[(MEMORY_STAT_AVAILABLE, 1000), (MEMORY_STAT_UNUSED, 400)],
+        );
+        assert!((used - 0.6).abs() < 1e-6, "{used}");
+        assert_eq!(
+            memory_usage(&i, &[(MEMORY_STAT_AVAILABLE, 0), (MEMORY_STAT_USABLE, 5)]),
+            1.0
+        );
+    }
+
+    #[test]
+    fn uptime_counts_from_first_seen_running_and_resets_on_restart() {
+        let tracker = UptimeTracker::default();
+        assert_eq!(tracker.observe(1, true, 100), 0);
+        {
+            let mut g = tracker.seen.lock().unwrap();
+            g.get_mut(&1).unwrap().0 -= 60;
+        }
+        assert!(tracker.observe(1, true, 200) >= 60);
+        assert_eq!(
+            tracker.observe(1, true, 50),
+            0,
+            "cpu time went backwards: a restart"
+        );
+        assert_eq!(tracker.observe(1, false, 0), 0);
+        assert!(tracker.seen.lock().unwrap().get(&1).is_none());
+    }
+
+    #[test]
+    fn cpu_samples_survive_a_new_client() {
+        CPU.forget(9_999_001);
+        assert_eq!(CPU.observe(9_999_001, 0, 1), 0.0);
+        assert!(CPU.samples.lock().unwrap().contains_key(&9_999_001));
+        CPU.forget(9_999_001);
+    }
 
     #[test]
     fn states_map_to_running_or_stopped() {

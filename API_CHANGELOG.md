@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **VM stats on libvirt hosts** — CPU usage, uptime, network and disk counters were always 0 and memory always 100% for VMs on libvirt hosts (marketplace nodes included). They now come from the domain's own counters and the guest's balloon statistics. `GET /api/v1/vm/{id}/time-series` returns an empty series instead of a 500, since libvirt keeps no history.
+
 - **Guests on libvirt hosts get DNS resolvers and the host's MTU** — the NoCloud network config now carries `nameservers` and, when the host has one set, `mtu`. Images that resolve through systemd-resolved (Debian 13 among them) ignored the resolvers in user-data and booted with no DNS at all.
 
 ### Added
