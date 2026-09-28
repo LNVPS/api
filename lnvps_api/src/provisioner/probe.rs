@@ -195,6 +195,15 @@ impl ProbeSpec {
         let Some(template) = templates.into_iter().next() else {
             bail!("Region {} has no template to probe with", host.region_id);
         };
+        let template = VmTemplate {
+            disk_iops_read: None,
+            disk_iops_write: None,
+            disk_mbps_read: None,
+            disk_mbps_write: None,
+            network_mbps: None,
+            cpu_limit: None,
+            ..template
+        };
 
         let wanted_arch = match template.cpu_arch {
             CpuArch::Unknown => host.cpu_arch,

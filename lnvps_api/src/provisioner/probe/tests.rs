@@ -237,6 +237,40 @@ async fn a_probe_uses_what_customers_buy() -> Result<()> {
 }
 
 #[tokio::test]
+async fn a_probe_runs_without_the_templates_limits() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+    mock.templates.lock().await.insert(
+        1,
+        lnvps_db::VmTemplate {
+            cpu_arch: lnvps_db::CpuArch::X86_64,
+            disk_iops_read: Some(1000),
+            disk_iops_write: Some(1000),
+            disk_mbps_read: Some(200),
+            disk_mbps_write: Some(200),
+            network_mbps: Some(1000),
+            cpu_limit: Some(0.5),
+            ..MockDb::mock_template()
+        },
+    );
+    let node = a_node(&db).await?;
+
+    let spec = ProbeSpec::build(&db, &node, KEY.to_string()).await?;
+    let limits = spec.vm_info().limits();
+
+    assert_eq!(spec.template.id, 1);
+    assert_eq!(limits.disk_iops_read, None);
+    assert_eq!(limits.disk_iops_write, None);
+    assert_eq!(limits.disk_mbps_read, None);
+    assert_eq!(limits.disk_mbps_write, None);
+    assert_eq!(limits.network_mbps, None);
+    assert_eq!(limits.cpu_limit, None);
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_probe_boots_alpine_when_the_catalogue_has_it() -> Result<()> {
     let mock = Arc::new(MockDb::empty());
     let db: Arc<dyn LNVpsDb> = mock.clone();

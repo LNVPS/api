@@ -215,9 +215,7 @@ async fn measure_disk_read(client: &mut SshClient) -> Result<u32> {
     // Best-effort: a guest that will not let us drop caches still gives a
     // useful number, it is just an optimistic one, and refusing to report
     // anything would be worse.
-    let _ = client
-        .execute("sync; echo 3 > /proc/sys/vm/drop_caches")
-        .await;
+    let _ = client.execute(DROP_CACHES_COMMAND).await;
 
     let started = Instant::now();
     let (code, out) = client
@@ -239,6 +237,8 @@ fn write_command(mb: u64) -> String {
 
 /// Read back and remove, so a probe cannot leave a quarter of a gigabyte behind
 /// on an operator's disk.
+const DROP_CACHES_COMMAND: &str = "sync; sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'";
+
 const READ_COMMAND: &str = "dd if=/var/tmp/probe of=/dev/null bs=1M 2>&1; rm -f /var/tmp/probe";
 
 /// Timed here rather than parsed from `dd`, whose output format varies with

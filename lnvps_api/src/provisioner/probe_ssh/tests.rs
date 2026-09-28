@@ -121,6 +121,14 @@ fn the_memory_test_cleans_up_in_the_same_breath() {
 /// The write is synced. Without it a node with a slow disk and plenty of RAM
 /// reports a gigabyte a second, which is the exact node this is meant to catch.
 #[test]
+fn the_cache_is_dropped_as_root() {
+    assert!(
+        DROP_CACHES_COMMAND.contains("sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'"),
+        "{DROP_CACHES_COMMAND}"
+    );
+}
+
+#[test]
 fn the_disk_write_is_not_measuring_the_page_cache() {
     assert!(
         write_command(256).contains("conv=fsync"),
