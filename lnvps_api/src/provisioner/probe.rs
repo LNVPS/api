@@ -31,8 +31,8 @@ use anyhow::{Context, Result, bail};
 use lnvps_api_common::host::config::ProvisionerConfig;
 use lnvps_api_common::host::{FullVmInfo, get_host_client};
 use lnvps_db::{
-    DiskInterface, DiskType, IpRange, LNVpsDb, MarketplaceNode, MarketplaceNodeHealth, UserSshKey,
-    Vm, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
+    CpuArch, DiskInterface, DiskType, IpRange, LNVpsDb, MarketplaceNode, MarketplaceNodeHealth,
+    UserSshKey, Vm, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
 };
 
 use super::{probe_address, probe_mac};
@@ -199,13 +199,19 @@ impl ProbeSpec {
             bail!("Region {} has no template to probe with", host.region_id);
         };
 
+        let wanted_arch = match template.cpu_arch {
+            CpuArch::Unknown => host.cpu_arch,
+            arch => arch,
+        };
         let image = db
             .list_os_image()
             .await?
             .into_iter()
-            .filter(|i| i.enabled && i.cpu_arch == template.cpu_arch)
+            .filter(|i| i.enabled && (wanted_arch == CpuArch::Unknown || i.cpu_arch == wanted_arch))
             .max_by_key(|i| i.release_date)
-            .ok_or_else(|| anyhow::anyhow!("No enabled OS image to probe with"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("No enabled OS image to probe with for {wanted_arch}")
+            })?;
 
         // The pool the node's own libvirt was configured with. Hardcoding a name
         // here would make the probe either fail or measure a disk customers are

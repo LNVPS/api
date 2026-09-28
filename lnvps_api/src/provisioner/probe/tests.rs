@@ -156,6 +156,7 @@ async fn a_node(db: &Arc<dyn LNVpsDb>) -> Result<MarketplaceNode> {
         region_id: 1,
         name: "node".to_string(),
         enabled: false,
+        cpu_arch: lnvps_db::CpuArch::X86_64,
         marketplace_node_id: Some(node_id),
         ..Default::default()
     })
@@ -232,6 +233,27 @@ async fn a_probe_uses_what_customers_buy() -> Result<()> {
         .min_by_key(|t| (t.memory, t.disk_size, t.cpu))
         .unwrap();
     assert_eq!(spec.template.id, smallest.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_template_with_no_architecture_falls_back_to_the_hosts() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+    mock.templates.lock().await.insert(
+        1,
+        lnvps_db::VmTemplate {
+            cpu_arch: lnvps_db::CpuArch::Unknown,
+            ..MockDb::mock_template()
+        },
+    );
+    let node = a_node(&db).await?;
+
+    let spec = ProbeSpec::build(&db, &node, KEY.to_string()).await?;
+
+    assert_eq!(spec.image.cpu_arch, lnvps_db::CpuArch::X86_64);
     Ok(())
 }
 
