@@ -23,6 +23,7 @@ use kube::{Client, Resource, ResourceExt};
 use log::{debug, error, info, warn};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
 
 use k8s_openapi::NamespaceResourceScope;
 use lnvps_db::{
@@ -694,6 +695,23 @@ pub fn build_service(
     })
 }
 
+pub const FILES_HASH_ANNOTATION: &str = "lnvps.io/files-hash";
+
+fn files_hash(files: &[ResolvedFile]) -> String {
+    let mut h = Sha256::new();
+    for f in files {
+        for part in [
+            f.path.as_bytes(),
+            &[f.sensitive as u8],
+            f.content.as_bytes(),
+        ] {
+            h.update((part.len() as u64).to_le_bytes());
+            h.update(part);
+        }
+    }
+    hex::encode(h.finalize())
+}
+
 /// A Deployment for a compose service. `replicas` is 0 when the deployment is
 /// stopped. Mounts PVCs (read-write) and file ConfigMap/Secret (read-only via
 /// `subPath`). Uses the `Recreate` strategy so a single RWO PVC is released
@@ -877,6 +895,10 @@ pub fn build_deployment(
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(sel),
+                    annotations: Some(BTreeMap::from([(
+                        FILES_HASH_ANNOTATION.to_string(),
+                        files_hash(files),
+                    )])),
                     ..Default::default()
                 }),
                 spec: Some(PodSpec {
@@ -2638,6 +2660,38 @@ config:
         assert_eq!(conf.name, "files-cm");
         let key = m.iter().find(|x| x.mount_path == "/etc/api.key").unwrap();
         assert_eq!(key.name, "files-secret");
+    }
+
+    #[test]
+    fn file_change_rolls_the_pod() {
+        let c = compose();
+        let annotation = |content: &str| {
+            let files = [ResolvedFile {
+                path: "/etc/web.conf".to_string(),
+                content: content.to_string(),
+                sensitive: false,
+            }];
+            build_deployment(
+                7,
+                "web",
+                &c.services["web"],
+                &BTreeMap::new(),
+                &files,
+                1,
+                1,
+                &[],
+            )
+            .spec
+            .unwrap()
+            .template
+            .metadata
+            .unwrap()
+            .annotations
+            .unwrap()[FILES_HASH_ANNOTATION]
+                .clone()
+        };
+        assert_eq!(annotation("a=1"), annotation("a=1"));
+        assert_ne!(annotation("a=1"), annotation("a=2"));
     }
 
     #[test]

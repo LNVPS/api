@@ -14,6 +14,8 @@ lnvps_api_common = { path = "../lnvps_api_common" }
 rand = "0.8"
 hickory-resolver = "0.26"
 chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+hex.workspace = true
 
 # Workspace dependencies
 tokio = { workspace = true, features = ["time", "signal"] }
