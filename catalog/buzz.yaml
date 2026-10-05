@@ -70,21 +70,26 @@ services:
     # the relay cannot start before the bucket exists.
     init:
       - name: create-media-bucket
-        image: quay.io/minio/mc:latest@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+        image: rclone/rclone:1.75.1@sha256:45401ad7410db1d67ffdb58e19059ad20b0d8e0285a60e38bbec55cc1019c7a5
         user: "65534"    # only talks to the in-namespace S3 service
         env:
-          MC_HOST_s3: "http://${S3_ACCESS_KEY}:${S3_SECRET_KEY}@s3:9000"
-          MC_CONFIG_DIR: /tmp/mc
+          RCLONE_CONFIG: /tmp/rclone.conf
+          RCLONE_CONFIG_S3_TYPE: s3
+          RCLONE_CONFIG_S3_PROVIDER: Other
+          RCLONE_CONFIG_S3_ENDPOINT: "http://s3:9000"
+          RCLONE_CONFIG_S3_REGION: us-east-1
+          RCLONE_CONFIG_S3_ACCESS_KEY_ID: "${S3_ACCESS_KEY}"
+          RCLONE_CONFIG_S3_SECRET_ACCESS_KEY: "${S3_SECRET_KEY}"
         command:
           - sh
           - -c
           - |
             set -e
-            until mc --quiet ls s3 >/dev/null 2>&1; do
+            until rclone lsd s3: >/dev/null 2>&1; do
               echo "waiting for http://s3:9000"
               sleep 2
             done
-            mc mb -p s3/buzz-media
+            rclone mkdir s3:buzz-media
     env:
       # --- identity / public URL ---
       RELAY_URL: "wss://${HOSTNAME}"

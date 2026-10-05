@@ -150,17 +150,21 @@ services:
       - { name: http, container: 3000, protocol: http, expose: ingress }
     init:
       - name: create-bucket           # DNS label, unique within the service
-        image: quay.io/minio/mc:latest
+        image: rclone/rclone:1.75.1
         env:                          # ${…} is resolved here, and only here
-          MC_HOST_s3: http://${S3_ACCESS_KEY}:${S3_SECRET_KEY}@s3:9000
-          MC_CONFIG_DIR: /tmp/mc
+          RCLONE_CONFIG: /tmp/rclone.conf
+          RCLONE_CONFIG_S3_TYPE: s3
+          RCLONE_CONFIG_S3_PROVIDER: Other
+          RCLONE_CONFIG_S3_ENDPOINT: http://s3:9000
+          RCLONE_CONFIG_S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+          RCLONE_CONFIG_S3_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
         command:
           - sh
           - -c
           - |
             set -e
-            until mc --quiet ls s3 >/dev/null 2>&1; do sleep 2; done
-            mc mb -p s3/media
+            until rclone lsd s3: >/dev/null 2>&1; do sleep 2; done
+            rclone mkdir s3:media
         # resources: { cpu: 50m, memory: 64Mi }   # the default
         # user: "65534"                           # defaults to the service's
 secrets:
