@@ -72,6 +72,7 @@ kubectl get ingress -n your-namespace
 |--------|------|---------|-------------|
 | `db` | string | **required** | MySQL connection string |
 | `namespace` | string | `"default"` | Kubernetes namespace to manage |
+| `nostr-domains` | boolean | `true` | Reconcile the nostr domains Ingress. Set `false` on an operator that only serves an app cluster, so a second operator elsewhere can own the domains |
 | `reconcile-interval` | number | `60` | Seconds between reconciliation runs |
 | `error-retry-interval` | number | `30` | Seconds to wait before retrying on errors |
 | `verbose` | boolean | `false` | Enable verbose logging |

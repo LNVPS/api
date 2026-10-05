@@ -41,6 +41,7 @@ encryption:
 # Kubernetes. When unset, app-deployment reconciliation is disabled (the
 # operator only manages nostr domains). Requires `encryption` (above).
 app-cluster-id: 1
+nostr-domains: false
 
 # Redis carrying reconcile triggers for this cluster (optional). Point it at
 # the same Redis the API uses. When set (with app-cluster-id), the operator

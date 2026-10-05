@@ -67,6 +67,8 @@ pub struct Settings {
     /// When unset, app-deployment reconciliation is disabled.
     pub app_cluster_id: Option<u64>,
 
+    pub nostr_domains: Option<bool>,
+
     /// Reconciliation interval in seconds (defaults to 60)
     pub reconcile_interval: Option<u64>,
 
@@ -203,6 +205,10 @@ pub struct Context {
 }
 
 impl Settings {
+    pub fn reconciles_nostr_domains(&self) -> bool {
+        self.nostr_domains.unwrap_or(true)
+    }
+
     /// Image the backup uploader container runs.
     pub fn backup_uploader_image(&self) -> &str {
         self.backups
@@ -368,9 +374,13 @@ async fn main() -> Result<()> {
     info!("LNVPS Operator is running and watching for resources...");
 
     // Initial reconciliation of nostr domains
-    info!("Starting initial nostr domain reconciliation...");
-    if let Err(e) = nostr_domains::reconcile_nostr_domains(&context).await {
-        error!("Failed to reconcile nostr domains: {}", e);
+    if context.settings.reconciles_nostr_domains() {
+        info!("Starting initial nostr domain reconciliation...");
+        if let Err(e) = nostr_domains::reconcile_nostr_domains(&context).await {
+            error!("Failed to reconcile nostr domains: {}", e);
+        }
+    } else {
+        info!("Nostr domain reconciliation disabled");
     }
     // Shared with the trigger listener so a payment-triggered sweep that leaves
     // a deployment provisioning also puts the timer on the fast cadence.
@@ -400,6 +410,9 @@ async fn main() -> Result<()> {
     // the steady interval while app deployments run their own cadence.
     let nostr_context = context.clone();
     let nostr_task = async move {
+        if !nostr_context.settings.reconciles_nostr_domains() {
+            return std::future::pending::<()>().await;
+        }
         let mut interval = tokio::time::interval(reconcile_interval);
         interval.tick().await;
         loop {
@@ -613,6 +626,7 @@ mod tests {
         // and encryption settings.
         let full = load("config.yaml");
         assert!(full.app_cluster_id.is_some());
+        assert!(!full.reconciles_nostr_domains());
         assert!(full.encryption.is_some());
         assert_eq!(full.ingress_namespace.as_deref(), Some("ingress-nginx"));
         assert_eq!(full.redis.as_deref(), Some("redis://localhost:6379"));
@@ -635,6 +649,7 @@ mod tests {
         // Minimal config (app-deployment keys commented out) still loads.
         let minimal = load("config.minimal.yaml");
         assert!(minimal.app_cluster_id.is_none());
+        assert!(minimal.reconciles_nostr_domains());
         assert!(minimal.encryption.is_none());
         // No redis: the periodic reconcile is the only trigger, which is what
         // the operator did before #254.
@@ -685,6 +700,7 @@ mod tests {
             db: String::new(),
             namespace: None,
             app_cluster_id: None,
+            nostr_domains: None,
             reconcile_interval: None,
             transition_reconcile_interval: None,
             error_retry_interval: None,
