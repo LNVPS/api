@@ -9,6 +9,9 @@ services:
       - path: /etc/strfry.conf
         content: |
           db = "/app/strfry-db/"
+          events {
+              rejectEventsOlderThanSeconds = ${reject_events_older_than_seconds}
+          }
           relay {
               bind = "0.0.0.0"
               port = 7777
@@ -22,3 +25,4 @@ services:
 config:
   - { name: relay_name, label: "Relay name", type: string, default: "My strfry relay" }
   - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay" }
+  - { name: reject_events_older_than_seconds, label: "Reject events older than (seconds)", type: int, default: "94608000", pattern: "[0-9]+" }
