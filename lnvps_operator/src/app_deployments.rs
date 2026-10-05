@@ -223,6 +223,13 @@ pub fn build_network_policy(deployment_id: u64, ingress_namespace: &str) -> Netw
         }),
         ..Default::default()
     };
+    let internet_v6 = NetworkPolicyPeer {
+        ip_block: Some(IPBlock {
+            cidr: "::/0".to_string(),
+            except: Some(vec!["fc00::/7".to_string(), "fe80::/10".to_string()]),
+        }),
+        ..Default::default()
+    };
     // `..Default::default()` covers the optional `end_port` field, which only
     // exists under some k8s_openapi feature sets; harmless where it doesn't.
     #[allow(clippy::needless_update)]
@@ -276,7 +283,7 @@ pub fn build_network_policy(deployment_id: u64, ingress_namespace: &str) -> Netw
                 },
                 // The public internet (private/cluster/metadata ranges excluded).
                 NetworkPolicyEgressRule {
-                    to: Some(vec![internet]),
+                    to: Some(vec![internet, internet_v6]),
                     ports: None,
                 },
             ]),
@@ -2138,6 +2145,7 @@ async fn gc_namespaces(client: &Client, active: &HashSet<u64>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::metrics::{ClaimUsage, ContainerUsage};
+    use k8s_openapi::api::networking::v1::IPBlock;
 
     /// Which statuses keep the operator sweeping quickly. A deployment the
     /// customer stopped is settled — the row only changes when someone acts on
@@ -2518,15 +2526,26 @@ config:
                 .map(|ps| ps.iter().any(|p| p.protocol.as_deref() == Some("UDP")))
                 .unwrap_or(false)
         }));
-        let internet = egress
+        let ip_blocks: Vec<&IPBlock> = egress
             .iter()
-            .find_map(|r| r.to.as_ref()?.iter().find_map(|p| p.ip_block.as_ref()))
-            .expect("internet ipBlock");
-        assert_eq!(internet.cidr, "0.0.0.0/0");
-        let except = internet.except.as_ref().unwrap();
+            .filter_map(|r| r.to.as_ref())
+            .flatten()
+            .filter_map(|p| p.ip_block.as_ref())
+            .collect();
+        let block = |cidr: &str| {
+            *ip_blocks
+                .iter()
+                .find(|b| b.cidr == cidr)
+                .unwrap_or_else(|| panic!("no {cidr} ipBlock"))
+        };
+        let except = block("0.0.0.0/0").except.as_ref().unwrap();
         assert!(except.contains(&"10.0.0.0/8".to_string()));
         // cloud metadata endpoint is inside the excluded link-local range
         assert!(except.contains(&"169.254.0.0/16".to_string()));
+
+        let except_v6 = block("::/0").except.as_ref().unwrap();
+        assert!(except_v6.contains(&"fc00::/7".to_string()));
+        assert!(except_v6.contains(&"fe80::/10".to_string()));
     }
 
     #[test]
