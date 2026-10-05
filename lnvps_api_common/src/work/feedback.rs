@@ -4,7 +4,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use futures::stream;
 use futures::stream::BoxStream;
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Value};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -128,7 +128,7 @@ impl JobFeedback {
 #[derive(Clone, Debug)]
 pub struct RedisWorkFeedback {
     redis: redis::Client,
-    conn: MultiplexedConnection,
+    conn: ConnectionManager,
 }
 
 impl RedisWorkFeedback {
@@ -139,7 +139,7 @@ impl RedisWorkFeedback {
 
     pub async fn new_from_client(client: redis::Client) -> Result<Self> {
         // get a reusable connection object
-        let conn = client.get_multiplexed_async_connection().await?;
+        let conn = ConnectionManager::new(client.clone()).await?;
         Ok(Self {
             conn,
             redis: client,

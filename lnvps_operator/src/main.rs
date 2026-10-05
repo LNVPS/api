@@ -506,17 +506,17 @@ async fn trigger_listener(
     // process: two operators serving the same cluster then share the work
     // rather than each reconciling every trigger.
     let consumer = format!("operator-{}", uuid::Uuid::new_v4());
-    let connected =
-        RedisWorkCommander::new_for_stream(&redis_url, &stream, "operator", &consumer).await;
-    let commander = match connected {
-        Ok(c) => c,
-        Err(e) => {
-            error!(
-                "Could not connect to redis at {redis_url} for {stream}: {e} — falling back to \
-                 the periodic reconcile only"
-            );
-            std::future::pending::<()>().await;
-            return;
+    let commander = loop {
+        match RedisWorkCommander::new_for_stream(&redis_url, &stream, "operator", &consumer).await
+        {
+            Ok(c) => break c,
+            Err(e) => {
+                error!(
+                    "Could not connect to redis at {redis_url} for {stream}: {e}, retrying in \
+                     30s (the periodic reconcile continues meanwhile)"
+                );
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
         }
     };
     info!("Listening for reconcile triggers on {stream} as {consumer}");

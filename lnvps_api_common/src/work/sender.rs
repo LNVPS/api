@@ -3,7 +3,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use log::{error, info, warn};
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use redis::streams::{
     StreamAddOptions, StreamId, StreamReadOptions, StreamReadReply, StreamTrimStrategy,
     StreamTrimmingMode,
@@ -98,7 +98,7 @@ pub fn pending_action(policy: &JobRetryPolicy, attempt: usize, idle: Duration) -
 #[derive(Clone)]
 pub struct RedisWorkCommander {
     redis: redis::Client,
-    conn: MultiplexedConnection,
+    conn: ConnectionManager,
     group_name: String,
     consumer_name: String,
     /// Stream this commander reads from, and writes to unless
@@ -121,7 +121,7 @@ impl RedisWorkCommander {
         consumer_name: &str,
     ) -> Result<Self> {
         let redis = redis::Client::open(redis_url)?;
-        let conn = redis.get_multiplexed_async_connection().await?;
+        let conn = ConnectionManager::new(redis.clone()).await?;
         Ok(Self {
             conn,
             redis,
@@ -155,7 +155,7 @@ impl RedisWorkCommander {
 
     pub async fn new_publisher(redis_url: &str) -> Result<Self> {
         let redis = redis::Client::open(redis_url)?;
-        let conn = redis.get_multiplexed_async_connection().await?;
+        let conn = ConnectionManager::new(redis.clone()).await?;
         Ok(Self {
             conn,
             redis,
@@ -167,7 +167,7 @@ impl RedisWorkCommander {
         })
     }
 
-    pub async fn ensure_group_exists(&self, conn: &mut MultiplexedConnection) -> Result<()> {
+    pub async fn ensure_group_exists(&self, conn: &mut ConnectionManager) -> Result<()> {
         // Try to create the group with MKSTREAM option, ignore error if it already exists
         let _: Result<String, _> = conn
             .xgroup_create_mkstream(&self.stream, &self.group_name, "$")
