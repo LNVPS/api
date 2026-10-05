@@ -23,4 +23,4 @@ services:
             enabled: true
             requireAuth: true
     volumes:
-      - { name: data, path: /app/data, size: 20Gi, label: files }
+      - { name: data, path: /app/data, size: 5Gi, label: files }

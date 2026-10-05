@@ -1362,12 +1362,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// A catalog edit may grow a persistent volume but not shrink, drop or
-    /// rename one (#292). Kubernetes permits PVC expansion only, and the
-    /// operator cannot prune a PVC it stops applying, so each of those puts
-    /// every existing deployment of the app somewhere the API cannot walk back.
+    /// A catalog edit may resize a persistent volume but not drop or rename
+    /// one (#292). The operator cannot prune a PVC it stops applying, so either
+    /// leaves the customer's data in an orphaned claim.
     #[tokio::test]
-    async fn test_admin_app_compose_volume_may_not_shrink() {
+    async fn test_admin_app_compose_volume_may_not_vanish() {
         let client = setup().await;
         let suffix = nostr::Keys::generate().public_key().to_hex()[..8].to_string();
         let slug = format!("e2e-vol-shrink-{suffix}");
@@ -1385,7 +1384,7 @@ mod tests {
                 "/api/admin/v1/apps",
                 &serde_json::json!({
                     "name": slug,
-                    "display_name": "Volumes Only Grow",
+                    "display_name": "Volumes Stay Put",
                     "category": "Nostr relay",
                     "compose": compose("{ name: data, path: /data, size: 5Gi }"),
                     "amount": 1000,
@@ -1406,9 +1405,8 @@ mod tests {
             .patch_auth(&path, &patch("{ name: data, path: /data, size: 1Gi }"))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let err = resp.text().await.unwrap();
-        assert!(err.contains("shrinks from 5Gi to 1Gi"), "{err}");
+        let status = resp.status();
+        assert_eq!(status, StatusCode::OK, "{}", resp.text().await.unwrap());
 
         // Dropping the volume, and renaming it, are refused the same way: the
         // old PVC survives with the customer's data in it either way.
@@ -1431,19 +1429,11 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        // Growing is the whole point of allowing the edit at all...
         let resp = client
             .patch_auth(&path, &patch("{ name: data, path: /data, size: 20Gi }"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-
-        // ...and the new size is the floor from then on.
-        let resp = client
-            .patch_auth(&path, &patch("{ name: data, path: /data, size: 5Gi }"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let resp = client.delete_auth(&path).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

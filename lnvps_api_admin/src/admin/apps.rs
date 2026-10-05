@@ -213,7 +213,7 @@ fn validate_category(category: String) -> Result<String, lnvps_api_common::ApiEr
     Ok(category.to_string())
 }
 
-/// Refuse an edit that shrinks, drops or renames a persistent volume (#292).
+/// Refuse an edit that drops or renames a persistent volume (#292).
 ///
 /// Update only: there is no stored row to compare against on create, and an
 /// app's first compose declares whatever it likes.

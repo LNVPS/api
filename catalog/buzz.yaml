@@ -15,7 +15,7 @@ services:
       # initdb refuses a non-empty directory, and a fresh ext4 PVC has lost+found
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
-      - { name: data, path: /var/lib/postgresql/data, size: 20Gi, label: database }
+      - { name: data, path: /var/lib/postgresql/data, size: 5Gi, label: database }
     scratch:
       # readOnlyRootFilesystem: the postmaster lock + unix socket need a
       # writable dir, but not a persistent one
@@ -124,7 +124,7 @@ services:
       BUZZ_MAX_CONNECTIONS: "2000"
       RUST_LOG: "info"
     volumes:
-      - { name: git, path: /var/lib/buzz/git, size: 20Gi, label: git repositories }
+      - { name: git, path: /var/lib/buzz/git, size: 5Gi, label: git repositories }
       - { name: packs, path: /var/cache/buzz/git-packs, size: 5Gi }
 secrets:
   - { name: DB_PASSWORD, generate: password }

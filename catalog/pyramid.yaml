@@ -11,4 +11,4 @@ services:
       DATA_PATH: "/app/data"
       NO_AUTO_UPDATES: "true"
     volumes:
-      - { name: data, path: /app/data, size: 20Gi, label: events }
+      - { name: data, path: /app/data, size: 5Gi, label: events }

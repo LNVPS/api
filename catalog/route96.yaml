@@ -39,7 +39,7 @@ services:
           max_upload_bytes: 104857600
           public_url: "https://${HOSTNAME}"
     volumes:
-      - { name: blobs, path: /app/data, size: 20Gi, label: files }
+      - { name: blobs, path: /app/data, size: 5Gi, label: files }
     backup:
       volume: blobs
 secrets:

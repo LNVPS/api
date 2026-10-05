@@ -1337,6 +1337,52 @@ where
     Ok(())
 }
 
+fn storage_request(pvc: &PersistentVolumeClaim) -> Option<&Quantity> {
+    pvc.spec
+        .as_ref()?
+        .resources
+        .as_ref()?
+        .requests
+        .as_ref()?
+        .get("storage")
+}
+
+fn never_shrink(desired: &Quantity, current: Option<&Quantity>) -> Quantity {
+    let bytes = |q: &Quantity| lnvps_compose::parse_bytes(&q.0).ok();
+    match current {
+        Some(cur) if bytes(cur) > bytes(desired) && bytes(desired).is_some() => cur.clone(),
+        _ => desired.clone(),
+    }
+}
+
+async fn apply_pvc(client: &Client, mut pvc: PersistentVolumeClaim) -> Result<()> {
+    let api: Api<PersistentVolumeClaim> =
+        Api::namespaced(client.clone(), &pvc.namespace().unwrap_or_default());
+    let existing = api.get_opt(&pvc.name_any()).await?;
+    let current = existing.as_ref().and_then(storage_request);
+    if let Some(desired) = storage_request(&pvc).cloned() {
+        let size = never_shrink(&desired, current);
+        if size != desired {
+            debug!(
+                "PVC {}/{} keeps {} rather than shrinking to {}",
+                pvc.namespace().unwrap_or_default(),
+                pvc.name_any(),
+                size.0,
+                desired.0
+            );
+        }
+        if let Some(requests) = pvc
+            .spec
+            .as_mut()
+            .and_then(|s| s.resources.as_mut())
+            .and_then(|r| r.requests.as_mut())
+        {
+            requests.insert("storage".to_string(), size);
+        }
+    }
+    apply(client, &pvc).await
+}
+
 /// Server-side apply the (cluster-scoped) Namespace.
 async fn apply_namespace(client: &Client, obj: &Namespace) -> Result<()> {
     let api: Api<Namespace> = Api::all(client.clone());
@@ -1818,7 +1864,7 @@ async fn reconcile_one(
     // 4. Per service: PVCs, file ConfigMap/Secret, Service, Deployment.
     for (sname, svc) in &compose.services {
         for v in &svc.volumes {
-            apply(client, &build_pvc(id, sname, &v.name, &v.size, multiplier)).await?;
+            apply_pvc(client, build_pvc(id, sname, &v.name, &v.size, multiplier)).await?;
         }
         let sfiles = files.get(sname).cloned().unwrap_or_default();
         if let Some(cm) = build_files_configmap(id, sname, &sfiles) {
@@ -2493,6 +2539,20 @@ config:
             None
         );
         assert_eq!(pod.security_context.as_ref().unwrap().fs_group, None);
+    }
+
+    #[test]
+    fn a_pvc_request_never_shrinks() {
+        let q = |s: &str| Quantity(s.to_string());
+        assert_eq!(never_shrink(&q("5Gi"), Some(&q("20Gi"))), q("20Gi"));
+        assert_eq!(
+            never_shrink(&q("5368709120"), Some(&q("21474836480"))),
+            q("21474836480")
+        );
+        assert_eq!(never_shrink(&q("20Gi"), Some(&q("5Gi"))), q("20Gi"));
+        assert_eq!(never_shrink(&q("5Gi"), Some(&q("5Gi"))), q("5Gi"));
+        assert_eq!(never_shrink(&q("5Gi"), None), q("5Gi"));
+        assert_eq!(never_shrink(&q("5Gi"), Some(&q("garbage"))), q("5Gi"));
     }
 
     #[test]

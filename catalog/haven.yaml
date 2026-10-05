@@ -54,7 +54,7 @@ services:
           ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
     volumes:
       - { name: db, path: /app/db, size: 10Gi, label: events }
-      - { name: blossom, path: /app/blossom, size: 20Gi, label: media }
+      - { name: blossom, path: /app/blossom, size: 5Gi, label: media }
 config:
   # HAVEN panics in nPubToPubkey on anything that is not an npub, so a mistyped
   # character is a paid-for deployment that crashloops. The pattern

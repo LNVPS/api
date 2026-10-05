@@ -28,8 +28,11 @@ rules:
   verbs: ["list", "create", "patch", "delete"]
 # Applied into each deployment namespace, never read back.
 - apiGroups: [""]
-  resources: ["services", "configmaps", "persistentvolumeclaims"]
+  resources: ["services", "configmaps"]
   verbs: ["create", "patch"]
+- apiGroups: [""]
+  resources: ["persistentvolumeclaims"]
+  verbs: ["get", "create", "patch"]
 # Secrets are NOT here: they are granted per deployment namespace by the
 # lnvps-operator-appns ClusterRole below, bound by the operator as it creates
 # each namespace. These two rules are what let it write that binding without
