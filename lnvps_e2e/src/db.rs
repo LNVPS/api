@@ -813,7 +813,7 @@ fn random_mac() -> String {
     )
 }
 
-fn rand_bytes32() -> [u8; 32] {
+pub fn rand_bytes32() -> [u8; 32] {
     use rand_core::RngCore;
     let mut b = [0u8; 32];
     rand_core::OsRng.fill_bytes(&mut b);

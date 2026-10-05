@@ -61,6 +61,34 @@ impl LNVpsDbMysql {
     pub fn pool(&self) -> &MySqlPool {
         &self.db
     }
+
+    #[cfg(feature = "admin")]
+    async fn fetch_recent<T>(
+        &self,
+        select: &str,
+        from_where: &str,
+        order_by: &str,
+        binds: &[DateTime<Utc>],
+        limit: u64,
+    ) -> DbResult<(Vec<T>, u64)>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow> + Send + Unpin,
+    {
+        let count_sql = format!("SELECT COUNT(*) {from_where}");
+        let mut count = sqlx::query_scalar::<_, i64>(&count_sql);
+        for b in binds {
+            count = count.bind(*b);
+        }
+        let total = count.fetch_one(&self.db).await?;
+
+        let data_sql = format!("SELECT {select} {from_where} ORDER BY {order_by} LIMIT ?");
+        let mut data = sqlx::query_as::<_, T>(&data_sql);
+        for b in binds {
+            data = data.bind(*b);
+        }
+        let rows = data.bind(limit).fetch_all(&self.db).await?;
+        Ok((rows, total as u64))
+    }
 }
 
 /// A paired `COUNT(*)` / `SELECT *` query over the same table, so a filtered
@@ -9175,6 +9203,154 @@ impl AdminDb for LNVpsDbMysql {
         .bind(end)
         .bind(start)
         .bind(end)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn admin_list_vms_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<Vm>, u64)> {
+        self.fetch_recent(
+            "v.*",
+            "FROM vm v \
+             JOIN subscription_line_item sli ON sli.id = v.subscription_line_item_id \
+             JOIN subscription s ON s.id = sli.subscription_id \
+             WHERE s.is_setup = 1 AND s.created >= ?",
+            "s.created DESC, v.id DESC",
+            &[since],
+            limit,
+        )
+        .await
+    }
+
+    async fn admin_list_vms_deleted_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::DeletedVm>, u64)> {
+        self.fetch_recent(
+            "v.*, d.deleted_at, \
+             (SELECT h.description FROM vm_history h \
+              WHERE h.vm_id = v.id AND h.action_type = 4 \
+              ORDER BY h.timestamp DESC, h.id DESC LIMIT 1) AS delete_reason",
+            "FROM vm v \
+             JOIN (SELECT vm_id, MAX(timestamp) AS deleted_at FROM vm_history \
+                   WHERE action_type = 4 AND timestamp >= ? GROUP BY vm_id) d ON d.vm_id = v.id \
+             JOIN subscription_line_item sli ON sli.id = v.subscription_line_item_id \
+             JOIN subscription s ON s.id = sli.subscription_id \
+             WHERE v.deleted = 1 AND s.is_setup = 1",
+            "d.deleted_at DESC, v.id DESC",
+            &[since],
+            limit,
+        )
+        .await
+    }
+
+    async fn admin_list_vms_expiring_between(
+        &self,
+        from: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<Vm>, u64)> {
+        self.fetch_recent(
+            "v.*",
+            "FROM vm v \
+             JOIN subscription_line_item sli ON sli.id = v.subscription_line_item_id \
+             JOIN subscription s ON s.id = sli.subscription_id \
+             WHERE v.deleted = 0 AND s.is_setup = 1 AND s.expires >= ? AND s.expires < ?",
+            "s.expires ASC, v.id ASC",
+            &[from, until],
+            limit,
+        )
+        .await
+    }
+
+    async fn admin_list_users_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<User>, u64)> {
+        self.fetch_recent(
+            "*",
+            "FROM users WHERE created >= ?",
+            "created DESC, id DESC",
+            &[since],
+            limit,
+        )
+        .await
+    }
+
+    async fn admin_list_vpn_subscriptions_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<VpnSubscription>, u64)> {
+        self.fetch_recent(
+            "p.*",
+            "FROM vpn_subscription p \
+             JOIN subscription_line_item sli ON sli.id = p.subscription_line_item_id \
+             JOIN subscription s ON s.id = sli.subscription_id \
+             WHERE s.is_setup = 1 AND p.created >= ?",
+            "p.created DESC, p.id DESC",
+            &[since],
+            limit,
+        )
+        .await
+    }
+
+    async fn admin_list_app_deployments_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<AppDeployment>, u64)> {
+        self.fetch_recent(
+            "d.*",
+            "FROM app_deployment d \
+             JOIN subscription_line_item sli ON sli.id = d.subscription_line_item_id \
+             JOIN subscription s ON s.id = sli.subscription_id \
+             WHERE s.is_setup = 1 AND d.created >= ?",
+            "d.created DESC, d.id DESC",
+            &[since],
+            limit,
+        )
+        .await
+    }
+
+    async fn admin_list_payments_paid_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::PaidSubscriptionPayment>, u64)> {
+        self.fetch_recent(
+            "sp.*, s.name AS subscription_name, c.base_currency AS company_base_currency",
+            "FROM subscription_payment sp \
+             JOIN subscription s ON s.id = sp.subscription_id \
+             JOIN company c ON c.id = s.company_id \
+             WHERE sp.is_paid = 1 AND sp.paid_at >= ?",
+            "sp.paid_at DESC, sp.created DESC",
+            &[since],
+            limit,
+        )
+        .await
+    }
+
+    async fn admin_sum_payments_paid_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> DbResult<Vec<crate::PaymentTotal>> {
+        Ok(sqlx::query_as(
+            "SELECT currency, payment_type, \
+             CAST(COUNT(*) AS UNSIGNED) AS count, \
+             CAST(SUM(amount) AS UNSIGNED) AS amount, \
+             CAST(SUM(tax) AS UNSIGNED) AS tax \
+             FROM subscription_payment \
+             WHERE is_paid = 1 AND paid_at >= ? \
+             GROUP BY currency, payment_type \
+             ORDER BY currency, payment_type",
+        )
+        .bind(since)
         .fetch_all(&self.db)
         .await?)
     }

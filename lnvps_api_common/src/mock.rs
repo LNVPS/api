@@ -138,6 +138,22 @@ pub struct MockDb {
 }
 
 impl MockDb {
+    #[cfg(feature = "admin")]
+    async fn paid_subscriptions_by_line_item(&self) -> HashMap<u64, Subscription> {
+        let subscriptions = self.subscriptions.lock().await;
+        self.subscription_line_items
+            .lock()
+            .await
+            .values()
+            .filter_map(|li| {
+                subscriptions
+                    .get(&li.subscription_id)
+                    .filter(|s| s.is_setup)
+                    .map(|s| (li.id, s.clone()))
+            })
+            .collect()
+    }
+
     /// Set a company's one-off marketplace node listing fee.
     ///
     /// Test support: the fee is normally set through the admin API, which is
@@ -7349,6 +7365,218 @@ impl lnvps_db::AdminDb for MockDb {
     ) -> DbResult<Vec<lnvps_db::ResourceCost>> {
         Ok(vec![])
     }
+
+    async fn admin_list_vms_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<Vm>, u64)> {
+        let paid = self.paid_subscriptions_by_line_item().await;
+        let rows = self
+            .vms
+            .lock()
+            .await
+            .values()
+            .filter_map(|v| {
+                paid.get(&v.subscription_line_item_id)
+                    .filter(|s| s.created >= since)
+                    .map(|s| (std::cmp::Reverse((s.created, v.id)), v.clone()))
+            })
+            .collect();
+        Ok(take_sorted(rows, limit))
+    }
+
+    async fn admin_list_vms_deleted_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<lnvps_db::DeletedVm>, u64)> {
+        let paid = self.paid_subscriptions_by_line_item().await;
+        let history = self.vm_history.lock().await;
+        let mut last_delete: HashMap<u64, &VmHistory> = HashMap::new();
+        for h in history.values().filter(|h| {
+            matches!(h.action_type, lnvps_db::VmHistoryActionType::Deleted) && h.timestamp >= since
+        }) {
+            let newer = last_delete
+                .get(&h.vm_id)
+                .is_none_or(|prev| (h.timestamp, h.id) > (prev.timestamp, prev.id));
+            if newer {
+                last_delete.insert(h.vm_id, h);
+            }
+        }
+        let rows = self
+            .vms
+            .lock()
+            .await
+            .values()
+            .filter(|v| v.deleted && paid.contains_key(&v.subscription_line_item_id))
+            .filter_map(|v| {
+                last_delete.get(&v.id).map(|h| {
+                    (
+                        std::cmp::Reverse((h.timestamp, v.id)),
+                        lnvps_db::DeletedVm {
+                            vm: v.clone(),
+                            deleted_at: h.timestamp,
+                            delete_reason: h.description.clone(),
+                        },
+                    )
+                })
+            })
+            .collect();
+        Ok(take_sorted(rows, limit))
+    }
+
+    async fn admin_list_vms_expiring_between(
+        &self,
+        from: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<Vm>, u64)> {
+        let paid = self.paid_subscriptions_by_line_item().await;
+        let rows = self
+            .vms
+            .lock()
+            .await
+            .values()
+            .filter(|v| !v.deleted)
+            .filter_map(|v| {
+                paid.get(&v.subscription_line_item_id)
+                    .and_then(|s| s.expires)
+                    .filter(|e| *e >= from && *e < until)
+                    .map(|e| ((e, v.id), v.clone()))
+            })
+            .collect();
+        Ok(take_sorted(rows, limit))
+    }
+
+    async fn admin_list_users_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<User>, u64)> {
+        let rows = self
+            .users
+            .lock()
+            .await
+            .values()
+            .filter(|u| u.created >= since)
+            .map(|u| (std::cmp::Reverse((u.created, u.id)), u.clone()))
+            .collect();
+        Ok(take_sorted(rows, limit))
+    }
+
+    async fn admin_list_vpn_subscriptions_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<VpnSubscription>, u64)> {
+        let paid = self.paid_subscriptions_by_line_item().await;
+        let rows = self
+            .vpn_subscriptions
+            .lock()
+            .await
+            .values()
+            .filter(|p| p.created >= since && paid.contains_key(&p.subscription_line_item_id))
+            .map(|p| (std::cmp::Reverse((p.created, p.id)), p.clone()))
+            .collect();
+        Ok(take_sorted(rows, limit))
+    }
+
+    async fn admin_list_app_deployments_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<AppDeployment>, u64)> {
+        let paid = self.paid_subscriptions_by_line_item().await;
+        let rows = self
+            .app_deployments
+            .lock()
+            .await
+            .values()
+            .filter(|d| d.created >= since && paid.contains_key(&d.subscription_line_item_id))
+            .map(|d| (std::cmp::Reverse((d.created, d.id)), d.clone()))
+            .collect();
+        Ok(take_sorted(rows, limit))
+    }
+
+    async fn admin_list_payments_paid_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<lnvps_db::PaidSubscriptionPayment>, u64)> {
+        let subscriptions = self.subscriptions.lock().await;
+        let companies = self.companies.lock().await;
+        let rows = self
+            .subscription_payments
+            .lock()
+            .await
+            .iter()
+            .filter(|p| p.is_paid && p.paid_at.is_some_and(|at| at >= since))
+            .filter_map(|p| {
+                let sub = subscriptions.get(&p.subscription_id)?;
+                let company = companies.get(&sub.company_id)?;
+                Some((
+                    std::cmp::Reverse((p.paid_at, p.created)),
+                    lnvps_db::PaidSubscriptionPayment {
+                        payment: p.clone(),
+                        subscription_name: sub.name.clone(),
+                        company_base_currency: company.base_currency.clone(),
+                    },
+                ))
+            })
+            .collect();
+        Ok(take_sorted(rows, limit))
+    }
+
+    async fn admin_sum_payments_paid_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> DbResult<Vec<lnvps_db::PaymentTotal>> {
+        let mut totals: Vec<lnvps_db::PaymentTotal> = Vec::new();
+        for p in self
+            .subscription_payments
+            .lock()
+            .await
+            .iter()
+            .filter(|p| p.is_paid && p.paid_at.is_some_and(|at| at >= since))
+        {
+            match totals
+                .iter_mut()
+                .find(|t| t.currency == p.currency && t.payment_type == p.payment_type)
+            {
+                Some(t) => {
+                    t.count += 1;
+                    t.amount += p.amount;
+                    t.tax += p.tax;
+                }
+                None => totals.push(lnvps_db::PaymentTotal {
+                    currency: p.currency.clone(),
+                    payment_type: p.payment_type,
+                    count: 1,
+                    amount: p.amount,
+                    tax: p.tax,
+                }),
+            }
+        }
+        totals.sort_by(|a, b| {
+            (a.currency.as_str(), a.payment_type as u16)
+                .cmp(&(b.currency.as_str(), b.payment_type as u16))
+        });
+        Ok(totals)
+    }
+}
+
+#[cfg(feature = "admin")]
+fn take_sorted<K: Ord, T>(mut rows: Vec<(K, T)>, limit: u64) -> (Vec<T>, u64) {
+    let total = rows.len() as u64;
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    (
+        rows.into_iter()
+            .take(limit as usize)
+            .map(|(_, row)| row)
+            .collect(),
+        total,
+    )
 }
 
 // Nostr trait implementation with stub methods

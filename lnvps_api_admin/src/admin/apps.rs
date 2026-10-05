@@ -716,9 +716,17 @@ async fn admin_list_app_deployments(
         .db
         .admin_list_app_deployments_filtered(limit, offset, &filter)
         .await?;
+    let rows = deployment_infos(this.db.as_ref(), deployments).await?;
+    ApiPaginatedData::ok(rows, total, limit, offset)
+}
+
+pub(crate) async fn deployment_infos(
+    db: &dyn lnvps_db::LNVpsDb,
+    deployments: Vec<lnvps_db::AppDeployment>,
+) -> Result<Vec<AdminAppDeploymentInfo>, lnvps_api_common::ApiError> {
     let ids: Vec<u64> = deployments.iter().map(|d| d.id).collect();
-    let (services, volumes) = this.db.list_app_deployment_usage_breakdown(&ids).await?;
-    let rows: Vec<AdminAppDeploymentInfo> = deployments
+    let (services, volumes) = db.list_app_deployment_usage_breakdown(&ids).await?;
+    Ok(deployments
         .into_iter()
         .map(|d| {
             let mut info = AdminAppDeploymentInfo::from(d.clone());
@@ -737,8 +745,7 @@ async fn admin_list_app_deployments(
             );
             info
         })
-        .collect();
-    ApiPaginatedData::ok(rows, total, limit, offset)
+        .collect())
 }
 
 /// Fill in a deployment's usage from the stored totals and breakdown.

@@ -4746,6 +4746,56 @@ through the plan in the path.
 
 ### Reports
 
+#### Activity Report
+
+```
+GET /api/admin/v1/reports/activity
+```
+
+Query Parameters:
+
+- `days`: number (optional) - look-back window in days, 1-90, default 7
+- `expiring_days`: number (optional) - look-ahead window for expiring VMs in days, 1-90, default 7
+- `limit`: number (optional) - max items per list, 1-100, default 20
+
+Required Permission: `analytics::view`
+
+Returns everything that happened since `now - days`. Every list is an object `{ "total": number, "items": [...] }`
+where `total` counts every match and `items` holds the newest `limit` of them. Orders whose subscription was never
+paid (`is_setup = false`) are left out of the VM, VPN and app lists.
+
+```json
+{
+  "since": "string (ISO 8601)",
+  "expiring_until": "string (ISO 8601)",
+  "new_users": { "total": number, "items": [{ "id": number, "pubkey": "string (hex)", "created": "string (ISO 8601)" }] },
+  "new_vms": { "total": number, "items": ["AdminVmInfo"] },
+  // Paid VMs whose subscription was created in the window, newest first
+  "deleted_vms": { "total": number, "items": ["AdminVmInfo + deleted_at + delete_reason"] },
+  // Paid VMs with a `deleted` history entry in the window, most recent deletion first.
+  // Each item is an AdminVmInfo with two extra fields:
+  //   "deleted_at": "string (ISO 8601)", "delete_reason": "string | null"
+  "expiring_vms": { "total": number, "items": ["AdminVmInfo"] },
+  // Live paid VMs whose expiry falls between `since` and `expiring_until`, soonest first.
+  // Includes VMs that already lapsed in the window but have not been deleted yet.
+  "new_vpn_subscriptions": { "total": number, "items": ["AdminVpnSubscriptionInfo"] },
+  "new_app_deployments": { "total": number, "items": ["AdminAppDeploymentInfo"] },
+  "payments": { "total": number, "items": ["AdminSubscriptionPaymentInfo + subscription_name"] },
+  // Paid payments with `paid_at` in the window, newest first. Refunds are included
+  // (`payment_type: "Refund"`); their amount is a magnitude to subtract.
+  "payment_totals": [
+    {
+      "currency": "string",
+      "payment_type": "Purchase" | "Renewal" | "Upgrade" | "Refund",
+      "count": number,
+      "amount": number,
+      // Sum of amounts in cents/millisats
+      "tax": number
+    }
+  ]
+}
+```
+
 #### Time Series Report
 
 ```

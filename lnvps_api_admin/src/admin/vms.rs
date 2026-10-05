@@ -114,7 +114,7 @@ struct ListVmsQuery {
 /// view and the bulk status endpoint — goes through here, so they cannot drift
 /// apart in shape, and none of them can reintroduce a per-VM query: all the
 /// data comes from [`AdminVmBatch`], which bulk-loads one table at a time.
-async fn load_admin_vm_infos(
+pub(crate) async fn load_admin_vm_infos(
     db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
     vm_state_cache: &VmStateCache,
     vms: &[lnvps_db::Vm],

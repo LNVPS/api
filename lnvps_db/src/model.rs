@@ -3443,6 +3443,31 @@ pub struct SubscriptionPaymentWithCompany {
     pub user_billing_tax_id: Option<String>,
 }
 
+#[derive(FromRow, Clone, Debug)]
+pub struct DeletedVm {
+    #[sqlx(flatten)]
+    pub vm: Vm,
+    pub deleted_at: DateTime<Utc>,
+    pub delete_reason: Option<String>,
+}
+
+#[derive(FromRow, Clone, Debug)]
+pub struct PaidSubscriptionPayment {
+    #[sqlx(flatten)]
+    pub payment: SubscriptionPayment,
+    pub subscription_name: String,
+    pub company_base_currency: String,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq)]
+pub struct PaymentTotal {
+    pub currency: String,
+    pub payment_type: SubscriptionPaymentType,
+    pub count: u64,
+    pub amount: u64,
+    pub tax: u64,
+}
+
 /// Internet Registry - Regional Internet Registry
 #[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize, PartialEq, Eq)]
 #[repr(u16)]

@@ -18,6 +18,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Activity report**: `GET /api/admin/v1/reports/activity`, guarded by `analytics::view`. One call returns what happened over the last `days` (default 7, max 90): new users, new VMs, deleted VMs with the reason recorded in their history, VMs expiring within `expiring_days` (or already lapsed but not yet deleted), new VPN plans, new app deployments, paid payments and per-currency payment totals. Each list carries its own `total`, capped at `limit` items (default 20, max 100). Orders that were never paid are left out of every list.
+
 - **Pin an admin-created VM to a host** — `POST /api/admin/v1/vms` accepts an optional `host_id`. The VM is placed on that host instead of the least-loaded one in the template's region; the host must be in that region, not deleted, and have room for the template. It may be disabled, so an admin can place a VM on a host kept out of customer placement.
 
 - **Regions report what else is in them** — `GET /api/admin/v1/regions` and `GET /api/admin/v1/regions/{id}` now also return `ip_ranges`, `vm_templates`, `app_clusters`, `app_deployments`, `tunnel_pools`, `vpn_services` and `routers` alongside the existing host, VM and IP figures, so an admin can see what a region holds without opening six other pages first.

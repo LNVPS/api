@@ -3443,6 +3443,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_admin_activity_report() {
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+        let uid = crate::db::ensure_user(&pool, &nostr::Keys::generate())
+            .await
+            .unwrap();
+
+        let fresh = crate::db::seed_standalone_vm(&pool, uid, "activity-new", "")
+            .await
+            .unwrap();
+        let expiring = crate::db::seed_standalone_vm(&pool, uid, "activity-exp", "")
+            .await
+            .unwrap();
+        let gone = crate::db::seed_standalone_vm(&pool, uid, "activity-del", "")
+            .await
+            .unwrap();
+        let (_app, _cluster, dep_id) = crate::db::seed_app_deployment(&pool, uid, "activity")
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "UPDATE subscription SET created = DATE_SUB(NOW(), INTERVAL 60 DAY), \
+             expires = DATE_ADD(NOW(), INTERVAL 2 DAY) WHERE id = ?",
+        )
+        .bind(expiring.subscription_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE vm SET deleted = 1 WHERE id = ?")
+            .bind(gone.vm_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO vm_history (vm_id, action_type, description) VALUES (?, 4, 'e2e delete')",
+        )
+        .bind(gone.vm_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let payment_id = crate::db::rand_bytes32().to_vec();
+        sqlx::query(
+            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, \
+             amount, currency, payment_method, payment_type, external_data, is_paid, rate, \
+             tax, processing_fee, paid_at) \
+             VALUES (?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL 1 DAY), 4321, 'BTC', 0, 0, '', 1, \
+             1.0, 0, 0, NOW())",
+        )
+        .bind(&payment_id)
+        .bind(fresh.subscription_id)
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let resp = client
+            .get_auth("/api/admin/v1/reports/activity?days=7&expiring_days=7&limit=100")
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let data = &body["data"];
+        let ids = |section: &str| -> Vec<u64> {
+            data[section]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["id"].as_u64().unwrap())
+                .collect()
+        };
+
+        assert!(ids("new_vms").contains(&fresh.vm_id));
+        assert!(!ids("new_vms").contains(&expiring.vm_id));
+        assert!(ids("expiring_vms").contains(&expiring.vm_id));
+        assert!(!ids("expiring_vms").contains(&gone.vm_id));
+        assert!(ids("new_app_deployments").contains(&dep_id));
+        assert!(ids("new_users").contains(&uid));
+
+        let deleted = data["deleted_vms"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"].as_u64() == Some(gone.vm_id))
+            .expect("deleted VM listed");
+        assert_eq!(deleted["delete_reason"], "e2e delete");
+
+        let payment = data["payments"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == hex::encode(&payment_id))
+            .expect("paid payment listed");
+        assert_eq!(payment["amount"], 4321);
+        assert_eq!(payment["subscription_name"], "activity-new-sub");
+        assert!(
+            data["payment_totals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["currency"] == "BTC" && t["amount"].as_u64() >= Some(4321))
+        );
+
+        for seeded in [&fresh, &expiring, &gone] {
+            crate::db::hard_delete_seeded_vm(&pool, seeded)
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn test_admin_referral_time_series_report() {
         let client = setup().await;
         let resp = client

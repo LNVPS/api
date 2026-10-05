@@ -109,7 +109,7 @@ pub struct RevokeVpnDeviceRequest {
     pub reason: Option<String>,
 }
 
-async fn subscription_info(
+pub(crate) async fn subscription_info(
     db: &std::sync::Arc<dyn LNVpsDb>,
     plan: VpnSubscription,
 ) -> Result<AdminVpnSubscriptionInfo, ApiError> {

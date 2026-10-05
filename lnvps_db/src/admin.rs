@@ -480,4 +480,52 @@ pub trait AdminDb: Send + Sync {
         start: chrono::DateTime<chrono::Utc>,
         end: chrono::DateTime<chrono::Utc>,
     ) -> DbResult<Vec<crate::ResourceCost>>;
+
+    async fn admin_list_vms_created_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::Vm>, u64)>;
+
+    async fn admin_list_vms_deleted_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::DeletedVm>, u64)>;
+
+    async fn admin_list_vms_expiring_between(
+        &self,
+        from: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::Vm>, u64)>;
+
+    async fn admin_list_users_created_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::User>, u64)>;
+
+    async fn admin_list_vpn_subscriptions_created_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::VpnSubscription>, u64)>;
+
+    async fn admin_list_app_deployments_created_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::AppDeployment>, u64)>;
+
+    async fn admin_list_payments_paid_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::PaidSubscriptionPayment>, u64)>;
+
+    async fn admin_sum_payments_paid_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> DbResult<Vec<crate::PaymentTotal>>;
 }
