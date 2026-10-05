@@ -54,7 +54,7 @@ services:
       RUSTFS_OBS_USE_STDOUT: "true"
       RUSTFS_OBS_LOGGER_LEVEL: warn
     volumes:
-      - { name: blobs, path: /data, size: 50Gi, label: media }
+      - { name: blobs, path: /data, size: 5Gi, label: media }
     backup:
       volume: blobs
   relay:

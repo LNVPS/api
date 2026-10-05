@@ -18,7 +18,7 @@ services:
           address = "0.0.0.0"
           port = 8080
     volumes:
-      - { name: db, path: /usr/src/app/db, size: 10Gi, label: events }
+      - { name: db, path: /usr/src/app/db, size: 5Gi, label: events }
 config:
   - { name: relay_name, label: "Relay name", type: string, default: "My nostr-rs-relay" }
   - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay" }
