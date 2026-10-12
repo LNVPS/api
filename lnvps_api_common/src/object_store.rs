@@ -85,6 +85,21 @@ impl ObjectStoreConfig {
     }
 }
 
+fn xml_tag(body: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&format!("</{tag}>"))? + start;
+    Some(body[start..end].to_string())
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn default_region() -> String {
     "us-east-1".to_string()
 }
@@ -223,6 +238,129 @@ impl ObjectStore {
             return Ok(());
         }
         bail!("DELETE '{key}' returned {}", resp.status())
+    }
+
+    pub async fn create_multipart(&self, key: &str) -> Result<String> {
+        check_key(key)?;
+        let url = self.presign(
+            "POST",
+            key,
+            Duration::from_secs(300),
+            &[("uploads".to_string(), String::new())],
+            Utc::now(),
+        )?;
+        let resp = self
+            .client
+            .post(&url)
+            .send()
+            .await
+            .with_context(|| format!("starting a multipart upload of '{key}' failed"))?;
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!("starting a multipart upload of '{key}' returned {status}: {body}");
+        }
+        xml_tag(&body, "UploadId")
+            .ok_or_else(|| anyhow!("starting a multipart upload of '{key}' returned no UploadId"))
+    }
+
+    pub async fn upload_part(
+        &self,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        body: Vec<u8>,
+    ) -> Result<String> {
+        check_key(key)?;
+        let url = self.presign(
+            "PUT",
+            key,
+            Duration::from_secs(3600),
+            &[
+                ("partNumber".to_string(), part_number.to_string()),
+                ("uploadId".to_string(), upload_id.to_string()),
+            ],
+            Utc::now(),
+        )?;
+        let resp = self
+            .client
+            .put(&url)
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("uploading part {part_number} of '{key}' failed"))?;
+        if !resp.status().is_success() {
+            bail!(
+                "uploading part {part_number} of '{key}' returned {}",
+                resp.status()
+            );
+        }
+        resp.headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("part {part_number} of '{key}' came back without an ETag"))
+    }
+
+    pub async fn complete_multipart(
+        &self,
+        key: &str,
+        upload_id: &str,
+        parts: &[(u32, String)],
+    ) -> Result<()> {
+        check_key(key)?;
+        let url = self.presign(
+            "POST",
+            key,
+            Duration::from_secs(300),
+            &[("uploadId".to_string(), upload_id.to_string())],
+            Utc::now(),
+        )?;
+        let body = format!(
+            "<CompleteMultipartUpload>{}</CompleteMultipartUpload>",
+            parts
+                .iter()
+                .map(|(n, etag)| format!(
+                    "<Part><PartNumber>{n}</PartNumber><ETag>{}</ETag></Part>",
+                    xml_escape(etag)
+                ))
+                .collect::<String>()
+        );
+        let resp = self
+            .client
+            .post(&url)
+            .header(reqwest::header::CONTENT_TYPE, "application/xml")
+            .body(body)
+            .send()
+            .await
+            .with_context(|| format!("completing the upload of '{key}' failed"))?;
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        if !status.is_success() || text.contains("<Error>") {
+            bail!("completing the upload of '{key}' returned {status}: {text}");
+        }
+        Ok(())
+    }
+
+    pub async fn abort_multipart(&self, key: &str, upload_id: &str) -> Result<()> {
+        check_key(key)?;
+        let url = self.presign(
+            "DELETE",
+            key,
+            Duration::from_secs(60),
+            &[("uploadId".to_string(), upload_id.to_string())],
+            Utc::now(),
+        )?;
+        let resp = self
+            .client
+            .delete(&url)
+            .send()
+            .await
+            .with_context(|| format!("aborting the upload of '{key}' failed"))?;
+        if resp.status().is_success() || resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
+        bail!("aborting the upload of '{key}' returned {}", resp.status())
     }
 
     /// Sign one request as a query-string-authenticated URL.
@@ -687,5 +825,100 @@ mod tests {
         {
             assert_eq!(base.with_env_credentials().access_key, "from-config");
         }
+    }
+
+    #[tokio::test]
+    async fn multipart_upload_round_trip_against_a_mock() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/backups/k"))
+            .and(query_param("uploads", ""))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<InitiateMultipartUploadResult><UploadId>up-1</UploadId></InitiateMultipartUploadResult>",
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/backups/k"))
+            .and(query_param("partNumber", "1"))
+            .and(query_param("uploadId", "up-1"))
+            .respond_with(ResponseTemplate::new(200).append_header("etag", "\"e1\""))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/backups/k"))
+            .and(query_param("partNumber", "2"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/backups/k"))
+            .and(query_param("uploadId", "up-1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("<CompleteMultipartUploadResult/>"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/backups/bad"))
+            .and(query_param("uploadId", "up-2"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("<Error><Code>InternalError</Code></Error>"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/backups/k"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/backups/denied"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/backups/denied"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("nope"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/backups/empty"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<x/>"))
+            .mount(&server)
+            .await;
+
+        let store = store_at(&server.uri());
+        let id = store.create_multipart("k").await.unwrap();
+        assert_eq!(id, "up-1");
+        let etag = store.upload_part("k", &id, 1, vec![1, 2, 3]).await.unwrap();
+        assert_eq!(etag, "\"e1\"");
+        assert!(store.upload_part("k", &id, 2, vec![4]).await.is_err());
+        store
+            .complete_multipart("k", &id, &[(1, etag.clone())])
+            .await
+            .unwrap();
+        assert!(
+            store
+                .complete_multipart("bad", "up-2", &[(1, etag)])
+                .await
+                .is_err()
+        );
+        store.abort_multipart("k", &id).await.unwrap();
+        assert!(store.abort_multipart("denied", "x").await.is_err());
+        assert!(store.create_multipart("denied").await.is_err());
+        assert!(store.create_multipart("empty").await.is_err());
+    }
+
+    #[test]
+    fn xml_helpers() {
+        assert_eq!(
+            xml_tag("<a><UploadId>x</UploadId></a>", "UploadId").as_deref(),
+            Some("x")
+        );
+        assert_eq!(xml_tag("<a/>", "UploadId"), None);
+        assert_eq!(xml_escape("\"a&b<c>\""), "&quot;a&amp;b&lt;c&gt;&quot;");
     }
 }

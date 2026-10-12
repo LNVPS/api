@@ -107,8 +107,10 @@ the pages they pointed at. Pick one of the two methods that give a consistent
 copy:
 
 - **`exec:`** when the image ships a tool that reads its own store while the app
-  runs. The operator runs the argv inside the running container and streams its
-  stdout into the backup Job, which gzips and uploads it. `${…}` is refused in
+  runs. The operator runs the argv inside the running container, gzips its
+  stdout as it arrives and sends it to the bucket as a multipart upload, so no
+  Job and no staging disk is involved. (Streaming it into a Job's stdin was the
+  first design; exec stdin on this cluster stops after about 128 KiB.) `${…}` is refused in
   the argv. strfry uses `["/app/strfry", "export"]` (JSONL, restored with
   `strfry import`) and nostr-rs-relay `["sqlite3", "/usr/src/app/db/nostr.db",
   ".dump"]` (SQL, restored with `sqlite3 nostr.db < dump`).

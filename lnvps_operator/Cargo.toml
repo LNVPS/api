@@ -20,6 +20,7 @@ hex.workspace = true
 # Workspace dependencies
 tokio = { workspace = true, features = ["time", "signal", "io-util"] }
 uuid.workspace = true
+flate2 = "1"
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true

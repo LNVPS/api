@@ -32,12 +32,9 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
-use kube::api::{
-    Api, AttachParams, AttachedProcess, DeleteParams, ListParams, Patch, PatchParams,
-    PropagationPolicy,
-};
+use kube::api::{Api, AttachParams, AttachedProcess, DeleteParams, ListParams, PropagationPolicy};
 use log::{debug, error, info, warn};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use lnvps_api_common::ObjectStore;
@@ -59,10 +56,9 @@ use crate::app_deployments::{
 /// encoding, which S3 rejects.
 const WORK_DIR: &str = "/work";
 const WORK_VOLUME: &str = "work";
-const PAYLOAD: &str = "payload";
 const UPLOADER_CONTAINER: &str = "upload";
-pub const PAYLOAD_READY_ANNOTATION: &str = "lnvps.io/payload-ready";
 const POD_WAIT: Duration = Duration::from_secs(300);
+const PART_BYTES: usize = 8 * 1024 * 1024;
 
 /// Where a `volume:` backup mounts the customer's data, always read-only.
 const DATA_DIR: &str = "/data";
@@ -200,12 +196,12 @@ pub fn build_backup_job(spec: &BackupJobSpec) -> Result<Job> {
     let mut affinity = None;
 
     let script = match (&spec.backup.command, &spec.backup.volume) {
-        _ if spec.backup.exec.is_some() => format!(
-            "set -e; while [ ! -e '{WORK_DIR}/{PAYLOAD}' ]; do sleep 1; done; \
-             gzip -n '{WORK_DIR}/{PAYLOAD}'; mv '{WORK_DIR}/{PAYLOAD}.gz' '{WORK_DIR}/{artifact}'; \
-             curl -fsS --upload-file '{WORK_DIR}/{artifact}' \"${UPLOAD_URL_ENV}\"",
-            artifact = spec.artifact
-        ),
+        _ if spec.backup.exec.is_some() => {
+            return Err(anyhow!(
+                "service '{}': an exec backup is streamed by the operator, not run as a job",
+                spec.service_name
+            ));
+        }
         (Some(command), _) => {
             if command.is_empty() {
                 return Err(anyhow!(
@@ -511,13 +507,14 @@ async fn step_backup(
     match backup.state {
         AppBackupState::Pending if to_start.contains(&backup.id) => {
             if method.quiesce {
-                mark_running(ctx, backup).await
-            } else {
-                start_backup(ctx, store, backup, ingress_domain).await?;
-                if let Some(argv) = method.exec {
-                    spawn_pump(ctx, backup.clone(), argv);
-                }
+                mark_running(ctx, backup, None).await.map(drop)
+            } else if let Some(argv) = method.exec {
+                let key = backup_object_key(backup.deployment_id, &backup.run_id, &backup.artifact);
+                let row = mark_running(ctx, backup, Some(key)).await?;
+                spawn_pump(ctx, row, argv);
                 Ok(())
+            } else {
+                start_backup(ctx, store, backup, ingress_domain).await
             }
         }
         AppBackupState::Pending => Ok(()),
@@ -525,16 +522,12 @@ async fn step_backup(
             if ctx.exec_pumps.lock().unwrap().contains(&backup.id) {
                 return Ok(());
             }
-            if payload_ready(ctx, backup).await? {
-                record_finished(ctx, store, backup).await
-            } else {
-                fail_backup(
-                    ctx,
-                    backup,
-                    "the operator restarted while it was copying this backup",
-                )
-                .await
-            }
+            fail_backup(
+                ctx,
+                backup,
+                "the operator restarted while it was copying this backup",
+            )
+            .await
         }
         _ if method.quiesce && backup.object_key.is_none() => {
             if service_pods(ctx, backup).await? == 0 {
@@ -554,16 +547,21 @@ async fn step_backup(
     }
 }
 
-async fn mark_running(ctx: &Context, backup: &AppDeploymentBackup) -> Result<()> {
+async fn mark_running(
+    ctx: &Context,
+    backup: &AppDeploymentBackup,
+    object_key: Option<String>,
+) -> Result<AppDeploymentBackup> {
     let mut row = backup.clone();
     row.state = AppBackupState::Running;
     row.started = Some(Utc::now());
+    row.object_key = object_key;
     ctx.db.update_app_deployment_backup(&row).await?;
     info!(
-        "backup {}: stopping deployment {} service {} for a consistent copy",
+        "backup {} started for deployment {} service {}",
         backup.id, backup.deployment_id, backup.service
     );
-    Ok(())
+    Ok(row)
 }
 
 async fn service_pods(ctx: &Context, backup: &AppDeploymentBackup) -> Result<usize> {
@@ -586,15 +584,6 @@ fn label_selector(labels: &BTreeMap<String, String>) -> String {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join(",")
-}
-
-async fn payload_ready(ctx: &Context, backup: &AppDeploymentBackup) -> Result<bool> {
-    let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace_name(backup.deployment_id));
-    Ok(jobs
-        .get_opt(&backup_job_name(backup.id))
-        .await?
-        .and_then(|j| j.metadata.annotations)
-        .is_some_and(|a| a.get(PAYLOAD_READY_ANNOTATION).is_some_and(|v| v == "true")))
 }
 
 fn spawn_pump(ctx: &Arc<Context>, backup: AppDeploymentBackup, argv: Vec<String>) {
@@ -688,31 +677,20 @@ async fn finished(
 }
 
 async fn pump_exec(ctx: &Context, backup: &AppDeploymentBackup, argv: &[String]) -> Result<()> {
-    let ns = namespace_name(backup.deployment_id);
-    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
+    let store = ctx
+        .object_store
+        .as_ref()
+        .ok_or_else(|| anyhow!("no backup storage is configured"))?;
+    let key = backup
+        .object_key
+        .clone()
+        .ok_or_else(|| anyhow!("a running backup has no object key"))?;
+    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace_name(backup.deployment_id));
     let app_pod = running_pod(
         &pods,
         &label_selector(&service_labels(backup.deployment_id, &backup.service)),
     )
     .await?;
-    let job_pod = running_pod(&pods, &format!("job-name={}", backup_job_name(backup.id))).await?;
-
-    let mut sink = pods
-        .exec(
-            &job_pod,
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                format!("cat > '{WORK_DIR}/{PAYLOAD}.part'"),
-            ],
-            &AttachParams::default()
-                .container(UPLOADER_CONTAINER)
-                .stdin(true)
-                .stdout(false)
-                .stderr(true),
-        )
-        .await?;
-    let sink_err = drain_stderr(&mut sink).await;
     let mut source = pods
         .exec(
             &app_pod,
@@ -724,47 +702,75 @@ async fn pump_exec(ctx: &Context, backup: &AppDeploymentBackup, argv: &[String])
         )
         .await?;
     let source_err = drain_stderr(&mut source).await;
-
     let mut stdout = source
         .stdout()
         .ok_or_else(|| anyhow!("the export has no stdout"))?;
-    let mut stdin = sink
-        .stdin()
-        .ok_or_else(|| anyhow!("the staging pod has no stdin"))?;
-    let copied = tokio::io::copy(&mut stdout, &mut stdin).await?;
-    stdin.shutdown().await?;
-    drop(stdin);
-    finished(source, source_err, "the app's export").await?;
-    finished(sink, sink_err, "staging the export").await?;
 
-    let mut publish = pods
-        .exec(
-            &job_pod,
-            vec![
-                "mv".to_string(),
-                format!("{WORK_DIR}/{PAYLOAD}.part"),
-                format!("{WORK_DIR}/{PAYLOAD}"),
-            ],
-            &AttachParams::default()
-                .container(UPLOADER_CONTAINER)
-                .stdout(false)
-                .stderr(true),
-        )
-        .await?;
-    let publish_err = drain_stderr(&mut publish).await;
-    finished(publish, publish_err, "publishing the export").await?;
+    let upload_id = store.create_multipart(&key).await?;
+    let streamed = stream_gzip_parts(store, &key, &upload_id, &mut stdout).await;
+    let exited = finished(source, source_err, "the app's export").await;
+    let parts = match (streamed, exited) {
+        (Ok(parts), Ok(())) => parts,
+        (Err(e), _) | (_, Err(e)) => {
+            if let Err(abort) = store.abort_multipart(&key, &upload_id).await {
+                warn!("backup {}: could not abort the upload: {abort}", backup.id);
+            }
+            return Err(e);
+        }
+    };
+    store.complete_multipart(&key, &upload_id, &parts).await?;
 
-    let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
-    jobs.patch(
-        &backup_job_name(backup.id),
-        &PatchParams::default(),
-        &Patch::Merge(serde_json::json!({
-            "metadata": { "annotations": { PAYLOAD_READY_ANNOTATION: "true" } }
-        })),
-    )
-    .await?;
-    info!("backup {}: copied {copied} bytes out of the app", backup.id);
+    let size = store.size(&key).await?;
+    let mut row = ctx.db.get_app_deployment_backup(backup.id).await?;
+    row.state = AppBackupState::Completed;
+    row.completed = Some(Utc::now());
+    row.size_bytes = size;
+    if size.is_none() {
+        row.state = AppBackupState::Failed;
+        row.message = Some("the export finished but no artifact was stored".to_string());
+    }
+    ctx.db.update_app_deployment_backup(&row).await?;
+    info!("backup {} completed ({size:?} bytes)", backup.id);
     Ok(())
+}
+
+pub async fn stream_gzip_parts<R: tokio::io::AsyncRead + Unpin>(
+    store: &ObjectStore,
+    key: &str,
+    upload_id: &str,
+    reader: &mut R,
+) -> Result<Vec<(u32, String)>> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(
+        Vec::with_capacity(PART_BYTES + 64 * 1024),
+        flate2::Compression::default(),
+    );
+    let mut parts: Vec<(u32, String)> = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        encoder.write_all(&buf[..n])?;
+        if encoder.get_ref().len() >= PART_BYTES {
+            let chunk = std::mem::take(encoder.get_mut());
+            let number = parts.len() as u32 + 1;
+            parts.push((
+                number,
+                store.upload_part(key, upload_id, number, chunk).await?,
+            ));
+        }
+    }
+    let last = encoder.finish()?;
+    if !last.is_empty() || parts.is_empty() {
+        let number = parts.len() as u32 + 1;
+        parts.push((
+            number,
+            store.upload_part(key, upload_id, number, last).await?,
+        ));
+    }
+    Ok(parts)
 }
 
 /// Which pending backups may start this pass, oldest first.
@@ -1734,35 +1740,77 @@ mod tests {
     }
 
     #[test]
-    fn exec_backup_waits_for_the_streamed_payload_and_uploads_it() {
+    fn an_exec_backup_is_never_built_as_a_job() {
         let c =
             relay_compose("{ exec: [\"/app/strfry\", \"export\"], artifact: strfry-events.jsonl }");
         let env = BTreeMap::new();
-        let job = build_backup_job(&spec(&c, "relay", &env, "strfry-events.jsonl.gz")).unwrap();
-        let pod = job.spec.unwrap().template.spec.unwrap();
-        assert!(pod.init_containers.is_none());
-        assert!(pod.affinity.is_none());
+        let err = build_backup_job(&spec(&c, "relay", &env, "strfry-events.jsonl.gz")).unwrap_err();
         assert!(
-            pod.volumes
-                .unwrap()
-                .iter()
-                .all(|v| v.persistent_volume_claim.is_none())
+            err.to_string().contains("streamed by the operator"),
+            "{err}"
         );
-        let upload = &pod.containers[0];
-        assert_eq!(upload.name, UPLOADER_CONTAINER);
-        let script = upload.command.as_ref().unwrap()[2].clone();
-        assert!(
-            script.contains("while [ ! -e '/work/payload' ]"),
-            "{script}"
+    }
+
+    #[tokio::test]
+    async fn an_export_is_gzipped_into_parts() {
+        use std::io::Read;
+        use std::sync::Mutex as StdMutex;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        struct Capture(Arc<StdMutex<Vec<Vec<u8>>>>);
+        impl Respond for Capture {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                let mut parts = self.0.lock().unwrap();
+                parts.push(req.body.clone());
+                ResponseTemplate::new(200).append_header("etag", format!("\"e{}\"", parts.len()))
+            }
+        }
+
+        let server = MockServer::start().await;
+        let captured = Arc::new(StdMutex::new(Vec::new()));
+        Mock::given(method("PUT"))
+            .respond_with(Capture(captured.clone()))
+            .mount(&server)
+            .await;
+        let store = ObjectStore::new(lnvps_api_common::ObjectStoreConfig {
+            endpoint: server.uri(),
+            region: "us-east-1".to_string(),
+            bucket: "b".to_string(),
+            access_key: "a".to_string(),
+            secret_key: "s".to_string(),
+            path_style: true,
+        })
+        .unwrap();
+
+        let mut x: u64 = 0x9E3779B97F4A7C15;
+        let input: Vec<u8> = (0..PART_BYTES + 2 * 1024 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        let parts = stream_gzip_parts(&store, "k", "up", &mut input.as_slice())
+            .await
+            .unwrap();
+        assert_eq!(
+            parts,
+            vec![(1, "\"e1\"".to_string()), (2, "\"e2\"".to_string())]
         );
-        assert!(
-            script.contains("mv '/work/payload.gz' '/work/strfry-events.jsonl.gz'"),
-            "{script}"
-        );
-        assert!(
-            script.contains("--upload-file '/work/strfry-events.jsonl.gz'"),
-            "{script}"
-        );
+        let joined: Vec<u8> = captured.lock().unwrap().concat();
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(joined.as_slice())
+            .read_to_end(&mut out)
+            .unwrap();
+        assert_eq!(out, input);
+
+        captured.lock().unwrap().clear();
+        let empty = stream_gzip_parts(&store, "k", "up", &mut [].as_slice())
+            .await
+            .unwrap();
+        assert_eq!(empty.len(), 1);
     }
 
     #[test]

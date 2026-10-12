@@ -186,3 +186,55 @@ async fn a_url_stops_working_when_it_expires() -> Result<()> {
     assert_eq!(store.size(key).await?, None);
     Ok(())
 }
+
+#[tokio::test]
+async fn a_multipart_upload_assembles_its_parts() -> Result<()> {
+    let store = store_or_skip!();
+    store.create_bucket().await?;
+
+    let key = "deployments/15/run-d/strfry-events.jsonl.gz";
+    let first: Vec<u8> = (0..5 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+    let second: Vec<u8> = (0..1024).map(|i| (i % 13) as u8).collect();
+
+    let id = store.create_multipart(key).await?;
+    let e1 = store.upload_part(key, &id, 1, first.clone()).await?;
+    let e2 = store.upload_part(key, &id, 2, second.clone()).await?;
+    store
+        .complete_multipart(key, &id, &[(1, e1), (2, e2)])
+        .await?;
+
+    assert_eq!(
+        store.size(key).await?,
+        Some((first.len() + second.len()) as u64)
+    );
+    let get = store.presign_get(key, Duration::from_secs(300), None)?;
+    let body = reqwest::Client::new()
+        .get(&get)
+        .send()
+        .await?
+        .bytes()
+        .await?;
+    let mut expected = first;
+    expected.extend(second);
+    if body.as_ref() != expected.as_slice() {
+        bail!("the assembled object does not match its parts");
+    }
+
+    let abandoned = store
+        .create_multipart("deployments/15/run-e/abandoned.gz")
+        .await?;
+    store
+        .upload_part(
+            "deployments/15/run-e/abandoned.gz",
+            &abandoned,
+            1,
+            vec![1u8; 16],
+        )
+        .await?;
+    store
+        .abort_multipart("deployments/15/run-e/abandoned.gz", &abandoned)
+        .await?;
+    assert_eq!(store.size("deployments/15/run-e/abandoned.gz").await?, None);
+    store.delete(key).await?;
+    Ok(())
+}
