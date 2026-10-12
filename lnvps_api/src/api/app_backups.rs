@@ -220,7 +220,9 @@ pub async fn start_backup(
             deployment_id,
             run_id: run_id.clone(),
             service: service.to_string(),
-            method: if backup.volume.is_some() {
+            method: if backup.exec.is_some() {
+                AppBackupMethod::Exec
+            } else if backup.volume.is_some() {
                 AppBackupMethod::Volume
             } else {
                 AppBackupMethod::Command

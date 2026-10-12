@@ -196,6 +196,7 @@ pub struct Context {
     /// Backup artifact storage. `None` when no bucket is configured, which
     /// disables backups entirely.
     pub object_store: Option<ObjectStore>,
+    pub exec_pumps: std::sync::Mutex<std::collections::HashSet<u64>>,
 }
 
 impl Settings {
@@ -345,6 +346,7 @@ async fn main() -> Result<()> {
         settings: settings.clone(),
         metrics,
         object_store,
+        exec_pumps: Default::default(),
     });
 
     info!("LNVPS Operator is running and watching for resources...");
@@ -434,8 +436,9 @@ async fn main() -> Result<()> {
             }
             // After the deployments, so a backup Job is only ever created for a
             // deployment this pass has already reconciled.
-            if let Err(e) = app_backups::reconcile_app_backups(&app_context).await {
-                error!("Failed to reconcile app backups: {}", e);
+            match app_backups::reconcile_app_backups(&app_context).await {
+                Ok(active) => app_transitioning.lock().unwrap().extend(active),
+                Err(e) => error!("Failed to reconcile app backups: {}", e),
             }
         }
     };

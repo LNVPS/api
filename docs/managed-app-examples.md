@@ -58,9 +58,10 @@ read-only, mounted via subPath), `depends_on`, `backup`, `user`,
 resolves to `{deployment-name}.{cluster-ingress-domain}`; a service name
 resolves to its in-namespace DNS (e.g. `db:3306`).
 
-**`backup`** — per service, either `command:` (an app-native dump, whose stdout
-becomes the artifact) or `volume:` (a raw tar of one named volume), plus an
-optional `artifact:` filename. A top-level `backup: { schedule, retention }`
+**`backup`** — per service, one of `command:` (an app-native dump run in its own
+pod, whose stdout becomes the artifact), `exec:` (the app's own export run inside
+its running container, whose stdout becomes the artifact) or `volume:` (a tar of
+one named volume), plus an optional `artifact:` filename. A top-level `backup: { schedule, retention }`
 turns it into an automatic run: a 5-field cron expression in **UTC** (no faster
 than hourly) and how many runs to keep. A run captures every service that
 declares a method, at one point in time.
@@ -96,10 +97,29 @@ A `backup:` method without a top-level schedule still lets the customer start a
 run from the deployment page (`POST /api/v1/app-deployments/{id}/backups`) and
 download the result. Those runs keep the newest 7, the same default a schedule
 gets. A service declares one method, so HAVEN backs up its event store and not
-its Blossom media. The relays use `volume:`: a `command:` runs in its own pod
-without the service's volumes, so `strfry export` and its kind have nothing to
-read. A tar of a live LMDB, SQLite or Badger store is taken while the app
-writes to it.
+its Blossom media.
+
+**Never tar a live database.** A tar of an LMDB, SQLite or Badger store taken
+while the app writes to it is a torn copy: the first strfry backup came back
+with valid gzip, a valid tar, and a database that `strfry scan --count` read as
+0 events out of 39,436, because tar read the meta pages before strfry reused
+the pages they pointed at. Pick one of the two methods that give a consistent
+copy:
+
+- **`exec:`** when the image ships a tool that reads its own store while the app
+  runs. The operator runs the argv inside the running container and streams its
+  stdout into the backup Job, which gzips and uploads it. `${…}` is refused in
+  the argv. strfry uses `["/app/strfry", "export"]` (JSONL, restored with
+  `strfry import`) and nostr-rs-relay `["sqlite3", "/usr/src/app/db/nostr.db",
+  ".dump"]` (SQL, restored with `sqlite3 nostr.db < dump`).
+- **`volume:` with `quiesce: true`** when it does not. The operator scales the
+  service to 0, tars the volume once its pods are gone, and scales it back. The
+  app is down for the copy and reports `pending` with "paused while a backup
+  copies its data". HAVEN (Badger holds an exclusive lock), pyramid (LMDB, no
+  export tool), yalr and blossom (SQLite, no `sqlite3` in the image) use this.
+
+A plain `volume:` is only right for files nobody rewrites in place, such as
+route96's content-addressed blobs.
 
 **`volumes[].label`** — optional, and what a **buyer** gets from that volume:
 `events`, `media`, `database`, `files`. Surfaced per volume on

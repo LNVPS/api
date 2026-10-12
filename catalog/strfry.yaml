@@ -71,7 +71,7 @@ services:
           }
     volumes:
       - { name: db, path: /app/strfry-db, size: 5Gi, label: events }
-    backup: { volume: db, artifact: strfry-db }
+    backup: { exec: ["/app/strfry", "export"], artifact: strfry-events.jsonl }
 config:
   - { name: relay_name, label: "Relay name", type: string, default: "My strfry relay", pattern: '[^"\\\r\n]*' }
   - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay", pattern: '[^"\\\r\n]*' }

@@ -62,7 +62,7 @@ services:
             password: "${dashboard_password}"
     volumes:
       - { name: data, path: /app/data, size: 5Gi, label: files }
-    backup: { volume: data, artifact: blossom-data }
+    backup: { volume: data, quiesce: true, artifact: blossom-data }
     scratch:
       - { path: /tmp }
 config:

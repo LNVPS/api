@@ -3527,6 +3527,7 @@ mod tests {
     fn test_app_backup_enum_rendering() {
         assert_eq!(AppBackupMethod::Command.to_string(), "command");
         assert_eq!(AppBackupMethod::Volume.to_string(), "volume");
+        assert_eq!(AppBackupMethod::Exec.to_string(), "exec");
         assert_eq!(AppBackupState::Pending.to_string(), "pending");
         assert_eq!(AppBackupState::Running.to_string(), "running");
         assert_eq!(AppBackupState::Completed.to_string(), "completed");
@@ -4750,6 +4751,7 @@ pub enum AppBackupMethod {
     Command = 0,
     /// Raw tar of a persistent volume.
     Volume = 1,
+    Exec = 2,
 }
 
 impl Display for AppBackupMethod {
@@ -4757,6 +4759,7 @@ impl Display for AppBackupMethod {
         match self {
             AppBackupMethod::Command => write!(f, "command"),
             AppBackupMethod::Volume => write!(f, "volume"),
+            AppBackupMethod::Exec => write!(f, "exec"),
         }
     }
 }

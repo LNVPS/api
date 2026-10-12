@@ -26,6 +26,7 @@ services:
       - { path: /tmp }
     backup:
       volume: data
+      quiesce: true
 config:
   - { name: anthropic_prompt_cache, label: "Anthropic prompt caching", type: bool, default: "true" }
   - { name: log_level, label: "Log level (RUST_LOG)", type: string, default: "info", pattern: "[A-Za-z0-9_:=,.-]+", group: "Advanced" }

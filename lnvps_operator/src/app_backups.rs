@@ -17,12 +17,14 @@
 //! The object **builders** are pure functions, unit-tested without a cluster;
 //! [`reconcile_app_backups`] is the loop that applies them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
+use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::api::core::v1::{
     Affinity, Container, EmptyDirVolumeSource, EnvVar, EnvVarSource,
     PersistentVolumeClaimVolumeSource, PodAffinity, PodAffinityTerm, PodSpec, PodTemplateSpec,
@@ -30,8 +32,12 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
-use kube::api::{Api, DeleteParams, PropagationPolicy};
+use kube::api::{
+    Api, AttachParams, AttachedProcess, DeleteParams, ListParams, Patch, PatchParams,
+    PropagationPolicy,
+};
 use log::{debug, error, info, warn};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use lnvps_api_common::ObjectStore;
@@ -53,6 +59,10 @@ use crate::app_deployments::{
 /// encoding, which S3 rejects.
 const WORK_DIR: &str = "/work";
 const WORK_VOLUME: &str = "work";
+const PAYLOAD: &str = "payload";
+const UPLOADER_CONTAINER: &str = "upload";
+pub const PAYLOAD_READY_ANNOTATION: &str = "lnvps.io/payload-ready";
+const POD_WAIT: Duration = Duration::from_secs(300);
 
 /// Where a `volume:` backup mounts the customer's data, always read-only.
 const DATA_DIR: &str = "/data";
@@ -115,7 +125,9 @@ pub fn backup_object_key(deployment_id: u64, run_id: &str, artifact: &str) -> St
 
 /// Which of the two capture methods a service's `backup:` selects.
 pub fn backup_method(backup: &Backup) -> AppBackupMethod {
-    if backup.volume.is_some() {
+    if backup.exec.is_some() {
+        AppBackupMethod::Exec
+    } else if backup.volume.is_some() {
         AppBackupMethod::Volume
     } else {
         AppBackupMethod::Command
@@ -188,6 +200,12 @@ pub fn build_backup_job(spec: &BackupJobSpec) -> Result<Job> {
     let mut affinity = None;
 
     let script = match (&spec.backup.command, &spec.backup.volume) {
+        _ if spec.backup.exec.is_some() => format!(
+            "set -e; while [ ! -e '{WORK_DIR}/{PAYLOAD}' ]; do sleep 1; done; \
+             gzip -n '{WORK_DIR}/{PAYLOAD}'; mv '{WORK_DIR}/{PAYLOAD}.gz' '{WORK_DIR}/{artifact}'; \
+             curl -fsS --upload-file '{WORK_DIR}/{artifact}' \"${UPLOAD_URL_ENV}\"",
+            artifact = spec.artifact
+        ),
         (Some(command), _) => {
             if command.is_empty() {
                 return Err(anyhow!(
@@ -251,7 +269,7 @@ pub fn build_backup_job(spec: &BackupJobSpec) -> Result<Job> {
             // that already has it attached, so the Job is pinned to the app's
             // node. Without this it schedules anywhere and sits in
             // `Multi-Attach error` until the deadline kills it.
-            affinity = Some(Affinity {
+            affinity = (!spec.backup.quiesce).then(|| Affinity {
                 pod_affinity: Some(PodAffinity {
                     required_during_scheduling_ignored_during_execution: Some(vec![
                         PodAffinityTerm {
@@ -285,7 +303,7 @@ pub fn build_backup_job(spec: &BackupJobSpec) -> Result<Job> {
     };
 
     let uploader = Container {
-        name: "upload".to_string(),
+        name: UPLOADER_CONTAINER.to_string(),
         image: Some(spec.uploader_image.to_string()),
         image_pull_policy: Some(IMAGE_PULL_POLICY.to_string()),
         command: Some(vec!["/bin/sh".to_string(), "-c".to_string(), script]),
@@ -423,10 +441,10 @@ fn shell_join(args: &[String]) -> String {
 /// No-op unless the operator has both a cluster and object storage configured.
 /// Individual failures are logged and skipped rather than ending the pass: one
 /// deployment's broken backup must not stop every other deployment's.
-pub async fn reconcile_app_backups(ctx: &Context) -> Result<()> {
+pub async fn reconcile_app_backups(ctx: &Arc<Context>) -> Result<BTreeSet<u64>> {
     let (Some(cluster_id), Some(store)) = (ctx.settings.app_cluster_id, ctx.object_store.as_ref())
     else {
-        return Ok(());
+        return Ok(BTreeSet::new());
     };
     let cluster = ctx.db.get_app_cluster(cluster_id).await?;
 
@@ -441,15 +459,7 @@ pub async fn reconcile_app_backups(ctx: &Context) -> Result<()> {
     let to_start = startable(&active, ctx.settings.max_concurrent_backups());
     for backup in &active {
         let id = backup.id;
-        let result = match backup.state {
-            AppBackupState::Pending if to_start.contains(&id) => {
-                start_backup(ctx, store, backup, &cluster.ingress_domain).await
-            }
-            // Waiting its turn. It keeps its place in the queue by staying
-            // pending, and starts on a later pass.
-            AppBackupState::Pending => continue,
-            _ => record_finished(ctx, store, backup).await,
-        };
+        let result = step_backup(ctx, store, backup, &to_start, &cluster.ingress_domain).await;
         if let Err(e) = result {
             error!("backup {id} failed: {e}");
             if let Err(e) = fail_backup(ctx, backup, &e.to_string()).await {
@@ -461,6 +471,299 @@ pub async fn reconcile_app_backups(ctx: &Context) -> Result<()> {
     if let Err(e) = prune_backups(ctx, store, cluster_id).await {
         warn!("backup retention pruning failed: {e}");
     }
+    Ok(active.iter().map(|b| b.deployment_id).collect())
+}
+
+pub fn quiesced_services(compose: &Compose, backups: &[AppDeploymentBackup]) -> BTreeSet<String> {
+    backups
+        .iter()
+        .filter(|b| b.state == AppBackupState::Running)
+        .filter(|b| {
+            compose
+                .services
+                .get(&b.service)
+                .and_then(|s| s.backup.as_ref())
+                .is_some_and(|m| m.quiesce)
+        })
+        .map(|b| b.service.clone())
+        .collect()
+}
+
+async fn backup_method_of(ctx: &Context, backup: &AppDeploymentBackup) -> Result<Backup> {
+    let deployment = ctx.db.get_app_deployment(backup.deployment_id).await?;
+    let app = ctx.db.get_app(deployment.app_id).await?;
+    let compose = Compose::parse(&app.compose)?;
+    compose
+        .services
+        .get(&backup.service)
+        .and_then(|s| s.backup.clone())
+        .ok_or_else(|| anyhow!("service '{}' declares no backup method", backup.service))
+}
+
+async fn step_backup(
+    ctx: &Arc<Context>,
+    store: &ObjectStore,
+    backup: &AppDeploymentBackup,
+    to_start: &[u64],
+    ingress_domain: &str,
+) -> Result<()> {
+    let method = backup_method_of(ctx, backup).await?;
+    match backup.state {
+        AppBackupState::Pending if to_start.contains(&backup.id) => {
+            if method.quiesce {
+                mark_running(ctx, backup).await
+            } else {
+                start_backup(ctx, store, backup, ingress_domain).await?;
+                if let Some(argv) = method.exec {
+                    spawn_pump(ctx, backup.clone(), argv);
+                }
+                Ok(())
+            }
+        }
+        AppBackupState::Pending => Ok(()),
+        _ if method.exec.is_some() => {
+            if ctx.exec_pumps.lock().unwrap().contains(&backup.id) {
+                return Ok(());
+            }
+            if payload_ready(ctx, backup).await? {
+                record_finished(ctx, store, backup).await
+            } else {
+                fail_backup(
+                    ctx,
+                    backup,
+                    "the operator restarted while it was copying this backup",
+                )
+                .await
+            }
+        }
+        _ if method.quiesce && backup.object_key.is_none() => {
+            if service_pods(ctx, backup).await? == 0 {
+                start_backup(ctx, store, backup, ingress_domain).await
+            } else if backup.started.is_some_and(|t| {
+                Utc::now() - t
+                    > chrono::Duration::from_std(ctx.settings.backup_job_deadline())
+                        .unwrap_or(chrono::Duration::hours(1))
+            }) {
+                fail_backup(ctx, backup, "the app did not stop for the backup in time").await
+            } else {
+                debug!("backup {}: waiting for the app to stop", backup.id);
+                Ok(())
+            }
+        }
+        _ => record_finished(ctx, store, backup).await,
+    }
+}
+
+async fn mark_running(ctx: &Context, backup: &AppDeploymentBackup) -> Result<()> {
+    let mut row = backup.clone();
+    row.state = AppBackupState::Running;
+    row.started = Some(Utc::now());
+    ctx.db.update_app_deployment_backup(&row).await?;
+    info!(
+        "backup {}: stopping deployment {} service {} for a consistent copy",
+        backup.id, backup.deployment_id, backup.service
+    );
+    Ok(())
+}
+
+async fn service_pods(ctx: &Context, backup: &AppDeploymentBackup) -> Result<usize> {
+    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace_name(backup.deployment_id));
+    Ok(pods
+        .list(
+            &ListParams::default().labels(&label_selector(&service_labels(
+                backup.deployment_id,
+                &backup.service,
+            ))),
+        )
+        .await?
+        .items
+        .len())
+}
+
+fn label_selector(labels: &BTreeMap<String, String>) -> String {
+    labels
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+async fn payload_ready(ctx: &Context, backup: &AppDeploymentBackup) -> Result<bool> {
+    let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace_name(backup.deployment_id));
+    Ok(jobs
+        .get_opt(&backup_job_name(backup.id))
+        .await?
+        .and_then(|j| j.metadata.annotations)
+        .is_some_and(|a| a.get(PAYLOAD_READY_ANNOTATION).is_some_and(|v| v == "true")))
+}
+
+fn spawn_pump(ctx: &Arc<Context>, backup: AppDeploymentBackup, argv: Vec<String>) {
+    ctx.exec_pumps.lock().unwrap().insert(backup.id);
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let deadline = ctx.settings.backup_job_deadline();
+        let result = match tokio::time::timeout(deadline, pump_exec(&ctx, &backup, &argv)).await {
+            Ok(r) => r,
+            Err(_) => Err(anyhow!(
+                "the app's export did not finish within {deadline:?}"
+            )),
+        };
+        if let Err(e) = result {
+            error!("backup {} failed: {e}", backup.id);
+            if let Err(e) = fail_backup(&ctx, &backup, &e.to_string()).await {
+                warn!("backup {}: could not record the failure: {e}", backup.id);
+            }
+        }
+        ctx.exec_pumps.lock().unwrap().remove(&backup.id);
+    });
+}
+
+async fn running_pod(pods: &Api<Pod>, selector: &str) -> Result<String> {
+    let started = tokio::time::Instant::now();
+    loop {
+        let found = pods
+            .list(&ListParams::default().labels(selector))
+            .await?
+            .items
+            .into_iter()
+            .find(|p| {
+                p.metadata.deletion_timestamp.is_none()
+                    && p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")
+            })
+            .and_then(|p| p.metadata.name);
+        if let Some(name) = found {
+            return Ok(name);
+        }
+        if started.elapsed() > POD_WAIT {
+            return Err(anyhow!("no running pod matches {selector}"));
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn drain_stderr(process: &mut AttachedProcess) -> tokio::task::JoinHandle<String> {
+    let stderr = process.stderr();
+    tokio::spawn(async move {
+        let Some(mut stderr) = stderr else {
+            return String::new();
+        };
+        let mut tail: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = stderr.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            tail.extend_from_slice(&buf[..n]);
+            if tail.len() > 2048 {
+                tail.drain(..tail.len() - 2048);
+            }
+        }
+        String::from_utf8_lossy(&tail).trim().to_string()
+    })
+}
+
+async fn finished(
+    mut process: AttachedProcess,
+    stderr: tokio::task::JoinHandle<String>,
+    what: &str,
+) -> Result<()> {
+    let status = match process.take_status() {
+        Some(s) => s.await,
+        None => None,
+    };
+    let stderr = stderr.await.unwrap_or_default();
+    match status {
+        Some(s) if s.status.as_deref() == Some("Success") => Ok(()),
+        Some(s) => Err(anyhow!(
+            "{what} failed: {}{}",
+            s.message.unwrap_or_else(|| "non-zero exit".to_string()),
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", truncate(&stderr, 400))
+            }
+        )),
+        None => Err(anyhow!("{what} ended without reporting an exit status")),
+    }
+}
+
+async fn pump_exec(ctx: &Context, backup: &AppDeploymentBackup, argv: &[String]) -> Result<()> {
+    let ns = namespace_name(backup.deployment_id);
+    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &ns);
+    let app_pod = running_pod(
+        &pods,
+        &label_selector(&service_labels(backup.deployment_id, &backup.service)),
+    )
+    .await?;
+    let job_pod = running_pod(&pods, &format!("job-name={}", backup_job_name(backup.id))).await?;
+
+    let mut sink = pods
+        .exec(
+            &job_pod,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("cat > '{WORK_DIR}/{PAYLOAD}.part'"),
+            ],
+            &AttachParams::default()
+                .container(UPLOADER_CONTAINER)
+                .stdin(true)
+                .stdout(false)
+                .stderr(true),
+        )
+        .await?;
+    let sink_err = drain_stderr(&mut sink).await;
+    let mut source = pods
+        .exec(
+            &app_pod,
+            argv.to_vec(),
+            &AttachParams::default()
+                .container(&backup.service)
+                .stdout(true)
+                .stderr(true),
+        )
+        .await?;
+    let source_err = drain_stderr(&mut source).await;
+
+    let mut stdout = source
+        .stdout()
+        .ok_or_else(|| anyhow!("the export has no stdout"))?;
+    let mut stdin = sink
+        .stdin()
+        .ok_or_else(|| anyhow!("the staging pod has no stdin"))?;
+    let copied = tokio::io::copy(&mut stdout, &mut stdin).await?;
+    stdin.shutdown().await?;
+    drop(stdin);
+    finished(source, source_err, "the app's export").await?;
+    finished(sink, sink_err, "staging the export").await?;
+
+    let mut publish = pods
+        .exec(
+            &job_pod,
+            vec![
+                "mv".to_string(),
+                format!("{WORK_DIR}/{PAYLOAD}.part"),
+                format!("{WORK_DIR}/{PAYLOAD}"),
+            ],
+            &AttachParams::default()
+                .container(UPLOADER_CONTAINER)
+                .stdout(false)
+                .stderr(true),
+        )
+        .await?;
+    let publish_err = drain_stderr(&mut publish).await;
+    finished(publish, publish_err, "publishing the export").await?;
+
+    let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
+    jobs.patch(
+        &backup_job_name(backup.id),
+        &PatchParams::default(),
+        &Patch::Merge(serde_json::json!({
+            "metadata": { "annotations": { PAYLOAD_READY_ANNOTATION: "true" } }
+        })),
+    )
+    .await?;
+    info!("backup {}: copied {copied} bytes out of the app", backup.id);
     Ok(())
 }
 
@@ -628,7 +931,7 @@ async fn start_backup(
     let mut row = backup.clone();
     row.object_key = Some(key);
     row.state = AppBackupState::Running;
-    row.started = Some(Utc::now());
+    row.started = backup.started.or(Some(Utc::now()));
     ctx.db.update_app_deployment_backup(&row).await?;
     info!(
         "backup {} started for deployment {} service {}",
@@ -1421,5 +1724,115 @@ mod tests {
         );
         let none = Compose::parse("services:\n  a:\n    image: x\n").unwrap();
         assert_eq!(retention_for(&none), None);
+    }
+
+    fn relay_compose(backup: &str) -> Compose {
+        Compose::parse(&format!(
+            "services:\n  relay:\n    image: example/relay:1\n    user: \"1000\"\n    volumes:\n      - {{ name: db, path: /app/db, size: 5Gi }}\n    backup: {backup}\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn exec_backup_waits_for_the_streamed_payload_and_uploads_it() {
+        let c =
+            relay_compose("{ exec: [\"/app/strfry\", \"export\"], artifact: strfry-events.jsonl }");
+        let env = BTreeMap::new();
+        let job = build_backup_job(&spec(&c, "relay", &env, "strfry-events.jsonl.gz")).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        assert!(pod.init_containers.is_none());
+        assert!(pod.affinity.is_none());
+        assert!(
+            pod.volumes
+                .unwrap()
+                .iter()
+                .all(|v| v.persistent_volume_claim.is_none())
+        );
+        let upload = &pod.containers[0];
+        assert_eq!(upload.name, UPLOADER_CONTAINER);
+        let script = upload.command.as_ref().unwrap()[2].clone();
+        assert!(
+            script.contains("while [ ! -e '/work/payload' ]"),
+            "{script}"
+        );
+        assert!(
+            script.contains("mv '/work/payload.gz' '/work/strfry-events.jsonl.gz'"),
+            "{script}"
+        );
+        assert!(
+            script.contains("--upload-file '/work/strfry-events.jsonl.gz'"),
+            "{script}"
+        );
+    }
+
+    #[test]
+    fn a_quiesced_volume_backup_is_not_pinned_to_the_stopped_app() {
+        let env = BTreeMap::new();
+        let live = relay_compose("{ volume: db }");
+        let pinned = build_backup_job(&spec(&live, "relay", &env, "relay-db.tar.gz")).unwrap();
+        assert!(
+            pinned
+                .spec
+                .unwrap()
+                .template
+                .spec
+                .unwrap()
+                .affinity
+                .is_some()
+        );
+        let quiet = relay_compose("{ volume: db, quiesce: true }");
+        let free = build_backup_job(&spec(&quiet, "relay", &env, "relay-db.tar.gz")).unwrap();
+        let pod = free.spec.unwrap().template.spec.unwrap();
+        assert!(pod.affinity.is_none());
+        assert!(pod.containers[0].command.as_ref().unwrap()[2].contains("tar -czf"));
+    }
+
+    #[test]
+    fn only_running_quiesced_backups_stop_their_service() {
+        let row = |service: &str, state: AppBackupState| AppDeploymentBackup {
+            id: 1,
+            deployment_id: 1,
+            run_id: "r".to_string(),
+            service: service.to_string(),
+            method: AppBackupMethod::Volume,
+            artifact: "a".to_string(),
+            object_key: None,
+            size_bytes: None,
+            state,
+            message: None,
+            scheduled: false,
+            created: Utc::now(),
+            started: None,
+            completed: None,
+            deleted: false,
+        };
+        let quiet = relay_compose("{ volume: db, quiesce: true }");
+        assert_eq!(
+            quiesced_services(&quiet, &[row("relay", AppBackupState::Running)]),
+            BTreeSet::from(["relay".to_string()])
+        );
+        assert!(quiesced_services(&quiet, &[row("relay", AppBackupState::Pending)]).is_empty());
+        assert!(quiesced_services(&quiet, &[row("relay", AppBackupState::Completed)]).is_empty());
+        assert!(quiesced_services(&quiet, &[row("gone", AppBackupState::Running)]).is_empty());
+        let live = relay_compose("{ volume: db }");
+        assert!(quiesced_services(&live, &[row("relay", AppBackupState::Running)]).is_empty());
+    }
+
+    #[test]
+    fn label_selectors_join_every_label() {
+        let sel = label_selector(&BTreeMap::from([
+            ("a".to_string(), "1".to_string()),
+            ("b".to_string(), "2".to_string()),
+        ]));
+        assert_eq!(sel, "a=1,b=2");
+        assert_eq!(
+            backup_method(
+                &relay_compose("{ exec: [\"x\"] }").services["relay"]
+                    .backup
+                    .clone()
+                    .unwrap()
+            ),
+            AppBackupMethod::Exec
+        );
     }
 }

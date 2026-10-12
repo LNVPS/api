@@ -1857,6 +1857,10 @@ async fn reconcile_one(
     // An expired deployment scales to 0 but keeps its PVCs (customer data);
     // only real deletion tears it down.
     let replicas = if gate == GateReason::Running { 1 } else { 0 };
+    let quiesced = crate::app_backups::quiesced_services(
+        &compose,
+        &ctx.db.list_app_deployment_backups(id).await?,
+    );
     // Size of this deployment as a multiple of the catalog app's footprint.
     // Legacy rows (pre-multiplier) decode as 0, so clamp to the base size.
     let multiplier = deployment.resource_multiplier.max(1);
@@ -1890,7 +1894,11 @@ async fn reconcile_one(
                 svc,
                 &svc_env,
                 &sfiles,
-                replicas,
+                if quiesced.contains(sname) {
+                    0
+                } else {
+                    replicas
+                },
                 multiplier,
                 init.get(sname).map(Vec::as_slice).unwrap_or_default(),
             ),
@@ -1943,7 +1951,10 @@ async fn reconcile_one(
     // correct, and the API server being briefly unavailable must not undo that
     // or overwrite a true status with a guess.
     let health = match read_workload_health(client, id).await {
-        Ok(h) => Some(h),
+        Ok(mut h) => {
+            h.paused_for_backup = !quiesced.is_empty();
+            Some(h)
+        }
         Err(e) => {
             warn!("app deployment {id}: could not read workload health: {e}");
             None
@@ -1967,6 +1978,7 @@ pub struct WorkloadHealth {
     pub ready: i32,
     /// Containers the kubelet says will not start.
     pub failures: Vec<ContainerFailure>,
+    pub paused_for_backup: bool,
 }
 
 /// One container the kubelet is refusing to run, and why.
@@ -2028,6 +2040,12 @@ pub fn workload_status(health: &WorkloadHealth) -> (AppDeploymentStatus, Option<
             .collect::<Vec<_>>()
             .join("; ");
         return (AppDeploymentStatus::Error, Some(detail));
+    }
+    if health.paused_for_backup {
+        return (
+            AppDeploymentStatus::Pending,
+            Some("paused while a backup copies its data".to_string()),
+        );
     }
     if health.desired > 0 && health.ready >= health.desired {
         return (AppDeploymentStatus::Running, None);
@@ -3670,6 +3688,7 @@ config:
             desired: 2,
             ready: 2,
             failures: vec![],
+            ..Default::default()
         });
         assert_eq!(s, AppDeploymentStatus::Running);
         assert_eq!(m, None);
@@ -3679,6 +3698,7 @@ config:
             desired: 2,
             ready: 1,
             failures: vec![],
+            ..Default::default()
         });
         assert_eq!(s, AppDeploymentStatus::Pending);
         assert!(m.unwrap().contains("1/2"));
@@ -3699,6 +3719,7 @@ config:
                 reason: "CrashLoopBackOff".to_string(),
                 detail: Some("InnoDB: Unable to create temporary file\n".to_string()),
             }],
+            ..Default::default()
         });
         assert_eq!(s, AppDeploymentStatus::Error);
         let m = m.unwrap();
@@ -3715,6 +3736,7 @@ config:
                 reason: "ImagePullBackOff".to_string(),
                 detail: None,
             }],
+            ..Default::default()
         });
         assert_eq!(s, AppDeploymentStatus::Error);
 
@@ -3728,9 +3750,18 @@ config:
                 reason: "CrashLoopBackOff".to_string(),
                 detail: Some("x".repeat(5000)),
             }],
+            ..Default::default()
         });
         let m = m.unwrap();
         assert!(m.len() < 400, "message stays renderable: {}", m.len());
+        let (s, m) = workload_status(&WorkloadHealth {
+            desired: 0,
+            ready: 0,
+            failures: vec![],
+            paused_for_backup: true,
+        });
+        assert_eq!(s, AppDeploymentStatus::Pending);
+        assert!(m.unwrap().contains("backup"));
     }
 
     /// A pod is only a failure once the kubelet has settled on one: a container

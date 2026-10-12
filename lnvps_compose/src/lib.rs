@@ -765,6 +765,12 @@ impl Backup {
                     .clone()
                     .unwrap_or_else(|| format!("{service}-{volume}"))
             ),
+            _ if self.exec.is_some() => format!(
+                "{}.gz",
+                self.artifact
+                    .clone()
+                    .unwrap_or_else(|| format!("{service}.dump"))
+            ),
             _ => format!("{service}.gz"),
         }
     }
@@ -813,7 +819,7 @@ pub enum FieldType {
 /// Whichever is used, the capture runs in a **separate pod**, not in the
 /// service's own container: the operator creates a Job per artifact, so a
 /// backup is not tied to a running app pod and cannot disturb it.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Backup {
     /// App-consistent dump command; stdout is captured as the artifact.
     ///
@@ -829,6 +835,10 @@ pub struct Backup {
     /// Alternatively, raw tar of this named volume (append-only data only).
     #[serde(default)]
     pub volume: Option<String>,
+    #[serde(default)]
+    pub exec: Option<Vec<String>>,
+    #[serde(default)]
+    pub quiesce: bool,
     /// Suggested artifact filename.
     #[serde(default)]
     pub artifact: Option<String>,
@@ -1233,19 +1243,42 @@ impl Compose {
             // artifact name is a filename we control the shape of (it becomes
             // the tail of an object key).
             if let Some(b) = &svc.backup {
-                match (&b.command, &b.volume) {
-                    (Some(_), Some(_)) => {
-                        bail!("service '{sname}': backup has both command and volume")
+                let methods = [b.command.is_some(), b.volume.is_some(), b.exec.is_some()]
+                    .iter()
+                    .filter(|m| **m)
+                    .count();
+                if b.command.is_some() && b.volume.is_some() {
+                    bail!("service '{sname}': backup has both command and volume");
+                }
+                if methods > 1 {
+                    bail!(
+                        "service '{sname}': backup declares more than one of command, volume and exec"
+                    );
+                }
+                if methods == 0 {
+                    bail!("service '{sname}': backup needs one of command, volume or exec");
+                }
+                if let Some(vol) = &b.volume
+                    && !svc.volumes.iter().any(|v| &v.name == vol)
+                {
+                    bail!("service '{sname}': backup volume '{vol}' is not declared");
+                }
+                if b.quiesce && b.volume.is_none() {
+                    bail!(
+                        "service '{sname}': backup `quiesce` only applies to a `volume:` backup, \
+                         which is the method that copies files the app is writing"
+                    );
+                }
+                if let Some(argv) = &b.exec {
+                    if argv.is_empty() {
+                        bail!("service '{sname}': backup exec is empty");
                     }
-                    (None, None) => {
-                        bail!("service '{sname}': backup needs either command or volume")
+                    if argv.iter().any(|a| !extract_refs(a).is_empty()) {
+                        bail!(
+                            "service '{sname}': backup exec must not contain '${{…}}': it runs \
+                             inside the customer's container as written"
+                        );
                     }
-                    (None, Some(vol)) => {
-                        if !svc.volumes.iter().any(|v| &v.name == vol) {
-                            bail!("service '{sname}': backup volume '{vol}' is not declared");
-                        }
-                    }
-                    _ => {}
                 }
                 // The artifact name is appended to a server-derived object key
                 // and shown as a download filename, so it is a plain filename:
@@ -3515,26 +3548,41 @@ config:
             command: Some(vec!["sh".into()]),
             volume: None,
             artifact: Some("route96.sql".into()),
+            ..Default::default()
         };
         assert_eq!(named.artifact_name("db"), "route96.sql.gz");
         let dump = Backup {
             command: Some(vec!["sh".into()]),
             volume: None,
             artifact: None,
+            ..Default::default()
         };
         assert_eq!(dump.artifact_name("db"), "db.dump.gz");
         let volume = Backup {
             command: None,
             volume: Some("data".into()),
             artifact: None,
+            ..Default::default()
         };
         assert_eq!(volume.artifact_name("relay"), "relay-data.tar.gz");
         let neither = Backup {
             command: None,
             volume: None,
             artifact: None,
+            ..Default::default()
         };
         assert_eq!(neither.artifact_name("x"), "x.gz");
+        let exec = Backup {
+            exec: Some(vec!["/app/strfry".into(), "export".into()]),
+            artifact: Some("strfry-events.jsonl".into()),
+            ..Default::default()
+        };
+        assert_eq!(exec.artifact_name("strfry"), "strfry-events.jsonl.gz");
+        let bare_exec = Backup {
+            exec: Some(vec!["x".into()]),
+            ..Default::default()
+        };
+        assert_eq!(bare_exec.artifact_name("relay"), "relay.dump.gz");
     }
 
     #[test]
@@ -3560,5 +3608,42 @@ config:
             .unwrap()
             .validate_declarations()
             .unwrap();
+    }
+
+    #[test]
+    fn backup_methods_are_exclusive_and_checked() {
+        let svc = |backup: &str| {
+            format!(
+                "services:\n  a:\n    image: x\n    user: \"1000\"\n    volumes:\n      - {{ name: d, path: /d, size: 1Gi }}\n    backup: {backup}\n"
+            )
+        };
+        for (backup, message) in [
+            (
+                "{ exec: [\"x\"], volume: d }",
+                "more than one of command, volume and exec",
+            ),
+            (
+                "{ exec: [\"x\"], command: [\"y\"] }",
+                "more than one of command, volume and exec",
+            ),
+            ("{ artifact: a }", "needs one of command, volume or exec"),
+            ("{ exec: [] }", "backup exec is empty"),
+            ("{ exec: [\"echo\", \"${X}\"] }", "must not contain"),
+            (
+                "{ exec: [\"x\"], quiesce: true }",
+                "only applies to a `volume:` backup",
+            ),
+            (
+                "{ command: [\"x\"], quiesce: true }",
+                "only applies to a `volume:` backup",
+            ),
+        ] {
+            let err = Compose::parse(&svc(backup)).unwrap_err().to_string();
+            assert!(err.contains(message), "{backup}: {err}");
+        }
+        let exec = Compose::parse(&svc("{ exec: [\"/app/strfry\", \"export\"] }")).unwrap();
+        exec.validate_declarations().unwrap();
+        let quiesced = Compose::parse(&svc("{ volume: d, quiesce: true }")).unwrap();
+        assert!(quiesced.services["a"].backup.as_ref().unwrap().quiesce);
     }
 }

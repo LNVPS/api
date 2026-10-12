@@ -1598,7 +1598,7 @@ interface AppBackup {
   id: number;
   run_id: string;                // groups the artifacts captured by one run
   service: string;               // compose service the artifact came from
-  method: "command" | "volume";  // app-native dump, or a tar of a volume
+  method: "command" | "volume" | "exec";  // dump in its own pod, tar of a volume, or the app's export run in its container
   artifact: string;              // download filename, e.g. "route96.sql.gz"
   state: "pending" | "running" | "completed" | "failed";
   size_bytes?: number;           // once uploaded

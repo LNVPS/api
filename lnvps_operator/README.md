@@ -147,6 +147,10 @@ secret verbs: `rolebindings: create, patch`, and `bind` on
 `lnvps-operator-appns` by name. `bind` exists for exactly this — it permits a
 binding to a named role without holding that role's permissions.
 
+`lnvps-operator-appns` also carries `pods/exec` (`get`, `create`): an `exec:`
+backup runs the app's export inside its own container and writes the stream
+into the backup Job's pod, both in that namespace.
+
 **What this does and does not buy.** Those two rules are themselves
 cluster-wide — a ClusterRole cannot scope `rolebindings` to namespaces that do
 not exist yet — so a stolen token can write the same binding into `kube-system`
