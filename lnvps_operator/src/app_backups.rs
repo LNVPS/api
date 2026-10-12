@@ -676,6 +676,36 @@ async fn finished(
     }
 }
 
+const EXEC_ATTEMPTS: u32 = 3;
+const MARKER_TAIL: usize = 128;
+
+pub fn wrap_with_marker(argv: &[String], nonce: &str) -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        format!(
+            "{}; rc=$?; printf '\\nLNVPS-END-%s %s\\n' '{nonce}' \"$rc\"",
+            shell_join(argv)
+        ),
+    ]
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ExportEnd {
+    Exited(i32),
+    Truncated,
+}
+
+pub fn split_marker(tail: &[u8], nonce: &str) -> Option<(usize, i32)> {
+    let needle = format!("\nLNVPS-END-{nonce} ");
+    let pos = tail
+        .windows(needle.len())
+        .rposition(|w| w == needle.as_bytes())?;
+    let rest = std::str::from_utf8(&tail[pos + needle.len()..]).ok()?;
+    let rc = rest.strip_suffix('\n')?.parse().ok()?;
+    Some((pos, rc))
+}
+
 async fn pump_exec(ctx: &Context, backup: &AppDeploymentBackup, argv: &[String]) -> Result<()> {
     let store = ctx
         .object_store
@@ -686,39 +716,66 @@ async fn pump_exec(ctx: &Context, backup: &AppDeploymentBackup, argv: &[String])
         .clone()
         .ok_or_else(|| anyhow!("a running backup has no object key"))?;
     let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace_name(backup.deployment_id));
-    let app_pod = running_pod(
-        &pods,
-        &label_selector(&service_labels(backup.deployment_id, &backup.service)),
-    )
-    .await?;
-    let mut source = pods
-        .exec(
-            &app_pod,
-            argv.to_vec(),
-            &AttachParams::default()
-                .container(&backup.service)
-                .stdout(true)
-                .stderr(true),
+
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        let app_pod = running_pod(
+            &pods,
+            &label_selector(&service_labels(backup.deployment_id, &backup.service)),
         )
         .await?;
-    let source_err = drain_stderr(&mut source).await;
-    let mut stdout = source
-        .stdout()
-        .ok_or_else(|| anyhow!("the export has no stdout"))?;
+        let nonce = Uuid::new_v4().simple().to_string();
+        let mut source = pods
+            .exec(
+                &app_pod,
+                wrap_with_marker(argv, &nonce),
+                &AttachParams::default()
+                    .container(&backup.service)
+                    .stdout(true)
+                    .stderr(true),
+            )
+            .await?;
+        let source_err = drain_stderr(&mut source).await;
+        let mut stdout = source
+            .stdout()
+            .ok_or_else(|| anyhow!("the export has no stdout"))?;
 
-    let upload_id = store.create_multipart(&key).await?;
-    let streamed = stream_gzip_parts(store, &key, &upload_id, &mut stdout).await;
-    let exited = finished(source, source_err, "the app's export").await;
-    let parts = match (streamed, exited) {
-        (Ok(parts), Ok(())) => parts,
-        (Err(e), _) | (_, Err(e)) => {
-            if let Err(abort) = store.abort_multipart(&key, &upload_id).await {
-                warn!("backup {}: could not abort the upload: {abort}", backup.id);
+        let upload_id = store.create_multipart(&key).await?;
+        let streamed = stream_gzip_parts(store, &key, &upload_id, &mut stdout, &nonce).await;
+        let exited = finished(source, source_err, "the app's export").await;
+        let outcome = match (streamed, exited) {
+            (Ok((parts, ExportEnd::Exited(0))), Ok(())) => Ok(Some(parts)),
+            (Ok((_, ExportEnd::Exited(rc))), _) => {
+                Err(anyhow!("the app's export exited with {rc}"))
             }
-            return Err(e);
+            (Ok((_, ExportEnd::Truncated)), _) => Ok(None),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        };
+        match outcome {
+            Ok(Some(parts)) => {
+                store.complete_multipart(&key, &upload_id, &parts).await?;
+                break;
+            }
+            other => {
+                if let Err(abort) = store.abort_multipart(&key, &upload_id).await {
+                    warn!("backup {}: could not abort the upload: {abort}", backup.id);
+                }
+                match other {
+                    Err(e) => return Err(e),
+                    _ if attempt >= EXEC_ATTEMPTS => {
+                        return Err(anyhow!(
+                            "the export stream ended early {EXEC_ATTEMPTS} times"
+                        ));
+                    }
+                    _ => warn!(
+                        "backup {}: the export stream ended early, retrying ({attempt}/{EXEC_ATTEMPTS})",
+                        backup.id
+                    ),
+                }
+            }
         }
-    };
-    store.complete_multipart(&key, &upload_id, &parts).await?;
+    }
 
     let size = store.size(&key).await?;
     let mut row = ctx.db.get_app_deployment_backup(backup.id).await?;
@@ -739,7 +796,8 @@ pub async fn stream_gzip_parts<R: tokio::io::AsyncRead + Unpin>(
     key: &str,
     upload_id: &str,
     reader: &mut R,
-) -> Result<Vec<(u32, String)>> {
+    nonce: &str,
+) -> Result<(Vec<(u32, String)>, ExportEnd)> {
     use std::io::Write;
     let mut encoder = flate2::write::GzEncoder::new(
         Vec::with_capacity(PART_BYTES + 64 * 1024),
@@ -747,12 +805,18 @@ pub async fn stream_gzip_parts<R: tokio::io::AsyncRead + Unpin>(
     );
     let mut parts: Vec<(u32, String)> = Vec::new();
     let mut buf = vec![0u8; 64 * 1024];
+    let mut held: Vec<u8> = Vec::new();
     loop {
         let n = reader.read(&mut buf).await?;
         if n == 0 {
             break;
         }
-        encoder.write_all(&buf[..n])?;
+        held.extend_from_slice(&buf[..n]);
+        if held.len() > MARKER_TAIL {
+            let release = held.len() - MARKER_TAIL;
+            encoder.write_all(&held[..release])?;
+            held.drain(..release);
+        }
         if encoder.get_ref().len() >= PART_BYTES {
             let chunk = std::mem::take(encoder.get_mut());
             let number = parts.len() as u32 + 1;
@@ -762,6 +826,13 @@ pub async fn stream_gzip_parts<R: tokio::io::AsyncRead + Unpin>(
             ));
         }
     }
+    let end = match split_marker(&held, nonce) {
+        Some((pos, rc)) => {
+            encoder.write_all(&held[..pos])?;
+            ExportEnd::Exited(rc)
+        }
+        None => return Ok((parts, ExportEnd::Truncated)),
+    };
     let last = encoder.finish()?;
     if !last.is_empty() || parts.is_empty() {
         let number = parts.len() as u32 + 1;
@@ -770,7 +841,7 @@ pub async fn stream_gzip_parts<R: tokio::io::AsyncRead + Unpin>(
             store.upload_part(key, upload_id, number, last).await?,
         ));
     }
-    Ok(parts)
+    Ok((parts, end))
 }
 
 /// Which pending backups may start this pass, oldest first.
@@ -1792,9 +1863,12 @@ mod tests {
                 x as u8
             })
             .collect();
-        let parts = stream_gzip_parts(&store, "k", "up", &mut input.as_slice())
+        let mut framed = input.clone();
+        framed.extend_from_slice(b"\nLNVPS-END-n1 0\n");
+        let (parts, end) = stream_gzip_parts(&store, "k", "up", &mut framed.as_slice(), "n1")
             .await
             .unwrap();
+        assert_eq!(end, ExportEnd::Exited(0));
         assert_eq!(
             parts,
             vec![(1, "\"e1\"".to_string()), (2, "\"e2\"".to_string())]
@@ -1807,10 +1881,31 @@ mod tests {
         assert_eq!(out, input);
 
         captured.lock().unwrap().clear();
-        let empty = stream_gzip_parts(&store, "k", "up", &mut [].as_slice())
+        let (empty, end) = stream_gzip_parts(
+            &store,
+            "k",
+            "up",
+            &mut b"\nLNVPS-END-n2 0\n".as_slice(),
+            "n2",
+        )
+        .await
+        .unwrap();
+        assert_eq!((empty.len(), end), (1, ExportEnd::Exited(0)));
+
+        let (_, cut) = stream_gzip_parts(&store, "k", "up", &mut input.as_slice(), "n3")
             .await
             .unwrap();
-        assert_eq!(empty.len(), 1);
+        assert_eq!(cut, ExportEnd::Truncated);
+        let (_, failed) = stream_gzip_parts(
+            &store,
+            "k",
+            "up",
+            &mut b"partial\nLNVPS-END-n4 3\n".as_slice(),
+            "n4",
+        )
+        .await
+        .unwrap();
+        assert_eq!(failed, ExportEnd::Exited(3));
     }
 
     #[test]
@@ -1882,5 +1977,27 @@ mod tests {
             ),
             AppBackupMethod::Exec
         );
+    }
+
+    #[test]
+    fn the_end_marker_survives_the_shell_and_is_found() {
+        let argv = vec!["printf".to_string(), "it's\nfine".to_string()];
+        let out = std::process::Command::new("sh")
+            .args(&wrap_with_marker(&argv, "abc")[1..])
+            .output()
+            .unwrap();
+        let (pos, rc) = split_marker(&out.stdout, "abc").unwrap();
+        assert_eq!(&out.stdout[..pos], b"it's\nfine");
+        assert_eq!(rc, 0);
+
+        let failing = std::process::Command::new("sh")
+            .args(&wrap_with_marker(&["false".to_string()], "def")[1..])
+            .output()
+            .unwrap();
+        assert_eq!(split_marker(&failing.stdout, "def").map(|m| m.1), Some(1));
+
+        assert_eq!(split_marker(b"data\nLNVPS-END-x 0\n", "y"), None);
+        assert_eq!(split_marker(b"data\nLNVPS-END-x 0", "x"), None);
+        assert_eq!(split_marker(b"data\nLNVPS-END-x zz\n", "x"), None);
     }
 }
