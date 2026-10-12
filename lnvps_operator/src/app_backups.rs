@@ -745,12 +745,13 @@ async fn pump_exec(ctx: &Context, backup: &AppDeploymentBackup, argv: &[String])
         let streamed = stream_gzip_parts(store, &key, &upload_id, &mut stdout, &nonce).await;
         let exited = finished(source, source_err, "the app's export").await;
         let outcome = match (streamed, exited) {
+            (Err(e), _) => Err(e),
+            (Ok((_, ExportEnd::Truncated)), _) => Ok(None),
+            (Ok(_), Err(e)) => Err(e),
             (Ok((parts, ExportEnd::Exited(0))), Ok(())) => Ok(Some(parts)),
-            (Ok((_, ExportEnd::Exited(rc))), _) => {
+            (Ok((_, ExportEnd::Exited(rc))), Ok(())) => {
                 Err(anyhow!("the app's export exited with {rc}"))
             }
-            (Ok((_, ExportEnd::Truncated)), _) => Ok(None),
-            (Err(e), _) | (_, Err(e)) => Err(e),
         };
         match outcome {
             Ok(Some(parts)) => {
