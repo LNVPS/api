@@ -1,3 +1,4 @@
+mod app_backups;
 mod apps;
 mod contact;
 mod docs;
@@ -25,6 +26,7 @@ mod webhook;
 
 use crate::settings::Settings;
 use crate::subscription::SubscriptionHandler;
+pub use app_backups::router as app_backups_router;
 pub use apps::router as apps_router;
 pub use contact::router as contacts_router;
 pub use docs::router as docs_router;

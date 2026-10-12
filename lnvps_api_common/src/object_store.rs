@@ -59,6 +59,32 @@ pub struct ObjectStoreConfig {
     pub path_style: bool,
 }
 
+pub const BACKUP_ACCESS_KEY_ENV: &str = "LNVPS_BACKUP_ACCESS_KEY";
+pub const BACKUP_SECRET_KEY_ENV: &str = "LNVPS_BACKUP_SECRET_KEY";
+
+impl ObjectStoreConfig {
+    pub fn with_credentials(
+        mut self,
+        access_key: Option<String>,
+        secret_key: Option<String>,
+    ) -> Self {
+        if let Some(key) = access_key.filter(|k| !k.trim().is_empty()) {
+            self.access_key = key.trim().to_string();
+        }
+        if let Some(key) = secret_key.filter(|k| !k.trim().is_empty()) {
+            self.secret_key = key.trim().to_string();
+        }
+        self
+    }
+
+    pub fn with_env_credentials(self) -> Self {
+        self.with_credentials(
+            std::env::var(BACKUP_ACCESS_KEY_ENV).ok(),
+            std::env::var(BACKUP_SECRET_KEY_ENV).ok(),
+        )
+    }
+}
+
 fn default_region() -> String {
     "us-east-1".to_string()
 }
@@ -634,5 +660,32 @@ mod tests {
 
     fn signature_of(url: &str) -> String {
         url.split("X-Amz-Signature=").nth(1).unwrap().to_string()
+    }
+
+    #[test]
+    fn credentials_prefer_the_override() {
+        let base = ObjectStoreConfig {
+            endpoint: "https://s3.example.com".to_string(),
+            region: "us-east-1".to_string(),
+            bucket: "b".to_string(),
+            access_key: "from-config".to_string(),
+            secret_key: "from-config".to_string(),
+            path_style: true,
+        };
+        let overridden = base
+            .clone()
+            .with_credentials(Some("from-env".to_string()), Some("  secret  ".to_string()));
+        assert_eq!(overridden.access_key, "from-env");
+        assert_eq!(overridden.secret_key, "secret");
+
+        let untouched = base.clone().with_credentials(None, Some("   ".to_string()));
+        assert_eq!(untouched.access_key, "from-config");
+        assert_eq!(untouched.secret_key, "from-config");
+
+        if std::env::var(BACKUP_ACCESS_KEY_ENV).is_err()
+            && std::env::var(BACKUP_SECRET_KEY_ENV).is_err()
+        {
+            assert_eq!(base.with_env_credentials().access_key, "from-config");
+        }
     }
 }

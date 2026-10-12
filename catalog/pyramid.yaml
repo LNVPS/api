@@ -12,3 +12,4 @@ services:
       NO_AUTO_UPDATES: "true"
     volumes:
       - { name: data, path: /app/data, size: 5Gi, label: events }
+    backup: { volume: data, artifact: pyramid-data }

@@ -6502,6 +6502,30 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    async fn list_app_deployment_backups_paginated(
+        &self,
+        deployment_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AppDeploymentBackup>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM app_deployment_backup WHERE deployment_id = ? AND deleted = 0",
+        )
+        .bind(deployment_id)
+        .fetch_one(&self.db)
+        .await?;
+        let rows = sqlx::query_as(
+            "SELECT * FROM app_deployment_backup WHERE deployment_id = ? AND deleted = 0 \
+             ORDER BY created DESC, id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(deployment_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        Ok((rows, total as u64))
+    }
+
     async fn get_app_deployment_backup(&self, id: u64) -> DbResult<AppDeploymentBackup> {
         Ok(
             sqlx::query_as("SELECT * FROM app_deployment_backup WHERE id = ? AND deleted = 0")

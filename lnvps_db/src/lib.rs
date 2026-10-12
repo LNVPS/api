@@ -1960,6 +1960,12 @@ pub trait LNVpsDbBase: Send + Sync {
         &self,
         deployment_id: u64,
     ) -> DbResult<Vec<AppDeploymentBackup>>;
+    async fn list_app_deployment_backups_paginated(
+        &self,
+        deployment_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AppDeploymentBackup>, u64)>;
     /// One backup by id. Callers check ownership through its deployment.
     async fn get_app_deployment_backup(&self, id: u64) -> DbResult<AppDeploymentBackup>;
     /// Record a backup artifact; returns its id. `id` on the input is ignored.

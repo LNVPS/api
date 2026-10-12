@@ -113,31 +113,6 @@ pub fn backup_object_key(deployment_id: u64, run_id: &str, artifact: &str) -> St
     format!("deployments/{deployment_id}/{run_id}/{artifact}")
 }
 
-/// Filename for a service's artifact, including the compression suffix.
-///
-/// The catalog may name the payload (`route96.sql`); the suffix is ours,
-/// because what the suffix describes is how this code compressed it.
-pub fn artifact_name(service: &str, backup: &Backup) -> String {
-    match (&backup.command, &backup.volume) {
-        (Some(_), _) => format!(
-            "{}.gz",
-            backup
-                .artifact
-                .clone()
-                .unwrap_or_else(|| format!("{service}.dump"))
-        ),
-        (_, Some(volume)) => format!(
-            "{}.tar.gz",
-            backup
-                .artifact
-                .clone()
-                .unwrap_or_else(|| format!("{service}-{volume}"))
-        ),
-        // Unreachable for a validated compose, which requires exactly one.
-        _ => format!("{service}.gz"),
-    }
-}
-
 /// Which of the two capture methods a service's `backup:` selects.
 pub fn backup_method(backup: &Backup) -> AppBackupMethod {
     if backup.volume.is_some() {
@@ -583,7 +558,7 @@ async fn schedule_one(
             run_id: run_id.clone(),
             service: service.to_string(),
             method: backup_method(backup),
-            artifact: artifact_name(service, backup),
+            artifact: backup.artifact_name(service),
             object_key: None,
             size_bytes: None,
             state: AppBackupState::Pending,
@@ -760,10 +735,9 @@ async fn prune_backups(ctx: &Context, store: &ObjectStore, cluster_id: u64) -> R
         let Ok(app) = ctx.db.get_app(deployment.app_id).await else {
             continue;
         };
-        let retention = match Compose::parse(&app.compose) {
-            Ok(c) => c.backup.as_ref().map(|p| p.retention_or_default()),
-            Err(_) => None,
-        };
+        let retention = Compose::parse(&app.compose)
+            .ok()
+            .and_then(|c| retention_for(&c));
         let Some(retention) = retention else {
             continue;
         };
@@ -784,6 +758,16 @@ async fn prune_backups(ctx: &Context, store: &ObjectStore, cluster_id: u64) -> R
         }
     }
     Ok(())
+}
+
+fn retention_for(compose: &Compose) -> Option<u32> {
+    match &compose.backup {
+        Some(policy) => Some(policy.retention_or_default()),
+        None if !compose.backup_services().is_empty() => {
+            Some(lnvps_compose::DEFAULT_BACKUP_RETENTION)
+        }
+        None => None,
+    }
 }
 
 /// The rows belonging to runs past the newest `retention` **restorable** runs.
@@ -1077,8 +1061,8 @@ mod tests {
         let c = compose();
         let db = c.services.get("db").unwrap().backup.as_ref().unwrap();
         let blobs = c.services.get("blobs").unwrap().backup.as_ref().unwrap();
-        assert_eq!(artifact_name("db", db), "route96.sql.gz");
-        assert_eq!(artifact_name("blobs", blobs), "blobs-files.tar.gz");
+        assert_eq!(db.artifact_name("db"), "route96.sql.gz");
+        assert_eq!(blobs.artifact_name("blobs"), "blobs-files.tar.gz");
         assert_eq!(backup_method(db), AppBackupMethod::Command);
         assert_eq!(backup_method(blobs), AppBackupMethod::Volume);
 
@@ -1087,10 +1071,13 @@ mod tests {
             Compose::parse("services:\n  a:\n    image: x\n    backup: { command: [\"sh\"] }\n")
                 .unwrap();
         assert_eq!(
-            artifact_name(
-                "a",
-                bare.services.get("a").unwrap().backup.as_ref().unwrap()
-            ),
+            bare.services
+                .get("a")
+                .unwrap()
+                .backup
+                .as_ref()
+                .unwrap()
+                .artifact_name("a"),
             "a.dump.gz"
         );
 
@@ -1415,5 +1402,24 @@ mod tests {
         assert_eq!(truncate(&"x".repeat(600), 500).len(), 500);
         // Counted in characters, so a multi-byte message is not cut mid-symbol.
         assert_eq!(truncate("äöü", 2), "äö");
+    }
+
+    #[test]
+    fn manual_only_apps_keep_the_default_retention() {
+        let scheduled = Compose::parse(
+            "services:\n  a:\n    image: x\n    volumes:\n      - { name: d, path: /d, size: 1Gi }\n    backup: { volume: d }\nbackup: { schedule: \"0 3 * * *\", retention: 3 }\n",
+        )
+        .unwrap();
+        assert_eq!(retention_for(&scheduled), Some(3));
+        let manual = Compose::parse(
+            "services:\n  a:\n    image: x\n    volumes:\n      - { name: d, path: /d, size: 1Gi }\n    backup: { volume: d }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            retention_for(&manual),
+            Some(lnvps_compose::DEFAULT_BACKUP_RETENTION)
+        );
+        let none = Compose::parse("services:\n  a:\n    image: x\n").unwrap();
+        assert_eq!(retention_for(&none), None);
     }
 }

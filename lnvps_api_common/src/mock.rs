@@ -6194,6 +6194,23 @@ impl LNVpsDbBase for MockDb {
         Ok(out)
     }
 
+    async fn list_app_deployment_backups_paginated(
+        &self,
+        deployment_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AppDeploymentBackup>, u64)> {
+        let all = self.list_app_deployment_backups(deployment_id).await?;
+        let total = all.len() as u64;
+        Ok((
+            all.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
     async fn get_app_deployment_backup(&self, id: u64) -> DbResult<AppDeploymentBackup> {
         self.app_deployment_backups
             .lock()
@@ -10020,6 +10037,16 @@ mod tests {
         assert_eq!(
             listed.iter().map(|b| b.id).collect::<Vec<_>>(),
             vec![blobs, db_backup]
+        );
+
+        let (page, total) = db
+            .list_app_deployment_backups_paginated(here, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(
+            page.iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![db_backup]
         );
 
         // The operator only sees the backups on its own cluster.

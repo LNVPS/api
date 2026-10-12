@@ -1063,6 +1063,7 @@ mod tests {
             format!(
                 "services:\n  db:\n    image: mariadb:11@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    user: \"999\"\n    \
                  volumes:\n      - {{ name: data, path: /var/lib/mysql, size: 5Gi }}\n    \
+                 backup: {{ volume: data }}\n    \
                  scratch:\n{scratch}  \
                  app:\n    image: example/app:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    user: \"1000\"\n    \
                  depends_on: [db]\n    ports:\n      \
@@ -1312,7 +1313,8 @@ mod tests {
             format!(
                 "services:\n  web:\n    image: example/web:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n{user}    \
                  ports:\n      - {{ name: http, container: 80, protocol: http, expose: ingress }}\n    \
-                 volumes:\n      - {{ name: data, path: /data, size: 1Gi }}\n"
+                 volumes:\n      - {{ name: data, path: /data, size: 1Gi }}\n    \
+                 backup: {{ command: [\"true\"] }}\n"
             )
         };
         let body = |compose: String| {
@@ -1355,6 +1357,22 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
+        let no_backup =
+            compose("    user: \"1000\"\n").replace("    backup: { command: [\"true\"] }\n", "");
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "compose": no_backup }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = resp.text().await.unwrap();
+        assert!(
+            err.contains("no service declares a `backup:` method"),
+            "{err}"
+        );
+
         let resp = client
             .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
             .await
@@ -1374,6 +1392,7 @@ mod tests {
         let compose = |vol: &str| {
             format!(
                 "services:\n  db:\n    image: example/db:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    user: \"1000\"\n    \
+                 backup: {{ command: [\"true\"] }}\n    \
                  volumes:\n      - {vol}\n"
             )
         };

@@ -91,3 +91,8 @@ agent:
 # covered by unit tests in lnvps_api_common::rate_limit.
 rate-limit:
   enabled: false
+app-backups:
+  endpoint: "http://localhost:9400"
+  bucket: "lnvps-e2e-app-backups"
+  access-key: "e2eaccesskey"
+  secret-key: "e2esecretkey"

@@ -111,6 +111,9 @@ pub struct Settings {
     /// configured — both issue the same stateless session JWTs. When omitted,
     /// `Bearer` session auth is disabled and only Nostr (NIP-98) auth works.
     pub session: Option<SessionConfig>,
+
+    #[serde(default)]
+    pub app_backups: Option<lnvps_api_common::object_store::ObjectStoreConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -752,6 +755,7 @@ pub fn mock_settings() -> Settings {
         oauth: None,
         webauthn: None,
         session: None,
+        app_backups: None,
     }
 }
 

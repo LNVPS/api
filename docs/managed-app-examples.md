@@ -86,6 +86,21 @@ that exists only inside the service's own container, and fails there. The dump
 sees the service's resolved env, so a generated password is available to it as
 the app has it.
 
+**An app that declares a volume must declare at least one `backup:` method.**
+App create and update refuse it otherwise, and so does `compose-validate`: a
+customer has to be able to take their data away. It is an authoring rule like
+the others in `validate_declarations`, so a stored app that predates it keeps
+reconciling. A stateless app with no volumes needs none.
+
+A `backup:` method without a top-level schedule still lets the customer start a
+run from the deployment page (`POST /api/v1/app-deployments/{id}/backups`) and
+download the result. Those runs keep the newest 7, the same default a schedule
+gets. A service declares one method, so HAVEN backs up its event store and not
+its Blossom media. The relays use `volume:`: a `command:` runs in its own pod
+without the service's volumes, so `strfry export` and its kind have nothing to
+read. A tar of a live LMDB, SQLite or Badger store is taken while the app
+writes to it.
+
 **`volumes[].label`** — optional, and what a **buyer** gets from that volume:
 `events`, `media`, `database`, `files`. Surfaced per volume on
 `GET /api/v1/apps`, so a listing can say "10 GB events + 20 GB media" instead of

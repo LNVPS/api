@@ -1574,6 +1574,42 @@ interface PatchAppDeploymentRequest {
 - **Response**: `true` — stops billing (deactivates the subscription) and tears the deployment down (namespace + volumes removed).
 - **Error**: `404` if not found or not owned by you
 
+#### Deployment Backups
+Apps whose compose declares a `backup:` method can be backed up. A run captures every such service at once, one artifact per service, into LNVPS object storage. Apps with a `backup:` schedule are also backed up automatically; every run counts towards the app's retention (7 runs when it declares no schedule), and older runs are deleted with their files.
+
+- **GET** `/api/v1/app-deployments/{id}/backups?limit=&offset=`
+  - **Auth**: Required
+  - **Response**: paginated `AppBackup[]`, newest first (`limit` defaults to 50, max 100). Artifacts of one run share a `run_id`.
+- **POST** `/api/v1/app-deployments/{id}/backups`
+  - **Auth**: Required
+  - **Response**: `AppBackup[]`, the new run's artifacts in `pending` state. The operator picks them up within a minute.
+  - **Errors**: `400` when backups are not available, the deployment is not `running`, the app declares no backup method, or a manual run started less than 60 minutes ago; `409` while a run is still pending or running; `404` if not found or not owned by you.
+- **GET** `/api/v1/app-deployments/{id}/backups/{backup_id}/download`
+  - **Auth**: Required
+  - **Response**: `{ url: string, filename: string, expires: string }`. `url` is a presigned download link valid for 60 minutes; open it directly, it needs no `Authorization` header. The response names the file `filename`.
+  - **Errors**: `400` when the backup is not `completed`; `404` if the backup does not belong to this deployment or the deployment is not yours.
+- **DELETE** `/api/v1/app-deployments/{id}/backups/{backup_id}`
+  - **Auth**: Required
+  - **Response**: `null`. Deletes the stored file, then the record.
+  - **Errors**: `409` while the backup is pending or running; `404` as above.
+
+```typescript
+interface AppBackup {
+  id: number;
+  run_id: string;                // groups the artifacts captured by one run
+  service: string;               // compose service the artifact came from
+  method: "command" | "volume";  // app-native dump, or a tar of a volume
+  artifact: string;              // download filename, e.g. "route96.sql.gz"
+  state: "pending" | "running" | "completed" | "failed";
+  size_bytes?: number;           // once uploaded
+  message?: string;              // failure detail
+  scheduled: boolean;            // started by the app's schedule rather than by you
+  created: string;
+  started?: string;
+  completed?: string;
+}
+```
+
 The catalog + read endpoints below are unauthenticated-safe views of what you can deploy and what you're running.
 
 #### List Catalog Apps

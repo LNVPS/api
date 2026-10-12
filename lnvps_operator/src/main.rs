@@ -32,12 +32,6 @@ const ENCRYPTION_KEY_ENV: &str = "LNVPS_ENCRYPTION_KEY";
 /// non-sensitive settings in a ConfigMap and read the DSN from a Secret.
 const DATABASE_URL_ENV: &str = "LNVPS_DATABASE_URL";
 
-/// Object storage credentials, for the same reason as [`DATABASE_URL_ENV`]:
-/// the config file lives in a ConfigMap, and a bucket key does not belong in
-/// one. The environment wins over anything in the file.
-const BACKUP_ACCESS_KEY_ENV: &str = "LNVPS_BACKUP_ACCESS_KEY";
-const BACKUP_SECRET_KEY_ENV: &str = "LNVPS_BACKUP_SECRET_KEY";
-
 /// Database field-encryption configuration (mirrors the API's `EncryptionConfig`
 /// so both sides use the same key).
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -285,20 +279,6 @@ fn database_url(configured: &str, from_env: Option<String>) -> Result<String> {
 /// Apply environment-supplied bucket credentials over whatever the config file
 /// carried, so the keys can live in a Secret while the rest stays in a
 /// ConfigMap. An empty or unset variable leaves the file's value alone.
-fn backup_credentials(
-    mut config: ObjectStoreConfig,
-    access_key: Option<String>,
-    secret_key: Option<String>,
-) -> ObjectStoreConfig {
-    if let Some(key) = access_key.filter(|k| !k.trim().is_empty()) {
-        config.access_key = key.trim().to_string();
-    }
-    if let Some(key) = secret_key.filter(|k| !k.trim().is_empty()) {
-        config.secret_key = key.trim().to_string();
-    }
-    config
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // kube (via hyper-rustls) and sqlx's TLS both use rustls, but the dependency
@@ -350,11 +330,7 @@ async fn main() -> Result<()> {
     // Backups are opt-in: without a bucket, nothing is scheduled and nothing
     // runs, which is how every operator behaved before backups existed.
     let object_store = match settings.backups.as_ref() {
-        Some(cfg) => Some(ObjectStore::new(backup_credentials(
-            cfg.store.clone(),
-            std::env::var(BACKUP_ACCESS_KEY_ENV).ok(),
-            std::env::var(BACKUP_SECRET_KEY_ENV).ok(),
-        ))?),
+        Some(cfg) => Some(ObjectStore::new(cfg.store.clone().with_env_credentials())?),
         None => {
             if settings.app_cluster_id.is_some() {
                 info!("No backup storage configured; app deployment backups are disabled");
@@ -520,8 +496,7 @@ async fn trigger_listener(
     // rather than each reconciling every trigger.
     let consumer = format!("operator-{}", uuid::Uuid::new_v4());
     let commander = loop {
-        match RedisWorkCommander::new_for_stream(&redis_url, &stream, "operator", &consumer).await
-        {
+        match RedisWorkCommander::new_for_stream(&redis_url, &stream, "operator", &consumer).await {
             Ok(c) => break c,
             Err(e) => {
                 error!(
@@ -665,31 +640,6 @@ mod tests {
             minimal.backup_uploader_image(),
             app_backups::DEFAULT_UPLOADER_IMAGE
         );
-    }
-
-    /// A bucket key does not belong in a ConfigMap, so the environment wins --
-    /// but an unset or blank variable must not blank a configured credential.
-    #[test]
-    fn backup_credentials_prefer_the_environment() {
-        let base = ObjectStoreConfig {
-            endpoint: "https://s3.example.com".to_string(),
-            region: "us-east-1".to_string(),
-            bucket: "b".to_string(),
-            access_key: "from-config".to_string(),
-            secret_key: "from-config".to_string(),
-            path_style: true,
-        };
-        let overridden = backup_credentials(
-            base.clone(),
-            Some("from-env".to_string()),
-            Some("  secret  ".to_string()),
-        );
-        assert_eq!(overridden.access_key, "from-env");
-        assert_eq!(overridden.secret_key, "secret");
-
-        let untouched = backup_credentials(base, None, Some("   ".to_string()));
-        assert_eq!(untouched.access_key, "from-config");
-        assert_eq!(untouched.secret_key, "from-config");
     }
 
     /// A Job that outlived its upload URL would fail with a signature error

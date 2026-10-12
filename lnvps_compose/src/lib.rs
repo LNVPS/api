@@ -750,6 +750,26 @@ fn compile_pattern(pattern: &str) -> Result<regex::Regex> {
         .map_err(|e| anyhow!("pattern '{pattern}' is not a valid regex: {e}"))
 }
 
+impl Backup {
+    pub fn artifact_name(&self, service: &str) -> String {
+        match (&self.command, &self.volume) {
+            (Some(_), _) => format!(
+                "{}.gz",
+                self.artifact
+                    .clone()
+                    .unwrap_or_else(|| format!("{service}.dump"))
+            ),
+            (_, Some(volume)) => format!(
+                "{}.tar.gz",
+                self.artifact
+                    .clone()
+                    .unwrap_or_else(|| format!("{service}-{volume}"))
+            ),
+            _ => format!("{service}.gz"),
+        }
+    }
+}
+
 /// Longest accepted `backup.artifact` filename.
 const MAX_ARTIFACT_NAME_LEN: usize = 64;
 
@@ -951,6 +971,16 @@ impl Compose {
                      or `user: root` if its entrypoint starts as root."
                 );
             }
+        }
+        if self.services.values().any(|s| !s.volumes.is_empty())
+            && self.backup_services().is_empty()
+        {
+            bail!(
+                "the app stores data in volumes but no service declares a `backup:` method, so a \
+                 customer could never take their data away. Add `backup: {{ volume: <name> }}` (a \
+                 tar of the volume) or `backup: {{ command: [...] }}` (an app-native dump) to the \
+                 service that holds it"
+            );
         }
         self.validate_merge_templates()?;
         for name in self.referenced_vars() {
@@ -2692,7 +2722,8 @@ config:
         let svc = |user: &str| {
             format!(
                 "services:\n  a:\n    image: x\n{user}    \
-                 volumes:\n      - {{ name: data, path: /data, size: 1Gi }}\n"
+                 volumes:\n      - {{ name: data, path: /data, size: 1Gi }}\n    \
+                 backup: {{ volume: data }}\n"
             )
         };
 
@@ -3476,5 +3507,58 @@ config:
             );
             assert!(Compose::parse(&doc).is_err(), "accepted group {group}");
         }
+    }
+
+    #[test]
+    fn backup_artifact_names() {
+        let named = Backup {
+            command: Some(vec!["sh".into()]),
+            volume: None,
+            artifact: Some("route96.sql".into()),
+        };
+        assert_eq!(named.artifact_name("db"), "route96.sql.gz");
+        let dump = Backup {
+            command: Some(vec!["sh".into()]),
+            volume: None,
+            artifact: None,
+        };
+        assert_eq!(dump.artifact_name("db"), "db.dump.gz");
+        let volume = Backup {
+            command: None,
+            volume: Some("data".into()),
+            artifact: None,
+        };
+        assert_eq!(volume.artifact_name("relay"), "relay-data.tar.gz");
+        let neither = Backup {
+            command: None,
+            volume: None,
+            artifact: None,
+        };
+        assert_eq!(neither.artifact_name("x"), "x.gz");
+    }
+
+    #[test]
+    fn apps_with_volumes_must_declare_a_backup() {
+        let without = Compose::parse(
+            "services:\n  a:\n    image: x\n    user: \"1000\"\n    volumes:\n      - { name: d, path: /d, size: 1Gi }\n",
+        )
+        .unwrap();
+        let err = without.validate_declarations().unwrap_err().to_string();
+        assert!(
+            err.contains("no service declares a `backup:` method"),
+            "{err}"
+        );
+        without.validate().unwrap();
+
+        Compose::parse(
+            "services:\n  a:\n    image: x\n    user: \"1000\"\n    volumes:\n      - { name: d, path: /d, size: 1Gi }\n    backup: { volume: d }\n",
+        )
+        .unwrap()
+        .validate_declarations()
+        .unwrap();
+        Compose::parse("services:\n  a:\n    image: x\n")
+            .unwrap()
+            .validate_declarations()
+            .unwrap();
     }
 }

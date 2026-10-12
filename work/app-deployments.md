@@ -226,10 +226,12 @@ Design (see "Backup execution" below for the detail):
       in `catalog/route96.yaml` and `catalog/buzz.yaml`, which both now carry a daily schedule.
 
 #### 6d — Customer API + docs
-- [ ] `POST /api/v1/app-deployments/{id}/backups` (start a run), `GET .../backups` (list),
-      `GET .../backups/{bid}/download` (redirect to a short-lived signed URL), `DELETE .../{bid}`.
-- [ ] Ownership checks on every route, opaque IDs only (never a client-supplied path).
-- [ ] e2e test, API_DOCUMENTATION.md, API_CHANGELOG.md.
+- [x] `POST /api/v1/app-deployments/{id}/backups` (start a run), `GET .../backups` (list),
+      `GET .../backups/{bid}/download` (JSON with a one-hour signed URL rather than a redirect,
+      because the web client authenticates with a header a browser navigation cannot send),
+      `DELETE .../{bid}`.
+- [x] Ownership checks on every route, opaque IDs only (never a client-supplied path).
+- [x] e2e test, API_DOCUMENTATION.md, API_CHANGELOG.md.
 
 #### Deferred to increment 6e — restore
 - [ ] Scale to 0, sanitized extraction (canonicalized entries, reject absolute paths / `..` /

@@ -104,7 +104,9 @@ async fn main() -> Result<(), Error> {
                 builder = builder.add_source(File::from(path.clone()));
             }
         }
-        builder.build()?.try_deserialize()?
+        let mut settings: Settings = builder.build()?.try_deserialize()?;
+        settings.app_backups = settings.app_backups.map(|c| c.with_env_credentials());
+        settings
     };
 
     // Email verification gates VM ordering, but it can only be delivered over
@@ -480,6 +482,7 @@ async fn main() -> Result<(), Error> {
             .merge(referral_router())
             .merge(marketplace_router())
             .merge(apps_router())
+            .merge(app_backups_router())
             .merge(vpn_router())
             .merge(routeserver_router())
             .merge(legal_router())

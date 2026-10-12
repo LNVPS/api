@@ -14,6 +14,7 @@
 
 mod admin_api;
 mod agent_chat;
+mod app_backups;
 pub mod client;
 pub mod db;
 mod discounts;
