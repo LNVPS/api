@@ -7,6 +7,7 @@ services:
       - { name: ws, container: 8080, protocol: http, expose: ingress }
     files:
       - path: /usr/src/app/config.toml
+        merge_from: config_overrides
         content: |
           [info]
           relay_url = "wss://${HOSTNAME}/"
@@ -17,8 +18,42 @@ services:
           [network]
           address = "0.0.0.0"
           port = 8080
+          ping_interval_seconds = ${ping_interval_seconds}
+          [options]
+          reject_future_seconds = ${reject_future_seconds}
+          [limits]
+          messages_per_sec = ${messages_per_sec}
+          subscriptions_per_min = ${subscriptions_per_min}
+          max_event_bytes = ${max_event_bytes}
+          max_ws_message_bytes = ${max_ws_message_bytes}
+          max_ws_frame_bytes = ${max_ws_frame_bytes}
+          broadcast_buffer = ${broadcast_buffer}
+          event_persist_buffer = ${event_persist_buffer}
+          event_kind_blacklist = [${event_kind_blacklist}]
+          limit_scrapers = ${limit_scrapers}
+          [authorization]
+          nip42_auth = ${nip42_auth}
+          nip42_dms = ${nip42_dms}
+          [verified_users]
+          mode = "${nip05_verification}"
     volumes:
       - { name: db, path: /usr/src/app/db, size: 5Gi, label: events }
 config:
-  - { name: relay_name, label: "Relay name", type: string, default: "My nostr-rs-relay" }
-  - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay" }
+  - { name: relay_name, label: "Relay name", type: string, default: "My nostr-rs-relay", pattern: '[^"\\\r\n]*' }
+  - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay", pattern: '[^"\\\r\n]*' }
+  - { name: event_kind_blacklist, label: "Blocked event kinds (comma-separated)", type: string, default: "", pattern: "([0-9]+(, *[0-9]+)*)?", group: "Access" }
+  - { name: limit_scrapers, label: "Reject kind-only and author-only queries", type: bool, default: "false", group: "Access" }
+  - { name: nip42_auth, label: "Enable NIP-42 AUTH", type: bool, default: "false", group: "Access" }
+  - { name: nip42_dms, label: "Only send DMs to their authenticated recipients", type: bool, default: "false", group: "Access" }
+  - { name: nip05_verification, label: "NIP-05 verification (disabled, passive or enabled)", type: string, default: "disabled",
+      pattern: "disabled|passive|enabled", group: "Access" }
+  - { name: ping_interval_seconds, label: "Websocket ping interval (seconds)", type: int, default: "300", pattern: "[1-9][0-9]*", group: "Limits" }
+  - { name: reject_future_seconds, label: "Reject events dated more than this far ahead (seconds)", type: int, default: "1800", pattern: "[1-9][0-9]*", group: "Limits" }
+  - { name: messages_per_sec, label: "Events accepted per second (0 for no limit)", type: int, default: "0", pattern: "[0-9]+", group: "Limits" }
+  - { name: subscriptions_per_min, label: "Subscriptions per minute per client (0 for no limit)", type: int, default: "0", pattern: "[0-9]+", group: "Limits" }
+  - { name: max_event_bytes, label: "Max event size (bytes, 0 for no limit)", type: int, default: "131072", pattern: "[0-9]+", group: "Limits" }
+  - { name: max_ws_message_bytes, label: "Max websocket message (bytes)", type: int, default: "131072", pattern: "[1-9][0-9]*", group: "Limits" }
+  - { name: max_ws_frame_bytes, label: "Max websocket frame (bytes)", type: int, default: "131072", pattern: "[1-9][0-9]*", group: "Limits" }
+  - { name: broadcast_buffer, label: "Broadcast buffer (events)", type: int, default: "16384", pattern: "[1-9][0-9]*", group: "Limits" }
+  - { name: event_persist_buffer, label: "Write buffer (events)", type: int, default: "4096", pattern: "[1-9][0-9]*", group: "Limits" }
+  - { name: config_overrides, label: "Advanced: config.toml overrides", type: file, default: "", group: "Advanced" }

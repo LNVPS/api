@@ -22,36 +22,41 @@ services:
       PRIVATE_RELAY_NAME: "${private_relay_name}"
       PRIVATE_RELAY_NPUB: "${owner_npub}"
       PRIVATE_RELAY_DESCRIPTION: "${private_relay_description}"
-      PRIVATE_RELAY_ICON: ""
-      CHAT_RELAY_NAME: "Chat relay"
+      PRIVATE_RELAY_ICON: "${private_relay_icon}"
+      CHAT_RELAY_NAME: "${chat_relay_name}"
       CHAT_RELAY_NPUB: "${owner_npub}"
-      CHAT_RELAY_DESCRIPTION: "Private chats for ${HOSTNAME}"
-      CHAT_RELAY_ICON: ""
-      OUTBOX_RELAY_NAME: "Outbox relay"
+      CHAT_RELAY_DESCRIPTION: "${chat_relay_description}"
+      CHAT_RELAY_ICON: "${chat_relay_icon}"
+      OUTBOX_RELAY_NAME: "${outbox_relay_name}"
       OUTBOX_RELAY_NPUB: "${owner_npub}"
-      OUTBOX_RELAY_DESCRIPTION: "Public messages and media for ${HOSTNAME}"
-      OUTBOX_RELAY_ICON: ""
-      INBOX_RELAY_NAME: "Inbox relay"
+      OUTBOX_RELAY_DESCRIPTION: "${outbox_relay_description}"
+      OUTBOX_RELAY_ICON: "${outbox_relay_icon}"
+      INBOX_RELAY_NAME: "${inbox_relay_name}"
       INBOX_RELAY_NPUB: "${owner_npub}"
-      INBOX_RELAY_DESCRIPTION: "Interactions for ${HOSTNAME}"
-      INBOX_RELAY_ICON: ""
-      # Bounds how far back the owner's history imports. Not startup-fatal if
-      # unparseable (import.go prints and returns), which is why it is a fixed
-      # default rather than an order-form field: a bad value silently imports
-      # nothing.
-      IMPORT_START_DATE: "2023-01-01"
+      INBOX_RELAY_DESCRIPTION: "${inbox_relay_description}"
+      INBOX_RELAY_ICON: "${inbox_relay_icon}"
+      INBOX_PULL_INTERVAL_SECONDS: "${inbox_pull_interval_seconds}"
+      IMPORT_START_DATE: "${import_start_date}"
       IMPORT_SEED_RELAYS_FILE: "relays_import.json"
       BLASTR_RELAYS_FILE: "relays_blastr.json"
-      WHITELISTED_NPUBS_FILE: ""
-      BLACKLISTED_NPUBS_FILE: ""
+      BLASTR_TIMEOUT_SECONDS: "${blastr_timeout_seconds}"
+      WHITELISTED_NPUBS_FILE: "whitelisted_npubs.json"
+      BLACKLISTED_NPUBS_FILE: "blacklisted_npubs.json"
+      WOT_DEPTH: "${wot_depth}"
+      WOT_MINIMUM_FOLLOWERS: "${wot_minimum_followers}"
+      WOT_REFRESH_INTERVAL: "${wot_refresh_interval}"
+      HAVEN_LOG_LEVEL: "${log_level}"
       BACKUP_PROVIDER: "none"
+    env_from: extra_env
     files:
       - path: /app/relays_import.json
-        content: |
-          ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
+        content: "${import_relays}"
       - path: /app/relays_blastr.json
-        content: |
-          ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
+        content: "${blastr_relays}"
+      - path: /app/whitelisted_npubs.json
+        content: "${whitelisted_npubs}"
+      - path: /app/blacklisted_npubs.json
+        content: "${blacklisted_npubs}"
     volumes:
       - { name: db, path: /app/db, size: 5Gi, label: events }
       - { name: blossom, path: /app/blossom, size: 5Gi, label: media }
@@ -61,9 +66,35 @@ config:
   # is bech32: `npub1` + 58 characters from the bech32 alphabet (no 1/b/i/o).
   - { name: owner_npub, label: "Owner npub", type: string, required: true,
       pattern: "npub1[02-9ac-hj-np-z]{58}" }
-  # The private relay's name and description are served as NIP-11 metadata, so
-  # they are customer-visible. The chat/outbox/inbox sets are functional relays
-  # rather than branding surfaces and stay fixed — eight more order-form fields
-  # would undo the one-click point of the catalog.
   - { name: private_relay_name, label: "Relay name", type: string, default: "My private relay" }
   - { name: private_relay_description, label: "Relay description", type: string, default: "A HAVEN relay" }
+  - { name: private_relay_icon, label: "Private relay icon URL", type: string, default: "", pattern: '(https?://\S+)?', group: "Relay info" }
+  - { name: chat_relay_name, label: "Chat relay name", type: string, default: "Chat relay", group: "Relay info" }
+  - { name: chat_relay_description, label: "Chat relay description", type: string, default: "Private chats", group: "Relay info" }
+  - { name: chat_relay_icon, label: "Chat relay icon URL", type: string, default: "", pattern: '(https?://\S+)?', group: "Relay info" }
+  - { name: outbox_relay_name, label: "Outbox relay name", type: string, default: "Outbox relay", group: "Relay info" }
+  - { name: outbox_relay_description, label: "Outbox relay description", type: string, default: "Public messages and media", group: "Relay info" }
+  - { name: outbox_relay_icon, label: "Outbox relay icon URL", type: string, default: "", pattern: '(https?://\S+)?', group: "Relay info" }
+  - { name: inbox_relay_name, label: "Inbox relay name", type: string, default: "Inbox relay", group: "Relay info" }
+  - { name: inbox_relay_description, label: "Inbox relay description", type: string, default: "Interactions", group: "Relay info" }
+  - { name: inbox_relay_icon, label: "Inbox relay icon URL", type: string, default: "", pattern: '(https?://\S+)?', group: "Relay info" }
+  - { name: inbox_pull_interval_seconds, label: "Inbox pull interval (seconds)", type: int, default: "3600", pattern: "[1-9][0-9]*", group: "Import and broadcast" }
+  - { name: import_start_date, label: "Import notes since (YYYY-MM-DD)", type: string, default: "2023-01-01",
+      pattern: "[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])", group: "Import and broadcast" }
+  - { name: import_relays, label: "Relays to import from (JSON list)", type: string,
+      default: '["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]',
+      pattern: '\[\s*("(wss?://)?[^"\s\\]+"(\s*,\s*"(wss?://)?[^"\s\\]+")*)?\s*\]', group: "Import and broadcast" }
+  - { name: blastr_relays, label: "Relays to broadcast to (JSON list)", type: string,
+      default: '["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]',
+      pattern: '\[\s*("(wss?://)?[^"\s\\]+"(\s*,\s*"(wss?://)?[^"\s\\]+")*)?\s*\]', group: "Import and broadcast" }
+  - { name: blastr_timeout_seconds, label: "Broadcast timeout (seconds)", type: int, default: "5", pattern: "[1-9][0-9]*", group: "Import and broadcast" }
+  - { name: whitelisted_npubs, label: "Extra npubs allowed to write (JSON list)", type: string, default: "[]",
+      pattern: '\[\s*("npub1[02-9ac-hj-np-z]{58}"(\s*,\s*"npub1[02-9ac-hj-np-z]{58}")*)?\s*\]', group: "Access" }
+  - { name: blacklisted_npubs, label: "Blocked npubs (JSON list)", type: string, default: "[]",
+      pattern: '\[\s*("npub1[02-9ac-hj-np-z]{58}"(\s*,\s*"npub1[02-9ac-hj-np-z]{58}")*)?\s*\]', group: "Access" }
+  - { name: wot_depth, label: "Web of trust depth", type: int, default: "3", pattern: "[0-9]+", group: "Access" }
+  - { name: wot_minimum_followers, label: "Web of trust minimum followers", type: int, default: "0", pattern: "[0-9]+", group: "Access" }
+  - { name: wot_refresh_interval, label: "Web of trust refresh interval (e.g. 24h)", type: string, default: "24h",
+      pattern: "([0-9]+(h|m|s))+", group: "Access" }
+  - { name: log_level, label: "Log level", type: string, default: "INFO", pattern: "DEBUG|INFO|WARNING|ERROR", group: "Advanced" }
+  - { name: extra_env, label: "Advanced: extra environment variables (KEY=value per line)", type: file, default: "", group: "Advanced" }

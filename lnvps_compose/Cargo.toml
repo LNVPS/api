@@ -14,3 +14,5 @@ rand = "0.9"
 # "when does this next fire" against a chrono timestamp.
 croner = "3.0"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+toml = "1"
+serde_json.workspace = true

@@ -1,0 +1,34 @@
+services:
+  yalr:
+    image: voidic/yalr:latest@sha256:9c7965f3743ca1e1083092aa2b1c8143d4a3085c551e14e64c8b3da0f4354815
+    user: "1000"
+    resources: { cpu: 500m, memory: 512Mi }
+    ports:
+      - { name: http, container: 3000, protocol: http, expose: ingress }
+    env:
+      RUST_LOG: "${log_level}"
+    env_from: extra_env
+    files:
+      - path: /app/config.yaml
+        merge_from: config_overrides
+        content: |
+          server:
+            host: "0.0.0.0"
+            port: 3000
+            admin_ui_path: "/app/admin/dist"
+          database:
+            url: "sqlite:/app/data/llm_router.db?mode=rwc"
+          anthropic:
+            prompt_cache: ${anthropic_prompt_cache}
+    volumes:
+      - { name: data, path: /app/data, size: 5Gi, label: database }
+    scratch:
+      - { path: /tmp }
+    backup:
+      volume: data
+config:
+  - { name: anthropic_prompt_cache, label: "Anthropic prompt caching", type: bool, default: "true" }
+  - { name: log_level, label: "Log level (RUST_LOG)", type: string, default: "info", pattern: "[A-Za-z0-9_:=,.-]+", group: "Advanced" }
+  - { name: config_overrides, label: "Advanced: config.yaml overrides", type: file, default: "", group: "Advanced" }
+  - { name: extra_env, label: "Advanced: extra environment variables (KEY=value per line)", type: file, default: "", group: "Advanced" }
+backup: { schedule: "0 3 * * *", retention: 7 }

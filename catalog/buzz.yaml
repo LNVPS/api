@@ -112,11 +112,19 @@ services:
       BUZZ_S3_ACCESS_KEY: "${S3_ACCESS_KEY}"
       BUZZ_S3_SECRET_KEY: "${S3_SECRET_KEY}"
       # --- access control ---
-      BUZZ_REQUIRE_AUTH_TOKEN: "true"
-      BUZZ_REQUIRE_RELAY_MEMBERSHIP: "true"
-      BUZZ_ALLOW_NIP_OA_AUTH: "true"
-      BUZZ_PUBKEY_ALLOWLIST: "false"
-      BUZZ_REQUIRE_MEDIA_GET_AUTH: "false"
+      BUZZ_REQUIRE_AUTH_TOKEN: "${require_auth_token}"
+      BUZZ_REQUIRE_RELAY_MEMBERSHIP: "${require_relay_membership}"
+      BUZZ_ALLOW_NIP_OA_AUTH: "${allow_nip_oa_auth}"
+      BUZZ_PUBKEY_ALLOWLIST: "${pubkey_allowlist}"
+      BUZZ_AGE_ATTESTATION_REQUIRED: "${age_attestation_required}"
+      BUZZ_TERMS_OF_SERVICE_MARKDOWN: "${terms_of_service}"
+      BUZZ_PRIVACY_POLICY_MARKDOWN: "${privacy_policy}"
+      BUZZ_AUDIT_ENABLED: "${audit_enabled}"
+      BUZZ_MAX_IMAGE_BYTES: "${max_image_bytes}"
+      BUZZ_MAX_GIF_BYTES: "${max_gif_bytes}"
+      BUZZ_MAX_VIDEO_BYTES: "${max_video_bytes}"
+      BUZZ_MAX_FILE_BYTES: "${max_file_bytes}"
+      BUZZ_MEDIA_UPLOADS_PER_MINUTE: "${media_uploads_per_minute}"
       # --- git on object storage ---
       BUZZ_GIT_REPO_PATH: "/var/lib/buzz/git"
       BUZZ_GIT_PACK_CACHE_PATH: "/var/cache/buzz/git-packs"
@@ -125,9 +133,14 @@ services:
       # probe is startup-fatal, so keep the race narrow (verified: 4x1 passes)
       BUZZ_GIT_PROBE_WRITERS: "4"
       BUZZ_GIT_PROBE_ROUNDS: "1"
+      BUZZ_GIT_MAX_PACK_BYTES: "${git_max_pack_bytes}"
+      BUZZ_GIT_MAX_REPO_BYTES: "${git_max_repo_bytes}"
+      BUZZ_GIT_MAX_REPOS_PER_PUBKEY: "${git_max_repos_per_pubkey}"
+      BUZZ_SERVE_GIT_WEB_GUI: "${serve_git_web_gui}"
       # --- capacity / logging ---
-      BUZZ_MAX_CONNECTIONS: "2000"
-      RUST_LOG: "info"
+      BUZZ_MAX_CONNECTIONS: "${max_connections}"
+      RUST_LOG: "${log_level}"
+    env_from: extra_env
     volumes:
       - { name: git, path: /var/lib/buzz/git, size: 5Gi, label: git repositories }
       - { name: packs, path: /var/cache/buzz/git-packs, size: 5Gi }
@@ -142,6 +155,26 @@ secrets:
 config:
   - { name: owner_pubkey, label: "Owner pubkey (64-char hex)", type: string, required: true,
       pattern: "[0-9a-fA-F]{64}" }
+  - { name: require_auth_token, label: "Require auth for every connection", type: bool, default: "true", group: "Access" }
+  - { name: require_relay_membership, label: "Only relay members can use the relay", type: bool, default: "true", group: "Access" }
+  - { name: allow_nip_oa_auth, label: "Allow agent auth (NIP-OA)", type: bool, default: "true", group: "Access" }
+  - { name: pubkey_allowlist, label: "Enforce the pubkey allowlist", type: bool, default: "false", group: "Access" }
+  - { name: age_attestation_required, label: "Require age attestation to join", type: bool, default: "false", group: "Access" }
+  - { name: terms_of_service, label: "Terms of service (markdown)", type: file, default: "", group: "Policies" }
+  - { name: privacy_policy, label: "Privacy policy (markdown)", type: file, default: "", group: "Policies" }
+  - { name: max_image_bytes, label: "Max image upload (bytes)", type: int, default: "52428800", pattern: "[1-9][0-9]*", group: "Media limits" }
+  - { name: max_gif_bytes, label: "Max GIF upload (bytes)", type: int, default: "10485760", pattern: "[1-9][0-9]*", group: "Media limits" }
+  - { name: max_video_bytes, label: "Max video upload (bytes)", type: int, default: "524288000", pattern: "[1-9][0-9]*", group: "Media limits" }
+  - { name: max_file_bytes, label: "Max file upload (bytes)", type: int, default: "104857600", pattern: "[1-9][0-9]*", group: "Media limits" }
+  - { name: media_uploads_per_minute, label: "Media uploads per minute per user", type: int, default: "30", pattern: "[1-9][0-9]*", group: "Media limits" }
+  - { name: git_max_pack_bytes, label: "Max git push (bytes)", type: int, default: "524288000", pattern: "[1-9][0-9]*", group: "Git" }
+  - { name: git_max_repo_bytes, label: "Max git repository size (bytes)", type: int, default: "1048576000", pattern: "[1-9][0-9]*", group: "Git" }
+  - { name: git_max_repos_per_pubkey, label: "Max git repositories per user", type: int, default: "100", pattern: "[1-9][0-9]*", group: "Git" }
+  - { name: serve_git_web_gui, label: "Serve the git web viewer", type: bool, default: "false", group: "Git" }
+  - { name: audit_enabled, label: "Audit log", type: bool, default: "true", group: "Advanced" }
+  - { name: max_connections, label: "Max connections", type: int, default: "2000", pattern: "[1-9][0-9]*", group: "Advanced" }
+  - { name: log_level, label: "Log level (RUST_LOG)", type: string, default: "info", pattern: "[A-Za-z0-9_:=,.-]+", group: "Advanced" }
+  - { name: extra_env, label: "Advanced: extra environment variables (KEY=value per line)", type: file, default: "", group: "Advanced" }
 # Daily at 03:00 UTC, keeping a week of restore points. Each run captures
 # every service that declares a `backup:` method above, at one point in time.
 backup: { schedule: "0 3 * * *", retention: 7 }

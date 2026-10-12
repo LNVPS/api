@@ -32,18 +32,43 @@ services:
       - { name: http, container: 8000, protocol: http, expose: ingress }
     files:
       - path: /app/config.yaml
+        merge_from: config_overrides
         content: |
           listen: "0.0.0.0:8000"
           database: "mysql://root:${DB_ROOT_PASSWORD}@db:3306/route96"
           storage_dir: "/app/data"
-          max_upload_bytes: 104857600
+          max_upload_bytes: ${max_upload_bytes}
           public_url: "https://${HOSTNAME}"
+          whitelist: ${upload_whitelist}
+          webhook_url: ${webhook_url}
+          reject_sensitive_exif: ${reject_sensitive_exif}
+          reject_steganography: ${reject_steganography}
+          identical_media_dedup: ${identical_media_dedup}
+          identical_media_dedup_distance: ${identical_media_dedup_distance}
+          identical_media_dedup_allow_override: ${identical_media_dedup_allow_override}
+          delete_unaccessed_days: ${delete_unaccessed_days}
+          delete_after_days: ${delete_after_days}
+          delete_zero_egress_days: ${delete_zero_egress_days}
     volumes:
       - { name: blobs, path: /app/data, size: 5Gi, label: files }
     backup:
       volume: blobs
 secrets:
   - { name: DB_ROOT_PASSWORD, generate: password }
+config:
+  - { name: max_upload_bytes, label: "Max upload size (bytes)", type: int, default: "104857600", pattern: "[1-9][0-9]*" }
+  - { name: upload_whitelist, label: "Uploaders allowed (JSON list of hex pubkeys, blank for anyone)", type: string, default: "",
+      pattern: '(\[ *"[0-9a-f]{64}"( *, *"[0-9a-f]{64}")* *\])?' }
+  - { name: webhook_url, label: "Upload webhook URL", type: string, default: "", pattern: '(https?://[^\s"''#]+)?', group: "Moderation" }
+  - { name: reject_sensitive_exif, label: "Reject images with GPS or device EXIF data", type: bool, default: "false", group: "Moderation" }
+  - { name: reject_steganography, label: "Reject images suspected of hidden data", type: bool, default: "false", group: "Moderation" }
+  - { name: identical_media_dedup, label: "Refuse visually identical images (BUD-12)", type: bool, default: "false", group: "Moderation" }
+  - { name: identical_media_dedup_distance, label: "Identical image distance (0 exact, 5 loose)", type: int, default: "0", pattern: "[0-9]+", group: "Moderation" }
+  - { name: identical_media_dedup_allow_override, label: "Let clients bypass the identical image check", type: bool, default: "true", group: "Moderation" }
+  - { name: delete_unaccessed_days, label: "Delete files not downloaded for (days, 0 never)", type: int, default: "0", pattern: "[0-9]+", group: "Retention" }
+  - { name: delete_after_days, label: "Delete all files older than (days, 0 never)", type: int, default: "0", pattern: "[0-9]+", group: "Retention" }
+  - { name: delete_zero_egress_days, label: "Delete never-downloaded files after (days, 0 never)", type: int, default: "0", pattern: "[0-9]+", group: "Retention" }
+  - { name: config_overrides, label: "Advanced: config.yaml overrides", type: file, default: "", group: "Advanced" }
 # Daily at 03:00 UTC, keeping a week of restore points. Each run captures
 # every service that declares a `backup:` method above, at one point in time.
 backup: { schedule: "0 3 * * *", retention: 7 }

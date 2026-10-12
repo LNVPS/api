@@ -7,6 +7,7 @@ services:
       - { name: http, container: 3000, protocol: http, expose: ingress }
     files:
       - path: /app/config.yml
+        merge_from: config_overrides
         content: |
           port: 3000
           host: 0.0.0.0
@@ -18,9 +19,80 @@ services:
             local:
               dir: /app/data/blobs
             rules:
-              - { type: "*", expiration: "1 month" }
+              - { type: "*", expiration: "${blob_expiration}" }
+            removeWhenNoOwners: ${remove_when_no_owners}
           upload:
-            enabled: true
-            requireAuth: true
+            enabled: ${upload_enabled}
+            requireAuth: ${upload_require_auth}
+            maxSize: ${upload_max_size}
+          mirror:
+            enabled: ${mirror_enabled}
+            requireAuth: ${mirror_require_auth}
+          delete:
+            requireAuth: ${delete_require_auth}
+          list:
+            enabled: ${list_enabled}
+            requireAuth: ${list_require_auth}
+            allowListOthers: ${list_allow_others}
+          landing:
+            enabled: ${landing_enabled}
+            title: "${landing_title}"
+          media:
+            enabled: ${media_enabled}
+            requireAuth: ${media_require_auth}
+            maxSize: ${media_max_size}
+            tmpDir: /app/data/media-tmp
+            image:
+              quality: ${media_image_quality}
+              maxWidth: ${media_image_max_width}
+              maxHeight: ${media_image_max_height}
+              outputFormat: ${media_image_format}
+              keepExif: ${media_keep_exif}
+            video:
+              quality: ${media_video_quality}
+              maxHeight: ${media_video_max_height}
+              maxFps: ${media_video_max_fps}
+            thumbnail:
+              enabled: ${media_thumbnails}
+          report:
+            enabled: ${report_enabled}
+          dashboard:
+            enabled: ${dashboard_enabled}
+            username: "${dashboard_username}"
+            password: "${dashboard_password}"
     volumes:
       - { name: data, path: /app/data, size: 5Gi, label: files }
+    scratch:
+      - { path: /tmp }
+config:
+  - { name: blob_expiration, label: "Delete blobs not accessed for", type: string, default: "1 month",
+      pattern: "[1-9][0-9]* ?(seconds?|minutes?|hours?|days?|weeks?|months?|years?)" }
+  - { name: landing_title, label: "Landing page title", type: string, default: "Blossom Server", pattern: '[^"\\\r\n]*' }
+  - { name: remove_when_no_owners, label: "Delete blobs with no owners", type: bool, default: "false", group: "Uploads" }
+  - { name: upload_enabled, label: "Allow uploads", type: bool, default: "true", group: "Uploads" }
+  - { name: upload_require_auth, label: "Require Nostr auth to upload", type: bool, default: "true", group: "Uploads" }
+  - { name: upload_max_size, label: "Max upload size (bytes)", type: int, default: "2147483648", pattern: "[1-9][0-9]*", group: "Uploads" }
+  - { name: mirror_enabled, label: "Allow mirroring from other servers", type: bool, default: "true", group: "Uploads" }
+  - { name: mirror_require_auth, label: "Require Nostr auth to mirror", type: bool, default: "true", group: "Uploads" }
+  - { name: delete_require_auth, label: "Require Nostr auth to delete", type: bool, default: "true", group: "Uploads" }
+  - { name: list_enabled, label: "Allow listing a user's blobs", type: bool, default: "false", group: "Listing and reports" }
+  - { name: list_require_auth, label: "Require Nostr auth to list", type: bool, default: "false", group: "Listing and reports" }
+  - { name: list_allow_others, label: "Allow listing other users' blobs", type: bool, default: "true", group: "Listing and reports" }
+  - { name: landing_enabled, label: "Show the landing page", type: bool, default: "true", group: "Listing and reports" }
+  - { name: report_enabled, label: "Accept blob reports (BUD-09)", type: bool, default: "true", group: "Listing and reports" }
+  - { name: media_enabled, label: "Enable media optimisation (BUD-05)", type: bool, default: "false", group: "Media optimisation" }
+  - { name: media_require_auth, label: "Require Nostr auth for media uploads", type: bool, default: "true", group: "Media optimisation" }
+  - { name: media_max_size, label: "Max media upload size (bytes)", type: int, default: "1073741824", pattern: "[1-9][0-9]*", group: "Media optimisation" }
+  - { name: media_image_quality, label: "Image quality (0-100)", type: int, default: "90", pattern: "[0-9]|[1-9][0-9]|100", group: "Media optimisation" }
+  - { name: media_image_max_width, label: "Image max width (px)", type: int, default: "1920", pattern: "[1-9][0-9]*", group: "Media optimisation" }
+  - { name: media_image_max_height, label: "Image max height (px)", type: int, default: "1080", pattern: "[1-9][0-9]*", group: "Media optimisation" }
+  - { name: media_image_format, label: "Image format (webp, jpeg or png)", type: string, default: "webp", pattern: "webp|jpeg|png", group: "Media optimisation" }
+  - { name: media_keep_exif, label: "Keep image EXIF metadata", type: bool, default: "false", group: "Media optimisation" }
+  - { name: media_video_quality, label: "Video quality (0-100)", type: int, default: "90", pattern: "[0-9]|[1-9][0-9]|100", group: "Media optimisation" }
+  - { name: media_video_max_height, label: "Video max height (px)", type: int, default: "1080", pattern: "[1-9][0-9]*", group: "Media optimisation" }
+  - { name: media_video_max_fps, label: "Video max frame rate", type: int, default: "30", pattern: "[1-9][0-9]*", group: "Media optimisation" }
+  - { name: media_thumbnails, label: "Generate thumbnails", type: bool, default: "true", group: "Media optimisation" }
+  - { name: dashboard_enabled, label: "Enable the admin dashboard at /admin", type: bool, default: "false", group: "Admin dashboard" }
+  - { name: dashboard_username, label: "Dashboard username", type: string, default: "admin", pattern: '[^"\\\r\n]+', group: "Admin dashboard" }
+  - { name: dashboard_password, label: "Dashboard password (blank logs a random one)", type: string, default: "", pattern: '[^"\\\r\n]*', group: "Admin dashboard" }
+  - { name: config_overrides, label: "Advanced: config.yml overrides", type: file, default: "", group: "Advanced" }

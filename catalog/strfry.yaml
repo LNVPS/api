@@ -5,24 +5,111 @@ services:
     resources: { cpu: 500m, memory: 512Mi }
     ports:
       - { name: ws, container: 7777, protocol: http, expose: ingress }
+    env:
+      STREAMS: "${stream_from_relays}"
     files:
       - path: /etc/strfry.conf
         content: |
           db = "/app/strfry-db/"
           events {
+              maxEventSize = ${max_event_size}
+              rejectEventsNewerThanSeconds = ${reject_events_newer_than_seconds}
               rejectEventsOlderThanSeconds = ${reject_events_older_than_seconds}
+              rejectEphemeralEventsOlderThanSeconds = ${reject_ephemeral_events_older_than_seconds}
+              ephemeralEventsLifetimeSeconds = ${ephemeral_events_lifetime_seconds}
+              maxNumTags = ${max_num_tags}
+              maxTagValSize = ${max_tag_val_size}
           }
           relay {
               bind = "0.0.0.0"
               port = 7777
+              auth {
+                  enabled = ${auth_enabled}
+                  serviceUrl = "wss://${HOSTNAME}"
+              }
               info {
                   name = "${relay_name}"
                   description = "${relay_description}"
+                  pubkey = "${relay_pubkey}"
+                  contact = "${relay_contact}"
+                  icon = "${relay_icon}"
+                  banner = "${relay_banner}"
+                  privacy = "${relay_privacy_url}"
+                  terms = "${relay_terms_url}"
+              }
+              maxWebsocketPayloadSize = ${max_websocket_payload_size}
+              maxReqFilterSize = ${max_req_filter_size}
+              autoPingSeconds = ${auto_ping_seconds}
+              enableTcpKeepalive = ${enable_tcp_keepalive}
+              queryTimesliceBudgetMicroseconds = ${query_timeslice_budget_microseconds}
+              maxFilterLimit = ${max_filter_limit}
+              maxFilterLimitCount = ${max_filter_limit_count}
+              maxSubsPerConnection = ${max_subs_per_connection}
+              compression {
+                  enabled = ${compression_enabled}
+                  slidingWindow = ${compression_sliding_window}
+              }
+              logging {
+                  dumpInAll = ${log_dump_in_all}
+                  dumpInEvents = ${log_dump_in_events}
+                  dumpInReqs = ${log_dump_in_reqs}
+                  dbScanPerf = ${log_db_scan_perf}
+                  invalidEvents = ${log_invalid_events}
+              }
+              negentropy {
+                  enabled = ${negentropy_enabled}
+                  maxSyncEvents = ${negentropy_max_sync_events}
+              }
+              filterValidation {
+                  enabled = ${filter_validation_enabled}
+                  maxFiltersPerReq = ${filter_validation_max_filters_per_req}
+                  minFiltersPerReq = ${filter_validation_min_filters_per_req}
+                  maxKindsPerFilter = ${filter_validation_max_kinds_per_filter}
+                  allowedKinds = "${filter_validation_allowed_kinds}"
+                  requireAuthorOrTag = ${filter_validation_require_author_or_tag}
               }
           }
     volumes:
       - { name: db, path: /app/strfry-db, size: 5Gi, label: events }
 config:
-  - { name: relay_name, label: "Relay name", type: string, default: "My strfry relay" }
-  - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay" }
-  - { name: reject_events_older_than_seconds, label: "Reject events older than (seconds)", type: int, default: "94608000", pattern: "[0-9]+" }
+  - { name: relay_name, label: "Relay name", type: string, default: "My strfry relay", pattern: '[^"\\\r\n]*' }
+  - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay", pattern: '[^"\\\r\n]*' }
+  - { name: relay_pubkey, label: "Admin pubkey (64-char hex)", type: string, default: "", pattern: "([0-9a-f]{64})?", group: "Relay info" }
+  - { name: relay_contact, label: "Admin contact", type: string, default: "", pattern: '[^"\\\r\n]*', group: "Relay info" }
+  - { name: relay_icon, label: "Icon URL", type: string, default: "", pattern: '(https?://[^"\\\s]+)?', group: "Relay info" }
+  - { name: relay_banner, label: "Banner URL", type: string, default: "", pattern: '(https?://[^"\\\s]+)?', group: "Relay info" }
+  - { name: relay_privacy_url, label: "Privacy policy URL", type: string, default: "", pattern: '(https?://[^"\\\s]+)?', group: "Relay info" }
+  - { name: relay_terms_url, label: "Terms of service URL", type: string, default: "", pattern: '(https?://[^"\\\s]+)?', group: "Relay info" }
+  - { name: auth_enabled, label: "Enable NIP-42 AUTH", type: bool, default: "false", group: "Access" }
+  - { name: filter_validation_enabled, label: "Restrict REQ filters", type: bool, default: "false", group: "Access" }
+  - { name: filter_validation_max_filters_per_req, label: "Max filters per REQ (when restricted)", type: int, default: "3", pattern: "[1-9][0-9]*", group: "Access" }
+  - { name: filter_validation_min_filters_per_req, label: "Min filters per REQ (when restricted)", type: int, default: "1", pattern: "[0-9]+", group: "Access" }
+  - { name: filter_validation_max_kinds_per_filter, label: "Max kinds per filter (when restricted)", type: int, default: "3", pattern: "[1-9][0-9]*", group: "Access" }
+  - { name: filter_validation_allowed_kinds, label: "Allowed kinds (comma-separated, blank for all)", type: string, default: "", pattern: "([0-9]+(, *[0-9]+)*)?", group: "Access" }
+  - { name: filter_validation_require_author_or_tag, label: "Require an author or tag in filters", type: bool, default: "false", group: "Access" }
+  - { name: max_event_size, label: "Max event size (bytes)", type: int, default: "65536", pattern: "[1-9][0-9]*", group: "Event limits" }
+  - { name: reject_events_newer_than_seconds, label: "Reject events newer than (seconds ahead)", type: int, default: "900", pattern: "[0-9]+", group: "Event limits" }
+  - { name: reject_events_older_than_seconds, label: "Reject events older than (seconds)", type: int, default: "94608000", pattern: "[0-9]+", group: "Event limits" }
+  - { name: reject_ephemeral_events_older_than_seconds, label: "Reject ephemeral events older than (seconds)", type: int, default: "60", pattern: "[0-9]+", group: "Event limits" }
+  - { name: ephemeral_events_lifetime_seconds, label: "Ephemeral event lifetime (seconds)", type: int, default: "300", pattern: "[0-9]+", group: "Event limits" }
+  - { name: max_num_tags, label: "Max tags per event", type: int, default: "2000", pattern: "[1-9][0-9]*", group: "Event limits" }
+  - { name: max_tag_val_size, label: "Max tag value size (bytes)", type: int, default: "1024", pattern: "[1-9][0-9]*", group: "Event limits" }
+  - { name: max_websocket_payload_size, label: "Max websocket payload (bytes)", type: int, default: "131072", pattern: "[1-9][0-9]*", group: "Connection limits" }
+  - { name: max_req_filter_size, label: "Max filters per REQ", type: int, default: "200", pattern: "[1-9][0-9]*", group: "Connection limits" }
+  - { name: auto_ping_seconds, label: "Websocket ping interval (seconds)", type: int, default: "55", pattern: "[0-9]+", group: "Connection limits" }
+  - { name: enable_tcp_keepalive, label: "TCP keepalive", type: bool, default: "false", group: "Connection limits" }
+  - { name: query_timeslice_budget_microseconds, label: "Query timeslice budget (microseconds)", type: int, default: "10000", pattern: "[1-9][0-9]*", group: "Connection limits" }
+  - { name: max_filter_limit, label: "Max events returned per filter", type: int, default: "500", pattern: "[1-9][0-9]*", group: "Connection limits" }
+  - { name: max_filter_limit_count, label: "Max COUNT result", type: int, default: "1000000", pattern: "[1-9][0-9]*", group: "Connection limits" }
+  - { name: max_subs_per_connection, label: "Max subscriptions per connection", type: int, default: "200", pattern: "[1-9][0-9]*", group: "Connection limits" }
+  - { name: compression_enabled, label: "Websocket compression", type: bool, default: "true", group: "Connection limits" }
+  - { name: compression_sliding_window, label: "Compression sliding window", type: bool, default: "true", group: "Connection limits" }
+  - { name: negentropy_enabled, label: "Negentropy sync", type: bool, default: "true", group: "Sync" }
+  - { name: negentropy_max_sync_events, label: "Negentropy max sync events", type: int, default: "1000000", pattern: "[1-9][0-9]*", group: "Sync" }
+  - { name: stream_from_relays, label: "Copy events from relays (comma-separated hosts)", type: string, default: "",
+      pattern: "([A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?(,[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?)*)?", group: "Sync" }
+  - { name: log_dump_in_all, label: "Log all incoming messages", type: bool, default: "false", group: "Logging" }
+  - { name: log_dump_in_events, label: "Log incoming events", type: bool, default: "false", group: "Logging" }
+  - { name: log_dump_in_reqs, label: "Log incoming REQs", type: bool, default: "false", group: "Logging" }
+  - { name: log_db_scan_perf, label: "Log query performance", type: bool, default: "false", group: "Logging" }
+  - { name: log_invalid_events, label: "Log rejected events", type: bool, default: "true", group: "Logging" }

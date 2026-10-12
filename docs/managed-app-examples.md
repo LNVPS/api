@@ -54,7 +54,7 @@ form fields, injected as `${name}`). Per service:
 `image`, `resources: { cpu, memory }`, `ports` (`expose: none|ingress`, ingress
 is HTTP only), `env`, `volumes` (PVCs, read-write), `files` (ConfigMap/Secret,
 read-only, mounted via subPath), `depends_on`, `backup`, `user`,
-`init`. Volumes take an optional `label` (see below). `${HOSTNAME}`
+`init`, `env_from`. A file may also take `merge_from` and `format`. Volumes take an optional `label` (see below). `${HOSTNAME}`
 resolves to `{deployment-name}.{cluster-ingress-domain}`; a service name
 resolves to its in-namespace DNS (e.g. `db:3306`).
 
@@ -445,6 +445,67 @@ string if it has none, and logs a warning. So a compose change is safe to roll
 out to already-deployed instances; give any new field a sensible `default` if a
 blank would break the app.
 
+**`config[].group`**: the form section a field is shown in. Fields with no
+group are shown first, then each group as a collapsed section named by its
+group, in the order the group first appears. Keep the ungrouped set to what a
+buyer actually decides at order time (a name, an owner key) and group the rest:
+an app with 40 settings otherwise renders a 40-box order form. A group holding a
+required field with no value opens by itself. At most 40 characters, and
+declare each group's fields together so the sections come out in a sensible
+order.
+
+```yaml
+config:
+  - { name: relay_name, label: "Relay name", type: string, default: "My relay" }
+  - { name: max_event_size, label: "Max event size (bytes)", type: int, default: "65536", group: "Event limits" }
+  - { name: config_overrides, label: "Advanced: config.toml overrides", type: file, default: "", group: "Advanced" }
+```
+
+**Customer overrides: `files[].merge_from` and `env_from`.** Two ways to let a
+customer write the app's own config directly, on top of whatever the catalog
+renders. Both name a `config:` field of `type: file`, so the order form shows a
+text box.
+
+```yaml
+services:
+  relay:
+    env:
+      RUST_LOG: "${log_level}"
+    env_from: extra_env              # KEY=value per line, set over `env`
+    files:
+      - path: /app/config.yaml
+        merge_from: config_overrides # deep-merged over the rendered content
+        content: |
+          listen: "0.0.0.0:8000"
+          max_upload_bytes: ${max_upload_bytes}
+config:
+  - { name: config_overrides, label: "Advanced: config.yaml overrides", type: file, default: "" }
+  - { name: extra_env, label: "Advanced: extra environment variables (KEY=value per line)", type: file, default: "" }
+```
+
+`merge_from` renders the inline `content` as usual, parses it and the
+customer's text in the same format, and merges them: mappings merge key by key
+at every depth, anything else (a scalar, a list) is replaced, and in YAML or
+JSON a `null` removes the key. The format comes from the path's extension
+(`.yaml`/`.yml`, `.toml`, `.json`); a file with any other extension needs
+`format: yaml|toml|json`. A file whose format has no merge (strfry's `.conf`)
+cannot use it, so every setting it has needs its own field.
+
+`env_from` lines are `KEY=value`; blank lines, `#` comments and a leading
+`export` are allowed, and one pair of surrounding quotes is stripped from the
+value. A key the service already sets is replaced. The value is literal: no
+`${…}`, so an override cannot pull a generated secret into somewhere else.
+
+Both are checked when the customer submits them: text that does not parse, a
+YAML list where a mapping belongs, or a malformed env line is refused with the
+field's label, as is anything over 256 KiB. A blank value leaves the rendered
+file byte for byte as it was, so adding an override field to an app does not
+restart its deployments. Admission also renders each `merge_from` template with
+the declared defaults and refuses one whose output does not parse, since no
+override could ever merge into it. Quoted strings in a template are where that
+bites: give such a field a pattern like `'[^"\\\r\n]*'` so a customer's quote
+cannot end the string early.
+
 ## Validating a compose document
 
 Before pasting a `compose` into the admin API, validate it locally with the
@@ -553,6 +614,12 @@ fails the render loudly.
   to `127.0.0.1` (must be `0.0.0.0` in a container), port `7777`, data in
   `./strfry-db/`. The `dockurr/strfry` image reads `/etc/strfry.conf`.
 
+- **Config:** every key the pinned binary (1.1.3) reads is a field, except
+  `db`, `dbParams`, `nofiles`, `numThreads`, `writePolicy` and the bind address
+  and port. `stream_from_relays` feeds the image's own `STREAMS` env, which runs
+  `strfry stream wss://<host> --dir down` per comma-separated host, so the
+  pattern only admits bare hosts.
+
 **Document:** [`catalog/strfry.yaml`](../catalog/strfry.yaml) —
 `scripts/app-catalog-test.sh catalog/strfry.yaml` starts it locally.
 
@@ -593,6 +660,13 @@ fails the render loudly.
   at `/usr/src/app/config.toml`; listens on `8080`; SQLite DB under
   `/usr/src/app/db`. Set `network.address = "0.0.0.0"` so it's reachable in the
   pod.
+
+- **Config:** the `[info]` name and description, `[options]`, `[limits]`,
+  NIP-42 and NIP-05 settings are fields. `pubkey`, `contact` and `relay_icon`
+  are not: the relay serves an empty string as-is in NIP-11, and TOML has no
+  way to leave a key out, so they go through `config_overrides` along with
+  `pubkey_whitelist`, `event_kind_allowlist` and the NIP-05 domain lists. An
+  empty `event_kind_allowlist` would reject every event.
 
 **Document:** [`catalog/nostr-rs-relay.yaml`](../catalog/nostr-rs-relay.yaml) —
 `scripts/app-catalog-test.sh catalog/nostr-rs-relay.yaml` starts it locally.
@@ -642,6 +716,14 @@ fails the render loudly.
   `wss://`). A fix to bake the templates into the image is proposed upstream
   (<https://github.com/HolgerHatGarKeineNode/haven-docker/pull/8>); once merged
   and released the dashboard works out of the box.
+
+- **Config:** all four relays' name, description and icon, the import and
+  broadcast relay lists, the white and black lists, web of trust and the log
+  level are fields. The lists are JSON written into the files HAVEN reads, and
+  a list that does not parse is `log.Fatalf` at startup, so each has a pattern.
+  The 32 rate limiter variables and the import timeouts go through `extra_env`.
+  `DB_ENGINE` and `BACKUP_PROVIDER` stay fixed: changing the engine orphans the
+  existing data, and backups are the platform's.
 
 **Document:** [`catalog/haven.yaml`](../catalog/haven.yaml) —
 `scripts/app-catalog-test.sh catalog/haven.yaml` starts it locally.
@@ -710,6 +792,25 @@ Everything else was verified end-to-end against these images (relay reaches
 `buzz-relay TCP listening`, `/_readiness` 200, NIP-11 served, A3 probe
 admitted) with all four containers running read-only-rootfs and non-root
 where the image allows it.
+
+---
+
+## YALR: LLM router
+
+- **Image:** `voidic/yalr` (official, built from the repo on every push to
+  `master`): <https://hub.docker.com/r/voidic/yalr>.
+- **Repo:** <https://github.com/v0l/yalr>. YAML config at `/app/config.yaml`,
+  SQLite under `/app/data`, port `3000`, admin UI served by the app. Providers,
+  routing, users and API keys live in the database and are managed in the
+  admin UI, so the config file only carries the database path and the Anthropic
+  prompt cache toggle. `auth.enabled` and `auth.allowed_pubkeys` are parsed but
+  never enforced, so they are not offered.
+- **Setup:** the first `POST /api/auth/setup` creates the admin user, and any
+  visitor can make it. Open the hostname and finish setup as soon as the
+  deployment is ready.
+
+**Document:** [`catalog/yalr.yaml`](../catalog/yalr.yaml).
+`scripts/app-catalog-test.sh catalog/yalr.yaml` starts it locally.
 
 ---
 

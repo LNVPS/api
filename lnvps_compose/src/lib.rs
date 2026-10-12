@@ -21,6 +21,9 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::str::FromStr;
 
+mod merge;
+pub use merge::{FileFormat, parse_env_lines};
+
 /// A parsed app compose document.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Compose {
@@ -209,6 +212,8 @@ pub struct Service {
     /// own container starts. See [`InitContainer`].
     #[serde(default)]
     pub init: Vec<InitContainer>,
+    #[serde(default)]
+    pub env_from: Option<String>,
 }
 
 /// A setup step that must succeed before its service's container starts.
@@ -407,9 +412,19 @@ pub struct File {
     /// Name of a `config` field whose value is used as the file content.
     #[serde(default)]
     pub content_from: Option<String>,
+    #[serde(default)]
+    pub merge_from: Option<String>,
+    #[serde(default)]
+    pub format: Option<FileFormat>,
     /// Render into a Secret instead of a ConfigMap (holds secret material).
     #[serde(default)]
     pub sensitive: bool,
+}
+
+impl File {
+    pub fn merge_format(&self) -> Option<FileFormat> {
+        self.format.or_else(|| FileFormat::from_path(&self.path))
+    }
 }
 
 /// How a port is exposed.
@@ -654,7 +669,11 @@ pub struct ConfigField {
     /// content is arbitrary.
     #[serde(default)]
     pub pattern: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
 }
+
+pub const MAX_CONFIG_GROUP_LEN: usize = 40;
 
 /// Longest accepted `pattern`. Long enough for the character-class patterns a
 /// catalog field needs (an npub, a domain, a hex key) and short enough that the
@@ -933,6 +952,7 @@ impl Compose {
                 );
             }
         }
+        self.validate_merge_templates()?;
         for name in self.referenced_vars() {
             let declared = self.config.iter().any(|c| c.name == name)
                 || self.secrets.iter().any(|s| s.name == name)
@@ -1130,6 +1150,26 @@ impl Compose {
                         }
                     }
                 }
+                if let Some(field) = &f.merge_from {
+                    if f.content.is_none() {
+                        bail!(
+                            "service '{sname}': file '{}' merge_from needs inline content to merge into",
+                            f.path
+                        );
+                    }
+                    self.require_file_field(
+                        sname,
+                        &format!("file '{}' merge_from", f.path),
+                        field,
+                    )?;
+                    if f.merge_format().is_none() {
+                        bail!(
+                            "service '{sname}': file '{}' merge_from needs `format: yaml|toml|json` \
+                             (the path has no recognised extension)",
+                            f.path
+                        );
+                    }
+                }
                 // A config file must not land inside a read-write data volume.
                 for v in &svc.volumes {
                     if f.path == v.path || path_is_within(&f.path, &v.path) {
@@ -1153,6 +1193,10 @@ impl Compose {
                         );
                     }
                 }
+            }
+
+            if let Some(field) = &svc.env_from {
+                self.require_file_field(sname, "env_from", field)?;
             }
 
             // A backup entry is exactly one of command | volume, and the
@@ -1249,6 +1293,14 @@ impl Compose {
             if let Some(pattern) = &f.pattern {
                 compile_pattern(pattern).map_err(|e| anyhow!("config field '{}': {e}", f.name))?;
             }
+            if let Some(group) = &f.group
+                && (group.trim().is_empty() || group.trim().chars().count() > MAX_CONFIG_GROUP_LEN)
+            {
+                bail!(
+                    "config field '{}': group must be 1-{MAX_CONFIG_GROUP_LEN} characters",
+                    f.name
+                );
+            }
         }
 
         // A schedule with nothing to run would bill storage and produce empty
@@ -1270,6 +1322,59 @@ impl Compose {
             policy.validate_frequency()?;
         }
         Ok(())
+    }
+
+    fn validate_merge_templates(&self) -> Result<()> {
+        let mut vars: HashMap<String, String> = self
+            .config
+            .iter()
+            .map(|c| {
+                let placeholder = match c.r#type {
+                    FieldType::Int => "0",
+                    FieldType::Bool => "false",
+                    FieldType::String | FieldType::File => "x",
+                };
+                (
+                    c.name.clone(),
+                    c.default.clone().unwrap_or_else(|| placeholder.to_string()),
+                )
+            })
+            .collect();
+        for s in &self.secrets {
+            vars.insert(s.name.clone(), "x".to_string());
+        }
+        vars.insert("HOSTNAME".to_string(), "app.example.com".to_string());
+        for (sname, svc) in &self.services {
+            for f in &svc.files {
+                let (Some(_), Some(content), Some(format)) =
+                    (&f.merge_from, &f.content, f.merge_format())
+                else {
+                    continue;
+                };
+                let rendered = substitute(content, &vars)?;
+                format.check_document(&rendered).map_err(|e| {
+                    anyhow!(
+                        "service '{sname}': file '{}' merge_from: the rendered content is not valid \
+                         {}, so a customer override can never be merged into it: {e}",
+                        f.path,
+                        format.name()
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn require_file_field(&self, service: &str, context: &str, field: &str) -> Result<()> {
+        match self.config.iter().find(|c| c.name == field) {
+            None => {
+                bail!("service '{service}': {context} references unknown config field '{field}'")
+            }
+            Some(c) if c.r#type != FieldType::File => {
+                bail!("service '{service}': {context} field '{field}' must be `type: file`")
+            }
+            Some(_) => Ok(()),
+        }
     }
 
     /// Services that declare a backup method, in a stable order so a run's
@@ -1369,6 +1474,11 @@ impl Compose {
             for (k, v) in &svc.env {
                 resolved.insert(k.clone(), substitute(v, vars)?);
             }
+            if let Some(overrides) = svc.env_from.as_ref().and_then(|f| vars.get(f))
+                && let Ok(lines) = parse_env_lines(overrides)
+            {
+                resolved.extend(lines);
+            }
             out.insert(sname.clone(), resolved);
         }
         Ok(out)
@@ -1392,6 +1502,15 @@ impl Compose {
                     // the reconcile.
                     (_, Some(field)) => vars.get(field).cloned().unwrap_or_default(),
                     (None, None) => bail!("file '{}': no content source", f.path),
+                };
+                let content = match (
+                    f.merge_from.as_ref().and_then(|m| vars.get(m)),
+                    f.merge_format(),
+                ) {
+                    (Some(overlay), Some(format)) => {
+                        format.merge(&content, overlay).unwrap_or(content)
+                    }
+                    _ => content,
                 };
                 files.push(ResolvedFile {
                     path: f.path.clone(),
@@ -1623,6 +1742,7 @@ pub fn resolve_config(
         match submitted_value.or(field.default.as_ref()) {
             Some(v) => {
                 field.check_value(v)?;
+                check_override(compose, field, v)?;
                 out.insert(field.name.clone(), v.clone());
             }
             None if field.required => {
@@ -1632,6 +1752,35 @@ pub fn resolve_config(
         }
     }
     Ok(out)
+}
+
+fn check_override(compose: &Compose, field: &ConfigField, value: &str) -> Result<()> {
+    let label = field.display_label();
+    let overrides = compose.services.values().any(|s| {
+        s.env_from.as_deref() == Some(field.name.as_str())
+            || s.files
+                .iter()
+                .any(|f| f.merge_from.as_deref() == Some(field.name.as_str()))
+    });
+    if overrides && value.len() > MAX_FILE_BYTES {
+        bail!("config field '{label}' exceeds {MAX_FILE_BYTES} bytes");
+    }
+    for svc in compose.services.values() {
+        if svc.env_from.as_deref() == Some(field.name.as_str()) {
+            parse_env_lines(value).map_err(|e| anyhow!("config field '{label}': {e}"))?;
+        }
+        for f in &svc.files {
+            if f.merge_from.as_deref() != Some(field.name.as_str()) {
+                continue;
+            }
+            if let Some(format) = f.merge_format() {
+                format.check_document(value).map_err(|e| {
+                    anyhow!("config field '{label}' is not valid {}: {e}", format.name())
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A config file with its final rendered content, ready to become a ConfigMap
@@ -3143,5 +3292,189 @@ config:
         let c = Compose::parse("services:\n  app:\n    image: example/app:latest\n").unwrap();
         c.validate().unwrap();
         assert!(c.validate_pinned_images().is_err());
+    }
+
+    const MERGE_DOC: &str = r#"
+services:
+  app:
+    image: x
+    env:
+      PORT: "8080"
+      NAME: "${name}"
+    env_from: extra_env
+    files:
+      - path: /app/config.yml
+        merge_from: extra_yaml
+        content: |
+          listen: "0.0.0.0:8000"
+          public_url: "https://${HOSTNAME}"
+          upload:
+            enabled: true
+            max: 100
+      - path: /app/config.toml
+        merge_from: extra_toml
+        content: |
+          [info]
+          name = "${name}"
+      - path: /app/settings
+        format: json
+        merge_from: extra_json
+        content: '{"a": {"b": 1}}'
+config:
+  - { name: name, type: string, default: "relay" }
+  - { name: extra_env, type: file, default: "" }
+  - { name: extra_yaml, type: file, default: "" }
+  - { name: extra_toml, type: file, default: "" }
+  - { name: extra_json, type: file, default: "" }
+"#;
+
+    fn merge_vars(config: &std::collections::BTreeMap<String, String>) -> HashMap<String, String> {
+        let mut vars: HashMap<String, String> = config.clone().into_iter().collect();
+        vars.insert("HOSTNAME".into(), "h.example.com".into());
+        vars
+    }
+
+    #[test]
+    fn merge_from_and_env_from_apply_customer_overrides() {
+        let c = Compose::parse(MERGE_DOC).unwrap();
+        c.validate_declarations().unwrap();
+        let mut submitted = std::collections::BTreeMap::new();
+        submitted.insert("extra_env".to_string(), "PORT=9000\nNEW=1\n".to_string());
+        submitted.insert(
+            "extra_yaml".to_string(),
+            "upload:\n  max: 5\nwhitelist: [\"aa\"]\n".to_string(),
+        );
+        submitted.insert(
+            "extra_toml".to_string(),
+            "[limits]\nmessages_per_sec = 5\n".to_string(),
+        );
+        submitted.insert("extra_json".to_string(), "{\"a\": {\"c\": 2}}".to_string());
+        let config = resolve_config(&c, &submitted).unwrap();
+        let vars = merge_vars(&config);
+
+        let env = &c.resolve_env(&vars).unwrap()["app"];
+        assert_eq!(env["PORT"], "9000");
+        assert_eq!(env["NEW"], "1");
+        assert_eq!(env["NAME"], "relay");
+
+        let files = &c.resolve_files(&vars).unwrap()["app"];
+        let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&files[0].content).unwrap();
+        assert_eq!(yaml["upload"]["max"], 5);
+        assert_eq!(yaml["upload"]["enabled"], true);
+        assert_eq!(yaml["public_url"], "https://h.example.com");
+        assert_eq!(yaml["whitelist"][0], "aa");
+        let toml_doc: toml::Table = files[1].content.parse().unwrap();
+        assert_eq!(toml_doc["info"]["name"].as_str(), Some("relay"));
+        assert_eq!(toml_doc["limits"]["messages_per_sec"].as_integer(), Some(5));
+        let json: serde_json::Value = serde_json::from_str(&files[2].content).unwrap();
+        assert_eq!(json["a"]["b"], 1);
+        assert_eq!(json["a"]["c"], 2);
+    }
+
+    #[test]
+    fn blank_overrides_render_the_template_unchanged() {
+        let c = Compose::parse(MERGE_DOC).unwrap();
+        let config = resolve_config(&c, &std::collections::BTreeMap::new()).unwrap();
+        let vars = merge_vars(&config);
+        let files = &c.resolve_files(&vars).unwrap()["app"];
+        assert!(files[0].content.starts_with("listen: \"0.0.0.0:8000\"\n"));
+        assert_eq!(c.resolve_env(&vars).unwrap()["app"]["PORT"], "8080");
+    }
+
+    #[test]
+    fn invalid_overrides_are_refused_at_order_time() {
+        let c = Compose::parse(MERGE_DOC).unwrap();
+        for (field, value) in [
+            ("extra_env", "not an env line"),
+            ("extra_yaml", "upload: ["),
+            ("extra_yaml", "- a list"),
+            ("extra_toml", "a = "),
+            ("extra_json", "[1]"),
+        ] {
+            let mut submitted = std::collections::BTreeMap::new();
+            submitted.insert(field.to_string(), value.to_string());
+            let err = resolve_config(&c, &submitted).unwrap_err().to_string();
+            assert!(err.contains(field), "{field}: {err}");
+        }
+        let mut huge = std::collections::BTreeMap::new();
+        huge.insert(
+            "extra_yaml".to_string(),
+            format!("a: \"{}\"", "x".repeat(MAX_FILE_BYTES)),
+        );
+        assert!(
+            resolve_config(&c, &huge)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+    }
+
+    #[test]
+    fn stored_invalid_override_falls_back_to_the_template() {
+        let c = Compose::parse(MERGE_DOC).unwrap();
+        let mut vars = merge_vars(&std::collections::BTreeMap::new());
+        vars.insert("extra_yaml".into(), "upload: [".into());
+        vars.insert("extra_env".into(), "garbage".into());
+        let files = &c.resolve_files(&vars).unwrap()["app"];
+        assert!(files[0].content.starts_with("listen:"));
+        assert_eq!(c.resolve_env(&vars).unwrap()["app"]["PORT"], "8080");
+    }
+
+    #[test]
+    fn merge_and_env_from_declarations_are_validated() {
+        let cases = [
+            "services:\n  a:\n    image: x\n    env_from: nope\n",
+            "services:\n  a:\n    image: x\n    env_from: s\nconfig:\n  - { name: s, type: string }\n",
+            "services:\n  a:\n    image: x\n    files:\n      - { path: /c.yml, content: 'a: 1', merge_from: nope }\n",
+            "services:\n  a:\n    image: x\n    files:\n      - { path: /c.yml, content: 'a: 1', merge_from: s }\nconfig:\n  - { name: s, type: int }\n",
+            "services:\n  a:\n    image: x\n    files:\n      - { path: /c.yml, content_from: f, merge_from: f }\nconfig:\n  - { name: f, type: file }\n",
+            "services:\n  a:\n    image: x\n    files:\n      - { path: /c.conf, content: 'a: 1', merge_from: f }\nconfig:\n  - { name: f, type: file }\n",
+        ];
+        for doc in cases {
+            assert!(Compose::parse(doc).is_err(), "accepted: {doc}");
+        }
+        let explicit = "services:\n  a:\n    image: x\n    files:\n      - { path: /c.conf, format: toml, content: 'a = 1', merge_from: f }\nconfig:\n  - { name: f, type: file }\n";
+        Compose::parse(explicit)
+            .unwrap()
+            .validate_declarations()
+            .unwrap();
+    }
+
+    #[test]
+    fn merge_template_must_render_to_its_format() {
+        let doc = "services:\n  a:\n    image: x\n    files:\n      - path: /c.toml\n        merge_from: f\n        content: |\n          port = ${port}\n          name = ${name}\nconfig:\n  - { name: f, type: file }\n  - { name: port, type: int }\n  - { name: name, type: string, default: \"bare\" }\n";
+        let err = Compose::parse(doc)
+            .unwrap()
+            .validate_declarations()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not valid TOML"), "{err}");
+        let ok = doc.replace("name = ${name}", "name = \"${name}\"");
+        Compose::parse(&ok)
+            .unwrap()
+            .validate_declarations()
+            .unwrap();
+        let with_secret = "services:\n  a:\n    image: x\n    files:\n      - path: /c.json\n        merge_from: f\n        content: '{\"k\": \"${S}\", \"on\": ${b}}'\nsecrets:\n  - { name: S, generate: password }\nconfig:\n  - { name: f, type: file }\n  - { name: b, type: bool }\n";
+        Compose::parse(with_secret)
+            .unwrap()
+            .validate_declarations()
+            .unwrap();
+    }
+
+    #[test]
+    fn config_group_is_parsed_and_bounded() {
+        let c = Compose::parse(
+            "services:\n  a:\n    image: x\nconfig:\n  - { name: a, group: Limits }\n  - { name: b }\n",
+        )
+        .unwrap();
+        assert_eq!(c.config[0].group.as_deref(), Some("Limits"));
+        assert_eq!(c.config[1].group, None);
+        let long = "x".repeat(MAX_CONFIG_GROUP_LEN + 1);
+        for group in ["''", "'  '", long.as_str()] {
+            let doc = format!(
+                "services:\n  a:\n    image: x\nconfig:\n  - {{ name: a, group: {group} }}\n"
+            );
+            assert!(Compose::parse(&doc).is_err(), "accepted group {group}");
+        }
     }
 }
