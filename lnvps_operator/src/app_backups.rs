@@ -58,6 +58,7 @@ const WORK_DIR: &str = "/work";
 const WORK_VOLUME: &str = "work";
 const UPLOADER_CONTAINER: &str = "upload";
 const POD_WAIT: Duration = Duration::from_secs(300);
+const STOP_WAIT: Duration = Duration::from_secs(30);
 const PART_BYTES: usize = 8 * 1024 * 1024;
 
 /// Where a `volume:` backup mounts the customer's data, always read-only.
@@ -522,6 +523,7 @@ async fn step_backup(
             if ctx.exec_pumps.lock().unwrap().contains(&backup.id) {
                 return Ok(());
             }
+            stop_exports(ctx, backup).await;
             fail_backup(
                 ctx,
                 backup,
@@ -591,14 +593,16 @@ fn spawn_pump(ctx: &Arc<Context>, backup: AppDeploymentBackup, argv: Vec<String>
     let ctx = ctx.clone();
     tokio::spawn(async move {
         let deadline = ctx.settings.backup_job_deadline();
-        let result = match tokio::time::timeout(deadline, pump_exec(&ctx, &backup, &argv)).await {
-            Ok(r) => r,
-            Err(_) => Err(anyhow!(
-                "the app's export did not finish within {deadline:?}"
-            )),
-        };
+        let result =
+            match tokio::time::timeout(deadline, pump_exec(&ctx, &backup, &argv, deadline)).await {
+                Ok(r) => r,
+                Err(_) => Err(anyhow!(
+                    "the app's export did not finish within {deadline:?}"
+                )),
+            };
         if let Err(e) = result {
             error!("backup {} failed: {e}", backup.id);
+            stop_exports(&ctx, &backup).await;
             if let Err(e) = fail_backup(&ctx, &backup, &e.to_string()).await {
                 warn!("backup {}: could not record the failure: {e}", backup.id);
             }
@@ -615,10 +619,7 @@ async fn running_pod(pods: &Api<Pod>, selector: &str) -> Result<String> {
             .await?
             .items
             .into_iter()
-            .find(|p| {
-                p.metadata.deletion_timestamp.is_none()
-                    && p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")
-            })
+            .find(is_running)
             .and_then(|p| p.metadata.name);
         if let Some(name) = found {
             return Ok(name);
@@ -627,6 +628,55 @@ async fn running_pod(pods: &Api<Pod>, selector: &str) -> Result<String> {
             return Err(anyhow!("no running pod matches {selector}"));
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn is_running(p: &Pod) -> bool {
+    p.metadata.deletion_timestamp.is_none()
+        && p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")
+}
+
+async fn stop_exports(ctx: &Context, backup: &AppDeploymentBackup) {
+    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &namespace_name(backup.deployment_id));
+    let selector = label_selector(&service_labels(backup.deployment_id, &backup.service));
+    let names: Vec<String> = match pods.list(&ListParams::default().labels(&selector)).await {
+        Ok(list) => list
+            .items
+            .into_iter()
+            .filter(is_running)
+            .filter_map(|p| p.metadata.name)
+            .collect(),
+        Err(e) => {
+            warn!(
+                "backup {}: could not list pods to stop its export: {e}",
+                backup.id
+            );
+            return;
+        }
+    };
+    for name in names {
+        let stop = async {
+            let mut process = pods
+                .exec(
+                    &name,
+                    stop_exports_command(backup.id),
+                    &AttachParams::default()
+                        .container(&backup.service)
+                        .stdout(false)
+                        .stderr(true),
+                )
+                .await?;
+            let stderr = drain_stderr(&mut process).await;
+            finished(process, stderr, "stopping the export").await
+        };
+        match tokio::time::timeout(STOP_WAIT, stop).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!("backup {}: {e} in pod {name}", backup.id),
+            Err(_) => warn!(
+                "backup {}: stopping the export in pod {name} took over {STOP_WAIT:?}",
+                backup.id
+            ),
+        }
     }
 }
 
@@ -679,13 +729,37 @@ async fn finished(
 const EXEC_ATTEMPTS: u32 = 3;
 const MARKER_TAIL: usize = 128;
 
-pub fn wrap_with_marker(argv: &[String], nonce: &str) -> Vec<String> {
+const EXPORT_TAG: &str = "lnvps-backup";
+
+pub fn export_nonce(backup_id: u64) -> String {
+    format!("{EXPORT_TAG}-{backup_id}-{}", Uuid::new_v4().simple())
+}
+
+pub fn wrap_with_marker(argv: &[String], nonce: &str, deadline: Duration) -> Vec<String> {
+    let secs = deadline.as_secs().max(1);
     vec![
         "sh".to_string(),
         "-c".to_string(),
         format!(
-            "{}; rc=$?; printf '\\nLNVPS-END-%s %s\\n' '{nonce}' \"$rc\"",
+            "{} & pid=$!; \
+             trap 'kill -9 $pid 2>/dev/null; exit 143' TERM INT HUP; \
+             ( i=0; while [ $i -lt {secs} ] && kill -0 $pid; do sleep 1; i=$((i+1)); done; \
+               [ $i -ge {secs} ] && kill -9 $pid ) >/dev/null 2>&1 & \
+             wait $pid; rc=$?; \
+             printf '\\nLNVPS-END-%s %s\\n' '{nonce}' \"$rc\"",
             shell_join(argv)
+        ),
+    ]
+}
+
+pub fn stop_exports_command(backup_id: u64) -> Vec<String> {
+    vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        format!(
+            "for d in /proc/[0-9]*; do p=${{d#/proc/}}; [ \"$p\" = \"$$\" ] && continue; \
+             grep -qF \"{EXPORT_TAG}\"\"-{backup_id}-\" \"$d/cmdline\" 2>/dev/null && kill \"$p\" 2>/dev/null; \
+             done; true"
         ),
     ]
 }
@@ -706,7 +780,12 @@ pub fn split_marker(tail: &[u8], nonce: &str) -> Option<(usize, i32)> {
     Some((pos, rc))
 }
 
-async fn pump_exec(ctx: &Context, backup: &AppDeploymentBackup, argv: &[String]) -> Result<()> {
+async fn pump_exec(
+    ctx: &Context,
+    backup: &AppDeploymentBackup,
+    argv: &[String],
+    deadline: Duration,
+) -> Result<()> {
     let store = ctx
         .object_store
         .as_ref()
@@ -725,11 +804,11 @@ async fn pump_exec(ctx: &Context, backup: &AppDeploymentBackup, argv: &[String])
             &label_selector(&service_labels(backup.deployment_id, &backup.service)),
         )
         .await?;
-        let nonce = Uuid::new_v4().simple().to_string();
+        let nonce = export_nonce(backup.id);
         let mut source = pods
             .exec(
                 &app_pod,
-                wrap_with_marker(argv, &nonce),
+                wrap_with_marker(argv, &nonce, deadline),
                 &AttachParams::default()
                     .container(&backup.service)
                     .stdout(true)
@@ -769,10 +848,13 @@ async fn pump_exec(ctx: &Context, backup: &AppDeploymentBackup, argv: &[String])
                             "the export stream ended early {EXEC_ATTEMPTS} times"
                         ));
                     }
-                    _ => warn!(
-                        "backup {}: the export stream ended early, retrying ({attempt}/{EXEC_ATTEMPTS})",
-                        backup.id
-                    ),
+                    _ => {
+                        warn!(
+                            "backup {}: the export stream ended early, retrying ({attempt}/{EXEC_ATTEMPTS})",
+                            backup.id
+                        );
+                        stop_exports(ctx, backup).await;
+                    }
                 }
             }
         }
@@ -1984,7 +2066,7 @@ mod tests {
     fn the_end_marker_survives_the_shell_and_is_found() {
         let argv = vec!["printf".to_string(), "it's\nfine".to_string()];
         let out = std::process::Command::new("sh")
-            .args(&wrap_with_marker(&argv, "abc")[1..])
+            .args(&wrap_with_marker(&argv, "abc", Duration::from_secs(60))[1..])
             .output()
             .unwrap();
         let (pos, rc) = split_marker(&out.stdout, "abc").unwrap();
@@ -1992,7 +2074,7 @@ mod tests {
         assert_eq!(rc, 0);
 
         let failing = std::process::Command::new("sh")
-            .args(&wrap_with_marker(&["false".to_string()], "def")[1..])
+            .args(&wrap_with_marker(&["false".to_string()], "def", Duration::from_secs(60))[1..])
             .output()
             .unwrap();
         assert_eq!(split_marker(&failing.stdout, "def").map(|m| m.1), Some(1));
@@ -2000,5 +2082,69 @@ mod tests {
         assert_eq!(split_marker(b"data\nLNVPS-END-x 0\n", "y"), None);
         assert_eq!(split_marker(b"data\nLNVPS-END-x 0", "x"), None);
         assert_eq!(split_marker(b"data\nLNVPS-END-x zz\n", "x"), None);
+    }
+
+    fn run_until_stdout_closes(mut child: std::process::Child) -> (Vec<u8>, Duration) {
+        let started = std::time::Instant::now();
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(child.stdout.as_mut().unwrap(), &mut out).unwrap();
+        child.wait().unwrap();
+        (out, started.elapsed())
+    }
+
+    #[test]
+    fn an_export_past_its_deadline_is_killed_inside_the_pod() {
+        let nonce = export_nonce(1_000_001);
+        let child = std::process::Command::new("sh")
+            .args(
+                &wrap_with_marker(
+                    &["sleep".to_string(), "30".to_string()],
+                    &nonce,
+                    Duration::from_secs(1),
+                )[1..],
+            )
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (out, took) = run_until_stdout_closes(child);
+        assert!(took < Duration::from_secs(10), "took {took:?}");
+        assert_eq!(split_marker(&out, &nonce).map(|m| m.1), Some(137));
+    }
+
+    #[test]
+    fn stopping_a_backup_kills_its_orphaned_export_and_nothing_else() {
+        let spawn = |id: u64| {
+            std::process::Command::new("sh")
+                .args(
+                    &wrap_with_marker(
+                        &["sleep".to_string(), "30".to_string()],
+                        &export_nonce(id),
+                        Duration::from_secs(60),
+                    )[1..],
+                )
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let target = spawn(1_000_002);
+        let mut bystander = spawn(10_000_020);
+        std::thread::sleep(Duration::from_millis(300));
+
+        let stop = std::process::Command::new("sh")
+            .args(&stop_exports_command(1_000_002)[1..])
+            .status()
+            .unwrap();
+        assert!(stop.success());
+
+        let (out, took) = run_until_stdout_closes(target);
+        assert!(took < Duration::from_secs(10), "took {took:?}");
+        assert!(!String::from_utf8_lossy(&out).contains("LNVPS-END-"));
+
+        assert!(bystander.try_wait().unwrap().is_none());
+        bystander.kill().unwrap();
+        std::process::Command::new("sh")
+            .args(&stop_exports_command(10_000_020)[1..])
+            .status()
+            .unwrap();
     }
 }
