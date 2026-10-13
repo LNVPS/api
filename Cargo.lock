@@ -4769,9 +4769,9 @@ checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "payments-rs"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63f5385002f244049c430ece91ea139574c1b0ab552c0b79a32e146d410f4e72"
+checksum = "c670330eb4478b9dda4490b184660550b604918dbea2cae5cb6e48bddb228022"
 dependencies = [
  "anyhow",
  "async-trait",
