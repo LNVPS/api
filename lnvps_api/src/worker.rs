@@ -15,6 +15,7 @@ use lnvps_api_common::{
     VmRunningStates, VmStateCache, WorkCommander, WorkFeedback, WorkJob, WorkJobMessage,
     capture_is_complete, merge_ssh_host_keys, op_fatal, parse_ssh_host_keys, quota_period,
     retry::{OpError, Pipeline, RetryPolicy},
+    upgrade_bandwidth,
 };
 use lnvps_db::{
     BulkMessageTarget, CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, IntervalType, LNVpsDb,
@@ -4436,6 +4437,20 @@ impl Worker {
                         if let Some(new_disk) = ctx.cfg.new_disk {
                             new_template.disk_size = new_disk;
                         }
+                        if ctx.cfg.changes_bandwidth() {
+                            let pricing = ctx.db.get_custom_pricing(old_template.pricing_id).await?;
+                            let (transfer_gb, network_mbps) = match upgrade_bandwidth(
+                                &ctx.cfg,
+                                &pricing,
+                                old_template.transfer_gb,
+                                old_template.network_mbps,
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => op_fatal!(e, anyhow::Error),
+                            };
+                            new_template.transfer_gb = transfer_gb;
+                            new_template.network_mbps = network_mbps;
+                        }
 
                         if old_template.cpu > new_template.cpu {
                             op_fatal!("Cannot downgrade CPU");
@@ -4451,6 +4466,8 @@ impl Worker {
                         if old_template.cpu == new_template.cpu
                             && old_template.memory == new_template.memory
                             && old_template.disk_size == new_template.disk_size
+                            && old_template.transfer_gb == new_template.transfer_gb
+                            && old_template.network_mbps == new_template.network_mbps
                         {
                             info!(
                                 "Custom template {} for VM {} already has the requested specs, skipping template update",
@@ -4474,12 +4491,16 @@ impl Worker {
                             "old_specs": {
                                 "cpu": old_template.cpu,
                                 "memory": old_template.memory,
-                                "disk_size": old_template.disk_size
+                                "disk_size": old_template.disk_size,
+                                "transfer_gb": old_template.transfer_gb,
+                                "network_mbps": old_template.network_mbps
                             },
                             "new_specs": {
                                 "cpu": new_template.cpu,
                                 "memory": new_template.memory,
-                                "disk_size": new_template.disk_size
+                                "disk_size": new_template.disk_size,
+                                "transfer_gb": new_template.transfer_gb,
+                                "network_mbps": new_template.network_mbps
                             }
                         });
 
@@ -4520,7 +4541,9 @@ impl Worker {
                             "changes": {
                                 "cpu": ctx.cfg.new_cpu,
                                 "memory": ctx.cfg.new_memory,
-                                "disk": ctx.cfg.new_disk
+                                "disk": ctx.cfg.new_disk,
+                                "transfer_gb": ctx.cfg.new_transfer_gb,
+                                "network_mbps": ctx.cfg.new_network_mbps
                             },
                             "converted_from_template_id": vm_before.template_id,
                             "new_custom_template_id": vm_after.custom_template_id
@@ -4547,6 +4570,9 @@ impl Worker {
             })
             .step("stop_vm", |ctx| {
                 Box::pin(async move {
+                    if !ctx.cfg.changes_compute() {
+                        return Ok(());
+                    }
                     let vm = ctx.db.get_vm(ctx.vm_id).await?;
                     let host = ctx.db.get_host(vm.host_id).await?;
                     let client = get_host_client(&ctx.db, &host, &ctx.settings.provisioner_config).await?;
@@ -4574,7 +4600,10 @@ impl Worker {
             })
             .step("configure_cpu_memory", |ctx| {
                 Box::pin(async move {
-                    if ctx.cfg.new_cpu.is_some() || ctx.cfg.new_memory.is_some() {
+                    if ctx.cfg.new_cpu.is_some()
+                        || ctx.cfg.new_memory.is_some()
+                        || ctx.cfg.changes_bandwidth()
+                    {
                         let full_info = FullVmInfo::load(ctx.vm_id, ctx.db.clone()).await?;
                         let host = ctx.db.get_host(full_info.host.id).await?;
                         let client = get_host_client(&ctx.db, &host, &ctx.settings.provisioner_config).await?;
@@ -4587,6 +4616,9 @@ impl Worker {
             })
             .step("start_vm", |ctx| {
                 Box::pin(async move {
+                    if !ctx.cfg.changes_compute() {
+                        return Ok(());
+                    }
                     let vm = ctx.db.get_vm(ctx.vm_id).await?;
                     let host = ctx.db.get_host(vm.host_id).await?;
                     let client = get_host_client(&ctx.db, &host, &ctx.settings.provisioner_config).await?;
@@ -8286,6 +8318,136 @@ mod tests {
             db.get_subscription(sub_id).await.is_ok(),
             "a subscription paid since the snapshot must not be purged"
         );
+        Ok(())
+    }
+
+    async fn add_bandwidth_plan(db: &Arc<MockDb>) {
+        db.custom_pricing.lock().await.insert(
+            1,
+            lnvps_db::VmCustomPricing {
+                id: 1,
+                enabled: true,
+                region_id: 1,
+                currency: "EUR".to_string(),
+                cpu_cost: 100,
+                min_cpu: 1,
+                max_cpu: 16,
+                max_memory: u64::MAX,
+                max_ip4: 4,
+                max_ip6: 4,
+                transfer_gb: Some(1000),
+                min_transfer_gb: 500,
+                max_transfer_gb: 10_000,
+                transfer_cost_per_tb: 100,
+                network_mbps: Some(1000),
+                min_network_mbps: 100,
+                max_network_mbps: 10_000,
+                network_cost_per_gbps: 200,
+                ..Default::default()
+            },
+        );
+        db.custom_pricing_disk.lock().await.insert(
+            1,
+            lnvps_db::VmCustomPricingDisk {
+                id: 1,
+                pricing_id: 1,
+                kind: lnvps_db::DiskType::SSD,
+                interface: lnvps_db::DiskInterface::PCIe,
+                cost: 1,
+                min_disk_size: 0,
+                max_disk_size: u64::MAX,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_upgrade_updates_custom_template() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        add_bandwidth_plan(&db).await;
+        let template_id = db
+            .insert_custom_vm_template(&lnvps_db::VmCustomTemplate {
+                cpu: 2,
+                memory: crate::GB,
+                disk_size: 10 * crate::GB,
+                disk_type: lnvps_db::DiskType::SSD,
+                disk_interface: lnvps_db::DiskInterface::PCIe,
+                pricing_id: 1,
+                transfer_gb: Some(1000),
+                network_mbps: Some(1000),
+                ..Default::default()
+            })
+            .await?;
+        let mut vm = db.get_vm(vm_id).await?;
+        vm.template_id = None;
+        vm.custom_template_id = Some(template_id);
+        db.update_vm(&vm).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .process_vm_upgrade(
+                vm_id,
+                &UpgradeConfig {
+                    new_transfer_gb: Some(4000),
+                    new_network_mbps: Some(2000),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let template = db.get_custom_vm_template(template_id).await?;
+        assert_eq!(template.transfer_gb, Some(4000));
+        assert_eq!(template.network_mbps, Some(2000));
+        assert_eq!(template.cpu, 2, "compute is untouched");
+        let line_item = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        assert_eq!(line_item.amount, 200 + 10 + 400 + 400);
+
+        let refused = worker
+            .process_vm_upgrade(
+                vm_id,
+                &UpgradeConfig {
+                    new_transfer_gb: Some(2000),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(refused.is_err(), "bandwidth cannot shrink");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_upgrade_converts_standard_template() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        add_bandwidth_plan(&db).await;
+        {
+            let mut templates = db.templates.lock().await;
+            let t = templates.get_mut(&1).expect("mock template");
+            t.disk_type = lnvps_db::DiskType::SSD;
+            t.disk_interface = lnvps_db::DiskInterface::PCIe;
+            t.transfer_gb = Some(500);
+            t.network_mbps = None;
+        }
+
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .process_vm_upgrade(
+                vm_id,
+                &UpgradeConfig {
+                    new_transfer_gb: Some(3000),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let vm = db.get_vm(vm_id).await?;
+        let template = db
+            .get_custom_vm_template(vm.custom_template_id.expect("converted"))
+            .await?;
+        assert_eq!(template.transfer_gb, Some(3000));
+        assert_eq!(template.network_mbps, None, "an uncapped VM stays uncapped");
         Ok(())
     }
 }

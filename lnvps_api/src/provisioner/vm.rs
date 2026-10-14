@@ -10,7 +10,8 @@ use lnvps_api_common::DnsServer;
 use lnvps_api_common::retry::{OpResult, Pipeline, RetryPolicy};
 use lnvps_api_common::{
     AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, NewPaymentInfo,
-    PricingEngine, UpgradeConfig, UpgradeCostQuote, VmStateCache, round_msat_to_sat,
+    PricingEngine, UpgradeConfig, UpgradeCostQuote, VmStateCache, apply_custom_pricing_limits,
+    round_msat_to_sat, upgrade_bandwidth,
 };
 use lnvps_api_common::{ExchangeRateService, op_fatal};
 use lnvps_db::{
@@ -308,18 +309,11 @@ impl VmProvisioner {
         }
         ensure_image_arch_compatible(image.cpu_arch, template.cpu_arch)?;
 
+        apply_custom_pricing_limits(&mut template, &pricing);
+
         // Reject out-of-range specs at order time (pricing itself no longer
         // validates, so existing/grandfathered VMs can still be priced/renewed).
         PricingEngine::validate_custom_vm_spec(&self.db, &template).await?;
-
-        // Copy resource limits from the pricing plan into the template
-        template.disk_iops_read = pricing.disk_iops_read;
-        template.disk_iops_write = pricing.disk_iops_write;
-        template.disk_mbps_read = pricing.disk_mbps_read;
-        template.disk_mbps_write = pricing.disk_mbps_write;
-        template.network_mbps = pricing.network_mbps;
-        template.cpu_limit = pricing.cpu_limit;
-        template.transfer_gb = pricing.transfer_gb;
 
         let cap = HostCapacityService::new(self.db.clone());
         let host = cap
@@ -1028,6 +1022,13 @@ impl VmProvisioner {
                 current_template.disk_interface
             ))?;
 
+        let (transfer_gb, network_mbps) = upgrade_bandwidth(
+            cfg,
+            &custom_pricing,
+            current_template.transfer_gb,
+            current_template.network_mbps,
+        )?;
+
         // Build the new custom template with upgraded specs, copying resource limits from pricing
         let new_custom_template = VmCustomTemplate {
             id: 0,
@@ -1048,9 +1049,9 @@ impl VmProvisioner {
             disk_iops_write: custom_pricing.disk_iops_write,
             disk_mbps_read: custom_pricing.disk_mbps_read,
             disk_mbps_write: custom_pricing.disk_mbps_write,
-            network_mbps: custom_pricing.network_mbps,
+            network_mbps,
             cpu_limit: custom_pricing.cpu_limit,
-            transfer_gb: custom_pricing.transfer_gb,
+            transfer_gb,
             ..Default::default()
         };
 
@@ -1739,6 +1740,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let (_, template, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
 
@@ -1769,6 +1771,7 @@ mod tests {
             new_cpu: None,
             new_memory: Some(8 * GB),
             new_disk: None,
+            ..Default::default()
         };
         let (_, template, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
 
@@ -1794,6 +1797,7 @@ mod tests {
             new_cpu: None,
             new_memory: None,
             new_disk: Some(128 * GB),
+            ..Default::default()
         };
         let (_, template, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
 
@@ -1819,6 +1823,7 @@ mod tests {
             new_cpu: Some(8),
             new_memory: Some(16 * GB),
             new_disk: Some(256 * GB),
+            ..Default::default()
         };
         let (_, _, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
 
@@ -1841,6 +1846,7 @@ mod tests {
             new_cpu: None,
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let (_, template, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
 
@@ -1892,6 +1898,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = prov.create_upgrade_template(vm_id, &cfg).await;
         assert!(result.is_err(), "should fail for custom-template VMs");
@@ -1918,6 +1925,7 @@ mod tests {
             new_cpu: Some(1),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = prov.create_upgrade_template(vm_id, &cfg).await;
         assert!(result.is_err(), "should fail for CPU downgrade");
@@ -1945,6 +1953,7 @@ mod tests {
             new_cpu: None,
             new_memory: Some(GB),
             new_disk: None,
+            ..Default::default()
         };
         let result = prov.create_upgrade_template(vm_id, &cfg).await;
         assert!(result.is_err(), "should fail for memory downgrade");
@@ -1972,6 +1981,7 @@ mod tests {
             new_cpu: None,
             new_memory: None,
             new_disk: Some(32 * GB),
+            ..Default::default()
         };
         let result = prov.create_upgrade_template(vm_id, &cfg).await;
         assert!(result.is_err(), "should fail for disk downgrade");
@@ -1999,6 +2009,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = prov.create_upgrade_template(vm_id, &cfg).await;
         assert!(
@@ -2471,6 +2482,96 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_provision_custom_applies_chosen_bandwidth() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let prov = make_provisioner(db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        let pricing_id = insert_custom_pricing(&db, DiskType::SSD, DiskInterface::PCIe).await?;
+        {
+            let mut p = db.custom_pricing.lock().await;
+            let pricing = p.get_mut(&pricing_id).unwrap();
+            pricing.transfer_gb = Some(1000);
+            pricing.min_transfer_gb = 1000;
+            pricing.max_transfer_gb = 8000;
+            pricing.transfer_cost_per_tb = 100;
+            pricing.network_mbps = Some(500);
+            pricing.min_network_mbps = 500;
+            pricing.max_network_mbps = 500;
+        }
+        let spec = |transfer_gb: Option<u32>| lnvps_db::VmCustomTemplate {
+            cpu: 2,
+            memory: 4 * GB,
+            disk_size: 50 * GB,
+            disk_type: DiskType::SSD,
+            disk_interface: DiskInterface::PCIe,
+            pricing_id,
+            transfer_gb,
+            ..Default::default()
+        };
+
+        let vm = prov
+            .provision_custom(user.id, spec(Some(4000)), 1, ssh_key.id, None)
+            .await?;
+        let template = db
+            .get_custom_vm_template(vm.custom_template_id.unwrap())
+            .await?;
+        assert_eq!(template.transfer_gb, Some(4000));
+        assert_eq!(template.network_mbps, Some(500), "plan default speed");
+        let line_item = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        assert_eq!(line_item.amount, 200 + 200 + 250 + 400);
+
+        assert!(
+            prov.provision_custom(user.id, spec(Some(9000)), 1, ssh_key.id, None)
+                .await
+                .is_err(),
+            "transfer above the plan maximum is refused"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_upgrade_template_carries_bandwidth() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_custom_pricing(&db, DiskType::SSD, DiskInterface::PCIe).await?;
+        db.custom_pricing
+            .lock()
+            .await
+            .get_mut(&pricing_id)
+            .unwrap()
+            .transfer_gb = Some(1000);
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let template_id = db.get_vm(vm_id).await?.template_id.unwrap();
+        db.templates
+            .lock()
+            .await
+            .get_mut(&template_id)
+            .unwrap()
+            .transfer_gb = Some(2000);
+        let prov = make_provisioner(db.clone());
+
+        let cfg = UpgradeConfig {
+            new_cpu: Some(4),
+            ..Default::default()
+        };
+        let (_, _, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
+        assert_eq!(
+            new_tpl.transfer_gb,
+            Some(2000),
+            "the VM keeps its allowance"
+        );
+        assert_eq!(new_tpl.network_mbps, None);
+
+        let cfg = UpgradeConfig {
+            new_transfer_gb: Some(1500),
+            ..Default::default()
+        };
+        assert!(prov.create_upgrade_template(vm_id, &cfg).await.is_err());
+        Ok(())
+    }
+
     // ── subscription line item amount update tests ───────────────────────────
 
     /// Regression: convert_to_custom_template must update line_item.amount to the new
@@ -2495,6 +2596,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         prov.convert_to_custom_template(vm_id, &cfg).await?;
 

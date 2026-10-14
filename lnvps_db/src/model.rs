@@ -1439,6 +1439,12 @@ pub struct VmCustomPricing {
     /// Monthly **outbound** transfer quota in GB granted to VMs built on this
     /// plan (None = unmetered)
     pub transfer_gb: Option<u32>,
+    pub min_transfer_gb: u32,
+    pub max_transfer_gb: u32,
+    pub transfer_cost_per_tb: u64,
+    pub min_network_mbps: u32,
+    pub max_network_mbps: u32,
+    pub network_cost_per_gbps: u64,
 }
 
 /// Pricing per GB on a disk type (SSD/HDD)

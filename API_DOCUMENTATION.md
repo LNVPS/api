@@ -417,6 +417,10 @@ interface CustomVmRequest {
   disk: number; // Disk size in bytes
   disk_type: 'hdd' | 'ssd';
   disk_interface: 'sata' | 'scsi' | 'pcie';
+  ip4_count?: number; // Defaults to 1
+  ip6_count?: number; // Defaults to 1
+  transfer_gb?: number; // Monthly outbound transfer in GB; defaults to transfer.default, ignored on an unmetered plan
+  network_mbps?: number; // Network speed in Mbit/s; defaults to network.default, ignored on an uncapped plan
 }
 
 interface CustomVmOrder extends CustomVmRequest {
@@ -437,6 +441,15 @@ interface CustomTemplateParams {
   min_memory: number; // In bytes
   max_memory: number; // In bytes
   disks: CustomTemplateDiskParam[];
+  transfer_gb?: number; // Default monthly transfer in GB; omitted when unmetered
+  transfer?: BandwidthRange; // Selectable monthly transfer in GB; omitted when unmetered
+  network?: BandwidthRange; // Selectable network speed in Mbit/s; omitted when uncapped
+}
+
+interface BandwidthRange {
+  min: number;
+  max: number;
+  default: number;
 }
 
 interface CustomTemplateDiskParam {
@@ -622,6 +635,8 @@ interface VmUpgradeRequest {
   cpu?: number; // New CPU core count (must be >= current)
   memory?: number; // New memory in bytes (must be >= current)
   disk?: number; // New disk size in bytes (must be >= current)
+  transfer_gb?: number; // New monthly transfer in GB (must be >= current, VM must be metered)
+  network_mbps?: number; // New network speed in Mbit/s (must be >= current, VM must be capped)
 }
 
 interface VmUpgradeQuote {
@@ -972,7 +987,7 @@ historical range is needed; a usage bar can be rendered from this object alone.
   - `payment_method_id`: Optional; for `method=saved`, the specific saved card to charge (omit to use the default saved card)
 - **Body**: `VmUpgradeRequest`
 - **Response**: `VmPayment`
-- **Description**: Create a payment for upgrading VM specifications. An upgrade must keep every resource at or above its current level and strictly increase at least one of CPU, memory or disk — requests that shrink a resource (or change nothing) are rejected; downgrades require a reinstall onto a smaller template. The upgrade is applied after payment confirmation. Payment method determines the currency and payment provider used. Saved methods are collected on the spot the same way as renewals: `method=nwc` pays via the user's saved Nostr Wallet Connect wallet, and `method=saved` charges a saved Revolut card off-session (merchant-initiated). For these off-session methods the request briefly waits for settlement — the returned `VmPayment` is already `is_paid: true` if it settled within ~10s, otherwise it is returned pending and settles asynchronously. **Important: Running VMs will be automatically stopped and restarted during the upgrade process to apply hardware changes.**
+- **Description**: Create a payment for upgrading VM specifications. An upgrade must keep every resource at or above its current level and strictly increase at least one of CPU, memory, disk, monthly transfer or network speed — requests that shrink a resource (or change nothing) are rejected; downgrades require a reinstall onto a smaller template. The upgrade is applied after payment confirmation. Payment method determines the currency and payment provider used. Saved methods are collected on the spot the same way as renewals: `method=nwc` pays via the user's saved Nostr Wallet Connect wallet, and `method=saved` charges a saved Revolut card off-session (merchant-initiated). For these off-session methods the request briefly waits for settlement — the returned `VmPayment` is already `is_paid: true` if it settled within ~10s, otherwise it is returned pending and settles asynchronously. **Important: Running VMs will be automatically stopped and restarted during the upgrade process to apply CPU, memory or disk changes.** An upgrade of only `transfer_gb` or `network_mbps` is applied without a restart. Bandwidth can only be raised on a VM that already has an allowance or speed cap; an unmetered or uncapped VM stays that way.
 
 ### VM Operations
 
@@ -1172,10 +1187,17 @@ These are properties of the offer, not of a host. A host's own capacity is never
 reported to customers: two hosts backing the same plan must be indistinguishable
 to the buyer.
 
-`CustomTemplateParams` also carries `transfer_gb`, the allowance copied onto
-every custom VM built from that plan. Its `limits` never includes
-`firewall_rule_limit` — a pricing plan holds none, so such a VM uses the server
-default.
+`CustomTemplateParams` also carries `transfer_gb`, the plan's default monthly
+allowance. Its `limits` never includes `firewall_rule_limit`: a pricing plan
+holds none, so such a VM uses the server default.
+
+Monthly transfer and network speed are selectable on a custom VM. `transfer` and
+`network` give the range a plan sells and the value used when the order leaves
+it out. Both are billed on the whole amount chosen, so use
+`POST /api/v1/vm/custom-template/price` for the price. A plan without `transfer`
+is unmetered and one without `network` is uncapped; neither can be bought on it.
+The chosen values appear on the VM as `template.transfer_gb` and
+`template.limits.network_mbps`.
 
 #### List OS Images
 - **GET** `/api/v1/image`

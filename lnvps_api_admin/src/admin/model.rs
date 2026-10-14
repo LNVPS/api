@@ -2092,6 +2092,12 @@ pub struct AdminCustomPricingInfo {
     /// (None = unmetered)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transfer_gb: Option<u32>,
+    pub min_transfer_gb: u32,
+    pub max_transfer_gb: u32,
+    pub transfer_cost_per_tb: u64,
+    pub min_network_mbps: u32,
+    pub max_network_mbps: u32,
+    pub network_cost_per_gbps: u64,
 }
 
 #[derive(Serialize)]
@@ -2352,6 +2358,12 @@ pub struct UpdateCustomPricingRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub transfer_gb: Option<Option<u32>>,
+    pub min_transfer_gb: Option<u32>,
+    pub max_transfer_gb: Option<u32>,
+    pub transfer_cost_per_tb: Option<u64>,
+    pub min_network_mbps: Option<u32>,
+    pub max_network_mbps: Option<u32>,
+    pub network_cost_per_gbps: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -2403,6 +2415,12 @@ pub struct CreateCustomPricingRequest {
     pub cpu_limit: Option<f32>,
     /// Monthly outbound transfer quota in GB (None = unmetered)
     pub transfer_gb: Option<u32>,
+    pub min_transfer_gb: Option<u32>,
+    pub max_transfer_gb: Option<u32>,
+    pub transfer_cost_per_tb: Option<u64>,
+    pub min_network_mbps: Option<u32>,
+    pub max_network_mbps: Option<u32>,
+    pub network_cost_per_gbps: Option<u64>,
 }
 
 #[derive(Deserialize)]

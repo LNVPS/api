@@ -224,6 +224,14 @@ mod tests {
             "max_ip4": 2,
             "min_ip6": 0,
             "max_ip6": 1,
+            "transfer_gb": 1000,
+            "min_transfer_gb": 500,
+            "max_transfer_gb": 5000,
+            "transfer_cost_per_tb": 100,
+            "network_mbps": 1000,
+            "min_network_mbps": 100,
+            "max_network_mbps": 10000,
+            "network_cost_per_gbps": 200,
             "disk_pricing": [{
                 "kind": "ssd",
                 "interface": "pcie",
@@ -2030,6 +2038,47 @@ mod tests {
             "Should have at least one history entry, got {history_count}"
         );
         eprintln!("VM {vm_id} has {history_count} history entries");
+
+        let price_of = |extra: Value| {
+            let mut body = serde_json::json!({
+                "pricing_id": custom_pricing_id,
+                "cpu": 1,
+                "memory": 1073741824_u64,
+                "disk": 10737418240_u64,
+                "disk_type": "ssd",
+                "disk_interface": "pcie"
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            let user = &user;
+            async move {
+                user.post_auth("/api/v1/vm/custom-template/price", &body)
+                    .await
+                    .unwrap()
+            }
+        };
+        let default_price = json_ok(price_of(serde_json::json!({})).await).await["data"]["amount"]
+            .as_u64()
+            .unwrap();
+        let more_bandwidth = json_ok(
+            price_of(serde_json::json!({ "transfer_gb": 3000, "network_mbps": 2000 })).await,
+        )
+        .await["data"]["amount"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            more_bandwidth - default_price,
+            200 + 200,
+            "2 TB more transfer at 100/TB and 1 Gbit/s more at 200/Gbit/s"
+        );
+        let resp = price_of(serde_json::json!({ "transfer_gb": 9000 })).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "transfer above the plan maximum must not be quotable"
+        );
+        eprintln!("Custom price follows bandwidth ({default_price} -> {more_bandwidth}) ✓");
 
         // ----------------------------------------------------------------
         // 19. Custom VM order (if custom pricing is set up)

@@ -838,6 +838,10 @@ pub struct ApiCustomVmRequest {
     /// IPv6 addresses to assign; defaults to 1.
     #[serde(default = "default_ip_count")]
     pub ip6_count: u16,
+    #[serde(default)]
+    pub transfer_gb: Option<u32>,
+    #[serde(default)]
+    pub network_mbps: Option<u32>,
 }
 
 fn default_ip_count() -> u16 {
@@ -872,6 +876,8 @@ impl From<ApiCustomVmRequest> for VmCustomTemplate {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or_default(),
             cpu_features: cpu_features.into(),
+            transfer_gb: value.transfer_gb,
+            network_mbps: value.network_mbps,
             ..Default::default()
         }
     }
@@ -882,6 +888,22 @@ pub struct ApiVmUpgradeRequest {
     pub cpu: Option<u16>,
     pub memory: Option<u64>,
     pub disk: Option<u64>,
+    #[serde(default)]
+    pub transfer_gb: Option<u32>,
+    #[serde(default)]
+    pub network_mbps: Option<u32>,
+}
+
+impl From<ApiVmUpgradeRequest> for UpgradeConfig {
+    fn from(req: ApiVmUpgradeRequest) -> Self {
+        Self {
+            new_cpu: req.cpu,
+            new_memory: req.memory,
+            new_disk: req.disk,
+            new_transfer_gb: req.transfer_gb,
+            new_network_mbps: req.network_mbps,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1648,6 +1670,31 @@ mod tests {
         let t: lnvps_db::VmCustomTemplate = req.into();
         assert_eq!(0, t.ip4_count);
         assert_eq!(3, t.ip6_count);
+    }
+
+    #[test]
+    fn custom_vm_request_carries_bandwidth() {
+        let req: ApiCustomVmRequest = serde_json::from_str(
+            r#"{"pricing_id": 1, "cpu": 2, "memory": 2147483648, "disk": 21474836480,
+                "disk_type": "ssd", "disk_interface": "pcie",
+                "transfer_gb": 4000, "network_mbps": 2500}"#,
+        )
+        .unwrap();
+        let t: lnvps_db::VmCustomTemplate = req.into();
+        assert_eq!(Some(4000), t.transfer_gb);
+        assert_eq!(Some(2500), t.network_mbps);
+    }
+
+    #[test]
+    fn upgrade_request_maps_to_config() {
+        let req: ApiVmUpgradeRequest =
+            serde_json::from_str(r#"{"cpu": 4, "transfer_gb": 3000, "network_mbps": 200}"#)
+                .unwrap();
+        let cfg: UpgradeConfig = req.into();
+        assert_eq!(cfg.new_cpu, Some(4));
+        assert_eq!(cfg.new_memory, None);
+        assert_eq!(cfg.new_transfer_gb, Some(3000));
+        assert_eq!(cfg.new_network_mbps, Some(200));
     }
     use super::*;
 

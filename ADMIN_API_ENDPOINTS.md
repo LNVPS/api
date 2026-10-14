@@ -529,6 +529,10 @@ Body:
   // Optional - IPv4 addresses to assign, default 1; must be within the plan's range
   "ip6_count": number,
   // Optional - IPv6 addresses to assign, default 1; must be within the plan's range
+  "transfer_gb": number,
+  // Optional - Monthly transfer in GB, default the plan's transfer_gb; must be within the plan's range
+  "network_mbps": number,
+  // Optional - Network speed in Mbit/s, default the plan's network_mbps; must be within the plan's range
   "image_id": number,
   // Required - OS image ID
   "ssh_key_id": number,
@@ -2378,6 +2382,20 @@ Body:
   "transfer_gb": number,
   // optional - Monthly outbound transfer allowance in GB granted to VMs built on
   // this plan (omit or null = unmetered)
+  "min_transfer_gb": number,
+  // optional - Smallest monthly transfer a customer may choose, default transfer_gb
+  "max_transfer_gb": number,
+  // optional - Largest monthly transfer a customer may choose, default transfer_gb
+  "transfer_cost_per_tb": number,
+  // optional - Cost per TB (1000 GB) of monthly transfer, billed on the whole
+  // amount chosen, smallest currency units, default 0
+  "min_network_mbps": number,
+  // optional - Slowest network speed a customer may choose, default network_mbps
+  "max_network_mbps": number,
+  // optional - Fastest network speed a customer may choose, default network_mbps
+  "network_cost_per_gbps": number,
+  // optional - Cost per Gbit/s of network speed, billed on the whole speed chosen,
+  // smallest currency units, default 0
   "disk_pricing": [
     // Array of disk pricing configurations
     {
@@ -2457,6 +2475,12 @@ Body (all optional):
   // Maximum CPU usage as fraction of allocated cores e.g. 0.5 = 50% - send null to clear
   "transfer_gb": "number | null",
   // Monthly outbound transfer allowance in GB - send null for unmetered
+  "min_transfer_gb": number,
+  "max_transfer_gb": number,
+  "transfer_cost_per_tb": number,
+  "min_network_mbps": number,
+  "max_network_mbps": number,
+  "network_cost_per_gbps": number,
   "disk_pricing": [
     {
       "kind": "ssd",
@@ -2473,6 +2497,14 @@ Body (all optional):
   ]
 }
 ```
+
+Customers choose monthly transfer and network speed within `min_*`/`max_*`
+when ordering or upgrading a custom VM, and `transfer_gb`/`network_mbps` is the
+value used when they do not. Both create and update return `400` when a minimum
+exceeds its maximum or the default falls outside its range. A plan with
+`transfer_gb` or `network_mbps` unset sells no transfer or speed, whatever the
+range and cost fields hold. An admin edit of a VM's custom template is not held
+to these ranges.
 
 #### Delete Custom Pricing Model
 
@@ -6532,6 +6564,12 @@ The RBAC system uses the following permission format: `resource::action`
   // Maximum CPU usage as a fraction of allocated cores e.g. 0.5 = 50% - omitted when uncapped
   "transfer_gb": number,
   // Monthly outbound transfer allowance in GB - omitted when unmetered
+  "min_transfer_gb": number,
+  "max_transfer_gb": number,
+  "transfer_cost_per_tb": number,
+  "min_network_mbps": number,
+  "max_network_mbps": number,
+  "network_cost_per_gbps": number,
   "disk_pricing": [
     // Array of disk pricing configurations
     {

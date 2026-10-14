@@ -962,6 +962,10 @@ pub struct CustomVmSpec {
     /// IPv6 addresses to assign; defaults to 1.
     #[serde(default = "default_ip_count")]
     pub ip6_count: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_gb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_mbps: Option<u32>,
 }
 
 fn default_ip_count() -> u16 {
@@ -1002,16 +1006,22 @@ impl CustomVmSpec {
             cpu_features: cpu_features.into(),
             ip4_count: self.ip4_count,
             ip6_count: self.ip6_count,
+            transfer_gb: self.transfer_gb,
+            network_mbps: self.network_mbps,
             ..Default::default()
         })
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpgradeConfig {
     pub new_cpu: Option<u16>,
     pub new_memory: Option<u64>,
     pub new_disk: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_transfer_gb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_network_mbps: Option<u32>,
 }
 
 impl UpgradeConfig {
@@ -1020,7 +1030,16 @@ impl UpgradeConfig {
             new_cpu,
             new_memory,
             new_disk,
+            ..Default::default()
         }
+    }
+
+    pub fn changes_compute(&self) -> bool {
+        self.new_cpu.is_some() || self.new_memory.is_some() || self.new_disk.is_some()
+    }
+
+    pub fn changes_bandwidth(&self) -> bool {
+        self.new_transfer_gb.is_some() || self.new_network_mbps.is_some()
     }
 }
 
@@ -1052,9 +1071,26 @@ pub struct ApiCustomTemplateParams {
     /// custom VM built from this plan. Omitted when the plan is unmetered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transfer_gb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer: Option<ApiBandwidthRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<ApiBandwidthRange>,
     /// Performance caps applied to every custom VM built from this plan,
     /// whatever specification is chosen. Not selectable.
     pub limits: ApiVmTemplateLimits,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ApiBandwidthRange {
+    pub min: u32,
+    pub max: u32,
+    pub default: u32,
+}
+
+impl ApiBandwidthRange {
+    fn for_plan(default: Option<u32>, min: u32, max: u32) -> Option<Self> {
+        default.map(|default| Self { min, max, default })
+    }
 }
 
 impl ApiCustomTemplateParams {
@@ -1106,6 +1142,16 @@ impl ApiCustomTemplateParams {
                 })
                 .collect(),
             transfer_gb: pricing.transfer_gb,
+            transfer: ApiBandwidthRange::for_plan(
+                pricing.transfer_gb,
+                pricing.min_transfer_gb,
+                pricing.max_transfer_gb,
+            ),
+            network: ApiBandwidthRange::for_plan(
+                pricing.network_mbps,
+                pricing.min_network_mbps,
+                pricing.max_network_mbps,
+            ),
             limits: pricing.into(),
         }
     }
@@ -1452,6 +1498,8 @@ mod tests {
             cpu_feature: vec![],
             ip4_count: 1,
             ip6_count: 1,
+            transfer_gb: None,
+            network_mbps: None,
         }
     }
 
@@ -1642,6 +1690,74 @@ mod tests {
         assert!(json.contains(r#""cpu_limit":0.5"#));
         let back: ApiVmTemplateLimits = serde_json::from_str(&json).unwrap();
         assert_eq!(back, EXPECTED_LIMITS);
+    }
+
+    #[test]
+    fn test_custom_vm_spec_carries_bandwidth() {
+        let spec: CustomVmSpec = serde_json::from_value(serde_json::json!({
+            "pricing_id": 7, "cpu": 1, "memory": 1, "disk": 1,
+            "disk_type": "ssd", "disk_interface": "pcie",
+            "cpu_mfg": null, "cpu_arch": null,
+            "transfer_gb": 2000, "network_mbps": 500
+        }))
+        .unwrap();
+        let t = spec.to_template().unwrap();
+        assert_eq!(t.transfer_gb, Some(2000));
+        assert_eq!(t.network_mbps, Some(500));
+        assert_eq!(custom_spec().to_template().unwrap().transfer_gb, None);
+    }
+
+    #[test]
+    fn test_upgrade_config_reads_metadata_without_bandwidth() {
+        let cfg: UpgradeConfig =
+            serde_json::from_str(r#"{"new_cpu":4,"new_memory":null,"new_disk":null}"#).unwrap();
+        assert_eq!(cfg.new_cpu, Some(4));
+        assert!(cfg.changes_compute());
+        assert!(!cfg.changes_bandwidth());
+
+        let cfg = UpgradeConfig {
+            new_network_mbps: Some(100),
+            ..Default::default()
+        };
+        assert!(!cfg.changes_compute());
+        assert!(cfg.changes_bandwidth());
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["new_network_mbps"], 100);
+        assert!(json.get("new_transfer_gb").is_none());
+    }
+
+    #[test]
+    fn test_custom_template_params_report_bandwidth_ranges() {
+        let region = Region {
+            id: 1,
+            name: "r".to_string(),
+            enabled: true,
+            company_id: 1,
+            country_code: None,
+        };
+        let pricing = VmCustomPricing {
+            id: 1,
+            transfer_gb: Some(1000),
+            min_transfer_gb: 500,
+            max_transfer_gb: 5000,
+            network_mbps: None,
+            min_network_mbps: 100,
+            max_network_mbps: 1000,
+            ..Default::default()
+        };
+        let params = ApiCustomTemplateParams::from(&pricing, &vec![], &region);
+        assert_eq!(
+            params.transfer,
+            Some(ApiBandwidthRange {
+                min: 500,
+                max: 5000,
+                default: 1000
+            })
+        );
+        assert_eq!(
+            params.network, None,
+            "an uncapped plan offers no speed choice"
+        );
     }
 }
 

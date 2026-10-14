@@ -919,6 +919,8 @@ impl PricingEngine {
         let memory_cost = pricing.memory_cost * memory_gb;
         let ip4_cost = pricing.ip4_cost * v4s;
         let ip6_cost = pricing.ip6_cost * v6s;
+        let transfer_cost = cost_per_thousand(template.transfer_gb, pricing.transfer_cost_per_tb);
+        let network_cost = cost_per_thousand(template.network_mbps, pricing.network_cost_per_gbps);
 
         let currency: Currency = if let Ok(p) = pricing.currency.parse() {
             p
@@ -932,6 +934,8 @@ impl PricingEngine {
             ip6_cost,
             ip4_cost,
             disk_cost,
+            transfer_cost,
+            network_cost,
         })
     }
 
@@ -947,6 +951,28 @@ impl PricingEngine {
         db: &Arc<dyn LNVpsDb>,
         template: &VmCustomTemplate,
     ) -> Result<()> {
+        let pricing = Self::validate_custom_vm_resources(db, template).await?;
+        ensure_bandwidth_in_range(
+            "Monthly transfer",
+            template.transfer_gb,
+            pricing.transfer_gb,
+            pricing.min_transfer_gb,
+            pricing.max_transfer_gb,
+        )?;
+        ensure_bandwidth_in_range(
+            "Network speed",
+            template.network_mbps,
+            pricing.network_mbps,
+            pricing.min_network_mbps,
+            pricing.max_network_mbps,
+        )?;
+        Ok(())
+    }
+
+    pub async fn validate_custom_vm_resources(
+        db: &Arc<dyn LNVpsDb>,
+        template: &VmCustomTemplate,
+    ) -> Result<VmCustomPricing> {
         let pricing = db.get_custom_pricing(template.pricing_id).await?;
         let pricing_disk = db.list_custom_pricing_disk(pricing.id).await?;
         let disk_pricing = pricing_disk
@@ -996,7 +1022,7 @@ impl PricingEngine {
                 pricing.max_ip6
             );
         }
-        Ok(())
+        Ok(pricing)
     }
 
     /// Get the renewal cost of a custom VM
@@ -1354,6 +1380,8 @@ impl PricingEngine {
             cpu_features,
             ip4_count,
             ip6_count,
+            transfer_gb,
+            network_mbps,
         ) = if let Some(template_id) = vm.template_id {
             let template = self.db.get_vm_template(template_id).await?;
             (
@@ -1376,6 +1404,8 @@ impl PricingEngine {
                 template.cpu_features,
                 template.ip4_count,
                 template.ip6_count,
+                template.transfer_gb,
+                template.network_mbps,
             )
         } else if let Some(custom_template_id) = vm.custom_template_id {
             let custom_template = self.db.get_custom_vm_template(custom_template_id).await?;
@@ -1393,6 +1423,8 @@ impl PricingEngine {
                 custom_template.cpu_features,
                 custom_template.ip4_count,
                 custom_template.ip6_count,
+                custom_template.transfer_gb,
+                custom_template.network_mbps,
             )
         } else {
             bail!("VM must have either a standard template or custom template to upgrade");
@@ -1408,12 +1440,18 @@ impl PricingEngine {
             cfg.new_memory.unwrap_or(memory),
             cfg.new_disk.unwrap_or(disk),
         );
+        let (new_transfer_gb, new_network_mbps) =
+            upgrade_bandwidth(cfg, &pricing, transfer_gb, network_mbps)?;
         ensure!(
             new_cpu >= cpu && new_memory >= memory && new_disk >= disk,
             "An upgrade cannot reduce the VM's resources"
         );
         ensure!(
-            new_cpu > cpu || new_memory > memory || new_disk > disk,
+            new_cpu > cpu
+                || new_memory > memory
+                || new_disk > disk
+                || new_transfer_gb != transfer_gb
+                || new_network_mbps != network_mbps,
             "An upgrade must increase at least one resource"
         );
 
@@ -1437,10 +1475,10 @@ impl PricingEngine {
             disk_iops_write: pricing.disk_iops_write,
             disk_mbps_read: pricing.disk_mbps_read,
             disk_mbps_write: pricing.disk_mbps_write,
-            network_mbps: pricing.network_mbps,
+            network_mbps: new_network_mbps,
             cpu_limit: pricing.cpu_limit,
             firewall_rule_limit: None,
-            transfer_gb: pricing.transfer_gb,
+            transfer_gb: new_transfer_gb,
         };
         Ok(new_custom_template)
     }
@@ -1780,12 +1818,93 @@ pub struct PricingData {
     pub ip6_cost: u64,
     /// Cost per GB disk in smallest currency units (cents for fiat, millisats for BTC)
     pub disk_cost: u64,
+    pub transfer_cost: u64,
+    pub network_cost: u64,
 }
 
 impl PricingData {
     pub fn total(&self) -> u64 {
-        self.cpu_cost + self.memory_cost + self.ip4_cost + self.ip6_cost + self.disk_cost
+        self.cpu_cost
+            + self.memory_cost
+            + self.ip4_cost
+            + self.ip6_cost
+            + self.disk_cost
+            + self.transfer_cost
+            + self.network_cost
     }
+}
+
+fn cost_per_thousand(amount: Option<u32>, cost_per_thousand: u64) -> u64 {
+    amount.map_or(0, |a| (a as u64 * cost_per_thousand).div_ceil(1000))
+}
+
+fn resolve_bandwidth(requested: Option<u32>, plan_default: Option<u32>) -> Option<u32> {
+    plan_default.and(requested.or(plan_default))
+}
+
+fn bandwidth_at_least(new: Option<u32>, current: Option<u32>) -> bool {
+    match (new, current) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(n), Some(c)) => n >= c,
+    }
+}
+
+fn ensure_bandwidth_in_range(
+    what: &str,
+    value: Option<u32>,
+    plan_default: Option<u32>,
+    min: u32,
+    max: u32,
+) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    ensure!(
+        plan_default.is_some(),
+        "{what} is not selectable on this plan"
+    );
+    ensure!(
+        (min..=max).contains(&value),
+        "{what} {value} out of range ({min}-{max})"
+    );
+    Ok(())
+}
+
+pub fn upgrade_bandwidth(
+    cfg: &UpgradeConfig,
+    pricing: &VmCustomPricing,
+    transfer_gb: Option<u32>,
+    network_mbps: Option<u32>,
+) -> Result<(Option<u32>, Option<u32>)> {
+    ensure!(
+        cfg.new_transfer_gb.is_none() || pricing.transfer_gb.is_some(),
+        "Monthly transfer is not selectable on this plan"
+    );
+    ensure!(
+        cfg.new_network_mbps.is_none() || pricing.network_mbps.is_some(),
+        "Network speed is not selectable on this plan"
+    );
+    let new_transfer_gb = cfg.new_transfer_gb.or(pricing.transfer_gb.and(transfer_gb));
+    let new_network_mbps = cfg
+        .new_network_mbps
+        .or(pricing.network_mbps.and(network_mbps));
+    ensure!(
+        bandwidth_at_least(new_transfer_gb, transfer_gb)
+            && bandwidth_at_least(new_network_mbps, network_mbps),
+        "An upgrade cannot reduce the VM's bandwidth"
+    );
+    Ok((new_transfer_gb, new_network_mbps))
+}
+
+pub fn apply_custom_pricing_limits(template: &mut VmCustomTemplate, pricing: &VmCustomPricing) {
+    template.disk_iops_read = pricing.disk_iops_read;
+    template.disk_iops_write = pricing.disk_iops_write;
+    template.disk_mbps_read = pricing.disk_mbps_read;
+    template.disk_mbps_write = pricing.disk_mbps_write;
+    template.cpu_limit = pricing.cpu_limit;
+    template.network_mbps = resolve_bandwidth(template.network_mbps, pricing.network_mbps);
+    template.transfer_gb = resolve_bandwidth(template.transfer_gb, pricing.transfer_gb);
 }
 
 #[cfg(test)]
@@ -2630,6 +2749,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
 
         let quote = pe
@@ -2702,6 +2822,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         // Revolut so a processing fee applies (Lightning has none).
         let quote = pe
@@ -2770,6 +2891,7 @@ mod tests {
             new_cpu: Some(2),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
 
         // Should fail for expired VM
@@ -2819,6 +2941,7 @@ mod tests {
             new_cpu: Some(1),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         assert!(
             pe.calculate_vm_upgrade_cost(1, &cpu_down, PaymentMethod::Lightning)
@@ -2831,6 +2954,7 @@ mod tests {
             new_cpu: None,
             new_memory: Some(crate::GB),
             new_disk: None,
+            ..Default::default()
         };
         assert!(
             pe.calculate_vm_upgrade_cost(1, &mem_down, PaymentMethod::Lightning)
@@ -2843,6 +2967,7 @@ mod tests {
             new_cpu: None,
             new_memory: None,
             new_disk: Some(32 * crate::GB),
+            ..Default::default()
         };
         assert!(
             pe.calculate_vm_upgrade_cost(1, &disk_down, PaymentMethod::Lightning)
@@ -2855,6 +2980,7 @@ mod tests {
             new_cpu: Some(2),
             new_memory: Some(2 * crate::GB),
             new_disk: Some(64 * crate::GB),
+            ..Default::default()
         };
         assert!(
             pe.calculate_vm_upgrade_cost(1, &same, PaymentMethod::Lightning)
@@ -2867,6 +2993,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         assert!(
             pe.calculate_vm_upgrade_cost(1, &up, PaymentMethod::Lightning)
@@ -2916,6 +3043,7 @@ mod tests {
             new_cpu: Some(2),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
 
         // Should fail for deleted VM
@@ -2967,6 +3095,7 @@ mod tests {
             new_cpu: Some(4), // Upgrade from 2 to 4 CPUs
             new_memory: Some(4 * crate::GB),
             new_disk: Some(120 * crate::GB),
+            ..Default::default()
         };
 
         let quote = pe
@@ -3029,6 +3158,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None, // Keep 2GB
             new_disk: None,   // Keep 64GB
+            ..Default::default()
         };
 
         // Get the old VM cost per second
@@ -3200,6 +3330,7 @@ mod tests {
             new_cpu: Some(8),                 // Upgrade from 2 to 8 CPUs (4x increase)
             new_memory: Some(16 * crate::GB), // Upgrade from 2GB to 16GB (8x increase)
             new_disk: Some(500 * crate::GB),  // Upgrade from 64GB to 500GB disk
+            ..Default::default()
         };
 
         let quote = pe
@@ -3597,6 +3728,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = pe.create_upgrade_template(vm_id, &cfg).await;
         assert!(result.is_ok(), "Should find pricing with Unknown cpu_mfg");
@@ -3620,6 +3752,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = pe.create_upgrade_template(vm_id, &cfg).await;
         assert!(
@@ -3647,6 +3780,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = pe.create_upgrade_template(vm_id, &cfg).await;
         assert!(
@@ -3675,6 +3809,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = pe.create_upgrade_template(vm_id, &cfg).await;
         assert!(result.is_ok(), "Should find second pricing");
@@ -3699,6 +3834,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = pe.create_upgrade_template(vm_id, &cfg).await;
         assert!(
@@ -3738,6 +3874,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = pe.create_upgrade_template(vm_id, &cfg).await;
         assert!(
@@ -4667,6 +4804,246 @@ mod tests {
         let pe = PricingEngine::new(db_arc, rates, VatClient::new());
         assert!(
             pe.calculate_app_upgrade_cost(1, 2, PaymentMethod::Revolut)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    async fn add_bandwidth_pricing(db: &MockDb) {
+        add_custom_pricing(db).await;
+        let mut p = db.custom_pricing.lock().await;
+        let pricing = p.get_mut(&1).unwrap();
+        pricing.transfer_gb = Some(1000);
+        pricing.min_transfer_gb = 500;
+        pricing.max_transfer_gb = 10_000;
+        pricing.transfer_cost_per_tb = 100;
+        pricing.network_mbps = Some(1000);
+        pricing.min_network_mbps = 100;
+        pricing.max_network_mbps = 10_000;
+        pricing.network_cost_per_gbps = 200;
+    }
+
+    async fn set_custom_template_bandwidth(
+        db: &MockDb,
+        transfer_gb: Option<u32>,
+        network_mbps: Option<u32>,
+    ) {
+        let mut t = db.custom_template.lock().await;
+        let template = t.get_mut(&1).unwrap();
+        template.transfer_gb = transfer_gb;
+        template.network_mbps = network_mbps;
+    }
+
+    #[tokio::test]
+    async fn custom_pricing_bills_bandwidth() -> Result<()> {
+        let db = MockDb::default();
+        add_bandwidth_pricing(&db).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+
+        let mut template = db.get_custom_vm_template(1).await?;
+        let unmetered = PricingEngine::get_custom_vm_cost_amount(&db, &template).await?;
+        assert_eq!(0, unmetered.transfer_cost);
+        assert_eq!(0, unmetered.network_cost);
+        assert_eq!(855, unmetered.total());
+
+        template.transfer_gb = Some(2500);
+        template.network_mbps = Some(1001);
+        let price = PricingEngine::get_custom_vm_cost_amount(&db, &template).await?;
+        assert_eq!(250, price.transfer_cost);
+        assert_eq!(201, price.network_cost, "a part unit rounds up");
+        assert_eq!(855 + 250 + 201, price.total());
+        Ok(())
+    }
+
+    #[test]
+    fn apply_custom_pricing_limits_settles_bandwidth() {
+        let pricing = VmCustomPricing {
+            transfer_gb: Some(1000),
+            network_mbps: None,
+            disk_iops_read: Some(5),
+            cpu_limit: Some(0.5),
+            ..Default::default()
+        };
+        let mut template = VmCustomTemplate::default();
+        apply_custom_pricing_limits(&mut template, &pricing);
+        assert_eq!(
+            template.transfer_gb,
+            Some(1000),
+            "plan default when none asked"
+        );
+        assert_eq!(template.network_mbps, None);
+        assert_eq!(template.disk_iops_read, Some(5));
+        assert_eq!(template.cpu_limit, Some(0.5));
+
+        let mut template = VmCustomTemplate {
+            transfer_gb: Some(4000),
+            network_mbps: Some(500),
+            ..Default::default()
+        };
+        apply_custom_pricing_limits(&mut template, &pricing);
+        assert_eq!(template.transfer_gb, Some(4000));
+        assert_eq!(
+            template.network_mbps, None,
+            "an uncapped plan stays uncapped"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_custom_vm_spec_checks_bandwidth() -> Result<()> {
+        let mock = MockDb::default();
+        add_bandwidth_pricing(&mock).await;
+        let custom_pricing = mock.custom_pricing.clone();
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+
+        let base = db.get_custom_vm_template(1).await?;
+        PricingEngine::validate_custom_vm_spec(&db, &base).await?;
+        for (transfer_gb, network_mbps, ok) in [
+            (Some(500), Some(100), true),
+            (Some(10_000), Some(10_000), true),
+            (Some(499), None, false),
+            (Some(10_001), None, false),
+            (None, Some(99), false),
+            (None, Some(10_001), false),
+        ] {
+            let t = VmCustomTemplate {
+                transfer_gb,
+                network_mbps,
+                ..base.clone()
+            };
+            assert_eq!(
+                PricingEngine::validate_custom_vm_spec(&db, &t)
+                    .await
+                    .is_ok(),
+                ok,
+                "transfer {transfer_gb:?} network {network_mbps:?}"
+            );
+            PricingEngine::validate_custom_vm_resources(&db, &t).await?;
+        }
+
+        custom_pricing.lock().await.get_mut(&1).unwrap().transfer_gb = None;
+        let t = VmCustomTemplate {
+            transfer_gb: Some(1000),
+            ..base
+        };
+        let err = PricingEngine::validate_custom_vm_spec(&db, &t)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not selectable"));
+        Ok(())
+    }
+
+    #[test]
+    fn upgrade_bandwidth_only_grows() {
+        let pricing = VmCustomPricing {
+            transfer_gb: Some(1000),
+            network_mbps: Some(1000),
+            ..Default::default()
+        };
+        let cfg = |t: Option<u32>, n: Option<u32>| UpgradeConfig {
+            new_transfer_gb: t,
+            new_network_mbps: n,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            upgrade_bandwidth(&cfg(None, None), &pricing, Some(1000), Some(500)).unwrap(),
+            (Some(1000), Some(500)),
+            "unchanged values carry over"
+        );
+        assert_eq!(
+            upgrade_bandwidth(
+                &cfg(Some(2000), Some(2000)),
+                &pricing,
+                Some(1000),
+                Some(500)
+            )
+            .unwrap(),
+            (Some(2000), Some(2000))
+        );
+        assert!(upgrade_bandwidth(&cfg(Some(999), None), &pricing, Some(1000), None).is_err());
+        assert!(
+            upgrade_bandwidth(&cfg(Some(5000), None), &pricing, None, None).is_err(),
+            "an unmetered VM cannot be given a quota"
+        );
+        assert_eq!(
+            upgrade_bandwidth(&cfg(None, None), &pricing, None, None).unwrap(),
+            (None, None),
+            "unmetered stays unmetered"
+        );
+
+        let unmetered = VmCustomPricing::default();
+        assert!(upgrade_bandwidth(&cfg(Some(5000), None), &unmetered, Some(1000), None).is_err());
+        assert!(upgrade_bandwidth(&cfg(None, Some(5000)), &unmetered, None, Some(1000)).is_err());
+        assert_eq!(
+            upgrade_bandwidth(&cfg(None, None), &unmetered, Some(1000), Some(100)).unwrap(),
+            (None, None),
+            "moving onto an unmetered plan lifts the quota"
+        );
+    }
+
+    async fn setup_custom_vm_with_bandwidth(db: &MockDb) -> Result<()> {
+        setup_upgrade_test_data(db).await?;
+        add_bandwidth_pricing(db).await;
+        set_custom_template_bandwidth(db, Some(1000), Some(1000)).await;
+        {
+            let mut subs = db.subscriptions.lock().await;
+            if let Some(s) = subs.get_mut(&1) {
+                s.expires = Some(Utc::now() + chrono::Duration::days(15));
+                s.is_setup = true;
+            }
+        }
+        db.vms.lock().await.insert(
+            1,
+            Vm {
+                id: 1,
+                user_id: 1,
+                template_id: None,
+                custom_template_id: Some(1),
+                deleted: false,
+                ..MockDb::mock_vm()
+            },
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_only_upgrade_is_charged() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+        setup_custom_vm_with_bandwidth(&db).await?;
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let pe = PricingEngine::new(db.clone(), rates, VatClient::new());
+
+        let cfg = UpgradeConfig {
+            new_transfer_gb: Some(5000),
+            new_network_mbps: Some(2000),
+            ..Default::default()
+        };
+        let template = pe.create_upgrade_template(1, &cfg).await?;
+        assert_eq!(template.transfer_gb, Some(5000));
+        assert_eq!(template.network_mbps, Some(2000));
+        assert_eq!(template.cpu, 2);
+
+        let quote = pe
+            .calculate_vm_upgrade_cost(1, &cfg, PaymentMethod::Revolut)
+            .await?;
+        assert_eq!(quote.renewal.amount.value(), 855 + 500 + 400);
+        assert!(quote.upgrade.amount.value() > 0);
+
+        let shrink = UpgradeConfig {
+            new_transfer_gb: Some(600),
+            ..Default::default()
+        };
+        assert!(pe.create_upgrade_template(1, &shrink).await.is_err());
+
+        let out_of_range = UpgradeConfig {
+            new_transfer_gb: Some(20_000),
+            ..Default::default()
+        };
+        assert!(
+            pe.calculate_vm_upgrade_cost(1, &out_of_range, PaymentMethod::Revolut)
                 .await
                 .is_err()
         );

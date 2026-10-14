@@ -10,7 +10,9 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use lnvps_api_common::{CUSTOM_VM_INTERVAL_AMOUNT, PricingEngine, alt_prices};
+use lnvps_api_common::{
+    CUSTOM_VM_INTERVAL_AMOUNT, PricingEngine, alt_prices, apply_custom_pricing_limits,
+};
 use lnvps_db::{
     DiskInterface, DiskType, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
 };
@@ -225,6 +227,18 @@ impl DbToolExecutor {
             "max_ip4": pricing.max_ip4,
             "min_ip6": pricing.min_ip6,
             "max_ip6": pricing.max_ip6,
+            "transfer": pricing.transfer_gb.map(|default| json!({
+                "default_gb": default,
+                "min_gb": pricing.min_transfer_gb,
+                "max_gb": pricing.max_transfer_gb,
+            })),
+            "cost_per_tb_transfer": self.priced(unit(pricing.transfer_cost_per_tb)).await,
+            "network_speed": pricing.network_mbps.map(|default| json!({
+                "default_mbps": default,
+                "min_mbps": pricing.min_network_mbps,
+                "max_mbps": pricing.max_network_mbps,
+            })),
+            "cost_per_gbps_network": self.priced(unit(pricing.network_cost_per_gbps)).await,
             "cpu_mfg": pricing.cpu_mfg.to_string(),
             "cpu_arch": pricing.cpu_arch.to_string(),
             "cpu_features": pricing.cpu_features.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -264,7 +278,14 @@ impl DbToolExecutor {
             None => default_disk.interface,
         };
 
-        let template = VmCustomTemplate {
+        let optional_u32 = |key: &str| -> Result<Option<u32>> {
+            Ok(args
+                .get(key)
+                .and_then(|v| v.as_u64())
+                .map(u32::try_from)
+                .transpose()?)
+        };
+        let mut template = VmCustomTemplate {
             id: 0,
             cpu: required_u64(args, "cpu")?.try_into()?,
             memory: required_gb_as_bytes(args, "memory_gb")?,
@@ -289,15 +310,11 @@ impl DbToolExecutor {
             cpu_mfg: pricing.cpu_mfg,
             cpu_arch: pricing.cpu_arch,
             cpu_features: pricing.cpu_features.clone(),
-            disk_iops_read: pricing.disk_iops_read,
-            disk_iops_write: pricing.disk_iops_write,
-            disk_mbps_read: pricing.disk_mbps_read,
-            disk_mbps_write: pricing.disk_mbps_write,
-            network_mbps: pricing.network_mbps,
-            cpu_limit: pricing.cpu_limit,
-            firewall_rule_limit: None,
-            transfer_gb: pricing.transfer_gb,
+            transfer_gb: optional_u32("transfer_gb")?,
+            network_mbps: optional_u32("network_mbps")?,
+            ..Default::default()
         };
+        apply_custom_pricing_limits(&mut template, &pricing);
 
         PricingEngine::validate_custom_vm_spec(&self.db, &template).await?;
         let price = PricingEngine::get_custom_vm_cost_amount(&self.db, &template).await?;
@@ -314,6 +331,8 @@ impl DbToolExecutor {
                 "disk_interface": template.disk_interface.to_string(),
                 "ip4_count": template.ip4_count,
                 "ip6_count": template.ip6_count,
+                "transfer_gb": template.transfer_gb,
+                "network_mbps": template.network_mbps,
             },
             "billing_interval": format!("{} month(s)", CUSTOM_VM_INTERVAL_AMOUNT),
             "breakdown": {
@@ -322,6 +341,8 @@ impl DbToolExecutor {
                 "disk": money(part(price.disk_cost)),
                 "ip4": money(part(price.ip4_cost)),
                 "ip6": money(part(price.ip6_cost)),
+                "transfer": money(part(price.transfer_cost)),
+                "network": money(part(price.network_cost)),
             },
             "total": self.priced(part(price.total())).await,
             "note": "Price excludes any tax and payment processing fee, which depend on the customer's country and payment method.",
@@ -518,6 +539,45 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("No disk price found"), "{err}");
+    }
+
+    #[tokio::test]
+    pub(super) async fn price_custom_vm_quotes_bandwidth() {
+        let (db, exec) = executor(1).await;
+        seed_custom_pricing(&db).await;
+        {
+            let mut p = db.custom_pricing.lock().await;
+            let pricing = p.get_mut(&1).unwrap();
+            pricing.transfer_gb = Some(1000);
+            pricing.min_transfer_gb = 1000;
+            pricing.max_transfer_gb = 5000;
+            pricing.transfer_cost_per_tb = 100;
+            pricing.network_mbps = Some(1000);
+            pricing.min_network_mbps = 1000;
+            pricing.max_network_mbps = 1000;
+            pricing.network_cost_per_gbps = 50;
+        }
+
+        let listed: Value =
+            serde_json::from_str(&exec.execute("list_custom_pricing", "{}").await.unwrap())
+                .unwrap();
+        assert_eq!(listed[0]["transfer"]["max_gb"], 5000);
+        assert_eq!(listed[0]["cost_per_tb_transfer"]["amount"], 100);
+        assert_eq!(listed[0]["network_speed"]["default_mbps"], 1000);
+
+        let out = exec
+            .execute(
+                "price_custom_vm",
+                r#"{"pricing_id":1,"cpu":3,"memory_gb":4,"disk_gb":40,"transfer_gb":3000}"#,
+            )
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["spec"]["transfer_gb"], 3000);
+        assert_eq!(parsed["spec"]["network_mbps"], 1000);
+        assert_eq!(parsed["breakdown"]["transfer"]["amount"], 300);
+        assert_eq!(parsed["breakdown"]["network"]["amount"], 50);
+        assert_eq!(parsed["total"]["amount"], 1010 + 300 + 50);
     }
 
     #[tokio::test]

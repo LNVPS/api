@@ -3123,15 +3123,76 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn test_admin_create_custom_pricing_rejects_default_outside_bandwidth_range() {
+        let client = setup().await;
+        let body = serde_json::json!({
+            "name": "e2e-bad-transfer-range",
+            "enabled": true,
+            "region_id": 1,
+            "currency": "EUR",
+            "cpu_cost": 100,
+            "memory_cost": 50,
+            "ip4_cost": 200,
+            "ip6_cost": 0,
+            "min_cpu": 1,
+            "max_cpu": 4,
+            "min_memory": 1073741824_u64,
+            "max_memory": 8589934592_u64,
+            "transfer_gb": 100,
+            "min_transfer_gb": 500,
+            "max_transfer_gb": 5000,
+            "disk_pricing": []
+        });
+        let resp = client
+            .post_auth("/api/admin/v1/custom_pricing", &body)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
     /// A plan may offer more than one address per family; the guest network
     /// config carries them all on one NIC.
     #[tokio::test]
     async fn test_admin_create_custom_pricing_accepts_multi_ip_range() {
         let client = setup().await;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let company = client
+            .post_auth(
+                "/api/admin/v1/companies",
+                &serde_json::json!({
+                    "name": format!("e2e-multi-ip-{ts}"),
+                    "email": format!("e2e-multi-ip-{ts}@test.local"),
+                    "base_currency": "EUR"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(company.status(), StatusCode::OK);
+        let company: Value = serde_json::from_str(&company.text().await.unwrap()).unwrap();
+        let company_id = company["data"]["id"].as_u64().unwrap();
+        let region = client
+            .post_auth(
+                "/api/admin/v1/regions",
+                &serde_json::json!({
+                    "name": format!("e2e-multi-ip-{ts}"),
+                    "enabled": true,
+                    "company_id": company_id
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(region.status(), StatusCode::OK);
+        let region: Value = serde_json::from_str(&region.text().await.unwrap()).unwrap();
+        let region_id = region["data"]["id"].as_u64().unwrap();
+
         let body = serde_json::json!({
             "name": "e2e-multi-ip",
             "enabled": true,
-            "region_id": 1,
+            "region_id": region_id,
             "currency": "EUR",
             "cpu_cost": 100,
             "memory_cost": 50,
@@ -3150,6 +3211,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let pricing: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(pricing["data"]["max_ip4"], 4);
+
+        let pool = crate::db::connect().await.unwrap();
+        crate::db::hard_delete_custom_pricing(&pool, pricing["data"]["id"].as_u64().unwrap())
+            .await
+            .unwrap();
+        crate::db::hard_delete_region(&pool, region_id)
+            .await
+            .unwrap();
+        crate::db::hard_delete_company(&pool, company_id)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

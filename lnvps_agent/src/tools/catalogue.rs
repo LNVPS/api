@@ -29,7 +29,7 @@ pub fn list_templates() -> FunctionObject {
 pub fn list_custom_pricing() -> FunctionObject {
     nullary(
         "list_custom_pricing",
-        "List the 'build your own' (custom VM) pricing available per region: the price per CPU core, per GB of memory, per GB of each disk type/interface, and per IPv4/IPv6 address, together with the minimum and maximum each configuration allows. Custom VMs bill monthly. Use this when a customer asks for a spec that no fixed plan matches, or asks how custom pricing works — then use price_custom_vm to quote an exact configuration.",
+        "List the 'build your own' (custom VM) pricing available per region: the price per CPU core, per GB of memory, per GB of each disk type/interface, per IPv4/IPv6 address, per TB of monthly transfer and per Gbit/s of network speed, together with the minimum and maximum each configuration allows. Custom VMs bill monthly. Use this when a customer asks for a spec that no fixed plan matches, or asks how custom pricing works — then use price_custom_vm to quote an exact configuration.",
     )
 }
 
@@ -62,6 +62,14 @@ pub fn price_custom_vm() -> FunctionObject {
                 "ip6_count": {
                     "type": "integer",
                     "description": "IPv6 addresses to include. Defaults to the pricing minimum."
+                },
+                "transfer_gb": {
+                    "type": "integer",
+                    "description": "Monthly outbound transfer in GB. Defaults to the pricing default; ignored when the pricing is unmetered."
+                },
+                "network_mbps": {
+                    "type": "integer",
+                    "description": "Network speed in Mbit/s. Defaults to the pricing default; ignored when the pricing is uncapped."
                 }
             },
             "required": ["pricing_id", "cpu", "memory_gb", "disk_gb"]
@@ -145,7 +153,14 @@ mod tests {
             assert!(required.iter().any(|v| v == key), "{key} must be required");
         }
         // Disk selection and IP counts fall back to the pricing defaults.
-        for key in ["disk_type", "disk_interface", "ip4_count", "ip6_count"] {
+        for key in [
+            "disk_type",
+            "disk_interface",
+            "ip4_count",
+            "ip6_count",
+            "transfer_gb",
+            "network_mbps",
+        ] {
             assert!(!required.iter().any(|v| v == key), "{key} must be optional");
             assert!(params["properties"][key].is_object());
         }

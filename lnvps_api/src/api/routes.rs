@@ -24,7 +24,7 @@ use std::time::Duration;
 use lnvps_api_common::{
     ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate,
     ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, TraderDetails, UpgradeConfig,
-    UserRateLimiter, VatClient, WorkJob,
+    UserRateLimiter, VatClient, WorkJob, apply_custom_pricing_limits,
 };
 use lnvps_db::{
     CpuArch, LNVpsDb, PaymentMethod, Region, Vm, VmCustomPricing, VmCustomPricingDisk,
@@ -1272,7 +1272,9 @@ async fn v1_custom_template_calc(
     Json(req): Json<ApiCustomVmRequest>,
 ) -> ApiResult<ApiCustomVmPrice> {
     // create a fake template from the request to generate the price
-    let template: VmCustomTemplate = req.into();
+    let mut template: VmCustomTemplate = req.into();
+    let pricing = this.db.get_custom_pricing(template.pricing_id).await?;
+    apply_custom_pricing_limits(&mut template, &pricing);
 
     // Reject out-of-range specs so the order form surfaces the error early.
     PricingEngine::validate_custom_vm_spec(&this.db, &template).await?;
@@ -2255,6 +2257,10 @@ async fn v1_get_payment_invoice(
         memory_upgrade: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         disk_upgrade: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transfer_upgrade: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        network_upgrade: Option<u32>,
     }
 
     // The selling company comes from the subscription, which is also what the
@@ -2278,6 +2284,8 @@ async fn v1_get_payment_invoice(
                 cpu_upgrade: c.new_cpu,
                 memory_upgrade: c.new_memory.map(|m| m / crate::GB),
                 disk_upgrade: c.new_disk.map(|m| m / crate::GB),
+                transfer_upgrade: c.new_transfer_gb,
+                network_upgrade: c.new_network_mbps,
             })
     } else {
         None
@@ -2451,12 +2459,7 @@ async fn v1_vm_upgrade_quote(
         return Err(ApiError::forbidden("VM does not belong to you"));
     }
 
-    // Create UpgradeConfig from request
-    let cfg = UpgradeConfig {
-        new_cpu: req.cpu,
-        new_memory: req.memory,
-        new_disk: req.disk,
-    };
+    let cfg: UpgradeConfig = req.into();
 
     // Calculate the upgrade cost and new renewal cost
     match this
@@ -2500,12 +2503,7 @@ async fn v1_vm_upgrade(
         return Err(ApiError::forbidden("VM does not belong to you"));
     }
 
-    // Create UpgradeConfig from request
-    let cfg = UpgradeConfig {
-        new_cpu: req.cpu,
-        new_memory: req.memory,
-        new_disk: req.disk,
-    };
+    let cfg: UpgradeConfig = req.into();
 
     // Same payment resolution as renewals/purchases: interactive, saved NWC
     // wallet, or saved Revolut card — collected on the spot for saved methods.

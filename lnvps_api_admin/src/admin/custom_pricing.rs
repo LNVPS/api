@@ -114,6 +114,12 @@ impl AdminCustomPricingInfo {
             network_mbps: pricing.network_mbps,
             cpu_limit: pricing.cpu_limit,
             transfer_gb: pricing.transfer_gb,
+            min_transfer_gb: pricing.min_transfer_gb,
+            max_transfer_gb: pricing.max_transfer_gb,
+            transfer_cost_per_tb: pricing.transfer_cost_per_tb,
+            min_network_mbps: pricing.min_network_mbps,
+            max_network_mbps: pricing.max_network_mbps,
+            network_cost_per_gbps: pricing.network_cost_per_gbps,
         })
     }
 }
@@ -169,9 +175,6 @@ async fn admin_create_custom_pricing(
     // Check permission
     auth.require_permission(AdminResource::VmCustomPricing, AdminAction::Create)?;
 
-    // Validate that region exists
-    let _region = this.db.get_host_region(req.region_id).await?;
-
     let pricing = VmCustomPricing {
         id: 0, // Will be set by database
         name: req.name,
@@ -215,9 +218,21 @@ async fn admin_create_custom_pricing(
         network_mbps: req.network_mbps,
         cpu_limit: req.cpu_limit,
         transfer_gb: req.transfer_gb,
+        min_transfer_gb: req.min_transfer_gb.unwrap_or(req.transfer_gb.unwrap_or(0)),
+        max_transfer_gb: req.max_transfer_gb.unwrap_or(req.transfer_gb.unwrap_or(0)),
+        transfer_cost_per_tb: req.transfer_cost_per_tb.unwrap_or(0),
+        min_network_mbps: req
+            .min_network_mbps
+            .unwrap_or(req.network_mbps.unwrap_or(0)),
+        max_network_mbps: req
+            .max_network_mbps
+            .unwrap_or(req.network_mbps.unwrap_or(0)),
+        network_cost_per_gbps: req.network_cost_per_gbps.unwrap_or(0),
     };
 
     validate_ip_ranges(&pricing)?;
+    validate_bandwidth_ranges(&pricing)?;
+    let _region = this.db.get_host_region(pricing.region_id).await?;
 
     let pricing_id = this.db.insert_custom_pricing(&pricing).await?;
 
@@ -346,8 +361,27 @@ async fn admin_update_custom_pricing(
     if let Some(v) = req.transfer_gb {
         pricing.transfer_gb = v;
     }
+    if let Some(v) = req.min_transfer_gb {
+        pricing.min_transfer_gb = v;
+    }
+    if let Some(v) = req.max_transfer_gb {
+        pricing.max_transfer_gb = v;
+    }
+    if let Some(v) = req.transfer_cost_per_tb {
+        pricing.transfer_cost_per_tb = v;
+    }
+    if let Some(v) = req.min_network_mbps {
+        pricing.min_network_mbps = v;
+    }
+    if let Some(v) = req.max_network_mbps {
+        pricing.max_network_mbps = v;
+    }
+    if let Some(v) = req.network_cost_per_gbps {
+        pricing.network_cost_per_gbps = v;
+    }
 
     validate_ip_ranges(&pricing)?;
+    validate_bandwidth_ranges(&pricing)?;
 
     this.db.update_custom_pricing(&pricing).await?;
 
@@ -466,6 +500,12 @@ async fn admin_copy_custom_pricing(
         network_mbps: source_pricing.network_mbps,
         cpu_limit: source_pricing.cpu_limit,
         transfer_gb: source_pricing.transfer_gb,
+        min_transfer_gb: source_pricing.min_transfer_gb,
+        max_transfer_gb: source_pricing.max_transfer_gb,
+        transfer_cost_per_tb: source_pricing.transfer_cost_per_tb,
+        min_network_mbps: source_pricing.min_network_mbps,
+        max_network_mbps: source_pricing.max_network_mbps,
+        network_cost_per_gbps: source_pricing.network_cost_per_gbps,
     };
 
     let new_pricing_id = this.db.insert_custom_pricing(&new_pricing).await?;
@@ -503,3 +543,36 @@ fn validate_ip_ranges(pricing: &VmCustomPricing) -> Result<(), ApiError> {
     }
     Ok(())
 }
+
+fn validate_bandwidth_ranges(pricing: &VmCustomPricing) -> Result<(), ApiError> {
+    if pricing.min_transfer_gb > pricing.max_transfer_gb {
+        return Err(ApiError::bad_request(
+            "min_transfer_gb cannot exceed max_transfer_gb",
+        ));
+    }
+    if pricing.min_network_mbps > pricing.max_network_mbps {
+        return Err(ApiError::bad_request(
+            "min_network_mbps cannot exceed max_network_mbps",
+        ));
+    }
+    if pricing
+        .transfer_gb
+        .is_some_and(|v| !(pricing.min_transfer_gb..=pricing.max_transfer_gb).contains(&v))
+    {
+        return Err(ApiError::bad_request(
+            "transfer_gb must be within min_transfer_gb and max_transfer_gb",
+        ));
+    }
+    if pricing
+        .network_mbps
+        .is_some_and(|v| !(pricing.min_network_mbps..=pricing.max_network_mbps).contains(&v))
+    {
+        return Err(ApiError::bad_request(
+            "network_mbps must be within min_network_mbps and max_network_mbps",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

@@ -1489,6 +1489,8 @@ mod tests {
                 disk_interface: ApiDiskInterface::PCIe,
             }],
             transfer_gb: None,
+            transfer: None,
+            network: None,
             limits: Default::default(),
         }
     }

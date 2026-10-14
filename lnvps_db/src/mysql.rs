@@ -7875,8 +7875,8 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> DbResult<u64> {
         let query = r#"
-             INSERT INTO vm_custom_pricing (name, enabled, created, expires, region_id, currency, cpu_mfg, cpu_arch, cpu_features, cpu_cost, memory_cost, ip4_cost, ip6_cost, min_cpu, max_cpu, min_memory, max_memory, min_ip4, max_ip4, min_ip6, max_ip6, disk_iops_read, disk_iops_write, disk_mbps_read, disk_mbps_write, network_mbps, cpu_limit, transfer_gb)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             INSERT INTO vm_custom_pricing (name, enabled, created, expires, region_id, currency, cpu_mfg, cpu_arch, cpu_features, cpu_cost, memory_cost, ip4_cost, ip6_cost, min_cpu, max_cpu, min_memory, max_memory, min_ip4, max_ip4, min_ip6, max_ip6, disk_iops_read, disk_iops_write, disk_mbps_read, disk_mbps_write, network_mbps, cpu_limit, transfer_gb, min_transfer_gb, max_transfer_gb, transfer_cost_per_tb, min_network_mbps, max_network_mbps, network_cost_per_gbps)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          "#;
 
         let result = sqlx::query(query)
@@ -7908,6 +7908,12 @@ impl AdminDb for LNVpsDbMysql {
             .bind(pricing.network_mbps)
             .bind(pricing.cpu_limit)
             .bind(pricing.transfer_gb)
+            .bind(pricing.min_transfer_gb)
+            .bind(pricing.max_transfer_gb)
+            .bind(pricing.transfer_cost_per_tb)
+            .bind(pricing.min_network_mbps)
+            .bind(pricing.max_network_mbps)
+            .bind(pricing.network_cost_per_gbps)
             .execute(&self.db)
             .await?;
 
@@ -7922,7 +7928,9 @@ impl AdminDb for LNVpsDbMysql {
                  min_cpu = ?, max_cpu = ?, min_memory = ?, max_memory = ?,
                  min_ip4 = ?, max_ip4 = ?, min_ip6 = ?, max_ip6 = ?,
                  disk_iops_read = ?, disk_iops_write = ?, disk_mbps_read = ?, disk_mbps_write = ?,
-                 network_mbps = ?, cpu_limit = ?, transfer_gb = ?
+                 network_mbps = ?, cpu_limit = ?, transfer_gb = ?,
+                 min_transfer_gb = ?, max_transfer_gb = ?, transfer_cost_per_tb = ?,
+                 min_network_mbps = ?, max_network_mbps = ?, network_cost_per_gbps = ?
              WHERE id = ?
          "#;
 
@@ -7954,6 +7962,12 @@ impl AdminDb for LNVpsDbMysql {
             .bind(pricing.network_mbps)
             .bind(pricing.cpu_limit)
             .bind(pricing.transfer_gb)
+            .bind(pricing.min_transfer_gb)
+            .bind(pricing.max_transfer_gb)
+            .bind(pricing.transfer_cost_per_tb)
+            .bind(pricing.min_network_mbps)
+            .bind(pricing.max_network_mbps)
+            .bind(pricing.network_cost_per_gbps)
             .bind(pricing.id)
             .execute(&self.db)
             .await?;

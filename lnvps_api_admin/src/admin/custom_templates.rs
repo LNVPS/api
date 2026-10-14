@@ -123,7 +123,7 @@ async fn admin_update_custom_template(
 
     // Validate against the (possibly new) plan's limits before writing, so an
     // out-of-range spec is a 400 rather than a VM the pricing engine cannot quote.
-    PricingEngine::validate_custom_vm_spec(&this.db, &new)
+    PricingEngine::validate_custom_vm_resources(&this.db, &new)
         .await
         .map_err(|e| ApiError::bad_request(format!("Invalid custom template: {e}")))?;
     let renewal_amount = PricingEngine::get_custom_vm_cost_amount(&this.db, &new)
