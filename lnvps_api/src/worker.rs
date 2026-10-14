@@ -220,6 +220,7 @@ pub struct WorkerSettings {
     /// Minimum fiat-settled referral commission (satoshis at the quote) before
     /// an automated converted payout is attempted. `None` disables them.
     pub referral_min_fiat_payout_sats: Option<u64>,
+    pub referral_commission_hold_days: u64,
     /// Source of the on-chain fee-rate estimate for the cap above.
     pub referral_fee_estimator: crate::settings::FeeEstimatorConfig,
     /// Source of chain lookups used to spot replaced deposits.
@@ -254,6 +255,11 @@ impl From<&Settings> for WorkerSettings {
                 .referral
                 .as_ref()
                 .and_then(|r| r.min_fiat_payout_sats),
+            referral_commission_hold_days: val
+                .referral
+                .as_ref()
+                .map(|r| r.commission_hold_days)
+                .unwrap_or(30),
             referral_fee_estimator: val
                 .referral
                 .as_ref()
@@ -333,7 +339,10 @@ impl Worker {
             subscription_handler.pricing_engine().rates(),
             settings.referral_min_fiat_payout_sats,
             kv.clone(),
-        );
+        )
+        .with_commission_hold(chrono::Duration::days(
+            settings.referral_commission_hold_days as i64,
+        ));
 
         let refunds = crate::refund::VmRefundHandler::new(
             db.clone(),

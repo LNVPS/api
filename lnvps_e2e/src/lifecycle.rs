@@ -1495,6 +1495,25 @@ mod tests {
             .await
             .unwrap();
 
+            let oc3_user = crate::db::ensure_user(&pool, &nostr::Keys::generate())
+                .await
+                .unwrap();
+            let (oc3_ref_id, oc3_vm_id) = crate::db::seed_referrer_with_commission(
+                &pool,
+                oc3_user,
+                referred_user,
+                &format!("{ref_code}OC3"),
+                3,
+                Some(&crate::onchain::new_regtest_address().await.unwrap()),
+                6000,
+                vm_id,
+            )
+            .await
+            .unwrap();
+            crate::db::set_referral_auto_payout(&pool, oc3_ref_id, false)
+                .await
+                .unwrap();
+
             // Trigger the payout job and wait for both on-chain referrers to be
             // paid.
             crate::worker::publish_job("\"ProcessReferralPayouts\"")
@@ -1546,6 +1565,13 @@ mod tests {
                     ln_payouts.is_empty(),
                     "unresolvable Lightning payout leaves no row"
                 );
+                assert!(
+                    crate::db::list_referral_payouts(&pool, oc3_ref_id)
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "a referrer without auto-payout approval is not paid"
+                );
 
                 // Idempotency: re-running the job pays nothing new.
                 //
@@ -1593,11 +1619,42 @@ mod tests {
                 );
             }
 
+            let usage_path = format!("/api/admin/v1/referrals/{oc3_ref_id}/usage");
+            let usage = json_ok(admin.get_auth(&usage_path).await.unwrap()).await;
+            assert_eq!(usage["total"].as_u64(), Some(1));
+            assert_eq!(usage["data"][0]["vm_id"].as_u64(), Some(oc3_vm_id));
+            assert_eq!(usage["data"][0]["user_id"].as_u64(), Some(referred_user));
+            assert_eq!(usage["data"][0]["commission"].as_u64(), Some(6_000_000));
+
+            let row_path = format!("{usage_path}/{oc3_vm_id}");
+            let resp = admin.delete_auth(&row_path).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let resp = admin.delete_auth(&row_path).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            let usage = json_ok(admin.get_auth(&usage_path).await.unwrap()).await;
+            assert_eq!(usage["total"].as_u64(), Some(0));
+
+            let approved = json_ok(
+                admin
+                    .patch_auth(
+                        &format!("/api/admin/v1/referrals/{oc3_ref_id}"),
+                        &serde_json::json!({ "auto_payout_approved": true }),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                approved["data"]["auto_payout_approved"].as_bool(),
+                Some(true)
+            );
+            eprintln!("Admin referral approval and referred VM removal verified");
+
             // Clean up seeded rows.
-            for vm in [oc1_vm_id, oc2_vm_id, ln_vm_id] {
+            for vm in [oc1_vm_id, oc2_vm_id, ln_vm_id, oc3_vm_id] {
                 crate::db::hard_delete_vm(&pool, vm).await.ok();
             }
-            for r in [oc1_ref_id, oc2_ref_id, ln_ref_id] {
+            for r in [oc1_ref_id, oc2_ref_id, ln_ref_id, oc3_ref_id] {
                 crate::db::hard_delete_referral(&pool, r).await.ok();
             }
             pool.close().await;

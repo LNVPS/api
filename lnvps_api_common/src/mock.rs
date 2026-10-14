@@ -4010,12 +4010,15 @@ impl LNVpsDbBase for MockDb {
         let line_items = self.subscription_line_items.lock().await;
         let sub_payments = self.subscription_payments.lock().await;
         // Effective rate: referrer override, else the default company's rate.
-        let effective_rate = {
+        let (referrer_id, override_rate) = {
             let referrals = self.referrals.lock().await;
-            let override_rate = referrals
-                .values()
-                .find(|r| r.code == code)
-                .and_then(|r| r.referral_rate);
+            let referral = referrals.values().find(|r| r.code == code);
+            (
+                referral.map(|r| r.user_id),
+                referral.and_then(|r| r.referral_rate),
+            )
+        };
+        let effective_rate = {
             match override_rate {
                 Some(r) => r,
                 None => self
@@ -4028,7 +4031,11 @@ impl LNVpsDbBase for MockDb {
             }
         };
         let mut result = Vec::new();
-        for vm in vms.values().filter(|v| v.ref_code.as_deref() == Some(code)) {
+        for vm in vms
+            .values()
+            .filter(|v| v.ref_code.as_deref() == Some(code))
+            .filter(|v| referrer_id != Some(v.user_id))
+        {
             let subscription_id = line_items
                 .get(&vm.subscription_line_item_id)
                 .map(|sli| sli.subscription_id);
@@ -4036,14 +4043,23 @@ impl LNVpsDbBase for MockDb {
                 let mut vm_payments: Vec<&SubscriptionPayment> = sub_payments
                     .iter()
                     .filter(|p| p.subscription_id == sid && p.is_paid)
+                    .filter(|p| !p.payment_type.is_refund())
                     .collect();
                 vm_payments.sort_by_key(|p| p.created);
                 if let Some(first) = vm_payments.first() {
+                    let refunded = sub_payments
+                        .iter()
+                        .filter(|p| p.is_paid && p.payment_type.is_refund())
+                        .filter(|p| p.refunded_payment_id.as_ref() == Some(&first.id))
+                        .map(|p| p.amount)
+                        .sum();
                     result.push(ReferralCostUsage {
                         vm_id: vm.id,
+                        user_id: vm.user_id,
                         ref_code: code.to_string(),
                         created: first.created,
                         amount: first.amount,
+                        refunded,
                         currency: first.currency.clone(),
                         rate: first.rate,
                         base_currency: "EUR".to_string(),
@@ -4073,12 +4089,20 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn count_failed_referrals(&self, code: &str) -> DbResult<u64> {
+        let referrer_id = self
+            .referrals
+            .lock()
+            .await
+            .values()
+            .find(|r| r.code == code)
+            .map(|r| r.user_id);
         let vms = self.vms.lock().await;
         let line_items = self.subscription_line_items.lock().await;
         let sub_payments = self.subscription_payments.lock().await;
         Ok(vms
             .values()
             .filter(|v| v.ref_code.as_deref() == Some(code))
+            .filter(|v| referrer_id != Some(v.user_id))
             .filter(|v| {
                 let sid = line_items
                     .get(&v.subscription_line_item_id)
@@ -7120,6 +7144,30 @@ impl lnvps_db::AdminDb for MockDb {
             .ok_or_else(|| DbError::Other(anyhow!("referral not found")))
     }
 
+    async fn admin_set_referral_auto_payout(
+        &self,
+        referral_id: u64,
+        approved: bool,
+    ) -> DbResult<()> {
+        let mut referrals = self.referrals.lock().await;
+        let referral = referrals
+            .get_mut(&referral_id)
+            .ok_or_else(|| DbError::Other(anyhow!("referral not found")))?;
+        referral.auto_payout_approved = approved;
+        Ok(())
+    }
+
+    async fn admin_remove_referred_vm(&self, code: &str, vm_id: u64) -> DbResult<bool> {
+        let mut vms = self.vms.lock().await;
+        match vms.get_mut(&vm_id) {
+            Some(vm) if vm.ref_code.as_deref() == Some(code) => {
+                vm.ref_code = None;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     async fn admin_list_ip_ranges(
         &self,
         _limit: u64,
@@ -8033,6 +8081,7 @@ mod tests {
             referral_rate: None,
             payout_threshold: None,
             created: Utc::now(),
+            auto_payout_approved: false,
         };
         let id_a = db.insert_referral(&mk("AAA")).await.unwrap();
         db.insert_referral(&mk("BBB")).await.unwrap();
@@ -8060,6 +8109,7 @@ mod tests {
             referral_rate: None,
             payout_threshold: None,
             created: Utc::now(),
+            auto_payout_approved: false,
         };
         let ref_id = db.insert_referral(&referral).await.unwrap();
 
@@ -8109,6 +8159,49 @@ mod tests {
         assert_eq!(vms[&3].ref_code.as_deref(), Some("OTHER"));
     }
 
+    #[cfg(feature = "admin")]
+    #[tokio::test]
+    async fn test_admin_referral_approval_and_vm_removal() {
+        use lnvps_db::{AdminDb, Referral};
+
+        let db = MockDb::default();
+        let id = db
+            .insert_referral(&Referral {
+                user_id: 1,
+                code: "REF".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !db.admin_get_referral(id)
+                .await
+                .unwrap()
+                .auto_payout_approved
+        );
+        db.admin_set_referral_auto_payout(id, true).await.unwrap();
+        assert!(
+            db.admin_get_referral(id)
+                .await
+                .unwrap()
+                .auto_payout_approved
+        );
+        assert!(db.admin_set_referral_auto_payout(99, true).await.is_err());
+
+        db.vms.lock().await.insert(
+            7,
+            Vm {
+                id: 7,
+                ref_code: Some("REF".to_string()),
+                ..MockDb::mock_vm()
+            },
+        );
+        assert!(!db.admin_remove_referred_vm("OTHER", 7).await.unwrap());
+        assert!(db.admin_remove_referred_vm("REF", 7).await.unwrap());
+        assert_eq!(db.vms.lock().await[&7].ref_code, None);
+        assert!(!db.admin_remove_referred_vm("REF", 7).await.unwrap());
+    }
+
     /// admin_list_referrals (pagination + code search) and admin_get_referral.
     #[cfg(feature = "admin")]
     #[tokio::test]
@@ -8125,6 +8218,7 @@ mod tests {
             referral_rate: None,
             payout_threshold: None,
             created: Utc::now(),
+            auto_payout_approved: false,
         };
         let id_a = db.insert_referral(&mk("ALPHA123")).await.unwrap();
         db.insert_referral(&mk("BETA456")).await.unwrap();

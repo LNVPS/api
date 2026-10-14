@@ -1635,6 +1635,8 @@ pub struct Referral {
     /// every fiat balance at the current rate — not on each currency alone.
     #[sqlx(default)]
     pub payout_threshold: Option<u64>,
+    #[sqlx(default)]
+    pub auto_payout_approved: bool,
 }
 
 /// One payout against a referrer's accrued commission.
@@ -1752,12 +1754,16 @@ impl Default for ReferralPayout {
     }
 }
 
-#[derive(FromRow, Clone, Debug)]
+#[derive(FromRow, Clone, Debug, Default)]
 pub struct ReferralCostUsage {
     pub vm_id: u64,
+    #[sqlx(default)]
+    pub user_id: u64,
     pub ref_code: String,
     pub created: DateTime<Utc>,
     pub amount: u64,
+    #[sqlx(default)]
+    pub refunded: u64,
     pub currency: String,
     pub rate: f32,
     pub base_currency: String,
@@ -1769,10 +1775,11 @@ pub struct ReferralCostUsage {
 }
 
 impl ReferralCostUsage {
-    /// Commission earned on this referral: `amount * effective_rate%`, floored,
+    /// Commission earned on this referral: `(amount - refunded) * effective_rate%`, floored,
     /// in the same smallest-currency unit as `amount`.
     pub fn commission(&self) -> u64 {
-        ((self.amount as f64) * (self.effective_rate as f64 / 100.0)).floor() as u64
+        let net = self.amount.saturating_sub(self.refunded);
+        ((net as f64) * (self.effective_rate as f64 / 100.0)).floor() as u64
     }
 }
 
@@ -3902,6 +3909,7 @@ mod tests {
             rate: 1.0,
             base_currency: "EUR".to_string(),
             effective_rate: 10.0,
+            ..Default::default()
         };
         // 10% of 10_000 = 1_000
         assert_eq!(u.commission(), 1_000);
@@ -3912,6 +3920,21 @@ mod tests {
         u.amount = 101;
         u.effective_rate = 2.5;
         assert_eq!(u.commission(), 2);
+    }
+
+    #[test]
+    fn test_referral_commission_excludes_refunded_amount() {
+        let mut u = ReferralCostUsage {
+            amount: 10_000,
+            refunded: 4_000,
+            effective_rate: 10.0,
+            ..Default::default()
+        };
+        assert_eq!(u.commission(), 600);
+        u.refunded = 10_000;
+        assert_eq!(u.commission(), 0);
+        u.refunded = 20_000;
+        assert_eq!(u.commission(), 0);
     }
 
     #[test]

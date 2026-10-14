@@ -41,6 +41,39 @@ const AGENT_CONVERSATION_OVERVIEW_SELECT: &str = r#"select c.*,
           group by conversation_id
      ) m on m.conversation_id = c.id"#;
 
+const REFERRAL_USAGE_SELECT: &str = r#"SELECT v.id as vm_id,
+           v.user_id,
+           v.ref_code,
+           sp.created,
+           sp.amount,
+           CAST(COALESCE((
+               SELECT SUM(rf.amount) FROM subscription_payment rf
+                WHERE rf.refunded_payment_id = sp.payment_id
+                  AND rf.payment_type = 3
+                  AND rf.is_paid = 1
+           ), 0) AS UNSIGNED) AS refunded,
+           sp.currency,
+           sp.rate,
+           c.base_currency,
+           COALESCE(r.referral_rate, c.referral_rate) AS effective_rate"#;
+
+const REFERRAL_USAGE_FROM: &str = r#"FROM vm v
+     JOIN (
+         SELECT v2.id as vm_id, sp2.id as payment_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
+                ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) AS rn
+         FROM subscription_payment sp2
+         JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
+             AND sli2.subscription_type = 3
+         JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
+         WHERE sp2.is_paid = 1
+           AND sp2.payment_type <> 3
+     ) sp ON v.id = sp.vm_id AND sp.rn = 1
+     JOIN vm_host vh ON v.host_id = vh.id
+     JOIN region vhr ON vh.region_id = vhr.id
+     JOIN company c ON vhr.company_id = c.id
+     LEFT JOIN referral r ON r.code = v.ref_code
+     WHERE (r.user_id IS NULL OR r.user_id <> v.user_id)"#;
+
 #[derive(Clone)]
 pub struct LNVpsDbMysql {
     db: MySqlPool,
@@ -4319,7 +4352,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_referral(&self, referral: &Referral) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO referral (user_id, code, address, mode, referral_rate, payout_threshold) VALUES (?, ?, ?, ?, ?, ?) returning id",
+            "INSERT INTO referral (user_id, code, address, mode, referral_rate, payout_threshold, auto_payout_approved) VALUES (?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(referral.user_id)
         .bind(&referral.code)
@@ -4327,6 +4360,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(referral.mode)
         .bind(referral.referral_rate)
         .bind(referral.payout_threshold)
+        .bind(referral.auto_payout_approved)
         .fetch_one(&self.db)
         .await?;
         Ok(res.try_get(0)?)
@@ -4442,30 +4476,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn list_referral_usage(&self, code: &str) -> DbResult<Vec<ReferralCostUsage>> {
         Ok(sqlx::query_as(
-            "SELECT v.id as vm_id,
-                    v.ref_code,
-                    sp.created,
-                    sp.amount,
-                    sp.currency,
-                    sp.rate,
-                    c.base_currency,
-                    COALESCE(r.referral_rate, c.referral_rate) AS effective_rate
-             FROM vm v
-             JOIN (
-                 SELECT v2.id as vm_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
-                        ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) AS rn
-                 FROM subscription_payment sp2
-                 JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
-                     AND sli2.subscription_type = 3
-                 JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
-                 WHERE sp2.is_paid = 1
-             ) sp ON v.id = sp.vm_id AND sp.rn = 1
-             JOIN vm_host vh ON v.host_id = vh.id
-             JOIN region vhr ON vh.region_id = vhr.id
-             JOIN company c ON vhr.company_id = c.id
-             LEFT JOIN referral r ON r.code = v.ref_code
-             WHERE v.ref_code = ?
-             ORDER BY sp.created DESC",
+&format!("{REFERRAL_USAGE_SELECT} {REFERRAL_USAGE_FROM} AND v.ref_code = ? ORDER BY sp.created DESC"),
         )
         .bind(code)
         .fetch_all(&self.db)
@@ -4479,31 +4490,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
         offset: u64,
     ) -> DbResult<(Vec<ReferralCostUsage>, u64)> {
         let rows = sqlx::query_as(
-            "SELECT v.id as vm_id,
-                    v.ref_code,
-                    sp.created,
-                    sp.amount,
-                    sp.currency,
-                    sp.rate,
-                    c.base_currency,
-                    COALESCE(r.referral_rate, c.referral_rate) AS effective_rate
-             FROM vm v
-             JOIN (
-                 SELECT v2.id as vm_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
-                        ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) AS rn
-                 FROM subscription_payment sp2
-                 JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
-                     AND sli2.subscription_type = 3
-                 JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
-                 WHERE sp2.is_paid = 1
-             ) sp ON v.id = sp.vm_id AND sp.rn = 1
-             JOIN vm_host vh ON v.host_id = vh.id
-             JOIN region vhr ON vh.region_id = vhr.id
-             JOIN company c ON vhr.company_id = c.id
-             LEFT JOIN referral r ON r.code = v.ref_code
-             WHERE v.ref_code = ?
-             ORDER BY sp.created DESC
-             LIMIT ? OFFSET ?",
+&format!(
+            "{REFERRAL_USAGE_SELECT} {REFERRAL_USAGE_FROM} AND v.ref_code = ? ORDER BY sp.created DESC LIMIT ? OFFSET ?"
+        ),
         )
         .bind(code)
         .bind(limit)
@@ -4512,23 +4501,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?;
 
         // Total row count mirrors the same joins/filters as the page query.
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)
-             FROM vm v
-             JOIN (
-                 SELECT v2.id as vm_id,
-                        ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) AS rn
-                 FROM subscription_payment sp2
-                 JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
-                     AND sli2.subscription_type = 3
-                 JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
-                 WHERE sp2.is_paid = 1
-             ) sp ON v.id = sp.vm_id AND sp.rn = 1
-             JOIN vm_host vh ON v.host_id = vh.id
-             JOIN region vhr ON vh.region_id = vhr.id
-             JOIN company c ON vhr.company_id = c.id
-             WHERE v.ref_code = ?",
-        )
+        let total: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) {REFERRAL_USAGE_FROM} AND v.ref_code = ?"
+        ))
         .bind(code)
         .fetch_one(&self.db)
         .await?;
@@ -4539,7 +4514,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn count_failed_referrals(&self, code: &str) -> DbResult<u64> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM vm v
+             LEFT JOIN referral r ON r.code = v.ref_code
              WHERE v.ref_code = ?
+               AND (r.user_id IS NULL OR r.user_id <> v.user_id)
                AND NOT EXISTS (
                    SELECT 1
                    FROM subscription_payment sp
@@ -8352,32 +8329,13 @@ impl AdminDb for LNVpsDbMysql {
         company_id: u64,
         ref_code: Option<&str>,
     ) -> DbResult<Vec<ReferralCostUsage>> {
-        let mut query = "SELECT v.id as vm_id,
-                                v.ref_code,
-                                sp.created,
-                                sp.amount,
-                                sp.currency,
-                                sp.rate,
-                                c.base_currency,
-                                COALESCE(r.referral_rate, c.referral_rate) AS effective_rate
-                         FROM vm v
-                         JOIN (
-                             SELECT v2.id as vm_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
-                                    ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) as rn
-                             FROM subscription_payment sp2
-                             JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
-                                 AND sli2.subscription_type = 3
-                             JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
-                             WHERE sp2.is_paid = 1
-                         ) sp ON v.id = sp.vm_id AND sp.rn = 1
-                         JOIN vm_host vh ON v.host_id = vh.id
-                         JOIN region vhr ON vh.region_id = vhr.id
-                         JOIN company c ON vhr.company_id = c.id
-                         LEFT JOIN referral r ON r.code = v.ref_code
-                         WHERE v.ref_code IS NOT NULL
-                           AND sp.created >= ?
-                           AND sp.created <= ?
-                           AND c.id = ?".to_string();
+        let mut query = format!(
+            "{REFERRAL_USAGE_SELECT} {REFERRAL_USAGE_FROM}
+               AND v.ref_code IS NOT NULL
+               AND sp.created >= ?
+               AND sp.created <= ?
+               AND c.id = ?"
+        );
 
         if ref_code.is_some() {
             query.push_str(" AND v.ref_code = ?");
@@ -8447,6 +8405,28 @@ impl AdminDb for LNVpsDbMysql {
             .bind(referral_id)
             .fetch_one(&self.db)
             .await?)
+    }
+
+    async fn admin_set_referral_auto_payout(
+        &self,
+        referral_id: u64,
+        approved: bool,
+    ) -> DbResult<()> {
+        sqlx::query("UPDATE referral SET auto_payout_approved = ? WHERE id = ?")
+            .bind(approved)
+            .bind(referral_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn admin_remove_referred_vm(&self, code: &str, vm_id: u64) -> DbResult<bool> {
+        let res = sqlx::query("UPDATE vm SET ref_code = NULL WHERE id = ? AND ref_code = ?")
+            .bind(vm_id)
+            .bind(code)
+            .execute(&self.db)
+            .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn admin_list_ip_ranges(

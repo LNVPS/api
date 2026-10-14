@@ -4074,6 +4074,7 @@ Returns a paginated list of `AdminReferralInfo`:
       "mode": "lightning_address",
       "referral_rate": 12.5,
       "payout_threshold": null,
+      "auto_payout_approved": false,
       "created": "2026-07-18T10:00:00Z"
     }
   ],
@@ -4084,6 +4085,8 @@ Returns a paginated list of `AdminReferralInfo`:
 ```
 
 `referral_rate` is the per-referrer commission override (whole %); `null` means the referred VM's `company.referral_rate` default applies.
+
+`auto_payout_approved` is false for every new referrer. Until an admin sets it, commission accrues but the payout job does not pay it.
 
 #### Get Referral Detail
 
@@ -4106,6 +4109,7 @@ Returns the referral plus per-currency earned commission, the outstanding balanc
     "mode": "lightning_address",
     "referral_rate": 12.5,
     "payout_threshold": null,
+    "auto_payout_approved": true,
     "created": "2026-07-18T10:00:00Z",
     "earned": [ { "currency": "BTC", "amount": 5000 } ],
     "balances": [
@@ -4122,7 +4126,7 @@ Returns the referral plus per-currency earned commission, the outstanding balanc
 }
 ```
 
-`earned` is commission (`first payment * effective_rate%`) aggregated per currency (keys upper-cased).
+`earned` is commission (`(first payment - refunds against it) * effective_rate%`) aggregated per currency (keys upper-cased). VMs owned by the referrer themselves earn nothing.
 
 `balances` nets each earned currency against what has already been paid **or reserved** in it (`settled` = payout `amount + fee`, matched on the currency a payout *settles*, not the one it sent) and values the remainder in millisats at current rates. `outstanding_msat` is `null` when no rate is available for that currency, and such balances are excluded from the total.
 
@@ -4147,10 +4151,54 @@ Body:
   // in use by another referral.
   "referral_rate": 12.5,
   // Set (number, >= 0), clear to company default (null), or omit to leave unchanged
-  "payout_threshold": 50000
+  "payout_threshold": 50000,
   // Set (number, satoshis), clear to system minimum (null), or omit to leave unchanged. Admin override is not bounded by the system minimum.
+  "auto_payout_approved": true
+  // Approve (true) or revoke (false) automated payouts, or omit to leave unchanged.
 }
 ```
+
+#### List Referred VMs
+
+```
+GET /api/admin/v1/referrals/{id}/usage?limit={limit}&offset={offset}
+```
+
+Required Permission: `referral::view`
+
+One row per referred VM that made a first payment, most recent first. `limit` defaults to 50 (max 100).
+
+```json
+{
+  "data": [
+    {
+      "vm_id": 812,
+      "user_id": 977,
+      "created": "2026-10-01T09:00:00Z",
+      "amount": 8400,
+      "refunded": 0,
+      "currency": "EUR",
+      "effective_rate": 33.0,
+      "commission": 2772
+    }
+  ],
+  "total": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+`amount` is the VM's first payment and `refunded` the total refunded against it, both in the smallest unit of `currency`. `commission = (amount - refunded) * effective_rate%`.
+
+#### Remove Referred VM
+
+```
+DELETE /api/admin/v1/referrals/{id}/usage/{vm_id}
+```
+
+Required Permission: `referral::delete`
+
+Clears the VM's referral code so it stops earning this referrer commission. Commission already paid on it then nets against the referrer's future earnings. Returns `404` when the VM was not referred by this referral.
 
 #### List Referral Payouts
 

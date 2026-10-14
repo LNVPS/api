@@ -146,6 +146,14 @@ impl VmProvisioner {
             .await
     }
 
+    async fn foreign_ref_code(&self, user_id: u64, ref_code: Option<String>) -> Option<String> {
+        let code = ref_code?;
+        match self.db.get_referral_by_code(&code).await {
+            Ok(referral) if referral.user_id == user_id => None,
+            _ => Some(code),
+        }
+    }
+
     pub async fn provision_on_host(
         &self,
         user_id: u64,
@@ -241,7 +249,7 @@ impl VmProvisioner {
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             ssh_host_keys: None,
             deleted: false,
-            ref_code,
+            ref_code: self.foreign_ref_code(user.id, ref_code).await,
             disabled: false,
             fw_policy_in: None,
             fw_policy_out: None,
@@ -379,7 +387,7 @@ impl VmProvisioner {
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             ssh_host_keys: None,
             deleted: false,
-            ref_code,
+            ref_code: self.foreign_ref_code(user.id, ref_code).await,
             disabled: false,
             fw_policy_in: None,
             fw_policy_out: None,
@@ -2731,6 +2739,26 @@ mod tests {
             .await?;
 
         assert_eq!(vm.ref_code, Some("TEST123".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_provision_drops_own_ref_code() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let prov = make_provisioner(db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        db.insert_referral(&lnvps_db::Referral {
+            user_id: user.id,
+            code: "SELF1".to_string(),
+            ..Default::default()
+        })
+        .await?;
+
+        let vm = prov
+            .provision(user.id, 1, 1, ssh_key.id, Some("SELF1".to_string()))
+            .await?;
+
+        assert_eq!(vm.ref_code, None);
         Ok(())
     }
 

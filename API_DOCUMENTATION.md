@@ -1488,6 +1488,7 @@ interface Referral {
   mode: "lightning_address" | "nwc" | "account_credit" | "on_chain"; // Payout method
   referral_rate: number | null;    // Per-referrer commission override (whole %), admin-controlled; null = no override, use company default. NOT the rate you earn by itself.
   effective_referral_rate: number; // The commission rate that currently applies to you (whole %): the override if set, else the default company's rate. Use this for display.
+  auto_payout_approved: boolean;   // Whether an admin has approved automated payouts. Until then commission accrues and is paid manually.
   created: string;                 // ISO 8601 datetime
 }
 
@@ -1515,7 +1516,8 @@ interface ReferralUsage {
   amount: number;        // The referred VM's first payment amount (smallest currency unit)
   currency: string;      // Currency of the payment / commission
   effective_rate: number;// Rate actually applied to THIS referred VM (whole %); resolved against the VM's own company
-  commission: number;    // Commission earned from this VM = amount * effective_rate% (smallest currency unit)
+  commission: number;    // Commission earned from this VM = (amount - refunded) * effective_rate% (smallest currency unit)
+  payable_after: string | null; // ISO 8601 datetime the commission becomes eligible for automated payout; null when automated payouts are off
 }
 
 interface ReferralState extends Referral {

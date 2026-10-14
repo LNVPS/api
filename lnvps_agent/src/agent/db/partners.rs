@@ -179,6 +179,7 @@ mod tests {
                 created: Utc::now(),
                 referral_rate: rate,
                 payout_threshold: Some(10_000),
+                auto_payout_approved: false,
             },
         );
     }

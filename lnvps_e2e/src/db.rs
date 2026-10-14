@@ -533,8 +533,8 @@ pub async fn seed_referrer_with_commission(
 
     // Referrer enrollment with a 100% override so commission == payment amount.
     let (referral_id,): (u64,) = sqlx::query_as(
-        "INSERT INTO referral (user_id, code, mode, address, referral_rate) \
-         VALUES (?, ?, ?, ?, 100) RETURNING id",
+        "INSERT INTO referral (user_id, code, mode, address, referral_rate, auto_payout_approved) \
+         VALUES (?, ?, ?, ?, 100, 1) RETURNING id",
     )
     .bind(referrer_user_id)
     .bind(code)
@@ -590,8 +590,8 @@ pub async fn seed_referrer_with_commission(
              currency, payment_method, payment_type, external_data, external_id, is_paid, rate, \
              tax, processing_fee, time_value, metadata, paid_at, tax_rate, tax_country_code, \
              tax_treatment, tax_evidence, tax_breakdown) \
-         VALUES (?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY), ?, 'BTC', 0, 0, '', NULL, 1, \
-             1.0, 0, 0, 2592000, NULL, NOW(), NULL, NULL, NULL, NULL, NULL)",
+         VALUES (?, ?, ?, DATE_SUB(NOW(), INTERVAL 60 DAY), NOW(), ?, 'BTC', 0, 0, '', NULL, 1, \
+             1.0, 0, 0, 2592000, NULL, DATE_SUB(NOW(), INTERVAL 60 DAY), NULL, NULL, NULL, NULL, NULL)",
     )
     .bind(payment_id.as_slice())
     .bind(sub_id)
@@ -821,6 +821,19 @@ pub fn rand_bytes32() -> [u8; 32] {
 }
 
 /// Hard-delete a referral and its payouts.
+pub async fn set_referral_auto_payout(
+    pool: &MySqlPool,
+    referral_id: u64,
+    approved: bool,
+) -> anyhow::Result<()> {
+    sqlx::query("UPDATE referral SET auto_payout_approved = ? WHERE id = ?")
+        .bind(approved)
+        .bind(referral_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn hard_delete_referral(pool: &MySqlPool, referral_id: u64) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM referral_payout WHERE referral_id = ?")
         .bind(referral_id)

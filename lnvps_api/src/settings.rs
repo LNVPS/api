@@ -398,6 +398,10 @@ fn default_max_onchain_fee_per_vbyte() -> u64 {
     50
 }
 
+fn default_commission_hold_days() -> u64 {
+    30
+}
+
 fn default_mempool_url() -> String {
     "https://mempool.space".to_string()
 }
@@ -438,6 +442,8 @@ pub struct ReferralConfig {
     /// to mempool.space; a fixed rate can be configured for regtest/testing.
     #[serde(default)]
     pub fee_estimator: FeeEstimatorConfig,
+    #[serde(default = "default_commission_hold_days")]
+    pub commission_hold_days: u64,
 }
 
 /// Source of read-only chain lookups used to spot replaced (RBF'd) deposits.

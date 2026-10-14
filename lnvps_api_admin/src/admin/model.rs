@@ -2541,7 +2541,35 @@ pub struct AdminReferralInfo {
     /// `max(system minimum, this value)`, judged against the referrer's total
     /// outstanding commission across every currency.
     pub payout_threshold: Option<u64>,
+    pub auto_payout_approved: bool,
     pub created: DateTime<Utc>,
+}
+
+#[derive(Serialize)]
+pub struct AdminReferralUsageInfo {
+    pub vm_id: u64,
+    pub user_id: u64,
+    pub created: DateTime<Utc>,
+    pub amount: u64,
+    pub refunded: u64,
+    pub currency: String,
+    pub effective_rate: f32,
+    pub commission: u64,
+}
+
+impl From<lnvps_db::ReferralCostUsage> for AdminReferralUsageInfo {
+    fn from(u: lnvps_db::ReferralCostUsage) -> Self {
+        Self {
+            commission: u.commission(),
+            vm_id: u.vm_id,
+            user_id: u.user_id,
+            created: u.created,
+            amount: u.amount,
+            refunded: u.refunded,
+            currency: u.currency,
+            effective_rate: u.effective_rate,
+        }
+    }
 }
 
 /// Per-currency earned commission for a referral.
@@ -2674,6 +2702,8 @@ pub struct AdminUpdateReferralRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub payout_threshold: Option<Option<u64>>,
+    #[serde(default)]
+    pub auto_payout_approved: Option<bool>,
 }
 
 /// Create a manual payout record for a referral.

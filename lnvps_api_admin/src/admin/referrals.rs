@@ -2,7 +2,7 @@ use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminCreateReferralPayoutRequest, AdminReferralBalance, AdminReferralDetail,
-    AdminReferralEarning, AdminReferralInfo, AdminReferralPayoutInfo,
+    AdminReferralEarning, AdminReferralInfo, AdminReferralPayoutInfo, AdminReferralUsageInfo,
     AdminUpdateReferralPayoutRequest, AdminUpdateReferralRequest,
 };
 use axum::extract::{Path, Query, State};
@@ -32,6 +32,14 @@ pub fn router() -> Router<RouterState> {
             "/api/admin/v1/referrals/{id}/payouts/{payout_id}",
             axum::routing::patch(admin_update_referral_payout),
         )
+        .route(
+            "/api/admin/v1/referrals/{id}/usage",
+            get(admin_list_referral_usage),
+        )
+        .route(
+            "/api/admin/v1/referrals/{id}/usage/{vm_id}",
+            axum::routing::delete(admin_remove_referred_vm),
+        )
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -57,6 +65,7 @@ async fn build_info(this: &RouterState, r: Referral) -> Result<AdminReferralInfo
         mode: r.mode.to_string(),
         referral_rate: r.referral_rate,
         payout_threshold: r.payout_threshold,
+        auto_payout_approved: r.auto_payout_approved,
         created: r.created,
     })
 }
@@ -231,8 +240,52 @@ async fn admin_update_referral(
     }
 
     this.db.update_referral(&referral).await?;
+    if let Some(approved) = req.auto_payout_approved {
+        this.db.admin_set_referral_auto_payout(id, approved).await?;
+    }
     let updated = this.db.admin_get_referral(id).await?;
     ApiData::ok(build_info(&this, updated).await?)
+}
+
+async fn admin_list_referral_usage(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Query(params): Query<ListReferralsQuery>,
+) -> ApiPaginatedResult<AdminReferralUsageInfo> {
+    auth.require_permission(AdminResource::Referral, AdminAction::View)?;
+
+    let referral = this.db.admin_get_referral(id).await?;
+    let limit = params.limit.unwrap_or(50).min(100);
+    let offset = params.offset.unwrap_or(0);
+    let (rows, total) = this
+        .db
+        .list_referral_usage_paginated(&referral.code, limit, offset)
+        .await?;
+    ApiPaginatedData::ok(
+        rows.into_iter().map(Into::into).collect(),
+        total,
+        limit,
+        offset,
+    )
+}
+
+async fn admin_remove_referred_vm(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path((id, vm_id)): Path<(u64, u64)>,
+) -> ApiResult<()> {
+    auth.require_permission(AdminResource::Referral, AdminAction::Delete)?;
+
+    let referral = this.db.admin_get_referral(id).await?;
+    if !this
+        .db
+        .admin_remove_referred_vm(&referral.code, vm_id)
+        .await?
+    {
+        return Err(ApiError::not_found("VM was not referred by this referral"));
+    }
+    ApiData::ok(())
 }
 
 /// List a referral's payout records.

@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **Referral self-dealing**: a VM ordered with the buyer's own referral code no longer earns commission, including VMs already ordered that way, so commission already paid on them nets against future earnings. Commission is reduced by refunds against the referred VM's first payment, and automated payouts wait until that payment is `commission-hold-days` old (default 30). `GET /api/v1/referral/usage` rows gain `payable_after`. Affects `GET /api/v1/referral`, `GET /api/v1/referral/usage`, `GET /api/admin/v1/referrals/*` and the referral usage reports.
+
+- **Referral auto-payout needs admin approval**: referrals gain `auto_payout_approved`, false for every referrer including existing ones. The payout job skips unapproved referrers and their commission accrues for manual payout. Admins set it with `PATCH /api/admin/v1/referrals/{id}`; `GET /api/v1/referral` and the admin referral responses return it.
+
 ### Changed
 
 - **Tunnel pool MTU has a floor of 1280** — `POST`/`PATCH /api/admin/v1/tunnel_pools` refuse an `mtu` below 1280, where Linux turns IPv6 off on the interface. A pool's MTU is now also applied to its route server interface and to the marketplace hosts in it, and a marketplace node whose measured path to the route server cannot carry the pool MTU plus WireGuard's overhead fails its probe.
@@ -17,6 +23,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Guests on libvirt hosts get DNS resolvers and the host's MTU** — the NoCloud network config now carries `nameservers` and, when the host has one set, `mtu`. Images that resolve through systemd-resolved (Debian 13 among them) ignored the resolvers in user-data and booted with no DNS at all.
 
 ### Added
+
+- **Admin referred VM list**: `GET /api/admin/v1/referrals/{id}/usage` lists a referrer's referred VMs with their owner, first payment, refunds and commission. `DELETE /api/admin/v1/referrals/{id}/usage/{vm_id}` detaches a VM from the referral so it earns no commission.
 
 - **Download app backups**: `GET`/`POST /api/v1/app-deployments/{id}/backups`, `GET /api/v1/app-deployments/{id}/backups/{backup_id}/download` and `DELETE /api/v1/app-deployments/{id}/backups/{backup_id}`. Customers can list their deployment's backups, start one (at most one manual run an hour, never while one is in flight), get a presigned download link valid for an hour, and delete a finished backup. The compose `backup:` grammar gains `exec:` (the app's own export, run inside its running container) and `quiesce: true` on a `volume:` backup (the service is stopped while its volume is copied); `AppBackup.method` may now be `exec`. `POST`/`PATCH /api/admin/v1/apps` now refuse an app that declares a volume but no service `backup:` method, and every catalog app declares one; runs on an app with no schedule keep the newest 7. The API reads the bucket from a new `app-backups` config block, with the keys overridable through `LNVPS_BACKUP_ACCESS_KEY` / `LNVPS_BACKUP_SECRET_KEY` like the operator's.
 

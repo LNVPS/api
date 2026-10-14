@@ -211,7 +211,13 @@ whatsapp:
 referral:
   min-payout-sats: 1000        # minimum accrued BTC commission before an auto-payout
   min-fiat-payout-sats: 1000   # same for fiat-settled commission, valued at the quote; omit to disable
+  commission-hold-days: 30     # days a referred VM's first payment must age before its commission is paid
 ```
+
+A referred VM's commission is only paid once its first payment is
+`commission-hold-days` old, which leaves time to refund an order placed through
+a sock-puppet account. Refunds against that payment reduce the commission, and a
+VM ordered with the buyer's own referral code earns nothing.
 
 Fiat-settled commission is paid by converting the balance to sats at the rate
 quoted when the payout is sent. The payout record keeps both sides — `amount`

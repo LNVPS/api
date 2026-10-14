@@ -165,6 +165,17 @@ fn settled_in(payouts: &[ReferralPayout], currency: &str) -> u64 {
         .sum()
 }
 
+fn matured(
+    usage: Vec<lnvps_db::ReferralCostUsage>,
+    now: chrono::DateTime<Utc>,
+    hold: chrono::Duration,
+) -> Vec<lnvps_db::ReferralCostUsage> {
+    usage
+        .into_iter()
+        .filter(|u| u.created + hold <= now)
+        .collect()
+}
+
 /// Commission earned per settled currency, excluding BTC (which the BTC passes
 /// own). Keys are upper-cased so `eur` and `EUR` are one balance.
 fn earned_by_fiat_currency(usage: &[lnvps_db::ReferralCostUsage]) -> BTreeMap<String, u64> {
@@ -263,6 +274,7 @@ pub struct ReferralPayoutHandler {
     /// Remembers which balances are currently refused over the ceiling, so an
     /// operator hears about a refusal once instead of on every pass.
     kv: Arc<dyn KeyValueStore>,
+    commission_hold: chrono::Duration,
 }
 
 impl ReferralPayoutHandler {
@@ -296,7 +308,18 @@ impl ReferralPayoutHandler {
             exchange,
             min_fiat_payout_msat: min_fiat_payout_sats.map(|s| s.saturating_mul(1000)),
             kv,
+            commission_hold: chrono::Duration::zero(),
         }
+    }
+
+    pub fn with_commission_hold(mut self, hold: chrono::Duration) -> Self {
+        self.commission_hold = hold;
+        self
+    }
+
+    async fn matured_usage(&self, code: &str) -> Result<Vec<lnvps_db::ReferralCostUsage>> {
+        let usage = self.db.list_referral_usage(code).await?;
+        Ok(matured(usage, Utc::now(), self.commission_hold))
     }
 
     /// Key holding whether one referrer's balance in `currency` is currently
@@ -374,7 +397,13 @@ impl ReferralPayoutHandler {
     /// [`Self::process_onchain_batch`]) so one transaction (and one fee) covers
     /// every eligible on-chain payout in the run.
     pub async fn process_payouts(&self) -> Result<()> {
-        let referrals = self.db.list_all_referrals().await?;
+        let referrals: Vec<Referral> = self
+            .db
+            .list_all_referrals()
+            .await?
+            .into_iter()
+            .filter(|r| r.auto_payout_approved)
+            .collect();
 
         // Lightning / NWC payouts, one payment each.
         if let Some(min_msat) = self.min_payout_msat {
@@ -537,7 +566,7 @@ impl ReferralPayoutHandler {
     /// the threshold applies to the converted amount, which is only known once
     /// the batch is quoted.
     async fn owed_fiat(&self, referral: &Referral) -> Result<Vec<(String, u64)>> {
-        let usage = self.db.list_referral_usage(&referral.code).await?;
+        let usage = self.matured_usage(&referral.code).await?;
         let earned = earned_by_fiat_currency(&usage);
         if earned.is_empty() {
             return Ok(Vec::new());
@@ -555,7 +584,7 @@ impl ReferralPayoutHandler {
     /// Outstanding BTC-settled commission (millisats) for one referrer: earned
     /// minus every existing (paid + reserved) BTC payout.
     async fn owed_btc_msat(&self, referral: &Referral) -> Result<u64> {
-        let usage = self.db.list_referral_usage(&referral.code).await?;
+        let usage = self.matured_usage(&referral.code).await?;
         let earned_msat: u64 = usage
             .iter()
             .filter(|u| u.currency.eq_ignore_ascii_case("BTC"))
@@ -1198,6 +1227,7 @@ mod tests {
             referral_rate: None,
             payout_threshold: None,
             created: Utc::now(),
+            auto_payout_approved: true,
         }
     }
 
@@ -1368,6 +1398,7 @@ mod tests {
             rate: 1.0,
             base_currency: "EUR".to_string(),
             effective_rate: 10.0,
+            ..Default::default()
         };
         let earned = earned_by_fiat_currency(&[
             usage("EUR", 1_000),
@@ -1532,6 +1563,71 @@ mod tests {
             Some(1),
             kv,
         )
+    }
+
+    fn eur_referrer(user_id: u64) -> Referral {
+        Referral {
+            user_id,
+            mode: ReferralPayoutMode::LightningAddress,
+            address: Some("payouts@example.invalid".to_string()),
+            ..referrer(0, "EURREF")
+        }
+    }
+
+    fn no_rates_handler(db: Arc<MockDb>) -> ReferralPayoutHandler {
+        fiat_handler(db, Arc::new(lnvps_api_common::MockExchangeRate::default()))
+    }
+
+    #[tokio::test]
+    async fn test_self_referral_earns_no_commission() {
+        let db = Arc::new(MockDb::default());
+        let referral = fiat_referrer(&db, "EUR", 28_000, eur_referrer(1)).await;
+        let h = no_rates_handler(db.clone());
+
+        use lnvps_db::LNVpsDbBase;
+
+        assert!(h.owed_fiat(&referral).await.unwrap().is_empty());
+        db.subscription_payments.lock().await[0].is_paid = false;
+        assert_eq!(db.count_failed_referrals(&referral.code).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_commission_is_held_until_the_payment_ages() {
+        let db = Arc::new(MockDb::default());
+        let referral = fiat_referrer(&db, "EUR", 10_000, eur_referrer(0)).await;
+        let h = no_rates_handler(db.clone()).with_commission_hold(chrono::Duration::days(30));
+
+        assert!(h.owed_fiat(&referral).await.unwrap().is_empty());
+
+        db.subscription_payments.lock().await[0].created = Utc::now() - chrono::Duration::days(31);
+        assert_eq!(
+            h.owed_fiat(&referral).await.unwrap(),
+            vec![("EUR".to_string(), 1_000)]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refunded_first_payment_earns_no_commission() {
+        let db = Arc::new(MockDb::default());
+        let referral = fiat_referrer(&db, "EUR", 10_000, eur_referrer(0)).await;
+        let h = no_rates_handler(db.clone());
+        assert_eq!(
+            h.owed_fiat(&referral).await.unwrap(),
+            vec![("EUR".to_string(), 1_000)]
+        );
+
+        let mut payments = db.subscription_payments.lock().await;
+        let refund = lnvps_db::SubscriptionPayment {
+            id: vec![0xee; 32],
+            created: Utc::now() + chrono::Duration::seconds(1),
+            payment_type: lnvps_db::SubscriptionPaymentType::Refund,
+            refunded_payment_id: Some(payments[0].id.clone()),
+            ..payments[0].clone()
+        };
+        payments.push(refund);
+        drop(payments);
+
+        assert!(h.owed_fiat(&referral).await.unwrap().is_empty());
     }
 
     /// A payment that fails leaves no reservation behind — the balance has to
@@ -1828,6 +1924,51 @@ mod tests {
             1,
             "no second transaction broadcast"
         );
+    }
+
+    #[tokio::test]
+    async fn test_unapproved_referrer_is_not_auto_paid() {
+        use lnvps_db::LNVpsDbBase;
+
+        let db = Arc::new(MockDb::default());
+        let referral = fiat_referrer(
+            &db,
+            "EUR",
+            10_000,
+            Referral {
+                mode: ReferralPayoutMode::OnChain,
+                address: Some(regtest_addr(9)),
+                auto_payout_approved: false,
+                ..referrer(0, "FIAT")
+            },
+        )
+        .await;
+        let onchain = Arc::new(MockOnChainProvider::default());
+        let h = onchain_fiat_handler(
+            db.clone(),
+            onchain.clone(),
+            eur_exchange(100_000.0).await,
+            Arc::new(ChannelWorkCommander::new()),
+            1,
+        );
+
+        h.process_payouts().await.unwrap();
+        assert!(onchain.sends.lock().await.is_empty());
+        assert!(
+            db.list_referral_payouts(referral.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        db.referrals
+            .lock()
+            .await
+            .get_mut(&referral.id)
+            .unwrap()
+            .auto_payout_approved = true;
+        h.process_payouts().await.unwrap();
+        assert_eq!(onchain.sends.lock().await.len(), 1);
     }
 
     /// `min-fiat-payout-sats` floors the on-chain rows too: it is not merely an

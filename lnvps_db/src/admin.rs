@@ -308,6 +308,14 @@ pub trait AdminDb: Send + Sync {
     /// Get a single referral enrollment by its id.
     async fn admin_get_referral(&self, referral_id: u64) -> DbResult<crate::Referral>;
 
+    async fn admin_set_referral_auto_payout(
+        &self,
+        referral_id: u64,
+        approved: bool,
+    ) -> DbResult<()>;
+
+    async fn admin_remove_referred_vm(&self, code: &str, vm_id: u64) -> DbResult<bool>;
+
     // IP Range management methods
     /// List all IP ranges with pagination
     async fn admin_list_ip_ranges(
