@@ -4075,7 +4075,9 @@ Returns a paginated list of `AdminReferralInfo`:
       "referral_rate": 12.5,
       "payout_threshold": null,
       "auto_payout_approved": false,
-      "created": "2026-07-18T10:00:00Z"
+      "created": "2026-07-18T10:00:00Z",
+      "outstanding_total_msat": 30000000,
+      "paid_total_msat": 125000000
     }
   ],
   "total": 1,
@@ -4085,6 +4087,8 @@ Returns a paginated list of `AdminReferralInfo`:
 ```
 
 `referral_rate` is the per-referrer commission override (whole %); `null` means the referred VM's `company.referral_rate` default applies.
+
+`outstanding_total_msat` is everything still owed across currencies, valued in millisats at current rates (the same figure as on the detail endpoint). `paid_total_msat` is the sum of paid payouts as sent, with any non-BTC transfer valued at the current rate. Currencies with no rate are left out of both.
 
 `auto_payout_approved` is false for every new referrer. Until an admin sets it, commission accrues but the payout job does not pay it.
 
@@ -4117,6 +4121,7 @@ Returns the referral plus per-currency earned commission, the outstanding balanc
       { "currency": "EUR", "earned": 2000, "settled": 1000, "outstanding": 1000, "outstanding_msat": 10000000 }
     ],
     "outstanding_total_msat": 10005000,
+    "paid_total_msat": 5000,
     "payouts": [
       { "id": 1, "amount": 5000, "fee": 0, "currency": "BTC", "sent_amount": 5000, "sent_fee": 0, "sent_currency": "BTC", "rate": 1.0, "rate_collected": null, "created": "2026-07-18T11:00:00Z", "is_paid": true, "mode": "lightning_address", "output": "lnbc...", "pre_image": "<hex>" }
     ],

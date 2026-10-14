@@ -1619,6 +1619,20 @@ mod tests {
                 );
             }
 
+            let list = json_ok(
+                admin
+                    .get_auth(&format!("/api/admin/v1/referrals?search={ref_code}OC3"))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(list["data"][0]["id"].as_u64(), Some(oc3_ref_id));
+            assert_eq!(
+                list["data"][0]["outstanding_total_msat"].as_u64(),
+                Some(6_000_000)
+            );
+            assert_eq!(list["data"][0]["paid_total_msat"].as_u64(), Some(0));
+
             let usage_path = format!("/api/admin/v1/referrals/{oc3_ref_id}/usage");
             let usage = json_ok(admin.get_auth(&usage_path).await.unwrap()).await;
             assert_eq!(usage["total"].as_u64(), Some(1));

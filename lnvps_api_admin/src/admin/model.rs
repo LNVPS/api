@@ -2659,6 +2659,14 @@ impl From<lnvps_db::ReferralPayout> for AdminReferralPayoutInfo {
     }
 }
 
+#[derive(Serialize)]
+pub struct AdminReferralListItem {
+    #[serde(flatten)]
+    pub referral: AdminReferralInfo,
+    pub outstanding_total_msat: u64,
+    pub paid_total_msat: u64,
+}
+
 /// Full referral detail: enrollment + earnings + payout history + counts.
 #[derive(Serialize)]
 pub struct AdminReferralDetail {
@@ -2672,6 +2680,7 @@ pub struct AdminReferralDetail {
     /// with `payout_threshold` (satoshis × 1000) and the system minimum.
     /// Currencies with no available rate are excluded.
     pub outstanding_total_msat: u64,
+    pub paid_total_msat: u64,
     pub payouts: Vec<AdminReferralPayoutInfo>,
     /// Referred VMs that made at least one payment.
     pub referrals_success: u64,

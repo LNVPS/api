@@ -26,6 +26,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Referral totals on the admin list**: `GET /api/admin/v1/referrals` rows and `GET /api/admin/v1/referrals/{id}` gain `outstanding_total_msat` and `paid_total_msat`.
+
 - **Admin referred VM list**: `GET /api/admin/v1/referrals/{id}/usage` lists a referrer's referred VMs with their owner, first payment, refunds and commission. `DELETE /api/admin/v1/referrals/{id}/usage/{vm_id}` detaches a VM from the referral so it earns no commission.
 
 - **Download app backups**: `GET`/`POST /api/v1/app-deployments/{id}/backups`, `GET /api/v1/app-deployments/{id}/backups/{backup_id}/download` and `DELETE /api/v1/app-deployments/{id}/backups/{backup_id}`. Customers can list their deployment's backups, start one (at most one manual run an hour, never while one is in flight), get a presigned download link valid for an hour, and delete a finished backup. The compose `backup:` grammar gains `exec:` (the app's own export, run inside its running container) and `quiesce: true` on a `volume:` backup (the service is stopped while its volume is copied); `AppBackup.method` may now be `exec`. `POST`/`PATCH /api/admin/v1/apps` now refuse an app that declares a volume but no service `backup:` method, and every catalog app declares one; runs on an app with no schedule keep the newest 7. The API reads the bucket from a new `app-backups` config block, with the keys overridable through `LNVPS_BACKUP_ACCESS_KEY` / `LNVPS_BACKUP_SECRET_KEY` like the operator's.
