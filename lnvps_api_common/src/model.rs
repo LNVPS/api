@@ -328,6 +328,27 @@ pub struct ApiVmTrafficSummary {
     /// Bytes received so far this period, for display only; never counted
     /// against the allowance
     pub bytes_in: u64,
+    #[serde(default)]
+    pub throttled: bool,
+}
+
+impl ApiVmTrafficSummary {
+    pub fn new(
+        transfer_gb: Option<u32>,
+        period_start: NaiveDate,
+        period_end: NaiveDate,
+        bytes_out: u64,
+        bytes_in: u64,
+    ) -> Self {
+        Self {
+            throttled: transfer_gb.is_some_and(|gb| crate::transfer_quota_exceeded(bytes_out, gb)),
+            transfer_gb,
+            period_start,
+            period_end,
+            bytes_out,
+            bytes_in,
+        }
+    }
 }
 
 /// Grace period (days) for a subscription, tiered by how long the subscription
@@ -470,13 +491,13 @@ pub async fn vm_to_status(
         }),
         max_prepay_days,
         host_ssh_keys,
-        traffic: ApiVmTrafficSummary {
-            transfer_gb: template_transfer_gb,
+        traffic: ApiVmTrafficSummary::new(
+            template_transfer_gb,
             period_start,
             period_end,
-            bytes_out: traffic_out,
-            bytes_in: traffic_in,
-        },
+            traffic_out,
+            traffic_in,
+        ),
     })
 }
 
@@ -1274,6 +1295,14 @@ impl ApiSubscriptionLineItemResource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_traffic_summary_reports_throttle() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        assert!(ApiVmTrafficSummary::new(Some(1), day, day, 1_000_000_000, 0).throttled);
+        assert!(!ApiVmTrafficSummary::new(Some(1), day, day, 999_999_999, 0).throttled);
+        assert!(!ApiVmTrafficSummary::new(None, day, day, u64::MAX, 0).throttled);
+    }
 
     /// `resolve_many` must issue one query per resource *table*, never per line
     /// item, and must tolerate a line item whose backing row is missing.

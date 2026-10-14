@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Transfer allowances are enforced**: a VM whose outbound transfer reaches its plan's `transfer_gb` has its network limited to 10 Mbit/s until the allowance resets on the 1st, then restored. The traffic summary on `GET /api/v1/vm`, `GET /api/v1/vm/{id}`, `GET /api/v1/vm/{id}/traffic` and the admin VM endpoints gains `throttled`. The 80% and 100% emails now say what happens at the limit.
+
 - **Tunnel pool MTU has a floor of 1280** — `POST`/`PATCH /api/admin/v1/tunnel_pools` refuse an `mtu` below 1280, where Linux turns IPv6 off on the interface. A pool's MTU is now also applied to its route server interface and to the marketplace hosts in it, and a marketplace node whose measured path to the route server cannot carry the pool MTU plus WireGuard's overhead fails its probe.
 
 ### Fixed

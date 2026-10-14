@@ -1088,13 +1088,13 @@ impl AdminVmInfo {
             disabled: vm.disabled,
             admin_notes: vm.admin_notes.clone(),
             subscription,
-            traffic: ApiVmTrafficSummary {
+            traffic: ApiVmTrafficSummary::new(
                 transfer_gb,
-                period_start: batch.period_start,
-                period_end: batch.period_end,
-                bytes_out: traffic_out,
-                bytes_in: traffic_in,
-            },
+                batch.period_start,
+                batch.period_end,
+                traffic_out,
+                traffic_in,
+            ),
         })
     }
 }

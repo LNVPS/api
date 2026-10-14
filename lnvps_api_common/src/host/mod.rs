@@ -307,6 +307,7 @@ pub struct FullVmInfo {
     pub ssh_key: UserSshKey,
     /// User-configured firewall rules for this VM (ordered by priority)
     pub firewall_rules: Vec<VmFirewallRule>,
+    pub transfer_throttled: bool,
 }
 
 impl FullVmInfo {
@@ -340,6 +341,14 @@ impl FullVmInfo {
             None
         };
         let firewall_rules = db.list_vm_firewall_rules(vm_id).await?;
+        let transfer_gb = match (&template, &custom_template) {
+            (Some(t), _) => t.transfer_gb,
+            (_, Some(t)) => t.transfer_gb,
+            _ => None,
+        };
+        let transfer_throttled =
+            crate::vm_over_transfer_quota(&db, vm_id, transfer_gb, chrono::Utc::now().date_naive())
+                .await?;
         // create VM
         Ok(FullVmInfo {
             vm,
@@ -352,6 +361,7 @@ impl FullVmInfo {
             ranges,
             ssh_key,
             firewall_rules,
+            transfer_throttled,
         })
     }
 
@@ -412,6 +422,14 @@ impl FullVmInfo {
     /// Resource limits for this VM (derived from template or custom template).
     /// Returns `VmLimits::default()` (all `None`) if no limits are configured.
     pub fn limits(&self) -> VmLimits {
+        let mut limits = self.plan_limits();
+        if self.transfer_throttled {
+            limits.network_mbps = Some(crate::throttled_network_mbps(limits.network_mbps));
+        }
+        limits
+    }
+
+    fn plan_limits(&self) -> VmLimits {
         if let Some(t) = &self.template {
             VmLimits {
                 disk_iops_read: t.disk_iops_read,
@@ -665,6 +683,7 @@ mod tests {
                 key_data: "ssh-ed25519 AAA=".into(),
             },
             firewall_rules: vec![],
+            transfer_throttled: false,
         }
     }
 }

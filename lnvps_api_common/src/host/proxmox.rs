@@ -4271,6 +4271,45 @@ mod tests {
     }
 
     #[test]
+    fn test_over_transfer_quota_throttles_network_rate() -> Result<()> {
+        let mut cfg = mock_full_vm();
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr1".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
+
+        cfg.transfer_throttled = true;
+        assert_eq!(
+            p.make_config(&cfg, None, None)?.net.unwrap().rate,
+            Some(1.25)
+        );
+
+        cfg.template.as_mut().unwrap().network_mbps = Some(800);
+        assert_eq!(
+            p.make_config(&cfg, None, None)?.net.unwrap().rate,
+            Some(1.25)
+        );
+
+        cfg.template.as_mut().unwrap().network_mbps = Some(4);
+        assert_eq!(
+            p.make_config(&cfg, None, None)?.net.unwrap().rate,
+            Some(0.5)
+        );
+
+        cfg.transfer_throttled = false;
+        cfg.template.as_mut().unwrap().network_mbps = None;
+        assert_eq!(p.make_config(&cfg, None, None)?.net.unwrap().rate, None);
+        Ok(())
+    }
+
+    #[test]
     fn test_cpu_limit_propagated() -> Result<()> {
         let mut cfg = mock_full_vm();
         cfg.template.as_mut().unwrap().cpu_limit = Some(0.5);

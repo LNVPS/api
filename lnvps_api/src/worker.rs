@@ -2127,11 +2127,7 @@ impl Worker {
     }
 
     /// Warn customers whose VMs are at or past their monthly transfer
-    /// allowance.
-    ///
-    /// Warning only — nothing here throttles, suspends or bills. The figures
-    /// come from hypervisor interface counters and include traffic that is not
-    /// billable internet egress, so they are not yet a basis for enforcement.
+    /// allowance, and throttle or restore their NIC as they cross it.
     async fn check_transfer_quotas(&self) -> Result<()> {
         let last_check = self.get_last_check_transfer().await?;
         if Utc::now().signed_duration_since(last_check).num_seconds() < Self::CHECK_TRANSFER_SECONDS
@@ -2165,16 +2161,27 @@ impl Worker {
                 },
                 _ => None,
             };
-            // Unmetered: there is no allowance to be near.
-            let Some(quota_gb) = quota_gb.filter(|g| *g > 0) else {
-                continue;
+            let over = match quota_gb.filter(|g| *g > 0) {
+                Some(quota_gb) => {
+                    match self
+                        .check_vm_transfer_quota(&vm, quota_gb, period_start, period_end)
+                        .await
+                    {
+                        Ok(over) => over,
+                        Err(e) => {
+                            warn!("Failed to check transfer quota for VM {}: {}", vm.id, e);
+                            continue;
+                        }
+                    }
+                }
+                None => false,
             };
 
             if let Err(e) = self
-                .check_vm_transfer_quota(&vm, quota_gb, period_start, period_end)
+                .sync_transfer_throttle(&vm, quota_gb, over, period_start)
                 .await
             {
-                warn!("Failed to check transfer quota for VM {}: {}", vm.id, e);
+                warn!("Failed to sync transfer throttle for VM {}: {}", vm.id, e);
             }
         }
 
@@ -2182,19 +2189,58 @@ impl Worker {
         Ok(())
     }
 
+    fn transfer_throttle_key(vm_id: u64) -> String {
+        format!("vm-transfer-throttled:{vm_id}")
+    }
+
+    async fn sync_transfer_throttle(
+        &self,
+        vm: &Vm,
+        quota_gb: Option<u32>,
+        over: bool,
+        period_start: NaiveDate,
+    ) -> Result<()> {
+        let key = Self::transfer_throttle_key(vm.id);
+        let applied = match self.kv.get(&key).await? {
+            Some(v) => v.first() == Some(&1),
+            None => {
+                let previous_period = period_start.pred_opt().unwrap_or(period_start);
+                lnvps_api_common::vm_over_transfer_quota(&self.db, vm.id, quota_gb, previous_period)
+                    .await?
+            }
+        };
+        if applied != over {
+            info!(
+                "{} network for VM {} (transfer allowance {})",
+                if over { "Throttling" } else { "Restoring" },
+                vm.id,
+                if over { "exceeded" } else { "reset" }
+            );
+            self.work_commander
+                .send(WorkJob::ConfigureVm {
+                    vm_id: vm.id,
+                    admin_user_id: None,
+                })
+                .await?;
+        }
+        self.kv.store(&key, &[over as u8]).await?;
+        Ok(())
+    }
+
     /// Warn about one VM if it has crossed a threshold it has not been warned
-    /// about this month.
+    /// about this month. Returns whether it is over its allowance.
     async fn check_vm_transfer_quota(
         &self,
         vm: &Vm,
         quota_gb: u32,
         period_start: NaiveDate,
         period_end: NaiveDate,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let (_, bytes_out) = self
             .db
             .get_vm_traffic_total(vm.id, period_start, period_end)
             .await?;
+        let over = lnvps_api_common::transfer_quota_exceeded(bytes_out, quota_gb);
 
         let quota_bytes = quota_gb as u64 * 1_000_000_000;
         let used_pct = (bytes_out as f64 / quota_bytes as f64 * 100.0) as u64;
@@ -2203,36 +2249,39 @@ impl Worker {
             .into_iter()
             .find(|t| used_pct >= *t as u64)
         else {
-            return Ok(());
+            return Ok(over);
         };
 
         let key = Self::transfer_warned_key(vm.id, period_start, threshold);
         if self.kv.get(&key).await?.is_some() {
-            return Ok(());
+            return Ok(over);
         }
 
         let used_gb = bytes_out as f64 / 1_000_000_000.0;
+        let resets = period_end.succ_opt().unwrap_or(period_end);
         let message = if threshold >= 100 {
             format!(
                 "VM {} has used {:.1} GB of its {} GB monthly outbound transfer allowance ({}%).\n\n\
-                 Your VM has not been throttled, suspended or charged for the excess — this is a \
-                 notification only. The allowance resets on {}.",
+                 Its network is now limited to {} Mbit/s. Full speed returns when the allowance \
+                 resets on {}.",
                 vm.id,
                 used_gb,
                 quota_gb,
                 used_pct,
-                period_end.succ_opt().unwrap_or(period_end)
+                lnvps_api_common::TRANSFER_THROTTLE_MBPS,
+                resets
             )
         } else {
             format!(
                 "VM {} has used {:.1} GB of its {} GB monthly outbound transfer allowance ({}%).\n\n\
-                 The allowance resets on {}. Nothing changes if you exceed it — this is an early \
-                 notice, not a warning of any action.",
+                 Once it reaches 100% its network is limited to {} Mbit/s until the allowance \
+                 resets on {}.",
                 vm.id,
                 used_gb,
                 quota_gb,
                 used_pct,
-                period_end.succ_opt().unwrap_or(period_end)
+                lnvps_api_common::TRANSFER_THROTTLE_MBPS,
+                resets
             )
         };
 
@@ -2249,7 +2298,7 @@ impl Worker {
         // Marked only after the notification is queued, so a failure to queue
         // is retried on the next pass rather than silently suppressed.
         self.kv.store(&key, &[1u8]).await?;
-        Ok(())
+        Ok(over)
     }
 
     pub async fn get_last_check_transfer(&self) -> Result<DateTime<Utc>> {
@@ -5917,6 +5966,87 @@ mod tests {
 
         assert!(worker.kv.get(&warned_key(vm_id, 100)).await?.is_none());
         assert!(worker.kv.get(&warned_key(vm_id, 80)).await?.is_none());
+        Ok(())
+    }
+
+    async fn queued_configure_vm(worker: &Worker, vm_id: u64) -> bool {
+        let mut found = false;
+        while let Ok(Ok(jobs)) =
+            tokio::time::timeout(Duration::from_millis(50), worker.work_commander.recv()).await
+        {
+            found |= jobs
+                .iter()
+                .any(|j| matches!(j.job, WorkJob::ConfigureVm { vm_id: v, .. } if v == vm_id));
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn test_transfer_quota_exceeded_throttles_once() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        set_template_transfer_gb(&db, Some(100)).await;
+        let worker = setup_worker(db.clone()).await?;
+
+        worker.check_transfer_quotas().await?;
+        assert!(!queued_configure_vm(&worker, vm_id).await);
+        assert!(
+            !FullVmInfo::load(vm_id, db.clone())
+                .await?
+                .transfer_throttled
+        );
+
+        book_traffic(&db, vm_id, 100_000_000_000).await;
+        worker.set_last_check_transfer(DateTime::UNIX_EPOCH).await?;
+        worker.check_transfer_quotas().await?;
+        assert!(queued_configure_vm(&worker, vm_id).await);
+        let info = FullVmInfo::load(vm_id, db.clone()).await?;
+        assert!(info.transfer_throttled);
+        assert_eq!(
+            info.limits().network_mbps,
+            Some(lnvps_api_common::TRANSFER_THROTTLE_MBPS)
+        );
+
+        worker.set_last_check_transfer(DateTime::UNIX_EPOCH).await?;
+        worker.check_transfer_quotas().await?;
+        assert!(
+            !queued_configure_vm(&worker, vm_id).await,
+            "an already throttled VM is not reconfigured every pass"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_transfer_throttle_lifts_when_the_period_resets() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        set_template_transfer_gb(&db, Some(100)).await;
+        let (period_start, _) = quota_period(Utc::now().date_naive());
+        db.add_vm_traffic(vm_id, period_start.pred_opt().unwrap(), 0, 200_000_000_000)
+            .await?;
+        let worker = setup_worker(db.clone()).await?;
+
+        worker.check_transfer_quotas().await?;
+        assert!(
+            queued_configure_vm(&worker, vm_id).await,
+            "a VM over last month's allowance is restored even with no stored state"
+        );
+        assert_eq!(
+            worker.kv.get(&Worker::transfer_throttle_key(vm_id)).await?,
+            Some(vec![0])
+        );
+
+        worker
+            .kv
+            .store(&Worker::transfer_throttle_key(vm_id), &[1])
+            .await?;
+        set_template_transfer_gb(&db, None).await;
+        worker.set_last_check_transfer(DateTime::UNIX_EPOCH).await?;
+        worker.check_transfer_quotas().await?;
+        assert!(
+            queued_configure_vm(&worker, vm_id).await,
+            "removing the allowance lifts the throttle"
+        );
         Ok(())
     }
 

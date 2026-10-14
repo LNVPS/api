@@ -47,9 +47,10 @@ use std::time::{Duration, Instant};
 use virt::connect::Connect;
 use virt::domain::Domain;
 use virt::sys::{
-    VIR_CONNECT_LIST_STORAGE_POOLS_ACTIVE, VIR_DOMAIN_BLOCK_RESIZE_BYTES, VIR_DOMAIN_MEM_CONFIG,
-    VIR_DOMAIN_MEM_LIVE, VIR_DOMAIN_UNDEFINE_CHECKPOINTS_METADATA, VIR_DOMAIN_UNDEFINE_NVRAM,
-    VIR_DOMAIN_UNDEFINE_SNAPSHOTS_METADATA, VIR_DOMAIN_VCPU_CONFIG, VIR_DOMAIN_VCPU_LIVE,
+    VIR_CONNECT_LIST_STORAGE_POOLS_ACTIVE, VIR_DOMAIN_AFFECT_LIVE, VIR_DOMAIN_BLOCK_RESIZE_BYTES,
+    VIR_DOMAIN_MEM_CONFIG, VIR_DOMAIN_MEM_LIVE, VIR_DOMAIN_UNDEFINE_CHECKPOINTS_METADATA,
+    VIR_DOMAIN_UNDEFINE_NVRAM, VIR_DOMAIN_UNDEFINE_SNAPSHOTS_METADATA, VIR_DOMAIN_VCPU_CONFIG,
+    VIR_DOMAIN_VCPU_LIVE,
 };
 use xml::{
     PRIMARY_DISK_TARGET, VolumeFormat, build_domain, domain_name, os_image_volume,
@@ -720,7 +721,7 @@ impl VmHostClient for LibVirtHost {
         let disk_path = self.primary_disk_path(cfg).await?;
         // Regenerate the seed so key/IP changes reach the guest on next boot.
         let seed_path = self.write_seed(cfg).await?;
-        let domain_xml = build_domain(
+        let domain = build_domain(
             cfg,
             &self.cfg.qemu,
             self.cfg.secure_boot,
@@ -728,9 +729,9 @@ impl VmHostClient for LibVirtHost {
             Some(&seed_path),
             self.cfg.vlan_aware_bridge,
         )
-        .map_err(OpError::Fatal)?
-        .to_xml()
         .map_err(OpError::Fatal)?;
+        let domain_xml = domain.to_xml().map_err(OpError::Fatal)?;
+        let interface_xml = domain.interface_xml().map_err(OpError::Fatal)?;
 
         let vm_id = cfg.vm.id;
         let resources = cfg.resources().map_err(OpError::Fatal)?;
@@ -776,6 +777,11 @@ impl VmHostClient for LibVirtHost {
                         resources.cpu,
                         e.message()
                     );
+                }
+                if let Some(xml) = &interface_xml {
+                    domain
+                        .update_device_flags(xml, VIR_DOMAIN_AFFECT_LIVE)
+                        .map_err(|e| map_virt_error("update_interface", e))?;
                 }
                 Ok(())
             })

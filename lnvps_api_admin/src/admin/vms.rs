@@ -929,13 +929,13 @@ async fn admin_get_vm_traffic(
     ApiData::ok(AdminVmTrafficInfo {
         vm_id,
         user_id: vm.user_id,
-        summary: ApiVmTrafficSummary {
+        summary: ApiVmTrafficSummary::new(
             transfer_gb,
             period_start,
             period_end,
             bytes_out,
             bytes_in,
-        },
+        ),
         days: days
             .into_iter()
             .map(|d| AdminVmTrafficDay {

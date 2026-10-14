@@ -921,14 +921,17 @@ network transfer for the current UTC calendar month:
   "period_start": "2026-08-01",
   "period_end": "2026-08-31",
   "bytes_out": 41231000000,
-  "bytes_in": 8800000000
+  "bytes_in": 8800000000,
+  "throttled": false
 }
 ```
 
 `transfer_gb` is the plan's **outbound** allowance per month and is omitted when
 the plan is unmetered; `bytes_out` is the figure it bounds. Inbound transfer is
-reported but never counted against the allowance. Exceeding it currently has no
-automatic effect — no throttle, no suspension, no overage billing.
+reported but never counted against the allowance. Once `bytes_out` reaches the
+allowance the VM's network is limited to 10 Mbit/s in each direction until the
+allowance resets on the 1st, and `throttled` is true. The limit is applied
+within about an hour of crossing it.
 
 Use `GET /api/v1/vm/{id}/traffic` only when a day-by-day breakdown or a
 historical range is needed; a usage bar can be rendered from this object alone.

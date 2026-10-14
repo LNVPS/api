@@ -311,6 +311,7 @@ impl ProbeSpec {
             // probe that installed extra rules would be measuring a machine
             // configured unlike the one customers get.
             firewall_rules: vec![],
+            transfer_throttled: false,
         }
     }
 }

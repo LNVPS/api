@@ -852,6 +852,43 @@ async fn configure_vm_updates_running_domain() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+#[ignore]
+async fn configure_vm_throttles_the_running_interface() -> Result<()> {
+    let host = host()?;
+    let mut info = vm_info(next_vm_id());
+    seed_os_image(&host, &info).await?;
+    cleanup(&host, &info).await;
+
+    host.create_vm(&info)
+        .await
+        .map_err(|e| anyhow!("{:?}", e))?;
+    assert!(!live_xml(&host, info.vm.id).await?.contains("<bandwidth>"));
+
+    info.transfer_throttled = true;
+    host.configure_vm(&info)
+        .await
+        .map_err(|e| anyhow!("{:?}", e))?;
+    let xml = live_xml(&host, info.vm.id).await?;
+    assert!(
+        xml.contains("<inbound average='1250'/>") && xml.contains("<outbound average='1250'/>"),
+        "running interface not throttled:\n{xml}"
+    );
+
+    info.transfer_throttled = false;
+    host.configure_vm(&info)
+        .await
+        .map_err(|e| anyhow!("{:?}", e))?;
+    let xml = live_xml(&host, info.vm.id).await?;
+    assert!(
+        !xml.contains("<bandwidth>"),
+        "running interface still throttled:\n{xml}"
+    );
+
+    cleanup(&host, &info).await;
+    Ok(())
+}
+
 /// Discovery must see the VMs on the host, including ones LNVPS doesn't manage.
 #[tokio::test]
 #[ignore]

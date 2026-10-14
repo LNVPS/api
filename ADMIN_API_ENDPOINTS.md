@@ -5325,7 +5325,8 @@ Same `start`/`end` parameters and same 400-day cap as the report above.
     "period_start": "2026-08-01",
     "period_end": "2026-08-31",
     "bytes_out": 41231000000,
-    "bytes_in": 8800000000
+    "bytes_in": 8800000000,
+    "throttled": false
   },
   "days": [
     { "day": "2026-08-24", "bytes_in": 310000000, "bytes_out": 2250000000 }
@@ -5336,7 +5337,8 @@ Same `start`/`end` parameters and same 400-day cap as the report above.
 `summary` always describes the **current** calendar month whatever range was
 requested, and is the same object carried by `traffic` on `AdminVmInfo` and on
 the customer-facing `VmStatus`. `transfer_gb` is the plan's outbound allowance
-(omitted when unmetered); exceeding it currently has no automatic effect.
+(omitted when unmetered). A VM whose `bytes_out` reaches it is limited to
+10 Mbit/s until the 1st, and `throttled` is true.
 
 ### App Deployments — Catalog & Clusters
 

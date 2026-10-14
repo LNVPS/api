@@ -2556,13 +2556,13 @@ async fn v1_get_vm_traffic(
         .await?;
 
     ApiData::ok(ApiVmTraffic {
-        summary: ApiVmTrafficSummary {
-            transfer_gb: vm_transfer_quota_gb(&this, &vm).await?,
-            period_start: quota_start,
-            period_end: quota_end,
-            bytes_out: quota_bytes_out,
-            bytes_in: quota_bytes_in,
-        },
+        summary: ApiVmTrafficSummary::new(
+            vm_transfer_quota_gb(&this, &vm).await?,
+            quota_start,
+            quota_end,
+            quota_bytes_out,
+            quota_bytes_in,
+        ),
         days: days
             .into_iter()
             .map(|d| ApiVmTrafficDay {

@@ -401,6 +401,19 @@ impl DomainXML {
     pub fn to_xml(&self) -> Result<String> {
         Ok(quick_xml::se::to_string(self)?)
     }
+
+    pub fn interface_xml(&self) -> Result<Option<String>> {
+        let Some(iface) = self.devices.contents.iter().find_map(|d| match d {
+            DomainDevice::Interface(i) => Some(i),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        Ok(Some(quick_xml::se::to_string_with_root(
+            "interface",
+            iface,
+        )?))
+    }
 }
 
 /// A size with an explicit unit. Always written in bytes to avoid libvirt's
@@ -1219,6 +1232,27 @@ mod tests {
         assert_eq!(tune.read_iops_sec, Some(1000));
         assert_eq!(tune.write_bytes_sec, Some(100_000_000));
         assert_eq!(tune.write_iops_sec, None);
+    }
+
+    #[test]
+    fn throttled_vm_interface_carries_the_throttle_rate() -> Result<()> {
+        let mut cfg = mock_full_vm();
+        cfg.transfer_throttled = true;
+        let domain = build_domain(&cfg, &qemu_cfg(), false, "/disk", None, true)?;
+        let xml = domain.interface_xml()?.expect("interface");
+        assert!(xml.starts_with("<interface type=\"bridge\">"), "got {xml}");
+        assert!(
+            xml.contains("<mac address=\"ff:ff:ff:ff:ff:fe\"/>"),
+            "got {xml}"
+        );
+        assert!(xml.contains("<inbound average=\"1250\"/>"), "got {xml}");
+        assert!(xml.contains("<outbound average=\"1250\"/>"), "got {xml}");
+
+        cfg.transfer_throttled = false;
+        let domain = build_domain(&cfg, &qemu_cfg(), false, "/disk", None, true)?;
+        let xml = domain.interface_xml()?.expect("interface");
+        assert!(!xml.contains("bandwidth"), "got {xml}");
+        Ok(())
     }
 
     #[test]
