@@ -970,6 +970,12 @@ historical range is needed; a usage bar can be rendered from this object alone.
 - **Body**: `CustomVmOrder`
 - **Response**: `VmStatus`
 
+#### Get VM Upgrade Options
+- **GET** `/api/v1/vm/{id}/upgrade/options`
+- **Auth**: Required
+- **Response**: `CustomTemplateParams`
+- **Description**: The custom pricing plan an upgrade of this VM is priced and limited by: the VM's own plan for a custom VM (returned even when the plan no longer takes new orders), or the region's matching plan for a VM on a standard template. Its `max_*` fields, `disks`, `transfer` and `network` bound what the upgrade request may ask for; the minimum for each is what the VM already has.
+
 #### Get VM Upgrade Quote
 - **POST** `/api/v1/vm/{id}/upgrade/quote?method={payment_method}`
 - **Auth**: Required

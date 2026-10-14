@@ -1708,6 +1708,19 @@ mod tests {
         // ----------------------------------------------------------------
         // 15. Upgrade quote
         // ----------------------------------------------------------------
+        let options = json_ok(
+            user.get_auth(&format!("/api/v1/vm/{vm_id}/upgrade/options"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            options["data"]["id"].as_u64(),
+            Some(custom_pricing_id),
+            "a standard VM upgrades onto its region's custom plan"
+        );
+        assert_eq!(options["data"]["transfer"]["max"], 5000);
+
         let body = serde_json::json!({ "cpu": 2, "memory": 2147483648_u64 });
         let resp = user
             .post_auth(&format!("/api/v1/vm/{vm_id}/upgrade/quote"), &body)

@@ -1359,6 +1359,27 @@ impl PricingEngine {
         Ok(custom_pricing)
     }
 
+    pub async fn upgrade_pricing(&self, vm_id: u64) -> Result<VmCustomPricing> {
+        let vm = self.db.get_vm(vm_id).await?;
+        if let Some(template_id) = vm.template_id {
+            let template = self.db.get_vm_template(template_id).await?;
+            self.find_custom_pricing(
+                template.region_id,
+                template.disk_type,
+                template.disk_interface,
+                template.cpu_mfg,
+                template.cpu_arch,
+                &template.cpu_features,
+            )
+            .await
+        } else if let Some(custom_template_id) = vm.custom_template_id {
+            let template = self.db.get_custom_vm_template(custom_template_id).await?;
+            Ok(self.db.get_custom_pricing(template.pricing_id).await?)
+        } else {
+            bail!("VM must have either a standard template or custom template to upgrade");
+        }
+    }
+
     /// Create a new custom template object from an existing VM for upgrade
     pub async fn create_upgrade_template(
         &self,
@@ -5047,6 +5068,43 @@ mod tests {
                 .await
                 .is_err()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upgrade_pricing_is_the_plan_the_vm_is_on() -> Result<()> {
+        let rates = Arc::new(MockExchangeRate::new());
+        let db = MockDb::default();
+        setup_custom_vm_with_bandwidth(&db).await?;
+        db.custom_pricing.lock().await.get_mut(&1).unwrap().enabled = false;
+        {
+            let mut templates = db.templates.lock().await;
+            let t = templates.get_mut(&1).unwrap();
+            t.disk_type = DiskType::SSD;
+            t.disk_interface = Default::default();
+        }
+        let custom_pricing = db.custom_pricing.clone();
+        let vms = db.vms.clone();
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let pe = PricingEngine::new(db.clone(), rates, VatClient::new());
+
+        assert_eq!(
+            pe.upgrade_pricing(1).await?.id,
+            1,
+            "a custom VM upgrades on its own plan, even a retired one"
+        );
+
+        custom_pricing.lock().await.get_mut(&1).unwrap().enabled = true;
+        {
+            let mut vms = vms.lock().await;
+            let vm = vms.get_mut(&1).unwrap();
+            vm.custom_template_id = None;
+            vm.template_id = Some(1);
+        }
+        assert_eq!(pe.upgrade_pricing(1).await?.id, 1);
+
+        vms.lock().await.get_mut(&1).unwrap().template_id = None;
+        assert!(pe.upgrade_pricing(1).await.is_err());
         Ok(())
     }
 }

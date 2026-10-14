@@ -170,6 +170,10 @@ pub fn routes() -> Router<RouterState> {
             .route("/api/v1/vm/{id}/payments", get(v1_payment_history))
             .route("/api/v1/vm/{id}/history", get(v1_get_vm_history))
             .route("/api/v1/vm/{id}/traffic", get(v1_get_vm_traffic))
+            .route(
+                "/api/v1/vm/{id}/upgrade/options",
+                get(v1_vm_upgrade_options),
+            )
             .route("/api/v1/vm/{id}/upgrade/quote", post(v1_vm_upgrade_quote))
             .route("/api/v1/vm/{id}/upgrade", post(v1_vm_upgrade))
             .route(
@@ -2442,6 +2446,27 @@ async fn v1_get_vm_history(
             .map(|h| ApiVmHistory::from_with_owner(h, vm.user_id))
             .collect(),
     )
+}
+
+async fn v1_vm_upgrade_options(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<ApiCustomTemplateParams> {
+    let pubkey = auth.pubkey();
+    let uid = this.db.upsert_user(&pubkey).await?;
+    let vm = this.db.get_vm(id).await?;
+    if vm.user_id != uid {
+        return Err(ApiError::forbidden("VM does not belong to you"));
+    }
+    let pricing = this
+        .sub_handler
+        .pricing_engine()
+        .upgrade_pricing(id)
+        .await?;
+    let disks = this.db.list_custom_pricing_disk(pricing.id).await?;
+    let region = this.db.get_host_region(pricing.region_id).await?;
+    ApiData::ok(ApiCustomTemplateParams::from(&pricing, &disks, &region))
 }
 
 /// Get a quote for upgrading a VM

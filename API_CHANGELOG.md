@@ -26,6 +26,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Upgrade options**: `GET /api/v1/vm/{id}/upgrade/options` returns the `CustomTemplateParams` of the plan an upgrade of the VM is priced and limited by, so an upgrade form can bound its inputs without guessing the plan.
+
 - **Bandwidth in custom pricing**: custom VMs can be ordered and upgraded with more monthly transfer and network speed. `POST /api/v1/vm/custom-template`, `POST /api/v1/vm/custom-template/price` and `POST /api/admin/v1/vms/custom` accept `transfer_gb` and `network_mbps`; `POST /api/v1/vm/{id}/upgrade` and `/upgrade/quote` accept the same two fields, and an upgrade that changes only bandwidth no longer restarts the VM. `CustomTemplateParams` on `GET /api/v1/vm/templates` gains `transfer` and `network` ranges. Custom pricing plans gain `min_transfer_gb`, `max_transfer_gb`, `transfer_cost_per_tb`, `min_network_mbps`, `max_network_mbps` and `network_cost_per_gbps` on `GET`/`POST`/`PATCH /api/admin/v1/custom_pricing` and the copy endpoint. Existing plans keep a fixed range at their current value and a cost of 0, so no price changes until one is set.
 
 - **Referral totals on the admin list**: `GET /api/admin/v1/referrals` rows and `GET /api/admin/v1/referrals/{id}` gain `outstanding_total_msat` and `paid_total_msat`.
