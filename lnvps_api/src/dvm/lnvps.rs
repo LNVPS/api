@@ -141,6 +141,9 @@ impl DVMHandler for LnvpsDvm {
             let invoice = sub_handler
                 .renew_subscription(line_item.subscription_id, PaymentMethod::Lightning, 1)
                 .await?;
+            if invoice.is_paid {
+                return Ok(());
+            }
 
             let mut payment = build_status_for_job(
                 &request,

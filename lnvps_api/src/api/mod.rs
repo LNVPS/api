@@ -1,6 +1,7 @@
 mod app_backups;
 mod apps;
 mod contact;
+mod credit;
 mod docs;
 mod ip_space;
 mod legal;
@@ -29,6 +30,7 @@ use crate::subscription::SubscriptionHandler;
 pub use app_backups::router as app_backups_router;
 pub use apps::router as apps_router;
 pub use contact::router as contacts_router;
+pub use credit::router as credit_router;
 pub use docs::router as docs_router;
 pub use ip_space::router as ip_space_router;
 pub use legal::router as legal_router;
@@ -194,6 +196,22 @@ pub(crate) async fn discount_line(
     Some(crate::api::model::ApiDiscount {
         code,
         amount_off: redemption.amount_off,
+    })
+}
+
+/// The account credit covering part of a payment, in the payment's currency.
+pub(crate) async fn credit_line(
+    db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+    payment: &lnvps_db::SubscriptionPayment,
+) -> Option<crate::api::model::ApiCredit> {
+    let debit = db
+        .get_account_credit_debit_by_payment(&payment.id)
+        .await
+        .ok()
+        .flatten()?;
+    Some(crate::api::model::ApiCredit {
+        amount: debit.payment_amount,
+        currency: payment.currency.clone(),
     })
 }
 
@@ -437,6 +455,7 @@ mod tests {
                 amount_off: 100,
                 currency: Currency::EUR,
             }),
+            credit: None,
         };
         let out: ApiRenewalQuote = quote.into();
         assert_eq!(out.amount, 900);
@@ -457,6 +476,62 @@ mod tests {
         assert!(!serde_json::to_string(&out).unwrap().contains("discount"));
     }
 
+    #[tokio::test]
+    async fn credit_line_reports_the_payment_currency() {
+        use lnvps_db::LNVpsDbBase;
+        let mock = lnvps_api_common::MockDb::default();
+        mock.adjust_account_credit(1, 5_000_000, "topup", None)
+            .await
+            .unwrap();
+        let id = mock
+            .reserve_account_credit(&lnvps_db::AccountCreditDebit {
+                user_id: 1,
+                amount: 5_000_000,
+                currency: "BTC".to_string(),
+                payment_amount: 500,
+                expires: chrono::Utc::now() + chrono::Duration::hours(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        mock.attach_account_credit_debit(id, &vec![3u8; 32], chrono::Utc::now())
+            .await
+            .unwrap();
+        let db: std::sync::Arc<dyn lnvps_db::LNVpsDb> = std::sync::Arc::new(mock);
+        let mut payment = lnvps_db::SubscriptionPayment {
+            id: vec![3u8; 32],
+            subscription_id: 1,
+            user_id: 1,
+            created: chrono::Utc::now(),
+            expires: chrono::Utc::now(),
+            amount: 1000,
+            currency: "EUR".to_string(),
+            payment_method: lnvps_db::PaymentMethod::Revolut,
+            payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
+            external_data: "{}".to_string().into(),
+            external_id: None,
+            is_paid: false,
+            rate: 1.0,
+            time_value: None,
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+            renewal_source: None,
+        };
+        let line = credit_line(&db, &payment).await.expect("credit line");
+        assert_eq!((line.amount, line.currency.as_str()), (500, "EUR"));
+        payment.id = vec![4u8; 32];
+        assert!(credit_line(&db, &payment).await.is_none());
+    }
+
     fn quote_without_discount() -> crate::subscription::RenewalQuote {
         crate::subscription::RenewalQuote {
             amount: 1_000,
@@ -468,6 +543,7 @@ mod tests {
             payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
             tax_lines: vec![],
             discount: None,
+            credit: None,
         }
     }
 }

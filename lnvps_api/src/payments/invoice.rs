@@ -27,6 +27,22 @@ impl NodeInvoiceHandler {
     }
 
     async fn mark_paid(&self, id: &Vec<u8>) -> Result<()> {
+        if let Some(topup) = self.db.get_account_credit_topup_by_hash(id).await? {
+            if !topup.is_paid {
+                info!(
+                    "Settling credit top-up {} for user {}",
+                    topup.id, topup.user_id
+                );
+                match self.db.settle_account_credit_topup(topup.id).await? {
+                    Some(t) => info!(
+                        "Credit top-up {} settled: +{} {} to user {}",
+                        t.id, t.amount, t.currency, t.user_id
+                    ),
+                    None => info!("Credit top-up {} already settled", topup.id),
+                }
+            }
+            return Ok(());
+        }
         let payment = self.db.get_subscription_payment(id).await?;
         self.complete(&payment).await
     }
@@ -229,6 +245,31 @@ mod tests {
         )?;
 
         Ok((db, node, sub, payment, vm_id))
+    }
+
+    #[tokio::test]
+    async fn mark_paid_settles_a_credit_topup_once() -> Result<()> {
+        let (db, node, sub, payment, _vm_id) =
+            setup_renewal(86400, SubscriptionPaymentType::Renewal).await?;
+        let hash = vec![9u8; 32];
+        db.insert_account_credit_topup(&lnvps_db::AccountCreditTopup {
+            user_id: payment.user_id,
+            amount: 21_000,
+            currency: "BTC".to_string(),
+            invoice_hash: hash.clone(),
+            ..Default::default()
+        })
+        .await?;
+        let handler = NodeInvoiceHandler::new(node, db.clone(), sub);
+
+        handler.mark_paid(&hash).await?;
+        handler.mark_paid(&hash).await?;
+        assert_eq!(
+            db.get_account_credit(payment.user_id).await?.balance,
+            21_000
+        );
+        assert!(!db.get_subscription_payment(&payment.id).await?.is_paid);
+        Ok(())
     }
 
     /// complete for a Renewal payment marks it paid and enqueues CheckVm.

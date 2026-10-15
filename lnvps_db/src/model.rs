@@ -1889,6 +1889,84 @@ pub struct DiscountRedemptionWithCode {
     pub discount_code: Option<String>,
 }
 
+/// A user's account credit balance. `balance` equals the sum of the user's
+/// [`AccountCreditEvent`] amounts.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct AccountCredit {
+    pub user_id: u64,
+    /// Minor units of `currency` (msat for BTC).
+    pub balance: u64,
+    pub currency: String,
+    pub auto_apply: bool,
+    pub updated: DateTime<Utc>,
+}
+
+/// One row of the append-only account credit ledger. `amount` is signed:
+/// `topup` and `refund` are positive, `spend` is negative, `admin` is either.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct AccountCreditEvent {
+    pub id: u64,
+    pub user_id: u64,
+    pub kind: String,
+    pub amount: i64,
+    pub currency: String,
+    pub subscription_payment_id: Option<Vec<u8>>,
+    pub note: Option<String>,
+    pub created: DateTime<Utc>,
+}
+
+/// Credit held against an order. Unsettled rows that have not expired are a
+/// reservation against the balance; settling moves the balance.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct AccountCreditDebit {
+    pub id: u64,
+    pub user_id: u64,
+    pub subscription_payment_id: Option<Vec<u8>>,
+    /// Minor units of `currency`, the balance currency.
+    pub amount: u64,
+    pub currency: String,
+    /// The same value in the payment's currency.
+    pub payment_amount: u64,
+    pub settled: bool,
+    pub expires: DateTime<Utc>,
+    pub created: DateTime<Utc>,
+    pub settled_at: Option<DateTime<Utc>>,
+}
+
+impl AccountCreditDebit {
+    pub fn clamp_to(&mut self, available: u64) {
+        if self.amount <= available {
+            return;
+        }
+        self.payment_amount = if self.amount == 0 {
+            0
+        } else {
+            (self.payment_amount as u128 * available as u128 / self.amount as u128) as u64
+        };
+        self.amount = available;
+    }
+}
+
+/// A top-up invoice. A top-up is not a `subscription_payment`: it does not
+/// belong to a subscription, it does not extend anything, and it must never
+/// appear in referral commission or the VM payment history. It lives in its
+/// own table so the Lightning listener can tell the two apart.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct AccountCreditTopup {
+    pub id: u64,
+    pub user_id: u64,
+    /// Minor units of `currency` (msat for BTC) the customer paid.
+    pub amount: u64,
+    pub currency: String,
+    /// BOLT11 payment hash of the top-up invoice.
+    pub invoice_hash: Vec<u8>,
+    /// The BOLT11 invoice string, for display and re-issuance.
+    pub external_data: String,
+    pub is_paid: bool,
+    pub paid_at: Option<DateTime<Utc>>,
+    pub created: DateTime<Utc>,
+}
+
 /// How an outbound payout reaches its recipient. Stored as a small integer; new
 /// methods are added as new variants (append-only to preserve values).
 ///
@@ -2824,6 +2902,13 @@ pub enum AdminResource {
     /// key that has to stop working now -- so support needs it without also
     /// being able to reprice the service.
     VpnSubscription = 33,
+    /// A customer's account credit balance: reading the balance and ledger, and
+    /// adjusting it (a manual top-up or clawback).
+    ///
+    /// Its own resource rather than part of [`AdminResource::Payments`] because
+    /// adjusting a balance is authority to create or destroy money the customer
+    /// can spend against invoices.
+    AccountCredit = 34,
 }
 
 /// Actions that can be performed on administrative resources
@@ -2877,6 +2962,7 @@ impl Display for AdminResource {
             AdminResource::MarketplaceNode => write!(f, "marketplace_node"),
             AdminResource::MarketplaceOperator => write!(f, "marketplace_operator"),
             AdminResource::SupportAgent => write!(f, "support_agent"),
+            AdminResource::AccountCredit => write!(f, "account_credit"),
         }
     }
 }
@@ -2922,6 +3008,7 @@ impl FromStr for AdminResource {
             "discount" | "discounts" => Ok(AdminResource::Discount),
             "vpn_service" | "vpn_services" => Ok(AdminResource::VpnService),
             "vpn_subscription" | "vpn_subscriptions" => Ok(AdminResource::VpnSubscription),
+            "account_credit" | "account_credits" => Ok(AdminResource::AccountCredit),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -2966,6 +3053,7 @@ impl TryFrom<u16> for AdminResource {
             31 => Ok(AdminResource::Discount),
             32 => Ok(AdminResource::VpnService),
             33 => Ok(AdminResource::VpnSubscription),
+            34 => Ok(AdminResource::AccountCredit),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -3009,6 +3097,7 @@ impl AdminResource {
             AdminResource::Discount,
             AdminResource::VpnService,
             AdminResource::VpnSubscription,
+            AdminResource::AccountCredit,
         ]
     }
 }

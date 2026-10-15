@@ -1413,6 +1413,85 @@ pub trait LNVpsDbBase: Send + Sync {
     /// cents would be meaningless.
     async fn sum_discount_redemptions(&self, discount_id: u64) -> DbResult<Vec<(String, u64)>>;
 
+    // ========================================================================
+    // Account credit
+    // ========================================================================
+
+    /// The user's credit row, or a zero BTC row when they have none.
+    async fn get_account_credit(&self, user_id: u64) -> DbResult<AccountCredit>;
+
+    async fn set_account_credit_auto_apply(
+        &self,
+        user_id: u64,
+        auto_apply: bool,
+    ) -> DbResult<AccountCredit>;
+
+    /// Credit held by unsettled, unexpired debits.
+    async fn get_account_credit_reserved(&self, user_id: u64) -> DbResult<u64>;
+
+    /// Shift the balance by a signed `delta` and write a ledger event in one
+    /// transaction. A negative delta may not take the balance below what is
+    /// reserved.
+    async fn adjust_account_credit(
+        &self,
+        user_id: u64,
+        delta: i64,
+        kind: &str,
+        note: Option<&str>,
+    ) -> DbResult<AccountCredit>;
+
+    async fn list_account_credit_events(
+        &self,
+        user_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AccountCreditEvent>, u64)>;
+
+    /// Hold `debit.amount` of the user's balance until `debit.expires`.
+    /// Returns the debit id, or `None` when the unreserved balance is short.
+    async fn reserve_account_credit(&self, debit: &AccountCreditDebit) -> DbResult<Option<u64>>;
+
+    async fn attach_account_credit_debit(
+        &self,
+        id: u64,
+        subscription_payment_id: &Vec<u8>,
+        expires: DateTime<Utc>,
+    ) -> DbResult<()>;
+
+    /// Drop an unsettled reservation.
+    async fn release_account_credit_debit(&self, id: u64) -> DbResult<()>;
+
+    async fn get_account_credit_debit_by_payment(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<AccountCreditDebit>>;
+
+    /// Spend the debit on a payment. Idempotent: returns `None` when there is
+    /// no unsettled debit. An expired reservation may find its credit promised
+    /// elsewhere, so it is clamped to what is left unreserved, and the returned
+    /// row carries the amounts actually spent.
+    async fn settle_account_credit_debit(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<AccountCreditDebit>>;
+
+    async fn insert_account_credit_topup(&self, topup: &AccountCreditTopup) -> DbResult<u64>;
+
+    async fn get_account_credit_topup_by_hash(
+        &self,
+        invoice_hash: &Vec<u8>,
+    ) -> DbResult<Option<AccountCreditTopup>>;
+
+    /// Mark a top-up paid and credit the balance. Idempotent.
+    async fn settle_account_credit_topup(&self, id: u64) -> DbResult<Option<AccountCreditTopup>>;
+
+    async fn list_account_credit_topups(
+        &self,
+        user_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AccountCreditTopup>, u64)>;
+
     // ----- Marketplace (operator-run compute nodes) -----
 
     /// Get a marketplace operator enrolment by id
