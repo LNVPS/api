@@ -198,6 +198,90 @@ Response:
 
 Returns `404` if the user does not exist.
 
+#### Get User Credit Balance
+
+```
+GET /api/admin/v1/users/{id}/credit
+```
+
+Required Permission: `account_credit::view`
+
+The user's account credit balance.
+
+```json
+{
+  "data": {
+    "user_id": 42,
+    "balance": 5000000,
+    "currency": "BTC",
+    "auto_apply": true
+  }
+}
+```
+
+- `balance`: minor units of `currency` (msat for BTC). Never negative.
+- `currency`: the balance's base currency. A quote converts it into the
+  payment currency at the current rate.
+- `auto_apply`: whether the customer opted into spending the balance against
+  quotes automatically.
+
+A user who has never topped up returns a zero row, not a 404.
+
+#### Adjust User Credit
+
+```
+PATCH /api/admin/v1/users/{id}/credit
+```
+
+Required Permission: `account_credit::update`
+
+Shifts the balance and records the movement in the ledger. The request body
+is `{ "delta": 5000000, "kind": "topup", "note": "goodwill grant" }`.
+`delta` is signed msat (positive credits, negative claws back) and `kind` is
+one of `topup`, `refund`, `admin`; a negative delta must use `admin`. Refuses
+(`400`) a delta of 0, an unknown `kind`, a negative `topup`/`refund`, or a
+clawback larger than the balance not held by pending orders. The response is the updated row in the same
+shape as the GET.
+
+#### List User Credit Ledger
+
+```
+GET /api/admin/v1/users/{id}/credit/events
+```
+
+Required Permission: `account_credit::view`
+
+The append-only ledger behind the balance, newest first, paginated with the
+standard `limit`/`offset`. Each row:
+
+```json
+{
+  "data": [
+    {
+      "id": 7,
+      "kind": "spend",
+      "amount": -1000000,
+      "currency": "BTC",
+      "subscription_payment_id": "a1b2c3…",
+      "note": null,
+      "created": "2026-10-15T12:00:00Z"
+    }
+  ],
+  "total": 7,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+- `kind`: `topup`, `spend`, `refund` or `admin`. `amount` is the signed change
+  to the balance: `spend` rows are negative, `topup` and `refund` positive,
+  `admin` either.
+- `subscription_payment_id`: the payment the row is about, for `spend`; null
+  otherwise. A VM refund that returns credit writes a `refund` row whose
+  `note` names the payment.
+- The balance always equals the ledger sum, so a mismatch is a bug and worth
+  reporting.
+
 #### Revoke User Passkey
 
 ```
@@ -5878,6 +5962,7 @@ The RBAC system uses the following permission format: `resource::action`
 - `marketplace_operator` - Marketplace operator revenue share and payout configuration
 - `support_agent` - Support-agent transcripts and the agent's memory of a customer
 - `discount` - Discount campaigns: codes, their rules and redemption reporting
+- `account_credit` - Customer account credit balances: read the balance and ledger, and adjust them
 
 ### Actions:
 

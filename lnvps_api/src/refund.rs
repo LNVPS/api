@@ -16,8 +16,7 @@ use anyhow::{Result, anyhow, bail, ensure};
 use chrono::{DateTime, Utc};
 use lightning_invoice::Bolt11Invoice;
 use lnvps_api_common::{
-    PricingEngine, RefundEvidence, VmHistoryLogger, allocate_refund, build_refund_row,
-    refundable_remaining,
+    PricingEngine, RefundEvidence, VmHistoryLogger, build_refund_row, refundable_remaining,
 };
 use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment};
 use log::{error, info};
@@ -44,6 +43,85 @@ pub struct RefundOutcome {
     pub currency: String,
     /// How many refund rows were written.
     pub refund_rows: u64,
+    /// Account credit returned for the share of the reversed payments that
+    /// credit paid for, in the balance currency's minor units.
+    pub credit_returned: u64,
+}
+
+/// One payment a refund reverses: `amount` is booked against it, `cash` of
+/// that goes out over Lightning and `credit` (balance currency) goes back to
+/// the customer's account credit.
+#[derive(Debug, Clone)]
+pub struct RefundShare {
+    pub payment: SubscriptionPayment,
+    pub amount: u64,
+    pub cash: u64,
+    pub credit: u64,
+}
+
+/// A payment that can absorb a refund: what is still refundable on it and
+/// the credit that paid for part of it.
+pub struct RefundCandidate {
+    pub payment: SubscriptionPayment,
+    pub remaining: u64,
+    pub debit: Option<lnvps_db::AccountCreditDebit>,
+}
+
+/// Split a cash refund of `cash_total` across `candidates`, newest first. A
+/// payment that credit partly paid for is reversed in proportion: the cash
+/// returned never exceeds the cash it collected, and the credit share is
+/// returned as credit.
+pub fn allocate_cash_refund(
+    candidates: &[RefundCandidate],
+    cash_total: u64,
+) -> Result<Vec<RefundShare>> {
+    let mut left = cash_total;
+    let mut out = Vec::new();
+    for c in candidates {
+        if left == 0 {
+            break;
+        }
+        let billable = (c.payment.amount + c.payment.tax) as u128;
+        let credit_paid = c
+            .debit
+            .as_ref()
+            .filter(|d| d.settled)
+            .map(|d| (d.payment_amount as u128).min(billable))
+            .unwrap_or(0);
+        let cash_paid = billable - credit_paid;
+        if billable == 0 || cash_paid == 0 {
+            continue;
+        }
+        let cash_capacity = (c.remaining as u128 * cash_paid / billable) as u64;
+        let cash = cash_capacity.min(left);
+        if cash == 0 {
+            continue;
+        }
+        let amount = if cash == cash_capacity {
+            c.remaining
+        } else {
+            ((cash as u128 * billable).div_ceil(cash_paid) as u64).min(c.remaining)
+        };
+        let credit = match &c.debit {
+            Some(d) if d.payment_amount > 0 => {
+                ((amount - cash) as u128 * d.amount as u128 / d.payment_amount as u128) as u64
+            }
+            _ => 0,
+        };
+        left -= cash;
+        out.push(RefundShare {
+            payment: c.payment.clone(),
+            amount,
+            cash,
+            credit,
+        });
+    }
+    ensure!(
+        left == 0,
+        "refund of {cash_total} exceeds the {} still refundable in cash on this VM's payments",
+        cash_total - left
+    );
+    Ok(out)
 }
 
 #[derive(Clone)]
@@ -138,6 +216,18 @@ impl VmRefundHandler {
             .allocation(vm_id, &currency, booked.value())
             .await
             .map_err(|e| anyhow!("VM {} refund cannot be booked, nothing paid: {}", vm_id, e))?;
+        let planned: u64 = plan.iter().map(|s| s.amount).sum();
+        let owed = quote.rate.convert(CurrencyAmount::millisats(owed_msat))?;
+        ensure!(
+            planned <= owed.value(),
+            "invoice of {} msat reverses {} {} including credit, but VM {} is only owed {} {}",
+            pay_msat,
+            planned,
+            currency,
+            vm_id,
+            owed.value(),
+            currency
+        );
 
         let paid = self
             .node
@@ -159,8 +249,15 @@ impl VmRefundHandler {
         let refunded_at = Utc::now();
         let mut refund_rows = 0;
         let mut booked_amount = 0;
+        let mut credit_returned = 0;
         let mut failures = Vec::new();
-        for (original, amount) in plan {
+        for RefundShare {
+            payment: original,
+            amount,
+            credit,
+            ..
+        } in plan
+        {
             let row = build_refund_row(
                 &original,
                 amount,
@@ -189,6 +286,35 @@ impl VmRefundHandler {
             booked_amount += amount;
             refund_rows += 1;
 
+            if credit > 0 {
+                match self
+                    .db
+                    .adjust_account_credit(
+                        original.user_id,
+                        credit as i64,
+                        "refund",
+                        Some(&format!(
+                            "VM {} refund of payment {}",
+                            vm_id,
+                            hex::encode(&original.id)
+                        )),
+                    )
+                    .await
+                {
+                    Ok(_) => credit_returned += credit,
+                    Err(e) => {
+                        error!(
+                            "Refund of payment {} for VM {} owes {} account credit that could not be returned: {}",
+                            hex::encode(&original.id),
+                            vm_id,
+                            credit,
+                            e
+                        );
+                        failures.push(format!("credit {}: {}", hex::encode(&original.id), e));
+                    }
+                }
+            }
+
             if let Err(e) = self
                 .history
                 .log_vm_refunded(
@@ -216,7 +342,7 @@ impl VmRefundHandler {
                 vm_id,
                 pay_msat,
                 preimage,
-                booked.value() - booked_amount,
+                planned - booked_amount,
                 failures.join(", ")
             );
         }
@@ -228,6 +354,7 @@ impl VmRefundHandler {
             booked_amount,
             currency,
             refund_rows,
+            credit_returned,
         })
     }
 
@@ -241,7 +368,7 @@ impl VmRefundHandler {
         vm_id: u64,
         currency: &str,
         amount: u64,
-    ) -> Result<Vec<(SubscriptionPayment, u64)>> {
+    ) -> Result<Vec<RefundShare>> {
         let mut payments: Vec<SubscriptionPayment> = self
             .db
             .list_vm_subscription_payments(vm_id)
@@ -259,10 +386,18 @@ impl VmRefundHandler {
             let existing = self.db.list_refunds_for_payment(&payment.id).await?;
             let remaining = refundable_remaining(&payment, &existing);
             if remaining > 0 {
-                candidates.push((payment, remaining));
+                let debit = self
+                    .db
+                    .get_account_credit_debit_by_payment(&payment.id)
+                    .await?;
+                candidates.push(RefundCandidate {
+                    payment,
+                    remaining,
+                    debit,
+                });
             }
         }
-        allocate_refund(&candidates, amount)
+        allocate_cash_refund(&candidates, amount)
     }
 }
 
@@ -652,6 +787,145 @@ mod tests {
         let older_refunds = db.list_refunds_for_payment(&older.id).await.unwrap();
         assert_eq!(older_refunds.len(), 1);
         assert_eq!(older_refunds[0].amount, 30);
+    }
+
+    fn debit(
+        payment: &SubscriptionPayment,
+        payment_amount: u64,
+        amount: u64,
+    ) -> lnvps_db::AccountCreditDebit {
+        lnvps_db::AccountCreditDebit {
+            user_id: payment.user_id,
+            subscription_payment_id: Some(payment.id.clone()),
+            amount,
+            currency: "BTC".to_string(),
+            payment_amount,
+            settled: true,
+            ..Default::default()
+        }
+    }
+
+    fn sale(amount: u64) -> SubscriptionPayment {
+        SubscriptionPayment {
+            id: vec![1u8; 32],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now(),
+            amount,
+            currency: "EUR".to_string(),
+            payment_method: PaymentMethod::Lightning,
+            payment_type: SubscriptionPaymentType::Renewal,
+            external_data: "".into(),
+            external_id: None,
+            is_paid: true,
+            rate: 1.0,
+            time_value: None,
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+            renewal_source: None,
+        }
+    }
+
+    fn candidate(amount: u64, debit: Option<lnvps_db::AccountCreditDebit>) -> RefundCandidate {
+        RefundCandidate {
+            payment: sale(amount),
+            remaining: amount,
+            debit,
+        }
+    }
+
+    #[test]
+    fn cash_refund_returns_the_credit_share_as_credit() {
+        let p = sale(1000);
+        let plan =
+            allocate_cash_refund(&[candidate(1000, Some(debit(&p, 500, 5_000_000)))], 200).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            (plan[0].amount, plan[0].cash, plan[0].credit),
+            (400, 200, 2_000_000)
+        );
+
+        let plan = allocate_cash_refund(&[candidate(1000, None)], 200).unwrap();
+        assert_eq!(
+            (plan[0].amount, plan[0].cash, plan[0].credit),
+            (200, 200, 0)
+        );
+    }
+
+    #[test]
+    fn cash_refund_cannot_take_more_cash_than_was_paid() {
+        let p = sale(1000);
+        let half = [candidate(1000, Some(debit(&p, 500, 5_000_000)))];
+        let plan = allocate_cash_refund(&half, 500).unwrap();
+        assert_eq!(
+            (plan[0].amount, plan[0].cash, plan[0].credit),
+            (1000, 500, 5_000_000)
+        );
+        assert!(allocate_cash_refund(&half, 501).is_err());
+
+        let all_credit = [candidate(1000, Some(debit(&p, 1000, 10_000_000)))];
+        assert!(allocate_cash_refund(&all_credit, 1).is_err());
+        assert!(allocate_cash_refund(&all_credit, 0).unwrap().is_empty());
+
+        let mut unsettled = debit(&p, 1000, 10_000_000);
+        unsettled.settled = false;
+        let plan = allocate_cash_refund(&[candidate(1000, Some(unsettled))], 300).unwrap();
+        assert_eq!((plan[0].amount, plan[0].credit), (300, 0));
+    }
+
+    #[tokio::test]
+    async fn a_refund_of_a_credit_funded_payment_returns_credit() {
+        let mock = MockDb::default();
+        let (vm, payment) = vm_with_payment(&mock, 1230, 230).await;
+        mock.account_credit_debits
+            .lock()
+            .await
+            .push(debit(&payment, 730, 7_300_000));
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let node = Arc::new(PayNode::default());
+        let handler = handler(db.clone(), node.clone()).await;
+
+        let err = handler
+            .process(1, 9, None, None, "lightning", Some(&invoice_for(500_000)))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("including credit"), "{err}");
+        assert!(node.paid.lock().unwrap().is_empty());
+
+        let outcome = handler
+            .process(1, 9, None, None, "lightning", Some(&invoice_for(300_000)))
+            .await
+            .expect("refund");
+        assert_eq!(
+            outcome.amount_msat, 300_000,
+            "only the cash share is paid out"
+        );
+        assert_eq!(outcome.booked_amount, 60);
+        assert_eq!(outcome.credit_returned, 300_000);
+        assert_eq!(
+            db.get_account_credit(vm.user_id).await.unwrap().balance,
+            300_000
+        );
+        let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
+        assert_eq!(refunds[0].amount, 60);
+        let (events, _) = db
+            .list_account_credit_events(vm.user_id, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            (events[0].kind.as_str(), events[0].amount),
+            ("refund", 300_000)
+        );
     }
 
     /// A failed payment writes no refund row: the ledger only ever records

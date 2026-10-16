@@ -102,6 +102,12 @@ pub async fn connect() -> anyhow::Result<MySqlPool> {
     Ok(pool)
 }
 
+/// The production database layer on the per-run test database.
+pub async fn lnvps_db() -> anyhow::Result<lnvps_db::LNVpsDbMysql> {
+    ensure_test_database().await?;
+    Ok(lnvps_db::LNVpsDbMysql::new(&db_url()).await?)
+}
+
 /// Ensure a user exists for the given Nostr keys and return the user_id.
 /// Uses the same INSERT IGNORE + SELECT pattern as the production `upsert_user`.
 pub async fn ensure_user(pool: &MySqlPool, keys: &Keys) -> anyhow::Result<u64> {

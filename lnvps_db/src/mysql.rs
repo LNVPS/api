@@ -1,9 +1,10 @@
 use crate::{
-    AccessPolicy, AgentConversation, AgentConversationFilter, AgentConversationOverview,
-    AgentMessage, App, AppBackupState, AppCluster, AppDeployment, AppDeploymentBackup,
-    AppDeploymentFilter, AppDeploymentServiceUsage, AppDeploymentVolumeUsage, AppTag,
-    AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, BulkMessageTarget, Company, DbError,
-    DbResult, Discount, DiscountRedemption, DiscountRedemptionWithCode, DnsServer, EncryptedString,
+    AccessPolicy, AccountCredit, AccountCreditDebit, AccountCreditEvent, AccountCreditTopup,
+    AgentConversation, AgentConversationFilter, AgentConversationOverview, AgentMessage, App,
+    AppBackupState, AppCluster, AppDeployment, AppDeploymentBackup, AppDeploymentFilter,
+    AppDeploymentServiceUsage, AppDeploymentVolumeUsage, AppTag, AsnSubscription,
+    AsnSubscriptionStatus, AvailableIpSpace, BulkMessageTarget, Company, DbError, DbResult,
+    Discount, DiscountRedemption, DiscountRedemptionWithCode, DnsServer, EncryptedString,
     IntervalType, IpRange, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode,
     MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage,
     PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
@@ -77,6 +78,40 @@ const REFERRAL_USAGE_FROM: &str = r#"FROM vm v
 #[derive(Clone)]
 pub struct LNVpsDbMysql {
     db: MySqlPool,
+}
+
+async fn lock_account_credit(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: u64,
+) -> Result<(u64, String)> {
+    sqlx::query(
+        "INSERT INTO account_credit (user_id, balance, currency) VALUES (?, 0, 'BTC') \
+         ON DUPLICATE KEY UPDATE user_id = user_id",
+    )
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(
+        sqlx::query_as("SELECT balance, currency FROM account_credit WHERE user_id = ? FOR UPDATE")
+            .bind(user_id)
+            .fetch_one(&mut **tx)
+            .await?,
+    )
+}
+
+async fn account_credit_reserved<'e, E: sqlx::MySqlExecutor<'e>>(
+    ex: E,
+    user_id: u64,
+    exclude: Option<u64>,
+) -> Result<u64> {
+    Ok(sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(amount), 0) AS UNSIGNED) FROM account_credit_debit \
+         WHERE user_id = ? AND settled = 0 AND expires > NOW() AND id <> ?",
+    )
+    .bind(user_id)
+    .bind(exclude.unwrap_or(0))
+    .fetch_one(ex)
+    .await?)
 }
 
 impl LNVpsDbMysql {
@@ -4749,6 +4784,345 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(discount_id)
         .fetch_all(&self.db)
         .await?)
+    }
+
+    // ========================================================================
+    // Account credit
+    // ========================================================================
+
+    async fn get_account_credit(&self, user_id: u64) -> DbResult<AccountCredit> {
+        let row: Option<AccountCredit> = sqlx::query_as(
+            "SELECT user_id, balance, currency, auto_apply, updated \
+             FROM account_credit WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.db)
+        .await?;
+        Ok(row.unwrap_or_else(|| AccountCredit {
+            user_id,
+            balance: 0,
+            currency: "BTC".to_string(),
+            auto_apply: false,
+            updated: Utc::now(),
+        }))
+    }
+
+    async fn set_account_credit_auto_apply(
+        &self,
+        user_id: u64,
+        auto_apply: bool,
+    ) -> DbResult<AccountCredit> {
+        sqlx::query(
+            "INSERT INTO account_credit (user_id, balance, currency, auto_apply) \
+             VALUES (?, 0, 'BTC', ?) \
+             ON DUPLICATE KEY UPDATE auto_apply = VALUES(auto_apply), updated = NOW()",
+        )
+        .bind(user_id)
+        .bind(auto_apply)
+        .execute(&self.db)
+        .await?;
+        self.get_account_credit(user_id).await
+    }
+
+    async fn get_account_credit_reserved(&self, user_id: u64) -> DbResult<u64> {
+        Ok(account_credit_reserved(&self.db, user_id, None).await?)
+    }
+
+    async fn adjust_account_credit(
+        &self,
+        user_id: u64,
+        delta: i64,
+        kind: &str,
+        note: Option<&str>,
+    ) -> DbResult<AccountCredit> {
+        if delta == 0 {
+            return self.get_account_credit(user_id).await;
+        }
+        let mut tx = self.db.begin().await?;
+        let (balance, currency) = lock_account_credit(&mut tx, user_id).await?;
+        let new_balance = if delta > 0 {
+            balance
+                .checked_add(delta.unsigned_abs())
+                .ok_or_else(|| anyhow!("account credit balance overflow for user {user_id}"))?
+        } else {
+            let reserved = account_credit_reserved(&mut *tx, user_id, None).await?;
+            let available = balance.saturating_sub(reserved);
+            if delta.unsigned_abs() > available {
+                tx.rollback().await?;
+                return Err(anyhow!(
+                    "account credit for user {user_id} has {available} unreserved, cannot remove {}",
+                    delta.unsigned_abs()
+                )
+                .into());
+            }
+            balance - delta.unsigned_abs()
+        };
+        sqlx::query("UPDATE account_credit SET balance = ?, updated = NOW() WHERE user_id = ?")
+            .bind(new_balance)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO account_credit_event (user_id, kind, amount, currency, note) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(kind)
+        .bind(delta)
+        .bind(&currency)
+        .bind(note)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.get_account_credit(user_id).await
+    }
+
+    async fn list_account_credit_events(
+        &self,
+        user_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AccountCreditEvent>, u64)> {
+        let rows = sqlx::query_as(
+            "SELECT * FROM account_credit_event WHERE user_id = ? \
+             ORDER BY created DESC, id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM account_credit_event WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_one(&self.db)
+                .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn reserve_account_credit(&self, debit: &AccountCreditDebit) -> DbResult<Option<u64>> {
+        let mut tx = self.db.begin().await?;
+        let (balance, _) = lock_account_credit(&mut tx, debit.user_id).await?;
+        let reserved = account_credit_reserved(&mut *tx, debit.user_id, None).await?;
+        if balance.saturating_sub(reserved) < debit.amount {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let res = sqlx::query(
+            "INSERT INTO account_credit_debit \
+             (user_id, amount, currency, payment_amount, settled, expires) \
+             VALUES (?, ?, ?, ?, 0, ?) RETURNING id",
+        )
+        .bind(debit.user_id)
+        .bind(debit.amount)
+        .bind(&debit.currency)
+        .bind(debit.payment_amount)
+        .bind(debit.expires)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(res.try_get(0)?))
+    }
+
+    async fn attach_account_credit_debit(
+        &self,
+        id: u64,
+        subscription_payment_id: &Vec<u8>,
+        expires: DateTime<Utc>,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE account_credit_debit SET subscription_payment_id = ?, expires = ? \
+             WHERE id = ? AND settled = 0",
+        )
+        .bind(subscription_payment_id)
+        .bind(expires)
+        .bind(id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn release_account_credit_debit(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM account_credit_debit WHERE id = ? AND settled = 0")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_account_credit_debit_by_payment(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<AccountCreditDebit>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM account_credit_debit WHERE subscription_payment_id = ?")
+                .bind(subscription_payment_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn settle_account_credit_debit(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<AccountCreditDebit>> {
+        let user_id: Option<u64> = sqlx::query_scalar(
+            "SELECT user_id FROM account_credit_debit \
+             WHERE subscription_payment_id = ? AND settled = 0",
+        )
+        .bind(subscription_payment_id)
+        .fetch_optional(&self.db)
+        .await?;
+        let Some(user_id) = user_id else {
+            return Ok(None);
+        };
+        let mut tx = self.db.begin().await?;
+        let (balance, _) = lock_account_credit(&mut tx, user_id).await?;
+        let debit: Option<AccountCreditDebit> = sqlx::query_as(
+            "SELECT * FROM account_credit_debit \
+             WHERE subscription_payment_id = ? AND settled = 0 FOR UPDATE",
+        )
+        .bind(subscription_payment_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(mut debit) = debit else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let available = if debit.expires > Utc::now() {
+            balance
+        } else {
+            let others = account_credit_reserved(&mut *tx, debit.user_id, Some(debit.id)).await?;
+            balance.saturating_sub(others)
+        };
+        debit.clamp_to(available);
+
+        sqlx::query(
+            "UPDATE account_credit_debit \
+             SET settled = 1, settled_at = NOW(), amount = ?, payment_amount = ? WHERE id = ?",
+        )
+        .bind(debit.amount)
+        .bind(debit.payment_amount)
+        .bind(debit.id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE account_credit SET balance = ?, updated = NOW() WHERE user_id = ?")
+            .bind(balance - debit.amount)
+            .bind(debit.user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO account_credit_event \
+             (user_id, kind, amount, currency, subscription_payment_id) \
+             VALUES (?, 'spend', ?, ?, ?)",
+        )
+        .bind(debit.user_id)
+        .bind(-i64::try_from(debit.amount).map_err(|e| anyhow!(e))?)
+        .bind(&debit.currency)
+        .bind(&debit.subscription_payment_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        debit.settled = true;
+        debit.settled_at = Some(Utc::now());
+        Ok(Some(debit))
+    }
+
+    async fn insert_account_credit_topup(&self, topup: &AccountCreditTopup) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO account_credit_topup \
+             (user_id, amount, currency, invoice_hash, external_data, is_paid) \
+             VALUES (?, ?, ?, ?, ?, 0) RETURNING id",
+        )
+        .bind(topup.user_id)
+        .bind(topup.amount)
+        .bind(&topup.currency)
+        .bind(&topup.invoice_hash)
+        .bind(&topup.external_data)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn get_account_credit_topup_by_hash(
+        &self,
+        invoice_hash: &Vec<u8>,
+    ) -> DbResult<Option<AccountCreditTopup>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM account_credit_topup WHERE invoice_hash = ?")
+                .bind(invoice_hash)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn settle_account_credit_topup(&self, id: u64) -> DbResult<Option<AccountCreditTopup>> {
+        let user_id: Option<u64> = sqlx::query_scalar(
+            "SELECT user_id FROM account_credit_topup WHERE id = ? AND is_paid = 0",
+        )
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await?;
+        let Some(user_id) = user_id else {
+            return Ok(None);
+        };
+        let mut tx = self.db.begin().await?;
+        let (balance, _) = lock_account_credit(&mut tx, user_id).await?;
+        let paid = sqlx::query(
+            "UPDATE account_credit_topup SET is_paid = 1, paid_at = NOW() \
+             WHERE id = ? AND is_paid = 0",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if paid.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let topup: AccountCreditTopup =
+            sqlx::query_as("SELECT * FROM account_credit_topup WHERE id = ?")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        sqlx::query("UPDATE account_credit SET balance = ?, updated = NOW() WHERE user_id = ?")
+            .bind(balance + topup.amount)
+            .bind(topup.user_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO account_credit_event (user_id, kind, amount, currency) \
+             VALUES (?, 'topup', ?, ?)",
+        )
+        .bind(topup.user_id)
+        .bind(i64::try_from(topup.amount).map_err(|e| anyhow!(e))?)
+        .bind(&topup.currency)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(topup))
+    }
+
+    async fn list_account_credit_topups(
+        &self,
+        user_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AccountCreditTopup>, u64)> {
+        let rows = sqlx::query_as(
+            "SELECT * FROM account_credit_topup WHERE user_id = ? \
+             ORDER BY created DESC, id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM account_credit_topup WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_one(&self.db)
+                .await?;
+        Ok((rows, total as u64))
     }
 
     // ----- Marketplace (operator-run compute nodes) -----

@@ -791,6 +791,90 @@ and React example. `{provider}` is one of the enabled tags (`google`, `github`,
 - **Notes**: Removes the stored number, clears verification state and sets `contact_whatsapp` to `false`.
 - **Response**: `null`
 
+### Account Credit
+
+A balance you top up and spend against purchases, renewals and upgrades, in the
+same flow as a saved wallet. The balance is held in msat and converted into
+the payment currency of whatever you buy at the current rate.
+
+#### Get Credit Balance
+- **GET** `/api/v1/account/credit`
+- **Auth**: Required
+- **Response**:
+```json
+{
+  "data": {
+    "balance": 5000000,
+    "currency": "BTC",
+    "auto_apply": true
+  }
+}
+```
+- `balance`: your available credit, in msat. Never negative.
+- `auto_apply`: when true, every quote automatically spends as much credit as
+  the bill allows; when false the balance waits for you to opt in.
+
+#### Toggle Auto-Apply
+- **PATCH** `/api/v1/account/credit`
+- **Auth**: Required
+- **Body**: `{ "auto_apply": bool }`
+- **Response**: the balance object above, reflecting the new flag.
+
+#### Top Up
+- **POST** `/api/v1/account/credit/topup`
+- **Auth**: Required
+- **Body**: `{ "amount": 10000000 }` (msat, rounded up to a whole sat; minimum 1000)
+- **Notes**: Issues a Lightning invoice. Pay it with any wallet; on settlement
+  the balance rises by the amount paid. A top-up is not tied to any
+  subscription and never appears on a VM's payment history.
+- **Response**:
+```json
+{
+  "data": {
+    "pr": "lnbc...",
+    "payment_hash": "...",
+    "amount": 10000000,
+    "currency": "BTC",
+    "expires": "2026-10-15T12:10:00Z"
+  }
+}
+```
+
+#### Credit Ledger
+- **GET** `/api/v1/account/credit/events?limit=50&offset=0`
+- **Auth**: Required
+- **Notes**: Every movement of your balance, newest first. `kind` is one of
+  `topup`, `spend`, `refund`, `admin`; `amount` is the signed change to the
+  balance (`spend` is negative). `subscription_payment_id` is set on `spend`
+  rows to the payment the credit went to.
+- **Response**: standard paginated wrapper of
+  `{ kind, amount, currency, subscription_payment_id, note, created }` rows.
+
+#### How credit is spent
+
+When `auto_apply` is on and you hold a balance, quotes for renewals, purchases
+and upgrades show a `credit` line (renewal quotes) or a `credit` object on the
+payment response:
+
+```json
+{ "amount": 500000, "currency": "BTC" }
+```
+
+That is the part of the bill your balance covers, in the bill's currency. The
+invoice you are asked to pay covers the remainder, and the processing fee is
+charged only on that remainder. A bill fully covered by credit needs no payment
+at all: it settles the moment it is ordered and its payment `data` is
+`"credit"`. If the remainder would fall below the payment method's minimum,
+less credit is used so the remainder meets it.
+
+Credit applied to an unpaid order is held until the order expires, so the same
+credit is never offered to two orders at once. If an order is paid after it
+expired and the credit has since gone elsewhere, only what is left is spent and
+the rest of the bill buys less time (on-chain) or is absorbed. Auto-renewal
+uses credit when it covers the whole renewal, otherwise your saved wallet or
+card pays the remainder. A refund of a VM paid partly with credit returns the
+credit share to your balance and the cash share to your invoice.
+
 ### Automatic Renewal with Nostr Wallet Connect
 
 The LNVPS platform supports automatic VM renewal using Nostr Wallet Connect (NWC). This feature allows users to set up their Lightning wallets to automatically pay for VM renewals before expiration.
@@ -983,7 +1067,7 @@ historical range is needed; a usage bar can be rendered from this object alone.
   - `method`: Optional payment method ('lightning' | 'revolut' | 'paypal'). Defaults to 'lightning'
 - **Body**: `VmUpgradeRequest`
 - **Response**: `VmUpgradeQuote`
-- **Description**: Calculate the pro-rated upgrade cost for remaining VM time and the new monthly renewal cost after upgrade. Available for both standard template VMs and custom template VMs. Like the upgrade endpoint itself, the request must strictly increase at least one resource (no downgrades). Cost is calculated in the currency appropriate for the selected payment method. The response includes the upgrade cost (cost_difference), new renewal cost, and the discount amount representing the value of remaining time at the old pricing rate.
+- **Description**: Calculate the pro-rated upgrade cost for remaining VM time and the new monthly renewal cost after upgrade. Available for both standard template VMs and custom template VMs. Like the upgrade endpoint itself, the request must strictly increase at least one resource (no downgrades). Cost is calculated in the currency appropriate for the selected payment method. The response includes the upgrade cost (cost_difference), new renewal cost, and the discount amount representing the value of remaining time at the old pricing rate. When account credit is auto-applied the response also carries `credit` (`{ amount, currency }`), and `processing_fee` is the fee on the remainder.
 
 #### Create VM Upgrade Payment
 - **POST** `/api/v1/vm/{id}/upgrade?method={payment_method}`
