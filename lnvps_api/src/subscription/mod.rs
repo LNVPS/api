@@ -273,7 +273,8 @@ impl SubscriptionHandler {
         })
     }
 
-    pub fn with_swap(mut self, swap: Option<Arc<dyn SwapProvider>>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_swap(mut self, swap: Option<Arc<dyn SwapProvider>>) -> Self {
         self.swap = swap;
         self
     }
@@ -345,10 +346,10 @@ impl SubscriptionHandler {
             "{} is not accepted for FixedFloat payments",
             coin
         );
-        let swap = self
-            .swap
-            .clone()
-            .context("FixedFloat payments are not configured")?;
+        let swap = match &self.swap {
+            Some(swap) => swap.clone(),
+            None => crate::swap::provider_for_config(&config)?,
+        };
         let receive_address = self.new_onchain_address(amount_msat, memo, label).await?;
         swap.create_order(SwapOrderRequest {
             coin: coin.to_string(),
@@ -3129,7 +3130,7 @@ pub(crate) mod revolut_offline_tests {
             ProviderConfig::FixedFloat(FixedFloatProviderConfig {
                 api_key: "k".to_string(),
                 api_secret: "s".to_string(),
-                url: None,
+                url: Some("http://127.0.0.1:1".to_string()),
                 refcode: None,
                 afftax: None,
             }),
@@ -3246,11 +3247,15 @@ pub(crate) mod revolut_offline_tests {
     }
 
     #[tokio::test]
-    async fn renew_subscription_fixedfloat_requires_swap_provider() {
-        let (sub, onchain, _swap, sub_id) = fixedfloat_setup("BTC", false, &[], true).await;
+    async fn renew_subscription_fixedfloat_builds_the_provider_from_the_config() {
+        let (sub, _onchain, swap, sub_id) = fixedfloat_setup("BTC", false, &[], true).await;
 
-        assert!(renew_with_coin(&sub, sub_id, Currency::XMR).await.is_err());
-        assert!(onchain.addresses.lock().await.is_empty());
+        let err = renew_with_coin(&sub, sub_id, Currency::XMR)
+            .await
+            .unwrap_err();
+
+        assert!(!err.to_string().contains("not configured"), "{err}");
+        assert!(swap.requests.lock().await.is_empty());
     }
 
     #[tokio::test]

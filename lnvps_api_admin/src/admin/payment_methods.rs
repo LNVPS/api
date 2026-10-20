@@ -72,6 +72,7 @@ async fn admin_create_payment_method(
     auth.require_permission(AdminResource::PaymentMethodConfig, AdminAction::Create)?;
 
     let config = request.to_payment_method_config()?;
+    require_onchain_for_fixedfloat(&this, &config).await?;
 
     let config_id = this.db.insert_payment_method_config(&config).await?;
 
@@ -178,6 +179,8 @@ async fn admin_update_payment_method(
         );
     }
 
+    require_onchain_for_fixedfloat(&this, &config).await?;
+
     this.db.update_payment_method_config(&config).await?;
 
     let updated_config = this.db.get_payment_method_config(id).await?;
@@ -202,4 +205,235 @@ async fn admin_delete_payment_method(
         "success": true,
         "message": "Payment method configuration deleted successfully"
     }))
+}
+
+async fn require_onchain_for_fixedfloat(
+    this: &RouterState,
+    config: &lnvps_db::PaymentMethodConfig,
+) -> anyhow::Result<()> {
+    if config.payment_method != lnvps_db::PaymentMethod::FixedFloat || !config.enabled {
+        return Ok(());
+    }
+    let onchain = this
+        .db
+        .get_payment_method_config_for_company(config.company_id, lnvps_db::PaymentMethod::OnChain)
+        .await
+        .ok()
+        .filter(|c| c.enabled);
+    anyhow::ensure!(
+        onchain.is_some(),
+        "FixedFloat pays out to an on-chain address, so the company needs an enabled onchain payment method first"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::admin::model::Permission;
+    use lnvps_api_common::{
+        ChannelWorkCommander, MockDb, MockExchangeRate, VatClient, VmStateCache,
+    };
+    use lnvps_db::{
+        FixedFloatProviderConfig, LNVpsDb, OnChainAddressType, OnChainProviderConfig,
+        PaymentMethod, PaymentMethodConfig, ProviderConfig,
+    };
+    use std::sync::Arc;
+
+    fn state(db: &Arc<dyn LNVpsDb>) -> RouterState {
+        RouterState {
+            node_control: None,
+            db: db.clone(),
+            work_commander: Arc::new(ChannelWorkCommander::new()),
+            feedback: None,
+            vm_state_cache: VmStateCache::new(),
+            exchange: Arc::new(MockExchangeRate::default()),
+            vat: VatClient::new(),
+        }
+    }
+
+    fn auth() -> AdminAuth {
+        AdminAuth {
+            user_id: 1,
+            pubkey: vec![1u8; 32],
+            permissions: [AdminAction::View, AdminAction::Create, AdminAction::Update]
+                .into_iter()
+                .map(|action| Permission {
+                    resource: AdminResource::PaymentMethodConfig,
+                    action,
+                })
+                .collect(),
+            nip98_auth: None,
+        }
+    }
+
+    fn fixedfloat(enabled: bool) -> PaymentMethodConfig {
+        PaymentMethodConfig::new_with_config(
+            1,
+            PaymentMethod::FixedFloat,
+            "FF".to_string(),
+            enabled,
+            ProviderConfig::FixedFloat(FixedFloatProviderConfig {
+                api_key: "k".to_string(),
+                api_secret: "s".to_string(),
+                url: None,
+                refcode: None,
+                afftax: None,
+            }),
+        )
+    }
+
+    fn onchain(enabled: bool) -> PaymentMethodConfig {
+        PaymentMethodConfig::new_with_config(
+            1,
+            PaymentMethod::OnChain,
+            "OC".to_string(),
+            enabled,
+            ProviderConfig::OnChain(OnChainProviderConfig {
+                url: "https://x:10009".to_string(),
+                cert_path: "c".into(),
+                macaroon_path: "m".into(),
+                address_type: OnChainAddressType::WitnessPubkeyHash,
+                account: None,
+                min_confirmations: 1,
+            }),
+        )
+    }
+
+    fn create_request(enabled: Option<bool>) -> CreatePaymentMethodConfigRequest {
+        CreatePaymentMethodConfigRequest {
+            company_id: 1,
+            name: "FF".to_string(),
+            enabled,
+            config: fixedfloat(true).get_provider_config().unwrap(),
+            processing_fee_rate: None,
+            processing_fee_base: None,
+            processing_fee_currency: None,
+            min_amount: None,
+            min_amount_currency: None,
+            supported_currencies: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_ignores_other_methods_and_disabled_fixedfloat() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let this = state(&db);
+
+        assert!(
+            require_onchain_for_fixedfloat(&this, &onchain(true))
+                .await
+                .is_ok()
+        );
+        assert!(
+            require_onchain_for_fixedfloat(&this, &fixedfloat(false))
+                .await
+                .is_ok()
+        );
+        assert!(
+            require_onchain_for_fixedfloat(&this, &fixedfloat(true))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn guard_needs_an_enabled_onchain_config() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let this = state(&db);
+
+        db.insert_payment_method_config(&onchain(false))
+            .await
+            .unwrap();
+        assert!(
+            require_onchain_for_fixedfloat(&this, &fixedfloat(true))
+                .await
+                .is_err()
+        );
+
+        let mut enabled = db
+            .get_payment_method_config_for_company(1, PaymentMethod::OnChain)
+            .await
+            .unwrap();
+        enabled.enabled = true;
+        db.update_payment_method_config(&enabled).await.unwrap();
+        assert!(
+            require_onchain_for_fixedfloat(&this, &fixedfloat(true))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_fixedfloat_requires_onchain() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let this = state(&db);
+
+        let res =
+            admin_create_payment_method(auth(), State(this.clone()), Json(create_request(None)))
+                .await;
+        assert!(res.is_err());
+        assert!(
+            db.get_payment_method_config_for_company(1, PaymentMethod::FixedFloat)
+                .await
+                .is_err()
+        );
+
+        db.insert_payment_method_config(&onchain(true))
+            .await
+            .unwrap();
+        let res =
+            admin_create_payment_method(auth(), State(this), Json(create_request(None))).await;
+        assert!(res.is_ok());
+        assert!(
+            db.get_payment_method_config_for_company(1, PaymentMethod::FixedFloat)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_disabled_fixedfloat_does_not_need_onchain() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let res = admin_create_payment_method(
+            auth(),
+            State(state(&db)),
+            Json(create_request(Some(false))),
+        )
+        .await;
+        assert!(res.is_ok());
+    }
+
+    #[tokio::test]
+    async fn enabling_fixedfloat_requires_onchain() {
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let id = db
+            .insert_payment_method_config(&fixedfloat(false))
+            .await
+            .unwrap();
+        let enable = || UpdatePaymentMethodConfigRequest {
+            name: None,
+            enabled: Some(true),
+            config: None,
+            processing_fee_rate: None,
+            processing_fee_base: None,
+            processing_fee_currency: None,
+            min_amount: None,
+            min_amount_currency: None,
+            supported_currencies: None,
+        };
+
+        let res =
+            admin_update_payment_method(auth(), State(state(&db)), Path(id), Json(enable())).await;
+        assert!(res.is_err());
+        assert!(!db.get_payment_method_config(id).await.unwrap().enabled);
+
+        db.insert_payment_method_config(&onchain(true))
+            .await
+            .unwrap();
+        let res =
+            admin_update_payment_method(auth(), State(state(&db)), Path(id), Json(enable())).await;
+        assert!(res.is_ok());
+        assert!(db.get_payment_method_config(id).await.unwrap().enabled);
+    }
 }

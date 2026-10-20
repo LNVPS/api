@@ -6370,7 +6370,7 @@ The RBAC system uses the following permission format: `resource::action`
   "company_base_currency": "string",
   // Base currency of the company that owns this VM (e.g., "EUR")
   "payment_method": "lightning",
-  // AdminPaymentMethod enum: "lightning", "revolut", "paypal", "stripe"
+  // AdminPaymentMethod enum: "lightning", "revolut", "paypal", "stripe", "onchain", "fixedfloat"
   "external_id": "string | null",
   // External payment provider ID
   "is_paid": boolean,
@@ -6379,9 +6379,28 @@ The RBAC system uses the following permission format: `resource::action`
   // When payment was completed (null if unpaid)
   "rate": number,
   // Exchange rate to company_base_currency
-  "discount": AdminPaymentDiscountInfo
+  "discount": AdminPaymentDiscountInfo,
   // The discount applied to this payment; omitted when there was none.
   // `amount` is already net of it.
+  "swap": AdminSwapInfo
+  // The swap order behind a `fixedfloat` payment; omitted for every other method.
+}
+```
+
+### AdminSwapInfo
+
+```json
+{
+  "coin": "string",
+  // XMR, LTC, ETH or USDTTRC
+  "order_id": "string",
+  // FixedFloat order id, as shown on ff.io/order/{order_id}
+  "deposit_address": "string",
+  // Where the customer sends `coin`
+  "deposit_amount": "string",
+  // Amount of `coin` the customer must send
+  "receive_address": "string"
+  // Our on-chain address FixedFloat pays the Bitcoin to
 }
 ```
 
@@ -6514,9 +6533,11 @@ The RBAC system uses the following permission format: `resource::action`
   // Tax amount in cents/millisats
   "processing_fee": number,
   // Processing fee in cents/millisats
-  "discount": AdminPaymentDiscountInfo
+  "discount": AdminPaymentDiscountInfo,
   // The discount applied to this payment; omitted when there was none.
   // `amount` is already net of it.
+  "swap": AdminSwapInfo
+  // The swap order behind a `fixedfloat` payment; omitted for every other method.
 }
 ```
 
@@ -8013,7 +8034,7 @@ Only the `type` field is required; all other fields are optional and will keep t
 - `stripe` - Stripe Payments API
 - `paypal` - PayPal REST API
 - `onchain` - On-chain Bitcoin payments (LND wallet backend). `address_type` is one of `witness_pubkey_hash`, `nested_pubkey_hash`, `taproot_pubkey`.
-- `fixedfloat` - Cryptocurrency payments through the FixedFloat exchange API (payment method `fixedfloat`). The customer picks a coin per payment (`coin` query parameter). The coins a company accepts are the config's `supported_currencies`, which for `fixedfloat` must be coins from `XMR`, `LTC`, `ETH` and `USDTTRC`; an empty list accepts all four. Coins are rejected on every other payment method, and a coin cannot be a company or plan currency. Each payment creates a FixedFloat order into that coin whose BTC destination is a fresh address from the company's `onchain` config, so an enabled `onchain` payment method is required as well. The BTC that arrives is settled by the on-chain watcher at the rate current on arrival. The response hides `api_key` and `api_secret` and returns `has_api_key` and `has_api_secret`. `afftax` is only sent together with `refcode`.
+- `fixedfloat` - Cryptocurrency payments through the FixedFloat exchange API (payment method `fixedfloat`). The customer picks a coin per payment (`coin` query parameter). The coins a company accepts are the config's `supported_currencies`, which for `fixedfloat` must be coins from `XMR`, `LTC`, `ETH` and `USDTTRC`; an empty list accepts all four. Coins are rejected on every other payment method, and a coin cannot be a company or plan currency. Each payment creates a FixedFloat order into that coin whose BTC destination is a fresh address from the company's `onchain` config, so an enabled `onchain` payment method is required as well: creating or enabling a `fixedfloat` config is rejected without one. Changes to the config apply to new payments without a restart. The BTC that arrives is settled by the on-chain watcher at the rate current on arrival. The response hides `api_key` and `api_secret` and returns `has_api_key` and `has_api_secret`. `afftax` is only sent together with `refcode`.
 
 **Multiple Configurations:**
 A company can have multiple payment method configurations for the same payment method type. This allows keeping disabled
