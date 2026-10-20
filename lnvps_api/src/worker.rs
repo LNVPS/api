@@ -486,10 +486,9 @@ impl Worker {
                 // A credit balance the user opted into is also a renewable
                 // method, so it counts even when no saved method exists.
                 let has_credit = self
-                    .db
-                    .get_account_credit(sub.user_id)
+                    .subscription_handler
+                    .credit_covers_renewal(sub.id)
                     .await
-                    .map(|c| c.auto_apply && c.balance > 0)
                     .unwrap_or(false);
                 if (has_method || has_credit) && !is_final_reminder {
                     // It will renew itself before it expires; an "expiring soon"
@@ -7079,6 +7078,36 @@ mod tests {
             notes, 0,
             "a freshly-renewed 1-day sub must not be 'expiring soon' (double-charge bug)"
         );
+        Ok(())
+    }
+
+    /// A credit balance too small to renew is not a renewal method: the user
+    /// still gets the early "expires in" reminders.
+    #[tokio::test]
+    async fn test_leftover_credit_does_not_suppress_expiry_reminders() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        let sub = {
+            let mut subs = db.subscriptions.lock().await;
+            let s = subs.get_mut(&subscription_id).unwrap();
+            s.auto_renewal_enabled = true;
+            s.expires = Some(
+                Utc::now()
+                    .add(TimeDelta::days(7))
+                    .sub(TimeDelta::minutes(1)),
+            );
+            s.clone()
+        };
+        db.adjust_account_credit(sub.user_id, 1_000, "topup", None)
+            .await?;
+        db.set_account_credit_auto_apply(sub.user_id, true).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .handle_subscription_state(&sub, Utc::now().sub(TimeDelta::minutes(5)))
+            .await?;
+
+        assert_eq!(count_notifications(&worker, "Expires in 7 days").await, 1);
         Ok(())
     }
 

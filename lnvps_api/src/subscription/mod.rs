@@ -2089,34 +2089,41 @@ impl SubscriptionHandler {
             .ok_or_else(|| anyhow::anyhow!("No NWC payment method configured"))
     }
 
+    pub async fn credit_covers_renewal(&self, sub_id: u64) -> Result<bool> {
+        let sub = self.db.get_subscription(sub_id).await?;
+        let credit = self.db.get_account_credit(sub.user_id).await?;
+        if !credit.auto_apply || credit.balance == 0 {
+            return Ok(false);
+        }
+        let quote = self
+            .quote_renewal(sub_id, PaymentMethod::Lightning, 1, None)
+            .await?;
+        Ok(credit_covers(
+            quote.credit.as_ref(),
+            quote.amount,
+            quote.tax,
+        ))
+    }
+
     /// Attempt automatic renewal using the user's default saved payment method,
     /// dispatching by provider (NWC Lightning wallet or Revolut card).
     pub async fn auto_renew(&self, sub_id: u64) -> Result<SubscriptionPayment> {
         let sub = self.db.get_subscription(sub_id).await?;
 
         let credit = self.db.get_account_credit(sub.user_id).await?;
-        if credit.auto_apply && credit.balance > 0 {
-            let quote = self
-                .quote_renewal(sub_id, PaymentMethod::Lightning, 1, None)
+        if self.credit_covers_renewal(sub_id).await? {
+            let payment = self
+                .renew_subscription_inner(
+                    sub_id,
+                    PaymentMethod::Lightning,
+                    1,
+                    RenewMode::default(),
+                    None,
+                    RenewalSource::Auto,
+                )
                 .await?;
-            let covered = quote
-                .credit
-                .as_ref()
-                .is_some_and(|c| c.amount >= quote.amount + quote.tax);
-            if covered {
-                let payment = self
-                    .renew_subscription_inner(
-                        sub_id,
-                        PaymentMethod::Lightning,
-                        1,
-                        RenewMode::default(),
-                        None,
-                        RenewalSource::Auto,
-                    )
-                    .await?;
-                info!("Subscription {sub_id} renewed on account credit");
-                return Ok(payment);
-            }
+            info!("Subscription {sub_id} renewed on account credit");
+            return Ok(payment);
         }
 
         let method = match self.default_payment_method(sub.user_id).await {
@@ -4509,5 +4516,22 @@ mod credit_tests {
             err.to_string().contains("No usable saved payment method"),
             "unexpected error: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn credit_covers_renewal_only_when_it_pays_the_whole_bill() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        assert!(!sub.credit_covers_renewal(sub_id).await.unwrap());
+
+        give_credit(&db, user_id, 4_000_000, true).await;
+        assert!(!sub.credit_covers_renewal(sub_id).await.unwrap());
+
+        give_credit(&db, user_id, 6_000_000, false).await;
+        assert!(!sub.credit_covers_renewal(sub_id).await.unwrap());
+
+        db.set_account_credit_auto_apply(user_id, true)
+            .await
+            .unwrap();
+        assert!(sub.credit_covers_renewal(sub_id).await.unwrap());
     }
 }
