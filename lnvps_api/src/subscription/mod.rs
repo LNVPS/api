@@ -359,6 +359,51 @@ impl SubscriptionHandler {
         .await
     }
 
+    pub async fn new_credit_topup_address(
+        &self,
+        amount_msat: u64,
+        label: String,
+    ) -> Result<String> {
+        let enabled = self
+            .db
+            .list_payment_method_configs()
+            .await?
+            .iter()
+            .any(|c| c.enabled && c.payment_method == PaymentMethod::OnChain);
+        ensure!(enabled, "On-chain payments are not enabled");
+        self.new_onchain_address(amount_msat, "LNVPS credit top-up".to_string(), label)
+            .await
+    }
+
+    pub async fn new_credit_topup_swap(
+        &self,
+        coin: Currency,
+        amount_msat: u64,
+        label: String,
+    ) -> Result<SwapOrder> {
+        let company_id = self
+            .db
+            .list_payment_method_configs()
+            .await?
+            .iter()
+            .find(|c| {
+                c.enabled
+                    && c.payment_method == PaymentMethod::FixedFloat
+                    && fixedfloat_coin_accepted(c, coin)
+            })
+            .map(|c| c.company_id)
+            .context("FixedFloat payments are not enabled for this coin")?;
+        self.new_fixedfloat_swap(
+            company_id,
+            &RenewMode::FixedFloat { coin },
+            Currency::BTC,
+            amount_msat,
+            "LNVPS credit top-up".to_string(),
+            label,
+        )
+        .await
+    }
+
     #[cfg(test)]
     pub(crate) fn set_revolut_for_test(&mut self, r: Arc<dyn FiatPaymentService>) {
         self.revolut = Some(r);

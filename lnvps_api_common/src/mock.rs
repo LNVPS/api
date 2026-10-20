@@ -4577,6 +4577,43 @@ impl LNVpsDbBase for MockDb {
             .cloned())
     }
 
+    async fn get_account_credit_topup_by_ext_id(
+        &self,
+        external_id: &str,
+    ) -> DbResult<Option<lnvps_db::AccountCreditTopup>> {
+        let topups = self.account_credit_topups.lock().await;
+        Ok(topups
+            .iter()
+            .find(|t| t.external_id.as_deref() == Some(external_id))
+            .cloned())
+    }
+
+    async fn list_account_credit_topups_by_method(
+        &self,
+        method: PaymentMethod,
+    ) -> DbResult<Vec<lnvps_db::AccountCreditTopup>> {
+        let topups = self.account_credit_topups.lock().await;
+        Ok(topups
+            .iter()
+            .filter(|t| t.payment_method == method)
+            .cloned()
+            .collect())
+    }
+
+    async fn set_account_credit_topup_deposit(
+        &self,
+        id: u64,
+        external_id: &str,
+        amount: u64,
+    ) -> DbResult<()> {
+        let mut topups = self.account_credit_topups.lock().await;
+        if let Some(t) = topups.iter_mut().find(|t| t.id == id && !t.is_paid) {
+            t.external_id = Some(external_id.to_string());
+            t.amount = amount;
+        }
+        Ok(())
+    }
+
     async fn settle_account_credit_topup(
         &self,
         id: u64,

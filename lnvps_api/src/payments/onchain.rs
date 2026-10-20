@@ -44,7 +44,9 @@ use anyhow::{Result, bail};
 use chrono::Utc;
 use futures::StreamExt;
 use lnvps_api_common::{CostResult, WorkJob};
-use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment, SubscriptionPaymentType};
+use lnvps_db::{
+    AccountCreditTopup, LNVpsDb, PaymentMethod, SubscriptionPayment, SubscriptionPaymentType,
+};
 use log::{debug, error, info, warn};
 use payments_rs::currency::CurrencyAmount;
 use payments_rs::onchain::{ChainPaymentUpdate, OnChainProvider};
@@ -72,6 +74,16 @@ fn receive_address(payment: &SubscriptionPayment) -> Option<String> {
     match payment.payment_method {
         PaymentMethod::OnChain => Some(payment.external_data.as_str().to_string()),
         PaymentMethod::FixedFloat => SwapData::parse(payment.external_data.as_str())
+            .ok()
+            .map(|d| d.receive_address),
+        _ => None,
+    }
+}
+
+fn topup_receive_address(topup: &AccountCreditTopup) -> Option<String> {
+    match topup.payment_method {
+        PaymentMethod::OnChain => Some(topup.external_data.clone()),
+        PaymentMethod::FixedFloat => SwapData::parse(&topup.external_data)
             .ok()
             .map(|d| d.receive_address),
         _ => None,
@@ -106,6 +118,101 @@ impl OnChainPaymentHandler {
             .filter(|d| d.settled)
             .map(|d| d.payment_amount)
             .unwrap_or(0))
+    }
+
+    async fn topup_for_address(&self, address: &str) -> Result<Option<AccountCreditTopup>> {
+        let mut topups = self
+            .db
+            .list_account_credit_topups_by_method(PaymentMethod::OnChain)
+            .await?;
+        topups.extend(
+            self.db
+                .list_account_credit_topups_by_method(PaymentMethod::FixedFloat)
+                .await?,
+        );
+        Ok(topups
+            .into_iter()
+            .filter(|t| topup_receive_address(t).as_deref() == Some(address))
+            .max_by_key(|t| t.created))
+    }
+
+    async fn handle_topup_detected(
+        &self,
+        address: &str,
+        key: &str,
+        amount_msat: u64,
+    ) -> Result<bool> {
+        if self
+            .db
+            .get_account_credit_topup_by_ext_id(key)
+            .await?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        let Some(topup) = self.topup_for_address(address).await? else {
+            return Ok(false);
+        };
+        if !topup.is_paid && topup.external_id.is_none() {
+            self.db
+                .set_account_credit_topup_deposit(topup.id, key, amount_msat)
+                .await?;
+        }
+        Ok(true)
+    }
+
+    async fn handle_topup_deposit(
+        &self,
+        address: &str,
+        key: &str,
+        amount_msat: u64,
+    ) -> Result<bool> {
+        let topup = match self.db.get_account_credit_topup_by_ext_id(key).await? {
+            Some(t) => t,
+            None => {
+                let Some(found) = self.topup_for_address(address).await? else {
+                    return Ok(false);
+                };
+                if found.is_paid {
+                    if found.payment_method != PaymentMethod::OnChain {
+                        debug!("Deposit {} to settled swap address, ignoring", key);
+                        return Ok(true);
+                    }
+                    let id = self
+                        .db
+                        .insert_account_credit_topup(&AccountCreditTopup {
+                            invoice_hash: rand::random::<[u8; 32]>().to_vec(),
+                            external_id: Some(key.to_string()),
+                            amount: amount_msat,
+                            ..found
+                        })
+                        .await?;
+                    self.settle_topup(id).await?;
+                    return Ok(true);
+                }
+                found
+            }
+        };
+        if topup.is_paid {
+            debug!("Skipping already processed deposit {}", key);
+            return Ok(true);
+        }
+        self.db
+            .set_account_credit_topup_deposit(topup.id, key, amount_msat)
+            .await?;
+        self.settle_topup(topup.id).await?;
+        Ok(true)
+    }
+
+    async fn settle_topup(&self, id: u64) -> Result<()> {
+        match self.db.settle_account_credit_topup(id).await? {
+            Some(t) => info!(
+                "Credit top-up {} settled on chain: +{} msat to user {}",
+                t.id, t.amount, t.user_id
+            ),
+            None => info!("Credit top-up {} already settled", id),
+        }
+        Ok(())
     }
 
     async fn payment_for_address(&self, address: &str) -> Result<Option<SubscriptionPayment>> {
@@ -192,6 +299,12 @@ impl OnChainPaymentHandler {
         amount_msat: u64,
     ) -> Result<()> {
         let key = deposit_key(txid, vout);
+        if self
+            .handle_topup_detected(address, &key, amount_msat)
+            .await?
+        {
+            return Ok(());
+        }
         // Already priced or settled (replayed event)
         if self
             .db
@@ -299,6 +412,12 @@ impl OnChainPaymentHandler {
         // deposit was already handled. An *unpaid* match is the pending
         // payment priced at Detected.
         let key = deposit_key(txid, vout);
+        if self
+            .handle_topup_deposit(address, &key, amount_msat)
+            .await?
+        {
+            return Ok(());
+        }
         let priced = match self.db.get_subscription_payment_by_ext_id(&key).await {
             Ok(p) if p.is_paid => {
                 debug!("Skipping already processed deposit {}", key);
@@ -1276,6 +1395,115 @@ mod tests {
         assert_eq!(db.subscription_payments.lock().await.len(), 1);
         assert_eq!(first.time_value, again.time_value);
         assert_eq!(first.external_id, again.external_id);
+        Ok(())
+    }
+
+    const TOPUP_ADDRESS: &str = "bcrt1qtopup0";
+
+    async fn add_topup(
+        db: &MockDb,
+        user_id: u64,
+        method: PaymentMethod,
+        data: String,
+    ) -> Result<u64> {
+        db.insert_account_credit_topup(&AccountCreditTopup {
+            user_id,
+            amount: 50_000,
+            currency: "BTC".to_string(),
+            payment_method: method,
+            invoice_hash: vec![5u8; 32],
+            external_data: data,
+            ..Default::default()
+        })
+        .await
+        .map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn test_onchain_topup_credits_balance_once() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        add_topup(
+            &db,
+            payment.user_id,
+            PaymentMethod::OnChain,
+            TOPUP_ADDRESS.into(),
+        )
+        .await?;
+
+        handler
+            .handle_detected(TOPUP_ADDRESS, "tx9", 0, 70_000)
+            .await?;
+        assert_eq!(db.get_account_credit(payment.user_id).await?.balance, 0);
+        handler
+            .handle_deposit(TOPUP_ADDRESS, "tx9", 0, 70_000)
+            .await?;
+        handler
+            .handle_deposit(TOPUP_ADDRESS, "tx9", 0, 70_000)
+            .await?;
+
+        assert_eq!(
+            db.get_account_credit(payment.user_id).await?.balance,
+            70_000
+        );
+        assert!(!get_payment(&db, &payment.id).await.is_paid);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_onchain_topup_address_reuse_credits_again() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        add_topup(
+            &db,
+            payment.user_id,
+            PaymentMethod::OnChain,
+            TOPUP_ADDRESS.into(),
+        )
+        .await?;
+
+        handler
+            .handle_deposit(TOPUP_ADDRESS, "tx1", 0, 40_000)
+            .await?;
+        handler
+            .handle_deposit(TOPUP_ADDRESS, "tx2", 1, 60_000)
+            .await?;
+
+        assert_eq!(
+            db.get_account_credit(payment.user_id).await?.balance,
+            100_000
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fixedfloat_topup_credits_balance() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        let swap = SwapData {
+            coin: "XMR".to_string(),
+            order_id: "ABC".to_string(),
+            order_token: "tok".to_string(),
+            deposit_address: "4Axmr".to_string(),
+            deposit_amount: "1.5".to_string(),
+            receive_address: TOPUP_ADDRESS.to_string(),
+        };
+        add_topup(
+            &db,
+            payment.user_id,
+            PaymentMethod::FixedFloat,
+            swap.to_json()?,
+        )
+        .await?;
+
+        handler
+            .handle_deposit(TOPUP_ADDRESS, "tx3", 0, 48_000)
+            .await?;
+        handler
+            .handle_deposit(TOPUP_ADDRESS, "tx4", 0, 9_000)
+            .await?;
+
+        assert_eq!(
+            db.get_account_credit(payment.user_id).await?.balance,
+            48_000
+        );
         Ok(())
     }
 }

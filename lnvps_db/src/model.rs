@@ -1958,10 +1958,15 @@ pub struct AccountCreditTopup {
     /// Minor units of `currency` (msat for BTC) the customer paid.
     pub amount: u64,
     pub currency: String,
-    /// BOLT11 payment hash of the top-up invoice.
+    pub payment_method: PaymentMethod,
+    /// BOLT11 payment hash of a Lightning top-up. Random for on-chain and
+    /// FixedFloat top-ups, which have no invoice.
     pub invoice_hash: Vec<u8>,
-    /// The BOLT11 invoice string, for display and re-issuance.
+    /// The BOLT11 invoice (Lightning), the receive address (on-chain) or the
+    /// swap order JSON (FixedFloat).
     pub external_data: String,
+    /// Outpoint (`{txid}:{vout}`) of the deposit once seen on chain.
+    pub external_id: Option<String>,
     pub is_paid: bool,
     pub paid_at: Option<DateTime<Utc>>,
     pub created: DateTime<Utc>,

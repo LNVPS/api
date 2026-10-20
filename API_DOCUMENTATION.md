@@ -824,22 +824,40 @@ the payment currency of whatever you buy at the current rate.
 #### Top Up
 - **POST** `/api/v1/account/credit/topup`
 - **Auth**: Required
-- **Body**: `{ "amount": 10000000 }` (msat, rounded up to a whole sat; minimum 1000)
-- **Notes**: Issues a Lightning invoice. Pay it with any wallet; on settlement
-  the balance rises by the amount paid. A top-up is not tied to any
-  subscription and never appears on a VM's payment history.
+- **Body**: `{ "amount": 10000000, "method": "lightning", "coin": "XMR" }`
+  (`amount` in msat, rounded up to a whole sat, minimum 1000). `method` is
+  `lightning` (default), `onchain` or `fixedfloat`; `coin` is required for
+  `fixedfloat` and is one of that method's `currencies`.
+- **Notes**: `lightning` issues an invoice. `onchain` issues a Bitcoin receive
+  address and `fixedfloat` a swap deposit address, both in `data` in the same
+  shape as a payment's `data`. On-chain and swap top-ups credit whatever
+  actually arrives, at any amount, once the deposit confirms; `amount` is only
+  the quote and the address stays valid for later deposits. A top-up is not tied
+  to any subscription and never appears on a VM's payment history.
 - **Response**:
 ```json
 {
   "data": {
     "pr": "lnbc...",
     "payment_hash": "...",
+    "method": "lightning",
+    "data": { "lightning": "lnbc..." },
     "amount": 10000000,
     "currency": "BTC",
+    "is_paid": false,
     "expires": "2026-10-15T12:10:00Z"
   }
 }
 ```
+`pr` is present only for `lightning`. `data` is `{ "onchain": { "address",
+"outpoint" } }` or `{ "fixedfloat": { "coin", "address", "amount", "outpoint" } }`
+for the other methods; `outpoint` appears once the deposit is seen in the mempool.
+
+#### Top-Up Status
+- **GET** `/api/v1/account/credit/topup/{payment_hash}`
+- **Auth**: Required
+- **Response**: the top-up object above with the current `is_paid` and, for
+  on-chain and swap top-ups, the received `amount` once a deposit is seen.
 
 #### Credit Ledger
 - **GET** `/api/v1/account/credit/events?limit=50&offset=0`

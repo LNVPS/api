@@ -1482,6 +1482,26 @@ pub trait LNVpsDbBase: Send + Sync {
         invoice_hash: &Vec<u8>,
     ) -> DbResult<Option<AccountCreditTopup>>;
 
+    async fn get_account_credit_topup_by_ext_id(
+        &self,
+        external_id: &str,
+    ) -> DbResult<Option<AccountCreditTopup>>;
+
+    async fn list_account_credit_topups_by_method(
+        &self,
+        method: PaymentMethod,
+    ) -> DbResult<Vec<AccountCreditTopup>>;
+
+    /// Record the deposit that pays an unpaid on-chain or FixedFloat top-up:
+    /// its outpoint and the msat actually received, which replaces the amount
+    /// the customer asked for. No-op once the top-up is paid.
+    async fn set_account_credit_topup_deposit(
+        &self,
+        id: u64,
+        external_id: &str,
+        amount: u64,
+    ) -> DbResult<()>;
+
     /// Mark a top-up paid and credit the balance. Idempotent.
     async fn settle_account_credit_topup(&self, id: u64) -> DbResult<Option<AccountCreditTopup>>;
 

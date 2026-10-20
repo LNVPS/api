@@ -5031,14 +5031,17 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn insert_account_credit_topup(&self, topup: &AccountCreditTopup) -> DbResult<u64> {
         let res = sqlx::query(
             "INSERT INTO account_credit_topup \
-             (user_id, amount, currency, invoice_hash, external_data, is_paid) \
-             VALUES (?, ?, ?, ?, ?, 0) RETURNING id",
+             (user_id, amount, currency, payment_method, invoice_hash, external_data, \
+              external_id, is_paid) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0) RETURNING id",
         )
         .bind(topup.user_id)
         .bind(topup.amount)
         .bind(&topup.currency)
+        .bind(topup.payment_method)
         .bind(&topup.invoice_hash)
         .bind(&topup.external_data)
+        .bind(&topup.external_id)
         .fetch_one(&self.db)
         .await?;
         Ok(res.try_get(0)?)
@@ -5054,6 +5057,48 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_optional(&self.db)
                 .await?,
         )
+    }
+
+    async fn get_account_credit_topup_by_ext_id(
+        &self,
+        external_id: &str,
+    ) -> DbResult<Option<AccountCreditTopup>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM account_credit_topup WHERE external_id = ?")
+                .bind(external_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn list_account_credit_topups_by_method(
+        &self,
+        method: PaymentMethod,
+    ) -> DbResult<Vec<AccountCreditTopup>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM account_credit_topup WHERE payment_method = ?")
+                .bind(method)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn set_account_credit_topup_deposit(
+        &self,
+        id: u64,
+        external_id: &str,
+        amount: u64,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE account_credit_topup SET external_id = ?, amount = ? \
+             WHERE id = ? AND is_paid = 0",
+        )
+        .bind(external_id)
+        .bind(amount)
+        .bind(id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
     }
 
     async fn settle_account_credit_topup(&self, id: u64) -> DbResult<Option<AccountCreditTopup>> {

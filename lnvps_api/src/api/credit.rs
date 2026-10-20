@@ -8,7 +8,7 @@
 //! that settles subscription payments. When the invoice settles the user's
 //! `account_credit.balance` increases and a `topup` ledger event is written.
 
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use payments_rs::lightning::AddInvoiceRequest;
@@ -18,9 +18,11 @@ use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, Nip98Auth, PageQuery,
     round_msat_to_sat,
 };
-use lnvps_db::{AccountCredit, AccountCreditEvent, AccountCreditTopup};
+use lnvps_db::{AccountCredit, AccountCreditEvent, AccountCreditTopup, PaymentMethod};
 
-use crate::api::RouterState;
+use crate::api::model::ApiPaymentData;
+use crate::api::{RouterState, parse_fixedfloat_coin};
+use crate::swap::SwapData;
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -29,6 +31,10 @@ pub fn router() -> Router<RouterState> {
             get(v1_get_credit).patch(v1_patch_credit),
         )
         .route("/api/v1/account/credit/topup", post(v1_topup_credit))
+        .route(
+            "/api/v1/account/credit/topup/{payment_hash}",
+            get(v1_get_topup),
+        )
         .route("/api/v1/account/credit/events", get(v1_list_credit_events))
 }
 
@@ -80,25 +86,76 @@ impl From<AccountCreditEvent> for ApiAccountCreditEvent {
     }
 }
 
-/// The top-up response: a Lightning invoice the customer pays to increase
-/// their balance.
+/// The top-up response: what the customer pays to increase their balance.
 #[derive(Serialize)]
 pub struct ApiCreditTopup {
-    /// BOLT11 payment request to pay.
-    pub pr: String,
-    /// The top-up's payment hash, for reference and later status lookups.
+    /// BOLT11 payment request to pay. Only set for Lightning top-ups.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr: Option<String>,
+    /// The top-up's reference, for later status lookups.
     pub payment_hash: String,
-    /// Msat the invoice is for.
+    /// `lightning`, `onchain` or `fixedfloat`.
+    pub method: String,
+    /// What to pay: an invoice, a receive address or a swap deposit.
+    pub data: ApiPaymentData,
+    /// Msat requested, or received once a deposit is seen.
     pub amount: u64,
     pub currency: String,
-    /// ISO-8601 time the invoice expires.
+    pub is_paid: bool,
+    /// ISO-8601 time the quote expires.
     pub expires: chrono::DateTime<chrono::Utc>,
+}
+
+impl ApiCreditTopup {
+    fn from_topup(t: &AccountCreditTopup, expires: chrono::DateTime<chrono::Utc>) -> Self {
+        let (method, data, pr) = match t.payment_method {
+            PaymentMethod::OnChain => (
+                "onchain",
+                ApiPaymentData::OnChain {
+                    address: t.external_data.clone(),
+                    outpoint: t.external_id.clone(),
+                },
+                None,
+            ),
+            PaymentMethod::FixedFloat => (
+                "fixedfloat",
+                SwapData::parse(&t.external_data)
+                    .map(|d| ApiPaymentData::FixedFloat {
+                        coin: d.coin,
+                        address: d.deposit_address,
+                        amount: d.deposit_amount,
+                        outpoint: t.external_id.clone(),
+                    })
+                    .unwrap_or(ApiPaymentData::Lightning(String::new())),
+                None,
+            ),
+            _ => (
+                "lightning",
+                ApiPaymentData::Lightning(t.external_data.clone()),
+                Some(t.external_data.clone()),
+            ),
+        };
+        Self {
+            pr,
+            payment_hash: hex::encode(&t.invoice_hash),
+            method: method.to_string(),
+            data,
+            amount: t.amount,
+            currency: t.currency.clone(),
+            is_paid: t.is_paid,
+            expires,
+        }
+    }
 }
 
 #[derive(Deserialize)]
 struct TopupRequest {
     /// Msat to top up, rounded up to a whole sat.
     amount: u64,
+    /// `lightning` (default), `onchain` or `fixedfloat`.
+    method: Option<String>,
+    /// For `fixedfloat`: the coin to pay with, e.g. `XMR`.
+    coin: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -106,7 +163,10 @@ struct PatchCreditRequest {
     auto_apply: bool,
 }
 
-/// Top up the account credit balance with a Lightning invoice.
+const LIGHTNING_TOPUP_EXPIRE: i64 = 600;
+const ONCHAIN_TOPUP_EXPIRE: i64 = 3600;
+
+/// Top up the account credit balance by Lightning, on-chain or a FixedFloat swap.
 async fn v1_topup_credit(
     auth: Nip98Auth,
     State(this): State<RouterState>,
@@ -130,37 +190,96 @@ async fn v1_topup_credit(
         credit.currency
     };
 
-    let invoice = this
-        .sub_handler
-        .node()
-        .add_invoice(AddInvoiceRequest {
-            memo: Some("LNVPS credit top-up".to_string()),
-            amount,
-            expire: Some(600),
-        })
-        .await
-        .map_err(|e| ApiError::new(format!("Failed to create invoice: {e}")))?;
-
-    let hash = hex::decode(invoice.payment_hash())
-        .map_err(|e| ApiError::new(format!("Failed to decode payment hash: {e}")))?;
-
-    let topup = AccountCreditTopup {
+    let method = req.method.as_deref().unwrap_or("lightning");
+    let mut topup = AccountCreditTopup {
         user_id: uid,
         amount,
-        currency: currency.clone(),
-        invoice_hash: hash.clone(),
-        external_data: invoice.pr(),
+        currency,
         ..Default::default()
     };
-    this.db.insert_account_credit_topup(&topup).await?;
+    let expire;
+    match method {
+        "lightning" => {
+            expire = LIGHTNING_TOPUP_EXPIRE;
+            let invoice = this
+                .sub_handler
+                .node()
+                .add_invoice(AddInvoiceRequest {
+                    memo: Some("LNVPS credit top-up".to_string()),
+                    amount,
+                    expire: Some(LIGHTNING_TOPUP_EXPIRE as u32),
+                })
+                .await
+                .map_err(|e| ApiError::new(format!("Failed to create invoice: {e}")))?;
+            topup.payment_method = PaymentMethod::Lightning;
+            topup.invoice_hash = hex::decode(invoice.payment_hash())
+                .map_err(|e| ApiError::new(format!("Failed to decode payment hash: {e}")))?;
+            topup.external_data = invoice.pr();
+        }
+        "onchain" => {
+            expire = ONCHAIN_TOPUP_EXPIRE;
+            let reference: [u8; 32] = rand::random();
+            topup.payment_method = PaymentMethod::OnChain;
+            topup.invoice_hash = reference.to_vec();
+            topup.external_data = this
+                .sub_handler
+                .new_credit_topup_address(amount, hex::encode(reference))
+                .await
+                .map_err(|e| ApiError::new(e.to_string()))?;
+        }
+        "fixedfloat" => {
+            let coin = parse_fixedfloat_coin(req.coin.as_deref())?;
+            let reference: [u8; 32] = rand::random();
+            let order = this
+                .sub_handler
+                .new_credit_topup_swap(coin, amount, hex::encode(reference))
+                .await
+                .map_err(|e| ApiError::new(e.to_string()))?;
+            expire = (order.expires - chrono::Utc::now()).num_seconds().max(0);
+            topup.payment_method = PaymentMethod::FixedFloat;
+            topup.invoice_hash = reference.to_vec();
+            topup.external_data = order
+                .data
+                .to_json()
+                .map_err(|e| ApiError::new(e.to_string()))?;
+        }
+        other => return ApiData::err(&format!("Unsupported top-up method: {other}")),
+    }
+    topup.id = this.db.insert_account_credit_topup(&topup).await?;
 
-    ApiData::ok(ApiCreditTopup {
-        pr: invoice.pr(),
-        payment_hash: hex::encode(&hash),
-        amount,
-        currency,
-        expires: chrono::Utc::now() + chrono::Duration::seconds(600),
-    })
+    ApiData::ok(ApiCreditTopup::from_topup(
+        &topup,
+        chrono::Utc::now() + chrono::Duration::seconds(expire),
+    ))
+}
+
+/// Status of one of the customer's top-ups, for polling.
+async fn v1_get_topup(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(payment_hash): Path<String>,
+) -> ApiResult<ApiCreditTopup> {
+    let pubkey = auth.pubkey();
+    let uid = this.db.upsert_user(&pubkey).await?;
+    let Ok(hash) = hex::decode(&payment_hash) else {
+        return ApiData::err("Invalid payment hash");
+    };
+    let Some(topup) = this
+        .db
+        .get_account_credit_topup_by_hash(&hash)
+        .await?
+        .filter(|t| t.user_id == uid)
+    else {
+        return ApiData::err("Top-up not found");
+    };
+    let window = match topup.payment_method {
+        PaymentMethod::Lightning => LIGHTNING_TOPUP_EXPIRE,
+        _ => ONCHAIN_TOPUP_EXPIRE,
+    };
+    ApiData::ok(ApiCreditTopup::from_topup(
+        &topup,
+        topup.created + chrono::Duration::seconds(window),
+    ))
 }
 
 /// The customer's current balance and opt-in flag.
