@@ -34,6 +34,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::swap::{SwapOrder, SwapOrderRequest, SwapProvider};
+
 mod app;
 mod ip_range;
 mod marketplace_node_fee;
@@ -207,6 +209,7 @@ pub struct SubscriptionHandler {
     node: Arc<dyn LightningNode>,
     onchain: Arc<dyn OnChainProvider>,
     revolut: Option<Arc<dyn FiatPaymentService>>,
+    swap: Option<Arc<dyn SwapProvider>>,
 
     pe: PricingEngine,
     vm_provisioner: VmProvisioner,
@@ -235,6 +238,7 @@ impl SubscriptionHandler {
         let max_prepay_days = settings.max_prepay_days;
         Ok(Self {
             revolut,
+            swap: None,
             pe: PricingEngine::new(db.clone(), rates, vat),
             vm_provisioner: VmProvisioner::new(settings, db.clone()),
             ip_range_provisioner: IpRangeProvisioner::new(db.clone(), tx.clone()),
@@ -246,6 +250,11 @@ impl SubscriptionHandler {
             saved_payment_settle_timeout: SAVED_PAYMENT_SETTLE_TIMEOUT,
             max_prepay_days,
         })
+    }
+
+    pub fn with_swap(mut self, swap: Option<Arc<dyn SwapProvider>>) -> Self {
+        self.swap = swap;
+        self
     }
 
     pub fn work_commander(&self) -> Arc<dyn WorkCommander> {
@@ -286,6 +295,29 @@ impl SubscriptionHandler {
             })
             .await?;
         Ok(resp.address)
+    }
+
+    async fn new_monero_swap(
+        &self,
+        currency: Currency,
+        amount_msat: u64,
+        memo: String,
+        label: String,
+    ) -> Result<SwapOrder> {
+        ensure!(
+            currency == Currency::BTC,
+            "Cannot create Monero payments for non-BTC currency"
+        );
+        let swap = self
+            .swap
+            .clone()
+            .context("Monero payments are not configured")?;
+        let receive_address = self.new_onchain_address(amount_msat, memo, label).await?;
+        swap.create_order(SwapOrderRequest {
+            receive_sats: amount_msat / 1000,
+            receive_address,
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -1460,6 +1492,65 @@ impl SubscriptionHandler {
                     refunded_payment_id: None,
                 }
             }
+            PaymentMethod::Monero => {
+                let desc = match payment_type {
+                    SubscriptionPaymentType::Purchase => {
+                        format!("Subscription purchase: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::Renewal => {
+                        format!("Subscription renewal: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::Upgrade => {
+                        format!("Subscription upgrade: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::Refund => {
+                        bail!("Cannot create an invoice for a refund")
+                    }
+                };
+                let receive_amount =
+                    round_msat_to_sat(converted_amount + tax + processing_fee - credit_covered);
+                let new_id: [u8; 32] = rand::random();
+                let order = self
+                    .new_monero_swap(
+                        converted_currency,
+                        receive_amount,
+                        desc,
+                        hex::encode(new_id),
+                    )
+                    .await?;
+
+                SubscriptionPayment {
+                    renewal_source: Some(source),
+                    id: new_id.to_vec(),
+                    subscription_id,
+                    user_id: subscription.user_id,
+                    created: Utc::now(),
+                    expires: order.expires,
+                    amount: converted_amount,
+                    currency: converted_currency.to_string(),
+                    payment_method: method,
+                    payment_type,
+                    external_data: order.data.to_json()?.into(),
+                    external_id: None,
+                    is_paid: false,
+                    rate,
+                    time_value: if time_value > 0 {
+                        Some(time_value)
+                    } else {
+                        None
+                    },
+                    metadata: None,
+                    tax,
+                    processing_fee,
+                    paid_at: None,
+                    tax_rate: tax_summary.rate,
+                    tax_country_code: tax_summary.country_code.clone(),
+                    tax_treatment: tax_summary.treatment.clone(),
+                    tax_evidence: tax_evidence.clone(),
+                    tax_breakdown: tax_breakdown.clone(),
+                    refunded_payment_id: None,
+                }
+            }
             PaymentMethod::Paypal => bail!("PayPal not implemented"),
             PaymentMethod::Stripe => bail!("Stripe not implemented"),
         })
@@ -2043,6 +2134,41 @@ impl SubscriptionHandler {
                     external_data: address.into(),
                     // txid is filled in by the chain watcher when the
                     // deposit is seen.
+                    external_id: None,
+                    is_paid: false,
+                    rate: p.rate.rate,
+                    time_value: Some(p.time_value),
+                    metadata,
+                    tax: p.tax,
+                    processing_fee: p.processing_fee,
+                    paid_at: None,
+                    tax_rate: tax_summary.rate,
+                    tax_country_code: tax_summary.country_code.clone(),
+                    tax_treatment: tax_summary.treatment.clone(),
+                    tax_evidence: tax_evidence.clone(),
+                    tax_breakdown: tax_breakdown.clone(),
+                    refunded_payment_id: None,
+                }
+            }
+            PaymentMethod::Monero => {
+                let receive_amount =
+                    round_msat_to_sat(p.amount + p.tax + p.processing_fee - credit_covered);
+                let new_id: [u8; 32] = rand::random();
+                let order = self
+                    .new_monero_swap(p.currency, receive_amount, desc, hex::encode(new_id))
+                    .await?;
+                SubscriptionPayment {
+                    renewal_source: Some(RenewalSource::Manual),
+                    id: new_id.to_vec(),
+                    subscription_id,
+                    user_id,
+                    created: Utc::now(),
+                    expires: order.expires,
+                    amount: p.amount,
+                    currency: p.currency.to_string(),
+                    payment_method: method,
+                    payment_type,
+                    external_data: order.data.to_json()?.into(),
                     external_id: None,
                     is_paid: false,
                     rate: p.rate.rate,
@@ -2923,6 +3049,129 @@ pub(crate) mod revolut_offline_tests {
         let addresses = onchain.addresses.lock().await;
         assert_eq!(addresses.len(), 1);
         assert_eq!(payment.external_data.as_str(), addresses[0]);
+    }
+
+    async fn monero_setup(
+        currency: &str,
+        with_swap: bool,
+    ) -> (
+        SubscriptionHandler,
+        Arc<MockOnChainProvider>,
+        Arc<crate::mocks::MockSwapProvider>,
+        u64,
+    ) {
+        let db = Arc::new(MockDb::default());
+        let onchain = Arc::new(MockOnChainProvider::default());
+        let swap = Arc::new(crate::mocks::MockSwapProvider::default());
+        let user_id = db.upsert_user(&[23u8; 32]).await.unwrap();
+        let (sub_id, _items) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "s".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: true,
+                    is_setup: true,
+                    currency: currency.to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: LineItemType::IpRange,
+                    name: "hosting".to_string(),
+                    description: None,
+                    amount: 100_000,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let rates = Arc::new(MockExchangeRate::default());
+        rates
+            .set_rate(
+                lnvps_api_common::Ticker::btc_rate("EUR").unwrap(),
+                100_000.0,
+            )
+            .await;
+        let handler = SubscriptionHandler::new(
+            mock_settings(),
+            db,
+            Arc::new(MockNode::default()),
+            onchain.clone(),
+            None,
+            rates,
+            VatClient::new(),
+            Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
+        )
+        .unwrap()
+        .with_swap(if with_swap {
+            Some(swap.clone() as Arc<dyn SwapProvider>)
+        } else {
+            None
+        });
+        (handler, onchain, swap, sub_id)
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_monero_creates_swap_to_onchain_address() {
+        let (sub, onchain, swap, sub_id) = monero_setup("BTC", true).await;
+
+        let payment = sub
+            .renew_subscription(sub_id, PaymentMethod::Monero, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(payment.payment_method, PaymentMethod::Monero);
+        assert!(!payment.is_paid);
+        assert_eq!(payment.external_id, None);
+        let data = crate::swap::MoneroSwapData::parse(payment.external_data.as_str()).unwrap();
+        let addresses = onchain.addresses.lock().await;
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(data.receive_address, addresses[0]);
+        assert_eq!(data.deposit_address, "4mockxmr00000000");
+        let requests = swap.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].receive_address, addresses[0]);
+        assert_eq!(
+            requests[0].receive_sats * 1000,
+            payment.amount + payment.tax + payment.processing_fee
+        );
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_monero_requires_swap_provider() {
+        let (sub, onchain, _swap, sub_id) = monero_setup("BTC", false).await;
+
+        assert!(
+            sub.renew_subscription(sub_id, PaymentMethod::Monero, 1)
+                .await
+                .is_err()
+        );
+        assert!(onchain.addresses.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_monero_for_fiat_subscription_is_btc() {
+        let (sub, _onchain, swap, sub_id) = monero_setup("EUR", true).await;
+
+        let payment = sub
+            .renew_subscription(sub_id, PaymentMethod::Monero, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(payment.currency, "BTC");
+        assert_eq!(swap.requests.lock().await.len(), 1);
     }
 
     #[tokio::test]

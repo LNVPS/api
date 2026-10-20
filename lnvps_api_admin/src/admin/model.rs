@@ -3469,6 +3469,7 @@ pub enum AdminPaymentMethod {
     Paypal,
     Stripe,
     OnChain,
+    Monero,
 }
 
 impl From<PaymentMethod> for AdminPaymentMethod {
@@ -3479,6 +3480,7 @@ impl From<PaymentMethod> for AdminPaymentMethod {
             PaymentMethod::Paypal => AdminPaymentMethod::Paypal,
             PaymentMethod::Stripe => AdminPaymentMethod::Stripe,
             PaymentMethod::OnChain => AdminPaymentMethod::OnChain,
+            PaymentMethod::Monero => AdminPaymentMethod::Monero,
         }
     }
 }
@@ -4521,6 +4523,7 @@ pub enum AdminPaymentMethodType {
     Paypal,
     Stripe,
     OnChain,
+    Monero,
 }
 
 impl From<lnvps_db::PaymentMethod> for AdminPaymentMethodType {
@@ -4531,6 +4534,7 @@ impl From<lnvps_db::PaymentMethod> for AdminPaymentMethodType {
             lnvps_db::PaymentMethod::Paypal => AdminPaymentMethodType::Paypal,
             lnvps_db::PaymentMethod::Stripe => AdminPaymentMethodType::Stripe,
             lnvps_db::PaymentMethod::OnChain => AdminPaymentMethodType::OnChain,
+            lnvps_db::PaymentMethod::Monero => AdminPaymentMethodType::Monero,
         }
     }
 }
@@ -4543,6 +4547,7 @@ impl From<AdminPaymentMethodType> for lnvps_db::PaymentMethod {
             AdminPaymentMethodType::Paypal => lnvps_db::PaymentMethod::Paypal,
             AdminPaymentMethodType::Stripe => lnvps_db::PaymentMethod::Stripe,
             AdminPaymentMethodType::OnChain => lnvps_db::PaymentMethod::OnChain,
+            AdminPaymentMethodType::Monero => lnvps_db::PaymentMethod::Monero,
         }
     }
 }
@@ -4566,6 +4571,16 @@ pub struct SanitizedOnChainConfig {
     pub address_type: String,
     pub account: Option<String>,
     pub min_confirmations: u32,
+}
+
+/// Sanitized FixedFloat config (hides api_key and api_secret)
+#[derive(Serialize)]
+pub struct SanitizedFixedFloatConfig {
+    pub url: Option<String>,
+    pub refcode: Option<String>,
+    pub afftax: Option<f32>,
+    pub has_api_key: bool,
+    pub has_api_secret: bool,
 }
 
 /// Sanitized Revolut config (hides token and webhook_secret)
@@ -4608,6 +4623,8 @@ pub enum SanitizedProviderConfig {
     Stripe(SanitizedStripeConfig),
     Paypal(SanitizedPaypalConfig),
     OnChain(SanitizedOnChainConfig),
+    #[serde(rename = "fixedfloat")]
+    FixedFloat(SanitizedFixedFloatConfig),
 }
 
 impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
@@ -4654,6 +4671,15 @@ impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
                     address_type: format!("{:?}", cfg.address_type),
                     account: cfg.account.clone(),
                     min_confirmations: cfg.min_confirmations,
+                })
+            }
+            lnvps_db::ProviderConfig::FixedFloat(cfg) => {
+                SanitizedProviderConfig::FixedFloat(SanitizedFixedFloatConfig {
+                    url: cfg.url.clone(),
+                    refcode: cfg.refcode.clone(),
+                    afftax: cfg.afftax,
+                    has_api_key: !cfg.api_key.is_empty(),
+                    has_api_secret: !cfg.api_secret.is_empty(),
                 })
             }
         }
@@ -4880,6 +4906,28 @@ pub struct PartialOnChainConfig {
     pub min_confirmations: Option<u32>,
 }
 
+/// Partial FixedFloat config for updates
+#[derive(Deserialize)]
+pub struct PartialFixedFloatConfig {
+    pub api_key: Option<String>,
+    pub api_secret: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub url: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub refcode: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub afftax: Option<Option<f32>>,
+}
+
 /// Partial provider configuration for updates - only provided fields will be updated
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -4890,6 +4938,8 @@ pub enum PartialProviderConfig {
     Paypal(PartialPaypalConfig),
     #[serde(rename = "onchain")]
     OnChain(PartialOnChainConfig),
+    #[serde(rename = "fixedfloat")]
+    FixedFloat(PartialFixedFloatConfig),
 }
 
 impl PartialProviderConfig {
@@ -4973,6 +5023,19 @@ impl PartialProviderConfig {
                         .unwrap_or(existing.min_confirmations),
                 }))
             }
+            (PartialProviderConfig::FixedFloat(partial), ProviderConfig::FixedFloat(existing)) => {
+                Ok(ProviderConfig::FixedFloat(
+                    lnvps_db::FixedFloatProviderConfig {
+                        api_key: partial.api_key.unwrap_or_else(|| existing.api_key.clone()),
+                        api_secret: partial
+                            .api_secret
+                            .unwrap_or_else(|| existing.api_secret.clone()),
+                        url: partial.url.unwrap_or_else(|| existing.url.clone()),
+                        refcode: partial.refcode.unwrap_or_else(|| existing.refcode.clone()),
+                        afftax: partial.afftax.unwrap_or(existing.afftax),
+                    },
+                ))
+            }
             _ => Err(anyhow!(
                 "Cannot change provider type during update. Create a new config instead."
             )),
@@ -4987,6 +5050,7 @@ impl PartialProviderConfig {
             PartialProviderConfig::Stripe(_) => "stripe",
             PartialProviderConfig::Paypal(_) => "paypal",
             PartialProviderConfig::OnChain(_) => "onchain",
+            PartialProviderConfig::FixedFloat(_) => "fixedfloat",
         }
     }
 }

@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Monero payments**: `monero` payment method. `PaymentData` gains `{ monero: { address, amount, outpoint? } }`, the XMR deposit address and amount of a swap into our Bitcoin wallet. Time is priced from the Bitcoin that arrives. Admins configure it with a `fixedfloat` provider config (`api_key`, `api_secret`, optional `url`, `refcode`, `afftax`) on `/api/admin/v1/payment_methods`, alongside the company's `onchain` config.
+
 ### Security
 
 - **Referral self-dealing**: a VM ordered with the buyer's own referral code no longer earns commission, including VMs already ordered that way, so commission already paid on them nets against future earnings. Commission is reduced by refunds against the referred VM's first payment, and automated payouts wait until that payment is `commission-hold-days` old (default 30). `GET /api/v1/referral/usage` rows gain `payable_after`. Affects `GET /api/v1/referral`, `GET /api/v1/referral/usage`, `GET /api/admin/v1/referrals/*` and the referral usage reports.

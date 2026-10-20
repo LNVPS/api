@@ -1994,6 +1994,7 @@ fn default_currencies_for_method(method: PaymentMethod) -> Vec<ApiCurrency> {
     match method {
         PaymentMethod::Lightning => vec![ApiCurrency::BTC],
         PaymentMethod::OnChain => vec![ApiCurrency::BTC],
+        PaymentMethod::Monero => vec![ApiCurrency::BTC],
         PaymentMethod::Revolut => vec![ApiCurrency::EUR, ApiCurrency::USD],
         PaymentMethod::Paypal => vec![ApiCurrency::EUR, ApiCurrency::USD],
         PaymentMethod::Stripe => vec![ApiCurrency::EUR, ApiCurrency::USD],
@@ -3107,7 +3108,8 @@ mod tests {
                 ApiPaymentMethod::Lightning
                 | ApiPaymentMethod::NWC
                 | ApiPaymentMethod::LNURL
-                | ApiPaymentMethod::OnChain => {
+                | ApiPaymentMethod::OnChain
+                | ApiPaymentMethod::Monero => {
                     assert_eq!(info.currencies, vec![ApiCurrency::BTC]);
                 }
                 ApiPaymentMethod::Revolut | ApiPaymentMethod::Paypal | ApiPaymentMethod::Stripe => {

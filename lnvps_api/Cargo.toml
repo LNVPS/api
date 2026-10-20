@@ -92,6 +92,8 @@ base64 = { version = "0.22", features = ["alloc"] }
 # On-chain Bitcoin address validation for referral payouts.
 bitcoin = "0.32"
 urlencoding = "2.1"
+hmac = "0.12"
+sha2 = "0.10"
 rand = "0.9"
 # ES256 signing for the "Sign in with Apple" client-secret JWT (.p8 key).
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }

@@ -2563,6 +2563,8 @@ pub enum PaymentMethod {
     Stripe,
     /// On-chain Bitcoin payments
     OnChain,
+    /// Monero paid through a third-party swap into our on-chain Bitcoin wallet
+    Monero,
 }
 
 #[derive(Type, Clone, Copy, Debug, Default, PartialEq)]
@@ -2581,6 +2583,7 @@ impl Display for PaymentMethod {
             PaymentMethod::Paypal => write!(f, "PayPal"),
             PaymentMethod::Stripe => write!(f, "Stripe"),
             PaymentMethod::OnChain => write!(f, "OnChain"),
+            PaymentMethod::Monero => write!(f, "Monero"),
         }
     }
 }
@@ -2595,6 +2598,7 @@ impl FromStr for PaymentMethod {
             "paypal" => Ok(PaymentMethod::Paypal),
             "stripe" => Ok(PaymentMethod::Stripe),
             "onchain" => Ok(PaymentMethod::OnChain),
+            "monero" => Ok(PaymentMethod::Monero),
             _ => bail!("Unknown payment method: {}", s),
         }
     }
@@ -4235,6 +4239,7 @@ mod tests {
             ("paypal", PaymentMethod::Paypal),
             ("stripe", PaymentMethod::Stripe),
             ("onchain", PaymentMethod::OnChain),
+            ("monero", PaymentMethod::Monero),
         ] {
             assert_eq!(PaymentMethod::from_str(s).unwrap(), m);
         }
@@ -4283,6 +4288,45 @@ mod tests {
         assert_eq!(oc.min_confirmations, 3);
         pmc.set_provider_config(parsed);
         assert_eq!(pmc.provider_type, "onchain");
+    }
+
+    #[test]
+    fn test_provider_config_fixedfloat() {
+        let json = serde_json::json!({
+            "type": "fixedfloat",
+            "api_key": "k",
+            "api_secret": "s"
+        });
+        let cfg: ProviderConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.provider_type(), "fixedfloat");
+        assert_eq!(cfg.payment_method(), PaymentMethod::Monero);
+        let ff = cfg.as_fixedfloat().unwrap();
+        assert_eq!((ff.api_key.as_str(), ff.api_secret.as_str()), ("k", "s"));
+        assert!(ff.url.is_none() && ff.refcode.is_none() && ff.afftax.is_none());
+        assert!(cfg.as_onchain().is_none());
+        assert!(
+            ProviderConfig::OnChain(OnChainProviderConfig {
+                url: String::new(),
+                cert_path: "".into(),
+                macaroon_path: "".into(),
+                address_type: OnChainAddressType::default(),
+                account: None,
+                min_confirmations: 1,
+            })
+            .as_fixedfloat()
+            .is_none()
+        );
+        let mut pmc = PaymentMethodConfig::new_with_config(
+            1,
+            PaymentMethod::Monero,
+            "xmr".to_string(),
+            true,
+            cfg,
+        );
+        assert_eq!(pmc.provider_type, "fixedfloat");
+        let parsed = pmc.get_provider_config().unwrap();
+        pmc.set_provider_config(parsed);
+        assert_eq!(pmc.provider_type, "fixedfloat");
     }
 
     #[test]
@@ -4498,6 +4542,24 @@ pub struct PaypalProviderConfig {
     pub mode: String,
 }
 
+/// FixedFloat swap provider configuration (XMR to BTC, settling to the on-chain wallet)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FixedFloatProviderConfig {
+    /// API key
+    pub api_key: String,
+    /// API secret used to sign requests
+    pub api_secret: String,
+    /// Base URL override, defaults to the public FixedFloat API
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Affiliate code credited for orders
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refcode: Option<String>,
+    /// Affiliate commission as a percentage of the swap, added to the customer's rate
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub afftax: Option<f32>,
+}
+
 /// Typed provider configuration enum
 /// Wraps all supported payment provider configurations
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4514,6 +4576,9 @@ pub enum ProviderConfig {
     /// On-chain Bitcoin payment configuration (LND wallet backend)
     #[serde(rename = "onchain")]
     OnChain(OnChainProviderConfig),
+    /// Monero payments swapped to Bitcoin through FixedFloat
+    #[serde(rename = "fixedfloat")]
+    FixedFloat(FixedFloatProviderConfig),
 }
 
 impl ProviderConfig {
@@ -4525,6 +4590,7 @@ impl ProviderConfig {
             ProviderConfig::Stripe(_) => "stripe",
             ProviderConfig::Paypal(_) => "paypal",
             ProviderConfig::OnChain(_) => "onchain",
+            ProviderConfig::FixedFloat(_) => "fixedfloat",
         }
     }
 
@@ -4536,6 +4602,7 @@ impl ProviderConfig {
             ProviderConfig::Stripe(_) => PaymentMethod::Stripe,
             ProviderConfig::Paypal(_) => PaymentMethod::Paypal,
             ProviderConfig::OnChain(_) => PaymentMethod::OnChain,
+            ProviderConfig::FixedFloat(_) => PaymentMethod::Monero,
         }
     }
 
@@ -4575,6 +4642,14 @@ impl ProviderConfig {
     pub fn as_onchain(&self) -> Option<&OnChainProviderConfig> {
         match self {
             ProviderConfig::OnChain(cfg) => Some(cfg),
+            _ => None,
+        }
+    }
+
+    /// Get FixedFloat config if this is a FixedFloat provider
+    pub fn as_fixedfloat(&self) -> Option<&FixedFloatProviderConfig> {
+        match self {
+            ProviderConfig::FixedFloat(cfg) => Some(cfg),
             _ => None,
         }
     }

@@ -527,6 +527,7 @@ interface Discount {
 type PaymentData = 
   | { lightning: string } // Lightning Network invoice
   | { onchain: { address: string; outpoint?: string } } // On-chain Bitcoin receive address (BTC only). `outpoint` ("{txid}:{vout}") is set as soon as a deposit is seen in the mempool (0-conf), before it confirms, so the UI can show "received, waiting for confirmation"; absent until a deposit is detected. Confirmed once is_paid is true
+  | { monero: { address: string; amount: string; outpoint?: string } } // Monero swapped to Bitcoin. Send exactly `amount` XMR to `address` before `expires`. A third-party exchange converts it and pays our Bitcoin wallet; `outpoint` ("{txid}:{vout}") appears when that Bitcoin is seen in the mempool. The credited time is priced from the Bitcoin actually received, so a short or late deposit buys proportionally less time. Confirmed once is_paid is true
   | { revolut: { token: string } } // Revolut payment token
   | { stripe: { session_id: string } }; // Stripe checkout session
 
@@ -535,7 +536,7 @@ interface PaymentType {
 }
 
 interface PaymentMethod {
-  name: 'lightning' | 'onchain' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
+  name: 'lightning' | 'onchain' | 'monero' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
   metadata: Record<string, string>;
   currencies: ('BTC' | 'EUR' | 'USD')[];
   processing_fee_rate?: number; // Percentage rate (e.g., 1.0 for 1%)
@@ -585,7 +586,7 @@ interface SubscriptionPayment {
   created: string; // ISO 8601 datetime
   expires: string; // ISO 8601 datetime
   amount: Price; // Total payment amount
-  payment_method: 'lightning' | 'onchain' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
+  payment_method: 'lightning' | 'onchain' | 'monero' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
   payment_type: 'Purchase' | 'Renewal' | 'Upgrade';
   is_paid: boolean;
   paid_at?: string; // ISO 8601 datetime when payment was completed (only present when is_paid is true)
@@ -1328,7 +1329,7 @@ interface ExchangeRates {
 - **GET** `/api/v1/vm/{id}/renew?method={payment_method}&intervals={count}`
 - **Auth**: Required
 - **Query Params**: 
-  - `method`: Optional payment method ('lightning' | 'onchain' | 'revolut' | 'paypal' | 'nwc')
+  - `method`: Optional payment method ('lightning' | 'onchain' | 'monero' | 'revolut' | 'paypal' | 'nwc')
   - `intervals`: Optional number of billing intervals to renew (default: 1). For example, if the VM has a monthly billing cycle, `intervals=3` would generate a payment for 3 months.
   - `code`: Optional discount code. A code that cannot be used (unknown, expired, exhausted, or not applicable to this order) **fails the request** rather than quietly invoicing full price, so the customer is told it did not work. The returned `amount` and `tax` are already net of any discount, and `discount` describes what was taken off.
 - **Response**: `VmPayment`

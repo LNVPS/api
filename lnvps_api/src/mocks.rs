@@ -647,3 +647,30 @@ impl OnChainProvider for MockOnChainProvider {
         })
     }
 }
+
+#[derive(Clone, Default)]
+pub struct MockSwapProvider {
+    pub requests: Arc<Mutex<Vec<crate::swap::SwapOrderRequest>>>,
+}
+
+#[async_trait]
+impl crate::swap::SwapProvider for MockSwapProvider {
+    async fn create_order(
+        &self,
+        req: crate::swap::SwapOrderRequest,
+    ) -> anyhow::Result<crate::swap::SwapOrder> {
+        let mut requests = self.requests.lock().await;
+        let n = requests.len();
+        requests.push(req.clone());
+        Ok(crate::swap::SwapOrder {
+            data: crate::swap::MoneroSwapData {
+                order_id: format!("MOCK{n}"),
+                order_token: format!("token{n}"),
+                deposit_address: format!("4mockxmr{n:08}"),
+                deposit_amount: "1.5".to_string(),
+                receive_address: req.receive_address,
+            },
+            expires: Utc::now() + chrono::Duration::minutes(30),
+        })
+    }
+}

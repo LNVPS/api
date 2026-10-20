@@ -601,6 +601,17 @@ impl ApiVmPayment {
                     address: value.external_data.into(),
                     outpoint: value.external_id.clone(),
                 },
+                PaymentMethod::Monero => {
+                    let data = crate::swap::MoneroSwapData::parse(value.external_data.as_str())
+                        .map_err(|e| {
+                            anyhow::anyhow!("Failed to parse Monero payment data: {}", e)
+                        })?;
+                    ApiPaymentData::Monero {
+                        address: data.deposit_address,
+                        amount: data.deposit_amount,
+                        outpoint: value.external_id.clone(),
+                    }
+                }
                 PaymentMethod::Revolut => {
                     #[derive(Deserialize)]
                     struct RevolutData {
@@ -710,6 +721,17 @@ pub enum ApiPaymentData {
         #[serde(skip_serializing_if = "Option::is_none")]
         outpoint: Option<String>,
     },
+    /// Monero paid through a swap that settles to our Bitcoin wallet
+    Monero {
+        /// Monero deposit address
+        address: String,
+        /// Amount of XMR to send, as a decimal string
+        amount: String,
+        /// Outpoint (`"{txid}:{vout}"`) of the Bitcoin the swap delivered, set
+        /// once it is seen in the mempool. `None` until the swap pays out.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        outpoint: Option<String>,
+    },
     /// Paid in full from account credit; nothing to pay externally.
     Credit,
 }
@@ -725,6 +747,7 @@ pub enum ApiPaymentMethod {
     NWC,
     LNURL,
     OnChain,
+    Monero,
 }
 
 impl From<PaymentMethod> for ApiPaymentMethod {
@@ -735,6 +758,7 @@ impl From<PaymentMethod> for ApiPaymentMethod {
             PaymentMethod::Paypal => ApiPaymentMethod::Paypal,
             PaymentMethod::Stripe => ApiPaymentMethod::Stripe,
             PaymentMethod::OnChain => ApiPaymentMethod::OnChain,
+            PaymentMethod::Monero => ApiPaymentMethod::Monero,
         }
     }
 }
@@ -1374,6 +1398,15 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
                 address: payment.external_data.clone().into(),
                 outpoint: payment.external_id.clone(),
             },
+            PaymentMethod::Monero => {
+                crate::swap::MoneroSwapData::parse(payment.external_data.as_str())
+                    .map(|d| ApiPaymentData::Monero {
+                        address: d.deposit_address,
+                        amount: d.deposit_amount,
+                        outpoint: payment.external_id.clone(),
+                    })
+                    .unwrap_or_else(|_| ApiPaymentData::Lightning(String::new()))
+            }
             PaymentMethod::Revolut => {
                 #[derive(Deserialize)]
                 struct RevolutData {
