@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
 
-use crate::swap::{MoneroSwapData, SwapOrder, SwapOrderRequest, SwapProvider};
+use crate::swap::{SwapData, SwapOrder, SwapOrderRequest, SwapProvider};
 
 const DEFAULT_URL: &str = "https://ff.io/api/v2";
 
@@ -92,7 +92,7 @@ impl FixedFloat {
     fn create_params(&self, req: &SwapOrderRequest) -> Value {
         let mut params = json!({
             "type": "float",
-            "fromCcy": "XMR",
+            "fromCcy": req.coin,
             "toCcy": "BTC",
             "direction": "to",
             "amount": req.receive_sats as f64 / 100_000_000.0,
@@ -115,7 +115,8 @@ impl SwapProvider for FixedFloat {
         let expires = DateTime::<Utc>::from_timestamp(order.time.expiration, 0)
             .context("FixedFloat order has an invalid expiration")?;
         Ok(SwapOrder {
-            data: MoneroSwapData {
+            data: SwapData {
+                coin: req.coin,
                 order_id: order.id,
                 order_token: order.token,
                 deposit_address: order.from.address,
@@ -145,6 +146,7 @@ mod tests {
 
     fn request() -> SwapOrderRequest {
         SwapOrderRequest {
+            coin: "XMR".to_string(),
             receive_sats: 150_000,
             receive_address: "bc1qdest".to_string(),
         }

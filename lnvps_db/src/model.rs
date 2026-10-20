@@ -2563,8 +2563,8 @@ pub enum PaymentMethod {
     Stripe,
     /// On-chain Bitcoin payments
     OnChain,
-    /// Monero paid through a third-party swap into our on-chain Bitcoin wallet
-    Monero,
+    /// A cryptocurrency (XMR, LTC, ETH, USDTTRC) paid through a third-party swap into our on-chain Bitcoin wallet
+    FixedFloat,
 }
 
 #[derive(Type, Clone, Copy, Debug, Default, PartialEq)]
@@ -2583,7 +2583,7 @@ impl Display for PaymentMethod {
             PaymentMethod::Paypal => write!(f, "PayPal"),
             PaymentMethod::Stripe => write!(f, "Stripe"),
             PaymentMethod::OnChain => write!(f, "OnChain"),
-            PaymentMethod::Monero => write!(f, "Monero"),
+            PaymentMethod::FixedFloat => write!(f, "FixedFloat"),
         }
     }
 }
@@ -2598,7 +2598,7 @@ impl FromStr for PaymentMethod {
             "paypal" => Ok(PaymentMethod::Paypal),
             "stripe" => Ok(PaymentMethod::Stripe),
             "onchain" => Ok(PaymentMethod::OnChain),
-            "monero" => Ok(PaymentMethod::Monero),
+            "fixedfloat" => Ok(PaymentMethod::FixedFloat),
             _ => bail!("Unknown payment method: {}", s),
         }
     }
@@ -4239,7 +4239,7 @@ mod tests {
             ("paypal", PaymentMethod::Paypal),
             ("stripe", PaymentMethod::Stripe),
             ("onchain", PaymentMethod::OnChain),
-            ("monero", PaymentMethod::Monero),
+            ("fixedfloat", PaymentMethod::FixedFloat),
         ] {
             assert_eq!(PaymentMethod::from_str(s).unwrap(), m);
         }
@@ -4299,7 +4299,7 @@ mod tests {
         });
         let cfg: ProviderConfig = serde_json::from_value(json).unwrap();
         assert_eq!(cfg.provider_type(), "fixedfloat");
-        assert_eq!(cfg.payment_method(), PaymentMethod::Monero);
+        assert_eq!(cfg.payment_method(), PaymentMethod::FixedFloat);
         let ff = cfg.as_fixedfloat().unwrap();
         assert_eq!((ff.api_key.as_str(), ff.api_secret.as_str()), ("k", "s"));
         assert!(ff.url.is_none() && ff.refcode.is_none() && ff.afftax.is_none());
@@ -4318,7 +4318,7 @@ mod tests {
         );
         let mut pmc = PaymentMethodConfig::new_with_config(
             1,
-            PaymentMethod::Monero,
+            PaymentMethod::FixedFloat,
             "xmr".to_string(),
             true,
             cfg,
@@ -4542,7 +4542,7 @@ pub struct PaypalProviderConfig {
     pub mode: String,
 }
 
-/// FixedFloat swap provider configuration (XMR to BTC, settling to the on-chain wallet)
+/// FixedFloat swap provider configuration (any supported coin to BTC, settling to the on-chain wallet)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FixedFloatProviderConfig {
     /// API key
@@ -4576,7 +4576,7 @@ pub enum ProviderConfig {
     /// On-chain Bitcoin payment configuration (LND wallet backend)
     #[serde(rename = "onchain")]
     OnChain(OnChainProviderConfig),
-    /// Monero payments swapped to Bitcoin through FixedFloat
+    /// Cryptocurrency payments swapped to Bitcoin through FixedFloat
     #[serde(rename = "fixedfloat")]
     FixedFloat(FixedFloatProviderConfig),
 }
@@ -4602,7 +4602,7 @@ impl ProviderConfig {
             ProviderConfig::Stripe(_) => PaymentMethod::Stripe,
             ProviderConfig::Paypal(_) => PaymentMethod::Paypal,
             ProviderConfig::OnChain(_) => PaymentMethod::OnChain,
-            ProviderConfig::FixedFloat(_) => PaymentMethod::Monero,
+            ProviderConfig::FixedFloat(_) => PaymentMethod::FixedFloat,
         }
     }
 

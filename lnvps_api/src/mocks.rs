@@ -663,7 +663,8 @@ impl crate::swap::SwapProvider for MockSwapProvider {
         let n = requests.len();
         requests.push(req.clone());
         Ok(crate::swap::SwapOrder {
-            data: crate::swap::MoneroSwapData {
+            data: crate::swap::SwapData {
+                coin: req.coin.clone(),
                 order_id: format!("MOCK{n}"),
                 order_token: format!("token{n}"),
                 deposit_address: format!("4mockxmr{n:08}"),

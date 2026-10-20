@@ -1994,7 +1994,12 @@ fn default_currencies_for_method(method: PaymentMethod) -> Vec<ApiCurrency> {
     match method {
         PaymentMethod::Lightning => vec![ApiCurrency::BTC],
         PaymentMethod::OnChain => vec![ApiCurrency::BTC],
-        PaymentMethod::Monero => vec![ApiCurrency::BTC],
+        PaymentMethod::FixedFloat => vec![
+            ApiCurrency::XMR,
+            ApiCurrency::LTC,
+            ApiCurrency::ETH,
+            ApiCurrency::USDTTRC,
+        ],
         PaymentMethod::Revolut => vec![ApiCurrency::EUR, ApiCurrency::USD],
         PaymentMethod::Paypal => vec![ApiCurrency::EUR, ApiCurrency::USD],
         PaymentMethod::Stripe => vec![ApiCurrency::EUR, ApiCurrency::USD],
@@ -3108,9 +3113,19 @@ mod tests {
                 ApiPaymentMethod::Lightning
                 | ApiPaymentMethod::NWC
                 | ApiPaymentMethod::LNURL
-                | ApiPaymentMethod::OnChain
-                | ApiPaymentMethod::Monero => {
+                | ApiPaymentMethod::OnChain => {
                     assert_eq!(info.currencies, vec![ApiCurrency::BTC]);
+                }
+                ApiPaymentMethod::FixedFloat => {
+                    assert_eq!(
+                        info.currencies,
+                        vec![
+                            ApiCurrency::XMR,
+                            ApiCurrency::LTC,
+                            ApiCurrency::ETH,
+                            ApiCurrency::USDTTRC
+                        ]
+                    );
                 }
                 ApiPaymentMethod::Revolut | ApiPaymentMethod::Paypal | ApiPaymentMethod::Stripe => {
                     assert_eq!(info.currencies, vec![ApiCurrency::EUR, ApiCurrency::USD]);

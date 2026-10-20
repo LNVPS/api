@@ -8,7 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- **Monero payments**: `monero` payment method. `PaymentData` gains `{ monero: { address, amount, outpoint? } }`, the XMR deposit address and amount of a swap into our Bitcoin wallet. Time is priced from the Bitcoin that arrives. Admins configure it with a `fixedfloat` provider config (`api_key`, `api_secret`, optional `url`, `refcode`, `afftax`) on `/api/admin/v1/payment_methods`, alongside the company's `onchain` config.
+- **Cryptocurrency payments**: `fixedfloat` payment method that takes a `coin` (`XMR`, `LTC`, `ETH` or `USDTTRC`) on `method=fixedfloat&coin=...`. `PaymentData` gains `{ fixedfloat: { coin, address, amount, outpoint? } }`, the deposit address and amount of a swap into our Bitcoin wallet. Time is priced from the Bitcoin that arrives. `ApiCurrency` gains `XMR`, `LTC`, `ETH` and `USDTTRC`, which appear only in a `fixedfloat` method's `currencies`. Admins configure it with a `fixedfloat` provider config (`api_key`, `api_secret`, optional `url`, `refcode`, `afftax`) on `/api/admin/v1/payment_methods`, alongside the company's `onchain` config, and list the accepted coins in `supported_currencies`.
 
 ### Security
 

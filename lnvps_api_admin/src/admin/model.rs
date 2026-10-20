@@ -3469,7 +3469,8 @@ pub enum AdminPaymentMethod {
     Paypal,
     Stripe,
     OnChain,
-    Monero,
+    #[serde(rename = "fixedfloat")]
+    FixedFloat,
 }
 
 impl From<PaymentMethod> for AdminPaymentMethod {
@@ -3480,7 +3481,7 @@ impl From<PaymentMethod> for AdminPaymentMethod {
             PaymentMethod::Paypal => AdminPaymentMethod::Paypal,
             PaymentMethod::Stripe => AdminPaymentMethod::Stripe,
             PaymentMethod::OnChain => AdminPaymentMethod::OnChain,
-            PaymentMethod::Monero => AdminPaymentMethod::Monero,
+            PaymentMethod::FixedFloat => AdminPaymentMethod::FixedFloat,
         }
     }
 }
@@ -4523,7 +4524,7 @@ pub enum AdminPaymentMethodType {
     Paypal,
     Stripe,
     OnChain,
-    Monero,
+    FixedFloat,
 }
 
 impl From<lnvps_db::PaymentMethod> for AdminPaymentMethodType {
@@ -4534,7 +4535,7 @@ impl From<lnvps_db::PaymentMethod> for AdminPaymentMethodType {
             lnvps_db::PaymentMethod::Paypal => AdminPaymentMethodType::Paypal,
             lnvps_db::PaymentMethod::Stripe => AdminPaymentMethodType::Stripe,
             lnvps_db::PaymentMethod::OnChain => AdminPaymentMethodType::OnChain,
-            lnvps_db::PaymentMethod::Monero => AdminPaymentMethodType::Monero,
+            lnvps_db::PaymentMethod::FixedFloat => AdminPaymentMethodType::FixedFloat,
         }
     }
 }
@@ -4547,7 +4548,7 @@ impl From<AdminPaymentMethodType> for lnvps_db::PaymentMethod {
             AdminPaymentMethodType::Paypal => lnvps_db::PaymentMethod::Paypal,
             AdminPaymentMethodType::Stripe => lnvps_db::PaymentMethod::Stripe,
             AdminPaymentMethodType::OnChain => lnvps_db::PaymentMethod::OnChain,
-            AdminPaymentMethodType::Monero => lnvps_db::PaymentMethod::Monero,
+            AdminPaymentMethodType::FixedFloat => lnvps_db::PaymentMethod::FixedFloat,
         }
     }
 }
@@ -4762,6 +4763,39 @@ pub struct CreatePaymentMethodConfigRequest {
     pub supported_currencies: Option<Vec<String>>,
 }
 
+/// Validate the currency codes an admin sets on a payment method config.
+///
+/// The `fixedfloat` method lists the coins a customer can pay with, which must be
+/// cryptocurrencies other than BTC. Every other method lists billing currencies,
+/// which cannot be a coin because coins have no exchange rate to price against.
+pub fn validate_supported_currencies(
+    method: lnvps_db::PaymentMethod,
+    currencies: &[String],
+) -> anyhow::Result<()> {
+    use payments_rs::currency::Currency;
+    for code in currencies {
+        let currency = code
+            .trim()
+            .parse::<Currency>()
+            .map_err(|_| anyhow!("Unknown currency code: {}", code))?;
+        let is_coin = currency.is_crypto() && currency != Currency::BTC;
+        if method == lnvps_db::PaymentMethod::FixedFloat {
+            if !is_coin {
+                return Err(anyhow!(
+                    "{} is not a coin. The FixedFloat payment method accepts XMR, LTC, ETH and USDTTRC",
+                    code
+                ));
+            }
+        } else if is_coin {
+            return Err(anyhow!(
+                "{} can only be listed on the FixedFloat payment method",
+                code
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl CreatePaymentMethodConfigRequest {
     pub fn to_payment_method_config(&self) -> anyhow::Result<lnvps_db::PaymentMethodConfig> {
         if self.name.trim().is_empty() {
@@ -4801,6 +4835,7 @@ impl CreatePaymentMethodConfigRequest {
             .as_ref()
             .map(|s| s.trim().to_uppercase());
         if let Some(currencies) = &self.supported_currencies {
+            validate_supported_currencies(payment_config.payment_method, currencies)?;
             payment_config.supported_currencies = lnvps_db::CommaSeparated::new(
                 currencies.iter().map(|s| s.trim().to_uppercase()).collect(),
             );
@@ -5114,6 +5149,69 @@ pub struct AdminUpdateUserPaymentMethodRequest {
 
 #[cfg(test)]
 mod tests {
+    use lnvps_db::PaymentMethod;
+
+    fn codes(c: &[&str]) -> Vec<String> {
+        c.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn fixedfloat_method_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&AdminPaymentMethod::FixedFloat).unwrap(),
+            "\"fixedfloat\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AdminPaymentMethodType::FixedFloat).unwrap(),
+            "\"fixedfloat\""
+        );
+        assert_eq!(
+            lnvps_db::PaymentMethod::from(AdminPaymentMethodType::FixedFloat),
+            lnvps_db::PaymentMethod::FixedFloat
+        );
+        assert_eq!(
+            AdminPaymentMethod::from(lnvps_db::PaymentMethod::FixedFloat),
+            AdminPaymentMethod::FixedFloat
+        );
+    }
+
+    #[test]
+    fn fixedfloat_method_lists_only_coins() {
+        assert!(
+            validate_supported_currencies(
+                PaymentMethod::FixedFloat,
+                &codes(&["XMR", "ltc", "ETH", "USDTTRC"])
+            )
+            .is_ok()
+        );
+        assert!(validate_supported_currencies(PaymentMethod::FixedFloat, &[]).is_ok());
+        for bad in ["BTC", "EUR", "USD", "DOGE"] {
+            assert!(
+                validate_supported_currencies(PaymentMethod::FixedFloat, &codes(&[bad])).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_methods_never_list_coins() {
+        for method in [
+            PaymentMethod::Lightning,
+            PaymentMethod::OnChain,
+            PaymentMethod::Revolut,
+            PaymentMethod::Stripe,
+            PaymentMethod::Paypal,
+        ] {
+            assert!(validate_supported_currencies(method, &codes(&["EUR", "BTC", "usd"])).is_ok());
+            for coin in ["XMR", "LTC", "ETH", "USDTTRC"] {
+                assert!(
+                    validate_supported_currencies(method, &codes(&[coin])).is_err(),
+                    "{method} {coin}"
+                );
+            }
+            assert!(validate_supported_currencies(method, &codes(&["DOGE"])).is_err());
+        }
+    }
     use super::*;
 
     /// Per-disk usage is attached to each configured disk, and a disk the

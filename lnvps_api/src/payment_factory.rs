@@ -201,7 +201,7 @@ impl PaymentMethodFactory {
     ) -> Result<Option<Arc<dyn crate::swap::SwapProvider>>> {
         let config = match self
             .db
-            .get_payment_method_config_for_company(company_id, PaymentMethod::Monero)
+            .get_payment_method_config_for_company(company_id, PaymentMethod::FixedFloat)
             .await
         {
             Ok(config) if config.enabled => config,

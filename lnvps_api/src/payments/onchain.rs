@@ -39,7 +39,7 @@
 //!   every payment is re-generated uniformly from current line-item pricing.
 
 use crate::subscription::SubscriptionHandler;
-use crate::swap::MoneroSwapData;
+use crate::swap::SwapData;
 use anyhow::{Result, bail};
 use chrono::Utc;
 use futures::StreamExt;
@@ -71,7 +71,7 @@ fn deposit_key(txid: &str, vout: u32) -> String {
 fn receive_address(payment: &SubscriptionPayment) -> Option<String> {
     match payment.payment_method {
         PaymentMethod::OnChain => Some(payment.external_data.as_str().to_string()),
-        PaymentMethod::Monero => MoneroSwapData::parse(payment.external_data.as_str())
+        PaymentMethod::FixedFloat => SwapData::parse(payment.external_data.as_str())
             .ok()
             .map(|d| d.receive_address),
         _ => None,
@@ -115,7 +115,7 @@ impl OnChainPaymentHandler {
             .await?;
         payments.extend(
             self.db
-                .list_subscription_payments_by_method(PaymentMethod::Monero)
+                .list_subscription_payments_by_method(PaymentMethod::FixedFloat)
                 .await?,
         );
         Ok(payments
@@ -811,10 +811,11 @@ mod tests {
         Ok(())
     }
 
-    async fn make_monero(db: &MockDb, payment: &SubscriptionPayment) -> Result<()> {
+    async fn make_fixedfloat(db: &MockDb, payment: &SubscriptionPayment) -> Result<()> {
         let mut p = payment.clone();
-        p.payment_method = PaymentMethod::Monero;
-        p.external_data = MoneroSwapData {
+        p.payment_method = PaymentMethod::FixedFloat;
+        p.external_data = SwapData {
+            coin: "XMR".to_string(),
             order_id: "ABC".to_string(),
             order_token: "tok".to_string(),
             deposit_address: "4Axmr".to_string(),
@@ -828,16 +829,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_monero_swap_deposit_settles() -> Result<()> {
+    async fn test_fixedfloat_swap_deposit_settles() -> Result<()> {
         let (db, _provider, handler, payment) = setup().await?;
-        make_monero(&db, &payment).await?;
+        make_fixedfloat(&db, &payment).await?;
         let expect = engine_price(&handler, payment.subscription_id, EXPECTED).await?;
 
         handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
 
         let p = get_payment(&db, &payment.id).await;
         assert!(p.is_paid);
-        assert_eq!(p.payment_method, PaymentMethod::Monero);
+        assert_eq!(p.payment_method, PaymentMethod::FixedFloat);
         assert_eq!(p.external_id.as_deref(), Some("tx1:0"));
         assert_close(p.time_value.unwrap(), expect.time_value);
         assert_eq!(db.subscription_payments.lock().await.len(), 1);
@@ -845,9 +846,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_monero_swap_short_deposit_buys_less_time() -> Result<()> {
+    async fn test_fixedfloat_swap_short_deposit_buys_less_time() -> Result<()> {
         let (db, _provider, handler, payment) = setup().await?;
-        make_monero(&db, &payment).await?;
+        make_fixedfloat(&db, &payment).await?;
         let expect_full = engine_price(&handler, payment.subscription_id, EXPECTED).await?;
 
         handler
@@ -862,9 +863,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_monero_swap_detected_locks_pricing() -> Result<()> {
+    async fn test_fixedfloat_swap_detected_locks_pricing() -> Result<()> {
         let (db, _provider, handler, payment) = setup().await?;
-        make_monero(&db, &payment).await?;
+        make_fixedfloat(&db, &payment).await?;
 
         handler.handle_detected(ADDRESS, "tx1", 0, EXPECTED).await?;
 
@@ -875,9 +876,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_monero_swap_second_deposit_to_settled_address_ignored() -> Result<()> {
+    async fn test_fixedfloat_swap_second_deposit_to_settled_address_ignored() -> Result<()> {
         let (db, _provider, handler, payment) = setup().await?;
-        make_monero(&db, &payment).await?;
+        make_fixedfloat(&db, &payment).await?;
 
         handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
         handler.handle_deposit(ADDRESS, "tx2", 0, EXPECTED).await?;
@@ -892,7 +893,7 @@ mod tests {
         assert_eq!(receive_address(&p).as_deref(), Some(ADDRESS));
         p.payment_method = PaymentMethod::Lightning;
         assert_eq!(receive_address(&p), None);
-        p.payment_method = PaymentMethod::Monero;
+        p.payment_method = PaymentMethod::FixedFloat;
         assert_eq!(receive_address(&p), None);
         Ok(())
     }

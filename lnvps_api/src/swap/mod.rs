@@ -9,18 +9,20 @@ pub use fixedfloat::FixedFloat;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SwapOrderRequest {
+    pub coin: String,
     pub receive_sats: u64,
     pub receive_address: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SwapOrder {
-    pub data: MoneroSwapData,
+    pub data: SwapData,
     pub expires: DateTime<Utc>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MoneroSwapData {
+pub struct SwapData {
+    pub coin: String,
     pub order_id: String,
     pub order_token: String,
     pub deposit_address: String,
@@ -28,7 +30,7 @@ pub struct MoneroSwapData {
     pub receive_address: String,
 }
 
-impl MoneroSwapData {
+impl SwapData {
     pub fn parse(raw: &str) -> Result<Self> {
         Ok(serde_json::from_str(raw)?)
     }

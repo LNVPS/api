@@ -73,7 +73,7 @@ pub(crate) fn payment_blocks_unpaid_deletion(p: &SubscriptionPayment, now: DateT
         && (p.expires > now
             || (matches!(
                 p.payment_method,
-                PaymentMethod::OnChain | PaymentMethod::Monero
+                PaymentMethod::OnChain | PaymentMethod::FixedFloat
             ) && p.external_id.is_some()))
 }
 

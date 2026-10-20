@@ -1771,7 +1771,7 @@ impl PricingEngine {
         method: PaymentMethod,
     ) -> Result<ConvertedCurrencyAmount> {
         Ok(match (list_price.currency(), method) {
-            (c, PaymentMethod::Lightning | PaymentMethod::OnChain | PaymentMethod::Monero)
+            (c, PaymentMethod::Lightning | PaymentMethod::OnChain | PaymentMethod::FixedFloat)
                 if c != Currency::BTC =>
             {
                 // convert to BTC if price is not already in bitcoin
@@ -1781,7 +1781,7 @@ impl PricingEngine {
                 converted.amount = round_to_sat(converted.amount);
                 converted
             }
-            (c, PaymentMethod::Lightning | PaymentMethod::OnChain | PaymentMethod::Monero)
+            (c, PaymentMethod::Lightning | PaymentMethod::OnChain | PaymentMethod::FixedFloat)
                 if c == Currency::BTC =>
             {
                 // pass-through price as BTC, rounded to nearest satoshi
