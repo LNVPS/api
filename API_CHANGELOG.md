@@ -13,6 +13,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **Account credit top-ups by on-chain Bitcoin and FixedFloat**: `POST /api/v1/account/credit/topup` takes `method` (`lightning`, `onchain` or `fixedfloat`) and, for `fixedfloat`, a `coin`. The response gains `method`, `data` (same shape as a payment's `data`) and `is_paid`, and `pr` is now present only for `lightning`. New `GET /api/v1/account/credit/topup/{payment_hash}` returns the same object for polling. On-chain and swap deposits credit whatever arrives once confirmed.
 
+- **Credit-funded payments report `credit` as their method**: a payment paid in full from account credit now has `payment_method: "credit"` on `GET /api/v1/subscriptions/{id}/payments` and the admin payment endpoints, instead of the method it was created with.
+
 ### Security
 
 - **Referral self-dealing**: a VM ordered with the buyer's own referral code no longer earns commission, including VMs already ordered that way, so commission already paid on them nets against future earnings. Commission is reduced by refunds against the referred VM's first payment, and automated payouts wait until that payment is `commission-hold-days` old (default 30). `GET /api/v1/referral/usage` rows gain `payable_after`. Affects `GET /api/v1/referral`, `GET /api/v1/referral/usage`, `GET /api/admin/v1/referrals/*` and the referral usage reports.

@@ -3127,6 +3127,7 @@ mod tests {
                         ]
                     );
                 }
+                ApiPaymentMethod::Credit => unreachable!("credit is not a configurable method"),
                 ApiPaymentMethod::Revolut | ApiPaymentMethod::Paypal | ApiPaymentMethod::Stripe => {
                     assert_eq!(info.currencies, vec![ApiCurrency::EUR, ApiCurrency::USD]);
                 }

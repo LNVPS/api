@@ -3471,6 +3471,17 @@ pub enum AdminPaymentMethod {
     OnChain,
     #[serde(rename = "fixedfloat")]
     FixedFloat,
+    Credit,
+}
+
+impl AdminPaymentMethod {
+    pub fn for_payment(method: PaymentMethod, external_data: &str) -> Self {
+        if external_data == "credit" {
+            AdminPaymentMethod::Credit
+        } else {
+            AdminPaymentMethod::from(method)
+        }
+    }
 }
 
 impl From<PaymentMethod> for AdminPaymentMethod {
@@ -3596,7 +3607,10 @@ impl AdminVmPaymentInfo {
             processing_fee: payment.processing_fee,
             currency: payment.currency.clone(),
             company_base_currency,
-            payment_method: AdminPaymentMethod::from(payment.payment_method),
+            payment_method: AdminPaymentMethod::for_payment(
+                payment.payment_method,
+                payment.external_data.as_str(),
+            ),
             external_id: payment.external_id.clone(),
             is_paid: payment.is_paid,
             paid_at: payment.paid_at,
@@ -4210,7 +4224,10 @@ impl AdminSubscriptionPaymentInfo {
             amount: payment.amount,
             currency: payment.currency,
             company_base_currency,
-            payment_method: AdminPaymentMethod::from(payment.payment_method),
+            payment_method: AdminPaymentMethod::for_payment(
+                payment.payment_method,
+                payment.external_data.as_str(),
+            ),
             payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
             external_id: payment.external_id,
             is_paid: payment.is_paid,
@@ -4245,7 +4262,10 @@ impl AdminSubscriptionPaymentInfo {
             amount: payment.amount,
             currency: payment.currency,
             company_base_currency: payment.company_base_currency,
-            payment_method: AdminPaymentMethod::from(payment.payment_method),
+            payment_method: AdminPaymentMethod::for_payment(
+                payment.payment_method,
+                payment.external_data.as_str(),
+            ),
             payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
             external_id: payment.external_id,
             is_paid: payment.is_paid,

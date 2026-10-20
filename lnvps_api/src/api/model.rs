@@ -750,6 +750,18 @@ pub enum ApiPaymentMethod {
     LNURL,
     OnChain,
     FixedFloat,
+    /// Paid in full from account credit. Only appears on payment records.
+    Credit,
+}
+
+impl ApiPaymentMethod {
+    pub fn for_payment(method: PaymentMethod, external_data: &str) -> Self {
+        if external_data == crate::subscription::CREDIT_FUNDED_MARKER {
+            ApiPaymentMethod::Credit
+        } else {
+            ApiPaymentMethod::from(method)
+        }
+    }
 }
 
 impl From<PaymentMethod> for ApiPaymentMethod {
@@ -1439,7 +1451,10 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
             created: payment.created,
             expires: payment.expires,
             amount: amount.into(),
-            payment_method: ApiPaymentMethod::from(payment.payment_method),
+            payment_method: ApiPaymentMethod::for_payment(
+                payment.payment_method,
+                payment.external_data.as_str(),
+            ),
             payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
             is_paid: payment.is_paid,
             paid_at: payment.paid_at,
@@ -1830,6 +1845,7 @@ mod tests {
         assert_eq!(serde_json::to_value(&vm).unwrap()["data"], "credit");
         let sub = ApiSubscriptionPayment::from(payment);
         assert!(matches!(sub.data, ApiPaymentData::Credit));
+        assert_eq!(serde_json::to_value(&sub).unwrap()["payment_method"], "credit");
     }
 
     fn fixedfloat_payment(external_data: &str) -> lnvps_db::SubscriptionPayment {
