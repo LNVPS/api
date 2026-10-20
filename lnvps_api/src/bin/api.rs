@@ -480,6 +480,7 @@ async fn main() -> Result<(), Error> {
             .merge(subscriptions_router())
             .merge(ip_space_router())
             .merge(referral_router())
+            .merge(credit_router())
             .merge(marketplace_router())
             .merge(apps_router())
             .merge(app_backups_router())

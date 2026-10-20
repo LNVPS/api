@@ -83,6 +83,20 @@ impl OnChainPaymentHandler {
 
     /// Find the payment a deposit belongs to: the most recent on-chain payment
     /// whose stored receive address matches.
+    /// Spend the credit held on `payment` and return what it covered, in msat.
+    async fn claim_credit_msat(&self, payment: &SubscriptionPayment) -> Result<u64> {
+        if let Some(d) = self.db.settle_account_credit_debit(&payment.id).await? {
+            return Ok(d.payment_amount);
+        }
+        Ok(self
+            .db
+            .get_account_credit_debit_by_payment(&payment.id)
+            .await?
+            .filter(|d| d.settled)
+            .map(|d| d.payment_amount)
+            .unwrap_or(0))
+    }
+
     async fn payment_for_address(&self, address: &str) -> Result<Option<SubscriptionPayment>> {
         Ok(self
             .db
@@ -187,7 +201,14 @@ impl OnChainPaymentHandler {
         {
             return Ok(());
         }
-        self.regenerate(&mut payment, amount_msat).await?;
+        let credit_msat = self
+            .db
+            .get_account_credit_debit_by_payment(&payment.id)
+            .await?
+            .map(|d| d.payment_amount)
+            .unwrap_or(0);
+        self.regenerate(&mut payment, amount_msat + credit_msat)
+            .await?;
         info!(
             "Deposit {} detected: priced payment {} at rate {} for {} msat ({}s)",
             key,
@@ -300,9 +321,10 @@ impl OnChainPaymentHandler {
             let mut payment = payment;
             // Price now unless Detected already did (and for the same gross
             // amount — a replaced tx could change the output value).
+            let gross = amount_msat + self.claim_credit_msat(&payment).await?;
             let priced_gross = payment.amount + payment.tax + payment.processing_fee;
-            if !already_priced || priced_gross != amount_msat {
-                self.regenerate(&mut payment, amount_msat).await?;
+            if !already_priced || priced_gross != gross {
+                self.regenerate(&mut payment, gross).await?;
             }
             info!(
                 "Settling on-chain payment {}: {} msat at rate {} ({}s)",
@@ -661,6 +683,91 @@ mod tests {
         assert_close(p.time_value.unwrap(), expect.time_value);
         // components sum to exactly what arrived
         assert_eq!(p.amount + p.tax + p.processing_fee, EXPECTED);
+        Ok(())
+    }
+
+    async fn hold_credit(db: &MockDb, payment: &SubscriptionPayment, msat: u64) {
+        db.adjust_account_credit(payment.user_id, msat as i64, "topup", None)
+            .await
+            .unwrap();
+        let id = db
+            .reserve_account_credit(&lnvps_db::AccountCreditDebit {
+                user_id: payment.user_id,
+                amount: msat,
+                currency: "BTC".to_string(),
+                payment_amount: msat,
+                expires: payment.expires,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        db.attach_account_credit_debit(id, &payment.id, payment.expires)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_credit_covered_deposit_prices_the_whole_bill() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        hold_credit(&db, &payment, 400_000).await;
+        let expect = engine_price(&handler, payment.subscription_id, EXPECTED).await?;
+
+        handler
+            .handle_detected(ADDRESS, "tx1", 0, EXPECTED - 400_000)
+            .await?;
+        handler
+            .handle_deposit(ADDRESS, "tx1", 0, EXPECTED - 400_000)
+            .await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(p.is_paid);
+        assert_eq!(p.amount + p.tax + p.processing_fee, EXPECTED);
+        assert_close(p.time_value.unwrap(), expect.time_value);
+        let debit = db
+            .get_account_credit_debit_by_payment(&payment.id)
+            .await?
+            .unwrap();
+        assert!(debit.settled);
+        assert_eq!(db.get_account_credit(payment.user_id).await?.balance, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_late_deposit_gets_only_the_credit_left() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        hold_credit(&db, &payment, 400_000).await;
+        db.attach_account_credit_debit(
+            db.get_account_credit_debit_by_payment(&payment.id)
+                .await?
+                .unwrap()
+                .id,
+            &payment.id,
+            Utc::now() - chrono::Duration::seconds(1),
+        )
+        .await?;
+        db.reserve_account_credit(&lnvps_db::AccountCreditDebit {
+            user_id: payment.user_id,
+            amount: 300_000,
+            currency: "BTC".to_string(),
+            payment_amount: 300_000,
+            expires: Utc::now() + chrono::Duration::hours(1),
+            ..Default::default()
+        })
+        .await?
+        .unwrap();
+
+        handler
+            .handle_deposit(ADDRESS, "tx1", 0, EXPECTED - 400_000)
+            .await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(p.is_paid);
+        assert_eq!(p.amount + p.tax + p.processing_fee, EXPECTED - 300_000);
+        assert_eq!(
+            db.get_account_credit(payment.user_id).await?.balance,
+            300_000
+        );
         Ok(())
     }
 

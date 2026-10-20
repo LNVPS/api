@@ -471,8 +471,9 @@ impl Worker {
             // earlier ones are notice only.
             let is_final_reminder = due <= lead;
 
-            // Attempt auto-renewal using the user's default saved payment method
-            // (NWC Lightning wallet or Revolut card), dispatched by provider.
+            // Attempt auto-renewal using the user's account credit or default
+            // saved payment method (NWC Lightning wallet or Revolut card),
+            // dispatched by provider.
             let mut auto_renewed = false;
 
             if sub.auto_renewal_enabled {
@@ -482,19 +483,33 @@ impl Worker {
                     .await
                     .map(|m| m.iter().any(|pm| pm.enabled))
                     .unwrap_or(false);
-                if has_method && !is_final_reminder {
+                // A credit balance the user opted into is also a renewable
+                // method, so it counts even when no saved method exists.
+                let has_credit = self
+                    .subscription_handler
+                    .credit_covers_renewal(sub.id)
+                    .await
+                    .unwrap_or(false);
+                if (has_method || has_credit) && !is_final_reminder {
                     // It will renew itself before it expires; an "expiring soon"
                     // warning a week out would just be wrong.
                     return Ok(());
                 }
-                if has_method {
+                if has_method || has_credit {
                     info!("Attempting auto-renewal for subscription {}", sub.id);
                     match self.subscription_handler.auto_renew(sub.id).await {
-                        Ok(_) => {
+                        Ok(payment) => {
                             info!("Successfully auto-renewed subscription {}", sub.id);
+                            let paid_with = if payment.external_data.as_str()
+                                == crate::subscription::CREDIT_FUNDED_MARKER
+                            {
+                                "your account credit"
+                            } else {
+                                "your saved payment method"
+                            };
                             self.queue_notification(
                                 sub.user_id,
-                                format!("Your subscription is being automatically renewed using your saved payment method.\n{}", sub_notification_descr),
+                                format!("Your subscription is being automatically renewed using {}.\n{}", paid_with, sub_notification_descr),
                                 Some(format!("[{}] Auto-Renewed", sub_notification_subject)),
                             ).await;
                             auto_renewed = true;
@@ -3943,12 +3958,21 @@ impl Worker {
                     );
                 }
 
+                let credit_note = if outcome.credit_returned > 0 {
+                    format!(
+                        " {} sats paid with account credit were returned to your balance.",
+                        outcome.credit_returned / 1000
+                    )
+                } else {
+                    String::new()
+                };
                 self.queue_notification(
                     vm.user_id,
                     format!(
-                        "Your VM #{} has been refunded {} sats and will be deleted.",
+                        "Your VM #{} has been refunded {} sats and will be deleted.{}",
                         vm_id,
-                        outcome.amount_msat / 1000
+                        outcome.amount_msat / 1000,
+                        credit_note
                     ),
                     Some(format!("[VM{}] Refunded", vm_id)),
                 )
@@ -7054,6 +7078,36 @@ mod tests {
             notes, 0,
             "a freshly-renewed 1-day sub must not be 'expiring soon' (double-charge bug)"
         );
+        Ok(())
+    }
+
+    /// A credit balance too small to renew is not a renewal method: the user
+    /// still gets the early "expires in" reminders.
+    #[tokio::test]
+    async fn test_leftover_credit_does_not_suppress_expiry_reminders() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        let sub = {
+            let mut subs = db.subscriptions.lock().await;
+            let s = subs.get_mut(&subscription_id).unwrap();
+            s.auto_renewal_enabled = true;
+            s.expires = Some(
+                Utc::now()
+                    .add(TimeDelta::days(7))
+                    .sub(TimeDelta::minutes(1)),
+            );
+            s.clone()
+        };
+        db.adjust_account_credit(sub.user_id, 1_000, "topup", None)
+            .await?;
+        db.set_account_credit_auto_apply(sub.user_id, true).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .handle_subscription_state(&sub, Utc::now().sub(TimeDelta::minutes(5)))
+            .await?;
+
+        assert_eq!(count_notifications(&worker, "Expires in 7 days").await, 1);
         Ok(())
     }
 

@@ -15,6 +15,7 @@ mod bulk_message;
 mod companies;
 mod cost_plans;
 mod costs;
+mod credit;
 mod custom_pricing;
 mod custom_templates;
 mod discounts;
@@ -84,6 +85,7 @@ pub fn admin_router(
         .merge(vm_os_images::router())
         .merge(vm_templates::router())
         .merge(companies::router())
+        .merge(credit::router())
         .merge(cost_plans::router())
         .merge(costs::router())
         .merge(custom_pricing::router())

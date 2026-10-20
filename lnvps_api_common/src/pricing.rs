@@ -569,43 +569,49 @@ impl PricingEngine {
         method: PaymentMethod,
         gross: CurrencyAmount,
     ) -> Result<()> {
+        let min = self
+            .min_amount_in(company_id, method, gross.currency())
+            .await?;
+        ensure!(
+            gross.value() >= min,
+            "Amount is below the minimum for this payment method ({} {})",
+            CurrencyAmount::from_u64(gross.currency(), min).value_f32(),
+            gross.currency()
+        );
+        Ok(())
+    }
+
+    /// The method's configured minimum processable amount in `currency`, or 0.
+    pub async fn min_amount_in(
+        &self,
+        company_id: u64,
+        method: PaymentMethod,
+        currency: Currency,
+    ) -> Result<u64> {
         if method == PaymentMethod::Lightning {
-            return Ok(());
+            return Ok(0);
         }
-        let config = match self
+        let Ok(config) = self
             .db
             .get_payment_method_config_for_company(company_id, method)
             .await
-        {
-            Ok(c) => c,
-            // No config -> nothing to enforce (fee calc logs this case already)
-            Err(_) => return Ok(()),
+        else {
+            return Ok(0);
         };
         let (Some(min_raw), Some(min_currency_str)) =
             (config.min_amount, config.min_amount_currency.as_deref())
         else {
-            return Ok(());
+            return Ok(0);
         };
         if min_raw == 0 {
-            return Ok(());
+            return Ok(0);
         }
         let min_currency = Currency::from_str(min_currency_str)
             .map_err(|_| anyhow!("Invalid min_amount_currency '{}'", min_currency_str))?;
-        // Convert the configured minimum into the gross currency (resolving a
-        // cross-rate path if there is no direct pair).
-        let min_in_gross = self
-            .convert_currency(
-                CurrencyAmount::from_u64(min_currency, min_raw),
-                gross.currency(),
-            )
-            .await?;
-        ensure!(
-            gross.value() >= min_in_gross.value(),
-            "Amount is below the minimum for this payment method ({} {})",
-            min_in_gross.value_f32(),
-            gross.currency()
-        );
-        Ok(())
+        Ok(self
+            .convert_currency(CurrencyAmount::from_u64(min_currency, min_raw), currency)
+            .await?
+            .value())
     }
 
     /// Turn an amount **actually paid** into VM extension time.

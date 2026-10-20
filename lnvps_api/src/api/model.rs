@@ -419,6 +419,11 @@ pub struct ApiVmPayment {
     /// further reduction to apply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discount: Option<ApiDiscount>,
+    /// Account credit applied to this payment, when the balance covered part of
+    /// it. A payment method, not a price change: `amount` is the full (discounted)
+    /// bill; `credit.amount` is the part the balance covered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit: Option<ApiCredit>,
 }
 
 /// A priced renewal order, computed without creating a payment.
@@ -443,6 +448,12 @@ pub struct ApiRenewalQuote {
     /// further reduction to apply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discount: Option<ApiDiscount>,
+    /// Account credit that would be applied, when the user opted in and has a
+    /// positive balance. A payment method, not a price change: `amount`, `tax`
+    /// and `processing_fee` are the full bill; `credit.amount` is the part
+    /// covered by the balance, so the external invoice is for the remainder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit: Option<ApiCredit>,
 }
 
 impl From<crate::subscription::RenewalQuote> for ApiRenewalQuote {
@@ -457,8 +468,19 @@ impl From<crate::subscription::RenewalQuote> for ApiRenewalQuote {
                 code: d.code,
                 amount_off: d.amount_off,
             }),
+            credit: q.credit.map(|c| ApiCredit {
+                amount: c.amount,
+                currency: c.currency.to_string(),
+            }),
         }
     }
+}
+
+/// Account credit covering part of a bill, in the bill's currency.
+#[derive(Serialize, Deserialize)]
+pub struct ApiCredit {
+    pub amount: u64,
+    pub currency: String,
 }
 
 /// A discount applied to a payment.
@@ -570,6 +592,8 @@ impl ApiVmPayment {
         // payment list down with it (this converter is collected with `?`).
         let data = if is_refund {
             ApiPaymentData::Lightning(String::new())
+        } else if value.external_data.as_str() == crate::subscription::CREDIT_FUNDED_MARKER {
+            ApiPaymentData::Credit
         } else {
             match &value.payment_method {
                 PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data.into()),
@@ -622,6 +646,7 @@ impl ApiVmPayment {
             is_refund,
             // Filled by handlers that have the database to look it up.
             discount: None,
+            credit: None,
         })
     }
 }
@@ -685,6 +710,8 @@ pub enum ApiPaymentData {
         #[serde(skip_serializing_if = "Option::is_none")]
         outpoint: Option<String>,
     },
+    /// Paid in full from account credit; nothing to pay externally.
+    Credit,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -916,6 +943,9 @@ pub struct ApiVmUpgradeQuote {
     pub tax: ApiPrice,
     /// Payment processing fee added on top (zero for Lightning).
     pub processing_fee: ApiPrice,
+    /// Account credit that would cover part of the upgrade.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit: Option<ApiCredit>,
 }
 
 // ============================================================================
@@ -1294,6 +1324,8 @@ pub struct ApiSubscriptionPayment {
     /// (and `tax`) are already net of it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discount: Option<ApiDiscount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit: Option<ApiCredit>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1332,6 +1364,9 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
         // Surface the payment-method data (e.g. the Lightning invoice) so callers
         // can actually pay. Non-lightning external data is best-effort parsed.
         let data = match &payment.payment_method {
+            _ if payment.external_data.as_str() == crate::subscription::CREDIT_FUNDED_MARKER => {
+                ApiPaymentData::Credit
+            }
             PaymentMethod::Lightning => {
                 ApiPaymentData::Lightning(payment.external_data.clone().into())
             }
@@ -1377,6 +1412,7 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
             data,
             // Filled by handlers that have the database to look it up.
             discount: None,
+            credit: None,
         }
     }
 }
@@ -1722,6 +1758,42 @@ mod tests {
         assert!((eur.rates["BTC"] - (1.0 / 100_000.0)).abs() < 1e-9);
         assert!((eur.rates["USD"] - 1.1).abs() < 1e-3);
         assert!(!eur.rates.contains_key("EUR"));
+    }
+
+    #[test]
+    fn a_credit_funded_payment_has_credit_data() {
+        let payment = lnvps_db::SubscriptionPayment {
+            id: vec![1u8; 32],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now(),
+            amount: 1000,
+            currency: "EUR".to_string(),
+            payment_method: PaymentMethod::Revolut,
+            payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
+            external_data: crate::subscription::CREDIT_FUNDED_MARKER.to_string().into(),
+            external_id: None,
+            is_paid: true,
+            rate: 1.0,
+            time_value: Some(2_592_000),
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+            renewal_source: None,
+        };
+        let vm = ApiVmPayment::from_subscription_payment(payment.clone(), 1).unwrap();
+        assert!(matches!(vm.data, ApiPaymentData::Credit));
+        assert_eq!(serde_json::to_value(&vm).unwrap()["data"], "credit");
+        let sub = ApiSubscriptionPayment::from(payment);
+        assert!(matches!(sub.data, ApiPaymentData::Credit));
     }
 
     /// On-chain payment data exposes the deposit outpoint (`{txid}:{vout}`) once

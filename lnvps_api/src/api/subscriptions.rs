@@ -368,8 +368,10 @@ async fn v1_renew_subscription(
         .map_err(|e| anyhow::anyhow!("Failed to generate payment: {}", e))?;
 
     let discount = crate::api::discount_line(&this.db, &payment.id).await;
+    let credit = crate::api::credit_line(&this.db, &payment).await;
     let mut out = ApiSubscriptionPayment::from(payment);
     out.discount = discount;
+    out.credit = credit;
     ApiData::ok(out)
 }
 

@@ -1524,8 +1524,10 @@ async fn v1_renew_vm(
         .await?;
 
     let discount = crate::api::discount_line(&this.db, &payment.id).await;
+    let credit = crate::api::credit_line(&this.db, &payment).await;
     let mut out = ApiVmPayment::from_subscription_payment(payment, id)?;
     out.discount = discount;
+    out.credit = credit;
     ApiData::ok(out)
 }
 
@@ -2486,31 +2488,42 @@ async fn v1_vm_upgrade_quote(
 
     let cfg: UpgradeConfig = req.into();
 
-    // Calculate the upgrade cost and new renewal cost
-    match this
+    let method = q
+        .method
+        .and_then(|m| PaymentMethod::from_str(&m).ok())
+        .unwrap_or(PaymentMethod::Lightning);
+    let quote = match this
         .sub_handler
         .pricing_engine()
-        .calculate_vm_upgrade_cost(
-            id,
-            &cfg,
-            q.method
-                .and_then(|m| PaymentMethod::from_str(&m).ok())
-                .unwrap_or(PaymentMethod::Lightning),
-        )
+        .calculate_vm_upgrade_cost(id, &cfg, method)
         .await
     {
-        Ok(quote) => {
-            let currency = quote.upgrade.amount.currency();
-            ApiData::ok(ApiVmUpgradeQuote {
-                cost_difference: quote.upgrade.amount.into(),
-                new_renewal_cost: quote.renewal.amount.into(),
-                discount: quote.discount.amount.into(),
-                tax: CurrencyAmount::from_u64(currency, quote.tax.amount).into(),
-                processing_fee: CurrencyAmount::from_u64(currency, quote.processing_fee).into(),
-            })
-        }
-        Err(e) => ApiData::err(e.to_string().as_str()),
-    }
+        Ok(quote) => quote,
+        Err(e) => return ApiData::err(e.to_string().as_str()),
+    };
+    let currency = quote.upgrade.amount.currency();
+    let (processing_fee, credit) = this
+        .sub_handler
+        .quote_vm_upgrade_credit(
+            id,
+            method,
+            quote.upgrade.amount.value(),
+            quote.tax.amount,
+            quote.processing_fee,
+            currency,
+        )
+        .await?;
+    ApiData::ok(ApiVmUpgradeQuote {
+        cost_difference: quote.upgrade.amount.into(),
+        new_renewal_cost: quote.renewal.amount.into(),
+        discount: quote.discount.amount.into(),
+        tax: CurrencyAmount::from_u64(currency, quote.tax.amount).into(),
+        processing_fee: CurrencyAmount::from_u64(currency, processing_fee).into(),
+        credit: credit.map(|c| crate::api::model::ApiCredit {
+            amount: c.amount,
+            currency: c.currency.to_string(),
+        }),
+    })
 }
 
 /// Upgrade a VM (requires payment first)
@@ -2539,7 +2552,10 @@ async fn v1_vm_upgrade(
         .await?;
 
     // Note: The actual upgrade happens after payment is confirmed
-    ApiData::ok(ApiVmPayment::from_subscription_payment(payment, id)?)
+    let credit = crate::api::credit_line(&this.db, &payment).await;
+    let mut out = ApiVmPayment::from_subscription_payment(payment, id)?;
+    out.credit = credit;
+    ApiData::ok(out)
 }
 
 /// Resolve the monthly outbound transfer quota for a VM from its (custom)
