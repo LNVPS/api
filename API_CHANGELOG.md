@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - **Cryptocurrency payments**: `fixedfloat` payment method that takes a `coin` (`XMR`, `LTC`, `ETH` or `USDTTRC`) on `method=fixedfloat&coin=...`. `PaymentData` gains `{ fixedfloat: { coin, address, amount, outpoint? } }`, the deposit address and amount of a swap into our Bitcoin wallet. Time is priced from the Bitcoin that arrives. `ApiCurrency` gains `XMR`, `LTC`, `ETH` and `USDTTRC`, which appear only in a `fixedfloat` method's `currencies`. Admins configure it with a `fixedfloat` provider config (`api_key`, `api_secret`, optional `url`, `refcode`, `afftax`) on `/api/admin/v1/payment_methods`, alongside the company's `onchain` config, and list the accepted coins in `supported_currencies`.
+- **FixedFloat in the admin API**: payment rows from `GET /api/admin/v1/vms/{id}/payments`, `/subscriptions/{id}/payments` and the single-payment endpoints gain `swap` (`coin`, `order_id`, `deposit_address`, `deposit_amount`, `receive_address`) on `fixedfloat` payments. Creating or enabling a `fixedfloat` payment method is rejected unless the company has an enabled `onchain` method. Edits to the FixedFloat config take effect on new payments without restarting the API.
 
 ### Security
 

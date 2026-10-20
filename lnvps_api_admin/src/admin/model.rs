@@ -3557,7 +3557,10 @@ pub struct AdminVmPaymentInfo {
     /// it — this only says which code was used and how much came off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discount: Option<AdminPaymentDiscountInfo>,
-    // Note: external_data is omitted as it may contain sensitive payment provider data
+    /// The swap order behind a `fixedfloat` payment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap: Option<AdminSwapInfo>,
+    // Note: external_data is otherwise omitted as it may contain sensitive payment provider data
 }
 
 /// Refunds recorded against one payment, with what is still refundable on it.
@@ -3601,6 +3604,7 @@ impl AdminVmPaymentInfo {
             payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
             refunded_payment_id: payment.refunded_payment_id.as_ref().map(hex::encode),
             discount: None,
+            swap: AdminSwapInfo::from_payment(payment.payment_method, &payment.external_data),
         }
     }
 
@@ -4099,6 +4103,36 @@ impl AdminCreateSubscriptionLineItemRequest {
     }
 }
 
+/// The swap behind a `fixedfloat` payment. The order token is left out: it
+/// authorises actions on the FixedFloat order.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct AdminSwapInfo {
+    pub coin: String,
+    pub order_id: String,
+    pub deposit_address: String,
+    pub deposit_amount: String,
+    pub receive_address: String,
+}
+
+impl AdminSwapInfo {
+    pub fn from_payment(
+        method: lnvps_db::PaymentMethod,
+        external_data: &lnvps_db::EncryptedString,
+    ) -> Option<Self> {
+        if method != lnvps_db::PaymentMethod::FixedFloat {
+            return None;
+        }
+        let data = lnvps_api_common::SwapData::parse(external_data.as_str()).ok()?;
+        Some(Self {
+            coin: data.coin,
+            order_id: data.order_id,
+            deposit_address: data.deposit_address,
+            deposit_amount: data.deposit_amount,
+            receive_address: data.receive_address,
+        })
+    }
+}
+
 // Subscription Payment Models
 #[derive(Serialize)]
 pub struct AdminSubscriptionPaymentInfo {
@@ -4127,6 +4161,9 @@ pub struct AdminSubscriptionPaymentInfo {
     /// it — this only says which code was used and how much came off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discount: Option<AdminPaymentDiscountInfo>,
+    /// The swap order behind a `fixedfloat` payment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap: Option<AdminSwapInfo>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -4163,6 +4200,7 @@ impl From<ApiSubscriptionPaymentType> for lnvps_db::SubscriptionPaymentType {
 
 impl AdminSubscriptionPaymentInfo {
     pub fn new(payment: lnvps_db::SubscriptionPayment, company_base_currency: String) -> Self {
+        let swap = AdminSwapInfo::from_payment(payment.payment_method, &payment.external_data);
         Self {
             id: hex::encode(&payment.id),
             subscription_id: payment.subscription_id,
@@ -4183,6 +4221,7 @@ impl AdminSubscriptionPaymentInfo {
             tax: payment.tax,
             processing_fee: payment.processing_fee,
             discount: None,
+            swap,
         }
     }
 
@@ -4196,6 +4235,7 @@ impl AdminSubscriptionPaymentInfo {
     }
 
     pub fn from_with_company(payment: lnvps_db::SubscriptionPaymentWithCompany) -> Self {
+        let swap = AdminSwapInfo::from_payment(payment.payment_method, &payment.external_data);
         Self {
             id: hex::encode(&payment.id),
             subscription_id: payment.subscription_id,
@@ -4216,6 +4256,7 @@ impl AdminSubscriptionPaymentInfo {
             tax: payment.tax,
             processing_fee: payment.processing_fee,
             discount: None,
+            swap,
         }
     }
 }
@@ -5153,6 +5194,152 @@ mod tests {
 
     fn codes(c: &[&str]) -> Vec<String> {
         c.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn swap_payment(
+        method: lnvps_db::PaymentMethod,
+        external_data: String,
+    ) -> lnvps_db::SubscriptionPayment {
+        lnvps_db::SubscriptionPayment {
+            id: vec![3; 32],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now(),
+            amount: 1000,
+            currency: "BTC".to_string(),
+            payment_method: method,
+            payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
+            external_data: lnvps_db::EncryptedString::new(external_data),
+            external_id: None,
+            is_paid: false,
+            rate: 1.0,
+            time_value: Some(2_592_000),
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+            renewal_source: None,
+        }
+    }
+
+    fn swap_json() -> String {
+        lnvps_api_common::SwapData {
+            coin: "XMR".to_string(),
+            order_id: "ABC123".to_string(),
+            order_token: "secret-token".to_string(),
+            deposit_address: "4deposit".to_string(),
+            deposit_amount: "0.5".to_string(),
+            receive_address: "bc1qours".to_string(),
+        }
+        .to_json()
+        .unwrap()
+    }
+
+    #[test]
+    fn fixedfloat_payment_shows_the_swap_without_the_token() {
+        let payment = swap_payment(lnvps_db::PaymentMethod::FixedFloat, swap_json());
+
+        let sub = AdminSubscriptionPaymentInfo::new(payment.clone(), "EUR".to_string());
+        let vm = AdminVmPaymentInfo::from_subscription_payment(&payment, 7, "EUR".to_string());
+
+        for json in [
+            serde_json::to_value(&sub).unwrap(),
+            serde_json::to_value(&vm).unwrap(),
+        ] {
+            assert_eq!(json["swap"]["coin"], "XMR");
+            assert_eq!(json["swap"]["order_id"], "ABC123");
+            assert_eq!(json["swap"]["deposit_address"], "4deposit");
+            assert_eq!(json["swap"]["deposit_amount"], "0.5");
+            assert_eq!(json["swap"]["receive_address"], "bc1qours");
+            assert!(!json.to_string().contains("secret-token"));
+        }
+    }
+
+    #[test]
+    fn fixedfloat_payment_with_company_shows_the_swap() {
+        let p = swap_payment(lnvps_db::PaymentMethod::FixedFloat, swap_json());
+        let with_company = lnvps_db::SubscriptionPaymentWithCompany {
+            id: p.id,
+            subscription_id: p.subscription_id,
+            user_id: p.user_id,
+            created: p.created,
+            expires: p.expires,
+            amount: p.amount,
+            currency: p.currency,
+            payment_method: p.payment_method,
+            payment_type: p.payment_type,
+            external_data: p.external_data,
+            external_id: p.external_id,
+            is_paid: p.is_paid,
+            rate: p.rate,
+            time_value: p.time_value,
+            metadata: p.metadata,
+            tax: p.tax,
+            processing_fee: p.processing_fee,
+            paid_at: p.paid_at,
+            tax_rate: p.tax_rate,
+            tax_country_code: p.tax_country_code,
+            tax_treatment: p.tax_treatment,
+            tax_evidence: p.tax_evidence,
+            tax_breakdown: p.tax_breakdown,
+            refunded_payment_id: p.refunded_payment_id,
+            renewal_source: p.renewal_source,
+            company_id: 1,
+            company_name: "Co".to_string(),
+            company_base_currency: "EUR".to_string(),
+            vm_id: None,
+            host_id: None,
+            host_name: None,
+            region_id: None,
+            region_name: None,
+            user_country_code: None,
+            user_geo_country_code: None,
+            user_billing_tax_id: None,
+        };
+
+        let json = serde_json::to_value(AdminSubscriptionPaymentInfo::from_with_company(
+            with_company,
+        ))
+        .unwrap();
+
+        assert_eq!(json["swap"]["order_id"], "ABC123");
+        assert!(!json.to_string().contains("secret-token"));
+    }
+
+    #[test]
+    fn other_payments_have_no_swap() {
+        let payment = swap_payment(lnvps_db::PaymentMethod::OnChain, swap_json());
+        let json = serde_json::to_value(AdminSubscriptionPaymentInfo::new(
+            payment.clone(),
+            "EUR".to_string(),
+        ))
+        .unwrap();
+        assert!(json.get("swap").is_none());
+        let json = serde_json::to_value(AdminVmPaymentInfo::from_subscription_payment(
+            &payment,
+            1,
+            "EUR".to_string(),
+        ))
+        .unwrap();
+        assert!(json.get("swap").is_none());
+    }
+
+    #[test]
+    fn fixedfloat_payment_with_unreadable_data_has_no_swap() {
+        let payment = swap_payment(lnvps_db::PaymentMethod::FixedFloat, "not json".to_string());
+        let json = serde_json::to_value(AdminSubscriptionPaymentInfo::new(
+            payment,
+            "EUR".to_string(),
+        ))
+        .unwrap();
+        assert!(json.get("swap").is_none());
     }
 
     #[test]
