@@ -39,6 +39,7 @@
 //!   every payment is re-generated uniformly from current line-item pricing.
 
 use crate::subscription::SubscriptionHandler;
+use crate::swap::SwapData;
 use anyhow::{Result, bail};
 use chrono::Utc;
 use futures::StreamExt;
@@ -65,6 +66,16 @@ pub struct OnChainPaymentHandler {
 /// the txid alone does not identify a deposit.
 fn deposit_key(txid: &str, vout: u32) -> String {
     format!("{}:{}", txid, vout)
+}
+
+fn receive_address(payment: &SubscriptionPayment) -> Option<String> {
+    match payment.payment_method {
+        PaymentMethod::OnChain => Some(payment.external_data.as_str().to_string()),
+        PaymentMethod::FixedFloat => SwapData::parse(payment.external_data.as_str())
+            .ok()
+            .map(|d| d.receive_address),
+        _ => None,
+    }
 }
 
 impl OnChainPaymentHandler {
@@ -98,12 +109,18 @@ impl OnChainPaymentHandler {
     }
 
     async fn payment_for_address(&self, address: &str) -> Result<Option<SubscriptionPayment>> {
-        Ok(self
+        let mut payments = self
             .db
             .list_subscription_payments_by_method(PaymentMethod::OnChain)
-            .await?
+            .await?;
+        payments.extend(
+            self.db
+                .list_subscription_payments_by_method(PaymentMethod::FixedFloat)
+                .await?,
+        );
+        Ok(payments
             .into_iter()
-            .filter(|p| p.external_data.as_str() == address)
+            .filter(|p| receive_address(p).as_deref() == Some(address))
             .max_by_key(|p| p.created))
     }
 
@@ -135,7 +152,7 @@ impl OnChainPaymentHandler {
         {
             Ok(vm) => {
                 engine
-                    .get_cost_by_amount(vm.id, gross, PaymentMethod::OnChain)
+                    .get_cost_by_amount(vm.id, gross, payment.payment_method)
                     .await?
             }
             Err(_) => {
@@ -143,7 +160,7 @@ impl OnChainPaymentHandler {
                     .get_subscription_cost_by_amount(
                         payment.subscription_id,
                         gross,
-                        PaymentMethod::OnChain,
+                        payment.payment_method,
                     )
                     .await?
             }
@@ -336,6 +353,12 @@ impl OnChainPaymentHandler {
             payment.external_id = Some(key);
             self.db.update_subscription_payment(&payment).await?;
             self.sub_handler.complete_payment(&payment).await?;
+        } else if payment.payment_method != PaymentMethod::OnChain {
+            debug!(
+                "Deposit {} to settled swap address of payment {}, ignoring",
+                key,
+                hex::encode(&payment.id)
+            );
         } else {
             // Address reuse after settlement: insert a new renewal payment,
             // priced from the received amount (issue #109).
@@ -785,6 +808,93 @@ mod tests {
         assert!(p.is_paid);
         assert_close(p.time_value.unwrap(), expect_full.time_value / 2);
         assert_eq!(p.amount + p.tax + p.processing_fee, EXPECTED / 2);
+        Ok(())
+    }
+
+    async fn make_fixedfloat(db: &MockDb, payment: &SubscriptionPayment) -> Result<()> {
+        let mut p = payment.clone();
+        p.payment_method = PaymentMethod::FixedFloat;
+        p.external_data = SwapData {
+            coin: "XMR".to_string(),
+            order_id: "ABC".to_string(),
+            order_token: "tok".to_string(),
+            deposit_address: "4Axmr".to_string(),
+            deposit_amount: "1.5".to_string(),
+            receive_address: ADDRESS.to_string(),
+        }
+        .to_json()?
+        .into();
+        db.update_subscription_payment(&p).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fixedfloat_swap_deposit_settles() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        make_fixedfloat(&db, &payment).await?;
+        let expect = engine_price(&handler, payment.subscription_id, EXPECTED).await?;
+
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(p.is_paid);
+        assert_eq!(p.payment_method, PaymentMethod::FixedFloat);
+        assert_eq!(p.external_id.as_deref(), Some("tx1:0"));
+        assert_close(p.time_value.unwrap(), expect.time_value);
+        assert_eq!(db.subscription_payments.lock().await.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fixedfloat_swap_short_deposit_buys_less_time() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        make_fixedfloat(&db, &payment).await?;
+        let expect_full = engine_price(&handler, payment.subscription_id, EXPECTED).await?;
+
+        handler
+            .handle_deposit(ADDRESS, "tx1", 0, EXPECTED / 2)
+            .await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(p.is_paid);
+        assert_close(p.time_value.unwrap(), expect_full.time_value / 2);
+        assert_eq!(p.amount + p.tax + p.processing_fee, EXPECTED / 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fixedfloat_swap_detected_locks_pricing() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        make_fixedfloat(&db, &payment).await?;
+
+        handler.handle_detected(ADDRESS, "tx1", 0, EXPECTED).await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(!p.is_paid);
+        assert_eq!(p.external_id.as_deref(), Some("tx1:0"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fixedfloat_swap_second_deposit_to_settled_address_ignored() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        make_fixedfloat(&db, &payment).await?;
+
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+        handler.handle_deposit(ADDRESS, "tx2", 0, EXPECTED).await?;
+
+        assert_eq!(db.subscription_payments.lock().await.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_receive_address() -> Result<()> {
+        let (_db, _provider, _handler, mut p) = setup().await?;
+        assert_eq!(receive_address(&p).as_deref(), Some(ADDRESS));
+        p.payment_method = PaymentMethod::Lightning;
+        assert_eq!(receive_address(&p), None);
+        p.payment_method = PaymentMethod::FixedFloat;
+        assert_eq!(receive_address(&p), None);
         Ok(())
     }
 

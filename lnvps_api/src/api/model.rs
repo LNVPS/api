@@ -601,6 +601,17 @@ impl ApiVmPayment {
                     address: value.external_data.into(),
                     outpoint: value.external_id.clone(),
                 },
+                PaymentMethod::FixedFloat => {
+                    let data = crate::swap::SwapData::parse(value.external_data.as_str()).map_err(
+                        |e| anyhow::anyhow!("Failed to parse FixedFloat payment data: {}", e),
+                    )?;
+                    ApiPaymentData::FixedFloat {
+                        coin: data.coin,
+                        address: data.deposit_address,
+                        amount: data.deposit_amount,
+                        outpoint: value.external_id.clone(),
+                    }
+                }
                 PaymentMethod::Revolut => {
                     #[derive(Deserialize)]
                     struct RevolutData {
@@ -710,6 +721,19 @@ pub enum ApiPaymentData {
         #[serde(skip_serializing_if = "Option::is_none")]
         outpoint: Option<String>,
     },
+    /// A cryptocurrency paid through a swap that settles to our Bitcoin wallet
+    FixedFloat {
+        /// Coin to send, e.g. `XMR`
+        coin: String,
+        /// Deposit address for `coin`
+        address: String,
+        /// Amount of `coin` to send, as a decimal string
+        amount: String,
+        /// Outpoint (`"{txid}:{vout}"`) of the Bitcoin the swap delivered, set
+        /// once it is seen in the mempool. `None` until the swap pays out.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        outpoint: Option<String>,
+    },
     /// Paid in full from account credit; nothing to pay externally.
     Credit,
 }
@@ -725,6 +749,7 @@ pub enum ApiPaymentMethod {
     NWC,
     LNURL,
     OnChain,
+    FixedFloat,
 }
 
 impl From<PaymentMethod> for ApiPaymentMethod {
@@ -735,6 +760,7 @@ impl From<PaymentMethod> for ApiPaymentMethod {
             PaymentMethod::Paypal => ApiPaymentMethod::Paypal,
             PaymentMethod::Stripe => ApiPaymentMethod::Stripe,
             PaymentMethod::OnChain => ApiPaymentMethod::OnChain,
+            PaymentMethod::FixedFloat => ApiPaymentMethod::FixedFloat,
         }
     }
 }
@@ -1374,6 +1400,16 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
                 address: payment.external_data.clone().into(),
                 outpoint: payment.external_id.clone(),
             },
+            PaymentMethod::FixedFloat => {
+                crate::swap::SwapData::parse(payment.external_data.as_str())
+                    .map(|d| ApiPaymentData::FixedFloat {
+                        coin: d.coin,
+                        address: d.deposit_address,
+                        amount: d.deposit_amount,
+                        outpoint: payment.external_id.clone(),
+                    })
+                    .unwrap_or_else(|_| ApiPaymentData::Lightning(String::new()))
+            }
             PaymentMethod::Revolut => {
                 #[derive(Deserialize)]
                 struct RevolutData {
@@ -1794,6 +1830,136 @@ mod tests {
         assert_eq!(serde_json::to_value(&vm).unwrap()["data"], "credit");
         let sub = ApiSubscriptionPayment::from(payment);
         assert!(matches!(sub.data, ApiPaymentData::Credit));
+    }
+
+    fn fixedfloat_payment(external_data: &str) -> lnvps_db::SubscriptionPayment {
+        lnvps_db::SubscriptionPayment {
+            id: vec![2u8; 16],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now(),
+            amount: 1000,
+            currency: "BTC".to_string(),
+            payment_method: PaymentMethod::FixedFloat,
+            payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
+            external_data: external_data.to_string().into(),
+            external_id: None,
+            is_paid: false,
+            rate: 1.0,
+            time_value: Some(2_592_000),
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+            renewal_source: None,
+        }
+    }
+
+    #[test]
+    fn test_fixedfloat_payment_exposes_coin_address_and_amount() {
+        let data = crate::swap::SwapData {
+            coin: "LTC".to_string(),
+            order_id: "ABC".to_string(),
+            order_token: "secret-token".to_string(),
+            deposit_address: "ltc1qdeposit".to_string(),
+            deposit_amount: "0.42".to_string(),
+            receive_address: "bc1qours".to_string(),
+        }
+        .to_json()
+        .unwrap();
+        let mut payment = fixedfloat_payment(&data);
+
+        let waiting = ApiVmPayment::from_subscription_payment(payment.clone(), 1).unwrap();
+        match &waiting.data {
+            ApiPaymentData::FixedFloat {
+                coin,
+                address,
+                amount,
+                outpoint,
+            } => {
+                assert_eq!(coin, "LTC");
+                assert_eq!(address, "ltc1qdeposit");
+                assert_eq!(amount, "0.42");
+                assert!(outpoint.is_none());
+            }
+            _ => panic!("expected FixedFloat data"),
+        }
+        let json = serde_json::to_value(&waiting).unwrap();
+        assert_eq!(json["data"]["fixedfloat"]["coin"], "LTC");
+        assert!(json["data"]["fixedfloat"].get("outpoint").is_none());
+        let text = json.to_string();
+        assert!(!text.contains("secret-token"), "order token must not leak");
+        assert!(
+            !text.contains("bc1qours"),
+            "our receive address must not leak"
+        );
+
+        payment.external_id = Some("txid:1".to_string());
+        let detected = ApiVmPayment::from_subscription_payment(payment, 1).unwrap();
+        match detected.data {
+            ApiPaymentData::FixedFloat { outpoint, .. } => {
+                assert_eq!(outpoint.as_deref(), Some("txid:1"))
+            }
+            _ => panic!("expected FixedFloat data"),
+        }
+    }
+
+    #[test]
+    fn test_subscription_fixedfloat_payment_exposes_coin() {
+        let data = crate::swap::SwapData {
+            coin: "USDTTRC".to_string(),
+            order_id: "ABC".to_string(),
+            order_token: "secret-token".to_string(),
+            deposit_address: "Tdeposit".to_string(),
+            deposit_amount: "55.1".to_string(),
+            receive_address: "bc1qours".to_string(),
+        }
+        .to_json()
+        .unwrap();
+        let sub = ApiSubscriptionPayment::from(fixedfloat_payment(&data));
+        match sub.data {
+            ApiPaymentData::FixedFloat {
+                coin,
+                address,
+                amount,
+                ..
+            } => {
+                assert_eq!(
+                    (coin.as_str(), address.as_str(), amount.as_str()),
+                    ("USDTTRC", "Tdeposit", "55.1")
+                );
+            }
+            _ => panic!("expected FixedFloat data"),
+        }
+    }
+
+    #[test]
+    fn test_fixedfloat_method_wire_name() {
+        assert_eq!(
+            serde_json::to_string(&ApiPaymentMethod::FixedFloat).unwrap(),
+            "\"fixedfloat\""
+        );
+        assert_eq!(
+            ApiPaymentMethod::from(PaymentMethod::FixedFloat),
+            ApiPaymentMethod::FixedFloat
+        );
+        assert_eq!(
+            serde_json::from_str::<ApiPaymentMethod>("\"fixedfloat\"").unwrap(),
+            ApiPaymentMethod::FixedFloat
+        );
+    }
+
+    #[test]
+    fn test_fixedfloat_payment_with_bad_data_is_an_error() {
+        let payment = fixedfloat_payment("not json");
+        assert!(ApiVmPayment::from_subscription_payment(payment, 1).is_err());
     }
 
     /// On-chain payment data exposes the deposit outpoint (`{txid}:{vout}`) once

@@ -195,6 +195,29 @@ impl PaymentMethodFactory {
         }
     }
 
+    pub async fn get_swap_provider_for_company(
+        &self,
+        company_id: u64,
+    ) -> Result<Option<Arc<dyn crate::swap::SwapProvider>>> {
+        let config = match self
+            .db
+            .get_payment_method_config_for_company(company_id, PaymentMethod::FixedFloat)
+            .await
+        {
+            Ok(config) if config.enabled => config,
+            _ => return Ok(None),
+        };
+        match config
+            .get_provider_config()
+            .context("Failed to parse provider config")?
+        {
+            ProviderConfig::FixedFloat(cfg) => {
+                Ok(Some(Arc::new(crate::swap::FixedFloat::new(&cfg))))
+            }
+            other => bail!("Unsupported swap provider type: {}", other.provider_type()),
+        }
+    }
+
     /// Get the on-chain payment provider for a company
     #[cfg(feature = "onchain")]
     pub async fn get_onchain_provider_for_company(

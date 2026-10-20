@@ -106,10 +106,7 @@ impl TickerRate {
     /// Number of smallest units per standard unit for a currency, matching
     /// `payments_rs` (BTC = 1e11 milli-sats, all fiat = 100 cents).
     fn scale(currency: Currency) -> f64 {
-        match currency {
-            Currency::BTC => 1.0e11,
-            _ => 100.0,
-        }
+        currency.scale()
     }
 
     pub fn passthrough(currency: Currency) -> Self {
@@ -525,6 +522,19 @@ struct MempoolRates {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scale_matches_payments_rs_for_every_currency() {
+        for c in Currency::ALL {
+            let expected = if c.is_crypto() { 1.0e11 } else { 100.0 };
+            assert_eq!(TickerRate::scale(c), expected, "{c}");
+            assert_eq!(
+                CurrencyAmount::from_f32(c, 1.0).value() as f64,
+                expected,
+                "{c}"
+            );
+        }
+    }
+
     use super::*;
 
     const RATE: f32 = 95_000.0;

@@ -11,6 +11,7 @@ pub mod refund;
 pub mod router;
 pub mod settings;
 pub mod subscription;
+pub mod swap;
 pub mod worker;
 
 #[cfg(test)]

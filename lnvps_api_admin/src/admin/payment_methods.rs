@@ -172,6 +172,7 @@ async fn admin_update_payment_method(
 
     // Update supported currencies if provided
     if let Some(currencies) = &request.supported_currencies {
+        crate::admin::model::validate_supported_currencies(config.payment_method, currencies)?;
         config.supported_currencies = lnvps_db::CommaSeparated::new(
             currencies.iter().map(|s| s.trim().to_uppercase()).collect(),
         );

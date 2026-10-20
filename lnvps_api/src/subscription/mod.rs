@@ -34,6 +34,8 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::swap::{SwapOrder, SwapOrderRequest, SwapProvider};
+
 mod app;
 mod ip_range;
 mod marketplace_node_fee;
@@ -92,12 +94,33 @@ pub enum RenewMode {
     /// NWC (Lightning) wallet pays the invoice. `method_id` selects a specific
     /// saved method; `None` uses the user's default for the chosen provider.
     Saved { method_id: Option<u64> },
+    /// Pay with a cryptocurrency swapped to Bitcoin; `coin` is the exchange's
+    /// code for what the customer sends (e.g. `XMR`).
+    FixedFloat { coin: Currency },
 }
 
 impl Default for RenewMode {
     fn default() -> Self {
         RenewMode::Interactive { save_card: false }
     }
+}
+
+/// Whether `coin` may be paid on a FixedFloat payment method config. An empty
+/// `supported_currencies` accepts every coin the swap provider supports.
+pub(crate) fn fixedfloat_coin_accepted(
+    config: &lnvps_db::PaymentMethodConfig,
+    coin: Currency,
+) -> bool {
+    if !coin.is_crypto() || coin == Currency::BTC {
+        return false;
+    }
+    if config.supported_currencies.is_empty() {
+        return true;
+    }
+    config
+        .supported_currencies
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(&coin.to_string()))
 }
 
 /// A priced renewal order: exactly what the renewal would charge, with nothing
@@ -207,6 +230,7 @@ pub struct SubscriptionHandler {
     node: Arc<dyn LightningNode>,
     onchain: Arc<dyn OnChainProvider>,
     revolut: Option<Arc<dyn FiatPaymentService>>,
+    swap: Option<Arc<dyn SwapProvider>>,
 
     pe: PricingEngine,
     vm_provisioner: VmProvisioner,
@@ -235,6 +259,7 @@ impl SubscriptionHandler {
         let max_prepay_days = settings.max_prepay_days;
         Ok(Self {
             revolut,
+            swap: None,
             pe: PricingEngine::new(db.clone(), rates, vat),
             vm_provisioner: VmProvisioner::new(settings, db.clone()),
             ip_range_provisioner: IpRangeProvisioner::new(db.clone(), tx.clone()),
@@ -246,6 +271,11 @@ impl SubscriptionHandler {
             saved_payment_settle_timeout: SAVED_PAYMENT_SETTLE_TIMEOUT,
             max_prepay_days,
         })
+    }
+
+    pub fn with_swap(mut self, swap: Option<Arc<dyn SwapProvider>>) -> Self {
+        self.swap = swap;
+        self
     }
 
     pub fn work_commander(&self) -> Arc<dyn WorkCommander> {
@@ -286,6 +316,46 @@ impl SubscriptionHandler {
             })
             .await?;
         Ok(resp.address)
+    }
+
+    async fn new_fixedfloat_swap(
+        &self,
+        company_id: u64,
+        mode: &RenewMode,
+        currency: Currency,
+        amount_msat: u64,
+        memo: String,
+        label: String,
+    ) -> Result<SwapOrder> {
+        ensure!(
+            currency == Currency::BTC,
+            "Cannot create FixedFloat payments for non-BTC currency"
+        );
+        let RenewMode::FixedFloat { coin } = mode else {
+            bail!("A coin is required for fixedfloat payments");
+        };
+        let config = self
+            .db
+            .get_payment_method_config_for_company(company_id, PaymentMethod::FixedFloat)
+            .await
+            .context("FixedFloat payments are not configured")?;
+        ensure!(config.enabled, "FixedFloat payments are not enabled");
+        ensure!(
+            fixedfloat_coin_accepted(&config, *coin),
+            "{} is not accepted for FixedFloat payments",
+            coin
+        );
+        let swap = self
+            .swap
+            .clone()
+            .context("FixedFloat payments are not configured")?;
+        let receive_address = self.new_onchain_address(amount_msat, memo, label).await?;
+        swap.create_order(SwapOrderRequest {
+            coin: coin.to_string(),
+            receive_sats: amount_msat / 1000,
+            receive_address,
+        })
+        .await
     }
 
     #[cfg(test)]
@@ -1346,6 +1416,9 @@ impl SubscriptionHandler {
                             .await?;
                         (info.external_id, info.raw_data)
                     }
+                    RenewMode::FixedFloat { .. } => {
+                        bail!("A coin cannot be used with this payment method")
+                    }
                     RenewMode::Interactive { save_card } => {
                         self.create_revolut_order(
                             rev,
@@ -1440,6 +1513,67 @@ impl SubscriptionHandler {
                     external_data: address.into(),
                     // txid is not known until the payment arrives; the chain
                     // watcher fills this in when the deposit is seen.
+                    external_id: None,
+                    is_paid: false,
+                    rate,
+                    time_value: if time_value > 0 {
+                        Some(time_value)
+                    } else {
+                        None
+                    },
+                    metadata: None,
+                    tax,
+                    processing_fee,
+                    paid_at: None,
+                    tax_rate: tax_summary.rate,
+                    tax_country_code: tax_summary.country_code.clone(),
+                    tax_treatment: tax_summary.treatment.clone(),
+                    tax_evidence: tax_evidence.clone(),
+                    tax_breakdown: tax_breakdown.clone(),
+                    refunded_payment_id: None,
+                }
+            }
+            PaymentMethod::FixedFloat => {
+                let desc = match payment_type {
+                    SubscriptionPaymentType::Purchase => {
+                        format!("Subscription purchase: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::Renewal => {
+                        format!("Subscription renewal: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::Upgrade => {
+                        format!("Subscription upgrade: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::Refund => {
+                        bail!("Cannot create an invoice for a refund")
+                    }
+                };
+                let receive_amount =
+                    round_msat_to_sat(converted_amount + tax + processing_fee - credit_covered);
+                let new_id: [u8; 32] = rand::random();
+                let order = self
+                    .new_fixedfloat_swap(
+                        subscription.company_id,
+                        mode,
+                        converted_currency,
+                        receive_amount,
+                        desc,
+                        hex::encode(new_id),
+                    )
+                    .await?;
+
+                SubscriptionPayment {
+                    renewal_source: Some(source),
+                    id: new_id.to_vec(),
+                    subscription_id,
+                    user_id: subscription.user_id,
+                    created: Utc::now(),
+                    expires: order.expires,
+                    amount: converted_amount,
+                    currency: converted_currency.to_string(),
+                    payment_method: method,
+                    payment_type,
+                    external_data: order.data.to_json()?.into(),
                     external_id: None,
                     is_paid: false,
                     rate,
@@ -1967,6 +2101,9 @@ impl SubscriptionHandler {
                             .await?;
                         (info.external_id, info.raw_data)
                     }
+                    RenewMode::FixedFloat { .. } => {
+                        bail!("A coin cannot be used with this payment method")
+                    }
                     RenewMode::Interactive { save_card } => {
                         self.create_revolut_order(
                             rev,
@@ -2043,6 +2180,49 @@ impl SubscriptionHandler {
                     external_data: address.into(),
                     // txid is filled in by the chain watcher when the
                     // deposit is seen.
+                    external_id: None,
+                    is_paid: false,
+                    rate: p.rate.rate,
+                    time_value: Some(p.time_value),
+                    metadata,
+                    tax: p.tax,
+                    processing_fee: p.processing_fee,
+                    paid_at: None,
+                    tax_rate: tax_summary.rate,
+                    tax_country_code: tax_summary.country_code.clone(),
+                    tax_treatment: tax_summary.treatment.clone(),
+                    tax_evidence: tax_evidence.clone(),
+                    tax_breakdown: tax_breakdown.clone(),
+                    refunded_payment_id: None,
+                }
+            }
+            PaymentMethod::FixedFloat => {
+                let receive_amount =
+                    round_msat_to_sat(p.amount + p.tax + p.processing_fee - credit_covered);
+                let new_id: [u8; 32] = rand::random();
+                let company_id = self.db.get_subscription(subscription_id).await?.company_id;
+                let order = self
+                    .new_fixedfloat_swap(
+                        company_id,
+                        mode,
+                        p.currency,
+                        receive_amount,
+                        desc,
+                        hex::encode(new_id),
+                    )
+                    .await?;
+                SubscriptionPayment {
+                    renewal_source: Some(RenewalSource::Manual),
+                    id: new_id.to_vec(),
+                    subscription_id,
+                    user_id,
+                    created: Utc::now(),
+                    expires: order.expires,
+                    amount: p.amount,
+                    currency: p.currency.to_string(),
+                    payment_method: method,
+                    payment_type,
+                    external_data: order.data.to_json()?.into(),
                     external_id: None,
                     is_paid: false,
                     rate: p.rate.rate,
@@ -2923,6 +3103,236 @@ pub(crate) mod revolut_offline_tests {
         let addresses = onchain.addresses.lock().await;
         assert_eq!(addresses.len(), 1);
         assert_eq!(payment.external_data.as_str(), addresses[0]);
+    }
+
+    async fn fixedfloat_setup(
+        currency: &str,
+        with_swap: bool,
+        coins: &[&str],
+        enabled: bool,
+    ) -> (
+        SubscriptionHandler,
+        Arc<MockOnChainProvider>,
+        Arc<crate::mocks::MockSwapProvider>,
+        u64,
+    ) {
+        use lnvps_db::{FixedFloatProviderConfig, PaymentMethodConfig, ProviderConfig};
+        let db = Arc::new(MockDb::default());
+        let onchain = Arc::new(MockOnChainProvider::default());
+        let swap = Arc::new(crate::mocks::MockSwapProvider::default());
+        let user_id = db.upsert_user(&[23u8; 32]).await.unwrap();
+        let mut config = PaymentMethodConfig::new_with_config(
+            1,
+            PaymentMethod::FixedFloat,
+            "FixedFloat".to_string(),
+            enabled,
+            ProviderConfig::FixedFloat(FixedFloatProviderConfig {
+                api_key: "k".to_string(),
+                api_secret: "s".to_string(),
+                url: None,
+                refcode: None,
+                afftax: None,
+            }),
+        );
+        config.supported_currencies =
+            lnvps_db::CommaSeparated::new(coins.iter().map(|c| c.to_string()).collect());
+        db.insert_payment_method_config(&config).await.unwrap();
+        let (sub_id, _items) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "s".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: true,
+                    is_setup: true,
+                    currency: currency.to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: LineItemType::IpRange,
+                    name: "hosting".to_string(),
+                    description: None,
+                    amount: 100_000,
+                    setup_amount: 0,
+                    configuration: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let rates = Arc::new(MockExchangeRate::default());
+        rates
+            .set_rate(
+                lnvps_api_common::Ticker::btc_rate("EUR").unwrap(),
+                100_000.0,
+            )
+            .await;
+        let handler = SubscriptionHandler::new(
+            mock_settings(),
+            db,
+            Arc::new(MockNode::default()),
+            onchain.clone(),
+            None,
+            rates,
+            VatClient::new(),
+            Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
+        )
+        .unwrap()
+        .with_swap(if with_swap {
+            Some(swap.clone() as Arc<dyn SwapProvider>)
+        } else {
+            None
+        });
+        (handler, onchain, swap, sub_id)
+    }
+
+    async fn renew_with_coin(
+        sub: &SubscriptionHandler,
+        sub_id: u64,
+        coin: Currency,
+    ) -> Result<SubscriptionPayment> {
+        sub.renew_subscription_with_mode(
+            sub_id,
+            PaymentMethod::FixedFloat,
+            1,
+            RenewMode::FixedFloat { coin },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_fixedfloat_creates_swap_to_onchain_address() {
+        let (sub, onchain, swap, sub_id) = fixedfloat_setup("BTC", true, &[], true).await;
+
+        let payment = renew_with_coin(&sub, sub_id, Currency::XMR).await.unwrap();
+
+        assert_eq!(payment.payment_method, PaymentMethod::FixedFloat);
+        assert!(!payment.is_paid);
+        assert_eq!(payment.external_id, None);
+        let data = crate::swap::SwapData::parse(payment.external_data.as_str()).unwrap();
+        let addresses = onchain.addresses.lock().await;
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(data.coin, "XMR");
+        assert_eq!(data.receive_address, addresses[0]);
+        assert_eq!(data.deposit_address, "4mockxmr00000000");
+        let requests = swap.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].coin, "XMR");
+        assert_eq!(requests[0].receive_address, addresses[0]);
+        assert_eq!(
+            requests[0].receive_sats * 1000,
+            payment.amount + payment.tax + payment.processing_fee
+        );
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_fixedfloat_orders_the_requested_coin() {
+        let (sub, _onchain, swap, sub_id) =
+            fixedfloat_setup("BTC", true, &["XMR", "LTC"], true).await;
+
+        renew_with_coin(&sub, sub_id, Currency::LTC).await.unwrap();
+
+        assert_eq!(swap.requests.lock().await[0].coin, "LTC");
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_fixedfloat_requires_swap_provider() {
+        let (sub, onchain, _swap, sub_id) = fixedfloat_setup("BTC", false, &[], true).await;
+
+        assert!(renew_with_coin(&sub, sub_id, Currency::XMR).await.is_err());
+        assert!(onchain.addresses.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_fixedfloat_rejects_a_coin_the_config_does_not_list() {
+        let (sub, onchain, swap, sub_id) = fixedfloat_setup("BTC", true, &["XMR"], true).await;
+
+        let err = renew_with_coin(&sub, sub_id, Currency::ETH)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("ETH is not accepted"), "{err}");
+        assert!(onchain.addresses.lock().await.is_empty());
+        assert!(swap.requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_fixedfloat_rejects_a_disabled_config() {
+        let (sub, onchain, _swap, sub_id) = fixedfloat_setup("BTC", true, &[], false).await;
+
+        assert!(renew_with_coin(&sub, sub_id, Currency::XMR).await.is_err());
+        assert!(onchain.addresses.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_fixedfloat_requires_a_coin() {
+        let (sub, onchain, _swap, sub_id) = fixedfloat_setup("BTC", true, &[], true).await;
+
+        let err = sub
+            .renew_subscription(sub_id, PaymentMethod::FixedFloat, 1)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("coin is required"), "{err}");
+        assert!(onchain.addresses.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_fixedfloat_for_fiat_subscription_is_btc() {
+        let (sub, _onchain, swap, sub_id) = fixedfloat_setup("EUR", true, &[], true).await;
+
+        let payment = renew_with_coin(&sub, sub_id, Currency::XMR).await.unwrap();
+
+        assert_eq!(payment.currency, "BTC");
+        assert_eq!(swap.requests.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn fixedfloat_coin_accepted_follows_the_config_list() {
+        use lnvps_db::{FixedFloatProviderConfig, PaymentMethodConfig, ProviderConfig};
+        let mut config = PaymentMethodConfig::new_with_config(
+            1,
+            PaymentMethod::FixedFloat,
+            "FixedFloat".to_string(),
+            true,
+            ProviderConfig::FixedFloat(FixedFloatProviderConfig {
+                api_key: String::new(),
+                api_secret: String::new(),
+                url: None,
+                refcode: None,
+                afftax: None,
+            }),
+        );
+        for coin in [
+            Currency::XMR,
+            Currency::LTC,
+            Currency::ETH,
+            Currency::USDTTRC,
+        ] {
+            assert!(
+                fixedfloat_coin_accepted(&config, coin),
+                "empty list accepts {coin}"
+            );
+        }
+        assert!(!fixedfloat_coin_accepted(&config, Currency::BTC));
+        assert!(!fixedfloat_coin_accepted(&config, Currency::EUR));
+
+        config.supported_currencies =
+            lnvps_db::CommaSeparated::new(vec!["xmr".to_string(), "USDTTRC".to_string()]);
+        assert!(fixedfloat_coin_accepted(&config, Currency::XMR));
+        assert!(fixedfloat_coin_accepted(&config, Currency::USDTTRC));
+        assert!(!fixedfloat_coin_accepted(&config, Currency::LTC));
+        assert!(!fixedfloat_coin_accepted(&config, Currency::BTC));
     }
 
     #[tokio::test]

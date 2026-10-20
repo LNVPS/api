@@ -733,6 +733,10 @@ pub enum ApiCurrency {
     CHF,
     AUD,
     JPY,
+    XMR,
+    LTC,
+    ETH,
+    USDTTRC,
 }
 
 impl From<Currency> for ApiCurrency {
@@ -746,6 +750,10 @@ impl From<Currency> for ApiCurrency {
             Currency::CHF => ApiCurrency::CHF,
             Currency::AUD => ApiCurrency::AUD,
             Currency::JPY => ApiCurrency::JPY,
+            Currency::XMR => ApiCurrency::XMR,
+            Currency::LTC => ApiCurrency::LTC,
+            Currency::ETH => ApiCurrency::ETH,
+            Currency::USDTTRC => ApiCurrency::USDTTRC,
         }
     }
 }
@@ -761,6 +769,10 @@ impl From<ApiCurrency> for Currency {
             ApiCurrency::CHF => Currency::CHF,
             ApiCurrency::AUD => Currency::AUD,
             ApiCurrency::JPY => Currency::JPY,
+            ApiCurrency::XMR => Currency::XMR,
+            ApiCurrency::LTC => Currency::LTC,
+            ApiCurrency::ETH => Currency::ETH,
+            ApiCurrency::USDTTRC => Currency::USDTTRC,
         }
     }
 }
@@ -1340,6 +1352,15 @@ impl ApiSubscriptionLineItemResource {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn api_currency_round_trips_every_currency() {
+        for c in Currency::ALL {
+            let api = ApiCurrency::from(c);
+            assert_eq!(Currency::from(api), c);
+            assert_eq!(serde_json::to_string(&api).unwrap(), format!("\"{}\"", c));
+        }
+    }
+
     use super::*;
 
     #[test]

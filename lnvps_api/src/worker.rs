@@ -71,7 +71,10 @@ fn get_host_info_path_for_arch(arch: CpuArch) -> Option<std::path::PathBuf> {
 pub(crate) fn payment_blocks_unpaid_deletion(p: &SubscriptionPayment, now: DateTime<Utc>) -> bool {
     !p.is_paid
         && (p.expires > now
-            || (p.payment_method == PaymentMethod::OnChain && p.external_id.is_some()))
+            || (matches!(
+                p.payment_method,
+                PaymentMethod::OnChain | PaymentMethod::FixedFloat
+            ) && p.external_id.is_some()))
 }
 
 /// Why a detected deposit can no longer confirm.

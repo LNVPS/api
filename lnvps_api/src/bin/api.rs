@@ -280,6 +280,9 @@ async fn main() -> Result<(), Error> {
         }
     }));
 
+    let swap = factory
+        .get_swap_provider_for_company(default_company_id)
+        .await?;
     let sub_handler = SubscriptionHandler::new(
         settings.clone(),
         db.clone(),
@@ -290,7 +293,8 @@ async fn main() -> Result<(), Error> {
         vat.clone(),
         work_commander.clone(),
         status.clone(),
-    )?;
+    )?
+    .with_swap(swap);
     sub_handler.vm_provisioner().init().await?;
 
     // On-chain provider for the worker's automated on-chain referral payouts.

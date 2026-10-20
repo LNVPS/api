@@ -70,6 +70,9 @@ pub(crate) struct PaymentMethodQuery {
     /// Discount code to apply to this order. A code that cannot be used fails
     /// the request rather than quietly charging full price.
     pub code: Option<String>,
+    /// For `method=fixedfloat`: the coin the customer pays with, one of the
+    /// codes in the method's `coins` metadata (e.g. `XMR`).
+    pub coin: Option<String>,
 }
 
 impl PaymentMethodQuery {
@@ -234,6 +237,28 @@ pub(crate) fn resolve_quote_method(q: &PaymentMethodQuery) -> lnvps_db::PaymentM
     }
 }
 
+pub(crate) fn parse_fixedfloat_coin(
+    coin: Option<&str>,
+) -> Result<payments_rs::currency::Currency, lnvps_api_common::ApiError> {
+    use payments_rs::currency::Currency;
+    use std::str::FromStr;
+
+    let coin = coin
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| {
+            lnvps_api_common::ApiError::from(anyhow::anyhow!(
+                "coin is required for fixedfloat payments"
+            ))
+        })?;
+    Currency::from_str(coin)
+        .ok()
+        .filter(|c| c.is_crypto() && *c != Currency::BTC)
+        .ok_or_else(|| {
+            lnvps_api_common::ApiError::from(anyhow::anyhow!("Unsupported coin: {}", coin))
+        })
+}
+
 pub(crate) async fn resolve_payment_mode(
     this: &RouterState,
     uid: u64,
@@ -267,6 +292,12 @@ pub(crate) async fn resolve_payment_mode(
                 method_id: q.payment_method_id,
             },
         )),
+        Some("fixedfloat") => Ok((
+            PaymentMethod::FixedFloat,
+            RenewMode::FixedFloat {
+                coin: parse_fixedfloat_coin(q.coin.as_deref())?,
+            },
+        )),
         other => Ok((
             other
                 .and_then(|m| PaymentMethod::from_str(m).ok())
@@ -292,6 +323,7 @@ mod tests {
             save_card: None,
             payment_method_id: None,
             code: None,
+            coin: None,
         }
     }
 
@@ -431,6 +463,29 @@ mod tests {
             resolve_quote_method(&query(None, None)),
             PaymentMethod::Lightning
         );
+    }
+
+    #[test]
+    fn parse_fixedfloat_coin_accepts_coins_in_any_case() {
+        use payments_rs::currency::Currency;
+
+        assert_eq!(parse_fixedfloat_coin(Some("XMR")).unwrap(), Currency::XMR);
+        assert_eq!(parse_fixedfloat_coin(Some(" ltc ")).unwrap(), Currency::LTC);
+        assert_eq!(parse_fixedfloat_coin(Some("eth")).unwrap(), Currency::ETH);
+        assert_eq!(
+            parse_fixedfloat_coin(Some("usdttrc")).unwrap(),
+            Currency::USDTTRC
+        );
+    }
+
+    #[test]
+    fn parse_fixedfloat_coin_rejects_missing_and_non_coins() {
+        assert!(parse_fixedfloat_coin(None).is_err());
+        assert!(parse_fixedfloat_coin(Some("")).is_err());
+        assert!(parse_fixedfloat_coin(Some("  ")).is_err());
+        assert!(parse_fixedfloat_coin(Some("BTC")).is_err());
+        assert!(parse_fixedfloat_coin(Some("EUR")).is_err());
+        assert!(parse_fixedfloat_coin(Some("DOGE")).is_err());
     }
 
     /// The wire shape mirrors the payment: amounts already net of the discount,

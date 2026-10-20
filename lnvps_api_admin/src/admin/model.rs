@@ -3469,6 +3469,8 @@ pub enum AdminPaymentMethod {
     Paypal,
     Stripe,
     OnChain,
+    #[serde(rename = "fixedfloat")]
+    FixedFloat,
 }
 
 impl From<PaymentMethod> for AdminPaymentMethod {
@@ -3479,6 +3481,7 @@ impl From<PaymentMethod> for AdminPaymentMethod {
             PaymentMethod::Paypal => AdminPaymentMethod::Paypal,
             PaymentMethod::Stripe => AdminPaymentMethod::Stripe,
             PaymentMethod::OnChain => AdminPaymentMethod::OnChain,
+            PaymentMethod::FixedFloat => AdminPaymentMethod::FixedFloat,
         }
     }
 }
@@ -4521,6 +4524,7 @@ pub enum AdminPaymentMethodType {
     Paypal,
     Stripe,
     OnChain,
+    FixedFloat,
 }
 
 impl From<lnvps_db::PaymentMethod> for AdminPaymentMethodType {
@@ -4531,6 +4535,7 @@ impl From<lnvps_db::PaymentMethod> for AdminPaymentMethodType {
             lnvps_db::PaymentMethod::Paypal => AdminPaymentMethodType::Paypal,
             lnvps_db::PaymentMethod::Stripe => AdminPaymentMethodType::Stripe,
             lnvps_db::PaymentMethod::OnChain => AdminPaymentMethodType::OnChain,
+            lnvps_db::PaymentMethod::FixedFloat => AdminPaymentMethodType::FixedFloat,
         }
     }
 }
@@ -4543,6 +4548,7 @@ impl From<AdminPaymentMethodType> for lnvps_db::PaymentMethod {
             AdminPaymentMethodType::Paypal => lnvps_db::PaymentMethod::Paypal,
             AdminPaymentMethodType::Stripe => lnvps_db::PaymentMethod::Stripe,
             AdminPaymentMethodType::OnChain => lnvps_db::PaymentMethod::OnChain,
+            AdminPaymentMethodType::FixedFloat => lnvps_db::PaymentMethod::FixedFloat,
         }
     }
 }
@@ -4566,6 +4572,16 @@ pub struct SanitizedOnChainConfig {
     pub address_type: String,
     pub account: Option<String>,
     pub min_confirmations: u32,
+}
+
+/// Sanitized FixedFloat config (hides api_key and api_secret)
+#[derive(Serialize)]
+pub struct SanitizedFixedFloatConfig {
+    pub url: Option<String>,
+    pub refcode: Option<String>,
+    pub afftax: Option<f32>,
+    pub has_api_key: bool,
+    pub has_api_secret: bool,
 }
 
 /// Sanitized Revolut config (hides token and webhook_secret)
@@ -4608,6 +4624,8 @@ pub enum SanitizedProviderConfig {
     Stripe(SanitizedStripeConfig),
     Paypal(SanitizedPaypalConfig),
     OnChain(SanitizedOnChainConfig),
+    #[serde(rename = "fixedfloat")]
+    FixedFloat(SanitizedFixedFloatConfig),
 }
 
 impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
@@ -4654,6 +4672,15 @@ impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
                     address_type: format!("{:?}", cfg.address_type),
                     account: cfg.account.clone(),
                     min_confirmations: cfg.min_confirmations,
+                })
+            }
+            lnvps_db::ProviderConfig::FixedFloat(cfg) => {
+                SanitizedProviderConfig::FixedFloat(SanitizedFixedFloatConfig {
+                    url: cfg.url.clone(),
+                    refcode: cfg.refcode.clone(),
+                    afftax: cfg.afftax,
+                    has_api_key: !cfg.api_key.is_empty(),
+                    has_api_secret: !cfg.api_secret.is_empty(),
                 })
             }
         }
@@ -4736,6 +4763,39 @@ pub struct CreatePaymentMethodConfigRequest {
     pub supported_currencies: Option<Vec<String>>,
 }
 
+/// Validate the currency codes an admin sets on a payment method config.
+///
+/// The `fixedfloat` method lists the coins a customer can pay with, which must be
+/// cryptocurrencies other than BTC. Every other method lists billing currencies,
+/// which cannot be a coin because coins have no exchange rate to price against.
+pub fn validate_supported_currencies(
+    method: lnvps_db::PaymentMethod,
+    currencies: &[String],
+) -> anyhow::Result<()> {
+    use payments_rs::currency::Currency;
+    for code in currencies {
+        let currency = code
+            .trim()
+            .parse::<Currency>()
+            .map_err(|_| anyhow!("Unknown currency code: {}", code))?;
+        let is_coin = currency.is_crypto() && currency != Currency::BTC;
+        if method == lnvps_db::PaymentMethod::FixedFloat {
+            if !is_coin {
+                return Err(anyhow!(
+                    "{} is not a coin. The FixedFloat payment method accepts XMR, LTC, ETH and USDTTRC",
+                    code
+                ));
+            }
+        } else if is_coin {
+            return Err(anyhow!(
+                "{} can only be listed on the FixedFloat payment method",
+                code
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl CreatePaymentMethodConfigRequest {
     pub fn to_payment_method_config(&self) -> anyhow::Result<lnvps_db::PaymentMethodConfig> {
         if self.name.trim().is_empty() {
@@ -4775,6 +4835,7 @@ impl CreatePaymentMethodConfigRequest {
             .as_ref()
             .map(|s| s.trim().to_uppercase());
         if let Some(currencies) = &self.supported_currencies {
+            validate_supported_currencies(payment_config.payment_method, currencies)?;
             payment_config.supported_currencies = lnvps_db::CommaSeparated::new(
                 currencies.iter().map(|s| s.trim().to_uppercase()).collect(),
             );
@@ -4880,6 +4941,28 @@ pub struct PartialOnChainConfig {
     pub min_confirmations: Option<u32>,
 }
 
+/// Partial FixedFloat config for updates
+#[derive(Deserialize)]
+pub struct PartialFixedFloatConfig {
+    pub api_key: Option<String>,
+    pub api_secret: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub url: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub refcode: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub afftax: Option<Option<f32>>,
+}
+
 /// Partial provider configuration for updates - only provided fields will be updated
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -4890,6 +4973,8 @@ pub enum PartialProviderConfig {
     Paypal(PartialPaypalConfig),
     #[serde(rename = "onchain")]
     OnChain(PartialOnChainConfig),
+    #[serde(rename = "fixedfloat")]
+    FixedFloat(PartialFixedFloatConfig),
 }
 
 impl PartialProviderConfig {
@@ -4973,6 +5058,19 @@ impl PartialProviderConfig {
                         .unwrap_or(existing.min_confirmations),
                 }))
             }
+            (PartialProviderConfig::FixedFloat(partial), ProviderConfig::FixedFloat(existing)) => {
+                Ok(ProviderConfig::FixedFloat(
+                    lnvps_db::FixedFloatProviderConfig {
+                        api_key: partial.api_key.unwrap_or_else(|| existing.api_key.clone()),
+                        api_secret: partial
+                            .api_secret
+                            .unwrap_or_else(|| existing.api_secret.clone()),
+                        url: partial.url.unwrap_or_else(|| existing.url.clone()),
+                        refcode: partial.refcode.unwrap_or_else(|| existing.refcode.clone()),
+                        afftax: partial.afftax.unwrap_or(existing.afftax),
+                    },
+                ))
+            }
             _ => Err(anyhow!(
                 "Cannot change provider type during update. Create a new config instead."
             )),
@@ -4987,6 +5085,7 @@ impl PartialProviderConfig {
             PartialProviderConfig::Stripe(_) => "stripe",
             PartialProviderConfig::Paypal(_) => "paypal",
             PartialProviderConfig::OnChain(_) => "onchain",
+            PartialProviderConfig::FixedFloat(_) => "fixedfloat",
         }
     }
 }
@@ -5050,6 +5149,69 @@ pub struct AdminUpdateUserPaymentMethodRequest {
 
 #[cfg(test)]
 mod tests {
+    use lnvps_db::PaymentMethod;
+
+    fn codes(c: &[&str]) -> Vec<String> {
+        c.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn fixedfloat_method_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&AdminPaymentMethod::FixedFloat).unwrap(),
+            "\"fixedfloat\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AdminPaymentMethodType::FixedFloat).unwrap(),
+            "\"fixedfloat\""
+        );
+        assert_eq!(
+            lnvps_db::PaymentMethod::from(AdminPaymentMethodType::FixedFloat),
+            lnvps_db::PaymentMethod::FixedFloat
+        );
+        assert_eq!(
+            AdminPaymentMethod::from(lnvps_db::PaymentMethod::FixedFloat),
+            AdminPaymentMethod::FixedFloat
+        );
+    }
+
+    #[test]
+    fn fixedfloat_method_lists_only_coins() {
+        assert!(
+            validate_supported_currencies(
+                PaymentMethod::FixedFloat,
+                &codes(&["XMR", "ltc", "ETH", "USDTTRC"])
+            )
+            .is_ok()
+        );
+        assert!(validate_supported_currencies(PaymentMethod::FixedFloat, &[]).is_ok());
+        for bad in ["BTC", "EUR", "USD", "DOGE"] {
+            assert!(
+                validate_supported_currencies(PaymentMethod::FixedFloat, &codes(&[bad])).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_methods_never_list_coins() {
+        for method in [
+            PaymentMethod::Lightning,
+            PaymentMethod::OnChain,
+            PaymentMethod::Revolut,
+            PaymentMethod::Stripe,
+            PaymentMethod::Paypal,
+        ] {
+            assert!(validate_supported_currencies(method, &codes(&["EUR", "BTC", "usd"])).is_ok());
+            for coin in ["XMR", "LTC", "ETH", "USDTTRC"] {
+                assert!(
+                    validate_supported_currencies(method, &codes(&[coin])).is_err(),
+                    "{method} {coin}"
+                );
+            }
+            assert!(validate_supported_currencies(method, &codes(&["DOGE"])).is_err());
+        }
+    }
     use super::*;
 
     /// Per-disk usage is attached to each configured disk, and a disk the

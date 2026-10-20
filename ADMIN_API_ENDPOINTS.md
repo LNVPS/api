@@ -7988,6 +7988,7 @@ All fields except `webhook_secret` are required when creating:
 | `stripe`      | stripe         | `secret_key`, `publishable_key`, `webhook_secret`                     |
 | `paypal`      | paypal         | `client_id`, `client_secret`, `mode`                                  |
 | `onchain`     | onchain        | `url`, `cert_path`, `macaroon_path` (`address_type`, `account`, `min_confirmations` optional) |
+| `fixedfloat`  | fixedfloat     | `api_key`, `api_secret` (`url`, `refcode`, `afftax` optional)         |
 
 ### PartialProviderConfig (Tagged Union) - For Updates
 
@@ -8001,6 +8002,7 @@ Only the `type` field is required; all other fields are optional and will keep t
 | `stripe`      | `secret_key`, `publishable_key`, `webhook_secret`             |
 | `paypal`      | `client_id`, `client_secret`, `mode`                          |
 | `onchain`     | `url`, `cert_path`, `macaroon_path`, `address_type`, `account` (null clears), `min_confirmations` |
+| `fixedfloat`  | `api_key`, `api_secret`, `url` (null clears), `refcode` (null clears), `afftax` (null clears) |
 
 ### Notes
 
@@ -8011,6 +8013,7 @@ Only the `type` field is required; all other fields are optional and will keep t
 - `stripe` - Stripe Payments API
 - `paypal` - PayPal REST API
 - `onchain` - On-chain Bitcoin payments (LND wallet backend). `address_type` is one of `witness_pubkey_hash`, `nested_pubkey_hash`, `taproot_pubkey`.
+- `fixedfloat` - Cryptocurrency payments through the FixedFloat exchange API (payment method `fixedfloat`). The customer picks a coin per payment (`coin` query parameter). The coins a company accepts are the config's `supported_currencies`, which for `fixedfloat` must be coins from `XMR`, `LTC`, `ETH` and `USDTTRC`; an empty list accepts all four. Coins are rejected on every other payment method, and a coin cannot be a company or plan currency. Each payment creates a FixedFloat order into that coin whose BTC destination is a fresh address from the company's `onchain` config, so an enabled `onchain` payment method is required as well. The BTC that arrives is settled by the on-chain watcher at the rate current on arrival. The response hides `api_key` and `api_secret` and returns `has_api_key` and `has_api_secret`. `afftax` is only sent together with `refcode`.
 
 **Multiple Configurations:**
 A company can have multiple payment method configurations for the same payment method type. This allows keeping disabled

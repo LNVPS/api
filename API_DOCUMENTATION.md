@@ -527,6 +527,7 @@ interface Discount {
 type PaymentData = 
   | { lightning: string } // Lightning Network invoice
   | { onchain: { address: string; outpoint?: string } } // On-chain Bitcoin receive address (BTC only). `outpoint` ("{txid}:{vout}") is set as soon as a deposit is seen in the mempool (0-conf), before it confirms, so the UI can show "received, waiting for confirmation"; absent until a deposit is detected. Confirmed once is_paid is true
+  | { fixedfloat: { coin: string; address: string; amount: string; outpoint?: string } } // A cryptocurrency swapped to Bitcoin. Send exactly `amount` of `coin` (XMR, LTC, ETH or USDTTRC) to `address` before `expires`. A third-party exchange converts it and pays our Bitcoin wallet; `outpoint` ("{txid}:{vout}") appears when that Bitcoin is seen in the mempool. The credited time is priced from the Bitcoin actually received, so a short or late deposit buys proportionally less time. Confirmed once is_paid is true
   | { revolut: { token: string } } // Revolut payment token
   | { stripe: { session_id: string } }; // Stripe checkout session
 
@@ -535,9 +536,9 @@ interface PaymentType {
 }
 
 interface PaymentMethod {
-  name: 'lightning' | 'onchain' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
+  name: 'lightning' | 'onchain' | 'fixedfloat' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
   metadata: Record<string, string>;
-  currencies: ('BTC' | 'EUR' | 'USD')[];
+  currencies: ('BTC' | 'EUR' | 'USD' | 'GBP' | 'CAD' | 'CHF' | 'AUD' | 'JPY' | 'XMR' | 'LTC' | 'ETH' | 'USDTTRC')[]; // For `fixedfloat` these are the coins the customer can pay with, never billing currencies
   processing_fee_rate?: number; // Percentage rate (e.g., 1.0 for 1%)
   processing_fee_base?: number; // Base amount in smallest currency units (cents for fiat, millisats for BTC)
   processing_fee_currency?: string; // Currency for the base fee (e.g., "EUR")
@@ -585,7 +586,7 @@ interface SubscriptionPayment {
   created: string; // ISO 8601 datetime
   expires: string; // ISO 8601 datetime
   amount: Price; // Total payment amount
-  payment_method: 'lightning' | 'onchain' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
+  payment_method: 'lightning' | 'onchain' | 'fixedfloat' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
   payment_type: 'Purchase' | 'Renewal' | 'Upgrade';
   is_paid: boolean;
   paid_at?: string; // ISO 8601 datetime when payment was completed (only present when is_paid is true)
@@ -1328,7 +1329,8 @@ interface ExchangeRates {
 - **GET** `/api/v1/vm/{id}/renew?method={payment_method}&intervals={count}`
 - **Auth**: Required
 - **Query Params**: 
-  - `method`: Optional payment method ('lightning' | 'onchain' | 'revolut' | 'paypal' | 'nwc')
+  - `method`: Optional payment method ('lightning' | 'onchain' | 'fixedfloat' | 'revolut' | 'paypal' | 'nwc')
+  - `coin`: Required when `method=fixedfloat`: one of the `currencies` the `fixedfloat` payment method lists (`XMR`, `LTC`, `ETH`, `USDTTRC`, case-insensitive). The payment is priced in BTC and the response `data` is `{ fixedfloat: { coin, address, amount } }`. A coin that is missing, not a coin, or not listed for the company is rejected
   - `intervals`: Optional number of billing intervals to renew (default: 1). For example, if the VM has a monthly billing cycle, `intervals=3` would generate a payment for 3 months.
   - `code`: Optional discount code. A code that cannot be used (unknown, expired, exhausted, or not applicable to this order) **fails the request** rather than quietly invoicing full price, so the customer is told it did not work. The returned `amount` and `tax` are already net of any discount, and `discount` describes what was taken off.
 - **Response**: `VmPayment`
