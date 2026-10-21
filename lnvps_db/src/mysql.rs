@@ -10,11 +10,11 @@ use crate::{
     PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
     Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelKind,
     RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod,
-    UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage,
-    VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice, VpnPeerTemplate,
-    VpnService, VpnSubscription, WebauthnCredential,
+    SubscriptionPaymentWithCompany, SwapOrderClient, Tunnel, TunnelPool, TunnelRoute, User,
+    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
+    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk,
+    VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal,
+    VpnDevice, VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -580,6 +580,22 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .execute(&self.db)
         .await?;
         Ok(())
+    }
+
+    async fn insert_swap_order_client(&self, record: &SwapOrderClient) -> DbResult<u64> {
+        let res = sqlx::query(
+            "insert into swap_order_client (user_id, order_id, payment_id, coin, ip, user_agent, accept_language) values (?, ?, ?, ?, ?, ?, ?) returning id",
+        )
+        .bind(record.user_id)
+        .bind(&record.order_id)
+        .bind(&record.payment_id)
+        .bind(&record.coin)
+        .bind(&record.ip)
+        .bind(&record.user_agent)
+        .bind(&record.accept_language)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
     }
 
     async fn list_users(&self) -> DbResult<Vec<User>> {
@@ -9320,6 +9336,35 @@ impl AdminDb for LNVpsDbMysql {
             .bind(pubkey)
             .fetch_one(&self.db)
             .await?)
+    }
+
+    async fn admin_list_swap_order_clients(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        order_id: Option<&str>,
+    ) -> DbResult<(Vec<SwapOrderClient>, u64)> {
+        let filter = "from swap_order_client where (? is null or user_id = ?) and (? is null or order_id = ?)";
+        let rows = sqlx::query_as(&format!(
+            "select * {filter} order by created desc, id desc limit ? offset ?"
+        ))
+        .bind(user_id)
+        .bind(user_id)
+        .bind(order_id)
+        .bind(order_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 = sqlx::query_scalar(&format!("select count(*) {filter}"))
+            .bind(user_id)
+            .bind(user_id)
+            .bind(order_id)
+            .bind(order_id)
+            .fetch_one(&self.db)
+            .await?;
+        Ok((rows, total as u64))
     }
 
     async fn admin_list_vm_ip_assignments(

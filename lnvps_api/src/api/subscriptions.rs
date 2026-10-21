@@ -344,6 +344,7 @@ async fn v1_create_subscription(
 /// - Renewal: Monthly cost only
 async fn v1_renew_subscription(
     auth: Nip98Auth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Query(q): Query<PaymentMethodQuery>,
@@ -366,6 +367,15 @@ async fn v1_renew_subscription(
         .renew_subscription_with_discount(id, method, intervals, mode, q.code.clone())
         .await
         .map_err(|e| anyhow::anyhow!("Failed to generate payment: {}", e))?;
+    crate::api::record_swap_client(
+        &this,
+        uid,
+        payment.payment_method,
+        &payment.id,
+        payment.external_data.as_str(),
+        &client,
+    )
+    .await;
 
     let discount = crate::api::discount_line(&this.db, &payment.id).await;
     let credit = crate::api::credit_line(&this.db, &payment).await;

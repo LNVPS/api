@@ -169,6 +169,7 @@ const ONCHAIN_TOPUP_EXPIRE: i64 = 3600;
 /// Top up the account credit balance by Lightning, on-chain or a FixedFloat swap.
 async fn v1_topup_credit(
     auth: Nip98Auth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Json(req): Json<TopupRequest>,
 ) -> ApiResult<ApiCreditTopup> {
@@ -246,6 +247,15 @@ async fn v1_topup_credit(
         other => return ApiData::err(&format!("Unsupported top-up method: {other}")),
     }
     topup.id = this.db.insert_account_credit_topup(&topup).await?;
+    crate::api::record_swap_client(
+        &this,
+        uid,
+        topup.payment_method,
+        &topup.invoice_hash,
+        &topup.external_data,
+        &client,
+    )
+    .await;
 
     ApiData::ok(ApiCreditTopup::from_topup(
         &topup,

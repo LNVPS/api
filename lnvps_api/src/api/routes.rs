@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use lnvps_api_common::{
     ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate,
-    ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, TraderDetails, UpgradeConfig,
-    UserRateLimiter, VatClient, WorkJob, apply_custom_pricing_limits,
+    ClientInfo, ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, TraderDetails,
+    UpgradeConfig, UserRateLimiter, VatClient, WorkJob, apply_custom_pricing_limits,
 };
 use lnvps_db::{
     CpuArch, LNVpsDb, PaymentMethod, Region, Vm, VmCustomPricing, VmCustomPricingDisk,
@@ -1500,6 +1500,7 @@ async fn v1_create_vm_order(
 /// a future release.
 async fn v1_renew_vm(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Query(q): Query<PaymentMethodQuery>,
@@ -1522,6 +1523,15 @@ async fn v1_renew_vm(
             q.code.clone(),
         )
         .await?;
+    crate::api::record_swap_client(
+        &this,
+        uid,
+        payment.payment_method,
+        &payment.id,
+        payment.external_data.as_str(),
+        &client,
+    )
+    .await;
 
     let discount = crate::api::discount_line(&this.db, &payment.id).await;
     let credit = crate::api::credit_line(&this.db, &payment).await;
@@ -2535,6 +2545,7 @@ async fn v1_vm_upgrade_quote(
 /// Upgrade a VM (requires payment first)
 async fn v1_vm_upgrade(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Query(q): Query<PaymentMethodQuery>,
@@ -2556,6 +2567,15 @@ async fn v1_vm_upgrade(
         .sub_handler
         .create_vm_upgrade_payment(id, &cfg, method, mode)
         .await?;
+    crate::api::record_swap_client(
+        &this,
+        uid,
+        payment.payment_method,
+        &payment.id,
+        payment.external_data.as_str(),
+        &client,
+    )
+    .await;
 
     // Note: The actual upgrade happens after payment is confirmed
     let credit = crate::api::credit_line(&this.db, &payment).await;

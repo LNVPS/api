@@ -1052,6 +1052,7 @@ async fn v1_app_deployment_upgrade_quote(
 /// upgrade leaves it untouched.
 async fn v1_app_deployment_upgrade(
     auth: Nip98Auth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Query(q): Query<PaymentMethodQuery>,
@@ -1068,6 +1069,15 @@ async fn v1_app_deployment_upgrade(
         .sub_handler
         .create_app_upgrade_payment(id, req.resource_multiplier, method, mode)
         .await?;
+    crate::api::record_swap_client(
+        &this,
+        uid,
+        payment.payment_method,
+        &payment.id,
+        payment.external_data.as_str(),
+        &client,
+    )
+    .await;
 
     ApiData::ok(ApiSubscriptionPayment::from(payment))
 }

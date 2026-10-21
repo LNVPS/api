@@ -34,6 +34,7 @@ mod reports;
 mod roles;
 mod routers;
 mod subscriptions;
+mod swap_orders;
 mod tunnel_pools;
 mod user_payment_methods;
 mod users;
@@ -86,6 +87,7 @@ pub fn admin_router(
         .merge(vm_templates::router())
         .merge(companies::router())
         .merge(credit::router())
+        .merge(swap_orders::router())
         .merge(cost_plans::router())
         .merge(costs::router())
         .merge(custom_pricing::router())

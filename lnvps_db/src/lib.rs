@@ -212,6 +212,9 @@ pub trait LNVpsDbBase: Send + Sync {
     /// preference, and clear the one-time link token for the given user.
     async fn link_telegram_chat(&self, user_id: u64, chat_id: i64) -> DbResult<()>;
 
+    /// Keep who ordered a swap, and from where. Rows outlive the user.
+    async fn insert_swap_order_client(&self, record: &SwapOrderClient) -> DbResult<u64>;
+
     /// List all users
     async fn list_users(&self) -> DbResult<Vec<User>>;
 

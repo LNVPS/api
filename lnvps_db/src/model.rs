@@ -1972,6 +1972,19 @@ pub struct AccountCreditTopup {
     pub created: DateTime<Utc>,
 }
 
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct SwapOrderClient {
+    pub id: u64,
+    pub user_id: u64,
+    pub order_id: String,
+    pub payment_id: Vec<u8>,
+    pub coin: String,
+    pub ip: Option<String>,
+    pub user_agent: Option<String>,
+    pub accept_language: Option<String>,
+    pub created: DateTime<Utc>,
+}
+
 /// How an outbound payout reaches its recipient. Stored as a small integer; new
 /// methods are added as new variants (append-only to preserve values).
 ///

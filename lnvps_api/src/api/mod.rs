@@ -259,6 +259,50 @@ pub(crate) fn parse_fixedfloat_coin(
         })
 }
 
+pub(crate) fn swap_client_record(
+    user_id: u64,
+    method: lnvps_db::PaymentMethod,
+    payment_id: &[u8],
+    external_data: &str,
+    client: &lnvps_api_common::ClientInfo,
+) -> Option<lnvps_db::SwapOrderClient> {
+    if method != lnvps_db::PaymentMethod::FixedFloat {
+        return None;
+    }
+    let swap = crate::swap::SwapData::parse(external_data).ok()?;
+    Some(lnvps_db::SwapOrderClient {
+        user_id,
+        order_id: swap.order_id,
+        payment_id: payment_id.to_vec(),
+        coin: swap.coin,
+        ip: client.ip.map(|ip| ip.to_string()),
+        user_agent: client.user_agent.clone(),
+        accept_language: client.accept_language.clone(),
+        ..Default::default()
+    })
+}
+
+pub(crate) async fn record_swap_client(
+    this: &RouterState,
+    user_id: u64,
+    method: lnvps_db::PaymentMethod,
+    payment_id: &[u8],
+    external_data: &str,
+    client: &lnvps_api_common::ClientInfo,
+) {
+    let Some(record) = swap_client_record(user_id, method, payment_id, external_data, client)
+    else {
+        return;
+    };
+    if let Err(e) = this.db.insert_swap_order_client(&record).await {
+        log::error!(
+            "Failed to record client for swap order {}: {}",
+            record.order_id,
+            e
+        );
+    }
+}
+
 pub(crate) async fn resolve_payment_mode(
     this: &RouterState,
     uid: u64,
@@ -462,6 +506,57 @@ mod tests {
         assert_eq!(
             resolve_quote_method(&query(None, None)),
             PaymentMethod::Lightning
+        );
+    }
+
+    #[test]
+    fn swap_client_record_keeps_ip_agent_and_language() {
+        let data = crate::swap::SwapData {
+            coin: "XMR".to_string(),
+            order_id: "ABC123".to_string(),
+            order_token: "tok".to_string(),
+            deposit_address: "addr".to_string(),
+            deposit_amount: "1.5".to_string(),
+            receive_address: "bc1q".to_string(),
+        };
+        let client = lnvps_api_common::ClientInfo {
+            ip: Some("203.0.113.7".parse().unwrap()),
+            user_agent: Some("Mozilla/5.0".to_string()),
+            accept_language: Some("en-GB,en;q=0.9".to_string()),
+        };
+        let record = swap_client_record(
+            7,
+            lnvps_db::PaymentMethod::FixedFloat,
+            &[1, 2, 3],
+            &data.to_json().unwrap(),
+            &client,
+        )
+        .unwrap();
+        assert_eq!(record.user_id, 7);
+        assert_eq!(record.order_id, "ABC123");
+        assert_eq!(record.coin, "XMR");
+        assert_eq!(record.payment_id, vec![1, 2, 3]);
+        assert_eq!(record.ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(record.user_agent.as_deref(), Some("Mozilla/5.0"));
+        assert_eq!(record.accept_language.as_deref(), Some("en-GB,en;q=0.9"));
+    }
+
+    #[test]
+    fn swap_client_record_ignores_other_methods_and_bad_data() {
+        let client = lnvps_api_common::ClientInfo::default();
+        assert!(
+            swap_client_record(1, lnvps_db::PaymentMethod::Lightning, &[1], "{}", &client)
+                .is_none()
+        );
+        assert!(
+            swap_client_record(
+                1,
+                lnvps_db::PaymentMethod::FixedFloat,
+                &[1],
+                "nope",
+                &client
+            )
+            .is_none()
         );
     }
 

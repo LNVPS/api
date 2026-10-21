@@ -83,6 +83,7 @@ pub struct MockDb {
     pub account_credit_events: Arc<Mutex<Vec<lnvps_db::AccountCreditEvent>>>,
     pub account_credit_debits: Arc<Mutex<Vec<lnvps_db::AccountCreditDebit>>>,
     pub account_credit_topups: Arc<Mutex<Vec<lnvps_db::AccountCreditTopup>>>,
+    pub swap_order_clients: Arc<Mutex<Vec<lnvps_db::SwapOrderClient>>>,
     pub marketplace_operators: Arc<Mutex<HashMap<u64, MarketplaceOperator>>>,
     pub marketplace_nodes: Arc<Mutex<HashMap<u64, MarketplaceNode>>>,
     pub marketplace_node_health: Arc<Mutex<HashMap<u64, MarketplaceNodeHealth>>>,
@@ -542,6 +543,7 @@ impl Default for MockDb {
             account_credit_events: Arc::new(Default::default()),
             account_credit_debits: Arc::new(Default::default()),
             account_credit_topups: Arc::new(Default::default()),
+            swap_order_clients: Arc::new(Default::default()),
             marketplace_operators: Arc::new(Default::default()),
             marketplace_nodes: Arc::new(Default::default()),
             marketplace_node_health: Arc::new(Default::default()),
@@ -892,6 +894,20 @@ impl LNVpsDbBase for MockDb {
             u.telegram_link_token = None;
         }
         Ok(())
+    }
+
+    async fn insert_swap_order_client(&self, record: &lnvps_db::SwapOrderClient) -> DbResult<u64> {
+        let mut rows = self.swap_order_clients.lock().await;
+        if rows.iter().any(|r| r.order_id == record.order_id) {
+            return Err(DbError::Other(anyhow!("duplicate swap order")));
+        }
+        let id = rows.len() as u64 + 1;
+        rows.push(lnvps_db::SwapOrderClient {
+            id,
+            created: Utc::now(),
+            ..record.clone()
+        });
+        Ok(id)
     }
 
     async fn list_users(&self) -> DbResult<Vec<User>> {
@@ -7705,6 +7721,30 @@ impl lnvps_db::AdminDb for MockDb {
         Ok((vec![], 0))
     }
 
+    async fn admin_list_swap_order_clients(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        order_id: Option<&str>,
+    ) -> DbResult<(Vec<lnvps_db::SwapOrderClient>, u64)> {
+        let rows = self.swap_order_clients.lock().await;
+        let mut matched: Vec<_> = rows
+            .iter()
+            .filter(|r| user_id.is_none_or(|u| r.user_id == u))
+            .filter(|r| order_id.is_none_or(|o| r.order_id == o))
+            .cloned()
+            .collect();
+        matched.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = matched.len() as u64;
+        let page = matched
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, total))
+    }
+
     async fn admin_get_vm_ip_assignment(
         &self,
         _assignment_id: u64,
@@ -13720,5 +13760,57 @@ mod account_credit_tests {
         assert!(page[0].id > page[1].id);
         let (rest, _) = db.list_account_credit_topups(1, 2, 2).await.unwrap();
         assert_eq!(rest.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn swap_order_clients_filter_by_user_and_order() {
+        use lnvps_db::AdminDb;
+        let db = MockDb::default();
+        for (user_id, order) in [(1u64, "A"), (2, "B"), (1, "C")] {
+            db.insert_swap_order_client(&lnvps_db::SwapOrderClient {
+                user_id,
+                order_id: order.to_string(),
+                payment_id: vec![user_id as u8],
+                coin: "XMR".to_string(),
+                ip: Some("203.0.113.7".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let (all, total) = db
+            .admin_list_swap_order_clients(10, 0, None, None)
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(all[0].order_id, "C");
+        let (mine, total) = db
+            .admin_list_swap_order_clients(10, 0, Some(1), None)
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        assert!(mine.iter().all(|r| r.user_id == 1));
+        let (one, total) = db
+            .admin_list_swap_order_clients(10, 0, None, Some("B"))
+            .await
+            .unwrap();
+        assert_eq!((one.len(), total), (1, 1));
+        let (page, total) = db
+            .admin_list_swap_order_clients(1, 1, None, None)
+            .await
+            .unwrap();
+        assert_eq!((page.len(), total), (1, 3));
+    }
+
+    #[tokio::test]
+    async fn swap_order_client_rejects_a_duplicate_order() {
+        let db = MockDb::default();
+        let record = lnvps_db::SwapOrderClient {
+            user_id: 1,
+            order_id: "A".to_string(),
+            ..Default::default()
+        };
+        db.insert_swap_order_client(&record).await.unwrap();
+        assert!(db.insert_swap_order_client(&record).await.is_err());
     }
 }

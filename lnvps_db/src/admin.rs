@@ -427,6 +427,15 @@ pub trait AdminDb: Send + Sync {
         include_deleted: Option<bool>,
     ) -> DbResult<(Vec<crate::VmIpAssignment>, u64)>;
 
+    /// Swap orders with who placed them, newest first.
+    async fn admin_list_swap_order_clients(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        order_id: Option<&str>,
+    ) -> DbResult<(Vec<crate::SwapOrderClient>, u64)>;
+
     /// Get VM IP assignment by ID
     async fn admin_get_vm_ip_assignment(
         &self,

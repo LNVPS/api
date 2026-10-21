@@ -3499,6 +3499,29 @@ Required Permission: `dns_server::delete`
 Note: DNS servers referenced by any IP range (forward or reverse) cannot be deleted. Remove the reference from all IP
 ranges first.
 
+### Swap Order Clients
+
+Every FixedFloat swap order records who placed it and from where. Rows are kept for at least one year, are never
+deleted by the API, and survive deletion of the user.
+
+#### List Swap Orders
+
+```
+GET /api/admin/v1/swap_orders
+```
+
+Query Parameters:
+
+- `limit`: number (optional) - Items per page (max 100, default 50)
+- `offset`: number (optional) - Pagination offset
+- `user_id`: number (optional) - Filter by user
+- `order_id`: string (optional) - Filter by FixedFloat order id
+
+Required Permission: `subscription_payments::view`
+
+Each row has `id`, `user_id`, `order_id`, `payment_id` (hex, the subscription payment or credit top-up it paid for),
+`coin`, `ip`, `user_agent`, `accept_language` and `created`.
+
 ### VM IP Assignment Management
 
 VM IP assignments bind specific IP addresses from IP ranges to virtual machines. These endpoints provide comprehensive

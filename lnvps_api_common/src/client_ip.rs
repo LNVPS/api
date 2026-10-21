@@ -83,6 +83,42 @@ where
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientInfo {
+    pub ip: Option<IpAddr>,
+    pub user_agent: Option<String>,
+    pub accept_language: Option<String>,
+}
+
+impl ClientInfo {
+    pub fn from_headers(headers: &axum::http::HeaderMap) -> Self {
+        Self {
+            ip: ClientIp::from_headers(headers).0,
+            user_agent: header_text(headers, "user-agent", 512),
+            accept_language: header_text(headers, "accept-language", 255),
+        }
+    }
+}
+
+fn header_text(headers: &axum::http::HeaderMap, name: &str, max: usize) -> Option<String> {
+    let value = headers.get(name)?.to_str().ok()?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.chars().take(max).collect())
+}
+
+impl<S> FromRequestParts<S> for ClientInfo
+where
+    S: Send + Sync,
+{
+    type Rejection = Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        Ok(ClientInfo::from_headers(&parts.headers))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +205,32 @@ mod tests {
         let (mut parts, _) = req.into_parts();
         let ip = ClientIp::from_request_parts(&mut parts, &()).await.unwrap();
         assert_eq!(ip.0, Some("10.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn client_info_collects_ip_agent_and_language() {
+        let info = ClientInfo::from_headers(&headers(&[
+            ("x-forwarded-for", "203.0.113.7"),
+            ("user-agent", " Mozilla/5.0 "),
+            ("accept-language", "en-GB,en;q=0.9"),
+        ]));
+        assert_eq!(info.ip, Some("203.0.113.7".parse().unwrap()));
+        assert_eq!(info.user_agent.as_deref(), Some("Mozilla/5.0"));
+        assert_eq!(info.accept_language.as_deref(), Some("en-GB,en;q=0.9"));
+    }
+
+    #[test]
+    fn client_info_is_empty_without_headers() {
+        assert_eq!(
+            ClientInfo::from_headers(&HeaderMap::new()),
+            ClientInfo::default()
+        );
+    }
+
+    #[test]
+    fn client_info_truncates_long_headers() {
+        let long = "a".repeat(2000);
+        let info = ClientInfo::from_headers(&headers(&[("user-agent", &long)]));
+        assert_eq!(info.user_agent.unwrap().len(), 512);
     }
 }
