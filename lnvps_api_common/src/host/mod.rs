@@ -49,10 +49,8 @@ pub struct MigrateVmRequest {
     pub target_storage: Option<String>,
 }
 
-/// Most snapshots a single VM may hold at once.
 pub const MAX_VM_SNAPSHOTS: usize = 3;
 
-/// A point-in-time copy of a VM's disk and configuration, held on its host.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmSnapshot {
     pub name: String,
@@ -60,8 +58,6 @@ pub struct VmSnapshot {
     pub created: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Why a snapshot request was refused, kept distinct from a host failure so
-/// the API can answer it as the client's mistake rather than a 500.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotRejection {
     Invalid(String),
@@ -78,28 +74,60 @@ impl std::fmt::Display for SnapshotRejection {
 
 impl std::error::Error for SnapshotRejection {}
 
+impl SnapshotRejection {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Invalid(_) => "invalid",
+            Self::Conflict(_) => "conflict",
+            Self::NotFound(_) => "not_found",
+        }
+    }
+
+    pub fn from_kind(kind: &str, message: String) -> Option<Self> {
+        match kind {
+            "invalid" => Some(Self::Invalid(message)),
+            "conflict" => Some(Self::Conflict(message)),
+            "not_found" => Some(Self::NotFound(message)),
+            _ => None,
+        }
+    }
+}
+
+pub fn check_restorable(existing: &[VmSnapshot], name: &str) -> Result<(), SnapshotRejection> {
+    let Some(at) = existing.iter().position(|s| s.name == name) else {
+        return Err(SnapshotRejection::NotFound(format!(
+            "Snapshot {name} does not exist"
+        )));
+    };
+    let newer: Vec<&str> = existing[at + 1..].iter().map(|s| s.name.as_str()).collect();
+    if !newer.is_empty() {
+        return Err(SnapshotRejection::Conflict(format!(
+            "Only the newest snapshot can be restored, delete {} first",
+            newer.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 impl From<SnapshotRejection> for OpError<anyhow::Error> {
     fn from(value: SnapshotRejection) -> Self {
         OpError::Fatal(value.into())
     }
 }
 
-/// Names are used verbatim as the hypervisor's snapshot id, so they are held to
-/// the strictest rule any host has (Proxmox): a letter first, then letters,
-/// digits, `_` or `-`, at most 40 characters. `current` is Proxmox's own name
-/// for the live state.
 pub fn validate_snapshot_name(name: &str) -> Result<(), SnapshotRejection> {
     let mut chars = name.chars();
     let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic());
     if !first_ok
         || name == "current"
+        || name.len() < 2
         || name.len() > 40
         || !name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
         return Err(SnapshotRejection::Invalid(
-            "Snapshot name must start with a letter and use only letters, digits, '_' and '-' (max 40 characters)".to_string(),
+            "Snapshot name must start with a letter and use only letters, digits, '_' and '-' (2 to 40 characters)".to_string(),
         ));
     }
     Ok(())
@@ -114,7 +142,6 @@ pub fn validate_snapshot_description(description: &str) -> Result<(), SnapshotRe
     Ok(())
 }
 
-/// Check a new snapshot against what the VM already holds.
 pub fn check_new_snapshot(
     existing: &[VmSnapshot],
     name: &str,
@@ -137,10 +164,6 @@ pub fn check_new_snapshot(
     Ok(())
 }
 
-/// Delete every snapshot of a VM, for operations that rewrite or resize the
-/// disk underneath them (reinstall, a disk upgrade), which hypervisors refuse
-/// while snapshots exist and which would leave them restoring a disk of the
-/// wrong size or contents.
 pub async fn clear_snapshots(client: &dyn VmHostClient, vm: &Vm) -> OpResult<usize> {
     let snapshots = client.list_snapshots(vm).await?;
     for snapshot in &snapshots {
@@ -202,24 +225,13 @@ pub trait VmHostClient: Send + Sync {
         )))
     }
 
-    /// List the snapshots of a VM, oldest first.
     async fn list_snapshots(&self, vm: &Vm) -> OpResult<Vec<VmSnapshot>>;
 
-    /// Snapshot a VM's disk and configuration.
-    ///
-    /// A running VM is left running. Hosts that cannot snapshot a live guest
-    /// stop it for the duration and start it again.
     async fn create_snapshot(&self, vm: &Vm, name: &str, description: Option<&str>)
     -> OpResult<()>;
 
-    /// Return a VM's disk and configuration to a snapshot.
-    ///
-    /// The VM is **stopped** afterwards, whatever it was doing before. The
-    /// configuration comes back as it was when the snapshot was taken, so the
-    /// caller reapplies the current one before starting it.
     async fn rollback_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()>;
 
-    /// Delete a snapshot. Deleting one that does not exist is a success.
     async fn delete_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()>;
 
     /// Download OS image to the host
@@ -636,7 +648,7 @@ pub struct VmHostDiskInfo {
 #[cfg(test)]
 mod tests {
     use crate::host::{
-        FullVmInfo, SnapshotRejection, VmSnapshot, check_new_snapshot,
+        FullVmInfo, SnapshotRejection, VmSnapshot, check_new_snapshot, check_restorable,
         validate_snapshot_description, validate_snapshot_name,
     };
     use crate::{GB, TB};
@@ -648,11 +660,12 @@ mod tests {
 
     #[test]
     fn snapshot_names_follow_the_strictest_host_rule() {
-        for ok in ["a", "before-upgrade", "Snap_1", &"a".repeat(40)] {
+        for ok in ["ab", "before-upgrade", "Snap_1", &"a".repeat(40)] {
             assert!(validate_snapshot_name(ok).is_ok(), "{ok}");
         }
         for bad in [
             "",
+            "a",
             "1abc",
             "-a",
             "a b",
@@ -686,15 +699,51 @@ mod tests {
             check_new_snapshot(&[held("one")], "one", None),
             Err(SnapshotRejection::Conflict(_))
         ));
-        let full: Vec<_> = ["a", "b", "c"].into_iter().map(held).collect();
+        let full: Vec<_> = ["s1", "s2", "s3"].into_iter().map(held).collect();
         assert!(matches!(
-            check_new_snapshot(&full, "d", None),
+            check_new_snapshot(&full, "s4", None),
             Err(SnapshotRejection::Conflict(m)) if m.contains('3')
         ));
         assert_eq!(
             SnapshotRejection::NotFound("gone".into()).to_string(),
             "gone"
         );
+    }
+
+    #[test]
+    fn only_the_newest_snapshot_is_restorable() {
+        let held: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|n| VmSnapshot {
+                name: n.to_string(),
+                description: None,
+                created: None,
+            })
+            .collect();
+        assert!(check_restorable(&held, "c").is_ok());
+        assert!(matches!(
+            check_restorable(&held, "a"),
+            Err(SnapshotRejection::Conflict(m)) if m.contains("b, c")
+        ));
+        assert!(matches!(
+            check_restorable(&held, "x"),
+            Err(SnapshotRejection::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_rejections_round_trip_through_their_kind() {
+        for r in [
+            SnapshotRejection::Invalid("i".into()),
+            SnapshotRejection::Conflict("c".into()),
+            SnapshotRejection::NotFound("n".into()),
+        ] {
+            assert_eq!(
+                SnapshotRejection::from_kind(r.kind(), r.to_string()),
+                Some(r)
+            );
+        }
+        assert_eq!(SnapshotRejection::from_kind("other", "x".into()), None);
     }
 
     #[test]
