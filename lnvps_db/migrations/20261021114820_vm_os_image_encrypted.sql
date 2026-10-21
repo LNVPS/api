@@ -1,0 +1,2 @@
+ALTER TABLE vm_os_image
+    ADD COLUMN encrypted TINYINT(1) NOT NULL DEFAULT 0;

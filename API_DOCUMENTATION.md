@@ -471,6 +471,7 @@ interface VmOsImage {
   release_date: string; // ISO 8601 datetime
   cpu_arch?: string; // CPU architecture (e.g. "x86_64", "arm64"; omitted if unspecified)
   default_username?: string;
+  encrypted: boolean; // root disk is encrypted; the VM asks for a passphrase on the serial console at first boot and at every boot
   popularity: number; // fraction (0.0–1.0) of active VMs using this image
 }
 

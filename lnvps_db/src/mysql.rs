@@ -1080,7 +1080,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_os_image(&self, image: &VmOsImage) -> DbResult<()> {
         sqlx::query(
-            "UPDATE vm_os_image SET distribution=?, flavour=?, version=?, enabled=?, release_date=?, url=?, cpu_arch=?, default_username=?, sha2=?, sha2_url=? WHERE id=?"
+            "UPDATE vm_os_image SET distribution=?, flavour=?, version=?, enabled=?, release_date=?, url=?, cpu_arch=?, default_username=?, sha2=?, sha2_url=?, encrypted=? WHERE id=?"
         )
         .bind(image.distribution as u16)
         .bind(&image.flavour)
@@ -1092,6 +1092,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&image.default_username)
         .bind(&image.sha2)
         .bind(&image.sha2_url)
+        .bind(image.encrypted)
         .bind(image.id)
         .execute(&self.db)
         .await?;
@@ -8121,8 +8122,8 @@ impl AdminDb for LNVpsDbMysql {
     async fn admin_create_vm_os_image(&self, image: &VmOsImage) -> DbResult<u64> {
         let result = sqlx::query(
             r#"
-            INSERT INTO vm_os_image (distribution, flavour, version, enabled, release_date, url, cpu_arch, default_username)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO vm_os_image (distribution, flavour, version, enabled, release_date, url, cpu_arch, default_username, encrypted)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#
         )
         .bind(image.distribution as u16)
@@ -8133,6 +8134,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&image.url)
         .bind(image.cpu_arch as u16)
         .bind(&image.default_username)
+        .bind(image.encrypted)
         .execute(&self.db)
         .await?;
 
@@ -8143,7 +8145,7 @@ impl AdminDb for LNVpsDbMysql {
         sqlx::query(
             r#"
             UPDATE vm_os_image 
-            SET distribution = ?, flavour = ?, version = ?, enabled = ?, release_date = ?, url = ?, cpu_arch = ?, default_username = ?, sha2 = ?, sha2_url = ?
+            SET distribution = ?, flavour = ?, version = ?, enabled = ?, release_date = ?, url = ?, cpu_arch = ?, default_username = ?, sha2 = ?, sha2_url = ?, encrypted = ?
             WHERE id = ?
             "#
         )
@@ -8157,6 +8159,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&image.default_username)
         .bind(&image.sha2)
         .bind(&image.sha2_url)
+        .bind(image.encrypted)
         .bind(image.id)
         .execute(&self.db)
         .await?;

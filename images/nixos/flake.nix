@@ -23,7 +23,7 @@
       # The qcow disk image is built for the guest architecture. LNVPS records
       # carry a `cpu_arch` field (x86_64 / arm64), so we expose one image per arch.
       mkImage =
-        system:
+        system: extraModules:
         nixos-generators.nixosGenerate {
           inherit system;
           # `qcow-efi` (NOT `qcow`) is required: LNVPS boots every VM with OVMF
@@ -34,18 +34,20 @@
           # UEFI fallback path (EFI/BOOT/BOOTX64.EFI) that OVMF finds without a
           # pre-existing NVRAM boot entry.
           format = "qcow-efi";
-          modules = [ ./configuration.nix ];
+          modules = [ ./configuration.nix ] ++ extraModules;
         };
     in
     {
       packages = {
         "x86_64-linux" = {
-          qcow-efi = mkImage "x86_64-linux";
-          default = mkImage "x86_64-linux";
+          qcow-efi = mkImage "x86_64-linux" [ ];
+          qcow-efi-encrypted = mkImage "x86_64-linux" [ ./encrypted.nix ];
+          default = mkImage "x86_64-linux" [ ];
         };
         "aarch64-linux" = {
-          qcow-efi = mkImage "aarch64-linux";
-          default = mkImage "aarch64-linux";
+          qcow-efi = mkImage "aarch64-linux" [ ];
+          qcow-efi-encrypted = mkImage "aarch64-linux" [ ./encrypted.nix ];
+          default = mkImage "aarch64-linux" [ ];
         };
       };
     };

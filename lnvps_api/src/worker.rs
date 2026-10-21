@@ -5216,6 +5216,7 @@ mod tests {
                 default_username: None,
                 sha2: None,
                 sha2_url: None,
+                encrypted: false,
             };
             let images = vec![
                 img(1, "https://example.com/a.qcow2"),
@@ -5562,6 +5563,7 @@ mod tests {
             default_username: Some("debian".to_string()),
             sha2: Some("cb".repeat(64)),
             sha2_url: Some(format!("{}/SHA512SUMS", server.uri())),
+            encrypted: false,
         };
         mock.os_images.lock().await.insert(6, image.clone());
         let worker = setup_worker(mock.clone()).await?;

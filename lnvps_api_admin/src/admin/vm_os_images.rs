@@ -178,6 +178,10 @@ async fn admin_update_vm_os_image(
         image.sha2 = sha2.clone();
     }
 
+    if let Some(encrypted) = request.encrypted {
+        image.encrypted = encrypted;
+    }
+
     let sha2_url_changed = request.sha2_url.is_some();
     if let Some(sha2_url) = &request.sha2_url {
         image.sha2_url = sha2_url.clone();

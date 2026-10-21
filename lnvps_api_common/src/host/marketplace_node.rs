@@ -237,6 +237,7 @@ mod tests {
             default_username: None,
             sha2: sha2.map(|s| s.to_string()),
             sha2_url: None,
+            encrypted: false,
         }
     }
 

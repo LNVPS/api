@@ -438,6 +438,7 @@ impl Default for MockDb {
                 default_username: None,
                 sha2: None,
                 sha2_url: None,
+                encrypted: false,
             },
         );
         Self {

@@ -885,6 +885,9 @@ pub struct ApiVmOsImage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_arch: Option<String>,
     pub default_username: Option<String>,
+    /// The root disk is encrypted. On first boot the VM asks for a passphrase
+    /// on the serial console, and asks for it again at every boot.
+    pub encrypted: bool,
     /// Popularity of this image expressed as a fraction (0.0â1.0) of all
     /// active VMs currently using it
     pub popularity: f32,
@@ -904,6 +907,7 @@ impl From<lnvps_db::VmOsImage> for ApiVmOsImage {
                 Some(image.cpu_arch.to_string())
             },
             default_username: image.default_username,
+            encrypted: image.encrypted,
             popularity: 0.0,
         }
     }
@@ -1352,6 +1356,29 @@ impl ApiSubscriptionLineItemResource {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn api_vm_os_image_reports_encrypted() {
+        let mut image = lnvps_db::VmOsImage {
+            id: 1,
+            distribution: lnvps_db::OsDistribution::NixOS,
+            flavour: "cloudinit".to_string(),
+            version: "24.11".to_string(),
+            enabled: true,
+            release_date: Utc::now(),
+            url: "https://example.com/nixos.qcow2.xz".to_string(),
+            cpu_arch: CpuArch::X86_64,
+            default_username: None,
+            sha2: None,
+            sha2_url: None,
+            encrypted: true,
+        };
+        let api: ApiVmOsImage = image.clone().into();
+        assert!(api.encrypted);
+        assert_eq!(serde_json::to_value(&api).unwrap()["encrypted"], true);
+        image.encrypted = false;
+        assert!(!ApiVmOsImage::from(image).encrypted);
+    }
+
     #[test]
     fn api_currency_round_trips_every_currency() {
         for c in Currency::ALL {

@@ -1686,6 +1686,7 @@ pub struct AdminVmOsImageInfo {
     pub active_vm_count: i64, // Number of active (non-deleted) VMs using this image
     pub sha2: Option<String>,
     pub sha2_url: Option<String>,
+    pub encrypted: bool,
 }
 
 #[derive(Deserialize)]
@@ -1701,6 +1702,8 @@ pub struct CreateVmOsImageRequest {
     pub default_username: Option<String>,
     pub sha2: Option<String>,
     pub sha2_url: Option<String>,
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 #[derive(Deserialize)]
@@ -1728,6 +1731,7 @@ pub struct UpdateVmOsImageRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub sha2_url: Option<Option<String>>,
+    pub encrypted: Option<bool>,
 }
 
 impl AdminVmOsImageInfo {
@@ -1758,6 +1762,7 @@ impl AdminVmOsImageInfo {
             default_username: image.default_username,
             sha2: image.sha2,
             sha2_url: image.sha2_url,
+            encrypted: image.encrypted,
             active_vm_count,
         })
     }
@@ -1781,6 +1786,7 @@ impl From<lnvps_db::VmOsImage> for AdminVmOsImageInfo {
             default_username: image.default_username,
             sha2: image.sha2,
             sha2_url: image.sha2_url,
+            encrypted: image.encrypted,
             active_vm_count: 0, // Default when not using the async method
         }
     }
@@ -1829,6 +1835,7 @@ impl CreateVmOsImageRequest {
             default_username: self.default_username.clone(),
             sha2: self.sha2.clone(),
             sha2_url: self.sha2_url.clone(),
+            encrypted: self.encrypted,
         })
     }
 }
@@ -5675,6 +5682,24 @@ mod tests {
             req.to_vm_os_image().unwrap().cpu_arch,
             lnvps_db::CpuArch::X86_64
         );
+    }
+
+    #[test]
+    fn test_vm_os_image_requests_carry_encrypted() {
+        let json = r#"{"distribution":"nixos","flavour":"cloudinit","version":"24.11","enabled":true,"release_date":"2026-01-01T00:00:00Z","url":"https://example.com/image.qcow2","encrypted":true}"#;
+        let req: CreateVmOsImageRequest = serde_json::from_str(json).unwrap();
+        let image = req.to_vm_os_image().unwrap();
+        assert!(image.encrypted);
+        assert!(AdminVmOsImageInfo::from(image).encrypted);
+
+        let json = r#"{"distribution":"nixos","flavour":"cloudinit","version":"24.11","enabled":true,"release_date":"2026-01-01T00:00:00Z","url":"https://example.com/image.qcow2"}"#;
+        let req: CreateVmOsImageRequest = serde_json::from_str(json).unwrap();
+        assert!(!req.to_vm_os_image().unwrap().encrypted);
+
+        let req: UpdateVmOsImageRequest = serde_json::from_str(r#"{"encrypted": true}"#).unwrap();
+        assert_eq!(req.encrypted, Some(true));
+        let req: UpdateVmOsImageRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(req.encrypted, None);
     }
 
     #[test]

@@ -3833,6 +3833,7 @@ mod tests {
             default_username: None,
             sha2: Some("5".repeat(64)),
             sha2_url: None,
+            encrypted: false,
         };
 
         assert!(client.download_os_image(&image).await.is_err());

@@ -4,12 +4,14 @@
 # ready to publish. Requires Nix with flakes enabled.
 #
 # Usage:
-#   ./build.sh [version] [arch]
+#   ./build.sh [version] [arch] [variant]
 #     version   image version label used in filenames (default: derived channel, e.g. 24.11)
 #     arch      x86_64 | arm64                        (default: x86_64)
+#     variant   cloudinit | encrypted | all           (default: all)
 #
 # Outputs (in ./out):
 #   nixos-<version>-cloudinit-<arch>.qcow2.xz
+#   nixos-<version>-encrypted-<arch>.qcow2.xz
 #   SHA256SUMS
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -23,31 +25,49 @@ case "$ARCH" in
   *) echo "unknown arch: $ARCH (expected x86_64 or arm64)" >&2; exit 1 ;;
 esac
 
+VARIANT="${3:-all}"
+case "$VARIANT" in
+  all) VARIANTS="cloudinit encrypted" ;;
+  cloudinit | encrypted) VARIANTS="$VARIANT" ;;
+  *) echo "unknown variant: $VARIANT (expected cloudinit, encrypted or all)" >&2; exit 1 ;;
+esac
+
 OUT_DIR="out"
-BASENAME="nixos-${VERSION}-cloudinit-${ARCH}"
 mkdir -p "$OUT_DIR"
 
-echo ">> Building qcow2 (UEFI) for ${NIX_SYSTEM} (this can take a while)…"
-# result/ is a symlink to a store path containing nixos.qcow2
-nix build ".#packages.${NIX_SYSTEM}.qcow-efi" --out-link result
+build_variant() {
+  local variant="$1" attr basename qcow_src
+  case "$variant" in
+    cloudinit) attr="qcow-efi" ;;
+    encrypted) attr="qcow-efi-encrypted" ;;
+  esac
+  basename="nixos-${VERSION}-${variant}-${ARCH}"
 
-QCOW_SRC="$(find -L result -maxdepth 1 -name '*.qcow2' | head -1)"
-if [[ -z "$QCOW_SRC" ]]; then
-  echo "!! No qcow2 found under result/" >&2
-  exit 1
-fi
+  echo ">> Building ${variant} qcow2 (UEFI) for ${NIX_SYSTEM} (this can take a while)…"
+  nix build ".#packages.${NIX_SYSTEM}.${attr}" --out-link "result-${variant}"
 
-echo ">> Compressing with xz (LNVPS decompresses .xz images host-side)…"
-# Copy out of the read-only store, then compress.
-cp -f "$QCOW_SRC" "$OUT_DIR/${BASENAME}.qcow2"
-rm -f "$OUT_DIR/${BASENAME}.qcow2.xz"
-xz -T0 -9 "$OUT_DIR/${BASENAME}.qcow2"
+  qcow_src="$(find -L "result-${variant}" -maxdepth 1 -name '*.qcow2' | head -1)"
+  if [[ -z "$qcow_src" ]]; then
+    echo "!! No qcow2 found under result-${variant}/" >&2
+    exit 1
+  fi
+
+  echo ">> Compressing with xz (LNVPS decompresses .xz images host-side)…"
+  cp -f "$qcow_src" "$OUT_DIR/${basename}.qcow2"
+  chmod u+w "$OUT_DIR/${basename}.qcow2"
+  rm -f "$OUT_DIR/${basename}.qcow2.xz"
+  xz -T0 -9 "$OUT_DIR/${basename}.qcow2"
+}
+
+for variant in $VARIANTS; do
+  build_variant "$variant"
+done
 
 echo ">> Writing SHA256SUMS…"
-( cd "$OUT_DIR" && sha256sum "${BASENAME}.qcow2.xz" > SHA256SUMS )
+( cd "$OUT_DIR" && sha256sum nixos-*.qcow2.xz > SHA256SUMS )
 
 echo
 echo "Done. Publish these:"
-ls -lh "$OUT_DIR/${BASENAME}.qcow2.xz" "$OUT_DIR/SHA256SUMS"
+ls -lh "$OUT_DIR"/nixos-*.qcow2.xz "$OUT_DIR/SHA256SUMS"
 echo
-echo "Then register the image (see images/nixos/README.md)."
+echo "Then register the images (see images/nixos/README.md)."
