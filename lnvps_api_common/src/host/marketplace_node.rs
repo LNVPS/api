@@ -24,7 +24,9 @@ use async_trait::async_trait;
 use lnvps_db::{MarketplaceNode, Vm, VmHost, VmOsImage};
 use log::{info, warn};
 
-use super::{FullVmInfo, HostVmSpec, MigrateVmRequest, TerminalStream, VmHostClient, VmHostInfo};
+use super::{
+    FullVmInfo, HostVmSpec, MigrateVmRequest, TerminalStream, VmHostClient, VmHostInfo, VmSnapshot,
+};
 use super::{TimeSeries, TimeSeriesData};
 use crate::VmRunningState;
 use crate::node_control::{NodeControl, NodeImageFetch};
@@ -137,6 +139,27 @@ impl VmHostClient for MarketplaceNodeHost {
 
     async fn migrate_vm(&self, vm: &Vm, req: &MigrateVmRequest) -> OpResult<()> {
         self.inner.migrate_vm(vm, req).await
+    }
+
+    async fn list_snapshots(&self, vm: &Vm) -> OpResult<Vec<VmSnapshot>> {
+        self.inner.list_snapshots(vm).await
+    }
+
+    async fn create_snapshot(
+        &self,
+        vm: &Vm,
+        name: &str,
+        description: Option<&str>,
+    ) -> OpResult<()> {
+        self.inner.create_snapshot(vm, name, description).await
+    }
+
+    async fn rollback_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+        self.inner.rollback_snapshot(vm, name).await
+    }
+
+    async fn delete_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+        self.inner.delete_snapshot(vm, name).await
     }
 
     async fn generate_mac(&self, vm: &Vm) -> OpResult<String> {

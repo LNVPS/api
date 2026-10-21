@@ -538,6 +538,29 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_vm_snapshots_require_auth() {
+        let client = user_client_no_auth();
+        for (method, path) in [
+            (reqwest::Method::GET, "/api/v1/vm/1/snapshots"),
+            (reqwest::Method::POST, "/api/v1/vm/1/snapshots"),
+            (reqwest::Method::DELETE, "/api/v1/vm/1/snapshots/one"),
+            (reqwest::Method::PATCH, "/api/v1/vm/1/snapshots/one/restore"),
+        ] {
+            let resp = client
+                .http
+                .request(method.clone(), client.url(path))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                resp.status() == StatusCode::FORBIDDEN || resp.status() == StatusCode::UNAUTHORIZED,
+                "{method} {path} without auth should return 401/403, got: {}",
+                resp.status()
+            );
+        }
+    }
+
     // ========================================================================
     // Authenticated User Endpoints
     // ========================================================================

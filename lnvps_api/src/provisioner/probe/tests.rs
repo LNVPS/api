@@ -879,6 +879,34 @@ impl lnvps_api_common::host::VmHostClient for RecordingHost {
     ) -> lnvps_api_common::retry::OpResult<lnvps_api_common::host::VmHostInfo> {
         unsupported!()
     }
+    async fn list_snapshots(
+        &self,
+        _vm: &Vm,
+    ) -> lnvps_api_common::retry::OpResult<Vec<lnvps_api_common::host::VmSnapshot>> {
+        unsupported!()
+    }
+    async fn create_snapshot(
+        &self,
+        _vm: &Vm,
+        _name: &str,
+        _description: Option<&str>,
+    ) -> lnvps_api_common::retry::OpResult<()> {
+        unsupported!()
+    }
+    async fn rollback_snapshot(
+        &self,
+        _vm: &Vm,
+        _name: &str,
+    ) -> lnvps_api_common::retry::OpResult<()> {
+        unsupported!()
+    }
+    async fn delete_snapshot(
+        &self,
+        _vm: &Vm,
+        _name: &str,
+    ) -> lnvps_api_common::retry::OpResult<()> {
+        unsupported!()
+    }
     async fn download_os_image(
         &self,
         _image: &lnvps_db::VmOsImage,

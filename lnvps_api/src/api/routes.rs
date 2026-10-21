@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use lnvps_api_common::{
     ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate,
-    ClientInfo, ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, TraderDetails,
-    UpgradeConfig, UserRateLimiter, VatClient, WorkJob, apply_custom_pricing_limits,
+    ClientInfo, ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, SnapshotAction,
+    TraderDetails, UpgradeConfig, UserRateLimiter, VatClient, WorkJob, apply_custom_pricing_limits,
 };
 use lnvps_db::{
     CpuArch, LNVpsDb, PaymentMethod, Region, Vm, VmCustomPricing, VmCustomPricingDisk,
@@ -36,16 +36,19 @@ use crate::api::model::{
     ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmPrice, ApiCustomVmRequest,
     ApiExchangeRates, ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiRenewalQuote,
     ApiTemplatesResponse, ApiVmFirewallPolicy, ApiVmFirewallRule, ApiVmHistory, ApiVmPayment,
-    ApiVmStatus, ApiVmTraffic, ApiVmTrafficDay, ApiVmTrafficSummary, ApiVmUpgradeQuote,
-    ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule, CreateVmRequest,
-    PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule, PaymentMethodResponse,
-    VMPatchRequest, VmTrafficQuery, quota_period, resolve_traffic_range, validate_firewall_cidr,
-    validate_firewall_ports, vm_to_status,
+    ApiVmSnapshot, ApiVmStatus, ApiVmTraffic, ApiVmTrafficDay, ApiVmTrafficSummary,
+    ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule, CreateVmRequest,
+    CreateVmSnapshotRequest, PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule,
+    PaymentMethodResponse, VMPatchRequest, VmTrafficQuery, quota_period, resolve_traffic_range,
+    validate_firewall_cidr, validate_firewall_ports, vm_to_status,
 };
 use crate::api::{
     AmountQuery, AuthQuery, PaymentMethodQuery, RouterState, TicketRequest, TicketResponse,
 };
-use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
+use crate::host::{
+    FullVmInfo, TimeSeries, TimeSeriesData, check_new_snapshot, get_host_client,
+    validate_snapshot_name,
+};
 use crate::provisioner::{HostCapacityService, PricingEngine};
 
 /// Attach the live-chat support agent websocket.
@@ -148,6 +151,18 @@ pub fn routes() -> Router<RouterState> {
             .route("/api/v1/vm/{id}/stop", patch(v1_stop_vm))
             .route("/api/v1/vm/{id}/restart", patch(v1_restart_vm))
             .route("/api/v1/vm/{id}/re-install", patch(v1_reinstall_vm))
+            .route(
+                "/api/v1/vm/{id}/snapshots",
+                get(v1_list_vm_snapshots).post(v1_create_vm_snapshot),
+            )
+            .route(
+                "/api/v1/vm/{id}/snapshots/{name}",
+                delete(v1_delete_vm_snapshot),
+            )
+            .route(
+                "/api/v1/vm/{id}/snapshots/{name}/restore",
+                patch(v1_restore_vm_snapshot),
+            )
             .route("/api/v1/vm/{id}/time-series", get(v1_time_series))
             .route(
                 "/api/v1/vm/{id}/console",
@@ -1841,6 +1856,148 @@ async fn v1_reinstall_vm(
             ApiData::ok(())
         }
     }
+}
+
+async fn ensure_vm_active(this: &RouterState, vm: &Vm, what: &str) -> Result<(), ApiError> {
+    let subscription = this
+        .db
+        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+        .await?;
+    if is_vm_expired(subscription.expires, Utc::now()) {
+        return Err(ApiError::payment_required(format!(
+            "Cannot {what} an expired VM, please renew it first"
+        )));
+    }
+    Ok(())
+}
+
+async fn v1_list_vm_snapshots(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<Vec<ApiVmSnapshot>> {
+    let (_, vm) = get_user_vm(&auth, &this, id).await?;
+    let snapshots = this
+        .sub_handler
+        .vm_provisioner()
+        .list_snapshots(vm.id)
+        .await?;
+    ApiData::ok(snapshots.into_iter().map(Into::into).collect())
+}
+
+async fn run_vm_snapshot(
+    this: &RouterState,
+    vm: &Vm,
+    uid: u64,
+    action: SnapshotAction,
+) -> Result<(), ApiError> {
+    let Some(feedback) = this.feedback.clone() else {
+        let result = this
+            .sub_handler
+            .vm_provisioner()
+            .run_snapshot_action(vm.id, Some(uid), &action, &this.history)
+            .await;
+        if !matches!(action, SnapshotAction::Delete { .. }) {
+            this.work_sender
+                .send(WorkJob::CheckVm { vm_id: vm.id })
+                .await?;
+        }
+        return Ok(result?);
+    };
+
+    let reply_channel = format!("snapshot-{}-{:032x}", vm.id, rand::random::<u128>());
+    let mut stream = feedback
+        .subscribe(&JobFeedback::channel_name(&reply_channel))
+        .await
+        .map_err(|e| ApiError::new(format!("Failed to subscribe to reply channel: {e}")))?;
+    this.work_sender
+        .send(WorkJob::VmSnapshot {
+            vm_id: vm.id,
+            user_id: Some(uid),
+            action,
+            reply_channel,
+        })
+        .await?;
+
+    match tokio::time::timeout(Duration::from_secs(180), stream.next()).await {
+        Ok(Some(Ok(fb))) => match (fb.snapshot_rejection(), fb.status) {
+            (Some(rejection), _) => Err(ApiError::from(lnvps_api_common::retry::OpError::from(
+                rejection,
+            ))),
+            (None, JobFeedbackStatus::Failed { error }) => {
+                Err(ApiError::new(format!("Snapshot failed: {error}")))
+            }
+            _ => Ok(()),
+        },
+        Ok(Some(Err(e))) => Err(ApiError::new(format!("Snapshot reply error: {e}"))),
+        Ok(None) => Err(ApiError::new("Snapshot reply channel closed")),
+        Err(_) => {
+            info!(
+                "Snapshot of VM {} still in progress after 180s; returning to client",
+                vm.id
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn v1_create_vm_snapshot(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<CreateVmSnapshotRequest>,
+) -> ApiResult<ApiVmSnapshot> {
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    ensure_vm_active(&this, &vm, "snapshot").await?;
+    let description = req.description.filter(|d| !d.is_empty());
+    check_new_snapshot(&[], &req.name, description.as_deref())
+        .map_err(lnvps_api_common::retry::OpError::from)?;
+    run_vm_snapshot(
+        &this,
+        &vm,
+        uid,
+        SnapshotAction::Create {
+            name: req.name.clone(),
+            description: description.clone(),
+        },
+    )
+    .await?;
+    let created = this
+        .sub_handler
+        .vm_provisioner()
+        .list_snapshots(vm.id)
+        .await?
+        .into_iter()
+        .find(|s| s.name == req.name)
+        .unwrap_or(lnvps_api_common::host::VmSnapshot {
+            name: req.name,
+            description,
+            created: None,
+        });
+    ApiData::ok(created.into())
+}
+
+async fn v1_restore_vm_snapshot(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path((id, name)): Path<(u64, String)>,
+) -> ApiResult<()> {
+    validate_snapshot_name(&name).map_err(lnvps_api_common::retry::OpError::from)?;
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    ensure_vm_active(&this, &vm, "restore").await?;
+    run_vm_snapshot(&this, &vm, uid, SnapshotAction::Restore { name }).await?;
+    ApiData::ok(())
+}
+
+async fn v1_delete_vm_snapshot(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path((id, name)): Path<(u64, String)>,
+) -> ApiResult<()> {
+    validate_snapshot_name(&name).map_err(lnvps_api_common::retry::OpError::from)?;
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    run_vm_snapshot(&this, &vm, uid, SnapshotAction::Delete { name }).await?;
+    ApiData::ok(())
 }
 
 async fn v1_time_series(

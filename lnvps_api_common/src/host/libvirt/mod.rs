@@ -32,13 +32,13 @@ use crate::host::cloud_init;
 use crate::host::config::LibVirtConfig;
 use crate::host::{
     FullVmInfo, HostVmSpec, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient,
-    VmHostDiskInfo, VmHostInfo,
+    VmHostDiskInfo, VmHostInfo, VmSnapshot,
 };
 use crate::retry::{OpError, OpResult};
 use crate::{KB, VmRunningState};
 use anyhow::{Context, Result, anyhow};
 use conn::LibVirtConn;
-use error::{is_not_found, map_virt_error};
+use error::{is_not_found, is_snapshot_not_found, map_virt_error};
 use lnvps_db::{Vm, VmOsImage};
 use log::{debug, info, warn};
 use rand::random;
@@ -54,7 +54,8 @@ use virt::sys::{
 };
 use xml::{
     PRIMARY_DISK_TARGET, VolumeFormat, build_domain, domain_name, os_image_volume,
-    parse_live_devices, primary_disk_volume, seed_volume, vm_id_from_domain_name,
+    parse_live_devices, parse_snapshot, primary_disk_volume, seed_volume, snapshot_xml,
+    vm_id_from_domain_name,
 };
 
 #[derive(Debug)]
@@ -333,6 +334,101 @@ impl VmHostClient for LibVirtHost {
                     });
                 }
                 Ok(out)
+            })
+            .await
+    }
+
+    async fn list_snapshots(&self, vm: &Vm) -> OpResult<Vec<VmSnapshot>> {
+        let vm_id = vm.id;
+        self.conn
+            .run(move |c| {
+                let domain = LibVirtHost::require_domain(c, vm_id)?;
+                let snapshots = domain
+                    .list_all_snapshots(0)
+                    .map_err(|e| map_virt_error("list_snapshots", e))?;
+                let mut out = Vec::with_capacity(snapshots.len());
+                for snapshot in snapshots {
+                    let xml = snapshot
+                        .xml_desc(0)
+                        .map_err(|e| map_virt_error("snapshot_xml_desc", e))?;
+                    out.push(parse_snapshot(&xml).map_err(OpError::Fatal)?);
+                }
+                out.sort_by_key(|s| s.created);
+                Ok(out)
+            })
+            .await
+    }
+
+    async fn create_snapshot(
+        &self,
+        vm: &Vm,
+        name: &str,
+        description: Option<&str>,
+    ) -> OpResult<()> {
+        let vm_id = vm.id;
+        let xml = snapshot_xml(name, description);
+        let was_running = self.is_active(vm_id).await?;
+        if was_running {
+            VmHostClient::stop_vm(self, vm).await?;
+        }
+        let created = self
+            .conn
+            .run(move |c| {
+                let domain = LibVirtHost::require_domain(c, vm_id)?;
+                domain
+                    .create_snapshot_xml(&xml, 0)
+                    .map_err(|e| map_virt_error("create_snapshot", e))?;
+                Ok(())
+            })
+            .await;
+        if was_running && let Err(e) = VmHostClient::start_vm(self, vm).await {
+            warn!("VM {} did not restart after snapshotting: {:?}", vm_id, e);
+            created?;
+            return Err(e);
+        }
+        created
+    }
+
+    async fn rollback_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+        let vm_id = vm.id;
+        let name = name.to_string();
+        if self.is_active(vm_id).await? {
+            VmHostClient::stop_vm(self, vm).await?;
+        }
+        self.conn
+            .run(move |c| {
+                let domain = LibVirtHost::require_domain(c, vm_id)?;
+                let snapshot = Domain::lookup_snapshot_by_name(&domain, &name, 0)
+                    .map_err(|e| map_virt_error("lookup_snapshot", e))?;
+                snapshot
+                    .revert(0)
+                    .map_err(|e| map_virt_error("revert_snapshot", e))?;
+                if domain.is_active().unwrap_or(false) {
+                    domain
+                        .destroy()
+                        .map_err(|e| map_virt_error("destroy_domain", e))?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    async fn delete_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+        let vm_id = vm.id;
+        let name = name.to_string();
+        self.conn
+            .run(move |c| {
+                let Some(domain) = LibVirtHost::lookup_domain(c, vm_id)? else {
+                    return Ok(());
+                };
+                let snapshot = match Domain::lookup_snapshot_by_name(&domain, &name, 0) {
+                    Ok(s) => s,
+                    Err(e) if is_snapshot_not_found(&e) => return Ok(()),
+                    Err(e) => return Err(map_virt_error("lookup_snapshot", e)),
+                };
+                snapshot
+                    .delete(0)
+                    .map_err(|e| map_virt_error("delete_snapshot", e))
             })
             .await
     }

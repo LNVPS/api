@@ -1136,6 +1136,72 @@ pub fn parse_live_devices(xml: &str) -> Result<LiveDomainDevices> {
     Ok(out)
 }
 
+pub fn snapshot_xml(name: &str, description: Option<&str>) -> String {
+    use quick_xml::escape::escape;
+    let description = description
+        .map(|d| format!("<description>{}</description>", escape(d)))
+        .unwrap_or_default();
+    format!(
+        "<domainsnapshot><name>{}</name>{}</domainsnapshot>",
+        escape(name),
+        description
+    )
+}
+
+pub fn parse_snapshot(xml: &str) -> Result<crate::host::VmSnapshot> {
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+
+    let mut reader = Reader::from_str(xml);
+    let mut field: Option<String> = None;
+    let mut text = String::new();
+    let mut name = None;
+    let mut description = None;
+    let mut created = None;
+    loop {
+        match reader.read_event()? {
+            Event::Eof => break,
+            Event::Start(e) => {
+                field = Some(String::from_utf8_lossy(e.name().as_ref()).to_string());
+                text.clear();
+            }
+            Event::Text(t) => text.push_str(&t.decode()?),
+            Event::GeneralRef(r) => {
+                let entity = r.decode()?;
+                match entity.as_ref() {
+                    "amp" => text.push('&'),
+                    "lt" => text.push('<'),
+                    "gt" => text.push('>'),
+                    "quot" => text.push('"'),
+                    "apos" => text.push('\''),
+                    _ => {}
+                }
+            }
+            Event::End(_) => {
+                match field.take().as_deref() {
+                    Some("name") if name.is_none() => name = Some(text.clone()),
+                    Some("description") => description = Some(text.clone()),
+                    Some("creationTime") => {
+                        created = text
+                            .trim()
+                            .parse::<i64>()
+                            .ok()
+                            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                    }
+                    _ => {}
+                }
+                text.clear();
+            }
+            _ => {}
+        }
+    }
+    Ok(crate::host::VmSnapshot {
+        name: name.ok_or_else(|| anyhow::anyhow!("snapshot XML has no name"))?,
+        description: description.filter(|d| !d.is_empty()),
+        created,
+    })
+}
+
 fn attr(e: &quick_xml::events::BytesStart, key: &str) -> Result<Option<String>> {
     for a in e.attributes() {
         let a = a?;
@@ -1447,6 +1513,38 @@ mod tests {
     fn parse_live_devices_handles_no_devices() -> Result<()> {
         let devices = parse_live_devices("<domain type='kvm'><name>x</name></domain>")?;
         assert_eq!(devices, LiveDomainDevices::default());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_xml_escapes_free_text() {
+        let xml = snapshot_xml("pre-upgrade", Some("a <b> & c"));
+        assert_eq!(
+            xml,
+            "<domainsnapshot><name>pre-upgrade</name>\
+             <description>a &lt;b&gt; &amp; c</description></domainsnapshot>"
+        );
+        assert_eq!(
+            snapshot_xml("x", None),
+            "<domainsnapshot><name>x</name></domainsnapshot>"
+        );
+    }
+
+    #[test]
+    fn snapshot_is_parsed_from_libvirt_xml() -> Result<()> {
+        let xml = "<domainsnapshot><name>s1</name><description>hello &amp; bye</description>\
+                   <state>shutoff</state><creationTime>1700000000</creationTime>\
+                   <domain><name>VM1</name></domain></domainsnapshot>";
+        let s = parse_snapshot(xml)?;
+        assert_eq!(s.name, "s1");
+        assert_eq!(s.description.as_deref(), Some("hello & bye"));
+        assert_eq!(s.created.map(|c| c.timestamp()), Some(1_700_000_000));
+
+        let bare = parse_snapshot("<domainsnapshot><name>s2</name></domainsnapshot>")?;
+        assert_eq!(bare.description, None);
+        assert_eq!(bare.created, None);
+
+        assert!(parse_snapshot("<domainsnapshot></domainsnapshot>").is_err());
         Ok(())
     }
 }

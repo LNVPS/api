@@ -1,4 +1,7 @@
-use crate::host::{FullVmInfo, VmHostClient, VmResources, get_host_client};
+use crate::host::{
+    FullVmInfo, VmHostClient, VmResources, VmSnapshot, check_new_snapshot, check_restorable,
+    clear_snapshots, get_host_client, validate_snapshot_name,
+};
 use crate::provisioner::VmNetworkProvisioner;
 use crate::router::{ArpEntry, Router, get_router};
 use crate::settings::{ProvisionerConfig, Settings};
@@ -13,11 +16,11 @@ use lnvps_api_common::{
     PricingEngine, UpgradeConfig, UpgradeCostQuote, VmStateCache, apply_custom_pricing_limits,
     round_msat_to_sat, upgrade_bandwidth,
 };
-use lnvps_api_common::{ExchangeRateService, op_fatal};
+use lnvps_api_common::{ExchangeRateService, SnapshotAction, VmHistoryLogger, op_fatal};
 use lnvps_db::{
     CpuArch, IntervalType, IpRange, IpRangeAllocationMode, LNVpsDb, LineItemType, PaymentMethod,
     PaymentType, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
-    Vm, VmCustomTemplate, VmIpAssignment, VmTemplate,
+    Vm, VmCustomTemplate, VmHistoryActionType, VmIpAssignment, VmTemplate,
 };
 
 /// Ensure an OS image's CPU architecture is compatible with the target
@@ -863,6 +866,18 @@ impl VmProvisioner {
                     ctx.client.stop_vm(&ctx.info.vm).await
                 })
             })
+            .step("clear_snapshots", |ctx| {
+                Box::pin(async move {
+                    let cleared = clear_snapshots(ctx.client.as_ref(), &ctx.info.vm).await?;
+                    if cleared > 0 {
+                        info!(
+                            "Deleted {} snapshots of VM {} for reinstall",
+                            cleared, ctx.vm_id
+                        );
+                    }
+                    Ok(())
+                })
+            })
             .step("unlink_disk", |ctx| {
                 Box::pin(async move {
                     info!("Unlinking disk for VM {}", ctx.vm_id);
@@ -888,6 +903,86 @@ impl VmProvisioner {
             .execute()
             .await?;
         Ok(())
+    }
+
+    async fn snapshot_client(&self, vm_id: u64) -> OpResult<(lnvps_db::Vm, Arc<dyn VmHostClient>)> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let host = self.db.get_host(vm.host_id).await?;
+        let client = get_host_client(&self.db, &host, &self.provisioner_config).await?;
+        Ok((vm, client))
+    }
+
+    pub async fn list_snapshots(&self, vm_id: u64) -> OpResult<Vec<VmSnapshot>> {
+        let (vm, client) = self.snapshot_client(vm_id).await?;
+        client.list_snapshots(&vm).await
+    }
+
+    pub async fn create_snapshot(
+        &self,
+        vm_id: u64,
+        name: &str,
+        description: Option<&str>,
+    ) -> OpResult<()> {
+        if self.read_only {
+            op_fatal!("Cant snapshot VM's in read-only mode");
+        }
+        let (vm, client) = self.snapshot_client(vm_id).await?;
+        let existing = client.list_snapshots(&vm).await?;
+        check_new_snapshot(&existing, name, description)?;
+        info!("Snapshotting VM {} as {}", vm_id, name);
+        client.create_snapshot(&vm, name, description).await
+    }
+
+    pub async fn rollback_snapshot(&self, vm_id: u64, name: &str) -> OpResult<()> {
+        if self.read_only {
+            op_fatal!("Cant restore VM's in read-only mode");
+        }
+        validate_snapshot_name(name)?;
+        let (vm, client) = self.snapshot_client(vm_id).await?;
+        check_restorable(&client.list_snapshots(&vm).await?, name)?;
+        info!("Restoring VM {} to snapshot {}", vm_id, name);
+        client.rollback_snapshot(&vm, name).await?;
+        let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
+        client.configure_vm(&info).await?;
+        client.start_vm(&vm).await
+    }
+
+    pub async fn delete_snapshot(&self, vm_id: u64, name: &str) -> OpResult<()> {
+        validate_snapshot_name(name)?;
+        let (vm, client) = self.snapshot_client(vm_id).await?;
+        client.delete_snapshot(&vm, name).await
+    }
+
+    pub async fn run_snapshot_action(
+        &self,
+        vm_id: u64,
+        user_id: Option<u64>,
+        action: &SnapshotAction,
+        history: &VmHistoryLogger,
+    ) -> OpResult<()> {
+        let (result, logged) = match action {
+            SnapshotAction::Create { name, description } => (
+                self.create_snapshot(vm_id, name, description.as_deref())
+                    .await,
+                VmHistoryActionType::SnapshotCreated,
+            ),
+            SnapshotAction::Restore { name } => (
+                self.rollback_snapshot(vm_id, name).await,
+                VmHistoryActionType::SnapshotRestored,
+            ),
+            SnapshotAction::Delete { name } => (
+                self.delete_snapshot(vm_id, name).await,
+                VmHistoryActionType::SnapshotDeleted,
+            ),
+        };
+        if result.is_ok()
+            && let Err(e) = history
+                .log_vm_snapshot(vm_id, user_id, logged, action.name())
+                .await
+        {
+            warn!("Failed to log snapshot history for VM {}: {}", vm_id, e);
+        }
+        result
     }
 
     /// Start a VM

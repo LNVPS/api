@@ -3377,6 +3377,9 @@ pub enum AdminVmHistoryActionType {
     Transferred,
     Refunded,
     Migrated,
+    SnapshotCreated,
+    SnapshotRestored,
+    SnapshotDeleted,
 }
 
 impl From<VmHistoryActionType> for AdminVmHistoryActionType {
@@ -3398,6 +3401,9 @@ impl From<VmHistoryActionType> for AdminVmHistoryActionType {
             }
             VmHistoryActionType::Transferred => AdminVmHistoryActionType::Transferred,
             VmHistoryActionType::Migrated => AdminVmHistoryActionType::Migrated,
+            VmHistoryActionType::SnapshotCreated => AdminVmHistoryActionType::SnapshotCreated,
+            VmHistoryActionType::SnapshotRestored => AdminVmHistoryActionType::SnapshotRestored,
+            VmHistoryActionType::SnapshotDeleted => AdminVmHistoryActionType::SnapshotDeleted,
         }
     }
 }

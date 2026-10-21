@@ -1,6 +1,6 @@
 use crate::host::{
     FullVmInfo, MigrateVmRequest, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient,
-    VmHostDiskInfo, VmHostInfo,
+    VmHostDiskInfo, VmHostInfo, VmSnapshot,
 };
 use crate::retry::OpResult;
 use crate::{GB, HostVmSpec, PB, TB, VmRunningState, VmRunningStates, op_fatal};
@@ -176,6 +176,10 @@ impl DummyVmHost {
         DUMMY_MIGRATIONS.lock().await.clone()
     }
 
+    pub async fn clear_all_snapshots() {
+        DUMMY_SNAPSHOTS.lock().await.clear();
+    }
+
     /// Forget all recorded migrations.
     pub async fn clear_migrations() {
         DUMMY_MIGRATIONS.lock().await.clear();
@@ -213,6 +217,9 @@ static DUMMY_HOST_VMS: LazyLock<Arc<Mutex<Vec<HostVmSpec>>>> =
 static DUMMY_HOST_VMS_BY_HOST: LazyLock<Arc<Mutex<HashMap<u64, Vec<HostVmSpec>>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
+static DUMMY_SNAPSHOTS: LazyLock<Arc<Mutex<HashMap<u64, Vec<VmSnapshot>>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
 /// Process-wide log of migrations requested through [`DummyVmHost::migrate_vm`].
 static DUMMY_MIGRATIONS: LazyLock<Arc<Mutex<Vec<(u64, MigrateVmRequest)>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
@@ -238,6 +245,58 @@ impl VmHostClient for DummyVmHost {
                 used: 0,
             }],
         })
+    }
+
+    async fn list_snapshots(&self, vm: &Vm) -> OpResult<Vec<VmSnapshot>> {
+        let snapshots = DUMMY_SNAPSHOTS.lock().await;
+        Ok(snapshots.get(&vm.id).cloned().unwrap_or_default())
+    }
+
+    async fn create_snapshot(
+        &self,
+        vm: &Vm,
+        name: &str,
+        description: Option<&str>,
+    ) -> OpResult<()> {
+        let mut snapshots = DUMMY_SNAPSHOTS.lock().await;
+        let held = snapshots.entry(vm.id).or_default();
+        if held.iter().any(|s| s.name == name) {
+            op_fatal!("Snapshot {} already exists", name);
+        }
+        held.push(VmSnapshot {
+            name: name.to_string(),
+            description: description.map(str::to_string),
+            created: Some(Utc::now()),
+        });
+        Ok(())
+    }
+
+    async fn rollback_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+        {
+            let snapshots = DUMMY_SNAPSHOTS.lock().await;
+            if !snapshots
+                .get(&vm.id)
+                .is_some_and(|held| held.iter().any(|s| s.name == name))
+            {
+                op_fatal!("Snapshot {} does not exist", name);
+            }
+        }
+        {
+            let mut vms = self.vms.lock().await;
+            if let Some(m) = vms.get_mut(&vm.id) {
+                m.state = VmRunningStates::Stopped;
+                m.uptime_secs = 0;
+            }
+        }
+        self.save().await;
+        Ok(())
+    }
+
+    async fn delete_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+        if let Some(held) = DUMMY_SNAPSHOTS.lock().await.get_mut(&vm.id) {
+            held.retain(|s| s.name != name);
+        }
+        Ok(())
     }
 
     async fn download_os_image(&self, _image: &VmOsImage) -> OpResult<()> {
@@ -444,5 +503,54 @@ impl VmHostClient for DummyVmHost {
             rx: client_rx,
             tx: server_tx,
         })
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+    use crate::host::tests::mock_full_vm;
+
+    #[tokio::test]
+    async fn snapshots_round_trip() {
+        let host = DummyVmHost::new();
+        let mut info = mock_full_vm();
+        info.vm.id = 940_001;
+        host.create_vm(&info).await.unwrap();
+        host.start_vm(&info.vm).await.unwrap();
+
+        assert!(host.list_snapshots(&info.vm).await.unwrap().is_empty());
+        host.create_snapshot(&info.vm, "one", Some("first"))
+            .await
+            .unwrap();
+        host.create_snapshot(&info.vm, "two", None).await.unwrap();
+        assert!(host.create_snapshot(&info.vm, "one", None).await.is_err());
+
+        let listed = host.list_snapshots(&info.vm).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].description.as_deref(), Some("first"));
+
+        host.rollback_snapshot(&info.vm, "one").await.unwrap();
+        assert_eq!(
+            host.get_vm_state(&info.vm).await.unwrap().state,
+            VmRunningStates::Stopped
+        );
+        assert!(host.rollback_snapshot(&info.vm, "nope").await.is_err());
+
+        host.delete_snapshot(&info.vm, "one").await.unwrap();
+        host.delete_snapshot(&info.vm, "one").await.unwrap();
+        assert_eq!(host.list_snapshots(&info.vm).await.unwrap().len(), 1);
+
+        DummyVmHost::clear_all_snapshots().await;
+        assert!(host.list_snapshots(&info.vm).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rolling_back_to_nothing_fails() {
+        let host = DummyVmHost::new();
+        let mut vm = mock_full_vm().vm;
+        vm.id = 940_002;
+        assert!(host.rollback_snapshot(&vm, "one").await.is_err());
+        host.delete_snapshot(&vm, "one").await.unwrap();
     }
 }

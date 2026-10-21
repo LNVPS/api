@@ -14,7 +14,7 @@ use lnvps_db::{
 use crate::HostVmSpec;
 use crate::VmRunningState;
 use crate::host::config::ProvisionerConfig;
-use crate::retry::OpResult;
+use crate::retry::{OpError, OpResult};
 
 pub mod cloud_init;
 pub mod config;
@@ -47,6 +47,129 @@ pub struct MigrateVmRequest {
     /// whether that pool is shared (nothing to copy) or node-local (the disk
     /// must travel, under the same name).
     pub target_storage: Option<String>,
+}
+
+pub const MAX_VM_SNAPSHOTS: usize = 3;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmSnapshot {
+    pub name: String,
+    pub description: Option<String>,
+    pub created: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotRejection {
+    Invalid(String),
+    Conflict(String),
+    NotFound(String),
+}
+
+impl std::fmt::Display for SnapshotRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Invalid(m) | Self::Conflict(m) | Self::NotFound(m)) = self;
+        f.write_str(m)
+    }
+}
+
+impl std::error::Error for SnapshotRejection {}
+
+impl SnapshotRejection {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Invalid(_) => "invalid",
+            Self::Conflict(_) => "conflict",
+            Self::NotFound(_) => "not_found",
+        }
+    }
+
+    pub fn from_kind(kind: &str, message: String) -> Option<Self> {
+        match kind {
+            "invalid" => Some(Self::Invalid(message)),
+            "conflict" => Some(Self::Conflict(message)),
+            "not_found" => Some(Self::NotFound(message)),
+            _ => None,
+        }
+    }
+}
+
+pub fn check_restorable(existing: &[VmSnapshot], name: &str) -> Result<(), SnapshotRejection> {
+    let Some(at) = existing.iter().position(|s| s.name == name) else {
+        return Err(SnapshotRejection::NotFound(format!(
+            "Snapshot {name} does not exist"
+        )));
+    };
+    let newer: Vec<&str> = existing[at + 1..].iter().map(|s| s.name.as_str()).collect();
+    if !newer.is_empty() {
+        return Err(SnapshotRejection::Conflict(format!(
+            "Only the newest snapshot can be restored, delete {} first",
+            newer.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+impl From<SnapshotRejection> for OpError<anyhow::Error> {
+    fn from(value: SnapshotRejection) -> Self {
+        OpError::Fatal(value.into())
+    }
+}
+
+pub fn validate_snapshot_name(name: &str) -> Result<(), SnapshotRejection> {
+    let mut chars = name.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic());
+    if !first_ok
+        || name == "current"
+        || name.len() < 2
+        || name.len() > 40
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(SnapshotRejection::Invalid(
+            "Snapshot name must start with a letter and use only letters, digits, '_' and '-' (2 to 40 characters)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_snapshot_description(description: &str) -> Result<(), SnapshotRejection> {
+    if description.chars().count() > 200 || description.chars().any(|c| c.is_control()) {
+        return Err(SnapshotRejection::Invalid(
+            "Snapshot description must be at most 200 characters on a single line".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn check_new_snapshot(
+    existing: &[VmSnapshot],
+    name: &str,
+    description: Option<&str>,
+) -> Result<(), SnapshotRejection> {
+    validate_snapshot_name(name)?;
+    if let Some(d) = description {
+        validate_snapshot_description(d)?;
+    }
+    if existing.iter().any(|s| s.name == name) {
+        return Err(SnapshotRejection::Conflict(format!(
+            "A snapshot named {name} already exists"
+        )));
+    }
+    if existing.len() >= MAX_VM_SNAPSHOTS {
+        return Err(SnapshotRejection::Conflict(format!(
+            "A VM can hold {MAX_VM_SNAPSHOTS} snapshots, delete one first"
+        )));
+    }
+    Ok(())
+}
+
+pub async fn clear_snapshots(client: &dyn VmHostClient, vm: &Vm) -> OpResult<usize> {
+    let snapshots = client.list_snapshots(vm).await?;
+    for snapshot in &snapshots {
+        client.delete_snapshot(vm, &snapshot.name).await?;
+    }
+    Ok(snapshots.len())
 }
 
 pub struct TerminalStream {
@@ -101,6 +224,15 @@ pub trait VmHostClient: Send + Sync {
             "VM migration is not supported on this host type"
         )))
     }
+
+    async fn list_snapshots(&self, vm: &Vm) -> OpResult<Vec<VmSnapshot>>;
+
+    async fn create_snapshot(&self, vm: &Vm, name: &str, description: Option<&str>)
+    -> OpResult<()>;
+
+    async fn rollback_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()>;
+
+    async fn delete_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()>;
 
     /// Download OS image to the host
     async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()>;
@@ -515,13 +647,113 @@ pub struct VmHostDiskInfo {
 
 #[cfg(test)]
 mod tests {
-    use crate::host::FullVmInfo;
+    use crate::host::{
+        FullVmInfo, SnapshotRejection, VmSnapshot, check_new_snapshot, check_restorable,
+        validate_snapshot_description, validate_snapshot_name,
+    };
     use crate::{GB, TB};
     use chrono::Utc;
     use lnvps_db::{
         CpuArch, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, OsDistribution,
         UserSshKey, Vm, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
     };
+
+    #[test]
+    fn snapshot_names_follow_the_strictest_host_rule() {
+        for ok in ["ab", "before-upgrade", "Snap_1", &"a".repeat(40)] {
+            assert!(validate_snapshot_name(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "a",
+            "1abc",
+            "-a",
+            "a b",
+            "a/b",
+            "a.b",
+            "naïve",
+            "current",
+            &"a".repeat(41),
+        ] {
+            assert!(validate_snapshot_name(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn new_snapshots_are_checked_against_the_vm() {
+        let held = |n: &str| VmSnapshot {
+            name: n.to_string(),
+            description: None,
+            created: None,
+        };
+        assert!(check_new_snapshot(&[], "one", Some("fine")).is_ok());
+        assert!(matches!(
+            check_new_snapshot(&[], "1", None),
+            Err(SnapshotRejection::Invalid(_))
+        ));
+        assert!(matches!(
+            check_new_snapshot(&[], "one", Some("a\nb")),
+            Err(SnapshotRejection::Invalid(_))
+        ));
+        assert!(matches!(
+            check_new_snapshot(&[held("one")], "one", None),
+            Err(SnapshotRejection::Conflict(_))
+        ));
+        let full: Vec<_> = ["s1", "s2", "s3"].into_iter().map(held).collect();
+        assert!(matches!(
+            check_new_snapshot(&full, "s4", None),
+            Err(SnapshotRejection::Conflict(m)) if m.contains('3')
+        ));
+        assert_eq!(
+            SnapshotRejection::NotFound("gone".into()).to_string(),
+            "gone"
+        );
+    }
+
+    #[test]
+    fn only_the_newest_snapshot_is_restorable() {
+        let held: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|n| VmSnapshot {
+                name: n.to_string(),
+                description: None,
+                created: None,
+            })
+            .collect();
+        assert!(check_restorable(&held, "c").is_ok());
+        assert!(matches!(
+            check_restorable(&held, "a"),
+            Err(SnapshotRejection::Conflict(m)) if m.contains("b, c")
+        ));
+        assert!(matches!(
+            check_restorable(&held, "x"),
+            Err(SnapshotRejection::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_rejections_round_trip_through_their_kind() {
+        for r in [
+            SnapshotRejection::Invalid("i".into()),
+            SnapshotRejection::Conflict("c".into()),
+            SnapshotRejection::NotFound("n".into()),
+        ] {
+            assert_eq!(
+                SnapshotRejection::from_kind(r.kind(), r.to_string()),
+                Some(r)
+            );
+        }
+        assert_eq!(SnapshotRejection::from_kind("other", "x".into()), None);
+    }
+
+    #[test]
+    fn snapshot_descriptions_are_short_and_single_line() {
+        assert!(validate_snapshot_description("").is_ok());
+        assert!(validate_snapshot_description("before the big change").is_ok());
+        assert!(validate_snapshot_description(&"x".repeat(200)).is_ok());
+        assert!(validate_snapshot_description(&"x".repeat(201)).is_err());
+        assert!(validate_snapshot_description("two\nlines").is_err());
+    }
 
     pub fn mock_full_vm() -> FullVmInfo {
         let template = VmTemplate {
