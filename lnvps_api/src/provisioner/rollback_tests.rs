@@ -1027,7 +1027,7 @@ mod tests {
             ["one", "two"]
         );
 
-        provisioner.rollback_snapshot(vm.id, "one").await?;
+        provisioner.rollback_snapshot(vm.id, "two").await?;
         assert_eq!(provisioner.list_snapshots(vm.id).await?.len(), 2);
 
         provisioner.delete_snapshot(vm.id, "one").await?;
@@ -1048,11 +1048,11 @@ mod tests {
             e.inner().downcast_ref::<SnapshotRejection>().cloned()
         };
 
-        for name in ["a", "b", "c"] {
+        for name in ["s1", "s2", "s3"] {
             provisioner.create_snapshot(vm.id, name, None).await?;
         }
         let full = provisioner
-            .create_snapshot(vm.id, "d", None)
+            .create_snapshot(vm.id, "s4", None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1061,7 +1061,7 @@ mod tests {
         ));
 
         let dup = provisioner
-            .create_snapshot(vm.id, "a", None)
+            .create_snapshot(vm.id, "s1", None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -1069,7 +1069,25 @@ mod tests {
             Some(SnapshotRejection::Conflict(_))
         ));
 
-        provisioner.delete_snapshot(vm.id, "a").await?;
+        let older = provisioner
+            .rollback_snapshot(vm.id, "s1")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            rejection(older),
+            Some(SnapshotRejection::Conflict(_))
+        ));
+        provisioner.rollback_snapshot(vm.id, "s3").await?;
+
+        let bad_path = provisioner
+            .delete_snapshot(vm.id, "../x")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            rejection(bad_path),
+            Some(SnapshotRejection::Invalid(_))
+        ));
+        provisioner.delete_snapshot(vm.id, "s1").await?;
         let bad = provisioner
             .create_snapshot(vm.id, "9 bad", None)
             .await
@@ -1087,6 +1105,58 @@ mod tests {
             rejection(missing),
             Some(SnapshotRejection::NotFound(_))
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_actions_are_logged_only_when_they_succeed() -> Result<()> {
+        use lnvps_api_common::{SnapshotAction, VmHistoryLogger};
+        clear_mock_state().await;
+        let db = Arc::new(MockDb::default());
+        setup_db_with_static_arp(&db).await?;
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let vm = spawned_vm(&provisioner, &db).await?;
+        let history = VmHistoryLogger::new(db.clone());
+        let actions = |n: &str| {
+            [
+                SnapshotAction::Create {
+                    name: n.to_string(),
+                    description: Some("d".to_string()),
+                },
+                SnapshotAction::Restore {
+                    name: n.to_string(),
+                },
+                SnapshotAction::Delete {
+                    name: n.to_string(),
+                },
+            ]
+        };
+        for action in actions("one") {
+            provisioner
+                .run_snapshot_action(vm.id, Some(vm.user_id), &action, &history)
+                .await?;
+        }
+        assert!(
+            provisioner
+                .run_snapshot_action(
+                    vm.id,
+                    None,
+                    &SnapshotAction::Restore {
+                        name: "gone".to_string()
+                    },
+                    &history,
+                )
+                .await
+                .is_err()
+        );
+        let logged: Vec<String> = db
+            .list_vm_history(vm.id)
+            .await?
+            .iter()
+            .map(|h| h.action_type.to_string())
+            .filter(|a| a.starts_with("snapshot"))
+            .collect();
+        assert_eq!(logged.len(), 3, "{logged:?}");
         Ok(())
     }
 

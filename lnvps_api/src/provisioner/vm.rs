@@ -1,6 +1,6 @@
 use crate::host::{
-    FullVmInfo, SnapshotRejection, VmHostClient, VmResources, VmSnapshot, check_new_snapshot,
-    clear_snapshots, get_host_client,
+    FullVmInfo, VmHostClient, VmResources, VmSnapshot, check_new_snapshot, check_restorable,
+    clear_snapshots, get_host_client, validate_snapshot_name,
 };
 use crate::provisioner::VmNetworkProvisioner;
 use crate::router::{ArpEntry, Router, get_router};
@@ -16,11 +16,11 @@ use lnvps_api_common::{
     PricingEngine, UpgradeConfig, UpgradeCostQuote, VmStateCache, apply_custom_pricing_limits,
     round_msat_to_sat, upgrade_bandwidth,
 };
-use lnvps_api_common::{ExchangeRateService, op_fatal};
+use lnvps_api_common::{ExchangeRateService, SnapshotAction, VmHistoryLogger, op_fatal};
 use lnvps_db::{
     CpuArch, IntervalType, IpRange, IpRangeAllocationMode, LNVpsDb, LineItemType, PaymentMethod,
     PaymentType, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
-    Vm, VmCustomTemplate, VmIpAssignment, VmTemplate,
+    Vm, VmCustomTemplate, VmHistoryActionType, VmIpAssignment, VmTemplate,
 };
 
 /// Ensure an OS image's CPU architecture is compatible with the target
@@ -917,10 +917,6 @@ impl VmProvisioner {
         client.list_snapshots(&vm).await
     }
 
-    /// Snapshot a VM. A running VM is running again afterwards.
-    ///
-    /// At most [`MAX_VM_SNAPSHOTS`] are kept, because each one holds the disk
-    /// blocks it diverged from for as long as it exists.
     pub async fn create_snapshot(
         &self,
         vm_id: u64,
@@ -937,26 +933,13 @@ impl VmProvisioner {
         client.create_snapshot(&vm, name, description).await
     }
 
-    /// Return a VM to a snapshot and start it again.
-    ///
-    /// The host restores the configuration as it was when the snapshot was
-    /// taken, so the current one (SSH key, addresses, limits) is reapplied
-    /// before the VM boots.
     pub async fn rollback_snapshot(&self, vm_id: u64, name: &str) -> OpResult<()> {
         if self.read_only {
             op_fatal!("Cant restore VM's in read-only mode");
         }
+        validate_snapshot_name(name)?;
         let (vm, client) = self.snapshot_client(vm_id).await?;
-        if !client
-            .list_snapshots(&vm)
-            .await?
-            .iter()
-            .any(|s| s.name == name)
-        {
-            return Err(
-                SnapshotRejection::NotFound(format!("Snapshot {name} does not exist")).into(),
-            );
-        }
+        check_restorable(&client.list_snapshots(&vm).await?, name)?;
         info!("Restoring VM {} to snapshot {}", vm_id, name);
         client.rollback_snapshot(&vm, name).await?;
         let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
@@ -965,8 +948,41 @@ impl VmProvisioner {
     }
 
     pub async fn delete_snapshot(&self, vm_id: u64, name: &str) -> OpResult<()> {
+        validate_snapshot_name(name)?;
         let (vm, client) = self.snapshot_client(vm_id).await?;
         client.delete_snapshot(&vm, name).await
+    }
+
+    pub async fn run_snapshot_action(
+        &self,
+        vm_id: u64,
+        user_id: Option<u64>,
+        action: &SnapshotAction,
+        history: &VmHistoryLogger,
+    ) -> OpResult<()> {
+        let (result, logged) = match action {
+            SnapshotAction::Create { name, description } => (
+                self.create_snapshot(vm_id, name, description.as_deref())
+                    .await,
+                VmHistoryActionType::SnapshotCreated,
+            ),
+            SnapshotAction::Restore { name } => (
+                self.rollback_snapshot(vm_id, name).await,
+                VmHistoryActionType::SnapshotRestored,
+            ),
+            SnapshotAction::Delete { name } => (
+                self.delete_snapshot(vm_id, name).await,
+                VmHistoryActionType::SnapshotDeleted,
+            ),
+        };
+        if result.is_ok()
+            && let Err(e) = history
+                .log_vm_snapshot(vm_id, user_id, logged, action.name())
+                .await
+        {
+            warn!("Failed to log snapshot history for VM {}: {}", vm_id, e);
+        }
+        result
     }
 
     /// Start a VM

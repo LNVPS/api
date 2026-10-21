@@ -841,9 +841,6 @@ impl ProxmoxClient {
         })
     }
 
-    /// List a VM's snapshots, with the `current` pseudo-entry still in.
-    ///
-    /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu/{vmid}/snapshot
     pub async fn list_vm_snapshots(
         &self,
         node: &str,

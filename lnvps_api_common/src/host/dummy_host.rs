@@ -176,7 +176,6 @@ impl DummyVmHost {
         DUMMY_MIGRATIONS.lock().await.clone()
     }
 
-    /// Forget every snapshot of every VM.
     pub async fn clear_all_snapshots() {
         DUMMY_SNAPSHOTS.lock().await.clear();
     }
@@ -218,8 +217,6 @@ static DUMMY_HOST_VMS: LazyLock<Arc<Mutex<Vec<HostVmSpec>>>> =
 static DUMMY_HOST_VMS_BY_HOST: LazyLock<Arc<Mutex<HashMap<u64, Vec<HostVmSpec>>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 
-/// Snapshots held by the dummy hypervisor, by VM id. Process-wide because the
-/// provisioner builds a fresh client for every operation.
 static DUMMY_SNAPSHOTS: LazyLock<Arc<Mutex<HashMap<u64, Vec<VmSnapshot>>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 

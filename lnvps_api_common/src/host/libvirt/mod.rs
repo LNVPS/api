@@ -367,10 +367,6 @@ impl VmHostClient for LibVirtHost {
     ) -> OpResult<()> {
         let vm_id = vm.id;
         let xml = snapshot_xml(name, description);
-        // A live snapshot of a UEFI guest needs a qcow2 varstore and would hold
-        // the guest's memory as well, so the guest is shut down for the copy.
-        // The disk image is then quiescent, which is also what makes the
-        // snapshot something a guest can boot from after a rollback.
         let was_running = self.is_active(vm_id).await?;
         if was_running {
             VmHostClient::stop_vm(self, vm).await?;

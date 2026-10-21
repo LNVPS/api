@@ -832,10 +832,8 @@ pub enum ApiVmHistoryInitiator {
 
 #[derive(Serialize)]
 pub struct ApiVmSnapshot {
-    /// Name the snapshot was created with
     pub name: String,
     pub description: Option<String>,
-    /// When the snapshot was taken, if the host reports it
     pub created: Option<DateTime<Utc>>,
 }
 

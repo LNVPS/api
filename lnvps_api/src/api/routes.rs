@@ -23,12 +23,12 @@ use std::time::Duration;
 
 use lnvps_api_common::{
     ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate,
-    ClientInfo, ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, TraderDetails,
-    UpgradeConfig, UserRateLimiter, VatClient, WorkJob, apply_custom_pricing_limits,
+    ClientInfo, ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, SnapshotAction,
+    TraderDetails, UpgradeConfig, UserRateLimiter, VatClient, WorkJob, apply_custom_pricing_limits,
 };
 use lnvps_db::{
     CpuArch, LNVpsDb, PaymentMethod, Region, Vm, VmCustomPricing, VmCustomPricingDisk,
-    VmCustomTemplate, VmHistoryActionType, VmHost,
+    VmCustomTemplate, VmHost,
 };
 
 use crate::api::model::{
@@ -45,7 +45,10 @@ use crate::api::model::{
 use crate::api::{
     AmountQuery, AuthQuery, PaymentMethodQuery, RouterState, TicketRequest, TicketResponse,
 };
-use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
+use crate::host::{
+    FullVmInfo, TimeSeries, TimeSeriesData, check_new_snapshot, get_host_client,
+    validate_snapshot_name,
+};
 use crate::provisioner::{HostCapacityService, PricingEngine};
 
 /// Attach the live-chat support agent websocket.
@@ -1868,7 +1871,6 @@ async fn ensure_vm_active(this: &RouterState, vm: &Vm, what: &str) -> Result<(),
     Ok(())
 }
 
-/// List a VM's snapshots, oldest first
 async fn v1_list_vm_snapshots(
     auth: Nip98Auth,
     State(this): State<RouterState>,
@@ -1883,7 +1885,62 @@ async fn v1_list_vm_snapshots(
     ApiData::ok(snapshots.into_iter().map(Into::into).collect())
 }
 
-/// Snapshot a VM. It is left running if it was running.
+async fn run_vm_snapshot(
+    this: &RouterState,
+    vm: &Vm,
+    uid: u64,
+    action: SnapshotAction,
+) -> Result<(), ApiError> {
+    let Some(feedback) = this.feedback.clone() else {
+        let result = this
+            .sub_handler
+            .vm_provisioner()
+            .run_snapshot_action(vm.id, Some(uid), &action, &this.history)
+            .await;
+        if !matches!(action, SnapshotAction::Delete { .. }) {
+            this.work_sender
+                .send(WorkJob::CheckVm { vm_id: vm.id })
+                .await?;
+        }
+        return Ok(result?);
+    };
+
+    let reply_channel = format!("snapshot-{}-{:032x}", vm.id, rand::random::<u128>());
+    let mut stream = feedback
+        .subscribe(&JobFeedback::channel_name(&reply_channel))
+        .await
+        .map_err(|e| ApiError::new(format!("Failed to subscribe to reply channel: {e}")))?;
+    this.work_sender
+        .send(WorkJob::VmSnapshot {
+            vm_id: vm.id,
+            user_id: Some(uid),
+            action,
+            reply_channel,
+        })
+        .await?;
+
+    match tokio::time::timeout(Duration::from_secs(180), stream.next()).await {
+        Ok(Some(Ok(fb))) => match (fb.snapshot_rejection(), fb.status) {
+            (Some(rejection), _) => Err(ApiError::from(lnvps_api_common::retry::OpError::from(
+                rejection,
+            ))),
+            (None, JobFeedbackStatus::Failed { error }) => {
+                Err(ApiError::new(format!("Snapshot failed: {error}")))
+            }
+            _ => Ok(()),
+        },
+        Ok(Some(Err(e))) => Err(ApiError::new(format!("Snapshot reply error: {e}"))),
+        Ok(None) => Err(ApiError::new("Snapshot reply channel closed")),
+        Err(_) => {
+            info!(
+                "Snapshot of VM {} still in progress after 180s; returning to client",
+                vm.id
+            );
+            Ok(())
+        }
+    }
+}
+
 async fn v1_create_vm_snapshot(
     auth: Nip98Auth,
     State(this): State<RouterState>,
@@ -1892,70 +1949,54 @@ async fn v1_create_vm_snapshot(
 ) -> ApiResult<ApiVmSnapshot> {
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
     ensure_vm_active(&this, &vm, "snapshot").await?;
-    let provisioner = this.sub_handler.vm_provisioner();
-    let description = req.description.as_deref().filter(|d| !d.is_empty());
-    provisioner
-        .create_snapshot(vm.id, &req.name, description)
-        .await?;
-    this.history
-        .log_vm_snapshot(
-            id,
-            Some(uid),
-            VmHistoryActionType::SnapshotCreated,
-            &req.name,
-        )
-        .await
-        .ok();
-    this.work_sender
-        .send(WorkJob::CheckVm { vm_id: id })
-        .await?;
-    let created = provisioner
+    let description = req.description.filter(|d| !d.is_empty());
+    check_new_snapshot(&[], &req.name, description.as_deref())
+        .map_err(lnvps_api_common::retry::OpError::from)?;
+    run_vm_snapshot(
+        &this,
+        &vm,
+        uid,
+        SnapshotAction::Create {
+            name: req.name.clone(),
+            description: description.clone(),
+        },
+    )
+    .await?;
+    let created = this
+        .sub_handler
+        .vm_provisioner()
         .list_snapshots(vm.id)
         .await?
         .into_iter()
         .find(|s| s.name == req.name)
-        .ok_or_else(|| ApiError::internal("Snapshot was not found after creating it"))?;
+        .unwrap_or(lnvps_api_common::host::VmSnapshot {
+            name: req.name,
+            description,
+            created: None,
+        });
     ApiData::ok(created.into())
 }
 
-/// Return a VM to a snapshot. Everything written since is lost, and the VM is
-/// started again afterwards.
 async fn v1_restore_vm_snapshot(
     auth: Nip98Auth,
     State(this): State<RouterState>,
     Path((id, name)): Path<(u64, String)>,
 ) -> ApiResult<()> {
+    validate_snapshot_name(&name).map_err(lnvps_api_common::retry::OpError::from)?;
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
     ensure_vm_active(&this, &vm, "restore").await?;
-    this.sub_handler
-        .vm_provisioner()
-        .rollback_snapshot(vm.id, &name)
-        .await?;
-    this.history
-        .log_vm_snapshot(id, Some(uid), VmHistoryActionType::SnapshotRestored, &name)
-        .await
-        .ok();
-    this.work_sender
-        .send(WorkJob::CheckVm { vm_id: id })
-        .await?;
+    run_vm_snapshot(&this, &vm, uid, SnapshotAction::Restore { name }).await?;
     ApiData::ok(())
 }
 
-/// Delete a snapshot
 async fn v1_delete_vm_snapshot(
     auth: Nip98Auth,
     State(this): State<RouterState>,
     Path((id, name)): Path<(u64, String)>,
 ) -> ApiResult<()> {
+    validate_snapshot_name(&name).map_err(lnvps_api_common::retry::OpError::from)?;
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
-    this.sub_handler
-        .vm_provisioner()
-        .delete_snapshot(vm.id, &name)
-        .await?;
-    this.history
-        .log_vm_snapshot(id, Some(uid), VmHistoryActionType::SnapshotDeleted, &name)
-        .await
-        .ok();
+    run_vm_snapshot(&this, &vm, uid, SnapshotAction::Delete { name }).await?;
     ApiData::ok(())
 }
 
