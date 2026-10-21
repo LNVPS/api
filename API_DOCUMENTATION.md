@@ -1123,6 +1123,25 @@ historical range is needed; a usage bar can be rendered from this object alone.
 - **Response**: `null`
 - **Errors**: `402 Payment Required` if the VM is expired (renew it first); `403 Forbidden` if the VM is not yours or the chosen image is not available; `404 Not Found` if the VM or image does not exist.
 
+#### VM Snapshots
+
+A snapshot keeps a VM's disk as it is now so it can be returned to later. A VM holds at most 3 snapshots, and each one uses host storage for as long as it exists, so delete the ones you no longer need. All four endpoints require auth, and snapshots cannot be created or restored on an expired VM (`402 Payment Required`).
+
+Snapshots are deleted when the VM is re-installed or its disk is resized.
+
+- **GET** `/api/v1/vm/{id}/snapshots`: list snapshots, oldest first.
+  - **Response**: `[{ "name": string, "description": string | null, "created": string | null }]`
+- **POST** `/api/v1/vm/{id}/snapshots`: take a snapshot.
+  - **Body**: `{ "name": string, "description"?: string }`. `name` starts with a letter and uses letters, digits, `_` and `-`, up to 40 characters. `description` is one line of up to 200 characters.
+  - **Response**: the created snapshot.
+  - **Errors**: `400 Bad Request` for an invalid name or description; `409 Conflict` if the name is taken or the VM already holds 3 snapshots.
+  - A running VM keeps running on Proxmox. On libvirt hosts (including marketplace nodes) it is shut down for the copy and started again, so expect a short outage.
+- **PATCH** `/api/v1/vm/{id}/snapshots/{name}/restore`: return the VM to a snapshot. Everything written to the disk since is lost. The VM is started again afterwards. Later snapshots are kept.
+  - **Response**: `null`
+  - **Errors**: `404 Not Found` if the snapshot does not exist.
+- **DELETE** `/api/v1/vm/{id}/snapshots/{name}`: delete a snapshot. Deleting one that does not exist succeeds.
+  - **Response**: `null`
+
 #### VM Serial Console (WebSocket)
 - **WebSocket** `/api/v1/vm/{id}/console`
 - **Auth**: Query parameter `?ticket=<ticket>` from [Issue an Auth Ticket](#issue-an-auth-ticket). The legacy `?auth=<base64_nip98_event>` form still works but is **deprecated**.

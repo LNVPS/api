@@ -7,7 +7,7 @@ use crate::host::proxmox_config::{
 };
 use crate::host::{
     FullVmInfo, MigrateVmRequest, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient,
-    VmHostDiskInfo, VmHostInfo,
+    VmHostDiskInfo, VmHostInfo, VmSnapshot,
 };
 use crate::retry::{OpError, OpResult, Pipeline, RetryPolicy};
 use crate::ssh_client::SshClient;
@@ -838,6 +838,82 @@ impl ProxmoxClient {
         Ok(TaskId {
             id: rsp.data,
             node: node_str,
+        })
+    }
+
+    /// List a VM's snapshots, with the `current` pseudo-entry still in.
+    ///
+    /// https://pve.proxmox.com/pve-docs/api-viewer/?ref=public_apis#/nodes/{node}/qemu/{vmid}/snapshot
+    pub async fn list_vm_snapshots(
+        &self,
+        node: &str,
+        vm: ProxmoxVmId,
+    ) -> OpResult<Vec<SnapshotInfo>> {
+        let rsp: ResponseBase<Vec<SnapshotInfo>> = self
+            .api
+            .get(&format!("/api2/json/nodes/{}/qemu/{}/snapshot", node, vm))
+            .await?;
+        Ok(rsp.data)
+    }
+
+    pub async fn create_vm_snapshot(
+        &self,
+        node: &str,
+        vm: ProxmoxVmId,
+        req: &CreateSnapshotRequest,
+    ) -> OpResult<TaskId> {
+        let rsp: ResponseBase<String> = self
+            .api
+            .post(
+                &format!("/api2/json/nodes/{}/qemu/{}/snapshot", node, vm),
+                req,
+            )
+            .await?;
+        Ok(TaskId {
+            id: rsp.data,
+            node: node.to_string(),
+        })
+    }
+
+    pub async fn rollback_vm_snapshot(
+        &self,
+        node: &str,
+        vm: ProxmoxVmId,
+        name: &str,
+    ) -> OpResult<TaskId> {
+        let rsp: ResponseBase<String> = self
+            .api
+            .post(
+                &format!(
+                    "/api2/json/nodes/{}/qemu/{}/snapshot/{}/rollback",
+                    node, vm, name
+                ),
+                (),
+            )
+            .await?;
+        Ok(TaskId {
+            id: rsp.data,
+            node: node.to_string(),
+        })
+    }
+
+    pub async fn delete_vm_snapshot(
+        &self,
+        node: &str,
+        vm: ProxmoxVmId,
+        name: &str,
+    ) -> OpResult<TaskId> {
+        let rsp: ResponseBase<String> = self
+            .api
+            .req::<_, ()>(
+                Method::DELETE,
+                &format!("/api2/json/nodes/{}/qemu/{}/snapshot/{}", node, vm, name),
+                None,
+            )
+            .await?;
+        Ok(TaskId {
+            id: rsp.data,
+            node: node.to_string(),
         })
     }
 
@@ -1746,6 +1822,59 @@ impl VmHostClient for ProxmoxClient {
             });
         }
         Ok(out)
+    }
+
+    async fn list_snapshots(&self, vm: &Vm) -> OpResult<Vec<VmSnapshot>> {
+        let mut out: Vec<VmSnapshot> = self
+            .list_vm_snapshots(&self.node, vm.id.into())
+            .await?
+            .into_iter()
+            .filter(|s| s.name != "current")
+            .map(VmSnapshot::from)
+            .collect();
+        out.sort_by_key(|s| s.created);
+        Ok(out)
+    }
+
+    async fn create_snapshot(
+        &self,
+        vm: &Vm,
+        name: &str,
+        description: Option<&str>,
+    ) -> OpResult<()> {
+        let task = self
+            .create_vm_snapshot(
+                &self.node,
+                vm.id.into(),
+                &CreateSnapshotRequest {
+                    snapname: name.to_string(),
+                    description: description.map(str::to_string),
+                    vmstate: false,
+                },
+            )
+            .await?;
+        self.wait_for_task(&task).await?;
+        Ok(())
+    }
+
+    async fn rollback_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+        let task = self
+            .rollback_vm_snapshot(&self.node, vm.id.into(), name)
+            .await?;
+        self.wait_for_task(&task).await?;
+        self.wait_for_vm_stopped(vm.id.into()).await
+    }
+
+    async fn delete_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+        let existing = self.list_vm_snapshots(&self.node, vm.id.into()).await?;
+        if !existing.iter().any(|s| s.name == name) {
+            return Ok(());
+        }
+        let task = self
+            .delete_vm_snapshot(&self.node, vm.id.into(), name)
+            .await?;
+        self.wait_for_task(&task).await?;
+        Ok(())
     }
 
     async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()> {
@@ -2951,6 +3080,39 @@ impl TaskStatus {
     pub fn is_success(&self) -> bool {
         self.is_finished() && self.exit_status == Some("OK".to_string())
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SnapshotInfo {
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(rename = "snaptime")]
+    pub snap_time: Option<i64>,
+}
+
+impl From<SnapshotInfo> for VmSnapshot {
+    fn from(s: SnapshotInfo) -> Self {
+        VmSnapshot {
+            name: s.name,
+            description: s.description.filter(|d| !d.is_empty()),
+            created: s
+                .snap_time
+                .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateSnapshotRequest {
+    pub snapname: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(serialize_with = "bool_as_int")]
+    pub vmstate: bool,
+}
+
+fn bool_as_int<S: Serializer>(v: &bool, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_u8(*v as u8)
 }
 
 #[derive(Deserialize)]
@@ -4766,6 +4928,167 @@ mod tests {
             !net.contains("fd00::"),
             "SLAAC address must not be pinned: {net}"
         );
+        Ok(())
+    }
+
+    fn snapshot_test_client(uri: &str) -> Result<ProxmoxClient> {
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        Ok(ProxmoxClient::new(
+            uri.parse()?,
+            "pve",
+            "",
+            None,
+            q_cfg,
+            None,
+        ))
+    }
+
+    async fn mock_finished_task(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/tasks/.*/status$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "id": "101", "node": "pve", "pid": 1, "pstart": 1, "starttime": 1,
+                    "status": "stopped", "type": "qmsnapshot",
+                    "upid": "UPID:node:0:0:task", "user": "root@pam", "exitstatus": "OK"
+                }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn snapshot_list_body() -> serde_json::Value {
+        serde_json::json!({"data": [
+            {"name": "later", "snaptime": 1700000200, "description": "second"},
+            {"name": "first", "snaptime": 1700000100, "description": ""},
+            {"name": "current", "description": "You are here!"}
+        ]})
+    }
+
+    #[tokio::test]
+    async fn test_list_snapshots_hides_current_and_orders_by_time() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/qemu/101/snapshot$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(snapshot_list_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = snapshot_test_client(&server.uri())?;
+        let mut vm = mock_full_vm().vm;
+        vm.id = 1;
+
+        let snaps = VmHostClient::list_snapshots(&client, &vm)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert_eq!(
+            snaps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["first", "later"]
+        );
+        assert_eq!(snaps[0].description, None);
+        assert_eq!(snaps[1].description.as_deref(), Some("second"));
+        assert_eq!(snaps[0].created.map(|c| c.timestamp()), Some(1700000100));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_snapshot_sends_name_without_memory() -> Result<()> {
+        use wiremock::matchers::body_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/qemu/101/snapshot$"))
+            .and(body_json(serde_json::json!({
+                "snapname": "before-upgrade",
+                "description": "safe point",
+                "vmstate": 0
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": "UPID:node:0:0:task"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mock_finished_task(&server).await;
+        let client = snapshot_test_client(&server.uri())?;
+        let mut vm = mock_full_vm().vm;
+        vm.id = 1;
+
+        VmHostClient::create_snapshot(&client, &vm, "before-upgrade", Some("safe point"))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rollback_snapshot_waits_for_the_vm_to_stop() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/qemu/101/snapshot/first/rollback$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": "UPID:node:0:0:task"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mock_finished_task(&server).await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/qemu/101/status/current$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": {"vmid": 101, "status": "stopped"}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = snapshot_test_client(&server.uri())?;
+        let mut vm = mock_full_vm().vm;
+        vm.id = 1;
+
+        VmHostClient::rollback_snapshot(&client, &vm, "first")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_snapshot_is_idempotent() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/qemu/101/snapshot$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(snapshot_list_body()))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(r".*/qemu/101/snapshot/first$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": "UPID:node:0:0:task"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mock_finished_task(&server).await;
+        let client = snapshot_test_client(&server.uri())?;
+        let mut vm = mock_full_vm().vm;
+        vm.id = 1;
+
+        VmHostClient::delete_snapshot(&client, &vm, "first")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        VmHostClient::delete_snapshot(&client, &vm, "missing")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         Ok(())
     }
 

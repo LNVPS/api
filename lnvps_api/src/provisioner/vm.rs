@@ -1,4 +1,7 @@
-use crate::host::{FullVmInfo, VmHostClient, VmResources, get_host_client};
+use crate::host::{
+    FullVmInfo, SnapshotRejection, VmHostClient, VmResources, VmSnapshot, check_new_snapshot,
+    clear_snapshots, get_host_client,
+};
 use crate::provisioner::VmNetworkProvisioner;
 use crate::router::{ArpEntry, Router, get_router};
 use crate::settings::{ProvisionerConfig, Settings};
@@ -863,6 +866,18 @@ impl VmProvisioner {
                     ctx.client.stop_vm(&ctx.info.vm).await
                 })
             })
+            .step("clear_snapshots", |ctx| {
+                Box::pin(async move {
+                    let cleared = clear_snapshots(ctx.client.as_ref(), &ctx.info.vm).await?;
+                    if cleared > 0 {
+                        info!(
+                            "Deleted {} snapshots of VM {} for reinstall",
+                            cleared, ctx.vm_id
+                        );
+                    }
+                    Ok(())
+                })
+            })
             .step("unlink_disk", |ctx| {
                 Box::pin(async move {
                     info!("Unlinking disk for VM {}", ctx.vm_id);
@@ -888,6 +903,70 @@ impl VmProvisioner {
             .execute()
             .await?;
         Ok(())
+    }
+
+    async fn snapshot_client(&self, vm_id: u64) -> OpResult<(lnvps_db::Vm, Arc<dyn VmHostClient>)> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let host = self.db.get_host(vm.host_id).await?;
+        let client = get_host_client(&self.db, &host, &self.provisioner_config).await?;
+        Ok((vm, client))
+    }
+
+    pub async fn list_snapshots(&self, vm_id: u64) -> OpResult<Vec<VmSnapshot>> {
+        let (vm, client) = self.snapshot_client(vm_id).await?;
+        client.list_snapshots(&vm).await
+    }
+
+    /// Snapshot a VM. A running VM is running again afterwards.
+    ///
+    /// At most [`MAX_VM_SNAPSHOTS`] are kept, because each one holds the disk
+    /// blocks it diverged from for as long as it exists.
+    pub async fn create_snapshot(
+        &self,
+        vm_id: u64,
+        name: &str,
+        description: Option<&str>,
+    ) -> OpResult<()> {
+        if self.read_only {
+            op_fatal!("Cant snapshot VM's in read-only mode");
+        }
+        let (vm, client) = self.snapshot_client(vm_id).await?;
+        let existing = client.list_snapshots(&vm).await?;
+        check_new_snapshot(&existing, name, description)?;
+        info!("Snapshotting VM {} as {}", vm_id, name);
+        client.create_snapshot(&vm, name, description).await
+    }
+
+    /// Return a VM to a snapshot and start it again.
+    ///
+    /// The host restores the configuration as it was when the snapshot was
+    /// taken, so the current one (SSH key, addresses, limits) is reapplied
+    /// before the VM boots.
+    pub async fn rollback_snapshot(&self, vm_id: u64, name: &str) -> OpResult<()> {
+        if self.read_only {
+            op_fatal!("Cant restore VM's in read-only mode");
+        }
+        let (vm, client) = self.snapshot_client(vm_id).await?;
+        if !client
+            .list_snapshots(&vm)
+            .await?
+            .iter()
+            .any(|s| s.name == name)
+        {
+            return Err(
+                SnapshotRejection::NotFound(format!("Snapshot {name} does not exist")).into(),
+            );
+        }
+        info!("Restoring VM {} to snapshot {}", vm_id, name);
+        client.rollback_snapshot(&vm, name).await?;
+        let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
+        client.configure_vm(&info).await?;
+        client.start_vm(&vm).await
+    }
+
+    pub async fn delete_snapshot(&self, vm_id: u64, name: &str) -> OpResult<()> {
+        let (vm, client) = self.snapshot_client(vm_id).await?;
+        client.delete_snapshot(&vm, name).await
     }
 
     /// Start a VM

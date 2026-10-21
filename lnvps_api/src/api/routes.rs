@@ -28,7 +28,7 @@ use lnvps_api_common::{
 };
 use lnvps_db::{
     CpuArch, LNVpsDb, PaymentMethod, Region, Vm, VmCustomPricing, VmCustomPricingDisk,
-    VmCustomTemplate, VmHost,
+    VmCustomTemplate, VmHistoryActionType, VmHost,
 };
 
 use crate::api::model::{
@@ -36,11 +36,11 @@ use crate::api::model::{
     ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmPrice, ApiCustomVmRequest,
     ApiExchangeRates, ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiRenewalQuote,
     ApiTemplatesResponse, ApiVmFirewallPolicy, ApiVmFirewallRule, ApiVmHistory, ApiVmPayment,
-    ApiVmStatus, ApiVmTraffic, ApiVmTrafficDay, ApiVmTrafficSummary, ApiVmUpgradeQuote,
-    ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule, CreateVmRequest,
-    PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule, PaymentMethodResponse,
-    VMPatchRequest, VmTrafficQuery, quota_period, resolve_traffic_range, validate_firewall_cidr,
-    validate_firewall_ports, vm_to_status,
+    ApiVmSnapshot, ApiVmStatus, ApiVmTraffic, ApiVmTrafficDay, ApiVmTrafficSummary,
+    ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule, CreateVmRequest,
+    CreateVmSnapshotRequest, PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule,
+    PaymentMethodResponse, VMPatchRequest, VmTrafficQuery, quota_period, resolve_traffic_range,
+    validate_firewall_cidr, validate_firewall_ports, vm_to_status,
 };
 use crate::api::{
     AmountQuery, AuthQuery, PaymentMethodQuery, RouterState, TicketRequest, TicketResponse,
@@ -148,6 +148,18 @@ pub fn routes() -> Router<RouterState> {
             .route("/api/v1/vm/{id}/stop", patch(v1_stop_vm))
             .route("/api/v1/vm/{id}/restart", patch(v1_restart_vm))
             .route("/api/v1/vm/{id}/re-install", patch(v1_reinstall_vm))
+            .route(
+                "/api/v1/vm/{id}/snapshots",
+                get(v1_list_vm_snapshots).post(v1_create_vm_snapshot),
+            )
+            .route(
+                "/api/v1/vm/{id}/snapshots/{name}",
+                delete(v1_delete_vm_snapshot),
+            )
+            .route(
+                "/api/v1/vm/{id}/snapshots/{name}/restore",
+                patch(v1_restore_vm_snapshot),
+            )
             .route("/api/v1/vm/{id}/time-series", get(v1_time_series))
             .route(
                 "/api/v1/vm/{id}/console",
@@ -1841,6 +1853,110 @@ async fn v1_reinstall_vm(
             ApiData::ok(())
         }
     }
+}
+
+async fn ensure_vm_active(this: &RouterState, vm: &Vm, what: &str) -> Result<(), ApiError> {
+    let subscription = this
+        .db
+        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+        .await?;
+    if is_vm_expired(subscription.expires, Utc::now()) {
+        return Err(ApiError::payment_required(format!(
+            "Cannot {what} an expired VM, please renew it first"
+        )));
+    }
+    Ok(())
+}
+
+/// List a VM's snapshots, oldest first
+async fn v1_list_vm_snapshots(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<Vec<ApiVmSnapshot>> {
+    let (_, vm) = get_user_vm(&auth, &this, id).await?;
+    let snapshots = this
+        .sub_handler
+        .vm_provisioner()
+        .list_snapshots(vm.id)
+        .await?;
+    ApiData::ok(snapshots.into_iter().map(Into::into).collect())
+}
+
+/// Snapshot a VM. It is left running if it was running.
+async fn v1_create_vm_snapshot(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<CreateVmSnapshotRequest>,
+) -> ApiResult<ApiVmSnapshot> {
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    ensure_vm_active(&this, &vm, "snapshot").await?;
+    let provisioner = this.sub_handler.vm_provisioner();
+    let description = req.description.as_deref().filter(|d| !d.is_empty());
+    provisioner
+        .create_snapshot(vm.id, &req.name, description)
+        .await?;
+    this.history
+        .log_vm_snapshot(
+            id,
+            Some(uid),
+            VmHistoryActionType::SnapshotCreated,
+            &req.name,
+        )
+        .await
+        .ok();
+    this.work_sender
+        .send(WorkJob::CheckVm { vm_id: id })
+        .await?;
+    let created = provisioner
+        .list_snapshots(vm.id)
+        .await?
+        .into_iter()
+        .find(|s| s.name == req.name)
+        .ok_or_else(|| ApiError::internal("Snapshot was not found after creating it"))?;
+    ApiData::ok(created.into())
+}
+
+/// Return a VM to a snapshot. Everything written since is lost, and the VM is
+/// started again afterwards.
+async fn v1_restore_vm_snapshot(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path((id, name)): Path<(u64, String)>,
+) -> ApiResult<()> {
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    ensure_vm_active(&this, &vm, "restore").await?;
+    this.sub_handler
+        .vm_provisioner()
+        .rollback_snapshot(vm.id, &name)
+        .await?;
+    this.history
+        .log_vm_snapshot(id, Some(uid), VmHistoryActionType::SnapshotRestored, &name)
+        .await
+        .ok();
+    this.work_sender
+        .send(WorkJob::CheckVm { vm_id: id })
+        .await?;
+    ApiData::ok(())
+}
+
+/// Delete a snapshot
+async fn v1_delete_vm_snapshot(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path((id, name)): Path<(u64, String)>,
+) -> ApiResult<()> {
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    this.sub_handler
+        .vm_provisioner()
+        .delete_snapshot(vm.id, &name)
+        .await?;
+    this.history
+        .log_vm_snapshot(id, Some(uid), VmHistoryActionType::SnapshotDeleted, &name)
+        .await
+        .ok();
+    ApiData::ok(())
 }
 
 async fn v1_time_series(

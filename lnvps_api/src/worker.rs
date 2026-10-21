@@ -4717,6 +4717,11 @@ impl Worker {
                         let host = ctx.db.get_host(full_info.host.id).await?;
                         let client = get_host_client(&ctx.db, &host, &ctx.settings.provisioner_config).await?;
 
+                        let cleared = lnvps_api_common::host::clear_snapshots(client.as_ref(), &full_info.vm).await?;
+                        if cleared > 0 {
+                            info!("Deleted {} snapshots of VM {} before resizing its disk", cleared, ctx.vm_id);
+                        }
+
                         info!("Resizing disk for VM {}", ctx.vm_id);
                         client.resize_disk(&full_info).await?;
                     }
@@ -5205,6 +5210,30 @@ mod tests {
 
             async fn generate_mac(&self, vm: &Vm) -> OpResult<String> {
                 self.inner.generate_mac(vm).await
+            }
+
+            async fn list_snapshots(
+                &self,
+                vm: &Vm,
+            ) -> OpResult<Vec<lnvps_api_common::host::VmSnapshot>> {
+                self.inner.list_snapshots(vm).await
+            }
+
+            async fn create_snapshot(
+                &self,
+                vm: &Vm,
+                name: &str,
+                description: Option<&str>,
+            ) -> OpResult<()> {
+                self.inner.create_snapshot(vm, name, description).await
+            }
+
+            async fn rollback_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+                self.inner.rollback_snapshot(vm, name).await
+            }
+
+            async fn delete_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+                self.inner.delete_snapshot(vm, name).await
             }
 
             async fn start_vm(&self, vm: &Vm) -> OpResult<()> {

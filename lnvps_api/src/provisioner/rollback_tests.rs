@@ -995,6 +995,128 @@ mod tests {
         Ok(())
     }
 
+    async fn spawned_vm(provisioner: &VmProvisioner, db: &Arc<MockDb>) -> Result<lnvps_db::Vm> {
+        let (user, ssh_key) = add_user(db).await?;
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        provisioner
+            .spawn_vm_pipeline(vm.id)
+            .await?
+            .execute()
+            .await?;
+        lnvps_api_common::host::dummy_host::DummyVmHost::clear_all_snapshots().await;
+        Ok(vm)
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_lifecycle() -> Result<()> {
+        clear_mock_state().await;
+        let db = Arc::new(MockDb::default());
+        setup_db_with_static_arp(&db).await?;
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let vm = spawned_vm(&provisioner, &db).await?;
+
+        provisioner
+            .create_snapshot(vm.id, "one", Some("first"))
+            .await?;
+        provisioner.create_snapshot(vm.id, "two", None).await?;
+        let listed = provisioner.list_snapshots(vm.id).await?;
+        assert_eq!(
+            listed.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+
+        provisioner.rollback_snapshot(vm.id, "one").await?;
+        assert_eq!(provisioner.list_snapshots(vm.id).await?.len(), 2);
+
+        provisioner.delete_snapshot(vm.id, "one").await?;
+        assert_eq!(provisioner.list_snapshots(vm.id).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_limits_and_rejections() -> Result<()> {
+        use lnvps_api_common::host::SnapshotRejection;
+        clear_mock_state().await;
+        let db = Arc::new(MockDb::default());
+        setup_db_with_static_arp(&db).await?;
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let vm = spawned_vm(&provisioner, &db).await?;
+
+        let rejection = |e: lnvps_api_common::retry::OpError<anyhow::Error>| {
+            e.inner().downcast_ref::<SnapshotRejection>().cloned()
+        };
+
+        for name in ["a", "b", "c"] {
+            provisioner.create_snapshot(vm.id, name, None).await?;
+        }
+        let full = provisioner
+            .create_snapshot(vm.id, "d", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            rejection(full),
+            Some(SnapshotRejection::Conflict(_))
+        ));
+
+        let dup = provisioner
+            .create_snapshot(vm.id, "a", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            rejection(dup),
+            Some(SnapshotRejection::Conflict(_))
+        ));
+
+        provisioner.delete_snapshot(vm.id, "a").await?;
+        let bad = provisioner
+            .create_snapshot(vm.id, "9 bad", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            rejection(bad),
+            Some(SnapshotRejection::Invalid(_))
+        ));
+
+        let missing = provisioner
+            .rollback_snapshot(vm.id, "nope")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            rejection(missing),
+            Some(SnapshotRejection::NotFound(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reinstall_discards_snapshots() -> Result<()> {
+        clear_mock_state().await;
+        let db = Arc::new(MockDb::default());
+        setup_db_with_static_arp(&db).await?;
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let vm = spawned_vm(&provisioner, &db).await?;
+
+        provisioner.create_snapshot(vm.id, "keep", None).await?;
+        provisioner.reinstall_vm(vm.id).await?;
+        assert!(provisioner.list_snapshots(vm.id).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshots_refused_in_read_only_mode() -> Result<()> {
+        clear_mock_state().await;
+        let mut settings = mock_settings();
+        settings.read_only = true;
+        let db = Arc::new(MockDb::default());
+        setup_db_with_static_arp(&db).await?;
+        let provisioner = VmProvisioner::new(settings, db.clone());
+        assert!(provisioner.create_snapshot(1, "one", None).await.is_err());
+        assert!(provisioner.rollback_snapshot(1, "one").await.is_err());
+        Ok(())
+    }
+
     /// A read-only provisioner must refuse to re-install.
     #[tokio::test]
     async fn test_reinstall_vm_read_only_rejected() -> Result<()> {

@@ -831,6 +831,32 @@ pub enum ApiVmHistoryInitiator {
 }
 
 #[derive(Serialize)]
+pub struct ApiVmSnapshot {
+    /// Name the snapshot was created with
+    pub name: String,
+    pub description: Option<String>,
+    /// When the snapshot was taken, if the host reports it
+    pub created: Option<DateTime<Utc>>,
+}
+
+impl From<lnvps_api_common::host::VmSnapshot> for ApiVmSnapshot {
+    fn from(value: lnvps_api_common::host::VmSnapshot) -> Self {
+        Self {
+            name: value.name,
+            description: value.description,
+            created: value.created,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CreateVmSnapshotRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Serialize)]
 pub struct ApiVmHistory {
     /// Unique history entry ID
     pub id: u64,
@@ -1728,6 +1754,28 @@ pub struct VmTrafficQuery {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn snapshot_request_description_is_optional() {
+        let req: CreateVmSnapshotRequest = serde_json::from_str(r#"{"name":"one"}"#).unwrap();
+        assert_eq!(req.name, "one");
+        assert_eq!(req.description, None);
+    }
+
+    #[test]
+    fn snapshot_converts_to_its_api_form() {
+        let api: ApiVmSnapshot = lnvps_api_common::host::VmSnapshot {
+            name: "one".into(),
+            description: Some("d".into()),
+            created: None,
+        }
+        .into();
+        let json = serde_json::to_value(&api).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"name": "one", "description": "d", "created": null})
+        );
+    }
 
     /// Omitted counts mean the single-IPv4/single-IPv6 offer that predates them
     /// being selectable, so an older client keeps ordering exactly what it did.
