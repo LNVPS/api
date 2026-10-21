@@ -13771,6 +13771,7 @@ mod account_credit_tests {
         assert_eq!(rest.len(), 1);
     }
 
+    #[cfg(feature = "admin")]
     #[tokio::test]
     async fn swap_order_clients_filter_by_user_and_order() {
         use lnvps_db::AdminDb;
