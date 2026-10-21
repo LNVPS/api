@@ -1056,7 +1056,7 @@ Every refund recorded against this payment, and what is still refundable on it.
     "payment_id": "a1b2...",
     "currency": "EUR",
     "amount": 1230,
-    // gross originally charged
+    // gross originally charged (net + tax)
     "refunded_total": 615,
     "refundable_remaining": 615,
     "refunds": [
@@ -1099,7 +1099,7 @@ Body (all fields optional):
 
 The refund is stored as a `subscription_payment` row with `payment_type = "Refund"`,
 `refunded_payment_id` pointing at the payment it reverses, and `amount`/`tax` holding
-the **magnitude** returned — the columns are unsigned, so reports subtract refund rows
+the **magnitude** returned (`amount` is the net slice, `tax` the VAT slice, and `amount + tax` equals the gross refunded) — the columns are unsigned, so reports subtract refund rows
 rather than reading a negative number. Currency, exchange `rate`, VAT rate, country and
 treatment are copied from the refunded payment (VAT is owed on what was charged, not on
 today's rates), `tax` is pro-rated and rounded down, `time_value` is null so nothing is

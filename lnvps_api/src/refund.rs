@@ -619,7 +619,8 @@ mod tests {
         let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
         assert_eq!(refunds.len(), 1);
         let refund = &refunds[0];
-        assert_eq!(refund.amount, 50);
+        assert_eq!(refund.amount + refund.tax, 50, "gross returned");
+        assert!(refund.tax > 0, "the VAT inside the refund is reversed");
         assert_eq!(refund.currency, "EUR");
         assert_eq!(refund.rate, payment.rate, "frozen at the charged rate");
         assert!(refund.payment_type.is_refund());
@@ -780,13 +781,13 @@ mod tests {
                 .await
                 .unwrap()
                 .iter()
-                .filter(|r| r.amount == 20)
+                .filter(|r| r.amount + r.tax == 20)
                 .count(),
             1
         );
         let older_refunds = db.list_refunds_for_payment(&older.id).await.unwrap();
         assert_eq!(older_refunds.len(), 1);
-        assert_eq!(older_refunds[0].amount, 30);
+        assert_eq!(older_refunds[0].amount + older_refunds[0].tax, 30);
     }
 
     fn debit(
@@ -917,7 +918,7 @@ mod tests {
             300_000
         );
         let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
-        assert_eq!(refunds[0].amount, 60);
+        assert_eq!(refunds[0].amount + refunds[0].tax, 60);
         let (events, _) = db
             .list_account_credit_events(vm.user_id, 10, 0)
             .await

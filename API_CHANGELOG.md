@@ -29,6 +29,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- **Refunds return the tax**: the refundable ceiling on a payment (`GET`/`POST /api/admin/v1/vms/{id}/payments/{payment_id}/refund`) is now the gross charge (net + tax), and the default refund amount returns everything charged. Previously only the net `amount` could be refunded, so the VAT was never returned. Refund rows still carry the net in `amount` and the VAT in `tax`, so reports are unchanged. Lightning refunds from `POST /api/admin/v1/vms/{id}/refund` now reverse the VAT inside the amount paid.
+
 - **VM stats on libvirt hosts** — CPU usage, uptime, network and disk counters were always 0 and memory always 100% for VMs on libvirt hosts (marketplace nodes included). They now come from the domain's own counters and the guest's balloon statistics. `GET /api/v1/vm/{id}/time-series` returns an empty series instead of a 500, since libvirt keeps no history.
 
 - **Guests on libvirt hosts get DNS resolvers and the host's MTU** — the NoCloud network config now carries `nameservers` and, when the host has one set, `mtu`. Images that resolve through systemd-resolved (Debian 13 among them) ignored the resolvers in user-data and booted with no DNS at all.

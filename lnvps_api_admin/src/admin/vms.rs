@@ -14,8 +14,8 @@ use lightning_invoice::Bolt11Invoice;
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, ApiVmTrafficSummary,
     PageQuery, PricingEngine, RefundEvidence, UpgradeConfig, VatClient, VmHistoryLogger,
-    VmRunningState, VmStateCache, WorkJob, build_refund_row, quota_period, refundable_remaining,
-    resolve_traffic_range,
+    VmRunningState, VmStateCache, WorkJob, build_refund_row, gross_charged, quota_period,
+    refundable_remaining, refunded_gross, resolve_traffic_range,
 };
 use lnvps_db::{AdminAction, AdminResource, SubscriptionPaymentType};
 use log::{error, info};
@@ -1326,12 +1326,12 @@ async fn admin_record_payment_refund(
     // ones already recorded. Without this, a payment could be refunded twice
     // over and the ledger would owe the customer money we never sent.
     let existing = this.db.list_refunds_for_payment(&payment.id).await?;
-    let already: u64 = existing.iter().map(|r| r.amount).sum();
+    let already: u64 = existing.iter().map(refunded_gross).sum();
     let refundable = refundable_remaining(&payment, &existing);
     if refundable == 0 {
         return Err(ApiError::conflict(format!(
             "Payment {payment_id} is already fully refunded ({already} of {})",
-            payment.amount
+            gross_charged(&payment)
         )));
     }
 
@@ -1345,7 +1345,7 @@ async fn admin_record_payment_refund(
         return Err(ApiError::conflict(format!(
             "Refund of {amount} exceeds the {refundable} still refundable on payment \
              {payment_id} ({already} of {} already refunded)",
-            payment.amount
+            gross_charged(&payment)
         )));
     }
 
@@ -1424,13 +1424,13 @@ async fn admin_list_payment_refunds(
     let refunds = this.db.list_refunds_for_payment(&payment.id).await?;
     let base_currency = this.db.get_vm_base_currency(vm_id).await?;
 
-    let refunded_total: u64 = refunds.iter().map(|r| r.amount).sum();
+    let refunded_total: u64 = refunds.iter().map(refunded_gross).sum();
     ApiData::ok(AdminPaymentRefundsInfo {
         payment_id: hex::encode(&payment.id),
         currency: payment.currency.clone(),
-        amount: payment.amount,
+        amount: gross_charged(&payment),
         refunded_total,
-        refundable_remaining: payment.amount.saturating_sub(refunded_total),
+        refundable_remaining: gross_charged(&payment).saturating_sub(refunded_total),
         // A refund row carries no discount of its own: the discount is on the
         // payment it reverses, which the caller already has.
         refunds: refunds

@@ -1845,7 +1845,10 @@ mod tests {
         assert_eq!(serde_json::to_value(&vm).unwrap()["data"], "credit");
         let sub = ApiSubscriptionPayment::from(payment);
         assert!(matches!(sub.data, ApiPaymentData::Credit));
-        assert_eq!(serde_json::to_value(&sub).unwrap()["payment_method"], "credit");
+        assert_eq!(
+            serde_json::to_value(&sub).unwrap()["payment_method"],
+            "credit"
+        );
     }
 
     fn fixedfloat_payment(external_data: &str) -> lnvps_db::SubscriptionPayment {

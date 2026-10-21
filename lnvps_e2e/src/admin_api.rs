@@ -4138,8 +4138,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "complete payment");
         let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
-        let amount = body["data"]["amount"].as_u64().unwrap();
         let tax = body["data"]["tax"].as_u64().unwrap();
+        let amount = body["data"]["amount"].as_u64().unwrap() + tax;
         assert!(amount > 1, "need a payment big enough to halve");
 
         // Nothing refunded yet: the whole payment is refundable.
@@ -4173,7 +4173,10 @@ mod tests {
             payment_id,
             "refund links to the payment it reverses"
         );
-        assert_eq!(refund["amount"].as_u64().unwrap(), half);
+        assert_eq!(
+            refund["amount"].as_u64().unwrap() + refund["tax"].as_u64().unwrap(),
+            half
+        );
         assert!(refund["is_paid"].as_bool().unwrap());
         // Tax is a slice of the tax actually charged, never more than it.
         assert!(refund["tax"].as_u64().unwrap() <= tax);
@@ -4203,7 +4206,10 @@ mod tests {
         let resp = admin.post_auth(&refunds_url, &rest).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "refund the remainder");
         let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
-        assert_eq!(body["data"]["amount"].as_u64().unwrap(), amount - half);
+        assert_eq!(
+            body["data"]["amount"].as_u64().unwrap() + body["data"]["tax"].as_u64().unwrap(),
+            amount - half
+        );
 
         let resp = admin
             .post_auth(&refunds_url, &serde_json::json!({ "refunded_at": at + 3 }))
