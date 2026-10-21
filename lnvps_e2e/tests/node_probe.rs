@@ -105,6 +105,7 @@ async fn a_probeable_node(stack: &Stack) -> Result<(Arc<MockDb>, MarketplaceNode
             default_username: Some("debian".to_string()),
             sha2: None,
             sha2_url: None,
+            encrypted: false,
         },
     );
 

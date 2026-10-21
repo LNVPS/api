@@ -919,6 +919,9 @@ pub struct VmOsImage {
     pub sha2: Option<String>,
     /// URL to the SHA-2 checksums file (e.g., SHA512SUMS)
     pub sha2_url: Option<String>,
+    /// The image encrypts its root disk on first boot and asks for the
+    /// passphrase on the serial console at every boot.
+    pub encrypted: bool,
 }
 
 /// Compression extensions recognised on OS image URLs. Files ending with one
@@ -3768,6 +3771,7 @@ mod tests {
             default_username: None,
             sha2: None,
             sha2_url: None,
+            encrypted: false,
         }
     }
 

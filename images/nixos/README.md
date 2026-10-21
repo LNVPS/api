@@ -22,7 +22,8 @@ to be **baked into the image at build time**, which is exactly what
 |---|---|
 | `flake.nix` | Pins nixpkgs + `nixos-generators`; exposes a `qcow-efi` (UEFI) image per arch |
 | `configuration.nix` | The NixOS profile: cloud-init, OpenSSH, serial console |
-| `build.sh` | Builds the qcow2, xz-compresses it, writes `SHA256SUMS` |
+| `encrypted.nix` | Extra module for the encrypted variant: LUKS2 root, passphrase prompt on the serial console |
+| `build.sh` | Builds the qcow2 images (`cloudinit`, `encrypted` or both), xz-compresses them, writes `SHA256SUMS` |
 | `../../.github/workflows/nixos-image.yml` | CI that builds + publishes on `nixos-image-v*` tags |
 
 ## Build locally
@@ -31,7 +32,8 @@ Requires Nix with flakes enabled.
 
 ```bash
 cd images/nixos
-./build.sh 24.11 x86_64      # -> out/nixos-24.11-cloudinit-x86_64.qcow2.xz + out/SHA256SUMS
+./build.sh 24.11 x86_64      # -> out/nixos-24.11-{cloudinit,encrypted}-x86_64.qcow2.xz + out/SHA256SUMS
+./build.sh 24.11 x86_64 encrypted   # only one variant
 ```
 
 The `.xz` extension matters: LNVPS recognises it as a compressed image and
@@ -79,6 +81,44 @@ Content-Type: application/json
 
 LNVPS downloads the URL, verifies it against `sha2_url`, decompresses it, and
 uses it like any other cloud image. Set `enabled: true` to make it selectable.
+
+## Encrypted variant
+
+`nixos-<version>-encrypted-<arch>.qcow2.xz` is the same image with a LUKS2 root
+(`aes-xts-plain64`, argon2id). Register it like the plain image, with
+`"flavour": "encrypted"` and `"encrypted": true`; the flag is returned by
+`GET /api/v1/image` so clients can warn the user before they order.
+
+How it works, all in the initrd (systemd stage 1):
+
+1. **First boot.** The image ships with an unencrypted ext4 root. A service
+   asks for a new passphrase twice on the serial console, then encrypts the
+   partition in place with `cryptsetup reencrypt`. This takes about 20 seconds
+   on a 4 GB image and the master key is generated on the VM, so no two VMs
+   share a key.
+2. **Every boot.** systemd asks for the passphrase on the serial console and
+   retries until it is right. Nothing is stored anywhere LNVPS can read.
+3. **Resize.** If the disk was enlarged, the partition, the LUKS container and
+   the ext4 filesystem all grow on the next boot, with no extra prompt.
+
+The user types the passphrase in the web terminal (`/api/v1/vm/{id}/console`).
+
+Consequences to communicate to users:
+
+- The VM waits at the prompt after **every** reboot, host maintenance, migration
+  or reinstall, until someone enters the passphrase. Nothing else starts,
+  including SSH.
+- A forgotten passphrase means the data is gone. LNVPS cannot recover it.
+- The prompt is printed once. A user who connects late presses Enter, or
+  restarts the VM, to see it again.
+- It protects against disk theft, retired drives, snapshots and backups. It
+  does not protect against someone with access to the hypervisor, who can read
+  the VM's memory after it is unlocked.
+- cloud-init runs after unlock, so SSH keys and IPs are applied as usual.
+
+Testing it without Proxmox: boot the qcow2 under QEMU with OVMF and a unix
+socket serial port (`-serial unix:ser.sock,server=on,wait=off`), and drive the
+prompts over the socket.
 
 ## Caveats to communicate to users
 

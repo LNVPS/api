@@ -517,6 +517,7 @@ async fn create_os_images(db: &LNVpsDbMysql) -> Result<Vec<VmOsImage>> {
             default_username: Some("ubuntu".to_string()),
             sha2: None,
             sha2_url: None,
+            encrypted: false,
         };
 
         let id = db.admin_create_vm_os_image(&os_image).await?;

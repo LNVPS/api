@@ -45,7 +45,7 @@ jobs:
       - name: Enable Nix build cache
         uses: DeterminateSystems/magic-nix-cache-action@main
 
-      - name: Build qcow2 (x86_64)
+      - name: Build qcow2 images (x86_64)
         working-directory: images/nixos
         run: ./build.sh "${{ steps.ver.outputs.version }}" x86_64
 

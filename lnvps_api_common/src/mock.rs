@@ -438,6 +438,7 @@ impl Default for MockDb {
                 default_username: None,
                 sha2: None,
                 sha2_url: None,
+                encrypted: false,
             },
         );
         Self {
@@ -13770,6 +13771,7 @@ mod account_credit_tests {
         assert_eq!(rest.len(), 1);
     }
 
+    #[cfg(feature = "admin")]
     #[tokio::test]
     async fn swap_order_clients_filter_by_user_and_order() {
         use lnvps_db::AdminDb;

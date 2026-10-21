@@ -77,6 +77,7 @@ async fn a_catalogue(mock: &MockDb) {
             default_username: Some("debian".to_string()),
             sha2: None,
             sha2_url: None,
+            encrypted: false,
         },
     );
     mock.os_images.lock().await.insert(
@@ -93,6 +94,7 @@ async fn a_catalogue(mock: &MockDb) {
             default_username: Some("debian".to_string()),
             sha2: None,
             sha2_url: None,
+            encrypted: false,
         },
     );
 }
@@ -288,6 +290,7 @@ async fn a_probe_boots_alpine_when_the_catalogue_has_it() -> Result<()> {
         default_username: Some("alpine".to_string()),
         sha2: None,
         sha2_url: None,
+        encrypted: false,
     };
     mock.os_images
         .lock()

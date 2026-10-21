@@ -2044,8 +2044,10 @@ Body:
    // Default SSH username
    "sha2": "string (optional)",
    // SHA-2 checksum (SHA-256, SHA-384, or SHA-512) for image verification
-   "sha2_url": "string (optional)"
+   "sha2_url": "string (optional)",
    // URL to the SHA-2 checksums file (e.g., https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS)
+   "encrypted": boolean (optional, default false)
+   // The image encrypts its root disk and prompts for a passphrase on the serial console
 }
 ```
 
@@ -2073,8 +2075,9 @@ Body (all optional):
    "default_username": "string",
    "sha2": "string (optional)",
    // SHA-2 checksum (SHA-256, SHA-384, or SHA-512) for image verification
-   "sha2_url": "string (optional)"
+   "sha2_url": "string (optional)",
    // URL to the SHA-2 checksums file (e.g., https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS)
+   "encrypted": boolean
 }
 ```
 
@@ -6581,8 +6584,10 @@ The RBAC system uses the following permission format: `resource::action`
   // Number of active (non-deleted) VMs using this image
   "sha2": "string | null",
   // SHA-256 checksum of the image file (omitted if not set)
-  "sha2_url": "string | null"
+  "sha2_url": "string | null",
   // URL to a file containing the SHA-256 checksum (omitted if not set)
+  "encrypted": boolean
+  // The image encrypts its root disk and prompts for a passphrase on the serial console
 }
 ```
 
