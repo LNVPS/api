@@ -2487,6 +2487,55 @@ impl Worker {
         .await
     }
 
+    async fn send_abuse_notice(
+        &self,
+        user_id: u64,
+        subject: &str,
+        message: &str,
+        action_id: Option<u64>,
+    ) -> Result<(), OpError<anyhow::Error>> {
+        let user = self
+            .db
+            .get_user(user_id)
+            .await
+            .map_err(|e| OpError::Transient(anyhow::Error::from(e)))?;
+        let mut delivered = false;
+        if !user.email.is_empty()
+            && let Some(smtp) = self.settings.smtp.as_ref()
+        {
+            send_email(smtp, user.email.as_str(), subject, message, None).await?;
+            delivered = true;
+        }
+        let notification = Notification::new(Some(subject.to_string()), message.to_string());
+        for channel in &self.notification_channels {
+            if channel.name() == "email" || !channel.wants(&user) {
+                continue;
+            }
+            match channel.send(&user, &notification).await {
+                Ok(()) => delivered = true,
+                Err(OpError::Fatal(e)) => warn!(
+                    "Permanent {} abuse notice error for user {}: {}",
+                    channel.name(),
+                    user_id,
+                    e
+                ),
+                Err(OpError::Transient(e)) => return Err(OpError::Transient(e)),
+            }
+        }
+        if delivered && let Some(id) = action_id {
+            self.db
+                .set_abuse_action_notified(id)
+                .await
+                .map_err(|e| OpError::Transient(anyhow::Error::from(e)))?;
+        } else if !delivered {
+            warn!(
+                "Abuse notice for user {} had no way to be delivered",
+                user_id
+            );
+        }
+        Ok(())
+    }
+
     async fn queue_notification(&self, user_id: u64, message: String, title: Option<String>) {
         if let Err(e) = self
             .work_commander
@@ -3538,13 +3587,24 @@ impl Worker {
             WorkJob::CheckSubscriptions => {
                 self.check_subscriptions().await?;
             }
-            WorkJob::PurgeClientRecords => {
+            WorkJob::PurgeExpiredRecords => {
                 let removed = self
                     .db
                     .purge_swap_order_clients(CLIENT_RECORD_RETENTION_DAYS)
                     .await?;
                 if removed > 0 {
                     info!("Purged {} expired swap order client records", removed);
+                }
+                let ips = self
+                    .db
+                    .purge_user_geo_ips(CLIENT_RECORD_RETENTION_DAYS)
+                    .await?;
+                if ips > 0 {
+                    info!("Cleared {} expired user IP addresses", ips);
+                }
+                let cases = self.db.purge_abuse_cases().await?;
+                if cases > 0 {
+                    info!("Purged {} expired abuse cases", cases);
                 }
             }
             WorkJob::ProcessReferralPayouts => {
@@ -4268,6 +4328,33 @@ impl Worker {
                         ),
                         OpError::Transient(e) => return Err(e),
                     }
+                }
+            }
+            WorkJob::SendAbuseNotice {
+                user_id,
+                subject,
+                message,
+                action_id,
+            } => {
+                if let Err(OpError::Transient(e)) = self
+                    .send_abuse_notice(*user_id, subject, message, *action_id)
+                    .await
+                {
+                    return Err(e);
+                }
+            }
+            WorkJob::SendAbuseReporterEmail {
+                to,
+                subject,
+                message,
+            } => {
+                let Some(smtp) = self.settings.smtp.as_ref() else {
+                    return Ok(None);
+                };
+                match send_email(smtp, to, subject, message, None).await {
+                    Ok(()) => {}
+                    Err(OpError::Fatal(e)) => warn!("Abuse reporter email to {} failed: {}", to, e),
+                    Err(OpError::Transient(e)) => return Err(e),
                 }
             }
             WorkJob::DownloadOsImages { image_id } => {
@@ -5336,7 +5423,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn purge_client_records_job_drops_only_expired_rows() -> Result<()> {
+    async fn purge_expired_records_job_drops_only_expired_rows() -> Result<()> {
         let db = Arc::new(MockDb::default());
         {
             let mut rows = db.swap_order_clients.lock().await;
@@ -5350,10 +5437,94 @@ mod tests {
             }
         }
         let worker = setup_worker(db.clone()).await?;
-        worker.try_job(&WorkJob::PurgeClientRecords).await?;
+        worker.try_job(&WorkJob::PurgeExpiredRecords).await?;
         let rows = db.swap_order_clients.lock().await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].order_id, "NEW");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_job_clears_old_user_ips_and_keeps_the_country() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let old = db.upsert_user(&[4u8; 32]).await?;
+        let fresh = db.upsert_user(&[5u8; 32]).await?;
+        for (id, age) in [(old, 400i64), (fresh, 10)] {
+            let mut u = db.get_user(id).await?;
+            u.geo_ip = Some("203.0.113.5".to_string());
+            u.geo_country_code = Some("IRL".to_string());
+            u.geo_updated = Some(Utc::now() - TimeDelta::days(age));
+            db.update_user(&u).await?;
+        }
+        let worker = setup_worker(db.clone()).await?;
+        worker.try_job(&WorkJob::PurgeExpiredRecords).await?;
+        let old = db.get_user(old).await?;
+        assert!(old.geo_ip.is_none());
+        assert_eq!(old.geo_country_code.as_deref(), Some("IRL"));
+        assert!(db.get_user(fresh).await?.geo_ip.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_job_also_drops_abuse_cases_a_year_after_closing() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        {
+            let mut rows = db.abuse_cases.lock().await;
+            for (id, closed_days) in [(1u64, 400i64), (2, 10)] {
+                rows.push(lnvps_db::AbuseCase {
+                    id,
+                    created: Utc::now() - TimeDelta::days(closed_days + 1),
+                    closed_at: Some(Utc::now() - TimeDelta::days(closed_days)),
+                    ..Default::default()
+                });
+            }
+        }
+        let worker = setup_worker(db.clone()).await?;
+        worker.try_job(&WorkJob::PurgeExpiredRecords).await?;
+        let rows = db.abuse_cases.lock().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_abuse_notice_with_no_way_to_reach_the_customer_does_not_fail_the_job() -> Result<()>
+    {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[3u8; 32]).await?;
+        let case = db
+            .insert_abuse_case(&lnvps_db::AbuseCase::default())
+            .await?;
+        let action_id = db
+            .insert_abuse_action(&lnvps_db::AbuseAction {
+                case_id: case,
+                ..Default::default()
+            })
+            .await?;
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .try_job(&WorkJob::SendAbuseNotice {
+                user_id,
+                subject: "s".to_string(),
+                message: "m".to_string(),
+                action_id: Some(action_id),
+            })
+            .await?;
+        assert!(db.get_abuse_action(action_id).await?.notified_at.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_abuse_reporter_email_without_smtp_is_a_no_op() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let worker = setup_worker(db).await?;
+        worker
+            .try_job(&WorkJob::SendAbuseReporterEmail {
+                to: "r@example.com".to_string(),
+                subject: "s".to_string(),
+                message: "m".to_string(),
+            })
+            .await?;
         Ok(())
     }
 

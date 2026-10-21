@@ -6,6 +6,7 @@ use lnvps_api_common::{
 use lnvps_db::LNVpsDb;
 use std::sync::Arc;
 
+mod abuse;
 mod access_policies;
 mod activity;
 mod agent;
@@ -86,6 +87,7 @@ pub fn admin_router(
         .merge(vm_os_images::router())
         .merge(vm_templates::router())
         .merge(companies::router())
+        .merge(abuse::router())
         .merge(credit::router())
         .merge(swap_orders::router())
         .merge(cost_plans::router())

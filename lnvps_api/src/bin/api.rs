@@ -345,7 +345,7 @@ async fn main() -> Result<(), Error> {
             );
         }
         tasks.push(
-            worker.spawn_job_interval(WorkJob::PurgeClientRecords, Duration::from_secs(86400)),
+            worker.spawn_job_interval(WorkJob::PurgeExpiredRecords, Duration::from_secs(86400)),
         );
         tasks.push(worker.spawn_handler_loop());
 
@@ -484,6 +484,7 @@ async fn main() -> Result<(), Error> {
             .merge(ip_space_router())
             .merge(referral_router())
             .merge(credit_router())
+            .merge(abuse_router())
             .merge(marketplace_router())
             .merge(apps_router())
             .merge(app_backups_router())

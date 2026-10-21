@@ -1,14 +1,15 @@
 use crate::{
-    AccessPolicy, AccountCredit, AccountCreditDebit, AccountCreditEvent, AccountCreditTopup,
-    AgentConversation, AgentConversationFilter, AgentConversationOverview, AgentMessage, App,
-    AppBackupState, AppCluster, AppDeployment, AppDeploymentBackup, AppDeploymentFilter,
-    AppDeploymentServiceUsage, AppDeploymentVolumeUsage, AppTag, AsnSubscription,
-    AsnSubscriptionStatus, AvailableIpSpace, BulkMessageTarget, Company, DbError, DbResult,
-    Discount, DiscountRedemption, DiscountRedemptionWithCode, DnsServer, EncryptedString,
-    IntervalType, IpRange, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode,
-    MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage,
-    PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
-    Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelKind,
+    AbuseAction, AbuseCase, AbuseChallenge, AbuseChallengeOutcome, AccessPolicy, AccountCredit,
+    AccountCreditDebit, AccountCreditEvent, AccountCreditTopup, AgentConversation,
+    AgentConversationFilter, AgentConversationOverview, AgentMessage, App, AppBackupState,
+    AppCluster, AppDeployment, AppDeploymentBackup, AppDeploymentFilter, AppDeploymentServiceUsage,
+    AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
+    BulkMessageTarget, Company, DbError, DbResult, Discount, DiscountRedemption,
+    DiscountRedemptionWithCode, DnsServer, EncryptedString, IntervalType, IpRange,
+    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth,
+    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, PaymentMethod,
+    PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout, Region,
+    RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelKind,
     RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
     SubscriptionPaymentWithCompany, SwapOrderClient, Tunnel, TunnelPool, TunnelRoute, User,
     UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
@@ -604,6 +605,179 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .bind(days)
                 .execute(&self.db)
                 .await?;
+        Ok(res.rows_affected())
+    }
+
+    async fn purge_user_geo_ips(&self, days: u32) -> DbResult<u64> {
+        let res = sqlx::query(
+            "update users set geo_ip = null where geo_ip is not null and geo_updated < NOW() - INTERVAL ? DAY",
+        )
+        .bind(days)
+        .execute(&self.db)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    async fn insert_abuse_case(&self, case: &AbuseCase) -> DbResult<u64> {
+        let res = sqlx::query(
+            "insert into abuse_case (vm_id, user_id, kind, reported_ip, incident_at, reporter_email, summary, proceedings_started) values (?, ?, ?, ?, ?, ?, ?, ?) returning id",
+        )
+        .bind(case.vm_id)
+        .bind(case.user_id)
+        .bind(case.kind)
+        .bind(&case.reported_ip)
+        .bind(case.incident_at)
+        .bind(&case.reporter_email)
+        .bind(&case.summary)
+        .bind(case.proceedings_started)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn get_abuse_case(&self, id: u64) -> DbResult<AbuseCase> {
+        Ok(sqlx::query_as("select * from abuse_case where id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn list_abuse_cases(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        vm_id: Option<u64>,
+        open: Option<bool>,
+    ) -> DbResult<(Vec<AbuseCase>, u64)> {
+        let filter = "from abuse_case where (? is null or user_id = ?) and (? is null or vm_id = ?) and (? is null or (closed_at is null) = ?)";
+        let rows = sqlx::query_as(&format!(
+            "select * {filter} order by created desc, id desc limit ? offset ?"
+        ))
+        .bind(user_id)
+        .bind(user_id)
+        .bind(vm_id)
+        .bind(vm_id)
+        .bind(open)
+        .bind(open)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 = sqlx::query_scalar(&format!("select count(*) {filter}"))
+            .bind(user_id)
+            .bind(user_id)
+            .bind(vm_id)
+            .bind(vm_id)
+            .bind(open)
+            .bind(open)
+            .fetch_one(&self.db)
+            .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn close_abuse_case(&self, id: u64) -> DbResult<()> {
+        sqlx::query("update abuse_case set closed_at = NOW() where id = ? and closed_at is null")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_abuse_action(&self, action: &AbuseAction) -> DbResult<u64> {
+        let res = sqlx::query(
+            "insert into abuse_action (case_id, kind, reason, facts, legal_basis, followed_report, notice_withheld, admin_user_id) values (?, ?, ?, ?, ?, ?, ?, ?) returning id",
+        )
+        .bind(action.case_id)
+        .bind(action.kind)
+        .bind(&action.reason)
+        .bind(&action.facts)
+        .bind(&action.legal_basis)
+        .bind(action.followed_report)
+        .bind(&action.notice_withheld)
+        .bind(action.admin_user_id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn get_abuse_action(&self, id: u64) -> DbResult<AbuseAction> {
+        Ok(sqlx::query_as("select * from abuse_action where id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn list_abuse_actions(&self, case_id: u64) -> DbResult<Vec<AbuseAction>> {
+        Ok(
+            sqlx::query_as("select * from abuse_action where case_id = ? order by id")
+                .bind(case_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn set_abuse_action_notified(&self, id: u64) -> DbResult<()> {
+        sqlx::query("update abuse_action set notified_at = NOW() where id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_abuse_challenge(&self, challenge: &AbuseChallenge) -> DbResult<u64> {
+        let res = sqlx::query(
+            "insert into abuse_challenge (case_id, action_id, message) values (?, ?, ?) returning id",
+        )
+        .bind(challenge.case_id)
+        .bind(challenge.action_id)
+        .bind(&challenge.message)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn get_abuse_challenge(&self, id: u64) -> DbResult<AbuseChallenge> {
+        Ok(sqlx::query_as("select * from abuse_challenge where id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn list_abuse_challenges(&self, case_id: u64) -> DbResult<Vec<AbuseChallenge>> {
+        Ok(
+            sqlx::query_as("select * from abuse_challenge where case_id = ? order by id")
+                .bind(case_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn decide_abuse_challenge(
+        &self,
+        id: u64,
+        outcome: AbuseChallengeOutcome,
+        response: &str,
+        decided_by: u64,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "update abuse_challenge set outcome = ?, response = ?, decided_by = ?, decided_at = NOW() where id = ?",
+        )
+        .bind(outcome)
+        .bind(response)
+        .bind(decided_by)
+        .bind(id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn purge_abuse_cases(&self) -> DbResult<u64> {
+        let res = sqlx::query(
+            "delete from abuse_case where closed_at is not null and (case when kind = 2 then created else closed_at end) < NOW() - INTERVAL (case when kind = 2 and proceedings_started = 0 then 183 else 365 end) DAY",
+        )
+        .execute(&self.db)
+        .await?;
         Ok(res.rows_affected())
     }
 

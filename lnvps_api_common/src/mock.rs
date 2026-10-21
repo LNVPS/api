@@ -84,6 +84,9 @@ pub struct MockDb {
     pub account_credit_debits: Arc<Mutex<Vec<lnvps_db::AccountCreditDebit>>>,
     pub account_credit_topups: Arc<Mutex<Vec<lnvps_db::AccountCreditTopup>>>,
     pub swap_order_clients: Arc<Mutex<Vec<lnvps_db::SwapOrderClient>>>,
+    pub abuse_cases: Arc<Mutex<Vec<lnvps_db::AbuseCase>>>,
+    pub abuse_actions: Arc<Mutex<Vec<lnvps_db::AbuseAction>>>,
+    pub abuse_challenges: Arc<Mutex<Vec<lnvps_db::AbuseChallenge>>>,
     pub marketplace_operators: Arc<Mutex<HashMap<u64, MarketplaceOperator>>>,
     pub marketplace_nodes: Arc<Mutex<HashMap<u64, MarketplaceNode>>>,
     pub marketplace_node_health: Arc<Mutex<HashMap<u64, MarketplaceNodeHealth>>>,
@@ -545,6 +548,9 @@ impl Default for MockDb {
             account_credit_debits: Arc::new(Default::default()),
             account_credit_topups: Arc::new(Default::default()),
             swap_order_clients: Arc::new(Default::default()),
+            abuse_cases: Arc::new(Default::default()),
+            abuse_actions: Arc::new(Default::default()),
+            abuse_challenges: Arc::new(Default::default()),
             marketplace_operators: Arc::new(Default::default()),
             marketplace_nodes: Arc::new(Default::default()),
             marketplace_node_health: Arc::new(Default::default()),
@@ -916,6 +922,180 @@ impl LNVpsDbBase for MockDb {
         let mut rows = self.swap_order_clients.lock().await;
         let before = rows.len();
         rows.retain(|r| r.created >= cutoff);
+        Ok((before - rows.len()) as u64)
+    }
+
+    async fn purge_user_geo_ips(&self, days: u32) -> DbResult<u64> {
+        let cutoff = Utc::now() - chrono::Duration::days(days as i64);
+        let mut users = self.users.lock().await;
+        let mut cleared = 0;
+        for u in users.values_mut() {
+            if u.geo_ip.is_some() && u.geo_updated.is_some_and(|t| t < cutoff) {
+                u.geo_ip = None;
+                cleared += 1;
+            }
+        }
+        Ok(cleared)
+    }
+
+    async fn insert_abuse_case(&self, case: &lnvps_db::AbuseCase) -> DbResult<u64> {
+        let mut rows = self.abuse_cases.lock().await;
+        let id = rows.len() as u64 + 1;
+        rows.push(lnvps_db::AbuseCase {
+            id,
+            created: Utc::now(),
+            closed_at: None,
+            ..case.clone()
+        });
+        Ok(id)
+    }
+
+    async fn get_abuse_case(&self, id: u64) -> DbResult<lnvps_db::AbuseCase> {
+        let rows = self.abuse_cases.lock().await;
+        rows.iter()
+            .find(|c| c.id == id)
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow!("no abuse case")))
+    }
+
+    async fn list_abuse_cases(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        vm_id: Option<u64>,
+        open: Option<bool>,
+    ) -> DbResult<(Vec<lnvps_db::AbuseCase>, u64)> {
+        let rows = self.abuse_cases.lock().await;
+        let mut matched: Vec<_> = rows
+            .iter()
+            .filter(|c| user_id.is_none_or(|u| c.user_id == Some(u)))
+            .filter(|c| vm_id.is_none_or(|v| c.vm_id == Some(v)))
+            .filter(|c| open.is_none_or(|o| c.closed_at.is_none() == o))
+            .cloned()
+            .collect();
+        matched.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = matched.len() as u64;
+        let page = matched
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, total))
+    }
+
+    async fn close_abuse_case(&self, id: u64) -> DbResult<()> {
+        let mut rows = self.abuse_cases.lock().await;
+        if let Some(c) = rows
+            .iter_mut()
+            .find(|c| c.id == id && c.closed_at.is_none())
+        {
+            c.closed_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn insert_abuse_action(&self, action: &lnvps_db::AbuseAction) -> DbResult<u64> {
+        let mut rows = self.abuse_actions.lock().await;
+        let id = rows.len() as u64 + 1;
+        rows.push(lnvps_db::AbuseAction {
+            id,
+            created: Utc::now(),
+            notified_at: None,
+            ..action.clone()
+        });
+        Ok(id)
+    }
+
+    async fn get_abuse_action(&self, id: u64) -> DbResult<lnvps_db::AbuseAction> {
+        let rows = self.abuse_actions.lock().await;
+        rows.iter()
+            .find(|a| a.id == id)
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow!("no abuse action")))
+    }
+
+    async fn list_abuse_actions(&self, case_id: u64) -> DbResult<Vec<lnvps_db::AbuseAction>> {
+        let rows = self.abuse_actions.lock().await;
+        Ok(rows
+            .iter()
+            .filter(|a| a.case_id == case_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn set_abuse_action_notified(&self, id: u64) -> DbResult<()> {
+        let mut rows = self.abuse_actions.lock().await;
+        if let Some(a) = rows.iter_mut().find(|a| a.id == id) {
+            a.notified_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn insert_abuse_challenge(&self, challenge: &lnvps_db::AbuseChallenge) -> DbResult<u64> {
+        let mut rows = self.abuse_challenges.lock().await;
+        let id = rows.len() as u64 + 1;
+        rows.push(lnvps_db::AbuseChallenge {
+            id,
+            received_at: Utc::now(),
+            outcome: None,
+            response: None,
+            decided_at: None,
+            decided_by: None,
+            ..challenge.clone()
+        });
+        Ok(id)
+    }
+
+    async fn get_abuse_challenge(&self, id: u64) -> DbResult<lnvps_db::AbuseChallenge> {
+        let rows = self.abuse_challenges.lock().await;
+        rows.iter()
+            .find(|c| c.id == id)
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow!("no abuse challenge")))
+    }
+
+    async fn list_abuse_challenges(&self, case_id: u64) -> DbResult<Vec<lnvps_db::AbuseChallenge>> {
+        let rows = self.abuse_challenges.lock().await;
+        Ok(rows
+            .iter()
+            .filter(|c| c.case_id == case_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn decide_abuse_challenge(
+        &self,
+        id: u64,
+        outcome: lnvps_db::AbuseChallengeOutcome,
+        response: &str,
+        decided_by: u64,
+    ) -> DbResult<()> {
+        let mut rows = self.abuse_challenges.lock().await;
+        if let Some(c) = rows.iter_mut().find(|c| c.id == id) {
+            c.outcome = Some(outcome);
+            c.response = Some(response.to_string());
+            c.decided_by = Some(decided_by);
+            c.decided_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn purge_abuse_cases(&self) -> DbResult<u64> {
+        let now = Utc::now();
+        let mut rows = self.abuse_cases.lock().await;
+        let before = rows.len();
+        rows.retain(|c| {
+            let Some(closed) = c.closed_at else {
+                return true;
+            };
+            let (start, days) = if c.kind == lnvps_db::AbuseCaseKind::CopyrightCa {
+                (c.created, if c.proceedings_started { 365 } else { 183 })
+            } else {
+                (closed, 365)
+            };
+            start >= now - chrono::Duration::days(days)
+        });
         Ok((before - rows.len()) as u64)
     }
 
@@ -13844,5 +14024,110 @@ mod account_credit_tests {
         let rows = db.swap_order_clients.lock().await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].order_id, "NEW");
+    }
+
+    fn aged_case(
+        id: u64,
+        kind: lnvps_db::AbuseCaseKind,
+        closed_days_ago: Option<i64>,
+        proceedings: bool,
+    ) -> lnvps_db::AbuseCase {
+        let closed = closed_days_ago.map(|d| Utc::now() - chrono::Duration::days(d));
+        lnvps_db::AbuseCase {
+            id,
+            kind,
+            proceedings_started: proceedings,
+            created: closed.unwrap_or_else(Utc::now) - chrono::Duration::days(1),
+            closed_at: closed,
+            summary: "s".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn abuse_cases_are_purged_a_year_after_closing_and_open_ones_are_kept() {
+        use lnvps_db::AbuseCaseKind::Abuse;
+        let db = MockDb::default();
+        {
+            let mut rows = db.abuse_cases.lock().await;
+            rows.push(aged_case(1, Abuse, Some(400), false));
+            rows.push(aged_case(2, Abuse, Some(300), false));
+            rows.push(aged_case(3, Abuse, None, false));
+        }
+        assert_eq!(db.purge_abuse_cases().await.unwrap(), 1);
+        let ids: Vec<_> = db.abuse_cases.lock().await.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_canadian_copyright_record_goes_after_six_months_unless_proceedings_started() {
+        use lnvps_db::AbuseCaseKind::CopyrightCa;
+        let db = MockDb::default();
+        {
+            let mut rows = db.abuse_cases.lock().await;
+            rows.push(aged_case(1, CopyrightCa, Some(200), false));
+            rows.push(aged_case(2, CopyrightCa, Some(200), true));
+            rows.push(aged_case(3, CopyrightCa, Some(100), false));
+        }
+        assert_eq!(db.purge_abuse_cases().await.unwrap(), 1);
+        let ids: Vec<_> = db.abuse_cases.lock().await.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn abuse_case_lists_filter_by_customer_service_and_state() {
+        let db = MockDb::default();
+        for (user, vm) in [(1u64, 10u64), (2, 20), (1, 10)] {
+            db.insert_abuse_case(&lnvps_db::AbuseCase {
+                user_id: Some(user),
+                vm_id: Some(vm),
+                summary: "s".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        db.close_abuse_case(1).await.unwrap();
+        let (mine, total) = db
+            .list_abuse_cases(10, 0, Some(1), None, None)
+            .await
+            .unwrap();
+        assert_eq!((mine.len(), total), (2, 2));
+        let (open, _) = db
+            .list_abuse_cases(10, 0, Some(1), None, Some(true))
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1);
+        let (svc, _) = db
+            .list_abuse_cases(10, 0, None, Some(20), None)
+            .await
+            .unwrap();
+        assert_eq!(svc.len(), 1);
+        let (page, total) = db.list_abuse_cases(1, 1, None, None, None).await.unwrap();
+        assert_eq!((page.len(), total), (1, 3));
+        db.close_abuse_case(1).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_abuse_action_records_when_the_customer_was_told() {
+        let db = MockDb::default();
+        let case = db
+            .insert_abuse_case(&lnvps_db::AbuseCase::default())
+            .await
+            .unwrap();
+        let id = db
+            .insert_abuse_action(&lnvps_db::AbuseAction {
+                case_id: case,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(db.get_abuse_action(id).await.unwrap().notified_at.is_none());
+        db.set_abuse_action_notified(id).await.unwrap();
+        assert!(db.get_abuse_action(id).await.unwrap().notified_at.is_some());
+        assert_eq!(db.list_abuse_actions(case).await.unwrap().len(), 1);
+        assert!(db.get_abuse_action(99).await.is_err());
+        assert!(db.get_abuse_case(99).await.is_err());
+        assert!(db.get_abuse_challenge(99).await.is_err());
     }
 }

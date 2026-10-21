@@ -3502,6 +3502,42 @@ Required Permission: `dns_server::delete`
 Note: DNS servers referenced by any IP range (forward or reverse) cannot be deleted. Remove the reference from all IP
 ranges first.
 
+### Abuse Cases
+
+Backs section 6.1 of the Terms. A case is one report about one VM. Actions on it (forwarded, restricted, suspended,
+terminated, reinstated, no action) are the decisions. Closed cases are deleted by the worker 12 months after closing, or
+6 months after receipt for a Canadian copyright notice (`kind: copyright_ca`) with no proceedings started.
+
+Permission resource is `abuse` (`create`, `view`, `update`, `delete`), granted to `super_admin` by default.
+
+```
+POST /api/admin/v1/abuse/cases
+GET  /api/admin/v1/abuse/cases?user_id=&vm_id=&open=&limit=&offset=
+GET  /api/admin/v1/abuse/cases/{id}
+POST /api/admin/v1/abuse/cases/{id}/actions
+POST /api/admin/v1/abuse/cases/{id}/close
+POST /api/admin/v1/abuse/cases/{id}/challenges
+POST /api/admin/v1/abuse/challenges/{id}/decision
+```
+
+- **Open a case** (`abuse::create`): `vm_id`, `kind` (`abuse`, `illegal_content`, `copyright_ca`), `reported_ip`,
+  `incident_at`, `reporter_email`, `summary`, `proceedings_started`. The customer is taken from the VM. A reporter email
+  gets a receipt. Each case reports `report_count_for_service`, the number of cases on the same VM, so repeats count.
+- **Record an action** (`abuse::update`): `kind`, `reason`, `facts`, `legal_basis`, `followed_report`,
+  `notice_withheld`. `suspended` and `terminated` disable the VM and queue a reconfigure; `reinstated` re-enables it.
+  Unless `notice_withheld` is set (text saying why the law requires it) or the kind is `no_action`, the customer is
+  emailed a statement of reasons: what was done, the facts, the reason, whether a report led to it, the law or Terms
+  section, and how to challenge. The email goes out whatever the customer's notification preferences. `notified_at`
+  shows when it was delivered. For `illegal_content` cases the reporter is told of the outcome, and for `copyright_ca`
+  when the notice is forwarded.
+- **Record a challenge** (`abuse::create`): `action_id`, `message`. Refused more than 183 days after the action.
+- **Decide a challenge** (`abuse::update`): `outcome` (`upheld`, `reversed`), `response`. `reversed` re-enables a
+  disabled VM. The customer is emailed the result.
+
+Customer endpoints: `GET /api/v1/abuse/cases`, `GET /api/v1/abuse/cases/{id}` (decisions with their reasons, with
+withheld ones left out, and the date each can be challenged until) and `POST /api/v1/abuse/cases/{id}/challenges`.
+The reporter's email and the reported IP are never returned to the customer.
+
 ### Swap Order Clients
 
 Every FixedFloat swap order records who placed it and from where. Rows are kept for 13 months (395 days) and then deleted by

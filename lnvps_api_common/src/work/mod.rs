@@ -236,8 +236,20 @@ pub enum WorkJob {
     CheckSubscriptions,
     /// Process automated referral commission payouts (BTC, over Lightning).
     ProcessReferralPayouts,
-    /// Delete client records kept for swap orders once past their retention period.
-    PurgeClientRecords,
+    /// Delete swap order client records and closed abuse cases past their retention period.
+    PurgeExpiredRecords,
+    /// Send a customer a notice about an abuse decision, by email and their contact preferences.
+    SendAbuseReporterEmail {
+        to: String,
+        subject: String,
+        message: String,
+    },
+    SendAbuseNotice {
+        user_id: u64,
+        subject: String,
+        message: String,
+        action_id: Option<u64>,
+    },
     /// Poll routers to refresh cached tunnel/BGP session/route state and record
     /// per-tunnel traffic samples.
     SyncRouterState,
@@ -361,7 +373,7 @@ impl WorkJob {
             Self::CheckVm { .. } => true,
             Self::CheckVms => true,
             Self::CheckSubscriptions => true,
-            Self::PurgeClientRecords => true,
+            Self::PurgeExpiredRecords => true,
             // A discovery request is a one-shot read tied to a waiting admin
             // request; never retry it if it fails.
             Self::ListUnmanagedVms { .. } => true,
@@ -422,7 +434,9 @@ impl fmt::Display for WorkJob {
             WorkJob::RefreshOsImageChecksums => write!(f, "RefreshOsImageChecksums"),
             WorkJob::CheckSubscriptions => write!(f, "CheckSubscriptions"),
             WorkJob::ProcessReferralPayouts => write!(f, "ProcessReferralPayouts"),
-            WorkJob::PurgeClientRecords => write!(f, "PurgeClientRecords"),
+            WorkJob::PurgeExpiredRecords => write!(f, "PurgeExpiredRecords"),
+            WorkJob::SendAbuseNotice { .. } => write!(f, "SendAbuseNotice"),
+            WorkJob::SendAbuseReporterEmail { .. } => write!(f, "SendAbuseReporterEmail"),
             WorkJob::SpawnVm { .. } => write!(f, "SpawnVm"),
             WorkJob::SyncRouterState => write!(f, "SyncRouterState"),
             WorkJob::ProbeMarketplaceNode => write!(f, "ProbeMarketplaceNode"),

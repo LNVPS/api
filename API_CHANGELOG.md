@@ -17,6 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **Client records for FixedFloat orders**: each FixedFloat swap order stores the requester's IP, `User-Agent` and `Accept-Language` against the order id. It is kept for 395 days, then deleted daily by the worker, and survives deletion of the user until then. New `GET /api/admin/v1/swap_orders` (filter by `user_id` or `order_id`, `subscription_payments::view`) looks them up.
 
+- **Abuse case handling**: reports, the actions taken and customer challenges are now recorded. New admin endpoints under `/api/admin/v1/abuse/` (new `abuse` permission resource, value 35, granted to `super_admin`) and customer endpoints `GET /api/v1/abuse/cases`, `GET /api/v1/abuse/cases/{id}` and `POST /api/v1/abuse/cases/{id}/challenges`. Suspending or terminating through a case disables the VM and emails the customer a statement of reasons. Closed cases are deleted after 12 months (6 months for a Canadian copyright notice with no proceedings).
+
 - **Credit-funded payments report `credit` as their method**: a payment paid in full from account credit now has `payment_method: "credit"` on `GET /api/v1/subscriptions/{id}/payments` and the admin payment endpoints, instead of the method it was created with.
 
 ### Security

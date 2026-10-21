@@ -1988,6 +1988,97 @@ pub struct SwapOrderClient {
     pub created: DateTime<Utc>,
 }
 
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum AbuseCaseKind {
+    #[default]
+    Abuse = 0,
+    IllegalContent = 1,
+    CopyrightCa = 2,
+}
+
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum AbuseActionKind {
+    #[default]
+    Forwarded = 0,
+    Restricted = 1,
+    Suspended = 2,
+    Terminated = 3,
+    Reinstated = 4,
+    NoAction = 5,
+}
+
+impl AbuseActionKind {
+    pub fn disables_service(self) -> bool {
+        matches!(self, Self::Suspended | Self::Terminated)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Forwarded => "forwarded the report to you",
+            Self::Restricted => "restricted part of your service",
+            Self::Suspended => "suspended your service",
+            Self::Terminated => "terminated your service",
+            Self::Reinstated => "restored your service",
+            Self::NoAction => "taken no action",
+        }
+    }
+}
+
+#[derive(Type, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum AbuseChallengeOutcome {
+    Upheld = 0,
+    Reversed = 1,
+}
+
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct AbuseCase {
+    pub id: u64,
+    pub vm_id: Option<u64>,
+    pub user_id: Option<u64>,
+    pub kind: AbuseCaseKind,
+    pub reported_ip: Option<String>,
+    pub incident_at: Option<DateTime<Utc>>,
+    pub reporter_email: Option<String>,
+    pub summary: String,
+    pub proceedings_started: bool,
+    pub created: DateTime<Utc>,
+    pub closed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct AbuseAction {
+    pub id: u64,
+    pub case_id: u64,
+    pub kind: AbuseActionKind,
+    pub reason: String,
+    pub facts: String,
+    pub legal_basis: Option<String>,
+    pub followed_report: bool,
+    pub notice_withheld: Option<String>,
+    pub notified_at: Option<DateTime<Utc>>,
+    pub admin_user_id: u64,
+    pub created: DateTime<Utc>,
+}
+
+#[derive(FromRow, Clone, Debug)]
+pub struct AbuseChallenge {
+    pub id: u64,
+    pub case_id: u64,
+    pub action_id: u64,
+    pub message: String,
+    pub received_at: DateTime<Utc>,
+    pub outcome: Option<AbuseChallengeOutcome>,
+    pub response: Option<String>,
+    pub decided_at: Option<DateTime<Utc>>,
+    pub decided_by: Option<u64>,
+}
+
 /// How an outbound payout reaches its recipient. Stored as a small integer; new
 /// methods are added as new variants (append-only to preserve values).
 ///
@@ -2934,6 +3025,10 @@ pub enum AdminResource {
     /// adjusting a balance is authority to create or destroy money the customer
     /// can spend against invoices.
     AccountCredit = 34,
+    /// Abuse cases: reports against a customer's service, the actions taken and
+    /// the customer's challenges. Its own resource because a decision here
+    /// suspends a customer's service and is sent to them as a legal notice.
+    Abuse = 35,
 }
 
 /// Actions that can be performed on administrative resources
@@ -2988,6 +3083,7 @@ impl Display for AdminResource {
             AdminResource::MarketplaceOperator => write!(f, "marketplace_operator"),
             AdminResource::SupportAgent => write!(f, "support_agent"),
             AdminResource::AccountCredit => write!(f, "account_credit"),
+            AdminResource::Abuse => write!(f, "abuse"),
         }
     }
 }
@@ -3034,6 +3130,7 @@ impl FromStr for AdminResource {
             "vpn_service" | "vpn_services" => Ok(AdminResource::VpnService),
             "vpn_subscription" | "vpn_subscriptions" => Ok(AdminResource::VpnSubscription),
             "account_credit" | "account_credits" => Ok(AdminResource::AccountCredit),
+            "abuse" => Ok(AdminResource::Abuse),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -3079,6 +3176,7 @@ impl TryFrom<u16> for AdminResource {
             32 => Ok(AdminResource::VpnService),
             33 => Ok(AdminResource::VpnSubscription),
             34 => Ok(AdminResource::AccountCredit),
+            35 => Ok(AdminResource::Abuse),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -3123,6 +3221,7 @@ impl AdminResource {
             AdminResource::VpnService,
             AdminResource::VpnSubscription,
             AdminResource::AccountCredit,
+            AdminResource::Abuse,
         ]
     }
 }

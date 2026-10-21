@@ -218,6 +218,52 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Delete swap order client records older than `days`. Returns the number removed.
     async fn purge_swap_order_clients(&self, days: u32) -> DbResult<u64>;
 
+    /// Clear the stored IP on users whose last-seen IP is older than `days`,
+    /// keeping the country that was derived from it. Returns the number cleared.
+    async fn purge_user_geo_ips(&self, days: u32) -> DbResult<u64>;
+
+    async fn insert_abuse_case(&self, case: &AbuseCase) -> DbResult<u64>;
+
+    async fn get_abuse_case(&self, id: u64) -> DbResult<AbuseCase>;
+
+    async fn list_abuse_cases(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        vm_id: Option<u64>,
+        open: Option<bool>,
+    ) -> DbResult<(Vec<AbuseCase>, u64)>;
+
+    /// Close a case. Its retention period runs from here. No-op once closed.
+    async fn close_abuse_case(&self, id: u64) -> DbResult<()>;
+
+    async fn insert_abuse_action(&self, action: &AbuseAction) -> DbResult<u64>;
+
+    async fn get_abuse_action(&self, id: u64) -> DbResult<AbuseAction>;
+
+    async fn list_abuse_actions(&self, case_id: u64) -> DbResult<Vec<AbuseAction>>;
+
+    async fn set_abuse_action_notified(&self, id: u64) -> DbResult<()>;
+
+    async fn insert_abuse_challenge(&self, challenge: &AbuseChallenge) -> DbResult<u64>;
+
+    async fn get_abuse_challenge(&self, id: u64) -> DbResult<AbuseChallenge>;
+
+    async fn list_abuse_challenges(&self, case_id: u64) -> DbResult<Vec<AbuseChallenge>>;
+
+    async fn decide_abuse_challenge(
+        &self,
+        id: u64,
+        outcome: AbuseChallengeOutcome,
+        response: &str,
+        decided_by: u64,
+    ) -> DbResult<()>;
+
+    /// Delete closed cases past retention: 12 months after closing, or 6 months
+    /// after receipt for a Canadian copyright notice with no proceedings started.
+    async fn purge_abuse_cases(&self) -> DbResult<u64>;
+
     /// List all users
     async fn list_users(&self) -> DbResult<Vec<User>>;
 
