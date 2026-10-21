@@ -344,6 +344,9 @@ async fn main() -> Result<(), Error> {
                     .spawn_job_interval(WorkJob::ProcessReferralPayouts, Duration::from_secs(3600)),
             );
         }
+        tasks.push(
+            worker.spawn_job_interval(WorkJob::PurgeClientRecords, Duration::from_secs(86400)),
+        );
         tasks.push(worker.spawn_handler_loop());
 
         // check all nostr domains every 10 minutes for CNAME entries (enable/disable as needed)

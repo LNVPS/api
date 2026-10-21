@@ -36,6 +36,8 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 /// Name of the host-info binary for x86_64 (expected in same directory as current executable)
+pub const CLIENT_RECORD_RETENTION_DAYS: u32 = 395;
+
 const HOST_INFO_BINARY_NAME_X86_64: &str = "lnvps-host-info";
 /// Name of the host-info binary for arm64 (expected in same directory as current executable)
 const HOST_INFO_BINARY_NAME_ARM64: &str = "lnvps-host-info-arm64";
@@ -3536,6 +3538,15 @@ impl Worker {
             WorkJob::CheckSubscriptions => {
                 self.check_subscriptions().await?;
             }
+            WorkJob::PurgeClientRecords => {
+                let removed = self
+                    .db
+                    .purge_swap_order_clients(CLIENT_RECORD_RETENTION_DAYS)
+                    .await?;
+                if removed > 0 {
+                    info!("Purged {} expired swap order client records", removed);
+                }
+            }
             WorkJob::ProcessReferralPayouts => {
                 self.referral_payouts.process_payouts().await?;
             }
@@ -5320,6 +5331,28 @@ mod tests {
             .try_job(&WorkJob::PatchHosts)
             .await
             .expect("a single unpatchable host must not fail the whole sweep");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_client_records_job_drops_only_expired_rows() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        {
+            let mut rows = db.swap_order_clients.lock().await;
+            for (id, order, age) in [(1u64, "OLD", 400i64), (2, "NEW", 30)] {
+                rows.push(lnvps_db::SwapOrderClient {
+                    id,
+                    order_id: order.to_string(),
+                    created: Utc::now() - TimeDelta::days(age),
+                    ..Default::default()
+                });
+            }
+        }
+        let worker = setup_worker(db.clone()).await?;
+        worker.try_job(&WorkJob::PurgeClientRecords).await?;
+        let rows = db.swap_order_clients.lock().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].order_id, "NEW");
         Ok(())
     }
 

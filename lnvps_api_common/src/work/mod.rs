@@ -236,6 +236,8 @@ pub enum WorkJob {
     CheckSubscriptions,
     /// Process automated referral commission payouts (BTC, over Lightning).
     ProcessReferralPayouts,
+    /// Delete client records kept for swap orders once past their retention period.
+    PurgeClientRecords,
     /// Poll routers to refresh cached tunnel/BGP session/route state and record
     /// per-tunnel traffic samples.
     SyncRouterState,
@@ -359,6 +361,7 @@ impl WorkJob {
             Self::CheckVm { .. } => true,
             Self::CheckVms => true,
             Self::CheckSubscriptions => true,
+            Self::PurgeClientRecords => true,
             // A discovery request is a one-shot read tied to a waiting admin
             // request; never retry it if it fails.
             Self::ListUnmanagedVms { .. } => true,
@@ -419,6 +422,7 @@ impl fmt::Display for WorkJob {
             WorkJob::RefreshOsImageChecksums => write!(f, "RefreshOsImageChecksums"),
             WorkJob::CheckSubscriptions => write!(f, "CheckSubscriptions"),
             WorkJob::ProcessReferralPayouts => write!(f, "ProcessReferralPayouts"),
+            WorkJob::PurgeClientRecords => write!(f, "PurgeClientRecords"),
             WorkJob::SpawnVm { .. } => write!(f, "SpawnVm"),
             WorkJob::SyncRouterState => write!(f, "SyncRouterState"),
             WorkJob::ProbeMarketplaceNode => write!(f, "ProbeMarketplaceNode"),

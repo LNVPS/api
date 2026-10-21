@@ -13,7 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **Account credit top-ups by on-chain Bitcoin and FixedFloat**: `POST /api/v1/account/credit/topup` takes `method` (`lightning`, `onchain` or `fixedfloat`) and, for `fixedfloat`, a `coin`. The response gains `method`, `data` (same shape as a payment's `data`) and `is_paid`, and `pr` is now present only for `lightning`. New `GET /api/v1/account/credit/topup/{payment_hash}` returns the same object for polling. On-chain and swap deposits credit whatever arrives once confirmed.
 
-- **Client records for FixedFloat orders**: each FixedFloat swap order stores the requester's IP, `User-Agent` and `Accept-Language` against the order id. It is kept for at least one year. New `GET /api/admin/v1/swap_orders` (filter by `user_id` or `order_id`, `subscription_payments::view`) looks them up.
+- **Client records for FixedFloat orders**: each FixedFloat swap order stores the requester's IP, `User-Agent` and `Accept-Language` against the order id. It is kept for 395 days, then deleted daily by the worker, and survives deletion of the user until then. New `GET /api/admin/v1/swap_orders` (filter by `user_id` or `order_id`, `subscription_payments::view`) looks them up.
 
 - **Credit-funded payments report `credit` as their method**: a payment paid in full from account credit now has `payment_method: "credit"` on `GET /api/v1/subscriptions/{id}/payments` and the admin payment endpoints, instead of the method it was created with.
 

@@ -3501,8 +3501,8 @@ ranges first.
 
 ### Swap Order Clients
 
-Every FixedFloat swap order records who placed it and from where. Rows are kept for at least one year, are never
-deleted by the API, and survive deletion of the user.
+Every FixedFloat swap order records who placed it and from where. Rows are kept for 13 months (395 days) and then deleted by
+the worker. They survive deletion of the user until then.
 
 #### List Swap Orders
 

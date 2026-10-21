@@ -910,6 +910,14 @@ impl LNVpsDbBase for MockDb {
         Ok(id)
     }
 
+    async fn purge_swap_order_clients(&self, days: u32) -> DbResult<u64> {
+        let cutoff = Utc::now() - chrono::Duration::days(days as i64);
+        let mut rows = self.swap_order_clients.lock().await;
+        let before = rows.len();
+        rows.retain(|r| r.created >= cutoff);
+        Ok((before - rows.len()) as u64)
+    }
+
     async fn list_users(&self) -> DbResult<Vec<User>> {
         let users = self.users.lock().await;
         Ok(users.values().cloned().collect())
@@ -13812,5 +13820,27 @@ mod account_credit_tests {
         };
         db.insert_swap_order_client(&record).await.unwrap();
         assert!(db.insert_swap_order_client(&record).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn purge_removes_only_swap_order_clients_past_the_cutoff() {
+        let db = MockDb::default();
+        let old = Utc::now() - chrono::Duration::days(400);
+        let recent = Utc::now() - chrono::Duration::days(30);
+        {
+            let mut rows = db.swap_order_clients.lock().await;
+            for (id, order, created) in [(1u64, "OLD", old), (2, "NEW", recent)] {
+                rows.push(lnvps_db::SwapOrderClient {
+                    id,
+                    order_id: order.to_string(),
+                    created,
+                    ..Default::default()
+                });
+            }
+        }
+        assert_eq!(db.purge_swap_order_clients(395).await.unwrap(), 1);
+        let rows = db.swap_order_clients.lock().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].order_id, "NEW");
     }
 }

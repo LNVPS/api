@@ -598,6 +598,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(res.try_get(0)?)
     }
 
+    async fn purge_swap_order_clients(&self, days: u32) -> DbResult<u64> {
+        let res =
+            sqlx::query("delete from swap_order_client where created < NOW() - INTERVAL ? DAY")
+                .bind(days)
+                .execute(&self.db)
+                .await?;
+        Ok(res.rows_affected())
+    }
+
     async fn list_users(&self) -> DbResult<Vec<User>> {
         Ok(sqlx::query_as("select * from users")
             .fetch_all(&self.db)

@@ -215,6 +215,9 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Keep who ordered a swap, and from where. Rows outlive the user.
     async fn insert_swap_order_client(&self, record: &SwapOrderClient) -> DbResult<u64>;
 
+    /// Delete swap order client records older than `days`. Returns the number removed.
+    async fn purge_swap_order_clients(&self, days: u32) -> DbResult<u64>;
+
     /// List all users
     async fn list_users(&self) -> DbResult<Vec<User>>;
 
