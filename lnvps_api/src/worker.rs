@@ -539,7 +539,7 @@ impl Worker {
             // Send a plain expiry warning whenever auto-renewal was not attempted
             // (auto_renewal off, or no saved payment method).
             if !auto_renewed {
-                let grace = self.grace_period_days(sub);
+                let grace = self.grace_period(sub);
                 self.queue_notification(
                     sub.user_id,
                     format!(
@@ -557,7 +557,7 @@ impl Worker {
                 )
                 .await;
             }
-        } else if expires.add(Days::new(self.grace_period_days(sub) as u64)) < Utc::now() {
+        } else if expires.add(self.grace_period(sub)) < Utc::now() {
             // mark subscription as not-active
             let mut sub = sub.clone();
             sub.is_active = false;
@@ -599,7 +599,7 @@ impl Worker {
             let already_handled = self
                 .subscription_expiry_already_handled(sub, &line_items, last_check)
                 .await;
-            let grace = self.grace_period_days(sub);
+            let grace = self.grace_period(sub);
             if !already_handled {
                 self.queue_notification(
                     sub.user_id,
@@ -713,17 +713,17 @@ fn post_expiry_reminder_due(
 /// Whole days left before deletion, rounded up so any remaining time reads as at
 /// least one day, floored at zero. The exact deletion timestamp is in the
 /// message body, so the rounding is only for the headline.
-fn days_until_deletion(expires: DateTime<Utc>, grace_days: u16, now: DateTime<Utc>) -> i64 {
+fn days_until_deletion(expires: DateTime<Utc>, grace: TimeDelta, now: DateTime<Utc>) -> i64 {
     const DAY: i64 = 24 * 60 * 60;
-    let secs = (expires + TimeDelta::days(grace_days as i64) - now).num_seconds();
+    let secs = (expires + grace - now).num_seconds();
     if secs <= 0 { 0 } else { (secs + DAY - 1) / DAY }
 }
 
 /// One-line warning naming the date the services are deleted.
-fn deletion_warning(expires: DateTime<Utc>, grace_days: u16) -> String {
+fn deletion_warning(expires: DateTime<Utc>, grace: TimeDelta) -> String {
     format!(
         "If it is not renewed, your services and all their data are permanently deleted on {}.",
-        format_timestamp(expires + TimeDelta::days(grace_days as i64))
+        format_timestamp(expires + grace)
     )
 }
 
@@ -738,7 +738,7 @@ fn format_days(days: i64) -> String {
 /// Grace period (days) for a subscription, tiered by subscription age. Lives in
 /// `lnvps_api_common` so the API layer can surface the resulting deletion date;
 /// re-exported here for the worker/subscription callers.
-pub use lnvps_api_common::grace_period_days_for_sub;
+pub use lnvps_api_common::{grace_period_days_for_sub, grace_period_for_sub};
 
 /// Approximate duration of one billing interval for a subscription.
 ///
@@ -802,8 +802,8 @@ impl Worker {
     /// | ≤ 28       | 7             |
     /// | ≤ 180      | 14            |
     /// | > 180      | delete_after  |
-    fn grace_period_days(&self, sub: &Subscription) -> u16 {
-        grace_period_days_for_sub(sub, Utc::now(), self.settings.delete_after)
+    fn grace_period(&self, sub: &Subscription) -> TimeDelta {
+        grace_period_for_sub(sub, Utc::now(), self.settings.delete_after)
     }
 
     /// Whether the one-shot "expired" handling for `sub` has already run.
@@ -7179,11 +7179,11 @@ mod tests {
     fn test_deletion_countdown_helpers() {
         let now = Utc::now();
         let expires = now.sub(TimeDelta::days(10));
-        assert_eq!(days_until_deletion(expires, 14, now), 4);
+        assert_eq!(days_until_deletion(expires, TimeDelta::days(14), now), 4);
         // Never negative, even past the deletion date.
-        assert_eq!(days_until_deletion(expires, 2, now), 0);
+        assert_eq!(days_until_deletion(expires, TimeDelta::days(2), now), 0);
 
-        let warning = deletion_warning(expires, 14);
+        let warning = deletion_warning(expires, TimeDelta::days(14));
         assert!(warning.contains(&format_timestamp(expires.add(TimeDelta::days(14)))));
         assert!(warning.contains("permanently deleted"));
 
@@ -7222,6 +7222,42 @@ mod tests {
             0,
             "expiry reminders must not repeat within the same milestone"
         );
+        Ok(())
+    }
+
+    /// An hourly subscription gets a 24 hour grace period, not the 1-14 day
+    /// age-tiered window, so a lapsed credit balance does not hold resources
+    /// for days. The same expiry under a monthly interval is still in grace.
+    #[tokio::test]
+    async fn test_hourly_subscription_is_cancelled_after_24h_grace() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        // Created 31 days + 6 hours ago: expired 6 hours ago... shift so the
+        // expiry is 30 hours in the past.
+        let created = Utc::now().sub(TimeDelta::days(31)).sub(TimeDelta::hours(6));
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, created, true).await?;
+        let monthly = db.get_subscription(subscription_id).await?;
+        let expires = monthly.expires.unwrap();
+        assert!(expires < Utc::now().sub(TimeDelta::hours(29)));
+        let worker = setup_worker_with_delete_after(db.clone(), 30).await?;
+
+        let mut hourly = monthly.clone();
+        hourly.interval_type = IntervalType::Hour;
+        assert_eq!(worker.grace_period(&hourly), TimeDelta::hours(24));
+        worker
+            .handle_subscription_state(&hourly, expires.sub(TimeDelta::minutes(1)))
+            .await?;
+        assert!(
+            count_notifications(&worker, "Cancelled").await >= 1,
+            "an hourly subscription 30h past expiry is beyond its 24h grace"
+        );
+
+        // The same expiry on a monthly plan is still inside its grace window.
+        let (_v2, sub2) = add_vm_with_subscription(&db, created, true).await?;
+        let monthly2 = db.get_subscription(sub2).await?;
+        worker
+            .handle_subscription_state(&monthly2, expires.sub(TimeDelta::minutes(1)))
+            .await?;
+        assert_eq!(count_notifications(&worker, "Cancelled").await, 0);
         Ok(())
     }
 
