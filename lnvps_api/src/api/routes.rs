@@ -122,7 +122,10 @@ pub fn routes() -> Router<RouterState> {
                 get(v1_notification_channels),
             )
             .route("/api/v1/vm", get(v1_list_vms))
-            .route("/api/v1/vm/{id}", get(v1_get_vm).patch(v1_patch_vm))
+            .route(
+                "/api/v1/vm/{id}",
+                get(v1_get_vm).patch(v1_patch_vm).delete(v1_delete_vm),
+            )
             .route("/api/v1/image", get(v1_list_vm_images))
             .route("/api/v1/vm/templates", get(v1_list_vm_templates))
             .route("/api/v1/exchange-rate", get(v1_exchange_rate))
@@ -1703,6 +1706,56 @@ async fn v1_stop_vm(
     ApiData::ok(())
 }
 
+/// Refuse an owner's deletion of a VM that has an open abuse case against it.
+///
+/// Deleting would destroy the evidence and the means of acting on the report
+/// (suspending, preserving, answering the reporter) before it is resolved.
+async fn ensure_vm_deletable_by_owner(db: &Arc<dyn LNVpsDb>, vm_id: u64) -> Result<(), ApiError> {
+    let (open_cases, _) = db
+        .list_abuse_cases(1, 0, None, Some(vm_id), Some(true))
+        .await?;
+    if open_cases.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::conflict(
+            "This VM is the subject of an open abuse case and cannot be deleted",
+        ))
+    }
+}
+
+/// Delete a VM the caller no longer needs.
+///
+/// Stops billing: the subscription is deactivated and auto-renewal turned off
+/// when the worker runs the deletion. For an hourly VM the time already paid
+/// for but unused is returned to the caller's account credit. Queued rather
+/// than done inline, because deleting touches the host, the network and the
+/// database, and the worker is the one path that does all of it.
+///
+/// A VM the owner cannot delete yet is refused rather than queued: one already
+/// deleted (404), or one that is the subject of an open abuse case, which must
+/// stay available until it is resolved.
+async fn v1_delete_vm(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<()> {
+    let (uid, _vm) = get_user_vm(&auth, &this, id).await?;
+
+    ensure_vm_deletable_by_owner(&this.db, id).await?;
+
+    this.work_sender
+        .send(WorkJob::DeleteVm {
+            vm_id: id,
+            reason: Some("Deleted by its owner".to_string()),
+            admin_user_id: None,
+            purge: false,
+            by_owner: true,
+        })
+        .await?;
+    info!("VM {} deletion requested by user {}", id, uid);
+    ApiData::ok(())
+}
+
 /// Restart a VM
 async fn v1_restart_vm(
     auth: Nip98Auth,
@@ -2874,6 +2927,42 @@ fn is_vm_expired(expires: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An owner cannot delete a VM while an abuse case against it is open, but
+    /// can once it is closed, and a case on another VM is irrelevant.
+    #[tokio::test]
+    async fn owner_delete_is_refused_during_an_open_abuse_case() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::AbuseCase;
+        let mock = Arc::new(MockDb::default());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+
+        assert!(ensure_vm_deletable_by_owner(&db, 7).await.is_ok());
+
+        let case_id = db
+            .insert_abuse_case(&AbuseCase {
+                vm_id: Some(7),
+                summary: "spam".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.insert_abuse_case(&AbuseCase {
+            vm_id: Some(8),
+            summary: "other".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let err = ensure_vm_deletable_by_owner(&db, 7).await.unwrap_err();
+        assert!(err.error.contains("open abuse case"), "{}", err.error);
+        assert_eq!(err.code, axum::http::StatusCode::CONFLICT);
+        assert!(ensure_vm_deletable_by_owner(&db, 9).await.is_ok());
+
+        db.close_abuse_case(case_id).await.unwrap();
+        assert!(ensure_vm_deletable_by_owner(&db, 7).await.is_ok());
+    }
     use chrono::Utc;
     use lnvps_db::PaymentMethodConfig;
 

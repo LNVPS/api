@@ -3682,11 +3682,30 @@ impl Worker {
                 reason,
                 admin_user_id,
                 purge,
+                by_owner,
             } => {
                 let vm = self.db.get_vm(*vm_id).await?;
                 if vm.deleted {
                     return Ok(None);
                 }
+
+                // Read the paid-through time before deleting: deletion stops
+                // billing, and an hourly VM's unused time is returned to its
+                // owner's credit afterwards.
+                let unused_refund_basis = if *by_owner {
+                    match self
+                        .db
+                        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+                        .await
+                    {
+                        Ok(s) if s.interval_type == IntervalType::Hour => {
+                            s.expires.map(|e| (e, Utc::now()))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
 
                 // A VM that has never had its first (purchase) payment confirmed
                 // carries no customer data, so purge it entirely. Super-admins
@@ -3709,20 +3728,80 @@ impl Worker {
                 // Only record deletion history for soft-deleted VMs.
                 if !hard_delete {
                     // Log VM deletion
-                    let metadata = if let Some(admin_id) = admin_user_id {
-                        Some(serde_json::json!({
-                            "admin_user_id": admin_id,
-                            "admin_action": true
-                        }))
+                    let (metadata, initiated_by) = if *by_owner {
+                        (
+                            Some(serde_json::json!({ "admin_action": false })),
+                            Some(vm.user_id),
+                        )
+                    } else if let Some(admin_id) = admin_user_id {
+                        (
+                            Some(serde_json::json!({
+                                "admin_user_id": admin_id,
+                                "admin_action": true
+                            })),
+                            *admin_user_id,
+                        )
                     } else {
-                        Some(serde_json::json!({
-                            "admin_action": true
-                        }))
+                        (
+                            Some(serde_json::json!({
+                                "admin_action": true
+                            })),
+                            None,
+                        )
                     };
 
                     self.vm_history_logger
-                        .log_vm_deleted(*vm_id, *admin_user_id, reason.as_deref(), metadata)
+                        .log_vm_deleted(*vm_id, initiated_by, reason.as_deref(), metadata)
                         .await?;
+                }
+
+                // The VM is gone and billing has stopped, so a refund that
+                // fails is money to hand back by hand, not a reason to retry the
+                // job: a redelivery would find the VM deleted and do nothing.
+                let mut credit_returned = 0;
+                if let Some((expires, at)) = unused_refund_basis {
+                    match self
+                        .refunds
+                        .refund_unused_to_credit(*vm_id, vm.user_id, expires, at)
+                        .await
+                    {
+                        Ok(c) => credit_returned = c,
+                        Err(e) => {
+                            error!(
+                                "VM {} was deleted by its owner but returning its unused time \
+                                 to account credit failed: {}",
+                                vm_id, e
+                            );
+                            self.queue_admin_notification(
+                                format!(
+                                    "VM {} was deleted by user {} but the unused time could not be \
+                                     returned to their account credit: {}",
+                                    vm_id, vm.user_id, e
+                                ),
+                                Some(format!("[VM{}] Credit refund failed", vm_id)),
+                            )
+                            .await;
+                        }
+                    }
+                }
+
+                if *by_owner {
+                    let msg = if credit_returned > 0 {
+                        format!(
+                            "Your VM #{} has been deleted and billing has stopped. The unused \
+                             time was returned to your account credit.",
+                            vm_id
+                        )
+                    } else {
+                        format!("Your VM #{} has been deleted and billing has stopped.", vm_id)
+                    };
+                    self.queue_notification(
+                        vm.user_id,
+                        msg,
+                        Some(format!("[VM{}] Deleted", vm_id)),
+                    )
+                    .await;
+                    return Ok(Some(format!("VM {} deleted by its owner", vm_id)));
                 }
 
                 // Send notifications
@@ -4031,6 +4110,7 @@ impl Worker {
                         )),
                         admin_user_id: Some(*admin_user_id),
                         purge: false,
+                        by_owner: false,
                     })
                     .await
                 {
@@ -7222,6 +7302,122 @@ mod tests {
             0,
             "expiry reminders must not repeat within the same milestone"
         );
+        Ok(())
+    }
+
+    /// An hourly VM whose owner deletes it stops billing and gets the unused
+    /// part of what credit paid for back as credit.
+    #[tokio::test]
+    async fn an_owner_deleting_an_hourly_vm_returns_unused_time_as_credit() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let created = Utc::now().sub(TimeDelta::hours(6));
+        let (vm_id, sub_id) = add_vm_with_subscription(&db, created, true).await?;
+        let vm = db.get_vm(vm_id).await?;
+        // 4 of the 8 paid hours are left.
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&sub_id).unwrap();
+            sub.interval_type = IntervalType::Hour;
+            sub.auto_renewal_enabled = true;
+            sub.expires = Some(Utc::now().add(TimeDelta::hours(4)));
+        }
+        let mut payment = make_subscription_payment(
+            sub_id,
+            vm.user_id,
+            created,
+            Utc::now().add(TimeDelta::hours(4)),
+            9,
+        );
+        payment.is_paid = true;
+        payment.amount = 8_000;
+        payment.time_value = Some(8 * 3600);
+        db.insert_subscription_payment(&payment).await?;
+        db.account_credit_debits
+            .lock()
+            .await
+            .push(lnvps_db::AccountCreditDebit {
+                user_id: vm.user_id,
+                subscription_payment_id: Some(payment.id.clone()),
+                amount: 8_000,
+                currency: "BTC".to_string(),
+                payment_amount: 8_000,
+                settled: true,
+                ..Default::default()
+            });
+        let worker = setup_worker(db.clone()).await?;
+
+        let out = worker
+            .try_job(&WorkJob::DeleteVm {
+                vm_id,
+                reason: Some("Deleted by its owner".to_string()),
+                admin_user_id: None,
+                purge: false,
+                by_owner: true,
+            })
+            .await?;
+        assert!(out.unwrap().contains("by its owner"));
+
+        assert!(db.get_vm(vm_id).await?.deleted);
+        let sub = db.get_subscription(sub_id).await?;
+        assert!(!sub.is_active && !sub.auto_renewal_enabled, "billing stops");
+        let balance = db.get_account_credit(vm.user_id).await?.balance;
+        assert!(
+            (3_990..=4_000).contains(&balance),
+            "about half of 8000 returned, got {balance}"
+        );
+        assert!(count_notifications(&worker, "Deleted").await >= 1);
+        // The history credits the owner, not an administrator.
+        let history = db.list_vm_history_paginated(vm_id, 20, 0).await?;
+        let deleted = history
+            .iter()
+            .find(|h| matches!(h.action_type, lnvps_db::VmHistoryActionType::Deleted))
+            .expect("a deleted entry");
+        assert_eq!(deleted.initiated_by_user, Some(vm.user_id));
+        Ok(())
+    }
+
+    /// An owner deleting a monthly VM is not refunded: only hourly time is
+    /// returned, so the money for a prepaid month stays with the sale.
+    #[tokio::test]
+    async fn an_owner_deleting_a_monthly_vm_gets_no_credit() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let created = Utc::now().sub(TimeDelta::days(5));
+        let (vm_id, sub_id) = add_vm_with_subscription(&db, created, true).await?;
+        let vm = db.get_vm(vm_id).await?;
+        let mut payment = make_subscription_payment(
+            sub_id,
+            vm.user_id,
+            created,
+            created.add(TimeDelta::days(30)),
+            9,
+        );
+        payment.is_paid = true;
+        db.insert_subscription_payment(&payment).await?;
+        db.account_credit_debits
+            .lock()
+            .await
+            .push(lnvps_db::AccountCreditDebit {
+                user_id: vm.user_id,
+                subscription_payment_id: Some(payment.id.clone()),
+                amount: 1_000,
+                currency: "BTC".to_string(),
+                payment_amount: 1_000,
+                settled: true,
+                ..Default::default()
+            });
+        let worker = setup_worker(db.clone()).await?;
+
+        worker
+            .try_job(&WorkJob::DeleteVm {
+                vm_id,
+                reason: None,
+                admin_user_id: None,
+                purge: false,
+                by_owner: true,
+            })
+            .await?;
+        assert!(db.get_vm(vm_id).await?.deleted);
+        assert_eq!(db.get_account_credit(vm.user_id).await?.balance, 0);
         Ok(())
     }
 

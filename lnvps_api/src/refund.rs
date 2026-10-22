@@ -358,6 +358,130 @@ impl VmRefundHandler {
         })
     }
 
+    /// Return the unused time on a VM's subscription to the owner's account
+    /// credit, as it is deleted.
+    ///
+    /// `expires` is the subscription's expiry and `at` the moment billing
+    /// stopped. The unused seconds are walked back through the VM's paid
+    /// payments, newest first, and each takes the share of what it charged that
+    /// those seconds represent (`gross * unused / time_value`), so tax, discounts
+    /// and rounding are all the customer's own, never a re-quote at today's
+    /// price. Only payments credit paid for in full are refunded: that money
+    /// goes back where it came from, and a payment that took cash is not ours to
+    /// hand back as credit.
+    ///
+    /// Each share is booked as a refund row against its payment and returned as
+    /// a `refund` ledger event. The row id is derived from the payment, amount
+    /// and `at`, so a repeat with the same `at` collides rather than refunding
+    /// twice. Returns the credit returned, in the balance currency.
+    pub async fn refund_unused_to_credit(
+        &self,
+        vm_id: u64,
+        owner_id: u64,
+        expires: DateTime<Utc>,
+        at: DateTime<Utc>,
+    ) -> Result<u64> {
+        let mut unused = (expires - at).num_seconds().max(0) as u64;
+        if unused == 0 {
+            return Ok(0);
+        }
+        let mut payments: Vec<SubscriptionPayment> = self
+            .db
+            .list_vm_subscription_payments(vm_id)
+            .await?
+            .into_iter()
+            .filter(|p| p.is_paid && !p.payment_type.is_refund() && p.time_value.unwrap_or(0) > 0)
+            .collect();
+        payments.sort_by_key(|p| std::cmp::Reverse(p.created));
+
+        let mut returned = 0;
+        for payment in payments {
+            if unused == 0 {
+                break;
+            }
+            // Time this payment bought, whether or not it can be refunded: the
+            // unused seconds belong to the newest periods first either way.
+            let time_value = payment.time_value.unwrap_or(0);
+            let take = unused.min(time_value);
+            unused -= take;
+
+            let Some(debit) = self
+                .db
+                .get_account_credit_debit_by_payment(&payment.id)
+                .await?
+                .filter(|d| d.settled)
+            else {
+                continue;
+            };
+            let billable = payment.amount + payment.tax;
+            if billable == 0 || debit.payment_amount < billable || debit.payment_amount == 0 {
+                continue;
+            }
+            let existing = self.db.list_refunds_for_payment(&payment.id).await?;
+            let gross = ((billable as u128 * take as u128 / time_value as u128) as u64)
+                .min(refundable_remaining(&payment, &existing));
+            if gross == 0 {
+                continue;
+            }
+            // What the customer's balance was debited for this share. Floors, so
+            // rounding never returns more credit than was taken.
+            let credit = (debit.amount as u128 * gross as u128 / debit.payment_amount as u128) as u64;
+
+            let mut row = build_refund_row(
+                &payment,
+                gross,
+                at,
+                owner_id,
+                RefundEvidence {
+                    reason: Some("VM deleted by its owner"),
+                    external_ref: None,
+                    instrument: None,
+                },
+            );
+            // `build_refund_row` records who issued the refund as an admin. This
+            // one was the customer's own, so say so rather than name a user as
+            // an administrator.
+            if let Some(refund) = row.metadata.as_mut().and_then(|m| m.get_mut("refund")) {
+                refund["recorded_by_admin_user_id"] = serde_json::Value::Null;
+                refund["by_owner_user_id"] = serde_json::json!(owner_id);
+                refund["returned_as_credit"] = serde_json::json!(credit);
+            }
+            self.db.insert_subscription_payment(&row).await?;
+            if credit > 0 {
+                self.db
+                    .adjust_account_credit(
+                        payment.user_id,
+                        credit as i64,
+                        "refund",
+                        Some(&format!(
+                            "VM {} deleted, unused time of payment {}",
+                            vm_id,
+                            hex::encode(&payment.id)
+                        )),
+                    )
+                    .await?;
+                returned += credit;
+            }
+            if let Err(e) = self
+                .history
+                .log_vm_refunded(
+                    vm_id,
+                    Some(owner_id),
+                    &payment.id,
+                    &row.id,
+                    gross,
+                    &row.currency,
+                    Some("VM deleted by its owner"),
+                    None,
+                )
+                .await
+            {
+                error!("Refund recorded but VM history entry failed for VM {vm_id}: {e}");
+            }
+        }
+        Ok(returned)
+    }
+
     /// Which of the VM's payments the refund comes off, newest first.
     ///
     /// Newest first because a refund of unused time reverses the period that
@@ -927,6 +1051,126 @@ mod tests {
             (events[0].kind.as_str(), events[0].amount),
             ("refund", 300_000)
         );
+    }
+
+    /// Deleting a VM that credit paid for returns the unused share of the
+    /// payment as credit: 15 of 30 days left on 1230 gross is 615, and the same
+    /// fraction of the 12.3M msat the balance was debited.
+    #[tokio::test]
+    async fn the_unused_time_of_a_credit_paid_vm_returns_as_credit() {
+        let mock = MockDb::default();
+        let (vm, payment) = vm_with_payment(&mock, 1000, 230).await;
+        mock.account_credit_debits
+            .lock()
+            .await
+            .push(debit(&payment, 1230, 12_300_000));
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let handler = handler(db.clone(), Arc::new(PayNode::default())).await;
+        let sub = db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await
+            .unwrap();
+
+        let returned = handler
+            .refund_unused_to_credit(vm.id, vm.user_id, sub.expires.unwrap(), Utc::now())
+            .await
+            .unwrap();
+        // Half is 615 cents. The clock moves between the fixture and the call,
+        // and the share floors to a whole cent (10_000 msat), so it is 614 or
+        // 615 cents' worth of the debit, never more.
+        assert!(
+            (6_140_000..=6_150_000).contains(&returned),
+            "returned {returned}"
+        );
+        assert_eq!(
+            db.get_account_credit(vm.user_id).await.unwrap().balance,
+            returned
+        );
+        let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
+        assert_eq!(refunds.len(), 1);
+        assert_eq!(refunds[0].payment_type, SubscriptionPaymentType::Refund);
+        assert_eq!(refunds[0].time_value, None, "a refund buys no time");
+        assert!((614..=616).contains(&(refunds[0].amount + refunds[0].tax)));
+        let meta = refunds[0].metadata.as_ref().unwrap();
+        assert_eq!(meta["refund"]["by_owner_user_id"], vm.user_id);
+        assert!(meta["refund"]["recorded_by_admin_user_id"].is_null());
+        let (events, _) = db
+            .list_account_credit_events(vm.user_id, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            (events[0].kind.as_str(), events[0].amount),
+            ("refund", returned as i64)
+        );
+    }
+
+    /// Cash is not handed back as credit, and a payment credit only partly paid
+    /// for is left alone: nothing is returned for either.
+    #[tokio::test]
+    async fn cash_paid_and_partly_credit_paid_time_is_not_returned() {
+        let mock = MockDb::default();
+        let (vm, payment) = vm_with_payment(&mock, 1000, 230).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let handler = handler(db.clone(), Arc::new(PayNode::default())).await;
+        let sub = db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await
+            .unwrap();
+        let expires = sub.expires.unwrap();
+
+        let returned = handler
+            .refund_unused_to_credit(vm.id, vm.user_id, expires, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(returned, 0, "paid in cash");
+        assert!(db.list_refunds_for_payment(&payment.id).await.unwrap().is_empty());
+        assert_eq!(db.get_account_credit(vm.user_id).await.unwrap().balance, 0);
+    }
+
+    /// Credit that paid for only part of a payment leaves the rest as cash, so
+    /// the payment is skipped entirely rather than half-refunded as credit.
+    #[tokio::test]
+    async fn a_partly_credit_paid_vm_returns_nothing_as_credit() {
+        let mock = MockDb::default();
+        let (vm, payment) = vm_with_payment(&mock, 1000, 230).await;
+        mock.account_credit_debits
+            .lock()
+            .await
+            .push(debit(&payment, 600, 6_000_000));
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let handler = handler(db.clone(), Arc::new(PayNode::default())).await;
+        let sub = db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await
+            .unwrap();
+
+        let returned = handler
+            .refund_unused_to_credit(vm.id, vm.user_id, sub.expires.unwrap(), Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(returned, 0);
+        assert!(db.list_refunds_for_payment(&payment.id).await.unwrap().is_empty());
+    }
+
+    /// Nothing is unused once the subscription has run out.
+    #[tokio::test]
+    async fn an_expired_subscription_returns_nothing() {
+        let mock = MockDb::default();
+        let (vm, payment) = vm_with_payment(&mock, 1000, 230).await;
+        mock.account_credit_debits
+            .lock()
+            .await
+            .push(debit(&payment, 1230, 12_300_000));
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let handler = handler(db.clone(), Arc::new(PayNode::default())).await;
+
+        let past = Utc::now() - chrono::Duration::hours(1);
+        let returned = handler
+            .refund_unused_to_credit(vm.id, vm.user_id, past, Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(returned, 0);
+        assert!(db.list_refunds_for_payment(&payment.id).await.unwrap().is_empty());
     }
 
     /// A failed payment writes no refund row: the ledger only ever records
