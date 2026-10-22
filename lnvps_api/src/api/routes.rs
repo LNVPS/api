@@ -2119,6 +2119,7 @@ struct InvoiceLine {
 /// their own `time_value` (everything that is not a VPS).
 fn interval_label(amount: u64, interval: lnvps_db::IntervalType) -> String {
     let unit = match interval {
+        lnvps_db::IntervalType::Hour => "hour",
         lnvps_db::IntervalType::Day => "day",
         lnvps_db::IntervalType::Month => "month",
         lnvps_db::IntervalType::Year => "year",
@@ -3446,6 +3447,8 @@ mod tests {
         use lnvps_db::IntervalType;
         assert_eq!(interval_label(1, IntervalType::Month), "1 month");
         assert_eq!(interval_label(3, IntervalType::Month), "3 months");
+        assert_eq!(interval_label(1, IntervalType::Hour), "1 hour");
+        assert_eq!(interval_label(6, IntervalType::Hour), "6 hours");
         assert_eq!(interval_label(1, IntervalType::Day), "1 day");
         assert_eq!(interval_label(14, IntervalType::Day), "14 days");
         assert_eq!(interval_label(1, IntervalType::Year), "1 year");

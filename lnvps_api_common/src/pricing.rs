@@ -3,7 +3,7 @@ use crate::{
     UpgradeConfig, VatClient, saturating_add_seconds,
 };
 use anyhow::{Result, anyhow, bail, ensure};
-use chrono::{DateTime, Days, Months, Utc};
+use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use isocountry::CountryCode;
 use lnvps_db::{
     CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, IntervalType, LNVpsDb, PaymentMethod,
@@ -393,6 +393,7 @@ impl PricingEngine {
     /// Convert cost plan interval to seconds
     fn cost_plan_interval_to_seconds(interval_type: IntervalType, interval_amount: u64) -> i64 {
         let base_seconds = match interval_type {
+            IntervalType::Hour => 60 * 60,            // 3,600 seconds per hour
             IntervalType::Day => 24 * 60 * 60,        // 86,400 seconds per day
             IntervalType::Month => 30 * 24 * 60 * 60, // 2,592,000 seconds per month (30 days)
             IntervalType::Year => 365 * 24 * 60 * 60, // 31,536,000 seconds per year (365 days)
@@ -1238,6 +1239,10 @@ impl PricingEngine {
         // falls back to leaving the expiry untouched (yielding a zero interval,
         // which the callers already treat as "nothing to bill").
         let next_expire = match cost_plan.interval_type {
+            IntervalType::Hour => i64::try_from(cost_plan.interval_amount)
+                .ok()
+                .and_then(TimeDelta::try_hours)
+                .and_then(|d| base.checked_add_signed(d)),
             IntervalType::Day => base.checked_add_days(Days::new(cost_plan.interval_amount)),
             IntervalType::Month => u32::try_from(cost_plan.interval_amount)
                 .ok()
@@ -1941,6 +1946,37 @@ pub fn apply_custom_pricing_limits(template: &mut VmCustomTemplate, pricing: &Vm
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hourly_interval_seconds_and_expiry() {
+        assert_eq!(
+            PricingEngine::cost_plan_interval_to_seconds(IntervalType::Hour, 1),
+            3_600
+        );
+        assert_eq!(
+            PricingEngine::cost_plan_interval_to_seconds(IntervalType::Hour, 6),
+            21_600
+        );
+        let plan = VmCostPlan {
+            id: 1,
+            name: "hourly".to_string(),
+            created: Utc::now(),
+            amount: 1,
+            currency: "EUR".to_string(),
+            interval_type: IntervalType::Hour,
+            interval_amount: 2,
+        };
+        assert_eq!(
+            PricingEngine::next_template_expire(Utc::now(), &plan),
+            7_200
+        );
+        // An absurd amount must not panic; it yields a zero interval.
+        let plan = VmCostPlan {
+            interval_amount: u64::MAX,
+            ..plan
+        };
+        assert_eq!(PricingEngine::next_template_expire(Utc::now(), &plan), 0);
+    }
     use crate::{MockDb, MockExchangeRate};
     use lnvps_db::{
         CpuMfg, DiskType, LNVpsDbBase, PaymentMethodConfig, User, VmCustomPricing,

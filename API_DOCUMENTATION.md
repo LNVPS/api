@@ -15,7 +15,7 @@ This document provides comprehensive API specifications for generating TypeScrip
 **DiskType**: `"hdd"`, `"ssd"`
 **DiskInterface**: `"sata"`, `"scsi"`, `"pcie"`
 **VmState**: `"unknown"`, `"running"`, `"stopped"`, `"creating"`
-**CostPlanIntervalType**: `"day"`, `"month"`, `"year"`
+**CostPlanIntervalType**: `"hour"`, `"day"`, `"month"`, `"year"`
 **OsDistribution**: `"ubuntu"`, `"debian"`, `"centos"`, `"fedora"`, `"freebsd"`, `"opensuse"`, `"archlinux"`,
 `"redhatenterprise"`, `"almalinux"`, `"rockylinux"`, `"alpine"`, `"nixos"`, `"openbsd"`, `"netbsd"`, `"gentoo"`,
 `"voidlinux"`
@@ -384,7 +384,7 @@ interface VmCostPlan {
   /** @deprecated (#230) Use GET /api/v1/exchange-rate instead. Still populated for now. */
   other_price: Price[]; // Alternative currency prices
   interval_amount: number;
-  interval_type: 'day' | 'month' | 'year';
+  interval_type: 'hour' | 'day' | 'month' | 'year';
 }
 
 interface Price {
@@ -1818,7 +1818,7 @@ interface App {
   amount: number;            // recurring price in smallest currency units (cents / millisats)
   currency: string;
   interval_amount: number;
-  interval_type: "day" | "month" | "year";
+  interval_type: "hour" | "day" | "month" | "year";
   setup_amount: number;      // one-off setup fee in smallest currency units (0 = none)
   // Resource footprint computed from the compose (issue #231):
   cpu_milli: number;         // total requested CPU in millicores

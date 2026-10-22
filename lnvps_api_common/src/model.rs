@@ -701,11 +701,13 @@ pub enum ApiIntervalType {
     Day = 0,
     Month = 1,
     Year = 2,
+    Hour = 3,
 }
 
 impl From<lnvps_db::IntervalType> for ApiIntervalType {
     fn from(value: lnvps_db::IntervalType) -> Self {
         match value {
+            lnvps_db::IntervalType::Hour => Self::Hour,
             lnvps_db::IntervalType::Day => Self::Day,
             lnvps_db::IntervalType::Month => Self::Month,
             lnvps_db::IntervalType::Year => Self::Year,
@@ -716,6 +718,7 @@ impl From<lnvps_db::IntervalType> for ApiIntervalType {
 impl From<ApiIntervalType> for lnvps_db::IntervalType {
     fn from(value: ApiIntervalType) -> Self {
         match value {
+            ApiIntervalType::Hour => Self::Hour,
             ApiIntervalType::Day => Self::Day,
             ApiIntervalType::Month => Self::Month,
             ApiIntervalType::Year => Self::Year,
@@ -1356,6 +1359,23 @@ impl ApiSubscriptionLineItemResource {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn api_interval_type_hour_round_trips() {
+        use super::ApiIntervalType;
+        use lnvps_db::IntervalType;
+        assert_eq!(ApiIntervalType::from(IntervalType::Hour), ApiIntervalType::Hour);
+        assert_eq!(IntervalType::from(ApiIntervalType::Hour), IntervalType::Hour);
+        assert_eq!(
+            serde_json::to_string(&ApiIntervalType::Hour).unwrap(),
+            "\"hour\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ApiIntervalType>("\"hour\"").unwrap(),
+            ApiIntervalType::Hour
+        );
+        assert_eq!(IntervalType::Hour as u16, 3);
+    }
+
     #[test]
     fn api_vm_os_image_reports_encrypted() {
         let mut image = lnvps_db::VmOsImage {

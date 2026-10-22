@@ -418,6 +418,8 @@ fn per_month_fraction(interval_amount: u64, interval_type: IntervalType) -> f64 
     }
     let n = interval_amount as f64;
     match interval_type {
+        // ~average hours per month divided by the interval length in hours
+        IntervalType::Hour => 30.436875 * 24.0 / n,
         // ~average days per month divided by the interval length in days
         IntervalType::Day => 30.436875 / n,
         IntervalType::Month => 1.0 / n,
@@ -1489,6 +1491,15 @@ const RENEWAL_SOURCE_TRACKED_FROM: &str = "2026-08-26";
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn per_month_fraction_hourly() {
+        // 730.485 hours in an average month.
+        let f = per_month_fraction(1, IntervalType::Hour);
+        assert!((f - 730.485).abs() < 1e-9, "{f}");
+        let f = per_month_fraction(24, IntervalType::Hour);
+        assert!((f - per_month_fraction(1, IntervalType::Day)).abs() < 1e-9);
+    }
 
     fn dt(y: i32, m: u32, d: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, m, d, 12, 0, 0).unwrap()

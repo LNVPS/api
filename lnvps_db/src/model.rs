@@ -1181,6 +1181,9 @@ pub enum IntervalType {
     #[default]
     Month = 1,
     Year = 2,
+    /// Hourly billing. Stored in the same `SMALLINT` column, so it needs no
+    /// migration. Intended to be paid from account credit.
+    Hour = 3,
 }
 
 /// The kind of resource a cost record is attached to (weak/polymorphic link).

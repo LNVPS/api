@@ -3828,6 +3828,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_one(tx.as_mut())
                 .await?;
             let interval_sql = match sub.interval_type {
+                IntervalType::Hour => "HOUR",
                 IntervalType::Day => "DAY",
                 IntervalType::Month => "MONTH",
                 IntervalType::Year => "YEAR",

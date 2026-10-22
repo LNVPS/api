@@ -747,6 +747,7 @@ pub use lnvps_api_common::grace_period_days_for_sub;
 fn subscription_interval(sub: &Subscription) -> TimeDelta {
     let amount = sub.interval_amount.max(1) as i64;
     match sub.interval_type {
+        IntervalType::Hour => TimeDelta::hours(amount),
         IntervalType::Day => TimeDelta::days(amount),
         IntervalType::Month => TimeDelta::days(30 * amount),
         IntervalType::Year => TimeDelta::days(365 * amount),
@@ -870,6 +871,13 @@ impl Worker {
         line_items: &Vec<SubscriptionLineItem>,
     ) -> String {
         let interval_str = match sub.interval_type {
+            IntervalType::Hour => {
+                if sub.interval_amount == 1 {
+                    "per hour".to_string()
+                } else {
+                    format!("every {} hours", sub.interval_amount)
+                }
+            }
             IntervalType::Day => {
                 if sub.interval_amount == 1 {
                     "per day".to_string()
@@ -7039,6 +7047,16 @@ mod tests {
         // A 2-day interval caps at 1 day (== the max), not more.
         sub.interval_amount = 2;
         assert_eq!(expiry_lead_window(&sub), TimeDelta::days(1));
+
+        // Hourly billing: the lead is half the interval (30 minutes), so a
+        // just-renewed hourly subscription is not immediately "expiring soon".
+        sub.interval_type = IntervalType::Hour;
+        sub.interval_amount = 1;
+        assert_eq!(subscription_interval(&sub), TimeDelta::hours(1));
+        assert_eq!(expiry_lead_window(&sub), TimeDelta::minutes(30));
+        sub.interval_amount = 6;
+        assert_eq!(subscription_interval(&sub), TimeDelta::hours(6));
+        assert_eq!(expiry_lead_window(&sub), TimeDelta::hours(3));
 
         // Yearly billing stays at the 1-day max.
         sub.interval_amount = 1;

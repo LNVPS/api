@@ -3603,6 +3603,9 @@ impl LNVpsDbBase for MockDb {
                 } else {
                     // Regular subscription path: use interval from subscription
                     match subscription.interval_type {
+                        IntervalType::Hour => {
+                            base.add(TimeDelta::hours(subscription.interval_amount as i64))
+                        }
                         IntervalType::Day => base.add(Days::new(subscription.interval_amount)),
                         IntervalType::Month => {
                             base.add(Months::new(subscription.interval_amount as u32))
@@ -9294,6 +9297,32 @@ mod tests {
         assert!(
             expires >= expected_min && expires <= expected_max,
             "expires {} not in expected range for 1-year interval",
+            expires
+        );
+    }
+
+    /// Regular subscription path: hour interval extends by N hours.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_interval_hour() {
+        let db = MockDb::default();
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.interval_amount = 3;
+            sub.interval_type = IntervalType::Hour;
+        }
+        let payment = make_payment(1, None);
+        db.insert_subscription_payment(&payment).await.unwrap();
+
+        let before = Utc::now();
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let subs = db.subscriptions.lock().await;
+        let expires = subs.get(&1).unwrap().expires.unwrap();
+        assert!(
+            expires >= before + chrono::Duration::hours(3)
+                && expires <= before + chrono::Duration::hours(3) + chrono::Duration::minutes(1),
+            "expires {} not 3 hours out",
             expires
         );
     }
