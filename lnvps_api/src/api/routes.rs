@@ -1802,7 +1802,7 @@ async fn v1_delete_vm(
     State(this): State<RouterState>,
     Path(id): Path<u64>,
 ) -> ApiResult<()> {
-    let (uid, _vm) = get_user_vm(&auth, &this, id).await?;
+    let (_uid, _vm) = get_user_vm(&auth, &this, id).await?;
 
     ensure_vm_deletable_by_owner(&this.db, id).await?;
 
@@ -1815,7 +1815,7 @@ async fn v1_delete_vm(
             by_owner: true,
         })
         .await?;
-    info!("VM {} deletion requested by user {}", id, uid);
+    info!("VM {} deletion requested by its owner", id);
     ApiData::ok(())
 }
 

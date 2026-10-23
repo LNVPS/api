@@ -1143,7 +1143,7 @@ mod tests {
         // 615 cents' worth of the debit, never more.
         assert!(
             (6_140_000..=6_150_000).contains(&returned),
-            "returned {returned}"
+            "unexpected credit returned"
         );
         assert_eq!(
             db.get_account_credit(vm.user_id).await.unwrap().balance,
@@ -1186,7 +1186,7 @@ mod tests {
             .unwrap();
         assert!(
             (6_140_000..=6_150_000).contains(&returned),
-            "returned {returned}"
+            "unexpected credit returned"
         );
         assert_eq!(
             db.get_account_credit(vm.user_id).await.unwrap().balance,
@@ -1357,7 +1357,7 @@ mod tests {
         // ~315 cents of cash = ~3.15M msat at today's rate.
         assert!(
             (7_620_000..=7_660_000).contains(&returned),
-            "returned {returned}"
+            "unexpected credit returned"
         );
     }
 
