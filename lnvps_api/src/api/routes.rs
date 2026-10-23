@@ -1290,7 +1290,15 @@ async fn v1_custom_template_calc(
     let amount = CurrencyAmount::from_u64(price.currency, price.total());
     // Include conversions to the other supported currencies, like the template
     // listing's `other_price`.
-    ApiData::ok(ApiCustomVmPrice::from_amount(amount, &this.rates).await?)
+    ApiData::ok(
+        ApiCustomVmPrice::from_amount(
+            amount,
+            pricing.interval_type,
+            pricing.interval_amount.max(1),
+            &this.rates,
+        )
+        .await?,
+    )
 }
 
 /// Create a new VM order

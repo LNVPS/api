@@ -61,14 +61,50 @@ pub struct RemainingTimeInfo {
     pub prorated_cost: CurrencyAmount,
 }
 
-/// Billing period a custom VM price buys. Custom builds have no cost plan row,
-/// so the interval is fixed here and is what both the renewal and the quoted
-/// price report.
+/// Default billing period for a custom pricing model: one month.
+///
+/// A model may set its own interval (see [`VmCustomPricing::interval_type`]); a
+/// VM then bills on its subscription's interval, which is seeded from the model
+/// when the VM is created. These are the defaults for models that don't say.
 pub const CUSTOM_VM_INTERVAL_AMOUNT: u64 = 1;
 pub const CUSTOM_VM_INTERVAL_TYPE: IntervalType = IntervalType::Month;
-// The renewal below advances by months, so a change of unit here has to be made
-// there too.
-const _: () = assert!(matches!(CUSTOM_VM_INTERVAL_TYPE, IntervalType::Month));
+
+/// Hours in the period custom pricing rates are quoted per: one month, which
+/// the pricing engine treats as 30 days everywhere it needs a fixed length.
+const CUSTOM_RATE_PERIOD_HOURS: u128 = 30 * 24;
+
+/// Length of one billing interval in hours, on the same 30-day-month basis the
+/// custom rates use. Only used to scale a price; expiry uses real calendar time.
+fn interval_hours(interval_type: IntervalType, interval_amount: u64) -> u128 {
+    let per_interval: u128 = match interval_type {
+        IntervalType::Hour => 1,
+        IntervalType::Day => 24,
+        IntervalType::Month => CUSTOM_RATE_PERIOD_HOURS,
+        IntervalType::Year => 12 * CUSTOM_RATE_PERIOD_HOURS,
+    };
+    per_interval * interval_amount.max(1) as u128
+}
+
+/// Scale a price quoted per month to what one billing interval costs, rounding
+/// up so a shorter interval never under-charges. A one-month interval is
+/// returned unchanged.
+///
+/// Do this in the **payment** currency (millisats for credit) rather than in the
+/// model's fiat currency: an hourly share of a monthly price is a fraction of a
+/// cent, which whole cents cannot represent.
+pub fn scale_monthly_to_interval(
+    monthly: u64,
+    interval_type: IntervalType,
+    interval_amount: u64,
+) -> u64 {
+    let hours = interval_hours(interval_type, interval_amount);
+    if hours == CUSTOM_RATE_PERIOD_HOURS {
+        return monthly;
+    }
+    (monthly as u128 * hours)
+        .div_ceil(CUSTOM_RATE_PERIOD_HOURS)
+        .min(u64::MAX as u128) as u64
+}
 
 /// ISO 3166-1 alpha-3 codes treated as inside the EU VAT area (27 member states).
 const EU_VAT_COUNTRIES: [&str; 27] = [
@@ -1056,20 +1092,37 @@ impl PricingEngine {
         let template = self.db.get_custom_vm_template(template_id).await?;
         let price = Self::get_custom_vm_cost_amount(&self.db, &template).await?;
 
+        // The VM bills on its subscription's interval, which was seeded from the
+        // custom pricing model when the VM was created. Rates are monthly, so a
+        // shorter interval charges the matching share of the monthly price.
+        let subscription = self
+            .db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await?;
+        let (interval_type, interval_amount) =
+            (subscription.interval_type, subscription.interval_amount);
+
         // clamp base to now for expired VMs
-        let base = self
-            .vm_subscription_expires(vm)
-            .await
-            .unwrap_or_else(Utc::now)
-            .max(Utc::now());
-        let time_value =
-            (base.add(Months::new(CUSTOM_VM_INTERVAL_AMOUNT as u32)) - base).num_seconds() as u64;
-        let converted_amount = self
+        let expires = subscription.expires;
+        let base = expires.unwrap_or_else(Utc::now).max(Utc::now());
+        let time_value = Self::interval_seconds_from(base, interval_type, interval_amount);
+        let mut converted_amount = self
             .get_amount_and_rate(
                 CurrencyAmount::from_u64(price.currency, price.total()),
                 method,
             )
             .await?;
+        // Scale after converting, in the payment currency: an hour of a monthly
+        // fiat price is a fraction of a cent, but a whole number of millisats.
+        let scaled = scale_monthly_to_interval(
+            converted_amount.amount.value(),
+            interval_type,
+            interval_amount,
+        );
+        converted_amount.amount = CurrencyAmount::from_u64(converted_amount.amount.currency(), scaled);
+        if converted_amount.amount.currency() == Currency::BTC {
+            converted_amount.amount = round_to_sat(converted_amount.amount);
+        }
         let tax_details = self
             .determine_tax(vm.user_id, converted_amount.amount.value(), company_id)
             .await?;
@@ -1239,6 +1292,22 @@ impl PricingEngine {
     }
 
     pub fn next_template_expire(base_expiry: DateTime<Utc>, cost_plan: &VmCostPlan) -> u64 {
+        Self::interval_seconds_from(
+            base_expiry,
+            cost_plan.interval_type,
+            cost_plan.interval_amount,
+        )
+    }
+
+    /// Seconds one `interval_amount` `interval_type` period adds to an expiry,
+    /// counted from `base_expiry` (clamped to now so expired VMs get a sensible
+    /// value). Months and years are calendar time, so the result depends on the
+    /// base.
+    pub fn interval_seconds_from(
+        base_expiry: DateTime<Utc>,
+        interval_type: IntervalType,
+        interval_amount: u64,
+    ) -> u64 {
         // Clamp the base to now so expired VMs get a sensible time_value
         let base = base_expiry.max(Utc::now());
         // `Days`/`Months` addition panics on overflow, and the `as u32` casts
@@ -1246,17 +1315,16 @@ impl PricingEngine {
         // must not be able to abort the process, so every step is checked and
         // falls back to leaving the expiry untouched (yielding a zero interval,
         // which the callers already treat as "nothing to bill").
-        let next_expire = match cost_plan.interval_type {
-            IntervalType::Hour => i64::try_from(cost_plan.interval_amount)
+        let next_expire = match interval_type {
+            IntervalType::Hour => i64::try_from(interval_amount)
                 .ok()
                 .and_then(TimeDelta::try_hours)
                 .and_then(|d| base.checked_add_signed(d)),
-            IntervalType::Day => base.checked_add_days(Days::new(cost_plan.interval_amount)),
-            IntervalType::Month => u32::try_from(cost_plan.interval_amount)
+            IntervalType::Day => base.checked_add_days(Days::new(interval_amount)),
+            IntervalType::Month => u32::try_from(interval_amount)
                 .ok()
                 .and_then(|m| base.checked_add_months(Months::new(m))),
-            IntervalType::Year => cost_plan
-                .interval_amount
+            IntervalType::Year => interval_amount
                 .checked_mul(12)
                 .and_then(|m| u32::try_from(m).ok())
                 .and_then(|m| base.checked_add_months(Months::new(m))),
@@ -1750,7 +1818,22 @@ impl PricingEngine {
             .get_amount_and_rate(new_cost_until_expire, method)
             .await?;
         let discount_currency = self.get_amount_and_rate(discount_currency, method).await?;
-        let new_renewal_currency = self.get_amount_and_rate(new_price, method).await?;
+        let mut new_renewal_currency = self.get_amount_and_rate(new_price, method).await?;
+        // The new renewal is one billing interval of the VM's subscription; the
+        // prices above are monthly.
+        let subscription = self
+            .db
+            .get_subscription_by_line_item_id(
+                self.db.get_vm(vm_id).await?.subscription_line_item_id,
+            )
+            .await?;
+        let scaled = scale_monthly_to_interval(
+            new_renewal_currency.amount.value(),
+            subscription.interval_type,
+            subscription.interval_amount,
+        );
+        new_renewal_currency.amount =
+            CurrencyAmount::from_u64(new_renewal_currency.amount.currency(), scaled);
 
         let upgrade = new_cost_until_expire.sub(discount_currency)?;
 
@@ -2241,6 +2324,76 @@ mod tests {
         assert_eq!(400, price.disk_cost);
         assert_eq!(855, price.total());
 
+        Ok(())
+    }
+
+    #[test]
+    fn monthly_price_scales_to_the_billing_interval() {
+        // A month is the identity, and an unset (zero) amount counts as one.
+        assert_eq!(72_000, scale_monthly_to_interval(72_000, IntervalType::Month, 1));
+        assert_eq!(72_000, scale_monthly_to_interval(72_000, IntervalType::Month, 0));
+        // 30-day month: 720 hours, so an hour is 1/720th, rounded UP.
+        assert_eq!(100, scale_monthly_to_interval(72_000, IntervalType::Hour, 1));
+        assert_eq!(101, scale_monthly_to_interval(72_001, IntervalType::Hour, 1));
+        assert_eq!(600, scale_monthly_to_interval(72_000, IntervalType::Hour, 6));
+        assert_eq!(2_400, scale_monthly_to_interval(72_000, IntervalType::Day, 1));
+        assert_eq!(864_000, scale_monthly_to_interval(72_000, IntervalType::Year, 1));
+        // Never wraps on a huge monthly price.
+        assert_eq!(
+            u64::MAX,
+            scale_monthly_to_interval(u64::MAX, IntervalType::Year, 1)
+        );
+    }
+
+    /// An hourly custom pricing model bills each hour a 1/720th share of the
+    /// monthly price, quoted in the payment currency, and extends by one hour.
+    #[tokio::test]
+    async fn hourly_custom_vm_renewal_charges_an_hourly_share() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+        setup_upgrade_test_data(&db).await?;
+        add_custom_pricing(&db).await;
+        db.vms.lock().await.insert(
+            1,
+            Vm {
+                id: 1,
+                user_id: 1,
+                template_id: None,
+                custom_template_id: Some(1),
+                deleted: false,
+                ..MockDb::mock_vm()
+            },
+        );
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let pe = PricingEngine::new(db.clone(), rates, VatClient::new());
+
+        // Monthly (the default): the whole monthly price buys a month.
+        let monthly = match pe.get_vm_cost(1, PaymentMethod::Lightning).await? {
+            CostResult::New(p) => p,
+            _ => bail!("expected a new payment"),
+        };
+
+        // Switch the VM's subscription to hourly billing.
+        let li = db
+            .get_subscription_by_line_item_id(MockDb::mock_vm().subscription_line_item_id)
+            .await?;
+        let mut sub = li.clone();
+        sub.interval_type = IntervalType::Hour;
+        sub.interval_amount = 1;
+        db.update_subscription(&sub).await?;
+
+        let hourly = match pe.get_vm_cost(1, PaymentMethod::Lightning).await? {
+            CostResult::New(p) => p,
+            _ => bail!("expected a new payment"),
+        };
+        assert_eq!(3_600, hourly.time_value);
+        assert_eq!(
+            round_msat_to_sat(monthly.amount.div_ceil(720)),
+            hourly.amount,
+            "an hour costs 1/720th of the monthly price, whole sats"
+        );
+        assert!(hourly.amount < monthly.amount);
         Ok(())
     }
 

@@ -1451,6 +1451,11 @@ pub struct VmCustomPricing {
     pub min_network_mbps: u32,
     pub max_network_mbps: u32,
     pub network_cost_per_gbps: u64,
+    /// Billing interval of VMs built from this model, e.g. `1` `Month`. The
+    /// rates above are always per month; a shorter interval charges the
+    /// matching fraction of the monthly price each period.
+    pub interval_amount: u64,
+    pub interval_type: IntervalType,
 }
 
 /// Pricing per GB on a disk type (SSD/HDD)

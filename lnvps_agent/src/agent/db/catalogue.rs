@@ -11,7 +11,7 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use lnvps_api_common::{
-    CUSTOM_VM_INTERVAL_AMOUNT, PricingEngine, alt_prices, apply_custom_pricing_limits,
+    PricingEngine, alt_prices, apply_custom_pricing_limits,
 };
 use lnvps_db::{
     DiskInterface, DiskType, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
@@ -26,6 +26,16 @@ fn interval(plan: &VmCostPlan) -> String {
         "{} {}",
         plan.interval_amount,
         format!("{:?}", plan.interval_type).to_lowercase()
+    )
+}
+
+/// Human-readable billing interval of a custom pricing model. Its rates are
+/// always per month, so a shorter interval charges a share of the monthly price.
+fn custom_interval(pricing: &VmCustomPricing) -> String {
+    format!(
+        "{} {}",
+        pricing.interval_amount.max(1),
+        format!("{:?}", pricing.interval_type).to_lowercase()
     )
 }
 
@@ -213,7 +223,7 @@ impl DbToolExecutor {
             "name": pricing.name,
             "region": { "id": pricing.region_id, "name": region_name },
             "currency": pricing.currency,
-            "billing_interval": format!("{} month(s)", CUSTOM_VM_INTERVAL_AMOUNT),
+            "billing_interval": custom_interval(&pricing),
             "cost_per_cpu_core": self.priced(unit(pricing.cpu_cost)).await,
             "cost_per_gb_memory": self.priced(unit(pricing.memory_cost)).await,
             "cost_per_ip4": self.priced(unit(pricing.ip4_cost)).await,
@@ -334,7 +344,7 @@ impl DbToolExecutor {
                 "transfer_gb": template.transfer_gb,
                 "network_mbps": template.network_mbps,
             },
-            "billing_interval": format!("{} month(s)", CUSTOM_VM_INTERVAL_AMOUNT),
+            "billing_interval": custom_interval(&pricing),
             "breakdown": {
                 "cpu": money(part(price.cpu_cost)),
                 "memory": money(part(price.memory_cost)),

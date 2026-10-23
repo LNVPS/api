@@ -2483,6 +2483,10 @@ Body:
   "network_cost_per_gbps": number,
   // optional - Cost per Gbit/s of network speed, billed on the whole speed chosen,
   // smallest currency units, default 0
+  "interval_amount": number,
+  // optional - Billing interval, default 1 month. Rates stay per month; a
+  // shorter interval charges the matching share each period
+  "interval_type": "hour" | "day" | "month" | "year",
   "disk_pricing": [
     // Array of disk pricing configurations
     {
@@ -2568,6 +2572,9 @@ Body (all optional):
   "min_network_mbps": number,
   "max_network_mbps": number,
   "network_cost_per_gbps": number,
+  "interval_amount": number,
+  // Billing interval; rates stay per month, a shorter interval charges the matching share each period
+  "interval_type": "hour" | "day" | "month" | "year",
   "disk_pricing": [
     {
       "kind": "ssd",
@@ -2762,8 +2769,11 @@ Body:
   // Name for the new pricing model
   "region_id": number,
   // Target region ID (optional, defaults to source region)
-  "enabled": boolean
+  "enabled": boolean,
   // Enable the new pricing model (optional, default true)
+  "interval_amount": number,
+  "interval_type": "hour" | "day" | "month" | "year"
+  // Billing interval for the copy (optional, defaults to the source's)
 }
 ```
 
@@ -6740,6 +6750,9 @@ The RBAC system uses the following permission format: `resource::action`
   "min_network_mbps": number,
   "max_network_mbps": number,
   "network_cost_per_gbps": number,
+  "interval_amount": number,
+  // Billing interval; rates stay per month, a shorter interval charges the matching share each period
+  "interval_type": "hour" | "day" | "month" | "year",
   "disk_pricing": [
     // Array of disk pricing configurations
     {

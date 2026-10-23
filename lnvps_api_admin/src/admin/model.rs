@@ -2105,6 +2105,10 @@ pub struct AdminCustomPricingInfo {
     pub min_network_mbps: u32,
     pub max_network_mbps: u32,
     pub network_cost_per_gbps: u64,
+    /// Billing interval of VMs built from this model. Rates are per month; a
+    /// shorter interval (e.g. 1 hour) charges the matching share each period.
+    pub interval_amount: u64,
+    pub interval_type: ApiIntervalType,
 }
 
 #[derive(Serialize)]
@@ -2371,6 +2375,9 @@ pub struct UpdateCustomPricingRequest {
     pub min_network_mbps: Option<u32>,
     pub max_network_mbps: Option<u32>,
     pub network_cost_per_gbps: Option<u64>,
+    /// Billing interval; defaults to 1 month
+    pub interval_amount: Option<u64>,
+    pub interval_type: Option<ApiIntervalType>,
 }
 
 #[derive(Deserialize)]
@@ -2428,6 +2435,9 @@ pub struct CreateCustomPricingRequest {
     pub min_network_mbps: Option<u32>,
     pub max_network_mbps: Option<u32>,
     pub network_cost_per_gbps: Option<u64>,
+    /// Billing interval; defaults to 1 month
+    pub interval_amount: Option<u64>,
+    pub interval_type: Option<ApiIntervalType>,
 }
 
 #[derive(Deserialize)]
@@ -2445,6 +2455,9 @@ pub struct CopyCustomPricingRequest {
     pub name: String,
     pub region_id: Option<u64>,
     pub enabled: Option<bool>,
+    /// Billing interval for the copy; defaults to the source's
+    pub interval_amount: Option<u64>,
+    pub interval_type: Option<ApiIntervalType>,
 }
 
 // Company Management Models

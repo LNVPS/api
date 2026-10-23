@@ -11,7 +11,7 @@ use lnvps_api_common::retry::{OpResult, Pipeline, RetryPolicy};
 use lnvps_api_common::{
     AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, NewPaymentInfo,
     PricingEngine, UpgradeConfig, UpgradeCostQuote, VmStateCache, apply_custom_pricing_limits,
-    round_msat_to_sat, upgrade_bandwidth,
+    round_msat_to_sat, scale_monthly_to_interval, upgrade_bandwidth,
 };
 use lnvps_api_common::{ExchangeRateService, op_fatal};
 use lnvps_db::{
@@ -332,7 +332,9 @@ impl VmProvisioner {
         let template_id = self.db.insert_custom_vm_template(&template).await?;
         let region = self.db.get_host_region(pricing.region_id).await?;
 
-        // Create subscription for this custom VM (1-month interval, amount computed at payment time)
+        // Create subscription for this custom VM. It bills on the pricing model's
+        // interval (monthly unless the model says otherwise); the amount is
+        // computed at payment time.
         let subscription = Subscription {
             id: 0,
             user_id: user.id,
@@ -344,8 +346,8 @@ impl VmProvisioner {
             is_active: false,
             is_setup: false,
             currency: pricing.currency.clone(),
-            interval_amount: 1,
-            interval_type: IntervalType::Month,
+            interval_amount: pricing.interval_amount.max(1),
+            interval_type: pricing.interval_type,
             setup_fee: 0,
             // Default new custom VM subscriptions to auto-renew (see note above).
             auto_renewal_enabled: true,
@@ -408,7 +410,11 @@ impl VmProvisioner {
         // Record the base monthly amount now that the VM id is known. With no IP
         // assignments yet this prices the base config plus the minimum 1x IPv4/IPv6.
         let price = PricingEngine::get_custom_vm_cost_amount(&self.db, &template).await?;
-        li.amount = price.total();
+        li.amount = scale_monthly_to_interval(
+            price.total(),
+            pricing.interval_type,
+            pricing.interval_amount.max(1),
+        );
         self.db.update_subscription_line_item(&li).await?;
 
         Ok(new_vm)
@@ -536,8 +542,8 @@ impl VmProvisioner {
             is_active: false,
             is_setup: false,
             currency: pricing.currency.clone(),
-            interval_amount: 1,
-            interval_type: IntervalType::Month,
+            interval_amount: pricing.interval_amount.max(1),
+            interval_type: pricing.interval_type,
             setup_fee: 0,
             auto_renewal_enabled: true,
             external_id: None,
@@ -597,7 +603,11 @@ impl VmProvisioner {
             .await?;
         li.name = format!("VM{} - {}", new_vm.id, pricing.name);
         let price = PricingEngine::get_custom_vm_cost_amount(&self.db, &template).await?;
-        li.amount = price.total();
+        li.amount = scale_monthly_to_interval(
+            price.total(),
+            pricing.interval_type,
+            pricing.interval_amount.max(1),
+        );
         self.db.update_subscription_line_item(&li).await?;
 
         Ok(new_vm)
@@ -955,14 +965,15 @@ impl VmProvisioner {
 
         self.db.update_vm(&vm).await?;
 
-        // Update the subscription to 1-Month billing (custom VMs are always monthly)
+        // Bill the subscription on the custom pricing model's interval
+        let new_pricing = self.db.get_custom_pricing(new_custom_template.pricing_id).await?;
         let line_item = self
             .db
             .get_subscription_line_item(vm.subscription_line_item_id)
             .await?;
         let mut subscription = self.db.get_subscription(line_item.subscription_id).await?;
-        subscription.interval_amount = 1;
-        subscription.interval_type = IntervalType::Month;
+        subscription.interval_amount = new_pricing.interval_amount.max(1);
+        subscription.interval_type = new_pricing.interval_type;
         self.db.update_subscription(&subscription).await?;
 
         // Calculate the new base-currency cost for the new custom template and update the line
@@ -975,7 +986,11 @@ impl VmProvisioner {
         let mut updated_line_item = line_item;
         updated_line_item.subscription_type = LineItemType::Vps;
         updated_line_item.configuration = Some(serde_json::to_value(cfg)?);
-        updated_line_item.amount = new_price.total();
+        updated_line_item.amount = scale_monthly_to_interval(
+            new_price.total(),
+            new_pricing.interval_type,
+            new_pricing.interval_amount.max(1),
+        );
         self.db
             .update_subscription_line_item(&updated_line_item)
             .await?;
@@ -999,7 +1014,12 @@ impl VmProvisioner {
             .db
             .get_subscription_line_item(vm.subscription_line_item_id)
             .await?;
-        line_item.amount = new_price.total();
+        let subscription = self.db.get_subscription(line_item.subscription_id).await?;
+        line_item.amount = scale_monthly_to_interval(
+            new_price.total(),
+            subscription.interval_type,
+            subscription.interval_amount,
+        );
         self.db.update_subscription_line_item(&line_item).await?;
 
         Ok(())
@@ -2510,6 +2530,51 @@ mod tests {
         assert!(!sub.is_active);
         assert!(!sub.is_setup);
 
+        Ok(())
+    }
+
+    /// A custom pricing model's billing interval seeds the VM's subscription, and
+    /// the line item shows what one interval costs rather than the monthly price.
+    #[tokio::test]
+    async fn test_provision_custom_uses_the_pricing_interval() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let prov = make_provisioner(db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        let pricing_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let template = lnvps_db::VmCustomTemplate {
+            id: 0,
+            cpu: 2,
+            memory: 4 * GB,
+            disk_size: 50 * GB,
+            disk_type: DiskType::SSD,
+            disk_interface: DiskInterface::PCIe,
+            pricing_id,
+            ..Default::default()
+        };
+
+        let monthly_vm = prov
+            .provision_custom(user.id, template.clone(), 1, ssh_key.id, None)
+            .await?;
+        let monthly_item = db
+            .get_subscription_line_item(monthly_vm.subscription_line_item_id)
+            .await?;
+
+        {
+            let mut p = db.custom_pricing.lock().await;
+            let pricing = p.get_mut(&pricing_id).unwrap();
+            pricing.interval_type = IntervalType::Hour;
+            pricing.interval_amount = 1;
+        }
+        let hourly_vm = prov
+            .provision_custom(user.id, template, 1, ssh_key.id, None)
+            .await?;
+        let hourly_item = db
+            .get_subscription_line_item(hourly_vm.subscription_line_item_id)
+            .await?;
+        let sub = db.get_subscription(hourly_item.subscription_id).await?;
+        assert!(matches!(sub.interval_type, IntervalType::Hour));
+        assert_eq!(1, sub.interval_amount);
+        assert_eq!(monthly_item.amount.div_ceil(720), hourly_item.amount);
         Ok(())
     }
 

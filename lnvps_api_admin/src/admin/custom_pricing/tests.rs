@@ -1,4 +1,5 @@
 use super::*;
+use lnvps_api_common::ApiIntervalType;
 use crate::admin::model::Permission;
 use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VatClient, VmStateCache};
 use serde_json::json;
@@ -141,4 +142,60 @@ async fn update_and_copy_carry_bandwidth_pricing() {
     assert_eq!(copied.transfer_cost_per_tb, 120);
     assert_eq!(copied.max_network_mbps, 10000);
     assert_eq!(copied.network_cost_per_gbps, 250);
+}
+
+#[tokio::test]
+async fn interval_defaults_to_monthly_and_copy_can_override_it() {
+    let this = state();
+    let created = admin_create_custom_pricing(
+        auth(),
+        State(this.clone()),
+        Json(create_request(json!({}))),
+    )
+    .await
+    .unwrap()
+    .0
+    .data;
+    assert_eq!(created.interval_amount, 1);
+    assert_eq!(created.interval_type, ApiIntervalType::Month);
+
+    // A plain copy keeps the source's interval.
+    let copy: CopyCustomPricingRequest = serde_json::from_value(json!({ "name": "same" })).unwrap();
+    let same = admin_copy_custom_pricing(auth(), State(this.clone()), Path(created.id), Json(copy))
+        .await
+        .unwrap()
+        .0
+        .data;
+    assert_eq!(same.interval_type, ApiIntervalType::Month);
+
+    // A copy can switch to hourly in one call.
+    let copy: CopyCustomPricingRequest = serde_json::from_value(
+        json!({ "name": "hourly", "interval_type": "hour", "interval_amount": 1 }),
+    )
+    .unwrap();
+    let hourly = admin_copy_custom_pricing(auth(), State(this.clone()), Path(created.id), Json(copy))
+        .await
+        .unwrap()
+        .0
+        .data;
+    assert_eq!(hourly.interval_type, ApiIntervalType::Hour);
+    assert_eq!(hourly.cpu_cost, created.cpu_cost);
+
+    // Update changes it; a zero amount is refused.
+    let patch: UpdateCustomPricingRequest =
+        serde_json::from_value(json!({ "interval_type": "day", "interval_amount": 2 })).unwrap();
+    let updated = admin_update_custom_pricing(auth(), State(this.clone()), Path(created.id), Json(patch))
+        .await
+        .unwrap()
+        .0
+        .data;
+    assert_eq!(updated.interval_type, ApiIntervalType::Day);
+    assert_eq!(updated.interval_amount, 2);
+    let zero: UpdateCustomPricingRequest =
+        serde_json::from_value(json!({ "interval_amount": 0 })).unwrap();
+    assert!(
+        admin_update_custom_pricing(auth(), State(this), Path(created.id), Json(zero))
+            .await
+            .is_err()
+    );
 }

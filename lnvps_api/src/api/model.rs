@@ -2,11 +2,12 @@
 pub use lnvps_api_common::*;
 
 use crate::exchange::{ExchangeRateService, alt_prices};
+use lnvps_api_common::scale_monthly_to_interval;
 use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 use humantime::format_duration;
 use lnvps_api_common::{ApiDiskInterface, ApiDiskType};
-use lnvps_db::{PaymentMethod, VmCustomTemplate};
+use lnvps_db::{IntervalType, PaymentMethod, VmCustomTemplate};
 
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::{Deserialize, Serialize};
@@ -60,19 +61,43 @@ pub struct ApiCustomVmPrice {
     /// backward compatibility; will be removed in a future release.
     pub other_price: Vec<ApiPrice>,
     /// Billing period the amount buys, same shape as a standard template's cost
-    /// plan. Custom builds renew monthly, so this is always 1 month.
+    /// plan. Follows the custom pricing model's interval (monthly by default).
     pub interval_amount: u64,
     pub interval_type: ApiIntervalType,
 }
 
 impl ApiCustomVmPrice {
-    /// Build from a base [`CurrencyAmount`], expanding conversions to the other
-    /// supported currencies via the exchange rates.
+    /// Build from a monthly base [`CurrencyAmount`], expanding conversions to
+    /// the other supported currencies via the exchange rates.
+    ///
+    /// `interval_*` is the pricing model's billing interval. The rates are
+    /// monthly, so a shorter interval quotes the matching share of the monthly
+    /// price. That share is a fraction of a cent for an hourly VM, so it is
+    /// quoted in BTC millisats (as hourly VMs are paid from credit) rather than
+    /// rounded to a whole fiat cent.
     pub async fn from_amount(
         amount: CurrencyAmount,
+        interval_type: IntervalType,
+        interval_amount: u64,
         rates: &Arc<dyn ExchangeRateService>,
     ) -> Result<Self> {
         let rate_list = rates.list_rates().await?;
+        let amount = if interval_type == IntervalType::Month && interval_amount == 1 {
+            amount
+        } else {
+            let base = if amount.currency() == Currency::BTC {
+                Some(amount)
+            } else {
+                alt_prices(&rate_list, amount)
+                    .into_iter()
+                    .find(|p| p.currency() == Currency::BTC)
+            }
+            .unwrap_or(amount);
+            CurrencyAmount::from_u64(
+                base.currency(),
+                scale_monthly_to_interval(base.value(), interval_type, interval_amount),
+            )
+        };
         let other_price = alt_prices(&rate_list, amount)
             .into_iter()
             .map(|p| ApiPrice {
@@ -84,8 +109,8 @@ impl ApiCustomVmPrice {
             currency: amount.currency().into(),
             amount: amount.value(),
             other_price,
-            interval_amount: CUSTOM_VM_INTERVAL_AMOUNT,
-            interval_type: CUSTOM_VM_INTERVAL_TYPE.into(),
+            interval_amount,
+            interval_type: interval_type.into(),
         })
     }
 }

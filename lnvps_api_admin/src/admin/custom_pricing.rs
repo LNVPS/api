@@ -120,6 +120,8 @@ impl AdminCustomPricingInfo {
             min_network_mbps: pricing.min_network_mbps,
             max_network_mbps: pricing.max_network_mbps,
             network_cost_per_gbps: pricing.network_cost_per_gbps,
+            interval_amount: pricing.interval_amount,
+            interval_type: pricing.interval_type.into(),
         })
     }
 }
@@ -228,8 +230,11 @@ async fn admin_create_custom_pricing(
             .max_network_mbps
             .unwrap_or(req.network_mbps.unwrap_or(0)),
         network_cost_per_gbps: req.network_cost_per_gbps.unwrap_or(0),
+        interval_amount: req.interval_amount.unwrap_or(1),
+        interval_type: req.interval_type.map(Into::into).unwrap_or_default(),
     };
 
+    validate_interval(&pricing)?;
     validate_ip_ranges(&pricing)?;
     validate_bandwidth_ranges(&pricing)?;
     let _region = this.db.get_host_region(pricing.region_id).await?;
@@ -379,7 +384,14 @@ async fn admin_update_custom_pricing(
     if let Some(v) = req.network_cost_per_gbps {
         pricing.network_cost_per_gbps = v;
     }
+    if let Some(v) = req.interval_amount {
+        pricing.interval_amount = v;
+    }
+    if let Some(v) = req.interval_type {
+        pricing.interval_type = v.into();
+    }
 
+    validate_interval(&pricing)?;
     validate_ip_ranges(&pricing)?;
     validate_bandwidth_ranges(&pricing)?;
 
@@ -506,7 +518,13 @@ async fn admin_copy_custom_pricing(
         min_network_mbps: source_pricing.min_network_mbps,
         max_network_mbps: source_pricing.max_network_mbps,
         network_cost_per_gbps: source_pricing.network_cost_per_gbps,
+        interval_amount: req.interval_amount.unwrap_or(source_pricing.interval_amount),
+        interval_type: req
+            .interval_type
+            .map(Into::into)
+            .unwrap_or(source_pricing.interval_type),
     };
+    validate_interval(&new_pricing)?;
 
     let new_pricing_id = this.db.insert_custom_pricing(&new_pricing).await?;
 
@@ -540,6 +558,14 @@ fn validate_ip_ranges(pricing: &VmCustomPricing) -> Result<(), ApiError> {
     }
     if pricing.min_ip6 > pricing.max_ip6 {
         return Err(ApiError::bad_request("min_ip6 cannot exceed max_ip6"));
+    }
+    Ok(())
+}
+
+/// A billing interval must be at least one period long.
+fn validate_interval(pricing: &VmCustomPricing) -> Result<(), ApiError> {
+    if pricing.interval_amount == 0 {
+        return Err(ApiError::bad_request("interval_amount must be at least 1"));
     }
     Ok(())
 }
