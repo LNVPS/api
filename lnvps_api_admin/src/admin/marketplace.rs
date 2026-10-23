@@ -830,6 +830,7 @@ mod tests {
                     amount: 0,
                     setup_amount: 5000,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await

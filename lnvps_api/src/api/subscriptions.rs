@@ -316,6 +316,7 @@ async fn v1_create_subscription(
                     amount,
                     setup_amount,
                     configuration,
+                    deactivated_at: None,
                 }
             },
         )

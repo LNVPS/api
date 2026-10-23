@@ -1406,7 +1406,10 @@ mod tests {
             external_id: None,
         };
         // Age does not lengthen an hourly grace, and delete_after is ignored.
-        assert_eq!(grace_period_for_sub(&sub, Utc::now(), 30), HOURLY_GRACE_PERIOD);
+        assert_eq!(
+            grace_period_for_sub(&sub, Utc::now(), 30),
+            HOURLY_GRACE_PERIOD
+        );
         assert_eq!(HOURLY_GRACE_PERIOD, TimeDelta::hours(24));
         // Other intervals keep the age-tiered whole-day window.
         sub.interval_type = IntervalType::Month;
@@ -1425,8 +1428,14 @@ mod tests {
     fn api_interval_type_hour_round_trips() {
         use super::ApiIntervalType;
         use lnvps_db::IntervalType;
-        assert_eq!(ApiIntervalType::from(IntervalType::Hour), ApiIntervalType::Hour);
-        assert_eq!(IntervalType::from(ApiIntervalType::Hour), IntervalType::Hour);
+        assert_eq!(
+            ApiIntervalType::from(IntervalType::Hour),
+            ApiIntervalType::Hour
+        );
+        assert_eq!(
+            IntervalType::from(ApiIntervalType::Hour),
+            IntervalType::Hour
+        );
         assert_eq!(
             serde_json::to_string(&ApiIntervalType::Hour).unwrap(),
             "\"hour\""
@@ -1532,6 +1541,7 @@ mod tests {
                     amount: 100,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 })
                 .await
                 .unwrap();

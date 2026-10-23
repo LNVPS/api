@@ -1120,7 +1120,10 @@ historical range is needed; a usage bar can be rendered from this object alone.
 - **DELETE** `/api/v1/vm/{id}`
 - **Auth**: Required
 - **Response**: `null`. The deletion is queued, not immediate.
-- **Description**: Deletes a VM you no longer need and stops its billing: the subscription is deactivated and auto-renewal is turned off. For a VM on an hourly subscription, the time you have paid for but not used is returned to your account credit, in proportion to what each payment charged (tax included), and only for payments account credit paid in full. Cash payments and VMs on other intervals are not refunded.
+- **Description**: Deletes a VM you no longer need and stops its billing. If the VM's subscription bills nothing else, the subscription is deactivated and auto-renewal turned off; if it also bills other products (an IP range, an app), only the VM's line item stops and the rest keep billing. The time you paid for but did not use is returned to your account credit, whatever the billing interval, as a `refund` event:
+  - each payment gives back the share of what it charged (tax included) that the unused time represents, and on a shared subscription only the VM line item's share of it;
+  - what account credit paid comes back as exactly the credit it took;
+  - what was paid in cash (Lightning, card, on-chain, swap) comes back as credit at the current exchange rate. It is not paid out to the original method.
 - **Errors**: `403 Forbidden` if the VM is not yours; `404 Not Found` if it does not exist or is already deleted; `409 Conflict` if the VM is the subject of an open abuse case.
 
 #### Reinstall VM

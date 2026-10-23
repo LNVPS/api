@@ -204,7 +204,8 @@ fn ensure_credit_funded_if_hourly(
     net: u64,
     tax: u64,
 ) -> Result<()> {
-    if subscription.interval_type != lnvps_db::IntervalType::Hour || credit_covers(credit, net, tax) {
+    if subscription.interval_type != lnvps_db::IntervalType::Hour || credit_covers(credit, net, tax)
+    {
         return Ok(());
     }
     bail!(
@@ -570,7 +571,12 @@ impl SubscriptionHandler {
         let line_items = self
             .db
             .list_subscription_line_items(payment.subscription_id)
-            .await?;
+            .await?
+            .into_iter()
+            // A deactivated item's resource is gone: it is not billed,
+            // renewed or handed lifecycle events.
+            .filter(|li| li.is_active())
+            .collect::<Vec<_>>();
         for li in &line_items {
             match self.make_line_item_handler(li).await {
                 Ok(handler) => {
@@ -1004,8 +1010,16 @@ impl SubscriptionHandler {
         let line_items = self
             .db
             .list_subscription_line_items(subscription_id)
-            .await?;
-        ensure!(!line_items.is_empty(), "Subscription has no line items");
+            .await?
+            .into_iter()
+            // A deactivated item's resource is gone: it is not billed,
+            // renewed or handed lifecycle events.
+            .filter(|li| li.is_active())
+            .collect::<Vec<_>>();
+        ensure!(
+            !line_items.is_empty(),
+            "Subscription has no active line items"
+        );
 
         // Get user for tax calculation
         let user = self.db.get_user(subscription.user_id).await?;
@@ -2745,6 +2759,7 @@ mod revolut_autorenew_tests {
                     amount: 999, // €9.99
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await?;
@@ -2913,6 +2928,7 @@ pub(crate) mod revolut_offline_tests {
                     amount: 999,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await
@@ -2990,6 +3006,7 @@ pub(crate) mod revolut_offline_tests {
                     amount: 100_000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await
@@ -3068,6 +3085,7 @@ pub(crate) mod revolut_offline_tests {
                     amount: 100, // 1.00 EUR
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await
@@ -3143,6 +3161,7 @@ pub(crate) mod revolut_offline_tests {
                     amount: 100_000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await
@@ -3235,6 +3254,7 @@ pub(crate) mod revolut_offline_tests {
                     amount: 100_000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await
@@ -3704,6 +3724,7 @@ mod sunset_tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await
@@ -3875,6 +3896,7 @@ mod discount_tests {
                     amount: 1_000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await
@@ -4334,6 +4356,7 @@ mod credit_tests {
                     amount: 1_000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await
@@ -4789,6 +4812,7 @@ mod credit_tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await

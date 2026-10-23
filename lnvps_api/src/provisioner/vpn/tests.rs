@@ -110,6 +110,7 @@ async fn a_plan_with(
                 amount: 500,
                 setup_amount: 0,
                 configuration: None,
+                deactivated_at: None,
             }],
         )
         .await?;

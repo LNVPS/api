@@ -1496,6 +1496,7 @@ mod tests {
                 amount,
                 setup_amount: 0,
                 configuration: None,
+                deactivated_at: None,
             },
         );
         db.subscription_payments

@@ -250,6 +250,121 @@ mod tests {
         }
     }
 
+    /// A refund to credit writes the refund row, the balance and a ledger event
+    /// pointing at the row in one transaction, and a repeat with the same row
+    /// id changes nothing. Also exercises `subscription_line_item.deactivated_at`.
+    #[tokio::test]
+    async fn mysql_refund_to_credit_is_atomic_and_once() {
+        use lnvps_db::{
+            LineItemType, PaymentMethod, Subscription, SubscriptionLineItem, SubscriptionPayment,
+            SubscriptionPaymentType,
+        };
+        let (uid, _customer) = customer().await;
+        let pool = db::connect().await.unwrap();
+        let db = db::lnvps_db().await.unwrap();
+
+        let (sub_id, lines) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id: uid,
+                    company_id: 1,
+                    name: "refund e2e".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: true,
+                    is_setup: true,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: lnvps_db::IntervalType::Hour,
+                    setup_fee: 0,
+                    auto_renewal_enabled: true,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: LineItemType::IpRange,
+                    name: "x".to_string(),
+                    description: None,
+                    amount: 1,
+                    setup_amount: 0,
+                    configuration: None,
+                    deactivated_at: None,
+                }],
+            )
+            .await
+            .unwrap();
+
+        // The new column round-trips.
+        let mut li = db.get_subscription_line_item(lines[0]).await.unwrap();
+        assert!(li.is_active());
+        li.deactivated_at = Some(Utc::now());
+        db.update_subscription_line_item(&li).await.unwrap();
+        assert!(
+            !db.get_subscription_line_item(lines[0])
+                .await
+                .unwrap()
+                .is_active()
+        );
+        assert_eq!(
+            db.get_subscription(sub_id).await.unwrap().interval_type,
+            lnvps_db::IntervalType::Hour,
+            "hour round-trips through the SMALLINT column"
+        );
+
+        let row = SubscriptionPayment {
+            id: Keys::generate().public_key().to_bytes().to_vec(),
+            subscription_id: sub_id,
+            user_id: uid,
+            created: Utc::now(),
+            expires: Utc::now(),
+            amount: 100,
+            currency: "EUR".to_string(),
+            payment_method: PaymentMethod::Lightning,
+            payment_type: SubscriptionPaymentType::Refund,
+            external_data: "".into(),
+            external_id: None,
+            is_paid: true,
+            rate: 1.0,
+            time_value: None,
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: Some(Utc::now()),
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+            renewal_source: None,
+        };
+        assert!(
+            db.insert_refund_to_credit(&row, 7_000, Some("e2e"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            !db.insert_refund_to_credit(&row, 7_000, Some("e2e"))
+                .await
+                .unwrap(),
+            "the same refund row is not booked twice"
+        );
+        assert_eq!(db.get_account_credit(uid).await.unwrap().balance, 7_000);
+        assert_eq!(ledger_sum(&pool, uid).await, 7_000);
+        let linked: Option<Vec<u8>> = sqlx::query_scalar(
+            "SELECT subscription_payment_id FROM account_credit_event WHERE user_id = ? AND kind = 'refund'",
+        )
+        .bind(uid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(linked, Some(row.id.clone()));
+        pool.close().await;
+    }
+
     async fn ledger_sum(pool: &sqlx::MySqlPool, user_id: u64) -> i64 {
         sqlx::query_scalar(
             "SELECT CAST(COALESCE(SUM(amount), 0) AS SIGNED) FROM account_credit_event WHERE user_id = ?",

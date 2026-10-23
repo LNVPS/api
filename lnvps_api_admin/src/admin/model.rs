@@ -4049,6 +4049,10 @@ pub struct AdminSubscriptionLineItemInfo {
     /// Typed reference to the resource this line item bills for, resolved from
     /// `subscription_type` (`null` when there is no linked resource).
     pub resource: Option<ApiSubscriptionLineItemResource>,
+    /// When this line item stopped billing on its own (its resource was
+    /// deleted while the subscription bills other products). `null` while
+    /// active.
+    pub deactivated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Deserialize)]
@@ -4101,6 +4105,7 @@ impl AdminSubscriptionLineItemInfo {
             setup_amount: line_item.setup_amount,
             configuration: line_item.configuration,
             resource,
+            deactivated_at: line_item.deactivated_at,
         }
     }
 }
@@ -4120,6 +4125,7 @@ impl AdminCreateSubscriptionLineItemRequest {
             amount: self.amount,
             setup_amount: self.setup_amount,
             configuration: self.configuration.clone(),
+            deactivated_at: None,
         })
     }
 }

@@ -485,6 +485,7 @@ pub(crate) async fn start_node_fee(
         amount: 0,
         setup_amount: company.marketplace_node_fee,
         configuration: None,
+        deactivated_at: None,
     };
 
     let (subscription_id, line_item_ids) = db

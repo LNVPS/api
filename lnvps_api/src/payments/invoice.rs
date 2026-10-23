@@ -181,6 +181,7 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await?;
@@ -382,6 +383,7 @@ mod tests {
                     amount: 500,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await?;
@@ -521,6 +523,7 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await?;
@@ -553,6 +556,7 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await?;

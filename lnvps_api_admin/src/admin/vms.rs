@@ -1823,6 +1823,7 @@ mod tests {
                 amount: 999,
                 setup_amount: 0,
                 configuration: None,
+                deactivated_at: None,
             })
             .await
             .unwrap();

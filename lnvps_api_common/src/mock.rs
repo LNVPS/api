@@ -531,6 +531,7 @@ impl Default for MockDb {
                         amount: 1000,
                         setup_amount: 0,
                         configuration: None,
+                        deactivated_at: None,
                     },
                 );
                 m
@@ -4592,6 +4593,45 @@ impl LNVpsDbBase for MockDb {
     async fn get_account_credit_reserved(&self, user_id: u64) -> DbResult<u64> {
         let debits = self.account_credit_debits.lock().await;
         Ok(reserved_credit(&debits, user_id, None))
+    }
+
+    async fn insert_refund_to_credit(
+        &self,
+        refund: &SubscriptionPayment,
+        credit: u64,
+        note: Option<&str>,
+    ) -> DbResult<bool> {
+        if self
+            .subscription_payments
+            .lock()
+            .await
+            .iter()
+            .any(|p| p.id == refund.id)
+        {
+            return Ok(false);
+        }
+        self.insert_subscription_payment(refund).await?;
+        if credit > 0 {
+            let mut credits = self.account_credits.lock().await;
+            let mut events = self.account_credit_events.lock().await;
+            let row = credits
+                .entry(refund.user_id)
+                .or_insert_with(|| empty_account_credit(refund.user_id));
+            row.balance += credit;
+            row.updated = Utc::now();
+            let event_id = events.len() as u64 + 1;
+            events.push(lnvps_db::AccountCreditEvent {
+                id: event_id,
+                user_id: refund.user_id,
+                kind: "refund".to_string(),
+                amount: credit as i64,
+                currency: row.currency.clone(),
+                subscription_payment_id: Some(refund.id.clone()),
+                note: note.map(str::to_string),
+                created: Utc::now(),
+            });
+        }
+        Ok(true)
     }
 
     async fn adjust_account_credit(
@@ -10144,6 +10184,7 @@ mod tests {
                 amount: 1000,
                 setup_amount: 0,
                 configuration: None,
+                deactivated_at: None,
             },
         );
 
@@ -10257,6 +10298,7 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 },
             );
             db.vms.lock().await.insert(
@@ -11159,6 +11201,7 @@ mod tests {
                 amount: 1000,
                 setup_amount: 0,
                 configuration: None,
+                deactivated_at: None,
             })
             .await
             .unwrap();
@@ -11664,6 +11707,7 @@ mod marketplace_tests {
                 amount: *amount,
                 setup_amount: *setup_amount,
                 configuration: None,
+                deactivated_at: None,
             })
             .collect();
         let (sub_id, _) = db
@@ -13071,6 +13115,7 @@ mod vpn_tests {
                     amount: 500,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await

@@ -236,6 +236,7 @@ mod tests {
                 amount: 599,
                 setup_amount: 0,
                 configuration: None,
+                deactivated_at: None,
             },
         );
     }

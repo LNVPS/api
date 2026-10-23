@@ -703,8 +703,16 @@ impl PricingEngine {
         let line_items = self
             .db
             .list_subscription_line_items(subscription_id)
-            .await?;
-        ensure!(!line_items.is_empty(), "Subscription has no line items");
+            .await?
+            .into_iter()
+            // A deactivated item's resource is gone: it is not billed,
+            // renewed or handed lifecycle events.
+            .filter(|li| li.is_active())
+            .collect::<Vec<_>>();
+        ensure!(
+            !line_items.is_empty(),
+            "Subscription has no active line items"
+        );
 
         let subscription_currency = Currency::from_str(&subscription.currency)
             .map_err(|_| anyhow!("Invalid subscription currency"))?;
@@ -2408,6 +2416,7 @@ mod tests {
                     amount: 1000, // €10.00 / month
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await?;
@@ -2488,6 +2497,7 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await?;
@@ -4767,6 +4777,7 @@ mod tests {
                     amount: 1000 * multiplier as u64,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 },
             );
             let mut subs = db.subscriptions.lock().await;

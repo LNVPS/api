@@ -326,6 +326,7 @@ mod tests {
                 amount: 500,
                 setup_amount: 0,
                 configuration: None,
+                deactivated_at: None,
             },
         );
         db.app_deployments.lock().await.insert(

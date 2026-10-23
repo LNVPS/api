@@ -264,6 +264,46 @@ async fn v1_topup_credit(
 }
 
 /// Status of one of the customer's top-ups, for polling.
+/// Create a Lightning credit top-up of `amount_msat` (rounded up to whole
+/// sats, as invoices are) for `user_id` and return its BOLT11 invoice.
+///
+/// Used where a payment is better landed as credit than as a renewal: an
+/// hourly VM's LNURL, whose subscription is renewed from credit every hour.
+pub(crate) async fn new_lightning_topup(
+    this: &RouterState,
+    user_id: u64,
+    amount_msat: u64,
+    memo: String,
+) -> anyhow::Result<String> {
+    anyhow::ensure!(amount_msat > 0, "Top-up amount must be positive");
+    let amount = round_msat_to_sat(amount_msat);
+    let credit = this.db.get_account_credit(user_id).await?;
+    let invoice = this
+        .sub_handler
+        .node()
+        .add_invoice(AddInvoiceRequest {
+            memo: Some(memo),
+            amount,
+            expire: Some(LIGHTNING_TOPUP_EXPIRE as u32),
+        })
+        .await?;
+    let topup = AccountCreditTopup {
+        user_id,
+        amount,
+        currency: if credit.currency.is_empty() {
+            "BTC".to_string()
+        } else {
+            credit.currency
+        },
+        payment_method: PaymentMethod::Lightning,
+        invoice_hash: hex::decode(invoice.payment_hash())?,
+        external_data: invoice.pr(),
+        ..Default::default()
+    };
+    this.db.insert_account_credit_topup(&topup).await?;
+    Ok(topup.external_data)
+}
+
 async fn v1_get_topup(
     auth: Nip98Auth,
     State(this): State<RouterState>,

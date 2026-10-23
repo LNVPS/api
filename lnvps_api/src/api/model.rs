@@ -1312,6 +1312,10 @@ pub struct ApiSubscriptionLineItem {
     /// Typed reference to the resource this line item bills for, resolved from
     /// the line item's subscription type (`null` when there is no linked resource).
     pub resource: Option<ApiSubscriptionLineItemResource>,
+    /// When this line item stopped billing on its own (its resource was
+    /// deleted while the subscription bills other products). `null` while
+    /// active.
+    pub deactivated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl ApiSubscriptionLineItem {
@@ -1337,6 +1341,7 @@ impl ApiSubscriptionLineItem {
             setup_fee: setup_fee.into(),
             configuration: line_item.configuration,
             resource,
+            deactivated_at: line_item.deactivated_at,
         }
     }
 }

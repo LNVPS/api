@@ -458,7 +458,13 @@ impl Worker {
         let lead = expiry_lead_window(sub);
         let lead_descr = format_lead_window(lead);
 
-        let line_items = self.db.list_subscription_line_items(sub.id).await?;
+        let line_items: Vec<_> = self
+            .db
+            .list_subscription_line_items(sub.id)
+            .await?
+            .into_iter()
+            .filter(|li| li.is_active())
+            .collect();
         let sub_notification_subject = self.sub_notification_subject(sub, &line_items).await;
         let sub_notification_descr = Self::sub_notification_message(sub, &line_items);
 
@@ -505,6 +511,12 @@ impl Worker {
                     match self.subscription_handler.auto_renew(sub.id).await {
                         Ok(payment) => {
                             info!("Successfully auto-renewed subscription {}", sub.id);
+                            // An hourly subscription renews every hour; a notice
+                            // each time would be 24 messages a day. It is only
+                            // worth telling the customer when renewal fails.
+                            if sub.interval_type == IntervalType::Hour {
+                                return Ok(());
+                            }
                             let paid_with = if payment.external_data.as_str()
                                 == crate::subscription::CREDIT_FUNDED_MARKER
                             {
@@ -1501,7 +1513,13 @@ impl Worker {
             return Ok(());
         }
 
-        let line_items = self.db.list_subscription_line_items(sub.id).await?;
+        let line_items: Vec<_> = self
+            .db
+            .list_subscription_line_items(sub.id)
+            .await?
+            .into_iter()
+            .filter(|li| li.is_active())
+            .collect();
         if line_items
             .iter()
             .any(|li| li.subscription_type == LineItemType::Vps)
@@ -3698,10 +3716,8 @@ impl Worker {
                         .get_subscription_by_line_item_id(vm.subscription_line_item_id)
                         .await
                     {
-                        Ok(s) if s.interval_type == IntervalType::Hour => {
-                            s.expires.map(|e| (e, Utc::now()))
-                        }
-                        _ => None,
+                        Ok(s) => s.expires.map(|e| (e, Utc::now())),
+                        Err(_) => None,
                     }
                 } else {
                     None
@@ -3793,7 +3809,10 @@ impl Worker {
                             vm_id
                         )
                     } else {
-                        format!("Your VM #{} has been deleted and billing has stopped.", vm_id)
+                        format!(
+                            "Your VM #{} has been deleted and billing has stopped.",
+                            vm_id
+                        )
                     };
                     self.queue_notification(
                         vm.user_id,
@@ -5239,7 +5258,7 @@ mod tests {
     use crate::mocks::{MockChainExplorer, MockNode, MockOnChainProvider};
     use crate::settings::mock_settings;
     use crate::subscription::SubscriptionHandler;
-    use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate};
+    use lnvps_api_common::{ChannelWorkCommander, ExchangeRateService, MockDb, MockExchangeRate};
     use lnvps_db::{
         LNVpsDbBase, LineItemType, Subscription, SubscriptionLineItem, SubscriptionPayment,
         UserSshKey, Vm,
@@ -6082,6 +6101,13 @@ mod tests {
         settings.delete_after = delete_after;
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
+        // Renewals priced in EUR against a BTC credit balance need a rate.
+        rates
+            .set_rate(
+                lnvps_api_common::Ticker::btc_rate("EUR").unwrap(),
+                100_000.0,
+            )
+            .await;
         let work_commander = Arc::new(ChannelWorkCommander::new());
         let cache = VmStateCache::new();
         let sub_handler = SubscriptionHandler::new(
@@ -6159,6 +6185,7 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await?;
@@ -7376,10 +7403,10 @@ mod tests {
         Ok(())
     }
 
-    /// An owner deleting a monthly VM is not refunded: only hourly time is
-    /// returned, so the money for a prepaid month stays with the sale.
+    /// An owner deleting a monthly VM gets the unused part of the month back
+    /// as credit too: 25 of 30 days left on 1000 msat of credit.
     #[tokio::test]
-    async fn an_owner_deleting_a_monthly_vm_gets_no_credit() -> Result<()> {
+    async fn an_owner_deleting_a_monthly_vm_returns_unused_time_as_credit() -> Result<()> {
         let db = Arc::new(MockDb::default());
         let created = Utc::now().sub(TimeDelta::days(5));
         let (vm_id, sub_id) = add_vm_with_subscription(&db, created, true).await?;
@@ -7417,7 +7444,11 @@ mod tests {
             })
             .await?;
         assert!(db.get_vm(vm_id).await?.deleted);
-        assert_eq!(db.get_account_credit(vm.user_id).await?.balance, 0);
+        let balance = db.get_account_credit(vm.user_id).await?.balance;
+        assert!(
+            (820..=834).contains(&balance),
+            "about 25/30 of 1000, got {balance}"
+        );
         Ok(())
     }
 
@@ -7537,6 +7568,39 @@ mod tests {
             notes, 0,
             "a freshly-renewed 1-day sub must not be 'expiring soon' (double-charge bug)"
         );
+        Ok(())
+    }
+
+    /// An hourly subscription renewed from credit is renewed silently: a notice
+    /// every hour would be 24 a day.
+    #[tokio::test]
+    async fn test_hourly_credit_renewal_sends_no_notice() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        let sub = {
+            let mut subs = db.subscriptions.lock().await;
+            let s = subs.get_mut(&subscription_id).unwrap();
+            s.interval_type = IntervalType::Hour;
+            s.auto_renewal_enabled = true;
+            // Inside the 30 minute lead window.
+            s.expires = Some(Utc::now().add(TimeDelta::minutes(20)));
+            s.clone()
+        };
+        db.adjust_account_credit(sub.user_id, 10_000_000_000, "topup", None)
+            .await?;
+        db.set_account_credit_auto_apply(sub.user_id, true).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .handle_subscription_state(&sub, Utc::now().sub(TimeDelta::minutes(15)))
+            .await?;
+
+        let renewed = db.get_subscription(subscription_id).await?;
+        assert!(
+            renewed.expires.unwrap() > sub.expires.unwrap(),
+            "the hour was renewed from credit"
+        );
+        assert_eq!(count_notifications(&worker, "").await, 0, "and silently");
         Ok(())
     }
 
@@ -8530,6 +8594,7 @@ mod tests {
                     amount: 500,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
                 }],
             )
             .await?;

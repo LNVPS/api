@@ -3506,6 +3506,17 @@ pub struct SubscriptionLineItem {
     /// `ip_range_subscription.subscription_line_item_id`, ...), never by
     /// parsing this column.
     pub configuration: Option<serde_json::Value>,
+    /// When this line item stopped billing on its own (its resource was
+    /// deleted while the subscription carries other products). `None` while
+    /// active. Renewals skip deactivated items.
+    #[serde(default)]
+    pub deactivated_at: Option<DateTime<Utc>>,
+}
+
+impl SubscriptionLineItem {
+    pub fn is_active(&self) -> bool {
+        self.deactivated_at.is_none()
+    }
 }
 
 /// Subscription payment
