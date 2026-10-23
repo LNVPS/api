@@ -30,6 +30,94 @@ fn round_to_sat(amount: CurrencyAmount) -> CurrencyAmount {
     CurrencyAmount::from_u64(Currency::BTC, round_msat_to_sat(amount.value()))
 }
 
+/// Pick the custom pricing model a standard VM converts to on upgrade.
+///
+/// Both the upgrade quote and the conversion that runs once it is paid call
+/// this, so the customer is charged for the model they are then moved onto.
+///
+/// Among the enabled models in the region that can price the VM's hardware, one
+/// that bills on the VM's current interval is preferred. A VM that is not billed
+/// hourly is never moved onto an hourly model, because hourly billing is paid
+/// from account credit only and the customer did not choose it. If the only
+/// compatible models are hourly the upgrade is refused rather than switching
+/// how the customer pays.
+#[allow(clippy::too_many_arguments)]
+pub async fn select_custom_pricing(
+    db: &Arc<dyn LNVpsDb>,
+    region_id: u64,
+    disk_type: DiskType,
+    disk_interface: DiskInterface,
+    cpu_mfg: CpuMfg,
+    cpu_arch: CpuArch,
+    cpu_features: &[CpuFeature],
+    current_interval: Option<(IntervalType, u64)>,
+) -> Result<VmCustomPricing> {
+    let vm_is_hourly = matches!(current_interval, Some((IntervalType::Hour, _)));
+    let mut best: Option<(bool, VmCustomPricing)> = None;
+
+    for pricing in db.list_custom_pricing(region_id).await? {
+        if !pricing.enabled {
+            continue;
+        }
+        // Hourly billing is credit-only; never move a VM onto it implicitly.
+        if pricing.interval_type == IntervalType::Hour && !vm_is_hourly {
+            continue;
+        }
+
+        // Check CPU manufacturer match (Unknown means any)
+        if cpu_mfg != CpuMfg::Unknown
+            && pricing.cpu_mfg != CpuMfg::Unknown
+            && pricing.cpu_mfg != cpu_mfg
+        {
+            continue;
+        }
+
+        // Check CPU architecture match (Unknown means any)
+        if cpu_arch != CpuArch::Unknown
+            && pricing.cpu_arch != CpuArch::Unknown
+            && pricing.cpu_arch != cpu_arch
+        {
+            continue;
+        }
+
+        // Check that pricing supports all required CPU features (empty list means any)
+        if !cpu_features.is_empty()
+            && !pricing.cpu_features.is_empty()
+            && !cpu_features
+                .iter()
+                .all(|f| pricing.cpu_features.contains(f))
+        {
+            continue;
+        }
+
+        // Check if this pricing supports the required disk type and interface
+        let disk_configs = db.list_custom_pricing_disk(pricing.id).await?;
+        if !disk_configs
+            .iter()
+            .any(|disk| disk.kind == disk_type && disk.interface == disk_interface)
+        {
+            continue;
+        }
+
+        let same_interval = current_interval
+            .is_some_and(|(t, a)| t == pricing.interval_type && a == pricing.interval_amount.max(1));
+        match &best {
+            // The first compatible model wins unless a later one matches the
+            // VM's interval and the current best does not.
+            Some((best_same, _)) if *best_same || !same_interval => {}
+            _ => best = Some((same_interval, pricing)),
+        }
+    }
+
+    best.map(|(_, p)| p).ok_or_else(|| {
+        anyhow!(
+            "No custom pricing available for this region that supports disk type {:?} with interface {:?}",
+            disk_type,
+            disk_interface
+        )
+    })
+}
+
 /// Result of calculating upgrade costs including both immediate upgrade cost and new renewal cost
 #[derive(Debug, Clone)]
 pub struct UpgradeCostQuote {
@@ -1333,6 +1421,8 @@ impl PricingEngine {
         })
     }
 
+    /// The custom pricing model a standard VM converts to when it is upgraded.
+    /// See [`select_custom_pricing`] for how the choice is made.
     async fn find_custom_pricing(
         &self,
         region_id: u64,
@@ -1341,59 +1431,29 @@ impl PricingEngine {
         cpu_mfg: CpuMfg,
         cpu_arch: CpuArch,
         cpu_features: &[CpuFeature],
+        current_interval: Option<(IntervalType, u64)>,
     ) -> Result<VmCustomPricing> {
-        // Get custom pricing for the region
-        let custom_pricings = self.db.list_custom_pricing(region_id).await?;
-        let mut compatible_pricing = None;
+        select_custom_pricing(
+            &self.db,
+            region_id,
+            disk_type,
+            disk_interface,
+            cpu_mfg,
+            cpu_arch,
+            cpu_features,
+            current_interval,
+        )
+        .await
+    }
 
-        for pricing in custom_pricings {
-            if !pricing.enabled {
-                continue;
-            }
-
-            // Check CPU manufacturer match (Unknown means any)
-            if cpu_mfg != CpuMfg::Unknown && pricing.cpu_mfg != CpuMfg::Unknown {
-                if pricing.cpu_mfg != cpu_mfg {
-                    continue;
-                }
-            }
-
-            // Check CPU architecture match (Unknown means any)
-            if cpu_arch != CpuArch::Unknown && pricing.cpu_arch != CpuArch::Unknown {
-                if pricing.cpu_arch != cpu_arch {
-                    continue;
-                }
-            }
-
-            // Check that pricing supports all required CPU features (empty list means any)
-            if !cpu_features.is_empty() && !pricing.cpu_features.is_empty() {
-                let has_all_features = cpu_features
-                    .iter()
-                    .all(|f| pricing.cpu_features.contains(f));
-                if !has_all_features {
-                    continue;
-                }
-            }
-
-            // Check if this pricing supports the required disk type and interface
-            let disk_configs = self.db.list_custom_pricing_disk(pricing.id).await?;
-            let has_compatible_disk = disk_configs
-                .iter()
-                .any(|disk| disk.kind == disk_type && disk.interface == disk_interface);
-
-            if has_compatible_disk {
-                compatible_pricing = Some(pricing);
-                break;
-            }
-        }
-
-        let custom_pricing = compatible_pricing
-            .ok_or_else(|| anyhow::anyhow!(
-                "No custom pricing available for this region that supports disk type {:?} with interface {:?}",
-                disk_type,
-                disk_interface
-            ))?;
-        Ok(custom_pricing)
+    /// The billing interval a VM is on now, from its subscription.
+    async fn vm_billing_interval(&self, vm: &Vm) -> Option<(IntervalType, u64)> {
+        let sub = self
+            .db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await
+            .ok()?;
+        Some((sub.interval_type, sub.interval_amount.max(1)))
     }
 
     pub async fn upgrade_pricing(&self, vm_id: u64) -> Result<VmCustomPricing> {
@@ -1407,6 +1467,7 @@ impl PricingEngine {
                 template.cpu_mfg,
                 template.cpu_arch,
                 &template.cpu_features,
+                self.vm_billing_interval(&vm).await,
             )
             .await
         } else if let Some(custom_template_id) = vm.custom_template_id {
@@ -1450,6 +1511,7 @@ impl PricingEngine {
                     template.cpu_mfg.clone(),
                     template.cpu_arch.clone(),
                     &template.cpu_features,
+                    self.vm_billing_interval(&vm).await,
                 )
                 .await?,
                 template.cpu,
@@ -3240,6 +3302,170 @@ mod tests {
                 .is_ok()
         );
 
+        Ok(())
+    }
+
+    /// Add a second enabled pricing model for region 1 that is hourly, at a finer
+    /// rate scale, with the same disk the first one has.
+    async fn add_hourly_pricing(db: &MockDb) {
+        let mut base = db.custom_pricing.lock().await.get(&1).unwrap().clone();
+        base.id = 2;
+        base.name = "Hourly".to_string();
+        base.interval_type = IntervalType::Hour;
+        base.interval_amount = 1;
+        base.rate_scale = 10_000;
+        // 2.00 EUR/CPU/month and 1.00 EUR/GB/month, per hour at 1/10_000 cent
+        base.cpu_cost = 2_778;
+        base.memory_cost = 1_389;
+        db.custom_pricing.lock().await.insert(2, base);
+        db.custom_pricing_disk.lock().await.insert(
+            2,
+            VmCustomPricingDisk {
+                id: 2,
+                pricing_id: 2,
+                kind: DiskType::SSD,
+                interface: DiskInterface::PCIe,
+                cost: 694, // 0.50 EUR/GB/month per hour
+                min_disk_size: 5 * crate::GB,
+                max_disk_size: 1 * crate::TB,
+            },
+        );
+    }
+
+    /// A VM that is not billed hourly is never moved onto an hourly model by an
+    /// upgrade: hourly billing is credit-only and the customer did not choose it.
+    /// Nothing else compatible means the upgrade is refused, not redirected.
+    #[tokio::test]
+    async fn upgrade_never_moves_a_monthly_vm_onto_an_hourly_model() -> Result<()> {
+        let db = MockDb::default();
+        setup_upgrade_test_data(&db).await?;
+        add_hourly_pricing(&db).await;
+        let db = Arc::new(db);
+        let monthly = Some((IntervalType::Month, 1));
+        let dyn_db: Arc<dyn LNVpsDb> = db.clone();
+        let picked = select_custom_pricing(
+            &dyn_db,
+            1,
+            DiskType::SSD,
+            DiskInterface::PCIe,
+            CpuMfg::Unknown,
+            CpuArch::Unknown,
+            &[],
+            monthly,
+        )
+        .await?;
+        assert_eq!(1, picked.id, "monthly VM stays on the monthly model");
+
+        // With the monthly model disabled, the hourly one is not a fallback.
+        db.custom_pricing.lock().await.get_mut(&1).unwrap().enabled = false;
+        assert!(
+            select_custom_pricing(
+                &dyn_db,
+                1,
+                DiskType::SSD,
+                DiskInterface::PCIe,
+                CpuMfg::Unknown,
+                CpuArch::Unknown,
+                &[],
+                monthly,
+            )
+            .await
+            .is_err()
+        );
+        // An hourly VM may use the hourly model.
+        let hourly = select_custom_pricing(
+            &dyn_db,
+            1,
+            DiskType::SSD,
+            DiskInterface::PCIe,
+            CpuMfg::Unknown,
+            CpuArch::Unknown,
+            &[],
+            Some((IntervalType::Hour, 1)),
+        )
+        .await?;
+        assert_eq!(2, hourly.id);
+        Ok(())
+    }
+
+    /// Upgrading a VM that is already on an hourly custom model quotes against
+    /// that hourly rate: the renewal is one hour, the upgrade is the extra
+    /// hourly cost over the time left, and nothing is read as whole cents.
+    #[tokio::test]
+    async fn upgrade_quote_on_an_hourly_custom_vm_uses_the_hourly_rate() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+        setup_upgrade_test_data(&db).await?;
+        add_hourly_pricing(&db).await;
+        // 6 hours of paid time left on an hourly subscription.
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let s = subs.get_mut(&1).unwrap();
+            s.expires = Some(Utc::now() + chrono::Duration::hours(6));
+            s.is_setup = true;
+            s.interval_type = IntervalType::Hour;
+            s.interval_amount = 1;
+        }
+        db.custom_template.lock().await.insert(
+            1,
+            VmCustomTemplate {
+                id: 1,
+                cpu: 2,
+                memory: 2 * crate::GB,
+                disk_size: 20 * crate::GB,
+                disk_type: DiskType::SSD,
+                disk_interface: DiskInterface::PCIe,
+                pricing_id: 2,
+                ip4_count: 1,
+                ip6_count: 1,
+                ..Default::default()
+            },
+        );
+        db.vms.lock().await.insert(
+            1,
+            Vm {
+                id: 1,
+                user_id: 1,
+                template_id: None,
+                custom_template_id: Some(1),
+                deleted: false,
+                ..MockDb::mock_vm()
+            },
+        );
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let pe = PricingEngine::new(db.clone(), rates, VatClient::new());
+
+        let cfg = UpgradeConfig {
+            new_cpu: Some(4),
+            ..Default::default()
+        };
+        let quote = pe
+            .calculate_vm_upgrade_cost(1, &cfg, PaymentMethod::Lightning)
+            .await?;
+
+        // One more core costs 2.00 EUR a month, so an hour is ~0.28 cent: the
+        // renewal for 4 CPU + 2 GB + 20 GB is one hour of that.
+        let hourly_raw = 4 * 2_778 + 2 * 1_389 + 20 * 694;
+        let eur_to_msat = |raw: u64| (raw as f64 / 10_000.0 / 100.0 / MOCK_RATE as f64 * 1.0e11);
+        assert_eq!(
+            round_msat_to_sat(eur_to_msat(hourly_raw).round() as u64),
+            quote.renewal.amount.value(),
+            "the renewal is one hour at the hourly rate"
+        );
+        // Upgrade = extra core for ~6 hours, never zero, and nowhere near a
+        // monthly price (a plain-cents read of 2_778 would be 27 EUR).
+        let upgrade = quote.upgrade.amount.value();
+        assert!(upgrade > 0, "upgrade must cost something");
+        assert!(
+            upgrade < quote.renewal.amount.value() * 6,
+            "6 hours of one extra core is less than 6 hours of the whole VM"
+        );
+        assert_eq!(
+            Currency::BTC,
+            quote.upgrade.amount.currency(),
+            "paid in sats"
+        );
         Ok(())
     }
 

@@ -1791,7 +1791,7 @@ mod tests {
                 let vm_upgraded_data = &vm_admin_upgraded["data"];
                 let sub_after_upgrade = &vm_upgraded_data["subscription"];
 
-                // Custom VMs are always billed monthly
+                // Custom VMs bill on their pricing model's interval
                 assert!(
                     sub_after_upgrade["is_active"].as_bool().unwrap_or(false),
                     "Subscription should still be active after upgrade"

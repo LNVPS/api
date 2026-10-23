@@ -2147,9 +2147,17 @@ pub struct AdminCustomTemplateInfo {
     pub region_name: Option<String>,
     /// Currency of `price`, from the pricing model
     pub currency: String,
-    /// Monthly renewal cost in smallest currency units (cents/millisats).
-    /// Custom VMs are always billed monthly.
+    /// Renewal cost of one billing interval (`interval_*`) in smallest currency
+    /// units (cents/millisats), rounded up from the model's finer `rate_scale`.
+    /// For a sub-cent hourly price this overstates what is actually charged;
+    /// use `price_raw` with `rate_scale` for the exact figure.
     pub price: u64,
+    /// The same price in `1/rate_scale` of the smallest unit, unrounded
+    pub price_raw: u64,
+    pub rate_scale: u64,
+    /// The billing interval `price` is for
+    pub interval_amount: u64,
+    pub interval_type: ApiIntervalType,
     pub ip4_count: u16,
     pub ip6_count: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2274,8 +2282,8 @@ pub struct UpdateCustomTemplateRequest {
 #[derive(Serialize)]
 pub struct AdminCustomTemplateUpdateResult {
     pub template: AdminCustomTemplateInfo,
-    /// New monthly renewal amount written to each VM's subscription line item,
-    /// in smallest units of `template.currency`.
+    /// New renewal amount of one billing interval, written to each VM's
+    /// subscription line item, in smallest units of `template.currency`.
     pub renewal_amount: u64,
     /// One job per VM using the template. Empty when nothing had to be applied
     /// to a host (an orphaned template, or a spec-neutral edit).

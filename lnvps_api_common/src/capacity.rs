@@ -1488,6 +1488,8 @@ mod tests {
                 disk_type: ApiDiskType::SSD,
                 disk_interface: ApiDiskInterface::PCIe,
             }],
+            interval_amount: 1,
+            interval_type: crate::ApiIntervalType::Month,
             transfer_gb: None,
             transfer: None,
             network: None,

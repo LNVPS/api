@@ -1110,6 +1110,10 @@ pub struct ApiCustomTemplateParams {
     /// Maximum IPv6 addresses selectable on this plan
     pub max_ip6: u16,
     pub disks: Vec<ApiCustomTemplateDiskParam>,
+    /// Billing period a VM on this plan is charged for, e.g. `1` `hour`. The
+    /// price from `POST /api/v1/vm/custom-template/price` is for one such period.
+    pub interval_amount: u64,
+    pub interval_type: ApiIntervalType,
     /// Outbound transfer included per calendar month, in GB, copied onto every
     /// custom VM built from this plan. Omitted when the plan is unmetered.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1184,6 +1188,8 @@ impl ApiCustomTemplateParams {
                     disk_interface: d.interface.into(),
                 })
                 .collect(),
+            interval_amount: pricing.interval_amount.max(1),
+            interval_type: pricing.interval_type.into(),
             transfer_gb: pricing.transfer_gb,
             transfer: ApiBandwidthRange::for_plan(
                 pricing.transfer_gb,
@@ -1899,6 +1905,39 @@ mod tests {
             params.network, None,
             "an uncapped plan offers no speed choice"
         );
+    }
+
+    /// The plan listing says how often the plan bills, so a client can label the
+    /// price it gets from the price endpoint. An unset (zero) amount reads as one.
+    #[test]
+    fn test_custom_template_params_report_the_billing_interval() {
+        let region = Region {
+            id: 1,
+            name: "r".to_string(),
+            enabled: true,
+            company_id: 1,
+            country_code: None,
+        };
+        let hourly = VmCustomPricing {
+            id: 1,
+            interval_amount: 1,
+            interval_type: lnvps_db::IntervalType::Hour,
+            ..Default::default()
+        };
+        let json =
+            serde_json::to_value(ApiCustomTemplateParams::from(&hourly, &vec![], &region)).unwrap();
+        assert_eq!(json["interval_amount"], 1);
+        assert_eq!(json["interval_type"], "hour");
+
+        let unset = VmCustomPricing {
+            id: 2,
+            interval_amount: 0,
+            ..Default::default()
+        };
+        let json =
+            serde_json::to_value(ApiCustomTemplateParams::from(&unset, &vec![], &region)).unwrap();
+        assert_eq!(json["interval_amount"], 1);
+        assert_eq!(json["interval_type"], "month");
     }
 }
 

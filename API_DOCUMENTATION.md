@@ -394,7 +394,9 @@ interface Price {
 
 interface CustomVmPrice {
   currency: 'BTC' | 'EUR' | 'USD';
-  amount: number; // Base price in smallest currency units
+  amount: number; // Price of ONE billing period, in smallest currency units
+  interval_amount: number; // The billing period `amount` is for, e.g. 1 `hour`
+  interval_type: 'hour' | 'day' | 'month' | 'year';
   /** @deprecated (#230) Use GET /api/v1/exchange-rate instead. Still populated for now. */
   other_price: Price[]; // The same price converted to other supported currencies
 }
@@ -441,6 +443,8 @@ interface CustomTemplateParams {
   min_memory: number; // In bytes
   max_memory: number; // In bytes
   disks: CustomTemplateDiskParam[];
+  interval_amount: number; // How often a VM on this plan bills, e.g. 1 `hour`; the price endpoint's `amount` is for one such period
+  interval_type: 'hour' | 'day' | 'month' | 'year';
   transfer_gb?: number; // Default monthly transfer in GB; omitted when unmetered
   transfer?: BandwidthRange; // Selectable monthly transfer in GB; omitted when unmetered
   network?: BandwidthRange; // Selectable network speed in Mbit/s; omitted when uncapped
@@ -1087,7 +1091,7 @@ historical range is needed; a usage bar can be rendered from this object alone.
   - `method`: Optional payment method ('lightning' | 'revolut' | 'paypal'). Defaults to 'lightning'
 - **Body**: `VmUpgradeRequest`
 - **Response**: `VmUpgradeQuote`
-- **Description**: Calculate the pro-rated upgrade cost for remaining VM time and the new monthly renewal cost after upgrade. Available for both standard template VMs and custom template VMs. Like the upgrade endpoint itself, the request must strictly increase at least one resource (no downgrades). Cost is calculated in the currency appropriate for the selected payment method. The response includes the upgrade cost (cost_difference), new renewal cost, and the discount amount representing the value of remaining time at the old pricing rate. When account credit is auto-applied the response also carries `credit` (`{ amount, currency }`), and `processing_fee` is the fee on the remainder.
+- **Description**: Calculate the pro-rated upgrade cost for remaining VM time and the new renewal cost after upgrade (one billing period of the plan the VM ends up on). Available for both standard template VMs and custom template VMs. Like the upgrade endpoint itself, the request must strictly increase at least one resource (no downgrades). Cost is calculated in the currency appropriate for the selected payment method. The response includes the upgrade cost (cost_difference), new renewal cost, and the discount amount representing the value of remaining time at the old pricing rate. When account credit is auto-applied the response also carries `credit` (`{ amount, currency }`), and `processing_fee` is the fee on the remainder.
 
 #### Create VM Upgrade Payment
 - **POST** `/api/v1/vm/{id}/upgrade?method={payment_method}`
@@ -1330,7 +1334,7 @@ The chosen values appear on the VM as `template.transfer_gb` and
 - **POST** `/api/v1/vm/custom-template/price`
 - **Auth**: None
 - **Body**: `CustomVmRequest`
-- **Response**: `CustomVmPrice` (base `{ currency, amount }` plus the deprecated `other_price[]`; prefer `GET /api/v1/exchange-rate` for conversions)
+- **Response**: `CustomVmPrice` (`{ currency, amount, interval_amount, interval_type }` plus the deprecated `other_price[]`; prefer `GET /api/v1/exchange-rate` for conversions). `amount` is the price of one billing period, the plan's `interval_*`. A plan that bills hourly is priced per hour, a fraction of a cent in fiat, so its `amount` comes back in BTC millisats (`currency: "BTC"`) rather than a rounded fiat cent; an hourly VM is paid from account credit.
 
 #### Exchange Rates
 - **GET** `/api/v1/exchange-rate`
@@ -2125,7 +2129,7 @@ function isApiSuccess<T>(response: ApiResult<T>): response is ApiResponse<T> {
 12. **Pro-rated Billing**: Upgrade costs are calculated based on the remaining time until VM expiration. The cost represents the difference between current and new specifications, pro-rated for the remaining billing period. The system calculates: (new_rate_per_second * seconds_remaining) - (old_rate_per_second * seconds_remaining). The discount field shows the value of remaining time at the old rate. The system respects the actual billing interval of the cost plan (daily, monthly, yearly) rather than assuming monthly billing.
 13. **Billing Interval Handling**: 
     - Standard template VMs: Use their cost plan's actual interval (interval_type and interval_amount)
-    - Custom template VMs: Always use monthly billing for pro-rating calculations
+    - Custom template VMs: Use the custom pricing plan's interval (`interval_*` on the plan, monthly unless the plan says otherwise)
     - Examples: A cost plan with interval_type="day" and interval_amount=7 bills every 7 days
 14. **Upgrade Payment Flow**: 
     - First, get a quote using `/api/v1/vm/{id}/upgrade/quote`
@@ -2158,7 +2162,7 @@ const quoteResponse = await fetch(`/api/v1/vm/123/upgrade/quote?method=${payment
 
 const quote: ApiResponse<VmUpgradeQuote> = await quoteResponse.json();
 console.log(`Upgrade cost: ${quote.data.cost_difference.amount} ${quote.data.cost_difference.currency}`);
-console.log(`New monthly cost: ${quote.data.new_renewal_cost.amount} ${quote.data.new_renewal_cost.currency}`);
+console.log(`New renewal cost: ${quote.data.new_renewal_cost.amount} ${quote.data.new_renewal_cost.currency}`);
 console.log(`Discount applied: ${quote.data.discount.amount} ${quote.data.discount.currency}`);
 
 // Step 2: Create upgrade payment if user accepts the quote (using same payment method)

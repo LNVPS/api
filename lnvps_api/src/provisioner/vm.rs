@@ -11,7 +11,7 @@ use lnvps_api_common::retry::{OpResult, Pipeline, RetryPolicy};
 use lnvps_api_common::{
     AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, NewPaymentInfo,
     PricingEngine, UpgradeConfig, UpgradeCostQuote, VmStateCache, apply_custom_pricing_limits,
-    round_msat_to_sat, upgrade_bandwidth,
+    round_msat_to_sat, select_custom_pricing, upgrade_bandwidth,
 };
 use lnvps_api_common::{ExchangeRateService, op_fatal};
 use lnvps_db::{
@@ -468,7 +468,13 @@ impl VmProvisioner {
             .list_custom_pricing(host.region_id)
             .await?
             .into_iter()
-            .find(|p| p.enabled && p.expires.map(|e| e > Utc::now()).unwrap_or(true))
+            // Never an hourly model: an imported VM would silently become
+            // credit-only billing, which its owner did not choose.
+            .find(|p| {
+                p.enabled
+                    && p.interval_type != IntervalType::Hour
+                    && p.expires.map(|e| e > Utc::now()).unwrap_or(true)
+            })
             .ok_or_else(|| {
                 anyhow!(
                     "No enabled custom pricing for region {}, cannot import VM",
@@ -1022,37 +1028,26 @@ impl VmProvisioner {
             .ok_or_else(|| anyhow::anyhow!("VM must have a standard template to upgrade"))?;
         let current_template = self.db.get_vm_template(template_id).await?;
 
-        // Get the custom pricing for the region that supports the required disk type and interface
-        let custom_pricings = self
+        // The same selection the upgrade quote used, so the customer is moved
+        // onto the model they were charged for.
+        let subscription = self
             .db
-            .list_custom_pricing(current_template.region_id)
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
             .await?;
-        let mut compatible_pricing = None;
-
-        for pricing in custom_pricings {
-            if !pricing.enabled {
-                continue;
-            }
-
-            // Check if this pricing supports the required disk type and interface
-            let disk_configs = self.db.list_custom_pricing_disk(pricing.id).await?;
-            let has_compatible_disk = disk_configs.iter().any(|disk| {
-                disk.kind == current_template.disk_type
-                    && disk.interface == current_template.disk_interface
-            });
-
-            if has_compatible_disk {
-                compatible_pricing = Some(pricing);
-                break;
-            }
-        }
-
-        let custom_pricing = compatible_pricing
-            .ok_or_else(|| anyhow::anyhow!(
-                "No custom pricing available for this region that supports disk type {:?} with interface {:?}",
-                current_template.disk_type,
-                current_template.disk_interface
-            ))?;
+        let custom_pricing = select_custom_pricing(
+            &self.db,
+            current_template.region_id,
+            current_template.disk_type,
+            current_template.disk_interface,
+            current_template.cpu_mfg,
+            current_template.cpu_arch,
+            &current_template.cpu_features,
+            Some((
+                subscription.interval_type,
+                subscription.interval_amount.max(1),
+            )),
+        )
+        .await?;
 
         let (transfer_gb, network_mbps) = upgrade_bandwidth(
             cfg,
@@ -2714,6 +2709,67 @@ mod tests {
             new_line_item.amount > 0,
             "new line_item.amount must be positive"
         );
+        Ok(())
+    }
+
+    /// A standard monthly VM that is upgraded is never converted onto an HOURLY
+    /// custom model, even when that is the only compatible one: hourly is
+    /// credit-only billing the customer never chose, so the upgrade is refused
+    /// and the VM is left exactly as it was.
+    #[tokio::test]
+    async fn test_convert_to_custom_template_refuses_an_hourly_only_region() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        {
+            let mut p = db.custom_pricing.lock().await;
+            let h = p.get_mut(&pricing_id).unwrap();
+            h.interval_type = IntervalType::Hour;
+            h.interval_amount = 1;
+            h.rate_scale = 10_000;
+        }
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let prov = make_provisioner(db.clone());
+
+        let cfg = UpgradeConfig {
+            new_cpu: Some(4),
+            ..Default::default()
+        };
+        assert!(prov.convert_to_custom_template(vm_id, &cfg).await.is_err());
+
+        let vm = db.get_vm(vm_id).await?;
+        assert!(vm.template_id.is_some() && vm.custom_template_id.is_none());
+        let sub = db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await?;
+        assert!(matches!(sub.interval_type, IntervalType::Month));
+        Ok(())
+    }
+
+    /// With both a monthly and an hourly model available, a monthly VM converts
+    /// onto the monthly one whichever the database lists first.
+    #[tokio::test]
+    async fn test_convert_to_custom_template_prefers_the_vms_interval() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let monthly_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let hourly_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        {
+            let mut p = db.custom_pricing.lock().await;
+            let h = p.get_mut(&hourly_id).unwrap();
+            h.interval_type = IntervalType::Hour;
+            h.interval_amount = 1;
+            h.rate_scale = 10_000;
+        }
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let prov = make_provisioner(db.clone());
+        let cfg = UpgradeConfig {
+            new_cpu: Some(4),
+            ..Default::default()
+        };
+        // The mock lists models in arbitrary order; repeat so both orders occur.
+        for _ in 0..8 {
+            let (_, _, tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
+            assert_eq!(monthly_id, tpl.pricing_id);
+        }
         Ok(())
     }
 

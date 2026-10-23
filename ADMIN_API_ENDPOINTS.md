@@ -2646,8 +2646,15 @@ Returns:
   "region_name": "string | null",
   "currency": "string",
   "price": number,
-  // Monthly renewal cost in smallest currency units (cents/millisats). 0 when the
-  // current plan cannot price this spec (a grandfathered VM).
+  // Renewal cost of one billing interval in smallest currency units (cents/millisats), rounded up
+  // from the model's finer rate_scale. 0 when the current plan cannot price this spec (a
+  // grandfathered VM).
+  "price_raw": number,
+  "rate_scale": number,
+  // The same price unrounded, in 1/rate_scale of the smallest unit
+  "interval_amount": number,
+  "interval_type": "hour" | "day" | "month" | "year",
+  // The billing interval `price` is for (the pricing model's)
   "ip4_count": number,
   "ip6_count": number,
   "cpu_mfg": "string (omitted when any)",
@@ -2720,7 +2727,7 @@ for its type/interface, so an out-of-range spec is a 400 rather than a VM that c
 A successful patch also:
 
 1. Rewrites the subscription line item amount for every VM using the template, so the next renewal bills the new spec
-   (custom VMs are always billed monthly).
+   (per billing interval of the pricing model, monthly unless it says otherwise).
 2. Queues host work: a change to `cpu`, `memory` or `disk_size` runs the same upgrade pipeline a paid upgrade uses (stop,
    resize disk, reconfigure, start); a change to disk type/interface or an IO/network/CPU cap queues a reconfigure only;
    a change the API enforces on its own (`pricing_id`, IP counts, `transfer_gb`, `firewall_rule_limit`) queues nothing.
@@ -2732,7 +2739,7 @@ Returns:
   "template": { ... },
   // The stored template, same shape as GET
   "renewal_amount": number,
-  // New monthly renewal amount written to each VM's line item, in smallest currency units
+  // New renewal amount of one billing interval written to each VM's line item, in smallest currency units
   "job_ids": ["string"]
   // One job per VM that needed host work; empty when nothing had to be applied
 }

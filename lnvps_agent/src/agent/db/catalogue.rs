@@ -29,8 +29,8 @@ fn interval(plan: &VmCostPlan) -> String {
     )
 }
 
-/// Human-readable billing interval of a custom pricing model. Its rates are
-/// always per month, so a shorter interval charges a share of the monthly price.
+/// Human-readable billing interval of a custom pricing model. Every rate on the
+/// model is the price for one such interval.
 fn custom_interval(pricing: &VmCustomPricing) -> String {
     format!(
         "{} {}",

@@ -76,8 +76,10 @@ impl DVMHandler for LnvpsDvm {
             };
             let mut pricing = db.list_custom_pricing(host_region.id).await?;
 
-            // Filter to only enabled pricing
-            pricing.retain(|p| p.enabled);
+            // Filter to only enabled pricing. Hourly models are paid from account
+            // credit only, which a DVM order paid by Lightning invoice can't use,
+            // so they are never picked here.
+            pricing.retain(|p| p.enabled && p.interval_type != lnvps_db::IntervalType::Hour);
 
             // we expect only 1 pricing per region
             let pricing = pricing
