@@ -95,6 +95,7 @@ pub async fn create_vpn_plan(
                 setup_amount: service.setup_amount,
                 configuration: None,
                 deactivated_at: None,
+                parent_line_item_id: None,
             }],
         )
         .await?;

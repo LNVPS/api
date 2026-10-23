@@ -369,8 +369,8 @@ impl VmRefundHandler {
     /// never a re-quote at today's price.
     ///
     /// On a subscription that also bills other products (an IP range, an app),
-    /// only the VM line item's share of each payment comes back: the share is
-    /// scaled by `vm line amount / sum of line amounts` at the time of deletion.
+    /// only the VM's share of each payment comes back: the VM line plus its
+    /// add-ons (`parent_line_item_id`), over the sum of all line amounts.
     ///
     /// Every share returns as account credit, whatever paid for it:
     /// - the part credit paid comes back as exactly the credit it took;
@@ -397,20 +397,25 @@ impl VmRefundHandler {
             .db
             .get_subscription_line_item(vm.subscription_line_item_id)
             .await?;
-        // The VM's share of what each renewal charged. Read every line item,
-        // deactivated or not: the payments being refunded were priced while
-        // they were all active.
-        let lines_total: u64 = self
+        // The VM's share of what each renewal charged: its own line plus its
+        // add-ons (e.g. paid snapshots), which stop with it. Read every line
+        // item, deactivated or not: the payments being refunded were priced
+        // while they were all active.
+        let items = self
             .db
             .list_subscription_line_items(vm_line.subscription_id)
-            .await?
+            .await?;
+        let owned = lnvps_db::SubscriptionLineItem::with_addons(&items, vm_line.id);
+        let lines_total: u64 = items.iter().map(|li| li.amount).sum();
+        let vm_total: u64 = items
             .iter()
+            .filter(|li| owned.contains(&li.id))
             .map(|li| li.amount)
             .sum();
-        let (share_num, share_den) = if lines_total == 0 || vm_line.amount >= lines_total {
+        let (share_num, share_den) = if lines_total == 0 || vm_total >= lines_total {
             (1u128, 1u128)
         } else {
-            (vm_line.amount as u128, lines_total as u128)
+            (vm_total as u128, lines_total as u128)
         };
         let balance_currency =
             Currency::from_str(&self.db.get_account_credit(owner_id).await?.currency)
@@ -722,6 +727,7 @@ mod tests {
                     setup_amount: 0,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -1258,6 +1264,7 @@ mod tests {
             setup_amount: 0,
             configuration: None,
             deactivated_at: None,
+            parent_line_item_id: None,
         })
         .await
         .unwrap();
@@ -1278,6 +1285,47 @@ mod tests {
         let gross = refunds[0].amount + refunds[0].tax;
         // 1230 * 1/2 * 1/4 = 153.75
         assert!((152..=154).contains(&gross), "gross {gross}");
+    }
+
+    /// A VM's add-ons are refunded with it: VM line 100 plus a 100 add-on, of
+    /// 400 in total (the other 200 an independent IP range), is half of half.
+    #[tokio::test]
+    async fn the_vm_share_includes_its_addons() {
+        let mock = MockDb::default();
+        let (vm, payment) = vm_with_payment(&mock, 1000, 230).await;
+        for (amount, parent) in [(100, Some(vm.subscription_line_item_id)), (200, None)] {
+            mock.insert_subscription_line_item(&lnvps_db::SubscriptionLineItem {
+                id: 0,
+                subscription_id: payment.subscription_id,
+                subscription_type: lnvps_db::LineItemType::IpRange,
+                name: "line".to_string(),
+                description: None,
+                amount,
+                setup_amount: 0,
+                configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: parent,
+            })
+            .await
+            .unwrap();
+        }
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let handler = handler(db.clone(), Arc::new(PayNode::default())).await;
+        let expires = db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await
+            .unwrap()
+            .expires
+            .unwrap();
+
+        handler
+            .refund_unused_to_credit(vm.id, vm.user_id, expires, Utc::now())
+            .await
+            .unwrap();
+        let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
+        let gross = refunds[0].amount + refunds[0].tax;
+        // 1230 * 1/2 * 200/400 = 307.5
+        assert!((306..=308).contains(&gross), "gross {gross}");
     }
 
     /// A payment split between credit and cash returns each part its own way:

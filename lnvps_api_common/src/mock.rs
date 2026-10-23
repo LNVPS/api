@@ -532,6 +532,7 @@ impl Default for MockDb {
                         setup_amount: 0,
                         configuration: None,
                         deactivated_at: None,
+                        parent_line_item_id: None,
                     },
                 );
                 m
@@ -10185,6 +10186,7 @@ mod tests {
                 setup_amount: 0,
                 configuration: None,
                 deactivated_at: None,
+                parent_line_item_id: None,
             },
         );
 
@@ -10299,6 +10301,7 @@ mod tests {
                     setup_amount: 0,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 },
             );
             db.vms.lock().await.insert(
@@ -11202,6 +11205,7 @@ mod tests {
                 setup_amount: 0,
                 configuration: None,
                 deactivated_at: None,
+                parent_line_item_id: None,
             })
             .await
             .unwrap();
@@ -11708,6 +11712,7 @@ mod marketplace_tests {
                 setup_amount: *setup_amount,
                 configuration: None,
                 deactivated_at: None,
+                parent_line_item_id: None,
             })
             .collect();
         let (sub_id, _) = db
@@ -13116,6 +13121,7 @@ mod vpn_tests {
                     setup_amount: 0,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await

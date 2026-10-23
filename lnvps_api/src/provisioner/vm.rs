@@ -231,6 +231,7 @@ impl VmProvisioner {
             setup_amount: 0,
             configuration: None,
             deactivated_at: None,
+            parent_line_item_id: None,
         };
         let (subscription_id, line_item_ids) = self
             .db
@@ -363,6 +364,7 @@ impl VmProvisioner {
             setup_amount: 0,
             configuration: None,
             deactivated_at: None,
+            parent_line_item_id: None,
         };
         let (subscription_id, line_item_ids) = self
             .db
@@ -550,6 +552,7 @@ impl VmProvisioner {
             setup_amount: 0,
             configuration: None,
             deactivated_at: None,
+            parent_line_item_id: None,
         };
         let (subscription_id, line_item_ids) = self
             .db
@@ -818,17 +821,26 @@ impl VmProvisioner {
                         // Only this VM's line item stops; the subscription ends
                         // once nothing on it is active, so other products
                         // sharing it keep running and billing.
-                        let mut item = ctx.0.get_subscription_line_item(line_item_id).await?;
-                        if item.deactivated_at.is_none() {
-                            item.deactivated_at = Some(Utc::now());
-                            ctx.0.update_subscription_line_item(&item).await?;
-                        }
-                        let others_active = ctx
+                        // The VM's line item and its add-ons (e.g. paid
+                        // snapshots) all stop with it.
+                        let item = ctx.0.get_subscription_line_item(line_item_id).await?;
+                        let items = ctx
                             .0
                             .list_subscription_line_items(item.subscription_id)
-                            .await?
+                            .await?;
+                        let owned = SubscriptionLineItem::with_addons(&items, line_item_id);
+                        for li in items.iter().filter(|li| owned.contains(&li.id)) {
+                            if li.deactivated_at.is_none() {
+                                let mut li = li.clone();
+                                li.deactivated_at = Some(Utc::now());
+                                ctx.0.update_subscription_line_item(&li).await?;
+                            }
+                        }
+                        // Only products independent of this VM keep the
+                        // subscription alive.
+                        let others_active = items
                             .iter()
-                            .any(|li| li.id != line_item_id && li.is_active());
+                            .any(|li| !owned.contains(&li.id) && li.is_active());
                         if !others_active {
                             let mut sub = ctx.0.get_subscription(item.subscription_id).await?;
                             if sub.is_active || sub.auto_renewal_enabled {
@@ -1715,6 +1727,7 @@ mod tests {
                     setup_amount: 0,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await?;
@@ -2961,6 +2974,7 @@ mod tests {
                 setup_amount: 0,
                 configuration: None,
                 deactivated_at: None,
+                parent_line_item_id: None,
             })
             .await?;
 
@@ -2986,6 +3000,53 @@ mod tests {
         // IP range alone.
         assert_eq!(quote.time_value, 0, "the deleted VM is no longer billed");
         assert!(quote.amount > 0, "the IP range still is");
+        Ok(())
+    }
+
+    /// Every line on the subscription belongs to the VM (its own line plus a
+    /// paid add-on), so deleting the VM ends the whole subscription.
+    #[tokio::test]
+    async fn test_delete_vm_with_only_addons_ends_the_subscription() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let sub_handler = make_sub_handler(db.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let payment = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+        sub_handler.complete_payment(&payment).await?;
+        let addon = db
+            .insert_subscription_line_item(&SubscriptionLineItem {
+                id: 0,
+                subscription_id: li.subscription_id,
+                subscription_type: LineItemType::IpRange,
+                name: "snapshots".to_string(),
+                description: None,
+                amount: 200,
+                setup_amount: 0,
+                configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: Some(li.id),
+            })
+            .await?;
+
+        provisioner.delete_vm(vm.id, false).await?;
+
+        let sub = db.get_subscription(li.subscription_id).await?;
+        assert!(
+            !sub.is_active && !sub.auto_renewal_enabled,
+            "nothing left to bill"
+        );
+        assert!(
+            !db.get_subscription_line_item(addon).await?.is_active(),
+            "the add-on stops too"
+        );
         Ok(())
     }
 

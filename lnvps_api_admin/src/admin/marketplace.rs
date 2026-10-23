@@ -831,6 +831,7 @@ mod tests {
                     setup_amount: 5000,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await

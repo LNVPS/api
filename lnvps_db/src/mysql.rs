@@ -3349,7 +3349,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             line_item.subscription_id = subscription_id;
 
             let li_res = sqlx::query(
-                "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration, parent_line_item_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(line_item.subscription_id)
             .bind(line_item.subscription_type)
@@ -3358,6 +3358,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(line_item.amount)
             .bind(line_item.setup_amount)
             .bind(&line_item.configuration)
+            .bind(line_item.parent_line_item_id)
             .execute(&mut *tx)
             .await?;
 
@@ -3560,7 +3561,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         line_item: &SubscriptionLineItem,
     ) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration, parent_line_item_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(line_item.subscription_id)
         .bind(line_item.subscription_type)
@@ -3569,6 +3570,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(line_item.amount)
         .bind(line_item.setup_amount)
         .bind(&line_item.configuration)
+        .bind(line_item.parent_line_item_id)
         .execute(&self.db)
         .await?;
 
@@ -3580,7 +3582,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         line_item: &SubscriptionLineItem,
     ) -> DbResult<()> {
         sqlx::query(
-            "UPDATE subscription_line_item SET subscription_id = ?, subscription_type = ?, name = ?, description = ?, amount = ?, setup_amount = ?, configuration = ?, deactivated_at = ? WHERE id = ?"
+            "UPDATE subscription_line_item SET subscription_id = ?, subscription_type = ?, name = ?, description = ?, amount = ?, setup_amount = ?, configuration = ?, deactivated_at = ?, parent_line_item_id = ? WHERE id = ?"
         )
         .bind(line_item.subscription_id)
         .bind(line_item.subscription_type)
@@ -3590,6 +3592,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(line_item.setup_amount)
         .bind(&line_item.configuration)
         .bind(line_item.deactivated_at)
+        .bind(line_item.parent_line_item_id)
         .bind(line_item.id)
         .execute(&self.db)
         .await?;

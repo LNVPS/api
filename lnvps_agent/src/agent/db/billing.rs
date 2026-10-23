@@ -237,6 +237,7 @@ mod tests {
                 setup_amount: 0,
                 configuration: None,
                 deactivated_at: None,
+                parent_line_item_id: None,
             },
         );
     }

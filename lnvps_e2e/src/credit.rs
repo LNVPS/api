@@ -292,6 +292,7 @@ mod tests {
                     setup_amount: 0,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -307,6 +308,29 @@ mod tests {
                 .await
                 .unwrap()
                 .is_active()
+        );
+        // An add-on line round-trips its parent.
+        let addon = db
+            .insert_subscription_line_item(&SubscriptionLineItem {
+                id: 0,
+                subscription_id: sub_id,
+                subscription_type: LineItemType::IpRange,
+                name: "addon".to_string(),
+                description: None,
+                amount: 1,
+                setup_amount: 0,
+                configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: Some(lines[0]),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_subscription_line_item(addon)
+                .await
+                .unwrap()
+                .parent_line_item_id,
+            Some(lines[0])
         );
         assert_eq!(
             db.get_subscription(sub_id).await.unwrap().interval_type,

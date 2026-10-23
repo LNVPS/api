@@ -4126,6 +4126,7 @@ impl AdminCreateSubscriptionLineItemRequest {
             setup_amount: self.setup_amount,
             configuration: self.configuration.clone(),
             deactivated_at: None,
+            parent_line_item_id: None,
         })
     }
 }

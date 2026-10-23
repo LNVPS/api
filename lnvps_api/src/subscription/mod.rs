@@ -2760,6 +2760,7 @@ mod revolut_autorenew_tests {
                     setup_amount: 0,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await?;
@@ -2929,6 +2930,7 @@ pub(crate) mod revolut_offline_tests {
                     setup_amount: 0,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -3007,6 +3009,7 @@ pub(crate) mod revolut_offline_tests {
                     setup_amount: 0,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -3086,6 +3089,7 @@ pub(crate) mod revolut_offline_tests {
                     setup_amount: 0,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -3162,6 +3166,7 @@ pub(crate) mod revolut_offline_tests {
                     setup_amount: 0,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -3255,6 +3260,7 @@ pub(crate) mod revolut_offline_tests {
                     setup_amount: 0,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -3725,6 +3731,7 @@ mod sunset_tests {
                     setup_amount: 0,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -3897,6 +3904,7 @@ mod discount_tests {
                     setup_amount: 0,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -4357,6 +4365,7 @@ mod credit_tests {
                     setup_amount: 0,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -4813,6 +4822,7 @@ mod credit_tests {
                     setup_amount: 0,
                     configuration: None,
                     deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
