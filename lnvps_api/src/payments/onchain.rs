@@ -204,15 +204,84 @@ impl OnChainPaymentHandler {
         Ok(true)
     }
 
+    /// Credit the balance for a top-up and tell the user about it.
+    ///
+    /// Only the call that actually settles the top-up notifies, so replayed
+    /// stream events never produce a second notification.
     async fn settle_topup(&self, id: u64) -> Result<()> {
         match self.db.settle_account_credit_topup(id).await? {
-            Some(t) => info!(
-                "Credit top-up {} settled on chain: +{} msat to user {}",
-                t.id, t.amount, t.user_id
-            ),
+            Some(t) => {
+                info!(
+                    "Credit top-up {} settled on chain: +{} msat to user {}",
+                    t.id, t.amount, t.user_id
+                );
+                self.notify_credited(&t).await;
+            }
             None => info!("Credit top-up {} already settled", id),
         }
         Ok(())
+    }
+
+    /// Queue a notification telling the user an on-chain deposit was credited.
+    async fn notify_credited(&self, topup: &AccountCreditTopup) {
+        let amount = if topup.currency == "BTC" {
+            format!("{} sats", topup.amount / 1000)
+        } else {
+            format!("{} {}", topup.amount, topup.currency)
+        };
+        if let Err(e) = self
+            .sub_handler
+            .work_commander()
+            .send(WorkJob::SendNotification {
+                user_id: topup.user_id,
+                title: Some("On-chain deposit received".to_string()),
+                message: format!(
+                    "Your on-chain deposit of {} has been confirmed and credited to your account balance.",
+                    amount
+                ),
+            })
+            .await
+        {
+            warn!(
+                "Failed to queue deposit notification for top-up {}: {}",
+                topup.id, e
+            );
+        }
+    }
+
+    /// Credit a deposit that has no live payment to settle (the VM it was
+    /// meant for was deleted) to the owner's account balance.
+    ///
+    /// Recorded as a settled top-up keyed by the deposit outpoint, so replays
+    /// of the stream are skipped by the same check as ordinary top-ups. The
+    /// receive address is deliberately not stored: it must not make later
+    /// deposits to the same address look like a top-up address.
+    async fn credit_unclaimed_deposit(
+        &self,
+        user_id: u64,
+        key: &str,
+        amount_msat: u64,
+    ) -> Result<()> {
+        let credit = self.db.get_account_credit(user_id).await?;
+        let currency = if credit.currency.is_empty() {
+            "BTC".to_string()
+        } else {
+            credit.currency
+        };
+        let id = self
+            .db
+            .insert_account_credit_topup(&AccountCreditTopup {
+                user_id,
+                amount: amount_msat,
+                currency,
+                payment_method: PaymentMethod::OnChain,
+                invoice_hash: rand::random::<[u8; 32]>().to_vec(),
+                external_data: String::new(),
+                external_id: Some(key.to_string()),
+                ..Default::default()
+            })
+            .await?;
+        self.settle_topup(id).await
     }
 
     async fn payment_for_address(&self, address: &str) -> Result<Option<SubscriptionPayment>> {
@@ -354,9 +423,9 @@ impl OnChainPaymentHandler {
 
     /// Notify the admins about a deposit that arrived for a deleted VM.
     ///
-    /// Database-wise the deposit is ignored — nothing is settled or recorded.
-    /// The sender is expected to contact support so it can be resolved out of
-    /// band.
+    /// The deposit is credited to the owner's account balance by the caller
+    /// (see [`Self::credit_unclaimed_deposit`]); this only informs the admins
+    /// so they can follow up if the sender contacts support.
     async fn notify_deleted_vm_deposit(
         &self,
         payment: SubscriptionPayment,
@@ -384,8 +453,8 @@ impl OnChainPaymentHandler {
                 message: format!(
                     "An on-chain deposit of {} sats (outpoint {}) arrived for deleted VM #{} (user {}).\n\
                      Receive address: {}\n\
-                     The deposit has NOT been credited. The sender is expected to \
-                     contact support so it can be resolved out of band.",
+                     The deposit has been credited to the user's account balance.",
+
                     amount_msat / 1000,
                     key,
                     vm_id,
@@ -448,6 +517,11 @@ impl OnChainPaymentHandler {
             .await
             && vm.deleted
         {
+            // Credit the owner so the funds are not stranded, then alert the
+            // admins. The credit is keyed by the outpoint, so a replay is
+            // skipped before reaching here.
+            self.credit_unclaimed_deposit(payment.user_id, &key, amount_msat)
+                .await?;
             return self
                 .notify_deleted_vm_deposit(payment, vm.id, address, &key, amount_msat)
                 .await;
@@ -1198,18 +1272,32 @@ mod tests {
         let p = get_payment(&db, &payment.id).await;
         assert_eq!(p.external_id, None);
 
-        // Confirmed: nothing touched in the database, one admin notification
+        // Confirmed: the payment is untouched, the owner is credited and told,
+        // and the admins are alerted
         handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
         let p = get_payment(&db, &payment.id).await;
         assert!(!p.is_paid, "payment must be untouched");
+        assert_eq!(
+            db.get_account_credit(payment.user_id).await?.balance,
+            EXPECTED
+        );
         assert_eq!(p.external_id, None);
         assert_eq!(p.metadata, None);
         assert_eq!(p.time_value, payment.time_value);
         assert_eq!(p.rate, payment.rate);
 
-        let jobs = handler.sub_handler.work_commander().recv().await?;
-        assert_eq!(jobs.len(), 1);
-        match &jobs[0].job {
+        let user_job = handler.sub_handler.work_commander().recv().await?;
+        let admin_job = handler.sub_handler.work_commander().recv().await?;
+        assert_eq!(user_job.len(), 1);
+        assert_eq!(admin_job.len(), 1);
+        match &user_job[0].job {
+            WorkJob::SendNotification { user_id, message, .. } => {
+                assert_eq!(*user_id, payment.user_id);
+                assert!(message.contains("credited"));
+            }
+            other => panic!("expected SendNotification, got {:?}", other),
+        }
+        match &admin_job[0].job {
             WorkJob::SendAdminNotification { title, message } => {
                 assert!(title.as_deref().unwrap_or("").contains("deleted VM"));
                 assert!(message.contains("tx1:0"));
@@ -1225,12 +1313,23 @@ mod tests {
             handler.sub_handler.work_commander().recv(),
         )
         .await;
-        assert!(no_job.is_err(), "replay must not re-notify admins");
+        assert!(no_job.is_err(), "replay must not re-notify");
+        assert_eq!(
+            db.get_account_credit(payment.user_id).await?.balance,
+            EXPECTED,
+            "replay must not credit twice"
+        );
 
         // A second distinct deposit to the same address notifies again
         handler.handle_deposit(ADDRESS, "tx2", 0, EXPECTED).await?;
         let jobs = handler.sub_handler.work_commander().recv().await?;
         assert_eq!(jobs.len(), 1);
+        let jobs = handler.sub_handler.work_commander().recv().await?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            db.get_account_credit(payment.user_id).await?.balance,
+            EXPECTED * 2
+        );
         Ok(())
     }
 
@@ -1448,6 +1547,23 @@ mod tests {
             70_000
         );
         assert!(!get_payment(&db, &payment.id).await.is_paid);
+
+        // Exactly one notification to the user, despite the replayed deposit
+        let jobs = handler.sub_handler.work_commander().recv().await?;
+        assert_eq!(jobs.len(), 1);
+        match &jobs[0].job {
+            WorkJob::SendNotification { user_id, message, .. } => {
+                assert_eq!(*user_id, payment.user_id);
+                assert!(message.contains("70 sats"));
+            }
+            other => panic!("expected SendNotification, got {:?}", other),
+        }
+        let no_job = tokio::time::timeout(
+            Duration::from_millis(50),
+            handler.sub_handler.work_commander().recv(),
+        )
+        .await;
+        assert!(no_job.is_err(), "replay must not re-notify the user");
         Ok(())
     }
 
