@@ -1181,6 +1181,9 @@ pub enum IntervalType {
     #[default]
     Month = 1,
     Year = 2,
+    /// Hourly billing. Stored in the same `SMALLINT` column, so it needs no
+    /// migration. Intended to be paid from account credit.
+    Hour = 3,
 }
 
 /// The kind of resource a cost record is attached to (weak/polymorphic link).
@@ -3503,6 +3506,41 @@ pub struct SubscriptionLineItem {
     /// `ip_range_subscription.subscription_line_item_id`, ...), never by
     /// parsing this column.
     pub configuration: Option<serde_json::Value>,
+    /// When this line item stopped billing on its own (its resource was
+    /// deleted while the subscription carries other products). `None` while
+    /// active. Renewals skip deactivated items.
+    #[serde(default)]
+    pub deactivated_at: Option<DateTime<Utc>>,
+    /// The line item this one is an add-on to (e.g. paid snapshots on a VM's
+    /// line item). An add-on stops billing, and is refunded, together with its
+    /// parent. `None` for a standalone product.
+    #[serde(default)]
+    pub parent_line_item_id: Option<u64>,
+}
+
+impl SubscriptionLineItem {
+    pub fn is_active(&self) -> bool {
+        self.deactivated_at.is_none()
+    }
+
+    /// The ids of `root` and every add-on below it in `items` (add-ons of
+    /// add-ons included), i.e. everything that stops when `root`'s resource is
+    /// deleted. A cycle in `parent_line_item_id` cannot loop: each id is
+    /// visited once.
+    pub fn with_addons(items: &[SubscriptionLineItem], root: u64) -> Vec<u64> {
+        let mut out = vec![root];
+        let mut i = 0;
+        while i < out.len() {
+            let parent = out[i];
+            for li in items {
+                if li.parent_line_item_id == Some(parent) && !out.contains(&li.id) {
+                    out.push(li.id);
+                }
+            }
+            i += 1;
+        }
+        out
+    }
 }
 
 /// Subscription payment
@@ -5725,4 +5763,46 @@ pub struct VpnPeerTemplate {
     /// The one address, valid on every interface the service terminates.
     pub address4: Option<String>,
     pub address6: Option<String>,
+}
+
+#[cfg(test)]
+mod line_item_addon_tests {
+    use super::*;
+
+    fn li(id: u64, parent: Option<u64>) -> SubscriptionLineItem {
+        SubscriptionLineItem {
+            id,
+            subscription_id: 1,
+            subscription_type: LineItemType::Vps,
+            name: String::new(),
+            description: None,
+            amount: 0,
+            setup_amount: 0,
+            configuration: None,
+            deactivated_at: None,
+            parent_line_item_id: parent,
+        }
+    }
+
+    /// Add-ons of add-ons are found, independent lines are not, and a parent
+    /// cycle terminates.
+    #[test]
+    fn with_addons_walks_the_tree_once() {
+        let items = vec![
+            li(1, None),
+            li(2, Some(1)),
+            li(3, Some(2)),
+            li(4, None),
+            li(5, Some(4)),
+        ];
+        let mut got = SubscriptionLineItem::with_addons(&items, 1);
+        got.sort();
+        assert_eq!(got, vec![1, 2, 3]);
+        assert_eq!(SubscriptionLineItem::with_addons(&items, 4), vec![4, 5]);
+
+        let cycle = vec![li(1, Some(2)), li(2, Some(1))];
+        let mut got = SubscriptionLineItem::with_addons(&cycle, 1);
+        got.sort();
+        assert_eq!(got, vec![1, 2]);
+    }
 }

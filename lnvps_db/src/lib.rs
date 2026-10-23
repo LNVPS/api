@@ -1481,6 +1481,20 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Credit held by unsettled, unexpired debits.
     async fn get_account_credit_reserved(&self, user_id: u64) -> DbResult<u64>;
 
+    /// Book a refund row and return `credit` (balance currency, may be 0) to the
+    /// refunded customer's balance, in one transaction. The `refund` ledger
+    /// event references the refund row. Either both land or neither does, so
+    /// the books never show a refund the customer did not receive.
+    ///
+    /// Returns `false` (and changes nothing) when a row with `refund.id`
+    /// already exists, so a retry with the same derived id cannot pay twice.
+    async fn insert_refund_to_credit(
+        &self,
+        refund: &SubscriptionPayment,
+        credit: u64,
+        note: Option<&str>,
+    ) -> DbResult<bool>;
+
     /// Shift the balance by a signed `delta` and write a ledger event in one
     /// transaction. A negative delta may not take the balance below what is
     /// reserved.

@@ -3,7 +3,7 @@ use crate::pricing::PricingEngine;
 use crate::ssh_host_key::{ApiVmHostKey, parse_ssh_host_keys};
 use crate::traffic::quota_period;
 use anyhow::{Result, anyhow, bail};
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use chrono::{DateTime, Days, NaiveDate, TimeDelta, Utc};
 use futures::future::join_all;
 use ipnetwork::IpNetwork;
 use lnvps_db::{
@@ -377,6 +377,30 @@ pub fn grace_period_days_for_sub(sub: &Subscription, now: DateTime<Utc>, delete_
     }
 }
 
+/// Grace period for hourly subscriptions, regardless of age.
+///
+/// An hourly subscription lapses when the customer's credit runs out. The
+/// age-tiered day windows would leave the service stopped but undeleted (and
+/// costing disk and IPs) for up to `delete_after` days with nothing paid, so
+/// hourly subscriptions get one day to top up instead.
+pub const HOURLY_GRACE_PERIOD: TimeDelta = TimeDelta::hours(24);
+
+/// How long after `expires` a subscription is kept before it is deleted.
+///
+/// Hourly subscriptions use the fixed [`HOURLY_GRACE_PERIOD`]; everything else
+/// uses the age-tiered whole-day window from [`grace_period_days_for_sub`].
+pub fn grace_period_for_sub(
+    sub: &Subscription,
+    now: DateTime<Utc>,
+    delete_after: u16,
+) -> TimeDelta {
+    if sub.interval_type == lnvps_db::IntervalType::Hour {
+        HOURLY_GRACE_PERIOD
+    } else {
+        TimeDelta::days(grace_period_days_for_sub(sub, now, delete_after) as i64)
+    }
+}
+
 // Function to build ApiVmStatus from VM data (moved from common)
 ///
 /// `host` is the VM's host, passed in by the caller so that listing endpoints
@@ -424,8 +448,8 @@ pub async fn vm_to_status(
                 // period is dynamic (subscription-age based), so surface the resulting
                 // date rather than a fixed offset.
                 let deleting_on = sub.expires.and_then(|expires| {
-                    let grace = grace_period_days_for_sub(&sub, Utc::now(), delete_after);
-                    expires.checked_add_days(Days::new(grace as u64))
+                    let grace = grace_period_for_sub(&sub, Utc::now(), delete_after);
+                    expires.checked_add_signed(grace)
                 });
                 // Effective prepay window: the company override when set, else the
                 // global default. Surfaced so the client can cap the renewal
@@ -701,11 +725,13 @@ pub enum ApiIntervalType {
     Day = 0,
     Month = 1,
     Year = 2,
+    Hour = 3,
 }
 
 impl From<lnvps_db::IntervalType> for ApiIntervalType {
     fn from(value: lnvps_db::IntervalType) -> Self {
         match value {
+            lnvps_db::IntervalType::Hour => Self::Hour,
             lnvps_db::IntervalType::Day => Self::Day,
             lnvps_db::IntervalType::Month => Self::Month,
             lnvps_db::IntervalType::Year => Self::Year,
@@ -716,6 +742,7 @@ impl From<lnvps_db::IntervalType> for ApiIntervalType {
 impl From<ApiIntervalType> for lnvps_db::IntervalType {
     fn from(value: ApiIntervalType) -> Self {
         match value {
+            ApiIntervalType::Hour => Self::Hour,
             ApiIntervalType::Day => Self::Day,
             ApiIntervalType::Month => Self::Month,
             ApiIntervalType::Year => Self::Year,
@@ -1357,6 +1384,70 @@ impl ApiSubscriptionLineItemResource {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn hourly_subscriptions_have_a_fixed_short_grace() {
+        use super::{HOURLY_GRACE_PERIOD, grace_period_for_sub};
+        use chrono::{TimeDelta, Utc};
+        use lnvps_db::{IntervalType, Subscription};
+        let mut sub = Subscription {
+            id: 1,
+            user_id: 1,
+            company_id: 1,
+            name: "s".to_string(),
+            description: None,
+            created: Utc::now() - TimeDelta::days(400),
+            expires: None,
+            is_active: true,
+            is_setup: true,
+            currency: "EUR".to_string(),
+            interval_amount: 1,
+            interval_type: IntervalType::Hour,
+            setup_fee: 0,
+            auto_renewal_enabled: false,
+            external_id: None,
+        };
+        // Age does not lengthen an hourly grace, and delete_after is ignored.
+        assert_eq!(
+            grace_period_for_sub(&sub, Utc::now(), 30),
+            HOURLY_GRACE_PERIOD
+        );
+        assert_eq!(HOURLY_GRACE_PERIOD, TimeDelta::hours(24));
+        // Other intervals keep the age-tiered whole-day window.
+        sub.interval_type = IntervalType::Month;
+        assert_eq!(
+            grace_period_for_sub(&sub, Utc::now(), 30),
+            TimeDelta::days(30)
+        );
+        sub.created = Utc::now();
+        assert_eq!(
+            grace_period_for_sub(&sub, Utc::now(), 30),
+            TimeDelta::days(1)
+        );
+    }
+
+    #[test]
+    fn api_interval_type_hour_round_trips() {
+        use super::ApiIntervalType;
+        use lnvps_db::IntervalType;
+        assert_eq!(
+            ApiIntervalType::from(IntervalType::Hour),
+            ApiIntervalType::Hour
+        );
+        assert_eq!(
+            IntervalType::from(ApiIntervalType::Hour),
+            IntervalType::Hour
+        );
+        assert_eq!(
+            serde_json::to_string(&ApiIntervalType::Hour).unwrap(),
+            "\"hour\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ApiIntervalType>("\"hour\"").unwrap(),
+            ApiIntervalType::Hour
+        );
+        assert_eq!(IntervalType::Hour as u16, 3);
+    }
+
+    #[test]
     fn api_vm_os_image_reports_encrypted() {
         let mut image = lnvps_db::VmOsImage {
             id: 1,
@@ -1450,6 +1541,8 @@ mod tests {
                     amount: 100,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 })
                 .await
                 .unwrap();

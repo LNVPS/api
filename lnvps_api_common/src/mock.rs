@@ -531,6 +531,8 @@ impl Default for MockDb {
                         amount: 1000,
                         setup_amount: 0,
                         configuration: None,
+                        deactivated_at: None,
+                        parent_line_item_id: None,
                     },
                 );
                 m
@@ -3603,6 +3605,9 @@ impl LNVpsDbBase for MockDb {
                 } else {
                     // Regular subscription path: use interval from subscription
                     match subscription.interval_type {
+                        IntervalType::Hour => {
+                            base.add(TimeDelta::hours(subscription.interval_amount as i64))
+                        }
                         IntervalType::Day => base.add(Days::new(subscription.interval_amount)),
                         IntervalType::Month => {
                             base.add(Months::new(subscription.interval_amount as u32))
@@ -4589,6 +4594,45 @@ impl LNVpsDbBase for MockDb {
     async fn get_account_credit_reserved(&self, user_id: u64) -> DbResult<u64> {
         let debits = self.account_credit_debits.lock().await;
         Ok(reserved_credit(&debits, user_id, None))
+    }
+
+    async fn insert_refund_to_credit(
+        &self,
+        refund: &SubscriptionPayment,
+        credit: u64,
+        note: Option<&str>,
+    ) -> DbResult<bool> {
+        if self
+            .subscription_payments
+            .lock()
+            .await
+            .iter()
+            .any(|p| p.id == refund.id)
+        {
+            return Ok(false);
+        }
+        self.insert_subscription_payment(refund).await?;
+        if credit > 0 {
+            let mut credits = self.account_credits.lock().await;
+            let mut events = self.account_credit_events.lock().await;
+            let row = credits
+                .entry(refund.user_id)
+                .or_insert_with(|| empty_account_credit(refund.user_id));
+            row.balance += credit;
+            row.updated = Utc::now();
+            let event_id = events.len() as u64 + 1;
+            events.push(lnvps_db::AccountCreditEvent {
+                id: event_id,
+                user_id: refund.user_id,
+                kind: "refund".to_string(),
+                amount: credit as i64,
+                currency: row.currency.clone(),
+                subscription_payment_id: Some(refund.id.clone()),
+                note: note.map(str::to_string),
+                created: Utc::now(),
+            });
+        }
+        Ok(true)
     }
 
     async fn adjust_account_credit(
@@ -9298,6 +9342,32 @@ mod tests {
         );
     }
 
+    /// Regular subscription path: hour interval extends by N hours.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_interval_hour() {
+        let db = MockDb::default();
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.interval_amount = 3;
+            sub.interval_type = IntervalType::Hour;
+        }
+        let payment = make_payment(1, None);
+        db.insert_subscription_payment(&payment).await.unwrap();
+
+        let before = Utc::now();
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let subs = db.subscriptions.lock().await;
+        let expires = subs.get(&1).unwrap().expires.unwrap();
+        assert!(
+            expires >= before + chrono::Duration::hours(3)
+                && expires <= before + chrono::Duration::hours(3) + chrono::Duration::minutes(1),
+            "expires {} not 3 hours out",
+            expires
+        );
+    }
+
     /// Regular subscription path: day interval extends by N days.
     #[tokio::test]
     async fn test_subscription_payment_paid_interval_day() {
@@ -10115,6 +10185,8 @@ mod tests {
                 amount: 1000,
                 setup_amount: 0,
                 configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: None,
             },
         );
 
@@ -10228,6 +10300,8 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 },
             );
             db.vms.lock().await.insert(
@@ -11130,6 +11204,8 @@ mod tests {
                 amount: 1000,
                 setup_amount: 0,
                 configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: None,
             })
             .await
             .unwrap();
@@ -11635,6 +11711,8 @@ mod marketplace_tests {
                 amount: *amount,
                 setup_amount: *setup_amount,
                 configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: None,
             })
             .collect();
         let (sub_id, _) = db
@@ -13042,6 +13120,8 @@ mod vpn_tests {
                     amount: 500,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await

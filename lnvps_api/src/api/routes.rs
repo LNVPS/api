@@ -10,7 +10,7 @@ use futures::future::join_all;
 use isocountry::CountryCode;
 use lnurl::pay::PayResponse;
 use lnurl::{LnUrlResponse, Tag};
-use log::{error, info};
+use log::{error, info, warn};
 use nostr_sdk::{ToBech32, Url};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::Serialize;
@@ -122,7 +122,10 @@ pub fn routes() -> Router<RouterState> {
                 get(v1_notification_channels),
             )
             .route("/api/v1/vm", get(v1_list_vms))
-            .route("/api/v1/vm/{id}", get(v1_get_vm).patch(v1_patch_vm))
+            .route(
+                "/api/v1/vm/{id}",
+                get(v1_get_vm).patch(v1_patch_vm).delete(v1_delete_vm),
+            )
             .route("/api/v1/image", get(v1_list_vm_images))
             .route("/api/v1/vm/templates", get(v1_list_vm_templates))
             .route("/api/v1/exchange-rate", get(v1_exchange_rate))
@@ -1468,6 +1471,18 @@ async fn v1_create_vm_order(
         )
         .await?;
 
+    if let Err(e) = ensure_hourly_order_funded(&this, &rsp).await {
+        // Nothing was paid and nothing provisioned on a host yet; remove the
+        // order outright rather than leave it for the never-paid sweep.
+        if let Err(pe) = this.db.hard_delete_vm(rsp.id).await {
+            warn!(
+                "Failed to purge unfunded hourly order VM {}: {}",
+                rsp.id, pe
+            );
+        }
+        return Err(e);
+    }
+
     // Log VM creation
     this.history
         .log_vm_created(&rsp, Some(uid), None)
@@ -1486,6 +1501,35 @@ async fn v1_create_vm_order(
         )
         .await?,
     )
+}
+
+/// Refuse an order on an hourly plan the customer's credit cannot pay for.
+///
+/// Hourly subscriptions are paid from account credit only (see
+/// `ensure_credit_funded_if_hourly`), so an order credit cannot cover would
+/// only fail at payment. Checking here, with the same quote the payment will
+/// use, refuses it before the customer is handed a VM they cannot start.
+async fn ensure_hourly_order_funded(this: &RouterState, vm: &Vm) -> Result<(), ApiError> {
+    let sub = this
+        .db
+        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+        .await?;
+    if sub.interval_type != lnvps_db::IntervalType::Hour {
+        return Ok(());
+    }
+    if this
+        .sub_handler
+        .credit_covers_renewal(sub.id)
+        .await
+        .unwrap_or(false)
+    {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            "Hourly plans are paid from account credit. Top up your credit and turn on \
+             'apply credit automatically' so it covers at least the first hour.",
+        ))
+    }
 }
 
 /// Renew(Extend) a VM
@@ -1615,6 +1659,32 @@ async fn v1_renew_vm_lnurlp(
         }
         .into());
     }
+    let invoice_err = |_| {
+        Json(lnurl::Response::Error {
+            reason: "Error generating invoice".to_string(),
+        })
+    };
+
+    // An hourly VM renews itself from account credit every hour, so a payment
+    // to its LNURL tops the owner's credit up instead of buying time directly
+    // (which the credit-only rule would refuse).
+    let hourly = this
+        .db
+        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+        .await
+        .is_ok_and(|s| s.interval_type == lnvps_db::IntervalType::Hour);
+    if hourly {
+        let pr = crate::api::credit::new_lightning_topup(
+            &this,
+            vm.user_id,
+            q.amount,
+            format!("LNVPS credit top-up for VM {}", id),
+        )
+        .await
+        .map_err(invoice_err)?;
+        return Ok(Json(LnUrlPayCallbackResponse::new(pr)));
+    }
+
     let rsp = this
         .sub_handler
         .renew_amount(
@@ -1623,11 +1693,7 @@ async fn v1_renew_vm_lnurlp(
             PaymentMethod::Lightning,
         )
         .await
-        .map_err(|_| {
-            Json(lnurl::Response::Error {
-                reason: "Error generating invoice".to_string(),
-            })
-        })?;
+        .map_err(invoice_err)?;
 
     // external_data is pr for lightning payment method
     Ok(Json(LnUrlPayCallbackResponse::new(
@@ -1700,6 +1766,56 @@ async fn v1_stop_vm(
     this.work_sender
         .send(WorkJob::CheckVm { vm_id: id })
         .await?;
+    ApiData::ok(())
+}
+
+/// Refuse an owner's deletion of a VM that has an open abuse case against it.
+///
+/// Deleting would destroy the evidence and the means of acting on the report
+/// (suspending, preserving, answering the reporter) before it is resolved.
+async fn ensure_vm_deletable_by_owner(db: &Arc<dyn LNVpsDb>, vm_id: u64) -> Result<(), ApiError> {
+    let (open_cases, _) = db
+        .list_abuse_cases(1, 0, None, Some(vm_id), Some(true))
+        .await?;
+    if open_cases.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::conflict(
+            "This VM is the subject of an open abuse case and cannot be deleted",
+        ))
+    }
+}
+
+/// Delete a VM the caller no longer needs.
+///
+/// Stops billing: the subscription is deactivated and auto-renewal turned off
+/// when the worker runs the deletion. For an hourly VM the time already paid
+/// for but unused is returned to the caller's account credit. Queued rather
+/// than done inline, because deleting touches the host, the network and the
+/// database, and the worker is the one path that does all of it.
+///
+/// A VM the owner cannot delete yet is refused rather than queued: one already
+/// deleted (404), or one that is the subject of an open abuse case, which must
+/// stay available until it is resolved.
+async fn v1_delete_vm(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<()> {
+    let (_uid, _vm) = get_user_vm(&auth, &this, id).await?;
+
+    ensure_vm_deletable_by_owner(&this.db, id).await?;
+
+    this.work_sender
+        .send(WorkJob::DeleteVm {
+            vm_id: id,
+            reason: Some("Deleted by its owner".to_string()),
+            admin_user_id: None,
+            purge: false,
+            by_owner: true,
+        })
+        .await?;
+    info!("VM {} deletion requested by its owner", id);
     ApiData::ok(())
 }
 
@@ -2119,6 +2235,7 @@ struct InvoiceLine {
 /// their own `time_value` (everything that is not a VPS).
 fn interval_label(amount: u64, interval: lnvps_db::IntervalType) -> String {
     let unit = match interval {
+        lnvps_db::IntervalType::Hour => "hour",
         lnvps_db::IntervalType::Day => "day",
         lnvps_db::IntervalType::Month => "month",
         lnvps_db::IntervalType::Year => "year",
@@ -2873,6 +2990,160 @@ fn is_vm_expired(expires: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use lnvps_db::LNVpsDbBase;
+
+    async fn mock_router_state(db: Arc<lnvps_api_common::MockDb>) -> RouterState {
+        use crate::mocks::{MockNode, MockOnChainProvider};
+        use lnvps_api_common::{ChannelWorkCommander, ExchangeRateService, MockExchangeRate};
+        let rates = Arc::new(MockExchangeRate::new());
+        rates
+            .set_rate(
+                lnvps_api_common::Ticker::btc_rate("EUR").unwrap(),
+                100_000.0,
+            )
+            .await;
+        let commander: Arc<dyn lnvps_api_common::WorkCommander> =
+            Arc::new(ChannelWorkCommander::new());
+        let sub_handler = crate::subscription::SubscriptionHandler::new(
+            crate::settings::mock_settings(),
+            db.clone(),
+            Arc::new(MockNode::default()),
+            Arc::new(MockOnChainProvider::default()),
+            None,
+            rates.clone(),
+            VatClient::new(),
+            commander.clone(),
+            lnvps_api_common::VmStateCache::new(),
+        )
+        .unwrap();
+        RouterState {
+            db: db.clone(),
+            state: lnvps_api_common::VmStateCache::new(),
+            sub_handler,
+            history: lnvps_api_common::VmHistoryLogger::new(db),
+            settings: crate::settings::mock_settings(),
+            rates,
+            work_sender: commander,
+            feedback: None,
+            geoip: None,
+        }
+    }
+
+    /// An order on an hourly plan is refused unless opted-in credit covers the
+    /// first hour; a monthly order is never held up by credit.
+    #[tokio::test]
+    async fn an_hourly_order_needs_credit_up_front() {
+        use lnvps_api_common::MockDb;
+        let db = Arc::new(MockDb::default());
+        let state = mock_router_state(db.clone()).await;
+        let uid = db.upsert_user(&[9u8; 32]).await.unwrap();
+        let key = db
+            .insert_user_ssh_key(&lnvps_db::UserSshKey {
+                id: 0,
+                name: "k".to_string(),
+                user_id: uid,
+                created: Default::default(),
+                key_data: "ssh-rsa AAA==".into(),
+            })
+            .await
+            .unwrap();
+        let vm = state
+            .sub_handler
+            .vm_provisioner()
+            .provision(uid, 1, 1, key, None)
+            .await
+            .unwrap();
+        assert!(
+            ensure_hourly_order_funded(&state, &vm).await.is_ok(),
+            "monthly"
+        );
+
+        let sub = db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await
+            .unwrap();
+        db.subscriptions
+            .lock()
+            .await
+            .get_mut(&sub.id)
+            .unwrap()
+            .interval_type = lnvps_db::IntervalType::Hour;
+        let err = ensure_hourly_order_funded(&state, &vm).await.unwrap_err();
+        assert!(err.error.contains("account credit"), "{}", err.error);
+
+        db.adjust_account_credit(uid, 10_000_000_000, "topup", None)
+            .await
+            .unwrap();
+        assert!(
+            ensure_hourly_order_funded(&state, &vm).await.is_err(),
+            "credit must be opted in"
+        );
+        db.set_account_credit_auto_apply(uid, true).await.unwrap();
+        assert!(ensure_hourly_order_funded(&state, &vm).await.is_ok());
+    }
+
+    /// The LNURL top-up helper books a Lightning top-up for the VM owner, so a
+    /// payment to an hourly VM's LNURL lands in their credit once settled.
+    #[tokio::test]
+    async fn an_lnurl_topup_is_booked_for_the_owner() {
+        use lnvps_api_common::MockDb;
+        let db = Arc::new(MockDb::default());
+        let state = mock_router_state(db.clone()).await;
+        let uid = db.upsert_user(&[8u8; 32]).await.unwrap();
+
+        let pr = crate::api::credit::new_lightning_topup(&state, uid, 21_500, "t".to_string())
+            .await
+            .unwrap();
+        assert!(!pr.is_empty());
+        let (topups, _) = db.list_account_credit_topups(uid, 10, 0).await.unwrap();
+        assert_eq!(topups.len(), 1);
+        assert_eq!(topups[0].amount, 22_000, "rounded up to whole sats");
+        assert!(!topups[0].is_paid);
+
+        assert!(
+            crate::api::credit::new_lightning_topup(&state, uid, 0, "t".to_string())
+                .await
+                .is_err(),
+            "nothing to top up"
+        );
+    }
+
+    /// An owner cannot delete a VM while an abuse case against it is open, but
+    /// can once it is closed, and a case on another VM is irrelevant.
+    #[tokio::test]
+    async fn owner_delete_is_refused_during_an_open_abuse_case() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::AbuseCase;
+        let mock = Arc::new(MockDb::default());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+
+        assert!(ensure_vm_deletable_by_owner(&db, 7).await.is_ok());
+
+        let case_id = db
+            .insert_abuse_case(&AbuseCase {
+                vm_id: Some(7),
+                summary: "spam".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.insert_abuse_case(&AbuseCase {
+            vm_id: Some(8),
+            summary: "other".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let err = ensure_vm_deletable_by_owner(&db, 7).await.unwrap_err();
+        assert!(err.error.contains("open abuse case"), "{}", err.error);
+        assert_eq!(err.code, axum::http::StatusCode::CONFLICT);
+        assert!(ensure_vm_deletable_by_owner(&db, 9).await.is_ok());
+
+        db.close_abuse_case(case_id).await.unwrap();
+        assert!(ensure_vm_deletable_by_owner(&db, 7).await.is_ok());
+    }
     use chrono::Utc;
     use lnvps_db::PaymentMethodConfig;
 
@@ -3316,6 +3587,8 @@ mod tests {
             amount: 1000,
             setup_amount: 0,
             configuration: None,
+            deactivated_at: None,
+            parent_line_item_id: None,
         };
         mock.subscription_line_items
             .lock()
@@ -3446,6 +3719,8 @@ mod tests {
         use lnvps_db::IntervalType;
         assert_eq!(interval_label(1, IntervalType::Month), "1 month");
         assert_eq!(interval_label(3, IntervalType::Month), "3 months");
+        assert_eq!(interval_label(1, IntervalType::Hour), "1 hour");
+        assert_eq!(interval_label(6, IntervalType::Hour), "6 hours");
         assert_eq!(interval_label(1, IntervalType::Day), "1 day");
         assert_eq!(interval_label(14, IntervalType::Day), "14 days");
         assert_eq!(interval_label(1, IntervalType::Year), "1 year");

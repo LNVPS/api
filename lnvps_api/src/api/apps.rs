@@ -720,6 +720,8 @@ async fn v1_create_app_deployment(
         amount: app.amount,
         setup_amount: app.setup_amount,
         configuration: None,
+        deactivated_at: None,
+        parent_line_item_id: None,
     };
     let (_sub_id, line_item_ids) = this
         .db
@@ -1359,6 +1361,8 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 },
             );
             let mut subs = db.subscriptions.lock().await;

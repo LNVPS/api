@@ -15,7 +15,7 @@ This document provides comprehensive API specifications for generating TypeScrip
 **DiskType**: `"hdd"`, `"ssd"`
 **DiskInterface**: `"sata"`, `"scsi"`, `"pcie"`
 **VmState**: `"unknown"`, `"running"`, `"stopped"`, `"creating"`
-**CostPlanIntervalType**: `"day"`, `"month"`, `"year"`
+**CostPlanIntervalType**: `"hour"`, `"day"`, `"month"`, `"year"`
 **OsDistribution**: `"ubuntu"`, `"debian"`, `"centos"`, `"fedora"`, `"freebsd"`, `"opensuse"`, `"archlinux"`,
 `"redhatenterprise"`, `"almalinux"`, `"rockylinux"`, `"alpine"`, `"nixos"`, `"openbsd"`, `"netbsd"`, `"gentoo"`,
 `"voidlinux"`
@@ -384,7 +384,7 @@ interface VmCostPlan {
   /** @deprecated (#230) Use GET /api/v1/exchange-rate instead. Still populated for now. */
   other_price: Price[]; // Alternative currency prices
   interval_amount: number;
-  interval_type: 'day' | 'month' | 'year';
+  interval_type: 'hour' | 'day' | 'month' | 'year';
 }
 
 interface Price {
@@ -1116,6 +1116,16 @@ historical range is needed; a usage bar can be rendered from this object alone.
 - **Auth**: Required
 - **Response**: `null`
 
+#### Delete VM
+- **DELETE** `/api/v1/vm/{id}`
+- **Auth**: Required
+- **Response**: `null`. The deletion is queued, not immediate.
+- **Description**: Deletes a VM you no longer need and stops its billing. If the VM's subscription bills nothing else, the subscription is deactivated and auto-renewal turned off; if it also bills other products (an IP range, an app), only the VM's line item and its add-ons (such as paid snapshots) stop, and the rest keep billing. A subscription whose line items all belong to the VM ends with it. The time you paid for but did not use is returned to your account credit, whatever the billing interval, as a `refund` event:
+  - each payment gives back the share of what it charged (tax included) that the unused time represents, and on a shared subscription only the VM line item's share of it;
+  - what account credit paid comes back as exactly the credit it took;
+  - what was paid in cash (Lightning, card, on-chain, swap) comes back as credit at the current exchange rate. It is not paid out to the original method.
+- **Errors**: `403 Forbidden` if the VM is not yours; `404 Not Found` if it does not exist or is already deleted; `409 Conflict` if the VM is the subject of an open abuse case.
+
 #### Reinstall VM
 - **PATCH** `/api/v1/vm/{id}/re-install`
 - **Auth**: Required
@@ -1818,7 +1828,7 @@ interface App {
   amount: number;            // recurring price in smallest currency units (cents / millisats)
   currency: string;
   interval_amount: number;
-  interval_type: "day" | "month" | "year";
+  interval_type: "hour" | "day" | "month" | "year";
   setup_amount: number;      // one-off setup fee in smallest currency units (0 = none)
   // Resource footprint computed from the compose (issue #231):
   cpu_milli: number;         // total requested CPU in millicores

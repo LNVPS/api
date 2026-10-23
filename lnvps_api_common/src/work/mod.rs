@@ -96,6 +96,11 @@ pub enum WorkJob {
         /// purged regardless of this flag.
         #[serde(default)]
         purge: bool,
+        /// The VM's owner asked for this (`DELETE /api/v1/vm/{id}`), not an
+        /// admin. Changes who the history and notifications credit, and for an
+        /// hourly subscription returns the unused time to account credit.
+        #[serde(default)]
+        by_owner: bool,
     },
     /// Start a VM
     StartVm {

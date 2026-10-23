@@ -458,7 +458,13 @@ impl Worker {
         let lead = expiry_lead_window(sub);
         let lead_descr = format_lead_window(lead);
 
-        let line_items = self.db.list_subscription_line_items(sub.id).await?;
+        let line_items: Vec<_> = self
+            .db
+            .list_subscription_line_items(sub.id)
+            .await?
+            .into_iter()
+            .filter(|li| li.is_active())
+            .collect();
         let sub_notification_subject = self.sub_notification_subject(sub, &line_items).await;
         let sub_notification_descr = Self::sub_notification_message(sub, &line_items);
 
@@ -505,6 +511,12 @@ impl Worker {
                     match self.subscription_handler.auto_renew(sub.id).await {
                         Ok(payment) => {
                             info!("Successfully auto-renewed subscription {}", sub.id);
+                            // An hourly subscription renews every hour; a notice
+                            // each time would be 24 messages a day. It is only
+                            // worth telling the customer when renewal fails.
+                            if sub.interval_type == IntervalType::Hour {
+                                return Ok(());
+                            }
                             let paid_with = if payment.external_data.as_str()
                                 == crate::subscription::CREDIT_FUNDED_MARKER
                             {
@@ -539,7 +551,7 @@ impl Worker {
             // Send a plain expiry warning whenever auto-renewal was not attempted
             // (auto_renewal off, or no saved payment method).
             if !auto_renewed {
-                let grace = self.grace_period_days(sub);
+                let grace = self.grace_period(sub);
                 self.queue_notification(
                     sub.user_id,
                     format!(
@@ -557,7 +569,7 @@ impl Worker {
                 )
                 .await;
             }
-        } else if expires.add(Days::new(self.grace_period_days(sub) as u64)) < Utc::now() {
+        } else if expires.add(self.grace_period(sub)) < Utc::now() {
             // mark subscription as not-active
             let mut sub = sub.clone();
             sub.is_active = false;
@@ -599,7 +611,7 @@ impl Worker {
             let already_handled = self
                 .subscription_expiry_already_handled(sub, &line_items, last_check)
                 .await;
-            let grace = self.grace_period_days(sub);
+            let grace = self.grace_period(sub);
             if !already_handled {
                 self.queue_notification(
                     sub.user_id,
@@ -713,17 +725,17 @@ fn post_expiry_reminder_due(
 /// Whole days left before deletion, rounded up so any remaining time reads as at
 /// least one day, floored at zero. The exact deletion timestamp is in the
 /// message body, so the rounding is only for the headline.
-fn days_until_deletion(expires: DateTime<Utc>, grace_days: u16, now: DateTime<Utc>) -> i64 {
+fn days_until_deletion(expires: DateTime<Utc>, grace: TimeDelta, now: DateTime<Utc>) -> i64 {
     const DAY: i64 = 24 * 60 * 60;
-    let secs = (expires + TimeDelta::days(grace_days as i64) - now).num_seconds();
+    let secs = (expires + grace - now).num_seconds();
     if secs <= 0 { 0 } else { (secs + DAY - 1) / DAY }
 }
 
 /// One-line warning naming the date the services are deleted.
-fn deletion_warning(expires: DateTime<Utc>, grace_days: u16) -> String {
+fn deletion_warning(expires: DateTime<Utc>, grace: TimeDelta) -> String {
     format!(
         "If it is not renewed, your services and all their data are permanently deleted on {}.",
-        format_timestamp(expires + TimeDelta::days(grace_days as i64))
+        format_timestamp(expires + grace)
     )
 }
 
@@ -738,7 +750,7 @@ fn format_days(days: i64) -> String {
 /// Grace period (days) for a subscription, tiered by subscription age. Lives in
 /// `lnvps_api_common` so the API layer can surface the resulting deletion date;
 /// re-exported here for the worker/subscription callers.
-pub use lnvps_api_common::grace_period_days_for_sub;
+pub use lnvps_api_common::{grace_period_days_for_sub, grace_period_for_sub};
 
 /// Approximate duration of one billing interval for a subscription.
 ///
@@ -747,6 +759,7 @@ pub use lnvps_api_common::grace_period_days_for_sub;
 fn subscription_interval(sub: &Subscription) -> TimeDelta {
     let amount = sub.interval_amount.max(1) as i64;
     match sub.interval_type {
+        IntervalType::Hour => TimeDelta::hours(amount),
         IntervalType::Day => TimeDelta::days(amount),
         IntervalType::Month => TimeDelta::days(30 * amount),
         IntervalType::Year => TimeDelta::days(365 * amount),
@@ -801,8 +814,8 @@ impl Worker {
     /// | ≤ 28       | 7             |
     /// | ≤ 180      | 14            |
     /// | > 180      | delete_after  |
-    fn grace_period_days(&self, sub: &Subscription) -> u16 {
-        grace_period_days_for_sub(sub, Utc::now(), self.settings.delete_after)
+    fn grace_period(&self, sub: &Subscription) -> TimeDelta {
+        grace_period_for_sub(sub, Utc::now(), self.settings.delete_after)
     }
 
     /// Whether the one-shot "expired" handling for `sub` has already run.
@@ -870,6 +883,13 @@ impl Worker {
         line_items: &Vec<SubscriptionLineItem>,
     ) -> String {
         let interval_str = match sub.interval_type {
+            IntervalType::Hour => {
+                if sub.interval_amount == 1 {
+                    "per hour".to_string()
+                } else {
+                    format!("every {} hours", sub.interval_amount)
+                }
+            }
             IntervalType::Day => {
                 if sub.interval_amount == 1 {
                     "per day".to_string()
@@ -1493,7 +1513,13 @@ impl Worker {
             return Ok(());
         }
 
-        let line_items = self.db.list_subscription_line_items(sub.id).await?;
+        let line_items: Vec<_> = self
+            .db
+            .list_subscription_line_items(sub.id)
+            .await?
+            .into_iter()
+            .filter(|li| li.is_active())
+            .collect();
         if line_items
             .iter()
             .any(|li| li.subscription_type == LineItemType::Vps)
@@ -3674,11 +3700,28 @@ impl Worker {
                 reason,
                 admin_user_id,
                 purge,
+                by_owner,
             } => {
                 let vm = self.db.get_vm(*vm_id).await?;
                 if vm.deleted {
                     return Ok(None);
                 }
+
+                // Read the paid-through time before deleting: deletion stops
+                // billing, and an hourly VM's unused time is returned to its
+                // owner's credit afterwards.
+                let unused_refund_basis = if *by_owner {
+                    match self
+                        .db
+                        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+                        .await
+                    {
+                        Ok(s) => s.expires.map(|e| (e, Utc::now())),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
 
                 // A VM that has never had its first (purchase) payment confirmed
                 // carries no customer data, so purge it entirely. Super-admins
@@ -3701,20 +3744,83 @@ impl Worker {
                 // Only record deletion history for soft-deleted VMs.
                 if !hard_delete {
                     // Log VM deletion
-                    let metadata = if let Some(admin_id) = admin_user_id {
-                        Some(serde_json::json!({
-                            "admin_user_id": admin_id,
-                            "admin_action": true
-                        }))
+                    let (metadata, initiated_by) = if *by_owner {
+                        (
+                            Some(serde_json::json!({ "admin_action": false })),
+                            Some(vm.user_id),
+                        )
+                    } else if let Some(admin_id) = admin_user_id {
+                        (
+                            Some(serde_json::json!({
+                                "admin_user_id": admin_id,
+                                "admin_action": true
+                            })),
+                            *admin_user_id,
+                        )
                     } else {
-                        Some(serde_json::json!({
-                            "admin_action": true
-                        }))
+                        (
+                            Some(serde_json::json!({
+                                "admin_action": true
+                            })),
+                            None,
+                        )
                     };
 
                     self.vm_history_logger
-                        .log_vm_deleted(*vm_id, *admin_user_id, reason.as_deref(), metadata)
+                        .log_vm_deleted(*vm_id, initiated_by, reason.as_deref(), metadata)
                         .await?;
+                }
+
+                // The VM is gone and billing has stopped, so a refund that
+                // fails is money to hand back by hand, not a reason to retry the
+                // job: a redelivery would find the VM deleted and do nothing.
+                let mut credit_returned = 0;
+                if let Some((expires, at)) = unused_refund_basis {
+                    match self
+                        .refunds
+                        .refund_unused_to_credit(*vm_id, vm.user_id, expires, at)
+                        .await
+                    {
+                        Ok(c) => credit_returned = c,
+                        Err(e) => {
+                            error!(
+                                "VM {} was deleted by its owner but returning its unused time \
+                                 to account credit failed: {}",
+                                vm_id, e
+                            );
+                            self.queue_admin_notification(
+                                format!(
+                                    "VM {} was deleted by user {} but the unused time could not be \
+                                     returned to their account credit: {}",
+                                    vm_id, vm.user_id, e
+                                ),
+                                Some(format!("[VM{}] Credit refund failed", vm_id)),
+                            )
+                            .await;
+                        }
+                    }
+                }
+
+                if *by_owner {
+                    let msg = if credit_returned > 0 {
+                        format!(
+                            "Your VM #{} has been deleted and billing has stopped. The unused \
+                             time was returned to your account credit.",
+                            vm_id
+                        )
+                    } else {
+                        format!(
+                            "Your VM #{} has been deleted and billing has stopped.",
+                            vm_id
+                        )
+                    };
+                    self.queue_notification(
+                        vm.user_id,
+                        msg,
+                        Some(format!("[VM{}] Deleted", vm_id)),
+                    )
+                    .await;
+                    return Ok(Some(format!("VM {} deleted by its owner", vm_id)));
                 }
 
                 // Send notifications
@@ -4023,6 +4129,7 @@ impl Worker {
                         )),
                         admin_user_id: Some(*admin_user_id),
                         purge: false,
+                        by_owner: false,
                     })
                     .await
                 {
@@ -5151,7 +5258,7 @@ mod tests {
     use crate::mocks::{MockChainExplorer, MockNode, MockOnChainProvider};
     use crate::settings::mock_settings;
     use crate::subscription::SubscriptionHandler;
-    use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate};
+    use lnvps_api_common::{ChannelWorkCommander, ExchangeRateService, MockDb, MockExchangeRate};
     use lnvps_db::{
         LNVpsDbBase, LineItemType, Subscription, SubscriptionLineItem, SubscriptionPayment,
         UserSshKey, Vm,
@@ -5994,6 +6101,13 @@ mod tests {
         settings.delete_after = delete_after;
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
+        // Renewals priced in EUR against a BTC credit balance need a rate.
+        rates
+            .set_rate(
+                lnvps_api_common::Ticker::btc_rate("EUR").unwrap(),
+                100_000.0,
+            )
+            .await;
         let work_commander = Arc::new(ChannelWorkCommander::new());
         let cache = VmStateCache::new();
         let sub_handler = SubscriptionHandler::new(
@@ -6071,6 +6185,8 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await?;
@@ -7040,6 +7156,16 @@ mod tests {
         sub.interval_amount = 2;
         assert_eq!(expiry_lead_window(&sub), TimeDelta::days(1));
 
+        // Hourly billing: the lead is half the interval (30 minutes), so a
+        // just-renewed hourly subscription is not immediately "expiring soon".
+        sub.interval_type = IntervalType::Hour;
+        sub.interval_amount = 1;
+        assert_eq!(subscription_interval(&sub), TimeDelta::hours(1));
+        assert_eq!(expiry_lead_window(&sub), TimeDelta::minutes(30));
+        sub.interval_amount = 6;
+        assert_eq!(subscription_interval(&sub), TimeDelta::hours(6));
+        assert_eq!(expiry_lead_window(&sub), TimeDelta::hours(3));
+
         // Yearly billing stays at the 1-day max.
         sub.interval_amount = 1;
         sub.interval_type = IntervalType::Year;
@@ -7161,11 +7287,11 @@ mod tests {
     fn test_deletion_countdown_helpers() {
         let now = Utc::now();
         let expires = now.sub(TimeDelta::days(10));
-        assert_eq!(days_until_deletion(expires, 14, now), 4);
+        assert_eq!(days_until_deletion(expires, TimeDelta::days(14), now), 4);
         // Never negative, even past the deletion date.
-        assert_eq!(days_until_deletion(expires, 2, now), 0);
+        assert_eq!(days_until_deletion(expires, TimeDelta::days(2), now), 0);
 
-        let warning = deletion_warning(expires, 14);
+        let warning = deletion_warning(expires, TimeDelta::days(14));
         assert!(warning.contains(&format_timestamp(expires.add(TimeDelta::days(14)))));
         assert!(warning.contains("permanently deleted"));
 
@@ -7204,6 +7330,162 @@ mod tests {
             0,
             "expiry reminders must not repeat within the same milestone"
         );
+        Ok(())
+    }
+
+    /// An hourly VM whose owner deletes it stops billing and gets the unused
+    /// part of what credit paid for back as credit.
+    #[tokio::test]
+    async fn an_owner_deleting_an_hourly_vm_returns_unused_time_as_credit() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let created = Utc::now().sub(TimeDelta::hours(6));
+        let (vm_id, sub_id) = add_vm_with_subscription(&db, created, true).await?;
+        let vm = db.get_vm(vm_id).await?;
+        // 4 of the 8 paid hours are left.
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&sub_id).unwrap();
+            sub.interval_type = IntervalType::Hour;
+            sub.auto_renewal_enabled = true;
+            sub.expires = Some(Utc::now().add(TimeDelta::hours(4)));
+        }
+        let mut payment = make_subscription_payment(
+            sub_id,
+            vm.user_id,
+            created,
+            Utc::now().add(TimeDelta::hours(4)),
+            9,
+        );
+        payment.is_paid = true;
+        payment.amount = 8_000;
+        payment.time_value = Some(8 * 3600);
+        db.insert_subscription_payment(&payment).await?;
+        db.account_credit_debits
+            .lock()
+            .await
+            .push(lnvps_db::AccountCreditDebit {
+                user_id: vm.user_id,
+                subscription_payment_id: Some(payment.id.clone()),
+                amount: 8_000,
+                currency: "BTC".to_string(),
+                payment_amount: 8_000,
+                settled: true,
+                ..Default::default()
+            });
+        let worker = setup_worker(db.clone()).await?;
+
+        let out = worker
+            .try_job(&WorkJob::DeleteVm {
+                vm_id,
+                reason: Some("Deleted by its owner".to_string()),
+                admin_user_id: None,
+                purge: false,
+                by_owner: true,
+            })
+            .await?;
+        assert!(out.unwrap().contains("by its owner"));
+
+        assert!(db.get_vm(vm_id).await?.deleted);
+        let sub = db.get_subscription(sub_id).await?;
+        assert!(!sub.is_active && !sub.auto_renewal_enabled, "billing stops");
+        let balance = db.get_account_credit(vm.user_id).await?.balance;
+        assert!(
+            (3_990..=4_000).contains(&balance),
+            "about half of 8000 returned, got {balance}"
+        );
+        assert!(count_notifications(&worker, "Deleted").await >= 1);
+        // The history credits the owner, not an administrator.
+        let history = db.list_vm_history_paginated(vm_id, 20, 0).await?;
+        let deleted = history
+            .iter()
+            .find(|h| matches!(h.action_type, lnvps_db::VmHistoryActionType::Deleted))
+            .expect("a deleted entry");
+        assert_eq!(deleted.initiated_by_user, Some(vm.user_id));
+        Ok(())
+    }
+
+    /// An owner deleting a monthly VM gets the unused part of the month back
+    /// as credit too: 25 of 30 days left on 1000 msat of credit.
+    #[tokio::test]
+    async fn an_owner_deleting_a_monthly_vm_returns_unused_time_as_credit() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let created = Utc::now().sub(TimeDelta::days(5));
+        let (vm_id, sub_id) = add_vm_with_subscription(&db, created, true).await?;
+        let vm = db.get_vm(vm_id).await?;
+        let mut payment = make_subscription_payment(
+            sub_id,
+            vm.user_id,
+            created,
+            created.add(TimeDelta::days(30)),
+            9,
+        );
+        payment.is_paid = true;
+        db.insert_subscription_payment(&payment).await?;
+        db.account_credit_debits
+            .lock()
+            .await
+            .push(lnvps_db::AccountCreditDebit {
+                user_id: vm.user_id,
+                subscription_payment_id: Some(payment.id.clone()),
+                amount: 1_000,
+                currency: "BTC".to_string(),
+                payment_amount: 1_000,
+                settled: true,
+                ..Default::default()
+            });
+        let worker = setup_worker(db.clone()).await?;
+
+        worker
+            .try_job(&WorkJob::DeleteVm {
+                vm_id,
+                reason: None,
+                admin_user_id: None,
+                purge: false,
+                by_owner: true,
+            })
+            .await?;
+        assert!(db.get_vm(vm_id).await?.deleted);
+        let balance = db.get_account_credit(vm.user_id).await?.balance;
+        assert!(
+            (820..=834).contains(&balance),
+            "about 25/30 of 1000, got {balance}"
+        );
+        Ok(())
+    }
+
+    /// An hourly subscription gets a 24 hour grace period, not the 1-14 day
+    /// age-tiered window, so a lapsed credit balance does not hold resources
+    /// for days. The same expiry under a monthly interval is still in grace.
+    #[tokio::test]
+    async fn test_hourly_subscription_is_cancelled_after_24h_grace() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        // Created 31 days + 6 hours ago: expired 6 hours ago... shift so the
+        // expiry is 30 hours in the past.
+        let created = Utc::now().sub(TimeDelta::days(31)).sub(TimeDelta::hours(6));
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, created, true).await?;
+        let monthly = db.get_subscription(subscription_id).await?;
+        let expires = monthly.expires.unwrap();
+        assert!(expires < Utc::now().sub(TimeDelta::hours(29)));
+        let worker = setup_worker_with_delete_after(db.clone(), 30).await?;
+
+        let mut hourly = monthly.clone();
+        hourly.interval_type = IntervalType::Hour;
+        assert_eq!(worker.grace_period(&hourly), TimeDelta::hours(24));
+        worker
+            .handle_subscription_state(&hourly, expires.sub(TimeDelta::minutes(1)))
+            .await?;
+        assert!(
+            count_notifications(&worker, "Cancelled").await >= 1,
+            "an hourly subscription 30h past expiry is beyond its 24h grace"
+        );
+
+        // The same expiry on a monthly plan is still inside its grace window.
+        let (_v2, sub2) = add_vm_with_subscription(&db, created, true).await?;
+        let monthly2 = db.get_subscription(sub2).await?;
+        worker
+            .handle_subscription_state(&monthly2, expires.sub(TimeDelta::minutes(1)))
+            .await?;
+        assert_eq!(count_notifications(&worker, "Cancelled").await, 0);
         Ok(())
     }
 
@@ -7287,6 +7569,39 @@ mod tests {
             notes, 0,
             "a freshly-renewed 1-day sub must not be 'expiring soon' (double-charge bug)"
         );
+        Ok(())
+    }
+
+    /// An hourly subscription renewed from credit is renewed silently: a notice
+    /// every hour would be 24 a day.
+    #[tokio::test]
+    async fn test_hourly_credit_renewal_sends_no_notice() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        let sub = {
+            let mut subs = db.subscriptions.lock().await;
+            let s = subs.get_mut(&subscription_id).unwrap();
+            s.interval_type = IntervalType::Hour;
+            s.auto_renewal_enabled = true;
+            // Inside the 30 minute lead window.
+            s.expires = Some(Utc::now().add(TimeDelta::minutes(20)));
+            s.clone()
+        };
+        db.adjust_account_credit(sub.user_id, 10_000_000_000, "topup", None)
+            .await?;
+        db.set_account_credit_auto_apply(sub.user_id, true).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .handle_subscription_state(&sub, Utc::now().sub(TimeDelta::minutes(15)))
+            .await?;
+
+        let renewed = db.get_subscription(subscription_id).await?;
+        assert!(
+            renewed.expires.unwrap() > sub.expires.unwrap(),
+            "the hour was renewed from credit"
+        );
+        assert_eq!(count_notifications(&worker, "").await, 0, "and silently");
         Ok(())
     }
 
@@ -8280,6 +8595,8 @@ mod tests {
                     amount: 500,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await?;

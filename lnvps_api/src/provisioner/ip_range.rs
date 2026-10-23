@@ -681,6 +681,8 @@ mod tests {
             amount: 1000,
             setup_amount: 0,
             configuration: Some(cfg),
+            deactivated_at: None,
+            parent_line_item_id: None,
         };
         db.subscription_line_items
             .lock()
@@ -868,6 +870,8 @@ mod tests {
             amount: 1000,
             setup_amount: 0,
             configuration: None,
+            deactivated_at: None,
+            parent_line_item_id: None,
         };
         db.subscription_line_items
             .lock()

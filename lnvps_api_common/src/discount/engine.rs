@@ -402,6 +402,7 @@ pub fn discount_tax_lines(lines: &[TaxLine], amount_off: u64) -> Vec<TaxLine> {
 /// The name a rule sees for a billing interval.
 fn interval_type_name(interval: IntervalType) -> &'static str {
     match interval {
+        IntervalType::Hour => "hour",
         IntervalType::Day => "day",
         IntervalType::Month => "month",
         IntervalType::Year => "year",
@@ -880,6 +881,7 @@ mod tests {
     #[test]
     fn interval_names_are_stable() {
         // Rules compare against these strings, so they are API.
+        assert_eq!(interval_type_name(IntervalType::Hour), "hour");
         assert_eq!(interval_type_name(IntervalType::Day), "day");
         assert_eq!(interval_type_name(IntervalType::Month), "month");
         assert_eq!(interval_type_name(IntervalType::Year), "year");

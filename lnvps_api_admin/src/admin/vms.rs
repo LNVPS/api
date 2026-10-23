@@ -702,6 +702,7 @@ async fn admin_delete_vm(
         reason: req.reason.clone(),
         admin_user_id: Some(auth.user_id),
         purge,
+        by_owner: false,
     };
 
     match this.work_commander.send(delete_job).await {
@@ -1822,6 +1823,8 @@ mod tests {
                 amount: 999,
                 setup_amount: 0,
                 configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: None,
             })
             .await
             .unwrap();

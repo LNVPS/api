@@ -14,6 +14,18 @@ use lnvps_db::{
 use log::{error, info, warn};
 use std::sync::Arc;
 
+/// A grace period for a notification: whole days when it is a multiple of a
+/// day, otherwise hours.
+fn format_grace(grace: chrono::TimeDelta) -> String {
+    let hours = grace.num_hours().max(1);
+    if hours % 24 == 0 {
+        let days = hours / 24;
+        format!("{} day{}", days, if days == 1 { "" } else { "s" })
+    } else {
+        format!("{} hour{}", hours, if hours == 1 { "" } else { "s" })
+    }
+}
+
 pub struct VmLineItemHandler {
     vm: Vm,
     vm_expires_before: chrono::DateTime<chrono::Utc>,
@@ -236,11 +248,8 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
         if line_item.subscription_type != LineItemType::Vps {
             return Ok(());
         }
-        let grace_days = crate::worker::grace_period_days_for_sub(
-            sub,
-            Utc::now(),
-            self.provisioner.delete_after,
-        );
+        let grace =
+            crate::worker::grace_period_for_sub(sub, Utc::now(), self.provisioner.delete_after);
         info!("Stopping expired VM {}", self.vm.id);
         // Stop is best-effort (the host may be unreachable or the VM already
         // stopped), but the history entry must always be written: it is the
@@ -258,8 +267,8 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
         self.queue_notification(
             self.vm.user_id,
             format!(
-                "Your VM #{} has expired and has been stopped.\n\nPlease renew your subscription within {} day(s) to restore access. If not renewed, the VM and all its data will be permanently deleted.",
-                self.vm.id, grace_days
+                "Your VM #{} has expired and has been stopped.\n\nPlease renew your subscription within {} to restore access. If not renewed, the VM and all its data will be permanently deleted.",
+                self.vm.id, format_grace(grace)
             ),
             Some(format!("[VM{}] Expired", self.vm.id)),
         ).await;
@@ -324,5 +333,22 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
         )
         .await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_grace;
+    use chrono::TimeDelta;
+
+    #[test]
+    fn grace_is_described_in_days_or_hours() {
+        assert_eq!(format_grace(TimeDelta::days(1)), "1 day");
+        assert_eq!(format_grace(TimeDelta::days(14)), "14 days");
+        assert_eq!(format_grace(TimeDelta::hours(24)), "1 day");
+        assert_eq!(format_grace(TimeDelta::hours(1)), "1 hour");
+        assert_eq!(format_grace(TimeDelta::hours(6)), "6 hours");
+        // Never "0 hours".
+        assert_eq!(format_grace(TimeDelta::minutes(10)), "1 hour");
     }
 }

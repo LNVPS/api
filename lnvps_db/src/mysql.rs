@@ -100,6 +100,44 @@ async fn lock_account_credit(
     )
 }
 
+async fn insert_subscription_payment_with<'e, E: sqlx::MySqlExecutor<'e>>(
+    ex: E,
+    payment: &SubscriptionPayment,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, tax, processing_fee, time_value, metadata, paid_at, tax_rate, tax_country_code, tax_treatment, tax_evidence, tax_breakdown, refunded_payment_id, renewal_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(&payment.id)
+    .bind(payment.subscription_id)
+    .bind(payment.user_id)
+    .bind(payment.created)
+    .bind(payment.expires)
+    .bind(payment.amount)
+    .bind(&payment.currency)
+    .bind(payment.payment_method)
+    .bind(payment.payment_type)
+    .bind(&payment.external_data)
+    .bind(&payment.external_id)
+    .bind(payment.is_paid)
+    .bind(payment.rate)
+    .bind(payment.tax)
+    .bind(payment.processing_fee)
+    .bind(payment.time_value)
+    .bind(&payment.metadata)
+    .bind(payment.paid_at)
+    .bind(payment.tax_rate)
+    .bind(&payment.tax_country_code)
+    .bind(&payment.tax_treatment)
+    .bind(&payment.tax_evidence)
+    .bind(&payment.tax_breakdown)
+    .bind(&payment.refunded_payment_id)
+    .bind(payment.renewal_source)
+    .execute(ex)
+    .await?;
+
+    Ok(())
+}
+
 async fn account_credit_reserved<'e, E: sqlx::MySqlExecutor<'e>>(
     ex: E,
     user_id: u64,
@@ -3311,7 +3349,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             line_item.subscription_id = subscription_id;
 
             let li_res = sqlx::query(
-                "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration, parent_line_item_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(line_item.subscription_id)
             .bind(line_item.subscription_type)
@@ -3320,6 +3358,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(line_item.amount)
             .bind(line_item.setup_amount)
             .bind(&line_item.configuration)
+            .bind(line_item.parent_line_item_id)
             .execute(&mut *tx)
             .await?;
 
@@ -3522,7 +3561,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         line_item: &SubscriptionLineItem,
     ) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration, parent_line_item_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(line_item.subscription_id)
         .bind(line_item.subscription_type)
@@ -3531,6 +3570,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(line_item.amount)
         .bind(line_item.setup_amount)
         .bind(&line_item.configuration)
+        .bind(line_item.parent_line_item_id)
         .execute(&self.db)
         .await?;
 
@@ -3542,7 +3582,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         line_item: &SubscriptionLineItem,
     ) -> DbResult<()> {
         sqlx::query(
-            "UPDATE subscription_line_item SET subscription_id = ?, subscription_type = ?, name = ?, description = ?, amount = ?, setup_amount = ?, configuration = ? WHERE id = ?"
+            "UPDATE subscription_line_item SET subscription_id = ?, subscription_type = ?, name = ?, description = ?, amount = ?, setup_amount = ?, configuration = ?, deactivated_at = ?, parent_line_item_id = ? WHERE id = ?"
         )
         .bind(line_item.subscription_id)
         .bind(line_item.subscription_type)
@@ -3551,6 +3591,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(line_item.amount)
         .bind(line_item.setup_amount)
         .bind(&line_item.configuration)
+        .bind(line_item.deactivated_at)
+        .bind(line_item.parent_line_item_id)
         .bind(line_item.id)
         .execute(&self.db)
         .await?;
@@ -3688,37 +3730,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()> {
-        sqlx::query(
-            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, tax, processing_fee, time_value, metadata, paid_at, tax_rate, tax_country_code, tax_treatment, tax_evidence, tax_breakdown, refunded_payment_id, renewal_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(&payment.id)
-        .bind(payment.subscription_id)
-        .bind(payment.user_id)
-        .bind(payment.created)
-        .bind(payment.expires)
-        .bind(payment.amount)
-        .bind(&payment.currency)
-        .bind(payment.payment_method)
-        .bind(payment.payment_type)
-        .bind(&payment.external_data)
-        .bind(&payment.external_id)
-        .bind(payment.is_paid)
-        .bind(payment.rate)
-        .bind(payment.tax)
-        .bind(payment.processing_fee)
-        .bind(payment.time_value)
-        .bind(&payment.metadata)
-        .bind(payment.paid_at)
-        .bind(payment.tax_rate)
-        .bind(&payment.tax_country_code)
-        .bind(&payment.tax_treatment)
-        .bind(&payment.tax_evidence)
-        .bind(&payment.tax_breakdown)
-        .bind(&payment.refunded_payment_id)
-        .bind(payment.renewal_source)
-        .execute(&self.db)
-        .await?;
-
+        insert_subscription_payment_with(&self.db, payment).await?;
         Ok(())
     }
 
@@ -3828,6 +3840,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_one(tx.as_mut())
                 .await?;
             let interval_sql = match sub.interval_type {
+                IntervalType::Hour => "HOUR",
                 IntervalType::Day => "DAY",
                 IntervalType::Month => "MONTH",
                 IntervalType::Year => "YEAR",
@@ -5026,6 +5039,55 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn get_account_credit_reserved(&self, user_id: u64) -> DbResult<u64> {
         Ok(account_credit_reserved(&self.db, user_id, None).await?)
+    }
+
+    async fn insert_refund_to_credit(
+        &self,
+        refund: &SubscriptionPayment,
+        credit: u64,
+        note: Option<&str>,
+    ) -> DbResult<bool> {
+        let mut tx = self.db.begin().await?;
+        // Lock the balance first: every transaction that moves it must, or
+        // concurrent settles hit MariaDB snapshot conflicts (error 1020).
+        let (balance, currency) = lock_account_credit(&mut tx, refund.user_id).await?;
+        let exists: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT id FROM subscription_payment WHERE id = ?")
+                .bind(&refund.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if exists.is_some() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        insert_subscription_payment_with(&mut *tx, refund).await?;
+        if credit > 0 {
+            let new_balance = balance.checked_add(credit).ok_or_else(|| {
+                anyhow!(
+                    "account credit balance overflow for user {}",
+                    refund.user_id
+                )
+            })?;
+            sqlx::query("UPDATE account_credit SET balance = ?, updated = NOW() WHERE user_id = ?")
+                .bind(new_balance)
+                .bind(refund.user_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "INSERT INTO account_credit_event \
+                 (user_id, kind, amount, currency, subscription_payment_id, note) \
+                 VALUES (?, 'refund', ?, ?, ?, ?)",
+            )
+            .bind(refund.user_id)
+            .bind(i64::try_from(credit).map_err(|_| anyhow!("refund credit too large"))?)
+            .bind(&currency)
+            .bind(&refund.id)
+            .bind(note)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     async fn adjust_account_credit(

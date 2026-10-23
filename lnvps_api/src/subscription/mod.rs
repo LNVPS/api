@@ -192,6 +192,28 @@ fn credit_covers(credit: Option<&AppliedCredit>, net: u64, tax: u64) -> bool {
     credit.is_some_and(|c| c.amount >= net + tax)
 }
 
+/// Hourly subscriptions are paid from account credit only.
+///
+/// An hourly plan renews every hour, so collecting it through a Lightning
+/// invoice or a card charge would mean a payment per hour. The order must be
+/// fully covered by the customer's credit, which also needs them to have opted
+/// in to spending it (`auto_apply`). Every other interval is unaffected.
+fn ensure_credit_funded_if_hourly(
+    subscription: &Subscription,
+    credit: Option<&AppliedCredit>,
+    net: u64,
+    tax: u64,
+) -> Result<()> {
+    if subscription.interval_type != lnvps_db::IntervalType::Hour || credit_covers(credit, net, tax)
+    {
+        return Ok(());
+    }
+    bail!(
+        "Hourly billing is paid from account credit. Top up your credit and turn on \
+         'apply credit automatically' so your balance covers the next hour."
+    )
+}
+
 fn scale_fee(fee: u64, collected: u64, billable: u64) -> u64 {
     if billable == 0 {
         return 0;
@@ -549,7 +571,12 @@ impl SubscriptionHandler {
         let line_items = self
             .db
             .list_subscription_line_items(payment.subscription_id)
-            .await?;
+            .await?
+            .into_iter()
+            // A deactivated item's resource is gone: it is not billed,
+            // renewed or handed lifecycle events.
+            .filter(|li| li.is_active())
+            .collect::<Vec<_>>();
         for li in &line_items {
             match self.make_line_item_handler(li).await {
                 Ok(handler) => {
@@ -983,8 +1010,16 @@ impl SubscriptionHandler {
         let line_items = self
             .db
             .list_subscription_line_items(subscription_id)
-            .await?;
-        ensure!(!line_items.is_empty(), "Subscription has no line items");
+            .await?
+            .into_iter()
+            // A deactivated item's resource is gone: it is not billed,
+            // renewed or handed lifecycle events.
+            .filter(|li| li.is_active())
+            .collect::<Vec<_>>();
+        ensure!(
+            !line_items.is_empty(),
+            "Subscription has no active line items"
+        );
 
         // Get user for tax calculation
         let user = self.db.get_user(subscription.user_id).await?;
@@ -1239,6 +1274,8 @@ impl SubscriptionHandler {
                 converted_currency,
             )
             .await?;
+
+        ensure_credit_funded_if_hourly(&subscription, credit.as_ref(), converted_amount, tax)?;
 
         // Reject payments below the method's configured minimum (gross = net + tax
         // + processing fee). Prevents uneconomic small charges (e.g. Revolut's
@@ -1955,8 +1992,8 @@ impl SubscriptionHandler {
             CostResult::Existing(p) => return Ok(p),
             CostResult::New(p) => p,
         };
+        let subscription = self.db.get_subscription(subscription_id).await?;
         let credit = if apply_credit {
-            let subscription = self.db.get_subscription(subscription_id).await?;
             let (fee, credit) = self
                 .price_credit(
                     user_id,
@@ -1973,6 +2010,7 @@ impl SubscriptionHandler {
         } else {
             None
         };
+        ensure_credit_funded_if_hourly(&subscription, credit.as_ref(), p.amount, p.tax)?;
         let reservation = self.reserve_credit(credit.as_ref()).await?;
         let created = async {
             let payment = self
@@ -2721,6 +2759,8 @@ mod revolut_autorenew_tests {
                     amount: 999, // €9.99
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await?;
@@ -2889,6 +2929,8 @@ pub(crate) mod revolut_offline_tests {
                     amount: 999,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -2966,6 +3008,8 @@ pub(crate) mod revolut_offline_tests {
                     amount: 100_000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -3044,6 +3088,8 @@ pub(crate) mod revolut_offline_tests {
                     amount: 100, // 1.00 EUR
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -3119,6 +3165,8 @@ pub(crate) mod revolut_offline_tests {
                     amount: 100_000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -3211,6 +3259,8 @@ pub(crate) mod revolut_offline_tests {
                     amount: 100_000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -3680,6 +3730,8 @@ mod sunset_tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -3851,6 +3903,8 @@ mod discount_tests {
                     amount: 1_000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -4310,6 +4364,8 @@ mod credit_tests {
                     amount: 1_000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -4576,6 +4632,68 @@ mod credit_tests {
         assert!(db.account_credit_debits.lock().await.is_empty());
     }
 
+    async fn make_hourly(db: &MockDb, sub_id: u64) {
+        db.subscriptions
+            .lock()
+            .await
+            .get_mut(&sub_id)
+            .unwrap()
+            .interval_type = lnvps_db::IntervalType::Hour;
+    }
+
+    /// An hourly subscription is credit-only: with no credit, or credit the
+    /// customer has not opted to spend, no invoice or card charge is created.
+    #[tokio::test]
+    async fn an_hourly_order_without_credit_is_refused() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        make_hourly(&db, sub_id).await;
+
+        let err = renew(&sub, sub_id).await.unwrap_err().to_string();
+        assert!(err.contains("paid from account credit"), "{err}");
+        assert!(quote(&sub, sub_id).await.is_err(), "quotes refuse too");
+        assert!(db.subscription_payments.lock().await.is_empty());
+
+        // A balance that is not opted in is still no use.
+        give_credit(&db, user_id, 500_000_000, false).await;
+        assert!(renew(&sub, sub_id).await.is_err());
+        assert!(db.subscription_payments.lock().await.is_empty());
+    }
+
+    /// Credit that covers only part of the hour is refused rather than topped
+    /// up with an invoice, and nothing stays held.
+    #[tokio::test]
+    async fn an_hourly_order_partly_covered_is_refused() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        make_hourly(&db, sub_id).await;
+        give_credit(&db, user_id, 1_000, true).await;
+
+        assert!(renew(&sub, sub_id).await.is_err());
+        assert!(db.subscription_payments.lock().await.is_empty());
+        assert_eq!(db.get_account_credit_reserved(user_id).await.unwrap(), 0);
+        assert!(db.account_credit_debits.lock().await.is_empty());
+    }
+
+    /// With enough opted-in credit an hourly order settles with no invoice.
+    #[tokio::test]
+    async fn an_hourly_order_covered_by_credit_settles() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        make_hourly(&db, sub_id).await;
+        give_credit(&db, user_id, 500_000_000, true).await;
+
+        let payment = renew(&sub, sub_id).await.unwrap();
+        assert!(payment.is_paid);
+        assert_eq!(payment.external_data.as_str(), CREDIT_FUNDED_MARKER);
+        assert!(db.get_account_credit(user_id).await.unwrap().balance < 500_000_000);
+    }
+
+    /// Other intervals are untouched: the same unfunded order is still created.
+    #[tokio::test]
+    async fn a_monthly_order_without_credit_is_still_invoiced() {
+        let (_db, sub, _user_id, sub_id) = setup().await;
+        let payment = renew(&sub, sub_id).await.unwrap();
+        assert!(!payment.is_paid);
+    }
+
     #[tokio::test]
     async fn a_fully_credit_funded_renewal_settles_immediately() {
         let (db, sub, user_id, sub_id) = setup().await;
@@ -4703,6 +4821,8 @@ mod credit_tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await

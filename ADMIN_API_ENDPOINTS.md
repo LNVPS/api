@@ -12,7 +12,7 @@ Admin API request/response format reference for LLM consumption.
 `"transferred"`
 **AdminPaymentMethod**: `"lightning"`, `"revolut"`, `"paypal"`, `"stripe"`
 **VmHostKind**: `"proxmox"`, `"libvirt"`
-**CostPlanIntervalType**: `"day"`, `"month"`, `"year"`
+**CostPlanIntervalType**: `"hour"`, `"day"`, `"month"`, `"year"`
 **ApiOsDistribution**: `"ubuntu"`, `"debian"`, `"centos"`, `"fedora"`, `"freebsd"`, `"opensuse"`, `"archlinux"`,
 `"redhatenterprise"`, `"almalinux"`, `"rockylinux"`, `"alpine"`, `"nixos"`, `"openbsd"`, `"netbsd"`, `"gentoo"`,
 `"voidlinux"`
@@ -3991,7 +3991,7 @@ Context available to a rule (read-only, money in minor units):
 
 | Variable | Fields |
 |---|---|
-| `order` | `amount`, `currency`, `intervals`, `interval_type` (`day`/`month`/`year`), `is_new`, `items` |
+| `order` | `amount`, `currency`, `intervals`, `interval_type` (`hour`/`day`/`month`/`year`), `is_new`, `items` |
 | `user` | `id`, `country` (ISO alpha-3, may be null) |
 | `history` | `orders` (settled payment count) |
 | `now` | unix timestamp (seconds) |
@@ -5610,7 +5610,7 @@ Required Permission: `app::create`. Body:
   "currency": "USD",
   "interval_amount": 1,
   "interval_type": "month",
-  // Required pricing (amount in smallest units; interval_type: day|month|year).
+  // Required pricing (amount in smallest units; interval_type: hour|day|month|year).
   "setup_amount": 0,
   // Optional one-off setup fee (default 0).
   "enabled": true
@@ -6204,7 +6204,7 @@ The RBAC system uses the following permission format: `resource::action`
     "is_active": boolean,
     "auto_renewal_enabled": boolean,
     "interval_amount": number,
-    "interval_type": "day" | "month" | "year",
+    "interval_type": "hour" | "day" | "month" | "year",
     "currency": "string",
     "payment_count": number,
     "line_items": [
@@ -8283,7 +8283,7 @@ field to leave it unchanged, or send `null` to clear it.
 | amount          | u64                        | Smallest currency units; per-IP for ip_range      |
 | currency        | string                     | e.g. `USD`, `EUR`                                 |
 | interval_amount | u64 \| null                | Required for `recurring`; null for `one_time`     |
-| interval_type   | `day`\|`month`\|`year`\|null | Billing interval unit                           |
+| interval_type   | `hour`\|`day`\|`month`\|`year`\|null | Billing interval unit                           |
 | billing_start   | datetime \| null           | Cost start / one-time purchase date               |
 | billing_end     | datetime \| null           | Cost end date; null = still active/ongoing         |
 | depreciation_months | u64 \| null            | Useful life for a `one_time` cost; null = expensed immediately |

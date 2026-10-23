@@ -449,7 +449,11 @@ impl VmHistoryLogger {
         meta["refund_payment_id"] = json!(hex::encode(refund_payment_id));
         meta["amount"] = json!(amount);
         meta["currency"] = json!(currency);
-        meta["admin_action"] = json!(true);
+        // A caller (the owner deleting their own VM) may say this was not an
+        // admin action; anything else is one.
+        if meta.get("admin_action").is_none() {
+            meta["admin_action"] = json!(true);
+        }
         if let Some(r) = reason {
             meta["reason"] = json!(r);
         }
@@ -737,6 +741,44 @@ mod tests {
     fn make_logger() -> VmHistoryLogger {
         let db = Arc::new(MockDb::empty());
         VmHistoryLogger::new(db)
+    }
+
+    /// A refund is an admin action unless the caller says otherwise: the owner
+    /// deleting their own VM is not.
+    #[tokio::test]
+    async fn refund_admin_action_defaults_true_and_can_be_cleared() {
+        let logger = make_logger();
+        logger
+            .log_vm_refunded(31, Some(1), &[1], &[2], 10, "BTC", None, None)
+            .await
+            .unwrap();
+        logger
+            .log_vm_refunded(
+                31,
+                Some(1),
+                &[1],
+                &[3],
+                10,
+                "BTC",
+                None,
+                Some(json!({ "admin_action": false })),
+            )
+            .await
+            .unwrap();
+        let flags: Vec<Value> = logger
+            .db
+            .list_vm_history(31)
+            .await
+            .unwrap()
+            .iter()
+            .map(|h| {
+                serde_json::from_slice::<Value>(h.metadata.as_ref().unwrap()).unwrap()
+                    ["admin_action"]
+                    .clone()
+            })
+            .collect();
+        assert!(flags.contains(&json!(true)));
+        assert!(flags.contains(&json!(false)));
     }
 
     /// Regression test for d88e153: log_vm_payment_received must format the payment amount
