@@ -497,6 +497,13 @@ impl VmRefundHandler {
                     instrument: None,
                 },
             );
+            // The credit goes to the VM's owner, who is the one deleting it and
+            // losing the time. `build_refund_row` copies the payer from the
+            // original payment, and `insert_refund_to_credit` credits the row's
+            // user, so a payment recorded against someone else (e.g. one filed
+            // under the wrong subscription by the pre-#152 LNURL-pay bug) would
+            // otherwise hand the owner's refund to that other account.
+            row.user_id = owner_id;
             // `build_refund_row` records who issued the refund as an admin. This
             // one was the customer's own, so say so rather than name a user as
             // an administrator.
@@ -1165,6 +1172,53 @@ mod tests {
             (events[0].kind.as_str(), events[0].amount),
             ("refund", returned as i64)
         );
+    }
+
+    /// The refund for deleting a VM goes to the VM's owner even when the payment
+    /// it reverses is recorded against another user (the pre-#152 LNURL-pay bug
+    /// filed payments under the wrong subscription): the owner is the one
+    /// deleting it and losing the time, and nothing is credited to the payer.
+    #[tokio::test]
+    async fn the_owner_gets_the_credit_when_the_payment_names_another_payer() {
+        let mock = MockDb::default();
+        let (vm, payment) = vm_with_payment(&mock, 1000, 230).await;
+        let other = mock.upsert_user(&[9u8; 32]).await.unwrap();
+        assert_ne!(other, vm.user_id);
+        mock.subscription_payments
+            .lock()
+            .await
+            .iter_mut()
+            .filter(|p| p.id == payment.id)
+            .for_each(|p| p.user_id = other);
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let handler = handler(db.clone(), Arc::new(PayNode::default())).await;
+        let sub = db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await
+            .unwrap();
+
+        let returned = handler
+            .refund_unused_to_credit(vm.id, vm.user_id, sub.expires.unwrap(), Utc::now())
+            .await
+            .unwrap();
+        assert!(returned > 0);
+        assert_eq!(
+            db.get_account_credit(vm.user_id).await.unwrap().balance,
+            returned,
+            "the owner is credited"
+        );
+        assert_eq!(
+            db.get_account_credit(other).await.unwrap().balance,
+            0,
+            "the recorded payer is not"
+        );
+        let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
+        assert_eq!(refunds[0].user_id, vm.user_id, "the refund row names the owner");
+        let (events, _) = db
+            .list_account_credit_events(vm.user_id, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!((events[0].kind.as_str(), events[0].amount), ("refund", returned as i64));
     }
 
     /// Time paid for in cash comes back as credit too, converted at today's
