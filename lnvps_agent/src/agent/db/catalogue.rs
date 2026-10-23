@@ -205,14 +205,16 @@ impl DbToolExecutor {
                 "error": format!("unknown currency {}", pricing.currency),
             });
         };
-        let unit = |amount: u64| CurrencyAmount::from_u64(currency, amount);
+        // Rates are per billing interval, in 1/rate_scale of a minor unit, so an
+        // hourly rate can be a fraction of a cent (see `priced_scaled`).
+        let scale = pricing.rate_scale;
 
         let mut disk_options = Vec::with_capacity(disks.len());
         for d in disks.iter().filter(|d| d.pricing_id == pricing.id) {
             disk_options.push(json!({
                 "disk_type": d.kind.to_string(),
                 "disk_interface": d.interface.to_string(),
-                "cost_per_gb": self.priced(unit(d.cost)).await,
+                "cost_per_gb": self.priced_scaled(d.cost, scale, currency).await,
                 "min_disk_bytes": d.min_disk_size,
                 "max_disk_bytes": d.max_disk_size,
             }));
@@ -224,10 +226,10 @@ impl DbToolExecutor {
             "region": { "id": pricing.region_id, "name": region_name },
             "currency": pricing.currency,
             "billing_interval": custom_interval(&pricing),
-            "cost_per_cpu_core": self.priced(unit(pricing.cpu_cost)).await,
-            "cost_per_gb_memory": self.priced(unit(pricing.memory_cost)).await,
-            "cost_per_ip4": self.priced(unit(pricing.ip4_cost)).await,
-            "cost_per_ip6": self.priced(unit(pricing.ip6_cost)).await,
+            "cost_per_cpu_core": self.priced_scaled(pricing.cpu_cost, scale, currency).await,
+            "cost_per_gb_memory": self.priced_scaled(pricing.memory_cost, scale, currency).await,
+            "cost_per_ip4": self.priced_scaled(pricing.ip4_cost, scale, currency).await,
+            "cost_per_ip6": self.priced_scaled(pricing.ip6_cost, scale, currency).await,
             "disk_options": disk_options,
             "min_cpu": pricing.min_cpu,
             "max_cpu": pricing.max_cpu,
@@ -242,13 +244,13 @@ impl DbToolExecutor {
                 "min_gb": pricing.min_transfer_gb,
                 "max_gb": pricing.max_transfer_gb,
             })),
-            "cost_per_tb_transfer": self.priced(unit(pricing.transfer_cost_per_tb)).await,
+            "cost_per_tb_transfer": self.priced_scaled(pricing.transfer_cost_per_tb, scale, currency).await,
             "network_speed": pricing.network_mbps.map(|default| json!({
                 "default_mbps": default,
                 "min_mbps": pricing.min_network_mbps,
                 "max_mbps": pricing.max_network_mbps,
             })),
-            "cost_per_gbps_network": self.priced(unit(pricing.network_cost_per_gbps)).await,
+            "cost_per_gbps_network": self.priced_scaled(pricing.network_cost_per_gbps, scale, currency).await,
             "cpu_mfg": pricing.cpu_mfg.to_string(),
             "cpu_arch": pricing.cpu_arch.to_string(),
             "cpu_features": pricing.cpu_features.iter().map(ToString::to_string).collect::<Vec<_>>(),
@@ -328,7 +330,10 @@ impl DbToolExecutor {
 
         PricingEngine::validate_custom_vm_spec(&self.db, &template).await?;
         let price = PricingEngine::get_custom_vm_cost_amount(&self.db, &template).await?;
-        let part = |amount: u64| CurrencyAmount::from_u64(price.currency, amount);
+        // Components are in 1/scale minor units (a fraction of a cent for an
+        // hourly model); each is shown rounded up to a whole minor unit, and the
+        // total is quoted exactly, so the parts can add up to a little over it.
+        let part = |amount: u64| CurrencyAmount::from_u64(price.currency, price.minor(amount));
 
         Ok(json!({
             "pricing_id": pricing_id,
@@ -354,7 +359,7 @@ impl DbToolExecutor {
                 "transfer": money(part(price.transfer_cost)),
                 "network": money(part(price.network_cost)),
             },
-            "total": self.priced(part(price.total())).await,
+            "total": self.priced_scaled(price.total_raw(), price.scale, price.currency).await,
             "note": "Price excludes any tax and payment processing fee, which depend on the customer's country and payment method.",
         }))
     }

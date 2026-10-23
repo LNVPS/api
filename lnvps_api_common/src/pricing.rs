@@ -51,59 +51,17 @@ pub struct UpgradeCostQuote {
 pub struct RemainingTimeInfo {
     /// Seconds remaining until VM expires
     pub seconds_remaining: i64,
-    /// Current renewal cost for full period
+    /// Current renewal cost for full period, in `1/scale` smallest currency units
     pub renewal_cost: CurrencyAmount,
+    /// Divisor taking `renewal_cost`, `cost_per_second` and `prorated_cost` to
+    /// the currency's smallest unit (1 except for fine-grained custom pricing)
+    pub scale: u64,
     /// Duration of renewal period in seconds
     pub renewal_period_seconds: i64,
-    /// Cost per second at current rate
+    /// Cost per second at current rate, in `1/scale` smallest currency units
     pub cost_per_second: f64,
-    /// Pro-rated cost for remaining time
+    /// Pro-rated cost for remaining time, in `1/scale` smallest currency units
     pub prorated_cost: CurrencyAmount,
-}
-
-/// Default billing period for a custom pricing model: one month.
-///
-/// A model may set its own interval (see [`VmCustomPricing::interval_type`]); a
-/// VM then bills on its subscription's interval, which is seeded from the model
-/// when the VM is created. These are the defaults for models that don't say.
-pub const CUSTOM_VM_INTERVAL_AMOUNT: u64 = 1;
-pub const CUSTOM_VM_INTERVAL_TYPE: IntervalType = IntervalType::Month;
-
-/// Hours in the period custom pricing rates are quoted per: one month, which
-/// the pricing engine treats as 30 days everywhere it needs a fixed length.
-const CUSTOM_RATE_PERIOD_HOURS: u128 = 30 * 24;
-
-/// Length of one billing interval in hours, on the same 30-day-month basis the
-/// custom rates use. Only used to scale a price; expiry uses real calendar time.
-fn interval_hours(interval_type: IntervalType, interval_amount: u64) -> u128 {
-    let per_interval: u128 = match interval_type {
-        IntervalType::Hour => 1,
-        IntervalType::Day => 24,
-        IntervalType::Month => CUSTOM_RATE_PERIOD_HOURS,
-        IntervalType::Year => 12 * CUSTOM_RATE_PERIOD_HOURS,
-    };
-    per_interval * interval_amount.max(1) as u128
-}
-
-/// Scale a price quoted per month to what one billing interval costs, rounding
-/// up so a shorter interval never under-charges. A one-month interval is
-/// returned unchanged.
-///
-/// Do this in the **payment** currency (millisats for credit) rather than in the
-/// model's fiat currency: an hourly share of a monthly price is a fraction of a
-/// cent, which whole cents cannot represent.
-pub fn scale_monthly_to_interval(
-    monthly: u64,
-    interval_type: IntervalType,
-    interval_amount: u64,
-) -> u64 {
-    let hours = interval_hours(interval_type, interval_amount);
-    if hours == CUSTOM_RATE_PERIOD_HOURS {
-        return monthly;
-    }
-    (monthly as u128 * hours)
-        .div_ceil(CUSTOM_RATE_PERIOD_HOURS)
-        .min(u64::MAX as u128) as u64
 }
 
 /// ISO 3166-1 alpha-3 codes treated as inside the EU VAT area (27 member states).
@@ -960,7 +918,8 @@ impl PricingEngine {
         // whose specs predate the current plan limits — so renewals and the startup
         // subscription backfill don't break for out-of-range legacy VMs.
 
-        // All costs are in smallest currency units (cents/millisats). Round GB
+        // All costs are in `1/rate_scale` smallest currency units (cents or
+        // millisats at scale 1), for one billing interval of the model. Round GB
         // counts UP so sub-GB fractions are billed rather than truncated to 0.
         let disk_size_gb = template.disk_size.div_ceil(crate::GB);
         let memory_gb = template.memory.div_ceil(crate::GB);
@@ -980,6 +939,9 @@ impl PricingEngine {
         };
         Ok(PricingData {
             currency,
+            scale: pricing.rate_scale.max(1),
+            interval_type: pricing.interval_type,
+            interval_amount: pricing.interval_amount.max(1),
             cpu_cost,
             memory_cost,
             ip6_cost,
@@ -1092,37 +1054,25 @@ impl PricingEngine {
         let template = self.db.get_custom_vm_template(template_id).await?;
         let price = Self::get_custom_vm_cost_amount(&self.db, &template).await?;
 
-        // The VM bills on its subscription's interval, which was seeded from the
-        // custom pricing model when the VM was created. Rates are monthly, so a
-        // shorter interval charges the matching share of the monthly price.
+        // A custom price is for one billing interval of its pricing model, so
+        // that interval (not a fixed month) is the time one payment buys.
         let subscription = self
             .db
             .get_subscription_by_line_item_id(vm.subscription_line_item_id)
             .await?;
-        let (interval_type, interval_amount) =
-            (subscription.interval_type, subscription.interval_amount);
-
         // clamp base to now for expired VMs
-        let expires = subscription.expires;
-        let base = expires.unwrap_or_else(Utc::now).max(Utc::now());
-        let time_value = Self::interval_seconds_from(base, interval_type, interval_amount);
-        let mut converted_amount = self
-            .get_amount_and_rate(
-                CurrencyAmount::from_u64(price.currency, price.total()),
+        let base = subscription.expires.unwrap_or_else(Utc::now).max(Utc::now());
+        let time_value =
+            Self::interval_seconds_from(base, price.interval_type, price.interval_amount);
+        // Convert the raw (sub-cent) price once, so an hourly share keeps its
+        // fraction until it is rounded to a whole satoshi.
+        let converted_amount = self
+            .get_amount_and_rate_scaled(
+                CurrencyAmount::from_u64(price.currency, price.total_raw()),
+                price.scale,
                 method,
             )
             .await?;
-        // Scale after converting, in the payment currency: an hour of a monthly
-        // fiat price is a fraction of a cent, but a whole number of millisats.
-        let scaled = scale_monthly_to_interval(
-            converted_amount.amount.value(),
-            interval_type,
-            interval_amount,
-        );
-        converted_amount.amount = CurrencyAmount::from_u64(converted_amount.amount.currency(), scaled);
-        if converted_amount.amount.currency() == Currency::BTC {
-            converted_amount.amount = round_to_sat(converted_amount.amount);
-        }
         let tax_details = self
             .determine_tax(vm.user_id, converted_amount.amount.value(), company_id)
             .await?;
@@ -1616,7 +1566,7 @@ impl PricingEngine {
         );
 
         // Get current VM pricing information
-        let (current_cost, current_time_value) = if let Some(tid) = vm.template_id {
+        let (current_cost, current_time_value, scale) = if let Some(tid) = vm.template_id {
             let template = self.db.get_vm_template(tid).await?;
             let cost_plan = self.db.get_cost_plan(template.cost_plan_id).await?;
             let time_value = Self::cost_plan_interval_to_seconds(
@@ -1632,17 +1582,17 @@ impl PricingEngine {
                     cost_plan.amount,
                 ),
                 time_value,
+                1u64,
             )
         } else if let Some(cid) = vm.custom_template_id {
             let template = self.db.get_custom_vm_template(cid).await?;
             let price = Self::get_custom_vm_cost_amount(&self.db, &template).await?;
-            let time_value = Self::cost_plan_interval_to_seconds(
-                CUSTOM_VM_INTERVAL_TYPE,
-                CUSTOM_VM_INTERVAL_AMOUNT,
-            );
+            let time_value =
+                Self::cost_plan_interval_to_seconds(price.interval_type, price.interval_amount);
             (
-                CurrencyAmount::from_u64(price.currency, price.total()),
+                CurrencyAmount::from_u64(price.currency, price.total_raw()),
                 time_value,
+                price.scale,
             )
         } else {
             bail!("VM must have either a standard template or custom template");
@@ -1657,6 +1607,7 @@ impl PricingEngine {
         Ok(RemainingTimeInfo {
             seconds_remaining,
             renewal_cost: current_cost,
+            scale,
             renewal_period_seconds: current_time_value,
             cost_per_second,
             prorated_cost,
@@ -1675,7 +1626,7 @@ impl PricingEngine {
             .await?;
 
         // Convert to the requested payment method currency
-        self.get_amount_and_rate(remaining_info.prorated_cost, method)
+        self.get_amount_and_rate_scaled(remaining_info.prorated_cost, remaining_info.scale, method)
             .await
     }
 
@@ -1795,45 +1746,38 @@ impl PricingEngine {
         // min/max limits (unlike plain renewals of existing specs).
         Self::validate_custom_vm_spec(&self.db, &new_custom_template).await?;
 
-        // Get the cost of renewal
+        // Get the cost of renewal: one billing interval of the new pricing
+        // model, kept in its fine `1/scale` unit until it is converted.
         let new_price = Self::get_custom_vm_cost_amount(&self.db, &new_custom_template).await?;
-        let new_price = CurrencyAmount::from_u64(new_price.currency, new_price.total());
+        let new_raw = CurrencyAmount::from_u64(new_price.currency, new_price.total_raw());
 
-        // Get the time value for the custom template
-        let custom_plan_seconds =
-            Self::cost_plan_interval_to_seconds(CUSTOM_VM_INTERVAL_TYPE, CUSTOM_VM_INTERVAL_AMOUNT);
-        let new_cost_per_second = new_price.value() as f64 / custom_plan_seconds as f64;
+        let interval_seconds = Self::cost_plan_interval_to_seconds(
+            new_price.interval_type,
+            new_price.interval_amount,
+        );
+        let new_cost_per_second = new_raw.value() as f64 / interval_seconds as f64;
 
         // calculate the cost based on the time until the vm expires
         let new_cost_until_expire = CurrencyAmount::from_u64(
-            new_price.currency(),
+            new_raw.currency(),
             (new_cost_per_second * remaining_info.seconds_remaining as f64) as u64,
         );
 
         // create a discount off the new price for the time remaining at the old rate
         let discount_currency = remaining_info.prorated_cost;
 
-        // convert prices to match payment method
+        // convert prices to match payment method; the old and new prices can be
+        // at different scales (a standard plan is whole cents), so each is
+        // converted with its own
         let new_cost_until_expire = self
-            .get_amount_and_rate(new_cost_until_expire, method)
+            .get_amount_and_rate_scaled(new_cost_until_expire, new_price.scale, method)
             .await?;
-        let discount_currency = self.get_amount_and_rate(discount_currency, method).await?;
-        let mut new_renewal_currency = self.get_amount_and_rate(new_price, method).await?;
-        // The new renewal is one billing interval of the VM's subscription; the
-        // prices above are monthly.
-        let subscription = self
-            .db
-            .get_subscription_by_line_item_id(
-                self.db.get_vm(vm_id).await?.subscription_line_item_id,
-            )
+        let discount_currency = self
+            .get_amount_and_rate_scaled(discount_currency, remaining_info.scale, method)
             .await?;
-        let scaled = scale_monthly_to_interval(
-            new_renewal_currency.amount.value(),
-            subscription.interval_type,
-            subscription.interval_amount,
-        );
-        new_renewal_currency.amount =
-            CurrencyAmount::from_u64(new_renewal_currency.amount.currency(), scaled);
+        let new_renewal_currency = self
+            .get_amount_and_rate_scaled(new_raw, new_price.scale, method)
+            .await?;
 
         let upgrade = new_cost_until_expire.sub(discount_currency)?;
 
@@ -1866,13 +1810,27 @@ impl PricingEngine {
         list_price: CurrencyAmount,
         method: PaymentMethod,
     ) -> Result<ConvertedCurrencyAmount> {
+        self.get_amount_and_rate_scaled(list_price, 1, method).await
+    }
+
+    /// [`Self::get_amount_and_rate`] for a `list_price` held in `1/scale` of its
+    /// smallest unit (custom pricing, see [`PricingData::total_raw`]). The fraction is
+    /// carried through the currency conversion and only rounded at the end, so
+    /// an hourly price of a fraction of a cent is not lost.
+    pub async fn get_amount_and_rate_scaled(
+        &self,
+        list_price: CurrencyAmount,
+        scale: u64,
+        method: PaymentMethod,
+    ) -> Result<ConvertedCurrencyAmount> {
+        let scale = scale.max(1);
         Ok(match (list_price.currency(), method) {
             (c, PaymentMethod::Lightning | PaymentMethod::OnChain | PaymentMethod::FixedFloat)
                 if c != Currency::BTC =>
             {
                 // convert to BTC if price is not already in bitcoin
                 let ticker = self.get_ticker(Currency::BTC, c).await?;
-                let mut converted = ticker.convert_with_rate(list_price)?;
+                let mut converted = ticker.convert_scaled_with_rate(list_price, scale)?;
                 // Round to nearest satoshi for wallet compatibility
                 converted.amount = round_to_sat(converted.amount);
                 converted
@@ -1880,16 +1838,19 @@ impl PricingEngine {
             (c, PaymentMethod::Lightning | PaymentMethod::OnChain | PaymentMethod::FixedFloat)
                 if c == Currency::BTC =>
             {
-                // pass-through price as BTC, rounded to nearest satoshi
+                // pass-through price as BTC, rounded up to the satoshi
                 ConvertedCurrencyAmount {
-                    amount: round_to_sat(list_price),
+                    amount: round_to_sat(CurrencyAmount::from_u64(
+                        Currency::BTC,
+                        list_price.value().div_ceil(scale),
+                    )),
                     rate: TickerRate::passthrough(Currency::BTC),
                 }
             }
             (c, PaymentMethod::Revolut) if c != Currency::BTC => {
                 // convert to base_currency if price is not already in bitcoin
                 let ticker = self.get_ticker(list_price.currency(), c).await?;
-                ticker.convert_with_rate(list_price)?
+                ticker.convert_scaled_with_rate(list_price, scale)?
             }
             // default
             (c, m) => bail!("Cant get price from {} to {}", c, m),
@@ -1932,25 +1893,39 @@ impl NewPaymentInfo {
     }
 }
 
+/// What a custom VM costs for one billing interval of its pricing model.
+///
+/// The components are in `1/scale` of the currency's smallest unit (see
+/// [`VmCustomPricing::rate_scale`]): an hourly price is a fraction of a cent, so
+/// converting or rounding each rate to whole cents would lose it. Use
+/// [`PricingData::total`] for plain minor units (rounded up), and
+/// [`PricingEngine::get_amount_and_rate_scaled`] with [`PricingData::total_raw`]
+/// to convert into a payment currency without that loss.
 #[derive(Clone, Debug)]
 pub struct PricingData {
     pub currency: Currency,
-    /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
+    /// Divisor taking the cost fields to the currency's smallest unit; never 0
+    pub scale: u64,
+    /// The billing interval this price is for (the pricing model's)
+    pub interval_type: IntervalType,
+    pub interval_amount: u64,
+    /// Cost of the CPU cores, in `1/scale` smallest currency units
     pub cpu_cost: u64,
-    /// Cost per GB RAM in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost of the RAM, in `1/scale` smallest currency units
     pub memory_cost: u64,
-    /// Cost per IPv4 address in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost of the IPv4 addresses, in `1/scale` smallest currency units
     pub ip4_cost: u64,
-    /// Cost per IPv6 address in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost of the IPv6 addresses, in `1/scale` smallest currency units
     pub ip6_cost: u64,
-    /// Cost per GB disk in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost of the disk, in `1/scale` smallest currency units
     pub disk_cost: u64,
     pub transfer_cost: u64,
     pub network_cost: u64,
 }
 
 impl PricingData {
-    pub fn total(&self) -> u64 {
+    /// The whole price in `1/scale` smallest currency units.
+    pub fn total_raw(&self) -> u64 {
         self.cpu_cost
             + self.memory_cost
             + self.ip4_cost
@@ -1958,6 +1933,18 @@ impl PricingData {
             + self.disk_cost
             + self.transfer_cost
             + self.network_cost
+    }
+
+    /// The whole price in the currency's smallest unit, rounded up so a
+    /// fractional cent is never given away. Identical to [`Self::total_raw`] at
+    /// scale 1.
+    pub fn total(&self) -> u64 {
+        self.total_raw().div_ceil(self.scale.max(1))
+    }
+
+    /// One component, in the currency's smallest unit rounded up.
+    pub fn minor(&self, raw: u64) -> u64 {
+        raw.div_ceil(self.scale.max(1))
     }
 }
 
@@ -2327,33 +2314,61 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn monthly_price_scales_to_the_billing_interval() {
-        // A month is the identity, and an unset (zero) amount counts as one.
-        assert_eq!(72_000, scale_monthly_to_interval(72_000, IntervalType::Month, 1));
-        assert_eq!(72_000, scale_monthly_to_interval(72_000, IntervalType::Month, 0));
-        // 30-day month: 720 hours, so an hour is 1/720th, rounded UP.
-        assert_eq!(100, scale_monthly_to_interval(72_000, IntervalType::Hour, 1));
-        assert_eq!(101, scale_monthly_to_interval(72_001, IntervalType::Hour, 1));
-        assert_eq!(600, scale_monthly_to_interval(72_000, IntervalType::Hour, 6));
-        assert_eq!(2_400, scale_monthly_to_interval(72_000, IntervalType::Day, 1));
-        assert_eq!(864_000, scale_monthly_to_interval(72_000, IntervalType::Year, 1));
-        // Never wraps on a huge monthly price.
-        assert_eq!(
-            u64::MAX,
-            scale_monthly_to_interval(u64::MAX, IntervalType::Year, 1)
-        );
+    fn priced(scale: u64, cpu: u64) -> PricingData {
+        PricingData {
+            currency: Currency::EUR,
+            scale,
+            interval_type: IntervalType::Hour,
+            interval_amount: 1,
+            cpu_cost: cpu,
+            memory_cost: 0,
+            ip4_cost: 0,
+            ip6_cost: 0,
+            disk_cost: 0,
+            transfer_cost: 0,
+            network_cost: 0,
+        }
     }
 
-    /// An hourly custom pricing model bills each hour a 1/720th share of the
-    /// monthly price, quoted in the payment currency, and extends by one hour.
+    /// At scale 1 a price is plain minor units, exactly as before; at a finer
+    /// scale the total rounds UP to a whole cent so a fraction is never given away.
+    #[test]
+    fn pricing_data_total_rounds_up_to_minor_units() {
+        assert_eq!(1_230, priced(1, 1_230).total());
+        assert_eq!(1_230, priced(1, 1_230).total_raw());
+        // 1.5 cents (15_000 at 1/10_000 of a cent) rounds up to 2.
+        assert_eq!(2, priced(10_000, 15_000).total());
+        assert_eq!(1, priced(10_000, 1).total());
+        assert_eq!(0, priced(10_000, 0).total());
+        // A scale of 0 (an unset column) behaves as 1, never divides by zero.
+        assert_eq!(7, priced(0, 7).total());
+    }
+
+    /// An hourly custom pricing model prices a VM per hour at a sub-cent scale:
+    /// a renewal charges that hour's price, converted without losing the
+    /// fraction of a cent, and extends the VM by one hour.
     #[tokio::test]
-    async fn hourly_custom_vm_renewal_charges_an_hourly_share() -> Result<()> {
+    async fn hourly_custom_vm_renewal_charges_one_hours_price() -> Result<()> {
         let db = MockDb::default();
         let rates = Arc::new(MockExchangeRate::new());
         rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
         setup_upgrade_test_data(&db).await?;
         add_custom_pricing(&db).await;
+        {
+            // Hourly, rates in 1/10_000 of a cent: 0.5 cent per CPU-hour.
+            let mut p = db.custom_pricing.lock().await;
+            let pricing = p.get_mut(&1).unwrap();
+            pricing.interval_type = IntervalType::Hour;
+            pricing.interval_amount = 1;
+            pricing.rate_scale = 10_000;
+            pricing.cpu_cost = 5_000;
+            pricing.memory_cost = 0;
+            pricing.ip4_cost = 0;
+            pricing.ip6_cost = 0;
+            for d in db.custom_pricing_disk.lock().await.values_mut() {
+                d.cost = 0;
+            }
+        }
         db.vms.lock().await.insert(
             1,
             Vm {
@@ -2365,35 +2380,27 @@ mod tests {
                 ..MockDb::mock_vm()
             },
         );
+        let template = db.get_custom_vm_template(1).await?;
         let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let cpus = template.cpu as u64;
         let pe = PricingEngine::new(db.clone(), rates, VatClient::new());
 
-        // Monthly (the default): the whole monthly price buys a month.
-        let monthly = match pe.get_vm_cost(1, PaymentMethod::Lightning).await? {
-            CostResult::New(p) => p,
-            _ => bail!("expected a new payment"),
-        };
-
-        // Switch the VM's subscription to hourly billing.
-        let li = db
-            .get_subscription_by_line_item_id(MockDb::mock_vm().subscription_line_item_id)
-            .await?;
-        let mut sub = li.clone();
-        sub.interval_type = IntervalType::Hour;
-        sub.interval_amount = 1;
-        db.update_subscription(&sub).await?;
+        let price = PricingEngine::get_custom_vm_cost_amount(&db, &template).await?;
+        assert_eq!(10_000, price.scale);
+        assert_eq!(5_000 * cpus, price.total_raw());
+        // The whole-cent total is rounded UP, never the 0 a plain-cents rate would be.
+        assert_eq!((5_000 * cpus).div_ceil(10_000), price.total());
 
         let hourly = match pe.get_vm_cost(1, PaymentMethod::Lightning).await? {
             CostResult::New(p) => p,
             _ => bail!("expected a new payment"),
         };
         assert_eq!(3_600, hourly.time_value);
-        assert_eq!(
-            round_msat_to_sat(monthly.amount.div_ceil(720)),
-            hourly.amount,
-            "an hour costs 1/720th of the monthly price, whole sats"
-        );
-        assert!(hourly.amount < monthly.amount);
+        // EUR -> msat at MOCK_RATE, from the unrounded value, then whole sats.
+        let expected_msat = (price.total_raw() as f64 / 10_000.0 / 100.0 / MOCK_RATE as f64
+            * 1.0e11)
+            .round() as u64;
+        assert_eq!(round_msat_to_sat(expected_msat), hourly.amount);
         Ok(())
     }
 

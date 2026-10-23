@@ -122,6 +122,7 @@ impl AdminCustomPricingInfo {
             network_cost_per_gbps: pricing.network_cost_per_gbps,
             interval_amount: pricing.interval_amount,
             interval_type: pricing.interval_type.into(),
+            rate_scale: pricing.rate_scale.max(1),
         })
     }
 }
@@ -232,6 +233,7 @@ async fn admin_create_custom_pricing(
         network_cost_per_gbps: req.network_cost_per_gbps.unwrap_or(0),
         interval_amount: req.interval_amount.unwrap_or(1),
         interval_type: req.interval_type.map(Into::into).unwrap_or_default(),
+        rate_scale: req.rate_scale.unwrap_or(1),
     };
 
     validate_interval(&pricing)?;
@@ -384,14 +386,34 @@ async fn admin_update_custom_pricing(
     if let Some(v) = req.network_cost_per_gbps {
         pricing.network_cost_per_gbps = v;
     }
+    let (old_amount, old_type, old_scale) = (
+        pricing.interval_amount,
+        pricing.interval_type,
+        pricing.rate_scale,
+    );
     if let Some(v) = req.interval_amount {
         pricing.interval_amount = v;
     }
     if let Some(v) = req.interval_type {
         pricing.interval_type = v.into();
     }
+    if let Some(v) = req.rate_scale {
+        pricing.rate_scale = v;
+    }
 
     validate_interval(&pricing)?;
+    // Every rate is the price for one interval at this scale, so changing either
+    // under VMs that already use the model would silently reprice them. Copy the
+    // model into the new interval instead (which converts the rates).
+    if (pricing.interval_amount, pricing.interval_type, pricing.rate_scale)
+        != (old_amount, old_type, old_scale)
+        && this.db.count_custom_templates_by_pricing(id).await? > 0
+    {
+        return Err(ApiError::bad_request(
+            "The billing interval and rate scale cannot change while VMs use this pricing \
+             model. Copy it into a new model with the interval you want instead.",
+        ));
+    }
     validate_ip_ranges(&pricing)?;
     validate_bandwidth_ranges(&pricing)?;
 
@@ -481,6 +503,28 @@ async fn admin_copy_custom_pricing(
     // Validate that target region exists
     let _region = this.db.get_host_region(target_region_id).await?;
 
+    // The copy may bill on a different interval. Every rate is the price for one
+    // interval, so convert the rates to keep the price over time the same (a
+    // monthly model copied to hourly gets the hourly equivalent, not the same
+    // numbers). Going shorter needs a finer unit to hold the fraction of a cent.
+    let new_interval = (
+        req.interval_amount.unwrap_or(source_pricing.interval_amount),
+        req.interval_type
+            .map(Into::into)
+            .unwrap_or(source_pricing.interval_type),
+    );
+    if new_interval.0 == 0 {
+        return Err(ApiError::bad_request("interval_amount must be at least 1"));
+    }
+    let old_scale = source_pricing.rate_scale.max(1);
+    let old_hours = interval_hours(source_pricing.interval_type, source_pricing.interval_amount);
+    let new_hours = interval_hours(new_interval.1, new_interval.0);
+    let new_scale = if new_hours < old_hours {
+        old_scale.max(RATE_SCALE_SUB_CENT)
+    } else {
+        old_scale
+    };
+    let convert = |v: u64| convert_rate(v, old_scale, old_hours, new_scale, new_hours);
     // Create new pricing model
     let new_pricing = VmCustomPricing {
         id: 0, // Will be set by database
@@ -493,10 +537,10 @@ async fn admin_copy_custom_pricing(
         cpu_mfg: source_pricing.cpu_mfg.clone(),
         cpu_arch: source_pricing.cpu_arch.clone(),
         cpu_features: source_pricing.cpu_features.clone(),
-        cpu_cost: source_pricing.cpu_cost,
-        memory_cost: source_pricing.memory_cost,
-        ip4_cost: source_pricing.ip4_cost,
-        ip6_cost: source_pricing.ip6_cost,
+        cpu_cost: convert(source_pricing.cpu_cost),
+        memory_cost: convert(source_pricing.memory_cost),
+        ip4_cost: convert(source_pricing.ip4_cost),
+        ip6_cost: convert(source_pricing.ip6_cost),
         min_cpu: source_pricing.min_cpu,
         max_cpu: source_pricing.max_cpu,
         min_memory: source_pricing.min_memory,
@@ -514,15 +558,13 @@ async fn admin_copy_custom_pricing(
         transfer_gb: source_pricing.transfer_gb,
         min_transfer_gb: source_pricing.min_transfer_gb,
         max_transfer_gb: source_pricing.max_transfer_gb,
-        transfer_cost_per_tb: source_pricing.transfer_cost_per_tb,
+        transfer_cost_per_tb: convert(source_pricing.transfer_cost_per_tb),
         min_network_mbps: source_pricing.min_network_mbps,
         max_network_mbps: source_pricing.max_network_mbps,
-        network_cost_per_gbps: source_pricing.network_cost_per_gbps,
-        interval_amount: req.interval_amount.unwrap_or(source_pricing.interval_amount),
-        interval_type: req
-            .interval_type
-            .map(Into::into)
-            .unwrap_or(source_pricing.interval_type),
+        network_cost_per_gbps: convert(source_pricing.network_cost_per_gbps),
+        interval_amount: new_interval.0,
+        interval_type: new_interval.1,
+        rate_scale: new_scale,
     };
     validate_interval(&new_pricing)?;
 
@@ -535,7 +577,7 @@ async fn admin_copy_custom_pricing(
             pricing_id: new_pricing_id,
             kind: disk_config.kind,
             interface: disk_config.interface,
-            cost: disk_config.cost,
+            cost: convert(disk_config.cost),
             min_disk_size: disk_config.min_disk_size,
             max_disk_size: disk_config.max_disk_size,
         };
@@ -560,6 +602,35 @@ fn validate_ip_ranges(pricing: &VmCustomPricing) -> Result<(), ApiError> {
         return Err(ApiError::bad_request("min_ip6 cannot exceed max_ip6"));
     }
     Ok(())
+}
+
+/// Rate scale given to a model whose interval is shorter than the one it was
+/// copied from: 1/10,000 of a cent, plenty for an hourly share of a monthly rate.
+const RATE_SCALE_SUB_CENT: u64 = 10_000;
+
+/// Hours in one billing interval (a month is 30 days, as everywhere else the
+/// pricing engine needs a fixed length).
+fn interval_hours(interval_type: lnvps_db::IntervalType, amount: u64) -> u128 {
+    use lnvps_db::IntervalType::*;
+    let per: u128 = match interval_type {
+        Hour => 1,
+        Day => 24,
+        Month => 30 * 24,
+        Year => 365 * 24,
+    };
+    per * amount.max(1) as u128
+}
+
+/// Re-express a rate held in `1/old_scale` units per `old_hours` as a rate in
+/// `1/new_scale` units per `new_hours`, rounded to nearest. A rate that is not
+/// zero never rounds to zero.
+fn convert_rate(v: u64, old_scale: u64, old_hours: u128, new_scale: u64, new_hours: u128) -> u64 {
+    if v == 0 {
+        return 0;
+    }
+    let num = v as u128 * new_scale as u128 * new_hours;
+    let den = old_scale as u128 * old_hours;
+    (((num + den / 2) / den).max(1)).min(u64::MAX as u128) as u64
 }
 
 /// A billing interval must be at least one period long.

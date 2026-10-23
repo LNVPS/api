@@ -2484,9 +2484,11 @@ Body:
   // optional - Cost per Gbit/s of network speed, billed on the whole speed chosen,
   // smallest currency units, default 0
   "interval_amount": number,
-  // optional - Billing interval, default 1 month. Rates stay per month; a
-  // shorter interval charges the matching share each period
+  // optional - Billing interval, default 1 month. Every rate above is the price for one interval
   "interval_type": "hour" | "day" | "month" | "year",
+  "rate_scale": number,
+  // optional - Rates (and disk costs) are in 1/rate_scale of the smallest currency unit, default 1.
+  // Use 10000 for an hourly model so a rate can be a fraction of a cent
   "disk_pricing": [
     // Array of disk pricing configurations
     {
@@ -2573,8 +2575,10 @@ Body (all optional):
   "max_network_mbps": number,
   "network_cost_per_gbps": number,
   "interval_amount": number,
-  // Billing interval; rates stay per month, a shorter interval charges the matching share each period
   "interval_type": "hour" | "day" | "month" | "year",
+  // Billing interval; every rate is the price for one interval. Cannot change while VMs use the model
+  "rate_scale": number,
+  // Rates and disk costs are in 1/rate_scale of the smallest currency unit. Cannot change while VMs use the model
   "disk_pricing": [
     {
       "kind": "ssd",
@@ -2773,7 +2777,8 @@ Body:
   // Enable the new pricing model (optional, default true)
   "interval_amount": number,
   "interval_type": "hour" | "day" | "month" | "year"
-  // Billing interval for the copy (optional, defaults to the source's)
+  // Billing interval for the copy (optional, defaults to the source's). A different interval
+  // converts every rate so the price over time is unchanged (finer rate_scale when shorter)
 }
 ```
 
@@ -6751,8 +6756,10 @@ The RBAC system uses the following permission format: `resource::action`
   "max_network_mbps": number,
   "network_cost_per_gbps": number,
   "interval_amount": number,
-  // Billing interval; rates stay per month, a shorter interval charges the matching share each period
   "interval_type": "hour" | "day" | "month" | "year",
+  // Billing interval; every rate is the price for one interval
+  "rate_scale": number,
+  // Rates and disk costs are in 1/rate_scale of the smallest currency unit
   "disk_pricing": [
     // Array of disk pricing configurations
     {

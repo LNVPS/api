@@ -179,9 +179,16 @@ async fn interval_defaults_to_monthly_and_copy_can_override_it() {
         .0
         .data;
     assert_eq!(hourly.interval_type, ApiIntervalType::Hour);
-    assert_eq!(hourly.cpu_cost, created.cpu_cost);
+    // Rates are per interval, so the copy holds the hourly equivalent in a finer
+    // unit: 100 cents a month is 1/720th of that an hour, i.e. 1389 at 1/10_000 cent.
+    assert_eq!(hourly.rate_scale, 10_000);
+    assert_eq!(created.cpu_cost, 100);
+    assert_eq!(hourly.cpu_cost, 1389);
+    // A longer-or-equal copy keeps the rates and scale as they were.
+    assert_eq!(same.cpu_cost, created.cpu_cost);
+    assert_eq!(same.rate_scale, created.rate_scale);
 
-    // Update changes it; a zero amount is refused.
+    // While no VM uses the model its interval can change; a zero amount is refused.
     let patch: UpdateCustomPricingRequest =
         serde_json::from_value(json!({ "interval_type": "day", "interval_amount": 2 })).unwrap();
     let updated = admin_update_custom_pricing(auth(), State(this.clone()), Path(created.id), Json(patch))
@@ -197,5 +204,59 @@ async fn interval_defaults_to_monthly_and_copy_can_override_it() {
         admin_update_custom_pricing(auth(), State(this), Path(created.id), Json(zero))
             .await
             .is_err()
+    );
+}
+
+#[test]
+fn rates_convert_between_intervals_and_scales() {
+    use lnvps_db::IntervalType::{Hour, Month};
+    let (month, hour) = (interval_hours(Month, 1), interval_hours(Hour, 1));
+    assert_eq!((month, hour), (720, 1));
+    // Month -> hour at a finer scale: 1.10 EUR a month (110 cents).
+    assert_eq!(1528, convert_rate(110, 1, month, 10_000, hour));
+    // ...and back again lands on the original.
+    assert_eq!(110, convert_rate(1528, 10_000, hour, 1, month));
+    // Same interval and scale is the identity; zero stays zero; non-zero never vanishes.
+    assert_eq!(110, convert_rate(110, 1, month, 1, month));
+    assert_eq!(0, convert_rate(0, 1, month, 10_000, hour));
+    // 1 cent a year is a fraction of a cent an hour at scale 1, but not free.
+    assert_eq!(1, convert_rate(1, 1, interval_hours(lnvps_db::IntervalType::Year, 1), 1, hour));
+}
+
+#[tokio::test]
+async fn interval_cannot_change_under_existing_vms() {
+    let this = state();
+    let id = admin_create_custom_pricing(
+        auth(),
+        State(this.clone()),
+        Json(create_request(json!({}))),
+    )
+    .await
+    .unwrap()
+    .0
+    .data
+    .id;
+    this.db
+        .insert_custom_vm_template(&lnvps_db::VmCustomTemplate {
+            pricing_id: id,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    for body in [json!({ "interval_type": "hour" }), json!({ "rate_scale": 10000 })] {
+        let patch: UpdateCustomPricingRequest = serde_json::from_value(body).unwrap();
+        assert!(
+            admin_update_custom_pricing(auth(), State(this.clone()), Path(id), Json(patch))
+                .await
+                .is_err()
+        );
+    }
+    // Setting the value it already has is not a change.
+    let same: UpdateCustomPricingRequest =
+        serde_json::from_value(json!({ "interval_type": "month", "rate_scale": 1 })).unwrap();
+    assert!(
+        admin_update_custom_pricing(auth(), State(this), Path(id), Json(same))
+            .await
+            .is_ok()
     );
 }

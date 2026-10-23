@@ -1403,16 +1403,21 @@ pub struct VmCustomPricing {
     pub expires: Option<DateTime<Utc>>,
     pub region_id: u64,
     pub currency: String,
+    /// Every rate on this model (and on its disk rows) is in `1/rate_scale` of
+    /// the currency's smallest unit. `1` is plain cents/millisats; a larger
+    /// scale lets a short billing interval carry a fraction of a cent. `0` is
+    /// read as `1`.
+    pub rate_scale: u64,
     pub cpu_mfg: CpuMfg,
     pub cpu_arch: CpuArch,
     pub cpu_features: CommaSeparated<CpuFeature>,
-    /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost per CPU core per billing interval, in `1/rate_scale` smallest currency units
     pub cpu_cost: u64,
-    /// Cost per GB ram in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost per GB ram per billing interval, in `1/rate_scale` smallest currency units
     pub memory_cost: u64,
-    /// Cost per IPv4 address in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost per IPv4 address per billing interval, in `1/rate_scale` smallest currency units
     pub ip4_cost: u64,
-    /// Cost per IPv6 address in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost per IPv6 address per billing interval, in `1/rate_scale` smallest currency units
     pub ip6_cost: u64,
     /// Minimum CPU cores allowed
     pub min_cpu: u16,
@@ -1451,9 +1456,8 @@ pub struct VmCustomPricing {
     pub min_network_mbps: u32,
     pub max_network_mbps: u32,
     pub network_cost_per_gbps: u64,
-    /// Billing interval of VMs built from this model, e.g. `1` `Month`. The
-    /// rates above are always per month; a shorter interval charges the
-    /// matching fraction of the monthly price each period.
+    /// Billing interval of VMs built from this model, e.g. `1` `Month`. Every
+    /// rate on the model is the price for one such interval.
     pub interval_amount: u64,
     pub interval_type: IntervalType,
 }
@@ -1465,7 +1469,8 @@ pub struct VmCustomPricingDisk {
     pub pricing_id: u64,
     pub kind: DiskType,
     pub interface: DiskInterface,
-    /// Cost per GB in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost per GB per billing interval, in `1/rate_scale` smallest currency
+    /// units of the parent [`VmCustomPricing`]
     pub cost: u64,
     /// Minimum disk size in bytes for this disk type/interface
     pub min_disk_size: u64,

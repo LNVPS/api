@@ -87,6 +87,13 @@ impl TickerRate {
     /// `f32`/`value_f32()` (as an earlier version did) lost precision — e.g.
     /// €1.00 at 100,000 EUR/BTC produced 999,999 msat instead of 1,000,000.
     pub fn convert(&self, source: CurrencyAmount) -> Result<CurrencyAmount> {
+        self.convert_scaled(source, 1)
+    }
+
+    /// Like [`Self::convert`], for a `source` held in `1/scale` of its smallest
+    /// unit (custom pricing rates: a fraction of a cent per hour). The division
+    /// happens before rounding, so the fraction is converted rather than lost.
+    pub fn convert_scaled(&self, source: CurrencyAmount, scale: u64) -> Result<CurrencyAmount> {
         ensure!(
             self.can_convert(source.currency()),
             "Cant convert, currency doesnt match"
@@ -97,7 +104,7 @@ impl TickerRate {
         } else {
             (self.ticker.0, 1.0 / rate)
         };
-        let src_standard = source.value() as f64 / Self::scale(source.currency());
+        let src_standard = source.value() as f64 / (Self::scale(source.currency()) * scale.max(1) as f64);
         let dst_standard = src_standard * factor;
         let dst_smallest = (dst_standard * Self::scale(target)).round() as u64;
         Ok(CurrencyAmount::from_u64(target, dst_smallest))
@@ -118,7 +125,16 @@ impl TickerRate {
 
     /// Convert from the source currency into the target currency and return ConvertedCurrencyAmount
     pub fn convert_with_rate(&self, source: CurrencyAmount) -> Result<ConvertedCurrencyAmount> {
-        let converted_amount = self.convert(source)?;
+        self.convert_scaled_with_rate(source, 1)
+    }
+
+    /// [`Self::convert_with_rate`] for a `source` held in `1/scale` of its smallest unit.
+    pub fn convert_scaled_with_rate(
+        &self,
+        source: CurrencyAmount,
+        scale: u64,
+    ) -> Result<ConvertedCurrencyAmount> {
+        let converted_amount = self.convert_scaled(source, scale)?;
         Ok(ConvertedCurrencyAmount {
             amount: converted_amount,
             rate: *self,

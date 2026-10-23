@@ -2105,10 +2105,14 @@ pub struct AdminCustomPricingInfo {
     pub min_network_mbps: u32,
     pub max_network_mbps: u32,
     pub network_cost_per_gbps: u64,
-    /// Billing interval of VMs built from this model. Rates are per month; a
-    /// shorter interval (e.g. 1 hour) charges the matching share each period.
+    /// Billing interval of VMs built from this model. Every rate is the price
+    /// for one such interval.
     pub interval_amount: u64,
     pub interval_type: ApiIntervalType,
+    /// Rates (and the disk costs) are in `1/rate_scale` of the currency's
+    /// smallest unit: 1 is plain cents/millisats, a larger scale holds a
+    /// fraction of a cent (e.g. an hourly rate).
+    pub rate_scale: u64,
 }
 
 #[derive(Serialize)]
@@ -2375,9 +2379,11 @@ pub struct UpdateCustomPricingRequest {
     pub min_network_mbps: Option<u32>,
     pub max_network_mbps: Option<u32>,
     pub network_cost_per_gbps: Option<u64>,
-    /// Billing interval; defaults to 1 month
+    /// Billing interval; defaults to 1 month. Every rate is the price for one interval.
     pub interval_amount: Option<u64>,
     pub interval_type: Option<ApiIntervalType>,
+    /// Rates are in `1/rate_scale` of the currency's smallest unit; defaults to 1.
+    pub rate_scale: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -2435,9 +2441,11 @@ pub struct CreateCustomPricingRequest {
     pub min_network_mbps: Option<u32>,
     pub max_network_mbps: Option<u32>,
     pub network_cost_per_gbps: Option<u64>,
-    /// Billing interval; defaults to 1 month
+    /// Billing interval; defaults to 1 month. Every rate is the price for one interval.
     pub interval_amount: Option<u64>,
     pub interval_type: Option<ApiIntervalType>,
+    /// Rates are in `1/rate_scale` of the currency's smallest unit; defaults to 1.
+    pub rate_scale: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -2455,7 +2463,9 @@ pub struct CopyCustomPricingRequest {
     pub name: String,
     pub region_id: Option<u64>,
     pub enabled: Option<bool>,
-    /// Billing interval for the copy; defaults to the source's
+    /// Billing interval for the copy; defaults to the source's. When it
+    /// differs, every rate is converted to the new interval so the copy
+    /// charges the same over time.
     pub interval_amount: Option<u64>,
     pub interval_type: Option<ApiIntervalType>,
 }

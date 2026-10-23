@@ -2,12 +2,11 @@
 pub use lnvps_api_common::*;
 
 use crate::exchange::{ExchangeRateService, alt_prices};
-use lnvps_api_common::scale_monthly_to_interval;
 use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
 use humantime::format_duration;
 use lnvps_api_common::{ApiDiskInterface, ApiDiskType};
-use lnvps_db::{IntervalType, PaymentMethod, VmCustomTemplate};
+use lnvps_db::{PaymentMethod, VmCustomTemplate};
 
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::{Deserialize, Serialize};
@@ -67,36 +66,35 @@ pub struct ApiCustomVmPrice {
 }
 
 impl ApiCustomVmPrice {
-    /// Build from a monthly base [`CurrencyAmount`], expanding conversions to
-    /// the other supported currencies via the exchange rates.
+    /// Build from what one billing interval of a custom pricing model costs,
+    /// expanding conversions to the other supported currencies.
     ///
-    /// `interval_*` is the pricing model's billing interval. The rates are
-    /// monthly, so a shorter interval quotes the matching share of the monthly
-    /// price. That share is a fraction of a cent for an hourly VM, so it is
-    /// quoted in BTC millisats (as hourly VMs are paid from credit) rather than
-    /// rounded to a whole fiat cent.
-    pub async fn from_amount(
-        amount: CurrencyAmount,
-        interval_type: IntervalType,
-        interval_amount: u64,
+    /// `price` is kept in its fine `1/scale` unit. A fiat price per hour is a
+    /// fraction of a cent, which a whole fiat amount can't state, so a price
+    /// that doesn't come out in whole minor units is quoted in BTC millisats
+    /// (as hourly VMs are paid from credit) instead of being rounded up to the
+    /// next cent.
+    pub async fn from_price(
+        price: &PricingData,
         rates: &Arc<dyn ExchangeRateService>,
     ) -> Result<Self> {
         let rate_list = rates.list_rates().await?;
-        let amount = if interval_type == IntervalType::Month && interval_amount == 1 {
-            amount
+        let raw = price.total_raw();
+        let amount = if price.scale <= 1 {
+            CurrencyAmount::from_u64(price.currency, raw)
+        } else if raw % price.scale == 0 {
+            CurrencyAmount::from_u64(price.currency, raw / price.scale)
         } else {
-            let base = if amount.currency() == Currency::BTC {
-                Some(amount)
-            } else {
-                alt_prices(&rate_list, amount)
-                    .into_iter()
-                    .find(|p| p.currency() == Currency::BTC)
-            }
-            .unwrap_or(amount);
-            CurrencyAmount::from_u64(
-                base.currency(),
-                scale_monthly_to_interval(base.value(), interval_type, interval_amount),
-            )
+            // Convert the raw price directly; fall back to rounded-up fiat if
+            // there is no BTC rate to convert with.
+            rate_list
+                .iter()
+                .filter(|r| r.can_convert(price.currency) && r.can_convert(Currency::BTC))
+                .find_map(|r| {
+                    r.convert_scaled(CurrencyAmount::from_u64(price.currency, raw), price.scale)
+                        .ok()
+                })
+                .unwrap_or_else(|| CurrencyAmount::from_u64(price.currency, price.total()))
         };
         let other_price = alt_prices(&rate_list, amount)
             .into_iter()
@@ -109,8 +107,8 @@ impl ApiCustomVmPrice {
             currency: amount.currency().into(),
             amount: amount.value(),
             other_price,
-            interval_amount,
-            interval_type: interval_type.into(),
+            interval_amount: price.interval_amount,
+            interval_type: price.interval_type.into(),
         })
     }
 }

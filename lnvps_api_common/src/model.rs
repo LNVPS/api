@@ -163,8 +163,8 @@ impl ApiVmTemplate {
                 amount: price.total(),
                 currency: price.currency.into(),
                 other_price: vec![], // filled externally
-                interval_amount: 1,
-                interval_type: ApiIntervalType::Month,
+                interval_amount: price.interval_amount,
+                interval_type: price.interval_type.into(),
             },
             region: ApiVmHostRegion {
                 id: region.id,

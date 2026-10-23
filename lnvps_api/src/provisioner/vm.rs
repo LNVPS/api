@@ -11,7 +11,7 @@ use lnvps_api_common::retry::{OpResult, Pipeline, RetryPolicy};
 use lnvps_api_common::{
     AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, NewPaymentInfo,
     PricingEngine, UpgradeConfig, UpgradeCostQuote, VmStateCache, apply_custom_pricing_limits,
-    round_msat_to_sat, scale_monthly_to_interval, upgrade_bandwidth,
+    round_msat_to_sat, upgrade_bandwidth,
 };
 use lnvps_api_common::{ExchangeRateService, op_fatal};
 use lnvps_db::{
@@ -407,14 +407,10 @@ impl VmProvisioner {
             .get_subscription_line_item(subscription_line_item_id)
             .await?;
         li.name = format!("VM{} - {}", new_vm.id, pricing.name);
-        // Record the base monthly amount now that the VM id is known. With no IP
+        // Record the base amount per billing interval now that the VM id is known. With no IP
         // assignments yet this prices the base config plus the minimum 1x IPv4/IPv6.
         let price = PricingEngine::get_custom_vm_cost_amount(&self.db, &template).await?;
-        li.amount = scale_monthly_to_interval(
-            price.total(),
-            pricing.interval_type,
-            pricing.interval_amount.max(1),
-        );
+        li.amount = price.total();
         self.db.update_subscription_line_item(&li).await?;
 
         Ok(new_vm)
@@ -603,11 +599,7 @@ impl VmProvisioner {
             .await?;
         li.name = format!("VM{} - {}", new_vm.id, pricing.name);
         let price = PricingEngine::get_custom_vm_cost_amount(&self.db, &template).await?;
-        li.amount = scale_monthly_to_interval(
-            price.total(),
-            pricing.interval_type,
-            pricing.interval_amount.max(1),
-        );
+        li.amount = price.total();
         self.db.update_subscription_line_item(&li).await?;
 
         Ok(new_vm)
@@ -986,11 +978,7 @@ impl VmProvisioner {
         let mut updated_line_item = line_item;
         updated_line_item.subscription_type = LineItemType::Vps;
         updated_line_item.configuration = Some(serde_json::to_value(cfg)?);
-        updated_line_item.amount = scale_monthly_to_interval(
-            new_price.total(),
-            new_pricing.interval_type,
-            new_pricing.interval_amount.max(1),
-        );
+        updated_line_item.amount = new_price.total();
         self.db
             .update_subscription_line_item(&updated_line_item)
             .await?;
@@ -1014,12 +1002,7 @@ impl VmProvisioner {
             .db
             .get_subscription_line_item(vm.subscription_line_item_id)
             .await?;
-        let subscription = self.db.get_subscription(line_item.subscription_id).await?;
-        line_item.amount = scale_monthly_to_interval(
-            new_price.total(),
-            subscription.interval_type,
-            subscription.interval_amount,
-        );
+        line_item.amount = new_price.total();
         self.db.update_subscription_line_item(&line_item).await?;
 
         Ok(())
@@ -2534,7 +2517,8 @@ mod tests {
     }
 
     /// A custom pricing model's billing interval seeds the VM's subscription, and
-    /// the line item shows what one interval costs rather than the monthly price.
+    /// the line item shows what one interval costs, in whole minor units rounded
+    /// up from the model's finer rate scale.
     #[tokio::test]
     async fn test_provision_custom_uses_the_pricing_interval() -> Result<()> {
         let db = Arc::new(MockDb::default());
@@ -2558,12 +2542,27 @@ mod tests {
         let monthly_item = db
             .get_subscription_line_item(monthly_vm.subscription_line_item_id)
             .await?;
+        let monthly_sub = db.get_subscription(monthly_item.subscription_id).await?;
+        assert!(matches!(monthly_sub.interval_type, IntervalType::Month));
 
+        // Re-denominate the same prices per hour at 1/10_000 of a cent.
         {
             let mut p = db.custom_pricing.lock().await;
             let pricing = p.get_mut(&pricing_id).unwrap();
             pricing.interval_type = IntervalType::Hour;
             pricing.interval_amount = 1;
+            pricing.rate_scale = 10_000;
+            for v in [
+                &mut pricing.cpu_cost,
+                &mut pricing.memory_cost,
+                &mut pricing.ip4_cost,
+                &mut pricing.ip6_cost,
+            ] {
+                *v = (*v * 10_000).div_ceil(720);
+            }
+        }
+        for d in db.custom_pricing_disk.lock().await.values_mut() {
+            d.cost = (d.cost * 10_000).div_ceil(720);
         }
         let hourly_vm = prov
             .provision_custom(user.id, template, 1, ssh_key.id, None)
@@ -2574,7 +2573,10 @@ mod tests {
         let sub = db.get_subscription(hourly_item.subscription_id).await?;
         assert!(matches!(sub.interval_type, IntervalType::Hour));
         assert_eq!(1, sub.interval_amount);
-        assert_eq!(monthly_item.amount.div_ceil(720), hourly_item.amount);
+        // One hour is about 1/720th of the month, in whole cents rounded up
+        // (a fraction of a cent is never given away, nor dropped to zero).
+        assert!(hourly_item.amount >= 1);
+        assert!(hourly_item.amount <= monthly_item.amount.div_ceil(720) + 1);
         Ok(())
     }
 
