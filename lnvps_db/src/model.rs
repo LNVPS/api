@@ -2865,6 +2865,9 @@ pub enum VmHistoryActionType {
     /// migration and for a placement change discovered on the hosts, so the
     /// audit trail shows where a VM has physically lived.
     Migrated = 13,
+    SnapshotCreated = 14,
+    SnapshotRestored = 15,
+    SnapshotDeleted = 16,
 }
 
 impl Display for VmHistoryActionType {
@@ -2884,6 +2887,9 @@ impl Display for VmHistoryActionType {
             VmHistoryActionType::Transferred => write!(f, "transferred"),
             VmHistoryActionType::Refunded => write!(f, "refunded"),
             VmHistoryActionType::Migrated => write!(f, "migrated"),
+            VmHistoryActionType::SnapshotCreated => write!(f, "snapshot_created"),
+            VmHistoryActionType::SnapshotRestored => write!(f, "snapshot_restored"),
+            VmHistoryActionType::SnapshotDeleted => write!(f, "snapshot_deleted"),
         }
     }
 }
@@ -2907,6 +2913,9 @@ impl FromStr for VmHistoryActionType {
             "transferred" => Ok(VmHistoryActionType::Transferred),
             "refunded" => Ok(VmHistoryActionType::Refunded),
             "migrated" => Ok(VmHistoryActionType::Migrated),
+            "snapshot_created" => Ok(VmHistoryActionType::SnapshotCreated),
+            "snapshot_restored" => Ok(VmHistoryActionType::SnapshotRestored),
+            "snapshot_deleted" => Ok(VmHistoryActionType::SnapshotDeleted),
             _ => Err(anyhow!("unknown VM history action type: {}", s)),
         }
     }

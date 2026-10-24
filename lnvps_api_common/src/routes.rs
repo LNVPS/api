@@ -190,6 +190,14 @@ impl From<lnvps_db::DbError> for ApiError {
 
 impl From<crate::retry::OpError<anyhow::Error>> for ApiError {
     fn from(value: crate::retry::OpError<anyhow::Error>) -> Self {
+        use crate::host::SnapshotRejection;
+        if let Some(rejection) = value.inner().downcast_ref::<SnapshotRejection>() {
+            return match rejection {
+                SnapshotRejection::Invalid(m) => Self::bad_request(m),
+                SnapshotRejection::Conflict(m) => Self::conflict(m),
+                SnapshotRejection::NotFound(m) => Self::not_found(m),
+            };
+        }
         Self::internal(value)
     }
 }
@@ -227,6 +235,33 @@ mod tests {
         let error = ApiError::new("Something went wrong");
         let json = serde_json::to_string(&error).unwrap();
         assert_eq!(json, r#"{"error":"Something went wrong"}"#);
+    }
+
+    #[test]
+    fn snapshot_rejections_map_to_client_errors() {
+        use crate::host::SnapshotRejection;
+        use crate::retry::OpError;
+        for (rejection, code) in [
+            (
+                SnapshotRejection::Invalid("a".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                SnapshotRejection::Conflict("b".into()),
+                StatusCode::CONFLICT,
+            ),
+            (
+                SnapshotRejection::NotFound("c".into()),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let message = rejection.to_string();
+            let err = ApiError::from(OpError::from(rejection));
+            assert_eq!(err.code, code);
+            assert_eq!(err.error, message);
+        }
+        let other = ApiError::from(OpError::Fatal(anyhow::anyhow!("host exploded")));
+        assert_eq!(other.code, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

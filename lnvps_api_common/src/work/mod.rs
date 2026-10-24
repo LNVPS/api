@@ -41,6 +41,28 @@ pub trait WorkCommander: Send + Sync {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum SnapshotAction {
+    Create {
+        name: String,
+        description: Option<String>,
+    },
+    Restore {
+        name: String,
+    },
+    Delete {
+        name: String,
+    },
+}
+
+impl SnapshotAction {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Create { name, .. } | Self::Restore { name } | Self::Delete { name } => name,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum WorkJob {
     /// Sync resources from hosts to database
@@ -202,6 +224,12 @@ pub enum WorkJob {
         /// Image the VM was reinstalled with (recorded in history).
         new_image_id: u64,
         /// Temporary channel id the worker replies on (via job feedback).
+        reply_channel: String,
+    },
+    VmSnapshot {
+        vm_id: u64,
+        user_id: Option<u64>,
+        action: SnapshotAction,
         reply_channel: String,
     },
     /// Create a VM for a specific user (admin action)
@@ -385,6 +413,7 @@ impl WorkJob {
             // A reinstall is a one-shot action tied to a waiting user request;
             // don't let the worker silently retry it later.
             Self::ReinstallVm { .. } => true,
+            Self::VmSnapshot { .. } => true,
             // The periodic reconcile is the backstop, so a failed trigger costs
             // at most one interval — not worth retrying and blocking the stream.
             Self::ReconcileAppDeployment { .. } => true,
@@ -429,6 +458,7 @@ impl fmt::Display for WorkJob {
             WorkJob::ProcessVmRefund { .. } => write!(f, "ProcessVmRefund"),
             WorkJob::ListUnmanagedVms { .. } => write!(f, "ListUnmanagedVms"),
             WorkJob::ReinstallVm { .. } => write!(f, "ReinstallVm"),
+            WorkJob::VmSnapshot { .. } => write!(f, "VmSnapshot"),
             WorkJob::ImportVm { .. } => write!(f, "ImportVm"),
             WorkJob::MigrateVm { .. } => write!(f, "MigrateVm"),
             WorkJob::ReconcileVmHosts => write!(f, "ReconcileVmHosts"),
@@ -533,5 +563,35 @@ mod tests {
             WorkJob::SyncNodeTunnel { tunnel_id: 5 }.to_string(),
             "SyncNodeTunnel"
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_action_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_action_name() {
+        for (action, name) in [
+            (
+                SnapshotAction::Create {
+                    name: "c1".into(),
+                    description: None,
+                },
+                "c1",
+            ),
+            (SnapshotAction::Restore { name: "r1".into() }, "r1"),
+            (SnapshotAction::Delete { name: "d1".into() }, "d1"),
+        ] {
+            assert_eq!(action.name(), name);
+        }
+        let job = WorkJob::VmSnapshot {
+            vm_id: 1,
+            user_id: None,
+            action: SnapshotAction::Delete { name: "d1".into() },
+            reply_channel: "x".into(),
+        };
+        assert!(job.can_skip());
+        assert_eq!(job.to_string(), "VmSnapshot");
     }
 }

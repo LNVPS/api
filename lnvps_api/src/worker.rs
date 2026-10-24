@@ -11,9 +11,10 @@ use hickory_resolver::TokioResolver;
 use lnvps_api_common::{
     BlackholeWorkFeedback, ChannelWorkCommander, InMemoryKeyValueStore, JobFeedback, KeyValueStore,
     NetworkProvisioner, RedisConfig, RedisKeyValueStore, RedisWorkCommander, RedisWorkFeedback,
-    SCANNED_KEY_FAMILIES, TrafficRecorder, UpgradeConfig, VmHistoryLogger, VmRunningState,
-    VmRunningStates, VmStateCache, WorkCommander, WorkFeedback, WorkJob, WorkJobMessage,
-    capture_is_complete, merge_ssh_host_keys, op_fatal, parse_ssh_host_keys, quota_period,
+    SCANNED_KEY_FAMILIES, SnapshotAction, TrafficRecorder, UpgradeConfig, VmHistoryLogger,
+    VmRunningState, VmRunningStates, VmStateCache, WorkCommander, WorkFeedback, WorkJob,
+    WorkJobMessage, capture_is_complete, merge_ssh_host_keys, op_fatal, parse_ssh_host_keys,
+    quota_period,
     retry::{OpError, Pipeline, RetryPolicy},
     upgrade_bandwidth,
 };
@@ -4057,6 +4058,40 @@ impl Worker {
                     Err(e) => format!("VM {} reinstall failed: {}", vm_id, e),
                 }));
             }
+            WorkJob::VmSnapshot {
+                vm_id,
+                user_id,
+                action,
+                reply_channel,
+            } => {
+                let result = self
+                    .subscription_handler
+                    .vm_provisioner()
+                    .run_snapshot_action(*vm_id, *user_id, action, &self.vm_history_logger)
+                    .await;
+                if !matches!(action, SnapshotAction::Delete { .. })
+                    && let Err(e) = self
+                        .work_commander
+                        .send(WorkJob::CheckVm { vm_id: *vm_id })
+                        .await
+                {
+                    warn!(
+                        "Failed to queue CheckVm after snapshot of VM {}: {}",
+                        vm_id, e
+                    );
+                }
+                if let Err(e) = self
+                    .feedback
+                    .publish(JobFeedback::snapshot_reply(reply_channel.clone(), &result))
+                    .await
+                {
+                    warn!("Failed to publish VmSnapshot reply for VM {}: {}", vm_id, e);
+                }
+                return Ok(Some(match &result {
+                    Ok(()) => format!("VM {} snapshot {} done", vm_id, action.name()),
+                    Err(e) => format!("VM {} snapshot {} failed: {}", vm_id, action.name(), e),
+                }));
+            }
             WorkJob::ApplyVmFirewall { vm_id } => {
                 self.apply_vm_firewall(*vm_id).await?;
             }
@@ -4824,6 +4859,11 @@ impl Worker {
                         let host = ctx.db.get_host(full_info.host.id).await?;
                         let client = get_host_client(&ctx.db, &host, &ctx.settings.provisioner_config).await?;
 
+                        let cleared = lnvps_api_common::host::clear_snapshots(client.as_ref(), &full_info.vm).await?;
+                        if cleared > 0 {
+                            info!("Deleted {} snapshots of VM {} before resizing its disk", cleared, ctx.vm_id);
+                        }
+
                         info!("Resizing disk for VM {}", ctx.vm_id);
                         client.resize_disk(&full_info).await?;
                     }
@@ -5314,6 +5354,30 @@ mod tests {
                 self.inner.generate_mac(vm).await
             }
 
+            async fn list_snapshots(
+                &self,
+                vm: &Vm,
+            ) -> OpResult<Vec<lnvps_api_common::host::VmSnapshot>> {
+                self.inner.list_snapshots(vm).await
+            }
+
+            async fn create_snapshot(
+                &self,
+                vm: &Vm,
+                name: &str,
+                description: Option<&str>,
+            ) -> OpResult<()> {
+                self.inner.create_snapshot(vm, name, description).await
+            }
+
+            async fn rollback_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+                self.inner.rollback_snapshot(vm, name).await
+            }
+
+            async fn delete_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+                self.inner.delete_snapshot(vm, name).await
+            }
+
             async fn start_vm(&self, vm: &Vm) -> OpResult<()> {
                 self.inner.start_vm(vm).await
             }
@@ -5490,6 +5554,59 @@ mod tests {
 
     async fn setup_worker(db: Arc<MockDb>) -> Result<Worker> {
         setup_worker_with_delete_after(db, 0).await
+    }
+
+    #[tokio::test]
+    async fn test_vm_snapshot_job_runs_and_reports() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        let worker = setup_worker(db.clone()).await?;
+        lnvps_api_common::host::dummy_host::DummyVmHost::clear_all_snapshots().await;
+
+        let job = |action| WorkJob::VmSnapshot {
+            vm_id,
+            user_id: None,
+            action,
+            reply_channel: "test".to_string(),
+        };
+        let done = worker
+            .try_job(&job(SnapshotAction::Create {
+                name: "first".to_string(),
+                description: None,
+            }))
+            .await?;
+        assert!(done.unwrap().contains("done"));
+        assert_eq!(
+            worker
+                .subscription_handler
+                .vm_provisioner()
+                .list_snapshots(vm_id)
+                .await?
+                .len(),
+            1
+        );
+
+        let failed = worker
+            .try_job(&job(SnapshotAction::Restore {
+                name: "missing".to_string(),
+            }))
+            .await?;
+        assert!(failed.unwrap().contains("failed"));
+
+        worker
+            .try_job(&job(SnapshotAction::Delete {
+                name: "first".to_string(),
+            }))
+            .await?;
+        assert!(
+            worker
+                .subscription_handler
+                .vm_provisioner()
+                .list_snapshots(vm_id)
+                .await?
+                .is_empty()
+        );
+        Ok(())
     }
 
     /// Regression test: one broken host must not abort the `PatchHosts` sweep.
