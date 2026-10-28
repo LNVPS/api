@@ -3320,6 +3320,7 @@ pub struct VmConfig {
     /// CPU usage limit as a fraction of allocated cores (e.g. 0.5 = 50%; 0 = uncapped)
     #[serde(rename = "cpulimit")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::deserialize_from_str_optional")]
     pub cpu_limit: Option<f32>,
     /// Custom cloud-init config files (e.g. "vendor=local:snippets/lnvps-vendor.yaml")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4244,6 +4245,28 @@ mod tests {
             .expect("Should deserialize actual Proxmox JSON");
         assert_eq!(config.kvm, Some(true)); // kvm:1 should become Some(true)
         assert_eq!(config.on_boot, Some(true)); // onboot:1 should become Some(true)
+    }
+
+    #[test]
+    fn test_vm_config_reads_a_string_cpulimit() {
+        let config: VmConfig = serde_json::from_str(
+            r#"{"cpulimit":"9","cores":4,"memory":"2048","kvm":1,"net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1,rate=125"}"#,
+        )
+        .expect("config with a string cpulimit parses");
+        assert_eq!(config.cpu_limit, Some(9.0));
+
+        let fractional: VmConfig = serde_json::from_str(r#"{"cpulimit":"0.5"}"#).unwrap();
+        assert_eq!(fractional.cpu_limit, Some(0.5));
+        let number: VmConfig = serde_json::from_str(r#"{"cpulimit":2}"#).unwrap();
+        assert_eq!(number.cpu_limit, Some(2.0));
+        let absent: VmConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.cpu_limit, None);
+        let out = serde_json::to_value(&VmConfig {
+            cpu_limit: Some(9.0),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(out["cpulimit"], serde_json::json!(9.0));
     }
 
     #[test]

@@ -2240,6 +2240,14 @@ impl Worker {
         format!("vm-transfer-throttled:{vm_id}")
     }
 
+    /// Make sure the VM's NIC matches whether it is over its allowance.
+    ///
+    /// The key records what was last *applied* to the host, and only
+    /// [`Self::configure_vm`] writes it, once the host has accepted the config.
+    /// While the two disagree a reconfigure is queued on every pass, so a
+    /// reconfigure that fails (and is dead-lettered) is retried an hour later
+    /// instead of the VM being left at full speed with the throttle believed
+    /// to be in place.
     async fn sync_transfer_throttle(
         &self,
         vm: &Vm,
@@ -2270,8 +2278,25 @@ impl Worker {
                 })
                 .await?;
         }
-        self.kv.store(&key, &[over as u8]).await?;
         Ok(())
+    }
+
+    /// Record the transfer throttle state a successful reconfigure put on the
+    /// host, so [`Self::sync_transfer_throttle`] stops re-queuing it.
+    async fn record_applied_transfer_throttle(&self, info: &FullVmInfo) {
+        if let Err(e) = self
+            .kv
+            .store(
+                &Self::transfer_throttle_key(info.vm.id),
+                &[info.transfer_throttled as u8],
+            )
+            .await
+        {
+            warn!(
+                "VM {} was reconfigured but its transfer throttle state was not recorded: {}",
+                info.vm.id, e
+            );
+        }
     }
 
     /// Warn about one VM if it has crossed a threshold it has not been warned
@@ -4903,6 +4928,7 @@ impl Worker {
         let client = get_host_client(&self.db, &host, &self.settings.provisioner_config).await?;
 
         client.configure_vm(&full_info).await?;
+        self.record_applied_transfer_throttle(&full_info).await;
 
         info!(
             "Successfully re-configured VM {} using current database settings",
@@ -6387,12 +6413,68 @@ mod tests {
             info.limits().network_mbps,
             Some(lnvps_api_common::TRANSFER_THROTTLE_MBPS)
         );
+        worker.configure_vm(vm_id, None).await?;
 
         worker.set_last_check_transfer(DateTime::UNIX_EPOCH).await?;
         worker.check_transfer_quotas().await?;
         assert!(
             !queued_configure_vm(&worker, vm_id).await,
             "an already throttled VM is not reconfigured every pass"
+        );
+        Ok(())
+    }
+
+    /// A reconfigure that fails must not be taken as applied. The throttle is
+    /// queued again on the next pass until a reconfigure succeeds, instead of
+    /// the VM staying at full speed with the throttle believed to be in place.
+    #[tokio::test]
+    async fn test_failed_throttle_reconfigure_is_retried() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        set_template_transfer_gb(&db, Some(100)).await;
+        let worker = setup_worker(db.clone()).await?;
+        book_traffic(&db, vm_id, 150_000_000_000).await;
+
+        let broken = db
+            .create_host(&VmHost {
+                kind: VmHostKind::Proxmox,
+                region_id: 1,
+                name: "broken-host".to_string(),
+                ip: "not a url".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let real_host = db.get_vm(vm_id).await?.host_id;
+        db.vms.lock().await.get_mut(&vm_id).unwrap().host_id = broken;
+
+        worker.check_transfer_quotas().await?;
+        assert!(queued_configure_vm(&worker, vm_id).await);
+        assert!(worker.configure_vm(vm_id, None).await.is_err());
+        assert_ne!(
+            worker.kv.get(&Worker::transfer_throttle_key(vm_id)).await?,
+            Some(vec![1]),
+            "a failed reconfigure is not recorded as throttled"
+        );
+
+        worker.set_last_check_transfer(DateTime::UNIX_EPOCH).await?;
+        worker.check_transfer_quotas().await?;
+        assert!(
+            queued_configure_vm(&worker, vm_id).await,
+            "the throttle is queued again after the failure"
+        );
+
+        db.vms.lock().await.get_mut(&vm_id).unwrap().host_id = real_host;
+        worker.configure_vm(vm_id, None).await?;
+        assert_eq!(
+            worker.kv.get(&Worker::transfer_throttle_key(vm_id)).await?,
+            Some(vec![1])
+        );
+        worker.set_last_check_transfer(DateTime::UNIX_EPOCH).await?;
+        worker.check_transfer_quotas().await?;
+        assert!(
+            !queued_configure_vm(&worker, vm_id).await,
+            "once applied, it is not re-queued"
         );
         Ok(())
     }
@@ -6412,9 +6494,11 @@ mod tests {
             queued_configure_vm(&worker, vm_id).await,
             "a VM over last month's allowance is restored even with no stored state"
         );
+        worker.configure_vm(vm_id, None).await?;
         assert_eq!(
             worker.kv.get(&Worker::transfer_throttle_key(vm_id)).await?,
-            Some(vec![0])
+            Some(vec![0]),
+            "the reconfigure records what it applied"
         );
 
         worker
