@@ -309,6 +309,43 @@ pub const NODE_QUIET_AFTER: chrono::Duration = chrono::Duration::minutes(10);
 const NODE_QUIET_SWEEP: chrono::Duration = chrono::Duration::minutes(5);
 pub const PROBE_FAILURES_TO_CORDON: u64 = 3;
 
+/// Build a one-shot client pinned to the first public address of `host:port`.
+///
+/// Every hop of an activation check connects to the address that was just
+/// validated (DNS rebinding cannot swap it for an internal one) while TLS and
+/// the Host header still name the real host. Redirects are followed manually
+/// by the caller, one validated hop at a time.
+async fn pinned_activation_client(host: &str, port: u16) -> anyhow::Result<reqwest::Client> {
+    let ip = tokio::net::lookup_host((host, port))
+        .await?
+        .map(|a| a.ip())
+        .find(|ip| !is_non_public(ip))
+        .ok_or_else(|| anyhow::anyhow!("no public address for {host}"))?;
+    Ok(reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .resolve(host, std::net::SocketAddr::new(ip, port))
+        .build()?)
+}
+
+/// Resolve a `Location` header against the current hop's base URL into the
+/// next `(scheme, host, port, path?query)`. Returns `None` for anything that
+/// is not an http(s) URL (the caller refuses without a valid next hop).
+fn redirect_target(base: &str, location: &str) -> Option<(String, String, u16, String)> {
+    let next = reqwest::Url::parse(base).ok()?.join(location).ok()?;
+    let scheme = next.scheme().to_string();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = next.host_str()?.to_string();
+    let port = next.port_or_known_default()?;
+    let path = match next.query() {
+        Some(q) => format!("{}?{}", next.path(), q),
+        None => next.path().to_string(),
+    };
+    Some((scheme, host, port, path))
+}
+
 impl Worker {
     const CHECK_VMS_SECONDS: u64 = 30;
 
@@ -750,7 +787,7 @@ fn format_days(days: i64) -> String {
 /// Grace period (days) for a subscription, tiered by subscription age. Lives in
 /// `lnvps_api_common` so the API layer can surface the resulting deletion date;
 /// re-exported here for the worker/subscription callers.
-pub use lnvps_api_common::{grace_period_days_for_sub, grace_period_for_sub};
+pub use lnvps_api_common::{grace_period_days_for_sub, grace_period_for_sub, is_non_public};
 
 /// Approximate duration of one billing interval for a subscription.
 ///
@@ -3125,31 +3162,45 @@ impl Worker {
             return Ok(false);
         };
 
-        // Build the activation URL: http://<domain>/.well-known/nostr.json?name=<hash>
-        let activation_url = format!(
-            "http://{}/.well-known/nostr.json?name={}",
-            domain.name, activation_hash
-        );
+        // The domain is customer-supplied, so this fetch is an SSRF primitive
+        // unless every hop is pinned to an address we validated: each hop
+        // resolves its host and refuses non-public addresses, then connects to
+        // the validated address while presenting the hostname (SNI/Host stay
+        // right, so an http->https upgrade on the customer's own host keeps
+        // working and DNS rebinding cannot swap in an internal address).
+        let mut host = domain.name.clone();
+        let mut port: u16 = 80;
+        let mut path = format!("/.well-known/nostr.json?name={}", activation_hash);
 
-        debug!(
-            "Checking path activation for domain {} at {}",
-            domain.name, activation_url
-        );
-
-        match self.http_client.get(&activation_url).send().await {
-            Ok(response) => {
-                if !response.status().is_success() {
+        for hop in 0..3 {
+            let client = match pinned_activation_client(&host, port).await {
+                Ok(c) => c,
+                Err(e) => {
                     debug!(
-                        "Path activation check failed for domain {} - got status {}",
-                        domain.name,
-                        response.status()
+                        "Path activation check failed for domain {} - {} (hop {})",
+                        domain.name, e, hop
                     );
                     return Ok(false);
                 }
+            };
+            let scheme = if port == 443 { "https" } else { "http" };
+            let url = format!("{}://{}:{}{}", scheme, host, port, path);
+            let response = match client.get(&url).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!(
+                        "Path activation check failed for domain {} - error: {}",
+                        domain.name, e
+                    );
+                    return Ok(false);
+                }
+            };
+
+            if response.status().is_success() {
                 // Verify the body is valid NIP-05 JSON with an empty `names` map.
                 // The lnvps_nostr server returns `{"names":{},"relays":{}}` when
                 // the activation hash matches, rather than a real handle lookup.
-                match response.json::<serde_json::Value>().await {
+                let activated = match response.json::<serde_json::Value>().await {
                     Ok(body) => {
                         let names_empty = body
                             .get("names")
@@ -3158,13 +3209,13 @@ impl Worker {
                             .unwrap_or(false);
                         if names_empty {
                             debug!("Path activation check succeeded for domain {}", domain.name);
-                            Ok(true)
+                            true
                         } else {
                             debug!(
                                 "Path activation check failed for domain {} - unexpected body",
                                 domain.name
                             );
-                            Ok(false)
+                            false
                         }
                     }
                     Err(e) => {
@@ -3172,18 +3223,54 @@ impl Worker {
                             "Path activation check failed for domain {} - invalid JSON: {}",
                             domain.name, e
                         );
-                        Ok(false)
+                        false
                     }
-                }
+                };
+                return Ok(activated);
             }
-            Err(e) => {
+
+            // Follow redirects one validated hop at a time (bounded): a plain
+            // no-redirect policy would break the common http->https upgrade on
+            // the customer's own host, but an unguarded follow would let a
+            // customer bounce the worker at internal services.
+            let location = if response.status().is_redirection() {
+                response
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(String::from)
+            } else {
+                None
+            };
+            let Some(location) = location else {
                 debug!(
-                    "Path activation check failed for domain {} - error: {}",
-                    domain.name, e
+                    "Path activation check failed for domain {} - got status {}",
+                    domain.name,
+                    response.status()
                 );
-                Ok(false)
-            }
+                return Ok(false);
+            };
+            let base = format!("{}://{}:{}", scheme, host, port);
+            let Some((next_scheme, next_host, next_port, next_path)) =
+                redirect_target(&base, &location)
+            else {
+                debug!(
+                    "Path activation check failed for domain {} - unsupported redirect to {}",
+                    domain.name, location
+                );
+                return Ok(false);
+            };
+            let _ = next_scheme;
+            host = next_host;
+            port = next_port;
+            path = next_path;
+            let _ = hop;
         }
+        debug!(
+            "Path activation check failed for domain {} - too many redirects",
+            domain.name
+        );
+        Ok(false)
     }
 
     /// Check all nostr domains for DNS records - enable disabled domains with DNS records, disable active domains without DNS records
@@ -9112,6 +9199,82 @@ mod tests {
             .await?;
         assert_eq!(template.transfer_gb, Some(3000));
         assert_eq!(template.network_mbps, None, "an uncapped VM stays uncapped");
+        Ok(())
+    }
+
+    /// The redirect resolver extends relative locations on the current hop,
+    /// accepts absolute http(s) targets (validated per hop by the pinned
+    /// client), and refuses non-http schemes and garbage.
+    #[test]
+    fn redirect_targets_are_resolved_and_constrained() {
+        assert_eq!(
+            redirect_target("http://a.example.com/x/y", "/b?c=d"),
+            Some((
+                "http".to_string(),
+                "a.example.com".to_string(),
+                80,
+                "/b?c=d".to_string()
+            ))
+        );
+        // the common http->https upgrade on the customer's own host
+        assert_eq!(
+            redirect_target("http://a.example.com/x", "https://a.example.com/b"),
+            Some((
+                "https".to_string(),
+                "a.example.com".to_string(),
+                443,
+                "/b".to_string()
+            ))
+        );
+        // an absolute target on another host is returned for validation
+        // downstream (the pinned client refuses non-public addresses)
+        assert_eq!(
+            redirect_target("http://a.example.com/", "http://b.example.com:8080/c?d=1"),
+            Some((
+                "http".to_string(),
+                "b.example.com".to_string(),
+                8080,
+                "/c?d=1".to_string()
+            ))
+        );
+        for refused in ["ftp://a.example.com/x", "file:///etc/passwd"] {
+            assert_eq!(
+                redirect_target("http://a.example.com/", refused),
+                None,
+                "{refused} must be refused"
+            );
+        }
+        // a non-URL string is a relative reference: it resolves onto the
+        // current validated hop, which is safe by construction
+        assert_eq!(
+            redirect_target("http://a.example.com/x", "::not a url::"),
+            Some((
+                "http".to_string(),
+                "a.example.com".to_string(),
+                80,
+                "/::not%20a%20url::".to_string()
+            ))
+        );
+    }
+
+    /// Regression (audit LNVM-008): path-based activation fetches a
+    /// customer-supplied "domain". A name that resolves only into loopback /
+    /// private / link-local space must be refused before any request leaves
+    /// the process — otherwise activation doubles as an internal-network
+    /// probe from the worker host.
+    #[tokio::test]
+    async fn path_activation_never_fetches_a_non_public_address() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let worker = setup_worker_with_delete_after(db, 3).await?;
+        let domain = lnvps_db::NostrDomain {
+            name: "localhost".to_string(),
+            activation_hash: Some("somethash".to_string()),
+            ..Default::default()
+        };
+
+        let activated = worker.check_path_activation(&domain).await?;
+
+        assert!(!activated, "a loopback-resolving domain must not activate");
         Ok(())
     }
 }

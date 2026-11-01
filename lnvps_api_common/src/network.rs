@@ -1010,3 +1010,61 @@ mod tests {
         );
     }
 }
+
+/// Whether `ip` is a loopback / private / link-local / otherwise non-public
+/// address that an outbound fetch of user-supplied hostnames must not be able
+/// to reach (SSRF guard: metadata services, internal services, localhost).
+pub fn is_non_public(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // unique local (fc00::/7)
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                // link local (fe80::/10)
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+#[cfg(test)]
+mod ssrf_guard_tests {
+    use super::*;
+
+    #[test]
+    fn private_and_special_ranges_are_rejected() {
+        for ip in [
+            "127.0.0.1",
+            "10.0.0.4",
+            "192.168.1.1",
+            "172.16.0.9",
+            "169.254.169.254",
+            "0.0.0.0",
+            "255.255.255.255",
+            "192.0.2.1",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+            "::",
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(is_non_public(&ip), "{ip} must be non-public");
+        }
+    }
+
+    #[test]
+    fn public_addresses_pass() {
+        for ip in ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(!is_non_public(&ip), "{ip} must be public");
+        }
+    }
+}
