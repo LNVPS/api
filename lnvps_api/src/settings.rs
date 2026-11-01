@@ -238,6 +238,10 @@ pub struct OAuthCommon {
     pub scopes: Option<Vec<String>>,
     /// Override the userinfo JSON field used as the stable subject id.
     pub subject_field: Option<String>,
+    /// The OIDC issuer (`iss`) this provider's `id_token`s must carry. Set it
+    /// for generic `oidc` providers whose `id_token` is relied on; built-in
+    /// flavors carry their canonical issuer.
+    pub issuer: Option<String>,
 }
 
 /// Sign in with Apple configuration. Apple requires the OAuth `client_secret` to
@@ -295,6 +299,17 @@ impl OAuthProviderConfig {
                 .as_deref()
                 .unwrap_or("https://appleid.apple.com/auth/authorize"),
             OAuthProviderConfig::Oidc(c) => c.auth_url.as_deref().unwrap_or_default(),
+        }
+    }
+
+    /// The `iss` value an `id_token` from this provider must carry, when the
+    /// id_token is relied on as an identity source. `None` = no id_token claim.
+    pub fn expected_iss(&self) -> Option<&str> {
+        match self {
+            OAuthProviderConfig::Google(_) => Some("https://accounts.google.com"),
+            OAuthProviderConfig::Apple(_) => Some("https://appleid.apple.com"),
+            OAuthProviderConfig::Oidc(c) => c.issuer.as_deref(),
+            OAuthProviderConfig::Github(_) | OAuthProviderConfig::Facebook(_) => None,
         }
     }
 

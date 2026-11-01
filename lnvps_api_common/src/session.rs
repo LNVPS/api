@@ -320,8 +320,9 @@ pub fn issue_state_token(
 }
 
 /// Verify a CSRF `state` value and return the provider tag it was issued for,
-/// along with the optional per-request redirect URL it carried.
-pub fn verify_state_token(token: &str) -> Result<(String, Option<String>)> {
+/// the OIDC `nonce` it bound, and the optional per-request redirect URL it
+/// carried.
+pub fn verify_state_token(token: &str) -> Result<(String, String, Option<String>)> {
     let secret = SESSION_SECRET
         .get()
         .ok_or_else(|| anyhow::anyhow!("Session auth not configured"))?;
@@ -341,7 +342,7 @@ pub fn verify_state_token(token: &str) -> Result<(String, Option<String>)> {
     if now_secs() >= claims.exp {
         bail!("State token expired");
     }
-    Ok((claims.prov, claims.redirect))
+    Ok((claims.prov, claims.nonce, claims.redirect))
 }
 
 /// Claims for a short-lived, path-scoped, single-use websocket/HTML auth ticket.
@@ -607,7 +608,7 @@ mod tests {
         let token = issue_state_token("google", "abc123", None, DEFAULT_STATE_TTL_SECS).unwrap();
         assert_eq!(
             verify_state_token(&token).unwrap(),
-            ("google".to_string(), None)
+            ("google".to_string(), "abc123".to_string(), None)
         );
 
         // With a per-request redirect that must round-trip intact.
@@ -622,6 +623,7 @@ mod tests {
             verify_state_token(&token).unwrap(),
             (
                 "github".to_string(),
+                "abc123".to_string(),
                 Some("http://localhost:3000/oauth/complete".to_string())
             )
         );
