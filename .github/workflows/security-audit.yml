@@ -1,0 +1,37 @@
+name: Security audit
+
+# Blocking gate: fails on any RustSec advisory in either workspace's lockfile.
+# Runs on every PR and master push, and weekly so an advisory published
+# against an already-pinned version still surfaces without a code change.
+# NOTE: expects #429 (RustSec dependency bumps) to land first — until then
+# master's lockfiles carry known-flagged versions and this gate will be red.
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+  schedule:
+    - cron: "37 5 * * 1"
+  workflow_dispatch:
+
+# Read-only: the gate never pushes, comments, or touches releases.
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        lockfile:
+          - Cargo.lock
+          - lnvps_fw/Cargo.lock
+    steps:
+      # Pinned by SHA (v5): third-party actions must not float.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit ${{ matrix.lockfile }}
+        run: cargo audit --file ${{ matrix.lockfile }}
