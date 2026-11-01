@@ -108,12 +108,13 @@ async fn v1_oauth_login(
     let redirect_uri = callback_uri(&this.settings.public_url, &provider);
     let scopes = provider_cfg.scopes().join(" ");
     let mut auth_url = format!(
-        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}",
+        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&nonce={}",
         provider_cfg.auth_url(),
         urlencoding::encode(provider_cfg.client_id()),
         urlencoding::encode(&redirect_uri),
         urlencoding::encode(&scopes),
         urlencoding::encode(&state),
+        urlencoding::encode(&nonce),
     );
     if let Some(mode) = provider_cfg.response_mode() {
         auth_url.push_str(&format!("&response_mode={}", mode));
@@ -160,7 +161,7 @@ async fn handle_callback(
         .ok_or_else(|| ApiError::from(anyhow::anyhow!("Missing state")))?;
 
     // Verify CSRF state and that it was issued for this provider.
-    let (state_provider, state_redirect) = verify_state_token(&state)
+    let (state_provider, state_nonce, state_redirect) = verify_state_token(&state)
         .map_err(|e| ApiError::from(anyhow::anyhow!("Invalid state: {}", e)))?;
     if state_provider != provider {
         return Err(ApiError::from(anyhow::anyhow!("State provider mismatch")));
@@ -168,7 +169,7 @@ async fn handle_callback(
 
     let (cfg, provider_cfg) = resolve_provider(this, provider)?;
     let redirect_uri = callback_uri(&this.settings.public_url, provider);
-    let profile = exchange_and_identify(&provider_cfg, &code, &redirect_uri)
+    let profile = exchange_and_identify(&provider_cfg, &code, &redirect_uri, Some(&state_nonce))
         .await
         .map_err(|e| ApiError::internal(format!("OAuth exchange failed: {}", e)))?;
 
@@ -333,6 +334,7 @@ async fn exchange_and_identify(
     cfg: &OAuthProviderConfig,
     code: &str,
     redirect_uri: &str,
+    expected_nonce: Option<&str>,
 ) -> anyhow::Result<OAuthProfile> {
     let client = reqwest::Client::new();
     let client_secret = client_secret(cfg)?;
@@ -374,6 +376,7 @@ async fn exchange_and_identify(
                 .id_token
                 .ok_or_else(|| anyhow::anyhow!("token response missing id_token"))?;
             let claims = decode_id_token(&id_token)?;
+            validate_id_token_claims(&claims, cfg, expected_nonce)?;
             if claims.sub.is_empty() {
                 anyhow::bail!("id_token missing sub");
             }
@@ -527,6 +530,75 @@ struct IdTokenClaims {
     sub: String,
     email: Option<String>,
     email_verified: Option<serde_json::Value>,
+    /// Issuer. OIDC Core requires it; validated against the provider's
+    /// expected issuer when one is known (see [`OAuthProviderConfig::expected_iss`]).
+    #[serde(default)]
+    iss: Option<String>,
+    /// Audience. OIDC Core requires it to contain the client id; the spec
+    /// allows a string or a single-element array, so it is kept as raw JSON.
+    #[serde(default)]
+    aud: Option<serde_json::Value>,
+    /// Expiry (unix seconds). OIDC Core requires it.
+    #[serde(default)]
+    exp: Option<u64>,
+    /// Nonce binding the id_token to the authorization request.
+    #[serde(default)]
+    nonce: Option<String>,
+}
+
+/// Enforce the OIDC Core §3.1.3.7 claim checks that still apply when the
+/// id_token arrives over the TLS-protected token-endpoint back channel
+/// (which is why the JWS signature is not re-verified here): `exp` must be
+/// in the future, `aud` must carry our client id, `iss` must match the
+/// provider's issuer when one is known, and the `nonce` we sent in the
+/// authorization request must come back.
+fn validate_id_token_claims(
+    claims: &IdTokenClaims,
+    cfg: &crate::settings::OAuthProviderConfig,
+    expected_nonce: Option<&str>,
+) -> anyhow::Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let exp = claims
+        .exp
+        .ok_or_else(|| anyhow::anyhow!("id_token missing exp"))?;
+    if now >= exp {
+        anyhow::bail!("id_token expired");
+    }
+    // `aud` is a string or an array of strings; the client id must appear in it.
+    let client_id = cfg.client_id();
+    let aud_ok = match &claims.aud {
+        Some(serde_json::Value::String(a)) => a == client_id,
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|a| a == client_id),
+        _ => false,
+    };
+    if !aud_ok {
+        anyhow::bail!("id_token audience mismatch");
+    }
+    if let Some(expected_iss) = cfg.expected_iss() {
+        let iss = claims
+            .iss
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("id_token missing iss"))?;
+        if iss != expected_iss {
+            anyhow::bail!("id_token issuer mismatch");
+        }
+    }
+    if let Some(sent) = expected_nonce {
+        let returned = claims
+            .nonce
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("id_token missing nonce"))?;
+        if returned != sent {
+            anyhow::bail!("id_token nonce mismatch");
+        }
+    }
+    Ok(())
 }
 
 /// Decode (without re-verifying) the claims from an OIDC `id_token`.
@@ -789,5 +861,120 @@ mod tests {
             db.get_user(uid).await.unwrap().email.as_str(),
             "user@example.com"
         );
+    }
+}
+
+#[cfg(test)]
+mod id_token_validation_tests {
+    use super::*;
+
+    fn claims_json(json: &str) -> IdTokenClaims {
+        serde_json::from_str(json).expect("claims deserialize")
+    }
+
+    fn apple_cfg() -> crate::settings::OAuthProviderConfig {
+        crate::settings::OAuthProviderConfig::Apple(crate::settings::AppleConfig {
+            client_id: "com.example.app".to_string(),
+            team_id: "TEAM".to_string(),
+            key_id: "KEY".to_string(),
+            private_key: "not-a-key".to_string(),
+            scopes: None,
+            auth_url: None,
+            token_url: None,
+        })
+    }
+
+    fn now_plus(secs: u64) -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + secs
+    }
+
+    #[test]
+    fn a_well_formed_apple_id_token_passes() {
+        let claims = claims_json(&format!(
+            r#"{{"iss":"https://appleid.apple.com","aud":"com.example.app","exp":{},"sub":"001234","nonce":"n1"}}"#,
+            now_plus(300)
+        ));
+        assert!(validate_id_token_claims(&claims, &apple_cfg(), Some("n1")).is_ok());
+    }
+
+    #[test]
+    fn an_expired_token_is_rejected() {
+        let claims = claims_json(&format!(
+            r#"{{"iss":"https://appleid.apple.com","aud":"com.example.app","exp":1,"sub":"s"}}"#
+        ));
+        let err = validate_id_token_claims(&claims, &apple_cfg(), None).unwrap_err();
+        assert!(err.to_string().contains("expired"));
+    }
+
+    #[test]
+    fn a_foreign_audience_is_rejected() {
+        let claims = claims_json(&format!(
+            r#"{{"iss":"https://appleid.apple.com","aud":"someone-else.app","exp":{},"sub":"s"}}"#,
+            now_plus(300)
+        ));
+        let err = validate_id_token_claims(&claims, &apple_cfg(), None).unwrap_err();
+        assert!(err.to_string().contains("audience"));
+    }
+
+    #[test]
+    fn an_audience_array_containing_our_client_id_passes() {
+        let claims = claims_json(&format!(
+            r#"{{"iss":"https://appleid.apple.com","aud":["someone-else.app","com.example.app"],"exp":{},"sub":"s"}}"#,
+            now_plus(300)
+        ));
+        assert!(validate_id_token_claims(&claims, &apple_cfg(), None).is_ok());
+    }
+
+    #[test]
+    fn a_wrong_issuer_is_rejected() {
+        let claims = claims_json(&format!(
+            r#"{{"iss":"https://evil.example","aud":"com.example.app","exp":{},"sub":"s"}}"#,
+            now_plus(300)
+        ));
+        let err = validate_id_token_claims(&claims, &apple_cfg(), None).unwrap_err();
+        assert!(err.to_string().contains("issuer"));
+    }
+
+    #[test]
+    fn a_missing_nonce_or_a_nonce_mismatch_is_rejected() {
+        let with_nonce = claims_json(&format!(
+            r#"{{"iss":"https://appleid.apple.com","aud":"com.example.app","exp":{},"sub":"s","nonce":"n1"}}"#,
+            now_plus(300)
+        ));
+        assert!(validate_id_token_claims(&with_nonce, &apple_cfg(), Some("n1")).is_ok());
+        assert!(validate_id_token_claims(&with_nonce, &apple_cfg(), Some("n2")).is_err());
+
+        let without_nonce = claims_json(&format!(
+            r#"{{"iss":"https://appleid.apple.com","aud":"com.example.app","exp":{},"sub":"s"}}"#,
+            now_plus(300)
+        ));
+        let err = validate_id_token_claims(&without_nonce, &apple_cfg(), Some("n1")).unwrap_err();
+        assert!(err.to_string().contains("nonce"));
+    }
+
+    /// A provider with no known issuer (e.g. GitHub) skips the iss check, and
+    /// a missing nonce expectation skips the nonce check: validation only
+    /// enforces what the configuration actually knows.
+    #[test]
+    fn unknown_issuer_and_absent_nonce_expectations_are_not_enforced() {
+        let cfg = crate::settings::OAuthProviderConfig::Github(crate::settings::OAuthCommon {
+            client_id: "cid".to_string(),
+            client_secret: "secret".to_string(),
+            auth_url: None,
+            token_url: None,
+            userinfo_url: None,
+            scopes: None,
+            subject_field: None,
+            issuer: None,
+        });
+        let claims = claims_json(&format!(
+            r#"{{"aud":"cid","exp":{},"sub":"s"}}"#,
+            now_plus(300)
+        ));
+        assert!(validate_id_token_claims(&claims, &cfg, None).is_ok());
     }
 }

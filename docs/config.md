@@ -142,10 +142,18 @@ oauth:
       auth-url: "https://idp.example.com/authorize"
       token-url: "https://idp.example.com/token"
       userinfo-url: "https://idp.example.com/userinfo"
+      issuer: "https://idp.example.com/"    # expected `iss` of this provider's id_token (optional)
 ```
 
 Supported `type` values: `google`, `github`, `facebook`, `apple`, `oidc`.
 Requires the `session:` block.
+
+Login requests carry an OIDC `nonce`, and `id_token` claims are validated
+before use: `exp` must be current, `aud` must contain the client id, `iss`
+must match the provider's issuer (built-in for `google`/`apple`; configure
+`issuer` for generic `oidc` providers whose `id_token` is relied on), and
+the `nonce` sent with the authorization request must be echoed by the
+`id_token`.
 
 ### WebAuthn / passkeys (optional)
 
