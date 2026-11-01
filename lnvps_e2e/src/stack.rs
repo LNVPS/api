@@ -114,9 +114,14 @@ pub struct Addrs {
     /// The pool's v6 block, which probe addresses come out of.
     pub pool_block6: String,
     pub rs_inner: String,
+    pub rs_inner6: String,
     pub node_inner: String,
+    pub node_inner6: String,
     pub guest: String,
     pub guest_gateway: String,
+    pub guest6: String,
+    pub guest6_prefix: u8,
+    pub guest_gateway6: String,
     /// An address nobody assigned the guest, for proving the filter drops it.
     pub guest_spoof: String,
     pub guest_mac: String,
@@ -144,9 +149,14 @@ impl Addrs {
             pool_block: format!("10.66.{index}.0/24"),
             pool_block6: format!("fd00:66:{index}::/64"),
             rs_inner: format!("10.66.{index}.1/24"),
+            rs_inner6: format!("fd00:66:{index}::1/64"),
             node_inner: format!("10.66.{index}.2/32"),
+            node_inner6: format!("fd00:66:{index}::2/128"),
             guest: format!("203.0.{index}.5"),
             guest_gateway: format!("203.0.{index}.1"),
+            guest6: format!("2001:db8:{index}::5"),
+            guest6_prefix: 64,
+            guest_gateway6: format!("2001:db8:{index}::1"),
             guest_spoof: format!("203.0.{index}.99"),
             guest_mac: format!("52:54:00:e2:e0:{index:02x}"),
             listen_port: 51820 + index as u16,
@@ -156,6 +166,14 @@ impl Addrs {
     /// The address without its prefix, which is what a ping wants.
     pub fn bare(addr: &str) -> &str {
         addr.split('/').next().unwrap_or(addr)
+    }
+
+    pub fn gateway_for(&self, guest: &str) -> String {
+        if guest.contains(':') {
+            self.guest_gateway6.clone()
+        } else {
+            self.guest_gateway.clone()
+        }
     }
 }
 
@@ -362,14 +380,20 @@ impl Stack {
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-        rs.sync_tunnel_addresses(&rs_interface, &[self.addrs.rs_inner.clone()])
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        rs.sync_tunnel_addresses(
+            &rs_interface,
+            &[self.addrs.rs_inner.clone(), self.addrs.rs_inner6.clone()],
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // The peer's AllowedIPs is the node's own address plus exactly the
         // guests LNVPS placed there — the anti-spoof boundary the node cannot
         // opt out of.
-        let mut allowed = vec![self.addrs.node_inner.clone()];
+        let mut allowed = vec![
+            self.addrs.node_inner.clone(),
+            self.addrs.node_inner6.clone(),
+        ];
         allowed.extend(guests.iter().cloned());
         rs.set_tunnel_peer(
             &rs_interface,
@@ -386,7 +410,10 @@ impl Stack {
         // The pool's own block as well as the guests: an address on a
         // point-to-point interface does not route the rest of its prefix, so
         // without the block the route server reaches no node in the pool.
-        let mut routes = vec![self.addrs.pool_block.clone()];
+        let mut routes = vec![
+            self.addrs.pool_block.clone(),
+            self.addrs.pool_block6.clone(),
+        ];
         routes.extend(guests.iter().cloned());
         rs.sync_tunnel_routes(&rs_interface, &routes)
             .await
@@ -421,23 +448,26 @@ impl Stack {
             libvirt: None,
             tunnel: lnvps_node::net::DesiredTunnel {
                 address4: Some(self.addrs.node_inner.clone()),
-                address6: None,
+                address6: Some(self.addrs.node_inner6.clone()),
                 gateway4: Some(Addrs::bare(&self.addrs.rs_inner).to_string()),
-                gateway6: None,
+                gateway6: Some(Addrs::bare(&self.addrs.rs_inner6).to_string()),
                 server_public_key: hex::encode(&server_key.public_key),
                 endpoint: self.addrs.endpoint(),
                 keepalive: Some(25),
                 mtu: 1420,
             },
-            gateways: guests
-                .iter()
-                .map(|_| self.addrs.guest_gateway.clone())
-                .collect(),
+            gateways: {
+                let mut gateways: Vec<String> =
+                    guests.iter().map(|g| self.addrs.gateway_for(g)).collect();
+                gateways.sort();
+                gateways.dedup();
+                gateways
+            },
             guests: guests
                 .iter()
                 .map(|address| lnvps_node::net::DesiredGuest {
                     address: address.clone(),
-                    gateway: self.addrs.guest_gateway.clone(),
+                    gateway: self.addrs.gateway_for(address),
                     mac: Some(self.addrs.guest_mac.clone()),
                 })
                 .collect(),

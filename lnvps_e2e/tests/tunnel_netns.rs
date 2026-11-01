@@ -278,6 +278,96 @@ async fn a_guest_behind_a_node_is_reachable_from_the_route_server() -> Result<()
     Ok(())
 }
 
+fn attach_guest6(stack: &Stack) -> Result<()> {
+    stack.in_guest(&[
+        "ip",
+        "addr",
+        "add",
+        &format!("{}/{}", stack.addrs.guest6, stack.addrs.guest6_prefix),
+        "dev",
+        &stack.names.guest_peer,
+        "nodad",
+    ])?;
+    stack.in_guest(&[
+        "ip",
+        "-6",
+        "route",
+        "replace",
+        "default",
+        "via",
+        &stack.addrs.guest_gateway6,
+    ])?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires root and network namespaces; run with scripts/tunnel-e2e.sh"]
+async fn an_ipv6_guest_keeps_its_gateway_when_neighbour_discovery_uses_link_local() -> Result<()> {
+    if !requirements_met() {
+        return Ok(());
+    }
+    let index = 6;
+    let stack = Stack::new("guest6", index)?;
+    let guests = [
+        format!("{}/32", stack.addrs.guest),
+        format!("{}/128", stack.addrs.guest6),
+    ];
+    let dataplane = stack.bring_up(index, &guests).await?;
+    attach_guest(&stack)?;
+    attach_guest6(&stack)?;
+
+    let guest_if = &stack.names.guest_peer;
+    stack.in_guest(&[
+        "sysctl",
+        "-qw",
+        &format!("net.ipv6.neigh.{guest_if}.base_reachable_time_ms=500"),
+        &format!("net.ipv6.neigh.{guest_if}.delay_first_probe_time=1"),
+        &format!("net.ipv6.neigh.{guest_if}.retrans_time_ms=200"),
+    ])?;
+    let rs_inner6 = Addrs::bare(&stack.addrs.rs_inner6);
+    stack
+        .in_guest(&[
+            "ping",
+            "-6",
+            "-c",
+            "3",
+            "-W",
+            "5",
+            "-I",
+            &stack.addrs.guest6,
+            rs_inner6,
+        ])
+        .context("the guest could not reach the route server over IPv6")?;
+
+    let soak = stack.in_guest(&[
+        "ping",
+        "-6",
+        "-c",
+        "40",
+        "-i",
+        "0.25",
+        "-W",
+        "1",
+        "-I",
+        &stack.addrs.guest6,
+        rs_inner6,
+    ]);
+    let gateway = stack.in_guest(&["ip", "-6", "neigh", "show", &stack.addrs.guest_gateway6])?;
+    let firewall = lnvps_node::fw::observe(&dataplane.firewall).await;
+    assert_eq!(
+        firewall.spoofed_packets,
+        0,
+        "the node dropped the guest's own neighbour discovery as spoofing; gateway entry: \
+         {gateway}\nsoak: {soak:?}\n{}",
+        stack
+            .in_dataplane(&["nft", "list", "chain", "inet", "lnvps", "source"])
+            .unwrap_or_default()
+    );
+    assert!(!gateway.contains("FAILED"), "{gateway}");
+    soak.context("the guest lost IPv6 while reconfirming its gateway")?;
+    Ok(())
+}
+
 /// The isolation the namespace exists for: the operator's own network is not
 /// reachable from inside the data plane, and their default route is untouched.
 #[tokio::test(flavor = "multi_thread")]

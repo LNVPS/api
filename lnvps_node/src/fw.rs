@@ -123,6 +123,8 @@ impl Policy {
 /// makes a refresh a no-op when nothing has changed. Derived from the policy
 /// rather than from the built ruleset, so a change in *how* the rules are
 /// expressed does not masquerade as a change in who is allowed.
+const RULESET_REVISION: u32 = 2;
+
 pub fn fingerprint(policy: &Policy) -> String {
     let joined = policy
         .bindings
@@ -130,9 +132,10 @@ pub fn fingerprint(policy: &Policy) -> String {
         .map(|b| format!("{}@{}", b.address, b.mac.as_deref().unwrap_or("-")))
         .collect::<Vec<_>>()
         .join(",");
+    let input = format!("r{RULESET_REVISION};{joined}");
     format!(
         "lnvps:{}",
-        &crate::control_auth::sha256_hex(joined.as_bytes())[..16]
+        &crate::control_auth::sha256_hex(input.as_bytes())[..16]
     )
 }
 
@@ -414,6 +417,32 @@ pub fn ruleset(policy: &Policy) -> Nftables<'static> {
     // The drop that carries the tag and the counter. Both live here because
     // this is the rule that says "a guest lied about who it is": the tag makes
     // the ruleset identifiable, and the counter makes the lying visible.
+    for unassigned_source in [
+        Expression::Named(NamedExpression::Prefix(nftables::expr::Prefix {
+            addr: Box::new(Expression::String("fe80::".into())),
+            len: 10,
+        })),
+        Expression::String("::".into()),
+    ] {
+        batch.add(rule(
+            SOURCE_CHAIN,
+            vec![
+                Statement::Match(Match {
+                    left: field("ip6", "saddr"),
+                    right: unassigned_source,
+                    op: Operator::EQ,
+                }),
+                Statement::Match(Match {
+                    left: field("ip6", "hoplimit"),
+                    right: Expression::Number(255),
+                    op: Operator::EQ,
+                }),
+                neighbour_discovery(),
+                Statement::Return(None),
+            ],
+            None,
+        ));
+    }
     batch.add(rule(
         SOURCE_CHAIN,
         vec![
@@ -782,6 +811,23 @@ fn icmp_types(v6: bool) -> Statement<'static> {
                 .into_iter()
                 .map(|t| nftables::expr::SetItem::Element(Expression::String(t.to_string().into())))
                 .collect(),
+        )),
+        op: Operator::EQ,
+    })
+}
+
+fn neighbour_discovery() -> Statement<'static> {
+    Statement::Match(Match {
+        left: field("icmpv6", "type"),
+        right: Expression::Named(NamedExpression::Set(
+            [
+                "nd-router-solicit",
+                "nd-neighbor-solicit",
+                "nd-neighbor-advert",
+            ]
+            .into_iter()
+            .map(|t| nftables::expr::SetItem::Element(Expression::String(t.into())))
+            .collect(),
         )),
         op: Operator::EQ,
     })
