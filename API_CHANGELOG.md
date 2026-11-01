@@ -833,6 +833,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     - `DELETE /api/v1/payment-methods/{id}` — remove a saved method.
   - **Breaking:** the `nwc_connection_string` field on `GET`/`PATCH /api/v1/account` has been removed. Existing NWC connections are migrated into `user_payment_method` (provider `nwc`); manage NWC via the new payment-methods endpoints instead.
 
+
+### Security
+
+- **Nostr domain activation can no longer be turned into an internal-network fetch.** The worker's path-activation check (`http://<domain>/.well-known/nostr.json?name=<hash>`, domain is customer-supplied) now resolves each hop itself, refuses loopback/private/link-local addresses, connects to the validated address while presenting the real hostname (so DNS rebinding cannot swap it), and follows redirects manually with a 3-hop bound instead of trusting the HTTP client's redirect policy. Legitimate http→https upgrades on the customer's own host keep working; a redirect to a non-public address (or a non-http(s) scheme) fails activation. New `redirect_target`/`pinned_activation_client` helpers with unit tests.
+
 ## [0.4.0] - 2026-07-13
 
 ### Added
