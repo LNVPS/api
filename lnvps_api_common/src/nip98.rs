@@ -117,10 +117,11 @@ impl Nip98Auth {
     /// Validate the auth against the request `path`/`method`.
     ///
     /// For NIP-98 this checks, in order: event kind, timestamp window, the `u`
-    /// tag's host *and* path, the `method` tag, the signature, and finally that
-    /// this exact event has not already been used. Session (bearer) tokens are
-    /// not bound to a path/method (they are verified at parse time), so this is
-    /// a no-op success for them.
+    /// tag's **path** (see below for why the host is *not* compared), the
+    /// `method` tag, the signature, and finally that this exact event has not
+    /// already been used. Session (bearer) tokens are not bound to a
+    /// path/method (they are verified at parse time), so this is a no-op
+    /// success for them.
     ///
     /// Note the ordering: the single-use check runs **last**, so an event is
     /// only consumed once it is known to be otherwise valid. A forged or
@@ -142,7 +143,19 @@ impl Nip98Auth {
             bail!("Created timestamp is out of range");
         }
 
-        // check url tag (host + path)
+        // Check the u tag's PATH only. NIP-98 says the tag carries the full
+        // URL and this check once compared the host too, but it was dropped
+        // deliberately (commit 0448d16): this deployment answers on several
+        // hostnames — clearnet, a Tor onion address and UAT — and no single
+        // configured value covers them, so valid clients were rejected with
+        // "U tag host does not match this server". The tradeoff: an event
+        // signed for ANY host with a matching path authenticates here. That
+        // window is bounded by the 60-second timestamp check, the single-use
+        // event cache, and the optional payload binding — but a phishing
+        // flow that obtains an event signed for an attacker-controlled host
+        // with a colliding path is NOT defended against. If that threat
+        // model matters, restore a host check against a configurable
+        // allowlist (several entries, not one value).
         let url = Self::tag_value(event, "u").ok_or_else(|| anyhow::anyhow!("Missing url tag"))?;
         let parsed_uri = url
             .parse::<Uri>()
