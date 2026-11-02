@@ -898,7 +898,7 @@ after checking the app cluster has room):
 jq -n --rawfile compose catalog/ditto-relay.yaml '{
   name: "ditto-relay",
   display_name: "Ditto Relay",
-  description: "A fast personal Nostr relay with NIP-45 counts, NIP-50 search, NIP-77 sync and strfry-compatible write-policy plugins.",
+  description: "A fast personal Nostr relay with NIP-45 counts, NIP-50 search, NIP-77 sync and a built-in write policy.",
   category: "Nostr relay",
   tags: ["nostr", "relay"],
   compose: $compose,
