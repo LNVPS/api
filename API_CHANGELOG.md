@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Admin `POST /api/admin/v1/apps` now requires at least one tag, and `PATCH` rejects an empty `tags` list (400), so apps are never invisible to tag filters.
+
 ### Added
 
 - **VM add-ons**: `GET`/`PUT /api/v1/vm/{id}/addons` and `POST /api/v1/vm/{id}/addons/quote`. Snapshot slots are the first add-on, billed as a `vm_addon` line item on the VM's subscription at a per-region monthly price scaled to the VM's interval. Raising the quantity creates an `AddonChange` payment for the rest of the paid period; lowering it is immediate, refunds nothing, and deletes the oldest snapshots over the new limit. `ApiSubscriptionPaymentType` (user and admin) gains `AddonChange`, and line item resources gain `{ "type": "vm_addon", "vm_id", "kind" }`. Admin catalog at `/api/admin/v1/vm_addon_prices` under the new `vm_addon_price` RBAC resource. Discount rules see `vm_addon` line items with `vm_id`, `kind` and `quantity`.
