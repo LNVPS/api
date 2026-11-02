@@ -152,6 +152,15 @@ async fn resolve_tag_slugs(
     Ok(ids)
 }
 
+fn require_tags(tag_ids: &[u64]) -> Result<(), lnvps_api_common::ApiError> {
+    if tag_ids.is_empty() {
+        return Err(lnvps_api_common::ApiError::new(
+            "at least one tag is required",
+        ));
+    }
+    Ok(())
+}
+
 /// Load one app's tags in the admin wire shape.
 async fn app_tag_refs(
     db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
@@ -312,10 +321,8 @@ async fn admin_create_app(
     let category = validate_category(req.category)?;
     // Resolve before the insert: an unknown slug should fail the whole request
     // rather than leave a created-but-untagged app behind.
-    let tag_ids = match &req.tags {
-        Some(slugs) => Some(resolve_tag_slugs(&this.db, slugs).await?),
-        None => None,
-    };
+    let tag_ids = resolve_tag_slugs(&this.db, req.tags.as_deref().unwrap_or_default()).await?;
+    require_tags(&tag_ids)?;
     let footprint = compose_footprint(&req.compose)?;
 
     let app = App {
@@ -341,9 +348,7 @@ async fn admin_create_app(
         created: chrono::Utc::now(),
     };
     let id = this.db.insert_app(&app).await?;
-    if let Some(tag_ids) = tag_ids {
-        this.db.set_app_tags(id, &tag_ids).await?;
-    }
+    this.db.set_app_tags(id, &tag_ids).await?;
     let tags = app_tag_refs(&this.db, id).await?;
     ApiData::ok(AdminAppInfo::from_app(this.db.get_app(id).await?, tags))
 }
@@ -413,7 +418,11 @@ async fn admin_update_app(
     // Resolve before any write, so an unknown slug leaves the app untouched
     // rather than half-applying the rest of the patch.
     let tag_ids = match &req.tags {
-        Some(slugs) => Some(resolve_tag_slugs(&this.db, slugs).await?),
+        Some(slugs) => {
+            let ids = resolve_tag_slugs(&this.db, slugs).await?;
+            require_tags(&ids)?;
+            Some(ids)
+        }
         None => None,
     };
     // Recompute the footprint from the (possibly updated) compose.
@@ -1072,6 +1081,20 @@ mod tests {
 
     const VALID_COMPOSE: &str = "services:\n  relay:\n    image: \
          example/relay:v1@sha256:0000000000000000000000000000000000000000000000000000000000000001\n";
+
+    #[test]
+    fn app_without_tags_is_rejected() {
+        assert!(require_tags(&[]).is_err());
+        assert!(require_tags(&[1]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn blank_tag_slugs_resolve_to_no_tags() {
+        use lnvps_api_common::MockDb;
+        let db: std::sync::Arc<dyn lnvps_db::LNVpsDb> = std::sync::Arc::new(MockDb::default());
+        let ids = resolve_tag_slugs(&db, &["  ".to_string()]).await.unwrap();
+        assert!(require_tags(&ids).is_err());
+    }
 
     #[tokio::test]
     async fn admin_cannot_assign_a_taken_custom_domain() {

@@ -757,6 +757,7 @@ mod tests {
             "description": "test relay app",
             "repo_url": "https://github.com/example/relay",
             "category": "Nostr relay",
+            "tags": ["nostr"],
             "compose": "services:\n  relay:\n    image: example/relay:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    ports:\n      - { name: ws, container: 7777, protocol: http, expose: ingress }\n",
             "amount": 1000,
             "currency": "usd",
@@ -801,6 +802,7 @@ mod tests {
             "description": "test relay app",
             "repo_url": "https://github.com/example/relay",
             "category": "Nostr relay",
+            "tags": ["nostr"],
             "compose": "services:\n  relay:\n    image: example/relay:latest\n    ports:\n      - { name: ws, container: 7777, protocol: http, expose: ingress }\n",
             "amount": 1000,
             "currency": "usd",
@@ -833,6 +835,7 @@ mod tests {
             "name": "Bad Name",
             "display_name": "x",
             "category": "Nostr relay",
+            "tags": ["nostr"],
             "compose": "services: {}",
             "amount": 1,
             "currency": "usd",
@@ -985,6 +988,7 @@ mod tests {
                 "name": slug,
                 "display_name": "Init App",
                 "category": "Media server",
+                "tags": ["nostr"],
                 "compose": compose,
                 "amount": 1000,
                 "currency": "usd",
@@ -1077,6 +1081,7 @@ mod tests {
                 "name": slug,
                 "display_name": "Scratch App",
                 "category": "Media server",
+                "tags": ["nostr"],
                 "compose": compose,
                 "amount": 1000,
                 "currency": "usd",
@@ -1166,6 +1171,7 @@ mod tests {
                 "name": slug,
                 "display_name": "Config Constraints",
                 "category": "Nostr relay",
+                "tags": ["nostr"],
                 "compose": compose,
                 "amount": 1000,
                 "currency": "usd",
@@ -1254,6 +1260,7 @@ mod tests {
                 "name": slug,
                 "display_name": "Addressed Peer",
                 "category": "Nostr relay",
+                "tags": ["nostr"],
                 "compose": compose,
                 "amount": 1000,
                 "currency": "usd",
@@ -1323,6 +1330,7 @@ mod tests {
                 "name": slug,
                 "display_name": "Volumes Need A User",
                 "category": "Nostr relay",
+                "tags": ["nostr"],
                 "compose": compose,
                 "amount": 1000,
                 "currency": "usd",
@@ -1406,6 +1414,7 @@ mod tests {
                     "name": slug,
                     "display_name": "Volumes Stay Put",
                     "category": "Nostr relay",
+                    "tags": ["nostr"],
                     "compose": compose("{ name: data, path: /data, size: 5Gi }"),
                     "amount": 1000,
                     "currency": "usd",
@@ -1480,6 +1489,7 @@ mod tests {
                 "name": slug,
                 "display_name": "Secret Bytes Relay",
                 "category": "Nostr relay",
+                "tags": ["nostr"],
                 "compose": compose,
                 "amount": 1000,
                 "currency": "usd",
@@ -1556,6 +1566,7 @@ mod tests {
             let mut v = serde_json::json!({
                 "name": slug,
                 "display_name": "SEO Relay",
+                "tags": ["nostr"],
                 "compose": "services:\n  relay:\n    image: example/relay:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n",
                 "amount": 1000,
                 "currency": "usd",
@@ -1851,6 +1862,7 @@ mod tests {
                 "name": format!("e2e-tags-{suffix}"),
                 "display_name": "E2E Tagged",
                 "category": "Nostr relay",
+                "tags": ["nostr"],
                 "compose": "services:\n  relay:\n    image: example/relay:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n",
                 "amount": 1000,
                 "currency": "usd",
@@ -1875,6 +1887,22 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(resp.text().await.unwrap().contains("no-such-tag"));
+
+        for empty in [Some(serde_json::json!([])), Some(serde_json::json!(["  "]))] {
+            let resp = client
+                .post_auth("/api/admin/v1/apps", &app_body(empty))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(resp.text().await.unwrap().contains("at least one tag"));
+        }
+        let mut untagged = app_body(None);
+        untagged.as_object_mut().unwrap().remove("tags");
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &untagged)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let resp = client
             .post_auth(
@@ -1961,16 +1989,23 @@ mod tests {
         let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         assert_eq!(slugs(&body["data"]), vec![tag_b.clone()]);
 
-        // `[]` clears.
-        let resp = client
-            .patch_auth(
-                &format!("/api/admin/v1/apps/{app_id}"),
-                &serde_json::json!({ "tags": [] }),
-            )
-            .await
-            .unwrap();
-        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
-        assert!(slugs(&body["data"]).is_empty());
+        for empty in [serde_json::json!([]), serde_json::json!(["  "])] {
+            let resp = client
+                .patch_auth(
+                    &format!("/api/admin/v1/apps/{app_id}"),
+                    &serde_json::json!({ "tags": empty }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(resp.text().await.unwrap().contains("at least one tag"));
+            let resp = client
+                .get_auth(&format!("/api/admin/v1/apps/{app_id}"))
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            assert_eq!(slugs(&body["data"]), vec![tag_b.clone()]);
+        }
         // Restore both for the public-surface checks below.
         let resp = client
             .patch_auth(
