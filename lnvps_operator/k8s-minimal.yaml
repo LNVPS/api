@@ -198,6 +198,18 @@ spec:
             secretKeyRef:
               name: lnvps-operator-db
               key: url
+        - name: LNVPS_BACKUP_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: lnvps-operator-backup
+              key: access-key
+              optional: true
+        - name: LNVPS_BACKUP_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: lnvps-operator-backup
+              key: secret-key
+              optional: true
         volumeMounts:
         - name: config
           mountPath: /etc/config

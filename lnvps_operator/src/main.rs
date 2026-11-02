@@ -719,4 +719,11 @@ mod tests {
         assert!(!readme.contains("k8s-deployment.yaml"));
         assert!(readme.contains("kubectl apply -f lnvps_operator/k8s-minimal.yaml"));
     }
+
+    #[test]
+    fn shipped_manifest_wires_backup_credentials_from_secret() {
+        let manifest = include_str!("../k8s-minimal.yaml");
+        assert!(manifest.contains("name: LNVPS_BACKUP_ACCESS_KEY"));
+        assert!(manifest.contains("name: LNVPS_BACKUP_SECRET_KEY"));
+    }
 }
