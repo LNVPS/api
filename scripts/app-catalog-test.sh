@@ -34,13 +34,15 @@ SETTLE="${SETTLE:-20}"
 
 # Config values for fields the customer must supply at order time. A required
 # field with no value here fails the render loudly rather than being skipped.
+CONFIG_ARGS=()
 app_config() {
     case "$1" in
         # A real bech32 npub (pubkey 0x…01): HAVEN decodes it at startup, so a
         # merely pattern-shaped string would crashloop the container.
-        haven) echo "--config owner_npub=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqshp52w2" ;;
-        buzz)  echo "--config owner_pubkey=0000000000000000000000000000000000000000000000000000000000000001" ;;
-        *)     echo "" ;;
+        haven) CONFIG_ARGS=(--config owner_npub=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqshp52w2) ;;
+        buzz)  CONFIG_ARGS=(--config owner_pubkey=0000000000000000000000000000000000000000000000000000000000000001) ;;
+        ditto-relay) CONFIG_ARGS=(--config "write_policy=$(cat catalog/tests/ditto-relay/write-policy.sh)") ;;
+        *)     CONFIG_ARGS=() ;;
     esac
 }
 
@@ -58,8 +60,8 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> rendering $APP_FILE"
-# shellcheck disable=SC2046  # app_config emits separate arguments on purpose
-RENDER="$("$BIN" "$APP_FILE" --out-dir "$OUT_DIR" --hostname localhost $(app_config "$APP"))"
+app_config "$APP"
+RENDER="$("$BIN" "$APP_FILE" --out-dir "$OUT_DIR" --hostname localhost "${CONFIG_ARGS[@]}")"
 echo "$RENDER"
 
 # Ingress ports are published on loopback at the container number, which on a
@@ -161,6 +163,15 @@ if [ "$failed" -eq 0 ]; then
             code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$port/" 2>/dev/null || true)"
             echo "    open (HTTP ${code:-000})"
         fi
+    done
+fi
+
+APP_CHECK="catalog/tests/$APP/check.sh"
+if [ "$failed" -eq 0 ] && [ -x "$APP_CHECK" ]; then
+    for port in $ports; do
+        echo "==> $APP_CHECK 127.0.0.1:$port"
+        "$APP_CHECK" "127.0.0.1:$port" || { echo "FAIL $APP: $APP_CHECK"; failed=1; }
+        break
     done
 fi
 

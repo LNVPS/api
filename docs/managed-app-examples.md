@@ -869,7 +869,47 @@ where the image allows it.
   `ditto-relay import`), consistent while the relay runs.
 
 **Document:** [`catalog/ditto-relay.yaml`](../catalog/ditto-relay.yaml).
-`scripts/app-catalog-test.sh catalog/ditto-relay.yaml` starts it locally.
+`scripts/app-catalog-test.sh catalog/ditto-relay.yaml` starts it locally, then
+runs [`catalog/tests/ditto-relay/check.sh`](../catalog/tests/ditto-relay/check.sh)
+against the running relay: it renders the document with a custom write policy
+(`catalog/tests/ditto-relay/write-policy.sh`, which rejects any event whose
+content contains `reject-me`), asserts the relay answers NIP-11 with NIP-45
+listed, that the rejected event gets `["OK", id, false, "blocked: ..."]`, that
+the accepted one gets `true`, and that `COUNT` then returns exactly 1. A script
+named `catalog/tests/<app>/check.sh` is run this way for any app.
+
+**Pricing:** 2.00 EUR per month, no setup fee. strfry, Pyramid and
+nostr-rs-relay are 1.50 EUR with 512Mi and 5Gi events storage, HAVEN is 2.00 EUR
+with 512Mi and 10Gi. Ditto has the same 5Gi but asks for 1Gi memory (LMDB plus
+the search index), so it sits at the HAVEN price.
+
+**Create the row** (admin key with `app::create`; created disabled, enable it
+after checking the app cluster has room):
+
+```bash
+jq -n --rawfile compose catalog/ditto-relay.yaml '{
+  name: "ditto-relay",
+  display_name: "Ditto Relay",
+  description: "A fast personal Nostr relay with NIP-45 counts, NIP-50 search, NIP-77 sync and strfry-compatible write-policy plugins.",
+  category: "Nostr relay",
+  tags: ["nostr", "relay"],
+  compose: $compose,
+  amount: 200,
+  currency: "EUR",
+  interval_amount: 1,
+  interval_type: "month",
+  setup_amount: 0,
+  enabled: false
+}' > /tmp/ditto-relay-app.json
+
+NOSTR_SECRET_KEY=$(cat ~/.nostr/lnvps-admin.nsec) nak curl -X POST \
+  -H "Content-Type: application/json" -d @/tmp/ditto-relay-app.json \
+  https://admin-api.lnvps.net/api/admin/v1/apps
+
+NOSTR_SECRET_KEY=$(cat ~/.nostr/lnvps-admin.nsec) nak curl -X PATCH \
+  -H "Content-Type: application/json" -d '{"enabled": true}' \
+  https://admin-api.lnvps.net/api/admin/v1/apps/<id from the POST response>
+```
 
 ---
 
