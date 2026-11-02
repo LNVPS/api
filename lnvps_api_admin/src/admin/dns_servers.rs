@@ -5,7 +5,8 @@ use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use lnvps_api_common::{
-    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, DnsZone, PageQuery, get_dns_server,
+    ApiData, ApiPaginatedData, ApiPaginatedResult, ApiResult, DnsZone, OrphanDnsRecord, PageQuery,
+    find_orphan_dns_records, get_dns_server,
 };
 use lnvps_db::{AdminAction, AdminResource};
 
@@ -20,6 +21,10 @@ pub fn router() -> Router<RouterState> {
             get(admin_get_dns_server)
                 .patch(admin_update_dns_server)
                 .delete(admin_delete_dns_server),
+        )
+        .route(
+            "/api/admin/v1/dns_servers/orphan_records",
+            get(admin_list_orphan_dns_records),
         )
         .route(
             "/api/admin/v1/dns_servers/{id}/zones",
@@ -131,6 +136,15 @@ async fn admin_list_dns_server_zones(
     let server = get_dns_server(&this.db, dns_server_id).await?;
     let zones = server.list_zones().await?;
     ApiData::ok(zones)
+}
+
+async fn admin_list_orphan_dns_records(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+) -> ApiResult<Vec<OrphanDnsRecord>> {
+    auth.require_permission(AdminResource::DnsServer, AdminAction::View)?;
+
+    ApiData::ok(find_orphan_dns_records(&this.db).await?)
 }
 
 async fn admin_delete_dns_server(

@@ -1,4 +1,4 @@
-use crate::dns::{BasicRecord, DnsRef, DnsServer, DnsZone};
+use crate::dns::{BasicRecord, DnsRef, DnsServer, DnsZone, RecordType};
 use crate::json_api::JsonApi;
 use crate::op_transient;
 use crate::retry::{OpError, OpResult};
@@ -243,6 +243,53 @@ impl DnsServer for Cloudflare {
             page += 1;
         }
         Ok(zones)
+    }
+
+    async fn list_records(&self, zone: &DnsRef) -> OpResult<Vec<BasicRecord>> {
+        let zone_id = zone
+            .as_id()
+            .context("zone id required for Cloudflare records")?;
+        let mut records = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let resp: CfResult<Vec<CfRecord>> = self
+                .api
+                .get(&format!(
+                    "/client/v4/zones/{zone_id}/dns_records?per_page=100&page={page}"
+                ))
+                .await?;
+            Self::bail_error(&resp)?;
+            for r in resp.result {
+                let kind = match r.r_type.as_deref() {
+                    Some("A") => RecordType::A,
+                    Some("AAAA") => RecordType::AAAA,
+                    Some("PTR") => RecordType::PTR,
+                    _ => continue,
+                };
+                records.push(BasicRecord {
+                    ip: match kind {
+                        RecordType::PTR => String::new(),
+                        _ => r.content.clone(),
+                    },
+                    name: r.name,
+                    value: r.content,
+                    id: r.id.map(DnsRef::Id),
+                    kind,
+                    zone: zone.clone(),
+                });
+            }
+            let total_pages = resp
+                .result_info
+                .as_ref()
+                .map(|i| i.total_pages)
+                .unwrap_or(1)
+                .max(1);
+            if page >= total_pages {
+                break;
+            }
+            page += 1;
+        }
+        Ok(records)
     }
 }
 

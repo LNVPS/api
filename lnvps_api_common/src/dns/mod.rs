@@ -11,8 +11,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 mod cloudflare;
+mod orphans;
 mod ovh;
 pub use cloudflare::*;
+pub use orphans::*;
 pub use ovh::*;
 
 /// A DNS zone available on a DNS server (provider specific, e.g. a Cloudflare zone).
@@ -41,6 +43,10 @@ pub trait DnsServer: Send + Sync {
     /// an empty list for providers that have no zone concept (e.g. OVH reverse
     /// DNS, which is keyed per-IP block).
     async fn list_zones(&self) -> OpResult<Vec<DnsZone>>;
+
+    async fn list_records(&self, _zone: &DnsRef) -> OpResult<Vec<BasicRecord>> {
+        Ok(vec![])
+    }
 }
 
 /// Construct a DNS server client from a database `dns_server` row.
