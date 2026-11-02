@@ -69,6 +69,12 @@ they once were — check them if previously-working requests start failing.
 - **`created_at` must be within 60 seconds** of server time (previously 600).
   A client with a badly-skewed clock will be rejected.
 - **The `method` tag must match the request method.**
+- **The `u` tag's path must match the request path.** The host inside the `u`
+  tag is **not** compared: this API answers on several hostnames (clearnet,
+  Tor, UAT) and no single configured value covers them. In practice clients
+  sign the URL they are calling; if you deliberately sign an event for a
+  different host with a colliding path, it will be accepted here within the
+  60-second window.
 - **The `payload` tag is optional, but verified when present.** If you include
   it, it must be the lowercase hex SHA-256 of the exact request body. Omitting
   it is still accepted; including it binds the body to the signature and is
