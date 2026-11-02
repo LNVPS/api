@@ -50,17 +50,17 @@ The database connection string does not go in the ConfigMap. See
 ### 3. Deploy the Operator
 
 ```bash
-kubectl apply -f lnvps_operator/k8s-deployment.yaml
+kubectl apply -f lnvps_operator/k8s-minimal.yaml
 ```
 
 ### 4. Verify Deployment
 
 ```bash
 # Check if operator is running
-kubectl get pods -n lnvps-system
+kubectl get pods -n lnvps
 
 # Check operator logs
-kubectl logs -n lnvps-system deployment/lnvps-operator
+kubectl logs -n lnvps deployment/lnvps-operator
 
 # Check if Ingress is created (when domains exist)
 kubectl get ingress -n your-namespace
@@ -218,7 +218,7 @@ GRANT INSERT, UPDATE ON lnvps.app_deployment_backup TO 'lnvps_operator'@'%';
 ```
 
 ```bash
-kubectl -n lnvps-system create secret generic lnvps-operator-db \
+kubectl -n lnvps create secret generic lnvps-operator-db \
   --from-literal=url='mysql://lnvps_operator:<password>@mysql-service:3306/lnvps'
 ```
 
@@ -244,10 +244,10 @@ The deployment includes:
 
 ```bash
 # Check pod status
-kubectl get pods -n lnvps-system
+kubectl get pods -n lnvps
 
 # Check logs for errors
-kubectl logs -n lnvps-system deployment/lnvps-operator
+kubectl logs -n lnvps deployment/lnvps-operator
 ```
 
 ### Database Connection Issues
@@ -262,7 +262,7 @@ kubectl run mysql-test --rm -it --image=mysql:8 -- \
 
 ```bash
 # Check if ServiceAccount exists
-kubectl get sa lnvps-operator -n lnvps-system
+kubectl get sa lnvps-operator -n lnvps
 
 # Check ClusterRoleBinding
 kubectl get clusterrolebinding lnvps-operator
