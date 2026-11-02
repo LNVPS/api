@@ -493,6 +493,9 @@ impl Stack {
     ) -> Result<String> {
         use lnvps_api::router::{ObservedInterface, TunnelConfig, TunnelRouter, WireguardConfig};
 
+        lnvps_api::provisioner::MarketplaceTunnels::new(db.clone())
+            .refresh_routes(pool)
+            .await?;
         let plan = lnvps_api::provisioner::wg::TunnelProvisioner::new(db.clone())
             .plan(pool)
             .await?;
