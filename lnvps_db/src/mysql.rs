@@ -7304,6 +7304,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn set_app_deployment_public_port(&self, id: u64, port: Option<u16>) -> DbResult<()> {
+        sqlx::query("UPDATE app_deployment SET public_port = ? WHERE id = ?")
+            .bind(port)
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
     async fn update_app_deployment_usage(
         &self,
         id: u64,
@@ -7531,7 +7540,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn delete_app_deployment(&self, id: u64) -> DbResult<()> {
-        sqlx::query("UPDATE app_deployment SET deleted = 1 WHERE id = ?")
+        sqlx::query("UPDATE app_deployment SET deleted = 1, public_port = NULL WHERE id = ?")
             .bind(id)
             .execute(&self.db)
             .await?;

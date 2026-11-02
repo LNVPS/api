@@ -3879,6 +3879,7 @@ name = "lnvps_operator"
 version = "0.4.7"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "config",

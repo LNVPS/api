@@ -41,6 +41,7 @@ app_config() {
         # merely pattern-shaped string would crashloop the container.
         haven) CONFIG_ARGS=(--config owner_npub=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqshp52w2) ;;
         buzz)  CONFIG_ARGS=(--config owner_pubkey=0000000000000000000000000000000000000000000000000000000000000001) ;;
+        minecraft-java) CONFIG_ARGS=(--config eula=TRUE --config rcon_password=testpass1234) ;;
         ditto-relay) CONFIG_ARGS=(--config "write_policy=$(cat catalog/tests/ditto-relay/write-policy.sh)") ;;
         *)     CONFIG_ARGS=() ;;
     esac
@@ -134,7 +135,7 @@ ports="$(grep -oE '127\.0\.0\.1:[0-9]+:' "$COMPOSE_FILE" | cut -d: -f2 | sort -u
 # guard silently, so anything but the two known values fails the run instead.
 doc_body="$(sed 's/^[[:space:]]*#.*$//; s/[[:space:]]#.*$//' "$APP_FILE")"
 unknown="$(printf '%s\n' "$doc_body" | grep -oE 'expose:[[:space:]]*[^,}[:space:]]+' \
-    | grep -vE 'expose:[[:space:]]*"?(none|ingress)"?$' || true)"
+    | grep -vE 'expose:[[:space:]]*"?(none|ingress|tcp|udp)"?$' || true)"
 if [ -n "$unknown" ]; then
     echo "FAIL $APP: unrecognised expose value: $unknown"
     failed=1

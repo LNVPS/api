@@ -9059,6 +9059,7 @@ mod tests {
                 hostname: None,
                 custom_domain: None,
                 custom_domain_verified: false,
+                public_port: None,
                 config: None,
                 desired_state: lnvps_db::AppDeploymentDesiredState::Running,
                 status: lnvps_db::AppDeploymentStatus::Pending,

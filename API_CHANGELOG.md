@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- App deployments can expose a raw TCP/UDP port (`expose: tcp|udp` in the compose). `GET /api/v1/app-deployments` and `/{id}` return `public_port`, `connect_address` and, when the port differs from the app's own and the app names an SRV service, an `srv` record (`name`, `target`, `port`). Additive. New `game` app tag for filtering game servers with `?tag=game`, and a Minecraft Java catalog entry (vanilla only).
+
 ### Changed
 
 - Admin `POST /api/admin/v1/apps` now requires at least one tag, and `PATCH` rejects an empty `tags` list (400), so apps are never invisible to tag filters.

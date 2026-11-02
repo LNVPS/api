@@ -18,6 +18,7 @@ use tokio::sync::Notify;
 
 mod app_backups;
 mod app_deployments;
+mod l4;
 mod metrics;
 mod nostr_domains;
 
@@ -136,6 +137,12 @@ pub struct Settings {
     /// exactly as before: the periodic reconcile is the only trigger, and it
     /// remains the backstop either way.
     pub redis: Option<String>,
+
+    /// Who does L4 (TCP/UDP) forwarding for apps that declare `expose: tcp|udp`,
+    /// and the public port range deployments are allocated from. Defaults to
+    /// ingress-nginx's `tcp-services`/`udp-services` ConfigMaps.
+    #[serde(default)]
+    pub l4: l4::L4Config,
 }
 
 /// Where backup artifacts go, and how the Jobs that produce them are bounded.
@@ -197,6 +204,7 @@ pub struct Context {
     /// disables backups entirely.
     pub object_store: Option<ObjectStore>,
     pub exec_pumps: std::sync::Mutex<std::collections::HashSet<u64>>,
+    pub l4: l4::L4Runtime,
 }
 
 impl Settings {
@@ -340,6 +348,8 @@ async fn main() -> Result<()> {
         }
     };
 
+    let l4 = l4::L4Runtime::new(&settings.l4, Arc::new(l4::KubeConfigMaps(client.clone())))?;
+
     let context = Arc::new(Context {
         client: client.clone(),
         db: Arc::new(db) as Arc<dyn LNVpsDb>,
@@ -347,6 +357,7 @@ async fn main() -> Result<()> {
         metrics,
         object_store,
         exec_pumps: Default::default(),
+        l4,
     });
 
     info!("LNVPS Operator is running and watching for resources...");
@@ -623,6 +634,13 @@ mod tests {
         assert_eq!(full.backup_job_deadline(), Duration::from_secs(5 * 3600));
         assert_eq!(full.backup_uploader_image(), "curlimages/curl:8.11.1");
         assert_eq!(full.max_concurrent_backups(), 2);
+        assert_eq!(full.l4.forwarder, l4::ForwarderKind::IngressNginx);
+        assert_eq!(full.l4.port_range.start, 25565);
+        assert_eq!(full.l4.port_range.end, 25664);
+        assert_eq!(full.l4.ingress_nginx.namespace, "ingress-nginx");
+        assert_eq!(full.l4.ingress_nginx.tcp_configmap, "tcp-services");
+        assert_eq!(full.l4.ingress_nginx.udp_configmap, "udp-services");
+        full.l4.validate().unwrap();
 
         // Minimal config (app-deployment keys commented out) still loads.
         let minimal = load("config.minimal.yaml");
@@ -636,6 +654,7 @@ mod tests {
         assert!(minimal.prometheus.is_none());
         // No backups: nothing is scheduled and nothing runs.
         assert!(minimal.backups.is_none());
+        assert_eq!(minimal.l4.forwarder, l4::ForwarderKind::IngressNginx);
         // The defaults still answer, so the code paths that read them do not
         // have to care whether backups are configured.
         assert_eq!(minimal.backup_url_expiry(), Duration::from_secs(6 * 3600));
@@ -682,6 +701,7 @@ mod tests {
                 max_concurrent: None,
             }),
             redis: None,
+            l4: Default::default(),
         };
         assert_eq!(
             settings(2, 9).backup_job_deadline(),

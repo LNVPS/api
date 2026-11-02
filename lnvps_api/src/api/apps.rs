@@ -272,6 +272,44 @@ pub struct ApiAppRegion {
     pub ingress_domain: String,
 }
 
+/// An SRV record that sends a client to a deployment's allocated port.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct ApiAppSrv {
+    /// Record name, e.g. `_minecraft._tcp.mine.games.example`.
+    pub name: String,
+    pub target: String,
+    pub port: u16,
+}
+
+/// Connect address and SRV record for an L4 deployment.
+fn connect_info(
+    compose: &str,
+    hostname: Option<&str>,
+    public_port: Option<u16>,
+) -> (Option<String>, Option<ApiAppSrv>) {
+    let (Some(host), Some(port)) = (hostname, public_port) else {
+        return (None, None);
+    };
+    let l4 = lnvps_compose::Compose::parse(compose).ok();
+    let l4 = l4.as_ref().and_then(|c| c.l4_port());
+    let default_port = l4.as_ref().map(|l| l.port.container);
+    if default_port == Some(port) {
+        return (Some(host.to_string()), None);
+    }
+    let srv = l4.as_ref().and_then(|l| {
+        l.port.srv.as_deref().map(|label| ApiAppSrv {
+            name: format!("_{label}._{}.{host}", l.protocol().as_str()),
+            target: host.to_string(),
+            port,
+        })
+    });
+    if srv.is_some() {
+        (Some(host.to_string()), srv)
+    } else {
+        (Some(format!("{host}:{port}")), None)
+    }
+}
+
 /// A customer's app deployment.
 #[derive(Serialize)]
 pub struct ApiAppDeployment {
@@ -283,6 +321,16 @@ pub struct ApiAppDeployment {
     /// Public endpoint hostname once assigned (`None` until reconciled or for
     /// apps with no ingress port).
     pub hostname: Option<String>,
+    /// Public L4 port allocated for an app that declares `expose: tcp|udp`
+    /// (game servers). `None` for HTTP-only apps and until allocated.
+    pub public_port: Option<u16>,
+    /// What a player types to connect: `hostname:public_port`, or just
+    /// `hostname` when the port is the app's own default and clients find it
+    /// without help. `None` until both are known.
+    pub connect_address: Option<String>,
+    /// SRV record that points clients at `public_port` when it differs from the
+    /// app's default port. `None` when not needed or the app names no service.
+    pub srv: Option<ApiAppSrv>,
     /// Customer-owned domain (CNAME'd to `hostname`). When set, the operator
     /// serves it too and cert-manager issues a TLS cert for it (HTTP-01 once
     /// DNS resolves). `None` when unset.
@@ -409,11 +457,15 @@ async fn deployment_to_api_with_breakdown(
     let app = db.get_app(d.app_id).await?;
     let m = multiplier as u64;
     let usage = AppDeploymentUsage::from_parts(&d, usage_services, usage_volumes);
+    let (connect_address, srv) = connect_info(&app.compose, d.hostname.as_deref(), d.public_port);
     Ok(ApiAppDeployment {
         id: d.id,
         app_id: d.app_id,
         name: d.name,
         hostname: d.hostname,
+        public_port: d.public_port,
+        connect_address,
+        srv,
         custom_domain_verified: d.custom_domain.is_some() && d.custom_domain_verified,
         custom_domain: d.custom_domain,
         desired_state: d.desired_state.to_string(),
@@ -745,6 +797,7 @@ async fn v1_create_app_deployment(
         hostname: None,
         custom_domain: None,
         custom_domain_verified: false,
+        public_port: None,
         config: Some(EncryptedString::new(config_json)),
         desired_state: AppDeploymentDesiredState::Running,
         status: AppDeploymentStatus::Pending,
@@ -1266,6 +1319,7 @@ mod tests {
             hostname: None,
             custom_domain: domain.map(str::to_string),
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
@@ -1337,6 +1391,7 @@ mod tests {
             hostname: None,
             custom_domain: None,
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
@@ -1485,6 +1540,7 @@ mod tests {
             hostname: None,
             custom_domain: None,
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status,
@@ -1583,6 +1639,7 @@ mod tests {
             hostname: None,
             custom_domain: None,
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Running,
@@ -1695,6 +1752,7 @@ mod tests {
             hostname: Some("d.apps.example.com".to_string()),
             custom_domain: Some("blog.example.com".to_string()),
             custom_domain_verified: true,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Running,
@@ -1714,5 +1772,44 @@ mod tests {
         d.custom_domain = None;
         let api = ok(deployment_to_api(&db, d).await);
         assert!(!api.custom_domain_verified);
+    }
+
+    const MC: &str = "services:\n  s:\n    image: x\n    ports:\n      - { name: g, container: 25565, protocol: tcp, expose: tcp, srv: minecraft }\n";
+    const NO_SRV: &str = "services:\n  s:\n    image: x\n    ports:\n      - { name: g, container: 7777, protocol: tcp, expose: tcp }\n";
+
+    #[test]
+    fn connect_address_is_unknown_until_host_and_port_exist() {
+        assert_eq!(connect_info(MC, None, Some(25570)), (None, None));
+        assert_eq!(connect_info(MC, Some("a.games.io"), None), (None, None));
+    }
+
+    #[test]
+    fn default_port_connects_on_the_bare_hostname() {
+        assert_eq!(
+            connect_info(MC, Some("a.games.io"), Some(25565)),
+            (Some("a.games.io".to_string()), None)
+        );
+    }
+
+    #[test]
+    fn non_default_port_with_srv_label_reports_the_srv_record() {
+        let (addr, srv) = connect_info(MC, Some("a.games.io"), Some(25570));
+        assert_eq!(addr.as_deref(), Some("a.games.io"));
+        assert_eq!(
+            srv,
+            Some(ApiAppSrv {
+                name: "_minecraft._tcp.a.games.io".to_string(),
+                target: "a.games.io".to_string(),
+                port: 25570,
+            })
+        );
+    }
+
+    #[test]
+    fn non_default_port_without_srv_label_needs_host_and_port() {
+        assert_eq!(
+            connect_info(NO_SRV, Some("a.games.io"), Some(25570)),
+            (Some("a.games.io:25570".to_string()), None)
+        );
     }
 }

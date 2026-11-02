@@ -5340,6 +5340,12 @@ pub struct AppDeployment {
     pub namespace: String,
     /// Public ingress hostname once assigned (e.g. `name.apps.lnvps.tld`).
     pub hostname: Option<String>,
+    /// Public L4 port the operator allocated for an app that declares
+    /// `expose: tcp|udp`. Players connect to `hostname:public_port`. Unique per
+    /// cluster, and cleared when the deployment is deleted so the port is free
+    /// to reuse.
+    #[sqlx(default)]
+    pub public_port: Option<u16>,
     /// Optional customer-owned domain (CNAME'd to `hostname` by the customer).
     /// When set, the operator adds it to the Ingress and cert-manager issues a
     /// TLS cert for it; the default `hostname` keeps working alongside it.

@@ -6968,6 +6968,14 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn set_app_deployment_public_port(&self, id: u64, port: Option<u16>) -> DbResult<()> {
+        let mut d = self.app_deployments.lock().await;
+        if let Some(x) = d.get_mut(&id) {
+            x.public_port = port;
+        }
+        Ok(())
+    }
+
     async fn update_app_deployment_usage(
         &self,
         id: u64,
@@ -7141,6 +7149,7 @@ impl LNVpsDbBase for MockDb {
         let mut d = self.app_deployments.lock().await;
         if let Some(x) = d.get_mut(&id) {
             x.deleted = true;
+            x.public_port = None;
         }
         Ok(())
     }
@@ -10886,6 +10895,7 @@ mod tests {
             hostname: None,
             custom_domain: None,
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
@@ -10949,6 +10959,7 @@ mod tests {
             hostname: None,
             custom_domain: None,
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Running,
@@ -11236,6 +11247,7 @@ mod tests {
             hostname: Some(format!("{name}.apps.example.com")),
             custom_domain: None,
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
@@ -11468,6 +11480,7 @@ mod tests {
                 hostname: None,
                 custom_domain: None,
                 custom_domain_verified: false,
+                public_port: None,
                 config: None,
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
@@ -11522,6 +11535,7 @@ mod tests {
                 hostname: None,
                 custom_domain: None,
                 custom_domain_verified: false,
+                public_port: None,
                 config: None,
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
@@ -11581,6 +11595,7 @@ mod tests {
                 hostname: None,
                 custom_domain: None,
                 custom_domain_verified: false,
+                public_port: None,
                 config: None,
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
@@ -11657,6 +11672,7 @@ mod tests {
             hostname: None,
             custom_domain: None,
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,

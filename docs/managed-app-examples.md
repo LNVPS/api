@@ -912,8 +912,22 @@ NOSTR_SECRET_KEY=$(cat ~/.nostr/lnvps-admin.nsec) nak curl -X PATCH \
 ```
 
 ---
+### Minecraft Java (game server)
+
+**Document:** [`catalog/minecraft-java.yaml`](../catalog/minecraft-java.yaml).
+Vanilla only: `TYPE=VANILLA` is fixed, the version comes from a short allowed
+list, and no field can reach `MODS`, `PLUGINS`, `MODPACK`, `*_URL` or any other
+setting that makes the image fetch or run customer code. Typed fields cover
+difficulty, max players, MOTD, whitelist and the RCON password. The game port is
+`expose: tcp` with `srv: minecraft`, so the operator allocates a public port and
+the API reports `connect_address` (and an SRV record when the port is not 25565).
+`scripts/app-catalog-test.sh catalog/minecraft-java.yaml` starts it, then
+[`catalog/tests/minecraft-java/check.sh`](../catalog/tests/minecraft-java/check.sh)
+sends a real Minecraft status ping to the published port and checks the version,
+slots and MOTD. The server runs with CPU and memory requests equal to limits
+(Guaranteed QoS).
 
 ## Notes on other apps
 
 - **zap-stream-core** — needs raw TCP/UDP ingest (RTMP `1935/tcp`, SRT), i.e.
-  the not-yet-implemented `expose: tcp|udp` path.
+  the `expose: tcp|udp` path (see the operator README, "Game servers").

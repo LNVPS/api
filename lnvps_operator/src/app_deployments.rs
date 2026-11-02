@@ -661,6 +661,13 @@ pub fn build_secret(
     })
 }
 
+fn k8s_protocol(protocol: lnvps_compose::Protocol) -> &'static str {
+    match protocol {
+        lnvps_compose::Protocol::Udp => "UDP",
+        _ => "TCP",
+    }
+}
+
 /// A ClusterIP Service exposing a compose service's declared ports. `None` when
 /// the service declares no ports (purely internal, no addressable endpoint).
 pub fn build_service(
@@ -677,6 +684,7 @@ pub fn build_service(
         .map(|p| ServicePort {
             name: Some(p.name.clone()),
             port: p.container as i32,
+            protocol: Some(k8s_protocol(p.protocol).to_string()),
             target_port: Some(
                 k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(p.container as i32),
             ),
@@ -865,6 +873,7 @@ pub fn build_deployment(
                 .map(|p| ContainerPort {
                     name: Some(p.name.clone()),
                     container_port: p.container as i32,
+                    protocol: Some(k8s_protocol(p.protocol).to_string()),
                     ..Default::default()
                 })
                 .collect(),
@@ -1210,6 +1219,7 @@ async fn apply_custom_domain_probe(
     db.set_app_deployment_custom_domain_verified(id).await?;
     Ok(AppDeployment {
         custom_domain_verified: true,
+        public_port: None,
         ..deployment.clone()
     })
 }
@@ -1585,8 +1595,17 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<BTreeSet<u64>> {
 
     let mut active: HashSet<u64> = HashSet::new();
     let mut transitioning: BTreeSet<u64> = BTreeSet::new();
+    let (deployments, l4_failures) = reconcile_l4(ctx, deployments).await;
     for d in &deployments {
         active.insert(d.id);
+        if let Some(message) = l4_failures.get(&d.id) {
+            error!("app deployment {} public port: {message}", d.id);
+            let mut errd = d.clone();
+            errd.status = AppDeploymentStatus::Error;
+            errd.status_message = Some(message.clone());
+            let _ = ctx.db.update_app_deployment(&errd).await;
+            continue;
+        }
         match reconcile_one(ctx, d, &cluster.ingress_domain).await {
             Ok(status) => {
                 if is_transitioning(status) {
@@ -1615,6 +1634,76 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<BTreeSet<u64>> {
     // rows are excluded from the active set above).
     gc_namespaces(&ctx.client, &active).await?;
     Ok(transitioning)
+}
+
+async fn l4_want(ctx: &Context, d: &AppDeployment) -> Result<Option<crate::l4::L4Want>> {
+    let app = ctx.db.get_app(d.app_id).await?;
+    let compose = lnvps_compose::Compose::parse(&app.compose)?;
+    let Some(l4) = compose.l4_port() else {
+        return Ok(None);
+    };
+    let sub = ctx
+        .db
+        .get_subscription_by_line_item_id(d.subscription_line_item_id)
+        .await
+        .ok();
+    let gate = gate_running(
+        d.desired_state == lnvps_db::AppDeploymentDesiredState::Running,
+        d.deleted,
+        sub.as_ref(),
+        None,
+        chrono::Utc::now(),
+    );
+    if !provisions_cluster_objects(&gate) {
+        return Ok(None);
+    }
+    Ok(Some(crate::l4::L4Want {
+        deployment: d.clone(),
+        target: crate::l4::L4Target {
+            service: l4.service.to_string(),
+            container_port: l4.port.container,
+            protocol: l4.protocol(),
+        },
+    }))
+}
+
+async fn reconcile_l4(
+    ctx: &Context,
+    deployments: Vec<AppDeployment>,
+) -> (Vec<AppDeployment>, std::collections::HashMap<u64, String>) {
+    let mut failures = std::collections::HashMap::new();
+    let mut wants = Vec::new();
+    for d in &deployments {
+        match l4_want(ctx, d).await {
+            Ok(Some(w)) => wants.push(w),
+            Ok(None) => {}
+            Err(e) => warn!("app deployment {}: could not plan L4 exposure: {e}", d.id),
+        }
+    }
+    let wanting: HashSet<u64> = wants.iter().map(|w| w.deployment.id).collect();
+    match crate::l4::sync_l4(ctx.db.as_ref(), &ctx.l4, &deployments, wants).await {
+        Ok(outcomes) => {
+            for o in outcomes {
+                if let Err(message) = o.result {
+                    failures.insert(o.deployment_id, message);
+                }
+            }
+        }
+        Err(e) => {
+            error!("L4 forwarding ({}) failed: {e}", ctx.l4.forwarder.kind());
+            for id in wanting {
+                failures.insert(id, format!("public port forwarding failed: {e}"));
+            }
+        }
+    }
+    let refreshed = match ctx.db.list_all_app_deployments().await {
+        Ok(all) => {
+            let ids: HashSet<u64> = deployments.iter().map(|d| d.id).collect();
+            all.into_iter().filter(|d| ids.contains(&d.id)).collect()
+        }
+        Err(_) => deployments,
+    };
+    (refreshed, failures)
 }
 
 /// Record what each deployment is consuming, from Prometheus (issue #278).
@@ -3669,12 +3758,25 @@ config:
 
             // Each documented app exposes an ingress endpoint.
             assert!(
-                build_ingress(id, &c, &host, None, "letsencrypt-prod", "nginx").is_some(),
-                "{name}: expected an ingress endpoint"
+                build_ingress(id, &c, &host, None, "letsencrypt-prod", "nginx").is_some()
+                    || c.l4_port().is_some(),
+                "{name}: expected an ingress or L4 endpoint"
             );
             // Shared namespace objects render from the footprint.
             let _ = build_network_policy(id, "ingress-nginx");
         }
+    }
+
+    #[test]
+    fn udp_ports_render_udp_on_the_service_and_the_container() {
+        let c = Compose::parse(
+            "services:\n  g:\n    image: x\n    ports:\n      - { name: game, container: 7777, protocol: udp, expose: udp }\n      - { name: q, container: 7778, protocol: tcp, expose: none }\n",
+        )
+        .unwrap();
+        let svc = build_service(3, "g", &c.services["g"]).unwrap();
+        let ports = svc.spec.unwrap().ports.unwrap();
+        assert_eq!(ports[0].protocol.as_deref(), Some("UDP"));
+        assert_eq!(ports[1].protocol.as_deref(), Some("TCP"));
     }
 
     /// `Running` now means the workload is running, not that the bill is paid
@@ -4123,6 +4225,7 @@ config:
                 hostname: None,
                 custom_domain: None,
                 custom_domain_verified: false,
+                public_port: None,
                 config: None,
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
@@ -4317,6 +4420,7 @@ config:
     fn a_verified_custom_domain_becomes_the_apps_public_hostname() {
         let d = AppDeployment {
             custom_domain_verified: true,
+            public_port: None,
             ..deployment_with_custom_domain()
         };
         assert_eq!(servable_custom_domain(&d), Some("relay.example.org"));
@@ -4354,6 +4458,7 @@ config:
             hostname: None,
             custom_domain: Some("relay.example.org".to_string()),
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: lnvps_db::AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Running,

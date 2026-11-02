@@ -103,6 +103,26 @@ backups:
 # source is the node IP, not this namespace — see docs.
 ingress-namespace: "ingress-nginx"
 
+# --- L4 (TCP/UDP) forwarding -------------------------------------------------
+# Apps that declare `expose: tcp|udp` in their compose (game servers) say only
+# that they need a public port. This block says who delivers it. Every key is
+# optional and the values shown are the defaults.
+l4:
+  # ingress-nginx writes the controller's tcp-services / udp-services ConfigMaps.
+  # nodeport and loadbalancer parse but are refused at startup with a
+  # "not supported yet" error.
+  forwarder: "ingress-nginx"
+  # Public ports handed out, one per deployment, lowest free first. Ports
+  # already present in the ConfigMaps under entries this operator does not own
+  # (e.g. a static "22") are skipped. The controller Service must expose them.
+  port-range:
+    start: 25565
+    end: 25664
+  ingress-nginx:
+    namespace: "ingress-nginx"
+    tcp-configmap: "tcp-services"
+    udp-configmap: "udp-services"
+
 # --- Nostr domains ----------------------------------------------------------
 # Service name for nostr domain ingress (optional, defaults to "lnvps-nostr")
 # All nostr domains will point to this single service

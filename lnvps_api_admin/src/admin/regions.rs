@@ -429,6 +429,7 @@ mod tests {
                         hostname: None,
                         custom_domain: None,
                         custom_domain_verified: false,
+                        public_port: None,
                         config: None,
                         desired_state: Default::default(),
                         status: Default::default(),

@@ -436,9 +436,10 @@ pub enum Expose {
     None,
     /// Public HTTP(S) via nginx Ingress + cert-manager TLS (http protocol only).
     Ingress,
-    /// Raw L4 TCP (ingress-controller TCP passthrough / NodePort). Not in MVP.
+    /// Raw L4 TCP. The app only says it needs a public TCP port; the
+    /// operator's configured forwarder decides how it is delivered.
     Tcp,
-    /// Raw L4 UDP. Not in MVP.
+    /// Raw L4 UDP, delivered the same way as [`Expose::Tcp`].
     Udp,
 }
 
@@ -466,6 +467,42 @@ pub struct Port {
     /// Ingress path (defaults to `/`), only meaningful for `expose: ingress`.
     #[serde(default)]
     pub path: Option<String>,
+    /// DNS SRV service label (`minecraft` gives `_minecraft._tcp`), only
+    /// meaningful for `expose: tcp|udp`. When the public port differs from
+    /// `container`, clients that honour SRV are told where to connect.
+    #[serde(default)]
+    pub srv: Option<String>,
+}
+
+/// The one port of a compose that needs a public L4 listener.
+#[derive(Debug, Clone, Copy)]
+pub struct L4Port<'a> {
+    pub service: &'a str,
+    pub port: &'a Port,
+}
+
+impl L4Port<'_> {
+    pub fn protocol(&self) -> L4Protocol {
+        match self.port.expose {
+            Expose::Udp => L4Protocol::Udp,
+            _ => L4Protocol::Tcp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum L4Protocol {
+    Tcp,
+    Udp,
+}
+
+impl L4Protocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            L4Protocol::Tcp => "tcp",
+            L4Protocol::Udp => "udp",
+        }
+    }
 }
 
 /// A persistent volume mounted into a service → one PVC.
@@ -1039,6 +1076,17 @@ impl Compose {
         Ok(())
     }
 
+    /// The port that needs a public L4 listener, if any. At most one is
+    /// allowed per app (see [`Self::validate`]).
+    pub fn l4_port(&self) -> Option<L4Port<'_>> {
+        self.services.iter().find_map(|(service, svc)| {
+            svc.ports
+                .iter()
+                .find(|p| matches!(p.expose, Expose::Tcp | Expose::Udp))
+                .map(|port| L4Port { service, port })
+        })
+    }
+
     /// Validate structural + policy rules. Enforced at parse time so the
     /// operator never tries to render an unsafe or malformed app.
     ///
@@ -1047,6 +1095,16 @@ impl Compose {
     pub fn validate(&self) -> Result<()> {
         if self.services.is_empty() {
             bail!("compose must define at least one service");
+        }
+
+        let l4_ports = self
+            .services
+            .values()
+            .flat_map(|s| &s.ports)
+            .filter(|p| matches!(p.expose, Expose::Tcp | Expose::Udp))
+            .count();
+        if l4_ports > 1 {
+            bail!("at most one port per app may use expose: tcp or udp, found {l4_ports}");
         }
 
         for (sname, svc) in &self.services {
@@ -1061,6 +1119,36 @@ impl Compose {
                         "service '{sname}' port '{}': expose: ingress requires protocol: http",
                         p.name
                     );
+                }
+                match (p.expose, p.protocol) {
+                    (Expose::Tcp, Protocol::Tcp) | (Expose::Udp, Protocol::Udp) => {}
+                    (Expose::Tcp, _) => bail!(
+                        "service '{sname}' port '{}': expose: tcp requires protocol: tcp",
+                        p.name
+                    ),
+                    (Expose::Udp, _) => bail!(
+                        "service '{sname}' port '{}': expose: udp requires protocol: udp",
+                        p.name
+                    ),
+                    _ => {}
+                }
+                if let Some(srv) = p.srv.as_deref() {
+                    if !matches!(p.expose, Expose::Tcp | Expose::Udp) {
+                        bail!(
+                            "service '{sname}' port '{}': srv is only valid with expose: tcp or udp",
+                            p.name
+                        );
+                    }
+                    if srv.is_empty()
+                        || !srv
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    {
+                        bail!(
+                            "service '{sname}' port '{}': srv must be lowercase letters, digits and hyphens",
+                            p.name
+                        );
+                    }
                 }
             }
             // `user:` must be root or a numeric UID. A name (e.g. `nonroot`)
@@ -2468,6 +2556,77 @@ config:
         assert!(Compose::parse(yaml).is_err());
     }
 
+    fn l4_doc(ports: &str) -> String {
+        format!("services:\n  a:\n    image: x\n    ports:\n{ports}\n")
+    }
+
+    #[test]
+    fn l4_expose_accepts_matching_protocol_and_reports_the_port() {
+        let c = Compose::parse(&l4_doc(
+            "      - { name: game, container: 25565, protocol: tcp, expose: tcp, srv: minecraft }",
+        ))
+        .unwrap();
+        let l4 = c.l4_port().unwrap();
+        assert_eq!(l4.service, "a");
+        assert_eq!(l4.port.container, 25565);
+        assert_eq!(l4.protocol(), L4Protocol::Tcp);
+        assert_eq!(l4.port.srv.as_deref(), Some("minecraft"));
+
+        let c = Compose::parse(&l4_doc(
+            "      - { name: game, container: 7777, protocol: udp, expose: udp }",
+        ))
+        .unwrap();
+        assert_eq!(c.l4_port().unwrap().protocol(), L4Protocol::Udp);
+    }
+
+    #[test]
+    fn l4_expose_rejects_mismatched_protocol_and_multiple_ports() {
+        let err = Compose::parse(&l4_doc(
+            "      - { name: g, container: 5, protocol: udp, expose: tcp }",
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expose: tcp requires protocol: tcp")
+        );
+        let err = Compose::parse(&l4_doc(
+            "      - { name: g, container: 5, protocol: tcp, expose: udp }",
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expose: udp requires protocol: udp")
+        );
+        let err = Compose::parse(&l4_doc(
+            "      - { name: g, container: 5, protocol: tcp, expose: tcp }\n      - { name: h, container: 6, protocol: udp, expose: udp }",
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("at most one port"));
+    }
+
+    #[test]
+    fn srv_label_needs_l4_expose_and_a_dns_safe_value() {
+        let err = Compose::parse(&l4_doc(
+            "      - { name: g, container: 5, protocol: tcp, expose: none, srv: minecraft }",
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("srv is only valid"));
+        let err = Compose::parse(&l4_doc(
+            "      - { name: g, container: 5, protocol: tcp, expose: tcp, srv: Mine_Craft }",
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("srv must be"));
+    }
+
+    #[test]
+    fn app_without_l4_port_has_none() {
+        let c = Compose::parse(&l4_doc(
+            "      - { name: p, container: 5, protocol: tcp, expose: none }",
+        ))
+        .unwrap();
+        assert!(c.l4_port().is_none());
+    }
+
     #[test]
     fn rejects_bad_mount_paths() {
         // relative
@@ -3645,5 +3804,154 @@ config:
         exec.validate_declarations().unwrap();
         let quiesced = Compose::parse(&svc("{ volume: d, quiesce: true }")).unwrap();
         assert!(quiesced.services["a"].backup.as_ref().unwrap().quiesce);
+    }
+
+    fn minecraft() -> Compose {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../catalog/minecraft-java.yaml"
+        );
+        let doc = std::fs::read_to_string(path).unwrap();
+        let c = Compose::parse(&doc).unwrap();
+        c.validate_declarations().unwrap();
+        c.validate_pinned_images().unwrap();
+        c
+    }
+
+    fn minecraft_config(extra: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        let mut m: std::collections::BTreeMap<String, String> =
+            [("eula", "TRUE"), ("rcon_password", "testpass1234")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        for (k, v) in extra {
+            m.insert(k.to_string(), v.to_string());
+        }
+        m
+    }
+
+    #[test]
+    fn minecraft_env_is_a_fixed_vanilla_allowlist() {
+        let c = minecraft();
+        let env = &c.services["server"].env;
+        let allowed = [
+            "EULA",
+            "TYPE",
+            "VERSION",
+            "MEMORY",
+            "DIFFICULTY",
+            "MAX_PLAYERS",
+            "MOTD",
+            "ENABLE_WHITELIST",
+            "WHITELIST",
+            "ENABLE_RCON",
+            "RCON_PASSWORD",
+        ];
+        for key in env.keys() {
+            assert!(allowed.contains(&key.as_str()), "unexpected env var {key}");
+        }
+        assert_eq!(env["TYPE"], "VANILLA");
+        assert_eq!(c.services.len(), 1);
+        assert!(c.services["server"].init.is_empty());
+    }
+
+    #[test]
+    fn minecraft_cannot_set_code_loading_env_vars() {
+        let c = minecraft();
+        let forbidden = [
+            "MODS",
+            "PLUGINS",
+            "MODPACK",
+            "GENERIC_PACK",
+            "CF_",
+            "MODRINTH_",
+            "SPIGET_",
+            "_URL",
+            "DATAPACK",
+            "WORLD",
+            "ICON",
+            "CUSTOM_SERVER",
+            "EXEC",
+            "TYPE",
+            "JVM",
+            "USE_AIKAR",
+        ];
+        for field in &c.config {
+            let name = field.name.to_uppercase();
+            assert!(
+                !forbidden.iter().any(|f| name.contains(f)),
+                "config field {} could reach the image's code loading",
+                field.name
+            );
+            assert!(
+                field.r#type != FieldType::File,
+                "{} accepts a file",
+                field.name
+            );
+        }
+        for key in c.services["server"].env.keys() {
+            assert!(
+                !forbidden
+                    .iter()
+                    .filter(|f| **f != "TYPE")
+                    .any(|f| key.contains(f)),
+                "env var {key} loads code"
+            );
+        }
+        assert!(c.services["server"].files.is_empty());
+        let svc = &c.services["server"];
+        for (key, value) in &svc.env {
+            if key == "TYPE" {
+                continue;
+            }
+            let refs: Vec<&str> = value.matches("${").collect();
+            assert!(refs.len() <= 1, "{key} mixes several fields");
+        }
+    }
+
+    #[test]
+    fn minecraft_rejects_customer_values_that_would_fetch_or_run_code() {
+        let c = minecraft();
+        let ok = resolve_config(&c, &minecraft_config(&[])).unwrap();
+        assert_eq!(ok["version"], "1.21.4");
+        let bad: &[(&str, &str)] = &[
+            ("version", "LATEST"),
+            ("version", "https://example.com/server.jar"),
+            ("version", "1.21.4\nTYPE=PAPER"),
+            ("difficulty", "hard\nMODS=x"),
+            ("motd", "hi\nPLUGINS=http://evil/x.jar"),
+            ("max_players", "20; rm -rf /"),
+            ("whitelist", "bob,http://evil"),
+            ("rcon_password", "short"),
+            ("rcon_password", "pass word 1234"),
+        ];
+        for (k, v) in bad {
+            assert!(
+                resolve_config(&c, &minecraft_config(&[(k, v)])).is_err(),
+                "{k}={v:?} was accepted"
+            );
+        }
+        let unknown = minecraft_config(&[("MODS", "https://example.com/mod.jar")]);
+        assert!(resolve_config(&c, &unknown).is_err());
+        let unknown = minecraft_config(&[("TYPE", "PAPER")]);
+        assert!(resolve_config(&c, &unknown).is_err());
+    }
+
+    #[test]
+    fn minecraft_requests_guaranteed_resources_and_a_world_volume() {
+        let c = minecraft();
+        let svc = &c.services["server"];
+        assert_eq!(svc.resources.cpu, "1000m");
+        assert_eq!(svc.resources.memory, "2Gi");
+        assert_eq!(svc.volumes[0].path, "/data");
+        let l4 = c.l4_port().unwrap();
+        assert_eq!(l4.port.container, 25565);
+        assert_eq!(l4.port.srv.as_deref(), Some("minecraft"));
+        assert!(
+            c.services["server"]
+                .ports
+                .iter()
+                .any(|p| p.container == 25575 && p.expose == Expose::None)
+        );
     }
 }

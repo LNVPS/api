@@ -16,6 +16,7 @@ hickory-resolver = "0.26"
 chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 hex.workspace = true
+async-trait.workspace = true
 
 # Workspace dependencies
 tokio = { workspace = true, features = ["time", "signal", "io-util"] }

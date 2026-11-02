@@ -2125,6 +2125,11 @@ pub trait LNVpsDbBase: Send + Sync {
     /// operator holds a row copy read at the top of the pass, and writing the
     /// whole row back would undo an edit the customer made in between.
     async fn set_app_deployment_custom_domain_verified(&self, id: u64) -> DbResult<()>;
+
+    /// Record (or clear) the public L4 port allocated to a deployment. Kept
+    /// apart from [`Self::update_app_deployment`] so a status write-back made
+    /// from a stale copy of the row cannot overwrite an allocation.
+    async fn set_app_deployment_public_port(&self, id: u64, port: Option<u16>) -> DbResult<()>;
     /// Record the usage the cluster last reported for a deployment, stamping
     /// the observation time.
     ///

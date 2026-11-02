@@ -66,6 +66,34 @@ rules:
   resources: ["networkpolicies"]
   verbs: ["create", "patch"]
 ---
+# L4 forwarding with the `ingress-nginx` forwarder: the operator reads and
+# merge-patches the two port maps the controller is told to watch. Scoped to
+# those ConfigMaps by name, and to the controller's namespace by the Role.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: lnvps-operator-l4
+  namespace: ingress-nginx
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["tcp-services", "udp-services"]
+  verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: lnvps-operator-l4
+  namespace: ingress-nginx
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: lnvps-operator-l4
+subjects:
+- kind: ServiceAccount
+  name: lnvps-operator
+  namespace: lnvps
+---
 # Namespace-scoped grant. Never bound cluster-wide: the operator creates a
 # RoleBinding to it inside each app-N namespace it provisions, so a stolen
 # token reads only the namespaces the operator itself created.
@@ -123,6 +151,21 @@ data:
     app-cluster-id: 1
     # Namespace the ingress controller runs in (isolation NetworkPolicy allows it).
     ingress-namespace: "ingress-nginx"
+    # --- L4 (TCP/UDP) forwarding for apps that declare `expose: tcp|udp` ---
+    # Who forwards, and the public ports deployments are allocated from. The
+    # ingress-nginx controller needs --tcp-services-configmap /
+    # --udp-services-configmap pointing at the ConfigMaps below, and its
+    # Service must expose every port in the range (see README, "Game servers").
+    # `nodeport` and `loadbalancer` are accepted names but refused at startup.
+    l4:
+      forwarder: "ingress-nginx"
+      port-range:
+        start: 25565
+        end: 25664
+      ingress-nginx:
+        namespace: "ingress-nginx"
+        tcp-configmap: "tcp-services"
+        udp-configmap: "udp-services"
     # Encryption key: supplied via the LNVPS_ENCRYPTION_KEY env var below (must
     # match the API's key) so the operator can decrypt app_deployment.config.
     # --- Backups (omit the whole block to disable them) ---

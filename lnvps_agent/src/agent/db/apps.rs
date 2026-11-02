@@ -344,6 +344,7 @@ mod tests {
                 hostname: Some("my-relay.apps.lnvps.tld".to_string()),
                 custom_domain: None,
                 custom_domain_verified: false,
+                public_port: None,
                 config: Some("SECRET-APP-CONFIG".to_string().into()),
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
