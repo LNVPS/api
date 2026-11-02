@@ -366,17 +366,20 @@ mod tests {
             renewal_source: None,
         };
         assert!(
-            db.insert_refund_to_credit(&row, 7_000, Some("e2e"))
+            db.insert_refund_to_credit(&row, &[("BTC".to_string(), 7_000)], Some("e2e"))
                 .await
                 .unwrap()
         );
         assert!(
-            !db.insert_refund_to_credit(&row, 7_000, Some("e2e"))
+            !db.insert_refund_to_credit(&row, &[("BTC".to_string(), 7_000)], Some("e2e"))
                 .await
                 .unwrap(),
             "the same refund row is not booked twice"
         );
-        assert_eq!(db.get_account_credit(uid).await.unwrap().balance, 7_000);
+        assert_eq!(
+            db.get_account_credit(uid, "BTC").await.unwrap().balance,
+            7_000
+        );
         assert_eq!(ledger_sum(&pool, uid).await, 7_000);
         let linked: Option<Vec<u8>> = sqlx::query_scalar(
             "SELECT subscription_payment_id FROM account_credit_event WHERE user_id = ? AND kind = 'refund'",
@@ -422,13 +425,13 @@ mod tests {
         let (uid, _customer) = customer().await;
         let pool = db::connect().await.unwrap();
         let db = db::lnvps_db().await.unwrap();
-        db.adjust_account_credit(uid, 10_000_000, "topup", None)
+        db.adjust_account_credit(uid, "BTC", 10_000_000, "topup", None)
             .await
             .unwrap();
 
         let payment = hold_on_payment(&db, uid, 6_000_000, 600).await;
         assert_eq!(
-            db.get_account_credit_reserved(uid).await.unwrap(),
+            db.get_account_credit_reserved(uid, "BTC").await.unwrap(),
             6_000_000
         );
         assert!(
@@ -439,7 +442,7 @@ mod tests {
             "held credit is not promised twice"
         );
         assert!(
-            db.adjust_account_credit(uid, -5_000_000, "admin", None)
+            db.adjust_account_credit(uid, "BTC", -5_000_000, "admin", None)
                 .await
                 .is_err(),
             "a clawback cannot take held credit"
@@ -457,8 +460,11 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(db.get_account_credit(uid).await.unwrap().balance, 4_000_000);
-        assert_eq!(db.get_account_credit_reserved(uid).await.unwrap(), 0);
+        assert_eq!(
+            db.get_account_credit(uid, "BTC").await.unwrap().balance,
+            4_000_000
+        );
+        assert_eq!(db.get_account_credit_reserved(uid, "BTC").await.unwrap(), 0);
         assert_eq!(ledger_sum(&pool, uid).await, 4_000_000);
 
         let released = db
@@ -467,7 +473,7 @@ mod tests {
             .unwrap()
             .unwrap();
         db.release_account_credit_debit(released).await.unwrap();
-        assert_eq!(db.get_account_credit_reserved(uid).await.unwrap(), 0);
+        assert_eq!(db.get_account_credit_reserved(uid, "BTC").await.unwrap(), 0);
         pool.close().await;
     }
 
@@ -476,7 +482,7 @@ mod tests {
         let (uid, _customer) = customer().await;
         let pool = db::connect().await.unwrap();
         let db = db::lnvps_db().await.unwrap();
-        db.adjust_account_credit(uid, 10_000_000, "topup", None)
+        db.adjust_account_credit(uid, "BTC", 10_000_000, "topup", None)
             .await
             .unwrap();
 
@@ -489,7 +495,10 @@ mod tests {
             .unwrap();
         assert_eq!(spent.amount, 3_000_000);
         assert_eq!(spent.payment_amount, 300);
-        assert_eq!(db.get_account_credit(uid).await.unwrap().balance, 7_000_000);
+        assert_eq!(
+            db.get_account_credit(uid, "BTC").await.unwrap().balance,
+            7_000_000
+        );
         assert_eq!(ledger_sum(&pool, uid).await, 7_000_000);
         pool.close().await;
     }
@@ -499,7 +508,7 @@ mod tests {
         let (uid, _customer) = customer().await;
         let pool = db::connect().await.unwrap();
         let db = db::lnvps_db().await.unwrap();
-        db.adjust_account_credit(uid, 50_000_000, "topup", None)
+        db.adjust_account_credit(uid, "BTC", 50_000_000, "topup", None)
             .await
             .unwrap();
 
@@ -541,7 +550,7 @@ mod tests {
             t.await.unwrap();
         }
 
-        let balance = db.get_account_credit(uid).await.unwrap().balance;
+        let balance = db.get_account_credit(uid, "BTC").await.unwrap().balance;
         assert_eq!(balance, 50_000_000 - 10_000_000 + 5_000_000);
         assert_eq!(ledger_sum(&pool, uid).await, balance as i64);
         pool.close().await;

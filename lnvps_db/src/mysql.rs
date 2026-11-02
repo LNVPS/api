@@ -84,20 +84,25 @@ pub struct LNVpsDbMysql {
 async fn lock_account_credit(
     tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
     user_id: u64,
-) -> Result<(u64, String)> {
+    currency: &str,
+) -> Result<u64> {
     sqlx::query(
-        "INSERT INTO account_credit (user_id, balance, currency) VALUES (?, 0, 'BTC') \
+        "INSERT INTO account_credit (user_id, balance, currency, auto_apply) \
+         SELECT ?, 0, ?, COALESCE(MAX(auto_apply), 0) FROM account_credit WHERE user_id = ? \
          ON DUPLICATE KEY UPDATE user_id = user_id",
     )
     .bind(user_id)
+    .bind(currency)
+    .bind(user_id)
     .execute(&mut **tx)
     .await?;
-    Ok(
-        sqlx::query_as("SELECT balance, currency FROM account_credit WHERE user_id = ? FOR UPDATE")
-            .bind(user_id)
-            .fetch_one(&mut **tx)
-            .await?,
+    Ok(sqlx::query_scalar(
+        "SELECT balance FROM account_credit WHERE user_id = ? AND currency = ? FOR UPDATE",
     )
+    .bind(user_id)
+    .bind(currency)
+    .fetch_one(&mut **tx)
+    .await?)
 }
 
 async fn insert_subscription_payment_with<'e, E: sqlx::MySqlExecutor<'e>>(
@@ -141,13 +146,15 @@ async fn insert_subscription_payment_with<'e, E: sqlx::MySqlExecutor<'e>>(
 async fn account_credit_reserved<'e, E: sqlx::MySqlExecutor<'e>>(
     ex: E,
     user_id: u64,
+    currency: &str,
     exclude: Option<u64>,
 ) -> Result<u64> {
     Ok(sqlx::query_scalar(
         "SELECT CAST(COALESCE(SUM(amount), 0) AS UNSIGNED) FROM account_credit_debit \
-         WHERE user_id = ? AND settled = 0 AND expires > NOW() AND id <> ?",
+         WHERE user_id = ? AND currency = ? AND settled = 0 AND expires > NOW() AND id <> ?",
     )
     .bind(user_id)
+    .bind(currency)
     .bind(exclude.unwrap_or(0))
     .fetch_one(ex)
     .await?)
@@ -5003,54 +5010,82 @@ impl LNVpsDbBase for LNVpsDbMysql {
     // Account credit
     // ========================================================================
 
-    async fn get_account_credit(&self, user_id: u64) -> DbResult<AccountCredit> {
+    async fn get_account_credit(&self, user_id: u64, currency: &str) -> DbResult<AccountCredit> {
         let row: Option<AccountCredit> = sqlx::query_as(
             "SELECT user_id, balance, currency, auto_apply, updated \
-             FROM account_credit WHERE user_id = ?",
+             FROM account_credit WHERE user_id = ? AND currency = ?",
         )
         .bind(user_id)
+        .bind(currency)
         .fetch_optional(&self.db)
         .await?;
-        Ok(row.unwrap_or_else(|| AccountCredit {
+        if let Some(row) = row {
+            return Ok(row);
+        }
+        let auto_apply: Option<bool> =
+            sqlx::query_scalar("SELECT MAX(auto_apply) FROM account_credit WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_one(&self.db)
+                .await?;
+        Ok(AccountCredit {
             user_id,
             balance: 0,
-            currency: "BTC".to_string(),
-            auto_apply: false,
+            currency: currency.to_string(),
+            auto_apply: auto_apply.unwrap_or(false),
             updated: Utc::now(),
-        }))
+        })
     }
 
-    async fn set_account_credit_auto_apply(
-        &self,
-        user_id: u64,
-        auto_apply: bool,
-    ) -> DbResult<AccountCredit> {
-        sqlx::query(
-            "INSERT INTO account_credit (user_id, balance, currency, auto_apply) \
-             VALUES (?, 0, 'BTC', ?) \
-             ON DUPLICATE KEY UPDATE auto_apply = VALUES(auto_apply), updated = NOW()",
+    async fn list_account_credits(&self, user_id: u64) -> DbResult<Vec<AccountCredit>> {
+        Ok(sqlx::query_as(
+            "SELECT user_id, balance, currency, auto_apply, updated \
+             FROM account_credit WHERE user_id = ? ORDER BY currency",
         )
         .bind(user_id)
-        .bind(auto_apply)
-        .execute(&self.db)
-        .await?;
-        self.get_account_credit(user_id).await
+        .fetch_all(&self.db)
+        .await?)
     }
 
-    async fn get_account_credit_reserved(&self, user_id: u64) -> DbResult<u64> {
-        Ok(account_credit_reserved(&self.db, user_id, None).await?)
+    async fn set_account_credit_auto_apply(&self, user_id: u64, auto_apply: bool) -> DbResult<()> {
+        let updated = sqlx::query(
+            "UPDATE account_credit SET auto_apply = ?, updated = NOW() WHERE user_id = ?",
+        )
+        .bind(auto_apply)
+        .bind(user_id)
+        .execute(&self.db)
+        .await?;
+        if updated.rows_affected() == 0 {
+            sqlx::query(
+                "INSERT INTO account_credit (user_id, balance, currency, auto_apply) \
+                 VALUES (?, 0, 'BTC', ?) \
+                 ON DUPLICATE KEY UPDATE auto_apply = VALUES(auto_apply), updated = NOW()",
+            )
+            .bind(user_id)
+            .bind(auto_apply)
+            .execute(&self.db)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn get_account_credit_reserved(&self, user_id: u64, currency: &str) -> DbResult<u64> {
+        Ok(account_credit_reserved(&self.db, user_id, currency, None).await?)
     }
 
     async fn insert_refund_to_credit(
         &self,
         refund: &SubscriptionPayment,
-        credit: u64,
+        credits: &[(String, u64)],
         note: Option<&str>,
     ) -> DbResult<bool> {
         let mut tx = self.db.begin().await?;
-        // Lock the balance first: every transaction that moves it must, or
-        // concurrent settles hit MariaDB snapshot conflicts (error 1020).
-        let (balance, currency) = lock_account_credit(&mut tx, refund.user_id).await?;
+        let mut balances = Vec::new();
+        let mut sorted: Vec<&(String, u64)> = credits.iter().filter(|(_, c)| *c > 0).collect();
+        sorted.sort();
+        for (currency, credit) in sorted {
+            let balance = lock_account_credit(&mut tx, refund.user_id, currency).await?;
+            balances.push((currency, *credit, balance));
+        }
         let exists: Option<Vec<u8>> =
             sqlx::query_scalar("SELECT id FROM subscription_payment WHERE id = ?")
                 .bind(&refund.id)
@@ -5061,18 +5096,22 @@ impl LNVpsDbBase for LNVpsDbMysql {
             return Ok(false);
         }
         insert_subscription_payment_with(&mut *tx, refund).await?;
-        if credit > 0 {
+        for (currency, credit, balance) in balances {
             let new_balance = balance.checked_add(credit).ok_or_else(|| {
                 anyhow!(
                     "account credit balance overflow for user {}",
                     refund.user_id
                 )
             })?;
-            sqlx::query("UPDATE account_credit SET balance = ?, updated = NOW() WHERE user_id = ?")
-                .bind(new_balance)
-                .bind(refund.user_id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE account_credit SET balance = ?, updated = NOW() \
+                 WHERE user_id = ? AND currency = ?",
+            )
+            .bind(new_balance)
+            .bind(refund.user_id)
+            .bind(currency)
+            .execute(&mut *tx)
+            .await?;
             sqlx::query(
                 "INSERT INTO account_credit_event \
                  (user_id, kind, amount, currency, subscription_payment_id, note) \
@@ -5080,7 +5119,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             )
             .bind(refund.user_id)
             .bind(i64::try_from(credit).map_err(|_| anyhow!("refund credit too large"))?)
-            .bind(&currency)
+            .bind(currency)
             .bind(&refund.id)
             .bind(note)
             .execute(&mut *tx)
@@ -5093,21 +5132,22 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn adjust_account_credit(
         &self,
         user_id: u64,
+        currency: &str,
         delta: i64,
         kind: &str,
         note: Option<&str>,
     ) -> DbResult<AccountCredit> {
         if delta == 0 {
-            return self.get_account_credit(user_id).await;
+            return self.get_account_credit(user_id, currency).await;
         }
         let mut tx = self.db.begin().await?;
-        let (balance, currency) = lock_account_credit(&mut tx, user_id).await?;
+        let balance = lock_account_credit(&mut tx, user_id, currency).await?;
         let new_balance = if delta > 0 {
             balance
                 .checked_add(delta.unsigned_abs())
                 .ok_or_else(|| anyhow!("account credit balance overflow for user {user_id}"))?
         } else {
-            let reserved = account_credit_reserved(&mut *tx, user_id, None).await?;
+            let reserved = account_credit_reserved(&mut *tx, user_id, currency, None).await?;
             let available = balance.saturating_sub(reserved);
             if delta.unsigned_abs() > available {
                 tx.rollback().await?;
@@ -5119,11 +5159,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
             }
             balance - delta.unsigned_abs()
         };
-        sqlx::query("UPDATE account_credit SET balance = ?, updated = NOW() WHERE user_id = ?")
-            .bind(new_balance)
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE account_credit SET balance = ?, updated = NOW() \
+             WHERE user_id = ? AND currency = ?",
+        )
+        .bind(new_balance)
+        .bind(user_id)
+        .bind(currency)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO account_credit_event (user_id, kind, amount, currency, note) \
              VALUES (?, ?, ?, ?, ?)",
@@ -5131,12 +5175,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(user_id)
         .bind(kind)
         .bind(delta)
-        .bind(&currency)
+        .bind(currency)
         .bind(note)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        self.get_account_credit(user_id).await
+        self.get_account_credit(user_id, currency).await
     }
 
     async fn list_account_credit_events(
@@ -5164,8 +5208,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn reserve_account_credit(&self, debit: &AccountCreditDebit) -> DbResult<Option<u64>> {
         let mut tx = self.db.begin().await?;
-        let (balance, _) = lock_account_credit(&mut tx, debit.user_id).await?;
-        let reserved = account_credit_reserved(&mut *tx, debit.user_id, None).await?;
+        let balance = lock_account_credit(&mut tx, debit.user_id, &debit.currency).await?;
+        let reserved =
+            account_credit_reserved(&mut *tx, debit.user_id, &debit.currency, None).await?;
         if balance.saturating_sub(reserved) < debit.amount {
             tx.rollback().await?;
             return Ok(None);
@@ -5228,18 +5273,18 @@ impl LNVpsDbBase for LNVpsDbMysql {
         &self,
         subscription_payment_id: &Vec<u8>,
     ) -> DbResult<Option<AccountCreditDebit>> {
-        let user_id: Option<u64> = sqlx::query_scalar(
-            "SELECT user_id FROM account_credit_debit \
+        let owner: Option<(u64, String)> = sqlx::query_as(
+            "SELECT user_id, currency FROM account_credit_debit \
              WHERE subscription_payment_id = ? AND settled = 0",
         )
         .bind(subscription_payment_id)
         .fetch_optional(&self.db)
         .await?;
-        let Some(user_id) = user_id else {
+        let Some((user_id, currency)) = owner else {
             return Ok(None);
         };
         let mut tx = self.db.begin().await?;
-        let (balance, _) = lock_account_credit(&mut tx, user_id).await?;
+        let balance = lock_account_credit(&mut tx, user_id, &currency).await?;
         let debit: Option<AccountCreditDebit> = sqlx::query_as(
             "SELECT * FROM account_credit_debit \
              WHERE subscription_payment_id = ? AND settled = 0 FOR UPDATE",
@@ -5254,7 +5299,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
         let available = if debit.expires > Utc::now() {
             balance
         } else {
-            let others = account_credit_reserved(&mut *tx, debit.user_id, Some(debit.id)).await?;
+            let others =
+                account_credit_reserved(&mut *tx, debit.user_id, &debit.currency, Some(debit.id))
+                    .await?;
             balance.saturating_sub(others)
         };
         debit.clamp_to(available);
@@ -5268,11 +5315,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(debit.id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("UPDATE account_credit SET balance = ?, updated = NOW() WHERE user_id = ?")
-            .bind(balance - debit.amount)
-            .bind(debit.user_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE account_credit SET balance = ?, updated = NOW() \
+             WHERE user_id = ? AND currency = ?",
+        )
+        .bind(balance - debit.amount)
+        .bind(debit.user_id)
+        .bind(&debit.currency)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO account_credit_event \
              (user_id, kind, amount, currency, subscription_payment_id) \
@@ -5364,17 +5415,17 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn settle_account_credit_topup(&self, id: u64) -> DbResult<Option<AccountCreditTopup>> {
-        let user_id: Option<u64> = sqlx::query_scalar(
-            "SELECT user_id FROM account_credit_topup WHERE id = ? AND is_paid = 0",
+        let owner: Option<(u64, String)> = sqlx::query_as(
+            "SELECT user_id, currency FROM account_credit_topup WHERE id = ? AND is_paid = 0",
         )
         .bind(id)
         .fetch_optional(&self.db)
         .await?;
-        let Some(user_id) = user_id else {
+        let Some((user_id, currency)) = owner else {
             return Ok(None);
         };
         let mut tx = self.db.begin().await?;
-        let (balance, _) = lock_account_credit(&mut tx, user_id).await?;
+        let balance = lock_account_credit(&mut tx, user_id, &currency).await?;
         let paid = sqlx::query(
             "UPDATE account_credit_topup SET is_paid = 1, paid_at = NOW() \
              WHERE id = ? AND is_paid = 0",
@@ -5391,11 +5442,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .bind(id)
                 .fetch_one(&mut *tx)
                 .await?;
-        sqlx::query("UPDATE account_credit SET balance = ?, updated = NOW() WHERE user_id = ?")
-            .bind(balance + topup.amount)
-            .bind(topup.user_id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE account_credit SET balance = ?, updated = NOW() \
+             WHERE user_id = ? AND currency = ?",
+        )
+        .bind(balance + topup.amount)
+        .bind(topup.user_id)
+        .bind(&topup.currency)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO account_credit_event (user_id, kind, amount, currency) \
              VALUES (?, 'topup', ?, ?)",

@@ -44,8 +44,30 @@ pub struct RefundOutcome {
     /// How many refund rows were written.
     pub refund_rows: u64,
     /// Account credit returned for the share of the reversed payments that
-    /// credit paid for, in the balance currency's minor units.
-    pub credit_returned: u64,
+    /// credit paid for, as (currency, minor units) of the balance it went back to.
+    pub credit_returned: Vec<(String, u64)>,
+}
+
+pub fn describe_credit(credits: &[(String, u64)]) -> String {
+    credits
+        .iter()
+        .map(|(currency, amount)| match Currency::from_str(currency) {
+            Ok(Currency::BTC) => format!("{} sats", amount / 1000),
+            Ok(c) => CurrencyAmount::from_u64(c, *amount).to_string(),
+            Err(_) => format!("{amount} {currency}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+pub fn add_credit(totals: &mut Vec<(String, u64)>, currency: &str, amount: u64) {
+    if amount == 0 {
+        return;
+    }
+    match totals.iter_mut().find(|(c, _)| c == currency) {
+        Some((_, total)) => *total += amount,
+        None => totals.push((currency.to_string(), amount)),
+    }
 }
 
 /// One payment a refund reverses: `amount` is booked against it, `cash` of
@@ -57,6 +79,7 @@ pub struct RefundShare {
     pub amount: u64,
     pub cash: u64,
     pub credit: u64,
+    pub credit_currency: String,
 }
 
 /// A payment that can absorb a refund: what is still refundable on it and
@@ -114,6 +137,11 @@ pub fn allocate_cash_refund(
             amount,
             cash,
             credit,
+            credit_currency: c
+                .debit
+                .as_ref()
+                .map(|d| d.currency.clone())
+                .unwrap_or_default(),
         });
     }
     ensure!(
@@ -249,12 +277,13 @@ impl VmRefundHandler {
         let refunded_at = Utc::now();
         let mut refund_rows = 0;
         let mut booked_amount = 0;
-        let mut credit_returned = 0;
+        let mut credit_returned = Vec::new();
         let mut failures = Vec::new();
         for RefundShare {
             payment: original,
             amount,
             credit,
+            credit_currency,
             ..
         } in plan
         {
@@ -291,6 +320,7 @@ impl VmRefundHandler {
                     .db
                     .adjust_account_credit(
                         original.user_id,
+                        &credit_currency,
                         credit as i64,
                         "refund",
                         Some(&format!(
@@ -301,7 +331,7 @@ impl VmRefundHandler {
                     )
                     .await
                 {
-                    Ok(_) => credit_returned += credit,
+                    Ok(_) => add_credit(&mut credit_returned, &credit_currency, credit),
                     Err(e) => {
                         error!(
                             "Refund of payment {} for VM {} owes {} account credit that could not be returned: {}",
@@ -373,24 +403,25 @@ impl VmRefundHandler {
     /// add-ons (`parent_line_item_id`), over the sum of all line amounts.
     ///
     /// Every share returns as account credit, whatever paid for it:
-    /// - the part credit paid comes back as exactly the credit it took;
-    /// - the part paid in cash (Lightning, card, on-chain) is converted into the
-    ///   balance currency at today's rate.
+    /// - the part credit paid comes back as exactly the credit it took, to the
+    ///   balance it was taken from;
+    /// - the part paid in cash (Lightning, card, on-chain) comes back in the
+    ///   currency the payment was charged in, with no conversion.
     ///
     /// Each share is one refund row and one `refund` ledger event, written in a
     /// single transaction. The row id is derived from the payment, amount and
     /// `at`, so a repeat with the same `at` is refused rather than refunding
-    /// twice. Returns the credit returned, in the balance currency.
+    /// twice. Returns the credit returned per balance currency.
     pub async fn refund_unused_to_credit(
         &self,
         vm_id: u64,
         owner_id: u64,
         expires: DateTime<Utc>,
         at: DateTime<Utc>,
-    ) -> Result<u64> {
+    ) -> Result<Vec<(String, u64)>> {
         let mut unused = (expires - at).num_seconds().max(0) as u64;
         if unused == 0 {
-            return Ok(0);
+            return Ok(Vec::new());
         }
         let vm = self.db.get_vm(vm_id).await?;
         let vm_line = self
@@ -417,9 +448,6 @@ impl VmRefundHandler {
         } else {
             (vm_total as u128, lines_total as u128)
         };
-        let balance_currency =
-            Currency::from_str(&self.db.get_account_credit(owner_id).await?.currency)
-                .map_err(|_| anyhow!("invalid account credit currency"))?;
 
         let mut payments: Vec<SubscriptionPayment> = self
             .db
@@ -430,7 +458,7 @@ impl VmRefundHandler {
             .collect();
         payments.sort_by_key(|p| std::cmp::Reverse(p.created));
 
-        let mut returned = 0;
+        let mut returned = Vec::new();
         for payment in payments {
             if unused == 0 {
                 break;
@@ -464,27 +492,17 @@ impl VmRefundHandler {
                 .unwrap_or(0);
             let gross_from_credit = (gross as u128 * credit_paid as u128 / billable as u128) as u64;
             let gross_from_cash = gross - gross_from_credit;
-            // Floors, so rounding never returns more credit than was taken.
             let credit_back = debit
                 .as_ref()
                 .map(|d| {
                     (d.amount as u128 * gross_from_credit as u128 / d.payment_amount as u128) as u64
                 })
                 .unwrap_or(0);
-            let cash_back = if gross_from_cash > 0 {
-                let currency = Currency::from_str(&payment.currency)
-                    .map_err(|_| anyhow!("invalid payment currency {}", payment.currency))?;
-                self.pricing
-                    .convert_currency(
-                        CurrencyAmount::from_u64(currency, gross_from_cash),
-                        balance_currency,
-                    )
-                    .await?
-                    .value()
-            } else {
-                0
-            };
-            let credit = credit_back + cash_back;
+            let mut credits = Vec::new();
+            if let Some(d) = &debit {
+                add_credit(&mut credits, &d.currency, credit_back);
+            }
+            add_credit(&mut credits, &payment.currency, gross_from_cash);
 
             let mut row = build_refund_row(
                 &payment,
@@ -510,8 +528,13 @@ impl VmRefundHandler {
             if let Some(refund) = row.metadata.as_mut().and_then(|m| m.get_mut("refund")) {
                 refund["recorded_by_admin_user_id"] = serde_json::Value::Null;
                 refund["by_owner_user_id"] = serde_json::json!(owner_id);
-                refund["returned_as_credit"] = serde_json::json!(credit);
-                refund["returned_from_cash"] = serde_json::json!(cash_back);
+                refund["returned_as_credit"] = serde_json::json!(
+                    credits
+                        .iter()
+                        .cloned()
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                );
+                refund["returned_from_cash"] = serde_json::json!(gross_from_cash);
             }
             let note = format!(
                 "VM {} deleted, unused time of payment {}",
@@ -520,7 +543,7 @@ impl VmRefundHandler {
             );
             if !self
                 .db
-                .insert_refund_to_credit(&row, credit, Some(&note))
+                .insert_refund_to_credit(&row, &credits, Some(&note))
                 .await?
             {
                 info!(
@@ -529,7 +552,9 @@ impl VmRefundHandler {
                 );
                 continue;
             }
-            returned += credit;
+            for (currency, amount) in &credits {
+                add_credit(&mut returned, currency, *amount);
+            }
             if let Err(e) = self
                 .history
                 .log_vm_refunded(
@@ -984,6 +1009,14 @@ mod tests {
         assert_eq!(older_refunds[0].amount + older_refunds[0].tax, 30);
     }
 
+    fn amount_in(credits: &[(String, u64)], currency: &str) -> u64 {
+        credits
+            .iter()
+            .filter(|(c, _)| c == currency)
+            .map(|(_, a)| a)
+            .sum()
+    }
+
     fn debit(
         payment: &SubscriptionPayment,
         payment_amount: u64,
@@ -1106,9 +1139,12 @@ mod tests {
             "only the cash share is paid out"
         );
         assert_eq!(outcome.booked_amount, 60);
-        assert_eq!(outcome.credit_returned, 300_000);
+        assert_eq!(outcome.credit_returned, vec![("BTC".to_string(), 300_000)]);
         assert_eq!(
-            db.get_account_credit(vm.user_id).await.unwrap().balance,
+            db.get_account_credit(vm.user_id, "BTC")
+                .await
+                .unwrap()
+                .balance,
             300_000
         );
         let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
@@ -1145,16 +1181,24 @@ mod tests {
             .refund_unused_to_credit(vm.id, vm.user_id, sub.expires.unwrap(), Utc::now())
             .await
             .unwrap();
-        // Half is 615 cents. The clock moves between the fixture and the call,
-        // and the share floors to a whole cent (10_000 msat), so it is 614 or
-        // 615 cents' worth of the debit, never more.
+        let returned = amount_in(&returned, "BTC");
         assert!(
             (6_140_000..=6_150_000).contains(&returned),
             "unexpected credit returned"
         );
         assert_eq!(
-            db.get_account_credit(vm.user_id).await.unwrap().balance,
+            db.get_account_credit(vm.user_id, "BTC")
+                .await
+                .unwrap()
+                .balance,
             returned
+        );
+        assert_eq!(
+            db.get_account_credit(vm.user_id, "EUR")
+                .await
+                .unwrap()
+                .balance,
+            0
         );
         let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
         assert_eq!(refunds.len(), 1);
@@ -1201,28 +1245,38 @@ mod tests {
             .refund_unused_to_credit(vm.id, vm.user_id, sub.expires.unwrap(), Utc::now())
             .await
             .unwrap();
+        let returned = amount_in(&returned, "EUR");
         assert!(returned > 0);
         assert_eq!(
-            db.get_account_credit(vm.user_id).await.unwrap().balance,
+            db.get_account_credit(vm.user_id, "EUR")
+                .await
+                .unwrap()
+                .balance,
             returned,
             "the owner is credited"
         );
         assert_eq!(
-            db.get_account_credit(other).await.unwrap().balance,
+            db.get_account_credit(other, "EUR").await.unwrap().balance,
             0,
             "the recorded payer is not"
         );
         let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
-        assert_eq!(refunds[0].user_id, vm.user_id, "the refund row names the owner");
+        assert_eq!(
+            refunds[0].user_id, vm.user_id,
+            "the refund row names the owner"
+        );
         let (events, _) = db
             .list_account_credit_events(vm.user_id, 10, 0)
             .await
             .unwrap();
-        assert_eq!((events[0].kind.as_str(), events[0].amount), ("refund", returned as i64));
+        assert_eq!(
+            (events[0].kind.as_str(), events[0].amount),
+            ("refund", returned as i64)
+        );
     }
 
-    /// Time paid for in cash comes back as credit too, converted at today's
-    /// rate: 615 of 1230 cents at 100k EUR/BTC is 6.15M msat.
+    /// Time paid for in cash comes back as credit in the currency it was
+    /// charged in: 615 of 1230 EUR cents is 615 EUR cents of credit, not sats.
     #[tokio::test]
     async fn cash_paid_unused_time_returns_as_credit() {
         let mock = MockDb::default();
@@ -1238,18 +1292,31 @@ mod tests {
             .refund_unused_to_credit(vm.id, vm.user_id, sub.expires.unwrap(), Utc::now())
             .await
             .unwrap();
+        assert!(returned.iter().all(|(c, _)| c == "EUR"), "{returned:?}");
+        let returned = amount_in(&returned, "EUR");
         assert!(
-            (6_140_000..=6_150_000).contains(&returned),
-            "unexpected credit returned"
+            (614..=615).contains(&returned),
+            "unexpected credit {returned}"
         );
         assert_eq!(
-            db.get_account_credit(vm.user_id).await.unwrap().balance,
+            db.get_account_credit(vm.user_id, "EUR")
+                .await
+                .unwrap()
+                .balance,
             returned
+        );
+        assert_eq!(
+            db.get_account_credit(vm.user_id, "BTC")
+                .await
+                .unwrap()
+                .balance,
+            0
         );
         let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
         assert_eq!(refunds.len(), 1);
         let meta = refunds[0].metadata.as_ref().unwrap();
         assert_eq!(meta["refund"]["returned_from_cash"], returned);
+        assert_eq!(meta["refund"]["returned_as_credit"]["EUR"], returned);
         // The ledger event points at the refund row it pays out.
         let (events, _) = db
             .list_account_credit_events(vm.user_id, 10, 0)
@@ -1283,12 +1350,12 @@ mod tests {
             .refund_unused_to_credit(vm.id, vm.user_id, expires, at)
             .await
             .unwrap();
-        assert!(first > 0);
+        assert!(!first.is_empty());
         let second = handler
             .refund_unused_to_credit(vm.id, vm.user_id, expires, at)
             .await
             .unwrap();
-        assert_eq!(second, 0, "the repeat returns nothing");
+        assert!(second.is_empty(), "the repeat returns nothing");
         assert_eq!(
             db.list_refunds_for_payment(&payment.id)
                 .await
@@ -1297,8 +1364,11 @@ mod tests {
             1
         );
         assert_eq!(
-            db.get_account_credit(vm.user_id).await.unwrap().balance,
-            first
+            db.get_account_credit(vm.user_id, "EUR")
+                .await
+                .unwrap()
+                .balance,
+            amount_in(&first, "EUR")
         );
     }
 
@@ -1407,11 +1477,22 @@ mod tests {
             .refund_unused_to_credit(vm.id, vm.user_id, expires, Utc::now())
             .await
             .unwrap();
-        // Half of each part: 300 cents of credit = 4.5M msat as debited, and
-        // ~315 cents of cash = ~3.15M msat at today's rate.
+        // Half of each part: 300 cents of credit comes back as the 4.5M msat
+        // debited, and ~315 cents of cash comes back as EUR cents.
         assert!(
-            (7_620_000..=7_660_000).contains(&returned),
-            "unexpected credit returned"
+            (4_480_000..=4_500_000).contains(&amount_in(&returned, "BTC")),
+            "unexpected credit {returned:?}"
+        );
+        assert!(
+            (314..=316).contains(&amount_in(&returned, "EUR")),
+            "unexpected credit {returned:?}"
+        );
+        assert_eq!(
+            db.get_account_credit(vm.user_id, "EUR")
+                .await
+                .unwrap()
+                .balance,
+            amount_in(&returned, "EUR")
         );
     }
 
@@ -1432,7 +1513,7 @@ mod tests {
             .refund_unused_to_credit(vm.id, vm.user_id, past, Utc::now())
             .await
             .unwrap();
-        assert_eq!(returned, 0);
+        assert!(returned.is_empty());
         assert!(
             db.list_refunds_for_payment(&payment.id)
                 .await

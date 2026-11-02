@@ -3071,7 +3071,7 @@ mod tests {
         let err = ensure_hourly_order_funded(&state, &vm).await.unwrap_err();
         assert!(err.error.contains("account credit"), "{}", err.error);
 
-        db.adjust_account_credit(uid, 10_000_000_000, "topup", None)
+        db.adjust_account_credit(uid, "BTC", 10_000_000_000, "topup", None)
             .await
             .unwrap();
         assert!(

@@ -1,6 +1,6 @@
 use super::*;
-use lnvps_api_common::ApiIntervalType;
 use crate::admin::model::Permission;
+use lnvps_api_common::ApiIntervalType;
 use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VatClient, VmStateCache};
 use serde_json::json;
 
@@ -147,15 +147,12 @@ async fn update_and_copy_carry_bandwidth_pricing() {
 #[tokio::test]
 async fn interval_defaults_to_monthly_and_copy_can_override_it() {
     let this = state();
-    let created = admin_create_custom_pricing(
-        auth(),
-        State(this.clone()),
-        Json(create_request(json!({}))),
-    )
-    .await
-    .unwrap()
-    .0
-    .data;
+    let created =
+        admin_create_custom_pricing(auth(), State(this.clone()), Json(create_request(json!({}))))
+            .await
+            .unwrap()
+            .0
+            .data;
     assert_eq!(created.interval_amount, 1);
     assert_eq!(created.interval_type, ApiIntervalType::Month);
 
@@ -173,11 +170,12 @@ async fn interval_defaults_to_monthly_and_copy_can_override_it() {
         json!({ "name": "hourly", "interval_type": "hour", "interval_amount": 1 }),
     )
     .unwrap();
-    let hourly = admin_copy_custom_pricing(auth(), State(this.clone()), Path(created.id), Json(copy))
-        .await
-        .unwrap()
-        .0
-        .data;
+    let hourly =
+        admin_copy_custom_pricing(auth(), State(this.clone()), Path(created.id), Json(copy))
+            .await
+            .unwrap()
+            .0
+            .data;
     assert_eq!(hourly.interval_type, ApiIntervalType::Hour);
     // Rates are per interval, so the copy holds the hourly equivalent in a finer
     // unit: 100 cents a month is 1/720th of that an hour, i.e. 1389 at 1/10_000 cent.
@@ -191,11 +189,12 @@ async fn interval_defaults_to_monthly_and_copy_can_override_it() {
     // While no VM uses the model its interval can change; a zero amount is refused.
     let patch: UpdateCustomPricingRequest =
         serde_json::from_value(json!({ "interval_type": "day", "interval_amount": 2 })).unwrap();
-    let updated = admin_update_custom_pricing(auth(), State(this.clone()), Path(created.id), Json(patch))
-        .await
-        .unwrap()
-        .0
-        .data;
+    let updated =
+        admin_update_custom_pricing(auth(), State(this.clone()), Path(created.id), Json(patch))
+            .await
+            .unwrap()
+            .0
+            .data;
     assert_eq!(updated.interval_type, ApiIntervalType::Day);
     assert_eq!(updated.interval_amount, 2);
     let zero: UpdateCustomPricingRequest =
@@ -220,22 +219,28 @@ fn rates_convert_between_intervals_and_scales() {
     assert_eq!(110, convert_rate(110, 1, month, 1, month));
     assert_eq!(0, convert_rate(0, 1, month, 10_000, hour));
     // 1 cent a year is a fraction of a cent an hour at scale 1, but not free.
-    assert_eq!(1, convert_rate(1, 1, interval_hours(lnvps_db::IntervalType::Year, 1), 1, hour));
+    assert_eq!(
+        1,
+        convert_rate(
+            1,
+            1,
+            interval_hours(lnvps_db::IntervalType::Year, 1),
+            1,
+            hour
+        )
+    );
 }
 
 #[tokio::test]
 async fn interval_cannot_change_under_existing_vms() {
     let this = state();
-    let id = admin_create_custom_pricing(
-        auth(),
-        State(this.clone()),
-        Json(create_request(json!({}))),
-    )
-    .await
-    .unwrap()
-    .0
-    .data
-    .id;
+    let id =
+        admin_create_custom_pricing(auth(), State(this.clone()), Json(create_request(json!({}))))
+            .await
+            .unwrap()
+            .0
+            .data
+            .id;
     this.db
         .insert_custom_vm_template(&lnvps_db::VmCustomTemplate {
             pricing_id: id,
@@ -243,7 +248,10 @@ async fn interval_cannot_change_under_existing_vms() {
         })
         .await
         .unwrap();
-    for body in [json!({ "interval_type": "hour" }), json!({ "rate_scale": 10000 })] {
+    for body in [
+        json!({ "interval_type": "hour" }),
+        json!({ "rate_scale": 10000 }),
+    ] {
         let patch: UpdateCustomPricingRequest = serde_json::from_value(body).unwrap();
         assert!(
             admin_update_custom_pricing(auth(), State(this.clone()), Path(id), Json(patch))

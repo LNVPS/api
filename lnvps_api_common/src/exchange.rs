@@ -104,7 +104,8 @@ impl TickerRate {
         } else {
             (self.ticker.0, 1.0 / rate)
         };
-        let src_standard = source.value() as f64 / (Self::scale(source.currency()) * scale.max(1) as f64);
+        let src_standard =
+            source.value() as f64 / (Self::scale(source.currency()) * scale.max(1) as f64);
         let dst_standard = src_standard * factor;
         let dst_smallest = (dst_standard * Self::scale(target)).round() as u64;
         Ok(CurrencyAmount::from_u64(target, dst_smallest))

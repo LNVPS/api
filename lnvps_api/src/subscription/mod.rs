@@ -1690,17 +1690,29 @@ impl SubscriptionHandler {
         gross: u64,
         currency: Currency,
     ) -> Result<Option<AppliedCredit>> {
-        let credit = self.db.get_account_credit(user_id).await?;
-        if !credit.auto_apply || credit.balance == 0 || gross == 0 {
+        let credits = self.db.list_account_credits(user_id).await?;
+        if !credits.iter().any(|c| c.auto_apply) || gross == 0 {
             return Ok(None);
         }
-        let available = credit
-            .balance
-            .saturating_sub(self.db.get_account_credit_reserved(user_id).await?);
-        if available == 0 {
-            return Ok(None);
+        let mut spendable = Vec::new();
+        for c in credits {
+            let reserved = self
+                .db
+                .get_account_credit_reserved(user_id, &c.currency)
+                .await?;
+            let available = c.balance.saturating_sub(reserved);
+            if available > 0 {
+                spendable.push((c.currency, available));
+            }
         }
-        let base_currency = Currency::from_str(&credit.currency)
+        let chosen = spendable
+            .iter()
+            .find(|(c, _)| *c == currency.to_string())
+            .or_else(|| spendable.first());
+        let Some((balance_currency, available)) = chosen.cloned() else {
+            return Ok(None);
+        };
+        let base_currency = Currency::from_str(&balance_currency)
             .map_err(|_| anyhow::anyhow!("Invalid credit currency"))?;
         let converted = self
             .pe
@@ -2353,10 +2365,14 @@ impl SubscriptionHandler {
             .ok_or_else(|| anyhow::anyhow!("No NWC payment method configured"))
     }
 
+    async fn has_spendable_credit(&self, user_id: u64) -> Result<bool> {
+        let credits = self.db.list_account_credits(user_id).await?;
+        Ok(credits.iter().any(|c| c.auto_apply && c.balance > 0))
+    }
+
     pub async fn credit_covers_renewal(&self, sub_id: u64) -> Result<bool> {
         let sub = self.db.get_subscription(sub_id).await?;
-        let credit = self.db.get_account_credit(sub.user_id).await?;
-        if !credit.auto_apply || credit.balance == 0 {
+        if !self.has_spendable_credit(sub.user_id).await? {
             return Ok(false);
         }
         let quote = self
@@ -2374,7 +2390,6 @@ impl SubscriptionHandler {
     pub async fn auto_renew(&self, sub_id: u64) -> Result<SubscriptionPayment> {
         let sub = self.db.get_subscription(sub_id).await?;
 
-        let credit = self.db.get_account_credit(sub.user_id).await?;
         if self.credit_covers_renewal(sub_id).await? {
             let payment = self
                 .renew_subscription_inner(
@@ -2392,7 +2407,7 @@ impl SubscriptionHandler {
 
         let method = match self.default_payment_method(sub.user_id).await {
             Ok(m) => m,
-            Err(_) if credit.auto_apply && credit.balance > 0 => {
+            Err(_) if self.has_spendable_credit(sub.user_id).await? => {
                 bail!(
                     "Account credit does not cover the renewal and no saved payment method is set"
                 )
@@ -4397,7 +4412,7 @@ mod credit_tests {
 
     async fn give_credit(db: &MockDb, user_id: u64, balance: u64, auto_apply: bool) {
         if balance > 0 {
-            db.adjust_account_credit(user_id, balance as i64, "topup", None)
+            db.adjust_account_credit(user_id, "BTC", balance as i64, "topup", None)
                 .await
                 .unwrap();
         }
@@ -4524,6 +4539,38 @@ mod credit_tests {
     }
 
     #[tokio::test]
+    async fn a_balance_in_the_bill_currency_is_spent_before_another_one() {
+        let (db, sub, user_id, _) = setup().await;
+        give_credit(&db, user_id, 500_000_000, true).await;
+        db.adjust_account_credit(user_id, "EUR", 4_000, "refund", None)
+            .await
+            .unwrap();
+
+        let credit = sub
+            .quote_credit(user_id, 10_000, Currency::EUR)
+            .await
+            .unwrap()
+            .expect("credit applies");
+        assert_eq!(
+            (credit.base_currency, credit.base_amount, credit.amount),
+            (Currency::EUR, 4_000, 4_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_balance_in_another_currency_is_converted_when_none_matches() {
+        let (db, sub, user_id, _) = setup().await;
+        give_credit(&db, user_id, 500_000_000, true).await;
+
+        let credit = sub
+            .quote_credit(user_id, 10_000, Currency::EUR)
+            .await
+            .unwrap()
+            .expect("credit applies");
+        assert_eq!(credit.base_currency, Currency::BTC);
+    }
+
+    #[tokio::test]
     async fn a_partly_credit_funded_renewal_holds_the_credit() {
         let (db, sub, user_id, sub_id) = setup().await;
         give_credit(&db, user_id, 5_000_000, true).await;
@@ -4540,11 +4587,13 @@ mod credit_tests {
         assert_eq!(debit.expires, payment.expires);
         assert!(!debit.settled);
         assert_eq!(
-            db.get_account_credit(user_id).await.unwrap().balance,
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
             5_000_000
         );
         assert_eq!(
-            db.get_account_credit_reserved(user_id).await.unwrap(),
+            db.get_account_credit_reserved(user_id, "BTC")
+                .await
+                .unwrap(),
             5_000_000
         );
 
@@ -4553,7 +4602,10 @@ mod credit_tests {
         assert_eq!(credit.base_amount, 5_000_000);
 
         sub.apply_payment(&payment).await.unwrap();
-        assert_eq!(db.get_account_credit(user_id).await.unwrap().balance, 0);
+        assert_eq!(
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
+            0
+        );
     }
 
     #[tokio::test]
@@ -4593,7 +4645,7 @@ mod credit_tests {
             .unwrap();
         assert_eq!((spent.amount, spent.payment_amount), (2_000_000, 200));
         assert_eq!(
-            db.get_account_credit(user_id).await.unwrap().balance,
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
             3_000_000
         );
     }
@@ -4628,7 +4680,12 @@ mod credit_tests {
             )
             .await;
         assert!(res.is_err(), "no saved card to charge");
-        assert_eq!(db.get_account_credit_reserved(user_id).await.unwrap(), 0);
+        assert_eq!(
+            db.get_account_credit_reserved(user_id, "BTC")
+                .await
+                .unwrap(),
+            0
+        );
         assert!(db.account_credit_debits.lock().await.is_empty());
     }
 
@@ -4669,7 +4726,12 @@ mod credit_tests {
 
         assert!(renew(&sub, sub_id).await.is_err());
         assert!(db.subscription_payments.lock().await.is_empty());
-        assert_eq!(db.get_account_credit_reserved(user_id).await.unwrap(), 0);
+        assert_eq!(
+            db.get_account_credit_reserved(user_id, "BTC")
+                .await
+                .unwrap(),
+            0
+        );
         assert!(db.account_credit_debits.lock().await.is_empty());
     }
 
@@ -4683,7 +4745,7 @@ mod credit_tests {
         let payment = renew(&sub, sub_id).await.unwrap();
         assert!(payment.is_paid);
         assert_eq!(payment.external_data.as_str(), CREDIT_FUNDED_MARKER);
-        assert!(db.get_account_credit(user_id).await.unwrap().balance < 500_000_000);
+        assert!(db.get_account_credit(user_id, "BTC").await.unwrap().balance < 500_000_000);
     }
 
     /// Other intervals are untouched: the same unfunded order is still created.
@@ -4711,7 +4773,7 @@ mod credit_tests {
         assert!(debit.settled);
         assert_eq!(debit.amount, 10_000_000);
         assert_eq!(
-            db.get_account_credit(user_id).await.unwrap().balance,
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
             10_000_000
         );
 
@@ -4878,7 +4940,7 @@ mod credit_tests {
         assert_eq!(payment.external_data.as_str(), CREDIT_FUNDED_MARKER);
         assert_eq!(payment.payment_type, SubscriptionPaymentType::Upgrade);
         assert_eq!(
-            db.get_account_credit(user_id).await.unwrap().balance,
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
             100_000_000_000 - (payment.amount + payment.tax)
         );
     }
@@ -4904,7 +4966,9 @@ mod credit_tests {
             .unwrap();
         assert_eq!(debit.amount, 1_000);
         assert_eq!(
-            db.get_account_credit_reserved(user_id).await.unwrap(),
+            db.get_account_credit_reserved(user_id, "BTC")
+                .await
+                .unwrap(),
             1_000
         );
     }
@@ -4927,7 +4991,10 @@ mod credit_tests {
 
         let first = renew(&sub, sub_id).await.unwrap();
         assert!(first.is_paid);
-        assert_eq!(db.get_account_credit(user_id).await.unwrap().balance, 0);
+        assert_eq!(
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
+            0
+        );
 
         let second = renew(&sub, sub_id).await.unwrap();
         assert!(!second.is_paid);
@@ -4957,7 +5024,7 @@ mod credit_tests {
         assert!(payment.is_paid, "fully credit-funded settles immediately");
         assert_eq!(payment.external_data.as_str(), CREDIT_FUNDED_MARKER);
         assert_eq!(
-            db.get_account_credit(user_id).await.unwrap().balance,
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
             15_000_000 - 10_000_000,
             "the bill is spent from the balance"
         );

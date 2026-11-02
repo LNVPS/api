@@ -79,7 +79,7 @@ pub struct MockDb {
     pub referrals: Arc<Mutex<HashMap<u64, Referral>>>,
     pub discounts: Arc<Mutex<HashMap<u64, Discount>>>,
     pub discount_redemptions: Arc<Mutex<Vec<DiscountRedemption>>>,
-    pub account_credits: Arc<Mutex<HashMap<u64, lnvps_db::AccountCredit>>>,
+    pub account_credits: Arc<Mutex<HashMap<(u64, String), lnvps_db::AccountCredit>>>,
     pub account_credit_events: Arc<Mutex<Vec<lnvps_db::AccountCreditEvent>>>,
     pub account_credit_debits: Arc<Mutex<Vec<lnvps_db::AccountCreditDebit>>>,
     pub account_credit_topups: Arc<Mutex<Vec<lnvps_db::AccountCreditTopup>>>,
@@ -584,25 +584,52 @@ impl Default for MockDb {
     }
 }
 
-fn empty_account_credit(user_id: u64) -> lnvps_db::AccountCredit {
+fn empty_account_credit(
+    credits: &HashMap<(u64, String), lnvps_db::AccountCredit>,
+    user_id: u64,
+    currency: &str,
+) -> lnvps_db::AccountCredit {
     lnvps_db::AccountCredit {
         user_id,
         balance: 0,
-        currency: "BTC".to_string(),
-        auto_apply: false,
+        currency: currency.to_string(),
+        auto_apply: credits
+            .iter()
+            .any(|((u, _), c)| *u == user_id && c.auto_apply),
         updated: Utc::now(),
     }
+}
+
+fn credit_row<'a>(
+    credits: &'a mut HashMap<(u64, String), lnvps_db::AccountCredit>,
+    user_id: u64,
+    currency: &str,
+) -> &'a mut lnvps_db::AccountCredit {
+    if !credits.contains_key(&(user_id, currency.to_string())) {
+        let row = empty_account_credit(credits, user_id, currency);
+        credits.insert((user_id, currency.to_string()), row);
+    }
+    credits
+        .get_mut(&(user_id, currency.to_string()))
+        .expect("inserted above")
 }
 
 fn reserved_credit(
     debits: &[lnvps_db::AccountCreditDebit],
     user_id: u64,
+    currency: &str,
     exclude: Option<u64>,
 ) -> u64 {
     let now = Utc::now();
     debits
         .iter()
-        .filter(|d| d.user_id == user_id && !d.settled && d.expires > now && Some(d.id) != exclude)
+        .filter(|d| {
+            d.user_id == user_id
+                && d.currency == currency
+                && !d.settled
+                && d.expires > now
+                && Some(d.id) != exclude
+        })
         .map(|d| d.amount)
         .sum()
 }
@@ -4569,37 +4596,50 @@ impl LNVpsDbBase for MockDb {
     // Account credit
     // ========================================================================
 
-    async fn get_account_credit(&self, user_id: u64) -> DbResult<lnvps_db::AccountCredit> {
-        let credits = self.account_credits.lock().await;
-        Ok(credits
-            .get(&user_id)
-            .cloned()
-            .unwrap_or_else(|| empty_account_credit(user_id)))
-    }
-
-    async fn set_account_credit_auto_apply(
+    async fn get_account_credit(
         &self,
         user_id: u64,
-        auto_apply: bool,
+        currency: &str,
     ) -> DbResult<lnvps_db::AccountCredit> {
-        let mut credits = self.account_credits.lock().await;
-        let row = credits
-            .entry(user_id)
-            .or_insert_with(|| empty_account_credit(user_id));
-        row.auto_apply = auto_apply;
-        row.updated = Utc::now();
-        Ok(row.clone())
+        let credits = self.account_credits.lock().await;
+        Ok(credits
+            .get(&(user_id, currency.to_string()))
+            .cloned()
+            .unwrap_or_else(|| empty_account_credit(&credits, user_id, currency)))
     }
 
-    async fn get_account_credit_reserved(&self, user_id: u64) -> DbResult<u64> {
+    async fn list_account_credits(&self, user_id: u64) -> DbResult<Vec<lnvps_db::AccountCredit>> {
+        let credits = self.account_credits.lock().await;
+        let mut rows: Vec<_> = credits
+            .values()
+            .filter(|c| c.user_id == user_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.currency.cmp(&b.currency));
+        Ok(rows)
+    }
+
+    async fn set_account_credit_auto_apply(&self, user_id: u64, auto_apply: bool) -> DbResult<()> {
+        let mut credits = self.account_credits.lock().await;
+        if !credits.keys().any(|(u, _)| *u == user_id) {
+            credit_row(&mut credits, user_id, "BTC");
+        }
+        for row in credits.values_mut().filter(|c| c.user_id == user_id) {
+            row.auto_apply = auto_apply;
+            row.updated = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn get_account_credit_reserved(&self, user_id: u64, currency: &str) -> DbResult<u64> {
         let debits = self.account_credit_debits.lock().await;
-        Ok(reserved_credit(&debits, user_id, None))
+        Ok(reserved_credit(&debits, user_id, currency, None))
     }
 
     async fn insert_refund_to_credit(
         &self,
         refund: &SubscriptionPayment,
-        credit: u64,
+        credits: &[(String, u64)],
         note: Option<&str>,
     ) -> DbResult<bool> {
         if self
@@ -4612,12 +4652,10 @@ impl LNVpsDbBase for MockDb {
             return Ok(false);
         }
         self.insert_subscription_payment(refund).await?;
-        if credit > 0 {
-            let mut credits = self.account_credits.lock().await;
-            let mut events = self.account_credit_events.lock().await;
-            let row = credits
-                .entry(refund.user_id)
-                .or_insert_with(|| empty_account_credit(refund.user_id));
+        let mut balances = self.account_credits.lock().await;
+        let mut events = self.account_credit_events.lock().await;
+        for (currency, credit) in credits.iter().filter(|(_, c)| *c > 0) {
+            let row = credit_row(&mut balances, refund.user_id, currency);
             row.balance += credit;
             row.updated = Utc::now();
             let event_id = events.len() as u64 + 1;
@@ -4625,8 +4663,8 @@ impl LNVpsDbBase for MockDb {
                 id: event_id,
                 user_id: refund.user_id,
                 kind: "refund".to_string(),
-                amount: credit as i64,
-                currency: row.currency.clone(),
+                amount: *credit as i64,
+                currency: currency.clone(),
                 subscription_payment_id: Some(refund.id.clone()),
                 note: note.map(str::to_string),
                 created: Utc::now(),
@@ -4638,6 +4676,7 @@ impl LNVpsDbBase for MockDb {
     async fn adjust_account_credit(
         &self,
         user_id: u64,
+        currency: &str,
         delta: i64,
         kind: &str,
         note: Option<&str>,
@@ -4645,9 +4684,7 @@ impl LNVpsDbBase for MockDb {
         let mut credits = self.account_credits.lock().await;
         let debits = self.account_credit_debits.lock().await;
         let mut events = self.account_credit_events.lock().await;
-        let row = credits
-            .entry(user_id)
-            .or_insert_with(|| empty_account_credit(user_id));
+        let row = credit_row(&mut credits, user_id, currency);
         if delta == 0 {
             return Ok(row.clone());
         }
@@ -4656,7 +4693,7 @@ impl LNVpsDbBase for MockDb {
         } else {
             let available = row
                 .balance
-                .saturating_sub(reserved_credit(&debits, user_id, None));
+                .saturating_sub(reserved_credit(&debits, user_id, currency, None));
             if delta.unsigned_abs() > available {
                 return Err(anyhow!(
                     "account credit for user {user_id} has {available} unreserved, cannot remove {}",
@@ -4673,7 +4710,7 @@ impl LNVpsDbBase for MockDb {
             user_id,
             kind: kind.to_string(),
             amount: delta,
-            currency: row.currency.clone(),
+            currency: currency.to_string(),
             subscription_payment_id: None,
             note: note.map(str::to_string),
             created: Utc::now(),
@@ -4710,8 +4747,17 @@ impl LNVpsDbBase for MockDb {
     ) -> DbResult<Option<u64>> {
         let credits = self.account_credits.lock().await;
         let mut debits = self.account_credit_debits.lock().await;
-        let balance = credits.get(&debit.user_id).map(|c| c.balance).unwrap_or(0);
-        if balance.saturating_sub(reserved_credit(&debits, debit.user_id, None)) < debit.amount {
+        let balance = credits
+            .get(&(debit.user_id, debit.currency.clone()))
+            .map(|c| c.balance)
+            .unwrap_or(0);
+        if balance.saturating_sub(reserved_credit(
+            &debits,
+            debit.user_id,
+            &debit.currency,
+            None,
+        )) < debit.amount
+        {
             return Ok(None);
         }
         let id = debits.len() as u64 + 1;
@@ -4770,14 +4816,17 @@ impl LNVpsDbBase for MockDb {
             return Ok(None);
         };
         let user_id = debits[idx].user_id;
-        let row = credits
-            .entry(user_id)
-            .or_insert_with(|| empty_account_credit(user_id));
+        let currency = debits[idx].currency.clone();
+        let row = credit_row(&mut credits, user_id, &currency);
         let available = if debits[idx].expires > Utc::now() {
             row.balance
         } else {
-            row.balance
-                .saturating_sub(reserved_credit(&debits, user_id, Some(debits[idx].id)))
+            row.balance.saturating_sub(reserved_credit(
+                &debits,
+                user_id,
+                &currency,
+                Some(debits[idx].id),
+            ))
         };
         let debit = &mut debits[idx];
         debit.clamp_to(available);
@@ -4876,9 +4925,7 @@ impl LNVpsDbBase for MockDb {
         row.is_paid = true;
         row.paid_at = Some(Utc::now());
         let settled = row.clone();
-        let entry = credits
-            .entry(settled.user_id)
-            .or_insert_with(|| empty_account_credit(settled.user_id));
+        let entry = credit_row(&mut credits, settled.user_id, &settled.currency);
         entry.balance += settled.amount;
         entry.updated = Utc::now();
         let event_id = events.len() as u64 + 1;
@@ -13713,7 +13760,7 @@ mod account_credit_tests {
     #[tokio::test]
     async fn get_credit_returns_zero_row_for_unknown_user() {
         let db = MockDb::default();
-        let row = db.get_account_credit(42).await.unwrap();
+        let row = db.get_account_credit(42, "BTC").await.unwrap();
         assert_eq!(row.user_id, 42);
         assert_eq!(row.balance, 0);
         assert_eq!(row.currency, "BTC");
@@ -13723,13 +13770,15 @@ mod account_credit_tests {
     #[tokio::test]
     async fn set_auto_apply_keeps_the_balance() {
         let db = MockDb::default();
-        db.adjust_account_credit(7, 500, "topup", None)
+        db.adjust_account_credit(7, "BTC", 500, "topup", None)
             .await
             .unwrap();
-        let row = db.set_account_credit_auto_apply(7, true).await.unwrap();
+        db.set_account_credit_auto_apply(7, true).await.unwrap();
+        let row = db.get_account_credit(7, "BTC").await.unwrap();
         assert!(row.auto_apply);
         assert_eq!(row.balance, 500);
-        let row = db.set_account_credit_auto_apply(7, false).await.unwrap();
+        db.set_account_credit_auto_apply(7, false).await.unwrap();
+        let row = db.get_account_credit(7, "BTC").await.unwrap();
         assert!(!row.auto_apply);
         assert_eq!(row.balance, 500);
     }
@@ -13737,10 +13786,10 @@ mod account_credit_tests {
     #[tokio::test]
     async fn ledger_is_signed_and_sums_to_the_balance() {
         let db = MockDb::default();
-        db.adjust_account_credit(1, 1000, "topup", None)
+        db.adjust_account_credit(1, "BTC", 1000, "topup", None)
             .await
             .unwrap();
-        db.adjust_account_credit(1, -300, "admin", Some("clawback"))
+        db.adjust_account_credit(1, "BTC", -300, "admin", Some("clawback"))
             .await
             .unwrap();
         let id = db
@@ -13764,7 +13813,7 @@ mod account_credit_tests {
                 .collect::<Vec<_>>(),
             vec![("spend", -200), ("admin", -300), ("topup", 1000)]
         );
-        assert_eq!(db.get_account_credit(1).await.unwrap().balance, 500);
+        assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 500);
         assert_eq!(ledger_sum(&db, 1).await, 500);
     }
 
@@ -13772,11 +13821,13 @@ mod account_credit_tests {
     async fn ledger_is_paginated_newest_first() {
         let db = MockDb::default();
         for i in 1..=5 {
-            db.adjust_account_credit(1, i * 100, "topup", None)
+            db.adjust_account_credit(1, "BTC", i * 100, "topup", None)
                 .await
                 .unwrap();
         }
-        db.adjust_account_credit(2, 1, "topup", None).await.unwrap();
+        db.adjust_account_credit(2, "BTC", 1, "topup", None)
+            .await
+            .unwrap();
 
         let (page, total) = db.list_account_credit_events(1, 3, 0).await.unwrap();
         assert_eq!(total, 5);
@@ -13789,7 +13840,7 @@ mod account_credit_tests {
     #[tokio::test]
     async fn a_reservation_holds_credit_until_it_expires() {
         let db = MockDb::default();
-        db.adjust_account_credit(1, 1000, "topup", None)
+        db.adjust_account_credit(1, "BTC", 1000, "topup", None)
             .await
             .unwrap();
 
@@ -13799,7 +13850,7 @@ mod account_credit_tests {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(db.get_account_credit_reserved(1).await.unwrap(), 700);
+        assert_eq!(db.get_account_credit_reserved(1, "BTC").await.unwrap(), 700);
         assert!(
             db.reserve_account_credit(&hold(1, 700, 600))
                 .await
@@ -13816,7 +13867,7 @@ mod account_credit_tests {
 
         let other = MockDb::default();
         other
-            .adjust_account_credit(1, 1000, "topup", None)
+            .adjust_account_credit(1, "BTC", 1000, "topup", None)
             .await
             .unwrap();
         other
@@ -13824,7 +13875,10 @@ mod account_credit_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(other.get_account_credit_reserved(1).await.unwrap(), 0);
+        assert_eq!(
+            other.get_account_credit_reserved(1, "BTC").await.unwrap(),
+            0
+        );
         assert!(
             other
                 .reserve_account_credit(&hold(1, 1000, 600))
@@ -13837,7 +13891,7 @@ mod account_credit_tests {
     #[tokio::test]
     async fn a_released_reservation_frees_the_credit() {
         let db = MockDb::default();
-        db.adjust_account_credit(1, 1000, "topup", None)
+        db.adjust_account_credit(1, "BTC", 1000, "topup", None)
             .await
             .unwrap();
         let id = db
@@ -13846,7 +13900,7 @@ mod account_credit_tests {
             .unwrap()
             .unwrap();
         db.release_account_credit_debit(id).await.unwrap();
-        assert_eq!(db.get_account_credit_reserved(1).await.unwrap(), 0);
+        assert_eq!(db.get_account_credit_reserved(1, "BTC").await.unwrap(), 0);
         assert!(
             db.reserve_account_credit(&hold(1, 1000, 600))
                 .await
@@ -13858,7 +13912,7 @@ mod account_credit_tests {
     #[tokio::test]
     async fn settle_moves_the_balance_once() {
         let db = MockDb::default();
-        db.adjust_account_credit(1, 1000, "topup", None)
+        db.adjust_account_credit(1, "BTC", 1000, "topup", None)
             .await
             .unwrap();
         let pid = vec![1u8; 32];
@@ -13880,8 +13934,8 @@ mod account_credit_tests {
         let settled = db.settle_account_credit_debit(&pid).await.unwrap().unwrap();
         assert_eq!(settled.amount, 400);
         assert!(settled.settled);
-        assert_eq!(db.get_account_credit(1).await.unwrap().balance, 600);
-        assert_eq!(db.get_account_credit_reserved(1).await.unwrap(), 0);
+        assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 600);
+        assert_eq!(db.get_account_credit_reserved(1, "BTC").await.unwrap(), 0);
 
         assert!(
             db.settle_account_credit_debit(&pid)
@@ -13889,7 +13943,7 @@ mod account_credit_tests {
                 .unwrap()
                 .is_none()
         );
-        assert_eq!(db.get_account_credit(1).await.unwrap().balance, 600);
+        assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 600);
         assert!(
             db.settle_account_credit_debit(&vec![2u8; 32])
                 .await
@@ -13901,7 +13955,7 @@ mod account_credit_tests {
     #[tokio::test]
     async fn a_late_settle_cannot_take_credit_promised_to_a_live_order() {
         let db = MockDb::default();
-        db.adjust_account_credit(1, 1000, "topup", None)
+        db.adjust_account_credit(1, "BTC", 1000, "topup", None)
             .await
             .unwrap();
         let late = vec![1u8; 32];
@@ -13925,14 +13979,14 @@ mod account_credit_tests {
             .unwrap();
         assert_eq!(settled.amount, 300, "only what the live order left over");
         assert_eq!(settled.payment_amount, 30, "payment figure scaled with it");
-        assert_eq!(db.get_account_credit(1).await.unwrap().balance, 700);
+        assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 700);
         assert_eq!(ledger_sum(&db, 1).await, 700);
     }
 
     #[tokio::test]
     async fn a_clawback_cannot_take_reserved_credit() {
         let db = MockDb::default();
-        db.adjust_account_credit(1, 1000, "topup", None)
+        db.adjust_account_credit(1, "BTC", 1000, "topup", None)
             .await
             .unwrap();
         db.reserve_account_credit(&hold(1, 600, 600))
@@ -13940,18 +13994,18 @@ mod account_credit_tests {
             .unwrap()
             .unwrap();
         assert!(
-            db.adjust_account_credit(1, -401, "admin", None)
+            db.adjust_account_credit(1, "BTC", -401, "admin", None)
                 .await
                 .is_err()
         );
-        assert_eq!(db.get_account_credit(1).await.unwrap().balance, 1000);
+        assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 1000);
         let row = db
-            .adjust_account_credit(1, -400, "admin", None)
+            .adjust_account_credit(1, "BTC", -400, "admin", None)
             .await
             .unwrap();
         assert_eq!(row.balance, 600);
         assert_eq!(
-            db.adjust_account_credit(1, 0, "admin", None)
+            db.adjust_account_credit(1, "BTC", 0, "admin", None)
                 .await
                 .unwrap()
                 .balance,
@@ -13989,11 +14043,11 @@ mod account_credit_tests {
 
         let settled = db.settle_account_credit_topup(id).await.unwrap().unwrap();
         assert!(settled.is_paid);
-        assert_eq!(db.get_account_credit(1).await.unwrap().balance, 2500);
+        assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 2500);
         assert_eq!(ledger_sum(&db, 1).await, 2500);
 
         assert!(db.settle_account_credit_topup(id).await.unwrap().is_none());
-        assert_eq!(db.get_account_credit(1).await.unwrap().balance, 2500);
+        assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 2500);
         assert!(
             db.settle_account_credit_topup(9999)
                 .await

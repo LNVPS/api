@@ -267,7 +267,7 @@ mod tests {
         handler.mark_paid(&hash).await?;
         handler.mark_paid(&hash).await?;
         assert_eq!(
-            db.get_account_credit(payment.user_id).await?.balance,
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
             21_000
         );
         assert!(!db.get_subscription_payment(&payment.id).await?.is_paid);

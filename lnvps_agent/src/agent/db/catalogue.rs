@@ -10,9 +10,7 @@ use std::collections::HashMap;
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
-use lnvps_api_common::{
-    PricingEngine, alt_prices, apply_custom_pricing_limits,
-};
+use lnvps_api_common::{PricingEngine, alt_prices, apply_custom_pricing_limits};
 use lnvps_db::{
     DiskInterface, DiskType, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
 };

@@ -1469,38 +1469,41 @@ pub trait LNVpsDbBase: Send + Sync {
     // Account credit
     // ========================================================================
 
-    /// The user's credit row, or a zero BTC row when they have none.
-    async fn get_account_credit(&self, user_id: u64) -> DbResult<AccountCredit>;
+    /// The user's balance in `currency`, or a zero row when they have none.
+    /// `auto_apply` is the user's flag, shared by all their balances.
+    async fn get_account_credit(&self, user_id: u64, currency: &str) -> DbResult<AccountCredit>;
 
-    async fn set_account_credit_auto_apply(
-        &self,
-        user_id: u64,
-        auto_apply: bool,
-    ) -> DbResult<AccountCredit>;
+    /// Every balance row the user has, one per currency.
+    async fn list_account_credits(&self, user_id: u64) -> DbResult<Vec<AccountCredit>>;
 
-    /// Credit held by unsettled, unexpired debits.
-    async fn get_account_credit_reserved(&self, user_id: u64) -> DbResult<u64>;
+    /// Set the user's auto-apply flag on all their balances.
+    async fn set_account_credit_auto_apply(&self, user_id: u64, auto_apply: bool) -> DbResult<()>;
 
-    /// Book a refund row and return `credit` (balance currency, may be 0) to the
-    /// refunded customer's balance, in one transaction. The `refund` ledger
-    /// event references the refund row. Either both land or neither does, so
-    /// the books never show a refund the customer did not receive.
+    /// Credit held by unsettled, unexpired debits in `currency`.
+    async fn get_account_credit_reserved(&self, user_id: u64, currency: &str) -> DbResult<u64>;
+
+    /// Book a refund row and return `credits` ((currency, minor units), may be
+    /// empty) to the refunded customer's balances, in one transaction. Each
+    /// `refund` ledger event references the refund row. Either both land or
+    /// neither does, so the books never show a refund the customer did not
+    /// receive.
     ///
     /// Returns `false` (and changes nothing) when a row with `refund.id`
     /// already exists, so a retry with the same derived id cannot pay twice.
     async fn insert_refund_to_credit(
         &self,
         refund: &SubscriptionPayment,
-        credit: u64,
+        credits: &[(String, u64)],
         note: Option<&str>,
     ) -> DbResult<bool>;
 
-    /// Shift the balance by a signed `delta` and write a ledger event in one
-    /// transaction. A negative delta may not take the balance below what is
-    /// reserved.
+    /// Shift the `currency` balance by a signed `delta` and write a ledger
+    /// event in one transaction. A negative delta may not take the balance
+    /// below what is reserved.
     async fn adjust_account_credit(
         &self,
         user_id: u64,
+        currency: &str,
         delta: i64,
         kind: &str,
         note: Option<&str>,

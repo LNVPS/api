@@ -262,18 +262,12 @@ impl OnChainPaymentHandler {
         key: &str,
         amount_msat: u64,
     ) -> Result<()> {
-        let credit = self.db.get_account_credit(user_id).await?;
-        let currency = if credit.currency.is_empty() {
-            "BTC".to_string()
-        } else {
-            credit.currency
-        };
         let id = self
             .db
             .insert_account_credit_topup(&AccountCreditTopup {
                 user_id,
                 amount: amount_msat,
-                currency,
+                currency: "BTC".to_string(),
                 payment_method: PaymentMethod::OnChain,
                 invoice_hash: rand::random::<[u8; 32]>().to_vec(),
                 external_data: String::new(),
@@ -905,7 +899,7 @@ mod tests {
     }
 
     async fn hold_credit(db: &MockDb, payment: &SubscriptionPayment, msat: u64) {
-        db.adjust_account_credit(payment.user_id, msat as i64, "topup", None)
+        db.adjust_account_credit(payment.user_id, "BTC", msat as i64, "topup", None)
             .await
             .unwrap();
         let id = db
@@ -947,7 +941,10 @@ mod tests {
             .await?
             .unwrap();
         assert!(debit.settled);
-        assert_eq!(db.get_account_credit(payment.user_id).await?.balance, 0);
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
+            0
+        );
         Ok(())
     }
 
@@ -983,7 +980,7 @@ mod tests {
         assert!(p.is_paid);
         assert_eq!(p.amount + p.tax + p.processing_fee, EXPECTED - 300_000);
         assert_eq!(
-            db.get_account_credit(payment.user_id).await?.balance,
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
             300_000
         );
         Ok(())
@@ -1278,7 +1275,7 @@ mod tests {
         let p = get_payment(&db, &payment.id).await;
         assert!(!p.is_paid, "payment must be untouched");
         assert_eq!(
-            db.get_account_credit(payment.user_id).await?.balance,
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
             EXPECTED
         );
         assert_eq!(p.external_id, None);
@@ -1291,7 +1288,9 @@ mod tests {
         assert_eq!(user_job.len(), 1);
         assert_eq!(admin_job.len(), 1);
         match &user_job[0].job {
-            WorkJob::SendNotification { user_id, message, .. } => {
+            WorkJob::SendNotification {
+                user_id, message, ..
+            } => {
                 assert_eq!(*user_id, payment.user_id);
                 assert!(message.contains("credited"));
             }
@@ -1315,7 +1314,7 @@ mod tests {
         .await;
         assert!(no_job.is_err(), "replay must not re-notify");
         assert_eq!(
-            db.get_account_credit(payment.user_id).await?.balance,
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
             EXPECTED,
             "replay must not credit twice"
         );
@@ -1327,7 +1326,7 @@ mod tests {
         let jobs = handler.sub_handler.work_commander().recv().await?;
         assert_eq!(jobs.len(), 1);
         assert_eq!(
-            db.get_account_credit(payment.user_id).await?.balance,
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
             EXPECTED * 2
         );
         Ok(())
@@ -1534,7 +1533,10 @@ mod tests {
         handler
             .handle_detected(TOPUP_ADDRESS, "tx9", 0, 70_000)
             .await?;
-        assert_eq!(db.get_account_credit(payment.user_id).await?.balance, 0);
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
+            0
+        );
         handler
             .handle_deposit(TOPUP_ADDRESS, "tx9", 0, 70_000)
             .await?;
@@ -1543,7 +1545,7 @@ mod tests {
             .await?;
 
         assert_eq!(
-            db.get_account_credit(payment.user_id).await?.balance,
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
             70_000
         );
         assert!(!get_payment(&db, &payment.id).await.is_paid);
@@ -1552,7 +1554,9 @@ mod tests {
         let jobs = handler.sub_handler.work_commander().recv().await?;
         assert_eq!(jobs.len(), 1);
         match &jobs[0].job {
-            WorkJob::SendNotification { user_id, message, .. } => {
+            WorkJob::SendNotification {
+                user_id, message, ..
+            } => {
                 assert_eq!(*user_id, payment.user_id);
                 assert!(message.contains("70 sats"));
             }
@@ -1586,7 +1590,7 @@ mod tests {
             .await?;
 
         assert_eq!(
-            db.get_account_credit(payment.user_id).await?.balance,
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
             100_000
         );
         Ok(())
@@ -1619,7 +1623,7 @@ mod tests {
             .await?;
 
         assert_eq!(
-            db.get_account_credit(payment.user_id).await?.balance,
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
             48_000
         );
         Ok(())

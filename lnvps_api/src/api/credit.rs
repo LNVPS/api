@@ -38,25 +38,56 @@ pub fn router() -> Router<RouterState> {
         .route("/api/v1/account/credit/events", get(v1_list_credit_events))
 }
 
-/// The customer's account credit balance and opt-in flag.
+const TOPUP_CURRENCY: &str = "BTC";
+
 #[derive(Serialize)]
-pub struct ApiAccountCredit {
+pub struct ApiCreditBalance {
     /// Minor units of `currency` (msat for BTC).
     pub balance: u64,
-    /// ISO currency code of the balance.
     pub currency: String,
-    /// Whether the balance is auto-applied against quotes.
-    pub auto_apply: bool,
 }
 
-impl From<AccountCredit> for ApiAccountCredit {
-    fn from(c: AccountCredit) -> Self {
+/// The customer's account credit balances and opt-in flag.
+#[derive(Serialize)]
+pub struct ApiAccountCredit {
+    /// The BTC balance in msat, the one top-ups add to.
+    pub balance: u64,
+    /// Always `BTC`: the currency of `balance`.
+    pub currency: String,
+    /// Whether the balances are auto-applied against quotes.
+    pub auto_apply: bool,
+    /// Every balance the customer holds, one per currency. Refunds come back in
+    /// the currency the payment was charged in.
+    pub balances: Vec<ApiCreditBalance>,
+}
+
+impl From<Vec<AccountCredit>> for ApiAccountCredit {
+    fn from(rows: Vec<AccountCredit>) -> Self {
+        let btc = rows
+            .iter()
+            .find(|c| c.currency == TOPUP_CURRENCY)
+            .map(|c| c.balance)
+            .unwrap_or(0);
         Self {
-            balance: c.balance,
-            currency: c.currency,
-            auto_apply: c.auto_apply,
+            balance: btc,
+            currency: TOPUP_CURRENCY.to_string(),
+            auto_apply: rows.iter().any(|c| c.auto_apply),
+            balances: rows
+                .into_iter()
+                .filter(|c| c.balance > 0 || c.currency == TOPUP_CURRENCY)
+                .map(|c| ApiCreditBalance {
+                    balance: c.balance,
+                    currency: c.currency,
+                })
+                .collect(),
         }
     }
+}
+
+async fn api_credit(this: &RouterState, user_id: u64) -> anyhow::Result<ApiAccountCredit> {
+    Ok(ApiAccountCredit::from(
+        this.db.list_account_credits(user_id).await?,
+    ))
 }
 
 /// One row of the account credit ledger, as shown to the customer.
@@ -184,12 +215,7 @@ async fn v1_topup_credit(
     let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
 
-    let credit = this.db.get_account_credit(uid).await?;
-    let currency = if credit.currency.is_empty() {
-        "BTC".to_string()
-    } else {
-        credit.currency
-    };
+    let currency = TOPUP_CURRENCY.to_string();
 
     let method = req.method.as_deref().unwrap_or("lightning");
     let mut topup = AccountCreditTopup {
@@ -277,7 +303,6 @@ pub(crate) async fn new_lightning_topup(
 ) -> anyhow::Result<String> {
     anyhow::ensure!(amount_msat > 0, "Top-up amount must be positive");
     let amount = round_msat_to_sat(amount_msat);
-    let credit = this.db.get_account_credit(user_id).await?;
     let invoice = this
         .sub_handler
         .node()
@@ -290,11 +315,7 @@ pub(crate) async fn new_lightning_topup(
     let topup = AccountCreditTopup {
         user_id,
         amount,
-        currency: if credit.currency.is_empty() {
-            "BTC".to_string()
-        } else {
-            credit.currency
-        },
+        currency: TOPUP_CURRENCY.to_string(),
         payment_method: PaymentMethod::Lightning,
         invoice_hash: hex::decode(invoice.payment_hash())?,
         external_data: invoice.pr(),
@@ -339,8 +360,7 @@ async fn v1_get_credit(
 ) -> ApiResult<ApiAccountCredit> {
     let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
-    let credit = this.db.get_account_credit(uid).await?;
-    ApiData::ok(ApiAccountCredit::from(credit))
+    ApiData::ok(api_credit(&this, uid).await?)
 }
 
 /// Toggle auto-apply for the customer's balance.
@@ -351,11 +371,10 @@ async fn v1_patch_credit(
 ) -> ApiResult<ApiAccountCredit> {
     let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
-    let credit = this
-        .db
+    this.db
         .set_account_credit_auto_apply(uid, req.auto_apply)
         .await?;
-    ApiData::ok(ApiAccountCredit::from(credit))
+    ApiData::ok(api_credit(&this, uid).await?)
 }
 
 /// The customer's account credit ledger, newest first, paginated.
@@ -393,7 +412,7 @@ mod tests {
     async fn api_view_of_unknown_user_is_zero() {
         let db = Arc::new(MockDb::default());
         let uid = db.upsert_user(&[1u8; 32]).await.unwrap();
-        let api = ApiAccountCredit::from(db.get_account_credit(uid).await.unwrap());
+        let api = ApiAccountCredit::from(db.list_account_credits(uid).await.unwrap());
         assert_eq!(api.balance, 0);
         assert_eq!(api.currency, "BTC");
         assert!(!api.auto_apply);
@@ -404,8 +423,8 @@ mod tests {
     async fn api_view_reflects_auto_apply() {
         let db = Arc::new(MockDb::default());
         let uid = db.upsert_user(&[2u8; 32]).await.unwrap();
-        let api =
-            ApiAccountCredit::from(db.set_account_credit_auto_apply(uid, true).await.unwrap());
+        db.set_account_credit_auto_apply(uid, true).await.unwrap();
+        let api = ApiAccountCredit::from(db.list_account_credits(uid).await.unwrap());
         assert!(api.auto_apply);
     }
 

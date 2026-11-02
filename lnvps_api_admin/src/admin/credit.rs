@@ -31,15 +31,36 @@ pub struct AdminAccountCredit {
     pub balance: u64,
     pub currency: String,
     pub auto_apply: bool,
+    pub balances: Vec<AdminCreditBalance>,
+}
+
+#[derive(Serialize)]
+pub struct AdminCreditBalance {
+    pub balance: u64,
+    pub currency: String,
 }
 
 impl From<AccountCredit> for AdminAccountCredit {
     fn from(c: AccountCredit) -> Self {
+        Self::from_rows(c.user_id, vec![c])
+    }
+}
+
+impl AdminAccountCredit {
+    fn from_rows(user_id: u64, rows: Vec<AccountCredit>) -> Self {
+        let btc = rows.iter().find(|c| c.currency == "BTC");
         Self {
-            user_id: c.user_id,
-            balance: c.balance,
-            currency: c.currency,
-            auto_apply: c.auto_apply,
+            user_id,
+            balance: btc.map(|c| c.balance).unwrap_or(0),
+            currency: "BTC".to_string(),
+            auto_apply: rows.iter().any(|c| c.auto_apply),
+            balances: rows
+                .into_iter()
+                .map(|c| AdminCreditBalance {
+                    balance: c.balance,
+                    currency: c.currency,
+                })
+                .collect(),
         }
     }
 }
@@ -72,7 +93,10 @@ impl From<AccountCreditEvent> for AdminAccountCreditEvent {
 
 #[derive(Deserialize)]
 struct AdjustCreditRequest {
-    /// Signed msat delta. Positive credits, negative claws back.
+    /// Currency of the balance to adjust. Defaults to `BTC`.
+    currency: Option<String>,
+    /// Signed delta in minor units of `currency` (msat for BTC). Positive
+    /// credits, negative claws back.
     delta: i64,
     /// Ledger `kind`: `topup`, `refund` (both positive only) or `admin`.
     #[serde(default = "default_kind")]
@@ -94,8 +118,8 @@ async fn admin_get_user_credit(
     Path(id): Path<u64>,
 ) -> ApiResult<AdminAccountCredit> {
     auth.require_permission(AdminResource::AccountCredit, AdminAction::View)?;
-    let credit = this.db.get_account_credit(id).await?;
-    ApiData::ok(AdminAccountCredit::from(credit))
+    let rows = this.db.list_account_credits(id).await?;
+    ApiData::ok(AdminAccountCredit::from_rows(id, rows))
 }
 
 /// Shift a user's balance (manual top-up or clawback) and record it in the
@@ -116,12 +140,16 @@ async fn admin_adjust_user_credit(
     if req.delta < 0 && req.kind != "admin" {
         return ApiData::err("a negative delta must use kind admin");
     }
-    let credit = this
-        .db
-        .adjust_account_credit(id, req.delta, &req.kind, req.note.as_deref())
+    let currency = req.currency.as_deref().unwrap_or("BTC");
+    if currency.parse::<payments_rs::currency::Currency>().is_err() {
+        return ApiData::err("unknown currency");
+    }
+    this.db
+        .adjust_account_credit(id, currency, req.delta, &req.kind, req.note.as_deref())
         .await
         .map_err(|e| ApiError::new(e.to_string()))?;
-    ApiData::ok(AdminAccountCredit::from(credit))
+    let rows = this.db.list_account_credits(id).await?;
+    ApiData::ok(AdminAccountCredit::from_rows(id, rows))
 }
 
 /// A user's account credit ledger, newest first, paginated.
@@ -174,7 +202,7 @@ mod tests {
     async fn admin_adjust_via_db_shows_in_api_view() {
         let db = Arc::new(MockDb::default());
         let row = db
-            .adjust_account_credit(5, 2500, "topup", Some("manual"))
+            .adjust_account_credit(5, "BTC", 2500, "topup", Some("manual"))
             .await
             .unwrap();
         let (events, _) = db.list_account_credit_events(5, 10, 0).await.unwrap();
@@ -182,7 +210,7 @@ mod tests {
             AdminAccountCreditEvent::from(events[0].clone()).amount,
             2500
         );
-        db.adjust_account_credit(5, -500, "admin", None)
+        db.adjust_account_credit(5, "BTC", -500, "admin", None)
             .await
             .unwrap();
         let (events, _) = db.list_account_credit_events(5, 10, 0).await.unwrap();
@@ -193,7 +221,7 @@ mod tests {
         let api = AdminAccountCredit::from(row);
         assert_eq!(api.user_id, 5);
         assert_eq!(api.balance, 2500);
-        assert_eq!(db.get_account_credit(5).await.unwrap().balance, 2000);
+        assert_eq!(db.get_account_credit(5, "BTC").await.unwrap().balance, 2000);
         assert_eq!(api.currency, "BTC");
     }
 

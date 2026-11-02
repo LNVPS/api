@@ -3799,7 +3799,7 @@ impl Worker {
                 // The VM is gone and billing has stopped, so a refund that
                 // fails is money to hand back by hand, not a reason to retry the
                 // job: a redelivery would find the VM deleted and do nothing.
-                let mut credit_returned = 0;
+                let mut credit_returned = Vec::new();
                 if let Some((expires, at)) = unused_refund_basis {
                     match self
                         .refunds
@@ -3827,11 +3827,12 @@ impl Worker {
                 }
 
                 if *by_owner {
-                    let msg = if credit_returned > 0 {
+                    let msg = if !credit_returned.is_empty() {
                         format!(
                             "Your VM #{} has been deleted and billing has stopped. The unused \
-                             time was returned to your account credit.",
-                            vm_id
+                             time ({}) was returned to your account credit.",
+                            vm_id,
+                            crate::refund::describe_credit(&credit_returned)
                         )
                     } else {
                         format!(
@@ -4164,10 +4165,10 @@ impl Worker {
                     );
                 }
 
-                let credit_note = if outcome.credit_returned > 0 {
+                let credit_note = if !outcome.credit_returned.is_empty() {
                     format!(
-                        " {} sats paid with account credit were returned to your balance.",
-                        outcome.credit_returned / 1000
+                        " {} paid with account credit were returned to your balance.",
+                        crate::refund::describe_credit(&outcome.credit_returned)
                     )
                 } else {
                     String::new()
@@ -7472,7 +7473,7 @@ mod tests {
         assert!(db.get_vm(vm_id).await?.deleted);
         let sub = db.get_subscription(sub_id).await?;
         assert!(!sub.is_active && !sub.auto_renewal_enabled, "billing stops");
-        let balance = db.get_account_credit(vm.user_id).await?.balance;
+        let balance = db.get_account_credit(vm.user_id, "BTC").await?.balance;
         assert!(
             (3_990..=4_000).contains(&balance),
             "about half of 8000 returned, got {balance}"
@@ -7529,7 +7530,7 @@ mod tests {
             })
             .await?;
         assert!(db.get_vm(vm_id).await?.deleted);
-        let balance = db.get_account_credit(vm.user_id).await?.balance;
+        let balance = db.get_account_credit(vm.user_id, "BTC").await?.balance;
         assert!(
             (820..=834).contains(&balance),
             "about 25/30 of 1000, got {balance}"
@@ -7671,7 +7672,7 @@ mod tests {
             s.expires = Some(Utc::now().add(TimeDelta::minutes(20)));
             s.clone()
         };
-        db.adjust_account_credit(sub.user_id, 10_000_000_000, "topup", None)
+        db.adjust_account_credit(sub.user_id, "BTC", 10_000_000_000, "topup", None)
             .await?;
         db.set_account_credit_auto_apply(sub.user_id, true).await?;
 
@@ -7706,7 +7707,7 @@ mod tests {
             );
             s.clone()
         };
-        db.adjust_account_credit(sub.user_id, 1_000, "topup", None)
+        db.adjust_account_credit(sub.user_id, "BTC", 1_000, "topup", None)
             .await?;
         db.set_account_credit_auto_apply(sub.user_id, true).await?;
 

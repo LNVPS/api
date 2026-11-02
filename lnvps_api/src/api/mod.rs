@@ -632,7 +632,7 @@ mod tests {
     async fn credit_line_reports_the_payment_currency() {
         use lnvps_db::LNVpsDbBase;
         let mock = lnvps_api_common::MockDb::default();
-        mock.adjust_account_credit(1, 5_000_000, "topup", None)
+        mock.adjust_account_credit(1, "BTC", 5_000_000, "topup", None)
             .await
             .unwrap();
         let id = mock
