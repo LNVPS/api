@@ -1,5 +1,6 @@
 mod abuse;
 mod app_backups;
+mod app_category;
 mod apps;
 mod contact;
 mod credit;

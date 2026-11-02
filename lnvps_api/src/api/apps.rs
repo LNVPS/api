@@ -3,6 +3,7 @@
 //! Browse the app catalog and view your own deployments. Ordering, lifecycle
 //! control and the operator reconcile land in later increments.
 
+use crate::api::app_category::localize_category;
 use crate::api::model::{ApiPrice, ApiSubscriptionPayment};
 use crate::api::{PaymentMethodQuery, RouterState};
 use crate::settings::Settings;
@@ -13,7 +14,7 @@ use chrono::{DateTime, Utc};
 use lnvps_api_common::k8s_names::{deployment_namespace, pending_deployment_namespace};
 use lnvps_api_common::{
     ApiData, ApiError, ApiIntervalType, ApiResult, AppCapacity, AppClusterCapacityService,
-    AppDeploymentUsage, Nip98Auth,
+    AppDeploymentUsage, ClientInfo, Nip98Auth,
 };
 use lnvps_db::{
     App, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus, AppTag, EncryptedString,
@@ -77,6 +78,7 @@ pub struct ApiApp {
     /// "hosting", no "managed" and no trailing punctuation — the client's
     /// template supplies those, e.g. `{display_name} Hosting — Managed
     /// {category}`. Also suitable for `Product.category` in structured data.
+    /// Translated per `Accept-Language` when a translation exists, else English.
     pub category: String,
     /// Per-app override for the page `<title>`. Null for almost every app —
     /// clients should template from `display_name` + `category` and only use
@@ -482,6 +484,7 @@ async fn tags_by_app(
 /// UI, and a stale chip should degrade to "no results", not to an error page.
 async fn v1_list_apps(
     State(this): State<RouterState>,
+    client: ClientInfo,
     Query(params): Query<Vec<(String, String)>>,
 ) -> ApiResult<Vec<ApiApp>> {
     let apps = this.db.list_apps(true).await?;
@@ -498,14 +501,23 @@ async fn v1_list_apps(
                 let matches = wanted
                     .iter()
                     .all(|slug| app_tags.iter().any(|t| &t.slug == slug));
-                matches.then(|| ApiApp::from_app(a, app_tags))
+                matches.then(|| {
+                    let mut app = ApiApp::from_app(a, app_tags);
+                    app.category =
+                        localize_category(&app.category, client.accept_language.as_deref());
+                    app
+                })
             })
             .collect(),
     )
 }
 
 /// Get a single enabled catalog app. Public (no auth), like the list.
-async fn v1_get_app(State(this): State<RouterState>, Path(id): Path<u64>) -> ApiResult<ApiApp> {
+async fn v1_get_app(
+    State(this): State<RouterState>,
+    client: ClientInfo,
+    Path(id): Path<u64>,
+) -> ApiResult<ApiApp> {
     let app = this.db.get_app(id).await?;
     if !app.enabled {
         return Err(ApiError::not_found("App not found"));
@@ -517,7 +529,9 @@ async fn v1_get_app(State(this): State<RouterState>, Path(id): Path<u64>) -> Api
         .into_iter()
         .map(|(_, t)| t.into())
         .collect();
-    ApiData::ok(ApiApp::from_app(app, tags))
+    let mut api = ApiApp::from_app(app, tags);
+    api.category = localize_category(&api.category, client.accept_language.as_deref());
+    ApiData::ok(api)
 }
 
 /// List the tag vocabulary with per-tag counts of enabled apps.
