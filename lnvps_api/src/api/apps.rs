@@ -890,26 +890,37 @@ async fn v1_patch_app_deployment(
     // a new domain is held until the operator sees it resolve to us, so the
     // flag only survives a no-op edit that resubmits the same domain.
     if let Some(cd) = &req.custom_domain {
-        let new_domain = match cd {
-            Some(d) if !d.trim().is_empty() => Some(validate_custom_domain(&this.settings, d)?),
-            _ => None,
-        };
-        if new_domain != deployment.custom_domain {
-            if let Some(domain) = &new_domain {
-                lnvps_api_common::ensure_custom_domain_free(
-                    this.db.as_ref(),
-                    domain,
-                    deployment.id,
-                )
-                .await?;
-            }
-            deployment.custom_domain_verified = false;
-        }
-        deployment.custom_domain = new_domain;
+        apply_custom_domain(
+            this.db.as_ref(),
+            &this.settings,
+            &mut deployment,
+            cd.as_deref(),
+        )
+        .await?;
     }
 
     this.db.update_app_deployment(&deployment).await?;
     ApiData::ok(deployment_to_api(this.db.as_ref(), deployment).await?)
+}
+
+async fn apply_custom_domain(
+    db: &dyn lnvps_db::LNVpsDb,
+    settings: &Settings,
+    deployment: &mut AppDeployment,
+    requested: Option<&str>,
+) -> Result<(), ApiError> {
+    let new_domain = match requested {
+        Some(d) if !d.trim().is_empty() => Some(validate_custom_domain(settings, d)?),
+        _ => None,
+    };
+    if new_domain != deployment.custom_domain {
+        if let Some(domain) = &new_domain {
+            lnvps_api_common::ensure_custom_domain_free(db, domain, deployment.id).await?;
+        }
+        deployment.custom_domain_verified = false;
+    }
+    deployment.custom_domain = new_domain;
+    Ok(())
 }
 
 async fn set_desired_state(
@@ -1242,13 +1253,8 @@ mod tests {
 
     /// The unique-name lookup is scoped to (cluster, name) and ignores
     /// soft-deleted rows, so a freed name is reusable but a live one isn't.
-    #[tokio::test]
-    async fn custom_domain_claimed_by_another_deployment_is_rejected() {
-        use lnvps_api_common::MockDb;
-        use lnvps_db::{AppDeployment, LNVpsDbBase};
-
-        let db = MockDb::default();
-        let mk = |name: &str, domain: Option<&str>| AppDeployment {
+    fn deployment(name: &str, domain: Option<&str>) -> AppDeployment {
+        AppDeployment {
             id: 0,
             user_id: 1,
             app_id: 1,
@@ -1270,34 +1276,47 @@ mod tests {
             usage_collected: None,
             created: Utc::now(),
             deleted: false,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn second_deployment_cannot_claim_a_taken_custom_domain() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::LNVpsDbBase;
+
+        let db = MockDb::default();
+        let settings = crate::settings::mock_settings();
         let first = db
-            .insert_app_deployment(&mk("a", Some("blog.example.com")))
+            .insert_app_deployment(&deployment("a", Some("blog.myrelay.org")))
             .await
             .unwrap();
-        let second = db.insert_app_deployment(&mk("b", None)).await.unwrap();
+        let second_id = db
+            .insert_app_deployment(&deployment("b", None))
+            .await
+            .unwrap();
+        let mut second = db.get_app_deployment(second_id).await.unwrap();
 
-        assert!(
-            lnvps_api_common::ensure_custom_domain_free(&db, "blog.example.com", second)
-                .await
-                .is_err()
-        );
-        assert!(
-            lnvps_api_common::ensure_custom_domain_free(&db, "blog.example.com", first)
-                .await
-                .is_ok()
-        );
-        assert!(
-            lnvps_api_common::ensure_custom_domain_free(&db, "other.example.com", second)
-                .await
-                .is_ok()
-        );
+        let err = apply_custom_domain(&db, &settings, &mut second, Some("Blog.MyRelay.org"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, axum::http::StatusCode::CONFLICT, "{}", err.error);
+        assert!(err.error.contains("already in use"), "{}", err.error);
+        assert_eq!(second.custom_domain, None);
+
+        apply_custom_domain(&db, &settings, &mut second, Some("other.myrelay.org"))
+            .await
+            .unwrap();
+        assert_eq!(second.custom_domain.as_deref(), Some("other.myrelay.org"));
+
+        let mut owner = db.get_app_deployment(first).await.unwrap();
+        apply_custom_domain(&db, &settings, &mut owner, Some("blog.myrelay.org"))
+            .await
+            .unwrap();
+
         db.delete_app_deployment(first).await.unwrap();
-        assert!(
-            lnvps_api_common::ensure_custom_domain_free(&db, "blog.example.com", second)
-                .await
-                .is_ok()
-        );
+        apply_custom_domain(&db, &settings, &mut second, Some("blog.myrelay.org"))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

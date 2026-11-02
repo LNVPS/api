@@ -831,20 +831,7 @@ async fn admin_update_app_deployment(
     // the operator sees it resolve to us, the same as on the customer endpoint
     // — an admin edit cannot vouch for someone else's DNS either.
     if let Some(cd) = &req.custom_domain {
-        let new_domain = match cd {
-            Some(v) if !v.trim().is_empty() => Some(
-                lnvps_compose::validate_custom_domain(v)
-                    .map_err(|e| lnvps_api_common::ApiError::new(e.to_string()))?,
-            ),
-            _ => None,
-        };
-        if new_domain != d.custom_domain {
-            if let Some(domain) = &new_domain {
-                lnvps_api_common::ensure_custom_domain_free(this.db.as_ref(), domain, d.id).await?;
-            }
-            d.custom_domain_verified = false;
-        }
-        d.custom_domain = new_domain;
+        apply_custom_domain(this.db.as_ref(), &mut d, cd.as_deref()).await?;
     }
 
     this.db.update_app_deployment(&d).await?;
@@ -1057,12 +1044,83 @@ async fn admin_delete_app_cluster(
     ApiData::ok(true)
 }
 
+async fn apply_custom_domain(
+    db: &dyn lnvps_db::LNVpsDb,
+    d: &mut lnvps_db::AppDeployment,
+    requested: Option<&str>,
+) -> Result<(), lnvps_api_common::ApiError> {
+    let new_domain = match requested {
+        Some(v) if !v.trim().is_empty() => Some(
+            lnvps_compose::validate_custom_domain(v)
+                .map_err(|e| lnvps_api_common::ApiError::new(e.to_string()))?,
+        ),
+        _ => None,
+    };
+    if new_domain != d.custom_domain {
+        if let Some(domain) = &new_domain {
+            lnvps_api_common::ensure_custom_domain_free(db, domain, d.id).await?;
+        }
+        d.custom_domain_verified = false;
+    }
+    d.custom_domain = new_domain;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const VALID_COMPOSE: &str = "services:\n  relay:\n    image: \
          example/relay:v1@sha256:0000000000000000000000000000000000000000000000000000000000000001\n";
+
+    #[tokio::test]
+    async fn admin_cannot_assign_a_taken_custom_domain() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::{AppDeploymentDesiredState, LNVpsDbBase};
+
+        let mk = |name: &str, domain: Option<&str>| lnvps_db::AppDeployment {
+            id: 0,
+            user_id: 1,
+            app_id: 1,
+            cluster_id: 1,
+            resource_multiplier: 1,
+            subscription_line_item_id: 0,
+            name: name.to_string(),
+            namespace: format!("ns-{name}"),
+            hostname: None,
+            custom_domain: domain.map(str::to_string),
+            custom_domain_verified: true,
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Pending,
+            status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
+            created: chrono::Utc::now(),
+            deleted: false,
+        };
+        let db = MockDb::default();
+        db.insert_app_deployment(&mk("a", Some("blog.myrelay.org")))
+            .await
+            .unwrap();
+        let id = db.insert_app_deployment(&mk("b", None)).await.unwrap();
+        let mut b = db.get_app_deployment(id).await.unwrap();
+
+        let err = apply_custom_domain(&db, &mut b, Some("blog.myrelay.org"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, axum::http::StatusCode::CONFLICT);
+        assert!(err.error.contains("already in use"), "{}", err.error);
+        assert_eq!(b.custom_domain, None);
+
+        apply_custom_domain(&db, &mut b, Some("free.myrelay.org"))
+            .await
+            .unwrap();
+        assert_eq!(b.custom_domain.as_deref(), Some("free.myrelay.org"));
+        assert!(!b.custom_domain_verified);
+    }
 
     #[test]
     fn test_validate_app_fields() {
