@@ -851,6 +851,28 @@ where the image allows it.
 
 ---
 
+## Ditto Relay
+
+- **Image:** `registry.v0l.io/ditto-relay`, built from
+  [`catalog/images/ditto-relay/Dockerfile`](../catalog/images/ditto-relay/Dockerfile)
+  against the relay's source tree (`docker build -f catalog/images/ditto-relay/Dockerfile <source>`).
+  Runs as uid 1000 with `HOME` and the data dir at `/data`.
+- **Relay:** Rust, LMDB, NIP-45 COUNT with HyperLogLog, NIP-50 search, NIP-77
+  negentropy. Config is a TOML file at `/etc/ditto-relay/ditto-relay.toml`;
+  it listens on `13131` and keeps its database, search index and signing key
+  under `data_dir`.
+- **Write policy:** the `write_policy` field is a strfry-style plugin script
+  (JSON event per line on stdin, verdict per line on stdout), mounted at
+  `/etc/ditto-relay/write-policy.sh` and run with `sh`. The default accepts
+  everything. The image carries `jq` for simple policies.
+- **Backup:** `exec:` of `ditto-relay export` (JSONL, restored with
+  `ditto-relay import`), consistent while the relay runs.
+
+**Document:** [`catalog/ditto-relay.yaml`](../catalog/ditto-relay.yaml).
+`scripts/app-catalog-test.sh catalog/ditto-relay.yaml` starts it locally.
+
+---
+
 ## Notes on other apps
 
 - **zap-stream-core** — needs raw TCP/UDP ingest (RTMP `1935/tcp`, SRT), i.e.

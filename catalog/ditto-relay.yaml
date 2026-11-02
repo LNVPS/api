@@ -1,0 +1,55 @@
+services:
+  relay:
+    image: registry.v0l.io/ditto-relay:2.5.1@sha256:c091cc418829802b8b516608a52ed83e3064e09fe3eb7d1a81e7590cfc6628c7
+    user: "1000"
+    resources: { cpu: 500m, memory: 1Gi }
+    ports:
+      - { name: ws, container: 13131, protocol: http, expose: ingress }
+    files:
+      - path: /etc/ditto-relay/ditto-relay.toml
+        merge_from: config_overrides
+        content: |
+          url = "wss://${HOSTNAME}/"
+          bind = "0.0.0.0:13131"
+          metrics_bind = ""
+          data_dir = "/data"
+          name = "${relay_name}"
+          description = "${relay_description}"
+          max_subscriptions = ${max_subscriptions}
+          max_filters = ${max_filters}
+          default_limit = ${default_limit}
+          max_limit = ${max_limit}
+          max_message_size = ${max_message_size}
+          max_future_seconds = ${max_future_seconds}
+          auth_kinds = [${auth_kinds}]
+          history = ${history}
+          search = ${search}
+          negentropy = ${negentropy}
+          nip85 = ${nip85}
+          write_policy_plugin = "sh /etc/ditto-relay/write-policy.sh"
+          write_policy_timeout_seconds = ${write_policy_timeout_seconds}
+      - path: /etc/ditto-relay/write-policy.sh
+        content_from: write_policy
+    volumes:
+      - { name: data, path: /data, size: 5Gi, label: events }
+    scratch:
+      - { path: /tmp }
+    backup: { exec: ["ditto-relay", "--config", "/etc/ditto-relay/ditto-relay.toml", "export"], artifact: ditto-relay-events.jsonl }
+config:
+  - { name: relay_name, label: "Relay name", type: string, default: "My Ditto relay", pattern: '[^"\\\r\n]*' }
+  - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay", pattern: '[^"\\\r\n]*' }
+  - { name: write_policy, label: "Write policy plugin (shell script)", type: file, group: "Access",
+      default: "jq -c --unbuffered '{id: .event.id, action: \"accept\", msg: \"\"}'\n" }
+  - { name: write_policy_timeout_seconds, label: "Write policy timeout (seconds)", type: int, default: "10", pattern: "[1-9][0-9]*", group: "Access" }
+  - { name: auth_kinds, label: "Kinds readable only by their parties (comma-separated, blank for none)", type: string, default: "", pattern: "([0-9]+(, *[0-9]+)*)?", group: "Access" }
+  - { name: max_subscriptions, label: "Max subscriptions per connection", type: int, default: "20", pattern: "[1-9][0-9]*", group: "Limits" }
+  - { name: max_filters, label: "Max filters per REQ", type: int, default: "100", pattern: "[1-9][0-9]*", group: "Limits" }
+  - { name: default_limit, label: "Default events returned per filter", type: int, default: "100", pattern: "[1-9][0-9]*", group: "Limits" }
+  - { name: max_limit, label: "Max events returned per filter", type: int, default: "1000", pattern: "[1-9][0-9]*", group: "Limits" }
+  - { name: max_message_size, label: "Max message size (bytes)", type: int, default: "4000000", pattern: "[1-9][0-9]*", group: "Limits" }
+  - { name: max_future_seconds, label: "Reject events dated more than this far ahead (seconds)", type: int, default: "900", pattern: "[0-9]+", group: "Limits" }
+  - { name: history, label: "Keep old versions of replaceable events", type: bool, default: "true", group: "Features" }
+  - { name: search, label: "NIP-50 search", type: bool, default: "true", group: "Features" }
+  - { name: negentropy, label: "NIP-77 negentropy sync", type: bool, default: "true", group: "Features" }
+  - { name: nip85, label: "NIP-85 trusted assertions", type: bool, default: "true", group: "Features" }
+  - { name: config_overrides, label: "Advanced: ditto-relay.toml overrides", type: file, default: "", group: "Advanced" }
