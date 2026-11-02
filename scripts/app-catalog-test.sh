@@ -42,7 +42,12 @@ app_config() {
         haven) CONFIG_ARGS=(--config owner_npub=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqshp52w2) ;;
         buzz)  CONFIG_ARGS=(--config owner_pubkey=0000000000000000000000000000000000000000000000000000000000000001) ;;
         minecraft-java) CONFIG_ARGS=(--config eula=TRUE --config rcon_password=testpass1234) ;;
-        ditto-relay) CONFIG_ARGS=(--config "write_policy=$(cat catalog/tests/ditto-relay/write-policy.sh)") ;;
+        ditto-relay) CONFIG_ARGS=(
+            --config policy_kinds=1
+            --config policy_deny_pubkeys=c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5
+            --config policy_min_pow=8
+            --config policy_max_event_bytes=1000
+        ) ;;
         *)     CONFIG_ARGS=() ;;
     esac
 }

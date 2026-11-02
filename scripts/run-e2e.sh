@@ -265,6 +265,7 @@ set_listen() {
     [[ "$port" != "$hostport" ]] || return 0
     sed -i "/^listen:/d" "$config"
     echo "listen: \"0.0.0.0:${port}\"" >> "$config"
+    sed -i -E "s#(public-url: |rp-origin: )\"http://localhost:[0-9]+\"#\1\"${url%/}\"#" "$config"
     echo "Pinned $(basename "$config") to port ${port}"
 }
 set_listen "$TMP_API_CONFIG" "${LNVPS_API_URL:-}"

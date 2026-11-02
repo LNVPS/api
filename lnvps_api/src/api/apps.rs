@@ -3,6 +3,7 @@
 //! Browse the app catalog and view your own deployments. Ordering, lifecycle
 //! control and the operator reconcile land in later increments.
 
+use crate::api::app_category::localize_category;
 use crate::api::model::{ApiPrice, ApiSubscriptionPayment};
 use crate::api::{PaymentMethodQuery, RouterState};
 use crate::settings::Settings;
@@ -13,7 +14,7 @@ use chrono::{DateTime, Utc};
 use lnvps_api_common::k8s_names::{deployment_namespace, pending_deployment_namespace};
 use lnvps_api_common::{
     ApiData, ApiError, ApiIntervalType, ApiResult, AppCapacity, AppClusterCapacityService,
-    AppDeploymentUsage, Nip98Auth,
+    AppDeploymentUsage, ClientInfo, Nip98Auth,
 };
 use lnvps_db::{
     App, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus, AppTag, EncryptedString,
@@ -77,6 +78,7 @@ pub struct ApiApp {
     /// "hosting", no "managed" and no trailing punctuation — the client's
     /// template supplies those, e.g. `{display_name} Hosting — Managed
     /// {category}`. Also suitable for `Product.category` in structured data.
+    /// Translated per `Accept-Language` when a translation exists, else English.
     pub category: String,
     /// Per-app override for the page `<title>`. Null for almost every app —
     /// clients should template from `display_name` + `category` and only use
@@ -202,7 +204,7 @@ impl ApiApp {
     /// that fetch inside a per-item conversion is precisely where an N+1 comes
     /// from. Callers load the whole result set's assignments in one query and
     /// hand in the slice.
-    pub fn from_app(a: App, tags: Vec<ApiAppTag>) -> Self {
+    pub fn from_app(a: App, tags: Vec<ApiAppTag>, accept_language: Option<&str>) -> Self {
         // Per-service and per-volume breakdowns from the (already-validated)
         // compose; best-effort, so a row that somehow fails to parse still
         // renders with its stored totals rather than failing the listing.
@@ -238,7 +240,11 @@ impl ApiApp {
             description: a.description,
             icon: a.icon,
             repo_url: a.repo_url,
-            category: a.category,
+            category: localize_category(
+                &a.category,
+                a.category_translations.as_deref(),
+                accept_language,
+            ),
             seo_title: a.seo_title,
             seo_description: a.seo_description,
             compose: a.compose,
@@ -534,6 +540,7 @@ async fn tags_by_app(
 /// UI, and a stale chip should degrade to "no results", not to an error page.
 async fn v1_list_apps(
     State(this): State<RouterState>,
+    client: ClientInfo,
     Query(params): Query<Vec<(String, String)>>,
 ) -> ApiResult<Vec<ApiApp>> {
     let apps = this.db.list_apps(true).await?;
@@ -543,6 +550,7 @@ async fn v1_list_apps(
     // unpaginated and already loads every enabled app plus every assignment,
     // so the rows are in hand and a second query shape would buy nothing.
     let wanted = tag_filter(&params);
+    let lang = client.accept_language.as_deref();
     ApiData::ok(
         apps.into_iter()
             .filter_map(|a| {
@@ -550,14 +558,18 @@ async fn v1_list_apps(
                 let matches = wanted
                     .iter()
                     .all(|slug| app_tags.iter().any(|t| &t.slug == slug));
-                matches.then(|| ApiApp::from_app(a, app_tags))
+                matches.then(|| ApiApp::from_app(a, app_tags, lang))
             })
             .collect(),
     )
 }
 
 /// Get a single enabled catalog app. Public (no auth), like the list.
-async fn v1_get_app(State(this): State<RouterState>, Path(id): Path<u64>) -> ApiResult<ApiApp> {
+async fn v1_get_app(
+    State(this): State<RouterState>,
+    client: ClientInfo,
+    Path(id): Path<u64>,
+) -> ApiResult<ApiApp> {
     let app = this.db.get_app(id).await?;
     if !app.enabled {
         return Err(ApiError::not_found("App not found"));
@@ -569,7 +581,11 @@ async fn v1_get_app(State(this): State<RouterState>, Path(id): Path<u64>) -> Api
         .into_iter()
         .map(|(_, t)| t.into())
         .collect();
-    ApiData::ok(ApiApp::from_app(app, tags))
+    ApiData::ok(ApiApp::from_app(
+        app,
+        tags,
+        client.accept_language.as_deref(),
+    ))
 }
 
 /// List the tag vocabulary with per-tag counts of enabled apps.
@@ -1470,6 +1486,7 @@ mod tests {
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
+                    category_translations: None,
                     compose: "services:\n  a:\n    image: x\n".to_string(),
                     amount: 1000,
                     currency: "USD".to_string(),
@@ -1611,6 +1628,7 @@ mod tests {
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
+                    category_translations: None,
                     compose: "services:\n  a:\n    image: x\n".to_string(),
                     amount: 1000,
                     currency: "USD".to_string(),
@@ -1725,6 +1743,7 @@ mod tests {
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
+                    category_translations: None,
                     compose: "services:\n  a:\n    image: x\n".to_string(),
                     amount: 1000,
                     currency: "USD".to_string(),

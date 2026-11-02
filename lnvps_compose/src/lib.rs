@@ -3954,4 +3954,204 @@ config:
                 .any(|p| p.container == 25575 && p.expose == Expose::None)
         );
     }
+
+    fn catalog_documents() -> Vec<(String, String)> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../catalog");
+        let mut out: Vec<(String, String)> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "yaml"))
+            .map(|p| {
+                (
+                    p.file_stem().unwrap().to_string_lossy().into_owned(),
+                    std::fs::read_to_string(&p).unwrap(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn ditto() -> Compose {
+        let yaml = catalog_documents()
+            .into_iter()
+            .find(|(n, _)| n == "ditto-relay")
+            .unwrap()
+            .1;
+        Compose::parse(&yaml).unwrap()
+    }
+
+    #[test]
+    fn catalog_never_takes_customer_code() {
+        for (name, yaml) in catalog_documents() {
+            let c = Compose::parse(&yaml).unwrap();
+            for (sname, svc) in &c.services {
+                for f in &svc.files {
+                    assert!(
+                        f.content_from.is_none(),
+                        "{name}/{sname}: {} takes a whole customer file",
+                        f.path
+                    );
+                    assert!(
+                        !f.path.ends_with(".sh")
+                            && !f.path.ends_with(".py")
+                            && !f.path.ends_with(".js"),
+                        "{name}/{sname}: {} looks like a script",
+                        f.path
+                    );
+                }
+                for init in &svc.init {
+                    for text in init.command.iter().chain(init.args.iter()).flatten() {
+                        assert!(
+                            !text.contains("${"),
+                            "{name}/{sname}: init step interpolates config"
+                        );
+                    }
+                }
+                if let Some(b) = &svc.backup {
+                    for text in b.command.iter().chain(b.exec.iter()).flatten() {
+                        assert!(
+                            !text.contains("${"),
+                            "{name}/{sname}: backup interpolates config"
+                        );
+                    }
+                }
+            }
+            for field in c.config.iter().filter(|f| f.r#type == FieldType::File) {
+                let overrides = c.services.values().any(|s| {
+                    s.env_from.as_deref() == Some(field.name.as_str())
+                        || s.files
+                            .iter()
+                            .any(|f| f.merge_from.as_deref() == Some(field.name.as_str()))
+                });
+                let as_env_value = c.services.values().any(|s| {
+                    s.env
+                        .values()
+                        .any(|v| v.contains(&format!("${{{}}}", field.name)))
+                });
+                assert!(
+                    overrides || as_env_value,
+                    "{name}: file field '{}' is neither a checked override nor a plain env value",
+                    field.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ditto_has_no_write_policy_plugin_field_or_override() {
+        let c = ditto();
+        let svc = &c.services["relay"];
+        assert!(svc.env_from.is_none());
+        assert!(
+            c.config
+                .iter()
+                .all(|f| f.r#type != FieldType::File && f.name != "write_policy")
+        );
+        for f in &svc.files {
+            assert!(
+                f.merge_from.is_none() && f.content_from.is_none(),
+                "{}",
+                f.path
+            );
+        }
+        let toml = svc
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("ditto-relay.toml"))
+            .unwrap();
+        assert!(
+            toml.content
+                .as_ref()
+                .unwrap()
+                .contains("write_policy_plugin = \"/usr/local/bin/ditto-policy\"")
+        );
+    }
+
+    #[test]
+    fn ditto_policy_fields_refuse_metacharacters() {
+        let c = ditto();
+        let hostile = [
+            "1; touch /tmp/x",
+            "1,$(id)",
+            "1`id`",
+            "1\"\n[evil]",
+            "1\\",
+            "1 && id",
+            "1|id",
+            "1\n2",
+            "../etc",
+            "true; id",
+            "-1",
+            "1e9",
+            " 1",
+        ];
+        let pubkey = "ab".repeat(32);
+        let fields = [
+            "policy_kinds",
+            "policy_allow_pubkeys",
+            "policy_deny_pubkeys",
+            "policy_min_pow",
+            "policy_max_event_bytes",
+            "policy_events_per_minute",
+            "policy_require_auth",
+            "write_policy_timeout_seconds",
+            "auth_kinds",
+        ];
+        for name in fields {
+            for bad in hostile.iter().copied().chain([
+                format!("{pubkey};id").as_str(),
+                format!("{pubkey},{pubkey}\n{pubkey}").as_str(),
+                "AB".repeat(32).as_str(),
+            ]) {
+                let mut submitted = std::collections::BTreeMap::new();
+                submitted.insert(name.to_string(), bad.to_string());
+                assert!(
+                    resolve_config(&c, &submitted).is_err(),
+                    "{name} accepted {bad:?}"
+                );
+            }
+        }
+        let mut good = std::collections::BTreeMap::new();
+        good.insert("policy_kinds".to_string(), "1,7,30023".to_string());
+        good.insert(
+            "policy_allow_pubkeys".to_string(),
+            format!("{pubkey},{pubkey}"),
+        );
+        good.insert("policy_deny_pubkeys".to_string(), pubkey.clone());
+        good.insert("policy_min_pow".to_string(), "20".to_string());
+        good.insert("policy_max_event_bytes".to_string(), "65536".to_string());
+        good.insert("policy_events_per_minute".to_string(), "60".to_string());
+        good.insert("policy_require_auth".to_string(), "true".to_string());
+        resolve_config(&c, &good).unwrap();
+    }
+
+    #[test]
+    fn ditto_policy_json_renders_as_data_only() {
+        let c = ditto();
+        let mut submitted = std::collections::BTreeMap::new();
+        submitted.insert("policy_kinds".to_string(), "1,7".to_string());
+        submitted.insert("policy_min_pow".to_string(), "12".to_string());
+        let config = resolve_config(&c, &submitted).unwrap();
+        let mut vars: HashMap<String, String> = config.into_iter().collect();
+        vars.insert("HOSTNAME".into(), "h.example.com".into());
+        let files = &c.resolve_files(&vars).unwrap()["relay"];
+        let policy = files
+            .iter()
+            .find(|f| f.path == "/etc/ditto-relay/policy.json")
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&policy.content).unwrap();
+        assert_eq!(json["kinds"], "1,7");
+        assert_eq!(json["min_pow"], "12");
+        assert_eq!(json["require_auth"], "false");
+        let toml = files
+            .iter()
+            .find(|f| f.path.ends_with("ditto-relay.toml"))
+            .unwrap();
+        let doc: toml::Table = toml.content.parse().unwrap();
+        assert_eq!(
+            doc["write_policy_plugin"].as_str(),
+            Some("/usr/local/bin/ditto-policy")
+        );
+    }
 }

@@ -1,0 +1,2 @@
+#!/bin/sh
+exec jq -c --unbuffered -n --slurpfile policy /etc/ditto-relay/policy.json -f /usr/local/share/ditto-relay/policy.jq

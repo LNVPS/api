@@ -60,6 +60,15 @@ impl TestClient {
         Ok(resp)
     }
 
+    pub async fn get_with_language(&self, path: &str, language: &str) -> anyhow::Result<Response> {
+        Ok(self
+            .http
+            .get(self.url(path))
+            .header("Accept-Language", language)
+            .send()
+            .await?)
+    }
+
     /// Make an unauthenticated POST request with JSON body.
     pub async fn post(&self, path: &str, body: &impl serde::Serialize) -> anyhow::Result<Response> {
         let url = self.url(path);

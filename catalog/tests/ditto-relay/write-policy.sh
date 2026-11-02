@@ -1,1 +1,0 @@
-jq -c --unbuffered '(.event.content | contains("reject-me")) as $bad | {id: .event.id, action: (if $bad then "reject" else "accept" end), msg: (if $bad then "blocked: rejected by policy" else "" end)}'

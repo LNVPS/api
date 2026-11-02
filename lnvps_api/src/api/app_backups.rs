@@ -335,6 +335,7 @@ mod tests {
                 category: "Nostr relay".to_string(),
                 seo_title: None,
                 seo_description: None,
+                category_translations: None,
                 compose: compose.to_string(),
                 amount: 1000,
                 currency: "USD".to_string(),

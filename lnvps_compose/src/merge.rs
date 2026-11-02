@@ -162,9 +162,106 @@ pub fn parse_env_lines(text: &str) -> Result<Vec<(String, String)>> {
                 i + 1
             );
         }
+        if let Some(reason) = forbidden_env_name(key) {
+            bail!("line {}: '{key}' is not allowed ({reason})", i + 1);
+        }
         out.push((key.to_string(), unquote(value.trim()).to_string()));
     }
     Ok(out)
+}
+
+const FORBIDDEN_ENV_NAMES: &[&str] = &[
+    "PATH",
+    "HOME",
+    "SHELL",
+    "IFS",
+    "ENV",
+    "BASH_ENV",
+    "PS4",
+    "CDPATH",
+    "GLOBIGNORE",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "CLASSPATH",
+    "GCONV_PATH",
+    "LOCPATH",
+    "NLSPATH",
+    "TERMINFO",
+    "RUSTC_WRAPPER",
+    "HOSTALIASES",
+    "PAGER",
+    "EDITOR",
+    "VISUAL",
+    "BROWSER",
+    "TMPDIR",
+    "SSLKEYLOGFILE",
+];
+
+const FORBIDDEN_ENV_PREFIXES: &[&str] = &[
+    "LD_",
+    "DYLD_",
+    "GIT_",
+    "MALLOC_",
+    "BASH_",
+    "PYTHON",
+    "PERL",
+    "RUBY",
+    "NODE_",
+    "DENO_",
+    "JAVA",
+    "_JAVA",
+    "JDK_",
+    "SSH_",
+    "GOFLAGS",
+    "GODEBUG",
+    "GOROOT",
+    "GOPATH",
+    "GOTOOL",
+    "CARGO_",
+    "RUSTC",
+    "RUSTFLAGS",
+    "RUSTDOC",
+    "LUA_",
+    "PHPRC",
+    "PHP_",
+];
+
+const FORBIDDEN_ENV_WORDS: &[&str] = &[
+    "COMMAND",
+    "CMD",
+    "EXEC",
+    "SCRIPT",
+    "PLUGIN",
+    "SHELL",
+    "PRELOAD",
+    "HOOK",
+    "HOOKS",
+    "ARGS",
+    "ARGV",
+    "OPTS",
+    "OPTIONS",
+    "ENTRYPOINT",
+    "INTERPRETER",
+];
+
+/// Names that make a process load a library, run a program or evaluate code
+/// when set. A customer sets data, never anything the app or its runtime would
+/// execute, so these are refused wherever a customer supplies environment.
+pub fn forbidden_env_name(key: &str) -> Option<&'static str> {
+    let upper = key.to_ascii_uppercase();
+    if FORBIDDEN_ENV_NAMES.contains(&upper.as_str()) {
+        return Some("it changes how the process starts");
+    }
+    if FORBIDDEN_ENV_PREFIXES.iter().any(|p| upper.starts_with(p)) {
+        return Some("it is read by the runtime or a tool the app starts");
+    }
+    if upper
+        .split('_')
+        .any(|word| FORBIDDEN_ENV_WORDS.contains(&word))
+    {
+        return Some("it can name a program or code to run");
+    }
+    None
 }
 
 fn is_env_name(key: &str) -> bool {
@@ -319,5 +416,44 @@ mod tests {
         assert!(parse_env_lines("BAD-NAME=x").is_err());
         assert!(parse_env_lines("=x").is_err());
         assert_eq!(unquote("\""), "\"");
+    }
+
+    #[test]
+    fn env_lines_refuse_names_that_run_code() {
+        for key in [
+            "LD_PRELOAD",
+            "ld_library_path",
+            "BASH_ENV",
+            "ENV",
+            "PATH",
+            "NODE_OPTIONS",
+            "JAVA_TOOL_OPTIONS",
+            "PYTHONSTARTUP",
+            "GIT_SSH_COMMAND",
+            "GIT_CONFIG_COUNT",
+            "GODEBUG",
+            "RUSTC_WRAPPER",
+            "PROMPT_COMMAND",
+            "WRITE_POLICY_PLUGIN",
+            "BUZZ_HOOK_COMMAND",
+            "STARTUP_SCRIPT",
+            "RUN_EXEC",
+            "EXTRA_ARGS",
+        ] {
+            let err = parse_env_lines(&format!("{key}=x"))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("not allowed"), "{key}: {err}");
+        }
+        for key in [
+            "RUST_LOG",
+            "HAVEN_LOG_LEVEL",
+            "WOT_DEPTH",
+            "BUZZ_MAX_CONNECTIONS",
+            "GOOGLE_API_KEY",
+        ] {
+            assert!(parse_env_lines(&format!("{key}=1")).is_ok(), "{key}");
+        }
+        assert!(parse_env_lines("export LD_PRELOAD=/x.so").is_err());
     }
 }

@@ -47,7 +47,7 @@ mod tests {
 
         let body = json_ok(customer.get_auth("/api/v1/account/credit").await.unwrap()).await;
         assert_eq!(body["data"]["balance"], 0);
-        assert_eq!(body["data"]["currency"], "BTC");
+        assert_eq!(body["data"]["currency"], "EUR");
         assert_eq!(body["data"]["auto_apply"], false);
     }
 
@@ -86,7 +86,7 @@ mod tests {
             admin
                 .patch_auth(
                     &format!("/api/admin/v1/users/{uid}/credit"),
-                    &json!({"delta": 3_000_000, "kind": "topup"}),
+                    &json!({"currency": "EUR", "delta": 3_000_000, "kind": "topup"}),
                 )
                 .await
                 .unwrap(),
@@ -101,7 +101,7 @@ mod tests {
         )
         .await;
         assert_eq!(body["data"]["balance"], 3_000_000);
-        assert_eq!(body["data"]["currency"], "BTC");
+        assert_eq!(body["data"]["currency"], "EUR");
         assert_eq!(body["data"]["auto_apply"], true);
     }
 
@@ -169,13 +169,14 @@ mod tests {
             admin
                 .patch_auth(
                     &format!("/api/admin/v1/users/{uid}/credit"),
-                    &json!({"delta": 5_000_000, "kind": "topup", "note": "e2e grant"}),
+                    &json!({"currency": "EUR", "delta": 5_000_000, "kind": "topup", "note": "e2e grant"}),
                 )
                 .await
                 .unwrap(),
         )
         .await;
-        assert_eq!(body["data"]["balance"], 5_000_000);
+        assert_eq!(body["data"]["balances"][0]["currency"], "EUR");
+        assert_eq!(body["data"]["balances"][0]["balance"], 5_000_000);
 
         // The ledger shows the grant.
         let body = json_ok(
@@ -194,7 +195,7 @@ mod tests {
         let resp = admin
             .patch_auth(
                 &format!("/api/admin/v1/users/{uid}/credit"),
-                &json!({"delta": -1_000_000, "kind": "topup"}),
+                &json!({"currency": "EUR", "delta": -1_000_000, "kind": "topup"}),
             )
             .await
             .unwrap();
@@ -204,7 +205,7 @@ mod tests {
         let resp = admin
             .patch_auth(
                 &format!("/api/admin/v1/users/{uid}/credit"),
-                &json!({"delta": -5_000_001, "kind": "admin"}),
+                &json!({"currency": "EUR", "delta": -5_000_001, "kind": "admin"}),
             )
             .await
             .unwrap();
@@ -214,7 +215,7 @@ mod tests {
             admin
                 .patch_auth(
                     &format!("/api/admin/v1/users/{uid}/credit"),
-                    &json!({"delta": -1_000_000, "kind": "admin", "note": "clawback"}),
+                    &json!({"currency": "EUR", "delta": -1_000_000, "kind": "admin", "note": "clawback"}),
                 )
                 .await
                 .unwrap(),
