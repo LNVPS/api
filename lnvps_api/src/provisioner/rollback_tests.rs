@@ -719,6 +719,10 @@ mod tests {
             .find(|i| i.ip.contains('.'))
             .expect("v4 ip");
 
+        MockDnsServer::fail_deletes(true).await;
+        let failed = provisioner.delete_vm(vm.id, false).await;
+        MockDnsServer::fail_deletes(false).await;
+        assert!(failed.is_err(), "failed DNS delete must fail the VM delete");
         provisioner.delete_vm(vm.id, false).await?;
         {
             let zones = dns.zones.lock().await;
