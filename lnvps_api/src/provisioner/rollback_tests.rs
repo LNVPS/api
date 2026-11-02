@@ -661,7 +661,11 @@ mod tests {
         let vm = provisioner
             .provision(user.id, 1, 1, ssh_key.id, None)
             .await?;
-        provisioner.spawn_vm_pipeline(vm.id).await?.execute().await?;
+        provisioner
+            .spawn_vm_pipeline(vm.id)
+            .await?
+            .execute()
+            .await?;
 
         let record_count = |dns: &MockDnsServer| {
             let zones = dns.zones.clone();
@@ -1053,6 +1057,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_lifecycle() -> Result<()> {
+        let _snapshots =
+            lnvps_api_common::host::dummy_host::DummyVmHost::exclusive_snapshots().await;
         clear_mock_state().await;
         let db = Arc::new(MockDb::default());
         setup_db_with_static_arp(&db).await?;
@@ -1079,6 +1085,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_limits_and_rejections() -> Result<()> {
+        let _snapshots =
+            lnvps_api_common::host::dummy_host::DummyVmHost::exclusive_snapshots().await;
         use lnvps_api_common::host::SnapshotRejection;
         clear_mock_state().await;
         let db = Arc::new(MockDb::default());
@@ -1152,6 +1160,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_snapshot_actions_are_logged_only_when_they_succeed() -> Result<()> {
+        let _snapshots =
+            lnvps_api_common::host::dummy_host::DummyVmHost::exclusive_snapshots().await;
         use lnvps_api_common::{SnapshotAction, VmHistoryLogger};
         clear_mock_state().await;
         let db = Arc::new(MockDb::default());
@@ -1204,6 +1214,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_reinstall_discards_snapshots() -> Result<()> {
+        let _snapshots =
+            lnvps_api_common::host::dummy_host::DummyVmHost::exclusive_snapshots().await;
         clear_mock_state().await;
         let db = Arc::new(MockDb::default());
         setup_db_with_static_arp(&db).await?;

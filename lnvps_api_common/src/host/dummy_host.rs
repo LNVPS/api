@@ -180,6 +180,13 @@ impl DummyVmHost {
         DUMMY_SNAPSHOTS.lock().await.clear();
     }
 
+    pub async fn exclusive_snapshots() -> tokio::sync::MutexGuard<'static, ()> {
+        static SNAPSHOT_TESTS: Mutex<()> = Mutex::const_new(());
+        let guard = SNAPSHOT_TESTS.lock().await;
+        Self::clear_all_snapshots().await;
+        guard
+    }
+
     /// Forget all recorded migrations.
     pub async fn clear_migrations() {
         DUMMY_MIGRATIONS.lock().await.clear();

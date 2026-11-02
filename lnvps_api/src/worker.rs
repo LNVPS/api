@@ -5585,6 +5585,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_vm_snapshot_job_runs_and_reports() -> Result<()> {
+        let _snapshots =
+            lnvps_api_common::host::dummy_host::DummyVmHost::exclusive_snapshots().await;
         let db = Arc::new(MockDb::default());
         let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
         let worker = setup_worker(db.clone()).await?;
