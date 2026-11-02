@@ -1533,6 +1533,7 @@ mod tests {
         {
             let zones = dns.zones.lock().await;
             assert_eq!(zones.get("mock-rev-zone-id").unwrap().len(), 0);
+            assert_eq!(zones.get("mock-v6-rev-zone-id").unwrap().len(), 0);
             assert_eq!(zones.get("mock-forward-zone-id").unwrap().len(), 0);
         }
 

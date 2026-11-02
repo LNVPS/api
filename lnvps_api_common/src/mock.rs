@@ -11560,6 +11560,7 @@ pub struct MockDnsServer {
     /// When set, `add_record` fails for records whose kind matches (e.g. "PTR",
     /// "A", "AAAA") or "*" for all. Used to simulate DNS provider failures.
     fail_kind: Arc<Mutex<Option<String>>>,
+    fail_delete: Arc<Mutex<bool>>,
 }
 
 pub struct MockDnsEntry {
@@ -11582,11 +11583,17 @@ impl MockDnsServer {
             static TL_ZONES: Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             static TL_FAIL: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            static TL_FAIL_DELETE: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         }
         Self {
             zones: TL_ZONES.with(|z| z.clone()),
             fail_kind: TL_FAIL.with(|f| f.clone()),
+            fail_delete: TL_FAIL_DELETE.with(|f| f.clone()),
         }
+    }
+
+    pub async fn fail_deletes(fail: bool) {
+        *Self::new().fail_delete.lock().await = fail;
     }
 
     /// Make `add_record` fail for records of the given kind ("A", "AAAA",
@@ -11603,6 +11610,7 @@ impl MockDnsServer {
     pub async fn reset() {
         Self::new().zones.lock().await.clear();
         *Self::new().fail_kind.lock().await = None;
+        *Self::new().fail_delete.lock().await = false;
     }
 }
 
@@ -11664,6 +11672,11 @@ impl crate::dns::DnsServer for MockDnsServer {
     }
 
     async fn delete_record(&self, record: &BasicRecord) -> OpResult<()> {
+        if *self.fail_delete.lock().await {
+            return Err(OpError::Fatal(anyhow::anyhow!(
+                "Injected DNS delete failure"
+            )));
+        }
         let zone_id = record
             .zone
             .as_id()

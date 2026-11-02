@@ -645,6 +645,48 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_delete_vm_keeps_dns_refs_when_dns_delete_fails_then_retries() -> Result<()> {
+        clear_mock_state().await;
+        MockDnsServer::reset().await;
+        let settings = mock_settings();
+        let db = Arc::new(MockDb::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, 69_420.0).await;
+        setup_db_with_static_arp(&db).await?;
+
+        let dns = MockDnsServer::new();
+        let provisioner = VmProvisioner::new(settings, db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        provisioner.spawn_vm_pipeline(vm.id).await?.execute().await?;
+
+        let record_count = |dns: &MockDnsServer| {
+            let zones = dns.zones.clone();
+            async move { zones.lock().await.values().map(|z| z.len()).sum::<usize>() }
+        };
+        let before = record_count(&dns).await;
+        assert!(before > 0);
+
+        MockDnsServer::fail_deletes(true).await;
+        let res = provisioner.delete_vm(vm.id, false).await;
+        MockDnsServer::fail_deletes(false).await;
+        assert!(res.is_err(), "failed DNS delete must fail the VM delete");
+        assert_eq!(record_count(&dns).await, before);
+        let ips = db.list_vm_ip_assignments(vm.id).await?;
+        assert!(!ips.is_empty());
+        assert!(
+            ips.iter()
+                .all(|i| i.dns_forward_ref.is_some() && i.dns_reverse_ref.is_some())
+        );
+
+        provisioner.delete_vm(vm.id, false).await?;
+        assert_eq!(record_count(&dns).await, 0);
+        Ok(())
+    }
+
     /// Test the delete_vm pipeline executes all cleanup steps
     #[tokio::test]
     async fn test_delete_vm_pipeline_complete_cleanup() -> Result<()> {
