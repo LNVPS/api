@@ -138,6 +138,10 @@ async fn main() -> Result<(), Error> {
         Some(i) => i.parse()?,
         None => SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 8001),
     };
+    #[cfg(feature = "demo")]
+    warn!(
+        "DEMO BUILD: /api/admin/v1/me/roles auto-assigns the admin role to any key when LNVPS_DEMO_OPEN_ADMIN=1 - never expose a demo build to the public internet"
+    );
     let listener = bind_address(ip).await?;
     info!("Listening on {}", ip);
     let router = admin_router(
