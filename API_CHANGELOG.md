@@ -833,6 +833,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     - `DELETE /api/v1/payment-methods/{id}` — remove a saved method.
   - **Breaking:** the `nwc_connection_string` field on `GET`/`PATCH /api/v1/account` has been removed. Existing NWC connections are migrated into `user_payment_method` (provider `nwc`); manage NWC via the new payment-methods endpoints instead.
 
+- **Demo auto-admin requires an explicit runtime opt-in**: in builds with the `demo` feature, `GET /api/admin/v1/me/roles` no longer self-assigns the admin role unconditionally — it now also requires `LNVPS_DEMO_OPEN_ADMIN=1` in the worker's environment, and the binary warns at startup when the feature is compiled in. Demo deployments set the variable; any other deployment (including one that accidentally shipped with `--features demo`) refuses self-promotion. Set the variable in the demo environment to restore the old behavior.
+
 ## [0.4.0] - 2026-07-13
 
 ### Added

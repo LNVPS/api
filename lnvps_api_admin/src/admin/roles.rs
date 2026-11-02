@@ -537,8 +537,16 @@ async fn admin_get_my_roles(
 
     #[cfg(feature = "demo")]
     {
-        // assign admin role when no roles are found
-        if role_assignments.len() == 0 {
+        // Demo builds auto-assign the admin role to any authenticated key
+        // that lands here — deliberately, so a demo deployment needs no
+        // bootstrap step. Two conditions must BOTH hold: the `demo` feature
+        // is compiled in AND the operator exported LNVPS_DEMO_OPEN_ADMIN=1.
+        // A release build with `--features demo` that forgot the variable
+        // (or an attacker hitting a demo deployment that did not set it) is
+        // refused instead of self-promoting.
+        if role_assignments.len() == 0
+            && std::env::var("LNVPS_DEMO_OPEN_ADMIN").as_deref() == Ok("1")
+        {
             let roles = this.db.list_roles().await?;
             if let Some(admin_role) = roles.iter().find(|r| r.name == "admin") {
                 this.db
@@ -763,5 +771,49 @@ mod tests {
         assert!(check_role_revocation(1, 2, false, SUPER_ADMIN_ROLE, 5).is_err());
         // Ordinary roles are unaffected.
         assert!(check_role_revocation(1, 1, false, "read_only", 1).is_ok());
+    }
+    /// Regression (audit LNVM-006): the demo auto-admin must require the
+    /// explicit `LNVPS_DEMO_OPEN_ADMIN=1` opt-in. Without the variable —
+    /// feature compiled in or not — an authenticated key with no roles is
+    /// reported as having none, never promoted. (The grant path itself needs
+    /// a database: MockDb's role functions are stubs, so only the refusal is
+    /// unit-testable here.)
+    #[tokio::test]
+    async fn demo_auto_admin_requires_the_explicit_opt_in() {
+        use lnvps_api_common::{
+            ChannelWorkCommander, MockDb, MockExchangeRate, VatClient, VmStateCache,
+        };
+        use lnvps_db::LNVpsDb;
+        use std::sync::Arc;
+
+        fn state(db: &Arc<dyn LNVpsDb>) -> crate::admin::RouterState {
+            crate::admin::RouterState {
+                node_control: None,
+                db: db.clone(),
+                work_commander: Arc::new(ChannelWorkCommander::new()),
+                feedback: None,
+                vm_state_cache: VmStateCache::new(),
+                exchange: Arc::new(MockExchangeRate::default()),
+                vat: VatClient::new(),
+            }
+        }
+
+        let db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        let pubkey = [30u8; 32];
+        let user_id = db.upsert_user(&pubkey).await.unwrap();
+
+        let auth = AdminAuth {
+            user_id,
+            pubkey: pubkey.to_vec(),
+            permissions: Default::default(),
+            nip98_auth: None,
+        };
+        // single-threaded test body: env mutation is fine here
+        unsafe { std::env::remove_var("LNVPS_DEMO_OPEN_ADMIN") };
+        let res = admin_get_my_roles(auth, State(state(&db))).await.unwrap();
+        assert!(
+            res.0.data.is_empty(),
+            "a key with no roles must not be promoted without the opt-in"
+        );
     }
 }
