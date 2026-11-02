@@ -87,6 +87,16 @@ async fn lock_account_credit(
     user_id: u64,
     currency: &str,
 ) -> Result<u64> {
+    let existing: Option<u64> = sqlx::query_scalar(
+        "SELECT balance FROM account_credit WHERE user_id = ? AND currency = ? FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(currency)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(balance) = existing {
+        return Ok(balance);
+    }
     sqlx::query(
         "INSERT INTO account_credit (user_id, balance, currency, auto_apply) \
          SELECT ?, 0, ?, COALESCE(MAX(auto_apply), 0) FROM account_credit WHERE user_id = ? \
