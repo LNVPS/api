@@ -154,6 +154,16 @@ pub enum OrderProduct {
     DnsHosting,
     /// A one-off marketplace node listing fee.
     MarketplaceNodeFee { node_id: Option<i64> },
+    /// Paid extras on a VM, such as snapshot slots.
+    VmAddon {
+        #[serde(default)]
+        vm_id: Option<i64>,
+        /// `snapshot`.
+        #[serde(default)]
+        kind: Option<String>,
+        #[serde(default)]
+        quantity: Option<i64>,
+    },
     /// A consumer VPN plan.
     Vpn {
         #[serde(default)]
@@ -218,6 +228,18 @@ impl OrderLineItem {
                 }
             }
             LineItemType::DnsHosting => OrderProduct::DnsHosting,
+            LineItemType::VmAddon => {
+                let a = db
+                    .get_vm_addon_by_line_item(line_item.id)
+                    .await
+                    .ok()
+                    .flatten();
+                OrderProduct::VmAddon {
+                    vm_id: a.as_ref().map(|a| a.vm_id as i64),
+                    kind: a.as_ref().map(|a| a.kind.to_string()),
+                    quantity: a.map(|a| a.quantity as i64),
+                }
+            }
             LineItemType::MarketplaceNodeFee => OrderProduct::MarketplaceNodeFee {
                 node_id: db
                     .get_marketplace_node_by_line_item(line_item.id)
@@ -675,6 +697,16 @@ mod tests {
             OrderLineItem::resolve(&db, &fee).await.product,
             OrderProduct::MarketplaceNodeFee {
                 node_id: Some(node_id as i64)
+            }
+        );
+
+        let orphan = line(&db, user_id, LineItemType::VmAddon, "Snapshots").await;
+        assert_eq!(
+            OrderLineItem::resolve(&db, &orphan).await.product,
+            OrderProduct::VmAddon {
+                vm_id: None,
+                kind: None,
+                quantity: None
             }
         );
     }

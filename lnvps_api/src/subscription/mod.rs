@@ -22,7 +22,7 @@ use lnvps_api_common::{
 };
 use lnvps_db::{
     LNVpsDb, LineItemType, PaymentMethod, RenewalSource, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentType, User, UserPaymentMethod,
+    SubscriptionPayment, SubscriptionPaymentType, User, UserPaymentMethod, VmAddonKind,
 };
 use log::{debug, info, warn};
 use payments_rs::currency::{Currency, CurrencyAmount};
@@ -40,6 +40,7 @@ mod app;
 mod ip_range;
 mod marketplace_node_fee;
 mod vm;
+mod vm_addon;
 mod vpn;
 
 use crate::provisioner::{IpRangeProvisioner, VmProvisioner};
@@ -540,6 +541,7 @@ impl SubscriptionHandler {
             // so reaching this is a wiring bug — fail loud instead of a swallowed
             // Err (the callers only `warn!` on Err, which is how a missing App
             // handler previously went unnoticed).
+            LineItemType::VmAddon => Ok(Box::new(vm_addon::VmAddonLineItemHandler)),
             t @ (LineItemType::AsnSponsoring | LineItemType::DnsHosting) => {
                 panic!("no subscription line item handler implemented for {t:?}")
             }
@@ -645,6 +647,16 @@ impl SubscriptionHandler {
                     );
                 }
             }
+        }
+
+        if payment.payment_type == SubscriptionPaymentType::AddonChange
+            && let Err(e) = self.apply_paid_vm_addon(payment).await
+        {
+            warn!(
+                "Failed to apply add-on payment {}: {}",
+                hex::encode(&payment.id),
+                e
+            );
         }
 
         info!(
@@ -1439,6 +1451,9 @@ impl SubscriptionHandler {
                     SubscriptionPaymentType::Upgrade => {
                         format!("Subscription upgrade: {}", subscription.name)
                     }
+                    SubscriptionPaymentType::AddonChange => {
+                        format!("Subscription add-ons: {}", subscription.name)
+                    }
                     // Refunds are recorded, never invoiced: nothing here creates
                     // one, and an invoice for money we owe the customer would be
                     // nonsense. Kept explicit so a future path that does reach
@@ -1516,6 +1531,9 @@ impl SubscriptionHandler {
                     }
                     SubscriptionPaymentType::Upgrade => {
                         format!("Subscription upgrade: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::AddonChange => {
+                        format!("Subscription add-ons: {}", subscription.name)
                     }
                     // Refunds are recorded, never invoiced: nothing here creates
                     // one, and an invoice for money we owe the customer would be
@@ -1619,6 +1637,9 @@ impl SubscriptionHandler {
                     SubscriptionPaymentType::Upgrade => {
                         format!("Subscription upgrade: {}", subscription.name)
                     }
+                    SubscriptionPaymentType::AddonChange => {
+                        format!("Subscription add-ons: {}", subscription.name)
+                    }
                     // Refunds are recorded, never invoiced: nothing here creates
                     // one, and an invoice for money we owe the customer would be
                     // nonsense. Kept explicit so a future path that does reach
@@ -1677,6 +1698,9 @@ impl SubscriptionHandler {
                     }
                     SubscriptionPaymentType::Upgrade => {
                         format!("Subscription upgrade: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::AddonChange => {
+                        format!("Subscription add-ons: {}", subscription.name)
                     }
                     SubscriptionPaymentType::Refund => {
                         bail!("Cannot create an invoice for a refund")
@@ -2008,6 +2032,7 @@ impl SubscriptionHandler {
                         format!("VM renewal {vm_id} to {}", p.new_expiry)
                     }
                     SubscriptionPaymentType::Upgrade => format!("VM upgrade {vm_id}"),
+                    SubscriptionPaymentType::AddonChange => format!("VM add-ons {vm_id}"),
                     SubscriptionPaymentType::Purchase => format!("VM purchase {vm_id}"),
                     // A refund is recorded against an existing payment, never
                     // priced and invoiced like a sale.
@@ -2702,6 +2727,125 @@ impl SubscriptionHandler {
         )
         .await
     }
+
+    pub async fn change_vm_addon(
+        &self,
+        vm_id: u64,
+        kind: VmAddonKind,
+        quantity: u32,
+        method: PaymentMethod,
+        mode: RenewMode,
+    ) -> Result<VmAddonChange> {
+        let quote = self
+            .pe
+            .calculate_vm_addon_cost(vm_id, kind, quantity, method)
+            .await?;
+        if quote.quantity == quote.current {
+            return Ok(VmAddonChange::Applied);
+        }
+        if quote.quantity < quote.current || quote.is_free() {
+            self.apply_vm_addon(vm_id, kind, quantity).await?;
+            return Ok(VmAddonChange::Applied);
+        }
+        let vm = self.db.get_vm(vm_id).await?;
+        let line_item = self
+            .db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let payment = NewPaymentInfo {
+            amount: quote.charge.amount.value(),
+            currency: quote.charge.amount.currency(),
+            rate: quote.charge.rate,
+            time_value: 0,
+            new_expiry: Default::default(),
+            tax: quote.tax.amount,
+            tax_details: quote.tax,
+            processing_fee: quote.processing_fee,
+        };
+        let metadata = serde_json::to_value(VmAddonConfig { kind, quantity })?;
+        let payment = self
+            .price_to_payment_for_subscription(
+                line_item.subscription_id,
+                vm.user_id,
+                format!("VM{vm_id} {kind} add-on x{quantity}"),
+                method,
+                CostResult::New(payment),
+                SubscriptionPaymentType::AddonChange,
+                Some(metadata),
+                mode,
+                true,
+            )
+            .await?;
+        Ok(VmAddonChange::Payment(Box::new(payment)))
+    }
+
+    pub async fn apply_vm_addon(&self, vm_id: u64, kind: VmAddonKind, quantity: u32) -> Result<()> {
+        let price = self.pe.vm_addon_price(vm_id, kind).await?;
+        let vm = self.db.get_vm(vm_id).await?;
+        let subscription = self
+            .db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await?;
+        let amount = self
+            .pe
+            .vm_addon_interval_amount(&price, quantity, &subscription)
+            .await?;
+        self.db
+            .set_vm_addon(
+                vm_id,
+                kind,
+                quantity,
+                amount,
+                &format!("VM{vm_id} - {quantity}x {kind}"),
+            )
+            .await?;
+        for mut pending in self.db.list_pending_vm_subscription_payments(vm_id).await? {
+            if pending.payment_type == SubscriptionPaymentType::Renewal {
+                pending.expires = Utc::now();
+                self.db.update_subscription_payment(&pending).await?;
+            }
+        }
+        if kind == VmAddonKind::Snapshot {
+            let deleted = self
+                .vm_provisioner
+                .trim_snapshots(vm_id, quantity as usize)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if !deleted.is_empty() {
+                info!(
+                    "Deleted snapshots {} of VM {vm_id} over its {quantity} slots",
+                    deleted.join(", ")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_paid_vm_addon(&self, payment: &SubscriptionPayment) -> Result<()> {
+        let config: VmAddonConfig = serde_json::from_value(
+            payment
+                .metadata
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Add-on payment has no metadata"))?,
+        )?;
+        let vm = self
+            .db
+            .get_vm_by_subscription(payment.subscription_id)
+            .await?;
+        self.apply_vm_addon(vm.id, config.kind, config.quantity)
+            .await
+    }
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct VmAddonConfig {
+    pub kind: VmAddonKind,
+    pub quantity: u32,
+}
+
+pub enum VmAddonChange {
+    Applied,
+    Payment(Box<SubscriptionPayment>),
 }
 
 /// Upgrade bookkeeping recorded on a managed-app upgrade payment.
@@ -3748,6 +3892,243 @@ pub(crate) mod revolut_offline_tests {
             .await
             .unwrap();
         assert!(!got.is_paid);
+    }
+}
+
+#[cfg(test)]
+mod addon_tests {
+    use super::*;
+    use crate::mocks::{MockNode, MockOnChainProvider};
+    use crate::settings::mock_settings;
+    use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VmStateCache};
+    use lnvps_db::{IntervalType, LNVpsDbBase, Vm, VmAddonPrice};
+
+    const MONTH: i64 = 30 * 24 * 3600;
+
+    async fn setup(
+        expires_in: i64,
+        currency: &str,
+        interval_type: IntervalType,
+    ) -> (Arc<MockDb>, SubscriptionHandler, u64, u64) {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[6u8; 32]).await.unwrap();
+        let (sub_id, ids) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "s".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: Some(Utc::now() + chrono::Duration::seconds(expires_in)),
+                    is_active: true,
+                    is_setup: true,
+                    currency: currency.to_string(),
+                    interval_amount: 1,
+                    interval_type,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: LineItemType::Vps,
+                    name: "vm".to_string(),
+                    description: None,
+                    amount: 1000,
+                    setup_amount: 0,
+                    configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let vm_id = db
+            .insert_vm(&Vm {
+                host_id: 1,
+                user_id,
+                image_id: 1,
+                template_id: Some(1),
+                subscription_line_item_id: ids[0],
+                disk_id: 1,
+                mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.insert_vm_addon_price(&VmAddonPrice {
+            id: 0,
+            region_id: 1,
+            kind: VmAddonKind::Snapshot,
+            currency: "EUR".to_string(),
+            monthly_amount: 100,
+            max_quantity: 5,
+            enabled: true,
+            created: Utc::now(),
+        })
+        .await
+        .unwrap();
+        let rates = Arc::new(MockExchangeRate::default());
+        rates
+            .set_rate(
+                lnvps_api_common::Ticker::btc_rate("EUR").unwrap(),
+                100_000.0,
+            )
+            .await;
+        let sub = SubscriptionHandler::new(
+            mock_settings(),
+            db.clone(),
+            Arc::new(MockNode::default()),
+            Arc::new(MockOnChainProvider::default()),
+            None,
+            rates,
+            VatClient::new(),
+            Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
+        )
+        .unwrap();
+        (db, sub, vm_id, sub_id)
+    }
+
+    async fn change(sub: &SubscriptionHandler, vm_id: u64, quantity: u32) -> Result<VmAddonChange> {
+        sub.change_vm_addon(
+            vm_id,
+            VmAddonKind::Snapshot,
+            quantity,
+            PaymentMethod::Lightning,
+            RenewMode::default(),
+        )
+        .await
+    }
+
+    async fn addon_line(db: &MockDb, sub_id: u64) -> Option<SubscriptionLineItem> {
+        db.list_subscription_line_items(sub_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|li| li.subscription_type == LineItemType::VmAddon)
+    }
+
+    #[tokio::test]
+    async fn buying_slots_charges_the_rest_of_the_period_and_applies_on_payment() {
+        let (db, sub, vm_id, sub_id) = setup(MONTH / 2, "EUR", IntervalType::Month).await;
+
+        let quote = sub
+            .pricing_engine()
+            .calculate_vm_addon_cost(vm_id, VmAddonKind::Snapshot, 2, PaymentMethod::Lightning)
+            .await
+            .unwrap();
+        assert_eq!(
+            quote.interval_amount,
+            CurrencyAmount::from_u64(Currency::EUR, 200)
+        );
+        assert_eq!(quote.charge.amount.currency(), Currency::BTC);
+        assert_eq!(quote.charge.amount.value(), 1_000_000);
+
+        let VmAddonChange::Payment(payment) = change(&sub, vm_id, 2).await.unwrap() else {
+            panic!("an increase needs paying for");
+        };
+        assert_eq!(payment.payment_type, SubscriptionPaymentType::AddonChange);
+        assert_eq!(payment.time_value, Some(0));
+        assert!(
+            addon_line(&db, sub_id).await.is_none(),
+            "nothing until paid"
+        );
+        assert_eq!(sub.vm_provisioner().snapshot_slots(vm_id).await.unwrap(), 0);
+
+        let expires = db.get_subscription(sub_id).await.unwrap().expires;
+        sub.complete_payment(&payment).await.unwrap();
+        assert_eq!(sub.vm_provisioner().snapshot_slots(vm_id).await.unwrap(), 2);
+        let line = addon_line(&db, sub_id).await.unwrap();
+        assert_eq!(line.amount, 200);
+        assert!(line.is_active());
+        assert_eq!(
+            line.parent_line_item_id,
+            Some(db.get_vm(vm_id).await.unwrap().subscription_line_item_id)
+        );
+        assert_eq!(db.get_subscription(sub_id).await.unwrap().expires, expires);
+    }
+
+    #[tokio::test]
+    async fn removing_slots_is_free_immediate_and_trims_snapshots() {
+        let (db, sub, vm_id, sub_id) = setup(MONTH, "EUR", IntervalType::Month).await;
+        sub.apply_vm_addon(vm_id, VmAddonKind::Snapshot, 3)
+            .await
+            .unwrap();
+        assert_eq!(addon_line(&db, sub_id).await.unwrap().amount, 300);
+
+        assert!(matches!(
+            change(&sub, vm_id, 1).await.unwrap(),
+            VmAddonChange::Applied
+        ));
+        assert_eq!(addon_line(&db, sub_id).await.unwrap().amount, 100);
+        assert_eq!(sub.vm_provisioner().snapshot_slots(vm_id).await.unwrap(), 1);
+        assert!(db.subscription_payments.lock().await.is_empty());
+
+        assert!(matches!(
+            change(&sub, vm_id, 0).await.unwrap(),
+            VmAddonChange::Applied
+        ));
+        assert!(!addon_line(&db, sub_id).await.unwrap().is_active());
+    }
+
+    #[tokio::test]
+    async fn slots_are_limited_and_need_a_price() {
+        let (db, sub, vm_id, _) = setup(MONTH, "EUR", IntervalType::Month).await;
+        assert!(change(&sub, vm_id, 6).await.is_err());
+        db.vm_addon_prices
+            .lock()
+            .await
+            .values_mut()
+            .for_each(|p| p.enabled = false);
+        let err = change(&sub, vm_id, 1).await.err().unwrap().to_string();
+        assert!(err.contains("not sold"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn renewal_includes_the_addon_line() {
+        let (db, sub, vm_id, sub_id) = setup(MONTH, "EUR", IntervalType::Month).await;
+        let plain = sub
+            .quote_renewal(sub_id, PaymentMethod::Lightning, 1, None)
+            .await
+            .unwrap();
+        let before = plain.amount;
+        sub.apply_vm_addon(vm_id, VmAddonKind::Snapshot, 2)
+            .await
+            .unwrap();
+        let after = sub
+            .quote_renewal(sub_id, PaymentMethod::Lightning, 1, None)
+            .await
+            .unwrap()
+            .amount;
+        assert_eq!(after - before, 2_000_000);
+        assert!(addon_line(&db, sub_id).await.is_some());
+
+        let by_amount = sub
+            .pricing_engine()
+            .get_cost_by_amount(
+                vm_id,
+                CurrencyAmount::millisats(after),
+                PaymentMethod::Lightning,
+            )
+            .await
+            .unwrap();
+        let CostResult::New(p) = by_amount else {
+            panic!("a fresh price")
+        };
+        assert_eq!(p.time_value, plain.time_value);
+    }
+
+    #[tokio::test]
+    async fn an_hourly_milli_euro_vm_pays_a_fraction_of_a_cent_an_hour() {
+        let (db, sub, vm_id, sub_id) = setup(3600, "MEUR", IntervalType::Hour).await;
+        sub.apply_vm_addon(vm_id, VmAddonKind::Snapshot, 1)
+            .await
+            .unwrap();
+        assert_eq!(addon_line(&db, sub_id).await.unwrap().amount, 139);
     }
 }
 

@@ -1426,6 +1426,7 @@ pub enum ApiSubscriptionPaymentType {
     /// Money returned to the customer. `amount`/`tax` are the magnitude
     /// refunded, so a client totalling what a customer paid must subtract it.
     Refund,
+    AddonChange,
 }
 
 impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
@@ -1435,6 +1436,9 @@ impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
             lnvps_db::SubscriptionPaymentType::Renewal => ApiSubscriptionPaymentType::Renewal,
             lnvps_db::SubscriptionPaymentType::Upgrade => ApiSubscriptionPaymentType::Upgrade,
             lnvps_db::SubscriptionPaymentType::Refund => ApiSubscriptionPaymentType::Refund,
+            lnvps_db::SubscriptionPaymentType::AddonChange => {
+                ApiSubscriptionPaymentType::AddonChange
+            }
         }
     }
 }

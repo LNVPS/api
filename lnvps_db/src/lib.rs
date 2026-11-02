@@ -1795,6 +1795,34 @@ pub trait LNVpsDbBase: Send + Sync {
     /// older one.
     async fn bump_tunnel_pool_generation(&self, id: u64) -> DbResult<u64>;
 
+    // ----- VM add-ons -----
+
+    async fn list_vm_addon_prices(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmAddonPrice>, u64)>;
+    async fn get_vm_addon_price(&self, id: u64) -> DbResult<VmAddonPrice>;
+    async fn get_vm_addon_price_for_region(
+        &self,
+        region_id: u64,
+        kind: VmAddonKind,
+    ) -> DbResult<Option<VmAddonPrice>>;
+    async fn insert_vm_addon_price(&self, price: &VmAddonPrice) -> DbResult<u64>;
+    async fn update_vm_addon_price(&self, price: &VmAddonPrice) -> DbResult<()>;
+    async fn delete_vm_addon_price(&self, id: u64) -> DbResult<()>;
+
+    async fn list_vm_addons(&self, vm_id: u64) -> DbResult<Vec<VmAddon>>;
+    async fn get_vm_addon_by_line_item(&self, line_item_id: u64) -> DbResult<Option<VmAddon>>;
+    async fn set_vm_addon(
+        &self,
+        vm_id: u64,
+        kind: VmAddonKind,
+        quantity: u32,
+        amount: u64,
+        name: &str,
+    ) -> DbResult<VmAddon>;
+
     // ----- VPN -----
 
     /// Get a VPN service by id

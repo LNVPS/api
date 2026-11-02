@@ -4866,6 +4866,26 @@ push is corrected without an admin doing anything. A peer on an LNVPS-managed
 interface that no allocation accounts for is **removed**: `wgln*` interfaces are
 LNVPS's, so an unclaimed key there is either a revoked node or somebody else's.
 
+### VM Add-on Prices
+
+The catalog of paid VM extras, one row per region and kind. `kind` is `snapshot` (one snapshot slot). `monthly_amount` is the price of one unit per month in `currency`'s smallest unit; it is scaled to each VM's billing interval and converted to the subscription's currency. Use a milli currency such as `MEUR` for prices below a cent an hour. `max_quantity` caps what one VM can buy. Turning `enabled` off stops new purchases; VMs keep what they bought.
+
+Required Permission: `vm_addon_price::view`, `::create`, `::update`, `::delete`
+
+```
+GET    /api/admin/v1/vm_addon_prices?limit=&offset=
+GET    /api/admin/v1/vm_addon_prices/{id}
+POST   /api/admin/v1/vm_addon_prices
+PATCH  /api/admin/v1/vm_addon_prices/{id}
+DELETE /api/admin/v1/vm_addon_prices/{id}
+```
+
+`POST` body: `{ "region_id": number, "kind": "snapshot", "currency": string, "monthly_amount": number, "max_quantity": number, "enabled"?: bool }`. A region holds one price per kind.
+
+`PATCH` body: any of `currency`, `monthly_amount`, `max_quantity`, `enabled`. A new price applies to purchases and quantity changes from then on; existing add-on lines keep their amount until changed.
+
+Response: `{ "id", "region_id", "kind", "currency", "monthly_amount", "max_quantity", "enabled", "created" }`
+
 ### VPN Services
 
 The VPN product an account subscribes to, and the interfaces that terminate it.

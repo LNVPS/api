@@ -9,16 +9,17 @@ use lnvps_db::{
     AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
     BulkMessageTarget, Company, CpuArch, CpuMfg, DbError, DbResult, Discount, DiscountRedemption,
     DiskInterface, DiskType, DnsServer, DnsServerKind, EncryptedString, IntervalType, IpRange,
-    IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode,
-    MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage,
-    NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod, PaymentMethodConfig, Referral,
-    ReferralCostUsage, ReferralPayout, Region, Router, RouterBgpRoute, RouterBgpSession,
-    RouterTunnel, RouterTunnelKind, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentWithCompany, Tunnel, TunnelPool, TunnelRoute, User,
-    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
-    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind,
-    VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal,
-    VpnDevice, VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
+    IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, LineItemType,
+    MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator,
+    NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod,
+    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region, Router,
+    RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelKind, RouterTunnelTraffic,
+    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany,
+    Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind,
+    VmAddonPrice, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment,
+    VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice,
+    VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
 };
 
 use async_trait::async_trait;
@@ -93,6 +94,8 @@ pub struct MockDb {
     pub tunnels: Arc<Mutex<HashMap<u64, Tunnel>>>,
     pub tunnel_pools: Arc<Mutex<HashMap<u64, TunnelPool>>>,
     pub vpn_services: Arc<Mutex<HashMap<u64, VpnService>>>,
+    pub vm_addon_prices: Arc<Mutex<HashMap<u64, VmAddonPrice>>>,
+    pub vm_addons: Arc<Mutex<HashMap<u64, VmAddon>>>,
     /// `vpn_service_pool`, keyed by pool id because an interface terminates at
     /// most one service.
     pub vpn_service_pools: Arc<Mutex<HashMap<u64, u64>>>,
@@ -559,6 +562,8 @@ impl Default for MockDb {
             tunnels: Arc::new(Default::default()),
             tunnel_pools: Arc::new(Default::default()),
             vpn_services: Arc::new(Default::default()),
+            vm_addon_prices: Arc::new(Default::default()),
+            vm_addons: Arc::new(Default::default()),
             vpn_service_pools: Arc::new(Default::default()),
             vpn_subscriptions: Arc::new(Default::default()),
             vpn_devices: Arc::new(Default::default()),
@@ -5659,6 +5664,159 @@ impl LNVpsDbBase for MockDb {
         }
         self.tunnel_pools.lock().await.remove(&id);
         Ok(())
+    }
+
+    // ----- VM add-ons -----
+
+    async fn list_vm_addon_prices(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmAddonPrice>, u64)> {
+        let prices = self.vm_addon_prices.lock().await;
+        let mut all: Vec<_> = prices.values().cloned().collect();
+        all.sort_by_key(|p| std::cmp::Reverse(p.id));
+        let total = all.len() as u64;
+        Ok((
+            all.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn get_vm_addon_price(&self, id: u64) -> DbResult<VmAddonPrice> {
+        self.vm_addon_prices
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("VM add-on price {id} not found").into())
+    }
+
+    async fn get_vm_addon_price_for_region(
+        &self,
+        region_id: u64,
+        kind: VmAddonKind,
+    ) -> DbResult<Option<VmAddonPrice>> {
+        Ok(self
+            .vm_addon_prices
+            .lock()
+            .await
+            .values()
+            .find(|p| p.region_id == region_id && p.kind == kind)
+            .cloned())
+    }
+
+    async fn insert_vm_addon_price(&self, price: &VmAddonPrice) -> DbResult<u64> {
+        let mut prices = self.vm_addon_prices.lock().await;
+        if prices
+            .values()
+            .any(|p| p.region_id == price.region_id && p.kind == price.kind)
+        {
+            return Err(anyhow!("Duplicate VM add-on price").into());
+        }
+        let id = prices.keys().max().copied().unwrap_or(0) + 1;
+        let mut p = price.clone();
+        p.id = id;
+        prices.insert(id, p);
+        Ok(id)
+    }
+
+    async fn update_vm_addon_price(&self, price: &VmAddonPrice) -> DbResult<()> {
+        let mut prices = self.vm_addon_prices.lock().await;
+        let p = prices
+            .get_mut(&price.id)
+            .ok_or_else(|| anyhow!("VM add-on price {} not found", price.id))?;
+        p.currency = price.currency.clone();
+        p.monthly_amount = price.monthly_amount;
+        p.max_quantity = price.max_quantity;
+        p.enabled = price.enabled;
+        Ok(())
+    }
+
+    async fn delete_vm_addon_price(&self, id: u64) -> DbResult<()> {
+        self.vm_addon_prices.lock().await.remove(&id);
+        Ok(())
+    }
+
+    async fn list_vm_addons(&self, vm_id: u64) -> DbResult<Vec<VmAddon>> {
+        let mut out: Vec<_> = self
+            .vm_addons
+            .lock()
+            .await
+            .values()
+            .filter(|a| a.vm_id == vm_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|a| a.kind as u16);
+        Ok(out)
+    }
+
+    async fn get_vm_addon_by_line_item(&self, line_item_id: u64) -> DbResult<Option<VmAddon>> {
+        Ok(self
+            .vm_addons
+            .lock()
+            .await
+            .values()
+            .find(|a| a.subscription_line_item_id == line_item_id)
+            .cloned())
+    }
+
+    async fn set_vm_addon(
+        &self,
+        vm_id: u64,
+        kind: VmAddonKind,
+        quantity: u32,
+        amount: u64,
+        name: &str,
+    ) -> DbResult<VmAddon> {
+        let vm = self.get_vm(vm_id).await?;
+        let parent = self
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let deactivated_at = (quantity == 0).then(Utc::now);
+        let mut addons = self.vm_addons.lock().await;
+        if let Some(a) = addons
+            .values_mut()
+            .find(|a| a.vm_id == vm_id && a.kind == kind)
+        {
+            a.quantity = quantity;
+            let mut items = self.subscription_line_items.lock().await;
+            let li = items
+                .get_mut(&a.subscription_line_item_id)
+                .ok_or_else(|| anyhow!("add-on line item missing"))?;
+            li.name = name.to_string();
+            li.amount = amount;
+            li.deactivated_at = deactivated_at;
+            return Ok(a.clone());
+        }
+        let line_item_id = self
+            .insert_subscription_line_item(&SubscriptionLineItem {
+                id: 0,
+                subscription_id: parent.subscription_id,
+                subscription_type: LineItemType::VmAddon,
+                name: name.to_string(),
+                description: None,
+                amount,
+                setup_amount: 0,
+                configuration: None,
+                deactivated_at,
+                parent_line_item_id: Some(parent.id),
+            })
+            .await?;
+        let id = addons.keys().max().copied().unwrap_or(0) + 1;
+        let addon = VmAddon {
+            id,
+            vm_id,
+            kind,
+            quantity,
+            subscription_line_item_id: line_item_id,
+            created: Utc::now(),
+        };
+        addons.insert(id, addon.clone());
+        Ok(addon)
     }
 
     // ----- VPN -----

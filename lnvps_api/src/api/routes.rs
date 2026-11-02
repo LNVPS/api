@@ -2065,7 +2065,12 @@ async fn v1_create_vm_snapshot(
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
     ensure_vm_active(&this, &vm, "snapshot").await?;
     let description = req.description.filter(|d| !d.is_empty());
-    check_new_snapshot(&[], &req.name, description.as_deref())
+    let slots = this
+        .sub_handler
+        .vm_provisioner()
+        .snapshot_slots(vm.id)
+        .await?;
+    check_new_snapshot(&[], slots, &req.name, description.as_deref())
         .map_err(lnvps_api_common::retry::OpError::from)?;
     run_vm_snapshot(
         &this,

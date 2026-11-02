@@ -1262,6 +1262,8 @@ pub enum ApiSubscriptionLineItemResource {
     /// A consumer VPN plan.
     #[serde(rename = "vpn")]
     Vpn { vpn_subscription_id: u64 },
+    #[serde(rename = "vm_addon")]
+    VmAddon { vm_id: u64, kind: String },
 }
 
 impl ApiSubscriptionLineItemResource {
@@ -1402,6 +1404,15 @@ impl ApiSubscriptionLineItemResource {
                 .flatten()
                 .map(|p| Self::Vpn {
                     vpn_subscription_id: p.id,
+                }),
+            LineItemType::VmAddon => db
+                .get_vm_addon_by_line_item(line_item.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|a| Self::VmAddon {
+                    vm_id: a.vm_id,
+                    kind: a.kind.to_string(),
                 }),
             LineItemType::DnsHosting => None,
         }

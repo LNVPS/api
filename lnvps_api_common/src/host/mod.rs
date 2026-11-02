@@ -49,8 +49,6 @@ pub struct MigrateVmRequest {
     pub target_storage: Option<String>,
 }
 
-pub const MAX_VM_SNAPSHOTS: usize = 3;
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmSnapshot {
     pub name: String,
@@ -144,6 +142,7 @@ pub fn validate_snapshot_description(description: &str) -> Result<(), SnapshotRe
 
 pub fn check_new_snapshot(
     existing: &[VmSnapshot],
+    limit: usize,
     name: &str,
     description: Option<&str>,
 ) -> Result<(), SnapshotRejection> {
@@ -156,9 +155,14 @@ pub fn check_new_snapshot(
             "A snapshot named {name} already exists"
         )));
     }
-    if existing.len() >= MAX_VM_SNAPSHOTS {
+    if limit == 0 {
+        return Err(SnapshotRejection::Conflict(
+            "Buy snapshot slots for this VM first".to_string(),
+        ));
+    }
+    if existing.len() >= limit {
         return Err(SnapshotRejection::Conflict(format!(
-            "A VM can hold {MAX_VM_SNAPSHOTS} snapshots, delete one first"
+            "This VM has {limit} snapshot slots, delete a snapshot or buy more slots"
         )));
     }
     Ok(())
@@ -686,23 +690,28 @@ mod tests {
             description: None,
             created: None,
         };
-        assert!(check_new_snapshot(&[], "one", Some("fine")).is_ok());
+        assert!(check_new_snapshot(&[], 3, "one", Some("fine")).is_ok());
         assert!(matches!(
-            check_new_snapshot(&[], "1", None),
+            check_new_snapshot(&[], 3, "1", None),
             Err(SnapshotRejection::Invalid(_))
         ));
         assert!(matches!(
-            check_new_snapshot(&[], "one", Some("a\nb")),
+            check_new_snapshot(&[], 3, "one", Some("a\nb")),
             Err(SnapshotRejection::Invalid(_))
         ));
         assert!(matches!(
-            check_new_snapshot(&[held("one")], "one", None),
+            check_new_snapshot(&[held("one")], 3, "one", None),
             Err(SnapshotRejection::Conflict(_))
         ));
         let full: Vec<_> = ["s1", "s2", "s3"].into_iter().map(held).collect();
         assert!(matches!(
-            check_new_snapshot(&full, "s4", None),
+            check_new_snapshot(&full, 3, "s4", None),
             Err(SnapshotRejection::Conflict(m)) if m.contains('3')
+        ));
+        assert!(check_new_snapshot(&full, 4, "s4", None).is_ok());
+        assert!(matches!(
+            check_new_snapshot(&[], 0, "one", None),
+            Err(SnapshotRejection::Conflict(m)) if m.contains("Buy")
         ));
         assert_eq!(
             SnapshotRejection::NotFound("gone".into()).to_string(),

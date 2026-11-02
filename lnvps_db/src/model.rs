@@ -3055,6 +3055,7 @@ pub enum AdminResource {
     /// the customer's challenges. Its own resource because a decision here
     /// suspends a customer's service and is sent to them as a legal notice.
     Abuse = 35,
+    VmAddonPrice = 36,
 }
 
 /// Actions that can be performed on administrative resources
@@ -3110,6 +3111,7 @@ impl Display for AdminResource {
             AdminResource::SupportAgent => write!(f, "support_agent"),
             AdminResource::AccountCredit => write!(f, "account_credit"),
             AdminResource::Abuse => write!(f, "abuse"),
+            AdminResource::VmAddonPrice => write!(f, "vm_addon_price"),
         }
     }
 }
@@ -3157,6 +3159,7 @@ impl FromStr for AdminResource {
             "vpn_subscription" | "vpn_subscriptions" => Ok(AdminResource::VpnSubscription),
             "account_credit" | "account_credits" => Ok(AdminResource::AccountCredit),
             "abuse" => Ok(AdminResource::Abuse),
+            "vm_addon_price" | "vm_addon_prices" => Ok(AdminResource::VmAddonPrice),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -3203,6 +3206,7 @@ impl TryFrom<u16> for AdminResource {
             33 => Ok(AdminResource::VpnSubscription),
             34 => Ok(AdminResource::AccountCredit),
             35 => Ok(AdminResource::Abuse),
+            36 => Ok(AdminResource::VmAddonPrice),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -3248,6 +3252,7 @@ impl AdminResource {
             AdminResource::VpnSubscription,
             AdminResource::AccountCredit,
             AdminResource::Abuse,
+            AdminResource::VmAddonPrice,
         ]
     }
 }
@@ -3332,6 +3337,7 @@ pub enum SubscriptionPaymentType {
     /// branch on [`SubscriptionPaymentType::is_refund`] — see
     /// [`SubscriptionPaymentType::signum`].
     Refund = 3,
+    AddonChange = 4,
 }
 
 impl SubscriptionPaymentType {
@@ -3383,6 +3389,7 @@ impl Display for SubscriptionPaymentType {
             SubscriptionPaymentType::Renewal => write!(f, "Renewal"),
             SubscriptionPaymentType::Upgrade => write!(f, "Upgrade"),
             SubscriptionPaymentType::Refund => write!(f, "Refund"),
+            SubscriptionPaymentType::AddonChange => write!(f, "AddonChange"),
         }
     }
 }
@@ -3491,6 +3498,7 @@ pub enum LineItemType {
     /// carries a `setup_amount` and an `amount` of zero, so the subscription
     /// never renews and never expires. See `subscription_payment_paid`.
     MarketplaceNodeFee = 5,
+    VmAddon = 7,
 }
 
 impl Display for LineItemType {
@@ -3503,6 +3511,7 @@ impl Display for LineItemType {
             LineItemType::App => write!(f, "App"),
             LineItemType::Vpn => write!(f, "VPN"),
             LineItemType::MarketplaceNodeFee => write!(f, "Marketplace Node Fee"),
+            LineItemType::VmAddon => write!(f, "VM Add-on"),
         }
     }
 }
@@ -4315,6 +4324,39 @@ mod tests {
             AdminResource::Referral
         );
         assert!(AdminResource::all().contains(&AdminResource::Referral));
+    }
+
+    #[test]
+    fn test_admin_resource_vm_addon_price_roundtrip() {
+        assert_eq!(
+            "vm_addon_price".parse::<AdminResource>().unwrap(),
+            AdminResource::VmAddonPrice
+        );
+        assert_eq!(AdminResource::VmAddonPrice.to_string(), "vm_addon_price");
+        assert_eq!(
+            AdminResource::try_from(36u16).unwrap(),
+            AdminResource::VmAddonPrice
+        );
+        assert!(AdminResource::all().contains(&AdminResource::VmAddonPrice));
+    }
+
+    #[test]
+    fn test_vm_addon_kind_roundtrip() {
+        assert_eq!(
+            "snapshot".parse::<VmAddonKind>().unwrap(),
+            VmAddonKind::Snapshot
+        );
+        assert_eq!(VmAddonKind::Snapshot.to_string(), "snapshot");
+        assert!("disk".parse::<VmAddonKind>().is_err());
+        assert_eq!(
+            serde_json::to_string(&VmAddonKind::Snapshot).unwrap(),
+            "\"snapshot\""
+        );
+        assert_eq!(LineItemType::VmAddon.to_string(), "VM Add-on");
+        assert_eq!(
+            SubscriptionPaymentType::AddonChange.to_string(),
+            "AddonChange"
+        );
     }
 
     #[test]
@@ -5828,4 +5870,52 @@ mod line_item_addon_tests {
         got.sort();
         assert_eq!(got, vec![1, 2]);
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum VmAddonKind {
+    Snapshot = 0,
+}
+
+impl Display for VmAddonKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VmAddonKind::Snapshot => write!(f, "snapshot"),
+        }
+    }
+}
+
+impl FromStr for VmAddonKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "snapshot" => Ok(VmAddonKind::Snapshot),
+            _ => Err(anyhow!("unknown VM add-on kind: {s}")),
+        }
+    }
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq)]
+pub struct VmAddonPrice {
+    pub id: u64,
+    pub region_id: u64,
+    pub kind: VmAddonKind,
+    pub currency: String,
+    pub monthly_amount: u64,
+    pub max_quantity: u32,
+    pub enabled: bool,
+    pub created: DateTime<Utc>,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq)]
+pub struct VmAddon {
+    pub id: u64,
+    pub vm_id: u64,
+    pub kind: VmAddonKind,
+    pub quantity: u32,
+    pub subscription_line_item_id: u64,
+    pub created: DateTime<Utc>,
 }

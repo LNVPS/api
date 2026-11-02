@@ -20,7 +20,7 @@ use lnvps_api_common::{ExchangeRateService, SnapshotAction, VmHistoryLogger, op_
 use lnvps_db::{
     CpuArch, IntervalType, IpRange, IpRangeAllocationMode, LNVpsDb, LineItemType, PaymentMethod,
     PaymentType, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
-    Vm, VmCustomTemplate, VmHistoryActionType, VmIpAssignment, VmTemplate,
+    Vm, VmAddonKind, VmCustomTemplate, VmHistoryActionType, VmIpAssignment, VmTemplate,
 };
 
 /// Ensure an OS image's CPU architecture is compatible with the target
@@ -954,6 +954,34 @@ impl VmProvisioner {
         client.list_snapshots(&vm).await
     }
 
+    pub async fn snapshot_slots(&self, vm_id: u64) -> Result<usize> {
+        Ok(self
+            .db
+            .list_vm_addons(vm_id)
+            .await?
+            .into_iter()
+            .find(|a| a.kind == VmAddonKind::Snapshot)
+            .map(|a| a.quantity as usize)
+            .unwrap_or(0))
+    }
+
+    pub async fn trim_snapshots(&self, vm_id: u64, keep: usize) -> OpResult<Vec<String>> {
+        let (vm, client) = self.snapshot_client(vm_id).await?;
+        let mut held = client.list_snapshots(&vm).await?;
+        held.sort_by_key(|s| s.created);
+        let excess = held.len().saturating_sub(keep);
+        let mut deleted = Vec::with_capacity(excess);
+        for s in held.into_iter().take(excess) {
+            info!(
+                "Deleting snapshot {} of VM {} over its slots",
+                s.name, vm_id
+            );
+            client.delete_snapshot(&vm, &s.name).await?;
+            deleted.push(s.name);
+        }
+        Ok(deleted)
+    }
+
     pub async fn create_snapshot(
         &self,
         vm_id: u64,
@@ -965,7 +993,8 @@ impl VmProvisioner {
         }
         let (vm, client) = self.snapshot_client(vm_id).await?;
         let existing = client.list_snapshots(&vm).await?;
-        check_new_snapshot(&existing, name, description)?;
+        let limit = self.snapshot_slots(vm_id).await?;
+        check_new_snapshot(&existing, limit, name, description)?;
         info!("Snapshotting VM {} as {}", vm_id, name);
         client.create_snapshot(&vm, name, description).await
     }

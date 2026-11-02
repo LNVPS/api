@@ -487,6 +487,7 @@ async fn main() -> Result<(), Error> {
             .merge(abuse_router())
             .merge(marketplace_router())
             .merge(apps_router())
+            .merge(vm_addons_router())
             .merge(app_backups_router())
             .merge(vpn_router())
             .merge(routeserver_router())

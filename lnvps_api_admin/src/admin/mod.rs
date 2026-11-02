@@ -39,6 +39,7 @@ mod swap_orders;
 mod tunnel_pools;
 mod user_payment_methods;
 mod users;
+mod vm_addon_prices;
 mod vm_ip_assignments;
 mod vm_os_images;
 mod vm_templates;
@@ -105,6 +106,7 @@ pub fn admin_router(
         .merge(referrals::router())
         .merge(marketplace::router())
         .merge(tunnel_pools::router())
+        .merge(vm_addon_prices::router())
         .merge(vpn_services::router())
         .merge(vpn_subscriptions::router())
         .merge(apps::router())

@@ -546,6 +546,9 @@ mod tests {
             (reqwest::Method::POST, "/api/v1/vm/1/snapshots"),
             (reqwest::Method::DELETE, "/api/v1/vm/1/snapshots/one"),
             (reqwest::Method::PATCH, "/api/v1/vm/1/snapshots/one/restore"),
+            (reqwest::Method::GET, "/api/v1/vm/1/addons"),
+            (reqwest::Method::PUT, "/api/v1/vm/1/addons"),
+            (reqwest::Method::POST, "/api/v1/vm/1/addons/quote"),
         ] {
             let resp = client
                 .http

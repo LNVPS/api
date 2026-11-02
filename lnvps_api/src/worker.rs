@@ -5591,6 +5591,8 @@ mod tests {
         let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
         let worker = setup_worker(db.clone()).await?;
         lnvps_api_common::host::dummy_host::DummyVmHost::clear_all_snapshots().await;
+        db.set_vm_addon(vm_id, lnvps_db::VmAddonKind::Snapshot, 3, 0, "Snapshots")
+            .await?;
 
         let job = |action| WorkJob::VmSnapshot {
             vm_id,

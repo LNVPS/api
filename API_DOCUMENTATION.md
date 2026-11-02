@@ -1145,7 +1145,7 @@ historical range is needed; a usage bar can be rendered from this object alone.
 
 #### VM Snapshots
 
-A snapshot keeps a VM's disk as it is now so it can be returned to later. A VM holds at most 3 snapshots, and each one uses host storage for as long as it exists, so delete the ones you no longer need. All four endpoints require auth, and snapshots cannot be created or restored on an expired VM (`402 Payment Required`).
+A snapshot keeps a VM's disk as it is now so it can be returned to later. A VM holds as many snapshots as it has snapshot slots, bought as a [VM add-on](#vm-add-ons); a VM with no slots cannot take one. All four endpoints require auth, and snapshots cannot be created or restored on an expired VM (`402 Payment Required`).
 
 Snapshots are deleted when the VM is re-installed or its disk is resized.
 
@@ -1154,7 +1154,7 @@ Snapshots are deleted when the VM is re-installed or its disk is resized.
 - **POST** `/api/v1/vm/{id}/snapshots`: take a snapshot.
   - **Body**: `{ "name": string, "description"?: string }`. `name` starts with a letter and uses letters, digits, `_` and `-`, 2 to 40 characters. `description` is one line of up to 200 characters.
   - **Response**: the created snapshot.
-  - **Errors**: `400 Bad Request` for an invalid name or description; `409 Conflict` if the name is taken or the VM already holds 3 snapshots.
+  - **Errors**: `400 Bad Request` for an invalid name or description; `409 Conflict` if the name is taken, the VM has no snapshot slots, or every slot is in use.
   - A running VM keeps running on Proxmox. On libvirt hosts (including marketplace nodes) it is shut down for the copy and started again, so expect a short outage.
 - **PATCH** `/api/v1/vm/{id}/snapshots/{name}/restore`: return the VM to a snapshot. Everything written to the disk since is lost. The VM is started again afterwards. Only the newest snapshot can be restored: to go back further, delete the newer ones first.
   - **Response**: `null`
@@ -1163,6 +1163,20 @@ Snapshots are deleted when the VM is re-installed or its disk is resized.
 
 Create, restore and delete wait up to 180 seconds for the host. If the operation is still running after that, the call returns success and the VM's state catches up shortly after.
   - **Response**: `null`
+
+#### VM Add-ons
+
+Paid extras billed on the VM's subscription as their own line items, renewed with the VM and stopped with it. The only kind is `snapshot`: each one is a snapshot slot. Prices are set per region at a monthly rate and scaled to the VM's billing interval; a VM in a region with no price cannot buy them.
+
+- **GET** `/api/v1/vm/{id}/addons`: the add-ons on sale for this VM.
+  - **Response**: `[{ "kind": "snapshot", "quantity": number, "max_quantity": number, "monthly_price": ApiPrice, "interval_price": ApiPrice }]`. `quantity` is what the VM holds now; `interval_price` is one unit for one of the VM's billing intervals, in the subscription's currency.
+- **POST** `/api/v1/vm/{id}/addons/quote?method=`: price a change without making it.
+  - **Body**: `{ "kind": "snapshot", "quantity": number }`
+  - **Response**: `{ "kind", "current", "quantity", "interval_price", "due_now", "tax", "processing_fee", "credit"? }`. `interval_price` is what the add-on costs each interval after the change; `due_now` (in the payment method's currency) covers the extra units for the rest of the paid period.
+- **PUT** `/api/v1/vm/{id}/addons?method=`: change the quantity. Takes the same `method`, `payment_method_id` and `coin` parameters as a renewal.
+  - **Body**: `{ "kind": "snapshot", "quantity": number }`
+  - **Response**: `{ "applied": bool, "payment"?: ApiVmPayment }`. Lowering the quantity is applied at once with no refund; when slots go below the snapshots held, the oldest snapshots are deleted to fit. Raising it returns a `payment` (payment type `AddonChange`) and takes effect when it is paid; `applied` is true when credit or a saved method settled it already.
+  - **Errors**: `400 Bad Request` if the add-on is not sold in the VM's region or the quantity is above `max_quantity`.
 
 #### VM Serial Console (WebSocket)
 - **WebSocket** `/api/v1/vm/{id}/console`

@@ -6,16 +6,17 @@ use crate::{
     AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
     BulkMessageTarget, Company, DbError, DbResult, Discount, DiscountRedemption,
     DiscountRedemptionWithCode, DnsServer, EncryptedString, IntervalType, IpRange,
-    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth,
-    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, PaymentMethod,
-    PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout, Region,
-    RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelKind,
+    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, LineItemType, MarketplaceNode,
+    MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage,
+    PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
+    Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelKind,
     RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
     SubscriptionPaymentWithCompany, SwapOrderClient, Tunnel, TunnelPool, TunnelRoute, User,
-    UserPaymentMethod, UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk,
-    VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk,
-    VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal,
-    VpnDevice, VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
+    UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind, VmAddonPrice, VmCostPlan,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
+    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily,
+    VmTrafficSample, VmTrafficTotal, VpnDevice, VpnPeerTemplate, VpnService, VpnSubscription,
+    WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -6070,6 +6071,178 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .execute(&self.db)
             .await?;
         Ok(())
+    }
+
+    // ----- VM add-ons -----
+
+    async fn list_vm_addon_prices(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmAddonPrice>, u64)> {
+        let rows = sqlx::query_as("SELECT * FROM vm_addon_price ORDER BY id DESC LIMIT ? OFFSET ?")
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await?;
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vm_addon_price")
+            .fetch_one(&self.db)
+            .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn get_vm_addon_price(&self, id: u64) -> DbResult<VmAddonPrice> {
+        Ok(sqlx::query_as("SELECT * FROM vm_addon_price WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn get_vm_addon_price_for_region(
+        &self,
+        region_id: u64,
+        kind: VmAddonKind,
+    ) -> DbResult<Option<VmAddonPrice>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM vm_addon_price WHERE region_id = ? AND kind = ?")
+                .bind(region_id)
+                .bind(kind)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn insert_vm_addon_price(&self, price: &VmAddonPrice) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO vm_addon_price (region_id, kind, currency, monthly_amount, max_quantity, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(price.region_id)
+        .bind(price.kind)
+        .bind(&price.currency)
+        .bind(price.monthly_amount)
+        .bind(price.max_quantity)
+        .bind(price.enabled)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn update_vm_addon_price(&self, price: &VmAddonPrice) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE vm_addon_price SET currency = ?, monthly_amount = ?, max_quantity = ?, enabled = ? \
+             WHERE id = ?",
+        )
+        .bind(&price.currency)
+        .bind(price.monthly_amount)
+        .bind(price.max_quantity)
+        .bind(price.enabled)
+        .bind(price.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_vm_addon_price(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM vm_addon_price WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_vm_addons(&self, vm_id: u64) -> DbResult<Vec<VmAddon>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM vm_addon WHERE vm_id = ? ORDER BY kind")
+                .bind(vm_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_vm_addon_by_line_item(&self, line_item_id: u64) -> DbResult<Option<VmAddon>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM vm_addon WHERE subscription_line_item_id = ?")
+                .bind(line_item_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn set_vm_addon(
+        &self,
+        vm_id: u64,
+        kind: VmAddonKind,
+        quantity: u32,
+        amount: u64,
+        name: &str,
+    ) -> DbResult<VmAddon> {
+        let mut tx = self.db.begin().await?;
+        let (parent_id, subscription_id): (u64, u64) = sqlx::query_as(
+            "SELECT li.id, li.subscription_id FROM vm v \
+             JOIN subscription_line_item li ON li.id = v.subscription_line_item_id \
+             WHERE v.id = ? FOR UPDATE",
+        )
+        .bind(vm_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let existing: Option<VmAddon> =
+            sqlx::query_as("SELECT * FROM vm_addon WHERE vm_id = ? AND kind = ? FOR UPDATE")
+                .bind(vm_id)
+                .bind(kind)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let deactivated_at = (quantity == 0).then(Utc::now);
+        let line_item_id = match &existing {
+            Some(a) => {
+                sqlx::query(
+                    "UPDATE subscription_line_item SET name = ?, amount = ?, deactivated_at = ? WHERE id = ?",
+                )
+                .bind(name)
+                .bind(amount)
+                .bind(deactivated_at)
+                .bind(a.subscription_line_item_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("UPDATE vm_addon SET quantity = ? WHERE id = ?")
+                    .bind(quantity)
+                    .bind(a.id)
+                    .execute(&mut *tx)
+                    .await?;
+                a.subscription_line_item_id
+            }
+            None => {
+                let li = sqlx::query(
+                    "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, amount, setup_amount, deactivated_at, parent_line_item_id) \
+                     VALUES (?, ?, ?, ?, 0, ?, ?)",
+                )
+                .bind(subscription_id)
+                .bind(LineItemType::VmAddon)
+                .bind(name)
+                .bind(amount)
+                .bind(deactivated_at)
+                .bind(parent_id)
+                .execute(&mut *tx)
+                .await?
+                .last_insert_id();
+                sqlx::query(
+                    "INSERT INTO vm_addon (vm_id, kind, quantity, subscription_line_item_id) VALUES (?, ?, ?, ?)",
+                )
+                .bind(vm_id)
+                .bind(kind)
+                .bind(quantity)
+                .bind(li)
+                .execute(&mut *tx)
+                .await?;
+                li
+            }
+        };
+        let addon = sqlx::query_as("SELECT * FROM vm_addon WHERE subscription_line_item_id = ?")
+            .bind(line_item_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(addon)
     }
 
     // ----- VPN -----

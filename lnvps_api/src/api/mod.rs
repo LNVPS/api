@@ -22,6 +22,7 @@ pub mod routeserver;
 mod subscriptions;
 #[cfg(feature = "agent")]
 mod support;
+mod vm_addons;
 mod vpn;
 mod webauthn;
 mod webhook;
@@ -51,6 +52,7 @@ pub use routeserver::router as routeserver_router;
 use serde::Deserialize;
 use std::sync::Arc;
 pub use subscriptions::router as subscriptions_router;
+pub use vm_addons::router as vm_addons_router;
 pub use vpn::router as vpn_router;
 pub use webauthn::router as webauthn_router;
 pub use webhook::router as webhook_router;

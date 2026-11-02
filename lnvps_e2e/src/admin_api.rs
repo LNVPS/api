@@ -90,6 +90,7 @@ mod tests {
             "/api/admin/v1/companies",
             "/api/admin/v1/cost_plans",
             "/api/admin/v1/custom_pricing",
+            "/api/admin/v1/vm_addon_prices",
             "/api/admin/v1/ip_ranges",
             "/api/admin/v1/access_policies",
             "/api/admin/v1/routers",

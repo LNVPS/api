@@ -1052,7 +1052,69 @@ mod tests {
             .execute()
             .await?;
         lnvps_api_common::host::dummy_host::DummyVmHost::clear_all_snapshots().await;
+        db.set_vm_addon(vm.id, lnvps_db::VmAddonKind::Snapshot, 3, 0, "Snapshots")
+            .await?;
         Ok(vm)
+    }
+
+    #[tokio::test]
+    async fn test_snapshots_need_paid_slots() -> Result<()> {
+        let _snapshots =
+            lnvps_api_common::host::dummy_host::DummyVmHost::exclusive_snapshots().await;
+        use lnvps_api_common::host::SnapshotRejection;
+        clear_mock_state().await;
+        let db = Arc::new(MockDb::default());
+        setup_db_with_static_arp(&db).await?;
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let vm = spawned_vm(&provisioner, &db).await?;
+        db.set_vm_addon(vm.id, lnvps_db::VmAddonKind::Snapshot, 0, 0, "Snapshots")
+            .await?;
+
+        let err = provisioner
+            .create_snapshot(vm.id, "one", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.inner().downcast_ref::<SnapshotRejection>(),
+            Some(SnapshotRejection::Conflict(m)) if m.contains("Buy")
+        ));
+
+        db.set_vm_addon(vm.id, lnvps_db::VmAddonKind::Snapshot, 1, 0, "Snapshots")
+            .await?;
+        provisioner.create_snapshot(vm.id, "one", None).await?;
+        assert!(
+            provisioner
+                .create_snapshot(vm.id, "two", None)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trim_snapshots_deletes_the_oldest() -> Result<()> {
+        let _snapshots =
+            lnvps_api_common::host::dummy_host::DummyVmHost::exclusive_snapshots().await;
+        clear_mock_state().await;
+        let db = Arc::new(MockDb::default());
+        setup_db_with_static_arp(&db).await?;
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let vm = spawned_vm(&provisioner, &db).await?;
+        for name in ["s1", "s2", "s3"] {
+            provisioner.create_snapshot(vm.id, name, None).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(provisioner.trim_snapshots(vm.id, 1).await?, ["s1", "s2"]);
+        let left: Vec<_> = provisioner
+            .list_snapshots(vm.id)
+            .await?
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(left, ["s3"]);
+        assert!(provisioner.trim_snapshots(vm.id, 1).await?.is_empty());
+        Ok(())
     }
 
     #[tokio::test]

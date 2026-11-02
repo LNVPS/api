@@ -262,6 +262,7 @@ async fn v1_generate_lir_agreement_from_subscription(
             lnvps_db::LineItemType::DnsHosting => ("DNS Hosting".to_string(), "—".to_string()),
             lnvps_db::LineItemType::Vps => ("VPS".to_string(), "—".to_string()),
             lnvps_db::LineItemType::App => ("App".to_string(), "—".to_string()),
+            lnvps_db::LineItemType::VmAddon => ("VM Add-on".to_string(), "—".to_string()),
             lnvps_db::LineItemType::Vpn => {
                 // The quantity is the device allowance, which is what the plan
                 // actually sells.

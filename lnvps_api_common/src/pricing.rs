@@ -7,8 +7,8 @@ use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use isocountry::CountryCode;
 use lnvps_db::{
     CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, IntervalType, LNVpsDb, PaymentMethod,
-    SubscriptionPayment, SubscriptionPaymentType, Vm, VmCostPlan, VmCustomPricing,
-    VmCustomTemplate,
+    SubscriptionPayment, SubscriptionPaymentType, Vm, VmAddonKind, VmAddonPrice, VmCostPlan,
+    VmCustomPricing, VmCustomTemplate,
 };
 use payments_rs::currency::{Currency, CurrencyAmount};
 #[cfg(test)]
@@ -117,6 +117,22 @@ pub async fn select_custom_pricing(
             disk_interface
         )
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct VmAddonQuote {
+    pub current: u32,
+    pub quantity: u32,
+    pub interval_amount: CurrencyAmount,
+    pub charge: ConvertedCurrencyAmount,
+    pub tax: TaxDetermination,
+    pub processing_fee: u64,
+}
+
+impl VmAddonQuote {
+    pub fn is_free(&self) -> bool {
+        self.charge.amount.value() == 0
+    }
 }
 
 /// Result of calculating upgrade costs including both immediate upgrade cost and new renewal cost
@@ -714,11 +730,12 @@ impl PricingEngine {
         let vm = self.db.get_vm(vm_id).await?;
         let company_id = self.db.get_vm_company_id(vm_id).await?;
 
-        let cost = if vm.template_id.is_some() {
+        let mut cost = if vm.template_id.is_some() {
             self.get_template_vm_cost(&vm, method, company_id).await?
         } else {
             self.get_custom_vm_cost(&vm, method, company_id).await?
         };
+        cost.amount += self.vm_addons_interval_cost(&vm, method).await?;
 
         ensure!(cost.currency == input.currency(), "Invalid currency");
 
@@ -1698,6 +1715,151 @@ impl PricingEngine {
         // Convert to the requested payment method currency
         self.get_amount_and_rate_scaled(remaining_info.prorated_cost, remaining_info.scale, method)
             .await
+    }
+
+    async fn vm_addons_interval_cost(&self, vm: &Vm, method: PaymentMethod) -> Result<u64> {
+        let subscription = self
+            .db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await?;
+        let total: u64 = self
+            .db
+            .list_subscription_line_items(subscription.id)
+            .await?
+            .iter()
+            .filter(|li| li.is_active() && li.subscription_type == lnvps_db::LineItemType::VmAddon)
+            .map(|li| li.amount)
+            .sum();
+        if total == 0 {
+            return Ok(0);
+        }
+        let currency = Currency::from_str(&subscription.currency)
+            .map_err(|_| anyhow!("Invalid subscription currency"))?;
+        Ok(self
+            .get_amount_and_rate(CurrencyAmount::from_u64(currency, total), method)
+            .await?
+            .amount
+            .value())
+    }
+
+    pub async fn vm_addon_price(&self, vm_id: u64, kind: VmAddonKind) -> Result<VmAddonPrice> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let host = self.db.get_host(vm.host_id).await?;
+        self.db
+            .get_vm_addon_price_for_region(host.region_id, kind)
+            .await?
+            .filter(|p| p.enabled)
+            .ok_or_else(|| anyhow!("{kind} add-ons are not sold in this region"))
+    }
+
+    pub async fn vm_addon_interval_amount(
+        &self,
+        price: &VmAddonPrice,
+        quantity: u32,
+        subscription: &lnvps_db::Subscription,
+    ) -> Result<u64> {
+        let from = Currency::from_str(&price.currency)
+            .map_err(|_| anyhow!("Invalid add-on currency {}", price.currency))?;
+        let to = Currency::from_str(&subscription.currency)
+            .map_err(|_| anyhow!("Invalid subscription currency"))?;
+        let monthly = price
+            .monthly_amount
+            .checked_mul(quantity as u64)
+            .ok_or_else(|| anyhow!("Add-on price overflow"))?;
+        if monthly == 0 {
+            return Ok(0);
+        }
+        let monthly = self
+            .convert_currency(CurrencyAmount::from_u64(from, monthly), to)
+            .await?
+            .value() as u128;
+        let month = Self::cost_plan_interval_to_seconds(IntervalType::Month, 1) as u128;
+        let interval = Self::cost_plan_interval_to_seconds(
+            subscription.interval_type,
+            subscription.interval_amount.max(1),
+        ) as u128;
+        let in_interval = (monthly * interval).div_ceil(month).max(1);
+        u64::try_from(in_interval).map_err(|_| anyhow!("Add-on price overflow"))
+    }
+
+    pub async fn calculate_vm_addon_cost(
+        &self,
+        vm_id: u64,
+        kind: VmAddonKind,
+        quantity: u32,
+        method: PaymentMethod,
+    ) -> Result<VmAddonQuote> {
+        let price = self.vm_addon_price(vm_id, kind).await?;
+        ensure!(
+            quantity <= price.max_quantity,
+            "At most {} {kind} add-ons can be bought",
+            price.max_quantity
+        );
+        let vm = self.db.get_vm(vm_id).await?;
+        ensure!(!vm.deleted, "Can't change add-ons on a deleted VM");
+        let subscription = self
+            .db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await?;
+        let current = self
+            .db
+            .list_vm_addons(vm_id)
+            .await?
+            .into_iter()
+            .find(|a| a.kind == kind)
+            .map(|a| a.quantity)
+            .unwrap_or(0);
+        let new_amount = self
+            .vm_addon_interval_amount(&price, quantity, &subscription)
+            .await?;
+        let old_amount = self
+            .vm_addon_interval_amount(&price, current, &subscription)
+            .await?;
+        let currency = Currency::from_str(&subscription.currency)
+            .map_err(|_| anyhow!("Invalid subscription currency"))?;
+
+        let now = Utc::now();
+        let remaining = subscription
+            .expires
+            .filter(|e| *e > now)
+            .map(|e| (e - now).num_seconds().max(0) as u128)
+            .unwrap_or(0);
+        let interval = Self::cost_plan_interval_to_seconds(
+            subscription.interval_type,
+            subscription.interval_amount.max(1),
+        ) as u128;
+        let delta = new_amount.saturating_sub(old_amount) as u128;
+        let due = if subscription.is_setup && interval > 0 {
+            (delta * remaining).div_ceil(interval) as u64
+        } else {
+            0
+        };
+        let charge = self
+            .get_amount_and_rate(CurrencyAmount::from_u64(currency, due), method)
+            .await?;
+        let company_id = subscription.company_id;
+        let tax = self
+            .determine_tax(vm.user_id, charge.amount.value(), company_id)
+            .await?;
+        let processing_fee = if charge.amount.value() > 0 {
+            self.calculate_processing_fee(
+                company_id,
+                method,
+                charge.amount.currency(),
+                charge.amount.value() + tax.amount,
+            )
+            .await
+        } else {
+            0
+        };
+        Ok(VmAddonQuote {
+            current,
+            quantity,
+            interval_amount: CurrencyAmount::from_u64(currency, new_amount),
+            charge,
+            tax,
+            processing_fee,
+        })
     }
 
     /// Calculate the prorated cost of resizing a managed app deployment to

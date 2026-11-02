@@ -212,6 +212,11 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
                     hex::encode(&payment.id)
                 );
             }
+        } else if payment.payment_type == SubscriptionPaymentType::AddonChange {
+            info!(
+                "Add-on payment for VM {} applied by the subscription",
+                vm_id
+            );
         } else {
             // For the very first payment on a VM (mac_address == ff:ff:ff:ff:ff:ff),
             // immediately set the cache state to Creating so the UI can show a
