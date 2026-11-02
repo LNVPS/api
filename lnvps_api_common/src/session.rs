@@ -287,8 +287,25 @@ struct StateClaims {
     /// configured default redirect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     redirect: Option<String>,
+    /// The PKCE code verifier this login generated (RFC 7636, S256). Secret:
+    /// it must reach the token endpoint with the authorization code, and the
+    /// signed state is the only server-side place to keep it (the flow is
+    /// stateless). Omitted for states minted before PKCE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    code_verifier: Option<String>,
     /// Expiry (unix seconds).
     exp: u64,
+}
+
+/// A verified OAuth CSRF `state`: the provider tag it was issued for, the OIDC
+/// `nonce` it bound, the optional validated post-login redirect it carried,
+/// and the optional PKCE code verifier it is holding for the token exchange.
+#[derive(Debug, Clone)]
+pub struct VerifiedState {
+    pub provider: String,
+    pub nonce: String,
+    pub redirect: Option<String>,
+    pub code_verifier: Option<String>,
 }
 
 /// Default CSRF `state` lifetime (10 minutes) — long enough to complete a login.
@@ -303,6 +320,7 @@ pub fn issue_state_token(
     provider: &str,
     nonce: &str,
     redirect: Option<&str>,
+    code_verifier: Option<&str>,
     ttl_secs: u64,
 ) -> Result<String> {
     let secret = SESSION_SECRET
@@ -312,6 +330,7 @@ pub fn issue_state_token(
         prov: provider.to_string(),
         nonce: nonce.to_string(),
         redirect: redirect.map(|s| s.to_string()),
+        code_verifier: code_verifier.map(|s| s.to_string()),
         exp: now_secs() + ttl_secs,
     };
     let payload = BASE64_URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?);
@@ -319,9 +338,10 @@ pub fn issue_state_token(
     Ok(format!("{payload}.{sig}"))
 }
 
-/// Verify a CSRF `state` value and return the provider tag it was issued for,
-/// along with the optional per-request redirect URL it carried.
-pub fn verify_state_token(token: &str) -> Result<(String, Option<String>)> {
+/// Verify a CSRF `state` value and return what it bound: the provider tag,
+/// the OIDC `nonce`, the optional validated redirect, and the optional PKCE
+/// code verifier.
+pub fn verify_state_token(token: &str) -> Result<VerifiedState> {
     let secret = SESSION_SECRET
         .get()
         .ok_or_else(|| anyhow::anyhow!("Session auth not configured"))?;
@@ -341,7 +361,12 @@ pub fn verify_state_token(token: &str) -> Result<(String, Option<String>)> {
     if now_secs() >= claims.exp {
         bail!("State token expired");
     }
-    Ok((claims.prov, claims.redirect))
+    Ok(VerifiedState {
+        provider: claims.prov,
+        nonce: claims.nonce,
+        redirect: claims.redirect,
+        code_verifier: claims.code_verifier,
+    })
 }
 
 /// Claims for a short-lived, path-scoped, single-use websocket/HTML auth ticket.
@@ -604,27 +629,30 @@ mod tests {
         init_session_secret(b"unit-test-secret".to_vec());
 
         // Without a per-request redirect.
-        let token = issue_state_token("google", "abc123", None, DEFAULT_STATE_TTL_SECS).unwrap();
-        assert_eq!(
-            verify_state_token(&token).unwrap(),
-            ("google".to_string(), None)
-        );
+        let token =
+            issue_state_token("google", "abc123", None, None, DEFAULT_STATE_TTL_SECS).unwrap();
+        let st = verify_state_token(&token).unwrap();
+        assert_eq!(st.provider, "google");
+        assert_eq!(st.nonce, "abc123");
+        assert_eq!(st.redirect, None);
+        assert_eq!(st.code_verifier, None);
 
         // With a per-request redirect that must round-trip intact.
         let token = issue_state_token(
             "github",
             "abc123",
             Some("http://localhost:3000/oauth/complete"),
+            Some("test-verifier"),
             DEFAULT_STATE_TTL_SECS,
         )
         .unwrap();
+        let st = verify_state_token(&token).unwrap();
+        assert_eq!(st.provider, "github");
         assert_eq!(
-            verify_state_token(&token).unwrap(),
-            (
-                "github".to_string(),
-                Some("http://localhost:3000/oauth/complete".to_string())
-            )
+            st.redirect,
+            Some("http://localhost:3000/oauth/complete".to_string())
         );
+        assert_eq!(st.code_verifier.as_deref(), Some("test-verifier"));
     }
 
     #[test]
