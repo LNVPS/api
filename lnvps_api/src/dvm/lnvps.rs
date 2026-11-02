@@ -86,16 +86,15 @@ impl DVMHandler for LnvpsDvm {
                 .first()
                 .context("no custom pricing found in region")?;
 
-            let template = VmCustomTemplate {
-                id: 0,
-                cpu: cpu.parse()?,
-                memory: crate::MB * memory.parse::<u64>()?,
-                disk_size: crate::GB * disk.parse::<u64>()?,
-                disk_type: DiskType::from_str(disk_type)?,
-                disk_interface: DiskInterface::from_str(disk_interface)?,
-                pricing_id: pricing.id,
-                ..Default::default()
-            };
+            let template = build_template(
+                &request.params,
+                cpu,
+                memory,
+                disk,
+                disk_type,
+                disk_interface,
+                pricing.id,
+            )?;
             let uid = db.upsert_user(request.event.pubkey.as_bytes()).await?;
 
             let pk: PublicKey = ssh_key.parse()?;
@@ -151,6 +150,35 @@ impl DVMHandler for LnvpsDvm {
             Ok(())
         })
     }
+}
+
+fn build_template(
+    params: &std::collections::HashMap<String, String>,
+    cpu: &str,
+    memory: &str,
+    disk: &str,
+    disk_type: &str,
+    disk_interface: &str,
+    pricing_id: u64,
+) -> anyhow::Result<VmCustomTemplate> {
+    let ip_count = |name: &str| -> anyhow::Result<u16> {
+        Ok(match params.get(name) {
+            Some(v) => v.parse()?,
+            None => 1,
+        })
+    };
+    Ok(VmCustomTemplate {
+        id: 0,
+        cpu: cpu.parse()?,
+        memory: crate::MB * memory.parse::<u64>()?,
+        disk_size: crate::GB * disk.parse::<u64>()?,
+        disk_type: DiskType::from_str(disk_type)?,
+        disk_interface: DiskInterface::from_str(disk_interface)?,
+        pricing_id,
+        ip4_count: ip_count("ip4_count")?,
+        ip6_count: ip_count("ip6_count")?,
+        ..Default::default()
+    })
 }
 
 fn payment_feedback(
@@ -235,6 +263,17 @@ mod tests {
             .find(|t| t.as_slice().first().map(String::as_str) == Some(name))
             .map(|t| t.as_slice()[1..].to_vec())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn dvm_template_defaults_ip_counts_to_one() {
+        let mut params = std::collections::HashMap::new();
+        let t = build_template(&params, "1", "1024", "10", "ssd", "pcie", 1).unwrap();
+        assert_eq!((t.ip4_count, t.ip6_count), (1, 1));
+        params.insert("ip4_count".to_string(), "0".to_string());
+        params.insert("ip6_count".to_string(), "2".to_string());
+        let t = build_template(&params, "1", "1024", "10", "ssd", "pcie", 1).unwrap();
+        assert_eq!((t.ip4_count, t.ip6_count), (0, 2));
     }
 
     #[tokio::test]
