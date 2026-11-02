@@ -1269,6 +1269,7 @@ impl PricingEngine {
         base_currency: Currency,
         target_currency: Currency,
     ) -> Result<TickerRate> {
+        let (base_currency, target_currency) = (base_currency.base(), target_currency.base());
         if base_currency == target_currency {
             return Ok(TickerRate::passthrough(base_currency));
         }
@@ -1311,19 +1312,22 @@ impl PricingEngine {
         if source.currency() == target {
             return Ok(source);
         }
+        if source.currency().base() == target.base() {
+            return TickerRate::passthrough(target).convert_into(source, 1, target);
+        }
         if let Some(rate) = self.find_rate(source.currency(), target).await {
-            return rate.convert(source);
+            return rate.convert_into(source, 1, target);
         }
         for mid in [Currency::BTC, Currency::EUR] {
-            if mid == source.currency() || mid == target {
+            if mid == source.currency().base() || mid == target.base() {
                 continue;
             }
             if let (Some(first), Some(second)) = (
                 self.find_rate(source.currency(), mid).await,
                 self.find_rate(mid, target).await,
             ) {
-                let intermediate = first.convert(source)?;
-                return second.convert(intermediate);
+                let intermediate = first.convert_into(source, 1, mid)?;
+                return second.convert_into(intermediate, 1, target);
             }
         }
         bail!(
@@ -5086,6 +5090,41 @@ mod tests {
             )
             .await?;
         assert_eq!(back.value(), 1_000);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_milli_price_converts_at_its_base_rate() -> Result<()> {
+        let pe = make_pe(Arc::new(MockDb::default())).await;
+        let hour = CurrencyAmount::from_u64(Currency::MEUR, 137);
+
+        let btc = pe
+            .get_amount_and_rate(hour, PaymentMethod::Lightning)
+            .await?;
+        assert_eq!(btc.amount, CurrencyAmount::millisats(2_000));
+
+        let card = pe.get_amount_and_rate(hour, PaymentMethod::Revolut).await?;
+        assert_eq!(card.amount, CurrencyAmount::from_u64(Currency::EUR, 1));
+        let month = CurrencyAmount::from_u64(Currency::MEUR, 4_990_000);
+        let card = pe
+            .get_amount_and_rate(month, PaymentMethod::Revolut)
+            .await?;
+        assert_eq!(card.amount, CurrencyAmount::from_u64(Currency::EUR, 4_990));
+
+        assert_eq!(
+            pe.convert_currency(hour, Currency::EUR).await?,
+            CurrencyAmount::from_u64(Currency::EUR, 1)
+        );
+        assert_eq!(
+            pe.convert_currency(CurrencyAmount::millisats(14_000), Currency::MEUR)
+                .await?,
+            CurrencyAmount::from_u64(Currency::MEUR, 1_400)
+        );
+        assert_eq!(
+            pe.convert_currency(CurrencyAmount::from_u64(Currency::EUR, 3), Currency::MEUR)
+                .await?,
+            CurrencyAmount::from_u64(Currency::MEUR, 3_000)
+        );
         Ok(())
     }
 

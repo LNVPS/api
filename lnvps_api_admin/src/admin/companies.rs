@@ -92,7 +92,9 @@ async fn admin_create_company(
         } else {
             // Validate currency by parsing it with the Currency enum
             match currency.parse::<payments_rs::currency::Currency>() {
-                Ok(c) if !c.is_crypto() || c == payments_rs::currency::Currency::BTC => {}
+                Ok(c)
+                    if (!c.is_crypto() && !c.is_milli())
+                        || c == payments_rs::currency::Currency::BTC => {}
                 _ => {
                     return ApiData::err(
                         "Invalid currency code. Supported currencies: EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC",
@@ -264,7 +266,9 @@ async fn admin_update_company(
         } else {
             // Validate currency by parsing it with the Currency enum
             match currency.parse::<payments_rs::currency::Currency>() {
-                Ok(c) if !c.is_crypto() || c == payments_rs::currency::Currency::BTC => {}
+                Ok(c)
+                    if (!c.is_crypto() && !c.is_milli())
+                        || c == payments_rs::currency::Currency::BTC => {}
                 _ => {
                     return ApiData::err(
                         "Invalid currency code. Supported currencies: EUR, USD, GBP, CAD, CHF, AUD, JPY, BTC",

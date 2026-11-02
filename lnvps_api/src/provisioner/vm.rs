@@ -2675,6 +2675,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_provision_custom_in_milli_euro_keeps_the_fraction() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let prov = make_provisioner(db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        let pricing_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        {
+            let mut p = db.custom_pricing.lock().await;
+            let pricing = p.get_mut(&pricing_id).unwrap();
+            pricing.currency = "MEUR".to_string();
+            pricing.interval_type = IntervalType::Hour;
+            pricing.interval_amount = 1;
+            pricing.rate_scale = 1;
+            pricing.cpu_cost = 137;
+            pricing.memory_cost = 0;
+            pricing.ip4_cost = 0;
+            pricing.ip6_cost = 0;
+        }
+        for d in db.custom_pricing_disk.lock().await.values_mut() {
+            d.cost = 0;
+        }
+        let template = lnvps_db::VmCustomTemplate {
+            id: 0,
+            cpu: 2,
+            memory: 4 * GB,
+            disk_size: 50 * GB,
+            disk_type: DiskType::SSD,
+            disk_interface: DiskInterface::PCIe,
+            pricing_id,
+            ..Default::default()
+        };
+        let vm = prov
+            .provision_custom(user.id, template, 1, ssh_key.id, None)
+            .await?;
+        let item = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let sub = db.get_subscription(item.subscription_id).await?;
+        assert_eq!(sub.currency, "MEUR");
+        assert_eq!(item.amount, 274);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_provision_custom_applies_chosen_bandwidth() -> Result<()> {
         let db = Arc::new(MockDb::default());
         let prov = make_provisioner(db.clone());

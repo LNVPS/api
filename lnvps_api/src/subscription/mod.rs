@@ -4796,6 +4796,34 @@ mod credit_tests {
         assert!(db.subscription_payments.lock().await.is_empty());
     }
 
+    #[tokio::test]
+    async fn an_hourly_milli_euro_order_charges_a_fraction_of_a_cent() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        make_hourly(&db, sub_id).await;
+        db.subscriptions
+            .lock()
+            .await
+            .get_mut(&sub_id)
+            .unwrap()
+            .currency = "MEUR".to_string();
+        for li in db.subscription_line_items.lock().await.values_mut() {
+            li.amount = 137;
+        }
+        give_credit(&db, user_id, 500_000_000, true).await;
+
+        let payment = sub
+            .renew_subscription_with_mode(sub_id, PaymentMethod::Lightning, 1, RenewMode::default())
+            .await
+            .unwrap();
+        assert!(payment.is_paid);
+        assert_eq!(payment.currency, "BTC");
+        assert_eq!(payment.amount, 2_000);
+        assert_eq!(
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
+            500_000_000 - 2_000
+        );
+    }
+
     /// Credit that covers only part of the hour is refused rather than topped
     /// up with an invoice, and nothing stays held.
     #[tokio::test]

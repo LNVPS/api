@@ -25,6 +25,15 @@ The admin API accepts and returns amounts as `u64` in smallest currency units.
 | EUR, USD, GBP, CAD, CHF, AUD | 2 | 100 cents = 1 unit |
 | JPY | 0 | No subdivisions |
 | BTC | — | Uses millisats (1000 millisats = 1 satoshi) |
+| MEUR, MUSD, MGBP, MCAD, MCHF, MAUD, MJPY | 5 | Milli fiat: 1000 = 1 cent of the base currency |
+
+## Milli Fiat Currencies
+
+`MEUR` and the others are the same money as their base currency (`Currency::base()`), counted in thousandths of a cent so an hourly price can be a fraction of a cent. Use them only as a list price currency: the currency of a pricing model, its subscriptions and their line items.
+
+- Rate lookups go through the base currency, so MEUR converts at the EUR rate. Converting from a milli currency rounds **up** in the target unit.
+- Payments, credit balances, top-ups and company `base_currency` are never milli. A card processor refuses a milli amount (`payments_rs::fiat::chargeable_minor_units`); `CurrencyAmount::to_base()` rounds up to the base currency's cent.
+- Prefer a milli currency over `rate_scale` for new sub-cent prices.
 
 ## Example
 

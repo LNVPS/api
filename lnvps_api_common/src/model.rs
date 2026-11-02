@@ -764,6 +764,13 @@ pub enum ApiCurrency {
     LTC,
     ETH,
     USDTTRC,
+    MEUR,
+    MUSD,
+    MGBP,
+    MCAD,
+    MCHF,
+    MAUD,
+    MJPY,
 }
 
 impl From<Currency> for ApiCurrency {
@@ -781,6 +788,13 @@ impl From<Currency> for ApiCurrency {
             Currency::LTC => ApiCurrency::LTC,
             Currency::ETH => ApiCurrency::ETH,
             Currency::USDTTRC => ApiCurrency::USDTTRC,
+            Currency::MEUR => ApiCurrency::MEUR,
+            Currency::MUSD => ApiCurrency::MUSD,
+            Currency::MGBP => ApiCurrency::MGBP,
+            Currency::MCAD => ApiCurrency::MCAD,
+            Currency::MCHF => ApiCurrency::MCHF,
+            Currency::MAUD => ApiCurrency::MAUD,
+            Currency::MJPY => ApiCurrency::MJPY,
         }
     }
 }
@@ -800,6 +814,13 @@ impl From<ApiCurrency> for Currency {
             ApiCurrency::LTC => Currency::LTC,
             ApiCurrency::ETH => Currency::ETH,
             ApiCurrency::USDTTRC => Currency::USDTTRC,
+            ApiCurrency::MEUR => Currency::MEUR,
+            ApiCurrency::MUSD => Currency::MUSD,
+            ApiCurrency::MGBP => Currency::MGBP,
+            ApiCurrency::MCAD => Currency::MCAD,
+            ApiCurrency::MCHF => Currency::MCHF,
+            ApiCurrency::MAUD => Currency::MAUD,
+            ApiCurrency::MJPY => Currency::MJPY,
         }
     }
 }
