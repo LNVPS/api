@@ -4912,9 +4912,19 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn get_account_credit_topup(
+        &self,
+        id: u64,
+    ) -> DbResult<Option<lnvps_db::AccountCreditTopup>> {
+        let topups = self.account_credit_topups.lock().await;
+        Ok(topups.iter().find(|t| t.id == id).cloned())
+    }
+
     async fn settle_account_credit_topup(
         &self,
         id: u64,
+        credit_currency: &str,
+        credit_amount: u64,
     ) -> DbResult<Option<lnvps_db::AccountCreditTopup>> {
         let mut topups = self.account_credit_topups.lock().await;
         let mut credits = self.account_credits.lock().await;
@@ -4924,17 +4934,19 @@ impl LNVpsDbBase for MockDb {
         };
         row.is_paid = true;
         row.paid_at = Some(Utc::now());
+        row.credit_currency = Some(credit_currency.to_string());
+        row.credit_amount = Some(credit_amount);
         let settled = row.clone();
-        let entry = credit_row(&mut credits, settled.user_id, &settled.currency);
-        entry.balance += settled.amount;
+        let entry = credit_row(&mut credits, settled.user_id, credit_currency);
+        entry.balance += credit_amount;
         entry.updated = Utc::now();
         let event_id = events.len() as u64 + 1;
         events.push(lnvps_db::AccountCreditEvent {
             id: event_id,
             user_id: settled.user_id,
             kind: "topup".to_string(),
-            amount: settled.amount as i64,
-            currency: settled.currency.clone(),
+            amount: credit_amount as i64,
+            currency: credit_currency.to_string(),
             subscription_payment_id: None,
             note: None,
             created: Utc::now(),
@@ -14041,15 +14053,24 @@ mod account_credit_tests {
                 .is_none()
         );
 
-        let settled = db.settle_account_credit_topup(id).await.unwrap().unwrap();
+        let settled = db
+            .settle_account_credit_topup(id, "BTC", 2500)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(settled.is_paid);
         assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 2500);
         assert_eq!(ledger_sum(&db, 1).await, 2500);
 
-        assert!(db.settle_account_credit_topup(id).await.unwrap().is_none());
+        assert!(
+            db.settle_account_credit_topup(id, "BTC", 2500)
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 2500);
         assert!(
-            db.settle_account_credit_topup(9999)
+            db.settle_account_credit_topup(9999, "BTC", 1)
                 .await
                 .unwrap()
                 .is_none()

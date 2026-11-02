@@ -5414,22 +5414,38 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn settle_account_credit_topup(&self, id: u64) -> DbResult<Option<AccountCreditTopup>> {
-        let owner: Option<(u64, String)> = sqlx::query_as(
-            "SELECT user_id, currency FROM account_credit_topup WHERE id = ? AND is_paid = 0",
+    async fn get_account_credit_topup(&self, id: u64) -> DbResult<Option<AccountCreditTopup>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM account_credit_topup WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn settle_account_credit_topup(
+        &self,
+        id: u64,
+        credit_currency: &str,
+        credit_amount: u64,
+    ) -> DbResult<Option<AccountCreditTopup>> {
+        let owner: Option<u64> = sqlx::query_scalar(
+            "SELECT user_id FROM account_credit_topup WHERE id = ? AND is_paid = 0",
         )
         .bind(id)
         .fetch_optional(&self.db)
         .await?;
-        let Some((user_id, currency)) = owner else {
+        let Some(user_id) = owner else {
             return Ok(None);
         };
         let mut tx = self.db.begin().await?;
-        let balance = lock_account_credit(&mut tx, user_id, &currency).await?;
+        let balance = lock_account_credit(&mut tx, user_id, credit_currency).await?;
         let paid = sqlx::query(
-            "UPDATE account_credit_topup SET is_paid = 1, paid_at = NOW() \
-             WHERE id = ? AND is_paid = 0",
+            "UPDATE account_credit_topup SET is_paid = 1, paid_at = NOW(), \
+             credit_currency = ?, credit_amount = ? WHERE id = ? AND is_paid = 0",
         )
+        .bind(credit_currency)
+        .bind(credit_amount)
         .bind(id)
         .execute(&mut *tx)
         .await?;
@@ -5446,9 +5462,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
             "UPDATE account_credit SET balance = ?, updated = NOW() \
              WHERE user_id = ? AND currency = ?",
         )
-        .bind(balance + topup.amount)
+        .bind(balance + credit_amount)
         .bind(topup.user_id)
-        .bind(&topup.currency)
+        .bind(credit_currency)
         .execute(&mut *tx)
         .await?;
         sqlx::query(
@@ -5456,8 +5472,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
              VALUES (?, 'topup', ?, ?)",
         )
         .bind(topup.user_id)
-        .bind(i64::try_from(topup.amount).map_err(|e| anyhow!(e))?)
-        .bind(&topup.currency)
+        .bind(i64::try_from(credit_amount).map_err(|e| anyhow!(e))?)
+        .bind(credit_currency)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

@@ -381,6 +381,57 @@ impl SubscriptionHandler {
         .await
     }
 
+    pub async fn topup_currency(&self, user_id: u64) -> Currency {
+        let from_subscription = async {
+            let mut subs = self.db.list_subscriptions_by_user(user_id).await.ok()?;
+            subs.sort_by_key(|s| std::cmp::Reverse(s.created));
+            let company = self.db.get_company(subs.first()?.company_id).await.ok()?;
+            Currency::from_str(&company.base_currency).ok()
+        };
+        if let Some(c) = from_subscription.await {
+            return c;
+        }
+        self.db
+            .list_companies()
+            .await
+            .ok()
+            .and_then(|cs| {
+                cs.into_iter()
+                    .find_map(|c| Currency::from_str(&c.base_currency).ok())
+            })
+            .unwrap_or(Currency::BTC)
+    }
+
+    pub async fn settle_credit_topup(
+        &self,
+        id: u64,
+    ) -> Result<Option<lnvps_db::AccountCreditTopup>> {
+        let Some(topup) = self.db.get_account_credit_topup(id).await? else {
+            return Ok(None);
+        };
+        if topup.is_paid {
+            return Ok(None);
+        }
+        let paid = Currency::from_str(&topup.currency)
+            .map_err(|_| anyhow::anyhow!("invalid top-up currency {}", topup.currency))?;
+        let wanted = self.topup_currency(topup.user_id).await;
+        let (target, credited) = match self
+            .pe
+            .convert_currency(CurrencyAmount::from_u64(paid, topup.amount), wanted)
+            .await
+        {
+            Ok(v) => (wanted, v.value()),
+            Err(e) => {
+                warn!("Top-up {id} cannot be converted to {wanted}, crediting {paid} instead: {e}");
+                (paid, topup.amount)
+            }
+        };
+        Ok(self
+            .db
+            .settle_account_credit_topup(id, &target.to_string(), credited)
+            .await?)
+    }
+
     pub async fn new_credit_topup_address(
         &self,
         amount_msat: u64,
@@ -4539,6 +4590,35 @@ mod credit_tests {
     }
 
     #[tokio::test]
+    async fn a_topup_is_credited_in_the_company_base_currency() {
+        let (db, sub, user_id, _) = setup().await;
+        let id = db
+            .insert_account_credit_topup(&lnvps_db::AccountCreditTopup {
+                user_id,
+                amount: 100_000_000,
+                currency: "BTC".to_string(),
+                invoice_hash: vec![9u8; 32],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let settled = sub.settle_credit_topup(id).await.unwrap().unwrap();
+        assert_eq!(settled.credit_currency.as_deref(), Some("EUR"));
+        let credited = settled.credit_amount.unwrap();
+        assert!(credited > 0);
+        assert_eq!(
+            db.get_account_credit(user_id, "EUR").await.unwrap().balance,
+            credited
+        );
+        assert_eq!(
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
+            0
+        );
+        assert!(sub.settle_credit_topup(id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn a_balance_in_the_bill_currency_is_spent_before_another_one() {
         let (db, sub, user_id, _) = setup().await;
         give_credit(&db, user_id, 500_000_000, true).await;
@@ -4986,7 +5066,9 @@ mod credit_tests {
             })
             .await
             .unwrap();
-        db.settle_account_credit_topup(topup_id).await.unwrap();
+        db.settle_account_credit_topup(topup_id, "BTC", 10_000_000)
+            .await
+            .unwrap();
         give_credit(&db, user_id, 0, true).await;
 
         let first = renew(&sub, sub_id).await.unwrap();

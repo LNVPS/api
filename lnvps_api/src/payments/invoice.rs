@@ -33,10 +33,13 @@ impl NodeInvoiceHandler {
                     "Settling credit top-up {} for user {}",
                     topup.id, topup.user_id
                 );
-                match self.db.settle_account_credit_topup(topup.id).await? {
+                match self.sub_handler.settle_credit_topup(topup.id).await? {
                     Some(t) => info!(
                         "Credit top-up {} settled: +{} {} to user {}",
-                        t.id, t.amount, t.currency, t.user_id
+                        t.id,
+                        t.credit_amount.unwrap_or(t.amount),
+                        t.credit_currency.as_deref().unwrap_or(&t.currency),
+                        t.user_id
                     ),
                     None => info!("Credit top-up {} already settled", topup.id),
                 }

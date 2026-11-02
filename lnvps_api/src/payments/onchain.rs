@@ -209,7 +209,7 @@ impl OnChainPaymentHandler {
     /// Only the call that actually settles the top-up notifies, so replayed
     /// stream events never produce a second notification.
     async fn settle_topup(&self, id: u64) -> Result<()> {
-        match self.db.settle_account_credit_topup(id).await? {
+        match self.sub_handler.settle_credit_topup(id).await? {
             Some(t) => {
                 info!(
                     "Credit top-up {} settled on chain: +{} msat to user {}",
@@ -224,10 +224,14 @@ impl OnChainPaymentHandler {
 
     /// Queue a notification telling the user an on-chain deposit was credited.
     async fn notify_credited(&self, topup: &AccountCreditTopup) {
-        let amount = if topup.currency == "BTC" {
-            format!("{} sats", topup.amount / 1000)
-        } else {
-            format!("{} {}", topup.amount, topup.currency)
+        let currency = topup.credit_currency.as_deref().unwrap_or(&topup.currency);
+        let value = topup.credit_amount.unwrap_or(topup.amount);
+        let amount = match currency.parse::<payments_rs::currency::Currency>() {
+            _ if currency == "BTC" => {
+                format!("{} sats", value / 1000)
+            }
+            Ok(c) => payments_rs::currency::CurrencyAmount::from_u64(c, value).to_string(),
+            Err(_) => format!("{value} {currency}"),
         };
         if let Err(e) = self
             .sub_handler
@@ -1275,8 +1279,8 @@ mod tests {
         let p = get_payment(&db, &payment.id).await;
         assert!(!p.is_paid, "payment must be untouched");
         assert_eq!(
-            db.get_account_credit(payment.user_id, "BTC").await?.balance,
-            EXPECTED
+            db.get_account_credit(payment.user_id, "EUR").await?.balance,
+            110
         );
         assert_eq!(p.external_id, None);
         assert_eq!(p.metadata, None);
@@ -1314,8 +1318,8 @@ mod tests {
         .await;
         assert!(no_job.is_err(), "replay must not re-notify");
         assert_eq!(
-            db.get_account_credit(payment.user_id, "BTC").await?.balance,
-            EXPECTED,
+            db.get_account_credit(payment.user_id, "EUR").await?.balance,
+            110,
             "replay must not credit twice"
         );
 
@@ -1326,8 +1330,8 @@ mod tests {
         let jobs = handler.sub_handler.work_commander().recv().await?;
         assert_eq!(jobs.len(), 1);
         assert_eq!(
-            db.get_account_credit(payment.user_id, "BTC").await?.balance,
-            EXPECTED * 2
+            db.get_account_credit(payment.user_id, "EUR").await?.balance,
+            220
         );
         Ok(())
     }
@@ -1534,7 +1538,7 @@ mod tests {
             .handle_detected(TOPUP_ADDRESS, "tx9", 0, 70_000)
             .await?;
         assert_eq!(
-            db.get_account_credit(payment.user_id, "BTC").await?.balance,
+            db.get_account_credit(payment.user_id, "EUR").await?.balance,
             0
         );
         handler
@@ -1545,8 +1549,8 @@ mod tests {
             .await?;
 
         assert_eq!(
-            db.get_account_credit(payment.user_id, "BTC").await?.balance,
-            70_000
+            db.get_account_credit(payment.user_id, "EUR").await?.balance,
+            7
         );
         assert!(!get_payment(&db, &payment.id).await.is_paid);
 
@@ -1558,7 +1562,7 @@ mod tests {
                 user_id, message, ..
             } => {
                 assert_eq!(*user_id, payment.user_id);
-                assert!(message.contains("70 sats"));
+                assert!(message.contains("EUR 0.07"));
             }
             other => panic!("expected SendNotification, got {:?}", other),
         }
@@ -1590,8 +1594,8 @@ mod tests {
             .await?;
 
         assert_eq!(
-            db.get_account_credit(payment.user_id, "BTC").await?.balance,
-            100_000
+            db.get_account_credit(payment.user_id, "EUR").await?.balance,
+            10
         );
         Ok(())
     }
@@ -1623,8 +1627,8 @@ mod tests {
             .await?;
 
         assert_eq!(
-            db.get_account_credit(payment.user_id, "BTC").await?.balance,
-            48_000
+            db.get_account_credit(payment.user_id, "EUR").await?.balance,
+            5
         );
         Ok(())
     }

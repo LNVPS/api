@@ -1571,8 +1571,16 @@ pub trait LNVpsDbBase: Send + Sync {
         amount: u64,
     ) -> DbResult<()>;
 
-    /// Mark a top-up paid and credit the balance. Idempotent.
-    async fn settle_account_credit_topup(&self, id: u64) -> DbResult<Option<AccountCreditTopup>>;
+    async fn get_account_credit_topup(&self, id: u64) -> DbResult<Option<AccountCreditTopup>>;
+
+    /// Mark a top-up paid and credit `credit_amount` to the user's
+    /// `credit_currency` balance. Idempotent.
+    async fn settle_account_credit_topup(
+        &self,
+        id: u64,
+        credit_currency: &str,
+        credit_amount: u64,
+    ) -> DbResult<Option<AccountCreditTopup>>;
 
     async fn list_account_credit_topups(
         &self,

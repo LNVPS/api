@@ -1986,6 +1986,10 @@ pub struct AccountCreditTopup {
     pub is_paid: bool,
     pub paid_at: Option<DateTime<Utc>>,
     pub created: DateTime<Utc>,
+    /// Currency of the balance the top-up was credited to, set when it settles.
+    pub credit_currency: Option<String>,
+    /// Minor units of `credit_currency` credited, set when it settles.
+    pub credit_amount: Option<u64>,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]

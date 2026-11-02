@@ -543,7 +543,9 @@ mod tests {
         for t in topups {
             let db = db.clone();
             tasks.push(tokio::spawn(async move {
-                db.settle_account_credit_topup(t).await.unwrap();
+                db.settle_account_credit_topup(t, "BTC", 500_000)
+                    .await
+                    .unwrap();
             }));
         }
         for t in tasks {
