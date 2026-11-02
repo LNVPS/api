@@ -4192,6 +4192,7 @@ config:
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
+                    category_translations: None,
                     compose:
                         "services:\n  a:\n    image: x\n    volumes:\n      - name: data\n        path: /d\n        size: 1Gi\n"
                             .to_string(),

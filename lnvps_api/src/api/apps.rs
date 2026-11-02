@@ -204,7 +204,7 @@ impl ApiApp {
     /// that fetch inside a per-item conversion is precisely where an N+1 comes
     /// from. Callers load the whole result set's assignments in one query and
     /// hand in the slice.
-    pub fn from_app(a: App, tags: Vec<ApiAppTag>) -> Self {
+    pub fn from_app(a: App, tags: Vec<ApiAppTag>, accept_language: Option<&str>) -> Self {
         // Per-service and per-volume breakdowns from the (already-validated)
         // compose; best-effort, so a row that somehow fails to parse still
         // renders with its stored totals rather than failing the listing.
@@ -240,7 +240,11 @@ impl ApiApp {
             description: a.description,
             icon: a.icon,
             repo_url: a.repo_url,
-            category: a.category,
+            category: localize_category(
+                &a.category,
+                a.category_translations.as_deref(),
+                accept_language,
+            ),
             seo_title: a.seo_title,
             seo_description: a.seo_description,
             compose: a.compose,
@@ -494,6 +498,7 @@ async fn v1_list_apps(
     // unpaginated and already loads every enabled app plus every assignment,
     // so the rows are in hand and a second query shape would buy nothing.
     let wanted = tag_filter(&params);
+    let lang = client.accept_language.as_deref();
     ApiData::ok(
         apps.into_iter()
             .filter_map(|a| {
@@ -501,12 +506,7 @@ async fn v1_list_apps(
                 let matches = wanted
                     .iter()
                     .all(|slug| app_tags.iter().any(|t| &t.slug == slug));
-                matches.then(|| {
-                    let mut app = ApiApp::from_app(a, app_tags);
-                    app.category =
-                        localize_category(&app.category, client.accept_language.as_deref());
-                    app
-                })
+                matches.then(|| ApiApp::from_app(a, app_tags, lang))
             })
             .collect(),
     )
@@ -529,9 +529,11 @@ async fn v1_get_app(
         .into_iter()
         .map(|(_, t)| t.into())
         .collect();
-    let mut api = ApiApp::from_app(app, tags);
-    api.category = localize_category(&api.category, client.accept_language.as_deref());
-    ApiData::ok(api)
+    ApiData::ok(ApiApp::from_app(
+        app,
+        tags,
+        client.accept_language.as_deref(),
+    ))
 }
 
 /// List the tag vocabulary with per-tag counts of enabled apps.
@@ -1429,6 +1431,7 @@ mod tests {
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
+                    category_translations: None,
                     compose: "services:\n  a:\n    image: x\n".to_string(),
                     amount: 1000,
                     currency: "USD".to_string(),
@@ -1569,6 +1572,7 @@ mod tests {
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
+                    category_translations: None,
                     compose: "services:\n  a:\n    image: x\n".to_string(),
                     amount: 1000,
                     currency: "USD".to_string(),
@@ -1682,6 +1686,7 @@ mod tests {
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
+                    category_translations: None,
                     compose: "services:\n  a:\n    image: x\n".to_string(),
                     amount: 1000,
                     currency: "USD".to_string(),

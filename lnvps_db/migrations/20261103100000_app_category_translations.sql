@@ -1,0 +1,1 @@
+ALTER TABLE app ADD COLUMN category_translations TEXT NULL DEFAULT NULL;

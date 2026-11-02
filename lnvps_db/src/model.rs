@@ -5024,6 +5024,11 @@ pub struct App {
     /// English-only caveat as [`App::seo_title`].
     #[sqlx(default)]
     pub seo_description: Option<String>,
+    /// JSON object of language code to translated [`App::category`], e.g.
+    /// `{"de":"Nostr-Relay"}`. Null when the app has none, in which case the
+    /// built-in table for seeded categories applies.
+    #[sqlx(default)]
+    pub category_translations: Option<String>,
     /// Docker-compose-style YAML defining the app (image, ports, env, volumes).
     pub compose: String,
     /// Recurring price in the smallest currency unit (cents / millisats).

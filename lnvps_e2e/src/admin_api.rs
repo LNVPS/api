@@ -1731,6 +1731,70 @@ mod tests {
             .expect("app in public catalog");
         assert_eq!(listed["category"].as_str(), Some("Personal Nostr relay"));
 
+        let category_in = |lang: &'static str| {
+            let public = public.clone();
+            async move {
+                let resp = match lang {
+                    "" => public.get(&format!("/api/v1/apps/{app_id}")).await,
+                    l => {
+                        public
+                            .get_with_language(&format!("/api/v1/apps/{app_id}"), l)
+                            .await
+                    }
+                }
+                .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+                body["data"]["category"].as_str().unwrap().to_string()
+            }
+        };
+        assert_eq!(category_in("").await, "Personal Nostr relay");
+        assert_eq!(category_in("de").await, "Persönliches Nostr-Relay");
+        assert_eq!(category_in("ja,en;q=0.5").await, "個人用Nostrリレー");
+        assert_eq!(category_in("it").await, "Personal Nostr relay");
+
+        let resp = public
+            .get_with_language("/api/v1/apps", "de")
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let listed = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"].as_u64() == Some(app_id))
+            .expect("app in public catalog");
+        assert_eq!(
+            listed["category"].as_str(),
+            Some("Persönliches Nostr-Relay")
+        );
+
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({
+                    "category": "Git server",
+                    "category_translations": { "de": "Git-Server" }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"]["category_translations"]["de"], "Git-Server");
+        assert_eq!(category_in("de").await, "Git-Server");
+        assert_eq!(category_in("ja").await, "Git server");
+        assert_eq!(category_in("").await, "Git server");
+
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "category_translations": { "de-DE": "x" } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
         // Cleanup.
         let resp = client
             .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))

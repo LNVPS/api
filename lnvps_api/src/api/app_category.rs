@@ -1,15 +1,17 @@
+use std::collections::BTreeMap;
+
 const TRANSLATIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "Nostr relay",
         &[
-            ("ar", "مُرحِّل Nostr"),
+            ("ar", "خادم Nostr"),
             ("de", "Nostr-Relay"),
-            ("es", "relé Nostr"),
+            ("es", "relé de Nostr"),
             ("fr", "relais Nostr"),
-            ("ja", "Nostr リレー"),
+            ("ja", "Nostrリレー"),
             ("ko", "Nostr 릴레이"),
             ("pt", "relay Nostr"),
-            ("ru", "релей Nostr"),
+            ("ru", "ретранслятор Nostr"),
             ("tr", "Nostr rölesi"),
             ("zh", "Nostr 中继"),
         ],
@@ -17,14 +19,14 @@ const TRANSLATIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "Community Nostr relay",
         &[
-            ("ar", "مُرحِّل Nostr مجتمعي"),
+            ("ar", "خادم Nostr مجتمعي"),
             ("de", "Community-Nostr-Relay"),
-            ("es", "relé Nostr comunitario"),
+            ("es", "relé de Nostr comunitario"),
             ("fr", "relais Nostr communautaire"),
-            ("ja", "コミュニティ向け Nostr リレー"),
+            ("ja", "コミュニティ向けNostrリレー"),
             ("ko", "커뮤니티 Nostr 릴레이"),
             ("pt", "relay Nostr comunitário"),
-            ("ru", "общественный релей Nostr"),
+            ("ru", "общественный ретранслятор Nostr"),
             ("tr", "topluluk Nostr rölesi"),
             ("zh", "社区 Nostr 中继"),
         ],
@@ -32,14 +34,14 @@ const TRANSLATIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "Personal Nostr relay",
         &[
-            ("ar", "مُرحِّل Nostr شخصي"),
+            ("ar", "خادم Nostr شخصي"),
             ("de", "Persönliches Nostr-Relay"),
-            ("es", "relé Nostr personal"),
+            ("es", "relé de Nostr personal"),
             ("fr", "relais Nostr personnel"),
-            ("ja", "個人用 Nostr リレー"),
+            ("ja", "個人用Nostrリレー"),
             ("ko", "개인용 Nostr 릴레이"),
             ("pt", "relay Nostr pessoal"),
-            ("ru", "персональный релей Nostr"),
+            ("ru", "персональный ретранслятор Nostr"),
             ("tr", "kişisel Nostr rölesi"),
             ("zh", "个人 Nostr 中继"),
         ],
@@ -49,9 +51,9 @@ const TRANSLATIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("ar", "خادم وسائط Blossom"),
             ("de", "Blossom-Medienserver"),
-            ("es", "servidor multimedia Blossom"),
+            ("es", "servidor de medios Blossom"),
             ("fr", "serveur multimédia Blossom"),
-            ("ja", "Blossom メディアサーバー"),
+            ("ja", "Blossomメディアサーバー"),
             ("ko", "Blossom 미디어 서버"),
             ("pt", "servidor de mídia Blossom"),
             ("ru", "медиасервер Blossom"),
@@ -100,18 +102,32 @@ pub fn preferred_languages(accept_language: &str) -> Vec<String> {
     ranked.into_iter().map(|(l, _)| l).collect()
 }
 
-pub fn localize_category(category: &str, accept_language: Option<&str>) -> String {
+pub fn parse_translations(raw: Option<&str>) -> BTreeMap<String, String> {
+    raw.and_then(|r| serde_json::from_str(r).ok())
+        .unwrap_or_default()
+}
+
+pub fn localize_category(
+    category: &str,
+    stored: Option<&str>,
+    accept_language: Option<&str>,
+) -> String {
     let Some(header) = accept_language else {
         return category.to_string();
     };
-    let Some((_, by_lang)) = TRANSLATIONS.iter().find(|(en, _)| *en == category) else {
-        return category.to_string();
-    };
+    let stored = parse_translations(stored);
+    let builtin = TRANSLATIONS
+        .iter()
+        .find(|(en, _)| *en == category)
+        .map(|(_, by_lang)| *by_lang);
     for lang in preferred_languages(header) {
         if lang == "en" {
             break;
         }
-        if let Some((_, text)) = by_lang.iter().find(|(l, _)| *l == lang) {
+        if let Some(text) = stored.get(&lang) {
+            return text.clone();
+        }
+        if let Some((_, text)) = builtin.and_then(|b| b.iter().find(|(l, _)| *l == lang)) {
             return text.to_string();
         }
     }
@@ -139,34 +155,69 @@ mod tests {
     #[test]
     fn serves_translated_category_for_accept_language() {
         assert_eq!(
-            localize_category("Nostr relay", Some("de-DE,de;q=0.9,en;q=0.8")),
+            localize_category("Nostr relay", None, Some("de-DE,de;q=0.9,en;q=0.8")),
             "Nostr-Relay"
         );
         assert_eq!(
-            localize_category("Blossom media server", Some("ru")),
+            localize_category("Blossom media server", None, Some("ru")),
             "медиасервер Blossom"
         );
     }
 
     #[test]
     fn falls_back_to_english() {
-        assert_eq!(localize_category("Nostr relay", None), "Nostr relay");
+        assert_eq!(localize_category("Nostr relay", None, None), "Nostr relay");
         assert_eq!(
-            localize_category("Nostr relay", Some("en-US")),
+            localize_category("Nostr relay", None, Some("en-US")),
             "Nostr relay"
         );
-        assert_eq!(localize_category("Nostr relay", Some("it")), "Nostr relay");
-        assert_eq!(localize_category("Git server", Some("de")), "Git server");
+        assert_eq!(
+            localize_category("Nostr relay", None, Some("it")),
+            "Nostr relay"
+        );
+        assert_eq!(
+            localize_category("Git server", None, Some("de")),
+            "Git server"
+        );
+    }
+
+    #[test]
+    fn stored_translation_beats_builtin_and_covers_new_categories() {
+        let stored = Some(r#"{"de":"Git-Server","fr":"serveur Git"}"#);
+        assert_eq!(
+            localize_category("Git server", stored, Some("de")),
+            "Git-Server"
+        );
+        assert_eq!(
+            localize_category("Git server", stored, Some("ja")),
+            "Git server"
+        );
+        assert_eq!(
+            localize_category("Nostr relay", Some(r#"{"de":"Relay"}"#), Some("de")),
+            "Relay"
+        );
+        assert_eq!(
+            localize_category("Nostr relay", Some(r#"{"de":"Relay"}"#), Some("fr")),
+            "relais Nostr"
+        );
+    }
+
+    #[test]
+    fn malformed_stored_translations_fall_back() {
+        assert_eq!(
+            localize_category("Nostr relay", Some("not json"), Some("de")),
+            "Nostr-Relay"
+        );
     }
 
     #[test]
     fn honours_quality_order() {
         assert_eq!(
-            localize_category("Nostr relay", Some("fr;q=0.4, ja;q=0.9")),
-            "Nostr リレー"
+            localize_category("Nostr relay", None, Some("fr;q=0.4, ja;q=0.9")),
+            "Nostrリレー"
         );
         assert_eq!(
-            localize_category("Nostr relay", Some("en, de;q=0.5")),
+            localize_category("Nostr relay", None, Some("en, de;q=0.5")),
             "Nostr relay"
         );
     }
