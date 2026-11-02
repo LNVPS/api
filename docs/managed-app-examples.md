@@ -528,7 +528,10 @@ JSON a `null` removes the key. The format comes from the path's extension
 `format: yaml|toml|json`. A file whose format has no merge (strfry's `.conf`)
 cannot use it, so every setting it has needs its own field.
 
-`env_from` lines are `KEY=value`; blank lines, `#` comments and a leading
+`env_from` lines are `KEY=value`, and a name that makes a process load a library,
+run a program or evaluate code is refused (`LD_PRELOAD`, `PATH`, `BASH_ENV`,
+`NODE_OPTIONS`, `GIT_*`, or any name with a `COMMAND`, `EXEC`, `SCRIPT`, `PLUGIN`,
+`HOOK`, `ARGS` or `OPTS` word; see `forbidden_env_name`); blank lines, `#` comments and a leading
 `export` are allowed, and one pair of surrounding quotes is stripped from the
 value. A key the service already sets is replaced. The value is literal: no
 `${…}`, so an override cannot pull a generated secret into somewhere else.
@@ -861,21 +864,26 @@ where the image allows it.
   negentropy. Config is a TOML file at `/etc/ditto-relay/ditto-relay.toml`;
   it listens on `13131` and keeps its database, search index and signing key
   under `data_dir`.
-- **Write policy:** the `write_policy` field is a strfry-style plugin script
-  (JSON event per line on stdin, verdict per line on stdout), mounted at
-  `/etc/ditto-relay/write-policy.sh` and run with `sh`. The default accepts
-  everything. The image carries `jq` for simple policies.
+- **Write policy:** a fixed policy baked into the image (`/usr/local/bin/ditto-policy`,
+  a `jq` filter, `catalog/images/ditto-relay/policy.jq`) that the relay runs as its
+  strfry-style plugin. Customers never supply code: the `policy_*` fields (allowed
+  kinds, pubkey allow and deny lists, minimum PoW bits, max event size, events per
+  address per minute, require AUTH) are rendered into `/etc/ditto-relay/policy.json`
+  as data, and each has a strict `pattern`. The app has no `type: file` field and no
+  `config_overrides` or `env_from`, so nothing a customer types reaches a shell, a
+  TOML key or an argv.
 - **Backup:** `exec:` of `ditto-relay export` (JSONL, restored with
   `ditto-relay import`), consistent while the relay runs.
 
 **Document:** [`catalog/ditto-relay.yaml`](../catalog/ditto-relay.yaml).
 `scripts/app-catalog-test.sh catalog/ditto-relay.yaml` starts it locally, then
 runs [`catalog/tests/ditto-relay/check.sh`](../catalog/tests/ditto-relay/check.sh)
-against the running relay: it renders the document with a custom write policy
-(`catalog/tests/ditto-relay/write-policy.sh`, which rejects any event whose
-content contains `reject-me`), asserts the relay answers NIP-11 with NIP-45
-listed, that the rejected event gets `["OK", id, false, "blocked: ..."]`, that
-the accepted one gets `true`, and that `COUNT` then returns exactly 1. A script
+against the running relay: it renders the document with a kind filter, a blocked
+pubkey, a PoW floor and a size cap, asserts NIP-11 lists NIP-45, that each of four
+events the policy refuses gets `["OK", id, false, "<reason>"]`, that the accepted one
+gets `true`, and that `COUNT` then returns exactly 1. `policy-test.sh` (run first)
+checks the filter alone per option, including that hostile text in every field is
+never executed. A script
 named `catalog/tests/<app>/check.sh` is run this way for any app.
 
 **Pricing:** 2.00 EUR per month, no setup fee. strfry, Pyramid and
@@ -917,3 +925,12 @@ NOSTR_SECRET_KEY=$(cat ~/.nostr/lnvps-admin.nsec) nak curl -X PATCH \
 
 - **zap-stream-core** — needs raw TCP/UDP ingest (RTMP `1935/tcp`, SRT), i.e.
   the not-yet-implemented `expose: tcp|udp` path.
+
+## Catalog security rule
+
+A catalog app must never execute customer-supplied code: no script or plugin
+file, no command, no environment the image evaluates. Customers set data through
+typed fields with a strict `pattern`; any logic is fixed and baked into the image.
+`catalog_never_takes_customer_code` in `lnvps_compose` enforces the parts that can
+be checked on the document (no `content_from`, no script paths, no config in a
+backup or init command, every `file` field is a checked override or a plain env value).

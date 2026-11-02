@@ -1,13 +1,12 @@
 services:
   relay:
-    image: registry.v0l.io/ditto-relay:2.5.1@sha256:c091cc418829802b8b516608a52ed83e3064e09fe3eb7d1a81e7590cfc6628c7
+    image: registry.v0l.io/ditto-relay:2.5.1-policy1@sha256:6e06f2c0ca80caea97055f121e1e59890aeba1dc3f297aabd998feb0ef6b0514
     user: "1000"
     resources: { cpu: 500m, memory: 1Gi }
     ports:
       - { name: ws, container: 13131, protocol: http, expose: ingress }
     files:
       - path: /etc/ditto-relay/ditto-relay.toml
-        merge_from: config_overrides
         content: |
           url = "wss://${HOSTNAME}/"
           bind = "0.0.0.0:13131"
@@ -26,10 +25,19 @@ services:
           search = ${search}
           negentropy = ${negentropy}
           nip85 = ${nip85}
-          write_policy_plugin = "sh /etc/ditto-relay/write-policy.sh"
+          write_policy_plugin = "/usr/local/bin/ditto-policy"
           write_policy_timeout_seconds = ${write_policy_timeout_seconds}
-      - path: /etc/ditto-relay/write-policy.sh
-        content_from: write_policy
+      - path: /etc/ditto-relay/policy.json
+        content: |
+          {
+            "kinds": "${policy_kinds}",
+            "allow": "${policy_allow_pubkeys}",
+            "deny": "${policy_deny_pubkeys}",
+            "min_pow": "${policy_min_pow}",
+            "max_size": "${policy_max_event_bytes}",
+            "per_minute": "${policy_events_per_minute}",
+            "require_auth": "${policy_require_auth}"
+          }
     volumes:
       - { name: data, path: /data, size: 5Gi, label: events }
     scratch:
@@ -38,9 +46,14 @@ services:
 config:
   - { name: relay_name, label: "Relay name", type: string, default: "My Ditto relay", pattern: '[^"\\\r\n]*' }
   - { name: relay_description, label: "Description", type: string, default: "A personal Nostr relay", pattern: '[^"\\\r\n]*' }
-  - { name: write_policy, label: "Write policy plugin (shell script)", type: file, group: "Access",
-      default: "jq -c --unbuffered '{id: .event.id, action: \"accept\", msg: \"\"}'\n" }
-  - { name: write_policy_timeout_seconds, label: "Write policy timeout (seconds)", type: int, default: "10", pattern: "[1-9][0-9]*", group: "Access" }
+  - { name: policy_kinds, label: "Write only these kinds (comma-separated, blank for all)", type: string, default: "", pattern: "([0-9]{1,5}(,[0-9]{1,5})*)?", group: "Write policy" }
+  - { name: policy_allow_pubkeys, label: "Only these pubkeys may write (comma-separated 64-char hex, blank for anyone)", type: string, default: "", pattern: "([0-9a-f]{64}(,[0-9a-f]{64}){0,199})?", group: "Write policy" }
+  - { name: policy_deny_pubkeys, label: "Blocked pubkeys (comma-separated 64-char hex)", type: string, default: "", pattern: "([0-9a-f]{64}(,[0-9a-f]{64}){0,199})?", group: "Write policy" }
+  - { name: policy_min_pow, label: "Minimum proof of work (bits, 0 for none)", type: int, default: "0", pattern: "[0-9]{1,2}", group: "Write policy" }
+  - { name: policy_max_event_bytes, label: "Max event size (bytes, 0 for no limit)", type: int, default: "0", pattern: "[0-9]{1,9}", group: "Write policy" }
+  - { name: policy_events_per_minute, label: "Max events per address per minute (0 for no limit)", type: int, default: "0", pattern: "[0-9]{1,6}", group: "Write policy" }
+  - { name: policy_require_auth, label: "Require NIP-42 AUTH to write", type: bool, default: "false", pattern: "true|false", group: "Write policy" }
+  - { name: write_policy_timeout_seconds, label: "Write policy timeout (seconds)", type: int, default: "10", pattern: "[1-9][0-9]{0,2}", group: "Write policy" }
   - { name: auth_kinds, label: "Kinds readable only by their parties (comma-separated, blank for none)", type: string, default: "", pattern: "([0-9]+(, *[0-9]+)*)?", group: "Access" }
   - { name: max_subscriptions, label: "Max subscriptions per connection", type: int, default: "20", pattern: "[1-9][0-9]*", group: "Limits" }
   - { name: max_filters, label: "Max filters per REQ", type: int, default: "100", pattern: "[1-9][0-9]*", group: "Limits" }
@@ -52,4 +65,3 @@ config:
   - { name: search, label: "NIP-50 search", type: bool, default: "true", group: "Features" }
   - { name: negentropy, label: "NIP-77 negentropy sync", type: bool, default: "true", group: "Features" }
   - { name: nip85, label: "NIP-85 trusted assertions", type: bool, default: "true", group: "Features" }
-  - { name: config_overrides, label: "Advanced: ditto-relay.toml overrides", type: file, default: "", group: "Advanced" }
