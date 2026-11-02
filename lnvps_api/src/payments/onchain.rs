@@ -1291,7 +1291,9 @@ mod tests {
         assert_eq!(user_job.len(), 1);
         assert_eq!(admin_job.len(), 1);
         match &user_job[0].job {
-            WorkJob::SendNotification { user_id, message, .. } => {
+            WorkJob::SendNotification {
+                user_id, message, ..
+            } => {
                 assert_eq!(*user_id, payment.user_id);
                 assert!(message.contains("credited"));
             }
@@ -1552,7 +1554,9 @@ mod tests {
         let jobs = handler.sub_handler.work_commander().recv().await?;
         assert_eq!(jobs.len(), 1);
         match &jobs[0].job {
-            WorkJob::SendNotification { user_id, message, .. } => {
+            WorkJob::SendNotification {
+                user_id, message, ..
+            } => {
                 assert_eq!(*user_id, payment.user_id);
                 assert!(message.contains("70 sats"));
             }

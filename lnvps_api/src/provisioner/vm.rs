@@ -964,7 +964,10 @@ impl VmProvisioner {
         self.db.update_vm(&vm).await?;
 
         // Bill the subscription on the custom pricing model's interval
-        let new_pricing = self.db.get_custom_pricing(new_custom_template.pricing_id).await?;
+        let new_pricing = self
+            .db
+            .get_custom_pricing(new_custom_template.pricing_id)
+            .await?;
         let line_item = self
             .db
             .get_subscription_line_item(vm.subscription_line_item_id)

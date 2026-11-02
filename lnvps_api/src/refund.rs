@@ -1213,12 +1213,18 @@ mod tests {
             "the recorded payer is not"
         );
         let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
-        assert_eq!(refunds[0].user_id, vm.user_id, "the refund row names the owner");
+        assert_eq!(
+            refunds[0].user_id, vm.user_id,
+            "the refund row names the owner"
+        );
         let (events, _) = db
             .list_account_credit_events(vm.user_id, 10, 0)
             .await
             .unwrap();
-        assert_eq!((events[0].kind.as_str(), events[0].amount), ("refund", returned as i64));
+        assert_eq!(
+            (events[0].kind.as_str(), events[0].amount),
+            ("refund", returned as i64)
+        );
     }
 
     /// Time paid for in cash comes back as credit too, converted at today's

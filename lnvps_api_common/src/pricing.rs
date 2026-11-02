@@ -99,8 +99,9 @@ pub async fn select_custom_pricing(
             continue;
         }
 
-        let same_interval = current_interval
-            .is_some_and(|(t, a)| t == pricing.interval_type && a == pricing.interval_amount.max(1));
+        let same_interval = current_interval.is_some_and(|(t, a)| {
+            t == pricing.interval_type && a == pricing.interval_amount.max(1)
+        });
         match &best {
             // The first compatible model wins unless a later one matches the
             // VM's interval and the current best does not.
@@ -1149,7 +1150,10 @@ impl PricingEngine {
             .get_subscription_by_line_item_id(vm.subscription_line_item_id)
             .await?;
         // clamp base to now for expired VMs
-        let base = subscription.expires.unwrap_or_else(Utc::now).max(Utc::now());
+        let base = subscription
+            .expires
+            .unwrap_or_else(Utc::now)
+            .max(Utc::now());
         let time_value =
             Self::interval_seconds_from(base, price.interval_type, price.interval_amount);
         // Convert the raw (sub-cent) price once, so an hourly share keeps its
@@ -1813,10 +1817,8 @@ impl PricingEngine {
         let new_price = Self::get_custom_vm_cost_amount(&self.db, &new_custom_template).await?;
         let new_raw = CurrencyAmount::from_u64(new_price.currency, new_price.total_raw());
 
-        let interval_seconds = Self::cost_plan_interval_to_seconds(
-            new_price.interval_type,
-            new_price.interval_amount,
-        );
+        let interval_seconds =
+            Self::cost_plan_interval_to_seconds(new_price.interval_type, new_price.interval_amount);
         let new_cost_per_second = new_raw.value() as f64 / interval_seconds as f64;
 
         // calculate the cost based on the time until the vm expires

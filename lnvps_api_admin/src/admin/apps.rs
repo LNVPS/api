@@ -839,6 +839,9 @@ async fn admin_update_app_deployment(
             _ => None,
         };
         if new_domain != d.custom_domain {
+            if let Some(domain) = &new_domain {
+                lnvps_api_common::ensure_custom_domain_free(this.db.as_ref(), domain, d.id).await?;
+            }
             d.custom_domain_verified = false;
         }
         d.custom_domain = new_domain;

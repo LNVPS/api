@@ -405,8 +405,11 @@ async fn admin_update_custom_pricing(
     // Every rate is the price for one interval at this scale, so changing either
     // under VMs that already use the model would silently reprice them. Copy the
     // model into the new interval instead (which converts the rates).
-    if (pricing.interval_amount, pricing.interval_type, pricing.rate_scale)
-        != (old_amount, old_type, old_scale)
+    if (
+        pricing.interval_amount,
+        pricing.interval_type,
+        pricing.rate_scale,
+    ) != (old_amount, old_type, old_scale)
         && this.db.count_custom_templates_by_pricing(id).await? > 0
     {
         return Err(ApiError::bad_request(
@@ -508,7 +511,8 @@ async fn admin_copy_custom_pricing(
     // monthly model copied to hourly gets the hourly equivalent, not the same
     // numbers). Going shorter needs a finer unit to hold the fraction of a cent.
     let new_interval = (
-        req.interval_amount.unwrap_or(source_pricing.interval_amount),
+        req.interval_amount
+            .unwrap_or(source_pricing.interval_amount),
         req.interval_type
             .map(Into::into)
             .unwrap_or(source_pricing.interval_type),
