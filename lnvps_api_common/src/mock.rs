@@ -11888,6 +11888,38 @@ impl crate::dns::DnsServer for MockDnsServer {
             name: "mock.example.com".to_string(),
         }])
     }
+
+    async fn list_records(&self, zone: &DnsRef) -> OpResult<Vec<BasicRecord>> {
+        let Some(zone_id) = zone.as_id() else {
+            return Ok(vec![]);
+        };
+        let zones = self.zones.lock().await;
+        Ok(zones
+            .get(zone_id)
+            .map(|t| {
+                t.iter()
+                    .map(|(id, e)| {
+                        let kind = match e.kind.as_str() {
+                            "A" => RecordType::A,
+                            "AAAA" => RecordType::AAAA,
+                            _ => RecordType::PTR,
+                        };
+                        BasicRecord {
+                            name: e.name.clone(),
+                            value: e.value.clone(),
+                            id: Some(DnsRef::Id(id.clone())),
+                            ip: match kind {
+                                RecordType::PTR => String::new(),
+                                _ => e.value.clone(),
+                            },
+                            kind,
+                            zone: zone.clone(),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
 }
 
 #[cfg(test)]
