@@ -142,10 +142,21 @@ oauth:
       auth-url: "https://idp.example.com/authorize"
       token-url: "https://idp.example.com/token"
       userinfo-url: "https://idp.example.com/userinfo"
+      issuer: "https://idp.example.com/"    # expected `iss` of this provider's id_token (optional)
 ```
 
 Supported `type` values: `google`, `github`, `facebook`, `apple`, `oidc`.
 Requires the `session:` block.
+
+Login requests carry an OIDC `nonce` and use PKCE (`S256`, RFC 7636), and
+`id_token` claims are validated before use: `exp` must be current, `aud`
+must contain the client id, `iss` must match the provider's issuer
+(built-in for `google`/`apple`; configure `issuer` for generic `oidc`
+providers whose `id_token` is relied on), and the `nonce` sent with the
+authorization request must be echoed by the `id_token`. Every
+standards-compliant provider accepts PKCE; if a provider rejects the
+extra authorization parameters, report it — the flow degrades by failing
+closed, not by disabling PKCE.
 
 ### WebAuthn / passkeys (optional)
 

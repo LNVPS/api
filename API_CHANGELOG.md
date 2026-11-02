@@ -833,6 +833,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     - `DELETE /api/v1/payment-methods/{id}` — remove a saved method.
   - **Breaking:** the `nwc_connection_string` field on `GET`/`PATCH /api/v1/account` has been removed. Existing NWC connections are migrated into `user_payment_method` (provider `nwc`); manage NWC via the new payment-methods endpoints instead.
 
+
+### Changed
+
+- **OAuth/OIDC logins now validate the `id_token` and bind the OIDC `nonce`.** The authorization request sends a `nonce`; for providers whose subject comes from the `id_token` (Apple, and generic `oidc` providers configured with it), the claims must satisfy OIDC Core §3.1.3.7: `exp` current, `aud` containing our client id (string or single-element array), `iss` matching the provider's issuer (canonical for `google`/`apple`; new optional per-provider `issuer` setting for generic `oidc`), and the `nonce` we sent echoed back. Tokens failing any check are rejected at login with a 500 (previously only the TLS back channel was trusted). Most deployments need no config change; a generic `oidc` provider whose `id_token` omits standard claims must now fix the provider.
+
+- **OAuth logins use PKCE (`S256`)**: every authorization request carries a `code_challenge` and the token exchange presents the `code_verifier` (RFC 7636). The verifier rides the signed, short-lived `state` token, so the flow stays stateless. Standards-compliant providers are unaffected; a provider that rejects the extra authorization parameters will fail login closed.
+
 ## [0.4.0] - 2026-07-13
 
 ### Added
