@@ -48,7 +48,7 @@ services:
         zmqpubrawblock=tcp://0.0.0.0:28332
         zmqpubrawtx=tcp://0.0.0.0:28333
     ports:
-      - "18443:18443"
+      - "${E2E_BITCOIND_RPC_PORT:-18443}:18443"
       - "28332:28332"
       - "28333:28333"
     volumes:
