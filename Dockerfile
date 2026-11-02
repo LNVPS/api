@@ -10,6 +10,8 @@ RUN apt update && apt -y install protobuf-compiler libvirt-dev libva-dev pkg-con
 RUN curl -L --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh | bash \
     && cargo binstall -y --locked cargo-chef
 WORKDIR /app/src
+COPY rust-toolchain.toml .
+RUN rustup toolchain install
 
 # --- planner: produce a dependency recipe from the manifests only ---
 FROM chef AS planner

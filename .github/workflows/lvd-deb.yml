@@ -48,8 +48,8 @@ jobs:
             exit 1
           fi
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain
+        run: rustup toolchain install
 
       - name: Cache cargo + build
         uses: actions/cache@v5
