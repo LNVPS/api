@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 mod merge;
-pub use merge::{FileFormat, parse_env_lines};
+pub use merge::{FileFormat, forbidden_env_name, parse_env_lines};
 
 /// A parsed app compose document.
 #[derive(Debug, Clone, Deserialize)]
@@ -214,6 +214,20 @@ pub struct Service {
     pub init: Vec<InitContainer>,
     #[serde(default)]
     pub env_from: Option<String>,
+    /// Names `env_from` may set: exact names, or a prefix ending in `*`. A
+    /// customer's environment is data for the variables the app documents,
+    /// so anything else is refused rather than screened by a denylist.
+    #[serde(default)]
+    pub env_allow: Vec<String>,
+}
+
+impl Service {
+    pub fn env_name_allowed(&self, name: &str) -> bool {
+        self.env_allow.iter().any(|a| match a.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => a == name,
+        })
+    }
 }
 
 /// A setup step that must succeed before its service's container starts.
@@ -1237,6 +1251,31 @@ impl Compose {
 
             if let Some(field) = &svc.env_from {
                 self.require_file_field(sname, "env_from", field)?;
+                if svc.env_allow.is_empty() {
+                    bail!("service '{sname}': env_from needs env_allow, the names it may set");
+                }
+            } else if !svc.env_allow.is_empty() {
+                bail!("service '{sname}': env_allow without env_from");
+            }
+            for allowed in &svc.env_allow {
+                let name = allowed.strip_suffix('*').unwrap_or(allowed);
+                let shaped = !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                if !shaped {
+                    bail!(
+                        "service '{sname}': env_allow '{allowed}' must be UPPER_CASE_NAME or PREFIX_*"
+                    );
+                }
+                if svc.env.contains_key(name) || svc.env.keys().any(|k| svc.env_name_allowed(k)) {
+                    bail!(
+                        "service '{sname}': env_allow '{allowed}' covers a variable the service sets itself"
+                    );
+                }
+                if let Some(reason) = forbidden_env_name(name) {
+                    bail!("service '{sname}': env_allow '{allowed}' is not allowed ({reason})");
+                }
             }
 
             // A backup entry is exactly one of command | volume, and the
@@ -1540,7 +1579,7 @@ impl Compose {
             if let Some(overrides) = svc.env_from.as_ref().and_then(|f| vars.get(f))
                 && let Ok(lines) = parse_env_lines(overrides)
             {
-                resolved.extend(lines);
+                resolved.extend(lines.into_iter().filter(|(k, _)| svc.env_name_allowed(k)));
             }
             out.insert(sname.clone(), resolved);
         }
@@ -1830,7 +1869,16 @@ fn check_override(compose: &Compose, field: &ConfigField, value: &str) -> Result
     }
     for svc in compose.services.values() {
         if svc.env_from.as_deref() == Some(field.name.as_str()) {
-            parse_env_lines(value).map_err(|e| anyhow!("config field '{label}': {e}"))?;
+            let lines =
+                parse_env_lines(value).map_err(|e| anyhow!("config field '{label}': {e}"))?;
+            for (key, _) in lines {
+                if !svc.env_name_allowed(&key) {
+                    bail!(
+                        "config field '{label}': '{key}' is not a setting this app accepts (allowed: {})",
+                        svc.env_allow.join(", ")
+                    );
+                }
+            }
         }
         for f in &svc.files {
             if f.merge_from.as_deref() != Some(field.name.as_str()) {
@@ -3366,6 +3414,7 @@ services:
       PORT: "8080"
       NAME: "${name}"
     env_from: extra_env
+    env_allow: [EXTRA, NEW, "APP_*"]
     files:
       - path: /app/config.yml
         merge_from: extra_yaml
@@ -3403,7 +3452,7 @@ config:
         let c = Compose::parse(MERGE_DOC).unwrap();
         c.validate_declarations().unwrap();
         let mut submitted = std::collections::BTreeMap::new();
-        submitted.insert("extra_env".to_string(), "PORT=9000\nNEW=1\n".to_string());
+        submitted.insert("extra_env".to_string(), "EXTRA=9000\nNEW=1\n".to_string());
         submitted.insert(
             "extra_yaml".to_string(),
             "upload:\n  max: 5\nwhitelist: [\"aa\"]\n".to_string(),
@@ -3417,7 +3466,7 @@ config:
         let vars = merge_vars(&config);
 
         let env = &c.resolve_env(&vars).unwrap()["app"];
-        assert_eq!(env["PORT"], "9000");
+        assert_eq!(env["EXTRA"], "9000");
         assert_eq!(env["NEW"], "1");
         assert_eq!(env["NAME"], "relay");
 
@@ -3670,6 +3719,121 @@ config:
             .unwrap()
             .1;
         Compose::parse(&yaml).unwrap()
+    }
+
+    #[test]
+    fn catalog_env_overrides_are_allowlisted() {
+        for (name, yaml) in catalog_documents() {
+            let c = Compose::parse(&yaml).unwrap();
+            for (sname, svc) in &c.services {
+                if svc.env_from.is_none() {
+                    continue;
+                }
+                assert!(!svc.env_allow.is_empty(), "{name}/{sname}");
+                for dangerous in [
+                    "LD_AUDIT",
+                    "LD_PRELOAD",
+                    "PYTHONSTARTUP",
+                    "PERL5OPT",
+                    "RUBYOPT",
+                    "JAVA_TOOL_OPTIONS",
+                    "GCONV_PATH",
+                    "NODE_OPTIONS",
+                    "BASH_ENV",
+                    "PATH",
+                    "DATABASE_URL",
+                    "BUZZ_RELAY_PRIVATE_KEY",
+                    "RUST_LOG",
+                    "HOME",
+                    "HOSTALIASES",
+                    "MALLOC_CONF",
+                    "SSL_CERT_FILE",
+                    "HTTP_PROXY",
+                    "OWNER_NPUB",
+                    "RELAY_URL",
+                ] {
+                    assert!(
+                        !svc.env_name_allowed(dangerous),
+                        "{name}/{sname} allows {dangerous}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn env_overrides_off_the_allowlist_are_refused() {
+        let c = Compose::parse(MERGE_DOC).unwrap();
+        for bad in [
+            "LD_AUDIT=/x.so",
+            "PERL5OPT=-Mevil",
+            "RUBYOPT=-r/x",
+            "UNLISTED=1",
+            "NAME=override",
+            "APP=1",
+            "EXTRA=1\nLD_PRELOAD=/x",
+            "PORT=1",
+        ] {
+            let mut submitted = std::collections::BTreeMap::new();
+            submitted.insert("extra_env".to_string(), bad.to_string());
+            let err = resolve_config(&c, &submitted).unwrap_err().to_string();
+            assert!(
+                err.contains("extra_env")
+                    || err.contains("Extra")
+                    || err.contains("accepts")
+                    || err.contains("not allowed"),
+                "{bad}: {err}"
+            );
+        }
+        let mut ok = std::collections::BTreeMap::new();
+        ok.insert("extra_env".to_string(), "EXTRA=1\nAPP_MODE=x".to_string());
+        resolve_config(&c, &ok).unwrap();
+    }
+
+    #[test]
+    fn stored_env_off_the_allowlist_is_not_applied() {
+        let c = Compose::parse(MERGE_DOC).unwrap();
+        let mut vars = merge_vars(&std::collections::BTreeMap::new());
+        vars.insert(
+            "extra_env".into(),
+            "UNLISTED=/x\nEXTRA=9\nPORT=7\nAPP_X=1".into(),
+        );
+        let env = &c.resolve_env(&vars).unwrap()["app"];
+        assert_eq!(env["EXTRA"], "9");
+        assert_eq!(env["PORT"], "8080");
+        assert_eq!(env["APP_X"], "1");
+        assert!(!env.contains_key("UNLISTED"));
+    }
+
+    #[test]
+    fn env_from_requires_a_valid_allowlist() {
+        for allow in [
+            "",
+            "    env_allow: []\n",
+            "    env_allow: [ld_audit]\n",
+            "    env_allow: [LD_*]\n",
+            "    env_allow: [PATH]\n",
+            "    env_allow: [\"*\"]\n",
+            "    env_allow: [A]\n    env:\n      A: x\n",
+        ] {
+            let doc = format!(
+                "services:\n  a:\n    image: x\n    env_from: s\n{allow}config:\n  - {{ name: s, type: file }}\n"
+            );
+            assert!(
+                Compose::parse(&doc).and_then(|c| c.validate()).is_err(),
+                "accepted: {allow}"
+            );
+        }
+        assert!(
+            Compose::parse(
+                "services:
+  a:
+    image: x
+    env_allow: [A]
+"
+            )
+            .is_err()
+        );
     }
 
     #[test]
