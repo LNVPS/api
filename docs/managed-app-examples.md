@@ -508,7 +508,8 @@ services:
   relay:
     env:
       RUST_LOG: "${log_level}"
-    env_from: extra_env              # KEY=value per line, set over `env`
+    env_from: extra_env              # KEY=value per line, only names in env_allow
+    env_allow: [EXTRA_*]
     files:
       - path: /app/config.yaml
         merge_from: config_overrides # deep-merged over the rendered content
@@ -528,12 +529,16 @@ JSON a `null` removes the key. The format comes from the path's extension
 `format: yaml|toml|json`. A file whose format has no merge (strfry's `.conf`)
 cannot use it, so every setting it has needs its own field.
 
-`env_from` lines are `KEY=value`, and a name that makes a process load a library,
-run a program or evaluate code is refused (`LD_PRELOAD`, `PATH`, `BASH_ENV`,
-`NODE_OPTIONS`, `GIT_*`, or any name with a `COMMAND`, `EXEC`, `SCRIPT`, `PLUGIN`,
-`HOOK`, `ARGS` or `OPTS` word; see `forbidden_env_name`); blank lines, `#` comments and a leading
+`env_from` lines are `KEY=value`; blank lines, `#` comments and a leading
 `export` are allowed, and one pair of surrounding quotes is stripped from the
-value. A key the service already sets is replaced. The value is literal: no
+value. The service must also list `env_allow`, the names (or `PREFIX_*`) the
+customer may set, taken from the variables the app documents. A name off the list
+is refused at order time and ignored if one is already stored. A name in
+`env_allow` must be UPPER_CASE and may not match `forbidden_env_name`, which
+refuses library-loading, interpreter and command-naming variables as a backstop.
+A key the service already sets cannot be listed. yalr has no `extra_env` field
+because it documents no environment beyond what the catalog sets.
+The value is literal: no
 `${…}`, so an override cannot pull a generated secret into somewhere else.
 
 Both are checked when the customer submits them: text that does not parse, a

@@ -141,6 +141,25 @@ services:
       BUZZ_MAX_CONNECTIONS: "${max_connections}"
       RUST_LOG: "${log_level}"
     env_from: extra_env
+    env_allow:
+      - BUZZ_RATE_LIMIT_*
+      - BUZZ_MAX_CONCURRENT_HANDLERS
+      - BUZZ_MAX_FRAME_BYTES
+      - BUZZ_SLOW_CLIENT_GRACE_LIMIT
+      - BUZZ_SEND_BUFFER
+      - BUZZ_CORS_ORIGINS
+      - BUZZ_DB_POOL_SIZE
+      - BUZZ_REDIS_POOL_SIZE
+      - BUZZ_MEDIA_MAX_CONCURRENT_UPLOADS
+      - BUZZ_MEDIA_MAX_CONCURRENT_UPLOADS_PER_PUBKEY
+      - BUZZ_EPHEMERAL_TTL_OVERRIDE
+      - BUZZ_GIT_MAX_CONCURRENT_OPS
+      - BUZZ_GIT_PACK_CACHE_MAX_BYTES
+      - BUZZ_REQUIRE_MEDIA_GET_AUTH
+      - BUZZ_REQUIRE_MEDIA_READ_AUTH
+      - BUZZ_HUDDLE_AUDIO_AVAILABLE
+      - BUZZ_MAX_COMMUNITIES_PER_OWNER
+      - RELAY_INACTIVE_CLEANUP_TIME
     volumes:
       - { name: git, path: /var/lib/buzz/git, size: 5Gi, label: git repositories }
       - { name: packs, path: /var/cache/buzz/git-packs, size: 5Gi }
@@ -174,7 +193,7 @@ config:
   - { name: audit_enabled, label: "Audit log", type: bool, default: "true", group: "Advanced" }
   - { name: max_connections, label: "Max connections", type: int, default: "2000", pattern: "[1-9][0-9]*", group: "Advanced" }
   - { name: log_level, label: "Log level (RUST_LOG)", type: string, default: "info", pattern: "[A-Za-z0-9_:=,.-]+", group: "Advanced" }
-  - { name: extra_env, label: "Advanced: extra environment variables (KEY=value per line)", type: file, default: "", group: "Advanced" }
+  - { name: extra_env, label: "Advanced: extra settings (allowed NAME=value lines only)", type: file, default: "", group: "Advanced" }
 # Daily at 03:00 UTC, keeping a week of restore points. Each run captures
 # every service that declares a `backup:` method above, at one point in time.
 backup: { schedule: "0 3 * * *", retention: 7 }

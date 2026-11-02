@@ -336,12 +336,38 @@ impl<'a> FilteredQuery<'a> {
     }
 }
 
+pub const MIGRATION_LOCK_NAME: &str = "lnvps_migrate";
+
+async fn migrate_locked(pool: &MySqlPool, migrator: &sqlx::migrate::Migrator) -> DbResult<()> {
+    let mut conn = pool.acquire().await?;
+    conn.close_on_drop();
+    let locked: Option<i64> = sqlx::query_scalar("select get_lock(?, 600)")
+        .bind(MIGRATION_LOCK_NAME)
+        .fetch_one(&mut *conn)
+        .await?;
+    if locked != Some(1) {
+        return Err(anyhow!("timed out waiting for the migration lock").into());
+    }
+    let result = migrator.run_direct(&mut *conn).await;
+    let _ = sqlx::query("select release_lock(?)")
+        .bind(MIGRATION_LOCK_NAME)
+        .execute(&mut *conn)
+        .await;
+    result?;
+    Ok(())
+}
+
+impl LNVpsDbMysql {
+    pub async fn migrate_with(&self, migrator: &sqlx::migrate::Migrator) -> DbResult<()> {
+        migrate_locked(&self.db, migrator).await
+    }
+}
+
 #[async_trait]
 impl LNVpsDbBase for LNVpsDbMysql {
     async fn migrate(&self) -> DbResult<()> {
-        let migrator = sqlx::migrate!();
-        migrator.run(&self.db).await?;
-        Ok(())
+        migrate_locked(&self.db, &sqlx::migrate!()).await
+
     }
 
     async fn upsert_user(&self, pubkey: &[u8; 32]) -> DbResult<u64> {
