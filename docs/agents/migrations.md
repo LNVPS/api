@@ -2,25 +2,15 @@
 
 ## Timestamp Rules
 
-**CRITICAL:** Migration filenames must have unique timestamps (full 14-digit `YYYYMMDDHHMMSS`). Before creating or modifying a migration:
+**CRITICAL:** Name every new migration from the clock, never by hand:
 
-1. **Check existing timestamps** — Run `ls lnvps_db/migrations/` and verify your full timestamp doesn't conflict
-2. **After rebasing** — If your branch adds migrations, check that the timestamps don't collide with migrations added to master
-3. **Use the current timestamp** — Generate with `date +%Y%m%d%H%M%S`
-
-Migration format: `YYYYMMDDHHMMSS_description.sql`
-
-Example conflict to avoid:
 ```
-20260219000000_cpu_type.sql            # from master
-20260219000000_email_verification.sql  # CONFLICT — same full timestamp!
+touch lnvps_db/migrations/$(date -u +%Y%m%d%H%M%S)_description.sql
 ```
 
-Fix by using a completely unique timestamp:
-```
-20260219000000_cpu_type.sql
-20260221120000_email_verification.sql  # different date AND time
-```
+Do not type a timestamp, round one, or reuse a date with `000000` or `100000`. Guessed times collide: two branches that both picked `20261024100000` broke every fresh database (#99).
+
+`lnvps_db/tests/migration_versions.rs` runs in CI and fails when two migrations share a version, or a new one has a time ending in `0000`. After rebasing, run `cargo test -p lnvps_db --test migration_versions`; if master added a migration with your version, rename yours with a fresh `date`.
 
 ## Migration Best Practices
 

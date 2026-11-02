@@ -216,6 +216,9 @@ jobs:
       - name: Run unit tests
         run: cargo test --locked --package lnvps_api --package lnvps_agent --features lnvps_api/libvirt -- --test-threads=1
 
+      - name: Check migration versions
+        run: cargo test --locked -p lnvps_db --test migration_versions
+
   # Build all 5 main images from the single shared Dockerfile via buildx bake:
   # the workspace is compiled ONCE and each image just packages its binary.
   build:

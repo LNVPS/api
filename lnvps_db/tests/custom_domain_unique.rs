@@ -3,7 +3,7 @@ use sqlx::mysql::MySqlPoolOptions;
 use sqlx::{Executor, MySqlPool, Row};
 use std::borrow::Cow;
 
-const UNIQUE_MIGRATION: i64 = 20261024100000;
+const UNIQUE_MIGRATION: i64 = 20261024100517;
 
 async fn pool() -> Option<MySqlPool> {
     let url = std::env::var("LNVPS_TEST_DATABASE_URL").ok()?;
