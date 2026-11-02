@@ -698,4 +698,32 @@ mod tests {
             Duration::from_secs(3600)
         );
     }
+
+    #[test]
+    fn shipped_manifest_and_readme_target_the_deployed_namespace() {
+        let manifest = include_str!("../k8s-minimal.yaml");
+        let readme = include_str!("../README.md");
+        assert!(!manifest.contains("lnvps-system"));
+        assert!(!readme.contains("lnvps-system"));
+        let subject_namespace = manifest
+            .split("kind: ClusterRoleBinding")
+            .nth(1)
+            .and_then(|b| b.lines().find(|l| l.trim_start().starts_with("namespace:")))
+            .map(|l| l.trim().trim_start_matches("namespace:").trim());
+        assert_eq!(subject_namespace, Some("lnvps"));
+    }
+
+    #[test]
+    fn readme_deploys_a_manifest_that_exists() {
+        let readme = include_str!("../README.md");
+        assert!(!readme.contains("k8s-deployment.yaml"));
+        assert!(readme.contains("kubectl apply -f lnvps_operator/k8s-minimal.yaml"));
+    }
+
+    #[test]
+    fn shipped_manifest_wires_backup_credentials_from_secret() {
+        let manifest = include_str!("../k8s-minimal.yaml");
+        assert!(manifest.contains("name: LNVPS_BACKUP_ACCESS_KEY"));
+        assert!(manifest.contains("name: LNVPS_BACKUP_SECRET_KEY"));
+    }
 }
