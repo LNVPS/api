@@ -6828,10 +6828,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn insert_app(&self, app: &App) -> DbResult<u64> {
         let res = sqlx::query(
             "INSERT INTO app (name, display_name, description, icon, repo_url, category, \
-             seo_title, seo_description, compose, amount, \
+             seo_title, seo_description, category_translations, compose, amount, \
              currency, interval_amount, interval_type, setup_amount, enabled, cpu_milli, \
              memory_bytes, storage_bytes) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(&app.name)
         .bind(&app.display_name)
@@ -6841,6 +6841,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&app.category)
         .bind(&app.seo_title)
         .bind(&app.seo_description)
+        .bind(&app.category_translations)
         .bind(&app.compose)
         .bind(app.amount)
         .bind(&app.currency)
@@ -6859,7 +6860,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn update_app(&self, app: &App) -> DbResult<()> {
         sqlx::query(
             "UPDATE app SET name = ?, display_name = ?, description = ?, icon = ?, repo_url = ?, \
-             category = ?, seo_title = ?, seo_description = ?, \
+             category = ?, seo_title = ?, seo_description = ?, category_translations = ?, \
              compose = ?, amount = ?, currency = ?, interval_amount = ?, interval_type = ?, \
              setup_amount = ?, enabled = ?, cpu_milli = ?, memory_bytes = ?, storage_bytes = ? \
              WHERE id = ?",
@@ -6872,6 +6873,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&app.category)
         .bind(&app.seo_title)
         .bind(&app.seo_description)
+        .bind(&app.category_translations)
         .bind(&app.compose)
         .bind(app.amount)
         .bind(&app.currency)

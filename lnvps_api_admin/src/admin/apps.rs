@@ -214,6 +214,34 @@ fn validate_tag_display_name(name: String) -> Result<String, lnvps_api_common::A
 /// string cannot reach the column on either. Returning the trimmed value
 /// rather than validating in place is what makes it impossible to store the
 /// untrimmed one by accident.
+fn encode_category_translations(
+    map: Option<std::collections::BTreeMap<String, String>>,
+) -> Result<Option<String>, lnvps_api_common::ApiError> {
+    let Some(map) = map else { return Ok(None) };
+    let mut clean = std::collections::BTreeMap::new();
+    for (lang, text) in map {
+        let lang = lang.trim().to_ascii_lowercase();
+        let text = text.trim();
+        let valid_lang =
+            (2..=3).contains(&lang.len()) && lang.chars().all(|c| c.is_ascii_lowercase());
+        if !valid_lang {
+            return Err(lnvps_api_common::ApiError::new(format!(
+                "category_translations key '{lang}' must be a 2 or 3 letter language code"
+            )));
+        }
+        if text.is_empty() {
+            return Err(lnvps_api_common::ApiError::new(format!(
+                "category_translations value for '{lang}' is empty"
+            )));
+        }
+        clean.insert(lang, text.to_string());
+    }
+    if clean.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(&clean).unwrap_or_default()))
+}
+
 fn validate_category(category: String) -> Result<String, lnvps_api_common::ApiError> {
     let category = category.trim();
     if category.is_empty() {
@@ -335,6 +363,7 @@ async fn admin_create_app(
         category,
         seo_title: req.seo_title.filter(|s| !s.trim().is_empty()),
         seo_description: req.seo_description.filter(|s| !s.trim().is_empty()),
+        category_translations: encode_category_translations(req.category_translations)?,
         compose: req.compose,
         amount: req.amount,
         currency: req.currency.trim().to_uppercase(),
@@ -390,6 +419,9 @@ async fn admin_update_app(
     }
     if let Some(seo_description) = req.seo_description {
         app.seo_description = seo_description.filter(|s| !s.trim().is_empty());
+    }
+    if let Some(translations) = req.category_translations {
+        app.category_translations = encode_category_translations(translations)?;
     }
     if let Some(compose) = req.compose {
         app.compose = compose;
@@ -1221,6 +1253,27 @@ mod tests {
         );
         assert!(validate_tag_display_name(String::new()).is_err());
         assert!(validate_tag_display_name("   ".to_string()).is_err());
+    }
+
+    #[test]
+    fn category_translations_are_normalised_and_validated() {
+        use std::collections::BTreeMap;
+        let ok = |pairs: &[(&str, &str)]| {
+            encode_category_translations(Some(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect::<BTreeMap<_, _>>(),
+            ))
+        };
+        assert_eq!(
+            ok(&[(" DE ", " Git-Server ")]).ok().flatten().as_deref(),
+            Some(r#"{"de":"Git-Server"}"#)
+        );
+        assert_eq!(encode_category_translations(None).ok().flatten(), None);
+        assert_eq!(ok(&[]).ok().flatten(), None);
+        assert!(ok(&[("de-DE", "x")]).is_err());
+        assert!(ok(&[("de", "  ")]).is_err());
     }
 
     #[test]

@@ -5954,6 +5954,7 @@ pub struct AdminAppInfo {
     pub seo_title: Option<String>,
     /// Per-app override for the public page meta description (English only).
     pub seo_description: Option<String>,
+    pub category_translations: Option<std::collections::BTreeMap<String, String>>,
     /// docker-compose-style YAML defining the app.
     pub compose: String,
     /// Recurring price in the smallest currency unit (cents / millisats).
@@ -6067,6 +6068,10 @@ impl AdminAppInfo {
             category: a.category,
             seo_title: a.seo_title,
             seo_description: a.seo_description,
+            category_translations: a
+                .category_translations
+                .as_deref()
+                .and_then(|r| serde_json::from_str(r).ok()),
             compose: a.compose,
             amount: a.amount,
             currency: a.currency,
@@ -6103,6 +6108,9 @@ pub struct AdminCreateAppRequest {
     pub seo_title: Option<String>,
     /// Per-app override for the public page meta description (English only).
     pub seo_description: Option<String>,
+    /// Language code (`de`, `ja`) to translated `category`. Served when the
+    /// request's `Accept-Language` matches; wins over the built-in table.
+    pub category_translations: Option<std::collections::BTreeMap<String, String>>,
     /// docker-compose-style YAML defining the app.
     pub compose: String,
     pub amount: u64,
@@ -6167,6 +6175,11 @@ pub struct AdminUpdateAppRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub seo_description: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub category_translations: Option<Option<std::collections::BTreeMap<String, String>>>,
     pub compose: Option<String>,
     pub amount: Option<u64>,
     pub currency: Option<String>,

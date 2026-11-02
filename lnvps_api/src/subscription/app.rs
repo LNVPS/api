@@ -244,6 +244,7 @@ mod tests {
             category: "Nostr relay".to_string(),
             seo_title: None,
             seo_description: None,
+            category_translations: None,
             compose: String::new(),
             amount,
             currency: "EUR".to_string(),
