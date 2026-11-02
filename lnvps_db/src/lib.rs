@@ -2084,6 +2084,10 @@ pub trait LNVpsDbBase: Send + Sync {
         cluster_id: u64,
         name: &str,
     ) -> DbResult<Option<AppDeployment>>;
+    async fn find_app_deployment_by_custom_domain(
+        &self,
+        domain: &str,
+    ) -> DbResult<Option<AppDeployment>>;
     async fn insert_app_deployment(&self, deployment: &AppDeployment) -> DbResult<u64>;
     async fn update_app_deployment(&self, deployment: &AppDeployment) -> DbResult<()>;
     /// Mark a deployment's custom domain as observed resolving to us, which is

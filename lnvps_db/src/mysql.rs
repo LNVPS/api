@@ -7064,6 +7064,18 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    async fn find_app_deployment_by_custom_domain(
+        &self,
+        domain: &str,
+    ) -> DbResult<Option<AppDeployment>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM app_deployment WHERE custom_domain = ? AND deleted = 0 LIMIT 1",
+        )
+        .bind(domain)
+        .fetch_optional(&self.db)
+        .await?)
+    }
+
     async fn insert_app_deployment(&self, deployment: &AppDeployment) -> DbResult<u64> {
         let res = sqlx::query(
             "INSERT INTO app_deployment (user_id, app_id, cluster_id, resource_multiplier, subscription_line_item_id, \

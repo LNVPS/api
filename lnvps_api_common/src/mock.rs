@@ -6768,6 +6768,19 @@ impl LNVpsDbBase for MockDb {
             .cloned())
     }
 
+    async fn find_app_deployment_by_custom_domain(
+        &self,
+        domain: &str,
+    ) -> DbResult<Option<AppDeployment>> {
+        Ok(self
+            .app_deployments
+            .lock()
+            .await
+            .values()
+            .find(|x| x.custom_domain.as_deref() == Some(domain) && !x.deleted)
+            .cloned())
+    }
+
     async fn insert_app_deployment(&self, deployment: &AppDeployment) -> DbResult<u64> {
         let mut d = self.app_deployments.lock().await;
         let new_id = d.keys().max().copied().unwrap_or(0) + 1;

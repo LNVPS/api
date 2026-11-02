@@ -895,6 +895,14 @@ async fn v1_patch_app_deployment(
             _ => None,
         };
         if new_domain != deployment.custom_domain {
+            if let Some(domain) = &new_domain {
+                lnvps_api_common::ensure_custom_domain_free(
+                    this.db.as_ref(),
+                    domain,
+                    deployment.id,
+                )
+                .await?;
+            }
             deployment.custom_domain_verified = false;
         }
         deployment.custom_domain = new_domain;
@@ -1234,6 +1242,64 @@ mod tests {
 
     /// The unique-name lookup is scoped to (cluster, name) and ignores
     /// soft-deleted rows, so a freed name is reusable but a live one isn't.
+    #[tokio::test]
+    async fn custom_domain_claimed_by_another_deployment_is_rejected() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::{AppDeployment, LNVpsDbBase};
+
+        let db = MockDb::default();
+        let mk = |name: &str, domain: Option<&str>| AppDeployment {
+            id: 0,
+            user_id: 1,
+            app_id: 1,
+            cluster_id: 1,
+            resource_multiplier: 1,
+            subscription_line_item_id: 0,
+            name: name.to_string(),
+            namespace: format!("ns-{name}"),
+            hostname: None,
+            custom_domain: domain.map(str::to_string),
+            custom_domain_verified: false,
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Pending,
+            status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
+            created: Utc::now(),
+            deleted: false,
+        };
+        let first = db
+            .insert_app_deployment(&mk("a", Some("blog.example.com")))
+            .await
+            .unwrap();
+        let second = db.insert_app_deployment(&mk("b", None)).await.unwrap();
+
+        assert!(
+            lnvps_api_common::ensure_custom_domain_free(&db, "blog.example.com", second)
+                .await
+                .is_err()
+        );
+        assert!(
+            lnvps_api_common::ensure_custom_domain_free(&db, "blog.example.com", first)
+                .await
+                .is_ok()
+        );
+        assert!(
+            lnvps_api_common::ensure_custom_domain_free(&db, "other.example.com", second)
+                .await
+                .is_ok()
+        );
+        db.delete_app_deployment(first).await.unwrap();
+        assert!(
+            lnvps_api_common::ensure_custom_domain_free(&db, "blog.example.com", second)
+                .await
+                .is_ok()
+        );
+    }
+
     #[tokio::test]
     async fn find_app_deployment_by_cluster_name_scopes_correctly() {
         use lnvps_api_common::MockDb;

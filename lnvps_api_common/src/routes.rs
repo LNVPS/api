@@ -306,3 +306,16 @@ mod tests {
         );
     }
 }
+
+pub async fn ensure_custom_domain_free(
+    db: &dyn lnvps_db::LNVpsDb,
+    domain: &str,
+    deployment_id: u64,
+) -> Result<(), ApiError> {
+    match db.find_app_deployment_by_custom_domain(domain).await? {
+        Some(existing) if existing.id != deployment_id => Err(ApiError::conflict(
+            "This custom domain is already in use by another deployment",
+        )),
+        _ => Ok(()),
+    }
+}
