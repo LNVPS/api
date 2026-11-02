@@ -1888,6 +1888,22 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(resp.text().await.unwrap().contains("no-such-tag"));
 
+        for empty in [Some(serde_json::json!([])), Some(serde_json::json!(["  "]))] {
+            let resp = client
+                .post_auth("/api/admin/v1/apps", &app_body(empty))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(resp.text().await.unwrap().contains("at least one tag"));
+        }
+        let mut untagged = app_body(None);
+        untagged.as_object_mut().unwrap().remove("tags");
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &untagged)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
         let resp = client
             .post_auth(
                 "/api/admin/v1/apps",
@@ -1973,16 +1989,23 @@ mod tests {
         let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         assert_eq!(slugs(&body["data"]), vec![tag_b.clone()]);
 
-        // `[]` clears.
-        let resp = client
-            .patch_auth(
-                &format!("/api/admin/v1/apps/{app_id}"),
-                &serde_json::json!({ "tags": [] }),
-            )
-            .await
-            .unwrap();
-        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
-        assert!(slugs(&body["data"]).is_empty());
+        for empty in [serde_json::json!([]), serde_json::json!(["  "])] {
+            let resp = client
+                .patch_auth(
+                    &format!("/api/admin/v1/apps/{app_id}"),
+                    &serde_json::json!({ "tags": empty }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(resp.text().await.unwrap().contains("at least one tag"));
+            let resp = client
+                .get_auth(&format!("/api/admin/v1/apps/{app_id}"))
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            assert_eq!(slugs(&body["data"]), vec![tag_b.clone()]);
+        }
         // Restore both for the public-surface checks below.
         let resp = client
             .patch_auth(
