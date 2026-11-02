@@ -336,12 +336,28 @@ impl<'a> FilteredQuery<'a> {
     }
 }
 
+async fn migrate_locked(pool: &MySqlPool) -> DbResult<()> {
+    let migrator = sqlx::migrate!();
+    let mut conn = pool.acquire().await?;
+    let locked: Option<i64> = sqlx::query_scalar("select get_lock('lnvps_migrate', 600)")
+        .fetch_one(&mut *conn)
+        .await?;
+    if locked != Some(1) {
+        return Err(anyhow!("timed out waiting for the migration lock").into());
+    }
+    let result = migrator.run(pool).await;
+    let _ = sqlx::query("select release_lock('lnvps_migrate')")
+        .execute(&mut *conn)
+        .await;
+    result?;
+    Ok(())
+}
+
 #[async_trait]
 impl LNVpsDbBase for LNVpsDbMysql {
     async fn migrate(&self) -> DbResult<()> {
-        let migrator = sqlx::migrate!();
-        migrator.run(&self.db).await?;
-        Ok(())
+        migrate_locked(&self.db).await
+
     }
 
     async fn upsert_user(&self, pubkey: &[u8; 32]) -> DbResult<u64> {
