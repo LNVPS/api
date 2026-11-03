@@ -12,12 +12,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Debug;
-use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use hickory_resolver::TokioResolver;
+use hickory_resolver::proto::rr::RData;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::{Client, Resource, ResourceExt};
 use log::{debug, error, info, warn};
@@ -52,6 +52,7 @@ use lnvps_api_common::k8s_names::{
     deployment_files_configmap, deployment_id_from_namespace,
     deployment_namespace as namespace_name, deployment_secret, deployment_volume,
 };
+use lnvps_api_common::{custom_domain_challenge_name, custom_domain_challenge_token};
 use lnvps_compose::{
     Compose, Expose, ROOT_ENTRYPOINT_CAPABILITIES, ResolvedFile, ResolvedInit,
     Service as ComposeService,
@@ -1095,13 +1096,14 @@ pub fn build_custom_domain_ingress(
     })
 }
 
-/// Whether `domain` resolves to an address `hostname` also resolves to.
+/// Whether `_lnvps-challenge.<domain>` carries this deployment's token.
 ///
-/// Address overlap rather than a CNAME check: a customer may point an A record
-/// at us instead of a CNAME, and either way the question is whether traffic for
-/// the name arrives here. Any resolver failure reads as "not yet" — holding a
-/// domain is recoverable on the next pass, serving one that is not ours is not.
-async fn resolves_to_same_address(domain: &str, hostname: &str) -> bool {
+/// Every deployment shares one load balancer, so a CNAME or A record toward us
+/// proves nothing about who owns the name. Only a TXT record carrying the token
+/// derived from the deployment id and the domain does. Any resolver failure
+/// reads as "not yet": holding a domain is recoverable on the next pass,
+/// serving one that is not ours is not.
+async fn challenge_published(deployment_id: u64, domain: &str) -> bool {
     static RESOLVER: OnceLock<Option<TokioResolver>> = OnceLock::new();
     let resolver =
         RESOLVER.get_or_init(
@@ -1117,30 +1119,36 @@ async fn resolves_to_same_address(domain: &str, hostname: &str) -> bool {
         return false;
     };
 
-    let ours = lookup(resolver, hostname).await;
-    if ours.is_empty() {
-        warn!("custom domain probe: {hostname} resolves to nothing from here");
-        return false;
-    }
-    let theirs = lookup(resolver, domain).await;
-    let matched = shares_an_address(&ours, &theirs);
+    let name = custom_domain_challenge_name(domain);
+    let records = lookup_txt(resolver, &name).await;
+    let matched = txt_proves_ownership(&records, deployment_id, domain);
     if !matched {
-        // Both sides logged: the usual cause of a domain that never releases is
-        // ours resolving to something the customer could never point at.
-        debug!("custom domain probe: {domain} {theirs:?} vs {hostname} {ours:?}");
+        debug!("custom domain probe: {name} TXT {records:?} lacks the token");
     }
     matched
 }
 
-/// Addresses for `name`, empty on any failure.
+/// TXT strings for `name`, empty on any failure.
 ///
 /// Bounded rather than left to the resolver's own retries: this runs inline in
 /// a reconcile pass, once per held domain, and a pass that does not finish
 /// stops every deployment behind it.
-async fn lookup(resolver: &TokioResolver, name: &str) -> Vec<IpAddr> {
+async fn lookup_txt(resolver: &TokioResolver, name: &str) -> Vec<String> {
     const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-    match tokio::time::timeout(PROBE_TIMEOUT, resolver.lookup_ip(name)).await {
-        Ok(Ok(ips)) => ips.iter().collect(),
+    match tokio::time::timeout(PROBE_TIMEOUT, resolver.txt_lookup(name)).await {
+        Ok(Ok(found)) => found
+            .answers()
+            .iter()
+            .filter_map(|r| match &r.data {
+                RData::TXT(txt) => Some(
+                    txt.txt_data
+                        .iter()
+                        .map(|part| String::from_utf8_lossy(part).into_owned())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect(),
         Ok(Err(_)) => Vec::new(),
         Err(_) => {
             warn!("custom domain probe timed out resolving {name}");
@@ -1149,10 +1157,10 @@ async fn lookup(resolver: &TokioResolver, name: &str) -> Vec<IpAddr> {
     }
 }
 
-/// Whether the two address sets intersect. Empty on either side is no match:
-/// a name that resolves to nothing is not pointed at us.
-fn shares_an_address(ours: &[IpAddr], theirs: &[IpAddr]) -> bool {
-    theirs.iter().any(|t| ours.contains(t))
+/// Whether any TXT record is exactly this deployment's token for `domain`.
+fn txt_proves_ownership(records: &[String], deployment_id: u64, domain: &str) -> bool {
+    let token = custom_domain_challenge_token(deployment_id, domain);
+    records.iter().any(|r| r.trim().trim_matches('"') == token)
 }
 
 /// Generate a random URL-safe secret value of `len` bytes (hex-encoded).
@@ -1189,7 +1197,7 @@ async fn resolve_custom_domain(
     let probe_passed = match deployment.custom_domain.as_deref() {
         // Verified is sticky, so an already-verified domain is never re-probed.
         Some(cd) if !deployment.custom_domain_verified => {
-            resolves_to_same_address(cd, hostname).await
+            challenge_published(deployment.id, cd).await
         }
         _ => false,
     };
@@ -1213,7 +1221,9 @@ async fn apply_custom_domain_probe(
         return Ok(deployment.clone());
     }
     if !probe_passed {
-        info!("app deployment {id} custom domain held: {cd} does not resolve to {hostname}");
+        info!(
+            "app deployment {id} custom domain held: {cd} has no matching TXT challenge (hostname {hostname})"
+        );
         return Ok(deployment.clone());
     }
     db.set_app_deployment_custom_domain_verified(id).await?;
@@ -4076,15 +4086,30 @@ config:
         );
     }
 
-    /// A domain is pointed at us when its addresses overlap ours, whether the
-    /// customer used a CNAME or an A record. Nothing resolving is not a match.
+    /// Ownership is the token for this deployment and domain, not where the
+    /// name points: another deployment's token, or none, never releases it.
     #[test]
-    fn address_overlap_is_what_counts_as_pointed_at_us() {
-        let ours: Vec<IpAddr> = vec!["185.18.221.87".parse().unwrap(), "2a01::1".parse().unwrap()];
-        assert!(shares_an_address(&ours, &["2a01::1".parse().unwrap()]));
-        assert!(!shares_an_address(&ours, &["1.2.3.4".parse().unwrap()]));
-        assert!(!shares_an_address(&ours, &[]));
-        assert!(!shares_an_address(&[], &["185.18.221.87".parse().unwrap()]));
+    fn only_this_deployments_txt_token_proves_ownership() {
+        let mine = custom_domain_challenge_token(7, "blog.example.com");
+        let theirs = custom_domain_challenge_token(8, "blog.example.com");
+        assert!(txt_proves_ownership(&[mine.clone()], 7, "blog.example.com"));
+        assert!(txt_proves_ownership(
+            &["v=spf1".to_string(), format!("\"{mine}\"")],
+            7,
+            "Blog.Example.com"
+        ));
+        assert!(!txt_proves_ownership(&[theirs], 7, "blog.example.com"));
+        assert!(!txt_proves_ownership(
+            &[mine.clone()],
+            7,
+            "other.example.com"
+        ));
+        assert!(!txt_proves_ownership(
+            &[format!("x{mine}")],
+            7,
+            "blog.example.com"
+        ));
+        assert!(!txt_proves_ownership(&[], 7, "blog.example.com"));
     }
 
     /// The compose is what resolves a claim name: `"{service}-{volume}"` cannot

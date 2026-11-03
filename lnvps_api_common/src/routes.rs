@@ -239,9 +239,37 @@ pub async fn ensure_custom_domain_free(
     }
 }
 
+pub const CUSTOM_DOMAIN_CHALLENGE_LABEL: &str = "_lnvps-challenge";
+
+pub fn custom_domain_challenge_name(domain: &str) -> String {
+    format!("{CUSTOM_DOMAIN_CHALLENGE_LABEL}.{domain}")
+}
+
+pub fn custom_domain_challenge_token(deployment_id: u64, domain: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!(
+        "lnvps-custom-domain:{deployment_id}:{}",
+        domain.trim_end_matches('.').to_ascii_lowercase()
+    ));
+    format!("lnvps-verify={}", hex::encode(&digest[..16]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn challenge_token_is_bound_to_deployment_and_domain() {
+        let t = custom_domain_challenge_token(1, "blog.example.com");
+        assert_eq!(t, custom_domain_challenge_token(1, "Blog.Example.com."));
+        assert_ne!(t, custom_domain_challenge_token(2, "blog.example.com"));
+        assert_ne!(t, custom_domain_challenge_token(1, "other.example.com"));
+        assert!(t.starts_with("lnvps-verify="));
+        assert_eq!(
+            custom_domain_challenge_name("blog.example.com"),
+            "_lnvps-challenge.blog.example.com"
+        );
+    }
 
     #[test]
     fn test_api_error_json_format() {

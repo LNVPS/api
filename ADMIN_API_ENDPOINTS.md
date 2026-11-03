@@ -5799,8 +5799,8 @@ Deletion is a soft delete, so `include_deleted=true` is the only way to inspect 
   "name": "new-name",               // DNS-safe; unique per cluster
   "custom_domain": "blog.example.com", // set; "" or null clears. A changed
                                        // domain is held (custom_domain_verified
-                                       // false) until the operator sees it
-                                       // resolve to the deployment hostname
+                                       // false) until the operator sees the
+                                       // _lnvps-challenge.<domain> TXT token
   "config": { "relay_name": "New" }  // validated against the app compose schema; replaces the stored config wholesale
 }
 ```
