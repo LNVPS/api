@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Custom domains are now released only after a TXT record proves ownership. `ApiAppDeployment` gains `custom_domain_challenge` (`{name, value}`, present while a domain is held): publish a TXT record `_lnvps-challenge.<domain>` with that value. Pointing a CNAME or A record at `hostname` no longer releases a domain on its own. Domains already verified are unaffected.
 - App deployments can expose a raw TCP/UDP port (`expose: tcp|udp` in the compose). `GET /api/v1/app-deployments` and `/{id}` return `public_port`, `connect_address` and, when the port differs from the app's own and the app names an SRV service, an `srv` record (`name`, `target`, `port`). Additive. New `game` app tag for filtering game servers with `?tag=game`, and a Minecraft Java catalog entry (vanilla only).
 
 ### Changed

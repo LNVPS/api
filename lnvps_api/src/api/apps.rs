@@ -316,6 +316,23 @@ fn connect_info(
     }
 }
 
+#[derive(Serialize)]
+pub struct ApiCustomDomainChallenge {
+    pub name: String,
+    pub value: String,
+}
+
+fn custom_domain_challenge(d: &AppDeployment) -> Option<ApiCustomDomainChallenge> {
+    let domain = d
+        .custom_domain
+        .as_deref()
+        .filter(|_| !d.custom_domain_verified)?;
+    Some(ApiCustomDomainChallenge {
+        name: lnvps_api_common::custom_domain_challenge_name(domain),
+        value: lnvps_api_common::custom_domain_challenge_token(d.id, domain),
+    })
+}
+
 /// A customer's app deployment.
 #[derive(Serialize)]
 pub struct ApiAppDeployment {
@@ -348,6 +365,10 @@ pub struct ApiAppDeployment {
     /// requested. Point a CNAME at `hostname` and the next reconcile releases
     /// it. Always `false` when `custom_domain` is `None`.
     pub custom_domain_verified: bool,
+    /// TXT record that proves ownership of `custom_domain`. The domain is
+    /// held until `name` carries `value`; a CNAME alone never releases it.
+    /// `None` when `custom_domain` is `None` or already verified.
+    pub custom_domain_challenge: Option<ApiCustomDomainChallenge>,
     /// Desired run state: `running` or `stopped`.
     pub desired_state: String,
     /// Observed status: `pending`, `running`, `stopped`, `error`, `deleting`.
@@ -464,6 +485,7 @@ async fn deployment_to_api_with_breakdown(
     let m = multiplier as u64;
     let usage = AppDeploymentUsage::from_parts(&d, usage_services, usage_volumes);
     let (connect_address, srv) = connect_info(&app.compose, d.hostname.as_deref(), d.public_port);
+    let custom_domain_challenge = custom_domain_challenge(&d);
     Ok(ApiAppDeployment {
         id: d.id,
         app_id: d.app_id,
@@ -473,6 +495,7 @@ async fn deployment_to_api_with_breakdown(
         connect_address,
         srv,
         custom_domain_verified: d.custom_domain.is_some() && d.custom_domain_verified,
+        custom_domain_challenge,
         custom_domain: d.custom_domain,
         desired_state: d.desired_state.to_string(),
         status: d.status.to_string(),
@@ -1787,10 +1810,21 @@ mod tests {
         let api = ok(deployment_to_api(&db, d.clone()).await);
         assert_eq!(api.custom_domain.as_deref(), Some("blog.example.com"));
         assert!(api.custom_domain_verified);
+        assert!(api.custom_domain_challenge.is_none());
+
+        d.custom_domain_verified = false;
+        let api = ok(deployment_to_api(&db, d.clone()).await);
+        let challenge = api.custom_domain_challenge.expect("challenge while held");
+        assert_eq!(challenge.name, "_lnvps-challenge.blog.example.com");
+        assert_eq!(
+            challenge.value,
+            lnvps_api_common::custom_domain_challenge_token(d.id, "blog.example.com")
+        );
 
         d.custom_domain = None;
         let api = ok(deployment_to_api(&db, d).await);
         assert!(!api.custom_domain_verified);
+        assert!(api.custom_domain_challenge.is_none());
     }
 
     const MC: &str = "services:\n  s:\n    image: x\n    ports:\n      - { name: g, container: 25565, protocol: tcp, expose: tcp, srv: minecraft }\n";
