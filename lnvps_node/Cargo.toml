@@ -1,11 +1,31 @@
 [package]
 name = "lnvps_node"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
+license = "MIT"
+description = "LNVPS marketplace node daemon"
 
 [[bin]]
 name = "lnvps-node"
 path = "src/main.rs"
+
+[package.metadata.deb]
+name = "lnvps-node"
+maintainer = "LNVPS <admin@lnvps.net>"
+copyright = "LNVPS"
+section = "net"
+priority = "optional"
+extended-description = """\
+The LNVPS marketplace node daemon. Serves the control API over the tunnel, \
+reports hardware inventory and applies the data plane LNVPS asks for. The \
+control public key is compiled in at build time."""
+depends = "$auto"
+maintainer-scripts = "debian/"
+assets = [
+    ["target/release/lnvps-node", "usr/bin/lnvps-node", "755"],
+    ["systemd/lnvps-node.service", "lib/systemd/system/lnvps-node.service", "644"],
+    ["config.example.yaml", "etc/lnvps-node/config.example.yaml", "644"],
+]
 
 [dependencies]
 lnvps_netlink = { path = "../lnvps_netlink" }

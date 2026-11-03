@@ -1,0 +1,16 @@
+[Unit]
+Description=LNVPS marketplace node daemon
+Documentation=https://github.com/LNVPS/api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lnvps-node --config /etc/lnvps-node/config.yaml run
+Restart=always
+RestartSec=5
+Environment=RUST_LOG=info
+User=root
+
+[Install]
+WantedBy=multi-user.target

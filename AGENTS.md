@@ -93,6 +93,18 @@ The daemon holds no state: interface keys, addresses and the peer set are all
 fetched, so a rebuilt route server needs its config file and nothing else. It
 also opens no listening socket, so no inbound port or firewall rule is required.
 
+## `lnvps-node` Release Procedure
+
+`lnvps-node` is the marketplace node daemon (crate `lnvps_node`). Like `lvd` it releases on its own `lnvps-node-v*` tag and `lnvps_node/Cargo.toml` carries an explicit `version`, independent of the API's.
+
+1. **Bump `lnvps_node/Cargo.toml`** - the `version` field.
+2. **Commit** - `git commit -m "chore(node): release lnvps-node-vX.Y.Z"`
+3. **Tag and push** - `git tag -a lnvps-node-vX.Y.Z -m "lnvps-node vX.Y.Z"` then `git push https://github.com/LNVPS/api.git && git push https://github.com/LNVPS/api.git lnvps-node-vX.Y.Z`
+
+Pushing the tag triggers `.github/workflows/lnvps-node-deb.yml`, which builds `lnvps-node_<version>-1_amd64.deb` with `cargo deb` and attaches it to the GitHub release. The workflow fails if `lnvps_node/Cargo.toml` does not match the tag. `LNVPS_CONTROL_PUBKEY` is set in the workflow `env`; it is the public control key the daemon is compiled against, and the daemon refuses to start without it. If the control key changes, update it there.
+
+Install on a node: `apt install ./lnvps-node_*.deb`, copy `/etc/lnvps-node/config.example.yaml` to `config.yaml`, set the credential, `chmod 600`, `lnvps-node check`, `systemctl enable --now lnvps-node`.
+
 ## `lnvps_fw` Release Procedure
 
 `lnvps_fw` is a separate workspace (excluded from the root one) with its own `[workspace.package]` version in `lnvps_fw/Cargo.toml`, and it releases on its own tag — the same convention as the NixOS image's `nixos-image-v*`. Its version is **independent** of the API's: bump it when the firewall changes, leave it alone when it doesn't.
