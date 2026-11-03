@@ -258,13 +258,17 @@ impl DnsServer for Cloudflare {
                     Some("SRV") => RecordType::SRV,
                     _ => continue,
                 };
+                let value = match (&kind, &r.data) {
+                    (RecordType::SRV, Some(d)) => d.to_value(),
+                    _ => r.content,
+                };
                 records.push(BasicRecord {
                     ip: match kind {
                         RecordType::PTR | RecordType::SRV => String::new(),
-                        _ => r.content.clone(),
+                        _ => value.clone(),
                     },
                     name: r.name,
-                    value: r.content,
+                    value,
                     id: r.id.map(DnsRef::Id),
                     kind,
                     zone: zone.clone(),
@@ -309,6 +313,13 @@ struct CfSrvData {
 }
 
 impl CfSrvData {
+    fn to_value(&self) -> String {
+        format!(
+            "{} {} {} {}",
+            self.priority, self.weight, self.port, self.target
+        )
+    }
+
     fn parse(value: &str) -> Option<Self> {
         let mut parts = value.split_whitespace();
         let data = Self {
@@ -441,6 +452,36 @@ mod tests {
         let out = cf.add_record(&rec).await?;
         assert_eq!(out.id, Some(DnsRef::Id("srv1".to_string())));
         assert!(matches!(out.kind, RecordType::SRV));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn listed_srv_value_includes_priority_from_data() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "errors": [],
+                "result": [{
+                    "id": "srv1",
+                    "name": "_minecraft._tcp.mc.apps.example.com",
+                    "content": "5 25570 mc.apps.example.com",
+                    "type": "SRV",
+                    "data": {"priority": 0, "weight": 5, "port": 25570, "target": "mc.apps.example.com"}
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let cf = Cloudflare::with_base(&server.uri(), "token");
+        let recs = cf.list_records(&DnsRef::Id("zone1".to_string())).await?;
+        let want = BasicRecord::srv(
+            "_minecraft._tcp.mc.apps.example.com".to_string(),
+            25570,
+            "mc.apps.example.com",
+            DnsRef::Id("zone1".to_string()),
+        );
+        assert_eq!(recs[0].value, want.value);
         Ok(())
     }
 
