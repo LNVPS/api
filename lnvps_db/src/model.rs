@@ -5109,6 +5109,13 @@ pub struct AppCluster {
     /// Static total persistent-storage capacity (bytes).
     #[sqlx(default)]
     pub capacity_storage_bytes: u64,
+    /// DNS server that publishes SRV records for this cluster's L4 deployments.
+    /// `None` publishes nothing.
+    #[sqlx(default)]
+    pub dns_server_id: Option<u64>,
+    /// Zone on `dns_server_id` that holds `ingress_domain`.
+    #[sqlx(default)]
+    pub dns_zone_id: Option<String>,
     pub created: DateTime<Utc>,
 }
 

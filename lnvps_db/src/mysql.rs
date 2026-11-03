@@ -367,7 +367,6 @@ impl LNVpsDbMysql {
 impl LNVpsDbBase for LNVpsDbMysql {
     async fn migrate(&self) -> DbResult<()> {
         migrate_locked(&self.db, &sqlx::migrate!()).await
-
     }
 
     async fn upsert_user(&self, pubkey: &[u8; 32]) -> DbResult<u64> {
@@ -7120,8 +7119,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn insert_app_cluster(&self, cluster: &AppCluster) -> DbResult<u64> {
         let res = sqlx::query(
             "INSERT INTO app_cluster (name, region_id, ingress_domain, enabled, \
-             capacity_cpu_milli, capacity_memory_bytes, capacity_storage_bytes) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) returning id",
+             capacity_cpu_milli, capacity_memory_bytes, capacity_storage_bytes, \
+             dns_server_id, dns_zone_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(&cluster.name)
         .bind(cluster.region_id)
@@ -7130,6 +7130,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(cluster.capacity_cpu_milli)
         .bind(cluster.capacity_memory_bytes)
         .bind(cluster.capacity_storage_bytes)
+        .bind(cluster.dns_server_id)
+        .bind(&cluster.dns_zone_id)
         .fetch_one(&self.db)
         .await?;
         Ok(res.try_get(0)?)
@@ -7138,7 +7140,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn update_app_cluster(&self, cluster: &AppCluster) -> DbResult<()> {
         sqlx::query(
             "UPDATE app_cluster SET name = ?, region_id = ?, ingress_domain = ?, enabled = ?, \
-             capacity_cpu_milli = ?, capacity_memory_bytes = ?, capacity_storage_bytes = ? \
+             capacity_cpu_milli = ?, capacity_memory_bytes = ?, capacity_storage_bytes = ?, \
+             dns_server_id = ?, dns_zone_id = ? \
              WHERE id = ?",
         )
         .bind(&cluster.name)
@@ -7148,6 +7151,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(cluster.capacity_cpu_milli)
         .bind(cluster.capacity_memory_bytes)
         .bind(cluster.capacity_storage_bytes)
+        .bind(cluster.dns_server_id)
+        .bind(&cluster.dns_zone_id)
         .bind(cluster.id)
         .execute(&self.db)
         .await?;

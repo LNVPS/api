@@ -10848,6 +10848,8 @@ mod tests {
                 capacity_cpu_milli: 100_000,
                 capacity_memory_bytes: 100u64 * 1024 * 1024 * 1024,
                 capacity_storage_bytes: 1024u64 * 1024 * 1024 * 1024,
+                dns_server_id: None,
+                dns_zone_id: None,
                 created: Utc::now(),
             })
             .await
@@ -10880,6 +10882,8 @@ mod tests {
                 capacity_cpu_milli: 100_000,
                 capacity_memory_bytes: 100u64 * 1024 * 1024 * 1024,
                 capacity_storage_bytes: 1024u64 * 1024 * 1024 * 1024,
+                dns_server_id: None,
+                dns_zone_id: None,
                 created: Utc::now(),
             })
             .await
@@ -11116,6 +11120,8 @@ mod tests {
             capacity_cpu_milli: 100_000,
             capacity_memory_bytes: 100u64 * 1024 * 1024 * 1024,
             capacity_storage_bytes: 1024u64 * 1024 * 1024 * 1024,
+            dns_server_id: None,
+            dns_zone_id: None,
             created: Utc::now(),
         }
     }
@@ -11648,6 +11654,8 @@ mod tests {
                 capacity_cpu_milli: 1500,
                 capacity_memory_bytes: 3 * 512 * 1024 * 1024,
                 capacity_storage_bytes: 3 * 1024 * 1024 * 1024,
+                dns_server_id: None,
+                dns_zone_id: None,
                 created: Utc::now(),
             })
             .await
@@ -11837,6 +11845,7 @@ impl crate::dns::DnsServer for MockDnsServer {
         Ok(BasicRecord {
             name: match record.kind {
                 RecordType::PTR => format!("{}.X.Y.Z.addr.in-arpa", record.name),
+                RecordType::SRV => record.name.clone(),
                 _ => format!("{}.lnvps.mock", record.name),
             },
             value: record.value.clone(),
@@ -11920,6 +11929,7 @@ impl crate::dns::DnsServer for MockDnsServer {
                         let kind = match e.kind.as_str() {
                             "A" => RecordType::A,
                             "AAAA" => RecordType::AAAA,
+                            "SRV" => RecordType::SRV,
                             _ => RecordType::PTR,
                         };
                         BasicRecord {
@@ -11927,7 +11937,7 @@ impl crate::dns::DnsServer for MockDnsServer {
                             value: e.value.clone(),
                             id: Some(DnsRef::Id(id.clone())),
                             ip: match kind {
-                                RecordType::PTR => String::new(),
+                                RecordType::PTR | RecordType::SRV => String::new(),
                                 _ => e.value.clone(),
                             },
                             kind,

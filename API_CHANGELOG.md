@@ -11,8 +11,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Custom domains are now released only after a TXT record proves ownership. `ApiAppDeployment` gains `custom_domain_challenge` (`{name, value}`, present while a domain is held): publish a TXT record `_lnvps-challenge.<domain>` with that value. Pointing a CNAME or A record at `hostname` no longer releases a domain on its own. Domains already verified are unaffected.
 - App deployments can expose a raw TCP/UDP port (`expose: tcp|udp` in the compose). `GET /api/v1/app-deployments` and `/{id}` return `public_port`, `connect_address` and, when the port differs from the app's own and the app names an SRV service, an `srv` record (`name`, `target`, `port`). Additive. New `game` app tag for filtering game servers with `?tag=game`, and a Minecraft Java catalog entry (vanilla only).
 
+- Game server SRV records: app clusters gain `dns_server_id` and `dns_zone_id` (admin create, update and `AdminAppClusterInfo`; `null` clears). When both are set the operator publishes `_<srv>._<proto>.<hostname>` SRV records for L4 deployments on a non-default port and removes them when the deployment is deleted. Admin `AdminAppDeploymentInfo` gains `public_port`. Needs migration `20261103120000_app_cluster_dns.sql`.
+
 ### Changed
 
+- The operator's default `l4.port-range` is now 25565-25584, matching the ingress-nginx Service the production cluster exposes.
 - Admin `POST /api/admin/v1/apps` now requires at least one tag, and `PATCH` rejects an empty `tags` list (400), so apps are never invisible to tag filters.
 
 ### Added

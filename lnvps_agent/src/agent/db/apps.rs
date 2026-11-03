@@ -309,6 +309,8 @@ mod tests {
                 capacity_cpu_milli: 100_000,
                 capacity_memory_bytes: 1024 * GB,
                 capacity_storage_bytes: 10_000 * GB,
+                dns_server_id: None,
+                dns_zone_id: None,
                 created: Utc::now(),
             },
         );

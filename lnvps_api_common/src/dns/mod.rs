@@ -69,6 +69,7 @@ pub enum RecordType {
     A,
     AAAA,
     PTR,
+    SRV,
 }
 
 /// A reference to a DNS zone or record.
@@ -135,11 +136,23 @@ impl Display for RecordType {
             RecordType::A => write!(f, "A"),
             RecordType::AAAA => write!(f, "AAAA"),
             RecordType::PTR => write!(f, "PTR"),
+            RecordType::SRV => write!(f, "SRV"),
         }
     }
 }
 
 impl BasicRecord {
+    pub fn srv(name: String, port: u16, target: &str, zone: DnsRef) -> Self {
+        Self {
+            name,
+            value: format!("0 5 {port} {}", target.trim_end_matches('.')),
+            id: None,
+            kind: RecordType::SRV,
+            ip: String::new(),
+            zone,
+        }
+    }
+
     /// The A/AAAA record for an assignment.
     ///
     /// `dns_forward` names the record when it is set, so an assignment that has
@@ -333,6 +346,19 @@ mod tests {
                 .contains("not a valid FQDN")
         );
         Ok(())
+    }
+
+    #[test]
+    fn an_srv_record_carries_priority_weight_port_and_target() {
+        let rec = BasicRecord::srv(
+            "_minecraft._tcp.mc.apps.example.com".to_string(),
+            25570,
+            "mc.apps.example.com.",
+            DnsRef::Id("z".to_string()),
+        );
+        assert_eq!(rec.value, "0 5 25570 mc.apps.example.com");
+        assert_eq!(rec.kind.to_string(), "SRV");
+        assert_eq!(rec.id, None);
     }
 
     #[test]

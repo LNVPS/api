@@ -85,7 +85,7 @@ kubectl get ingress -n your-namespace
 | `prometheus.url` | string | unset | Prometheus HTTP API to read deployment CPU/memory/volume usage from. Omit to collect no usage |
 | `prometheus.timeout-seconds` | number | `10` | Per-query timeout; collection is best-effort and never blocks a reconcile |
 | `l4.forwarder` | string | `"ingress-nginx"` | Who delivers `expose: tcp\|udp` ports. `nodeport` and `loadbalancer` are recognised but refused at startup with a "not supported yet" error |
-| `l4.port-range.start` / `end` | number | `25565` / `25664` | Public ports allocated to deployments, lowest free first |
+| `l4.port-range.start` / `end` | number | `25565` / `25584` | Public ports allocated to deployments, lowest free first |
 | `l4.ingress-nginx.namespace` | string | `"ingress-nginx"` | Namespace holding the controller's port-map ConfigMaps |
 | `l4.ingress-nginx.tcp-configmap` / `udp-configmap` | string | `"tcp-services"` / `"udp-services"` | ConfigMap names |
 
@@ -108,14 +108,14 @@ namespace are never touched or overwritten, so a static entry such as
 `"22": git/gitea-ssh:22` survives. Entries for deployments that are gone are
 removed on the next reconcile, which also frees the port. If the range is
 exhausted the deployment goes to `error` with
-`no public port available: all of 25565-25664 are in use`.
+`no public port available: all of 25565-25584 are in use`.
 
 The cluster needs, none of which the operator creates:
 
 - the controller started with `--tcp-services-configmap=ingress-nginx/tcp-services`
   (and `--udp-services-configmap=ingress-nginx/udp-services` for UDP apps);
 - both ConfigMaps to exist (an empty `data` is fine);
-- the controller Service exposing every port in the range, for example 25565-25664
+- the controller Service exposing every port in the range, for example 25565-25584
   for TCP. A MetalLB `LoadBalancer` Service needs each port listed; the range is
   the place to size that;
 - the `lnvps-operator-l4` Role in [`k8s-minimal.yaml`](k8s-minimal.yaml).

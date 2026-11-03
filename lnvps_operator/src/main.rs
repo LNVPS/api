@@ -21,6 +21,7 @@ mod app_deployments;
 mod l4;
 mod metrics;
 mod nostr_domains;
+mod srv_dns;
 
 use crate::metrics::PrometheusClient;
 
@@ -636,7 +637,7 @@ mod tests {
         assert_eq!(full.max_concurrent_backups(), 2);
         assert_eq!(full.l4.forwarder, l4::ForwarderKind::IngressNginx);
         assert_eq!(full.l4.port_range.start, 25565);
-        assert_eq!(full.l4.port_range.end, 25664);
+        assert_eq!(full.l4.port_range.end, 25584);
         assert_eq!(full.l4.ingress_nginx.namespace, "ingress-nginx");
         assert_eq!(full.l4.ingress_nginx.tcp_configmap, "tcp-services");
         assert_eq!(full.l4.ingress_nginx.udp_configmap, "udp-services");

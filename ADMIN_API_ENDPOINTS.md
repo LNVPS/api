@@ -5751,6 +5751,8 @@ These use the dedicated **`app_deployment`** RBAC resource (distinct from the ca
   "namespace": "app-1",
   "hostname": "my-relay.apps.lnvps.tld",
   "custom_domain": "blog.example.com",
+  "public_port": 25570,
+  // Allocated public L4 port for game server apps, null otherwise.
   "custom_domain_verified": true,
   "desired_state": "running",
   "status": "running",
@@ -5863,6 +5865,11 @@ Required Permissions: `app::view` / `app::create` / `app::update` / `app::delete
   "capacity_storage_bytes": 107374182400,
   // Static total capacity available for deployments (millicores / bytes / bytes).
   // A cluster with 0 capacity accepts no deployments (1:1, no overcommit).
+  "dns_server_id": 1,
+  "dns_zone_id": "cloudflare-zone-id",
+  // Optional. When both are set the operator publishes SRV records for L4
+  // (game server) deployments on a non-default port in this zone, and removes
+  // them on deletion. `null` on PATCH clears.
   "created": "2026-07-24T10:00:00Z"
 }
 ```

@@ -6209,6 +6209,10 @@ pub struct AdminAppClusterInfo {
     pub capacity_cpu_milli: u64,
     pub capacity_memory_bytes: u64,
     pub capacity_storage_bytes: u64,
+    /// DNS server that publishes SRV records for L4 (game server) deployments.
+    pub dns_server_id: Option<u64>,
+    /// Zone on that server holding `ingress_domain`.
+    pub dns_zone_id: Option<String>,
     pub created: DateTime<Utc>,
 }
 
@@ -6223,6 +6227,8 @@ impl From<lnvps_db::AppCluster> for AdminAppClusterInfo {
             capacity_cpu_milli: c.capacity_cpu_milli,
             capacity_memory_bytes: c.capacity_memory_bytes,
             capacity_storage_bytes: c.capacity_storage_bytes,
+            dns_server_id: c.dns_server_id,
+            dns_zone_id: c.dns_zone_id,
             created: c.created,
         }
     }
@@ -6243,6 +6249,8 @@ pub struct AdminAppDeploymentInfo {
     pub name: String,
     pub namespace: String,
     pub hostname: Option<String>,
+    /// Public L4 port allocated for a game server app (`expose: tcp|udp`).
+    pub public_port: Option<u16>,
     /// Customer-owned domain (CNAME'd to `hostname`), served alongside it.
     pub custom_domain: Option<String>,
     /// Whether that domain is served yet. `false` means held: stored, but never
@@ -6281,6 +6289,7 @@ impl From<lnvps_db::AppDeployment> for AdminAppDeploymentInfo {
             name: d.name,
             namespace: d.namespace,
             hostname: d.hostname,
+            public_port: d.public_port,
             custom_domain_verified: d.custom_domain.is_some() && d.custom_domain_verified,
             custom_domain: d.custom_domain,
             desired_state: d.desired_state.to_string(),
@@ -6327,6 +6336,10 @@ pub struct AdminCreateAppClusterRequest {
     pub capacity_memory_bytes: u64,
     #[serde(default)]
     pub capacity_storage_bytes: u64,
+    #[serde(default)]
+    pub dns_server_id: Option<u64>,
+    #[serde(default)]
+    pub dns_zone_id: Option<String>,
 }
 
 /// Update an app cluster (all fields optional; omitted = unchanged).
@@ -6339,6 +6352,12 @@ pub struct AdminUpdateAppClusterRequest {
     pub capacity_cpu_milli: Option<u64>,
     pub capacity_memory_bytes: Option<u64>,
     pub capacity_storage_bytes: Option<u64>,
+    /// Set or clear (`null`) the DNS server; absent leaves it unchanged.
+    #[serde(default, deserialize_with = "crate::admin::model::double_option")]
+    pub dns_server_id: Option<Option<u64>>,
+    /// Set or clear (`null`) the zone; absent leaves it unchanged.
+    #[serde(default, deserialize_with = "crate::admin::model::double_option")]
+    pub dns_zone_id: Option<Option<String>>,
 }
 
 fn default_true() -> bool {

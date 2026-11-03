@@ -1695,6 +1695,8 @@ mod tests {
                     capacity_cpu_milli: 10_000,
                     capacity_memory_bytes: 100_000,
                     capacity_storage_bytes: 100_000,
+                    dns_server_id: None,
+                    dns_zone_id: None,
                     created: Utc::now(),
                 },
             );
@@ -1846,6 +1848,8 @@ mod tests {
                     capacity_cpu_milli: 10_000,
                     capacity_memory_bytes: 100_000,
                     capacity_storage_bytes: 100_000,
+                    dns_server_id: None,
+                    dns_zone_id: None,
                     created: Utc::now(),
                 },
             );
@@ -1948,6 +1952,8 @@ mod tests {
                     capacity_cpu_milli: 10_000,
                     capacity_memory_bytes: 100_000,
                     capacity_storage_bytes: 100_000,
+                    dns_server_id: None,
+                    dns_zone_id: None,
                     created: Utc::now(),
                 },
             );

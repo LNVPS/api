@@ -407,6 +407,8 @@ mod tests {
                 capacity_cpu_milli: 1000,
                 capacity_memory_bytes: 1024,
                 capacity_storage_bytes: 1024,
+                dns_server_id: None,
+                dns_zone_id: None,
                 created: Utc::now(),
             })
             .await

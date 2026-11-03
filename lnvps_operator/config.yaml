@@ -117,7 +117,7 @@ l4:
   # (e.g. a static "22") are skipped. The controller Service must expose them.
   port-range:
     start: 25565
-    end: 25664
+    end: 25584
   ingress-nginx:
     namespace: "ingress-nginx"
     tcp-configmap: "tcp-services"

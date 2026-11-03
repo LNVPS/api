@@ -1029,6 +1029,8 @@ async fn admin_create_app_cluster(
         capacity_cpu_milli: req.capacity_cpu_milli,
         capacity_memory_bytes: req.capacity_memory_bytes,
         capacity_storage_bytes: req.capacity_storage_bytes,
+        dns_server_id: req.dns_server_id,
+        dns_zone_id: req.dns_zone_id,
         created: chrono::Utc::now(),
     };
     let id = this.db.insert_app_cluster(&cluster).await?;
@@ -1065,6 +1067,15 @@ async fn admin_update_app_cluster(
     }
     if let Some(v) = req.capacity_storage_bytes {
         cluster.capacity_storage_bytes = v;
+    }
+    if let Some(v) = req.dns_server_id {
+        if let Some(id) = v {
+            this.db.get_dns_server(id).await?;
+        }
+        cluster.dns_server_id = v;
+    }
+    if let Some(v) = req.dns_zone_id {
+        cluster.dns_zone_id = v;
     }
 
     this.db.update_app_cluster(&cluster).await?;
@@ -1113,6 +1124,44 @@ mod tests {
 
     const VALID_COMPOSE: &str = "services:\n  relay:\n    image: \
          example/relay:v1@sha256:0000000000000000000000000000000000000000000000000000000000000001\n";
+
+    #[tokio::test]
+    async fn admin_deployment_info_shows_the_allocated_public_port() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::LNVpsDbBase;
+        let db = MockDb::default();
+        let mut d = lnvps_db::AppDeployment {
+            id: 0,
+            user_id: 1,
+            app_id: 1,
+            cluster_id: 1,
+            resource_multiplier: 1,
+            subscription_line_item_id: 0,
+            name: "mc".to_string(),
+            namespace: "ns-mc".to_string(),
+            hostname: None,
+            custom_domain: None,
+            custom_domain_verified: false,
+            public_port: Some(25570),
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Pending,
+            status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
+            created: chrono::Utc::now(),
+            deleted: false,
+        };
+        d.id = db.insert_app_deployment(&d).await.unwrap();
+        let infos = deployment_infos(&db, vec![d]).await.unwrap();
+        assert_eq!(infos[0].public_port, Some(25570));
+        assert_eq!(
+            serde_json::to_value(&infos[0]).unwrap()["public_port"],
+            25570
+        );
+    }
 
     #[test]
     fn app_without_tags_is_rejected() {

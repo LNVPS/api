@@ -303,8 +303,8 @@ fn connect_info(
         return (Some(host.to_string()), None);
     }
     let srv = l4.as_ref().and_then(|l| {
-        l.port.srv.as_deref().map(|label| ApiAppSrv {
-            name: format!("_{label}._{}.{host}", l.protocol().as_str()),
+        l.srv_name(host).map(|name| ApiAppSrv {
+            name,
             target: host.to_string(),
             port,
         })

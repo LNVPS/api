@@ -502,6 +502,13 @@ impl L4Port<'_> {
             _ => L4Protocol::Tcp,
         }
     }
+
+    pub fn srv_name(&self, host: &str) -> Option<String> {
+        self.port
+            .srv
+            .as_deref()
+            .map(|label| format!("_{label}._{}.{host}", self.protocol().as_str()))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

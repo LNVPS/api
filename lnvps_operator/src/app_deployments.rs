@@ -1606,6 +1606,9 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<BTreeSet<u64>> {
     let mut active: HashSet<u64> = HashSet::new();
     let mut transitioning: BTreeSet<u64> = BTreeSet::new();
     let (deployments, l4_failures) = reconcile_l4(ctx, deployments).await;
+    if let Err(e) = reconcile_srv_dns(ctx, &cluster, &deployments, &l4_failures).await {
+        warn!("SRV DNS sync failed: {e}");
+    }
     for d in &deployments {
         active.insert(d.id);
         if let Some(message) = l4_failures.get(&d.id) {
@@ -1675,6 +1678,39 @@ async fn l4_want(ctx: &Context, d: &AppDeployment) -> Result<Option<crate::l4::L
             protocol: l4.protocol(),
         },
     }))
+}
+
+async fn reconcile_srv_dns(
+    ctx: &Context,
+    cluster: &lnvps_db::AppCluster,
+    deployments: &[AppDeployment],
+    l4_failures: &std::collections::HashMap<u64, String>,
+) -> Result<()> {
+    let (Some(dns_server_id), Some(zone_id)) = (cluster.dns_server_id, cluster.dns_zone_id.clone())
+    else {
+        return Ok(());
+    };
+    let zone = lnvps_api_common::DnsRef::Id(zone_id);
+    let mut desired = Vec::new();
+    for d in deployments {
+        if d.deleted || d.public_port.is_none() || l4_failures.contains_key(&d.id) {
+            continue;
+        }
+        let app = ctx.db.get_app(d.app_id).await?;
+        let compose = lnvps_compose::Compose::parse(&app.compose)?;
+        desired.extend(crate::srv_dns::desired_srv(
+            &compose,
+            &d.name,
+            d.public_port,
+            &cluster.ingress_domain,
+            &zone,
+        ));
+    }
+    let dns = lnvps_api_common::get_dns_server(&ctx.db, dns_server_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("dns server {dns_server_id}: {}", e.inner()))?;
+    crate::srv_dns::sync_srv(dns.as_ref(), &zone, &cluster.ingress_domain, &desired).await?;
+    Ok(())
 }
 
 async fn reconcile_l4(

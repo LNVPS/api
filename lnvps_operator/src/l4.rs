@@ -13,7 +13,7 @@ use lnvps_db::{AppDeployment, LNVpsDb};
 use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_PORT_RANGE_START: u16 = 25565;
-pub const DEFAULT_PORT_RANGE_END: u16 = 25664;
+pub const DEFAULT_PORT_RANGE_END: u16 = 25584;
 pub const DEFAULT_INGRESS_NGINX_NAMESPACE: &str = "ingress-nginx";
 pub const DEFAULT_TCP_CONFIGMAP: &str = "tcp-services";
 pub const DEFAULT_UDP_CONFIGMAP: &str = "udp-services";
