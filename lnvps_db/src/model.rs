@@ -5982,7 +5982,16 @@ pub struct IpProvider {
     pub enable_ranges_on_delivery: bool,
 }
 
-#[derive(FromRow, Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize, Default)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum IpWhenNoIp {
+    #[default]
+    Reject = 0,
+    OrderAndWait = 1,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq, Default)]
 pub struct IpProviderRegion {
     pub id: u64,
     pub provider_id: u64,
@@ -5993,6 +6002,20 @@ pub struct IpProviderRegion {
     pub quantity: u32,
     pub auto_threshold: Option<u64>,
     pub enabled: bool,
+    pub when_no_ip: IpWhenNoIp,
+    pub sell_without_capacity: bool,
+    pub wait_refund_hours: u32,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq)]
+pub struct VmIpWait {
+    pub id: u64,
+    pub vm_id: u64,
+    pub region_id: u64,
+    pub ip4_needed: u16,
+    pub ip_order_id: Option<u64>,
+    pub released: bool,
+    pub created: DateTime<Utc>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize, Default)]

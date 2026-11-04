@@ -1814,12 +1814,26 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn update_ip_provider_region(&self, rule: &IpProviderRegion) -> DbResult<()>;
     async fn delete_ip_provider_region(&self, id: u64) -> DbResult<()>;
 
+    // ----- VMs waiting for an IP -----
+
+    async fn get_vm_ip_wait(&self, vm_id: u64) -> DbResult<Option<VmIpWait>>;
+    async fn insert_vm_ip_wait(&self, wait: &VmIpWait) -> DbResult<u64>;
+    /// Oldest first.
+    async fn list_vm_ip_waits(&self, region_id: Option<u64>) -> DbResult<Vec<VmIpWait>>;
+    async fn set_vm_ip_wait_order(&self, vm_id: u64, ip_order_id: Option<u64>) -> DbResult<()>;
+    async fn set_vm_ip_wait_released(&self, vm_id: u64, released: bool) -> DbResult<()>;
+    async fn delete_vm_ip_wait(&self, vm_id: u64) -> DbResult<()>;
+
     // ----- On-demand IP orders -----
 
     async fn insert_ip_order(&self, order: &IpOrder) -> DbResult<u64>;
     async fn get_ip_order(&self, id: u64) -> DbResult<IpOrder>;
     async fn get_ip_order_by_key(&self, key: &str) -> DbResult<Option<IpOrder>>;
     async fn update_ip_order(&self, order: &IpOrder) -> DbResult<()>;
+    /// Raise the quantity of an order that has not been approved yet. Returns
+    /// whether it was raised, which it only is while the order is still
+    /// awaiting approval and the new quantity is larger.
+    async fn grow_ip_order_quantity(&self, id: u64, quantity: u32) -> DbResult<bool>;
     /// Move an order between states only if it is still in `from`. Returns
     /// whether this caller made the move, which is what stops two workers
     /// both buying the same order.

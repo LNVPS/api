@@ -17,6 +17,8 @@ use std::sync::Arc;
 pub enum CapacityError {
     /// No host in the region can accommodate the requested configuration.
     NoAvailableHosts,
+    /// The region has no free IPv4 address for the purchase and none is on the way.
+    OutOfIpCapacity(String),
 }
 
 impl std::fmt::Display for CapacityError {
@@ -26,6 +28,7 @@ impl std::fmt::Display for CapacityError {
                 f,
                 "No hosts with enough capacity are currently available in this region for the selected configuration"
             ),
+            CapacityError::OutOfIpCapacity(m) => write!(f, "{m}"),
         }
     }
 }
@@ -55,14 +58,22 @@ impl HostCapacityService {
             join_all(hosts.iter().map(|h| self.get_host_capacity(h, None, None))).await;
         let caps: Vec<HostCapacity> = caps.into_iter().filter_map(Result::ok).collect();
 
-        Ok(templates
-            .into_iter()
-            .filter(|t| {
-                caps.iter()
-                    .filter(|c| c.host.region_id == t.region_id)
-                    .any(|c| c.can_accommodate(t))
-            })
-            .collect())
+        let mut out = Vec::new();
+        for t in templates {
+            let in_region = || caps.iter().filter(|c| c.host.region_id == t.region_id);
+            let ok = in_region().any(|c| c.can_accommodate(&t))
+                || (in_region().any(|c| c.can_accommodate_with(&t, false))
+                    && crate::ip_provider::sells_without_stock(
+                        self.db.as_ref(),
+                        t.region_id,
+                        t.ip4_count,
+                    )
+                    .await);
+            if ok {
+                out.push(t);
+            }
+        }
+        Ok(out)
     }
 
     /// Pick a host for the purposes of provisioning a new VM
@@ -80,6 +91,47 @@ impl HostCapacityService {
         region_id: u64,
         template: &impl Template,
         host_id: Option<u64>,
+    ) -> Result<HostCapacity> {
+        self.get_host_for_template_with(region_id, template, host_id, true)
+            .await
+    }
+
+    pub async fn get_host_for_template_ip_aware(
+        &self,
+        region_id: u64,
+        template: &impl Template,
+        host_id: Option<u64>,
+    ) -> Result<HostCapacity> {
+        let first = self
+            .get_host_for_template_with(region_id, template, host_id, true)
+            .await;
+        let Err(err) = first else {
+            return first;
+        };
+        let Ok(stockless) = self
+            .get_host_for_template_with(region_id, template, host_id, false)
+            .await
+        else {
+            return Err(err);
+        };
+        match crate::ip_provider::sale_decision(self.db.as_ref(), region_id, template.ip4_count())
+            .await?
+        {
+            crate::ip_provider::IpSale::WaitForIp | crate::ip_provider::IpSale::InStock => {
+                Ok(stockless)
+            }
+            crate::ip_provider::IpSale::OutOfCapacity(m) => {
+                Err(CapacityError::OutOfIpCapacity(m).into())
+            }
+        }
+    }
+
+    pub async fn get_host_for_template_with(
+        &self,
+        region_id: u64,
+        template: &impl Template,
+        host_id: Option<u64>,
+        require_ip4: bool,
     ) -> Result<HostCapacity> {
         let hosts = match host_id {
             Some(id) => vec![self.db.get_host(id).await?]
@@ -100,7 +152,7 @@ impl HostCapacityService {
         let mut host_cap: Vec<HostCapacity> = caps
             .into_iter()
             .filter_map(|v| v.ok())
-            .filter(|v| v.can_accommodate(template))
+            .filter(|v| v.can_accommodate_with(template, require_ip4))
             .collect();
 
         // `total_cmp` rather than `partial_cmp().unwrap()`: a host whose
@@ -132,6 +184,17 @@ impl HostCapacityService {
 
         // make a copy for modification
         let mut templates = templates.clone();
+
+        let mut stockless: HashSet<u64> = HashSet::new();
+        let mut checked: HashSet<u64> = HashSet::new();
+        for t in templates.iter() {
+            if checked.insert(t.region.id)
+                && crate::ip_provider::sells_without_stock(self.db.as_ref(), t.region.id, t.min_ip4)
+                    .await
+            {
+                stockless.insert(t.region.id);
+            }
+        }
 
         // Get distinct region IDs from the templates
         let region_ids: HashSet<u64> = templates.iter().map(|t| t.region.id).collect();
@@ -184,7 +247,9 @@ impl HostCapacityService {
             // this plan sells. A plan whose minimum cannot be met is not
             // orderable at all.
             let min_ip4 = template.min_ip4;
-            let host_has_ipv4 = move |h: &&HostCapacity| h.available_ip4() >= min_ip4 as u128;
+            let sells_stockless = stockless.contains(&template.region.id);
+            let host_has_ipv4 =
+                move |h: &&HostCapacity| sells_stockless || h.available_ip4() >= min_ip4 as u128;
 
             // Limit disk maximums based on actual host capacity.
             //
@@ -256,7 +321,9 @@ impl HostCapacityService {
                 .map(|h| h.available_ip4())
                 .max()
                 .unwrap_or(0);
-            template.max_ip4 = template.max_ip4.min(max_ip4.min(u16::MAX as u128) as u16);
+            if !sells_stockless {
+                template.max_ip4 = template.max_ip4.min(max_ip4.min(u16::MAX as u128) as u16);
+            }
         }
 
         // remove templates with 0 max cpu/ram/disk, or that cannot supply the
@@ -479,6 +546,10 @@ impl HostCapacity {
 
     /// Can this host and its available capacity accommodate the given template
     pub fn can_accommodate(&self, template: &impl Template) -> bool {
+        self.can_accommodate_with(template, true)
+    }
+
+    pub fn can_accommodate_with(&self, template: &impl Template, require_ip4: bool) -> bool {
         // Check cpu manufacturer match (Unknown means any)
         let mfg_ok =
             template.cpu_mfg() == CpuMfg::Unknown || self.host.cpu_mfg == template.cpu_mfg();
@@ -501,7 +572,7 @@ impl HostCapacity {
                 .disks
                 .iter()
                 .any(|d| d.available_capacity() >= template.disk_size())
-            && self.available_ip4() >= template.ip4_count() as u128
+            && (!require_ip4 || self.available_ip4() >= template.ip4_count() as u128)
     }
 
     /// Free IPv4 addresses across every range in the host's region.

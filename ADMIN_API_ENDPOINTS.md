@@ -3102,9 +3102,11 @@ failed, awaiting approval and released.
 Providers are database rows, managed through the endpoints below; the worker reads them on every
 tick (every 5 minutes), so changes need no restart.
 
-A VM purchase in a region with no free IP does not order one: it fails with "No IPs available in this
-region" (or, when an order is in flight or awaiting approval, with an error saying so). Only the
-automatic top-up (`auto_threshold` on a region rule) buys capacity ahead of demand.
+A VM purchase in a region with no free IP is refused up front, at quote and order time, with an
+"out of capacity" error, unless the region has an enabled provider rule with `when_no_ip:
+"order_and_wait"` (see On-Demand IP Ordering below). Independently of that, `auto_threshold` on a
+region rule buys capacity ahead of demand. When an order is in flight or awaiting approval, the
+error a buyer sees says so.
 
 #### IP Providers
 
@@ -3160,13 +3162,66 @@ DELETE /api/admin/v1/ip_providers/{id}/regions/{rule_id}
   "prefix_len": 32,
   "quantity": 2,
   "auto_threshold": 10,
-  "enabled": true
+  "enabled": true,
+  "when_no_ip": "order_and_wait",
+  "sell_without_capacity": false,
+  "wait_refund_hours": 72
 }
 ```
 
 One rule per provider and region. `prefix_len` is 32 or 24 to 30 (blocks need `quantity` 1).
 `auto_threshold` orders `quantity` when the region has fewer free addresses (null disables top-up);
 at most one automatic order per provider and region per day.
+
+`when_no_ip` is `reject` (default) or `order_and_wait`. `sell_without_capacity` and
+`wait_refund_hours` only matter for `order_and_wait`; see below. Setting `order_and_wait` needs the
+provider to have a `gateway`.
+
+#### On-Demand IP Ordering
+
+A region sells VMs without pre-loaded IPs when it has an enabled provider with an enabled rule whose
+`when_no_ip` is `order_and_wait`. Example for a GB region (id 4) with OVH:
+
+```
+POST /api/admin/v1/ip_providers
+{ "name": "ovh-gb", "kind": "ovh", "url": "https://eu.api.ovh.com",
+  "token": "app_key:app_secret:consumer_key", "subsidiary": "GB", "rir": "ripe",
+  "gateway": "203.0.113.254", "approval_required": false,
+  "monthly_spend_cap": 5000, "currency": "EUR", "enabled": true }
+
+POST /api/admin/v1/ip_providers/{id}/regions
+{ "region_id": 4, "country": "UK", "prefix_len": 32, "quantity": 4,
+  "when_no_ip": "order_and_wait", "sell_without_capacity": false, "wait_refund_hours": 72 }
+```
+
+With free addresses, a purchase is unchanged. With none:
+
+- **Sale gate (quote and order time, before payment).** The purchase is accepted only if capacity is
+  covered: free addresses plus addresses on order cover every VM already waiting plus this one. Else,
+  with `sell_without_capacity: true` it is accepted anyway (the customer is told delivery may take
+  longer). Otherwise it is refused with "out of capacity" when the provider needs approval, an order
+  awaits approval, or the monthly spend cap cannot cover another order.
+- **Waiting.** After payment the VM is not spawned. It is recorded as waiting (`status.state`
+  `waitingforip` with a `status_reason` in the customer VM API), the admin and customer are
+  notified, and an order is created immediately: quantity is the larger of the rule `quantity` and
+  every waiting VM's need, minus free and on-order addresses. Ten concurrent purchases make one
+  order; a VM that arrives while that order still awaits approval grows it. A recent failed or
+  rejected order is not retried automatically.
+- **Delivery.** When the order is delivered and the range registered, waiting VMs are released
+  oldest first and spawned, and each customer is notified.
+- **Failure.** The admin is notified and the VMs stay waiting. When `wait_refund_hours` is greater
+  than zero and no order is in flight, a VM that has waited that long is deleted and its payment
+  returned to account credit through the owner-deletion refund path.
+
+Approval and the spend cap apply exactly as for any order.
+
+```
+GET /api/admin/v1/vm_ip_waits?region_id=4
+```
+
+Required Permission: `ip_order::view`. Waiting VMs, oldest first, with `vm_id`, `user_id`,
+`region_id`, `ip4_needed`, `released`, `waiting_since`, `ip_order_id`, `ip_order_state` and
+`ip_order_error`.
 
 #### Create IP Order
 

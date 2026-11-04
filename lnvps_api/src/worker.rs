@@ -1937,9 +1937,19 @@ impl Worker {
 
     /// Spawn a VM and send notifications
     async fn spawn_vm_internal(&self, vm: &Vm) -> Result<()> {
+        if !self.ip_orders.gate_vm(vm).await? {
+            info!(
+                "VM {} is waiting for an IP address, not spawning yet",
+                vm.id
+            );
+            return Ok(());
+        }
         let provisioner = self.subscription_handler.vm_provisioner();
         let pipeline = provisioner.spawn_vm_pipeline(vm.id).await?;
         pipeline.execute().await?;
+        if let Err(e) = self.db.delete_vm_ip_wait(vm.id).await {
+            warn!("Failed to clear the IP wait of VM {}: {}", vm.id, e);
+        }
 
         // Log VM created
         if let Err(e) = self

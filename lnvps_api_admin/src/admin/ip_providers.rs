@@ -4,7 +4,9 @@ use axum::{Json, Router};
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, parse_gateway,
 };
-use lnvps_db::{AdminAction, AdminResource, IpProvider, IpProviderKind, IpProviderRegion, LNVpsDb};
+use lnvps_db::{
+    AdminAction, AdminResource, IpProvider, IpProviderKind, IpProviderRegion, IpWhenNoIp, LNVpsDb,
+};
 use payments_rs::currency::Currency;
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +87,9 @@ pub struct AdminIpProviderRegion {
     pub quantity: u32,
     pub auto_threshold: Option<u64>,
     pub enabled: bool,
+    pub when_no_ip: IpWhenNoIp,
+    pub sell_without_capacity: bool,
+    pub wait_refund_hours: u32,
 }
 
 impl From<IpProviderRegion> for AdminIpProviderRegion {
@@ -99,6 +104,9 @@ impl From<IpProviderRegion> for AdminIpProviderRegion {
             quantity: r.quantity,
             auto_threshold: r.auto_threshold,
             enabled: r.enabled,
+            when_no_ip: r.when_no_ip,
+            sell_without_capacity: r.sell_without_capacity,
+            wait_refund_hours: r.wait_refund_hours,
         }
     }
 }
@@ -156,6 +164,9 @@ pub struct CreateIpProviderRegionRequest {
     pub quantity: Option<u32>,
     pub auto_threshold: Option<u64>,
     pub enabled: Option<bool>,
+    pub when_no_ip: Option<IpWhenNoIp>,
+    pub sell_without_capacity: Option<bool>,
+    pub wait_refund_hours: Option<u32>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -169,6 +180,9 @@ pub struct UpdateIpProviderRegionRequest {
     #[serde(default, deserialize_with = "double_option")]
     pub auto_threshold: Option<Option<u64>>,
     pub enabled: Option<bool>,
+    pub when_no_ip: Option<IpWhenNoIp>,
+    pub sell_without_capacity: Option<bool>,
+    pub wait_refund_hours: Option<u32>,
 }
 
 pub fn validate_name(name: &str) -> Result<String, ApiError> {
@@ -219,6 +233,16 @@ pub fn validate_rule(prefix_len: u16, quantity: u32) -> Result<(), ApiError> {
     if prefix_len != 32 && quantity != 1 {
         return Err(ApiError::bad_request(
             "address blocks are ordered one at a time, quantity must be 1",
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_order_and_wait(db: &dyn LNVpsDb, provider_id: u64) -> Result<(), ApiError> {
+    let p = db.get_ip_provider(provider_id).await?;
+    if p.gateway.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "order_and_wait needs the provider to have a gateway for the ranges it registers",
         ));
     }
     Ok(())
@@ -434,6 +458,9 @@ async fn admin_create_ip_provider_region(
     let prefix_len = req.prefix_len.unwrap_or(32);
     let quantity = req.quantity.unwrap_or(1);
     validate_rule(prefix_len, quantity)?;
+    if req.when_no_ip == Some(IpWhenNoIp::OrderAndWait) {
+        validate_order_and_wait(this.db.as_ref(), id).await?;
+    }
     let rule = IpProviderRegion {
         id: 0,
         provider_id: id,
@@ -444,6 +471,9 @@ async fn admin_create_ip_provider_region(
         quantity,
         auto_threshold: req.auto_threshold,
         enabled: req.enabled.unwrap_or(true),
+        when_no_ip: req.when_no_ip.unwrap_or_default(),
+        sell_without_capacity: req.sell_without_capacity.unwrap_or(false),
+        wait_refund_hours: req.wait_refund_hours.unwrap_or(0),
     };
     let rid = this.db.insert_ip_provider_region(&rule).await?;
     ApiData::ok(this.db.get_ip_provider_region(rid).await?.into())
@@ -475,7 +505,19 @@ async fn admin_update_ip_provider_region(
     if let Some(v) = req.enabled {
         r.enabled = v;
     }
+    if let Some(v) = req.when_no_ip {
+        r.when_no_ip = v;
+    }
+    if let Some(v) = req.sell_without_capacity {
+        r.sell_without_capacity = v;
+    }
+    if let Some(v) = req.wait_refund_hours {
+        r.wait_refund_hours = v;
+    }
     validate_rule(r.prefix_len, r.quantity)?;
+    if r.when_no_ip == IpWhenNoIp::OrderAndWait {
+        validate_order_and_wait(this.db.as_ref(), id).await?;
+    }
     this.db.update_ip_provider_region(&r).await?;
     ApiData::ok(this.db.get_ip_provider_region(rule_id).await?.into())
 }

@@ -1,13 +1,15 @@
 use crate::ip_provider::{
-    IpOrderSpec, IpProvider as IpProviderClient, MockIpProvider, OvhIpProvider, ProviderOrderStatus,
+    IpOrderSpec, IpProvider as IpProviderClient, MockIpProvider, OvhIpProvider,
+    ProviderOrderStatus, free_ip4, in_flight_orders, month_start, order_supply, region_rule,
+    vm_ip4_needed, waiting_ip4,
 };
 use crate::retry::OpError;
 use crate::{NetworkProvisioner, WorkCommander, WorkJob};
 use anyhow::{Result, bail};
-use chrono::{DateTime, Datelike, TimeZone, Utc};
+use chrono::Utc;
 use lnvps_db::{
     IpOrder, IpOrderState, IpProvider, IpProviderKind, IpProviderRegion, IpRange,
-    IpRangeAllocationMode, LNVpsDb,
+    IpRangeAllocationMode, LNVpsDb, Vm, VmIpWait,
 };
 use log::{error, info, warn};
 use std::collections::HashMap;
@@ -132,12 +134,6 @@ pub async fn reject_ip_order(db: &dyn LNVpsDb, id: u64, admin_user_id: u64) -> R
     db.insert_ip_order_audit(id, "rejected", None, Some(admin_user_id))
         .await?;
     Ok(db.get_ip_order(id).await?)
-}
-
-fn month_start(now: DateTime<Utc>) -> DateTime<Utc> {
-    Utc.with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
-        .single()
-        .unwrap_or(now)
 }
 
 pub struct IpOrderService {
@@ -560,16 +556,7 @@ impl IpOrderService {
     }
 
     pub async fn free_addresses(&self, region_id: u64) -> Result<u64> {
-        let mut free = 0;
-        for range in self.db.list_ip_range_in_region(region_id).await? {
-            let used = self
-                .db
-                .list_vm_ip_assignments_in_range(range.id)
-                .await?
-                .len() as u64;
-            free += NetworkProvisioner::count_available_ips(&range, used).unwrap_or(0);
-        }
-        Ok(free)
+        free_ip4(self.db.as_ref(), region_id).await
     }
 
     pub async fn sweep(&self) -> Result<()> {
@@ -581,6 +568,7 @@ impl IpOrderService {
                 }
             }
         }
+        self.serve_waiting_vms().await?;
         self.top_up().await
     }
 
@@ -632,6 +620,277 @@ impl IpOrderService {
         }
         Ok(())
     }
+
+    pub async fn gate_vm(&self, vm: &Vm) -> Result<bool> {
+        let ip4 = vm_ip4_needed(self.db.as_ref(), vm).await?;
+        if ip4 == 0 {
+            return Ok(true);
+        }
+        if !self.db.list_vm_ip_assignments(vm.id).await?.is_empty() {
+            return Ok(true);
+        }
+        let existing = self.db.get_vm_ip_wait(vm.id).await?;
+        if existing.as_ref().is_some_and(|w| w.released) {
+            return Ok(true);
+        }
+        let region_id = self.db.get_host(vm.host_id).await?.region_id;
+        let waits = self.db.list_vm_ip_waits(Some(region_id)).await?;
+        let older = waiting_ip4(&waits, existing.as_ref());
+        let free = free_ip4(self.db.as_ref(), region_id).await?;
+        if free >= older + ip4 as u64 {
+            if existing.is_some() {
+                self.db.delete_vm_ip_wait(vm.id).await?;
+            }
+            return Ok(true);
+        }
+        if existing.is_none() {
+            self.db
+                .insert_vm_ip_wait(&VmIpWait {
+                    id: 0,
+                    vm_id: vm.id,
+                    region_id,
+                    ip4_needed: ip4,
+                    ip_order_id: None,
+                    released: false,
+                    created: Utc::now(),
+                })
+                .await?;
+            self.notify(
+                "VM waiting for an IP",
+                format!(
+                    "VM #{} (user {}) is waiting for an IP address in region {}.",
+                    vm.id, vm.user_id, region_id
+                ),
+            )
+            .await;
+            self.tell_user(
+                vm.user_id,
+                format!("[VM{}] Waiting for an IP address", vm.id),
+                format!(
+                    "Your VM #{} is paid and queued. This region is out of IP addresses, so we are \
+                     ordering more. Delivery may take longer than usual, and you will be told when \
+                     your VM is ready.",
+                    vm.id
+                ),
+            )
+            .await;
+        }
+        self.ensure_region_capacity(region_id).await?;
+        Ok(false)
+    }
+
+    async fn tell_user(&self, user_id: u64, title: String, message: String) {
+        if let Err(e) = self
+            .commander
+            .send(WorkJob::SendNotification {
+                user_id,
+                message,
+                title: Some(title),
+            })
+            .await
+        {
+            warn!("Failed to queue notification for user {}: {}", user_id, e);
+        }
+    }
+
+    pub async fn ensure_region_capacity(&self, region_id: u64) -> Result<Option<IpOrder>> {
+        let created = {
+            let _gate = self.gate.lock().await;
+            self.create_demand_order(region_id).await?
+        };
+        if let Some(o) = &created {
+            self.process_order(o.id).await?;
+        }
+        Ok(created)
+    }
+
+    async fn create_demand_order(&self, region_id: u64) -> Result<Option<IpOrder>> {
+        let waits = self.db.list_vm_ip_waits(Some(region_id)).await?;
+        let pending: Vec<&VmIpWait> = waits.iter().filter(|w| !w.released).collect();
+        if pending.is_empty() {
+            return Ok(None);
+        }
+        let Some((provider, rule)) = region_rule(self.db.as_ref(), region_id).await? else {
+            return Ok(None);
+        };
+        let oldest = pending
+            .iter()
+            .map(|w| w.created)
+            .min()
+            .unwrap_or_else(Utc::now);
+        let (history, _) = self
+            .db
+            .list_ip_orders(None, Some(region_id), 1000, 0)
+            .await?;
+        if history.iter().any(|o| {
+            o.provider == provider.name
+                && o.created >= oldest
+                && matches!(o.state, IpOrderState::Failed | IpOrderState::Rejected)
+        }) {
+            return Ok(None);
+        }
+        let free = free_ip4(self.db.as_ref(), region_id).await?;
+        let demand: u64 = pending.iter().map(|w| w.ip4_needed as u64).sum();
+        let in_flight = in_flight_orders(self.db.as_ref(), region_id, &provider.name).await?;
+        let supply: u64 = in_flight.iter().map(order_supply).sum();
+        if free + supply >= demand {
+            self.link_waits(&pending, in_flight.first()).await?;
+            return Ok(None);
+        }
+        let shortfall = demand - free - supply;
+        if let Some(open) = in_flight
+            .iter()
+            .find(|o| o.state == IpOrderState::AwaitingApproval)
+        {
+            if rule.prefix_len == 32 {
+                let wanted = (open.quantity as u64 + shortfall).min(u32::MAX as u64) as u32;
+                if self.db.grow_ip_order_quantity(open.id, wanted).await? {
+                    self.audit(open, "grown", Some(&format!("quantity now {wanted}")))
+                        .await;
+                }
+            }
+            self.link_waits(&pending, Some(open)).await?;
+            return Ok(None);
+        }
+        if !in_flight.is_empty() {
+            self.link_waits(&pending, in_flight.first()).await?;
+            return Ok(None);
+        }
+        let quantity = if rule.prefix_len == 32 {
+            shortfall.max(rule.quantity as u64).min(u32::MAX as u64) as u32
+        } else {
+            1
+        };
+        let (order, created) = create_ip_order(
+            self.db.as_ref(),
+            NewIpOrder {
+                provider: provider.name.clone(),
+                region_id,
+                country: rule.country.clone(),
+                destination: rule.destination.clone(),
+                prefix_len: rule.prefix_len,
+                quantity,
+                idempotency_key: Some(format!(
+                    "demand:{}:{}:{}",
+                    provider.name,
+                    region_id,
+                    Utc::now().format("%Y-%m-%d-%H")
+                )),
+                auto: true,
+                requested_by: None,
+            },
+        )
+        .await?;
+        if !created {
+            return Ok(None);
+        }
+        self.audit(
+            &order,
+            "demand",
+            Some(&format!("{} VM(s) waiting for an IP", pending.len())),
+        )
+        .await;
+        self.link_waits(&pending, Some(&order)).await?;
+        Ok(Some(order))
+    }
+
+    async fn link_waits(&self, waits: &[&VmIpWait], order: Option<&IpOrder>) -> Result<()> {
+        let Some(order) = order else {
+            return Ok(());
+        };
+        for w in waits.iter().filter(|w| w.ip_order_id != Some(order.id)) {
+            self.db
+                .set_vm_ip_wait_order(w.vm_id, Some(order.id))
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub async fn serve_waiting_vms(&self) -> Result<()> {
+        let all = self.db.list_vm_ip_waits(None).await?;
+        let mut regions: Vec<u64> = all.iter().map(|w| w.region_id).collect();
+        regions.sort();
+        regions.dedup();
+        for region_id in regions {
+            let waits = self.db.list_vm_ip_waits(Some(region_id)).await?;
+            let mut free = free_ip4(self.db.as_ref(), region_id).await?;
+            for w in waits.iter().filter(|w| !w.released) {
+                if free < w.ip4_needed as u64 {
+                    break;
+                }
+                free -= w.ip4_needed as u64;
+                self.db.set_vm_ip_wait_released(w.vm_id, true).await?;
+                self.commander
+                    .send(WorkJob::SpawnVm { vm_id: w.vm_id })
+                    .await?;
+                if let Ok(vm) = self.db.get_vm(w.vm_id).await {
+                    self.tell_user(
+                        vm.user_id,
+                        format!("[VM{}] IP address ready", vm.id),
+                        format!(
+                            "An IP address is now available and your VM #{} is being provisioned.",
+                            vm.id
+                        ),
+                    )
+                    .await;
+                }
+            }
+            if let Err(e) = self.ensure_region_capacity(region_id).await {
+                error!("Failed to order capacity for region {}: {}", region_id, e);
+            }
+            self.refund_stale_waits(region_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn refund_stale_waits(&self, region_id: u64) -> Result<()> {
+        let rules = self
+            .db
+            .list_ip_provider_regions(None, Some(region_id))
+            .await?;
+        let hours = rules
+            .iter()
+            .map(|r| r.wait_refund_hours)
+            .filter(|h| *h > 0)
+            .min();
+        let Some(hours) = hours else {
+            return Ok(());
+        };
+        let cutoff = Utc::now() - chrono::Duration::hours(hours as i64);
+        let (orders, _) = self
+            .db
+            .list_ip_orders(None, Some(region_id), 1000, 0)
+            .await?;
+        if orders.iter().any(|o| o.state.is_in_flight()) {
+            return Ok(());
+        }
+        for w in self.db.list_vm_ip_waits(Some(region_id)).await? {
+            if w.released || w.created > cutoff {
+                continue;
+            }
+            self.commander
+                .send(WorkJob::DeleteVm {
+                    vm_id: w.vm_id,
+                    reason: Some(format!(
+                        "No IP address could be supplied within {hours} hours; refunded"
+                    )),
+                    admin_user_id: None,
+                    purge: false,
+                    by_owner: true,
+                })
+                .await?;
+            self.db.delete_vm_ip_wait(w.vm_id).await?;
+            self.notify(
+                "Waiting VM refunded",
+                format!(
+                    "VM #{} waited more than {hours}h for an IP in region {region_id} with no order in flight, and was deleted and refunded to credit.",
+                    w.vm_id
+                ),
+            )
+            .await;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -671,6 +930,7 @@ mod tests {
             quantity: 1,
             auto_threshold: Some(threshold),
             enabled: true,
+            ..Default::default()
         }
     }
 

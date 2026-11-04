@@ -15,7 +15,7 @@ use crate::{
     SubscriptionPaymentWithCompany, SwapOrderClient, Tunnel, TunnelPool, TunnelRoute, User,
     UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind, VmAddonPrice, VmCostPlan,
     VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
-    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily,
+    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmIpWait, VmOsImage, VmTemplate, VmTrafficDaily,
     VmTrafficSample, VmTrafficTotal, VpnDevice, VpnPeerTemplate, VpnService, VpnSubscription,
     WebauthnCredential,
 };
@@ -1494,7 +1494,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn insert_ip_provider_region(&self, r: &IpProviderRegion) -> DbResult<u64> {
         let res = sqlx::query(
             "INSERT INTO ip_provider_region (provider_id, region_id, country, destination, prefix_len, \
-             quantity, auto_threshold, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             quantity, auto_threshold, enabled, when_no_ip, sell_without_capacity, wait_refund_hours) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(r.provider_id)
         .bind(r.region_id)
@@ -1504,6 +1505,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(r.quantity)
         .bind(r.auto_threshold)
         .bind(r.enabled)
+        .bind(r.when_no_ip)
+        .bind(r.sell_without_capacity)
+        .bind(r.wait_refund_hours)
         .execute(&self.db)
         .await?;
         Ok(res.last_insert_id())
@@ -1512,7 +1516,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn update_ip_provider_region(&self, r: &IpProviderRegion) -> DbResult<()> {
         sqlx::query(
             "UPDATE ip_provider_region SET country = ?, destination = ?, prefix_len = ?, quantity = ?, \
-             auto_threshold = ?, enabled = ? WHERE id = ?",
+             auto_threshold = ?, enabled = ?, when_no_ip = ?, sell_without_capacity = ?, \
+             wait_refund_hours = ? WHERE id = ?",
         )
         .bind(&r.country)
         .bind(&r.destination)
@@ -1520,6 +1525,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(r.quantity)
         .bind(r.auto_threshold)
         .bind(r.enabled)
+        .bind(r.when_no_ip)
+        .bind(r.sell_without_capacity)
+        .bind(r.wait_refund_hours)
         .bind(r.id)
         .execute(&self.db)
         .await?;
@@ -1529,6 +1537,63 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn delete_ip_provider_region(&self, id: u64) -> DbResult<()> {
         sqlx::query("delete from ip_provider_region where id = ?")
             .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_vm_ip_wait(&self, vm_id: u64) -> DbResult<Option<VmIpWait>> {
+        Ok(sqlx::query_as("select * from vm_ip_wait where vm_id = ?")
+            .bind(vm_id)
+            .fetch_optional(&self.db)
+            .await?)
+    }
+
+    async fn insert_vm_ip_wait(&self, w: &VmIpWait) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO vm_ip_wait (vm_id, region_id, ip4_needed, ip_order_id, released) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(w.vm_id)
+        .bind(w.region_id)
+        .bind(w.ip4_needed)
+        .bind(w.ip_order_id)
+        .bind(w.released)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn list_vm_ip_waits(&self, region_id: Option<u64>) -> DbResult<Vec<VmIpWait>> {
+        Ok(sqlx::query_as(
+            "select * from vm_ip_wait where (? is null or region_id = ?) order by created, id",
+        )
+        .bind(region_id)
+        .bind(region_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn set_vm_ip_wait_order(&self, vm_id: u64, ip_order_id: Option<u64>) -> DbResult<()> {
+        sqlx::query("update vm_ip_wait set ip_order_id = ? where vm_id = ?")
+            .bind(ip_order_id)
+            .bind(vm_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_vm_ip_wait_released(&self, vm_id: u64, released: bool) -> DbResult<()> {
+        sqlx::query("update vm_ip_wait set released = ? where vm_id = ?")
+            .bind(released)
+            .bind(vm_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_vm_ip_wait(&self, vm_id: u64) -> DbResult<()> {
+        sqlx::query("delete from vm_ip_wait where vm_id = ?")
+            .bind(vm_id)
             .execute(&self.db)
             .await?;
         Ok(())
@@ -1582,11 +1647,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_ip_order(&self, order: &IpOrder) -> DbResult<()> {
         sqlx::query(
-            "UPDATE ip_order SET state = ?, provider_order_id = ?, cost = ?, currency = ?, \
+            "UPDATE ip_order SET state = ?, quantity = ?, provider_order_id = ?, cost = ?, currency = ?, \
              approved_by = ?, approved_at = ?, error = ?, ordered_at = ?, delivered_at = ? \
              WHERE id = ?",
         )
         .bind(order.state)
+        .bind(order.quantity)
         .bind(&order.provider_order_id)
         .bind(order.cost)
         .bind(&order.currency)
@@ -1599,6 +1665,19 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .execute(&self.db)
         .await?;
         Ok(())
+    }
+
+    async fn grow_ip_order_quantity(&self, id: u64, quantity: u32) -> DbResult<bool> {
+        let res = sqlx::query(
+            "UPDATE ip_order SET quantity = ? WHERE id = ? AND state = ? AND quantity < ?",
+        )
+        .bind(quantity)
+        .bind(id)
+        .bind(IpOrderState::AwaitingApproval)
+        .bind(quantity)
+        .execute(&self.db)
+        .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn transition_ip_order(

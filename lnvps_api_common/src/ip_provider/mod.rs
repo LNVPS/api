@@ -1,7 +1,9 @@
+mod demand;
 mod mock;
 mod ovh;
 mod service;
 
+pub use demand::*;
 pub use mock::*;
 pub use ovh::*;
 pub use service::*;
@@ -54,3 +56,6 @@ pub trait IpProvider: Send + Sync {
     async fn list_owned(&self) -> OpResult<Vec<OwnedIp>>;
     async fn release(&self, cidr: &str) -> OpResult<()>;
 }
+
+#[cfg(test)]
+mod on_demand_tests;

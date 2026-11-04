@@ -1,6 +1,6 @@
 use lnvps_db::{
     AdminDb, IpOrder, IpOrderState, IpProvider, IpProviderKind, IpProviderRegion, IpRange,
-    LNVpsDbBase, LNVpsDbMysql,
+    IpWhenNoIp, LNVpsDbBase, LNVpsDbMysql,
 };
 use sqlx::Executor;
 use sqlx::mysql::MySqlPoolOptions;
@@ -53,6 +53,7 @@ async fn ip_orders_migrate_and_round_trip() {
     ip_order_lifecycle_round_trips(&db).await;
     bought_range_links_to_its_order(&db).await;
     ip_provider_config_round_trips(&db).await;
+    vm_ip_wait_round_trips(&db).await;
 }
 
 async fn ip_order_lifecycle_round_trips(db: &LNVpsDbMysql) {
@@ -192,11 +193,17 @@ async fn ip_provider_config_round_trips(db: &LNVpsDbMysql) {
         quantity: 2,
         auto_threshold: Some(5),
         enabled: true,
+        when_no_ip: IpWhenNoIp::OrderAndWait,
+        sell_without_capacity: true,
+        wait_refund_hours: 24,
     };
     let rid = db.insert_ip_provider_region(&rule).await.unwrap();
     assert!(db.insert_ip_provider_region(&rule).await.is_err());
     let mut r = db.get_ip_provider_region(rid).await.unwrap();
     assert_eq!(r.quantity, 2);
+    assert_eq!(r.when_no_ip, IpWhenNoIp::OrderAndWait);
+    assert!(r.sell_without_capacity);
+    assert_eq!(r.wait_refund_hours, 24);
     r.auto_threshold = None;
     db.update_ip_provider_region(&r).await.unwrap();
     assert_eq!(
@@ -244,4 +251,106 @@ async fn ip_provider_config_round_trips(db: &LNVpsDbMysql) {
             .unwrap()
             .is_empty()
     );
+}
+
+async fn vm_ip_wait_round_trips(db: &LNVpsDbMysql) {
+    use lnvps_db::{IntervalType, LineItemType, Subscription, SubscriptionLineItem, Vm, VmIpWait};
+    for sql in [
+        "insert into vm_host(id,kind,region_id,name,ip,cpu,memory,enabled,api_token) values(1,65535,1,'h','https://localhost',4,4294967296,1,'')",
+        "insert into vm_host_disk(id,host_id,name,size,kind,interface,enabled) values(1,1,'d',1000000000000,1,2,1)",
+        "insert into vm_os_image(id,distribution,flavour,version,enabled,url,release_date) values(1,0,'Server','24.04',1,'https://example.com/i.img','2024-04-25')",
+        "insert into vm_cost_plan(id,name,amount,currency,interval_amount,interval_type) values(1,'p',200,'EUR',1,1)",
+        "insert into vm_template(id,name,enabled,cpu,memory,disk_size,disk_type,disk_interface,cost_plan_id,region_id) values(1,'t',1,1,1073741824,42949672960,1,2,1,1)",
+    ] {
+        db.execute(sql).await.unwrap();
+    }
+    let user_id = db.upsert_user(&[9u8; 32]).await.unwrap();
+    let (_, ids) = db
+        .insert_subscription_with_line_items(
+            &Subscription {
+                id: 0,
+                user_id,
+                company_id: 1,
+                name: "s".to_string(),
+                description: None,
+                created: chrono::Utc::now(),
+                expires: None,
+                is_active: true,
+                is_setup: true,
+                currency: "EUR".to_string(),
+                interval_amount: 1,
+                interval_type: IntervalType::Month,
+                setup_fee: 0,
+                auto_renewal_enabled: false,
+                external_id: None,
+            },
+            vec![SubscriptionLineItem {
+                id: 0,
+                subscription_id: 0,
+                subscription_type: LineItemType::Vps,
+                name: "vm".to_string(),
+                description: None,
+                amount: 1000,
+                setup_amount: 0,
+                configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let vm_id = db
+        .insert_vm(&Vm {
+            host_id: 1,
+            user_id,
+            image_id: 1,
+            template_id: Some(1),
+            subscription_line_item_id: ids[0],
+            disk_id: 1,
+            mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let order_id = db
+        .insert_ip_order(&IpOrder {
+            provider: "x".to_string(),
+            region_id: 1,
+            prefix_len: 32,
+            quantity: 1,
+            created: chrono::Utc::now(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert!(db.grow_ip_order_quantity(order_id, 5).await.unwrap());
+    assert!(!db.grow_ip_order_quantity(order_id, 5).await.unwrap());
+    assert_eq!(db.get_ip_order(order_id).await.unwrap().quantity, 5);
+
+    let wait = VmIpWait {
+        id: 0,
+        vm_id,
+        region_id: 1,
+        ip4_needed: 2,
+        ip_order_id: None,
+        released: false,
+        created: chrono::Utc::now(),
+    };
+    db.insert_vm_ip_wait(&wait).await.unwrap();
+    assert!(db.insert_vm_ip_wait(&wait).await.is_err());
+    db.set_vm_ip_wait_order(vm_id, Some(order_id))
+        .await
+        .unwrap();
+    let got = db.get_vm_ip_wait(vm_id).await.unwrap().unwrap();
+    assert_eq!(
+        (got.ip4_needed, got.ip_order_id, got.released),
+        (2, Some(order_id), false)
+    );
+    db.set_vm_ip_wait_released(vm_id, true).await.unwrap();
+    assert!(db.get_vm_ip_wait(vm_id).await.unwrap().unwrap().released);
+    assert_eq!(db.list_vm_ip_waits(Some(1)).await.unwrap().len(), 1);
+    assert!(db.list_vm_ip_waits(Some(2)).await.unwrap().is_empty());
+    db.delete_vm_ip_wait(vm_id).await.unwrap();
+    assert!(db.get_vm_ip_wait(vm_id).await.unwrap().is_none());
 }

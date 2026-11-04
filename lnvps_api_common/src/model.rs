@@ -268,6 +268,9 @@ pub struct ApiVmStatus {
     pub ip_assignments: Vec<ApiVmIpAssignment>,
     /// Current running state of the VM
     pub status: VmRunningState,
+    /// Why the VM is in a waiting state, when it is
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
     /// Enable automatic renewal (from subscription)
     pub auto_renewal_enabled: bool,
     /// Date the VM will be deleted if not renewed (expiry + dynamic grace period).
@@ -435,6 +438,20 @@ pub async fn vm_to_status(
         .map(|i| (i.id, i))
         .collect();
 
+    let (status, status_reason) = match db.get_vm_ip_wait(vm.id).await? {
+        Some(w) if !w.released => (
+            VmRunningState {
+                state: crate::VmRunningStates::WaitingForIp,
+                ..Default::default()
+            },
+            Some(
+                "Waiting for an IP address: this region is out of addresses and more have been ordered"
+                    .to_string(),
+            ),
+        ),
+        _ => (state.unwrap_or_default(), None),
+    };
+
     let template = ApiVmTemplate::from_vm(db, &vm).await?;
     let template_transfer_gb = template.transfer_gb;
     // Load subscription for created + expiry + auto_renewal + dynamic deletion date
@@ -492,7 +509,8 @@ pub async fn vm_to_status(
         image: image.into(),
         template,
         ssh_key,
-        status: state.unwrap_or_default(),
+        status,
+        status_reason,
         ip_assignments: ips
             .into_iter()
             .map(|i| {

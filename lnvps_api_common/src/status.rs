@@ -18,6 +18,8 @@ pub enum VmRunningStates {
     Stopped,
     /// Payment received; VM is being provisioned on the host for the first time.
     Creating,
+    /// Paid, but the region has no free IP address yet; one is on order.
+    WaitingForIp,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]

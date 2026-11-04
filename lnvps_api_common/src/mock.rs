@@ -19,7 +19,7 @@ use lnvps_db::{
     Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind,
     VmAddonPrice, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
     VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment,
-    VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice,
+    VmIpWait, VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice,
     VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
 };
 
@@ -98,6 +98,7 @@ pub struct MockDb {
     pub vm_addon_prices: Arc<Mutex<HashMap<u64, VmAddonPrice>>>,
     pub ip_providers: Arc<Mutex<HashMap<u64, IpProvider>>>,
     pub ip_provider_regions: Arc<Mutex<HashMap<u64, IpProviderRegion>>>,
+    pub vm_ip_waits: Arc<Mutex<Vec<VmIpWait>>>,
     pub ip_orders: Arc<Mutex<HashMap<u64, IpOrder>>>,
     pub ip_order_audits: Arc<Mutex<Vec<IpOrderAudit>>>,
     pub ip_order_ranges: Arc<Mutex<Vec<IpOrderRange>>>,
@@ -571,6 +572,7 @@ impl Default for MockDb {
             vm_addon_prices: Arc::new(Default::default()),
             ip_providers: Arc::new(Default::default()),
             ip_provider_regions: Arc::new(Default::default()),
+            vm_ip_waits: Arc::new(Default::default()),
             ip_orders: Arc::new(Default::default()),
             ip_order_audits: Arc::new(Default::default()),
             ip_order_ranges: Arc::new(Default::default()),
@@ -5798,6 +5800,72 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn get_vm_ip_wait(&self, vm_id: u64) -> DbResult<Option<VmIpWait>> {
+        Ok(self
+            .vm_ip_waits
+            .lock()
+            .await
+            .iter()
+            .find(|w| w.vm_id == vm_id)
+            .cloned())
+    }
+
+    async fn insert_vm_ip_wait(&self, w: &VmIpWait) -> DbResult<u64> {
+        let mut m = self.vm_ip_waits.lock().await;
+        if m.iter().any(|e| e.vm_id == w.vm_id) {
+            return Err(anyhow!("VM {} already waits for an IP", w.vm_id).into());
+        }
+        let id = m.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        let mut n = w.clone();
+        n.id = id;
+        m.push(n);
+        Ok(id)
+    }
+
+    async fn list_vm_ip_waits(&self, region_id: Option<u64>) -> DbResult<Vec<VmIpWait>> {
+        let mut v: Vec<VmIpWait> = self
+            .vm_ip_waits
+            .lock()
+            .await
+            .iter()
+            .filter(|w| region_id.is_none_or(|r| w.region_id == r))
+            .cloned()
+            .collect();
+        v.sort_by_key(|w| (w.created, w.id));
+        Ok(v)
+    }
+
+    async fn set_vm_ip_wait_order(&self, vm_id: u64, ip_order_id: Option<u64>) -> DbResult<()> {
+        if let Some(w) = self
+            .vm_ip_waits
+            .lock()
+            .await
+            .iter_mut()
+            .find(|w| w.vm_id == vm_id)
+        {
+            w.ip_order_id = ip_order_id;
+        }
+        Ok(())
+    }
+
+    async fn set_vm_ip_wait_released(&self, vm_id: u64, released: bool) -> DbResult<()> {
+        if let Some(w) = self
+            .vm_ip_waits
+            .lock()
+            .await
+            .iter_mut()
+            .find(|w| w.vm_id == vm_id)
+        {
+            w.released = released;
+        }
+        Ok(())
+    }
+
+    async fn delete_vm_ip_wait(&self, vm_id: u64) -> DbResult<()> {
+        self.vm_ip_waits.lock().await.retain(|w| w.vm_id != vm_id);
+        Ok(())
+    }
+
     async fn insert_ip_order(&self, order: &IpOrder) -> DbResult<u64> {
         let mut orders = self.ip_orders.lock().await;
         if let Some(k) = &order.idempotency_key {
@@ -5840,6 +5908,7 @@ impl LNVpsDbBase for MockDb {
             .get_mut(&order.id)
             .ok_or_else(|| anyhow!("IP order {} not found", order.id))?;
         o.state = order.state;
+        o.quantity = order.quantity;
         o.provider_order_id = order.provider_order_id.clone();
         o.cost = order.cost;
         o.currency = order.currency.clone();
@@ -5849,6 +5918,17 @@ impl LNVpsDbBase for MockDb {
         o.ordered_at = order.ordered_at;
         o.delivered_at = order.delivered_at;
         Ok(())
+    }
+
+    async fn grow_ip_order_quantity(&self, id: u64, quantity: u32) -> DbResult<bool> {
+        let mut orders = self.ip_orders.lock().await;
+        match orders.get_mut(&id) {
+            Some(o) if o.state == IpOrderState::AwaitingApproval && o.quantity < quantity => {
+                o.quantity = quantity;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn transition_ip_order(
@@ -10074,6 +10154,54 @@ mod tests {
         let host = db.get_host(vm.host_id).await.ok();
         let res = vm_to_status(&db, vm, host, None, 0, 365).await;
         assert!(res.is_err(), "expected error, not a panic");
+    }
+
+    #[tokio::test]
+    async fn test_vm_to_status_reports_waiting_for_ip_with_a_reason() {
+        use crate::model::vm_to_status;
+        use lnvps_db::{LNVpsDb, UserSshKey, VmIpWait};
+
+        let db = MockDb::default();
+        db.vms.lock().await.insert(1, MockDb::mock_vm());
+        db.insert_user_ssh_key(&UserSshKey {
+            id: 0,
+            name: "k".to_string(),
+            user_id: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let wait = VmIpWait {
+            id: 0,
+            vm_id: 1,
+            region_id: 1,
+            ip4_needed: 1,
+            ip_order_id: None,
+            released: false,
+            created: Utc::now(),
+        };
+        db.insert_vm_ip_wait(&wait).await.unwrap();
+        let db: std::sync::Arc<dyn LNVpsDb> = std::sync::Arc::new(db);
+
+        let vm = db.get_vm(1).await.unwrap();
+        let host = db.get_host(vm.host_id).await.ok();
+        let waiting = vm_to_status(&db, vm.clone(), host.clone(), None, 0, 365)
+            .await
+            .unwrap();
+        assert_eq!(waiting.status.state, crate::VmRunningStates::WaitingForIp);
+        let json = serde_json::to_value(&waiting).unwrap();
+        assert_eq!(json["status"]["state"], "waitingforip");
+        assert!(
+            json["status_reason"]
+                .as_str()
+                .unwrap()
+                .contains("IP address")
+        );
+
+        db.set_vm_ip_wait_released(1, true).await.unwrap();
+        let released = vm_to_status(&db, vm, host, None, 0, 365).await.unwrap();
+        assert_ne!(released.status.state, crate::VmRunningStates::WaitingForIp);
+        assert!(released.status_reason.is_none());
     }
 
     /// A VM's captured host keys reach the customer parsed, and a VM with none

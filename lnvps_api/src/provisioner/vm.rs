@@ -191,7 +191,7 @@ impl VmProvisioner {
         // TODO: cache capacity somewhere
         let cap = HostCapacityService::new(self.db.clone());
         let host = cap
-            .get_host_for_template_on(template.region_id, &template, host_id)
+            .get_host_for_template_ip_aware(template.region_id, &template, host_id)
             .await?;
 
         let pick_disk = if let Some(hd) = host.disks.first() {
@@ -322,7 +322,7 @@ impl VmProvisioner {
 
         let cap = HostCapacityService::new(self.db.clone());
         let host = cap
-            .get_host_for_template(pricing.region_id, &template)
+            .get_host_for_template_ip_aware(pricing.region_id, &template, None)
             .await?;
 
         let pick_disk = if let Some(hd) = host.disks.first() {
