@@ -6,17 +6,18 @@ use crate::{
     AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
     BulkMessageTarget, Company, DbError, DbResult, Discount, DiscountRedemption,
     DiscountRedemptionWithCode, DnsServer, EncryptedString, IntervalType, IpOrder, IpOrderAudit,
-    IpOrderRange, IpOrderState, IpRange, IpRangeSubscription, IpSpacePricing, LNVpsDbBase,
-    LineItemType, MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus,
-    MarketplaceOperator, NewAgentMessage, PaymentMethod, PaymentMethodConfig, PaymentType,
-    Referral, ReferralCostUsage, ReferralPayout, Region, RegionStats, Router, RouterBgpRoute,
-    RouterBgpSession, RouterTunnel, RouterTunnelKind, RouterTunnelTraffic, Subscription,
-    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, SwapOrderClient,
-    Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind,
-    VmAddonPrice, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage,
-    VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice, VpnPeerTemplate,
-    VpnService, VpnSubscription, WebauthnCredential,
+    IpOrderRange, IpOrderState, IpProvider, IpProviderRegion, IpRange, IpRangeSubscription,
+    IpSpacePricing, LNVpsDbBase, LineItemType, MarketplaceNode, MarketplaceNodeHealth,
+    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, PaymentMethod,
+    PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout, Region,
+    RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelKind,
+    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentWithCompany, SwapOrderClient, Tunnel, TunnelPool, TunnelRoute, User,
+    UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind, VmAddonPrice, VmCostPlan,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
+    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily,
+    VmTrafficSample, VmTrafficTotal, VpnDevice, VpnPeerTemplate, VpnService, VpnSubscription,
+    WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -1374,6 +1375,163 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_all(&self.db)
                 .await?,
         )
+    }
+
+    async fn list_ip_providers(&self) -> DbResult<Vec<IpProvider>> {
+        Ok(sqlx::query_as("select * from ip_provider order by name")
+            .fetch_all(&self.db)
+            .await?)
+    }
+
+    async fn get_ip_provider(&self, id: u64) -> DbResult<IpProvider> {
+        Ok(sqlx::query_as("select * from ip_provider where id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn get_ip_provider_by_name(&self, name: &str) -> DbResult<Option<IpProvider>> {
+        Ok(sqlx::query_as("select * from ip_provider where name = ?")
+            .bind(name)
+            .fetch_optional(&self.db)
+            .await?)
+    }
+
+    async fn insert_ip_provider(&self, p: &IpProvider) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO ip_provider (name, kind, enabled, url, token, subsidiary, rir, gateway, \
+             access_policy_id, approval_required, monthly_spend_cap, currency, enable_ranges_on_delivery) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&p.name)
+        .bind(p.kind)
+        .bind(p.enabled)
+        .bind(&p.url)
+        .bind(&p.token)
+        .bind(&p.subsidiary)
+        .bind(&p.rir)
+        .bind(&p.gateway)
+        .bind(p.access_policy_id)
+        .bind(p.approval_required)
+        .bind(p.monthly_spend_cap)
+        .bind(&p.currency)
+        .bind(p.enable_ranges_on_delivery)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn update_ip_provider(&self, p: &IpProvider) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE ip_provider SET name = ?, kind = ?, enabled = ?, url = ?, token = ?, subsidiary = ?, \
+             rir = ?, gateway = ?, access_policy_id = ?, approval_required = ?, monthly_spend_cap = ?, \
+             currency = ?, enable_ranges_on_delivery = ? WHERE id = ?",
+        )
+        .bind(&p.name)
+        .bind(p.kind)
+        .bind(p.enabled)
+        .bind(&p.url)
+        .bind(&p.token)
+        .bind(&p.subsidiary)
+        .bind(&p.rir)
+        .bind(&p.gateway)
+        .bind(p.access_policy_id)
+        .bind(p.approval_required)
+        .bind(p.monthly_spend_cap)
+        .bind(&p.currency)
+        .bind(p.enable_ranges_on_delivery)
+        .bind(p.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_ip_provider(&self, id: u64) -> DbResult<()> {
+        let p = self.get_ip_provider(id).await?;
+        let orders: i64 = sqlx::query_scalar("select count(*) from ip_order where provider = ?")
+            .bind(&p.name)
+            .fetch_one(&self.db)
+            .await?;
+        if orders > 0 {
+            return Err(DbError::Source(
+                anyhow!("Cannot delete IP provider: {} orders reference it", orders)
+                    .into_boxed_dyn_error(),
+            ));
+        }
+        sqlx::query("delete from ip_provider where id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_ip_provider_regions(
+        &self,
+        provider_id: Option<u64>,
+        region_id: Option<u64>,
+    ) -> DbResult<Vec<IpProviderRegion>> {
+        Ok(sqlx::query_as(
+            "select * from ip_provider_region where (? is null or provider_id = ?) \
+             and (? is null or region_id = ?) order by id",
+        )
+        .bind(provider_id)
+        .bind(provider_id)
+        .bind(region_id)
+        .bind(region_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn get_ip_provider_region(&self, id: u64) -> DbResult<IpProviderRegion> {
+        Ok(
+            sqlx::query_as("select * from ip_provider_region where id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn insert_ip_provider_region(&self, r: &IpProviderRegion) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO ip_provider_region (provider_id, region_id, country, destination, prefix_len, \
+             quantity, auto_threshold, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(r.provider_id)
+        .bind(r.region_id)
+        .bind(&r.country)
+        .bind(&r.destination)
+        .bind(r.prefix_len)
+        .bind(r.quantity)
+        .bind(r.auto_threshold)
+        .bind(r.enabled)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn update_ip_provider_region(&self, r: &IpProviderRegion) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE ip_provider_region SET country = ?, destination = ?, prefix_len = ?, quantity = ?, \
+             auto_threshold = ?, enabled = ? WHERE id = ?",
+        )
+        .bind(&r.country)
+        .bind(&r.destination)
+        .bind(r.prefix_len)
+        .bind(r.quantity)
+        .bind(r.auto_threshold)
+        .bind(r.enabled)
+        .bind(r.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_ip_provider_region(&self, id: u64) -> DbResult<()> {
+        sqlx::query("delete from ip_provider_region where id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
     }
 
     async fn insert_ip_order(&self, order: &IpOrder) -> DbResult<u64> {

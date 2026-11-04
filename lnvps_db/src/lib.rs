@@ -1795,6 +1795,25 @@ pub trait LNVpsDbBase: Send + Sync {
     /// older one.
     async fn bump_tunnel_pool_generation(&self, id: u64) -> DbResult<u64>;
 
+    // ----- IP providers -----
+
+    async fn list_ip_providers(&self) -> DbResult<Vec<IpProvider>>;
+    async fn get_ip_provider(&self, id: u64) -> DbResult<IpProvider>;
+    async fn get_ip_provider_by_name(&self, name: &str) -> DbResult<Option<IpProvider>>;
+    async fn insert_ip_provider(&self, provider: &IpProvider) -> DbResult<u64>;
+    async fn update_ip_provider(&self, provider: &IpProvider) -> DbResult<()>;
+    /// Refused while orders reference the provider, so the audit trail keeps its subject.
+    async fn delete_ip_provider(&self, id: u64) -> DbResult<()>;
+    async fn list_ip_provider_regions(
+        &self,
+        provider_id: Option<u64>,
+        region_id: Option<u64>,
+    ) -> DbResult<Vec<IpProviderRegion>>;
+    async fn get_ip_provider_region(&self, id: u64) -> DbResult<IpProviderRegion>;
+    async fn insert_ip_provider_region(&self, rule: &IpProviderRegion) -> DbResult<u64>;
+    async fn update_ip_provider_region(&self, rule: &IpProviderRegion) -> DbResult<()>;
+    async fn delete_ip_provider_region(&self, id: u64) -> DbResult<()>;
+
     // ----- On-demand IP orders -----
 
     async fn insert_ip_order(&self, order: &IpOrder) -> DbResult<u64>;

@@ -1,113 +1,40 @@
 use crate::ip_provider::{
-    IpOrderSpec, IpProvider, MockIpProvider, OvhIpProvider, ProviderOrderStatus,
+    IpOrderSpec, IpProvider as IpProviderClient, MockIpProvider, OvhIpProvider, ProviderOrderStatus,
 };
 use crate::retry::OpError;
 use crate::{NetworkProvisioner, WorkCommander, WorkJob};
 use anyhow::{Result, bail};
 use chrono::{DateTime, Datelike, TimeZone, Utc};
-use lnvps_db::{IpOrder, IpOrderState, IpRange, IpRangeAllocationMode, LNVpsDb};
+use lnvps_db::{
+    IpOrder, IpOrderState, IpProvider, IpProviderKind, IpProviderRegion, IpRange,
+    IpRangeAllocationMode, LNVpsDb,
+};
 use log::{error, info, warn};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum IpProviderKind {
-    #[default]
-    Ovh,
-    Mock,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct IpProviderRegionConfig {
-    pub region_id: u64,
-    pub country: Option<String>,
-    pub destination: Option<String>,
-    #[serde(default = "default_prefix_len")]
-    pub prefix_len: u16,
-    #[serde(default = "default_quantity")]
-    pub quantity: u32,
-    pub auto_threshold: Option<u64>,
-}
-
-fn default_prefix_len() -> u16 {
-    32
-}
-
-fn default_quantity() -> u32 {
-    1
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_rir() -> String {
-    "ripe".to_string()
-}
-
-fn default_subsidiary() -> String {
-    "IE".to_string()
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub struct IpProviderConfig {
-    pub name: String,
-    #[serde(default)]
-    pub kind: IpProviderKind,
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default)]
-    pub url: String,
-    #[serde(default)]
-    pub token: String,
-    #[serde(default = "default_subsidiary")]
-    pub subsidiary: String,
-    #[serde(default = "default_rir")]
-    pub rir: String,
-    pub gateway: Option<String>,
-    pub access_policy_id: Option<u64>,
-    #[serde(default = "default_true")]
-    pub approval_required: bool,
-    #[serde(default)]
-    pub monthly_spend_cap: u64,
-    #[serde(default)]
-    pub currency: String,
-    #[serde(default = "default_true")]
-    pub enable_ranges_on_delivery: bool,
-    #[serde(default)]
-    pub regions: Vec<IpProviderRegionConfig>,
-}
-
+#[derive(Clone)]
 pub struct IpProviderEntry {
-    pub config: IpProviderConfig,
-    pub provider: Arc<dyn IpProvider>,
+    pub config: IpProvider,
+    pub provider: Arc<dyn IpProviderClient>,
 }
 
-pub fn build_ip_providers(configs: &[IpProviderConfig]) -> Vec<IpProviderEntry> {
-    configs
-        .iter()
-        .map(|c| {
-            let provider: Arc<dyn IpProvider> = match c.kind {
-                IpProviderKind::Ovh => Arc::new(OvhIpProvider::new(
-                    &c.name,
-                    &c.url,
-                    &c.token,
-                    &c.subsidiary,
-                    &c.rir.to_lowercase(),
-                )),
-                IpProviderKind::Mock => Arc::new(MockIpProvider::new(&c.name, 0)),
-            };
-            IpProviderEntry {
-                config: c.clone(),
-                provider,
-            }
-        })
-        .collect()
+pub type ProviderBuilder = Arc<dyn Fn(&IpProvider) -> Arc<dyn IpProviderClient> + Send + Sync>;
+
+pub fn default_provider_builder() -> ProviderBuilder {
+    Arc::new(|c: &IpProvider| -> Arc<dyn IpProviderClient> {
+        match c.kind {
+            IpProviderKind::Ovh => Arc::new(OvhIpProvider::new(
+                &c.name,
+                &c.url,
+                c.token.as_str(),
+                &c.subsidiary,
+                &c.rir.to_lowercase(),
+            )),
+            IpProviderKind::Mock => Arc::new(MockIpProvider::new(&c.name, 0)),
+        }
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -216,29 +143,33 @@ fn month_start(now: DateTime<Utc>) -> DateTime<Utc> {
 pub struct IpOrderService {
     db: Arc<dyn LNVpsDb>,
     commander: Arc<dyn WorkCommander>,
-    providers: HashMap<String, IpProviderEntry>,
+    builder: ProviderBuilder,
     gate: Mutex<()>,
 }
 
 impl IpOrderService {
-    pub fn new(
+    pub fn new(db: Arc<dyn LNVpsDb>, commander: Arc<dyn WorkCommander>) -> Self {
+        Self::with_builder(db, commander, default_provider_builder())
+    }
+
+    pub fn with_builder(
         db: Arc<dyn LNVpsDb>,
         commander: Arc<dyn WorkCommander>,
-        providers: Vec<IpProviderEntry>,
+        builder: ProviderBuilder,
     ) -> Self {
         Self {
             db,
             commander,
-            providers: providers
-                .into_iter()
-                .map(|p| (p.config.name.clone(), p))
-                .collect(),
+            builder,
             gate: Mutex::new(()),
         }
     }
 
-    pub fn has_providers(&self) -> bool {
-        self.providers.values().any(|p| p.config.enabled)
+    async fn entry(&self, name: &str) -> Result<Option<IpProviderEntry>> {
+        Ok(self.db.get_ip_provider_by_name(name).await?.map(|config| {
+            let provider = (self.builder)(&config);
+            IpProviderEntry { config, provider }
+        }))
     }
 
     async fn notify(&self, title: &str, message: String) {
@@ -307,7 +238,7 @@ impl IpOrderService {
     }
 
     async fn review(&self, order: &mut IpOrder) -> Result<()> {
-        let Some(entry) = self.providers.get(&order.provider) else {
+        let Some(entry) = self.entry(&order.provider).await? else {
             return self
                 .fail(order, &format!("unknown ip provider '{}'", order.provider))
                 .await;
@@ -364,7 +295,7 @@ impl IpOrderService {
     }
 
     async fn place(&self, order: &mut IpOrder) -> Result<()> {
-        let Some(entry) = self.providers.get(&order.provider) else {
+        let Some(entry) = self.entry(&order.provider).await? else {
             return self
                 .fail(order, &format!("unknown ip provider '{}'", order.provider))
                 .await;
@@ -378,7 +309,7 @@ impl IpOrderService {
                 )
                 .await;
         }
-        if cfg.gateway.is_none() {
+        if cfg.gateway.is_empty() {
             return self
                 .fail(
                     order,
@@ -483,7 +414,7 @@ impl IpOrderService {
     }
 
     async fn poll(&self, order: &mut IpOrder) -> Result<()> {
-        let Some(entry) = self.providers.get(&order.provider) else {
+        let Some(entry) = self.entry(&order.provider).await? else {
             return Ok(());
         };
         let Some(provider_order_id) = order.provider_order_id.clone() else {
@@ -507,7 +438,7 @@ impl IpOrderService {
                 }
                 let mut registered = vec![];
                 for ip in &ips {
-                    let range = self.register_range(order, entry, &ip.cidr).await?;
+                    let range = self.register_range(order, &entry, &ip.cidr).await?;
                     registered.push(range.cidr);
                 }
                 order.state = IpOrderState::Delivered;
@@ -542,7 +473,7 @@ impl IpOrderService {
             None => {
                 let mut r = IpRange {
                     cidr: cidr.to_string(),
-                    gateway: entry.config.gateway.clone().unwrap_or_default(),
+                    gateway: entry.config.gateway.clone(),
                     enabled: entry.config.enable_ranges_on_delivery,
                     region_id: order.region_id,
                     access_policy_id: entry.config.access_policy_id,
@@ -579,7 +510,7 @@ impl IpOrderService {
             return Ok(());
         }
         let order = self.db.get_ip_order(link.ip_order_id).await?;
-        let Some(entry) = self.providers.get(&order.provider) else {
+        let Some(entry) = self.entry(&order.provider).await? else {
             bail!("unknown ip provider '{}'", order.provider);
         };
         if !entry.config.enabled {
@@ -655,8 +586,15 @@ impl IpOrderService {
 
     pub async fn top_up(&self) -> Result<()> {
         let day = Utc::now().format("%Y-%m-%d");
-        for entry in self.providers.values().filter(|p| p.config.enabled) {
-            for region in &entry.config.regions {
+        for config in self.db.list_ip_providers().await? {
+            if !config.enabled {
+                continue;
+            }
+            let rules = self
+                .db
+                .list_ip_provider_regions(Some(config.id), None)
+                .await?;
+            for region in rules.into_iter().filter(|r| r.enabled) {
                 let Some(threshold) = region.auto_threshold else {
                     continue;
                 };
@@ -666,7 +604,7 @@ impl IpOrderService {
                 let (order, created) = create_ip_order(
                     self.db.as_ref(),
                     NewIpOrder {
-                        provider: entry.config.name.clone(),
+                        provider: config.name.clone(),
                         region_id: region.region_id,
                         country: region.country.clone(),
                         destination: region.destination.clone(),
@@ -674,7 +612,7 @@ impl IpOrderService {
                         quantity: region.quantity,
                         idempotency_key: Some(format!(
                             "auto:{}:{}:{}",
-                            entry.config.name, region.region_id, day
+                            config.name, region.region_id, day
                         )),
                         auto: true,
                         requested_by: None,
@@ -703,22 +641,36 @@ mod tests {
     use crate::{ChannelWorkCommander, MockDb};
     use lnvps_db::{LNVpsDbBase, VmIpAssignment};
 
-    fn config(approval_required: bool, cap: u64) -> IpProviderConfig {
-        IpProviderConfig {
+    fn config(approval_required: bool, cap: u64) -> IpProvider {
+        IpProvider {
+            id: 0,
             name: "mock".to_string(),
             kind: IpProviderKind::Mock,
             enabled: true,
             url: String::new(),
-            token: String::new(),
+            token: "".into(),
             subsidiary: "IE".to_string(),
             rir: "ripe".to_string(),
-            gateway: Some("203.0.113.254".to_string()),
+            gateway: "203.0.113.254".to_string(),
             access_policy_id: None,
             approval_required,
             monthly_spend_cap: cap,
             currency: "EUR".to_string(),
             enable_ranges_on_delivery: true,
-            regions: vec![],
+        }
+    }
+
+    fn rule(threshold: u64, country: Option<&str>) -> IpProviderRegion {
+        IpProviderRegion {
+            id: 0,
+            provider_id: 1,
+            region_id: 1,
+            country: country.map(|c| c.to_string()),
+            destination: None,
+            prefix_len: 32,
+            quantity: 1,
+            auto_threshold: Some(threshold),
+            enabled: true,
         }
     }
 
@@ -728,16 +680,22 @@ mod tests {
         service: IpOrderService,
     }
 
-    fn fixture_with(cfg: IpProviderConfig) -> Fixture {
+    async fn fixture_with(cfg: IpProvider) -> Fixture {
+        fixture_with_rules(cfg, vec![]).await
+    }
+
+    async fn fixture_with_rules(cfg: IpProvider, rules: Vec<IpProviderRegion>) -> Fixture {
         let db = Arc::new(MockDb::default());
+        db.insert_ip_provider(&cfg).await.unwrap();
+        for r in rules {
+            db.insert_ip_provider_region(&r).await.unwrap();
+        }
         let mock = MockIpProvider::new("mock", 200);
-        let service = IpOrderService::new(
+        let shared = mock.clone();
+        let service = IpOrderService::with_builder(
             db.clone(),
             Arc::new(ChannelWorkCommander::new()),
-            vec![IpProviderEntry {
-                config: cfg,
-                provider: Arc::new(mock.clone()),
-            }],
+            Arc::new(move |_| Arc::new(shared.clone())),
         );
         Fixture { db, mock, service }
     }
@@ -766,7 +724,7 @@ mod tests {
 
     #[tokio::test]
     async fn order_requires_approval_before_any_money_moves() {
-        let f = fixture_with(config(true, 10_000));
+        let f = fixture_with(config(true, 10_000)).await;
         let (order, created) = create_ip_order(f.db.as_ref(), request(None)).await.unwrap();
         assert!(created);
         f.service.process_order(order.id).await.unwrap();
@@ -779,7 +737,7 @@ mod tests {
 
     #[tokio::test]
     async fn approved_order_is_placed_once() {
-        let f = fixture_with(config(true, 10_000));
+        let f = fixture_with(config(true, 10_000)).await;
         let (order, _) = create_ip_order(f.db.as_ref(), request(None)).await.unwrap();
         f.service.process_order(order.id).await.unwrap();
         approve_ip_order(f.db.as_ref(), order.id, 7).await.unwrap();
@@ -794,7 +752,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_order_is_never_placed() {
-        let f = fixture_with(config(true, 10_000));
+        let f = fixture_with(config(true, 10_000)).await;
         let (order, _) = create_ip_order(f.db.as_ref(), request(None)).await.unwrap();
         reject_ip_order(f.db.as_ref(), order.id, 7).await.unwrap();
         assert!(approve_ip_order(f.db.as_ref(), order.id, 7).await.is_err());
@@ -804,7 +762,7 @@ mod tests {
 
     #[tokio::test]
     async fn approval_cannot_be_given_twice() {
-        let f = fixture_with(config(true, 10_000));
+        let f = fixture_with(config(true, 10_000)).await;
         let (order, _) = create_ip_order(f.db.as_ref(), request(None)).await.unwrap();
         approve_ip_order(f.db.as_ref(), order.id, 7).await.unwrap();
         assert!(approve_ip_order(f.db.as_ref(), order.id, 8).await.is_err());
@@ -812,7 +770,7 @@ mod tests {
 
     #[tokio::test]
     async fn delivery_polling_registers_the_range() {
-        let f = fixture_with(config(false, 10_000));
+        let f = fixture_with(config(false, 10_000)).await;
         let (order, _) = create_ip_order(f.db.as_ref(), request(None)).await.unwrap();
         f.service.process_order(order.id).await.unwrap();
         assert_eq!(
@@ -861,7 +819,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_cancelled_order_fails() {
-        let f = fixture_with(config(false, 10_000));
+        let f = fixture_with(config(false, 10_000)).await;
         let (order, _) = create_ip_order(f.db.as_ref(), request(None)).await.unwrap();
         f.service.process_order(order.id).await.unwrap();
         *f.mock.status.lock().await = ProviderOrderStatus::Failed("cancelled".to_string());
@@ -873,7 +831,7 @@ mod tests {
 
     #[tokio::test]
     async fn retried_request_does_not_double_buy() {
-        let f = fixture_with(config(false, 10_000));
+        let f = fixture_with(config(false, 10_000)).await;
         let (a, created_a) = create_ip_order(f.db.as_ref(), request(Some("k1")))
             .await
             .unwrap();
@@ -890,7 +848,7 @@ mod tests {
 
     #[tokio::test]
     async fn identical_in_flight_request_is_reused_without_a_key() {
-        let f = fixture_with(config(false, 10_000));
+        let f = fixture_with(config(false, 10_000)).await;
         let (a, _) = create_ip_order(f.db.as_ref(), request(None)).await.unwrap();
         let (b, created) = create_ip_order(f.db.as_ref(), request(None)).await.unwrap();
         assert!(!created);
@@ -899,7 +857,7 @@ mod tests {
 
     #[tokio::test]
     async fn finished_order_does_not_block_a_new_request() {
-        let f = fixture_with(config(false, 10_000));
+        let f = fixture_with(config(false, 10_000)).await;
         let (a, _) = create_ip_order(f.db.as_ref(), request(None)).await.unwrap();
         f.service.process_order(a.id).await.unwrap();
         deliver(&f, "203.0.113.5/32").await;
@@ -911,7 +869,7 @@ mod tests {
 
     #[tokio::test]
     async fn spend_cap_refuses_the_order() {
-        let f = fixture_with(config(false, 300));
+        let f = fixture_with(config(false, 300)).await;
         let (a, _) = create_ip_order(f.db.as_ref(), request(Some("a")))
             .await
             .unwrap();
@@ -931,7 +889,7 @@ mod tests {
     async fn disabled_provider_never_orders() {
         let mut cfg = config(false, 10_000);
         cfg.enabled = false;
-        let f = fixture_with(cfg);
+        let f = fixture_with(cfg).await;
         let (order, _) = create_ip_order(f.db.as_ref(), request(None)).await.unwrap();
         f.service.process_order(order.id).await.unwrap();
         assert_eq!(
@@ -943,7 +901,7 @@ mod tests {
 
     #[tokio::test]
     async fn provider_failure_marks_order_failed() {
-        let f = fixture_with(config(false, 10_000));
+        let f = fixture_with(config(false, 10_000)).await;
         *f.mock.fail_order.lock().await = Some("boom".to_string());
         let (order, _) = create_ip_order(f.db.as_ref(), request(None)).await.unwrap();
         f.service.process_order(order.id).await.unwrap();
@@ -966,7 +924,7 @@ mod tests {
 
     #[tokio::test]
     async fn release_terminates_an_unused_range() {
-        let f = fixture_with(config(false, 10_000));
+        let f = fixture_with(config(false, 10_000)).await;
         let range_id = delivered_range(&f).await;
         f.service.release_range(range_id, Some(1)).await.unwrap();
         assert_eq!(*f.mock.release_calls.lock().await, vec!["203.0.113.5/32"]);
@@ -977,7 +935,7 @@ mod tests {
 
     #[tokio::test]
     async fn release_is_refused_while_ips_are_allocated() {
-        let f = fixture_with(config(false, 10_000));
+        let f = fixture_with(config(false, 10_000)).await;
         let range_id = delivered_range(&f).await;
         f.db.ip_assignments.lock().await.insert(
             1,
@@ -1001,23 +959,14 @@ mod tests {
 
     #[tokio::test]
     async fn release_is_refused_for_ranges_not_bought() {
-        let f = fixture_with(config(false, 10_000));
+        let f = fixture_with(config(false, 10_000)).await;
         assert!(f.service.release_range(1, None).await.is_err());
         assert!(f.mock.release_calls.lock().await.is_empty());
     }
 
     #[tokio::test]
     async fn top_up_orders_once_per_day_when_below_threshold() {
-        let mut cfg = config(false, 10_000);
-        cfg.regions = vec![IpProviderRegionConfig {
-            region_id: 1,
-            country: Some("IE".to_string()),
-            destination: None,
-            prefix_len: 32,
-            quantity: 1,
-            auto_threshold: Some(1_000_000),
-        }];
-        let f = fixture_with(cfg);
+        let f = fixture_with_rules(config(false, 10_000), vec![rule(1_000_000, Some("IE"))]).await;
         f.service.top_up().await.unwrap();
         f.service.top_up().await.unwrap();
         assert_eq!(f.mock.orders_placed(), 1);
@@ -1027,17 +976,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn top_up_orders_the_rule_quantity() {
+        let mut r = rule(1_000_000, None);
+        r.quantity = 3;
+        let f = fixture_with_rules(config(true, 10_000), vec![r]).await;
+        f.service.top_up().await.unwrap();
+        let (orders, _) = f.db.list_ip_orders(None, None, 10, 0).await.unwrap();
+        assert_eq!(orders[0].quantity, 3);
+    }
+
+    #[tokio::test]
     async fn top_up_waits_for_approval_by_default() {
-        let mut cfg = config(true, 10_000);
-        cfg.regions = vec![IpProviderRegionConfig {
-            region_id: 1,
-            country: None,
-            destination: None,
-            prefix_len: 32,
-            quantity: 1,
-            auto_threshold: Some(1_000_000),
-        }];
-        let f = fixture_with(cfg);
+        let f = fixture_with_rules(config(true, 10_000), vec![rule(1_000_000, None)]).await;
         f.service.top_up().await.unwrap();
         assert_eq!(f.mock.orders_placed(), 0);
         let (orders, _) = f.db.list_ip_orders(None, None, 10, 0).await.unwrap();
@@ -1046,17 +996,42 @@ mod tests {
 
     #[tokio::test]
     async fn top_up_skips_regions_with_enough_free_addresses() {
-        let mut cfg = config(false, 10_000);
-        cfg.regions = vec![IpProviderRegionConfig {
-            region_id: 1,
-            country: None,
-            destination: None,
-            prefix_len: 32,
-            quantity: 1,
-            auto_threshold: Some(1),
-        }];
-        let f = fixture_with(cfg);
+        let f = fixture_with_rules(config(false, 10_000), vec![rule(1, None)]).await;
         f.service.top_up().await.unwrap();
         assert_eq!(f.mock.orders_placed(), 0);
+    }
+
+    #[tokio::test]
+    async fn top_up_does_nothing_for_a_disabled_provider() {
+        let mut cfg = config(false, 10_000);
+        cfg.enabled = false;
+        let f = fixture_with_rules(cfg, vec![rule(1_000_000, None)]).await;
+        f.service.top_up().await.unwrap();
+        let (orders, _) = f.db.list_ip_orders(None, None, 10, 0).await.unwrap();
+        assert!(orders.is_empty());
+        assert_eq!(f.mock.orders_placed(), 0);
+    }
+
+    #[tokio::test]
+    async fn top_up_does_nothing_for_a_disabled_rule() {
+        let mut r = rule(1_000_000, None);
+        r.enabled = false;
+        let f = fixture_with_rules(config(false, 10_000), vec![r]).await;
+        f.service.top_up().await.unwrap();
+        assert_eq!(f.mock.orders_placed(), 0);
+    }
+
+    #[tokio::test]
+    async fn config_changes_apply_on_the_next_tick_without_a_restart() {
+        let f = fixture_with_rules(config(false, 10_000), vec![rule(1_000_000, None)]).await;
+        let mut p = f.db.get_ip_provider(1).await.unwrap();
+        p.enabled = false;
+        f.db.update_ip_provider(&p).await.unwrap();
+        f.service.top_up().await.unwrap();
+        assert_eq!(f.mock.orders_placed(), 0);
+        p.enabled = true;
+        f.db.update_ip_provider(&p).await.unwrap();
+        f.service.top_up().await.unwrap();
+        assert_eq!(f.mock.orders_placed(), 1);
     }
 }

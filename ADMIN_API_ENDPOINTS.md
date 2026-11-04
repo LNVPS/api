@@ -3081,7 +3081,7 @@ record can't abort the batch. Returns a `JobResponse` (`{ "job_id": string }`).
 Buys IP addresses from an upstream provider (first implementation: OVH additional IPs) and registers
 them as `ip_range` rows. This spends real money, so every step is gated:
 
-- the provider must be configured and `enabled: true` under `ip-providers` in the API config
+- the provider must exist (see IP Providers below) and be `enabled`
 - by default (`approval-required: true`) an admin must approve each order before anything is bought
 - the sum of cost for orders placed this calendar month (UTC) plus the new quote must stay within
   `monthly-spend-cap`, in the provider `currency`
@@ -3098,6 +3098,75 @@ Permissions use the `ip_order` resource: `view` (lists), `create` (order), `upda
 
 Every state change is written to an audit trail and admins are notified on order placed, delivered,
 failed, awaiting approval and released.
+
+Providers are database rows, managed through the endpoints below; the worker reads them on every
+tick (every 5 minutes), so changes need no restart.
+
+A VM purchase in a region with no free IP does not order one: it fails with "No IPs available in this
+region" (or, when an order is in flight or awaiting approval, with an error saying so). Only the
+automatic top-up (`auto_threshold` on a region rule) buys capacity ahead of demand.
+
+#### IP Providers
+
+```
+GET    /api/admin/v1/ip_providers
+POST   /api/admin/v1/ip_providers
+GET    /api/admin/v1/ip_providers/{id}
+PATCH  /api/admin/v1/ip_providers/{id}
+DELETE /api/admin/v1/ip_providers/{id}
+```
+
+Permissions: `ip_order::view`, `create`, `update`, `delete`. Delete is refused (409) while orders
+reference the provider.
+
+```json
+{
+  "name": "ovh",
+  "kind": "ovh",
+  "enabled": false,
+  "url": "https://eu.api.ovh.com",
+  "token": "app_key:app_secret:consumer_key",
+  "subsidiary": "IE",
+  "rir": "ripe",
+  "gateway": "203.0.113.254",
+  "access_policy_id": 1,
+  "approval_required": true,
+  "monthly_spend_cap": 5000,
+  "currency": "EUR",
+  "enable_ranges_on_delivery": true
+}
+```
+
+`token` is write-only and stored encrypted; responses carry `has_token` instead. `enabled` defaults
+to false and `approval_required` to true. `monthly_spend_cap` is in the smallest unit of `currency`
+(a fiat currency). `rir` is `ripe` or `arin`. `PATCH` takes any subset; `access_policy_id: null`
+clears it.
+
+#### IP Provider Region Rules
+
+```
+GET    /api/admin/v1/ip_providers/{id}/regions
+POST   /api/admin/v1/ip_providers/{id}/regions
+GET    /api/admin/v1/ip_providers/{id}/regions/{rule_id}
+PATCH  /api/admin/v1/ip_providers/{id}/regions/{rule_id}
+DELETE /api/admin/v1/ip_providers/{id}/regions/{rule_id}
+```
+
+```json
+{
+  "region_id": 1,
+  "country": "IE",
+  "destination": "ns1234.ip-1-2-3.eu",
+  "prefix_len": 32,
+  "quantity": 2,
+  "auto_threshold": 10,
+  "enabled": true
+}
+```
+
+One rule per provider and region. `prefix_len` is 32 or 24 to 30 (blocks need `quantity` 1).
+`auto_threshold` orders `quantity` when the region has fewer free addresses (null disables top-up);
+at most one automatic order per provider and region per day.
 
 #### Create IP Order
 
@@ -3119,7 +3188,7 @@ Required Permission: `ip_order::create`
 }
 ```
 
-- `provider`: the `name` of a configured `ip-providers` entry
+- `provider`: the `name` of an IP provider
 - `prefix_len`: `32` (single addresses, `quantity` of them) or `24` to `30` (one block, `quantity` must be 1). Default 32
 - `country`, `destination`: passed to the provider (OVH `country` and `destination` cart configuration)
 

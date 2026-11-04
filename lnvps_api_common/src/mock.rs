@@ -9,17 +9,18 @@ use lnvps_db::{
     AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
     BulkMessageTarget, Company, CpuArch, CpuMfg, DbError, DbResult, Discount, DiscountRedemption,
     DiskInterface, DiskType, DnsServer, DnsServerKind, EncryptedString, IntervalType, IpOrder,
-    IpOrderAudit, IpOrderRange, IpOrderState, IpRange, IpRangeAllocationMode, IpRangeSubscription,
-    IpSpacePricing, LNVpsDbBase, LineItemType, MarketplaceNode, MarketplaceNodeHealth,
-    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, NostrDomain, NostrDomainHandle,
-    OsDistribution, PaymentMethod, PaymentMethodConfig, Referral, ReferralCostUsage,
-    ReferralPayout, Region, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
-    RouterTunnelKind, RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod,
-    UserSshKey, Vm, VmAddon, VmAddonKind, VmAddonPrice, VmCostPlan, VmCustomPricing,
-    VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost,
-    VmHostDisk, VmHostKind, VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample,
-    VmTrafficTotal, VpnDevice, VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
+    IpOrderAudit, IpOrderRange, IpOrderState, IpProvider, IpProviderRegion, IpRange,
+    IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, LineItemType,
+    MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator,
+    NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod,
+    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region, Router,
+    RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelKind, RouterTunnelTraffic,
+    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany,
+    Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind,
+    VmAddonPrice, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment,
+    VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice,
+    VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
 };
 
 use async_trait::async_trait;
@@ -95,6 +96,8 @@ pub struct MockDb {
     pub tunnel_pools: Arc<Mutex<HashMap<u64, TunnelPool>>>,
     pub vpn_services: Arc<Mutex<HashMap<u64, VpnService>>>,
     pub vm_addon_prices: Arc<Mutex<HashMap<u64, VmAddonPrice>>>,
+    pub ip_providers: Arc<Mutex<HashMap<u64, IpProvider>>>,
+    pub ip_provider_regions: Arc<Mutex<HashMap<u64, IpProviderRegion>>>,
     pub ip_orders: Arc<Mutex<HashMap<u64, IpOrder>>>,
     pub ip_order_audits: Arc<Mutex<Vec<IpOrderAudit>>>,
     pub ip_order_ranges: Arc<Mutex<Vec<IpOrderRange>>>,
@@ -566,6 +569,8 @@ impl Default for MockDb {
             tunnel_pools: Arc::new(Default::default()),
             vpn_services: Arc::new(Default::default()),
             vm_addon_prices: Arc::new(Default::default()),
+            ip_providers: Arc::new(Default::default()),
+            ip_provider_regions: Arc::new(Default::default()),
             ip_orders: Arc::new(Default::default()),
             ip_order_audits: Arc::new(Default::default()),
             ip_order_ranges: Arc::new(Default::default()),
@@ -5673,6 +5678,125 @@ impl LNVpsDbBase for MockDb {
     }
 
     // ----- VM add-ons -----
+
+    async fn list_ip_providers(&self) -> DbResult<Vec<IpProvider>> {
+        let mut v: Vec<IpProvider> = self.ip_providers.lock().await.values().cloned().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(v)
+    }
+
+    async fn get_ip_provider(&self, id: u64) -> DbResult<IpProvider> {
+        self.ip_providers
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("IP provider {id} not found").into())
+    }
+
+    async fn get_ip_provider_by_name(&self, name: &str) -> DbResult<Option<IpProvider>> {
+        Ok(self
+            .ip_providers
+            .lock()
+            .await
+            .values()
+            .find(|p| p.name == name)
+            .cloned())
+    }
+
+    async fn insert_ip_provider(&self, p: &IpProvider) -> DbResult<u64> {
+        let mut m = self.ip_providers.lock().await;
+        if m.values().any(|e| e.name == p.name) {
+            return Err(anyhow!("Duplicate IP provider name").into());
+        }
+        let id = m.keys().max().copied().unwrap_or(0) + 1;
+        let mut n = p.clone();
+        n.id = id;
+        m.insert(id, n);
+        Ok(id)
+    }
+
+    async fn update_ip_provider(&self, p: &IpProvider) -> DbResult<()> {
+        let mut m = self.ip_providers.lock().await;
+        if m.values().any(|e| e.name == p.name && e.id != p.id) {
+            return Err(anyhow!("Duplicate IP provider name").into());
+        }
+        m.insert(p.id, p.clone());
+        Ok(())
+    }
+
+    async fn delete_ip_provider(&self, id: u64) -> DbResult<()> {
+        let p = self.get_ip_provider(id).await?;
+        if self
+            .ip_orders
+            .lock()
+            .await
+            .values()
+            .any(|o| o.provider == p.name)
+        {
+            return Err(anyhow!("Cannot delete IP provider: orders reference it").into());
+        }
+        self.ip_providers.lock().await.remove(&id);
+        self.ip_provider_regions
+            .lock()
+            .await
+            .retain(|_, r| r.provider_id != id);
+        Ok(())
+    }
+
+    async fn list_ip_provider_regions(
+        &self,
+        provider_id: Option<u64>,
+        region_id: Option<u64>,
+    ) -> DbResult<Vec<IpProviderRegion>> {
+        let mut v: Vec<IpProviderRegion> = self
+            .ip_provider_regions
+            .lock()
+            .await
+            .values()
+            .filter(|r| provider_id.is_none_or(|p| r.provider_id == p))
+            .filter(|r| region_id.is_none_or(|g| r.region_id == g))
+            .cloned()
+            .collect();
+        v.sort_by_key(|r| r.id);
+        Ok(v)
+    }
+
+    async fn get_ip_provider_region(&self, id: u64) -> DbResult<IpProviderRegion> {
+        self.ip_provider_regions
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("IP provider region {id} not found").into())
+    }
+
+    async fn insert_ip_provider_region(&self, r: &IpProviderRegion) -> DbResult<u64> {
+        let mut m = self.ip_provider_regions.lock().await;
+        if m.values()
+            .any(|e| e.provider_id == r.provider_id && e.region_id == r.region_id)
+        {
+            return Err(anyhow!("Duplicate IP provider region").into());
+        }
+        let id = m.keys().max().copied().unwrap_or(0) + 1;
+        let mut n = r.clone();
+        n.id = id;
+        m.insert(id, n);
+        Ok(id)
+    }
+
+    async fn update_ip_provider_region(&self, r: &IpProviderRegion) -> DbResult<()> {
+        self.ip_provider_regions
+            .lock()
+            .await
+            .insert(r.id, r.clone());
+        Ok(())
+    }
+
+    async fn delete_ip_provider_region(&self, id: u64) -> DbResult<()> {
+        self.ip_provider_regions.lock().await.remove(&id);
+        Ok(())
+    }
 
     async fn insert_ip_order(&self, order: &IpOrder) -> DbResult<u64> {
         let mut orders = self.ip_orders.lock().await;

@@ -5949,6 +5949,55 @@ impl FromStr for VmAddonKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize, Default)]
 #[repr(u16)]
 #[serde(rename_all = "snake_case")]
+pub enum IpProviderKind {
+    #[default]
+    Ovh = 0,
+    Mock = u16::MAX,
+}
+
+impl Display for IpProviderKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IpProviderKind::Ovh => write!(f, "ovh"),
+            IpProviderKind::Mock => write!(f, "mock"),
+        }
+    }
+}
+
+#[derive(FromRow, Clone, Debug)]
+pub struct IpProvider {
+    pub id: u64,
+    pub name: String,
+    pub kind: IpProviderKind,
+    pub enabled: bool,
+    pub url: String,
+    pub token: EncryptedString,
+    pub subsidiary: String,
+    pub rir: String,
+    pub gateway: String,
+    pub access_policy_id: Option<u64>,
+    pub approval_required: bool,
+    pub monthly_spend_cap: u64,
+    pub currency: String,
+    pub enable_ranges_on_delivery: bool,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq)]
+pub struct IpProviderRegion {
+    pub id: u64,
+    pub provider_id: u64,
+    pub region_id: u64,
+    pub country: Option<String>,
+    pub destination: Option<String>,
+    pub prefix_len: u16,
+    pub quantity: u32,
+    pub auto_threshold: Option<u64>,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize, Default)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
 pub enum IpOrderState {
     #[default]
     AwaitingApproval = 0,

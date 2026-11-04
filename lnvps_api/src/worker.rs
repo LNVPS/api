@@ -237,7 +237,6 @@ pub struct WorkerSettings {
     /// deployment with no nostr key: such a worker patches its own hosts and
     /// leaves nodes' hardware as last reported.
     pub node_control: Option<lnvps_api_common::node_control::NodeControl>,
-    pub ip_providers: Vec<lnvps_api_common::ip_provider::IpProviderConfig>,
 }
 
 impl From<&Settings> for WorkerSettings {
@@ -275,7 +274,6 @@ impl From<&Settings> for WorkerSettings {
                 .map(|r| r.fee_estimator.clone())
                 .unwrap_or_default(),
             chain_explorer: val.chain_explorer.clone(),
-            ip_providers: val.ip_providers.clone(),
             node_control: val.nostr.as_ref().and_then(|n| {
                 match lnvps_api_common::node_control::NodeControl::new(&n.nsec) {
                     Ok(c) => Some(c),
@@ -375,7 +373,6 @@ impl Worker {
         let ip_orders = Arc::new(lnvps_api_common::ip_provider::IpOrderService::new(
             db.clone(),
             work_commander.clone(),
-            lnvps_api_common::ip_provider::build_ip_providers(&settings.ip_providers),
         ));
 
         Ok(Self {
