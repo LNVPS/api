@@ -347,6 +347,9 @@ async fn main() -> Result<(), Error> {
         tasks.push(
             worker.spawn_job_interval(WorkJob::PurgeExpiredRecords, Duration::from_secs(86400)),
         );
+        if settings.ip_providers.iter().any(|p| p.enabled) {
+            tasks.push(worker.spawn_job_interval(WorkJob::CheckIpOrders, Duration::from_secs(300)));
+        }
         tasks.push(worker.spawn_handler_loop());
 
         // check all nostr domains every 10 minutes for CNAME entries (enable/disable as needed)

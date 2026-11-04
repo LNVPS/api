@@ -1795,6 +1795,59 @@ pub trait LNVpsDbBase: Send + Sync {
     /// older one.
     async fn bump_tunnel_pool_generation(&self, id: u64) -> DbResult<u64>;
 
+    // ----- On-demand IP orders -----
+
+    async fn insert_ip_order(&self, order: &IpOrder) -> DbResult<u64>;
+    async fn get_ip_order(&self, id: u64) -> DbResult<IpOrder>;
+    async fn get_ip_order_by_key(&self, key: &str) -> DbResult<Option<IpOrder>>;
+    async fn update_ip_order(&self, order: &IpOrder) -> DbResult<()>;
+    /// Move an order between states only if it is still in `from`. Returns
+    /// whether this caller made the move, which is what stops two workers
+    /// both buying the same order.
+    async fn transition_ip_order(
+        &self,
+        id: u64,
+        from: IpOrderState,
+        to: IpOrderState,
+    ) -> DbResult<bool>;
+    async fn list_ip_orders(
+        &self,
+        state: Option<IpOrderState>,
+        region_id: Option<u64>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpOrder>, u64)>;
+    /// Total cost of orders that have committed money (ordering, ordered or
+    /// delivered) at or after `since`, in `currency`.
+    async fn sum_ip_order_cost_since(&self, since: DateTime<Utc>, currency: &str) -> DbResult<u64>;
+    async fn insert_ip_order_audit(
+        &self,
+        ip_order_id: u64,
+        event: &str,
+        detail: Option<&str>,
+        actor_user_id: Option<u64>,
+    ) -> DbResult<u64>;
+    async fn list_ip_order_audit(&self, ip_order_id: u64) -> DbResult<Vec<IpOrderAudit>>;
+    async fn insert_ip_order_range(
+        &self,
+        ip_order_id: u64,
+        ip_range_id: u64,
+        cidr: &str,
+    ) -> DbResult<u64>;
+    async fn list_ip_order_ranges_for_order(&self, ip_order_id: u64)
+    -> DbResult<Vec<IpOrderRange>>;
+    async fn list_ip_order_ranges(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpOrderRange>, u64)>;
+    async fn get_ip_order_range_by_range(&self, ip_range_id: u64)
+    -> DbResult<Option<IpOrderRange>>;
+    async fn mark_ip_order_range_released(&self, id: u64) -> DbResult<()>;
+    async fn insert_ip_range(&self, range: &IpRange) -> DbResult<u64>;
+    async fn get_ip_range_by_cidr(&self, cidr: &str) -> DbResult<Option<IpRange>>;
+    async fn set_ip_range_enabled(&self, id: u64, enabled: bool) -> DbResult<()>;
+
     // ----- VM add-ons -----
 
     async fn list_vm_addon_prices(

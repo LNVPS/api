@@ -5,18 +5,18 @@ use crate::{
     AppCluster, AppDeployment, AppDeploymentBackup, AppDeploymentFilter, AppDeploymentServiceUsage,
     AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
     BulkMessageTarget, Company, DbError, DbResult, Discount, DiscountRedemption,
-    DiscountRedemptionWithCode, DnsServer, EncryptedString, IntervalType, IpRange,
-    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, LineItemType, MarketplaceNode,
-    MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage,
-    PaymentMethod, PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout,
-    Region, RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelKind,
-    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, SwapOrderClient, Tunnel, TunnelPool, TunnelRoute, User,
-    UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind, VmAddonPrice, VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
-    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily,
-    VmTrafficSample, VmTrafficTotal, VpnDevice, VpnPeerTemplate, VpnService, VpnSubscription,
-    WebauthnCredential,
+    DiscountRedemptionWithCode, DnsServer, EncryptedString, IntervalType, IpOrder, IpOrderAudit,
+    IpOrderRange, IpOrderState, IpRange, IpRangeSubscription, IpSpacePricing, LNVpsDbBase,
+    LineItemType, MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus,
+    MarketplaceOperator, NewAgentMessage, PaymentMethod, PaymentMethodConfig, PaymentType,
+    Referral, ReferralCostUsage, ReferralPayout, Region, RegionStats, Router, RouterBgpRoute,
+    RouterBgpSession, RouterTunnel, RouterTunnelKind, RouterTunnelTraffic, Subscription,
+    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, SwapOrderClient,
+    Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind,
+    VmAddonPrice, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage,
+    VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice, VpnPeerTemplate,
+    VpnService, VpnSubscription, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -1374,6 +1374,262 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_all(&self.db)
                 .await?,
         )
+    }
+
+    async fn insert_ip_order(&self, order: &IpOrder) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO ip_order (provider, region_id, idempotency_key, country, destination, \
+             prefix_len, quantity, state, provider_order_id, cost, currency, auto, requested_by, \
+             approved_by, approved_at, error, ordered_at, delivered_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&order.provider)
+        .bind(order.region_id)
+        .bind(&order.idempotency_key)
+        .bind(&order.country)
+        .bind(&order.destination)
+        .bind(order.prefix_len)
+        .bind(order.quantity)
+        .bind(order.state)
+        .bind(&order.provider_order_id)
+        .bind(order.cost)
+        .bind(&order.currency)
+        .bind(order.auto)
+        .bind(order.requested_by)
+        .bind(order.approved_by)
+        .bind(order.approved_at)
+        .bind(&order.error)
+        .bind(order.ordered_at)
+        .bind(order.delivered_at)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn get_ip_order(&self, id: u64) -> DbResult<IpOrder> {
+        Ok(sqlx::query_as("select * from ip_order where id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn get_ip_order_by_key(&self, key: &str) -> DbResult<Option<IpOrder>> {
+        Ok(
+            sqlx::query_as("select * from ip_order where idempotency_key = ?")
+                .bind(key)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn update_ip_order(&self, order: &IpOrder) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE ip_order SET state = ?, provider_order_id = ?, cost = ?, currency = ?, \
+             approved_by = ?, approved_at = ?, error = ?, ordered_at = ?, delivered_at = ? \
+             WHERE id = ?",
+        )
+        .bind(order.state)
+        .bind(&order.provider_order_id)
+        .bind(order.cost)
+        .bind(&order.currency)
+        .bind(order.approved_by)
+        .bind(order.approved_at)
+        .bind(&order.error)
+        .bind(order.ordered_at)
+        .bind(order.delivered_at)
+        .bind(order.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn transition_ip_order(
+        &self,
+        id: u64,
+        from: IpOrderState,
+        to: IpOrderState,
+    ) -> DbResult<bool> {
+        let res = sqlx::query("UPDATE ip_order SET state = ? WHERE id = ? AND state = ?")
+            .bind(to)
+            .bind(id)
+            .bind(from)
+            .execute(&self.db)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn list_ip_orders(
+        &self,
+        state: Option<IpOrderState>,
+        region_id: Option<u64>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpOrder>, u64)> {
+        let rows = sqlx::query_as(
+            "select * from ip_order where (? is null or state = ?) and (? is null or region_id = ?) \
+             order by id desc limit ? offset ?",
+        )
+        .bind(state)
+        .bind(state)
+        .bind(region_id)
+        .bind(region_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 = sqlx::query_scalar(
+            "select count(*) from ip_order where (? is null or state = ?) and (? is null or region_id = ?)",
+        )
+        .bind(state)
+        .bind(state)
+        .bind(region_id)
+        .bind(region_id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn sum_ip_order_cost_since(&self, since: DateTime<Utc>, currency: &str) -> DbResult<u64> {
+        let sum: i64 = sqlx::query_scalar(
+            "select cast(coalesce(sum(cost), 0) as signed) from ip_order \
+             where state in (2, 3, 4) and currency = ? and coalesce(ordered_at, created) >= ?",
+        )
+        .bind(currency)
+        .bind(since)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(sum as u64)
+    }
+
+    async fn insert_ip_order_audit(
+        &self,
+        ip_order_id: u64,
+        event: &str,
+        detail: Option<&str>,
+        actor_user_id: Option<u64>,
+    ) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO ip_order_audit (ip_order_id, event, detail, actor_user_id) VALUES (?, ?, ?, ?)",
+        )
+        .bind(ip_order_id)
+        .bind(event)
+        .bind(detail)
+        .bind(actor_user_id)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn list_ip_order_audit(&self, ip_order_id: u64) -> DbResult<Vec<IpOrderAudit>> {
+        Ok(
+            sqlx::query_as("select * from ip_order_audit where ip_order_id = ? order by id")
+                .bind(ip_order_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn insert_ip_order_range(
+        &self,
+        ip_order_id: u64,
+        ip_range_id: u64,
+        cidr: &str,
+    ) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO ip_order_range (ip_order_id, ip_range_id, cidr) VALUES (?, ?, ?)",
+        )
+        .bind(ip_order_id)
+        .bind(ip_range_id)
+        .bind(cidr)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn list_ip_order_ranges_for_order(
+        &self,
+        ip_order_id: u64,
+    ) -> DbResult<Vec<IpOrderRange>> {
+        Ok(
+            sqlx::query_as("select * from ip_order_range where ip_order_id = ? order by id")
+                .bind(ip_order_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn list_ip_order_ranges(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpOrderRange>, u64)> {
+        let rows = sqlx::query_as("select * from ip_order_range order by id desc limit ? offset ?")
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await?;
+        let total: i64 = sqlx::query_scalar("select count(*) from ip_order_range")
+            .fetch_one(&self.db)
+            .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn get_ip_order_range_by_range(
+        &self,
+        ip_range_id: u64,
+    ) -> DbResult<Option<IpOrderRange>> {
+        Ok(
+            sqlx::query_as("select * from ip_order_range where ip_range_id = ?")
+                .bind(ip_range_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn mark_ip_order_range_released(&self, id: u64) -> DbResult<()> {
+        sqlx::query("update ip_order_range set released_at = current_timestamp where id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_ip_range(&self, range: &IpRange) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO ip_range (cidr, gateway, enabled, region_id, reverse_zone_id, access_policy_id, \
+             allocation_mode, use_full_range, forward_dns_server_id, reverse_dns_server_id, forward_zone_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&range.cidr)
+        .bind(&range.gateway)
+        .bind(range.enabled)
+        .bind(range.region_id)
+        .bind(&range.reverse_zone_id)
+        .bind(range.access_policy_id)
+        .bind(range.allocation_mode as u16)
+        .bind(range.use_full_range)
+        .bind(range.forward_dns_server_id)
+        .bind(range.reverse_dns_server_id)
+        .bind(&range.forward_zone_id)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn get_ip_range_by_cidr(&self, cidr: &str) -> DbResult<Option<IpRange>> {
+        Ok(sqlx::query_as("select * from ip_range where cidr = ?")
+            .bind(cidr)
+            .fetch_optional(&self.db)
+            .await?)
+    }
+
+    async fn set_ip_range_enabled(&self, id: u64, enabled: bool) -> DbResult<()> {
+        sqlx::query("update ip_range set enabled = ? where id = ?")
+            .bind(enabled)
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
     }
 
     async fn get_cost_plan(&self, id: u64) -> DbResult<VmCostPlan> {

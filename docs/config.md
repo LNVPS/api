@@ -232,6 +232,41 @@ back at that same quote. The floor applied to those rows is the higher of
 `min-fiat-payout-sats` and `min-onchain-payout-sats`, because an on-chain payout
 must also clear the mempool fee it pays.
 
+### IP providers (optional, spends real money)
+
+Buys IP addresses on demand and registers them as `ip_range` rows. Off unless a provider is listed
+with `enabled: true`. Orders are placed on the provider account's default payment method.
+
+```yaml
+ip-providers:
+  - name: ovh
+    kind: ovh                 # ovh | mock
+    enabled: true             # money moves only when true
+    url: https://eu.api.ovh.com
+    token: "app_key:app_secret:consumer_key"   # needs POST/GET /order/cart*, /me/order*, GET /ip*, POST /ip/*/terminate
+    subsidiary: IE            # OVH ovhSubsidiary for the cart
+    rir: ripe                 # ripe | arin, selects the plan code (ip-failover-ripe, ip-v4-s29-ripe, ...)
+    gateway: 203.0.113.254    # gateway written on each registered ip_range
+    access-policy-id: 1       # optional, set on each registered ip_range
+    approval-required: true   # default true: an admin must approve every order
+    monthly-spend-cap: 5000   # smallest currency unit per calendar month (UTC), 0 refuses everything
+    currency: EUR             # must match the provider quote currency
+    enable-ranges-on-delivery: true
+    regions:                  # optional automatic top-up
+      - region-id: 1
+        country: IE
+        destination: ns1234.ip-1-2-3.eu
+        prefix-len: 32
+        quantity: 2
+        auto-threshold: 10    # order when free addresses in the region drop below this
+```
+
+The worker checks in-flight orders and the top-up threshold every five minutes. With
+`approval-required: true` a top-up only creates an order waiting for an admin; at most one automatic
+order is created per provider and region per day. Costs are tax inclusive as OVH quotes them. The
+checkout is never retried after an error, because the purchase may have happened; check the OVH
+account and the order's audit trail before ordering again.
+
 ### Chain explorer (optional)
 
 ```yaml

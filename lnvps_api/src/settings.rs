@@ -114,6 +114,9 @@ pub struct Settings {
 
     #[serde(default)]
     pub app_backups: Option<lnvps_api_common::object_store::ObjectStoreConfig>,
+
+    #[serde(default)]
+    pub ip_providers: Vec<lnvps_api_common::ip_provider::IpProviderConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -762,6 +765,7 @@ pub fn mock_settings() -> Settings {
         webauthn: None,
         session: None,
         app_backups: None,
+        ip_providers: vec![],
     }
 }
 

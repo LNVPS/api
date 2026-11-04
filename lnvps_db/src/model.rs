@@ -3056,6 +3056,7 @@ pub enum AdminResource {
     /// suspends a customer's service and is sent to them as a legal notice.
     Abuse = 35,
     VmAddonPrice = 36,
+    IpOrder = 37,
 }
 
 /// Actions that can be performed on administrative resources
@@ -3112,6 +3113,7 @@ impl Display for AdminResource {
             AdminResource::AccountCredit => write!(f, "account_credit"),
             AdminResource::Abuse => write!(f, "abuse"),
             AdminResource::VmAddonPrice => write!(f, "vm_addon_price"),
+            AdminResource::IpOrder => write!(f, "ip_order"),
         }
     }
 }
@@ -3160,6 +3162,7 @@ impl FromStr for AdminResource {
             "account_credit" | "account_credits" => Ok(AdminResource::AccountCredit),
             "abuse" => Ok(AdminResource::Abuse),
             "vm_addon_price" | "vm_addon_prices" => Ok(AdminResource::VmAddonPrice),
+            "ip_order" | "ip_orders" => Ok(AdminResource::IpOrder),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -3207,6 +3210,7 @@ impl TryFrom<u16> for AdminResource {
             34 => Ok(AdminResource::AccountCredit),
             35 => Ok(AdminResource::Abuse),
             36 => Ok(AdminResource::VmAddonPrice),
+            37 => Ok(AdminResource::IpOrder),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -3253,6 +3257,7 @@ impl AdminResource {
             AdminResource::AccountCredit,
             AdminResource::Abuse,
             AdminResource::VmAddonPrice,
+            AdminResource::IpOrder,
         ]
     }
 }
@@ -4338,6 +4343,31 @@ mod tests {
             AdminResource::VmAddonPrice
         );
         assert!(AdminResource::all().contains(&AdminResource::VmAddonPrice));
+    }
+
+    #[test]
+    fn test_admin_resource_ip_order_roundtrip() {
+        assert_eq!(
+            "ip_order".parse::<AdminResource>().unwrap(),
+            AdminResource::IpOrder
+        );
+        assert_eq!(AdminResource::IpOrder.to_string(), "ip_order");
+        assert_eq!(
+            AdminResource::try_from(37u16).unwrap(),
+            AdminResource::IpOrder
+        );
+        assert!(AdminResource::all().contains(&AdminResource::IpOrder));
+    }
+
+    #[test]
+    fn test_ip_order_state_in_flight() {
+        assert!(IpOrderState::AwaitingApproval.is_in_flight());
+        assert!(IpOrderState::Approved.is_in_flight());
+        assert!(IpOrderState::Ordering.is_in_flight());
+        assert!(IpOrderState::Ordered.is_in_flight());
+        assert!(!IpOrderState::Delivered.is_in_flight());
+        assert!(!IpOrderState::Failed.is_in_flight());
+        assert!(!IpOrderState::Rejected.is_in_flight());
     }
 
     #[test]
@@ -5914,6 +5944,113 @@ impl FromStr for VmAddonKind {
             _ => Err(anyhow!("unknown VM add-on kind: {s}")),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize, Default)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum IpOrderState {
+    #[default]
+    AwaitingApproval = 0,
+    Approved = 1,
+    Ordering = 2,
+    Ordered = 3,
+    Delivered = 4,
+    Failed = 5,
+    Rejected = 6,
+}
+
+impl IpOrderState {
+    pub fn is_in_flight(&self) -> bool {
+        matches!(
+            self,
+            IpOrderState::AwaitingApproval
+                | IpOrderState::Approved
+                | IpOrderState::Ordering
+                | IpOrderState::Ordered
+        )
+    }
+
+    pub fn is_spent(&self) -> bool {
+        matches!(
+            self,
+            IpOrderState::Ordering | IpOrderState::Ordered | IpOrderState::Delivered
+        )
+    }
+}
+
+impl Display for IpOrderState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IpOrderState::AwaitingApproval => write!(f, "awaiting_approval"),
+            IpOrderState::Approved => write!(f, "approved"),
+            IpOrderState::Ordering => write!(f, "ordering"),
+            IpOrderState::Ordered => write!(f, "ordered"),
+            IpOrderState::Delivered => write!(f, "delivered"),
+            IpOrderState::Failed => write!(f, "failed"),
+            IpOrderState::Rejected => write!(f, "rejected"),
+        }
+    }
+}
+
+impl FromStr for IpOrderState {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "awaiting_approval" => Ok(IpOrderState::AwaitingApproval),
+            "approved" => Ok(IpOrderState::Approved),
+            "ordering" => Ok(IpOrderState::Ordering),
+            "ordered" => Ok(IpOrderState::Ordered),
+            "delivered" => Ok(IpOrderState::Delivered),
+            "failed" => Ok(IpOrderState::Failed),
+            "rejected" => Ok(IpOrderState::Rejected),
+            _ => Err(anyhow!("unknown ip order state: {}", s)),
+        }
+    }
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq, Default)]
+pub struct IpOrder {
+    pub id: u64,
+    pub provider: String,
+    pub region_id: u64,
+    pub idempotency_key: Option<String>,
+    pub country: Option<String>,
+    pub destination: Option<String>,
+    pub prefix_len: u16,
+    pub quantity: u32,
+    pub state: IpOrderState,
+    pub provider_order_id: Option<String>,
+    pub cost: u64,
+    pub currency: String,
+    pub auto: bool,
+    pub requested_by: Option<u64>,
+    pub approved_by: Option<u64>,
+    pub approved_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+    pub created: DateTime<Utc>,
+    pub ordered_at: Option<DateTime<Utc>>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq)]
+pub struct IpOrderRange {
+    pub id: u64,
+    pub ip_order_id: u64,
+    pub ip_range_id: u64,
+    pub cidr: String,
+    pub released_at: Option<DateTime<Utc>>,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq)]
+pub struct IpOrderAudit {
+    pub id: u64,
+    pub ip_order_id: u64,
+    pub event: String,
+    pub detail: Option<String>,
+    pub actor_user_id: Option<u64>,
+    pub created: DateTime<Utc>,
 }
 
 #[derive(FromRow, Clone, Debug, PartialEq)]

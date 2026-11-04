@@ -23,6 +23,7 @@ mod discounts;
 mod dns_servers;
 mod docs;
 mod hosts;
+mod ip_orders;
 mod ip_ranges;
 mod ip_space;
 mod marketplace;
@@ -107,6 +108,7 @@ pub fn admin_router(
         .merge(marketplace::router())
         .merge(tunnel_pools::router())
         .merge(vm_addon_prices::router())
+        .merge(ip_orders::router())
         .merge(vpn_services::router())
         .merge(vpn_subscriptions::router())
         .merge(apps::router())

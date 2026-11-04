@@ -7,6 +7,7 @@ mod exchange;
 mod expiry;
 mod geoip;
 pub mod host;
+pub mod ip_provider;
 mod json_api;
 pub mod k8s_names;
 mod kv;

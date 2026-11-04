@@ -8,18 +8,18 @@ use lnvps_db::{
     AppDeploymentDesiredState, AppDeploymentFilter, AppDeploymentServiceUsage, AppDeploymentStatus,
     AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
     BulkMessageTarget, Company, CpuArch, CpuMfg, DbError, DbResult, Discount, DiscountRedemption,
-    DiskInterface, DiskType, DnsServer, DnsServerKind, EncryptedString, IntervalType, IpRange,
-    IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, LineItemType,
-    MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator,
-    NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod,
-    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region, Router,
-    RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelKind, RouterTunnelTraffic,
-    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany,
-    Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind,
-    VmAddonPrice, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment,
-    VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice,
-    VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
+    DiskInterface, DiskType, DnsServer, DnsServerKind, EncryptedString, IntervalType, IpOrder,
+    IpOrderAudit, IpOrderRange, IpOrderState, IpRange, IpRangeAllocationMode, IpRangeSubscription,
+    IpSpacePricing, LNVpsDbBase, LineItemType, MarketplaceNode, MarketplaceNodeHealth,
+    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, NostrDomain, NostrDomainHandle,
+    OsDistribution, PaymentMethod, PaymentMethodConfig, Referral, ReferralCostUsage,
+    ReferralPayout, Region, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
+    RouterTunnelKind, RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentWithCompany, Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod,
+    UserSshKey, Vm, VmAddon, VmAddonKind, VmAddonPrice, VmCostPlan, VmCustomPricing,
+    VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost,
+    VmHostDisk, VmHostKind, VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample,
+    VmTrafficTotal, VpnDevice, VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
 };
 
 use async_trait::async_trait;
@@ -95,6 +95,9 @@ pub struct MockDb {
     pub tunnel_pools: Arc<Mutex<HashMap<u64, TunnelPool>>>,
     pub vpn_services: Arc<Mutex<HashMap<u64, VpnService>>>,
     pub vm_addon_prices: Arc<Mutex<HashMap<u64, VmAddonPrice>>>,
+    pub ip_orders: Arc<Mutex<HashMap<u64, IpOrder>>>,
+    pub ip_order_audits: Arc<Mutex<Vec<IpOrderAudit>>>,
+    pub ip_order_ranges: Arc<Mutex<Vec<IpOrderRange>>>,
     pub vm_addons: Arc<Mutex<HashMap<u64, VmAddon>>>,
     /// `vpn_service_pool`, keyed by pool id because an interface terminates at
     /// most one service.
@@ -563,6 +566,9 @@ impl Default for MockDb {
             tunnel_pools: Arc::new(Default::default()),
             vpn_services: Arc::new(Default::default()),
             vm_addon_prices: Arc::new(Default::default()),
+            ip_orders: Arc::new(Default::default()),
+            ip_order_audits: Arc::new(Default::default()),
+            ip_order_ranges: Arc::new(Default::default()),
             vm_addons: Arc::new(Default::default()),
             vpn_service_pools: Arc::new(Default::default()),
             vpn_subscriptions: Arc::new(Default::default()),
@@ -5667,6 +5673,248 @@ impl LNVpsDbBase for MockDb {
     }
 
     // ----- VM add-ons -----
+
+    async fn insert_ip_order(&self, order: &IpOrder) -> DbResult<u64> {
+        let mut orders = self.ip_orders.lock().await;
+        if let Some(k) = &order.idempotency_key {
+            if orders
+                .values()
+                .any(|o| o.idempotency_key.as_ref() == Some(k))
+            {
+                return Err(anyhow!("Duplicate ip order key {k}").into());
+            }
+        }
+        let id = orders.keys().max().copied().unwrap_or(0) + 1;
+        let mut o = order.clone();
+        o.id = id;
+        orders.insert(id, o);
+        Ok(id)
+    }
+
+    async fn get_ip_order(&self, id: u64) -> DbResult<IpOrder> {
+        self.ip_orders
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("IP order {id} not found").into())
+    }
+
+    async fn get_ip_order_by_key(&self, key: &str) -> DbResult<Option<IpOrder>> {
+        Ok(self
+            .ip_orders
+            .lock()
+            .await
+            .values()
+            .find(|o| o.idempotency_key.as_deref() == Some(key))
+            .cloned())
+    }
+
+    async fn update_ip_order(&self, order: &IpOrder) -> DbResult<()> {
+        let mut orders = self.ip_orders.lock().await;
+        let o = orders
+            .get_mut(&order.id)
+            .ok_or_else(|| anyhow!("IP order {} not found", order.id))?;
+        o.state = order.state;
+        o.provider_order_id = order.provider_order_id.clone();
+        o.cost = order.cost;
+        o.currency = order.currency.clone();
+        o.approved_by = order.approved_by;
+        o.approved_at = order.approved_at;
+        o.error = order.error.clone();
+        o.ordered_at = order.ordered_at;
+        o.delivered_at = order.delivered_at;
+        Ok(())
+    }
+
+    async fn transition_ip_order(
+        &self,
+        id: u64,
+        from: IpOrderState,
+        to: IpOrderState,
+    ) -> DbResult<bool> {
+        let mut orders = self.ip_orders.lock().await;
+        match orders.get_mut(&id) {
+            Some(o) if o.state == from => {
+                o.state = to;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn list_ip_orders(
+        &self,
+        state: Option<IpOrderState>,
+        region_id: Option<u64>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpOrder>, u64)> {
+        let orders = self.ip_orders.lock().await;
+        let mut v: Vec<IpOrder> = orders
+            .values()
+            .filter(|o| state.is_none_or(|s| o.state == s))
+            .filter(|o| region_id.is_none_or(|r| o.region_id == r))
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = v.len() as u64;
+        Ok((
+            v.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn sum_ip_order_cost_since(&self, since: DateTime<Utc>, currency: &str) -> DbResult<u64> {
+        Ok(self
+            .ip_orders
+            .lock()
+            .await
+            .values()
+            .filter(|o| o.state.is_spent() && o.currency == currency)
+            .filter(|o| o.ordered_at.unwrap_or(o.created) >= since)
+            .map(|o| o.cost)
+            .sum())
+    }
+
+    async fn insert_ip_order_audit(
+        &self,
+        ip_order_id: u64,
+        event: &str,
+        detail: Option<&str>,
+        actor_user_id: Option<u64>,
+    ) -> DbResult<u64> {
+        let mut a = self.ip_order_audits.lock().await;
+        let id = a.len() as u64 + 1;
+        a.push(IpOrderAudit {
+            id,
+            ip_order_id,
+            event: event.to_string(),
+            detail: detail.map(|d| d.to_string()),
+            actor_user_id,
+            created: Utc::now(),
+        });
+        Ok(id)
+    }
+
+    async fn list_ip_order_audit(&self, ip_order_id: u64) -> DbResult<Vec<IpOrderAudit>> {
+        Ok(self
+            .ip_order_audits
+            .lock()
+            .await
+            .iter()
+            .filter(|a| a.ip_order_id == ip_order_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn insert_ip_order_range(
+        &self,
+        ip_order_id: u64,
+        ip_range_id: u64,
+        cidr: &str,
+    ) -> DbResult<u64> {
+        let mut r = self.ip_order_ranges.lock().await;
+        let id = r.len() as u64 + 1;
+        r.push(IpOrderRange {
+            id,
+            ip_order_id,
+            ip_range_id,
+            cidr: cidr.to_string(),
+            released_at: None,
+        });
+        Ok(id)
+    }
+
+    async fn list_ip_order_ranges_for_order(
+        &self,
+        ip_order_id: u64,
+    ) -> DbResult<Vec<IpOrderRange>> {
+        Ok(self
+            .ip_order_ranges
+            .lock()
+            .await
+            .iter()
+            .filter(|r| r.ip_order_id == ip_order_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_ip_order_ranges(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpOrderRange>, u64)> {
+        let r = self.ip_order_ranges.lock().await;
+        let total = r.len() as u64;
+        Ok((
+            r.iter()
+                .rev()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .cloned()
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn get_ip_order_range_by_range(
+        &self,
+        ip_range_id: u64,
+    ) -> DbResult<Option<IpOrderRange>> {
+        Ok(self
+            .ip_order_ranges
+            .lock()
+            .await
+            .iter()
+            .find(|r| r.ip_range_id == ip_range_id)
+            .cloned())
+    }
+
+    async fn mark_ip_order_range_released(&self, id: u64) -> DbResult<()> {
+        if let Some(r) = self
+            .ip_order_ranges
+            .lock()
+            .await
+            .iter_mut()
+            .find(|r| r.id == id)
+        {
+            r.released_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn insert_ip_range(&self, range: &IpRange) -> DbResult<u64> {
+        let mut ranges = self.ip_range.lock().await;
+        if ranges.values().any(|r| r.cidr == range.cidr) {
+            return Err(anyhow!("Duplicate cidr {}", range.cidr).into());
+        }
+        let id = ranges.keys().max().copied().unwrap_or(0) + 1;
+        let mut r = range.clone();
+        r.id = id;
+        ranges.insert(id, r);
+        Ok(id)
+    }
+
+    async fn get_ip_range_by_cidr(&self, cidr: &str) -> DbResult<Option<IpRange>> {
+        Ok(self
+            .ip_range
+            .lock()
+            .await
+            .values()
+            .find(|r| r.cidr == cidr)
+            .cloned())
+    }
+
+    async fn set_ip_range_enabled(&self, id: u64, enabled: bool) -> DbResult<()> {
+        if let Some(r) = self.ip_range.lock().await.get_mut(&id) {
+            r.enabled = enabled;
+        }
+        Ok(())
+    }
 
     async fn list_vm_addon_prices(
         &self,

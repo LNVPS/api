@@ -363,6 +363,17 @@ pub enum WorkJob {
         ip_range_id: u64,
         admin_user_id: Option<u64>,
     },
+    /// Advance one on-demand IP order: review, place, or poll it, depending on its state.
+    ProcessIpOrder {
+        order_id: u64,
+    },
+    /// Poll in-flight IP orders and run the automatic top-up check.
+    CheckIpOrders,
+    /// Terminate a bought IP range with its provider. Refused while it has allocated IPs.
+    ReleaseIpRange {
+        ip_range_id: u64,
+        admin_user_id: Option<u64>,
+    },
     /// Reconcile one managed-app deployment now, rather than at the operator's
     /// next poll (issue #254).
     ///
@@ -484,6 +495,9 @@ impl fmt::Display for WorkJob {
             WorkJob::ReconcileTunnelPeers { .. } => write!(f, "ReconcileTunnelPeers"),
             WorkJob::SyncNodeTunnel { .. } => write!(f, "SyncNodeTunnel"),
             WorkJob::PatchIpRangeDns { .. } => write!(f, "PatchIpRangeDns"),
+            WorkJob::ProcessIpOrder { .. } => write!(f, "ProcessIpOrder"),
+            WorkJob::CheckIpOrders => write!(f, "CheckIpOrders"),
+            WorkJob::ReleaseIpRange { .. } => write!(f, "ReleaseIpRange"),
         }
     }
 }

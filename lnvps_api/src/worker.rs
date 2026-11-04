@@ -202,6 +202,7 @@ pub struct Worker {
     referral_payouts: crate::referral::ReferralPayoutHandler,
     refunds: crate::refund::VmRefundHandler,
     chain_explorer: Option<Arc<dyn crate::chain::ChainExplorer>>,
+    ip_orders: Arc<lnvps_api_common::ip_provider::IpOrderService>,
 }
 
 #[derive(Clone)]
@@ -236,6 +237,7 @@ pub struct WorkerSettings {
     /// deployment with no nostr key: such a worker patches its own hosts and
     /// leaves nodes' hardware as last reported.
     pub node_control: Option<lnvps_api_common::node_control::NodeControl>,
+    pub ip_providers: Vec<lnvps_api_common::ip_provider::IpProviderConfig>,
 }
 
 impl From<&Settings> for WorkerSettings {
@@ -273,6 +275,7 @@ impl From<&Settings> for WorkerSettings {
                 .map(|r| r.fee_estimator.clone())
                 .unwrap_or_default(),
             chain_explorer: val.chain_explorer.clone(),
+            ip_providers: val.ip_providers.clone(),
             node_control: val.nostr.as_ref().and_then(|n| {
                 match lnvps_api_common::node_control::NodeControl::new(&n.nsec) {
                     Ok(c) => Some(c),
@@ -369,8 +372,15 @@ impl Worker {
         let notification_channels = build_channels(&settings, nostr.as_ref(), &http_client);
         let chain_explorer = crate::chain::build_chain_explorer(&settings.chain_explorer);
 
+        let ip_orders = Arc::new(lnvps_api_common::ip_provider::IpOrderService::new(
+            db.clone(),
+            work_commander.clone(),
+            lnvps_api_common::ip_provider::build_ip_providers(&settings.ip_providers),
+        ));
+
         Ok(Self {
             chain_explorer,
+            ip_orders,
             db,
             subscription_handler,
             vm_state_cache,
@@ -4530,6 +4540,21 @@ impl Worker {
             }
             WorkJob::RefreshOsImageChecksums => {
                 self.refresh_os_image_checksums().await?;
+            }
+            WorkJob::ProcessIpOrder { order_id } => {
+                self.ip_orders.process_order(*order_id).await?;
+            }
+            WorkJob::CheckIpOrders => {
+                self.ip_orders.sweep().await?;
+            }
+            WorkJob::ReleaseIpRange {
+                ip_range_id,
+                admin_user_id,
+            } => {
+                self.ip_orders
+                    .release_range(*ip_range_id, *admin_user_id)
+                    .await?;
+                return Ok(Some(format!("Released IP range {}", ip_range_id)));
             }
             WorkJob::PatchIpRangeDns {
                 ip_range_id,

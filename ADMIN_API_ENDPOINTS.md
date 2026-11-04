@@ -3076,6 +3076,131 @@ configuration. Useful after changing a range's `forward_dns_server_id` / `revers
 (e.g. switching reverse DNS to OVH). Per-assignment DNS failures are logged and skipped so one bad
 record can't abort the batch. Returns a `JobResponse` (`{ "job_id": string }`).
 
+### IP Orders (On-Demand IP Purchases)
+
+Buys IP addresses from an upstream provider (first implementation: OVH additional IPs) and registers
+them as `ip_range` rows. This spends real money, so every step is gated:
+
+- the provider must be configured and `enabled: true` under `ip-providers` in the API config
+- by default (`approval-required: true`) an admin must approve each order before anything is bought
+- the sum of cost for orders placed this calendar month (UTC) plus the new quote must stay within
+  `monthly-spend-cap`, in the provider `currency`
+- a request is idempotent: the same `idempotency_key`, or an identical request still in flight,
+  returns the existing order instead of creating a second one
+
+Order states: `awaiting_approval`, `approved`, `ordering`, `ordered`, `delivered`, `failed`, `rejected`.
+`ordering` means the checkout call was made and its outcome is not yet recorded. A checkout that
+errors leaves the order `failed` with a note to verify with the provider; it is never retried
+automatically, because the purchase may have happened.
+
+Permissions use the `ip_order` resource: `view` (lists), `create` (order), `update` (approve, reject),
+`delete` (release).
+
+Every state change is written to an audit trail and admins are notified on order placed, delivered,
+failed, awaiting approval and released.
+
+#### Create IP Order
+
+```
+POST /api/admin/v1/ip_orders
+```
+
+Required Permission: `ip_order::create`
+
+```json
+{
+  "provider": "ovh",
+  "region_id": 1,
+  "country": "IE",
+  "destination": "ns1234.ip-1-2-3.eu",
+  "prefix_len": 32,
+  "quantity": 2,
+  "idempotency_key": "optional-client-key"
+}
+```
+
+- `provider`: the `name` of a configured `ip-providers` entry
+- `prefix_len`: `32` (single addresses, `quantity` of them) or `24` to `30` (one block, `quantity` must be 1). Default 32
+- `country`, `destination`: passed to the provider (OVH `country` and `destination` cart configuration)
+
+Returns an `AdminIpOrder`. Queues the `ProcessIpOrder` job, which quotes the order and either waits
+for approval or, with approval disabled, places it.
+
+#### List IP Orders
+
+```
+GET /api/admin/v1/ip_orders?state=awaiting_approval&region_id=1&limit=50&offset=0
+```
+
+Required Permission: `ip_order::view`. Paginated list of `AdminIpOrder`, newest first.
+
+#### Get IP Order
+
+```
+GET /api/admin/v1/ip_orders/{id}
+```
+
+Required Permission: `ip_order::view`. `AdminIpOrder` plus `ranges` (registered ranges with provider
+and cost) and `audit` (`id`, `event`, `detail`, `actor_user_id`, `created`).
+
+#### Approve / Reject IP Order
+
+```
+POST /api/admin/v1/ip_orders/{id}/approve
+POST /api/admin/v1/ip_orders/{id}/reject
+```
+
+Required Permission: `ip_order::update`. Only `awaiting_approval` orders can be decided (otherwise 409).
+Approving queues `ProcessIpOrder`, which spends the money.
+
+#### List Bought Ranges
+
+```
+GET /api/admin/v1/ip_order_ranges
+```
+
+Required Permission: `ip_order::view`. Paginated `AdminIpOrderRange` (`cidr`, `ip_range_id`,
+`provider`, `cost`, `currency`, `released_at`).
+
+#### Release Range
+
+```
+POST /api/admin/v1/ip_ranges/{id}/release
+```
+
+Required Permission: `ip_order::delete`. Terminates a bought range with its provider and disables the
+`ip_range`. Refused with 409 while the range has any allocated IP, and re-checked by the job. Returns
+a `JobResponse`.
+
+#### AdminIpOrder
+
+```json
+{
+  "id": 1,
+  "provider": "ovh",
+  "region_id": 1,
+  "idempotency_key": null,
+  "country": "IE",
+  "destination": null,
+  "prefix_len": 32,
+  "quantity": 2,
+  "state": "ordered",
+  "provider_order_id": "424242",
+  "cost": 478,
+  "currency": "EUR",
+  "auto": false,
+  "requested_by": 1,
+  "approved_by": 1,
+  "approved_at": "2026-11-04T12:00:00Z",
+  "error": null,
+  "created": "2026-11-04T11:59:00Z",
+  "ordered_at": "2026-11-04T12:00:05Z",
+  "delivered_at": null
+}
+```
+
+`cost` is in the currency's smallest unit (cents), including tax as quoted by the provider.
+
 ### Access Policy Management
 
 #### List Access Policies
