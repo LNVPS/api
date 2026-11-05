@@ -158,6 +158,12 @@ async fn main() -> Result<(), Error> {
             None => None,
         },
         vat,
+        settings.chain_explorer_url.as_ref().map(|url| {
+            Arc::new(lnvps_api_admin::admin::chain::MempoolOutputLookup::new(
+                url,
+                db.clone(),
+            )) as Arc<dyn lnvps_api_admin::admin::chain::ChainOutputLookup>
+        }),
     );
 
     // Same cross-cutting stack as the public API. The admin surface previously

@@ -1903,6 +1903,7 @@ mod tests {
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
             vat: VatClient::new(),
+            chain: None,
         };
         let auth = |permissions: Vec<Permission>| AdminAuth {
             user_id: 1,
@@ -2117,6 +2118,7 @@ mod tests {
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
             vat: VatClient::new(),
+            chain: None,
         };
         let admin = || AdminAuth {
             user_id: 1,
@@ -2409,6 +2411,7 @@ mod tests {
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
             vat: VatClient::new(),
+            chain: None,
         };
         let admin = || AdminAuth {
             user_id: 1,

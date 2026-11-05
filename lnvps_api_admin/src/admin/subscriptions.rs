@@ -59,6 +59,10 @@ pub fn router() -> Router<RouterState> {
             "/api/admin/v1/subscription_payments/{id}/complete",
             post(admin_complete_subscription_payment),
         )
+        .route(
+            "/api/admin/v1/subscription_payments/external",
+            post(admin_record_external_payment),
+        )
 }
 
 #[derive(Deserialize, Default)]
@@ -643,6 +647,312 @@ async fn admin_complete_subscription_payment(
     ApiData::ok(AdminSubscriptionPaymentInfo::from_with_company(updated).with_discount(discount))
 }
 
+#[derive(Deserialize)]
+struct AdminExternalPaymentRequest {
+    outpoint: String,
+    amount_msat: u64,
+    currency: String,
+    payment_method: String,
+    subscription_id: Option<u64>,
+    user_id: Option<u64>,
+    note: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum AdminExternalPaymentResult {
+    Payment(Box<AdminSubscriptionPaymentInfo>),
+    Credit {
+        topup_id: u64,
+        user_id: u64,
+        amount_msat: u64,
+        external_id: String,
+        balance_msat: u64,
+    },
+}
+
+fn random_32_bytes() -> Vec<u8> {
+    let mut out = uuid::Uuid::new_v4().into_bytes().to_vec();
+    out.extend(uuid::Uuid::new_v4().into_bytes());
+    out
+}
+
+fn is_duplicate_error(e: &dyn std::fmt::Display) -> bool {
+    let text = e.to_string().to_lowercase();
+    text.contains("duplicate") || text.contains("unique")
+}
+
+fn parse_outpoint(outpoint: &str) -> Result<(String, u32), ApiError> {
+    let invalid = || ApiError::bad_request("outpoint must be <txid>:<vout>");
+    let (txid, vout) = outpoint.split_once(':').ok_or_else(invalid)?;
+    if txid.len() != 64 || !txid.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(invalid());
+    }
+    Ok((
+        txid.to_ascii_lowercase(),
+        vout.parse().map_err(|_| invalid())?,
+    ))
+}
+
+async fn ensure_outpoint_unused(db: &Arc<dyn LNVpsDb>, outpoint: &str) -> Result<(), ApiError> {
+    let taken = db
+        .get_subscription_payment_by_ext_id(outpoint)
+        .await
+        .is_ok()
+        || db
+            .get_account_credit_topup_by_ext_id(outpoint)
+            .await?
+            .is_some();
+    if taken {
+        return Err(ApiError::conflict(format!(
+            "Outpoint {outpoint} is already recorded"
+        )));
+    }
+    Ok(())
+}
+
+async fn price_external_payment(
+    this: &RouterState,
+    payment: &mut lnvps_db::SubscriptionPayment,
+) -> Result<(), ApiError> {
+    use lnvps_api_common::{CostResult, PricingEngine};
+    let engine = PricingEngine::new(this.db.clone(), this.exchange.clone(), this.vat.clone());
+    let gross = payments_rs::currency::CurrencyAmount::millisats(payment.amount);
+    let cost = match this
+        .db
+        .get_vm_by_subscription(payment.subscription_id)
+        .await
+    {
+        Ok(vm) => {
+            engine
+                .get_cost_by_amount(vm.id, gross, payment.payment_method)
+                .await
+        }
+        Err(_) => {
+            engine
+                .get_subscription_cost_by_amount(
+                    payment.subscription_id,
+                    gross,
+                    payment.payment_method,
+                )
+                .await
+        }
+    }
+    .map_err(|e| ApiError::bad_request(format!("Cannot price payment: {e}")))?;
+    let CostResult::New(p) = cost else {
+        return Err(ApiError::bad_request("Unexpected existing cost result"));
+    };
+    payment.time_value = Some(p.time_value);
+    payment.rate = p.rate.rate;
+    payment.amount = p.amount;
+    payment.tax = p.tax;
+    payment.processing_fee = p.processing_fee;
+    Ok(())
+}
+
+/// Record a confirmed on-chain deposit that has no payment row.
+async fn admin_record_external_payment(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Json(req): Json<AdminExternalPaymentRequest>,
+) -> ApiResult<AdminExternalPaymentResult> {
+    use lnvps_db::{PaymentMethod, SubscriptionPayment, SubscriptionPaymentType};
+    auth.require_permission(AdminResource::SubscriptionPayments, AdminAction::Create)?;
+
+    if req.payment_method != "onchain" || req.currency != "BTC" {
+        return ApiData::err("Only onchain BTC payments can be recorded");
+    }
+    if req.amount_msat == 0 {
+        return ApiData::err("amount_msat must be positive");
+    }
+    if req.note.trim().is_empty() {
+        return ApiData::err("note is required");
+    }
+    let (txid, vout) = parse_outpoint(&req.outpoint)?;
+    let outpoint = format!("{txid}:{vout}");
+
+    ensure_outpoint_unused(&this.db, &outpoint).await?;
+
+    let Some(chain) = &this.chain else {
+        return Err(ApiError::with_status(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "No chain explorer configured, cannot verify the outpoint",
+        ));
+    };
+    let output = chain
+        .lookup(&txid, vout)
+        .await
+        .map_err(|e| ApiError::bad_request(format!("Chain lookup failed: {e}")))?
+        .ok_or_else(|| ApiError::bad_request("Outpoint not found on chain"))?;
+    if !output.confirmed {
+        return ApiData::err("Outpoint is not confirmed");
+    }
+    if !output.ours {
+        return ApiData::err("Outpoint does not pay an address in our wallet");
+    }
+    if output.amount_msat != req.amount_msat {
+        return ApiData::err("amount_msat does not match the output value on chain");
+    }
+
+    let Some(subscription_id) = req.subscription_id else {
+        let user_id = req
+            .user_id
+            .ok_or_else(|| ApiError::bad_request("user_id is required without subscription_id"))?;
+        this.db
+            .get_user(user_id)
+            .await
+            .map_err(|_| ApiError::not_found("User not found"))?;
+        let topup_id = this
+            .db
+            .insert_account_credit_topup(&lnvps_db::AccountCreditTopup {
+                user_id,
+                amount: req.amount_msat,
+                currency: "BTC".to_string(),
+                payment_method: PaymentMethod::OnChain,
+                invoice_hash: random_32_bytes(),
+                external_data: String::new(),
+                external_id: Some(outpoint.clone()),
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| {
+                if is_duplicate_error(&e) {
+                    ApiError::conflict(format!("Outpoint {outpoint} is already recorded"))
+                } else {
+                    ApiError::internal(e)
+                }
+            })?;
+        this.db
+            .settle_account_credit_topup(topup_id, "BTC", req.amount_msat)
+            .await?;
+        log::info!(
+            "Admin {} credited external deposit {} ({} msat) to user {}: {}",
+            auth.user_id,
+            outpoint,
+            req.amount_msat,
+            user_id,
+            req.note
+        );
+        let balance_msat = this
+            .db
+            .list_account_credits(user_id)
+            .await?
+            .into_iter()
+            .find(|c| c.currency == "BTC")
+            .map(|c| c.balance)
+            .unwrap_or(0);
+        return ApiData::ok(AdminExternalPaymentResult::Credit {
+            topup_id,
+            user_id,
+            amount_msat: req.amount_msat,
+            external_id: outpoint,
+            balance_msat,
+        });
+    };
+
+    let subscription = this
+        .db
+        .get_subscription(subscription_id)
+        .await
+        .map_err(|_| ApiError::not_found("Subscription not found"))?;
+    if req.user_id.is_some_and(|u| u != subscription.user_id) {
+        return ApiData::err("user_id does not own the subscription");
+    }
+
+    let id = random_32_bytes();
+    let mut payment = SubscriptionPayment {
+        id: id.clone(),
+        subscription_id,
+        user_id: subscription.user_id,
+        created: Utc::now(),
+        expires: Utc::now(),
+        amount: req.amount_msat,
+        currency: "BTC".to_string(),
+        payment_method: PaymentMethod::OnChain,
+        payment_type: SubscriptionPaymentType::Renewal,
+        external_data: String::new().into(),
+        external_id: Some(outpoint.clone()),
+        renewal_source: Some(lnvps_db::RenewalSource::Manual),
+        is_paid: false,
+        rate: 0.0,
+        time_value: None,
+        metadata: None,
+        tax: 0,
+        processing_fee: 0,
+        paid_at: None,
+        tax_rate: None,
+        tax_country_code: None,
+        tax_treatment: None,
+        tax_evidence: None,
+        tax_breakdown: None,
+        refunded_payment_id: None,
+    };
+    price_external_payment(&this, &mut payment).await?;
+    this.db
+        .insert_subscription_payment(&payment)
+        .await
+        .map_err(|e| {
+            if is_duplicate_error(&e) {
+                ApiError::conflict(format!("Outpoint {outpoint} is already recorded"))
+            } else {
+                ApiError::internal(e)
+            }
+        })?;
+    this.db.subscription_payment_paid(&payment).await?;
+    log::info!(
+        "Admin {} recorded external deposit {} ({} msat) on subscription {}: {}",
+        auth.user_id,
+        outpoint,
+        req.amount_msat,
+        subscription_id,
+        req.note
+    );
+
+    if let Ok(vm) = this.db.get_vm_by_subscription(subscription_id).await {
+        let history = lnvps_db::VmHistory {
+            id: 0,
+            vm_id: vm.id,
+            action_type: lnvps_db::VmHistoryActionType::PaymentReceived,
+            timestamp: Utc::now(),
+            initiated_by_user: Some(auth.user_id),
+            previous_state: None,
+            new_state: None,
+            metadata: serde_json::to_vec(&serde_json::json!({
+                "outpoint": outpoint,
+                "amount_msat": req.amount_msat,
+                "time_added_seconds": payment.time_value,
+                "admin_id": auth.user_id,
+                "note": req.note,
+            }))
+            .ok(),
+            description: Some(format!(
+                "External on-chain payment {outpoint} recorded by admin: {}",
+                req.note
+            )),
+        };
+        if let Err(e) = this.db.insert_vm_history(&history).await {
+            log::error!("Failed to write history for external payment {outpoint}: {e}");
+        }
+    }
+
+    let payment_id = hex::encode(&id);
+    this.work_commander
+        .send(WorkJob::ApplySubscriptionPayment { payment_id })
+        .await?;
+    if let Err(e) = this.work_commander.send(WorkJob::CheckSubscriptions).await {
+        log::error!(
+            "External payment recorded but failed to dispatch CheckSubscriptions for subscription {}: {}",
+            subscription_id,
+            e
+        );
+    }
+
+    let updated = this.db.get_subscription_payment_with_company(&id).await?;
+    ApiData::ok(AdminExternalPaymentResult::Payment(Box::new(
+        AdminSubscriptionPaymentInfo::from_with_company(updated),
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -666,6 +976,296 @@ mod tests {
             auto_renewal_enabled: false,
             external_id: None,
         }
+    }
+
+    use crate::admin::chain::{ChainOutput, ChainOutputLookup};
+    use crate::admin::model::Permission;
+    use lnvps_api_common::ExchangeRateService;
+    use lnvps_api_common::{
+        ChannelWorkCommander, MockDb, MockExchangeRate, Ticker, VatClient, VmStateCache,
+    };
+    use lnvps_db::{LNVpsDbBase, LineItemType, SubscriptionLineItem, SubscriptionPayment, Vm};
+
+    const TXID: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const AMOUNT: u64 = 1_100_000;
+
+    struct FixedChain(Option<ChainOutput>);
+
+    #[async_trait::async_trait]
+    impl ChainOutputLookup for FixedChain {
+        async fn lookup(&self, _txid: &str, _vout: u32) -> anyhow::Result<Option<ChainOutput>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn chain_output(confirmed: bool, ours: bool) -> ChainOutput {
+        ChainOutput {
+            address: "bcrt1qours".to_string(),
+            amount_msat: AMOUNT,
+            confirmed,
+            ours,
+        }
+    }
+
+    fn create_auth() -> AdminAuth {
+        AdminAuth {
+            user_id: 7,
+            pubkey: vec![1u8; 32],
+            permissions: [Permission {
+                resource: AdminResource::SubscriptionPayments,
+                action: AdminAction::Create,
+            }]
+            .into_iter()
+            .collect(),
+            nip98_auth: None,
+        }
+    }
+
+    async fn fixture(output: Option<ChainOutput>) -> (Arc<MockDb>, RouterState, u64, u64) {
+        crate::verbose_errors_for_tests();
+        let db = Arc::new(MockDb::default());
+        let rates = Arc::new(MockExchangeRate::default());
+        rates
+            .set_rate(Ticker::btc_rate("EUR").unwrap(), 100_000.0)
+            .await;
+        let user_id = db.upsert_user(&[1u8; 32]).await.unwrap();
+        let (sub_id, items) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    user_id,
+                    company_id: 1,
+                    name: "test".to_string(),
+                    created: Utc::now(),
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    ..mk_subscription(None)
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: LineItemType::Vps,
+                    name: "vm renewal".to_string(),
+                    description: None,
+                    amount: 1000,
+                    setup_amount: 0,
+                    configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        db.insert_vm(&Vm {
+            host_id: 1,
+            user_id,
+            image_id: 1,
+            template_id: Some(1),
+            subscription_line_item_id: items[0],
+            disk_id: 1,
+            mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let dyn_db: Arc<dyn LNVpsDb> = db.clone();
+        let this = RouterState {
+            node_control: None,
+            db: dyn_db,
+            work_commander: Arc::new(ChannelWorkCommander::new()),
+            feedback: None,
+            vm_state_cache: VmStateCache::new(),
+            exchange: rates,
+            vat: VatClient::new(),
+            chain: Some(Arc::new(FixedChain(output))),
+        };
+        (db, this, sub_id, user_id)
+    }
+
+    fn request(subscription_id: Option<u64>, user_id: Option<u64>) -> AdminExternalPaymentRequest {
+        AdminExternalPaymentRequest {
+            outpoint: format!("{TXID}:0"),
+            amount_msat: AMOUNT,
+            currency: "BTC".to_string(),
+            payment_method: "onchain".to_string(),
+            subscription_id,
+            user_id,
+            note: "late payment to purged VM".to_string(),
+        }
+    }
+
+    async fn credit_balance(db: &MockDb, user_id: u64) -> u64 {
+        db.list_account_credits(user_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|c| c.currency == "BTC")
+            .map(|c| c.balance)
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn external_payment_extends_subscription_and_records_history() {
+        let (db, this, sub_id, _) = fixture(Some(chain_output(true, true))).await;
+        let before = db.get_subscription(sub_id).await.unwrap().expires;
+
+        let out = admin_record_external_payment(
+            create_auth(),
+            State(this),
+            Json(request(Some(sub_id), None)),
+        )
+        .await
+        .unwrap();
+        let AdminExternalPaymentResult::Payment(p) = out.0.data else {
+            panic!("expected a payment");
+        };
+        assert!(p.is_paid);
+        assert_eq!(p.external_id, Some(format!("{TXID}:0")));
+        let time = p.time_value.expect("priced time");
+        assert!(time > 0);
+        assert_eq!(p.amount + p.tax + p.processing_fee, AMOUNT);
+
+        let after = db.get_subscription(sub_id).await.unwrap().expires.unwrap();
+        let floor = before.unwrap_or_else(Utc::now).max(Utc::now());
+        assert!((after - floor).num_seconds().abs() as u64 >= time - 5);
+
+        let vm = db.get_vm_by_subscription(sub_id).await.unwrap();
+        let history = db.list_vm_history(vm.id).await.unwrap();
+        assert!(history.iter().any(|h| {
+            h.initiated_by_user == Some(7)
+                && h.description
+                    .as_deref()
+                    .is_some_and(|d| d.contains("late payment"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn external_payment_twice_conflicts_without_extending_again() {
+        let (db, this, sub_id, _) = fixture(Some(chain_output(true, true))).await;
+        admin_record_external_payment(
+            create_auth(),
+            State(this.clone()),
+            Json(request(Some(sub_id), None)),
+        )
+        .await
+        .unwrap();
+        let expires = db.get_subscription(sub_id).await.unwrap().expires;
+
+        let err = admin_record_external_payment(
+            create_auth(),
+            State(this),
+            Json(request(Some(sub_id), None)),
+        )
+        .await
+        .err()
+        .expect("second call refused");
+        assert_eq!(err.code, axum::http::StatusCode::CONFLICT);
+        assert_eq!(db.get_subscription(sub_id).await.unwrap().expires, expires);
+    }
+
+    #[tokio::test]
+    async fn external_payment_already_settled_by_watcher_conflicts() {
+        let (db, this, sub_id, user_id) = fixture(Some(chain_output(true, true))).await;
+        db.insert_subscription_payment(&SubscriptionPayment {
+            id: vec![9u8; 32],
+            subscription_id: sub_id,
+            user_id,
+            created: Utc::now(),
+            expires: Utc::now(),
+            amount: AMOUNT,
+            currency: "BTC".to_string(),
+            payment_method: lnvps_db::PaymentMethod::OnChain,
+            payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
+            external_data: "bcrt1qours".into(),
+            external_id: Some(format!("{TXID}:0")),
+            is_paid: true,
+            rate: 1.0,
+            time_value: Some(86_400),
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: Some(Utc::now()),
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+            renewal_source: None,
+        })
+        .await
+        .unwrap();
+        let expires = db.get_subscription(sub_id).await.unwrap().expires;
+
+        let err = admin_record_external_payment(
+            create_auth(),
+            State(this),
+            Json(request(Some(sub_id), None)),
+        )
+        .await
+        .err()
+        .expect("refused");
+        assert_eq!(err.code, axum::http::StatusCode::CONFLICT);
+        assert_eq!(db.get_subscription(sub_id).await.unwrap().expires, expires);
+    }
+
+    #[tokio::test]
+    async fn external_payment_without_subscription_credits_user_once() {
+        let (db, this, _, user_id) = fixture(Some(chain_output(true, true))).await;
+        let before = credit_balance(&db, user_id).await;
+
+        admin_record_external_payment(
+            create_auth(),
+            State(this.clone()),
+            Json(request(None, Some(user_id))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(credit_balance(&db, user_id).await, before + AMOUNT);
+
+        let err = admin_record_external_payment(
+            create_auth(),
+            State(this),
+            Json(request(None, Some(user_id))),
+        )
+        .await
+        .err()
+        .expect("refused");
+        assert_eq!(err.code, axum::http::StatusCode::CONFLICT);
+        assert_eq!(credit_balance(&db, user_id).await, before + AMOUNT);
+    }
+
+    #[tokio::test]
+    async fn external_payment_requires_confirmed_outpoint_in_our_wallet() {
+        for output in [
+            None,
+            Some(chain_output(false, true)),
+            Some(chain_output(true, false)),
+        ] {
+            let (db, this, sub_id, _) = fixture(output).await;
+            let err = admin_record_external_payment(
+                create_auth(),
+                State(this),
+                Json(request(Some(sub_id), None)),
+            )
+            .await
+            .err()
+            .expect("refused");
+            assert_eq!(err.code, axum::http::StatusCode::BAD_REQUEST);
+            assert!(db.subscription_payments.lock().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn external_payment_requires_create_permission() {
+        let (_, this, sub_id, _) = fixture(Some(chain_output(true, true))).await;
+        let mut auth = create_auth();
+        auth.permissions.clear();
+        assert!(
+            admin_record_external_payment(auth, State(this), Json(request(Some(sub_id), None)))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

@@ -733,6 +733,7 @@ mod tests {
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
             vat: VatClient::new(),
+            chain: None,
         }
     }
 

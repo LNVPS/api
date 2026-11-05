@@ -1465,6 +1465,16 @@ POST /api/admin/v1/subscription_payments/{hex_id}/complete
 
 Required Permission: `subscription_payments::update`
 
+### Record External On-Chain Payment
+```
+POST /api/admin/v1/subscription_payments/external
+```
+Required Permission: `subscription_payments::create`
+
+Body: `{"outpoint": "<txid>:<vout>", "amount_msat": 1100000, "currency": "BTC", "payment_method": "onchain", "subscription_id": 1, "user_id": null, "note": "why"}`
+
+Verifies the outpoint on chain (confirmed, pays our wallet, amount matches). With `subscription_id` inserts a paid, priced renewal keyed by the outpoint and writes a VM history entry with the admin id and note; without it `user_id` is required and the user's account credit is topped up. A repeated outpoint returns 409.
+
 Manually marks a subscription payment as paid. Sets `is_paid=true`, records `paid_at`, extends the subscription by 30 days, and activates it, then queues the same on-payment handling a Lightning settlement runs (instant app reconcile, applying a VM/app upgrade) on the worker.
 
 Calling it again on an already-paid payment only re-queues that handling (the subscription is not extended twice), so a failed queue dispatch can be retried.

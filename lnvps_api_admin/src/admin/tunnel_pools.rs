@@ -1223,6 +1223,7 @@ mod tests {
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
             vat: VatClient::new(),
+            chain: None,
         };
         let auth = |resource: AdminResource| AdminAuth {
             user_id: 1,
@@ -1427,6 +1428,7 @@ mod tests {
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
             vat: lnvps_api_common::VatClient::new(),
+            chain: None,
         };
         let admin = AdminAuth {
             user_id: 1,

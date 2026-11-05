@@ -2018,6 +2018,7 @@ mod tests {
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
             vat: Default::default(),
+            chain: None,
         }
     }
 

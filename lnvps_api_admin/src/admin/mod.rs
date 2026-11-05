@@ -13,6 +13,7 @@ mod agent;
 mod apps;
 mod auth;
 mod bulk_message;
+pub mod chain;
 mod companies;
 mod cost_plans;
 mod costs;
@@ -66,6 +67,7 @@ pub(crate) struct RouterState {
     /// caller that reports a rate must check [`VatClient::rate_count`] before
     /// presenting 0% as a determination rather than as "not loaded yet".
     pub vat: VatClient,
+    pub chain: Option<Arc<dyn chain::ChainOutputLookup>>,
 }
 
 pub fn admin_router(
@@ -76,6 +78,7 @@ pub fn admin_router(
     feedback: Option<RedisWorkFeedback>,
     node_control: Option<lnvps_api_common::node_control::NodeControl>,
     vat: VatClient,
+    chain: Option<Arc<dyn chain::ChainOutputLookup>>,
 ) -> Router {
     Router::new()
         .merge(docs::router())
@@ -128,5 +131,6 @@ pub fn admin_router(
             feedback,
             exchange,
             vat,
+            chain,
         })
 }

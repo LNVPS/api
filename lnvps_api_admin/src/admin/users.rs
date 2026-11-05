@@ -391,6 +391,7 @@ mod tax_tests {
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
             vat,
+            chain: None,
         }
     }
 
