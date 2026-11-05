@@ -296,6 +296,7 @@ mod tests {
                 address_type: OnChainAddressType::WitnessPubkeyHash,
                 account: None,
                 min_confirmations: 1,
+                unpaid_purge_grace_hours: 24,
             }),
         )
     }

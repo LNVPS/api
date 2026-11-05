@@ -85,6 +85,7 @@ pub struct MockDb {
     pub account_credit_events: Arc<Mutex<Vec<lnvps_db::AccountCreditEvent>>>,
     pub account_credit_debits: Arc<Mutex<Vec<lnvps_db::AccountCreditDebit>>>,
     pub account_credit_topups: Arc<Mutex<Vec<lnvps_db::AccountCreditTopup>>>,
+    pub onchain_address_owners: Arc<Mutex<Vec<lnvps_db::OnchainAddressOwner>>>,
     pub swap_order_clients: Arc<Mutex<Vec<lnvps_db::SwapOrderClient>>>,
     pub abuse_cases: Arc<Mutex<Vec<lnvps_db::AbuseCase>>>,
     pub abuse_actions: Arc<Mutex<Vec<lnvps_db::AbuseAction>>>,
@@ -156,6 +157,50 @@ pub struct MockDb {
 }
 
 impl MockDb {
+    async fn record_onchain_address_owners(&self, subscription_id: u64, vm_id: Option<u64>) {
+        let payments = self.subscription_payments.lock().await;
+        let debits = self.account_credit_debits.lock().await;
+        let mut owners = self.onchain_address_owners.lock().await;
+        let (unpaid, paid): (Vec<_>, Vec<_>) = payments
+            .iter()
+            .filter(|p| p.subscription_id == subscription_id)
+            .partition(|p| !p.is_paid);
+        for p in unpaid.into_iter().chain(paid) {
+            let Some(address) = p.onchain_receive_address() else {
+                continue;
+            };
+            let hash = lnvps_db::onchain_address_hash(&address);
+            if owners.iter().any(|o| o.address_hash == hash) {
+                continue;
+            }
+            let covered = debits
+                .iter()
+                .find(|d| d.subscription_payment_id.as_ref() == Some(&p.id))
+                .map(|d| d.payment_amount)
+                .unwrap_or(0);
+            let id = owners.len() as u64 + 1;
+            owners.push(lnvps_db::OnchainAddressOwner {
+                id,
+                address: address.into(),
+                address_hash: hash,
+                user_id: p.user_id,
+                subscription_id: Some(p.subscription_id),
+                payment_id: Some(p.id.clone()),
+                vm_id,
+                created: Utc::now(),
+                expires: Some(p.expires),
+                currency: Some(p.currency.clone()),
+                amount: (!p.is_paid).then(|| {
+                    (p.amount + p.tax + p.processing_fee)
+                        .saturating_sub(covered)
+                        .div_ceil(1000)
+                        * 1000
+                }),
+                ..Default::default()
+            });
+        }
+    }
+
     #[cfg(feature = "admin")]
     async fn paid_subscriptions_by_line_item(&self) -> HashMap<u64, Subscription> {
         let subscriptions = self.subscriptions.lock().await;
@@ -559,6 +604,7 @@ impl Default for MockDb {
             account_credit_events: Arc::new(Default::default()),
             account_credit_debits: Arc::new(Default::default()),
             account_credit_topups: Arc::new(Default::default()),
+            onchain_address_owners: Arc::new(Default::default()),
             swap_order_clients: Arc::new(Default::default()),
             abuse_cases: Arc::new(Default::default()),
             abuse_actions: Arc::new(Default::default()),
@@ -1932,6 +1978,8 @@ impl LNVpsDbBase for MockDb {
         self.vm_traffic_samples.lock().await.remove(&vm_id);
 
         if let Some(subscription_id) = subscription_id {
+            self.record_onchain_address_owners(subscription_id, Some(vm_id))
+                .await;
             self.subscription_payments
                 .lock()
                 .await
@@ -3286,6 +3334,7 @@ impl LNVpsDbBase for MockDb {
             )));
         }
 
+        self.record_onchain_address_owners(id, None).await;
         self.subscription_payments
             .lock()
             .await
@@ -4993,6 +5042,91 @@ impl LNVpsDbBase for MockDb {
                 .collect(),
             total,
         ))
+    }
+
+    async fn get_onchain_address_owner(
+        &self,
+        address: &str,
+    ) -> DbResult<Option<lnvps_db::OnchainAddressOwner>> {
+        let hash = lnvps_db::onchain_address_hash(address);
+        Ok(self
+            .onchain_address_owners
+            .lock()
+            .await
+            .iter()
+            .find(|o| o.address_hash == hash)
+            .cloned())
+    }
+
+    async fn mark_onchain_address_owner_notified(&self, id: u64, outpoint: &str) -> DbResult<bool> {
+        let mut owners = self.onchain_address_owners.lock().await;
+        let Some(o) = owners.iter_mut().find(|o| o.id == id) else {
+            return Ok(false);
+        };
+        let told_and_pending =
+            o.notified_outpoint.is_some() && o.notified_outpoint != o.credited_outpoint;
+        if told_and_pending || o.credited_outpoint.as_deref() == Some(outpoint) {
+            return Ok(false);
+        }
+        o.notified_outpoint = Some(outpoint.to_string());
+        Ok(true)
+    }
+
+    async fn credit_onchain_address_owner(
+        &self,
+        id: u64,
+        outpoint: &str,
+        amount_msat: u64,
+        note: &str,
+    ) -> DbResult<Option<u64>> {
+        let mut owners = self.onchain_address_owners.lock().await;
+        let Some(owner) = owners.iter_mut().find(|o| o.id == id) else {
+            return Ok(None);
+        };
+        let mut topups = self.account_credit_topups.lock().await;
+        if topups
+            .iter()
+            .any(|t| t.external_id.as_deref() == Some(outpoint))
+        {
+            return Ok(None);
+        }
+        let topup_id = topups.len() as u64 + 1;
+        topups.push(lnvps_db::AccountCreditTopup {
+            id: topup_id,
+            user_id: owner.user_id,
+            amount: amount_msat,
+            currency: "BTC".to_string(),
+            payment_method: PaymentMethod::OnChain,
+            invoice_hash: lnvps_db::onchain_address_hash(&format!("late:{outpoint}")),
+            external_data: String::new(),
+            external_id: Some(outpoint.to_string()),
+            is_paid: true,
+            paid_at: Some(Utc::now()),
+            created: Utc::now(),
+            credit_currency: Some("BTC".to_string()),
+            credit_amount: Some(amount_msat),
+        });
+        let mut credits = self.account_credits.lock().await;
+        let row = credit_row(&mut credits, owner.user_id, "BTC");
+        row.balance += amount_msat;
+        row.updated = Utc::now();
+        let balance = row.balance;
+        let mut events = self.account_credit_events.lock().await;
+        let event_id = events.len() as u64 + 1;
+        events.push(lnvps_db::AccountCreditEvent {
+            id: event_id,
+            user_id: owner.user_id,
+            kind: "topup".to_string(),
+            amount: amount_msat as i64,
+            currency: "BTC".to_string(),
+            subscription_payment_id: None,
+            note: Some(note.to_string()),
+            created: Utc::now(),
+        });
+        owner.status = lnvps_db::OnchainAddressOwnerStatus::Credited;
+        owner.credited_outpoint = Some(outpoint.to_string());
+        owner.notified_outpoint = Some(outpoint.to_string());
+        Ok(Some(balance))
     }
 
     // ----- Marketplace (operator-run compute nodes) -----
@@ -7645,6 +7779,8 @@ impl LNVpsDbBase for MockDb {
                     .any(|d| line_item_ids.contains(&d.subscription_line_item_id));
 
             if !still_billed {
+                self.record_onchain_address_owners(subscription_id, None)
+                    .await;
                 self.subscription_payments
                     .lock()
                     .await

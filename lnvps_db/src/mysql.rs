@@ -8,16 +8,16 @@ use crate::{
     DiscountRedemptionWithCode, DnsServer, EncryptedString, IntervalType, IpOrder, IpOrderAudit,
     IpOrderRange, IpOrderState, IpProvider, IpProviderRegion, IpRange, IpRangeSubscription,
     IpSpacePricing, LNVpsDbBase, LineItemType, MarketplaceNode, MarketplaceNodeHealth,
-    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, PaymentMethod,
-    PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout, Region,
-    RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelKind,
-    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, SwapOrderClient, Tunnel, TunnelPool, TunnelRoute, User,
-    UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind, VmAddonPrice, VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
-    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmIpWait, VmOsImage, VmTemplate, VmTrafficDaily,
-    VmTrafficSample, VmTrafficTotal, VpnDevice, VpnPeerTemplate, VpnService, VpnSubscription,
-    WebauthnCredential,
+    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, OnchainAddressOwner,
+    OnchainAddressOwnerStatus, PaymentMethod, PaymentMethodConfig, PaymentType, Referral,
+    ReferralCostUsage, ReferralPayout, Region, RegionStats, Router, RouterBgpRoute,
+    RouterBgpSession, RouterTunnel, RouterTunnelKind, RouterTunnelTraffic, Subscription,
+    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, SwapOrderClient,
+    Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind,
+    VmAddonPrice, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmIpWait,
+    VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice,
+    VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -152,6 +152,58 @@ async fn insert_subscription_payment_with<'e, E: sqlx::MySqlExecutor<'e>>(
     .execute(ex)
     .await?;
 
+    Ok(())
+}
+
+async fn record_onchain_address_owners(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    subscription_id: u64,
+    vm_id: Option<u64>,
+) -> Result<()> {
+    let payments: Vec<SubscriptionPayment> = sqlx::query_as(
+        "SELECT * FROM subscription_payment WHERE subscription_id = ? AND payment_method IN (?, ?)",
+    )
+    .bind(subscription_id)
+    .bind(PaymentMethod::OnChain as u16)
+    .bind(PaymentMethod::FixedFloat as u16)
+    .fetch_all(&mut **tx)
+    .await?;
+    let (unpaid, paid): (Vec<_>, Vec<_>) = payments.into_iter().partition(|p| !p.is_paid);
+    for p in unpaid.iter().chain(paid.iter()) {
+        let Some(address) = p.onchain_receive_address() else {
+            continue;
+        };
+        let covered: Option<u64> = sqlx::query_scalar(
+            "SELECT payment_amount FROM account_credit_debit WHERE subscription_payment_id = ?",
+        )
+        .bind(&p.id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO onchain_address_owner \
+             (address, address_hash, user_id, subscription_id, payment_id, vm_id, expires, currency, amount) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE id = id",
+        )
+        .bind(EncryptedString::new(address.clone()))
+        .bind(crate::onchain_address_hash(&address))
+        .bind(p.user_id)
+        .bind(p.subscription_id)
+        .bind(&p.id)
+        .bind(vm_id)
+        .bind(p.expires)
+        .bind(&p.currency)
+        .bind(
+            (!p.is_paid)
+                .then(|| {
+                    (p.amount + p.tax + p.processing_fee)
+                        .saturating_sub(covered.unwrap_or(0))
+                        .div_ceil(1000)
+                        * 1000
+                }),
+        )
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok(())
 }
 
@@ -2312,6 +2364,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         // CASCADE so it must be cleared first; subscription_line_item does
         // cascade, so deleting the subscription removes the line items.
         if let Some(subscription_id) = subscription_id {
+            record_onchain_address_owners(&mut tx, subscription_id, Some(vm_id)).await?;
             sqlx::query("delete from subscription_payment where subscription_id = ?")
                 .bind(subscription_id)
                 .execute(&mut *tx)
@@ -3965,6 +4018,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
         // subscription_payment has no ON DELETE CASCADE so it must be cleared
         // first; subscription_line_item does cascade from subscription.
+        record_onchain_address_owners(&mut tx, id, None).await?;
         sqlx::query("delete from subscription_payment where subscription_id = ?")
             .bind(id)
             .execute(&mut *tx)
@@ -6030,6 +6084,100 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_one(&self.db)
                 .await?;
         Ok((rows, total as u64))
+    }
+
+    async fn get_onchain_address_owner(
+        &self,
+        address: &str,
+    ) -> DbResult<Option<OnchainAddressOwner>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM onchain_address_owner WHERE address_hash = ?")
+                .bind(crate::onchain_address_hash(address))
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn mark_onchain_address_owner_notified(&self, id: u64, outpoint: &str) -> DbResult<bool> {
+        let r = sqlx::query(
+            "UPDATE onchain_address_owner SET notified_outpoint = ? \
+             WHERE id = ? AND (notified_outpoint IS NULL OR notified_outpoint = credited_outpoint) \
+             AND (credited_outpoint IS NULL OR credited_outpoint <> ?)",
+        )
+        .bind(outpoint)
+        .bind(id)
+        .bind(outpoint)
+        .execute(&self.db)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    async fn credit_onchain_address_owner(
+        &self,
+        id: u64,
+        outpoint: &str,
+        amount_msat: u64,
+        note: &str,
+    ) -> DbResult<Option<u64>> {
+        let mut tx = self.db.begin().await?;
+        let user_id: Option<u64> =
+            sqlx::query_scalar("SELECT user_id FROM onchain_address_owner WHERE id = ? FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(user_id) = user_id else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let inserted = sqlx::query(
+            "INSERT IGNORE INTO account_credit_topup \
+             (user_id, amount, currency, payment_method, invoice_hash, external_data, external_id, \
+              is_paid, paid_at, credit_currency, credit_amount) \
+             VALUES (?, ?, 'BTC', ?, ?, '', ?, 1, NOW(), 'BTC', ?)",
+        )
+        .bind(user_id)
+        .bind(amount_msat)
+        .bind(PaymentMethod::OnChain)
+        .bind(crate::onchain_address_hash(&format!("late:{outpoint}")))
+        .bind(outpoint)
+        .bind(amount_msat)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let balance = lock_account_credit(&mut tx, user_id, "BTC").await?;
+        let new_balance = balance + amount_msat;
+        sqlx::query(
+            "UPDATE account_credit SET balance = ?, updated = NOW() \
+             WHERE user_id = ? AND currency = 'BTC'",
+        )
+        .bind(new_balance)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO account_credit_event (user_id, kind, amount, currency, note) \
+             VALUES (?, 'topup', ?, 'BTC', ?)",
+        )
+        .bind(user_id)
+        .bind(i64::try_from(amount_msat).map_err(|e| anyhow!(e))?)
+        .bind(note)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE onchain_address_owner SET status = ?, credited_outpoint = ?, \
+             notified_outpoint = ? WHERE id = ?",
+        )
+        .bind(OnchainAddressOwnerStatus::Credited)
+        .bind(outpoint)
+        .bind(outpoint)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(new_balance))
     }
 
     // ----- Marketplace (operator-run compute nodes) -----
@@ -8125,6 +8273,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             // cleared first; subscription_line_item does cascade from
             // subscription.
             if still_billed == 0 {
+                record_onchain_address_owners(&mut tx, subscription_id, None).await?;
                 sqlx::query("delete from subscription_payment where subscription_id = ?")
                     .bind(subscription_id)
                     .execute(&mut *tx)

@@ -1589,6 +1589,21 @@ pub trait LNVpsDbBase: Send + Sync {
         offset: u64,
     ) -> DbResult<(Vec<AccountCreditTopup>, u64)>;
 
+    async fn get_onchain_address_owner(
+        &self,
+        address: &str,
+    ) -> DbResult<Option<OnchainAddressOwner>>;
+
+    async fn mark_onchain_address_owner_notified(&self, id: u64, outpoint: &str) -> DbResult<bool>;
+
+    async fn credit_onchain_address_owner(
+        &self,
+        id: u64,
+        outpoint: &str,
+        amount_msat: u64,
+        note: &str,
+    ) -> DbResult<Option<u64>>;
+
     // ----- Marketplace (operator-run compute nodes) -----
 
     /// Get a marketplace operator enrolment by id

@@ -273,6 +273,18 @@ standard `limit`/`offset`. Each row:
 }
 ```
 
+A deposit that reaches an on-chain or FixedFloat address after its order was
+purged is credited here as a `topup` row whose `note` is
+`<txid>:<vout>: late on-chain payment after the order was removed`. When an
+unpaid VM, subscription or app deployment is hard deleted, the receive
+addresses of its on-chain and FixedFloat payments are kept in the
+`onchain_address_owner` table (user, subscription, payment, VM, quoted amount),
+so a later deposit still has an owner. The deposit is credited in BTC for the
+exact amount received, once per outpoint, when it confirms. The customer is told
+when it is first seen and again when it is credited; admins get a notification
+on every credit, and instead of the customer when the customer has no email or
+nostr key. A deposit to an address that was never ours is ignored.
+
 - `kind`: `topup`, `spend`, `refund` or `admin`. `amount` is the signed change
   to the balance: `spend` rows are negative, `topup` and `refund` positive,
   `admin` either.
@@ -8375,7 +8387,7 @@ All fields except `webhook_secret` are required when creating:
 | `revolut`     | revolut        | `url`, `token`, `api_version`, `public_key` (webhook_secret optional) |
 | `stripe`      | stripe         | `secret_key`, `publishable_key`, `webhook_secret`                     |
 | `paypal`      | paypal         | `client_id`, `client_secret`, `mode`                                  |
-| `onchain`     | onchain        | `url`, `cert_path`, `macaroon_path` (`address_type`, `account`, `min_confirmations` optional) |
+| `onchain`     | onchain        | `url`, `cert_path`, `macaroon_path` (`address_type`, `account`, `min_confirmations`, `unpaid_purge_grace_hours` optional) |
 | `fixedfloat`  | fixedfloat     | `api_key`, `api_secret` (`url`, `refcode`, `afftax` optional)         |
 
 ### PartialProviderConfig (Tagged Union) - For Updates
@@ -8389,7 +8401,7 @@ Only the `type` field is required; all other fields are optional and will keep t
 | `revolut`     | `url`, `token`, `api_version`, `public_key`, `webhook_secret` |
 | `stripe`      | `secret_key`, `publishable_key`, `webhook_secret`             |
 | `paypal`      | `client_id`, `client_secret`, `mode`                          |
-| `onchain`     | `url`, `cert_path`, `macaroon_path`, `address_type`, `account` (null clears), `min_confirmations` |
+| `onchain`     | `url`, `cert_path`, `macaroon_path`, `address_type`, `account` (null clears), `min_confirmations`, `unpaid_purge_grace_hours` |
 | `fixedfloat`  | `api_key`, `api_secret`, `url` (null clears), `refcode` (null clears), `afftax` (null clears) |
 
 ### Notes

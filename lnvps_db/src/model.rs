@@ -1992,6 +1992,55 @@ pub struct AccountCreditTopup {
     pub credit_amount: Option<u64>,
 }
 
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum OnchainAddressOwnerStatus {
+    #[default]
+    Open = 0,
+    Credited = 1,
+}
+
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct OnchainAddressOwner {
+    pub id: u64,
+    pub address: EncryptedString,
+    pub address_hash: Vec<u8>,
+    pub user_id: u64,
+    pub subscription_id: Option<u64>,
+    pub payment_id: Option<Vec<u8>>,
+    pub vm_id: Option<u64>,
+    pub created: DateTime<Utc>,
+    pub expires: Option<DateTime<Utc>>,
+    pub currency: Option<String>,
+    pub amount: Option<u64>,
+    pub status: OnchainAddressOwnerStatus,
+    pub credited_outpoint: Option<String>,
+    pub notified_outpoint: Option<String>,
+}
+
+pub fn onchain_address_hash(address: &str) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(address.as_bytes()).to_vec()
+}
+
+impl SubscriptionPayment {
+    pub fn onchain_receive_address(&self) -> Option<String> {
+        match self.payment_method {
+            PaymentMethod::OnChain => Some(self.external_data.as_str().to_string()),
+            PaymentMethod::FixedFloat => {
+                serde_json::from_str::<serde_json::Value>(self.external_data.as_str())
+                    .ok()?
+                    .get("receive_address")?
+                    .as_str()
+                    .map(str::to_string)
+            }
+            _ => None,
+        }
+        .filter(|a| !a.is_empty())
+    }
+}
+
 #[derive(FromRow, Clone, Debug, Default)]
 pub struct SwapOrderClient {
     pub id: u64,
@@ -3822,6 +3871,63 @@ impl InternetRegistry {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_onchain_receive_address_per_method() {
+        let payment = |method, data: &str| SubscriptionPayment {
+            id: vec![1; 32],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now(),
+            amount: 1000,
+            currency: "BTC".to_string(),
+            payment_method: method,
+            payment_type: SubscriptionPaymentType::Purchase,
+            external_data: data.into(),
+            external_id: None,
+            is_paid: false,
+            rate: 1.0,
+            time_value: None,
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+            renewal_source: None,
+        };
+        assert_eq!(
+            payment(PaymentMethod::OnChain, "bc1qours").onchain_receive_address(),
+            Some("bc1qours".to_string())
+        );
+        assert_eq!(
+            payment(
+                PaymentMethod::FixedFloat,
+                r#"{"deposit_address":"ltc1q","receive_address":"bc1qswap"}"#
+            )
+            .onchain_receive_address(),
+            Some("bc1qswap".to_string())
+        );
+        assert_eq!(
+            payment(PaymentMethod::FixedFloat, "not json").onchain_receive_address(),
+            None
+        );
+        assert_eq!(
+            payment(PaymentMethod::OnChain, "").onchain_receive_address(),
+            None
+        );
+        assert_eq!(
+            payment(PaymentMethod::Lightning, "lnbc1").onchain_receive_address(),
+            None
+        );
+        assert_eq!(onchain_address_hash("bc1qours").len(), 32);
+        assert_ne!(onchain_address_hash("a"), onchain_address_hash("b"));
+    }
+
     /// The backup enums are rendered into API responses and log lines, and
     /// their numeric values are the stored column, so both are pinned.
     #[test]
@@ -4510,6 +4616,7 @@ mod tests {
             address_type: OnChainAddressType::TaprootPubkey,
             account: Some("deposits".to_string()),
             min_confirmations: 3,
+            unpaid_purge_grace_hours: 24,
         });
         assert_eq!(config.provider_type(), "onchain");
         assert_eq!(config.payment_method(), PaymentMethod::OnChain);
@@ -4566,6 +4673,7 @@ mod tests {
                 address_type: OnChainAddressType::default(),
                 account: None,
                 min_confirmations: 1,
+                unpaid_purge_grace_hours: 24,
             })
             .as_fixedfloat()
             .is_none()
@@ -4779,6 +4887,12 @@ pub struct OnChainProviderConfig {
     /// Confirmations required before a deposit is settled
     #[serde(default = "default_min_confirmations")]
     pub min_confirmations: u32,
+    #[serde(default = "default_unpaid_purge_grace_hours")]
+    pub unpaid_purge_grace_hours: u32,
+}
+
+fn default_unpaid_purge_grace_hours() -> u32 {
+    24
 }
 
 fn default_min_confirmations() -> u32 {

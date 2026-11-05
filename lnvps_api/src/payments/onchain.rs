@@ -45,7 +45,8 @@ use chrono::Utc;
 use futures::StreamExt;
 use lnvps_api_common::{CostResult, WorkJob};
 use lnvps_db::{
-    AccountCreditTopup, LNVpsDb, PaymentMethod, SubscriptionPayment, SubscriptionPaymentType,
+    AccountCreditTopup, AccountType, LNVpsDb, OnchainAddressOwner, PaymentMethod,
+    SubscriptionPayment, SubscriptionPaymentType,
 };
 use log::{debug, error, info, warn};
 use payments_rs::currency::CurrencyAmount;
@@ -282,6 +283,149 @@ impl OnChainPaymentHandler {
         self.settle_topup(id).await
     }
 
+    async fn owner_reachable(&self, user_id: u64) -> bool {
+        self.db
+            .get_user(user_id)
+            .await
+            .map(|u| !u.email.is_empty() || u.account_type == AccountType::Nostr)
+            .unwrap_or(false)
+    }
+
+    async fn queue(&self, job: WorkJob) {
+        if let Err(e) = self.sub_handler.work_commander().send(job).await {
+            warn!("Failed to queue late deposit notification: {}", e);
+        }
+    }
+
+    async fn handle_late_detected(
+        &self,
+        owner: &OnchainAddressOwner,
+        txid: &str,
+        key: &str,
+        amount_msat: u64,
+    ) -> Result<()> {
+        if !self
+            .db
+            .mark_onchain_address_owner_notified(owner.id, key)
+            .await?
+        {
+            return Ok(());
+        }
+        info!(
+            "Late deposit {} of {} msat seen for removed order of user {}",
+            key, amount_msat, owner.user_id
+        );
+        if self.owner_reachable(owner.user_id).await {
+            self.queue(WorkJob::SendNotification {
+                user_id: owner.user_id,
+                title: Some("We have seen your on-chain payment".to_string()),
+                message: format!(
+                    "We can see your on-chain payment of {} sats (transaction {}). \
+                     The order it was for has expired and been removed, so once the payment \
+                     confirms we will add it to your account credit. You do not need to do anything.",
+                    amount_msat / 1000,
+                    txid
+                ),
+            })
+            .await;
+        } else {
+            self.queue(WorkJob::SendAdminNotification {
+                title: Some("Late on-chain payment seen, owner unreachable".to_string()),
+                message: format!(
+                    "An unconfirmed deposit of {} sats (outpoint {}) arrived at {}, which belonged \
+                     to a removed order of user {}. The user has no email and no nostr key, so they \
+                     could not be told. It will be credited to their account once it confirms.",
+                    amount_msat / 1000,
+                    key,
+                    owner.address.as_str(),
+                    owner.user_id
+                ),
+            })
+            .await;
+        }
+        Ok(())
+    }
+
+    async fn handle_late_deposit(
+        &self,
+        owner: &OnchainAddressOwner,
+        txid: &str,
+        key: &str,
+        amount_msat: u64,
+    ) -> Result<()> {
+        let note = format!("{key}: late on-chain payment after the order was removed");
+        let Some(balance) = self
+            .db
+            .credit_onchain_address_owner(owner.id, key, amount_msat, &note)
+            .await?
+        else {
+            debug!("Late deposit {} already credited", key);
+            return Ok(());
+        };
+        warn!(
+            "Late deposit {} of {} msat credited to user {} (order removed)",
+            key, amount_msat, owner.user_id
+        );
+        let sats = amount_msat / 1000;
+        let quoted = owner
+            .amount
+            .filter(|_| owner.currency.as_deref() == Some("BTC"))
+            .map(|q| q / 1000);
+        let mismatch = match quoted {
+            Some(q) if sats < q => {
+                format!(" This is less than the {q} sats quoted for the order.")
+            }
+            Some(q) if sats > q => {
+                format!(" This is more than the {q} sats quoted for the order.")
+            }
+            _ => String::new(),
+        };
+        let reachable = self.owner_reachable(owner.user_id).await;
+        if reachable {
+            self.queue(WorkJob::SendNotification {
+                user_id: owner.user_id,
+                title: Some("Your on-chain payment was added to your account credit".to_string()),
+                message: format!(
+                    "Your on-chain payment of {sats} sats (transaction {txid}) has confirmed. \
+                     The order it was for had expired and been removed, so we have added the full \
+                     amount received to your account credit.{mismatch} Your credit balance is now \
+                     {} sats. To use it, order a VM from the dashboard and pay with your account credit.",
+                    balance / 1000
+                ),
+            })
+            .await;
+        }
+        let vm = owner
+            .vm_id
+            .map(|id| format!("[VM{id}] "))
+            .unwrap_or_default();
+        self.queue(WorkJob::SendAdminNotification {
+            title: Some(format!("{vm}Late on-chain payment credited")),
+            message: format!(
+                "A deposit of {sats} sats (outpoint {key}) arrived at {}, which belonged to a \
+                 removed order (user {}, VM {}, subscription {}). It has been credited to the \
+                 user's account balance.{}",
+                owner.address.as_str(),
+                owner.user_id,
+                owner
+                    .vm_id
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none".into()),
+                owner
+                    .subscription_id
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none".into()),
+                if reachable {
+                    ""
+                } else {
+                    " The user has no email and no nostr key, so they could not be told."
+                }
+            ),
+        })
+        .await;
+        Ok(())
+    }
+
     async fn payment_for_address(&self, address: &str) -> Result<Option<SubscriptionPayment>> {
         let mut payments = self
             .db
@@ -382,6 +526,10 @@ impl OnChainPaymentHandler {
             return Ok(());
         }
         let Some(mut payment) = self.payment_for_address(address).await? else {
+            if let Some(owner) = self.db.get_onchain_address_owner(address).await? {
+                self.handle_late_detected(&owner, txid, &key, amount_msat)
+                    .await?;
+            }
             return Ok(());
         };
         // Address-reuse deposits are handled at confirmation; only a pending
@@ -500,7 +648,12 @@ impl OnChainPaymentHandler {
             None => match self.payment_for_address(address).await? {
                 Some(p) => p,
                 None => {
-                    debug!("Deposit {} to unknown address {}, ignoring", txid, address);
+                    if let Some(owner) = self.db.get_onchain_address_owner(address).await? {
+                        return self
+                            .handle_late_deposit(&owner, txid, &key, amount_msat)
+                            .await;
+                    }
+                    debug!("Deposit {} to unknown address {}, ignoring", key, address);
                     return Ok(());
                 }
             },
@@ -1105,10 +1258,12 @@ mod tests {
         Ok(())
     }
 
-    /// Deposits to unknown addresses are ignored.
     #[tokio::test]
     async fn test_unknown_address_ignored() -> Result<()> {
         let (db, _provider, handler, payment) = setup().await?;
+        handler
+            .handle_detected("bcrt1qunknown", "tx1", 0, EXPECTED)
+            .await?;
         handler
             .handle_deposit("bcrt1qunknown", "tx1", 0, EXPECTED)
             .await?;
@@ -1116,6 +1271,204 @@ mod tests {
         let p = get_payment(&db, &payment.id).await;
         assert!(!p.is_paid);
         assert_eq!(db.subscription_payments.lock().await.len(), 1);
+        assert!(db.account_credit_events.lock().await.is_empty());
+        assert!(next_jobs(&handler).await.is_empty());
+        Ok(())
+    }
+
+    async fn next_jobs(handler: &OnChainPaymentHandler) -> Vec<WorkJob> {
+        let mut jobs = Vec::new();
+        while let Ok(Ok(batch)) = tokio::time::timeout(
+            Duration::from_millis(50),
+            handler.sub_handler.work_commander().recv(),
+        )
+        .await
+        {
+            jobs.extend(batch.into_iter().map(|m| m.job));
+        }
+        jobs
+    }
+
+    async fn purge_order(db: &MockDb, payment: &SubscriptionPayment) -> Result<u64> {
+        let vm = db.get_vm_by_subscription(payment.subscription_id).await?;
+        db.hard_delete_vm(vm.id).await?;
+        assert!(db.subscription_payments.lock().await.is_empty());
+        Ok(vm.id)
+    }
+
+    fn user_notice(job: &WorkJob) -> Option<(u64, String)> {
+        match job {
+            WorkJob::SendNotification {
+                user_id, message, ..
+            } => Some((*user_id, message.clone())),
+            _ => None,
+        }
+    }
+
+    fn admin_notice(job: &WorkJob) -> Option<String> {
+        match job {
+            WorkJob::SendAdminNotification { title, message } => {
+                Some(format!("{}\n{}", title.as_deref().unwrap_or(""), message))
+            }
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_late_deposit_to_purged_order_credits_owner_once() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        let vm_id = purge_order(&db, &payment).await?;
+
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
+            EXPECTED
+        );
+        let events = db.account_credit_events.lock().await.clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "topup");
+        let note = events[0].note.clone().unwrap();
+        assert!(note.contains("tx1:0"), "{note}");
+        assert!(
+            note.contains("late on-chain payment after the order was removed"),
+            "{note}"
+        );
+        let owner = db.get_onchain_address_owner(ADDRESS).await?.unwrap();
+        assert_eq!(owner.status, lnvps_db::OnchainAddressOwnerStatus::Credited);
+        assert_eq!(owner.credited_outpoint.as_deref(), Some("tx1:0"));
+
+        let jobs = next_jobs(&handler).await;
+        assert_eq!(jobs.len(), 2, "{jobs:?}");
+        let (user_id, message) = user_notice(&jobs[0]).expect("owner notice first");
+        assert_eq!(user_id, payment.user_id);
+        assert!(message.contains("1100 sats"), "{message}");
+        assert!(message.contains("tx1"), "{message}");
+        assert!(message.contains("account credit"), "{message}");
+        assert!(message.contains("balance is now 1100 sats"), "{message}");
+        assert!(
+            message.contains("order a VM from the dashboard"),
+            "{message}"
+        );
+        assert!(!message.contains('\u{2014}') && !message.contains('\u{2013}'));
+        let admin = admin_notice(&jobs[1]).expect("admin notice");
+        assert!(admin.contains("tx1:0"), "{admin}");
+        assert!(admin.contains(ADDRESS), "{admin}");
+        assert!(admin.contains(&format!("VM{vm_id}")), "{admin}");
+
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
+            EXPECTED,
+            "a replay credits nothing more"
+        );
+        assert!(next_jobs(&handler).await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_late_deposit_detected_tells_owner_once_and_credits_nothing() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        purge_order(&db, &payment).await?;
+
+        handler.handle_detected(ADDRESS, "tx1", 0, EXPECTED).await?;
+        handler.handle_detected(ADDRESS, "tx1", 0, EXPECTED).await?;
+        handler.handle_detected(ADDRESS, "tx2", 0, EXPECTED).await?;
+
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
+            0
+        );
+        assert!(db.account_credit_events.lock().await.is_empty());
+        let jobs = next_jobs(&handler).await;
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        let (user_id, message) = user_notice(&jobs[0]).unwrap();
+        assert_eq!(user_id, payment.user_id);
+        assert!(message.contains("1100 sats"), "{message}");
+        assert!(message.contains("tx1"), "{message}");
+        assert!(message.contains("once the payment confirms"), "{message}");
+
+        handler.handle_deposit(ADDRESS, "tx2", 0, EXPECTED).await?;
+        let jobs = next_jobs(&handler).await;
+        assert_eq!(jobs.len(), 2, "{jobs:?}");
+        assert!(user_notice(&jobs[0]).unwrap().1.contains("balance is now"));
+
+        handler.handle_detected(ADDRESS, "tx2", 0, EXPECTED).await?;
+        assert!(next_jobs(&handler).await.is_empty());
+
+        handler.handle_detected(ADDRESS, "tx3", 0, EXPECTED).await?;
+        let jobs = next_jobs(&handler).await;
+        assert_eq!(jobs.len(), 1, "a new deposit after a credit is announced");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_late_deposit_states_an_under_or_over_payment() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        purge_order(&db, &payment).await?;
+
+        handler.handle_deposit(ADDRESS, "tx1", 0, 600_000).await?;
+        let jobs = next_jobs(&handler).await;
+        let message = user_notice(&jobs[0]).unwrap().1;
+        assert!(message.contains("600 sats"), "{message}");
+        assert!(message.contains("less than the 1100 sats"), "{message}");
+
+        handler.handle_deposit(ADDRESS, "tx2", 0, 2_000_000).await?;
+        let jobs = next_jobs(&handler).await;
+        let message = user_notice(&jobs[0]).unwrap().1;
+        assert!(message.contains("more than the 1100 sats"), "{message}");
+        assert!(message.contains("balance is now 2600 sats"), "{message}");
+
+        handler.handle_deposit(ADDRESS, "tx3", 0, EXPECTED).await?;
+        let jobs = next_jobs(&handler).await;
+        let message = user_notice(&jobs[0]).unwrap().1;
+        assert!(!message.contains("than the"), "{message}");
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
+            600_000 + 2_000_000 + EXPECTED
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_late_deposit_owner_without_contact_goes_to_admin() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        purge_order(&db, &payment).await?;
+        db.users
+            .lock()
+            .await
+            .get_mut(&payment.user_id)
+            .unwrap()
+            .account_type = lnvps_db::AccountType::OAuth;
+
+        handler.handle_detected(ADDRESS, "tx1", 0, EXPECTED).await?;
+        let jobs = next_jobs(&handler).await;
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        let admin = admin_notice(&jobs[0]).expect("admin told instead of the owner");
+        assert!(admin.contains("tx1:0"), "{admin}");
+        assert!(admin.contains("no email"), "{admin}");
+
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+        let jobs = next_jobs(&handler).await;
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        let admin = admin_notice(&jobs[0]).expect("admin told instead of the owner");
+        assert!(admin.contains("no email"), "{admin}");
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
+            EXPECTED
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deposit_to_live_order_does_not_use_the_owner_table() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        handler.handle_detected(ADDRESS, "tx1", 0, EXPECTED).await?;
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+
+        assert!(get_payment(&db, &payment.id).await.is_paid);
+        assert!(db.account_credit_topups.lock().await.is_empty());
+        assert!(db.onchain_address_owners.lock().await.is_empty());
         Ok(())
     }
 

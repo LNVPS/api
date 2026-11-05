@@ -4691,6 +4691,7 @@ pub struct SanitizedOnChainConfig {
     pub address_type: String,
     pub account: Option<String>,
     pub min_confirmations: u32,
+    pub unpaid_purge_grace_hours: u32,
 }
 
 /// Sanitized FixedFloat config (hides api_key and api_secret)
@@ -4791,6 +4792,7 @@ impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
                     address_type: format!("{:?}", cfg.address_type),
                     account: cfg.account.clone(),
                     min_confirmations: cfg.min_confirmations,
+                    unpaid_purge_grace_hours: cfg.unpaid_purge_grace_hours,
                 })
             }
             lnvps_db::ProviderConfig::FixedFloat(cfg) => {
@@ -5058,6 +5060,7 @@ pub struct PartialOnChainConfig {
     )]
     pub account: Option<Option<String>>,
     pub min_confirmations: Option<u32>,
+    pub unpaid_purge_grace_hours: Option<u32>,
 }
 
 /// Partial FixedFloat config for updates
@@ -5175,6 +5178,9 @@ impl PartialProviderConfig {
                     min_confirmations: partial
                         .min_confirmations
                         .unwrap_or(existing.min_confirmations),
+                    unpaid_purge_grace_hours: partial
+                        .unpaid_purge_grace_hours
+                        .unwrap_or(existing.unpaid_purge_grace_hours),
                 }))
             }
             (PartialProviderConfig::FixedFloat(partial), ProviderConfig::FixedFloat(existing)) => {
@@ -5660,11 +5666,12 @@ mod tests {
             address_type: OnChainAddressType::WitnessPubkeyHash,
             account: Some("orders".to_string()),
             min_confirmations: 1,
+            unpaid_purge_grace_hours: 24,
         });
 
         // Only change the URL + confirmations; everything else is preserved.
         let partial: PartialProviderConfig = serde_json::from_str(
-            r#"{"type":"onchain","url":"https://new:10009","min_confirmations":3}"#,
+            r#"{"type":"onchain","url":"https://new:10009","min_confirmations":3,"unpaid_purge_grace_hours":72}"#,
         )
         .unwrap();
         let merged = partial.merge_with(&existing).unwrap();
@@ -5672,6 +5679,7 @@ mod tests {
             ProviderConfig::OnChain(c) => {
                 assert_eq!(c.url, "https://new:10009");
                 assert_eq!(c.min_confirmations, 3);
+                assert_eq!(c.unpaid_purge_grace_hours, 72);
                 assert_eq!(c.cert_path, PathBuf::from("/old/tls.cert"));
                 assert_eq!(c.address_type, OnChainAddressType::WitnessPubkeyHash);
                 assert_eq!(c.account, Some("orders".to_string()));
@@ -5683,7 +5691,10 @@ mod tests {
         let clear: PartialProviderConfig =
             serde_json::from_str(r#"{"type":"onchain","account":null}"#).unwrap();
         match clear.merge_with(&existing).unwrap() {
-            ProviderConfig::OnChain(c) => assert_eq!(c.account, None),
+            ProviderConfig::OnChain(c) => {
+                assert_eq!(c.account, None);
+                assert_eq!(c.unpaid_purge_grace_hours, 24);
+            }
             _ => panic!("expected OnChain"),
         }
     }

@@ -2,7 +2,7 @@ use crate::provisioner::VmProvisioner;
 use crate::subscription::SubscriptionLineItemHandler;
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use lnvps_api_common::{
     UpgradeConfig, VmHistoryLogger, VmRunningState, VmRunningStates, VmStateCache, WorkCommander,
     WorkJob,
@@ -305,8 +305,9 @@ impl SubscriptionLineItemHandler for VmLineItemHandler {
             .list_vm_subscription_payments(vm_id)
             .await
             .map(|ps| {
-                ps.iter()
-                    .any(|p| crate::worker::payment_blocks_unpaid_deletion(p, now))
+                ps.iter().any(|p| {
+                    crate::worker::payment_blocks_unpaid_deletion(p, now, TimeDelta::zero())
+                })
             })
             .unwrap_or(false)
         {
