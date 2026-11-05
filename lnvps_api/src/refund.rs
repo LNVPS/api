@@ -458,12 +458,8 @@ impl VmRefundHandler {
             .collect();
         payments.sort_by_key(|p| std::cmp::Reverse(p.created));
 
-        let paid_seconds: i64 = payments
-            .iter()
-            .map(|p| p.time_value.unwrap_or(0) as i64)
-            .sum();
-        if let Some(first) = payments.last() {
-            let paid_through = first.created + chrono::Duration::seconds(paid_seconds);
+        let paid_through = paid_through(&payments);
+        if let Some(paid_through) = paid_through {
             unused = unused.min((paid_through - at).num_seconds().max(0) as u64);
         }
 
@@ -625,6 +621,18 @@ impl VmRefundHandler {
         }
         allocate_cash_refund(&candidates, amount)
     }
+}
+
+pub fn paid_through(payments: &[SubscriptionPayment]) -> Option<DateTime<Utc>> {
+    let mut ordered: Vec<&SubscriptionPayment> = payments.iter().collect();
+    ordered.sort_by_key(|p| p.paid_at.unwrap_or(p.created));
+    let mut through: Option<DateTime<Utc>> = None;
+    for p in ordered {
+        let paid = p.paid_at.unwrap_or(p.created);
+        let start = through.map_or(paid, |t| t.max(paid));
+        through = Some(start + chrono::Duration::seconds(p.time_value.unwrap_or(0) as i64));
+    }
+    through
 }
 
 #[cfg(test)]
@@ -1381,27 +1389,80 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn admin_granted_days_are_not_refunded() {
+    async fn refund_with_payments(
+        periods: &[(i64, Option<u64>)],
+        free_days: i64,
+        delete_day: i64,
+    ) -> Vec<(String, u64)> {
         let mock = MockDb::default();
-        let (vm, payment) = vm_with_payment(&mock, 3100, 0).await;
-        let start = Utc::now() - chrono::Duration::days(20);
-        for p in mock.subscription_payments.lock().await.iter_mut() {
-            if p.id == payment.id {
-                p.created = start;
-                p.time_value = Some(31 * 86_400);
+        let (vm, base) = vm_with_payment(&mock, 3100, 0).await;
+        let start = Utc::now() - chrono::Duration::days(300);
+        let day = |d: i64| start + chrono::Duration::days(d);
+        let mut expires = day(periods[0].0);
+        {
+            let mut all = mock.subscription_payments.lock().await;
+            all.clear();
+            for (i, (at_day, days)) in periods.iter().enumerate() {
+                let mut p = base.clone();
+                p.id = vec![10 + i as u8; 32];
+                p.created = day(*at_day);
+                p.paid_at = Some(day(*at_day));
+                p.time_value = days.map(|d| d * 86_400);
+                p.amount = days.unwrap_or(0) * 100;
+                expires =
+                    expires.max(day(*at_day)) + chrono::Duration::days(days.unwrap_or(0) as i64);
+                all.push(p);
             }
         }
         let db: Arc<dyn LNVpsDb> = Arc::new(mock);
         let handler = handler(db.clone(), Arc::new(PayNode::default())).await;
-        let expires = start + chrono::Duration::days(31 + 365);
-        let at = start + chrono::Duration::days(20);
-
-        let returned = handler
-            .refund_unused_to_credit(vm.id, vm.user_id, expires, at)
+        let expires = expires + chrono::Duration::days(free_days);
+        handler
+            .refund_unused_to_credit(vm.id, vm.user_id, expires, day(delete_day))
             .await
-            .unwrap();
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_granted_days_are_not_refunded() {
+        let returned = refund_with_payments(&[(0, Some(31))], 365, 20).await;
         assert_eq!(amount_in(&returned, "EUR"), 1100);
+    }
+
+    #[tokio::test]
+    async fn contiguous_payments_refund_the_unused_part_of_the_second() {
+        let returned = refund_with_payments(&[(0, Some(31)), (31, Some(31))], 0, 40).await;
+        assert_eq!(amount_in(&returned, "EUR"), 2200);
+    }
+
+    #[tokio::test]
+    async fn a_gap_between_payments_does_not_shrink_the_refund() {
+        let returned = refund_with_payments(&[(0, Some(31)), (91, Some(31))], 0, 100).await;
+        assert_eq!(amount_in(&returned, "EUR"), 2200);
+    }
+
+    #[tokio::test]
+    async fn an_early_renewal_keeps_the_time_it_stacked_on() {
+        let returned = refund_with_payments(&[(0, Some(31)), (20, Some(31))], 0, 30).await;
+        assert_eq!(amount_in(&returned, "EUR"), 3200);
+    }
+
+    #[tokio::test]
+    async fn payments_without_time_are_ignored() {
+        let returned =
+            refund_with_payments(&[(0, Some(31)), (10, None), (15, Some(0))], 0, 20).await;
+        assert_eq!(amount_in(&returned, "EUR"), 1100);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_refunded_after_the_paid_through_date() {
+        let returned = refund_with_payments(&[(0, Some(31))], 365, 40).await;
+        assert!(returned.is_empty(), "{returned:?}");
+    }
+
+    #[test]
+    fn paid_through_of_nothing_is_none() {
+        assert!(paid_through(&[]).is_none());
     }
 
     /// On a subscription that also bills an IP range, only the VM line item's

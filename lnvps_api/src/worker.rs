@@ -7656,7 +7656,7 @@ mod tests {
     #[tokio::test]
     async fn an_owner_deleting_an_hourly_vm_returns_unused_time_as_credit() -> Result<()> {
         let db = Arc::new(MockDb::default());
-        let created = Utc::now().sub(TimeDelta::hours(6));
+        let created = Utc::now().sub(TimeDelta::hours(4));
         let (vm_id, sub_id) = add_vm_with_subscription(&db, created, true).await?;
         let vm = db.get_vm(vm_id).await?;
         // 4 of the 8 paid hours are left.
