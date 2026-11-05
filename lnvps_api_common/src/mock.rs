@@ -5011,11 +5011,12 @@ impl LNVpsDbBase for MockDb {
         Ok(topups.iter().find(|t| t.id == id).cloned())
     }
 
-    async fn settle_account_credit_topup(
+    async fn settle_account_credit_topup_noted(
         &self,
         id: u64,
         credit_currency: &str,
         credit_amount: u64,
+        note: Option<&str>,
     ) -> DbResult<Option<lnvps_db::AccountCreditTopup>> {
         let mut topups = self.account_credit_topups.lock().await;
         let mut credits = self.account_credits.lock().await;
@@ -5039,7 +5040,7 @@ impl LNVpsDbBase for MockDb {
             amount: credit_amount as i64,
             currency: credit_currency.to_string(),
             subscription_payment_id: None,
-            note: None,
+            note: note.map(str::to_string),
             created: Utc::now(),
         });
         Ok(Some(settled))

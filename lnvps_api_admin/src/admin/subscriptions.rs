@@ -822,8 +822,12 @@ async fn admin_record_external_payment(
                     ApiError::internal(e)
                 }
             })?;
+        let ledger_note = format!(
+            "{outpoint}: external on-chain deposit recorded by admin {}: {}",
+            auth.user_id, req.note
+        );
         this.db
-            .settle_account_credit_topup(topup_id, "BTC", req.amount_msat)
+            .settle_account_credit_topup_noted(topup_id, "BTC", req.amount_msat, Some(&ledger_note))
             .await?;
         log::info!(
             "Admin {} credited external deposit {} ({} msat) to user {}: {}",
@@ -1222,6 +1226,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(credit_balance(&db, user_id).await, before + AMOUNT);
+        let events = db.account_credit_events.lock().await.clone();
+        let note = events
+            .iter()
+            .find(|e| e.user_id == user_id)
+            .and_then(|e| e.note.clone())
+            .expect("ledger note");
+        assert!(note.contains(&format!("{TXID}:0")), "{note}");
+        assert!(note.contains("admin 7"), "{note}");
+        assert!(note.contains("late payment to purged VM"), "{note}");
 
         let err = admin_record_external_payment(
             create_auth(),
@@ -1254,6 +1267,67 @@ mod tests {
             assert_eq!(err.code, axum::http::StatusCode::BAD_REQUEST);
             assert!(db.subscription_payments.lock().await.is_empty());
         }
+    }
+
+    async fn assert_priced_and_extended(db: &MockDb, this: RouterState, sub_id: u64) {
+        let out = admin_record_external_payment(
+            create_auth(),
+            State(this),
+            Json(request(Some(sub_id), None)),
+        )
+        .await
+        .unwrap();
+        let AdminExternalPaymentResult::Payment(p) = out.0.data else {
+            panic!("expected a payment");
+        };
+        assert!(p.is_paid);
+        assert!(p.time_value.expect("priced time") > 0);
+        assert_eq!(p.amount + p.tax + p.processing_fee, AMOUNT);
+        let expires = db.get_subscription(sub_id).await.unwrap().expires;
+        assert!(expires.is_some_and(|e| e > Utc::now()));
+    }
+
+    #[tokio::test]
+    async fn external_payment_prices_subscription_whose_vm_was_soft_deleted() {
+        let (db, this, sub_id, _) = fixture(Some(chain_output(true, true))).await;
+        let vm = db.get_vm_by_subscription(sub_id).await.unwrap();
+        db.delete_vm(vm.id).await.unwrap();
+        assert!(db.get_vm_by_subscription(sub_id).await.unwrap().deleted);
+        assert_priced_and_extended(&db, this, sub_id).await;
+    }
+
+    #[tokio::test]
+    async fn external_payment_prices_subscription_without_vm_from_line_items() {
+        let (db, this, _, user_id) = fixture(Some(chain_output(true, true))).await;
+        let (sub_id, _) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    user_id,
+                    company_id: 1,
+                    name: "dns".to_string(),
+                    created: Utc::now(),
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    ..mk_subscription(None)
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: LineItemType::DnsHosting,
+                    name: "dns".to_string(),
+                    description: None,
+                    amount: 1000,
+                    setup_amount: 0,
+                    configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        assert!(db.get_vm_by_subscription(sub_id).await.is_err());
+        assert_priced_and_extended(&db, this, sub_id).await;
     }
 
     #[tokio::test]

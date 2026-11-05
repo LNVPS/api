@@ -1475,6 +1475,8 @@ Body: `{"outpoint": "<txid>:<vout>", "amount_msat": 1100000, "currency": "BTC", 
 
 Verifies the outpoint on chain (confirmed, pays our wallet, amount matches). With `subscription_id` inserts a paid, priced renewal keyed by the outpoint and writes a VM history entry with the admin id and note; without it `user_id` is required and the user's account credit is topped up. A repeated outpoint returns 409.
 
+"Pays our wallet" means the output address is one LNVPS issued: it appears on a stored on-chain or FixedFloat payment, an account credit top-up, or a kept `onchain_address_owner` row (purged orders). A deposit to a wallet address that has no such row at all is refused with 400, because `OnChainProvider` cannot list the addresses the wallet owns and the admin API holds no LND connection. Credit those with the account credit adjust endpoint and put the txid in the note. The credit path also writes the admin id, outpoint and note on the `account_credit_event` ledger row.
+
 Manually marks a subscription payment as paid. Sets `is_paid=true`, records `paid_at`, extends the subscription by 30 days, and activates it, then queues the same on-payment handling a Lightning settlement runs (instant app reconcile, applying a VM/app upgrade) on the worker.
 
 Calling it again on an already-paid payment only re-queues that handling (the subscription is not extended twice), so a failed queue dispatch can be retried.

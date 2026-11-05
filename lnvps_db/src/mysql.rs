@@ -6033,11 +6033,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
-    async fn settle_account_credit_topup(
+    async fn settle_account_credit_topup_noted(
         &self,
         id: u64,
         credit_currency: &str,
         credit_amount: u64,
+        note: Option<&str>,
     ) -> DbResult<Option<AccountCreditTopup>> {
         let owner: Option<u64> = sqlx::query_scalar(
             "SELECT user_id FROM account_credit_topup WHERE id = ? AND is_paid = 0",
@@ -6078,12 +6079,13 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO account_credit_event (user_id, kind, amount, currency) \
-             VALUES (?, 'topup', ?, ?)",
+            "INSERT INTO account_credit_event (user_id, kind, amount, currency, note) \
+             VALUES (?, 'topup', ?, ?, ?)",
         )
         .bind(topup.user_id)
         .bind(i64::try_from(credit_amount).map_err(|e| anyhow!(e))?)
         .bind(credit_currency)
+        .bind(note)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

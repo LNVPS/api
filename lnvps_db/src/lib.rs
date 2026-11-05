@@ -1588,6 +1588,17 @@ pub trait LNVpsDbBase: Send + Sync {
         id: u64,
         credit_currency: &str,
         credit_amount: u64,
+    ) -> DbResult<Option<AccountCreditTopup>> {
+        self.settle_account_credit_topup_noted(id, credit_currency, credit_amount, None)
+            .await
+    }
+
+    async fn settle_account_credit_topup_noted(
+        &self,
+        id: u64,
+        credit_currency: &str,
+        credit_amount: u64,
+        note: Option<&str>,
     ) -> DbResult<Option<AccountCreditTopup>>;
 
     async fn list_account_credit_topups(
