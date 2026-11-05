@@ -1514,6 +1514,33 @@ mod tests {
         assert_eq!(amount_in(&first, "BTC") + amount_in(&rest, "BTC"), 1);
     }
 
+    #[tokio::test]
+    async fn production_sub_cent_credit_refund_returns_one_cent() {
+        let mock = MockDb::default();
+        let (vm, payment) = vm_with_payment(&mock, 25_000, 0).await;
+        let mut d = debit(&payment, 25_000, 1);
+        d.currency = "EUR".to_string();
+        mock.account_credit_debits.lock().await.push(d);
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let handler = handler(db.clone(), Arc::new(PayNode::default())).await;
+        let expires = payment.expires;
+        let at = expires - chrono::Duration::seconds(9_819 * 30 * 86_400 / 25_000);
+
+        let returned = handler
+            .refund_unused_to_credit(vm.id, vm.user_id, expires, at)
+            .await
+            .unwrap();
+        assert_eq!(amount_in(&returned, "EUR"), 1, "{returned:?}");
+        let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
+        assert_eq!(refunds.len(), 1);
+        let (events, _) = db
+            .list_account_credit_events(vm.user_id, 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].amount, 1);
+    }
+
     #[test]
     fn paid_through_of_nothing_is_none() {
         assert!(paid_through(&[]).is_none());
