@@ -7676,6 +7676,7 @@ mod tests {
         );
         payment.is_paid = true;
         payment.amount = 8_000;
+        payment.paid_at = Some(Utc::now().sub(TimeDelta::hours(4)));
         payment.time_value = Some(8 * 3600);
         db.insert_subscription_payment(&payment).await?;
         db.account_credit_debits
