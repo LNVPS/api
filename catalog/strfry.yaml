@@ -23,6 +23,10 @@ services:
           relay {
               bind = "0.0.0.0"
               port = 7777
+              realIpHeader = "${real_ip_header}"
+              writePolicy {
+                  plugin = "${write_policy_plugin}"
+              }
               auth {
                   enabled = ${auth_enabled}
                   serviceUrl = "wss://${HOSTNAME}"
@@ -69,6 +73,118 @@ services:
                   requireAuthorOrTag = ${filter_validation_require_author_or_tag}
               }
           }
+      - path: /etc/strfry-view-policy.py
+        content: |
+          #!/usr/bin/env python3
+          import json
+          import os
+          import sys
+          import time
+
+          VIEW_KIND = 7700
+          MIN_POW_BITS = int(os.environ.get("VIEW_POW_BITS", "18"))
+          PER_TARGET_WINDOW = 24 * 60 * 60
+          PER_IP_WINDOW = 60
+          PER_IP_MAX = 30
+          MAX_SKEW = 15 * 60
+          MAX_TRACKED = 200000
+
+          seen_targets = {}
+          ip_windows = {}
+
+
+          def leading_zero_bits(hex_id):
+              bits = 0
+              for ch in hex_id:
+                  nibble = int(ch, 16)
+                  if nibble == 0:
+                      bits += 4
+                      continue
+                  return bits + 4 - nibble.bit_length()
+              return bits
+
+
+          def committed_pow(event):
+              for tag in event["tags"]:
+                  if tag and tag[0] == "nonce":
+                      try:
+                          return int(tag[2])
+                      except (IndexError, ValueError, TypeError):
+                          return 0
+              return 0
+
+
+          def view_target(event):
+              for tag in event["tags"]:
+                  if len(tag) > 1 and tag[0] in ("e", "a") and isinstance(tag[1], str) and tag[1]:
+                      return tag[0] + ":" + tag[1]
+              return None
+
+
+          def source_key(msg):
+              if msg.get("sourceType") in ("IP4", "IP6"):
+                  return msg["sourceInfo"]
+              if msg.get("authed"):
+                  return "pk:" + msg["authed"]
+              return "%s:%s" % (msg.get("sourceType"), msg["event"]["pubkey"])
+
+
+          def prune(now):
+              if len(seen_targets) <= MAX_TRACKED:
+                  return
+              for key in [k for k, at in seen_targets.items() if now - at >= PER_TARGET_WINDOW]:
+                  del seen_targets[key]
+              if len(seen_targets) > MAX_TRACKED:
+                  seen_targets.clear()
+              for key in [k for k, ts in ip_windows.items() if all(now - t >= PER_IP_WINDOW for t in ts)]:
+                  del ip_windows[key]
+
+
+          def judge(msg, now=None):
+              event = msg["event"]
+              if event["kind"] != VIEW_KIND:
+                  return {"action": "accept"}
+              now = int(time.time()) if now is None else now
+              if abs(event["created_at"] - now) > MAX_SKEW:
+                  return {"action": "reject", "msg": "invalid: created_at too far from now"}
+              target = view_target(event)
+              if not target:
+                  return {"action": "reject", "msg": "invalid: view needs an e or a tag"}
+              if leading_zero_bits(event["id"]) < MIN_POW_BITS or committed_pow(event) < MIN_POW_BITS:
+                  return {"action": "reject", "msg": "pow: need %d bits of proof of work" % MIN_POW_BITS}
+              source = source_key(msg)
+              key = source + "|" + target
+              last = seen_targets.get(key)
+              if last is not None and now - last < PER_TARGET_WINDOW:
+                  return {"action": "shadowReject", "msg": ""}
+              window = [t for t in ip_windows.get(source, []) if now - t < PER_IP_WINDOW]
+              if len(window) >= PER_IP_MAX:
+                  ip_windows[source] = window
+                  return {"action": "reject", "msg": "rate-limited: too many views from this address"}
+              window.append(now)
+              ip_windows[source] = window
+              seen_targets[key] = now
+              prune(now)
+              return {"action": "accept"}
+
+
+          def main():
+              for line in sys.stdin:
+                  try:
+                      msg = json.loads(line)
+                  except ValueError:
+                      continue
+                  event_id = (msg.get("event") or {}).get("id", "")
+                  try:
+                      verdict = judge(msg)
+                  except Exception:
+                      verdict = {"action": "reject", "msg": "error: internal error"}
+                  sys.stdout.write(json.dumps(dict(id=event_id, **verdict)) + "\n")
+                  sys.stdout.flush()
+
+
+          if __name__ == "__main__":
+              main()
     volumes:
       - { name: db, path: /app/strfry-db, size: 5Gi, label: events }
     backup: { exec: ["/app/strfry", "export"], artifact: strfry-events.jsonl }
@@ -81,6 +197,8 @@ config:
   - { name: relay_banner, label: "Banner URL", type: string, default: "", pattern: '(https?://[^"\\\s]+)?', group: "Relay info" }
   - { name: relay_privacy_url, label: "Privacy policy URL", type: string, default: "", pattern: '(https?://[^"\\\s]+)?', group: "Relay info" }
   - { name: relay_terms_url, label: "Terms of service URL", type: string, default: "", pattern: '(https?://[^"\\\s]+)?', group: "Relay info" }
+  - { name: write_policy_plugin, label: "Write policy (blank for none)", type: string, default: "", pattern: '(python3 /etc/strfry-view-policy\.py)?', group: "Access" }
+  - { name: real_ip_header, label: "Client IP header", type: string, default: "", pattern: "(x-real-ip|x-forwarded-for)?", group: "Access" }
   - { name: auth_enabled, label: "Enable NIP-42 AUTH", type: bool, default: "false", group: "Access" }
   - { name: filter_validation_enabled, label: "Restrict REQ filters", type: bool, default: "false", group: "Access" }
   - { name: filter_validation_max_filters_per_req, label: "Max filters per REQ (when restricted)", type: int, default: "3", pattern: "[1-9][0-9]*", group: "Access" }
