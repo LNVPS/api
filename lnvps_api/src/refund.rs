@@ -500,7 +500,24 @@ impl VmRefundHandler {
             let credit_back = debit
                 .as_ref()
                 .map(|d| {
-                    (d.amount as u128 * gross_from_credit as u128 / d.payment_amount as u128) as u64
+                    let den = d.payment_amount as u128;
+                    let earlier_gross_from_credit: u128 = existing
+                        .iter()
+                        .map(|r| {
+                            (r.amount + r.tax) as u128 * credit_paid as u128 / billable as u128
+                        })
+                        .sum();
+                    let earlier_credit: u128 = existing
+                        .iter()
+                        .filter_map(|r| r.metadata.as_ref())
+                        .filter_map(|m| m["refund"]["returned_as_credit"][&d.currency].as_u64())
+                        .map(|v| v as u128)
+                        .sum();
+                    let cumulative = (d.amount as u128
+                        * (earlier_gross_from_credit + gross_from_credit as u128))
+                        .div_ceil(den)
+                        .min(d.amount as u128);
+                    cumulative.saturating_sub(earlier_credit) as u64
                 })
                 .unwrap_or(0);
             let mut credits = Vec::new();
@@ -509,6 +526,9 @@ impl VmRefundHandler {
             }
             add_credit(&mut credits, &payment.currency, gross_from_cash);
 
+            let no_credit_reason = credits
+                .is_empty()
+                .then_some("credit share of the refund is below one unit of the balance currency");
             let mut row = build_refund_row(
                 &payment,
                 gross,
@@ -540,6 +560,9 @@ impl VmRefundHandler {
                         .collect::<std::collections::BTreeMap<_, _>>()
                 );
                 refund["returned_from_cash"] = serde_json::json!(gross_from_cash);
+                if let Some(reason) = no_credit_reason {
+                    refund["no_credit_reason"] = serde_json::json!(reason);
+                }
             }
             let note = format!(
                 "VM {} deleted, unused time of payment {}",
@@ -1458,6 +1481,37 @@ mod tests {
     async fn nothing_is_refunded_after_the_paid_through_date() {
         let returned = refund_with_payments(&[(0, Some(31))], 365, 40).await;
         assert!(returned.is_empty(), "{returned:?}");
+    }
+
+    #[tokio::test]
+    async fn a_sub_cent_credit_share_is_carried_not_lost() {
+        let mock = MockDb::default();
+        let (vm, payment) = vm_with_payment(&mock, 25_000, 0).await;
+        mock.account_credit_debits
+            .lock()
+            .await
+            .push(debit(&payment, 25_000, 1));
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let handler = handler(db.clone(), Arc::new(PayNode::default())).await;
+        let expires = payment.expires;
+        let first_at = expires - chrono::Duration::seconds(9_819 * 30 * 86_400 / 25_000);
+        let first = handler
+            .refund_unused_to_credit(vm.id, vm.user_id, expires, first_at)
+            .await
+            .unwrap();
+        assert_eq!(amount_in(&first, "BTC"), 1, "{first:?}");
+        let rows = db.list_refunds_for_payment(&payment.id).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let rest = handler
+            .refund_unused_to_credit(
+                vm.id,
+                vm.user_id,
+                expires,
+                payment.expires - chrono::Duration::days(15),
+            )
+            .await
+            .unwrap();
+        assert_eq!(amount_in(&first, "BTC") + amount_in(&rest, "BTC"), 1);
     }
 
     #[test]
