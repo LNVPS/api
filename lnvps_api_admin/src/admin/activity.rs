@@ -5,7 +5,10 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
 use lnvps_api_common::{ApiData, ApiError, ApiResult, deserialize_from_str_optional};
-use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
+use lnvps_db::{
+    AdminAction, AdminResource, LNVpsDb, PaidSubscriptionPayment, SubscriptionPayment, VmHistory,
+    VmHistoryActionType,
+};
 
 use crate::admin::RouterState;
 use crate::admin::apps::deployment_infos;
@@ -68,6 +71,79 @@ pub struct AdminActivityPayment {
     #[serde(flatten)]
     pub payment: AdminSubscriptionPaymentInfo,
     pub subscription_name: String,
+    pub vm_id: Option<u64>,
+    pub refund_trigger: Option<RefundTrigger>,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RefundTrigger {
+    OwnerDelete,
+    AdminDelete,
+    Admin,
+    Manual,
+}
+
+fn metadata_json(history: &VmHistory) -> Option<serde_json::Value> {
+    history
+        .metadata
+        .as_deref()
+        .and_then(|m| serde_json::from_slice(m).ok())
+}
+
+pub fn refund_trigger(
+    payment: &SubscriptionPayment,
+    deletion: Option<&VmHistory>,
+) -> Option<RefundTrigger> {
+    if !payment.payment_type.is_refund() {
+        return None;
+    }
+    let refund = payment.metadata.as_ref().and_then(|m| m.get("refund"));
+    let field = |name: &str| refund.and_then(|r| r.get(name)).filter(|v| !v.is_null());
+    if field("by_owner_user_id").is_some() {
+        return Some(RefundTrigger::OwnerDelete);
+    }
+    let admin_id = field("recorded_by_admin_user_id").and_then(|v| v.as_u64());
+    let deleted_by_that_admin = deletion.is_some_and(|d| {
+        d.timestamp <= payment.created
+            && metadata_json(d).is_some_and(|m| {
+                m.get("admin_action").and_then(|v| v.as_bool()) == Some(true)
+                    && admin_id.is_some()
+                    && m.get("admin_user_id").and_then(|v| v.as_u64()) == admin_id
+            })
+    });
+    if deleted_by_that_admin {
+        Some(RefundTrigger::AdminDelete)
+    } else if !payment.external_data.as_str().is_empty() {
+        Some(RefundTrigger::Admin)
+    } else {
+        Some(RefundTrigger::Manual)
+    }
+}
+
+async fn activity_payment(
+    db: &std::sync::Arc<dyn LNVpsDb>,
+    p: PaidSubscriptionPayment,
+) -> AdminActivityPayment {
+    let vm_id = db
+        .get_vm_by_subscription(p.payment.subscription_id)
+        .await
+        .ok()
+        .map(|vm| vm.id);
+    let deletion = match (vm_id, p.payment.payment_type.is_refund()) {
+        (Some(id), true) => db.list_vm_history(id).await.ok().and_then(|h| {
+            h.into_iter()
+                .filter(|e| matches!(e.action_type, VmHistoryActionType::Deleted))
+                .min_by_key(|e| e.timestamp)
+        }),
+        _ => None,
+    };
+    AdminActivityPayment {
+        refund_trigger: refund_trigger(&p.payment, deletion.as_ref()),
+        payment: AdminSubscriptionPaymentInfo::new(p.payment, p.company_base_currency),
+        subscription_name: p.subscription_name,
+        vm_id,
+    }
 }
 
 #[derive(Serialize)]
@@ -150,6 +226,11 @@ async fn build_activity_report(
         })
         .collect();
 
+    let mut payment_items = Vec::with_capacity(payments.len());
+    for p in payments {
+        payment_items.push(activity_payment(db, p).await);
+    }
+
     Ok(AdminActivityReport {
         since,
         expiring_until,
@@ -178,16 +259,7 @@ async fn build_activity_report(
             deployment_infos(db.as_ref(), apps).await?,
             apps_total,
         ),
-        payments: AdminActivitySection::new(
-            payments
-                .into_iter()
-                .map(|p| AdminActivityPayment {
-                    payment: AdminSubscriptionPaymentInfo::new(p.payment, p.company_base_currency),
-                    subscription_name: p.subscription_name,
-                })
-                .collect(),
-            payments_total,
-        ),
+        payments: AdminActivitySection::new(payment_items, payments_total),
         payment_totals: totals
             .into_iter()
             .map(|t| AdminPaymentTotal {

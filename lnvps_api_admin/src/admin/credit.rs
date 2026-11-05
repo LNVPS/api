@@ -7,7 +7,8 @@ use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Json, Router};
 use lnvps_api_common::{
-    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, PageQuery,
+    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult,
+    deserialize_from_str_optional,
 };
 use lnvps_db::{AccountCredit, AccountCreditEvent, AdminAction, AdminResource};
 use serde::{Deserialize, Serialize};
@@ -91,6 +92,16 @@ impl From<AccountCreditEvent> for AdminAccountCreditEvent {
     }
 }
 
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct CreditEventsQuery {
+    #[serde(deserialize_with = "deserialize_from_str_optional")]
+    limit: Option<u64>,
+    #[serde(deserialize_with = "deserialize_from_str_optional")]
+    offset: Option<u64>,
+    currency: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct AdjustCreditRequest {
     /// Currency of the balance to adjust. Defaults to `BTC`.
@@ -157,16 +168,20 @@ async fn admin_list_user_credit_events(
     auth: AdminAuth,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
-    Query(q): Query<PageQuery>,
+    Query(q): Query<CreditEventsQuery>,
 ) -> ApiPaginatedResult<AdminAccountCreditEvent> {
     auth.require_permission(AdminResource::AccountCredit, AdminAction::View)?;
     let limit = q.limit.unwrap_or(50).min(100);
     let offset = q.offset.unwrap_or(0);
-    let (events, total) = this
-        .db
-        .list_account_credit_events(id, limit, offset)
-        .await
-        .map_err(|e| ApiError::new(e.to_string()))?;
+    let (events, total) = match q.currency.as_deref().filter(|c| !c.is_empty()) {
+        Some(currency) => {
+            this.db
+                .list_account_credit_events_in_currency(id, currency, limit, offset)
+                .await
+        }
+        None => this.db.list_account_credit_events(id, limit, offset).await,
+    }
+    .map_err(|e| ApiError::new(e.to_string()))?;
     let out: Vec<AdminAccountCreditEvent> = events
         .into_iter()
         .map(AdminAccountCreditEvent::from)
@@ -223,6 +238,37 @@ mod tests {
         assert_eq!(api.balance, 2500);
         assert_eq!(db.get_account_credit(5, "BTC").await.unwrap().balance, 2000);
         assert_eq!(api.currency, "BTC");
+    }
+
+    #[tokio::test]
+    async fn events_filter_by_currency() {
+        let db = Arc::new(MockDb::default());
+        db.adjust_account_credit(5, "BTC", 2500, "topup", None)
+            .await
+            .unwrap();
+        db.adjust_account_credit(5, "EUR", 700, "topup", None)
+            .await
+            .unwrap();
+        db.adjust_account_credit(5, "EUR", 300, "topup", None)
+            .await
+            .unwrap();
+        let (eur, total) = db
+            .list_account_credit_events_in_currency(5, "EUR", 10, 0)
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        assert!(eur.iter().all(|e| e.currency == "EUR"));
+        let (_, all) = db.list_account_credit_events(5, 10, 0).await.unwrap();
+        assert_eq!(all, 3);
+    }
+
+    #[test]
+    fn events_query_parses_currency() {
+        let q: CreditEventsQuery =
+            serde_urlencoded::from_str("currency=EUR&limit=5&offset=1").unwrap();
+        assert_eq!(q.currency.as_deref(), Some("EUR"));
+        assert_eq!(q.limit, Some(5));
+        assert_eq!(q.offset, Some(1));
     }
 
     /// The default ledger kind is `admin`.
