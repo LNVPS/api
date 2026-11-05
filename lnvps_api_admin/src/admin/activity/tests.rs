@@ -383,6 +383,13 @@ async fn reports_only_paid_activity_inside_the_window() {
         .collect();
     assert_eq!(paid, vec![1000, 500, 300, 200]);
     assert_eq!(report.payments.items[1].subscription_name, "sub 20");
+    assert_eq!(report.payments.items[0].vm_id, Some(10));
+    assert_eq!(report.payments.items[1].vm_id, None);
+    assert_eq!(report.payments.items[0].refund_trigger, None);
+    assert_eq!(
+        report.payments.items[3].refund_trigger,
+        Some(RefundTrigger::Manual)
+    );
     assert_eq!(
         report.payments.items[0].payment.company_base_currency,
         "EUR"
@@ -455,6 +462,107 @@ async fn rejects_out_of_range_windows_and_missing_permission() {
             .await
             .is_err()
     );
+}
+
+fn refund_payment(metadata: Option<serde_json::Value>, instrument: &str) -> SubscriptionPayment {
+    SubscriptionPayment {
+        metadata,
+        external_data: instrument.to_string().into(),
+        ..payment(
+            9,
+            10,
+            100,
+            SubscriptionPaymentType::Refund,
+            Some(Utc::now()),
+        )
+    }
+}
+
+fn delete_history(admin_user_id: Option<u64>, at: DateTime<Utc>) -> VmHistory {
+    VmHistory {
+        id: 1,
+        vm_id: 10,
+        action_type: VmHistoryActionType::Deleted,
+        timestamp: at,
+        initiated_by_user: admin_user_id,
+        previous_state: None,
+        new_state: None,
+        metadata: Some(
+            serde_json::json!({"admin_action": true, "admin_user_id": admin_user_id})
+                .to_string()
+                .into_bytes(),
+        ),
+        description: None,
+    }
+}
+
+#[test]
+fn refund_trigger_is_none_for_a_sale() {
+    let sale = payment(1, 10, 100, SubscriptionPaymentType::Purchase, None);
+    assert_eq!(refund_trigger(&sale, None), None);
+}
+
+#[test]
+fn refund_trigger_owner_delete_from_metadata() {
+    let meta = serde_json::json!({"refund": {
+        "recorded_by_admin_user_id": null, "by_owner_user_id": 4}});
+    assert_eq!(
+        refund_trigger(&refund_payment(Some(meta), ""), None),
+        Some(RefundTrigger::OwnerDelete)
+    );
+}
+
+#[test]
+fn refund_trigger_admin_delete_when_same_admin_deleted_the_vm_first() {
+    let meta = serde_json::json!({"refund": {"recorded_by_admin_user_id": 7}});
+    let p = refund_payment(Some(meta), "lnbc1");
+    let deletion = delete_history(Some(7), p.created - Duration::hours(1));
+    assert_eq!(
+        refund_trigger(&p, Some(&deletion)),
+        Some(RefundTrigger::AdminDelete)
+    );
+    let other_admin = delete_history(Some(8), p.created - Duration::hours(1));
+    assert_eq!(
+        refund_trigger(&p, Some(&other_admin)),
+        Some(RefundTrigger::Admin)
+    );
+}
+
+#[test]
+fn refund_trigger_admin_for_payout_and_manual_for_recorded() {
+    let meta = serde_json::json!({"refund": {"recorded_by_admin_user_id": 7}});
+    assert_eq!(
+        refund_trigger(&refund_payment(Some(meta.clone()), "lnbc1"), None),
+        Some(RefundTrigger::Admin)
+    );
+    assert_eq!(
+        refund_trigger(&refund_payment(Some(meta), ""), None),
+        Some(RefundTrigger::Manual)
+    );
+}
+
+#[tokio::test]
+async fn activity_payment_resolves_refund_trigger_from_vm_deletion() {
+    let this = seeded().await;
+    let at = Utc::now();
+    let meta = serde_json::json!({"refund": {"recorded_by_admin_user_id": 7}});
+    let mut refund = refund_payment(Some(meta), "lnbc1");
+    refund.created = at;
+    this.db
+        .insert_vm_history(&delete_history(Some(7), at - Duration::hours(1)))
+        .await
+        .unwrap();
+    let item = activity_payment(
+        &this.db,
+        PaidSubscriptionPayment {
+            payment: refund,
+            subscription_name: "sub 10".to_string(),
+            company_base_currency: "EUR".to_string(),
+        },
+    )
+    .await;
+    assert_eq!(item.vm_id, Some(10));
+    assert_eq!(item.refund_trigger, Some(RefundTrigger::AdminDelete));
 }
 
 fn days(n: i64) -> Duration {

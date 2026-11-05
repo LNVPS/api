@@ -1509,6 +1509,14 @@ pub trait LNVpsDbBase: Send + Sync {
         note: Option<&str>,
     ) -> DbResult<AccountCredit>;
 
+    async fn list_account_credit_events_in_currency(
+        &self,
+        user_id: u64,
+        currency: &str,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AccountCreditEvent>, u64)>;
+
     async fn list_account_credit_events(
         &self,
         user_id: u64,

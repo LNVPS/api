@@ -214,11 +214,18 @@ The user's account credit balance.
     "user_id": 42,
     "balance": 5000000,
     "currency": "BTC",
-    "auto_apply": true
+    "auto_apply": true,
+    "balances": [
+      { "balance": 5000000, "currency": "BTC" },
+      { "balance": 2500, "currency": "EUR" }
+    ]
   }
 }
 ```
 
+- `balance`, `currency`: the BTC balance only (kept for older clients), 0 if none.
+- `balances`: one entry per currency the user holds a balance in, each in minor
+  units of its currency. Credit is per currency and never converted when held.
 - `balance`: minor units of `currency` (msat for BTC). Never negative.
 - `currency`: the balance's base currency. A quote converts it into the
   payment currency at the current rate.
@@ -236,8 +243,10 @@ PATCH /api/admin/v1/users/{id}/credit
 Required Permission: `account_credit::update`
 
 Shifts the balance and records the movement in the ledger. The request body
-is `{ "delta": 5000000, "kind": "topup", "note": "goodwill grant" }`.
-`delta` is signed msat (positive credits, negative claws back) and `kind` is
+is `{ "currency": "EUR", "delta": 5000, "kind": "topup", "note": "goodwill grant" }`.
+`currency` is optional (default `BTC`) and names the balance to adjust; an unknown
+currency is refused (`400`). `delta` is signed minor units of that currency (msat
+for BTC; positive credits, negative claws back) and `kind` is
 one of `topup`, `refund`, `admin`; a negative delta must use `admin`. Refuses
 (`400`) a delta of 0, an unknown `kind`, a negative `topup`/`refund`, or a
 clawback larger than the balance not held by pending orders. The response is the updated row in the same
@@ -252,7 +261,8 @@ GET /api/admin/v1/users/{id}/credit/events
 Required Permission: `account_credit::view`
 
 The append-only ledger behind the balance, newest first, paginated with the
-standard `limit`/`offset`. Each row:
+standard `limit`/`offset`. Pass `currency` (e.g. `EUR`) to list only that
+currency's rows; `total` then counts only those rows. Each row:
 
 ```json
 {
@@ -5314,7 +5324,13 @@ paid (`is_setup = false`) are left out of the VM, VPN and app lists.
   // Includes VMs that already lapsed in the window but have not been deleted yet.
   "new_vpn_subscriptions": { "total": number, "items": ["AdminVpnSubscriptionInfo"] },
   "new_app_deployments": { "total": number, "items": ["AdminAppDeploymentInfo"] },
-  "payments": { "total": number, "items": ["AdminSubscriptionPaymentInfo + subscription_name"] },
+  "payments": { "total": number, "items": ["AdminSubscriptionPaymentInfo + subscription_name + vm_id + refund_trigger"] },
+  // `vm_id`: the VM on the payment's subscription (via its VPS line item), null when there is none.
+  // `refund_trigger`: null unless `payment_type` is "Refund", then one of
+  //   "owner_delete" (customer deleted the VM; `metadata.refund.by_owner_user_id` set),
+  //   "admin_delete" (an admin deleted the VM and the refund was recorded by that admin after the deletion),
+  //   "admin" (admin Lightning payout, the row carries the paid invoice),
+  //   "manual" (admin recorded a refund made out of band).
   // Paid payments with `paid_at` in the window, newest first. Refunds are included
   // (`payment_type: "Refund"`); their amount is a magnitude to subtract.
   "payment_totals": [

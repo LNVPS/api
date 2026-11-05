@@ -4785,6 +4785,30 @@ impl LNVpsDbBase for MockDb {
         Ok(row.clone())
     }
 
+    async fn list_account_credit_events_in_currency(
+        &self,
+        user_id: u64,
+        currency: &str,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<lnvps_db::AccountCreditEvent>, u64)> {
+        let events = self.account_credit_events.lock().await;
+        let mut all: Vec<lnvps_db::AccountCreditEvent> = events
+            .iter()
+            .filter(|e| e.user_id == user_id && e.currency == currency)
+            .cloned()
+            .collect();
+        all.sort_by_key(|e| std::cmp::Reverse(e.id));
+        let total = all.len() as u64;
+        Ok((
+            all.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
     async fn list_account_credit_events(
         &self,
         user_id: u64,

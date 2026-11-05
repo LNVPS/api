@@ -5766,6 +5766,33 @@ impl LNVpsDbBase for LNVpsDbMysql {
         self.get_account_credit(user_id, currency).await
     }
 
+    async fn list_account_credit_events_in_currency(
+        &self,
+        user_id: u64,
+        currency: &str,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AccountCreditEvent>, u64)> {
+        let rows = sqlx::query_as(
+            "SELECT * FROM account_credit_event WHERE user_id = ? AND currency = ? \
+             ORDER BY created DESC, id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(user_id)
+        .bind(currency)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM account_credit_event WHERE user_id = ? AND currency = ?",
+        )
+        .bind(user_id)
+        .bind(currency)
+        .fetch_one(&self.db)
+        .await?;
+        Ok((rows, total as u64))
+    }
+
     async fn list_account_credit_events(
         &self,
         user_id: u64,
