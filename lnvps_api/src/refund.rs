@@ -458,6 +458,15 @@ impl VmRefundHandler {
             .collect();
         payments.sort_by_key(|p| std::cmp::Reverse(p.created));
 
+        let paid_seconds: u64 = payments.iter().map(|p| p.time_value.unwrap_or(0)).sum();
+        let paid_from = payments
+            .iter()
+            .map(|p| p.paid_at.unwrap_or(p.created))
+            .min()
+            .unwrap_or(at);
+        let consumed = (at - paid_from).num_seconds().max(0) as u64;
+        unused = unused.min(paid_seconds.saturating_sub(consumed));
+
         let mut returned = Vec::new();
         for payment in payments {
             if unused == 0 {
@@ -495,14 +504,18 @@ impl VmRefundHandler {
             let credit_back = debit
                 .as_ref()
                 .map(|d| {
-                    (d.amount as u128 * gross_from_credit as u128 / d.payment_amount as u128) as u64
+                    let den = d.payment_amount as u128;
+                    ((d.amount as u128 * gross_from_credit as u128 * 2 + den) / (den * 2)) as u64
                 })
                 .unwrap_or(0);
             let mut credits = Vec::new();
-            if let Some(d) = &debit {
-                add_credit(&mut credits, &d.currency, credit_back);
+            let mut cash_credit = gross_from_cash;
+            match &debit {
+                Some(d) if credit_back > 0 => add_credit(&mut credits, &d.currency, credit_back),
+                Some(_) => cash_credit += gross_from_credit,
+                None => {}
             }
-            add_credit(&mut credits, &payment.currency, gross_from_cash);
+            add_credit(&mut credits, &payment.currency, cash_credit);
 
             let mut row = build_refund_row(
                 &payment,
@@ -534,7 +547,7 @@ impl VmRefundHandler {
                         .cloned()
                         .collect::<std::collections::BTreeMap<_, _>>()
                 );
-                refund["returned_from_cash"] = serde_json::json!(gross_from_cash);
+                refund["returned_from_cash"] = serde_json::json!(cash_credit);
             }
             let note = format!(
                 "VM {} deleted, unused time of payment {}",
@@ -1370,6 +1383,58 @@ mod tests {
                 .balance,
             amount_in(&first, "EUR")
         );
+    }
+
+    /// A refund whose credit share rounds below one unit still returns credit.
+    #[tokio::test]
+    async fn a_sub_unit_credit_share_still_returns_credit() {
+        let mock = MockDb::default();
+        let (vm, payment) = vm_with_payment(&mock, 1000, 230).await;
+        mock.account_credit_debits
+            .lock()
+            .await
+            .push(debit(&payment, 25_000, 1));
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let handler = handler(db.clone(), Arc::new(PayNode::default())).await;
+        let expires = db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await
+            .unwrap()
+            .expires
+            .unwrap();
+        let at = expires - chrono::Duration::seconds(2200);
+
+        let returned = handler
+            .refund_unused_to_credit(vm.id, vm.user_id, expires, at)
+            .await
+            .unwrap();
+        let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
+        assert_eq!(refunds.len(), 1);
+        assert!(
+            amount_in(&returned, "BTC") + amount_in(&returned, "EUR") > 0,
+            "refund row recorded but nothing returned: {returned:?}"
+        );
+    }
+
+    /// Admin-granted days raise expiry but buy nothing: paying for 30 days,
+    /// being given 365 and deleting on day 20 refunds the 10 paid days left.
+    #[tokio::test]
+    async fn admin_granted_time_is_not_refunded() {
+        let mock = MockDb::default();
+        let (vm, payment) = vm_with_payment(&mock, 1000, 230).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let handler = handler(db.clone(), Arc::new(PayNode::default())).await;
+        let paid_at = payment.paid_at.unwrap();
+        let at = paid_at + chrono::Duration::days(20);
+        let expires = payment.expires + chrono::Duration::days(365);
+
+        handler
+            .refund_unused_to_credit(vm.id, vm.user_id, expires, at)
+            .await
+            .unwrap();
+        let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
+        let gross = refunds[0].amount + refunds[0].tax;
+        assert!((409..=411).contains(&gross), "gross {gross}");
     }
 
     /// On a subscription that also bills an IP range, only the VM line item's
