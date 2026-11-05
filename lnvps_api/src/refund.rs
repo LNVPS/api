@@ -458,6 +458,15 @@ impl VmRefundHandler {
             .collect();
         payments.sort_by_key(|p| std::cmp::Reverse(p.created));
 
+        let paid_seconds: i64 = payments
+            .iter()
+            .map(|p| p.time_value.unwrap_or(0) as i64)
+            .sum();
+        if let Some(first) = payments.last() {
+            let paid_through = first.created + chrono::Duration::seconds(paid_seconds);
+            unused = unused.min((paid_through - at).num_seconds().max(0) as u64);
+        }
+
         let mut returned = Vec::new();
         for payment in payments {
             if unused == 0 {
@@ -1370,6 +1379,29 @@ mod tests {
                 .balance,
             amount_in(&first, "EUR")
         );
+    }
+
+    #[tokio::test]
+    async fn admin_granted_days_are_not_refunded() {
+        let mock = MockDb::default();
+        let (vm, payment) = vm_with_payment(&mock, 3100, 0).await;
+        let start = Utc::now() - chrono::Duration::days(20);
+        for p in mock.subscription_payments.lock().await.iter_mut() {
+            if p.id == payment.id {
+                p.created = start;
+                p.time_value = Some(31 * 86_400);
+            }
+        }
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let handler = handler(db.clone(), Arc::new(PayNode::default())).await;
+        let expires = start + chrono::Duration::days(31 + 365);
+        let at = start + chrono::Duration::days(20);
+
+        let returned = handler
+            .refund_unused_to_credit(vm.id, vm.user_id, expires, at)
+            .await
+            .unwrap();
+        assert_eq!(amount_in(&returned, "EUR"), 1100);
     }
 
     /// On a subscription that also bills an IP range, only the VM line item's
