@@ -9063,6 +9063,24 @@ impl lnvps_db::AdminDb for MockDb {
         Ok(take_sorted(rows, limit))
     }
 
+    async fn admin_list_refunds_paid_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> DbResult<Vec<lnvps_db::SubscriptionPayment>> {
+        let mut rows: Vec<_> = self
+            .subscription_payments
+            .lock()
+            .await
+            .iter()
+            .filter(|p| {
+                p.is_paid && p.payment_type.is_refund() && p.paid_at.is_some_and(|at| at >= since)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| (b.paid_at, b.created).cmp(&(a.paid_at, a.created)));
+        Ok(rows)
+    }
+
     async fn admin_sum_payments_paid_since(
         &self,
         since: DateTime<Utc>,

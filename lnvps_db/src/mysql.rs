@@ -11052,6 +11052,20 @@ impl AdminDb for LNVpsDbMysql {
         .await
     }
 
+    async fn admin_list_refunds_paid_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> DbResult<Vec<crate::SubscriptionPayment>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM subscription_payment \
+             WHERE is_paid = 1 AND payment_type = 3 AND paid_at >= ? \
+             ORDER BY paid_at DESC, created DESC",
+        )
+        .bind(since)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
     async fn admin_sum_payments_paid_since(
         &self,
         since: DateTime<Utc>,

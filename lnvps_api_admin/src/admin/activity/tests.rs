@@ -115,7 +115,7 @@ async fn deletion(db: &MockDb, vm_id: u64, at: DateTime<Utc>, reason: &str) {
     .unwrap();
 }
 
-fn payment(
+pub(super) fn payment(
     id: u8,
     subscription_id: u64,
     amount: u64,

@@ -541,6 +541,11 @@ pub trait AdminDb: Send + Sync {
         limit: u64,
     ) -> DbResult<(Vec<crate::PaidSubscriptionPayment>, u64)>;
 
+    async fn admin_list_refunds_paid_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> DbResult<Vec<crate::SubscriptionPayment>>;
+
     async fn admin_sum_payments_paid_since(
         &self,
         since: chrono::DateTime<chrono::Utc>,
