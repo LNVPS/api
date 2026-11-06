@@ -1,6 +1,7 @@
+use crate::HostCapacity;
 use crate::host::VmResources;
-use lnvps_api_common::{
-    HostCapacity, IpPolicy, MIGRATION_ESTIMATE_BYTES_PER_SEC, MigrationIpChange, MigrationMethod,
+use crate::migration::{
+    IpPolicy, MIGRATION_ESTIMATE_BYTES_PER_SEC, MigrationIpChange, MigrationMethod,
     MigrationOptions, MigrationPlan,
 };
 use lnvps_db::{IpRange, OsDistribution, Vm, VmHost, VmHostDisk, VmHostKind, VmOsImage};
@@ -257,7 +258,7 @@ pub fn migration_method(source: &VmHostKind, target: &VmHostKind) -> Option<Migr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lnvps_api_common::{DiskCapacity, GB, IPRangeCapacity, LoadFactors};
+    use crate::{DiskCapacity, GB, IPRangeCapacity, LoadFactors};
     use lnvps_db::CpuArch;
 
     fn host(id: u64, kind: VmHostKind, region: u64) -> VmHost {

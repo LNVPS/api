@@ -1,6 +1,6 @@
 use crate::host::{
-    FullVmInfo, MigrateVmRequest, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient,
-    VmHostDiskInfo, VmHostInfo, VmSnapshot,
+    DiskStream, FullVmInfo, ImportedDisk, MigrateVmRequest, TerminalStream, TimeSeries,
+    TimeSeriesData, VmHostClient, VmHostDiskInfo, VmHostInfo, VmSnapshot,
 };
 use crate::retry::OpResult;
 use crate::{GB, HostVmSpec, PB, TB, VmRunningState, VmRunningStates, op_fatal};
@@ -192,6 +192,37 @@ impl DummyVmHost {
         DUMMY_MIGRATIONS.lock().await.clear();
     }
 
+    pub async fn set_disk(host_id: u64, vm_id: u64, bytes: Vec<u8>) {
+        DUMMY_DISKS.lock().await.insert((host_id, vm_id), bytes);
+    }
+
+    pub async fn disk(host_id: u64, vm_id: u64) -> Option<Vec<u8>> {
+        DUMMY_DISKS.lock().await.get(&(host_id, vm_id)).cloned()
+    }
+
+    pub async fn set_fault(host_id: u64, fault: Option<DummyFault>) {
+        let mut faults = DUMMY_FAULTS.lock().await;
+        match fault {
+            Some(f) => faults.insert(host_id, f),
+            None => faults.remove(&host_id),
+        };
+    }
+
+    pub async fn is_retired(host_id: u64, vm_id: u64) -> bool {
+        DUMMY_RETIRED.lock().await.contains(&(host_id, vm_id))
+    }
+
+    pub async fn clear_disks() {
+        DUMMY_DISKS.lock().await.clear();
+        DUMMY_FAULTS.lock().await.clear();
+        DUMMY_RETIRED.lock().await.clear();
+    }
+
+    async fn fault(&self) -> Option<DummyFault> {
+        let id = self.host_id?;
+        DUMMY_FAULTS.lock().await.get(&id).copied()
+    }
+
     /// Set the list of host VMs reported by [`list_host_vms`].
     ///
     /// Backed by a process-wide registry so the value survives the fresh
@@ -230,6 +261,24 @@ static DUMMY_SNAPSHOTS: LazyLock<Arc<Mutex<HashMap<u64, Vec<VmSnapshot>>>>> =
 /// Process-wide log of migrations requested through [`DummyVmHost::migrate_vm`].
 static DUMMY_MIGRATIONS: LazyLock<Arc<Mutex<Vec<(u64, MigrateVmRequest)>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DummyFault {
+    ExportFails,
+    ImportFails,
+    CorruptImport,
+    StartFails,
+    DeleteFails,
+}
+
+static DUMMY_DISKS: LazyLock<Mutex<HashMap<(u64, u64), Vec<u8>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static DUMMY_FAULTS: LazyLock<Mutex<HashMap<u64, DummyFault>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+static DUMMY_RETIRED: LazyLock<Mutex<std::collections::HashSet<(u64, u64)>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
 #[async_trait]
 impl VmHostClient for DummyVmHost {
@@ -348,7 +397,66 @@ impl VmHostClient for DummyVmHost {
         Ok(())
     }
 
+    async fn export_primary_disk(&self, vm: &Vm) -> OpResult<DiskStream> {
+        if self.fault().await == Some(DummyFault::ExportFails) {
+            op_fatal!("export failed");
+        }
+        let host_id = self.host_id.unwrap_or_default();
+        let Some(bytes) = Self::disk(host_id, vm.id).await else {
+            op_fatal!("VM {} has no disk on host {}", vm.id, host_id);
+        };
+        Ok(DiskStream {
+            size: bytes.len() as u64,
+            reader: Box::pin(std::io::Cursor::new(bytes)),
+        })
+    }
+
+    async fn create_vm_from_disk(
+        &self,
+        cfg: &FullVmInfo,
+        mut disk: DiskStream,
+    ) -> OpResult<ImportedDisk> {
+        use sha2::Digest;
+        use tokio::io::AsyncReadExt;
+        let fault = self.fault().await;
+        if fault == Some(DummyFault::ImportFails) {
+            op_fatal!("import failed");
+        }
+        let mut bytes = Vec::new();
+        disk.reader
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|e| crate::retry::OpError::Fatal(e.into()))?;
+        if fault == Some(DummyFault::CorruptImport)
+            && let Some(b) = bytes.first_mut()
+        {
+            *b ^= 0xff;
+        }
+        let imported = ImportedDisk {
+            bytes: bytes.len() as u64,
+            sha256: hex::encode(sha2::Sha256::digest(&bytes)),
+        };
+        Self::set_disk(self.host_id.unwrap_or_default(), cfg.vm.id, bytes).await;
+        self.create_vm(cfg).await?;
+        Ok(imported)
+    }
+
+    async fn retire_vm(&self, vm: &Vm) -> OpResult<()> {
+        self.stop_vm(vm).await?;
+        DUMMY_RETIRED
+            .lock()
+            .await
+            .insert((self.host_id.unwrap_or_default(), vm.id));
+        Ok(())
+    }
+
     async fn delete_vm(&self, vm: &Vm) -> OpResult<()> {
+        if self.fault().await == Some(DummyFault::DeleteFails) {
+            op_fatal!("delete failed");
+        }
+        if let Some(host_id) = self.host_id {
+            DUMMY_DISKS.lock().await.remove(&(host_id, vm.id));
+        }
         {
             let mut vms = self.vms.lock().await;
             vms.remove(&vm.id);
@@ -358,6 +466,9 @@ impl VmHostClient for DummyVmHost {
     }
 
     async fn start_vm(&self, vm: &Vm) -> OpResult<()> {
+        if self.fault().await == Some(DummyFault::StartFails) {
+            op_fatal!("start failed");
+        }
         {
             let mut vms = self.vms.lock().await;
             if let Some(m) = vms.get_mut(&vm.id) {
@@ -559,5 +670,43 @@ mod snapshot_tests {
         vm.id = 940_002;
         assert!(host.rollback_snapshot(&vm, "one").await.is_err());
         host.delete_snapshot(&vm, "one").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disks_export_and_import_byte_for_byte() {
+        use sha2::Digest;
+        let src = DummyVmHost::new().with_host_id(940_010);
+        let dst = DummyVmHost::new().with_host_id(940_011);
+        let mut info = mock_full_vm();
+        info.vm.id = 940_003;
+        let bytes: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        DummyVmHost::set_disk(940_010, info.vm.id, bytes.clone()).await;
+
+        let stream = src.export_primary_disk(&info.vm).await.unwrap();
+        assert_eq!(stream.size, bytes.len() as u64);
+        let imported = dst.create_vm_from_disk(&info, stream).await.unwrap();
+        assert_eq!(imported.bytes, bytes.len() as u64);
+        assert_eq!(imported.sha256, hex::encode(sha2::Sha256::digest(&bytes)));
+        assert_eq!(
+            DummyVmHost::disk(940_011, info.vm.id).await,
+            Some(bytes.clone())
+        );
+
+        DummyVmHost::set_fault(940_011, Some(DummyFault::CorruptImport)).await;
+        let stream = src.export_primary_disk(&info.vm).await.unwrap();
+        let corrupt = dst.create_vm_from_disk(&info, stream).await.unwrap();
+        assert_ne!(corrupt.sha256, imported.sha256);
+
+        src.retire_vm(&info.vm).await.unwrap();
+        assert!(DummyVmHost::is_retired(940_010, info.vm.id).await);
+        DummyVmHost::set_fault(940_011, None).await;
+        dst.delete_vm(&info.vm).await.unwrap();
+        assert!(DummyVmHost::disk(940_011, info.vm.id).await.is_none());
+        assert!(
+            DummyVmHost::new()
+                .export_primary_disk(&info.vm)
+                .await
+                .is_err()
+        );
     }
 }

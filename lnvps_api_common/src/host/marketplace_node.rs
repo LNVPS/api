@@ -25,7 +25,8 @@ use lnvps_db::{MarketplaceNode, Vm, VmHost, VmOsImage};
 use log::{info, warn};
 
 use super::{
-    FullVmInfo, HostVmSpec, MigrateVmRequest, TerminalStream, VmHostClient, VmHostInfo, VmSnapshot,
+    DiskStream, FullVmInfo, HostVmSpec, ImportedDisk, MigrateVmRequest, TerminalStream,
+    VmHostClient, VmHostInfo, VmSnapshot,
 };
 use super::{TimeSeries, TimeSeriesData};
 use crate::VmRunningState;
@@ -139,6 +140,22 @@ impl VmHostClient for MarketplaceNodeHost {
 
     async fn migrate_vm(&self, vm: &Vm, req: &MigrateVmRequest) -> OpResult<()> {
         self.inner.migrate_vm(vm, req).await
+    }
+
+    async fn export_primary_disk(&self, vm: &Vm) -> OpResult<DiskStream> {
+        self.inner.export_primary_disk(vm).await
+    }
+
+    async fn create_vm_from_disk(
+        &self,
+        cfg: &FullVmInfo,
+        disk: DiskStream,
+    ) -> OpResult<ImportedDisk> {
+        self.inner.create_vm_from_disk(cfg, disk).await
+    }
+
+    async fn retire_vm(&self, vm: &Vm) -> OpResult<()> {
+        self.inner.retire_vm(vm).await
     }
 
     async fn list_snapshots(&self, vm: &Vm) -> OpResult<Vec<VmSnapshot>> {

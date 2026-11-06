@@ -49,6 +49,19 @@ pub struct MigrateVmRequest {
     pub target_storage: Option<String>,
 }
 
+pub type DiskReader = std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>;
+
+pub struct DiskStream {
+    pub size: u64,
+    pub reader: DiskReader,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedDisk {
+    pub bytes: u64,
+    pub sha256: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmSnapshot {
     pub name: String,
@@ -230,6 +243,26 @@ pub trait VmHostClient: Send + Sync {
     }
 
     async fn list_snapshots(&self, vm: &Vm) -> OpResult<Vec<VmSnapshot>>;
+
+    async fn export_primary_disk(&self, _vm: &Vm) -> OpResult<DiskStream> {
+        Err(OpError::Fatal(anyhow!(
+            "Exporting a VM disk is not supported on this host type"
+        )))
+    }
+
+    async fn create_vm_from_disk(
+        &self,
+        _cfg: &FullVmInfo,
+        _disk: DiskStream,
+    ) -> OpResult<ImportedDisk> {
+        Err(OpError::Fatal(anyhow!(
+            "Importing a VM disk is not supported on this host type"
+        )))
+    }
+
+    async fn retire_vm(&self, vm: &Vm) -> OpResult<()> {
+        self.stop_vm(vm).await
+    }
 
     async fn create_snapshot(&self, vm: &Vm, name: &str, description: Option<&str>)
     -> OpResult<()>;
