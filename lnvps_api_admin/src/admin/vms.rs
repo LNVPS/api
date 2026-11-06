@@ -589,7 +589,7 @@ async fn admin_migrate_vm(
         });
     }
     if !plan.allowed() {
-        return Err(ApiError::conflict(&format!(
+        return Err(ApiError::conflict(format!(
             "Migration refused: {}",
             plan.refusals.join("; ")
         )));
