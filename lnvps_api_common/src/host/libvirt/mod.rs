@@ -31,8 +31,8 @@ mod qemu_tests;
 use crate::host::cloud_init;
 use crate::host::config::LibVirtConfig;
 use crate::host::{
-    FullVmInfo, HostVmSpec, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient,
-    VmHostDiskInfo, VmHostInfo, VmSnapshot,
+    DiskFormat, DiskStream, FullVmInfo, HostVmSpec, TerminalStream, TimeSeries, TimeSeriesData,
+    VmHostClient, VmHostDiskInfo, VmHostInfo, VmSnapshot, disk_channel,
 };
 use crate::retry::{OpError, OpResult};
 use crate::{KB, VmRunningState};
@@ -334,6 +334,82 @@ impl VmHostClient for LibVirtHost {
                     });
                 }
                 Ok(out)
+            })
+            .await
+    }
+
+    async fn export_primary_disk(&self, vm: &Vm) -> OpResult<DiskStream> {
+        let vm_id = vm.id;
+        let (size, format, path) = self
+            .conn
+            .run(move |c| {
+                let domain = LibVirtHost::require_domain(c, vm_id)?;
+                if domain
+                    .is_active()
+                    .map_err(|e| map_virt_error("domain_is_active", e))?
+                {
+                    return Err(OpError::Fatal(anyhow!(
+                        "domain {} is running; stop it before exporting its disk",
+                        domain_name(vm_id)
+                    )));
+                }
+                let xml = domain
+                    .xml_desc(0)
+                    .map_err(|e| map_virt_error("domain_xml", e))?;
+                let devices = parse_live_devices(&xml).map_err(OpError::Fatal)?;
+                let path = devices.disk_files.first().cloned().ok_or_else(|| {
+                    OpError::Fatal(anyhow!("domain {} has no disk", domain_name(vm_id)))
+                })?;
+                let vol = c
+                    .lookup_storage_vol_by_path(&path)
+                    .map_err(|e| map_virt_error("lookup_storage_vol_by_path", e))?;
+                let size = vol
+                    .info_flags(virt::sys::VIR_STORAGE_VOL_GET_PHYSICAL)
+                    .map_err(|e| map_virt_error("storage_vol_info", e))?
+                    .allocation;
+                let vol_xml = vol
+                    .xml_desc(0)
+                    .map_err(|e| map_virt_error("storage_vol_xml", e))?;
+                let format =
+                    if vol_xml.contains("type='qcow2'") || vol_xml.contains("type=\"qcow2\"") {
+                        DiskFormat::QCow2
+                    } else {
+                        DiskFormat::Raw
+                    };
+                Ok((size, format, path))
+            })
+            .await?;
+
+        let (tx, reader) = disk_channel(16);
+        let conn = self.conn.handle()?;
+        tokio::task::spawn_blocking(move || {
+            let res = conn
+                .lookup_storage_vol_by_path(&path)
+                .map_err(|e| map_virt_error("lookup_storage_vol_by_path", e))
+                .and_then(|vol| storage::download_volume(&conn, &vol, size, &tx));
+            if let Err(e) = res {
+                let _ = tx.blocking_send(Err(std::io::Error::other(format!("{e:?}"))));
+            }
+        });
+        Ok(DiskStream {
+            size,
+            format,
+            reader,
+        })
+    }
+
+    async fn retire_vm(&self, vm: &Vm) -> OpResult<()> {
+        self.stop_vm(vm).await?;
+        let vm_id = vm.id;
+        self.conn
+            .run(move |c| {
+                let Some(domain) = LibVirtHost::lookup_domain(c, vm_id)? else {
+                    return Ok(());
+                };
+                domain
+                    .set_autostart(false)
+                    .map_err(|e| map_virt_error("set_autostart", e))?;
+                Ok(())
             })
             .await
     }
@@ -1021,6 +1097,19 @@ mod tests {
         let mut info = mock_full_vm();
         info.disk.name = "default-pool".to_string();
         info
+    }
+
+    #[tokio::test]
+    async fn exporting_needs_a_stopped_domain_and_retiring_tolerates_a_missing_one() -> Result<()> {
+        let host = host()?;
+        let mut vm = vm_info().vm;
+        vm.id = 424_242;
+        assert!(matches!(
+            host.export_primary_disk(&vm).await,
+            Err(OpError::Fatal(_))
+        ));
+        host.retire_vm(&vm).await.ok();
+        Ok(())
     }
 
     #[tokio::test]

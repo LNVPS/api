@@ -1040,3 +1040,83 @@ async fn vlan_requires_an_explicitly_vlan_aware_bridge() -> Result<()> {
     assert!(!exists, "domain was defined despite the VLAN refusal");
     Ok(())
 }
+
+#[tokio::test]
+#[ignore]
+async fn a_stopped_domain_disk_exports_byte_for_byte() -> Result<()> {
+    use sha2::Digest;
+    use tokio::io::AsyncReadExt;
+
+    let dir = tempfile::TempDir::new()?;
+    let pool_name = format!("lnvps-export-{}", std::process::id());
+    let host = host()?;
+    let vm_id = next_vm_id();
+    let bytes: Vec<u8> = (0..(3 * 1024 * 1024 + 17u32))
+        .map(|i| (i.wrapping_mul(31) % 253) as u8)
+        .collect();
+    let image = dir.path().join(format!("vm-{vm_id}-disk0"));
+    std::fs::write(&image, &bytes)?;
+
+    let pool_xml = format!(
+        "<pool type='dir'><name>{pool_name}</name><target><path>{}</path></target></pool>",
+        dir.path().display()
+    );
+    let image_path = image.display().to_string();
+    let domain_xml = format!(
+        "<domain type='qemu'><name>{}</name><memory unit='MiB'>64</memory>\
+         <os><type arch='x86_64'>hvm</type></os><devices>\
+         <disk type='file' device='disk'><driver name='qemu' type='raw'/>\
+         <source file='{image_path}'/><target dev='vda' bus='virtio'/></disk>\
+         </devices></domain>",
+        domain_name(vm_id)
+    );
+    host.conn
+        .run(move |c| {
+            let pool = c
+                .create_storage_pool_xml(&pool_xml, 0)
+                .map_err(|e| map_virt_error("create_pool", e))?;
+            pool.refresh(0).map_err(|e| map_virt_error("refresh", e))?;
+            c.define_domain_xml(&domain_xml)
+                .map_err(|e| map_virt_error("define", e))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow!("{e:?}"))?;
+
+    let vm = Vm {
+        id: vm_id,
+        ..Default::default()
+    };
+    let result = async {
+        let mut stream = host
+            .export_primary_disk(&vm)
+            .await
+            .map_err(|e| anyhow!("{e:?}"))?;
+        assert_eq!(stream.size, bytes.len() as u64);
+        assert_eq!(stream.format, DiskFormat::Raw);
+        let mut got = Vec::new();
+        stream.reader.read_to_end(&mut got).await?;
+        assert_eq!(got.len(), bytes.len());
+        assert_eq!(
+            hex::encode(sha2::Sha256::digest(&got)),
+            hex::encode(sha2::Sha256::digest(&bytes))
+        );
+        host.retire_vm(&vm).await.map_err(|e| anyhow!("{e:?}"))?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+
+    host.conn
+        .run(move |c| {
+            if let Some(d) = LibVirtHost::lookup_domain(c, vm_id)? {
+                let _ = d.undefine();
+            }
+            if let Ok(p) = c.lookup_storage_pool_by_name(&pool_name) {
+                let _ = p.destroy();
+            }
+            Ok(())
+        })
+        .await
+        .ok();
+    result
+}
