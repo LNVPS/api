@@ -10,7 +10,7 @@
 //! is aimed at the host in that column, so a stale value silently points all of
 //! them at a node that no longer has the VM.
 
-use crate::host::{MigrateVmRequest, VmResources, get_host_client};
+use crate::host::{MigrateVmRequest, VmResources};
 use crate::provisioner::{UNASSIGNED_MAC, VmProvisioner};
 use anyhow::{Result, anyhow, bail};
 use lnvps_api_common::{
@@ -335,7 +335,7 @@ impl VmProvisioner {
             &capacity,
         )?;
 
-        let source_client = get_host_client(self.db(), &source_host, self.config()).await?;
+        let source_client = self.host_client(&source_host).await?;
         let was_running = matches!(
             source_client.get_vm_state(&vm).await.map(|s| s.state),
             Ok(VmRunningStates::Running)
@@ -375,7 +375,7 @@ impl VmProvisioner {
 
         // Start it again where it now lives; an online migration never stopped.
         if was_running && !live {
-            let target_client = get_host_client(self.db(), &target_host, self.config()).await?;
+            let target_client = self.host_client(&target_host).await?;
             if let Err(e) = target_client.start_vm(&vm).await {
                 warn!(
                     "VM {} migrated to host {} but failed to start: {}",
@@ -425,7 +425,7 @@ impl VmProvisioner {
         let mut observed: HashMap<u64, Vec<HostVmSpec>> = HashMap::new();
         let mut unreachable = 0;
         for host in &hosts {
-            let client = match get_host_client(self.db(), host, self.config()).await {
+            let client = match self.host_client(host).await {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("Skipping host {} in placement check: {}", host.id, e);

@@ -512,6 +512,98 @@ async fn reassign_failure_before_flip_frees_the_new_addresses() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_stale_attempt_from_a_dead_worker_is_expired_and_the_vm_restarted_after() {
+    let _s = SERIAL.lock().await;
+    let w = world(1).await;
+    let src = w
+        .provisioner
+        .host_client(&w.db.get_host(SRC).await.unwrap())
+        .await
+        .unwrap();
+    src.stop_vm(&w.db.get_vm(w.vm_id).await.unwrap())
+        .await
+        .unwrap();
+    let id =
+        w.db.insert_vm_migration(&VmMigration {
+            vm_id: w.vm_id,
+            source_host_id: SRC,
+            target_host_id: DST,
+            target_disk_id: DST_DISK,
+            phase: "copying".to_string(),
+            options: "{}".to_string(),
+            source_was_running: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    w.db.vm_migrations
+        .lock()
+        .await
+        .get_mut(&id)
+        .unwrap()
+        .created = Utc::now() - chrono::TimeDelta::days(2);
+    DummyVmHost::set_fault(DST, Some(DummyFault::ImportFails)).await;
+
+    assert!(
+        w.provisioner
+            .migrate_vm_with(w.vm_id, DST, false, &MigrationOptions::default(), None)
+            .await
+            .is_err()
+    );
+    let all = w.db.list_vm_migrations(w.vm_id).await.unwrap();
+    let stale = all.iter().find(|m| m.id == id).unwrap();
+    assert_eq!(stale.state, VmMigrationState::Failed);
+    assert!(stale.needs_attention);
+    assert_eq!(
+        state_on(&w, SRC).await,
+        Some(VmRunningStates::Running),
+        "the dead attempt stopped a running VM, so the rollback restarts it"
+    );
+    DummyVmHost::set_fault(DST, None).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_recent_attempt_still_holds_the_lock() {
+    let _s = SERIAL.lock().await;
+    let w = world(1).await;
+    w.db.insert_vm_migration(&VmMigration {
+        vm_id: w.vm_id,
+        options: "{}".to_string(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert!(
+        w.provisioner
+            .migrate_vm_with(w.vm_id, DST, false, &MigrationOptions::default(), None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_hypervisor_migration_holds_and_releases_the_lock() {
+    let _s = SERIAL.lock().await;
+    let w = world(1).await;
+    w.db.hosts.lock().await.get_mut(&SRC).unwrap().kind = VmHostKind::Proxmox;
+    let out = w
+        .provisioner
+        .migrate_vm_with(w.vm_id, DST, true, &MigrationOptions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(out.method, MigrationMethod::Hypervisor);
+    let m = &w.db.list_vm_migrations(w.vm_id).await.unwrap()[0];
+    assert_eq!(m.state, VmMigrationState::Completed);
+    assert!(
+        w.db.get_active_vm_migration(w.vm_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(w.db.get_vm(w.vm_id).await.unwrap().host_id, DST);
+}
+
+#[tokio::test(start_paused = true)]
 async fn dry_run_plan_changes_nothing() {
     let _s = SERIAL.lock().await;
     let w = world(2).await;

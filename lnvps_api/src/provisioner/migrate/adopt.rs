@@ -13,6 +13,8 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
+const STALE_MIGRATION_GRACE_SECS: u64 = 3600;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReassignedIp {
     pub old_ip: String,
@@ -39,6 +41,7 @@ struct Ctx {
     options: MigrationOptions,
     plan: MigrationPlan,
     initiated_by: Option<u64>,
+    inherited_running: bool,
     old_ips: Vec<VmIpAssignment>,
     new_ip_ids: Vec<u64>,
     target_created: bool,
@@ -65,6 +68,7 @@ impl VmProvisioner {
         if self.read_only() {
             bail!("Cant migrate VM's in read-only mode");
         }
+        let inherited_running = self.expire_stale_migration(vm_id).await?;
         let plan = self
             .plan_vm_migration(vm_id, target_host_id, options)
             .await?;
@@ -73,12 +77,39 @@ impl VmProvisioner {
         }
         match plan.method {
             Some(MigrationMethod::Hypervisor) => {
-                let vm = self
+                let db = self.get_db();
+                let vm = db.get_vm(vm_id).await?;
+                let mut lock = VmMigration {
+                    vm_id,
+                    source_host_id: vm.host_id,
+                    source_disk_id: vm.disk_id,
+                    target_host_id,
+                    target_disk_id: plan.target_disk_id.unwrap_or_default(),
+                    phase: "hypervisor".to_string(),
+                    options: serde_json::to_string(options)?,
+                    initiated_by,
+                    ..Default::default()
+                };
+                lock.id = db
+                    .insert_vm_migration(&lock)
+                    .await
+                    .context("VM is already being migrated")?;
+                let res = self
                     .migrate_vm(vm_id, target_host_id, live, initiated_by)
-                    .await?;
+                    .await;
+                lock.state = if res.is_ok() {
+                    VmMigrationState::Completed
+                } else {
+                    VmMigrationState::Failed
+                };
+                lock.flipped = res.is_ok();
+                lock.error = res.as_ref().err().map(|e| format!("{e:#}"));
+                lock.finished = Some(Utc::now());
+                db.update_vm_migration(&lock).await?;
+                let vm = res?;
                 Ok(MigrationOutcome {
                     vm,
-                    migration_id: None,
+                    migration_id: Some(lock.id),
                     method: MigrationMethod::Hypervisor,
                     reassigned: vec![],
                     source_retained: false,
@@ -86,10 +117,42 @@ impl VmProvisioner {
                 })
             }
             _ => {
-                self.copy_and_adopt(plan, options.clone(), initiated_by)
+                self.copy_and_adopt(plan, options.clone(), initiated_by, inherited_running)
                     .await
             }
         }
+    }
+
+    async fn expire_stale_migration(&self, vm_id: u64) -> Result<bool> {
+        let db = self.get_db();
+        let Some(mut active) = db.get_active_vm_migration(vm_id).await? else {
+            return Ok(false);
+        };
+        let options: MigrationOptions = serde_json::from_str(&active.options).unwrap_or_default();
+        let disk = FullVmInfo::vm_resources(vm_id, db.clone())
+            .await
+            .map(|r| r.disk_size)
+            .unwrap_or(0);
+        let limit = chrono::TimeDelta::seconds(
+            (options.transfer_timeout_secs(disk) + STALE_MIGRATION_GRACE_SECS) as i64,
+        );
+        if Utc::now() - active.created < limit {
+            return Ok(false);
+        }
+        warn!(
+            "Migration {} of VM {} has been in phase {} since {}; treating it as abandoned",
+            active.id, vm_id, active.phase, active.created
+        );
+        let inherit = active.source_was_running && !active.flipped;
+        active.state = VmMigrationState::Failed;
+        active.needs_attention = true;
+        active.error = Some(format!(
+            "abandoned in phase {} (worker stopped?); check host {} for a partial copy",
+            active.phase, active.target_host_id
+        ));
+        active.finished = Some(Utc::now());
+        db.update_vm_migration(&active).await?;
+        Ok(inherit)
     }
 
     async fn copy_and_adopt(
@@ -97,6 +160,7 @@ impl VmProvisioner {
         plan: MigrationPlan,
         options: MigrationOptions,
         initiated_by: Option<u64>,
+        inherited_running: bool,
     ) -> Result<MigrationOutcome> {
         let db = self.get_db();
         let vm = db.get_vm(plan.vm_id).await?;
@@ -133,6 +197,7 @@ impl VmProvisioner {
             options,
             plan,
             initiated_by,
+            inherited_running,
             old_ips: vec![],
             new_ip_ids: vec![],
             target_created: false,
@@ -224,7 +289,7 @@ impl VmProvisioner {
             ctx.source.get_vm_state(&ctx.vm).await.map(|s| s.state),
             Ok(VmRunningStates::Running)
         );
-        ctx.migration.source_was_running = running;
+        ctx.migration.source_was_running = running || ctx.inherited_running;
         if running {
             ctx.source.stop_vm(&ctx.vm).await?;
         }
