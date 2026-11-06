@@ -1858,6 +1858,12 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn set_vm_ip_wait_released(&self, vm_id: u64, released: bool) -> DbResult<()>;
     async fn delete_vm_ip_wait(&self, vm_id: u64) -> DbResult<()>;
 
+    async fn insert_vm_migration(&self, migration: &VmMigration) -> DbResult<u64>;
+    async fn update_vm_migration(&self, migration: &VmMigration) -> DbResult<()>;
+    async fn get_active_vm_migration(&self, vm_id: u64) -> DbResult<Option<VmMigration>>;
+    async fn list_vm_migrations(&self, vm_id: u64) -> DbResult<Vec<VmMigration>>;
+    async fn list_open_vm_migrations(&self) -> DbResult<Vec<VmMigration>>;
+
     // ----- On-demand IP orders -----
 
     async fn insert_ip_order(&self, order: &IpOrder) -> DbResult<u64>;

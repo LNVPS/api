@@ -19,8 +19,9 @@ use lnvps_db::{
     Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind,
     VmAddonPrice, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
     VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment,
-    VmIpWait, VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice,
-    VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
+    VmIpWait, VmMigration, VmMigrationState, VmOsImage, VmTemplate, VmTrafficDaily,
+    VmTrafficSample, VmTrafficTotal, VpnDevice, VpnPeerTemplate, VpnService, VpnSubscription,
+    WebauthnCredential,
 };
 
 use async_trait::async_trait;
@@ -100,6 +101,7 @@ pub struct MockDb {
     pub ip_providers: Arc<Mutex<HashMap<u64, IpProvider>>>,
     pub ip_provider_regions: Arc<Mutex<HashMap<u64, IpProviderRegion>>>,
     pub vm_ip_waits: Arc<Mutex<Vec<VmIpWait>>>,
+    pub vm_migrations: Arc<Mutex<HashMap<u64, VmMigration>>>,
     pub ip_orders: Arc<Mutex<HashMap<u64, IpOrder>>>,
     pub ip_order_audits: Arc<Mutex<Vec<IpOrderAudit>>>,
     pub ip_order_ranges: Arc<Mutex<Vec<IpOrderRange>>>,
@@ -619,6 +621,7 @@ impl Default for MockDb {
             ip_providers: Arc::new(Default::default()),
             ip_provider_regions: Arc::new(Default::default()),
             vm_ip_waits: Arc::new(Default::default()),
+            vm_migrations: Arc::new(Default::default()),
             ip_orders: Arc::new(Default::default()),
             ip_order_audits: Arc::new(Default::default()),
             ip_order_ranges: Arc::new(Default::default()),
@@ -6023,6 +6026,72 @@ impl LNVpsDbBase for MockDb {
     async fn delete_vm_ip_wait(&self, vm_id: u64) -> DbResult<()> {
         self.vm_ip_waits.lock().await.retain(|w| w.vm_id != vm_id);
         Ok(())
+    }
+
+    async fn insert_vm_migration(&self, migration: &VmMigration) -> DbResult<u64> {
+        let mut all = self.vm_migrations.lock().await;
+        if migration.state == VmMigrationState::InProgress
+            && all
+                .values()
+                .any(|m| m.vm_id == migration.vm_id && m.state == VmMigrationState::InProgress)
+        {
+            return Err(anyhow!("VM {} is already migrating", migration.vm_id).into());
+        }
+        let id = all.keys().max().copied().unwrap_or(0) + 1;
+        let mut m = migration.clone();
+        m.id = id;
+        m.created = Utc::now();
+        all.insert(id, m);
+        Ok(id)
+    }
+
+    async fn update_vm_migration(&self, migration: &VmMigration) -> DbResult<()> {
+        let mut all = self.vm_migrations.lock().await;
+        let m = all
+            .get_mut(&migration.id)
+            .ok_or_else(|| anyhow!("no migration {}", migration.id))?;
+        let created = m.created;
+        *m = migration.clone();
+        m.created = created;
+        Ok(())
+    }
+
+    async fn get_active_vm_migration(&self, vm_id: u64) -> DbResult<Option<VmMigration>> {
+        Ok(self
+            .vm_migrations
+            .lock()
+            .await
+            .values()
+            .find(|m| m.vm_id == vm_id && m.state == VmMigrationState::InProgress)
+            .cloned())
+    }
+
+    async fn list_vm_migrations(&self, vm_id: u64) -> DbResult<Vec<VmMigration>> {
+        let mut out: Vec<VmMigration> = self
+            .vm_migrations
+            .lock()
+            .await
+            .values()
+            .filter(|m| m.vm_id == vm_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|m| std::cmp::Reverse(m.id));
+        Ok(out)
+    }
+
+    async fn list_open_vm_migrations(&self) -> DbResult<Vec<VmMigration>> {
+        let mut out: Vec<VmMigration> = self
+            .vm_migrations
+            .lock()
+            .await
+            .values()
+            .filter(|m| {
+                m.state == VmMigrationState::InProgress || m.source_retained || m.needs_attention
+            })
+            .cloned()
+            .collect();
+        out.sort_by_key(|m| m.id);
+        Ok(out)
     }
 
     async fn insert_ip_order(&self, order: &IpOrder) -> DbResult<u64> {
@@ -14630,6 +14699,26 @@ mod vpn_tests {
 
     /// The routes behind a peer are a set, replaced wholesale, because the
     /// planner is told what should be there rather than what changed.
+    #[tokio::test]
+    async fn only_one_migration_of_a_vm_can_be_in_progress() {
+        let db = MockDb::default();
+        let m = VmMigration {
+            vm_id: 5,
+            ..Default::default()
+        };
+        let id = db.insert_vm_migration(&m).await.unwrap();
+        assert!(db.insert_vm_migration(&m).await.is_err());
+        let mut active = db.get_active_vm_migration(5).await.unwrap().unwrap();
+        assert_eq!(active.id, id);
+        active.state = VmMigrationState::Completed;
+        active.source_retained = true;
+        db.update_vm_migration(&active).await.unwrap();
+        assert!(db.get_active_vm_migration(5).await.unwrap().is_none());
+        assert_eq!(db.list_open_vm_migrations().await.unwrap().len(), 1);
+        db.insert_vm_migration(&m).await.unwrap();
+        assert_eq!(db.list_vm_migrations(5).await.unwrap().len(), 2);
+    }
+
     #[tokio::test]
     async fn tunnel_routes_are_replaced_not_merged() {
         let db = MockDb::default();

@@ -16,7 +16,7 @@ use crate::{
     Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind,
     VmAddonPrice, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
     VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmIpWait,
-    VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice,
+    VmMigration, VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice,
     VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
@@ -1649,6 +1649,82 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .execute(&self.db)
             .await?;
         Ok(())
+    }
+
+    async fn insert_vm_migration(&self, m: &VmMigration) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO vm_migration (vm_id, source_host_id, source_disk_id, target_host_id, \
+             target_disk_id, state, phase, options, old_ips, source_retained, needs_attention, \
+             bytes_copied, checksum, error, initiated_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(m.vm_id)
+        .bind(m.source_host_id)
+        .bind(m.source_disk_id)
+        .bind(m.target_host_id)
+        .bind(m.target_disk_id)
+        .bind(m.state)
+        .bind(&m.phase)
+        .bind(&m.options)
+        .bind(&m.old_ips)
+        .bind(m.source_retained)
+        .bind(m.needs_attention)
+        .bind(m.bytes_copied)
+        .bind(&m.checksum)
+        .bind(&m.error)
+        .bind(m.initiated_by)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn update_vm_migration(&self, m: &VmMigration) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE vm_migration SET target_disk_id = ?, state = ?, phase = ?, old_ips = ?, \
+             source_retained = ?, needs_attention = ?, bytes_copied = ?, checksum = ?, error = ?, \
+             finished = ? WHERE id = ?",
+        )
+        .bind(m.target_disk_id)
+        .bind(m.state)
+        .bind(&m.phase)
+        .bind(&m.old_ips)
+        .bind(m.source_retained)
+        .bind(m.needs_attention)
+        .bind(m.bytes_copied)
+        .bind(&m.checksum)
+        .bind(&m.error)
+        .bind(m.finished)
+        .bind(m.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_active_vm_migration(&self, vm_id: u64) -> DbResult<Option<VmMigration>> {
+        Ok(
+            sqlx::query_as("select * from vm_migration where vm_id = ? and state = 0")
+                .bind(vm_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn list_vm_migrations(&self, vm_id: u64) -> DbResult<Vec<VmMigration>> {
+        Ok(
+            sqlx::query_as("select * from vm_migration where vm_id = ? order by id desc")
+                .bind(vm_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn list_open_vm_migrations(&self) -> DbResult<Vec<VmMigration>> {
+        Ok(sqlx::query_as(
+            "select * from vm_migration where state = 0 or source_retained = 1 or needs_attention = 1 \
+             order by id",
+        )
+        .fetch_all(&self.db)
+        .await?)
     }
 
     async fn insert_ip_order(&self, order: &IpOrder) -> DbResult<u64> {

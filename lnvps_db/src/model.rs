@@ -6135,6 +6135,39 @@ pub struct VmIpWait {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize, Default)]
 #[repr(u16)]
 #[serde(rename_all = "snake_case")]
+pub enum VmMigrationState {
+    #[default]
+    InProgress = 0,
+    Completed = 1,
+    RolledBack = 2,
+    Failed = 3,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq, Default)]
+pub struct VmMigration {
+    pub id: u64,
+    pub vm_id: u64,
+    pub source_host_id: u64,
+    pub source_disk_id: u64,
+    pub target_host_id: u64,
+    pub target_disk_id: u64,
+    pub state: VmMigrationState,
+    pub phase: String,
+    pub options: String,
+    pub old_ips: Option<String>,
+    pub source_retained: bool,
+    pub needs_attention: bool,
+    pub bytes_copied: u64,
+    pub checksum: Option<String>,
+    pub error: Option<String>,
+    pub initiated_by: Option<u64>,
+    pub created: DateTime<Utc>,
+    pub finished: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize, Default)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
 pub enum IpOrderState {
     #[default]
     AwaitingApproval = 0,
