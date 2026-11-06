@@ -21,6 +21,9 @@ use log::{info, warn};
 use serde_json::json;
 use std::collections::HashMap;
 
+mod plan;
+pub use plan::*;
+
 /// Where a migration should put the VM on the destination host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationTarget {
