@@ -604,6 +604,25 @@ async fn a_hypervisor_migration_holds_and_releases_the_lock() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_source_started_during_the_copy_is_not_adopted() {
+    let _s = SERIAL.lock().await;
+    let w = world(1).await;
+    DummyVmHost::set_fault(DST, Some(DummyFault::StartHostDuringImport(SRC))).await;
+    let err = w
+        .provisioner
+        .migrate_vm_with(w.vm_id, DST, false, &MigrationOptions::default(), None)
+        .await
+        .expect_err("a source that ran during the copy has newer data than the copy");
+    assert!(
+        format!("{err:#}").contains("started during the copy"),
+        "{err:#}"
+    );
+    assert_eq!(w.db.get_vm(w.vm_id).await.unwrap().host_id, SRC);
+    assert_eq!(state_on(&w, DST).await, None);
+    DummyVmHost::set_fault(DST, None).await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn dry_run_plan_changes_nothing() {
     let _s = SERIAL.lock().await;
     let w = world(2).await;

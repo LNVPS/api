@@ -216,6 +216,7 @@ impl DummyVmHost {
         DUMMY_DISKS.lock().await.clear();
         DUMMY_FAULTS.lock().await.clear();
         DUMMY_RETIRED.lock().await.clear();
+        DUMMY_POWERED_ON.lock().await.clear();
     }
 
     async fn fault(&self) -> Option<DummyFault> {
@@ -269,6 +270,7 @@ pub enum DummyFault {
     CorruptImport,
     StartFails,
     DeleteFails,
+    StartHostDuringImport(u64),
 }
 
 static DUMMY_DISKS: LazyLock<Mutex<HashMap<(u64, u64), Vec<u8>>>> =
@@ -278,6 +280,9 @@ static DUMMY_FAULTS: LazyLock<Mutex<HashMap<u64, DummyFault>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static DUMMY_RETIRED: LazyLock<Mutex<std::collections::HashSet<(u64, u64)>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+static DUMMY_POWERED_ON: LazyLock<Mutex<std::collections::HashSet<(u64, u64)>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
 #[async_trait]
@@ -433,6 +438,9 @@ impl VmHostClient for DummyVmHost {
         {
             *b ^= 0xff;
         }
+        if let Some(DummyFault::StartHostDuringImport(host)) = fault {
+            DUMMY_POWERED_ON.lock().await.insert((host, cfg.vm.id));
+        }
         let imported = ImportedDisk {
             bytes: bytes.len() as u64,
             sha256: hex::encode(sha2::Sha256::digest(&bytes)),
@@ -533,8 +541,15 @@ impl VmHostClient for DummyVmHost {
     /// return a Stopped state rather than a fatal error so the worker does not
     /// endlessly try to re-spawn it.
     async fn get_vm_state(&self, vm: &Vm) -> OpResult<VmRunningState> {
+        let powered_on = match self.host_id {
+            Some(h) => DUMMY_POWERED_ON.lock().await.remove(&(h, vm.id)),
+            None => false,
+        };
         let mut vms = self.vms.lock().await;
         if let Some(m) = vms.get_mut(&vm.id) {
+            if powered_on {
+                m.state = VmRunningStates::Running;
+            }
             m.tick();
             Ok(m.to_running_state())
         } else {

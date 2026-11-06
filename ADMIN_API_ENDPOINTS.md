@@ -716,28 +716,114 @@ Moves a VM to another host. Request body:
 {
   "target_host_id": 3,
   "live": true,
-  "reason": "Draining host 2 for maintenance"
+  "reason": "Draining host 2 for maintenance",
+  "ip_policy": "keep",
+  "keep_source": true,
+  "target_disk_id": 12,
+  "timeout_secs_per_gb": 60,
+  "dry_run": false
 }
 ```
 
-- `target_host_id` (required) — host to move the VM onto.
-- `live` (optional, default `false`) — attempt an online migration. When
+- `target_host_id` (required): host to move the VM onto.
+- `live` (optional, default `false`): attempt an online migration. When
   `false`, a running VM is stopped, migrated and started again on the
-  destination.
-- `reason` (optional) — free-text reason recorded in the audit log.
+  destination. Only used for a hypervisor migration (see below).
+- `reason` (optional): free-text reason recorded in the audit log.
+- `ip_policy` (optional, default `keep`): `keep` keeps every address and is
+  refused when one of the VM's ranges is not in the target host's region.
+  `reassign` gives the VM new addresses from the target region: this changes
+  the customer's IPs and is only accepted when the VM changes region.
+- `keep_source` (optional, default `true`): after a copy, keep the stopped
+  source copy for manual deletion. `false` deletes it once the VM runs on the
+  destination with nothing flagged.
+- `target_disk_id` (optional): storage pool on the target host. Default: the
+  pool of the same name for a hypervisor migration, otherwise the pool with
+  the most free space.
+- `timeout_secs_per_gb` (optional, default `60`): copy timeout per GB of
+  disk, on top of a 900s base.
+- `dry_run` (optional, default `false`): return the plan and do nothing.
 
-**Asynchronous Processing:** dispatches a `MigrateVm` work job and returns a
-`job_id`. The worker runs the pre-flight checks and refuses the migration if the
-target host is disabled, in a different region (the VM's IPs would not exist on
-the destination's VLANs), of a different CPU architecture or hypervisor kind, or
-lacks free CPU/memory/disk for the VM. `vm.host_id` and `vm.disk_id` are only
-updated after the hypervisor reports the migration succeeded, and the firewall
-ruleset is re-applied on the destination. The move is recorded in VM history as
-a `migrated` action.
+Two methods, chosen from the host kinds and regions:
 
-The endpoint itself returns `409` when the VM is deleted, already on the target
-host, or the target host is disabled, and `404` when the host does not exist.
-Migration is currently implemented for Proxmox hosts only.
+| From | To | Method |
+|---|---|---|
+| `proxmox` | `proxmox`, same region | `hypervisor` (`qm migrate`, as before) |
+| `proxmox` | `proxmox`, other region | `copy_and_adopt` |
+| `libvirt` | `proxmox` | `copy_and_adopt` |
+| `marketplace_node` | `proxmox` | `copy_and_adopt` |
+| anything else | | refused |
+
+`copy_and_adopt` is an offline copy: the VM is stopped on the source, its
+primary disk is streamed to the target and imported into a new VM built from
+the database like a fresh spawn (same MAC, cloud-init regenerated, OVMF with a
+new EFI disk, virtio-scsi, serial console). The SHA-256 and byte count of what
+the source sent must match what the target wrote. Only then does `vm.host_id`
+change, the source copy is stopped with autostart off, the firewall and DNS are
+re-applied and the VM is started on the target. Only Linux images are copied.
+A disk with a backing file is refused.
+
+Failure before the switch-over removes the half-made copy, frees any new
+addresses and restarts the VM on the source (migration state `rolled_back`).
+Failure after it leaves the VM on the target and flags the migration
+(`needs_attention`), and the source copy is never deleted in that case. Only
+one migration of a VM runs at a time; an attempt older than its timeout plus
+one hour is treated as abandoned on the next request. The placement poller
+leaves a VM alone while it migrates and ignores a retained source copy.
+
+Every phase is written to VM history as `migration_progress` (metadata
+`migration_id`, `phase`) and the move as `migrated`. With `reassign`, the
+migrated entry lists `reassigned` old and new addresses and the owner is
+notified of the new ones.
+
+**Response** (queued):
+
+```json
+{
+  "data": {
+    "job_id": "1730000000000-0",
+    "plan": { "...": "as below" }
+  }
+}
+```
+
+**Response** (`dry_run: true`):
+
+```json
+{
+  "data": {
+    "dry_run": true,
+    "plan": {
+      "vm_id": 42,
+      "source_host_id": 7,
+      "source_host_kind": "marketplace_node",
+      "source_region_id": 2,
+      "target_host_id": 3,
+      "target_host_kind": "proxmox",
+      "target_region_id": 1,
+      "method": "copy_and_adopt",
+      "ip_policy": "reassign",
+      "keep_source": true,
+      "target_disk_id": 12,
+      "target_storage": "local-zfs",
+      "disk_bytes": 85899345920,
+      "estimated_seconds": 1639,
+      "transfer_timeout_seconds": 5700,
+      "ip_changes": [{ "old_ip": "185.18.221.70", "new_ip": null, "range_id": null }],
+      "warnings": ["..."],
+      "refusals": []
+    }
+  }
+}
+```
+
+`refusals` lists every reason the migration would not run; a request without
+`dry_run` and with any refusal returns `409` with them joined. `new_ip` is only
+known once the job allocates it. `estimated_seconds` assumes 50 MB/s.
+
+The endpoint returns `409` when the VM is deleted, already on the target host,
+the target host is disabled (except for a dry run), or the plan has refusals,
+and `404` when the host does not exist.
 
 #### Start VM
 

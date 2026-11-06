@@ -364,6 +364,15 @@ impl VmProvisioner {
                 imported.sha256
             );
         }
+        if matches!(
+            ctx.source.get_vm_state(&ctx.vm).await.map(|s| s.state),
+            Ok(VmRunningStates::Running)
+        ) {
+            bail!(
+                "the VM was started during the copy on source host {}; the copy is stale",
+                ctx.source_host.id
+            );
+        }
         self.phase(
             ctx,
             "verified",
