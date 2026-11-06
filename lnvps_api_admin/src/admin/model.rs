@@ -3411,6 +3411,7 @@ pub enum AdminVmHistoryActionType {
     SnapshotCreated,
     SnapshotRestored,
     SnapshotDeleted,
+    MigrationProgress,
 }
 
 impl From<VmHistoryActionType> for AdminVmHistoryActionType {
@@ -3435,6 +3436,7 @@ impl From<VmHistoryActionType> for AdminVmHistoryActionType {
             VmHistoryActionType::SnapshotCreated => AdminVmHistoryActionType::SnapshotCreated,
             VmHistoryActionType::SnapshotRestored => AdminVmHistoryActionType::SnapshotRestored,
             VmHistoryActionType::SnapshotDeleted => AdminVmHistoryActionType::SnapshotDeleted,
+            VmHistoryActionType::MigrationProgress => AdminVmHistoryActionType::MigrationProgress,
         }
     }
 }

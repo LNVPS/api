@@ -2921,6 +2921,7 @@ pub enum VmHistoryActionType {
     SnapshotCreated = 14,
     SnapshotRestored = 15,
     SnapshotDeleted = 16,
+    MigrationProgress = 17,
 }
 
 impl Display for VmHistoryActionType {
@@ -2943,6 +2944,7 @@ impl Display for VmHistoryActionType {
             VmHistoryActionType::SnapshotCreated => write!(f, "snapshot_created"),
             VmHistoryActionType::SnapshotRestored => write!(f, "snapshot_restored"),
             VmHistoryActionType::SnapshotDeleted => write!(f, "snapshot_deleted"),
+            VmHistoryActionType::MigrationProgress => write!(f, "migration_progress"),
         }
     }
 }
@@ -2969,6 +2971,7 @@ impl FromStr for VmHistoryActionType {
             "snapshot_created" => Ok(VmHistoryActionType::SnapshotCreated),
             "snapshot_restored" => Ok(VmHistoryActionType::SnapshotRestored),
             "snapshot_deleted" => Ok(VmHistoryActionType::SnapshotDeleted),
+            "migration_progress" => Ok(VmHistoryActionType::MigrationProgress),
             _ => Err(anyhow!("unknown VM history action type: {}", s)),
         }
     }

@@ -185,6 +185,33 @@ impl VmHistoryLogger {
         Ok(())
     }
 
+    pub async fn log_vm_migration_phase(
+        &self,
+        vm_id: u64,
+        initiated_by_user: Option<u64>,
+        migration_id: u64,
+        phase: &str,
+        description: String,
+        metadata: Option<Value>,
+    ) -> Result<()> {
+        let mut meta = metadata.unwrap_or_else(|| json!({}));
+        meta["migration_id"] = json!(migration_id);
+        meta["phase"] = json!(phase);
+        let history = VmHistory {
+            id: 0,
+            vm_id,
+            action_type: VmHistoryActionType::MigrationProgress,
+            timestamp: Utc::now(),
+            initiated_by_user,
+            previous_state: None,
+            new_state: None,
+            metadata: serialize_json_to_bytes(Some(meta)),
+            description: Some(description),
+        };
+        self.db.insert_vm_history(&history).await?;
+        Ok(())
+    }
+
     pub async fn log_vm_restarted(
         &self,
         vm_id: u64,
@@ -1167,6 +1194,25 @@ mod tests {
             kinds,
             ["snapshot_created", "snapshot_deleted", "snapshot_restored"]
         );
+    }
+
+    #[tokio::test]
+    async fn migration_phases_name_the_migration_and_phase() {
+        let logger = make_logger();
+        logger
+            .log_vm_migration_phase(41, Some(2), 7, "copy", "Copying disk".to_string(), None)
+            .await
+            .unwrap();
+        let h = logger.db.list_vm_history(41).await.unwrap();
+        assert_eq!(h[0].action_type.to_string(), "migration_progress");
+        assert!(matches!(
+            "migration_progress".parse::<VmHistoryActionType>().unwrap(),
+            VmHistoryActionType::MigrationProgress
+        ));
+        let meta: Value = serde_json::from_slice(h[0].metadata.as_ref().unwrap()).unwrap();
+        assert_eq!(meta["migration_id"], 7);
+        assert_eq!(meta["phase"], "copy");
+        assert_eq!(h[0].description.as_deref(), Some("Copying disk"));
     }
 
     #[tokio::test]
