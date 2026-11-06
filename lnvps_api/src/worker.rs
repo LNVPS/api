@@ -2757,6 +2757,97 @@ impl Worker {
         }
     }
 
+    async fn after_cross_host_migration(
+        &self,
+        source_host_id: u64,
+        outcome: &crate::provisioner::MigrationOutcome,
+    ) {
+        let vm = &outcome.vm;
+        for host_id in [source_host_id, vm.host_id] {
+            let Ok(host) = self.db.get_host(host_id).await else {
+                continue;
+            };
+            let Some(node_id) = host.marketplace_node_id else {
+                continue;
+            };
+            let pool = async {
+                let node = self.db.get_marketplace_node(node_id).await?;
+                let tunnel = self
+                    .db
+                    .get_tunnel(node.tunnel_id.context("node has no tunnel")?)
+                    .await?;
+                tunnel.pool_id.context("tunnel has no pool")
+            }
+            .await;
+            match pool {
+                Ok(pool_id) => {
+                    if let Err(e) = self
+                        .work_commander
+                        .send(WorkJob::SyncTunnelPool { pool_id })
+                        .await
+                    {
+                        warn!("Failed to queue tunnel route refresh for pool {pool_id}: {e}");
+                    }
+                }
+                Err(e) => warn!("No tunnel routes to refresh for node {node_id}: {e:#}"),
+            }
+        }
+
+        if !outcome.reassigned.is_empty() {
+            let lines = outcome
+                .reassigned
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{} is now {}",
+                        r.old_ip,
+                        r.new_ip.as_deref().unwrap_or("removed")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.queue_notification(
+                vm.user_id,
+                format!(
+                    "Your VM #{} has been moved to a new location and its IP addresses changed:\n\n{}\n\n\
+                     Update any DNS records or firewall rules that point at the old addresses.",
+                    vm.id, lines
+                ),
+                Some(format!("[VM{}] IP addresses changed", vm.id)),
+            )
+            .await;
+        }
+
+        let mut notes = Vec::new();
+        if let Some(p) = &outcome.needs_attention {
+            notes.push(format!("Needs attention: {p}"));
+        }
+        if outcome.source_retained {
+            notes.push(format!(
+                "The stopped copy on host {source_host_id} is kept and must be deleted by hand once the VM is confirmed healthy"
+            ));
+        }
+        if let Ok(src) = self.db.get_host(source_host_id).await
+            && src.marketplace_node_id.is_some()
+        {
+            notes.push(format!(
+                "Host {source_host_id} is a marketplace node: its operator no longer earns a share of this VM"
+            ));
+        }
+        if outcome.migration_id.is_some() && !notes.is_empty() {
+            self.queue_admin_notification(
+                format!(
+                    "VM {} moved to host {}.\n\n{}",
+                    vm.id,
+                    vm.host_id,
+                    notes.join("\n")
+                ),
+                Some(format!("VM {} Migration", vm.id)),
+            )
+            .await;
+        }
+    }
+
     async fn patch_host(&self, host: &mut VmHost) -> Result<()> {
         if host.kind == VmHostKind::Dummy {
             return Ok(());
@@ -4439,6 +4530,7 @@ impl Worker {
                 live,
                 admin_user_id,
                 reason,
+                options,
             } => {
                 info!(
                     "Migrating VM {} to host {} ({})",
@@ -4447,11 +4539,13 @@ impl Worker {
                     if *live { "online" } else { "offline" }
                 );
                 let provisioner = self.subscription_handler.vm_provisioner();
+                let source_host_id = self.db.get_vm(*vm_id).await?.host_id;
                 match provisioner
-                    .migrate_vm(*vm_id, *target_host_id, *live, *admin_user_id)
+                    .migrate_vm_with(*vm_id, *target_host_id, *live, options, *admin_user_id)
                     .await
                 {
-                    Ok(vm) => {
+                    Ok(outcome) => {
+                        let vm = outcome.vm.clone();
                         // The destination enforces its own firewall/ipset state,
                         // so re-apply the ruleset rather than assuming it came
                         // across with the VM.
@@ -4462,10 +4556,17 @@ impl Worker {
                         {
                             warn!("Failed to queue firewall re-apply for VM {}: {}", vm.id, e);
                         }
+                        self.after_cross_host_migration(source_host_id, &outcome)
+                            .await;
                         return Ok(Some(format!(
-                            "VM {} migrated to host {}{}",
+                            "VM {} migrated to host {}{}{}",
                             vm.id,
                             target_host_id,
+                            outcome
+                                .needs_attention
+                                .as_ref()
+                                .map(|p| format!(", needs attention: {p}"))
+                                .unwrap_or_default(),
                             reason
                                 .as_ref()
                                 .map(|r| format!(" ({})", r))
@@ -7401,6 +7502,53 @@ mod tests {
     /// detected — not on every CheckSubscriptions cycle. Previously the expired branch had
     /// no edge-trigger guard and re-ran every ~30s, re-stopping the VM and spamming
     /// notifications in an endless loop.
+    #[tokio::test]
+    async fn reassigned_addresses_are_told_to_the_owner_and_admins() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let created = Utc::now();
+        let (vm_id, _) = add_vm_with_subscription(&db, created, true).await?;
+        let worker = setup_worker_with_delete_after(db.clone(), 30).await?;
+        let vm = db.get_vm(vm_id).await?;
+        let outcome = crate::provisioner::MigrationOutcome {
+            vm: vm.clone(),
+            migration_id: Some(1),
+            method: lnvps_api_common::MigrationMethod::CopyAndAdopt,
+            reassigned: vec![crate::provisioner::ReassignedIp {
+                old_ip: "10.0.0.5".to_string(),
+                new_ip: Some("10.9.0.5".to_string()),
+            }],
+            source_retained: true,
+            needs_attention: None,
+        };
+        worker
+            .after_cross_host_migration(vm.host_id, &outcome)
+            .await;
+
+        let mut user_msgs = Vec::new();
+        let mut admin_msgs = Vec::new();
+        while let Ok(Ok(jobs)) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            worker.work_commander.recv(),
+        )
+        .await
+        {
+            for j in jobs {
+                match j.job {
+                    WorkJob::SendNotification {
+                        user_id, message, ..
+                    } => user_msgs.push((user_id, message)),
+                    WorkJob::SendAdminNotification { message, .. } => admin_msgs.push(message),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(user_msgs.len(), 1);
+        assert_eq!(user_msgs[0].0, vm.user_id);
+        assert!(user_msgs[0].1.contains("10.0.0.5 is now 10.9.0.5"));
+        assert!(admin_msgs.iter().any(|m| m.contains("deleted by hand")));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_expired_subscription_notifies_once_within_grace_period() -> Result<()> {
         let db = Arc::new(MockDb::default());
