@@ -370,6 +370,15 @@ impl VmHostClient for LibVirtHost {
                 let vol_xml = vol
                     .xml_desc(0)
                     .map_err(|e| map_virt_error("storage_vol_xml", e))?;
+                if vol_xml
+                    .split("<backingStore>")
+                    .nth(1)
+                    .is_some_and(|tail| tail.contains("<path>"))
+                {
+                    return Err(OpError::Fatal(anyhow!(
+                        "disk {path} has a backing file; flatten it before migrating"
+                    )));
+                }
                 let format =
                     if vol_xml.contains("type='qcow2'") || vol_xml.contains("type=\"qcow2\"") {
                         DiskFormat::QCow2
