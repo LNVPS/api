@@ -13,13 +13,14 @@ use chrono::{DateTime, Days, Utc};
 use lightning_invoice::Bolt11Invoice;
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, ApiVmTrafficSummary,
-    PageQuery, PricingEngine, RefundEvidence, UpgradeConfig, VatClient, VmHistoryLogger,
-    VmRunningState, VmStateCache, WorkJob, build_refund_row, gross_charged, quota_period,
-    refundable_remaining, refunded_gross, resolve_traffic_range,
+    IpPolicy, MigrationOptions, MigrationPlan, PageQuery, PricingEngine, RefundEvidence,
+    UpgradeConfig, VatClient, VmHistoryLogger, VmRunningState, VmStateCache, WorkJob,
+    build_refund_row, gross_charged, load_migration_plan, quota_period, refundable_remaining,
+    refunded_gross, resolve_traffic_range,
 };
 use lnvps_db::{AdminAction, AdminResource, SubscriptionPaymentType};
 use log::{error, info};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 pub fn router() -> Router<RouterState> {
@@ -520,6 +521,34 @@ struct AdminMigrateVmRequest {
     #[serde(default)]
     live: bool,
     reason: Option<String>,
+    #[serde(default)]
+    ip_policy: IpPolicy,
+    #[serde(default)]
+    keep_source: Option<bool>,
+    #[serde(default)]
+    target_disk_id: Option<u64>,
+    #[serde(default)]
+    timeout_secs_per_gb: Option<u64>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+impl AdminMigrateVmRequest {
+    fn options(&self) -> MigrationOptions {
+        MigrationOptions {
+            ip_policy: self.ip_policy,
+            keep_source: self.keep_source.unwrap_or(true),
+            target_disk_id: self.target_disk_id,
+            timeout_secs_per_gb: self.timeout_secs_per_gb,
+        }
+    }
+}
+
+#[derive(Serialize, Debug)]
+#[serde(untagged)]
+enum AdminMigrateVmResponse {
+    Queued { job_id: String, plan: MigrationPlan },
+    DryRun { dry_run: bool, plan: MigrationPlan },
 }
 
 /// Migrate a VM to another host (issue #66)
@@ -533,7 +562,7 @@ async fn admin_migrate_vm(
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Json(req): Json<AdminMigrateVmRequest>,
-) -> ApiResult<JobResponse> {
+) -> ApiResult<AdminMigrateVmResponse> {
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
 
     let vm = this.db.get_vm(id).await?;
@@ -547,8 +576,23 @@ async fn admin_migrate_vm(
     // Fail an unknown/disabled host here rather than in a background job the
     // caller has to go looking for.
     let target = this.db.get_host(req.target_host_id).await?;
-    if !target.enabled {
+    if !target.enabled && !req.dry_run {
         return Err(ApiError::conflict("Target host is disabled"));
+    }
+
+    let options = req.options();
+    let plan = load_migration_plan(&this.db, id, req.target_host_id, &options).await?;
+    if req.dry_run {
+        return ApiData::ok(AdminMigrateVmResponse::DryRun {
+            dry_run: true,
+            plan,
+        });
+    }
+    if !plan.allowed() {
+        return Err(ApiError::conflict(&format!(
+            "Migration refused: {}",
+            plan.refusals.join("; ")
+        )));
     }
 
     let job = WorkJob::MigrateVm {
@@ -557,6 +601,7 @@ async fn admin_migrate_vm(
         live: req.live,
         admin_user_id: Some(auth.user_id),
         reason: req.reason,
+        options,
     };
 
     match this.work_commander.send(job).await {
@@ -565,7 +610,10 @@ async fn admin_migrate_vm(
                 "Admin {} queued migration of VM {} to host {} (stream {})",
                 auth.user_id, id, req.target_host_id, stream_id
             );
-            ApiData::ok(JobResponse { job_id: stream_id })
+            ApiData::ok(AdminMigrateVmResponse::Queued {
+                job_id: stream_id,
+                plan,
+            })
         }
         Err(e) => {
             error!("Failed to queue VM migration job: {}", e);
@@ -1874,8 +1922,147 @@ mod tests {
         assert_eq!(sub.user_pubkey, hex::encode([2u8; 32]));
     }
 
-    /// The endpoint itself: permission gate, id cap, de-duplication, and
-    /// unknown ids skipped rather than failing the batch.
+    async fn migrate_fixture() -> (
+        RouterState,
+        std::sync::Arc<lnvps_api_common::ChannelWorkCommander>,
+        u64,
+    ) {
+        use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VatClient};
+        use lnvps_db::{LNVpsDbBase, VmHost, VmHostDisk, VmHostKind};
+        use std::sync::Arc;
+
+        crate::verbose_errors_for_tests();
+        let db = MockDb::default();
+        db.hosts.lock().await.insert(
+            2,
+            VmHost {
+                id: 2,
+                kind: VmHostKind::Dummy,
+                region_id: 1,
+                name: "mock-host-2".to_string(),
+                cpu: 64,
+                cpu_arch: lnvps_db::CpuArch::X86_64,
+                memory: 512 * lnvps_api_common::GB,
+                enabled: true,
+                load_cpu: 1.0,
+                load_memory: 1.0,
+                load_disk: 1.0,
+                ..Default::default()
+            },
+        );
+        db.host_disks.lock().await.insert(
+            2,
+            VmHostDisk {
+                id: 2,
+                host_id: 2,
+                name: "mock-disk-2".to_string(),
+                size: 10_000 * lnvps_api_common::GB,
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let user_id = db.upsert_user(&[4u8; 32]).await.unwrap();
+        let mut vm = MockDb::mock_vm();
+        vm.user_id = user_id;
+        vm.ssh_key_id = None;
+        let vm_id = db.insert_vm(&vm).await.unwrap();
+        let commander = Arc::new(ChannelWorkCommander::new());
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(db);
+        (
+            RouterState {
+                node_control: None,
+                db,
+                work_commander: commander.clone(),
+                feedback: None,
+                vm_state_cache: VmStateCache::new(),
+                exchange: Arc::new(MockExchangeRate::default()),
+                vat: VatClient::new(),
+                chain: None,
+            },
+            commander,
+            vm_id,
+        )
+    }
+
+    fn vm_admin() -> AdminAuth {
+        AdminAuth {
+            user_id: 1,
+            pubkey: vec![1u8; 32],
+            permissions: [crate::admin::model::Permission {
+                resource: AdminResource::VirtualMachines,
+                action: AdminAction::Update,
+            }]
+            .into_iter()
+            .collect(),
+            nip98_auth: None,
+        }
+    }
+
+    async fn queued(commander: &lnvps_api_common::ChannelWorkCommander) -> Vec<WorkJob> {
+        use lnvps_api_common::WorkCommander;
+        match tokio::time::timeout(std::time::Duration::from_millis(50), commander.recv()).await {
+            Ok(Ok(jobs)) => jobs.into_iter().map(|j| j.job).collect(),
+            _ => vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn migrate_dry_run_returns_the_plan_and_queues_nothing() {
+        let (this, commander, vm_id) = migrate_fixture().await;
+        let req: AdminMigrateVmRequest =
+            serde_json::from_str(r#"{"target_host_id":2,"dry_run":true}"#).unwrap();
+        let out = admin_migrate_vm(vm_admin(), State(this.clone()), Path(vm_id), Json(req))
+            .await
+            .unwrap();
+        let body = serde_json::to_value(&out.0.data).unwrap();
+        assert_eq!(body["dry_run"], true);
+        assert_eq!(body["plan"]["method"], "hypervisor");
+        assert_eq!(body["plan"]["target_disk_id"], 2);
+        assert!(body["plan"]["refusals"].as_array().unwrap().is_empty());
+        assert!(body.get("job_id").is_none());
+        assert!(queued(&commander).await.is_empty());
+        assert_eq!(this.db.get_vm(vm_id).await.unwrap().host_id, 1);
+    }
+
+    #[tokio::test]
+    async fn migrate_old_request_shape_still_queues_a_job() {
+        let (this, commander, vm_id) = migrate_fixture().await;
+        let req: AdminMigrateVmRequest =
+            serde_json::from_str(r#"{"target_host_id":2,"live":true,"reason":"drain"}"#).unwrap();
+        let out = admin_migrate_vm(vm_admin(), State(this), Path(vm_id), Json(req))
+            .await
+            .unwrap();
+        let body = serde_json::to_value(&out.0.data).unwrap();
+        assert!(body["job_id"].is_string());
+        let jobs = queued(&commander).await;
+        let [
+            WorkJob::MigrateVm {
+                target_host_id: 2,
+                live: true,
+                options,
+                ..
+            },
+        ] = jobs.as_slice()
+        else {
+            panic!("{jobs:?}");
+        };
+        assert_eq!(*options, MigrationOptions::default());
+    }
+
+    #[tokio::test]
+    async fn migrate_refusals_are_returned_before_queueing() {
+        let (this, commander, vm_id) = migrate_fixture().await;
+        let req: AdminMigrateVmRequest = serde_json::from_str(
+            r#"{"target_host_id":2,"ip_policy":"reassign","keep_source":false,"target_disk_id":99}"#,
+        )
+        .unwrap();
+        let err = admin_migrate_vm(vm_admin(), State(this), Path(vm_id), Json(req))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.error.contains("disk 99"), "{}", err.error);
+        assert!(queued(&commander).await.is_empty());
+    }
     #[tokio::test]
     async fn admin_bulk_vm_status_endpoint() {
         use crate::admin::model::Permission;
