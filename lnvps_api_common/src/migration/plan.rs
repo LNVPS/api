@@ -1,11 +1,13 @@
-use crate::HostCapacity;
-use crate::host::VmResources;
+use crate::host::{FullVmInfo, VmResources};
 use crate::migration::{
     IpPolicy, MIGRATION_ESTIMATE_BYTES_PER_SEC, MigrationIpChange, MigrationMethod,
     MigrationOptions, MigrationPlan,
 };
+use crate::{HostCapacity, HostCapacityService};
 use lnvps_db::{IpRange, OsDistribution, Vm, VmHost, VmHostDisk, VmHostKind, VmOsImage};
+use lnvps_db::{LNVpsDb, VmIpAssignment};
 use std::net::IpAddr;
+use std::sync::Arc;
 
 pub struct PlanInputs<'a> {
     pub vm: &'a Vm,
@@ -20,11 +22,67 @@ pub struct PlanInputs<'a> {
     pub options: &'a MigrationOptions,
 }
 
+pub async fn load_migration_plan(
+    db: &Arc<dyn LNVpsDb>,
+    vm_id: u64,
+    target_host_id: u64,
+    options: &MigrationOptions,
+) -> anyhow::Result<MigrationPlan> {
+    let vm = db.get_vm(vm_id).await?;
+    if vm.deleted {
+        anyhow::bail!("Cannot migrate a deleted VM");
+    }
+    let source_host = db.get_host(vm.host_id).await?;
+    let target_host = db.get_host(target_host_id).await?;
+    let source_disk = db.get_host_disk(vm.disk_id).await?;
+    let image = db.get_os_image(vm.image_id).await?;
+    let resources = FullVmInfo::vm_resources(vm.id, db.clone()).await?;
+    let capacity = HostCapacityService::new(db.clone())
+        .get_host_capacity(&target_host, None, None)
+        .await?;
+    let ips: Vec<VmIpAssignment> = db
+        .list_vm_ip_assignments(vm.id)
+        .await?
+        .into_iter()
+        .filter(|i| !i.deleted)
+        .collect();
+    let mut ranges: Vec<IpRange> = Vec::new();
+    for id in ips.iter().map(|i| i.ip_range_id) {
+        if !ranges.iter().any(|r| r.id == id) {
+            ranges.push(db.get_ip_range(id).await?);
+        }
+    }
+    let addresses: Vec<String> = ips.iter().map(|i| i.ip.clone()).collect();
+    let mut plan = plan_vm_migration(&PlanInputs {
+        vm: &vm,
+        resources: &resources,
+        image: &image,
+        source_host: &source_host,
+        source_disk: &source_disk,
+        target_host: &target_host,
+        target_capacity: &capacity,
+        assigned_ranges: &ranges,
+        assigned_ips: &addresses,
+        options,
+    });
+    if let Some(active) = db.get_active_vm_migration(vm.id).await? {
+        plan.refusals.push(format!(
+            "VM {} is already being migrated (migration {}, phase {})",
+            vm.id, active.id, active.phase
+        ));
+    }
+    Ok(plan)
+}
+
 pub fn plan_vm_migration(input: &PlanInputs<'_>) -> MigrationPlan {
     let source = input.source_host;
     let target = input.target_host;
     let options = input.options;
-    let method = migration_method(&source.kind, &target.kind);
+    let method = migration_method(
+        &source.kind,
+        &target.kind,
+        source.region_id == target.region_id,
+    );
     let disk_bytes = input.resources.disk_size;
     let mut plan = MigrationPlan {
         vm_id: input.vm.id,
@@ -208,6 +266,14 @@ fn plan_ips(input: &PlanInputs<'_>, plan: &mut MigrationPlan) {
             }
         }
         IpPolicy::Reassign => {
+            if input.source_host.region_id == target_region {
+                plan.refusals.push(
+                    "ip_policy=reassign only applies when the VM changes region; its addresses \
+                     are already routed in region "
+                        .to_string()
+                        + &target_region.to_string(),
+                );
+            }
             let v4_needed = input
                 .assigned_ips
                 .iter()
@@ -243,14 +309,25 @@ fn plan_ips(input: &PlanInputs<'_>, plan: &mut MigrationPlan) {
     }
 }
 
-pub fn migration_method(source: &VmHostKind, target: &VmHostKind) -> Option<MigrationMethod> {
+pub fn migration_method(
+    source: &VmHostKind,
+    target: &VmHostKind,
+    same_region: bool,
+) -> Option<MigrationMethod> {
     match (source, target) {
-        (VmHostKind::Proxmox, VmHostKind::Proxmox) | (VmHostKind::Dummy, VmHostKind::Dummy) => {
+        (VmHostKind::Proxmox, VmHostKind::Proxmox) | (VmHostKind::Dummy, VmHostKind::Dummy)
+            if same_region =>
+        {
             Some(MigrationMethod::Hypervisor)
         }
-        (VmHostKind::LibVirt | VmHostKind::MarketplaceNode, VmHostKind::Proxmox) => {
-            Some(MigrationMethod::CopyAndAdopt)
-        }
+        (
+            VmHostKind::Proxmox | VmHostKind::LibVirt | VmHostKind::MarketplaceNode,
+            VmHostKind::Proxmox,
+        )
+        | (
+            VmHostKind::Dummy | VmHostKind::LibVirt | VmHostKind::MarketplaceNode,
+            VmHostKind::Dummy,
+        ) => Some(MigrationMethod::CopyAndAdopt),
         _ => None,
     }
 }
@@ -603,8 +680,34 @@ mod tests {
     #[test]
     fn dummy_hosts_migrate_like_proxmox() {
         assert_eq!(
-            migration_method(&VmHostKind::Dummy, &VmHostKind::Dummy),
+            migration_method(&VmHostKind::Dummy, &VmHostKind::Dummy, true),
             Some(MigrationMethod::Hypervisor)
         );
+        assert_eq!(
+            migration_method(&VmHostKind::Dummy, &VmHostKind::Dummy, false),
+            Some(MigrationMethod::CopyAndAdopt)
+        );
+    }
+
+    #[test]
+    fn proxmox_to_proxmox_across_regions_is_a_copy() {
+        let mut c = Case::marketplace_to_proxmox();
+        c.source.kind = VmHostKind::Proxmox;
+        c.target.region_id = 2;
+        c.capacity.ranges[0].range.region_id = 2;
+        c.options.ip_policy = IpPolicy::Reassign;
+        let plan = c.plan();
+        assert!(plan.allowed(), "{:?}", plan.refusals);
+        assert_eq!(plan.method, Some(MigrationMethod::CopyAndAdopt));
+    }
+
+    #[test]
+    fn reassign_within_one_region_is_refused() {
+        let mut c = Case::marketplace_to_proxmox();
+        c.options.ip_policy = IpPolicy::Reassign;
+        assert!(refused_with(
+            &c.plan(),
+            "only applies when the VM changes region"
+        ));
     }
 }

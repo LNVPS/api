@@ -1655,8 +1655,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
         let res = sqlx::query(
             "INSERT INTO vm_migration (vm_id, source_host_id, source_disk_id, target_host_id, \
              target_disk_id, state, phase, options, old_ips, source_retained, needs_attention, \
-             bytes_copied, checksum, error, initiated_by) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             source_was_running, flipped, bytes_copied, checksum, error, initiated_by) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(m.vm_id)
         .bind(m.source_host_id)
@@ -1669,6 +1669,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&m.old_ips)
         .bind(m.source_retained)
         .bind(m.needs_attention)
+        .bind(m.source_was_running)
+        .bind(m.flipped)
         .bind(m.bytes_copied)
         .bind(&m.checksum)
         .bind(&m.error)
@@ -1681,7 +1683,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn update_vm_migration(&self, m: &VmMigration) -> DbResult<()> {
         sqlx::query(
             "UPDATE vm_migration SET target_disk_id = ?, state = ?, phase = ?, old_ips = ?, \
-             source_retained = ?, needs_attention = ?, bytes_copied = ?, checksum = ?, error = ?, \
+             source_retained = ?, needs_attention = ?, source_was_running = ?, flipped = ?, \
+             bytes_copied = ?, checksum = ?, error = ?, \
              finished = ? WHERE id = ?",
         )
         .bind(m.target_disk_id)
@@ -1690,6 +1693,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&m.old_ips)
         .bind(m.source_retained)
         .bind(m.needs_attention)
+        .bind(m.source_was_running)
+        .bind(m.flipped)
         .bind(m.bytes_copied)
         .bind(&m.checksum)
         .bind(&m.error)

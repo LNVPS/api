@@ -6160,6 +6160,8 @@ pub struct VmMigration {
     pub old_ips: Option<String>,
     pub source_retained: bool,
     pub needs_attention: bool,
+    pub source_was_running: bool,
+    pub flipped: bool,
     pub bytes_copied: u64,
     pub checksum: Option<String>,
     pub error: Option<String>,

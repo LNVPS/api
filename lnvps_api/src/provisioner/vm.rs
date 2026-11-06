@@ -66,6 +66,7 @@ pub struct VmProvisioner {
     pub network: VmNetworkProvisioner,
     provisioner_config: ProvisionerConfig,
     pub delete_after: u16,
+    host_clients: Option<Arc<dyn Fn(&lnvps_db::VmHost) -> Arc<dyn VmHostClient> + Send + Sync>>,
 }
 
 impl VmProvisioner {
@@ -81,7 +82,24 @@ impl VmProvisioner {
             read_only: settings.read_only,
             delete_after: settings.delete_after,
             db,
+            host_clients: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_host_clients(
+        mut self,
+        f: impl Fn(&lnvps_db::VmHost) -> Arc<dyn VmHostClient> + Send + Sync + 'static,
+    ) -> Self {
+        self.host_clients = Some(Arc::new(f));
+        self
+    }
+
+    pub async fn host_client(&self, host: &lnvps_db::VmHost) -> Result<Arc<dyn VmHostClient>> {
+        if let Some(f) = &self.host_clients {
+            return Ok(f(host));
+        }
+        get_host_client(&self.db, host, &self.provisioner_config).await
     }
 
     pub fn config(&self) -> &ProvisionerConfig {

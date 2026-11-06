@@ -53,7 +53,126 @@ pub type DiskReader = std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send>>;
 
 pub struct DiskStream {
     pub size: u64,
+    pub format: DiskFormat,
     pub reader: DiskReader,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiskFormat {
+    Raw,
+    QCow2,
+}
+
+impl DiskFormat {
+    pub fn extension(&self) -> &'static str {
+        match self {
+            DiskFormat::Raw => "raw",
+            DiskFormat::QCow2 => "qcow2",
+        }
+    }
+}
+
+pub type DiskChunkSender = tokio::sync::mpsc::Sender<std::io::Result<Vec<u8>>>;
+
+pub fn disk_channel(depth: usize) -> (DiskChunkSender, DiskReader) {
+    let (tx, rx) = tokio::sync::mpsc::channel(depth);
+    (
+        tx,
+        Box::pin(ChannelReader {
+            rx,
+            pending: Vec::new(),
+            offset: 0,
+        }),
+    )
+}
+
+struct ChannelReader {
+    rx: tokio::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    pending: Vec<u8>,
+    offset: usize,
+}
+
+impl tokio::io::AsyncRead for ChannelReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::Poll;
+        loop {
+            if self.offset < self.pending.len() {
+                let n = buf.remaining().min(self.pending.len() - self.offset);
+                let start = self.offset;
+                buf.put_slice(&self.pending[start..start + n]);
+                self.offset += n;
+                return Poll::Ready(Ok(()));
+            }
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    self.pending = chunk;
+                    self.offset = 0;
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
+                Poll::Ready(None) => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+pub struct HashingReader {
+    inner: DiskReader,
+    state: Arc<std::sync::Mutex<(sha2::Sha256, u64)>>,
+}
+
+#[derive(Clone)]
+pub struct HashingProbe(Arc<std::sync::Mutex<(sha2::Sha256, u64)>>);
+
+impl HashingProbe {
+    pub fn bytes(&self) -> u64 {
+        self.0.lock().map(|s| s.1).unwrap_or(0)
+    }
+
+    pub fn finish(&self) -> (u64, String) {
+        use sha2::Digest;
+        let s = self.0.lock().expect("hash state");
+        (s.1, hex::encode(s.0.clone().finalize()))
+    }
+}
+
+impl HashingReader {
+    pub fn wrap(inner: DiskReader) -> (DiskReader, HashingProbe) {
+        use sha2::Digest;
+        let state = Arc::new(std::sync::Mutex::new((sha2::Sha256::new(), 0u64)));
+        (
+            Box::pin(Self {
+                inner,
+                state: state.clone(),
+            }),
+            HashingProbe(state),
+        )
+    }
+}
+
+impl tokio::io::AsyncRead for HashingReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use sha2::Digest;
+        let before = buf.filled().len();
+        let res = self.inner.as_mut().poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &res {
+            let fresh = &buf.filled()[before..];
+            if let Ok(mut s) = self.state.lock() {
+                s.0.update(fresh);
+                s.1 += fresh.len() as u64;
+            }
+        }
+        res
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

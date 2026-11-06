@@ -53,6 +53,7 @@ async fn one_active_migration_per_vm_and_round_trip() {
     active.checksum = Some("ab".repeat(32));
     active.state = VmMigrationState::Completed;
     active.source_retained = true;
+    active.flipped = true;
     active.finished = Some(chrono::Utc::now());
     db.update_vm_migration(&active).await.unwrap();
 
@@ -61,6 +62,7 @@ async fn one_active_migration_per_vm_and_round_trip() {
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].bytes_copied, 42);
     assert!(open[0].source_retained);
+    assert!(open[0].flipped);
 
     db.insert_vm_migration(&m).await.unwrap();
     assert_eq!(db.list_vm_migrations(7).await.unwrap().len(), 2);

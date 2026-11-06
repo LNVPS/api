@@ -11,6 +11,8 @@ CREATE TABLE vm_migration (
     old_ips TEXT,
     source_retained BIT(1) NOT NULL DEFAULT 0,
     needs_attention BIT(1) NOT NULL DEFAULT 0,
+    source_was_running BIT(1) NOT NULL DEFAULT 0,
+    flipped BIT(1) NOT NULL DEFAULT 0,
     bytes_copied BIGINT UNSIGNED NOT NULL DEFAULT 0,
     checksum VARCHAR(128),
     error TEXT,

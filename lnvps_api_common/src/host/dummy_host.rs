@@ -407,6 +407,7 @@ impl VmHostClient for DummyVmHost {
         };
         Ok(DiskStream {
             size: bytes.len() as u64,
+            format: crate::host::DiskFormat::Raw,
             reader: Box::pin(std::io::Cursor::new(bytes)),
         })
     }
