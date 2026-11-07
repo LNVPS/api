@@ -4154,6 +4154,37 @@ config:
 
     const BAKED_SCRIPTS: &[(&str, &str)] = &[("strfry", "/etc/strfry-view-policy.py")];
 
+    fn script_violation(name: &str, path: &str, content: &str) -> Option<&'static str> {
+        if BAKED_SCRIPTS.contains(&(name, path)) {
+            return content
+                .contains("${")
+                .then_some("baked script interpolates config");
+        }
+        [".sh", ".py", ".js"]
+            .iter()
+            .any(|e| path.ends_with(e))
+            .then_some("looks like a script")
+    }
+
+    #[test]
+    fn script_guard_rejects_interpolation_and_unlisted_scripts() {
+        let baked = "/etc/strfry-view-policy.py";
+        assert_eq!(script_violation("strfry", baked, "print(1)"), None);
+        assert_eq!(
+            script_violation("strfry", baked, "print('${x}')"),
+            Some("baked script interpolates config")
+        );
+        assert_eq!(
+            script_violation("other", baked, "print(1)"),
+            Some("looks like a script")
+        );
+        assert_eq!(
+            script_violation("strfry", "/etc/other.py", "print(1)"),
+            Some("looks like a script")
+        );
+        assert_eq!(script_violation("strfry", "/etc/a.conf", "x"), None);
+    }
+
     #[test]
     fn catalog_never_takes_customer_code() {
         for (name, yaml) in catalog_documents() {
@@ -4165,20 +4196,10 @@ config:
                         "{name}/{sname}: {} takes a whole customer file",
                         f.path
                     );
-                    let baked = BAKED_SCRIPTS.contains(&(name.as_str(), f.path.as_str()));
-                    if baked {
-                        assert!(
-                            !f.content.as_deref().unwrap_or_default().contains("${"),
-                            "{name}/{sname}: baked script {} interpolates config",
-                            f.path
-                        );
-                    }
-                    assert!(
-                        baked
-                            || (!f.path.ends_with(".sh")
-                                && !f.path.ends_with(".py")
-                                && !f.path.ends_with(".js")),
-                        "{name}/{sname}: {} looks like a script",
+                    assert_eq!(
+                        script_violation(&name, &f.path, f.content.as_deref().unwrap_or_default()),
+                        None,
+                        "{name}/{sname}: {}",
                         f.path
                     );
                 }
