@@ -4152,6 +4152,8 @@ config:
         );
     }
 
+    const BAKED_SCRIPTS: &[(&str, &str)] = &[("strfry", "/etc/strfry-view-policy.py")];
+
     #[test]
     fn catalog_never_takes_customer_code() {
         for (name, yaml) in catalog_documents() {
@@ -4163,10 +4165,19 @@ config:
                         "{name}/{sname}: {} takes a whole customer file",
                         f.path
                     );
+                    let baked = BAKED_SCRIPTS.contains(&(name.as_str(), f.path.as_str()));
+                    if baked {
+                        assert!(
+                            !f.content.as_deref().unwrap_or_default().contains("${"),
+                            "{name}/{sname}: baked script {} interpolates config",
+                            f.path
+                        );
+                    }
                     assert!(
-                        !f.path.ends_with(".sh")
-                            && !f.path.ends_with(".py")
-                            && !f.path.ends_with(".js"),
+                        baked
+                            || (!f.path.ends_with(".sh")
+                                && !f.path.ends_with(".py")
+                                && !f.path.ends_with(".js")),
                         "{name}/{sname}: {} looks like a script",
                         f.path
                     );
