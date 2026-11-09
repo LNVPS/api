@@ -1524,6 +1524,15 @@ pub trait LNVpsDbBase: Send + Sync {
         offset: u64,
     ) -> DbResult<(Vec<AccountCreditEvent>, u64)>;
 
+    /// Every ledger event of `kind` in `currency` created at or after `since`,
+    /// across all users, oldest first.
+    async fn list_account_credit_events_by_kind(
+        &self,
+        kind: &str,
+        currency: &str,
+        since: DateTime<Utc>,
+    ) -> DbResult<Vec<AccountCreditEvent>>;
+
     /// Hold `debit.amount` of the user's balance until `debit.expires`.
     /// Returns the debit id, or `None` when the unreserved balance is short.
     async fn reserve_account_credit(&self, debit: &AccountCreditDebit) -> DbResult<Option<u64>>;

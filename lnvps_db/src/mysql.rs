@@ -5897,6 +5897,23 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok((rows, total as u64))
     }
 
+    async fn list_account_credit_events_by_kind(
+        &self,
+        kind: &str,
+        currency: &str,
+        since: DateTime<Utc>,
+    ) -> DbResult<Vec<AccountCreditEvent>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM account_credit_event WHERE kind = ? AND currency = ? AND created >= ? \
+             ORDER BY created, id",
+        )
+        .bind(kind)
+        .bind(currency)
+        .bind(since)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
     async fn reserve_account_credit(&self, debit: &AccountCreditDebit) -> DbResult<Option<u64>> {
         let mut tx = self.db.begin().await?;
         let balance = lock_account_credit(&mut tx, debit.user_id, &debit.currency).await?;

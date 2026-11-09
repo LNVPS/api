@@ -4835,6 +4835,20 @@ impl LNVpsDbBase for MockDb {
         ))
     }
 
+    async fn list_account_credit_events_by_kind(
+        &self,
+        kind: &str,
+        currency: &str,
+        since: DateTime<Utc>,
+    ) -> DbResult<Vec<lnvps_db::AccountCreditEvent>> {
+        let events = self.account_credit_events.lock().await;
+        Ok(events
+            .iter()
+            .filter(|e| e.kind == kind && e.currency == currency && e.created >= since)
+            .cloned()
+            .collect())
+    }
+
     async fn reserve_account_credit(
         &self,
         debit: &lnvps_db::AccountCreditDebit,

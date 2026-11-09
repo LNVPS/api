@@ -18,6 +18,7 @@ mod companies;
 mod cost_plans;
 mod costs;
 mod credit;
+mod credit_rebook;
 mod custom_pricing;
 mod custom_templates;
 mod discounts;
@@ -96,6 +97,7 @@ pub fn admin_router(
         .merge(companies::router())
         .merge(abuse::router())
         .merge(credit::router())
+        .merge(credit_rebook::router())
         .merge(swap_orders::router())
         .merge(cost_plans::router())
         .merge(costs::router())
