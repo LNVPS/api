@@ -170,6 +170,27 @@ pub struct AppliedCredit {
     pub base_amount: u64,
     /// The balance's currency.
     pub base_currency: Currency,
+    /// Further balances spent on the same bill after the first, each in its own currency.
+    pub extra: Vec<CreditPart>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreditPart {
+    pub amount: u64,
+    pub base_amount: u64,
+    pub base_currency: Currency,
+}
+
+impl AppliedCredit {
+    fn parts(&self) -> Vec<CreditPart> {
+        let mut parts = vec![CreditPart {
+            amount: self.amount - self.extra.iter().map(|p| p.amount).sum::<u64>(),
+            base_amount: self.base_amount,
+            base_currency: self.base_currency,
+        }];
+        parts.extend(self.extra.iter().cloned());
+        parts
+    }
 }
 
 /// The `external_data` of a payment fully funded by account credit.
@@ -177,9 +198,18 @@ pub(crate) const CREDIT_FUNDED_MARKER: &str = "credit";
 
 impl AppliedCredit {
     fn reduce_to(&mut self, amount: u64) {
-        if self.amount > 0 {
-            self.base_amount =
-                (self.base_amount as u128 * amount as u128 / self.amount as u128) as u64;
+        let total = self.amount;
+        let scale = |v: u64| {
+            if total == 0 {
+                v
+            } else {
+                (v as u128 * amount as u128 / total as u128) as u64
+            }
+        };
+        self.base_amount = scale(self.base_amount);
+        for p in &mut self.extra {
+            p.base_amount = scale(p.base_amount);
+            p.amount = scale(p.amount);
         }
         self.amount = amount;
     }
@@ -592,28 +622,35 @@ impl SubscriptionHandler {
             ),
         }
 
-        let held = self
+        let held: Vec<u64> = self
             .db
-            .get_account_credit_debit_by_payment(&payment.id)
+            .list_account_credit_debits_by_payment(&payment.id)
             .await
-            .ok()
-            .flatten()
-            .map(|d| d.amount);
-        match self.db.settle_account_credit_debit(&payment.id).await {
-            Ok(Some(d)) if held.is_some_and(|h| h > d.amount) => warn!(
-                "Account credit on payment {} fell short: {} of {} {} spent",
-                hex::encode(&payment.id),
-                d.amount,
-                held.unwrap_or_default(),
-                d.currency
-            ),
-            Ok(Some(d)) => info!(
-                "Account credit {} {} spent on payment {}",
-                d.amount,
-                d.currency,
-                hex::encode(&payment.id)
-            ),
-            Ok(None) => {}
+            .unwrap_or_default()
+            .iter()
+            .map(|d| d.amount)
+            .collect();
+        match self.db.settle_account_credit_debits(&payment.id).await {
+            Ok(spent) => {
+                for (i, d) in spent.iter().enumerate() {
+                    if held.get(i).is_some_and(|h| *h > d.amount) {
+                        warn!(
+                            "Account credit on payment {} fell short: {} of {} {} spent",
+                            hex::encode(&payment.id),
+                            d.amount,
+                            held[i],
+                            d.currency
+                        );
+                    } else {
+                        info!(
+                            "Account credit {} {} spent on payment {}",
+                            d.amount,
+                            d.currency,
+                            hex::encode(&payment.id)
+                        );
+                    }
+                }
+            }
             Err(e) => warn!(
                 "Failed to settle account credit for payment {}: {}",
                 hex::encode(&payment.id),
@@ -926,21 +963,31 @@ impl SubscriptionHandler {
         &self,
         payment: &SubscriptionPayment,
     ) -> Result<Option<AppliedCredit>> {
-        let Some(debit) = self
+        let debits = self
             .db
-            .get_account_credit_debit_by_payment(&payment.id)
-            .await?
-        else {
+            .list_account_credit_debits_by_payment(&payment.id)
+            .await?;
+        let Some(first) = debits.first() else {
             return Ok(None);
         };
+        let part = |d: &lnvps_db::AccountCreditDebit| -> Result<CreditPart> {
+            Ok(CreditPart {
+                amount: d.payment_amount,
+                base_amount: d.amount,
+                base_currency: Currency::from_str(&d.currency)
+                    .map_err(|_| anyhow::anyhow!("Invalid credit currency"))?,
+            })
+        };
+        let first_part = part(first)?;
+        let extra = debits[1..].iter().map(part).collect::<Result<Vec<_>>>()?;
         Ok(Some(AppliedCredit {
-            user_id: debit.user_id,
-            amount: debit.payment_amount,
+            user_id: first.user_id,
+            amount: debits.iter().map(|d| d.payment_amount).sum(),
             currency: Currency::from_str(&payment.currency)
                 .map_err(|_| anyhow::anyhow!("Invalid payment currency"))?,
-            base_amount: debit.amount,
-            base_currency: Currency::from_str(&debit.currency)
-                .map_err(|_| anyhow::anyhow!("Invalid credit currency"))?,
+            base_amount: first_part.base_amount,
+            base_currency: first_part.base_currency,
+            extra,
         }))
     }
 
@@ -1780,36 +1827,51 @@ impl SubscriptionHandler {
                 spendable.push((c.currency, available));
             }
         }
-        let chosen = spendable
-            .iter()
-            .find(|(c, _)| *c == currency.to_string())
-            .or_else(|| spendable.first());
-        let Some((balance_currency, available)) = chosen.cloned() else {
-            return Ok(None);
-        };
-        let base_currency = Currency::from_str(&balance_currency)
-            .map_err(|_| anyhow::anyhow!("Invalid credit currency"))?;
-        let converted = self
-            .pe
-            .convert_currency(CurrencyAmount::from_u64(base_currency, available), currency)
-            .await?
-            .value();
-        let applied = converted.min(gross);
-        if applied == 0 {
+        spendable.sort_by_key(|(c, _)| *c != currency.to_string());
+        let mut parts: Vec<CreditPart> = Vec::new();
+        let mut left = gross;
+        for (balance_currency, available) in spendable {
+            if left == 0 {
+                break;
+            }
+            let base_currency = Currency::from_str(&balance_currency)
+                .map_err(|_| anyhow::anyhow!("Invalid credit currency"))?;
+            let converted = if base_currency == currency {
+                available
+            } else {
+                self.pe
+                    .convert_currency(CurrencyAmount::from_u64(base_currency, available), currency)
+                    .await?
+                    .value()
+            };
+            let applied = converted.min(left);
+            if applied == 0 {
+                continue;
+            }
+            let base_amount = if base_currency == currency {
+                applied
+            } else {
+                ((applied as u128 * available as u128) / converted as u128) as u64
+            }
+            .min(available);
+            left -= applied;
+            parts.push(CreditPart {
+                amount: applied,
+                base_amount,
+                base_currency,
+            });
+        }
+        if parts.is_empty() {
             return Ok(None);
         }
-        let base_amount = if base_currency == currency {
-            applied
-        } else {
-            ((applied as u128 * available as u128) / converted as u128) as u64
-        }
-        .min(available);
+        let first = parts.remove(0);
         Ok(Some(AppliedCredit {
             user_id,
-            amount: applied,
+            amount: first.amount + parts.iter().map(|p| p.amount).sum::<u64>(),
             currency,
-            base_amount,
-            base_currency,
+            base_amount: first.base_amount,
+            base_currency: first.base_currency,
+            extra: parts,
         }))
     }
 
@@ -1880,38 +1942,50 @@ impl SubscriptionHandler {
         .await
     }
 
-    async fn reserve_credit(&self, credit: Option<&AppliedCredit>) -> Result<Option<u64>> {
+    async fn reserve_credit(&self, credit: Option<&AppliedCredit>) -> Result<Vec<u64>> {
         let Some(c) = credit else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
-        self.db
-            .reserve_account_credit(&lnvps_db::AccountCreditDebit {
-                user_id: c.user_id,
-                amount: c.base_amount,
-                currency: c.base_currency.to_string(),
-                payment_amount: c.amount,
-                expires: credit_hold_expiry(),
-                ..Default::default()
-            })
-            .await?
-            .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("Account credit balance changed, please try again"))
+        let mut held = Vec::new();
+        for part in c.parts() {
+            let reserved = self
+                .db
+                .reserve_account_credit(&lnvps_db::AccountCreditDebit {
+                    user_id: c.user_id,
+                    amount: part.base_amount,
+                    currency: part.base_currency.to_string(),
+                    payment_amount: part.amount,
+                    expires: credit_hold_expiry(),
+                    ..Default::default()
+                })
+                .await?;
+            match reserved {
+                Some(id) => held.push(id),
+                None => {
+                    self.release_credit(held).await;
+                    return Err(anyhow::anyhow!(
+                        "Account credit balance changed, please try again"
+                    ));
+                }
+            }
+        }
+        Ok(held)
     }
 
-    async fn release_credit(&self, reservation: Option<u64>) {
-        if let Some(id) = reservation
-            && let Err(e) = self.db.release_account_credit_debit(id).await
-        {
-            warn!("Failed to release account credit reservation {id}: {e}");
+    async fn release_credit(&self, reservations: Vec<u64>) {
+        for id in reservations {
+            if let Err(e) = self.db.release_account_credit_debit(id).await {
+                warn!("Failed to release account credit reservation {id}: {e}");
+            }
         }
     }
 
     async fn attach_credit(
         &self,
-        reservation: Option<u64>,
+        reservations: Vec<u64>,
         payment: &SubscriptionPayment,
     ) -> Result<()> {
-        if let Some(id) = reservation {
+        for id in reservations {
             self.db
                 .attach_account_credit_debit(id, &payment.id, payment.expires)
                 .await?;
@@ -1927,21 +2001,23 @@ impl SubscriptionHandler {
         }
         let held = self
             .db
-            .get_account_credit_debit_by_payment(&payment.id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Credit-funded payment has no credit held"))?;
-        let spent = self
-            .db
-            .settle_account_credit_debit(&payment.id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Credit-funded payment was already settled"))?;
+            .list_account_credit_debits_by_payment(&payment.id)
+            .await?;
+        ensure!(!held.is_empty(), "Credit-funded payment has no credit held");
+        let spent = self.db.settle_account_credit_debits(&payment.id).await?;
         ensure!(
-            spent.amount == held.amount,
-            "Account credit fell short on payment {}: {} of {} spent",
-            hex::encode(&payment.id),
-            spent.amount,
-            held.amount
+            !spent.is_empty(),
+            "Credit-funded payment was already settled"
         );
+        for (h, s) in held.iter().filter(|h| !h.settled).zip(&spent) {
+            ensure!(
+                s.amount == h.amount,
+                "Account credit fell short on payment {}: {} of {} spent",
+                hex::encode(&payment.id),
+                s.amount,
+                h.amount
+            );
+        }
         self.complete_payment(payment).await?;
         payment.is_paid = true;
         Ok(())
@@ -5013,8 +5089,58 @@ mod credit_tests {
             .unwrap()
             .expect("credit applies");
         assert_eq!(
-            (credit.base_currency, credit.base_amount, credit.amount),
-            (Currency::EUR, 4_000, 4_000)
+            (credit.base_currency, credit.base_amount),
+            (Currency::EUR, 4_000)
+        );
+        assert_eq!(credit.amount, 10_000);
+        assert_eq!(credit.extra.len(), 1);
+        assert_eq!(credit.extra[0].base_currency, Currency::BTC);
+        assert_eq!(credit.extra[0].amount, 6_000);
+    }
+
+    #[tokio::test]
+    async fn a_bill_is_covered_by_a_eur_balance_and_a_btc_balance_together() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        give_credit(&db, user_id, 2_000_000, true).await;
+        db.adjust_account_credit(user_id, "EUR", 300, "refund", None)
+            .await
+            .unwrap();
+
+        let quoted = quote(&sub, sub_id).await.unwrap();
+        let credit = quoted.credit.expect("credit on the quote");
+        assert_eq!(credit.amount, 500);
+
+        let payment = renew(&sub, sub_id).await.unwrap();
+        assert_eq!(payment.amount, 1_000);
+        let held = db
+            .list_account_credit_debits_by_payment(&payment.id)
+            .await
+            .unwrap();
+        let mut held: Vec<_> = held
+            .iter()
+            .map(|d| (d.currency.clone(), d.amount, d.payment_amount))
+            .collect();
+        held.sort();
+        assert_eq!(
+            held,
+            vec![
+                ("BTC".to_string(), 2_000_000, 200),
+                ("EUR".to_string(), 300, 300)
+            ]
+        );
+        assert_eq!(
+            db.get_account_credit(user_id, "EUR").await.unwrap().balance,
+            300
+        );
+
+        sub.apply_payment(&payment).await.unwrap();
+        assert_eq!(
+            db.get_account_credit(user_id, "EUR").await.unwrap().balance,
+            0
+        );
+        assert_eq!(
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
+            0
         );
     }
 

@@ -493,40 +493,48 @@ impl VmRefundHandler {
 
             // Split the share between what credit paid and what cash paid, in
             // proportion to how the payment was funded.
-            let debit = self
+            let debits: Vec<_> = self
                 .db
-                .get_account_credit_debit_by_payment(&payment.id)
+                .list_account_credit_debits_by_payment(&payment.id)
                 .await?
-                .filter(|d| d.settled && d.payment_amount > 0);
-            let credit_paid = debit
-                .as_ref()
-                .map(|d| d.payment_amount.min(billable))
-                .unwrap_or(0);
+                .into_iter()
+                .filter(|d| d.settled && d.payment_amount > 0)
+                .collect();
+            let total_debited: u128 = debits.iter().map(|d| d.payment_amount as u128).sum();
+            let credit_paid = total_debited.min(billable as u128) as u64;
             let gross_from_credit = (gross as u128 * credit_paid as u128 / billable as u128) as u64;
             let gross_from_cash = gross - gross_from_credit;
-            let credit_back = debit
-                .as_ref()
-                .map(|d| {
-                    let den = d.payment_amount as u128;
-                    let earlier_gross_from_credit: u128 = existing
-                        .iter()
-                        .map(|r| {
-                            (r.amount + r.tax) as u128 * credit_paid as u128 / billable as u128
-                        })
-                        .sum();
-                    let earlier_credit: u128 = existing
-                        .iter()
-                        .filter_map(|r| r.metadata.as_ref())
-                        .filter_map(|m| m["refund"]["returned_as_credit"][&d.currency].as_u64())
-                        .map(|v| v as u128)
-                        .sum();
-                    let cumulative = (d.amount as u128
-                        * (earlier_gross_from_credit + gross_from_credit as u128))
-                        .div_ceil(den)
-                        .min(d.amount as u128);
-                    cumulative.saturating_sub(earlier_credit) as u64
-                })
-                .unwrap_or(0);
+            let mut credits = Vec::new();
+            let mut from_debits = Vec::new();
+            for d in &debits {
+                let den = d.payment_amount as u128;
+                let earlier_gross_from_credit: u128 = existing
+                    .iter()
+                    .map(|r| {
+                        (r.amount + r.tax) as u128 * credit_paid as u128 / billable as u128
+                            * d.payment_amount as u128
+                            / total_debited
+                    })
+                    .sum();
+                let earlier_credit: u128 = existing
+                    .iter()
+                    .filter_map(|r| r.metadata.as_ref())
+                    .filter_map(|m| {
+                        m["refund"]["returned_from_debits"][&d.currency]
+                            .as_u64()
+                            .or_else(|| m["refund"]["returned_as_credit"][&d.currency].as_u64())
+                    })
+                    .map(|v| v as u128)
+                    .sum();
+                let this_gross =
+                    gross_from_credit as u128 * d.payment_amount as u128 / total_debited;
+                let cumulative = (d.amount as u128 * (earlier_gross_from_credit + this_gross))
+                    .div_ceil(den)
+                    .min(d.amount as u128);
+                let back = cumulative.saturating_sub(earlier_credit) as u64;
+                add_credit(&mut credits, &d.currency, back);
+                add_credit(&mut from_debits, &d.currency, back);
+            }
             let converting = payment.currency != billing_currency;
             let (cash_credit, cash_credit_currency) = if gross_from_cash == 0 {
                 (0, billing_currency.clone())
@@ -552,10 +560,6 @@ impl VmRefundHandler {
                     None => (gross_from_cash, payment.currency.clone()),
                 }
             };
-            let mut credits = Vec::new();
-            if let Some(d) = &debit {
-                add_credit(&mut credits, &d.currency, credit_back);
-            }
             add_credit(&mut credits, &cash_credit_currency, cash_credit);
 
             let no_credit_reason = credits
@@ -587,6 +591,12 @@ impl VmRefundHandler {
                 refund["by_owner_user_id"] = serde_json::json!(owner_id);
                 refund["returned_as_credit"] = serde_json::json!(
                     credits
+                        .iter()
+                        .cloned()
+                        .collect::<std::collections::BTreeMap<_, _>>()
+                );
+                refund["returned_from_debits"] = serde_json::json!(
+                    from_debits
                         .iter()
                         .cloned()
                         .collect::<std::collections::BTreeMap<_, _>>()
@@ -1409,12 +1419,7 @@ mod tests {
 
     async fn lightning_paid_eur_vm(
         rate: f32,
-    ) -> (
-        Arc<dyn LNVpsDb>,
-        VmRefundHandler,
-        Vm,
-        SubscriptionPayment,
-    ) {
+    ) -> (Arc<dyn LNVpsDb>, VmRefundHandler, Vm, SubscriptionPayment) {
         let mock = MockDb::default();
         let (vm, mut payment) = vm_with_payment(&mock, 12_500_000, 2_875_000).await;
         payment.currency = "BTC".to_string();

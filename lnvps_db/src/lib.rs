@@ -1541,7 +1541,36 @@ pub trait LNVpsDbBase: Send + Sync {
     async fn get_account_credit_debit_by_payment(
         &self,
         subscription_payment_id: &Vec<u8>,
-    ) -> DbResult<Option<AccountCreditDebit>>;
+    ) -> DbResult<Option<AccountCreditDebit>> {
+        Ok(self
+            .list_account_credit_debits_by_payment(subscription_payment_id)
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    /// Every debit held against a payment: one per balance currency when the
+    /// bill was covered by several balances.
+    async fn list_account_credit_debits_by_payment(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Vec<AccountCreditDebit>>;
+
+    /// Spend every unsettled debit on a payment. Each is settled on its own, so
+    /// a retry after a failure resumes with the ones left.
+    async fn settle_account_credit_debits(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Vec<AccountCreditDebit>> {
+        let mut settled = Vec::new();
+        while let Some(d) = self
+            .settle_account_credit_debit(subscription_payment_id)
+            .await?
+        {
+            settled.push(d);
+        }
+        Ok(settled)
+    }
 
     /// Spend the debit on a payment. Idempotent: returns `None` when there is
     /// no unsettled debit. An expired reservation may find its credit promised

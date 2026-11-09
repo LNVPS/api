@@ -5948,16 +5948,16 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn get_account_credit_debit_by_payment(
+    async fn list_account_credit_debits_by_payment(
         &self,
         subscription_payment_id: &Vec<u8>,
-    ) -> DbResult<Option<AccountCreditDebit>> {
-        Ok(
-            sqlx::query_as("SELECT * FROM account_credit_debit WHERE subscription_payment_id = ?")
-                .bind(subscription_payment_id)
-                .fetch_optional(&self.db)
-                .await?,
+    ) -> DbResult<Vec<AccountCreditDebit>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM account_credit_debit WHERE subscription_payment_id = ? ORDER BY id",
         )
+        .bind(subscription_payment_id)
+        .fetch_all(&self.db)
+        .await?)
     }
 
     async fn settle_account_credit_debit(
@@ -5966,7 +5966,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     ) -> DbResult<Option<AccountCreditDebit>> {
         let owner: Option<(u64, String)> = sqlx::query_as(
             "SELECT user_id, currency FROM account_credit_debit \
-             WHERE subscription_payment_id = ? AND settled = 0",
+             WHERE subscription_payment_id = ? AND settled = 0 ORDER BY id LIMIT 1",
         )
         .bind(subscription_payment_id)
         .fetch_optional(&self.db)
@@ -5978,9 +5978,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
         let balance = lock_account_credit(&mut tx, user_id, &currency).await?;
         let debit: Option<AccountCreditDebit> = sqlx::query_as(
             "SELECT * FROM account_credit_debit \
-             WHERE subscription_payment_id = ? AND settled = 0 FOR UPDATE",
+             WHERE subscription_payment_id = ? AND currency = ? AND settled = 0 FOR UPDATE",
         )
         .bind(subscription_payment_id)
+        .bind(&currency)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(mut debit) = debit else {

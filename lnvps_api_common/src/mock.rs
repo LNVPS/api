@@ -4886,15 +4886,16 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn get_account_credit_debit_by_payment(
+    async fn list_account_credit_debits_by_payment(
         &self,
         subscription_payment_id: &Vec<u8>,
-    ) -> DbResult<Option<lnvps_db::AccountCreditDebit>> {
+    ) -> DbResult<Vec<lnvps_db::AccountCreditDebit>> {
         let debits = self.account_credit_debits.lock().await;
         Ok(debits
             .iter()
-            .find(|d| d.subscription_payment_id.as_ref() == Some(subscription_payment_id))
-            .cloned())
+            .filter(|d| d.subscription_payment_id.as_ref() == Some(subscription_payment_id))
+            .cloned()
+            .collect())
     }
 
     async fn settle_account_credit_debit(

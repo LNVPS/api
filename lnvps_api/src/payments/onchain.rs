@@ -109,16 +109,18 @@ impl OnChainPaymentHandler {
     /// whose stored receive address matches.
     /// Spend the credit held on `payment` and return what it covered, in msat.
     async fn claim_credit_msat(&self, payment: &SubscriptionPayment) -> Result<u64> {
-        if let Some(d) = self.db.settle_account_credit_debit(&payment.id).await? {
-            return Ok(d.payment_amount);
+        let settled = self.db.settle_account_credit_debits(&payment.id).await?;
+        if !settled.is_empty() {
+            return Ok(settled.iter().map(|d| d.payment_amount).sum());
         }
         Ok(self
             .db
-            .get_account_credit_debit_by_payment(&payment.id)
+            .list_account_credit_debits_by_payment(&payment.id)
             .await?
+            .iter()
             .filter(|d| d.settled)
             .map(|d| d.payment_amount)
-            .unwrap_or(0))
+            .sum())
     }
 
     async fn topup_for_address(&self, address: &str) -> Result<Option<AccountCreditTopup>> {
@@ -546,12 +548,13 @@ impl OnChainPaymentHandler {
         {
             return Ok(());
         }
-        let credit_msat = self
+        let credit_msat: u64 = self
             .db
-            .get_account_credit_debit_by_payment(&payment.id)
+            .list_account_credit_debits_by_payment(&payment.id)
             .await?
+            .iter()
             .map(|d| d.payment_amount)
-            .unwrap_or(0);
+            .sum();
         self.regenerate(&mut payment, amount_msat + credit_msat)
             .await?;
         info!(
