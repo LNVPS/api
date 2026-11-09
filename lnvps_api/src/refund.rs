@@ -17,6 +17,7 @@ use chrono::{DateTime, Utc};
 use lightning_invoice::Bolt11Invoice;
 use lnvps_api_common::{
     PricingEngine, RefundEvidence, VmHistoryLogger, build_refund_row, refundable_remaining,
+    value_in_billing_currency,
 };
 use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment};
 use log::{error, info};
@@ -406,7 +407,8 @@ impl VmRefundHandler {
     /// - the part credit paid comes back as exactly the credit it took, to the
     ///   balance it was taken from;
     /// - the part paid in cash (Lightning, card, on-chain) comes back in the
-    ///   currency the payment was charged in, with no conversion.
+    ///   currency the subscription is billed in, valued at the payment's own
+    ///   stored rate (never today's).
     ///
     /// Each share is one refund row and one `refund` ledger event, written in a
     /// single transaction. The row id is derived from the payment, amount and
@@ -428,6 +430,11 @@ impl VmRefundHandler {
             .db
             .get_subscription_line_item(vm.subscription_line_item_id)
             .await?;
+        let billing_currency = self
+            .db
+            .get_subscription(vm_line.subscription_id)
+            .await?
+            .currency;
         // The VM's share of what each renewal charged: its own line plus its
         // add-ons (e.g. paid snapshots), which stop with it. Read every line
         // item, deactivated or not: the payments being refunded were priced
@@ -520,11 +527,36 @@ impl VmRefundHandler {
                     cumulative.saturating_sub(earlier_credit) as u64
                 })
                 .unwrap_or(0);
+            let converting = payment.currency != billing_currency;
+            let (cash_credit, cash_credit_currency) = if gross_from_cash == 0 {
+                (0, billing_currency.clone())
+            } else {
+                let earlier = |key: &str| -> u64 {
+                    existing
+                        .iter()
+                        .filter_map(|r| r.metadata.as_ref())
+                        .filter(|m| m["refund"]["billing_currency"].is_string())
+                        .filter_map(|m| m["refund"][key].as_u64())
+                        .sum()
+                };
+                match value_in_billing_currency(
+                    earlier("returned_from_cash") + gross_from_cash,
+                    &payment.currency,
+                    &billing_currency,
+                    payment.rate,
+                ) {
+                    Some(cumulative) => (
+                        cumulative.saturating_sub(earlier("returned_from_cash_billing")),
+                        billing_currency.clone(),
+                    ),
+                    None => (gross_from_cash, payment.currency.clone()),
+                }
+            };
             let mut credits = Vec::new();
             if let Some(d) = &debit {
                 add_credit(&mut credits, &d.currency, credit_back);
             }
-            add_credit(&mut credits, &payment.currency, gross_from_cash);
+            add_credit(&mut credits, &cash_credit_currency, cash_credit);
 
             let no_credit_reason = credits
                 .is_empty()
@@ -560,6 +592,13 @@ impl VmRefundHandler {
                         .collect::<std::collections::BTreeMap<_, _>>()
                 );
                 refund["returned_from_cash"] = serde_json::json!(gross_from_cash);
+                refund["returned_from_cash_billing"] = serde_json::json!(cash_credit);
+                refund["billing_currency"] = serde_json::json!(cash_credit_currency);
+                if converting {
+                    refund["original_currency"] = serde_json::json!(payment.currency);
+                    refund["original_amount"] = serde_json::json!(billable);
+                    refund["rate"] = serde_json::json!(payment.rate);
+                }
                 if let Some(reason) = no_credit_reason {
                     refund["no_credit_reason"] = serde_json::json!(reason);
                 }
@@ -1366,6 +1405,87 @@ mod tests {
             events[0].subscription_payment_id.as_ref(),
             Some(&refunds[0].id)
         );
+    }
+
+    async fn lightning_paid_eur_vm(
+        rate: f32,
+    ) -> (
+        Arc<dyn LNVpsDb>,
+        VmRefundHandler,
+        Vm,
+        SubscriptionPayment,
+    ) {
+        let mock = MockDb::default();
+        let (vm, mut payment) = vm_with_payment(&mock, 12_500_000, 2_875_000).await;
+        payment.currency = "BTC".to_string();
+        payment.rate = rate;
+        {
+            let mut all = mock.subscription_payments.lock().await;
+            let row = all.iter_mut().find(|p| p.id == payment.id).unwrap();
+            row.currency = payment.currency.clone();
+            row.rate = rate;
+        }
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let handler = handler(db.clone(), Arc::new(PayNode::default())).await;
+        (db, handler, vm, payment)
+    }
+
+    #[tokio::test]
+    async fn a_lightning_paid_eur_vm_is_refunded_in_eur_at_the_payment_rate() {
+        let (db, handler, vm, payment) = lightning_paid_eur_vm(80_000.0).await;
+        let returned = handler
+            .refund_unused_to_credit(vm.id, vm.user_id, payment.expires, Utc::now())
+            .await
+            .unwrap();
+        assert!(returned.iter().all(|(c, _)| c == "EUR"), "{returned:?}");
+        let eur = amount_in(&returned, "EUR");
+        assert!((614..=616).contains(&eur), "unexpected credit {eur}");
+        assert_eq!(
+            db.get_account_credit(vm.user_id, "BTC")
+                .await
+                .unwrap()
+                .balance,
+            0
+        );
+        assert_eq!(
+            db.get_account_credit(vm.user_id, "EUR")
+                .await
+                .unwrap()
+                .balance,
+            eur
+        );
+        let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
+        let meta = &refunds[0].metadata.as_ref().unwrap()["refund"];
+        assert_eq!(meta["original_currency"], "BTC");
+        assert_eq!(meta["billing_currency"], "EUR");
+        assert_eq!(meta["rate"], 80_000.0);
+        assert!(meta["original_amount"].as_u64().unwrap() > 7_000_000);
+    }
+
+    #[tokio::test]
+    async fn partial_lightning_refunds_of_a_eur_vm_convert_cumulatively_without_losing_cents() {
+        let (_db, handler, vm, payment) = lightning_paid_eur_vm(80_000.0).await;
+        let expires = payment.expires;
+        let first = handler
+            .refund_unused_to_credit(
+                vm.id,
+                vm.user_id,
+                expires,
+                expires - chrono::Duration::days(3),
+            )
+            .await
+            .unwrap();
+        let rest = handler
+            .refund_unused_to_credit(
+                vm.id,
+                vm.user_id,
+                expires,
+                expires - chrono::Duration::days(15),
+            )
+            .await
+            .unwrap();
+        let total = amount_in(&first, "EUR") + amount_in(&rest, "EUR");
+        assert!((737..=739).contains(&total), "total {total}");
     }
 
     /// Repeating the refund for the same moment books nothing new: the derived
