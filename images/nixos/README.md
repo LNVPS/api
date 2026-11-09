@@ -32,8 +32,8 @@ Requires Nix with flakes enabled.
 
 ```bash
 cd images/nixos
-./build.sh 24.11 x86_64      # -> out/nixos-24.11-{cloudinit,encrypted}-x86_64.qcow2.xz + out/SHA256SUMS
-./build.sh 24.11 x86_64 encrypted   # only one variant
+./build.sh 26.05 x86_64      # -> out/nixos-26.05-{cloudinit,encrypted}-x86_64.qcow2.xz + out/SHA256SUMS
+./build.sh 26.05 x86_64 encrypted   # only one variant
 ```
 
 The `.xz` extension matters: LNVPS recognises it as a compressed image and
@@ -46,8 +46,8 @@ Push a dedicated tag (kept separate from the main `v*` release tags so it does
 not trigger the firewall `.deb` build):
 
 ```bash
-git tag nixos-image-v24.11
-git push https://github.com/LNVPS/api.git nixos-image-v24.11
+git tag nixos-image-v26.05
+git push https://github.com/LNVPS/api.git nixos-image-v26.05
 ```
 
 The workflow builds the qcow2 and attaches
@@ -69,10 +69,10 @@ Content-Type: application/json
 {
   "distribution": 11,
   "flavour": "cloudinit",
-  "version": "24.11",
+  "version": "26.05",
   "enabled": true,
-  "release_date": "2024-11-30T00:00:00Z",
-  "url": "https://<host>/nixos-24.11-cloudinit-x86_64.qcow2.xz",
+  "release_date": "2026-05-31T00:00:00Z",
+  "url": "https://<host>/nixos-26.05-cloudinit-x86_64.qcow2.xz",
   "cpu_arch": "x86_64",
   "default_username": "root",
   "sha2_url": "https://<host>/SHA256SUMS"

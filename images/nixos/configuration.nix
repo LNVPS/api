@@ -64,5 +64,5 @@
   time.timeZone = lib.mkDefault "UTC";
 
   # Keep this in sync with the nixpkgs channel pinned in flake.nix.
-  system.stateVersion = "24.11";
+  system.stateVersion = "26.05";
 }

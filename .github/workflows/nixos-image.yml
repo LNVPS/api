@@ -14,9 +14,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Image version label (used in filenames), e.g. 24.11"
+        description: "Image version label (used in filenames), e.g. 26.05"
         required: true
-        default: "24.11"
+        default: "26.05"
 
 permissions:
   contents: write
@@ -35,7 +35,7 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
           else
-            # tag form: nixos-image-v24.11  ->  24.11
+            # tag form: nixos-image-v26.05  ->  26.05
             echo "version=${GITHUB_REF_NAME#nixos-image-v}" >> "$GITHUB_OUTPUT"
           fi
 
