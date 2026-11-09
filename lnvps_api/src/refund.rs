@@ -1468,6 +1468,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_onchain_paid_eur_vm_is_refunded_in_eur_at_the_payment_rate() {
+        let (db, handler, vm, payment) = lightning_paid_eur_vm(80_000.0).await;
+        let onchain = {
+            let mut p = payment.clone();
+            p.payment_method = PaymentMethod::OnChain;
+            p
+        };
+        db.update_subscription_payment(&onchain).await.unwrap();
+
+        let returned = handler
+            .refund_unused_to_credit(vm.id, vm.user_id, payment.expires, Utc::now())
+            .await
+            .unwrap();
+        assert!(returned.iter().all(|(c, _)| c == "EUR"), "{returned:?}");
+        let eur = amount_in(&returned, "EUR");
+        assert!((614..=616).contains(&eur), "unexpected credit {eur}");
+        assert_eq!(
+            db.get_account_credit(vm.user_id, "BTC")
+                .await
+                .unwrap()
+                .balance,
+            0
+        );
+        let refunds = db.list_refunds_for_payment(&payment.id).await.unwrap();
+        assert_eq!(refunds[0].payment_method, PaymentMethod::OnChain);
+        assert_eq!(
+            refunds[0].metadata.as_ref().unwrap()["refund"]["billing_currency"],
+            "EUR"
+        );
+    }
+
+    #[tokio::test]
     async fn partial_lightning_refunds_of_a_eur_vm_convert_cumulatively_without_losing_cents() {
         let (_db, handler, vm, payment) = lightning_paid_eur_vm(80_000.0).await;
         let expires = payment.expires;

@@ -283,6 +283,41 @@ currency's rows; `total` then counts only those rows. Each row:
 }
 ```
 
+#### Rebook BTC Refund Credit
+
+```
+POST /api/admin/v1/credit/rebook_btc_refunds
+```
+
+Required Permission: `account_credit::update`
+
+One-off correction for owner-delete refunds that were credited in BTC to
+subscriptions billed in another currency. For each such `refund` ledger event
+(BTC, created at or after `since`, default 2026-11-02T10:39:24Z) it debits the
+BTC credit and credits the billing currency at the original payment's stored
+`rate`. **Dry run by default**: pass `dry_run=false` (query) to apply. A refund
+whose BTC has already been spent is reported with `btc_already_spent: true` and
+left alone. Applied refunds are marked in their metadata and never rebooked twice.
+
+```json
+{
+  "data": {
+    "dry_run": true,
+    "lines": [
+      {
+        "user_id": 12,
+        "refund_id": "a1b2c3…",
+        "btc_amount": 6250000,
+        "billing_currency": "EUR",
+        "billing_amount": 500,
+        "btc_already_spent": false,
+        "rebooked": false
+      }
+    ]
+  }
+}
+```
+
 A deposit that reaches an on-chain or FixedFloat address after its order was
 purged is credited here as a `topup` row whose `note` is
 `<txid>:<vout>: late on-chain payment after the order was removed`. When an
