@@ -118,6 +118,22 @@ fn field(hasher: &mut Sha256, value: Option<&str>) {
     }
 }
 
+pub fn truncate_ip(ip: &str) -> String {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            let o = v4.octets();
+            format!("{}.{}.{}.0", o[0], o[1], o[2])
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            let s = v6.segments();
+            std::net::Ipv6Addr::new(s[0], s[1], s[2], 0, 0, 0, 0, 0).to_string()
+        }
+        Err(_) => String::new(),
+    }
+}
+
+pub const IP_RETENTION_DAYS: u32 = 90;
+
 pub fn compute_hash(prev_hash: &str, created: i64, e: &NewAuditEntry) -> String {
     let mut h = Sha256::new();
     field(&mut h, Some(prev_hash));
@@ -126,7 +142,8 @@ pub fn compute_hash(prev_hash: &str, created: i64, e: &NewAuditEntry) -> String 
     field(&mut h, e.actor_id.map(|v| v.to_string()).as_deref());
     field(&mut h, e.auth_method.as_deref());
     field(&mut h, e.credential_id.as_deref());
-    field(&mut h, e.ip.as_deref());
+    let masked = e.ip.as_deref().map(truncate_ip);
+    field(&mut h, masked.as_deref());
     field(&mut h, e.user_agent.as_deref());
     field(&mut h, Some(&e.action));
     field(&mut h, e.target_type.as_deref());
@@ -343,6 +360,30 @@ mod tests {
             ..Default::default()
         };
         assert!(!f.matches(&e));
+    }
+
+    #[test]
+    fn truncation_keeps_a_v4_24_and_a_v6_48() {
+        assert_eq!(truncate_ip("203.0.113.77"), "203.0.113.0");
+        assert_eq!(truncate_ip("2001:db8:abcd:1234::5"), "2001:db8:abcd::");
+        assert_eq!(truncate_ip("junk"), "");
+    }
+
+    #[test]
+    fn truncating_a_stored_ip_keeps_the_chain_valid() {
+        let mut c = chain(3);
+        let mut e = NewAuditEntry::new("user", Some(1), "auth.login");
+        e.ip = Some("203.0.113.77".into());
+        let prev = c[2].hash.clone();
+        let mut sealed = AuditEntry::seal(4, 2000, &prev, e);
+        assert!(verify_chain(&{
+            let mut all = c.clone();
+            all.push(sealed.clone());
+            all
+        }, None).is_ok());
+        sealed.ip = Some(truncate_ip(sealed.ip.as_deref().unwrap()));
+        c.push(sealed);
+        assert_eq!(verify_chain(&c, None).unwrap().last_id, 4);
     }
 
     #[test]

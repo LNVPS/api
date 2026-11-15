@@ -6285,6 +6285,24 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
+    async fn truncate_audit_ips(&self, days: u32) -> DbResult<u64> {
+        let cutoff = Utc::now().timestamp() - days as i64 * 86400;
+        let mut changed = 0;
+        for e in self.audit_log.lock().await.iter_mut() {
+            if e.created >= cutoff {
+                continue;
+            }
+            if let Some(ip) = e.ip.as_mut() {
+                let masked = lnvps_db::audit::truncate_ip(ip);
+                if !ip.is_empty() && masked != *ip {
+                    *ip = masked;
+                    changed += 1;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
     async fn audit_range(&self, after_id: u64, limit: u64) -> DbResult<Vec<lnvps_db::AuditEntry>> {
         Ok(self
             .audit_log

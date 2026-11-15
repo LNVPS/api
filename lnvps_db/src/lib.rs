@@ -1949,6 +1949,9 @@ pub trait LNVpsDbBase: Send + Sync {
         limit: u64,
         offset: u64,
     ) -> DbResult<Vec<AuditEntry>>;
+    /// Truncate the stored IP on audit rows older than `days` to /24 (IPv4) or /48 (IPv6).
+    /// The row hash covers the truncated form, so the chain stays valid. Returns rows changed.
+    async fn truncate_audit_ips(&self, days: u32) -> DbResult<u64>;
     async fn audit_range(&self, after_id: u64, limit: u64) -> DbResult<Vec<AuditEntry>>;
     async fn insert_ip_order_audit(
         &self,

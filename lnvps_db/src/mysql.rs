@@ -1988,6 +1988,30 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    async fn truncate_audit_ips(&self, days: u32) -> DbResult<u64> {
+        let cutoff = Utc::now().timestamp() - days as i64 * 86400;
+        let rows: Vec<(u64, String)> = sqlx::query_as(
+            "select id, ip from audit_log where created < ? and ip is not null and ip <> '' limit 5000",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.db)
+        .await?;
+        let mut changed = 0;
+        for (id, ip) in rows {
+            let masked = crate::audit::truncate_ip(&ip);
+            if masked == ip {
+                continue;
+            }
+            let res = sqlx::query("update audit_log set ip = ? where id = ?")
+                .bind(masked)
+                .bind(id)
+                .execute(&self.db)
+                .await?;
+            changed += res.rows_affected();
+        }
+        Ok(changed)
+    }
+
     async fn audit_range(&self, after_id: u64, limit: u64) -> DbResult<Vec<AuditEntry>> {
         Ok(
             sqlx::query_as("select * from audit_log where id > ? order by id limit ?")

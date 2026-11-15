@@ -3784,6 +3784,13 @@ impl Worker {
                 if ips > 0 {
                     info!("Cleared {} expired user IP addresses", ips);
                 }
+                let audit_ips = self
+                    .db
+                    .truncate_audit_ips(lnvps_db::audit::IP_RETENTION_DAYS)
+                    .await?;
+                if audit_ips > 0 {
+                    info!("Truncated {} audit log IP addresses", audit_ips);
+                }
                 let cases = self.db.purge_abuse_cases().await?;
                 if cases > 0 {
                     info!("Purged {} expired abuse cases", cases);
@@ -5872,6 +5879,38 @@ mod tests {
         assert!(old.geo_ip.is_none());
         assert_eq!(old.geo_country_code.as_deref(), Some("IRL"));
         assert!(db.get_user(fresh).await?.geo_ip.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_job_truncates_old_audit_ips_and_keeps_the_chain_valid() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        {
+            let mut log = db.audit_log.lock().await;
+            for (i, (ip, age)) in [("203.0.113.77", 120i64), ("198.51.100.9", 5)]
+                .into_iter()
+                .enumerate()
+            {
+                let prev = log
+                    .last()
+                    .map(|e| e.hash.clone())
+                    .unwrap_or_else(|| lnvps_db::audit::GENESIS_HASH.to_string());
+                let mut entry = lnvps_db::NewAuditEntry::new("user", Some(1), "auth.login");
+                entry.ip = Some(ip.to_string());
+                log.push(lnvps_db::AuditEntry::seal(
+                    i as u64 + 1,
+                    (Utc::now() - TimeDelta::days(age)).timestamp(),
+                    &prev,
+                    entry,
+                ));
+            }
+        }
+        let worker = setup_worker(db.clone()).await?;
+        worker.try_job(&WorkJob::PurgeExpiredRecords).await?;
+        let rows = db.audit_range(0, 10).await?;
+        assert_eq!(rows[0].ip.as_deref(), Some("203.0.113.0"));
+        assert_eq!(rows[1].ip.as_deref(), Some("198.51.100.9"));
+        assert!(lnvps_db::audit::verify_chain(&rows, None).is_ok());
         Ok(())
     }
 

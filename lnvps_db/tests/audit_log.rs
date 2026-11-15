@@ -88,3 +88,36 @@ async fn concurrent_appends_keep_one_chain() {
     assert_eq!(rows.len(), 8);
     assert!(verify_chain(&rows, None).is_ok());
 }
+
+#[tokio::test]
+async fn old_ips_are_truncated_without_breaking_the_chain() {
+    let Some((db, raw)) = db().await else { return };
+    let mut e = NewAuditEntry::new("user", Some(1), "auth.login");
+    e.ip = Some("203.0.113.77".into());
+    let old = chrono::Utc::now().timestamp() - 120 * 86400;
+    let sealed = lnvps_db::AuditEntry::seal(1, old, lnvps_db::audit::GENESIS_HASH, e.clone());
+    sqlx::query("insert into audit_log (id, created, actor_type, actor_id, ip, action, prev_hash, hash) values (?,?,?,?,?,?,?,?)")
+        .bind(sealed.id)
+        .bind(sealed.created)
+        .bind(&sealed.actor_type)
+        .bind(sealed.actor_id)
+        .bind(&sealed.ip)
+        .bind(&sealed.action)
+        .bind(&sealed.prev_hash)
+        .bind(&sealed.hash)
+        .execute(&raw)
+        .await
+        .unwrap();
+    db.append_audit(e).await.unwrap();
+    assert_eq!(db.truncate_audit_ips(90).await.unwrap(), 1);
+    assert_eq!(db.truncate_audit_ips(90).await.unwrap(), 0);
+    let rows = db.audit_range(0, 10).await.unwrap();
+    assert_eq!(rows[0].ip.as_deref(), Some("203.0.113.0"));
+    assert_eq!(rows[1].ip.as_deref(), Some("203.0.113.77"));
+    assert!(verify_chain(&rows, None).is_ok());
+    assert!(
+        raw.execute("update audit_log set actor_id = 2")
+            .await
+            .is_err()
+    );
+}
