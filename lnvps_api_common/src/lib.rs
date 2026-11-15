@@ -1,3 +1,4 @@
+mod account_limit;
 mod audit;
 mod capacity;
 mod client_ip;
@@ -43,6 +44,7 @@ mod vm_history;
 mod wireguard;
 mod work;
 
+pub use account_limit::*;
 pub use audit::*;
 pub use capacity::*;
 pub use client_ip::*;

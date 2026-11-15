@@ -1266,6 +1266,7 @@ async fn admin_process_vm_refund(
     // VM permission alone would let whoever can delete a VM send funds out.
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
     auth.require_permission(AdminResource::Payments, AdminAction::Update)?;
+    lnvps_api_common::enforce_account_limit(lnvps_api_common::AccountAction::Refund, auth.user_id).await?;
 
     // Verify VM exists
     let _vm = this.db.get_vm(vm_id).await?;
@@ -1410,6 +1411,7 @@ async fn admin_record_payment_refund(
 ) -> ApiResult<AdminVmPaymentInfo> {
     // Money leaving the business is a payments write, like completing one.
     auth.require_permission(AdminResource::Payments, AdminAction::Update)?;
+    lnvps_api_common::enforce_account_limit(lnvps_api_common::AccountAction::Refund, auth.user_id).await?;
 
     let vm = this.db.get_vm(vm_id).await?;
     let payment = load_vm_payment(&this, &vm, &payment_id).await?;

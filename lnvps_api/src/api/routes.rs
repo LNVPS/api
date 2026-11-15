@@ -22,9 +22,9 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use lnvps_api_common::{
-    ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate,
+    AccountAction, ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate,
     ClientInfo, ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, SnapshotAction,
-    TraderDetails, UpgradeConfig, UserRateLimiter, VatClient, WorkJob, apply_custom_pricing_limits,
+    TraderDetails, UpgradeConfig, UserRateLimiter, VatClient, WorkJob, apply_custom_pricing_limits, enforce_account_limit,
 };
 use lnvps_db::{
     CpuArch, LNVpsDb, PaymentMethod, Region, Vm, VmCustomPricing, VmCustomPricingDisk,
@@ -1324,6 +1324,7 @@ async fn v1_create_custom_vm_order(
 ) -> ApiResult<ApiVmStatus> {
     let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
+    enforce_account_limit(AccountAction::VmOrder, uid).await?;
 
     // Capture place-of-supply evidence at purchase time (see capture_client_geo).
     capture_client_geo(&this, uid, client_ip).await;
@@ -1475,6 +1476,7 @@ async fn v1_create_vm_order(
 ) -> ApiResult<ApiVmStatus> {
     let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
+    enforce_account_limit(AccountAction::VmOrder, uid).await?;
 
     // Capture place-of-supply evidence at purchase time (see capture_client_geo).
     capture_client_geo(&this, uid, client_ip).await;
@@ -1579,6 +1581,7 @@ async fn v1_renew_vm(
     Query(q): Query<PaymentMethodQuery>,
 ) -> ApiResult<ApiVmPayment> {
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    enforce_account_limit(AccountAction::Payment, uid).await?;
     let intervals = q.validated_intervals()?;
     let vm_line = this
         .db
@@ -2858,6 +2861,7 @@ async fn v1_vm_upgrade(
 ) -> ApiResult<ApiVmPayment> {
     let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
+    enforce_account_limit(AccountAction::Payment, uid).await?;
     let vm = this.db.get_vm(id).await?;
     if vm.user_id != uid {
         return Err(ApiError::forbidden("VM does not belong to you"));

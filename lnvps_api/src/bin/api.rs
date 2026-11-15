@@ -249,6 +249,16 @@ async fn main() -> Result<(), Error> {
             lnvps_api_common::RedisSeenSet::new(&redis_config.url).await?,
         ));
     }
+    {
+        let store: std::sync::Arc<dyn lnvps_api_common::CounterStore> = match &settings.redis {
+            Some(r) => std::sync::Arc::new(lnvps_api_common::RedisCounterStore::new(&r.url).await?),
+            None => std::sync::Arc::new(lnvps_api_common::MemoryCounterStore::default()),
+        };
+        lnvps_api_common::install_account_limiter(lnvps_api_common::AccountLimiter::new(
+            store,
+            settings.rate_limit.enabled,
+        ));
+    }
     let status = if let Some(redis_config) = &settings.redis {
         VmStateCache::new_with_redis(redis_config.clone()).await?
     } else {
