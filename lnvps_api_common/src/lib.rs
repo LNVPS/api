@@ -1,3 +1,4 @@
+mod abuse_signals;
 mod account_limit;
 mod api_token;
 mod audit;
@@ -45,6 +46,7 @@ mod vm_history;
 mod wireguard;
 mod work;
 
+pub use abuse_signals::*;
 pub use account_limit::*;
 pub use api_token::*;
 pub use audit::*;

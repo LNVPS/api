@@ -237,6 +237,30 @@ async fn capture_client_geo(this: &RouterState, uid: u64, client_ip: ClientIp) {
     }
 }
 
+async fn flag_suspicious_order(this: &RouterState, user: &lnvps_db::User, vm_id: u64, cpu: u16, memory: u64) {
+    let signals = lnvps_api_common::order_signals(
+        user.created,
+        Utc::now(),
+        cpu,
+        memory,
+        user.email.as_str(),
+    );
+    if !lnvps_api_common::should_alert(&signals) {
+        return;
+    }
+    lnvps_api_common::log_suspicious_order(user.id, vm_id, &signals);
+    if let Err(e) = this
+        .work_sender
+        .send(WorkJob::SendAdminNotification {
+            message: lnvps_api_common::alert_message(user.id, vm_id, &signals),
+            title: Some("Suspicious order".to_string()),
+        })
+        .await
+    {
+        warn!("Failed to queue suspicious order alert: {}", e);
+    }
+}
+
 /// Update user account
 async fn v1_patch_account(
     auth: Nip98Auth,
@@ -1361,12 +1385,14 @@ async fn v1_create_custom_vm_order(
 
     // create a fake template from the request to generate the order
     let template = req.spec.clone().into();
+    let (spec_cpu, spec_memory) = (req.spec.cpu, req.spec.memory);
 
     let rsp = this
         .sub_handler
         .vm_provisioner()
         .provision_custom(uid, template, req.image_id, req.ssh_key_id, req.ref_code)
         .await?;
+    flag_suspicious_order(&this, &user, rsp.id, spec_cpu, spec_memory).await;
 
     // Log VM creation
     this.history
@@ -1510,6 +1536,7 @@ async fn v1_create_vm_order(
         ));
     }
 
+    let template = this.db.get_vm_template(req.template_id).await?;
     let rsp = this
         .sub_handler
         .vm_provisioner()
@@ -1521,6 +1548,7 @@ async fn v1_create_vm_order(
             req.ref_code,
         )
         .await?;
+    flag_suspicious_order(&this, &user, rsp.id, template.cpu, template.memory).await;
 
     if let Err(e) = ensure_hourly_order_funded(&this, &rsp).await {
         // Nothing was paid and nothing provisioned on a host yet; remove the
