@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
 use config::{Config, File};
 use lnvps_api::key_rotation::rotate_all;

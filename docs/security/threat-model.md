@@ -43,7 +43,7 @@ Severity: H high, M medium, L low.
 | 2 | H | Billing name, address, city, state, postcode and tax id stored in plaintext | DB or backup leak | `lnvps_db/src/model.rs` `User`, migration `20250501132143_billing_info.sql` | Typed as `EncryptedString`, columns widened, rotation tool encrypts old rows | E1 |
 | 3 | H | Release builds could start with no key (PII and tokens in plaintext) or auto-generate a key file on an ephemeral disk, losing all data on redeploy | Misconfigured deploy | `lnvps_api/src/bin/api.rs`, `lnvps_db/src/encryption.rs` | Release builds refuse to start without a key and refuse `auto-generate` | E2 |
 | 4 | M | No key rotation. One leaked key decrypts all history forever | Key leak | `lnvps_db/src/encryption.rs` | Key ring (`LNVPS_ENCRYPTION_KEY_PREVIOUS`), `rotate_encryption_key` bin re-encrypts every encrypted column, then the old key is dropped | E3 |
-| 5 | M | Plaintext IPs and user agents on `users.geo_ip`, `swap_order_client`, `ip_order_audit` and the new `audit_log` | DB leak | `lnvps_db/src/mysql.rs` (purge helpers exist for geo and swap) | Retention policy for `audit_log.ip` needs a decision, see follow-ups | open |
+| 5 | M | Plaintext IPs and user agents on `users.geo_ip`, `swap_order_client`, `ip_order_audit` and the new `audit_log` | DB leak | `lnvps_db/src/mysql.rs` (purge helpers exist for geo and swap) | Decided: truncate `audit_log.ip` to /24 (IPv4) or /48 (IPv6) after 90 days, once the off-box copy exists (#636) | open |
 | 6 | M | Rate limits are per IP and in-process only. Only WhatsApp sends have a per-account limit. VM create, payment and refund have no per-account bound. The client IP is the right-most `X-Forwarded-For`, spoofable if the pod is reachable without the proxy | Botnet spreads across IPs to brute force or mass-order | `lnvps_api_common/src/rate_limit.rs`, `client_ip.rs` | Per-account limiters on order, payment and refund endpoints, shared (Redis) counters, burst alert | open |
 | 7 | M | Customer credentials cannot be scoped. A session JWT lives 30 days and grants the whole account. There is no read-only or VM-only token and no last-used IP | Stolen session or token has full account power | `lnvps_api_common/src/session.rs` (`DEFAULT_SESSION_TTL_SECS`) | Scoped, expiring API tokens with last-used tracking, shorter session TTL | open |
 | 8 | M | Admin destructive and financial actions need no step-up. A stolen admin NIP-98 key or session can refund or purge immediately | Stolen admin key | `lnvps_api_admin/src/admin/vms.rs`, `credit.rs`, `roles.rs` | Fresh WebAuthn assertion for refund, purge, credit adjust, role change | open |
@@ -86,7 +86,7 @@ External agents (mail triage, admin-API skills) are not enforced by this reposit
 | 2 billing PII | E1 | Done (types, widened columns, rotation tool encrypts existing rows). Keyed hash for search not needed: no query filters on these columns |
 | 3 no-key start | E2 | Done |
 | 4 rotation | E3 | Done (key ring, `rotate_encryption_key`) |
-| 5 IP retention | | Open, needs a decision on retention period |
+| 5 IP retention | | Open, decided (/24 or /48 after 90 days once off-box copy exists), implementation in #636 |
 | 6 rate limits | | Open |
 | 7 scoped tokens | | Open |
 | 8 step-up | | Open |
