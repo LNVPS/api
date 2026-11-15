@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **API tokens**: `GET`/`POST /api/v1/account/tokens` and `DELETE /api/v1/account/tokens/{id}`. Create with `{name, scope: "read"|"vm", expires_in_days}` (default 90, max 365); the secret (`lnvps_...`) is returned once. Use as `Authorization: Bearer`. `read` allows GET on `/api/v1`, `vm` adds start, stop and restart. Tokens cannot reach the admin API, payments, or token management. Responses list `last_used` and `last_ip`. Needs migration `20261201000100_api_token.sql`.
+- **Per-account rate limits** on VM orders (20/h), renew and upgrade payments (60/h) and admin refunds (10/h), shared through Redis when configured. Exceeding returns 429.
+- **Step-up**: `POST /api/v1/webauthn/step-up/start` and `/finish` return a 5 minute token for the `X-Step-Up` header. With admin config `require-step-up: true`, refunds, VM purge, credit adjustment and role changes need it.
+- **Audit**: login, passkey add, token create and revoke, email change, firewall changes, reinstall, and all VM history and IP order events are now in the audit log. `audit_log.ip` is truncated to /24 or /48 after 90 days (migration `20261201000000_audit_log_ip_truncate.sql`).
+- **Abuse alert**: a new account ordering a large template with a throwaway email domain notifies admins.
+
+### Changed
+
+- Session tokens now default to 7 days (was 30). The `session.ttl` setting still overrides it.
+- NIP-98 single-use tracking is shared through Redis when configured.
+
 - **Audit log**: `GET /api/admin/v1/audit-log` (filters `actor_type`, `actor_id`, `action`, `target_type`, `target_id`, `since`, `until`, `limit`, `offset`) and `GET /api/admin/v1/audit-log/verify`, both needing `audit::view`. Entries are hash-chained and append-only. Needs migration `20261115172956_audit_log.sql`.
 - **Key rotation**: `LNVPS_ENCRYPTION_KEY_PREVIOUS` (comma separated hex keys) keeps old ciphertexts readable, and the `rotate_encryption_key` binary re-encrypts every encrypted column. `verify_audit_log` checks the audit chain.
 
