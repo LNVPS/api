@@ -73,6 +73,20 @@ impl VmHistoryLogger {
         Self { db }
     }
 
+    async fn store(&self, history: &VmHistory) -> Result<u64> {
+        let id = self.db.insert_vm_history(history).await?;
+        let entry = lnvps_db::NewAuditEntry::new(
+            if history.initiated_by_user.is_some() { "user" } else { "system" },
+            history.initiated_by_user,
+            &format!("vm.history.{}", history.action_type.to_string().to_lowercase()),
+        )
+        .target("vm", history.vm_id);
+        if let Err(e) = crate::record_audit(self.db.as_ref(), entry).await {
+            log::warn!("vm history {id} not mirrored to the audit log: {}", e.error);
+        }
+        Ok(id)
+    }
+
     pub async fn log_vm_created(
         &self,
         vm: &Vm,
@@ -106,7 +120,7 @@ impl VmHistoryLogger {
             }),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -128,7 +142,7 @@ impl VmHistoryLogger {
             description: Some("VM started".to_string()),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -150,7 +164,7 @@ impl VmHistoryLogger {
             description: Some("VM stopped".to_string()),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -181,7 +195,7 @@ impl VmHistoryLogger {
             description: Some(description),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -208,7 +222,7 @@ impl VmHistoryLogger {
             metadata: serialize_json_to_bytes(Some(meta)),
             description: Some(description),
         };
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -230,7 +244,7 @@ impl VmHistoryLogger {
             description: Some("VM restarted".to_string()),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -255,7 +269,7 @@ impl VmHistoryLogger {
             description: Some(description),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -272,7 +286,7 @@ impl VmHistoryLogger {
             description: Some("VM expired, renew it to restore service".to_string()),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -306,7 +320,7 @@ impl VmHistoryLogger {
             description: Some(format!("VM renewed until {}", format_time(new_expires))),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -348,7 +362,7 @@ impl VmHistoryLogger {
             description: Some(description),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -377,7 +391,7 @@ impl VmHistoryLogger {
             }),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -401,7 +415,7 @@ impl VmHistoryLogger {
             description: Some("VM ownership transferred to another account".to_string()),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -480,7 +494,7 @@ impl VmHistoryLogger {
             )),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -533,7 +547,7 @@ impl VmHistoryLogger {
             description: Some(description),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -559,7 +573,7 @@ impl VmHistoryLogger {
             )),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -594,7 +608,7 @@ impl VmHistoryLogger {
             )),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -641,7 +655,7 @@ impl VmHistoryLogger {
             ),
         };
 
-        self.db.insert_vm_history(&history).await?;
+        self.store(&history).await?;
         Ok(())
     }
 
@@ -799,6 +813,19 @@ mod tests {
     fn make_logger() -> VmHistoryLogger {
         let db = Arc::new(MockDb::empty());
         VmHistoryLogger::new(db)
+    }
+
+    #[tokio::test]
+    async fn vm_history_entries_are_mirrored_to_the_audit_log() {
+        let logger = make_logger();
+        logger
+            .log_vm_refunded(31, Some(1), &[1], &[2], 10, "BTC", None, None)
+            .await
+            .unwrap();
+        let rows = logger.db.audit_range(0, 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].action, "vm.history.refunded");
+        assert_eq!(rows[0].target_id.as_deref(), Some("31"));
     }
 
     /// A refund is an admin action unless the caller says otherwise: the owner

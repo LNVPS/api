@@ -232,6 +232,7 @@ async fn capture_client_geo(this: &RouterState, uid: u64, client_ip: ClientIp) {
 async fn v1_patch_account(
     auth: Nip98Auth,
     client_ip: ClientIp,
+    client: ClientInfo,
     State(this): State<RouterState>,
     req: Json<AccountPatchRequest>,
 ) -> ApiResult<AccountPatchResult> {
@@ -257,6 +258,16 @@ async fn v1_patch_account(
             let email_changed = old_email != new_email.as_str();
             user.email = new_email.clone().into();
             if email_changed {
+                lnvps_api_common::audit_user_action(
+                    this.db.as_ref(),
+                    &client,
+                    uid,
+                    auth.auth_method(),
+                    "user.email.change",
+                    ("user", uid),
+                    None,
+                )
+                .await?;
                 // Mark email as unverified and generate a verification token.
                 // Only the SHA-256 hash is stored; the raw token goes to the
                 // user's inbox and is compared by hash on submission.
@@ -1898,12 +1909,23 @@ struct ReinstallRequest {
 /// Re-install a VM
 async fn v1_reinstall_vm(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     body: Option<Json<ReinstallRequest>>,
 ) -> ApiResult<()> {
     let (uid, mut vm) = get_user_vm(&auth, &this, id).await?;
     let req = body.map(|Json(b)| b).unwrap_or_default();
+    lnvps_api_common::audit_user_action(
+        this.db.as_ref(),
+        &client,
+        uid,
+        auth.auth_method(),
+        "vm.reinstall",
+        ("vm", id),
+        req.image_id.map(|i| format!("image {i}")),
+    )
+    .await?;
 
     // Reject re-install only on a *genuinely* expired VM (a concrete expiry in
     // the past). Such a VM may already be stopped/removed on the host, so
@@ -2991,11 +3013,22 @@ async fn v1_get_firewall_policy(
 /// Update the per-VM default firewall policy
 async fn v1_patch_firewall_policy(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Json(req): Json<PatchVmFirewallPolicy>,
 ) -> ApiResult<ApiVmFirewallPolicy> {
-    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    lnvps_api_common::audit_user_action(
+        this.db.as_ref(),
+        &client,
+        uid,
+        auth.auth_method(),
+        "vm.firewall.policy.update",
+        ("vm", vm.id),
+        None,
+    )
+    .await?;
 
     let policy_in = match req.policy_in {
         Some(v) => v.map(Into::into),
@@ -3020,11 +3053,22 @@ async fn v1_patch_firewall_policy(
 /// Create a firewall rule for a VM
 async fn v1_create_firewall_rule(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Json(req): Json<CreateVmFirewallRule>,
 ) -> ApiResult<ApiVmFirewallRule> {
-    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    lnvps_api_common::audit_user_action(
+        this.db.as_ref(),
+        &client,
+        uid,
+        auth.auth_method(),
+        "vm.firewall.rule.create",
+        ("vm", vm.id),
+        None,
+    )
+    .await?;
 
     // Enforce the per-VM rule limit
     let limit = vm_firewall_rule_limit(&this, &vm).await?;
@@ -3070,11 +3114,22 @@ async fn v1_create_firewall_rule(
 /// Update a firewall rule
 async fn v1_patch_firewall_rule(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path((id, rule_id)): Path<(u64, u64)>,
     Json(req): Json<PatchVmFirewallRule>,
 ) -> ApiResult<ApiVmFirewallRule> {
-    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    lnvps_api_common::audit_user_action(
+        this.db.as_ref(),
+        &client,
+        uid,
+        auth.auth_method(),
+        "vm.firewall.rule.update",
+        ("vm", vm.id),
+        None,
+    )
+    .await?;
 
     let mut rule = this.db.get_vm_firewall_rule(rule_id).await?;
     if rule.vm_id != vm.id {
@@ -3130,10 +3185,21 @@ async fn v1_patch_firewall_rule(
 /// Delete a firewall rule
 async fn v1_delete_firewall_rule(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path((id, rule_id)): Path<(u64, u64)>,
 ) -> ApiResult<()> {
-    let (_uid, vm) = get_user_vm(&auth, &this, id).await?;
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    lnvps_api_common::audit_user_action(
+        this.db.as_ref(),
+        &client,
+        uid,
+        auth.auth_method(),
+        "vm.firewall.rule.delete",
+        ("vm", vm.id),
+        None,
+    )
+    .await?;
 
     let rule = this.db.get_vm_firewall_rule(rule_id).await?;
     if rule.vm_id != vm.id {
@@ -3912,6 +3978,45 @@ mod tests {
 
     const TEST_SSH_KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl test";
+
+    #[tokio::test]
+    async fn firewall_changes_are_audited_and_blocked_when_the_log_fails() {
+        use lnvps_api_common::MockDb;
+        let db = Arc::new(MockDb::default());
+        let state = mock_router_state(db.clone()).await;
+        let auth = nostr_auth(5);
+        let uid = db.upsert_user(&auth.pubkey()).await.unwrap();
+        let vm_id = db
+            .insert_vm(&lnvps_db::Vm {
+                user_id: uid,
+                ssh_key_id: None,
+                ..MockDb::mock_vm()
+            })
+            .await
+            .unwrap();
+        db.fail_audit_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let blocked = v1_delete_firewall_rule(
+            auth,
+            ClientInfo::default(),
+            State(state.clone()),
+            Path((vm_id, 1)),
+        )
+        .await;
+        assert!(blocked.is_err());
+        db.fail_audit_writes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = v1_delete_firewall_rule(
+            nostr_auth(5),
+            ClientInfo::default(),
+            State(state),
+            Path((vm_id, 1)),
+        )
+        .await;
+        let log = db.audit_log.lock().await;
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].action, "vm.firewall.rule.delete");
+    }
 
     #[tokio::test]
     async fn adding_an_ssh_key_is_audited() {

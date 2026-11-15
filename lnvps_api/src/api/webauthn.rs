@@ -316,6 +316,7 @@ async fn register_start(
 /// Complete registration: verify the attestation, create the account, store the
 /// credential and issue a session token.
 async fn register_finish(
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Json(req): Json<RegisterFinishRequest>,
 ) -> ApiResult<WebauthnTokenResponse> {
@@ -352,6 +353,16 @@ async fn register_finish(
         })
         .await?;
 
+    lnvps_api_common::audit_user_action(
+        this.db.as_ref(),
+        &client,
+        uid,
+        "webauthn",
+        "auth.passkey.add",
+        ("user", uid),
+        None,
+    )
+    .await?;
     let session_version = this.db.get_user(uid).await?.session_version;
     issue_token(&pubkey, uid, session_version, session_ttl(&this))
 }
@@ -381,6 +392,7 @@ async fn login_start(State(this): State<RouterState>) -> ApiResult<LoginStartRes
 /// Complete a discoverable login: identify the account from the assertion,
 /// verify it against the stored passkeys, bump the counter and issue a token.
 async fn login_finish(
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Json(req): Json<LoginFinishRequest>,
 ) -> ApiResult<WebauthnTokenResponse> {
@@ -434,6 +446,16 @@ async fn login_finish(
         .try_into()
         .map_err(|_| ApiError::internal("Invalid stored pubkey"))?;
 
+    lnvps_api_common::audit_user_action(
+        this.db.as_ref(),
+        &client,
+        used.user_id,
+        "webauthn",
+        "auth.login",
+        ("user", used.user_id),
+        None,
+    )
+    .await?;
     issue_token(
         &pubkey,
         used.user_id,
@@ -503,6 +525,7 @@ async fn add_credential_start(
 /// Complete adding a passkey to the authenticated account and store it.
 async fn add_credential_finish(
     auth: Nip98Auth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Json(req): Json<RegisterFinishRequest>,
 ) -> ApiResult<WebauthnCredentialInfo> {
@@ -523,6 +546,16 @@ async fn add_credential_finish(
     }
 
     let uid = this.db.upsert_user(&auth.pubkey()).await?;
+    lnvps_api_common::audit_user_action(
+        this.db.as_ref(),
+        &client,
+        uid,
+        auth.auth_method(),
+        "auth.passkey.add",
+        ("user", uid),
+        req.name.clone(),
+    )
+    .await?;
     let passkey_json = serde_json::to_string(&passkey).map_err(ApiError::internal)?;
     let id = this
         .db

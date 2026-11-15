@@ -125,18 +125,20 @@ async fn v1_oauth_login(
 async fn v1_oauth_callback_get(
     Path(provider): Path<String>,
     Query(q): Query<CallbackParams>,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
 ) -> Result<axum::response::Response, ApiError> {
-    handle_callback(&this, &provider, q).await
+    handle_callback(&this, &provider, q, &client).await
 }
 
 /// `form_post` callback (Apple) — the parameters arrive as a POST form body.
 async fn v1_oauth_callback_post(
     Path(provider): Path<String>,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Form(q): Form<CallbackParams>,
 ) -> Result<axum::response::Response, ApiError> {
-    handle_callback(&this, &provider, q).await
+    handle_callback(&this, &provider, q, &client).await
 }
 
 /// Shared callback logic: verify state, exchange the code, resolve the user and
@@ -145,6 +147,7 @@ async fn handle_callback(
     this: &RouterState,
     provider: &str,
     q: CallbackParams,
+    client: &lnvps_api_common::ClientInfo,
 ) -> Result<axum::response::Response, ApiError> {
     if let Some(err) = q.error {
         return Err(ApiError::from(anyhow::anyhow!(
@@ -185,6 +188,16 @@ async fn handle_callback(
 
     // Stamp the account's current session version into the token so it can be
     // revoked later by bumping that column.
+    lnvps_api_common::audit_user_action(
+        this.db.as_ref(),
+        client,
+        uid,
+        "oauth",
+        "auth.login",
+        ("user", uid),
+        Some(provider.to_string()),
+    )
+    .await?;
     let session_version = this.db.get_user(uid).await?.session_version;
     let token = issue_session_token(&pubkey, uid, session_version, session_ttl(this))
         .map_err(|e| ApiError::internal(format!("Failed to issue session: {}", e)))?;

@@ -12,6 +12,28 @@ pub fn with_client(entry: NewAuditEntry, client: &ClientInfo) -> NewAuditEntry {
     )
 }
 
+pub async fn audit_user_action(
+    db: &dyn LNVpsDb,
+    client: &ClientInfo,
+    uid: u64,
+    auth_method: &str,
+    action: &str,
+    target: (&str, impl ToString),
+    after: Option<String>,
+) -> Result<(), ApiError> {
+    record_audit(
+        db,
+        with_client(
+            NewAuditEntry::new("user", Some(uid), action)
+                .auth(auth_method, None)
+                .target(target.0, target.1)
+                .change(None, after),
+            client,
+        ),
+    )
+    .await
+}
+
 pub async fn record_audit(db: &dyn LNVpsDb, entry: NewAuditEntry) -> Result<(), ApiError> {
     let sealed = db.append_audit(entry).await.map_err(|e| {
         log::error!("audit log write failed, refusing the action: {e}");

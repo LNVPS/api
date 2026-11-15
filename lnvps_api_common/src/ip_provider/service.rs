@@ -52,6 +52,29 @@ pub struct NewIpOrder {
     pub requested_by: Option<u64>,
 }
 
+pub async fn audit_ip_order(
+    db: &dyn LNVpsDb,
+    ip_order_id: u64,
+    event: &str,
+    detail: Option<&str>,
+    actor_user_id: Option<u64>,
+) -> Result<u64> {
+    let id = db
+        .insert_ip_order_audit(ip_order_id, event, detail, actor_user_id)
+        .await?;
+    let entry = lnvps_db::NewAuditEntry::new(
+        if actor_user_id.is_some() { "user" } else { "system" },
+        actor_user_id,
+        &format!("ip_order.{event}"),
+    )
+    .target("ip_order", ip_order_id)
+    .change(None, detail.map(str::to_string));
+    if let Err(e) = crate::record_audit(db, entry).await {
+        log::warn!("ip order audit {id} not mirrored to the audit log: {}", e.error);
+    }
+    Ok(id)
+}
+
 pub async fn create_ip_order(db: &dyn LNVpsDb, req: NewIpOrder) -> Result<(IpOrder, bool)> {
     if req.quantity == 0 {
         bail!("quantity must be at least 1");
@@ -93,7 +116,7 @@ pub async fn create_ip_order(db: &dyn LNVpsDb, req: NewIpOrder) -> Result<(IpOrd
         ..Default::default()
     };
     order.id = db.insert_ip_order(&order).await?;
-    db.insert_ip_order_audit(order.id, "requested", None, req.requested_by)
+    audit_ip_order(db, order.id, "requested", None, req.requested_by)
         .await?;
     Ok((order, true))
 }
@@ -114,7 +137,7 @@ pub async fn approve_ip_order(db: &dyn LNVpsDb, id: u64, admin_user_id: u64) -> 
     order.approved_by = Some(admin_user_id);
     order.approved_at = Some(Utc::now());
     db.update_ip_order(&order).await?;
-    db.insert_ip_order_audit(id, "approved", None, Some(admin_user_id))
+    audit_ip_order(db, id, "approved", None, Some(admin_user_id))
         .await?;
     Ok(order)
 }
@@ -131,7 +154,7 @@ pub async fn reject_ip_order(db: &dyn LNVpsDb, id: u64, admin_user_id: u64) -> R
             order.state
         );
     }
-    db.insert_ip_order_audit(id, "rejected", None, Some(admin_user_id))
+    audit_ip_order(db, id, "rejected", None, Some(admin_user_id))
         .await?;
     Ok(db.get_ip_order(id).await?)
 }
@@ -182,10 +205,7 @@ impl IpOrderService {
     }
 
     async fn audit(&self, order: &IpOrder, event: &str, detail: Option<&str>) {
-        if let Err(e) = self
-            .db
-            .insert_ip_order_audit(order.id, event, detail, None)
-            .await
+        if let Err(e) = audit_ip_order(self.db.as_ref(), order.id, event, detail, None).await
         {
             error!("Failed to write ip order audit for {}: {}", order.id, e);
         }
@@ -537,15 +557,25 @@ impl IpOrderService {
             self.db
                 .set_ip_range_enabled(ip_range_id, range.enabled)
                 .await?;
-            self.db
-                .insert_ip_order_audit(order.id, "release_failed", Some(&e.to_string()), actor)
-                .await?;
+            audit_ip_order(
+                self.db.as_ref(),
+                order.id,
+                "release_failed",
+                Some(&e.to_string()),
+                actor,
+            )
+            .await?;
             bail!("provider refused to release {}: {}", link.cidr, e);
         }
         self.db.mark_ip_order_range_released(link.id).await?;
-        self.db
-            .insert_ip_order_audit(order.id, "released", Some(&link.cidr), actor)
-            .await?;
+        audit_ip_order(
+            self.db.as_ref(),
+            order.id,
+            "released",
+            Some(&link.cidr),
+            actor,
+        )
+        .await?;
         info!("Released {} ({})", link.cidr, order.provider);
         self.notify(
             "IP range released",
@@ -993,6 +1023,17 @@ mod tests {
         assert_eq!(o.state, IpOrderState::AwaitingApproval);
         assert_eq!(f.mock.orders_placed(), 0);
         assert_eq!(o.cost, 200);
+    }
+
+    #[tokio::test]
+    async fn ip_order_events_are_mirrored_to_the_audit_log() {
+        let f = fixture_with(config(true, 10_000)).await;
+        let (order, _) = create_ip_order(f.db.as_ref(), request(None)).await.unwrap();
+        approve_ip_order(f.db.as_ref(), order.id, 7).await.unwrap();
+        let rows = f.db.audit_range(0, 10).await.unwrap();
+        let actions: Vec<_> = rows.iter().map(|r| r.action.as_str()).collect();
+        assert_eq!(actions, vec!["ip_order.requested", "ip_order.approved"]);
+        assert_eq!(rows[1].actor_id, Some(7));
     }
 
     #[tokio::test]
