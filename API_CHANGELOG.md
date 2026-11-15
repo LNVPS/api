@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **Audit log**: `GET /api/admin/v1/audit-log` (filters `actor_type`, `actor_id`, `action`, `target_type`, `target_id`, `since`, `until`, `limit`, `offset`) and `GET /api/admin/v1/audit-log/verify`, both needing `audit::view`. Entries are hash-chained and append-only. Needs migration `20261115172956_audit_log.sql`.
+- **Key rotation**: `LNVPS_ENCRYPTION_KEY_PREVIOUS` (comma separated hex keys) keeps old ciphertexts readable, and the `rotate_encryption_key` binary re-encrypts every encrypted column. `verify_audit_log` checks the audit chain.
+
+### Changed
+
+- **Billing details are encrypted at rest** (name, address lines, city, state, postcode, tax id). Needs migration `20261115173632_billing_pii_wide.sql`. Run `rotate_encryption_key` once to encrypt existing rows.
+- **Release builds refuse to start without an encryption key** and ignore `encryption.auto-generate`.
+
 ### Changed
 
 - **Owner VM delete refunds in the billing currency**: the cash-paid share of a refund on VM deletion now comes back as account credit in the subscription's billing currency (EUR for a EUR-priced VM), valued at the payment's own stored `rate`, whatever method paid it. This corrects the earlier "Refund credit in the source currency" entry: card and Revolut payers got EUR, but Lightning and on-chain payers got sats. The refund row metadata gains `billing_currency`, and for a converted payment `original_currency`, `original_amount` and `rate`. The credit-paid share still returns to the balance it came from.

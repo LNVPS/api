@@ -452,6 +452,7 @@ async fn admin_get_user_roles(
 /// Assign role to user
 async fn admin_assign_user_role(
     auth: AdminAuth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path(user_id): Path<u64>,
     Json(req): Json<AssignRoleRequest>,
@@ -488,6 +489,17 @@ async fn admin_assign_user_role(
     )?;
 
     // Assign the role
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("admin", Some(auth.user_id), "admin.role.assign")
+                .auth("nip98", None)
+                .target("user", user_id)
+                .change(None, Some(format!("role {} ({})", role.name, role.id))),
+            &client,
+        ),
+    )
+    .await?;
     this.db
         .assign_user_role(user_id, req.role_id, auth.user_id)
         .await?;
@@ -498,6 +510,7 @@ async fn admin_assign_user_role(
 /// Revoke role from user
 async fn admin_revoke_user_role(
     auth: AdminAuth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path((user_id, role_id)): Path<(u64, u64)>,
 ) -> ApiResult<()> {
@@ -519,6 +532,17 @@ async fn admin_revoke_user_role(
     )?;
 
     // Revoke the role
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("admin", Some(auth.user_id), "admin.role.revoke")
+                .auth("nip98", None)
+                .target("user", user_id)
+                .change(Some(format!("role {} ({})", role.name, role.id)), None),
+            &client,
+        ),
+    )
+    .await?;
     this.db.revoke_user_role(user_id, role_id).await?;
 
     ApiData::ok(())

@@ -465,6 +465,7 @@ struct AdminTransferVmRequest {
 /// Transfer a VM to another user account
 async fn admin_transfer_vm(
     auth: AdminAuth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Json(req): Json<AdminTransferVmRequest>,
@@ -478,6 +479,17 @@ async fn admin_transfer_vm(
     if vm.deleted {
         return Err(ApiError::conflict("Cannot transfer a deleted VM"));
     }
+
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("admin", Some(auth.user_id), "admin.vm.transfer")
+                .auth("nip98", None)
+                .target("vm", id),
+            &client,
+        ),
+    )
+    .await?;
 
     let old_user_id = vm.user_id;
 
@@ -718,6 +730,7 @@ struct AdminProcessRefundRequest {
 /// Delete a VM
 async fn admin_delete_vm(
     auth: AdminAuth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     req: Json<AdminDeleteVmRequest>,
@@ -743,6 +756,26 @@ async fn admin_delete_vm(
     if vm.deleted && !purge {
         return Err(ApiError::conflict("VM is already deleted"));
     }
+
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new(
+                "admin",
+                Some(auth.user_id),
+                if purge {
+                    "admin.vm.purge"
+                } else {
+                    "admin.vm.delete"
+                },
+            )
+            .auth("nip98", None)
+            .target("vm", id)
+            .change(None, req.reason.clone()),
+            &client,
+        ),
+    )
+    .await?;
 
     // Send delete job via Redis stream for distributed processing
     let delete_job = WorkJob::DeleteVm {
@@ -1224,6 +1257,7 @@ async fn admin_calculate_vm_refund(
 /// would report success for something nothing here can do.
 async fn admin_process_vm_refund(
     auth: AdminAuth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path(vm_id): Path<u64>,
     Json(req): Json<AdminProcessRefundRequest>,
@@ -1291,6 +1325,25 @@ async fn admin_process_vm_refund(
         return Err(ApiError::bad_request("Lightning invoice has expired"));
     }
 
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("admin", Some(auth.user_id), "admin.refund")
+                .auth("nip98", None)
+                .target("vm", vm_id)
+                .change(
+                    None,
+                    Some(format!(
+                        "lightning refund {} msat from {:?}",
+                        parsed.amount_milli_satoshis().unwrap_or_default(),
+                        req.refund_from_date
+                    )),
+                ),
+            &client,
+        ),
+    )
+    .await?;
+
     let refund_job = WorkJob::ProcessVmRefund {
         vm_id,
         admin_user_id: auth.user_id,
@@ -1350,6 +1403,7 @@ struct AdminRecordRefundRequest {
 /// `GET /refund` computes, from the cost plan) would misstate the return.
 async fn admin_record_payment_refund(
     auth: AdminAuth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path((vm_id, payment_id)): Path<(u64, String)>,
     Json(req): Json<AdminRecordRefundRequest>,
@@ -1426,6 +1480,20 @@ async fn admin_record_payment_refund(
         ));
     }
 
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("admin", Some(auth.user_id), "admin.refund")
+                .auth("nip98", None)
+                .target("payment", payment_id.as_str())
+                .change(
+                    None,
+                    Some(format!("{} {} recorded", amount, refund.currency)),
+                ),
+            &client,
+        ),
+    )
+    .await?;
     this.db.insert_subscription_payment(&refund).await?;
 
     info!(
@@ -2646,6 +2714,63 @@ mod tests {
                 }
             )),
             "the pinned disabled host was not passed to the job"
+        );
+    }
+    #[tokio::test]
+    async fn admin_vm_delete_is_written_to_the_audit_log_first() {
+        use crate::admin::model::Permission;
+        use lnvps_api_common::{
+            ChannelWorkCommander, MockDb, MockExchangeRate, VatClient, VmStateCache,
+        };
+        use lnvps_db::LNVpsDbBase;
+        use std::sync::Arc;
+
+        let mock = Arc::new(MockDb::default());
+        let user_id = mock.upsert_user(&[3u8; 32]).await.unwrap();
+        let mut vm = MockDb::mock_vm();
+        vm.user_id = user_id;
+        vm.ssh_key_id = None;
+        let vm_id = mock.insert_vm(&vm).await.unwrap();
+        let db: Arc<dyn lnvps_db::LNVpsDb> = mock.clone();
+        let this = RouterState {
+            node_control: None,
+            db: db.clone(),
+            work_commander: Arc::new(ChannelWorkCommander::new()),
+            feedback: None,
+            vm_state_cache: VmStateCache::new(),
+            exchange: Arc::new(MockExchangeRate::default()),
+            vat: VatClient::new(),
+            chain: None,
+        };
+        let auth = AdminAuth {
+            user_id: 77,
+            pubkey: vec![1u8; 32],
+            permissions: [Permission {
+                resource: AdminResource::VirtualMachines,
+                action: AdminAction::Delete,
+            }]
+            .into_iter()
+            .collect(),
+            nip98_auth: None,
+        };
+        let _ = admin_delete_vm(
+            auth,
+            lnvps_api_common::ClientInfo::default(),
+            State(this),
+            Path(vm_id),
+            Json(AdminDeleteVmRequest {
+                reason: Some("abuse".into()),
+                purge: None,
+            }),
+        )
+        .await;
+        let log = mock.audit_log.lock().await;
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].action, "admin.vm.delete");
+        assert_eq!(log[0].actor_id, Some(77));
+        assert_eq!(
+            log[0].target_id.as_deref(),
+            Some(vm_id.to_string().as_str())
         );
     }
 }

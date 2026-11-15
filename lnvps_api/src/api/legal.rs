@@ -317,12 +317,17 @@ async fn v1_generate_lir_agreement_from_subscription(
         provider_address,
         provider_register: company.tax_id.clone().unwrap_or_else(|| "—".to_string()),
 
-        end_user_name: user.billing_name.clone().unwrap_or_else(|| "—".to_string()),
+        end_user_name: user
+            .billing_name
+            .as_ref()
+            .map(|v| v.as_str().to_string())
+            .unwrap_or_else(|| "—".to_string()),
         end_user_legal_form: "—".to_string(),
         end_user_address,
         end_user_registration_number: user
             .billing_tax_id
-            .clone()
+            .as_ref()
+            .map(|v| v.as_str().to_string())
             .unwrap_or_else(|| "—".to_string()),
         end_user_email: user.email.as_str().to_string(),
 
@@ -341,7 +346,11 @@ async fn v1_generate_lir_agreement_from_subscription(
         provider_signatory_name: "—".to_string(),
         provider_signatory_title: "—".to_string(),
         provider_signature_date: now.format("%Y-%m-%d").to_string(),
-        end_user_signatory_name: user.billing_name.clone().unwrap_or_default(),
+        end_user_signatory_name: user
+            .billing_name
+            .as_ref()
+            .map(|v| v.as_str().to_string())
+            .unwrap_or_default(),
         end_user_signatory_title: "—".to_string(),
         end_user_signature_date: now.format("%Y-%m-%d").to_string(),
 

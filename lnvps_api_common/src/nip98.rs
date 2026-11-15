@@ -75,6 +75,13 @@ pub struct Nip98Auth {
 }
 
 impl Nip98Auth {
+    pub fn auth_method(&self) -> &'static str {
+        match self.kind {
+            AuthKind::Nostr(_) => "nip98",
+            AuthKind::Session(_) => "session",
+        }
+    }
+
     /// The 32-byte identity that authenticated this request. This is the value
     /// used as the `users.pubkey` primary identity for both Nostr and OAuth
     /// accounts.

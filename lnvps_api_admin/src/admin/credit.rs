@@ -137,6 +137,7 @@ async fn admin_get_user_credit(
 /// ledger.
 async fn admin_adjust_user_credit(
     auth: AdminAuth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Json(req): Json<AdjustCreditRequest>,
@@ -155,6 +156,20 @@ async fn admin_adjust_user_credit(
     if currency.parse::<payments_rs::currency::Currency>().is_err() {
         return ApiData::err("unknown currency");
     }
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("admin", Some(auth.user_id), "admin.credit.adjust")
+                .auth("nip98", None)
+                .target("user", id)
+                .change(
+                    None,
+                    Some(format!("{:+} {} ({})", req.delta, currency, req.kind)),
+                ),
+            &client,
+        ),
+    )
+    .await?;
     this.db
         .adjust_account_credit(id, currency, req.delta, &req.kind, req.note.as_deref())
         .await

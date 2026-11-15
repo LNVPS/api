@@ -99,19 +99,19 @@ pub struct User {
     /// Users country
     pub country_code: Option<String>,
     /// Name to show on invoices
-    pub billing_name: Option<String>,
+    pub billing_name: Option<EncryptedString>,
     /// Billing address line 1
-    pub billing_address_1: Option<String>,
+    pub billing_address_1: Option<EncryptedString>,
     /// Billing address line 2
-    pub billing_address_2: Option<String>,
+    pub billing_address_2: Option<EncryptedString>,
     /// Billing city
-    pub billing_city: Option<String>,
+    pub billing_city: Option<EncryptedString>,
     /// Billing state/county
-    pub billing_state: Option<String>,
+    pub billing_state: Option<EncryptedString>,
     /// Billing postcode/zip
-    pub billing_postcode: Option<String>,
+    pub billing_postcode: Option<EncryptedString>,
     /// Billing tax id
-    pub billing_tax_id: Option<String>,
+    pub billing_tax_id: Option<EncryptedString>,
     /// Country (ISO 3166-1 alpha-3) resolved from the client's IP address.
     ///
     /// This is an *independent* place-of-supply evidence signal for EU VAT,

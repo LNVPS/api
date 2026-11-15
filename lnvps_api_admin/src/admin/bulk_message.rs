@@ -26,7 +26,7 @@ fn summarise_recipients(
         if methods.is_empty() {
             unreachable.push(BulkMessageUnreachableUser {
                 user_id: user.id,
-                billing_name: user.billing_name.clone(),
+                billing_name: user.billing_name.as_ref().map(|v| v.as_str().to_string()),
             });
             continue;
         }
@@ -184,7 +184,7 @@ mod tests {
             let u = users.get_mut(&reachable).unwrap();
             u.contact_email = true;
             u.email = "owner@example.com".into();
-            u.billing_name = Some("Owner".to_string());
+            u.billing_name = Some("Owner".into());
             // The other user opts into nothing, so nothing can reach them.
             let u = users.get_mut(&unreachable).unwrap();
             u.contact_email = false;

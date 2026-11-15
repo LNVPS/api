@@ -3,21 +3,22 @@ use crate::{
     AccountCreditDebit, AccountCreditEvent, AccountCreditTopup, AgentConversation,
     AgentConversationFilter, AgentConversationOverview, AgentMessage, App, AppBackupState,
     AppCluster, AppDeployment, AppDeploymentBackup, AppDeploymentFilter, AppDeploymentServiceUsage,
-    AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
-    BulkMessageTarget, Company, DbError, DbResult, Discount, DiscountRedemption,
-    DiscountRedemptionWithCode, DnsServer, EncryptedString, IntervalType, IpOrder, IpOrderAudit,
-    IpOrderRange, IpOrderState, IpProvider, IpProviderRegion, IpRange, IpRangeSubscription,
-    IpSpacePricing, LNVpsDbBase, LineItemType, MarketplaceNode, MarketplaceNodeHealth,
-    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, OnchainAddressOwner,
-    OnchainAddressOwnerStatus, PaymentMethod, PaymentMethodConfig, PaymentType, Referral,
-    ReferralCostUsage, ReferralPayout, Region, RegionStats, Router, RouterBgpRoute,
-    RouterBgpSession, RouterTunnel, RouterTunnelKind, RouterTunnelTraffic, Subscription,
-    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, SwapOrderClient,
-    Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind,
-    VmAddonPrice, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
-    VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmIpWait,
-    VmMigration, VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice,
-    VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
+    AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AuditEntry,
+    AuditFilter, AvailableIpSpace, BulkMessageTarget, Company, DbError, DbResult, Discount,
+    DiscountRedemption, DiscountRedemptionWithCode, DnsServer, EncryptedString, IntervalType,
+    IpOrder, IpOrderAudit, IpOrderRange, IpOrderState, IpProvider, IpProviderRegion, IpRange,
+    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, LineItemType, MarketplaceNode,
+    MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage,
+    NewAuditEntry, OnchainAddressOwner, OnchainAddressOwnerStatus, PaymentMethod,
+    PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout, Region,
+    RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelKind,
+    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
+    SubscriptionPaymentWithCompany, SwapOrderClient, Tunnel, TunnelPool, TunnelRoute, User,
+    UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind, VmAddonPrice, VmCostPlan,
+    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
+    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmIpWait, VmMigration, VmOsImage, VmTemplate,
+    VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice, VpnPeerTemplate, VpnService,
+    VpnSubscription, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -1869,6 +1870,132 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .fetch_one(&self.db)
         .await?;
         Ok(sum as u64)
+    }
+
+    async fn transform_column_batch(
+        &self,
+        table: &str,
+        id_expr: &str,
+        column: &str,
+        skip_prefix: &str,
+        limit: u64,
+        transform: &(dyn for<'a> Fn(&'a str) -> anyhow::Result<Option<String>> + Send + Sync),
+    ) -> DbResult<u64> {
+        let select = format!(
+            "select cast({id_expr} as char), {column} from {table} where {column} is not null and {column} != '' and {column} not like ? order by 1 limit ?"
+        );
+        let update =
+            format!("update {table} set {column} = ? where {id_expr} = ? and {column} = ?");
+        let rows: Vec<(String, String)> = sqlx::query_as(&select)
+            .bind(format!("{skip_prefix}%"))
+            .bind(limit)
+            .fetch_all(&self.db)
+            .await?;
+        let mut changed = 0;
+        for (id, value) in rows {
+            if let Some(next) = transform(&value)? {
+                let res = sqlx::query(&update)
+                    .bind(next)
+                    .bind(&id)
+                    .bind(&value)
+                    .execute(&self.db)
+                    .await?;
+                changed += res.rows_affected();
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn append_audit(&self, entry: NewAuditEntry) -> DbResult<AuditEntry> {
+        let mut tx = self.db.begin().await?;
+        let locked: Option<i64> = sqlx::query_scalar("select get_lock('lnvps_audit_log', 10)")
+            .fetch_one(&mut *tx)
+            .await?;
+        if locked != Some(1) {
+            return Err(anyhow::anyhow!("could not lock the audit log").into());
+        }
+        let result = async {
+            let tail: Option<(u64, String)> =
+                sqlx::query_as("select id, hash from audit_log order by id desc limit 1")
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let (prev_id, prev_hash) =
+                tail.unwrap_or((0, crate::audit::GENESIS_HASH.to_string()));
+            let sealed = AuditEntry::seal(
+                prev_id + 1,
+                Utc::now().timestamp(),
+                &prev_hash,
+                entry,
+            );
+            sqlx::query(
+                "insert into audit_log (id, created, actor_type, actor_id, auth_method, credential_id, ip, user_agent, action, target_type, target_id, before_summary, after_summary, request_id, prev_hash, hash) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            )
+            .bind(sealed.id)
+            .bind(sealed.created)
+            .bind(&sealed.actor_type)
+            .bind(sealed.actor_id)
+            .bind(&sealed.auth_method)
+            .bind(&sealed.credential_id)
+            .bind(&sealed.ip)
+            .bind(&sealed.user_agent)
+            .bind(&sealed.action)
+            .bind(&sealed.target_type)
+            .bind(&sealed.target_id)
+            .bind(&sealed.before_summary)
+            .bind(&sealed.after_summary)
+            .bind(&sealed.request_id)
+            .bind(&sealed.prev_hash)
+            .bind(&sealed.hash)
+            .execute(&mut *tx)
+            .await?;
+            Ok::<_, sqlx::Error>(sealed)
+        }
+        .await;
+        let _ = sqlx::query("select release_lock('lnvps_audit_log')")
+            .execute(&mut *tx)
+            .await;
+        let sealed = result?;
+        tx.commit().await?;
+        Ok(sealed)
+    }
+
+    async fn list_audit(
+        &self,
+        filter: &AuditFilter,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<Vec<AuditEntry>> {
+        Ok(sqlx::query_as(
+            "select * from audit_log where (? is null or actor_type = ?) and (? is null or actor_id = ?) and (? is null or action = ?) and (? is null or target_type = ?) and (? is null or target_id = ?) and (? is null or created >= ?) and (? is null or created <= ?) order by id desc limit ? offset ?",
+        )
+        .bind(&filter.actor_type)
+        .bind(&filter.actor_type)
+        .bind(filter.actor_id)
+        .bind(filter.actor_id)
+        .bind(&filter.action)
+        .bind(&filter.action)
+        .bind(&filter.target_type)
+        .bind(&filter.target_type)
+        .bind(&filter.target_id)
+        .bind(&filter.target_id)
+        .bind(filter.since)
+        .bind(filter.since)
+        .bind(filter.until)
+        .bind(filter.until)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn audit_range(&self, after_id: u64, limit: u64) -> DbResult<Vec<AuditEntry>> {
+        Ok(
+            sqlx::query_as("select * from audit_log where id > ? order by id limit ?")
+                .bind(after_id)
+                .bind(limit)
+                .fetch_all(&self.db)
+                .await?,
+        )
     }
 
     async fn insert_ip_order_audit(

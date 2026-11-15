@@ -121,7 +121,10 @@ async fn main() -> Result<(), Error> {
     // Initialize encryption: prefer the environment variable, otherwise fall
     // back to the key file configured in settings.
     if let Ok(hex_key) = std::env::var(lnvps_api::settings::ENCRYPTION_KEY_ENV) {
-        EncryptionContext::init_from_hex(&hex_key)?;
+        EncryptionContext::init_from_hex_with_previous(
+            &hex_key,
+            &lnvps_db::encryption::previous_keys_from_env(),
+        )?;
         info!("Database encryption initialized from environment");
     } else if let Some(ref encryption_config) = settings.encryption {
         EncryptionContext::init_from_file(
@@ -130,6 +133,7 @@ async fn main() -> Result<(), Error> {
         )?;
         info!("Database encryption initialized from key file");
     }
+    lnvps_api::settings::require_encryption_configured(EncryptionContext::get().is_ok())?;
 
     // Connect database and migrate
     let db = LNVpsDbMysql::new(&settings.db).await?;

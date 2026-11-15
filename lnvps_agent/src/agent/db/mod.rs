@@ -275,6 +275,7 @@ impl DbToolExecutor {
 #[async_trait]
 impl ToolExecutor for DbToolExecutor {
     async fn execute(&self, name: &str, arguments: &str) -> Result<String> {
+        crate::tools::guard::refuse_if_human_only(name)?;
         let args = parse_args(arguments);
 
         match name {

@@ -707,6 +707,19 @@ pub struct EncryptionConfig {
 /// Environment variable holding the hex-encoded database encryption key
 pub const ENCRYPTION_KEY_ENV: &str = "LNVPS_ENCRYPTION_KEY";
 
+pub fn require_encryption_configured(configured: bool) -> anyhow::Result<()> {
+    check_encryption_configured(configured, !cfg!(debug_assertions))
+}
+
+fn check_encryption_configured(configured: bool, release: bool) -> anyhow::Result<()> {
+    if configured || !release {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "no encryption key configured: set {ENCRYPTION_KEY_ENV} or an existing encryption.key-file, refusing to store personal data in plaintext"
+    )
+}
+
 /// Default global maximum prepay window (days) when unspecified in config.
 pub fn default_max_prepay_days() -> u16 {
     365
@@ -762,6 +775,26 @@ pub fn mock_settings() -> Settings {
         webauthn: None,
         session: None,
         app_backups: None,
+    }
+}
+
+#[cfg(test)]
+mod encryption_required_tests {
+    use super::*;
+
+    #[test]
+    fn a_configured_key_is_accepted() {
+        assert!(check_encryption_configured(true, true).is_ok());
+    }
+
+    #[test]
+    fn a_release_build_refuses_to_start_without_a_key() {
+        assert!(check_encryption_configured(false, true).is_err());
+    }
+
+    #[test]
+    fn a_debug_build_may_run_without_a_key() {
+        assert!(check_encryption_configured(false, false).is_ok());
     }
 }
 

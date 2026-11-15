@@ -10,6 +10,14 @@ default-run = "lnvps_api"
 name = "lnvps_api"
 path = "src/bin/api.rs"
 
+[[bin]]
+name = "verify_audit_log"
+path = "src/bin/verify_audit_log.rs"
+
+[[bin]]
+name = "rotate_encryption_key"
+path = "src/bin/rotate_encryption_key.rs"
+
 # One-shot admin tool: re-credit LNURL-pay topups that landed on the wrong VM
 # (see PR #152). Decodes the stored BOLT11 memo in-process; no LND connection.
 [[bin]]

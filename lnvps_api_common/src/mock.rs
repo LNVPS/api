@@ -104,6 +104,7 @@ pub struct MockDb {
     pub vm_migrations: Arc<Mutex<HashMap<u64, VmMigration>>>,
     pub ip_orders: Arc<Mutex<HashMap<u64, IpOrder>>>,
     pub ip_order_audits: Arc<Mutex<Vec<IpOrderAudit>>>,
+    pub audit_log: Arc<Mutex<Vec<lnvps_db::AuditEntry>>>,
     pub ip_order_ranges: Arc<Mutex<Vec<IpOrderRange>>>,
     pub vm_addons: Arc<Mutex<HashMap<u64, VmAddon>>>,
     /// `vpn_service_pool`, keyed by pool id because an interface terminates at
@@ -624,6 +625,7 @@ impl Default for MockDb {
             vm_migrations: Arc::new(Default::default()),
             ip_orders: Arc::new(Default::default()),
             ip_order_audits: Arc::new(Default::default()),
+            audit_log: Arc::new(Default::default()),
             ip_order_ranges: Arc::new(Default::default()),
             vm_addons: Arc::new(Default::default()),
             vpn_service_pools: Arc::new(Default::default()),
@@ -6227,6 +6229,61 @@ impl LNVpsDbBase for MockDb {
             .sum())
     }
 
+    async fn transform_column_batch(
+        &self,
+        _table: &str,
+        _id_expr: &str,
+        _column: &str,
+        _skip_prefix: &str,
+        _limit: u64,
+        _transform: &(dyn for<'a> Fn(&'a str) -> anyhow::Result<Option<String>> + Send + Sync),
+    ) -> DbResult<u64> {
+        Ok(0)
+    }
+
+    async fn append_audit(&self, entry: lnvps_db::NewAuditEntry) -> DbResult<lnvps_db::AuditEntry> {
+        let mut log = self.audit_log.lock().await;
+        let prev = log
+            .last()
+            .map(|e| e.hash.clone())
+            .unwrap_or_else(|| lnvps_db::audit::GENESIS_HASH.to_string());
+        let sealed =
+            lnvps_db::AuditEntry::seal(log.len() as u64 + 1, Utc::now().timestamp(), &prev, entry);
+        log.push(sealed.clone());
+        Ok(sealed)
+    }
+
+    async fn list_audit(
+        &self,
+        filter: &lnvps_db::AuditFilter,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<Vec<lnvps_db::AuditEntry>> {
+        Ok(self
+            .audit_log
+            .lock()
+            .await
+            .iter()
+            .rev()
+            .filter(|e| filter.matches(e))
+            .skip(offset as usize)
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    async fn audit_range(&self, after_id: u64, limit: u64) -> DbResult<Vec<lnvps_db::AuditEntry>> {
+        Ok(self
+            .audit_log
+            .lock()
+            .await
+            .iter()
+            .filter(|e| e.id > after_id)
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
     async fn insert_ip_order_audit(
         &self,
         ip_order_id: u64,
@@ -8622,7 +8679,8 @@ impl lnvps_db::AdminDb for MockDb {
                     renewal_source: None,
                     user_country_code: user.and_then(|u| u.country_code.clone()),
                     user_geo_country_code: user.and_then(|u| u.geo_country_code.clone()),
-                    user_billing_tax_id: user.and_then(|u| u.billing_tax_id.clone()),
+                    user_billing_tax_id: user
+                        .and_then(|u| u.billing_tax_id.as_ref().map(|t| t.as_str().to_string())),
                 });
             }
         }

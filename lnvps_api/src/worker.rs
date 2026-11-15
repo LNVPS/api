@@ -8952,7 +8952,7 @@ mod tests {
             let mut users = db.users.lock().await;
             let u = users.get_mut(&reachable).unwrap();
             u.contact_nip17 = true;
-            u.billing_name = Some("Nostr Owner".to_string());
+            u.billing_name = Some("Nostr Owner".into());
             users.get_mut(&other_host_owner).unwrap().contact_nip17 = true;
         }
         {

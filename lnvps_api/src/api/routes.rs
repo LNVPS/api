@@ -310,25 +310,25 @@ async fn v1_patch_account(
             .map(|c| c.alpha3().to_string());
     }
     if let Some(name) = &req.name {
-        user.billing_name = name.clone();
+        user.billing_name = name.clone().map(Into::into);
     }
     if let Some(address_1) = &req.address_1 {
-        user.billing_address_1 = address_1.clone();
+        user.billing_address_1 = address_1.clone().map(Into::into);
     }
     if let Some(address_2) = &req.address_2 {
-        user.billing_address_2 = address_2.clone();
+        user.billing_address_2 = address_2.clone().map(Into::into);
     }
     if let Some(city) = &req.city {
-        user.billing_city = city.clone();
+        user.billing_city = city.clone().map(Into::into);
     }
     if let Some(state) = &req.state {
-        user.billing_state = state.clone();
+        user.billing_state = state.clone().map(Into::into);
     }
     if let Some(postcode) = &req.postcode {
-        user.billing_postcode = postcode.clone();
+        user.billing_postcode = postcode.clone().map(Into::into);
     }
     if let Some(tax_id) = &req.tax_id {
-        user.billing_tax_id = tax_id.clone();
+        user.billing_tax_id = tax_id.clone().map(Into::into);
     }
 
     // Validate the tax ID (VAT number) against VIES when one is set, and ask
@@ -343,15 +343,18 @@ async fn v1_patch_account(
         .filter(|s| !s.is_empty())
     {
         let trader = TraderDetails {
-            name: user.billing_name.clone(),
+            name: user.billing_name.as_ref().map(|v| v.as_str().to_string()),
             street: match (&user.billing_address_1, &user.billing_address_2) {
                 (Some(a1), Some(a2)) if !a2.trim().is_empty() => Some(format!("{} {}", a1, a2)),
-                (Some(a1), _) => Some(a1.clone()),
-                (None, Some(a2)) => Some(a2.clone()),
+                (Some(a1), _) => Some(a1.as_str().to_string()),
+                (None, Some(a2)) => Some(a2.as_str().to_string()),
                 _ => None,
             },
-            postal_code: user.billing_postcode.clone(),
-            city: user.billing_city.clone(),
+            postal_code: user
+                .billing_postcode
+                .as_ref()
+                .map(|v| v.as_str().to_string()),
+            city: user.billing_city.as_ref().map(|v| v.as_str().to_string()),
             company_type: None,
         };
         let result = VatClient::new()
@@ -1392,6 +1395,7 @@ async fn v1_list_ssh_keys(
 /// Add new SSH key to account
 async fn v1_add_ssh_key(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Json(req): Json<CreateSshKey>,
 ) -> ApiResult<ApiUserSshKey> {
@@ -1415,6 +1419,17 @@ async fn v1_add_ssh_key(
             .into(),
         ..Default::default()
     };
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("user", Some(uid), "user.ssh_key.add")
+                .auth(auth.auth_method(), None)
+                .target("user", uid)
+                .change(None, Some(new_key.name.clone())),
+            &client,
+        ),
+    )
+    .await?;
     let key_id = this.db.insert_user_ssh_key(&new_key).await?;
     new_key.id = key_id;
 
@@ -1813,12 +1828,24 @@ async fn ensure_vm_deletable_by_owner(db: &Arc<dyn LNVpsDb>, vm_id: u64) -> Resu
 /// stay available until it is resolved.
 async fn v1_delete_vm(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
 ) -> ApiResult<()> {
-    let (_uid, _vm) = get_user_vm(&auth, &this, id).await?;
+    let (uid, _vm) = get_user_vm(&auth, &this, id).await?;
 
     ensure_vm_deletable_by_owner(&this.db, id).await?;
+
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("user", Some(uid), "user.vm.delete")
+                .auth(auth.auth_method(), None)
+                .target("vm", id),
+            &client,
+        ),
+    )
+    .await?;
 
     this.work_sender
         .send(WorkJob::DeleteVm {

@@ -15,6 +15,7 @@ static ENCRYPTION_CONTEXT: OnceLock<EncryptionContext> = OnceLock::new();
 /// Encryption context that holds the cipher instance
 pub struct EncryptionContext {
     cipher: Aes256Gcm,
+    retired: Vec<(String, Aes256Gcm)>,
     /// Identifier for the key currently in use, derived from the key material.
     /// Stored in versioned ciphertexts so the correct key can be selected
     /// during future key rotation.
@@ -55,11 +56,61 @@ impl EncryptionContext {
         Self::init_with_key(key)
     }
 
-    fn init_with_key(key: Key<Aes256Gcm>) -> Result<()> {
-        let cipher = Aes256Gcm::new(&key);
-        let key_id = derive_key_id(&key);
-        let context = EncryptionContext { cipher, key_id };
+    pub fn init_from_hex_with_previous(hex_key: &str, previous_hex: &[String]) -> Result<()> {
+        let key = decode_hex_key(hex_key)?;
+        let previous = previous_hex
+            .iter()
+            .map(|k| decode_hex_key(k))
+            .collect::<Result<Vec<_>>>()?;
+        Self::set_global(EncryptionContext::with_keys(key, &previous))
+    }
 
+    pub fn with_keys(key: Key<Aes256Gcm>, previous: &[Key<Aes256Gcm>]) -> Self {
+        let key_id = derive_key_id(&key);
+        let retired = previous
+            .iter()
+            .map(|k| (derive_key_id(k), Aes256Gcm::new(k)))
+            .filter(|(id, _)| *id != key_id)
+            .collect();
+        EncryptionContext {
+            cipher: Aes256Gcm::new(&key),
+            retired,
+            key_id,
+        }
+    }
+
+    pub fn from_raw_keys(key: [u8; 32], previous: &[[u8; 32]]) -> Self {
+        let previous: Vec<_> = previous
+            .iter()
+            .map(|k| *Key::<Aes256Gcm>::from_slice(k))
+            .collect();
+        Self::with_keys(*Key::<Aes256Gcm>::from_slice(&key), &previous)
+    }
+
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    pub fn needs_rotation(&self, data: &str) -> bool {
+        match data.strip_prefix("ENC1:") {
+            Some(rest) => rest.split_once(':').map(|(id, _)| id) != Some(self.key_id.as_str()),
+            None => Self::is_legacy_format(data),
+        }
+    }
+
+    pub fn rotate(&self, data: &str) -> Result<Option<String>> {
+        if !Self::is_encrypted(data) || !self.needs_rotation(data) {
+            return Ok(None);
+        }
+        let plaintext = self.decrypt(data)?;
+        Ok(Some(self.encrypt(&plaintext)?))
+    }
+
+    fn init_with_key(key: Key<Aes256Gcm>) -> Result<()> {
+        Self::set_global(EncryptionContext::with_keys(key, &[]))
+    }
+
+    fn set_global(context: EncryptionContext) -> Result<()> {
         ENCRYPTION_CONTEXT
             .set(context)
             .map_err(|_| anyhow!("Encryption context already initialized"))?;
@@ -108,16 +159,20 @@ impl EncryptionContext {
     /// format (`ENC1:<key-id>:<data>`) and the legacy unversioned `ENC:<data>`
     /// format written before key ids existed.
     pub fn decrypt(&self, encrypted_data: &str) -> Result<String> {
+        let mut cipher = &self.cipher;
         let base64_data = if let Some(rest) = encrypted_data.strip_prefix("ENC1:") {
             let (key_id, data) = rest
                 .split_once(':')
                 .ok_or_else(|| anyhow!("Malformed ENC1 ciphertext: missing key id separator"))?;
             if key_id != self.key_id {
-                bail!(
-                    "Ciphertext was encrypted with key id '{}' but the loaded key has id '{}'",
-                    key_id,
-                    self.key_id
-                );
+                match self.retired.iter().find(|(id, _)| id == key_id) {
+                    Some((_, retired)) => cipher = retired,
+                    None => bail!(
+                        "Ciphertext was encrypted with key id '{}' but the loaded key has id '{}'",
+                        key_id,
+                        self.key_id
+                    ),
+                }
             }
             data
         } else if let Some(stripped) = encrypted_data.strip_prefix("ENC:") {
@@ -139,9 +194,15 @@ impl EncryptionContext {
         let nonce = Nonce::from_slice(&encrypted_bytes[..12]);
         let ciphertext = &encrypted_bytes[12..];
 
-        let plaintext = self
-            .cipher
+        let plaintext = cipher
             .decrypt(nonce, ciphertext)
+            .or_else(|e| {
+                self.retired
+                    .iter()
+                    .filter(|_| !encrypted_data.starts_with("ENC1:"))
+                    .find_map(|(_, c)| c.decrypt(nonce, ciphertext).ok())
+                    .ok_or(e)
+            })
             .map_err(|e| anyhow!("Decryption failed: {}", e))?;
 
         String::from_utf8(plaintext).map_err(|e| anyhow!("Invalid UTF-8 in decrypted data: {}", e))
@@ -177,6 +238,14 @@ fn load_or_generate_key<P: AsRef<Path>>(
     key_file: P,
     auto_generate: bool,
 ) -> Result<Key<Aes256Gcm>> {
+    load_key(key_file, auto_generate, auto_generate_permitted())
+}
+
+fn load_key<P: AsRef<Path>>(
+    key_file: P,
+    auto_generate: bool,
+    generation_permitted: bool,
+) -> Result<Key<Aes256Gcm>> {
     let key_path = key_file.as_ref();
 
     if key_path.exists() {
@@ -192,6 +261,10 @@ fn load_or_generate_key<P: AsRef<Path>>(
         }
 
         Ok(*Key::<Aes256Gcm>::from_slice(&key_bytes))
+    } else if auto_generate && !generation_permitted {
+        Err(anyhow!(
+            "Encryption key file does not exist and auto-generate is refused in release builds: provide LNVPS_ENCRYPTION_KEY or an existing key file"
+        ))
     } else if auto_generate {
         // Generate new key
         let key = Aes256Gcm::generate_key(OsRng);
@@ -214,6 +287,23 @@ fn load_or_generate_key<P: AsRef<Path>>(
     }
 }
 
+fn auto_generate_permitted() -> bool {
+    cfg!(debug_assertions)
+}
+
+pub const PREVIOUS_KEYS_ENV: &str = "LNVPS_ENCRYPTION_KEY_PREVIOUS";
+
+pub fn previous_keys_from_env() -> Vec<String> {
+    std::env::var(PREVIOUS_KEYS_ENV)
+        .map(|v| {
+            v.split(',')
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 fn write_owner_only(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     let mut options = fs::OpenOptions::new();
@@ -234,7 +324,11 @@ mod tests {
         let key = Aes256Gcm::generate_key(OsRng);
         let cipher = Aes256Gcm::new(&key);
         let key_id = derive_key_id(&key);
-        Ok(EncryptionContext { cipher, key_id })
+        Ok(EncryptionContext {
+            cipher,
+            retired: Vec::new(),
+            key_id,
+        })
     }
 
     #[test]
@@ -326,6 +420,51 @@ mod tests {
         assert!(err.to_string().contains("encrypted with key id"));
     }
 
+    fn key_of(byte: u8) -> Key<Aes256Gcm> {
+        *Key::<Aes256Gcm>::from_slice(&[byte; 32])
+    }
+
+    #[test]
+    fn rotation_reencrypts_under_the_new_key_and_old_key_still_decrypts() {
+        let old = EncryptionContext::with_keys(key_of(1), &[]);
+        let new = EncryptionContext::with_keys(key_of(2), &[key_of(1)]);
+        let stored = old.encrypt("tax id 123").unwrap();
+        assert!(new.needs_rotation(&stored));
+        assert_eq!(new.decrypt(&stored).unwrap(), "tax id 123");
+        let rotated = new.rotate(&stored).unwrap().unwrap();
+        assert!(rotated.starts_with(&format!("ENC1:{}:", new.key_id())));
+        assert!(!new.needs_rotation(&rotated));
+        assert_eq!(new.rotate(&rotated).unwrap(), None);
+        assert_eq!(new.decrypt(&rotated).unwrap(), "tax id 123");
+    }
+
+    #[test]
+    fn retired_key_removed_means_old_ciphertext_fails() {
+        let old = EncryptionContext::with_keys(key_of(1), &[]);
+        let new = EncryptionContext::with_keys(key_of(2), &[]);
+        let stored = old.encrypt("x").unwrap();
+        assert!(new.decrypt(&stored).is_err());
+    }
+
+    #[test]
+    fn legacy_ciphertext_under_a_retired_key_is_decrypted_and_rotated() {
+        let old = EncryptionContext::with_keys(key_of(1), &[]);
+        let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+        let mut blob = nonce.to_vec();
+        blob.extend(old.cipher.encrypt(&nonce, "legacy".as_bytes()).unwrap());
+        let legacy = format!("ENC:{}", STANDARD.encode(blob));
+        let new = EncryptionContext::with_keys(key_of(2), &[key_of(1)]);
+        assert_eq!(new.decrypt(&legacy).unwrap(), "legacy");
+        let rotated = new.rotate(&legacy).unwrap().unwrap();
+        assert!(rotated.starts_with("ENC1:"));
+    }
+
+    #[test]
+    fn rotate_leaves_plaintext_alone() {
+        let ctx = EncryptionContext::with_keys(key_of(1), &[]);
+        assert_eq!(ctx.rotate("plain").unwrap(), None);
+    }
+
     #[test]
     fn test_decode_hex_key() {
         let key = decode_hex_key(&"ab".repeat(32)).unwrap();
@@ -354,6 +493,15 @@ mod tests {
         let context = create_test_context().unwrap();
         let err = context.decrypt("ENC1:nokeyid").unwrap_err();
         assert!(err.to_string().contains("Malformed ENC1"));
+    }
+
+    #[test]
+    fn release_builds_refuse_to_generate_a_missing_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db.key");
+        let err = load_key(&path, true, false).unwrap_err();
+        assert!(err.to_string().contains("refused in release"));
+        assert!(!path.exists());
     }
 
     #[test]

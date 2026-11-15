@@ -20,11 +20,12 @@
 
 use async_openai::types::FunctionObject;
 
-pub mod account;
+mod account;
 pub mod apps;
 pub mod billing;
 pub mod catalogue;
 pub mod diagnostics;
+pub mod guard;
 pub mod partners;
 pub mod vms;
 

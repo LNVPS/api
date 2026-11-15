@@ -11,6 +11,7 @@ mod access_policies;
 mod activity;
 mod agent;
 mod apps;
+mod audit_log;
 mod auth;
 mod bulk_message;
 pub mod chain;
@@ -86,6 +87,7 @@ pub fn admin_router(
         .merge(activity::router())
         .merge(users::router())
         .merge(agent::router())
+        .merge(audit_log::router())
         .merge(passkeys::router())
         .merge(bulk_message::router())
         .merge(vms::router())

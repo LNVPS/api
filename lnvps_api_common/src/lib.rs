@@ -1,3 +1,4 @@
+mod audit;
 mod capacity;
 mod client_ip;
 pub mod discount;
@@ -42,6 +43,7 @@ mod vm_history;
 mod wireguard;
 mod work;
 
+pub use audit::*;
 pub use capacity::*;
 pub use client_ip::*;
 pub use discount::*;

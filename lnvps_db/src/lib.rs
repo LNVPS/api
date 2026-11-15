@@ -6,6 +6,7 @@ use thiserror::Error;
 
 #[cfg(feature = "admin")]
 mod admin;
+pub mod audit;
 pub mod comma_separated;
 pub mod encrypted_string;
 pub mod encryption;
@@ -19,6 +20,7 @@ pub mod nostr;
 use crate::nostr::LNVPSNostrDb;
 #[cfg(feature = "admin")]
 pub use admin::*;
+pub use audit::{AuditEntry, AuditFilter, NewAuditEntry};
 pub use comma_separated::CommaSeparated;
 pub use encrypted_string::EncryptedString;
 pub use encryption::EncryptionContext;
@@ -1931,6 +1933,23 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Total cost of orders that have committed money (ordering, ordered or
     /// delivered) at or after `since`, in `currency`.
     async fn sum_ip_order_cost_since(&self, since: DateTime<Utc>, currency: &str) -> DbResult<u64>;
+    async fn transform_column_batch(
+        &self,
+        table: &str,
+        id_expr: &str,
+        column: &str,
+        skip_prefix: &str,
+        limit: u64,
+        transform: &(dyn for<'a> Fn(&'a str) -> anyhow::Result<Option<String>> + Send + Sync),
+    ) -> DbResult<u64>;
+    async fn append_audit(&self, entry: NewAuditEntry) -> DbResult<AuditEntry>;
+    async fn list_audit(
+        &self,
+        filter: &AuditFilter,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<Vec<AuditEntry>>;
+    async fn audit_range(&self, after_id: u64, limit: u64) -> DbResult<Vec<AuditEntry>>;
     async fn insert_ip_order_audit(
         &self,
         ip_order_id: u64,
