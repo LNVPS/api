@@ -221,6 +221,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_replicas_on_one_redis_reject_a_replayed_nip98_event() {
+        let Ok(url) = std::env::var("LNVPS_TEST_REDIS_URL") else {
+            return;
+        };
+        let a: Arc<dyn SharedSeenSet> = Arc::new(RedisSeenSet::new(&url).await.unwrap());
+        let b: Arc<dyn SharedSeenSet> = Arc::new(RedisSeenSet::new(&url).await.unwrap());
+        let ttl = Duration::from_secs(5);
+        let id = format!("replay-{}", std::process::id());
+        consume_shared(Some(&a), "nip98", &id, ttl).await.unwrap();
+        assert!(consume_shared(Some(&b), "nip98", &id, ttl).await.is_err());
+        assert!(consume_shared(Some(&a), "nip98", &id, ttl).await.is_err());
+    }
+
+    #[tokio::test]
     async fn redis_set_is_shared_when_available() {
         let Ok(url) = std::env::var("LNVPS_TEST_REDIS_URL") else { return };
         let a = RedisSeenSet::new(&url).await.unwrap();

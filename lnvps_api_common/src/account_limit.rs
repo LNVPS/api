@@ -207,6 +207,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn two_replicas_on_one_redis_share_an_account_budget() {
+        let Ok(url) = std::env::var("LNVPS_TEST_REDIS_URL") else {
+            return;
+        };
+        let a = AccountLimiter::new(Arc::new(RedisCounterStore::new(&url).await.unwrap()), true);
+        let b = AccountLimiter::new(Arc::new(RedisCounterStore::new(&url).await.unwrap()), true);
+        let user = 9_000_000 + std::process::id() as u64;
+        a.check_with(AccountAction::Refund, user, 2).await.unwrap();
+        b.check_with(AccountAction::Refund, user, 2).await.unwrap();
+        assert!(a.check_with(AccountAction::Refund, user, 2).await.is_err());
+        assert!(b.check_with(AccountAction::Refund, user, 2).await.is_err());
+    }
+
+    #[tokio::test]
     async fn redis_counter_is_shared_when_available() {
         let Ok(url) = std::env::var("LNVPS_TEST_REDIS_URL") else {
             return;
