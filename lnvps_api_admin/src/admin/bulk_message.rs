@@ -161,6 +161,7 @@ mod tests {
             .into_iter()
             .collect(),
             nip98_auth: None,
+            step_up: false,
         }
     }
 

@@ -57,6 +57,7 @@ pub fn admin(user_id: u64, grants: &[(AdminResource, AdminAction)]) -> AdminAuth
             })
             .collect(),
         nip98_auth: None,
+        step_up: false,
     }
 }
 

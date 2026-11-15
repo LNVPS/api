@@ -47,6 +47,7 @@ const PURPOSE_REG: &str = "webauthn-reg";
 const PURPOSE_AUTH: &str = "webauthn-auth";
 /// Registration ceremony for adding a passkey to an already-authenticated account.
 const PURPOSE_CRED_REG: &str = "webauthn-cred-reg";
+const PURPOSE_STEP_UP: &str = "webauthn-step-up";
 
 pub fn router() -> Router<RouterState> {
     Router::new()
@@ -54,6 +55,8 @@ pub fn router() -> Router<RouterState> {
         .route("/api/v1/webauthn/register/finish", post(register_finish))
         .route("/api/v1/webauthn/login/start", post(login_start))
         .route("/api/v1/webauthn/login/finish", post(login_finish))
+        .route("/api/v1/webauthn/step-up/start", post(step_up_start))
+        .route("/api/v1/webauthn/step-up/finish", post(step_up_finish))
         // Manage passkeys on the authenticated account.
         .route("/api/v1/webauthn/credentials", get(list_credentials))
         .route(
@@ -369,7 +372,11 @@ async fn register_finish(
 
 /// Begin a usernameless (discoverable) login.
 async fn login_start(State(this): State<RouterState>) -> ApiResult<LoginStartResponse> {
-    let cfg = webauthn_cfg(&this)?;
+    start_assertion(&this, PURPOSE_AUTH)
+}
+
+fn start_assertion(this: &RouterState, purpose: &str) -> ApiResult<LoginStartResponse> {
+    let cfg = webauthn_cfg(this)?;
     let webauthn = build_webauthn(&cfg)?;
 
     let (rcr, auth) = webauthn
@@ -377,7 +384,7 @@ async fn login_start(State(this): State<RouterState>) -> ApiResult<LoginStartRes
         .map_err(|e| ApiError::internal(format!("Failed to start authentication: {}", e)))?;
 
     let token = issue_challenge_token(
-        PURPOSE_AUTH,
+        purpose,
         &serde_json::to_string(&auth).map_err(ApiError::internal)?,
         DEFAULT_CHALLENGE_TTL_SECS,
     )
@@ -391,20 +398,23 @@ async fn login_start(State(this): State<RouterState>) -> ApiResult<LoginStartRes
 
 /// Complete a discoverable login: identify the account from the assertion,
 /// verify it against the stored passkeys, bump the counter and issue a token.
-async fn login_finish(
-    client: lnvps_api_common::ClientInfo,
-    State(this): State<RouterState>,
-    Json(req): Json<LoginFinishRequest>,
-) -> ApiResult<WebauthnTokenResponse> {
-    let cfg = webauthn_cfg(&this)?;
+struct AssertedUser {
+    user_id: u64,
+}
+
+async fn assert_passkey(
+    this: &RouterState,
+    req: &LoginFinishRequest,
+    purpose: &str,
+) -> Result<u64, ApiError> {
+    let cfg = webauthn_cfg(this)?;
     let webauthn = build_webauthn(&cfg)?;
 
-    let state_json = consume_challenge_token(PURPOSE_AUTH, &req.state)
+    let state_json = consume_challenge_token(purpose, &req.state)
         .map_err(|e| ApiError::from(anyhow::anyhow!("Invalid authentication state: {}", e)))?;
     let auth: DiscoverableAuthentication =
         serde_json::from_str(&state_json).map_err(ApiError::internal)?;
 
-    // Extract the credential id the user asserted with, and locate the account.
     let (_uuid, cred_id) = webauthn
         .identify_discoverable_authentication(&req.credential)
         .map_err(|e| ApiError::from(anyhow::anyhow!("Unknown credential: {}", e)))?;
@@ -415,7 +425,6 @@ async fn login_finish(
         .await
         .map_err(|_| ApiError::from(anyhow::anyhow!("Unknown credential")))?;
 
-    // Load all of the account's passkeys as discoverable keys for verification.
     let stored = this.db.list_webauthn_credentials(used.user_id).await?;
     let passkeys: Vec<Passkey> = stored
         .iter()
@@ -427,7 +436,6 @@ async fn login_finish(
         .finish_discoverable_authentication(&req.credential, auth, &discoverable)
         .map_err(|e| ApiError::from(anyhow::anyhow!("Authentication failed: {}", e)))?;
 
-    // Persist any counter/backup-state change on the credential that was used.
     if let Some(mut pk) = passkeys
         .iter()
         .find(|p| p.cred_id() == result.cred_id())
@@ -435,10 +443,18 @@ async fn login_finish(
         && pk.update_credential(&result).is_some()
         && let Ok(json) = serde_json::to_string(&pk)
     {
-        // Best-effort — a failed counter write must not block a valid login.
         let _ = this.db.update_webauthn_credential(used.id, &json).await;
     }
+    Ok(used.user_id)
+}
 
+async fn login_finish(
+    client: lnvps_api_common::ClientInfo,
+    State(this): State<RouterState>,
+    Json(req): Json<LoginFinishRequest>,
+) -> ApiResult<WebauthnTokenResponse> {
+    let user_id = assert_passkey(&this, &req, PURPOSE_AUTH).await?;
+    let used = AssertedUser { user_id };
     let user = this.db.get_user(used.user_id).await?;
     let pubkey: [u8; 32] = user
         .pubkey
@@ -462,6 +478,50 @@ async fn login_finish(
         user.session_version,
         session_ttl(&this),
     )
+}
+
+#[derive(Serialize)]
+struct StepUpTokenResponse {
+    token: String,
+    expires_in: u64,
+}
+
+async fn step_up_start(
+    _auth: Nip98Auth,
+    State(this): State<RouterState>,
+) -> ApiResult<LoginStartResponse> {
+    start_assertion(&this, PURPOSE_STEP_UP)
+}
+
+async fn step_up_finish(
+    auth: Nip98Auth,
+    client: lnvps_api_common::ClientInfo,
+    State(this): State<RouterState>,
+    Json(req): Json<LoginFinishRequest>,
+) -> ApiResult<StepUpTokenResponse> {
+    let uid = this.db.upsert_user(&auth.pubkey()).await?;
+    let asserted = assert_passkey(&this, &req, PURPOSE_STEP_UP).await?;
+    if asserted != uid {
+        return Err(ApiError::forbidden(
+            "Passkey does not belong to the authenticated account",
+        ));
+    }
+    lnvps_api_common::audit_user_action(
+        this.db.as_ref(),
+        &client,
+        uid,
+        auth.auth_method(),
+        "auth.step_up",
+        ("user", uid),
+        None,
+    )
+    .await?;
+    let token = lnvps_api_common::issue_step_up_token(uid, lnvps_api_common::STEP_UP_TTL_SECS)
+        .map_err(|e| ApiError::internal(format!("Failed to issue step-up: {}", e)))?;
+    ApiData::ok(StepUpTokenResponse {
+        token,
+        expires_in: lnvps_api_common::STEP_UP_TTL_SECS,
+    })
 }
 
 /// List the passkeys registered to the authenticated account.

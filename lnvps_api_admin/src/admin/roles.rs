@@ -459,6 +459,7 @@ async fn admin_assign_user_role(
 ) -> ApiResult<()> {
     // Role assignment is role management, not user management
     auth.require_permission(AdminResource::Roles, AdminAction::Update)?;
+    auth.require_step_up()?;
 
     // Check that user exists
     let _user = this.db.get_user(user_id).await?;
@@ -516,6 +517,7 @@ async fn admin_revoke_user_role(
 ) -> ApiResult<()> {
     // Role assignment is role management, not user management
     auth.require_permission(AdminResource::Roles, AdminAction::Update)?;
+    auth.require_step_up()?;
 
     // Check that user exists
     let _user = this.db.get_user(user_id).await?;
@@ -832,6 +834,7 @@ mod tests {
             pubkey: pubkey.to_vec(),
             permissions: Default::default(),
             nip98_auth: None,
+            step_up: false,
         };
         // single-threaded test body: env mutation is fine here
         unsafe { std::env::remove_var("LNVPS_DEMO_OPEN_ADMIN") };

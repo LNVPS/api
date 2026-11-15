@@ -142,6 +142,7 @@ mod tests {
                 Default::default()
             },
             nip98_auth: None,
+            step_up: false,
         }
     }
 

@@ -742,6 +742,9 @@ async fn admin_delete_vm(
     // is restricted to super-admins. Never-paid VMs are purged automatically by
     // the worker regardless of this flag. Authorize before looking up the VM.
     let purge = req.purge.unwrap_or(false);
+    if purge {
+        auth.require_step_up()?;
+    }
     if purge && !auth.is_super_admin(&this.db).await? {
         return Err(ApiError::forbidden(
             "Only super admins can permanently purge a VM",
@@ -1266,6 +1269,7 @@ async fn admin_process_vm_refund(
     // VM permission alone would let whoever can delete a VM send funds out.
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
     auth.require_permission(AdminResource::Payments, AdminAction::Update)?;
+    auth.require_step_up()?;
     lnvps_api_common::enforce_account_limit(lnvps_api_common::AccountAction::Refund, auth.user_id).await?;
 
     // Verify VM exists
@@ -1411,6 +1415,7 @@ async fn admin_record_payment_refund(
 ) -> ApiResult<AdminVmPaymentInfo> {
     // Money leaving the business is a payments write, like completing one.
     auth.require_permission(AdminResource::Payments, AdminAction::Update)?;
+    auth.require_step_up()?;
     lnvps_api_common::enforce_account_limit(lnvps_api_common::AccountAction::Refund, auth.user_id).await?;
 
     let vm = this.db.get_vm(vm_id).await?;
@@ -2065,6 +2070,7 @@ mod tests {
             .into_iter()
             .collect(),
             nip98_auth: None,
+            step_up: false,
         }
     }
 
@@ -2167,6 +2173,7 @@ mod tests {
             pubkey: vec![1u8; 32],
             permissions: permissions.into_iter().collect(),
             nip98_auth: None,
+            step_up: false,
         };
         let viewer = || {
             auth(vec![Permission {
@@ -2387,6 +2394,7 @@ mod tests {
             .into_iter()
             .collect(),
             nip98_auth: None,
+            step_up: false,
         };
 
         // Happy path: normalised and saved
@@ -2485,6 +2493,7 @@ mod tests {
                     pubkey: vec![1u8; 32],
                     permissions: Default::default(),
                     nip98_auth: None,
+                    step_up: false,
                 },
                 State(this.clone()),
                 Path(vm_id),
@@ -2680,6 +2689,7 @@ mod tests {
             .into_iter()
             .collect(),
             nip98_auth: None,
+            step_up: false,
         };
         let request = |host_id| AdminCreateVmRequest {
             user_id,

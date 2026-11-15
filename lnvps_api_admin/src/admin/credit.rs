@@ -143,6 +143,7 @@ async fn admin_adjust_user_credit(
     Json(req): Json<AdjustCreditRequest>,
 ) -> ApiResult<AdminAccountCredit> {
     auth.require_permission(AdminResource::AccountCredit, AdminAction::Update)?;
+    auth.require_step_up()?;
     if req.delta == 0 {
         return ApiData::err("delta must be non-zero");
     }

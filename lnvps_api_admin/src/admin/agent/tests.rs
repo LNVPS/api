@@ -34,6 +34,7 @@ fn auth_for(resource: AdminResource) -> AdminAuth {
         .map(|action| Permission { resource, action })
         .collect(),
         nip98_auth: None,
+        step_up: false,
     }
 }
 
@@ -443,6 +444,7 @@ async fn rewriting_memory_needs_update_not_view() -> Result<(), ApiError> {
         .into_iter()
         .collect(),
         nip98_auth: None,
+        step_up: false,
     };
 
     let denied = admin_update_agent_conversation(
