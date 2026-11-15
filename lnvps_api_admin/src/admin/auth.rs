@@ -174,7 +174,7 @@ impl AdminAuthQuery {
             (Some(ticket), _) => lnvps_api_common::consume_ticket(ticket, path)?,
             (None, Some(auth)) => {
                 let nip98 = Nip98Auth::from_base64(auth)?;
-                nip98.check(path, "GET")?;
+                nip98.check_shared(path, "GET").await?;
                 nip98.pubkey()
             }
             (None, None) => anyhow::bail!("Missing auth or ticket param"),

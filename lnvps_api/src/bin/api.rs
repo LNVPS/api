@@ -244,6 +244,11 @@ async fn main() -> Result<(), Error> {
         None => None,
     };
 
+    if let Some(redis_config) = &settings.redis {
+        lnvps_api_common::install_shared_seen_set(std::sync::Arc::new(
+            lnvps_api_common::RedisSeenSet::new(&redis_config.url).await?,
+        ));
+    }
     let status = if let Some(redis_config) = &settings.redis {
         VmStateCache::new_with_redis(redis_config.clone()).await?
     } else {

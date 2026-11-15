@@ -188,6 +188,19 @@ impl Nip98Auth {
         Ok(())
     }
 
+    pub async fn check_shared(&self, path: &str, method: &str) -> anyhow::Result<()> {
+        self.check(path, method)?;
+        if let AuthKind::Nostr(ev) = &self.kind {
+            crate::consume_installed(
+                "nip98",
+                &ev.id.to_hex(),
+                Duration::from_secs(AUTH_WINDOW_SECS * 2),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Verify the `payload` tag against the actual request body.
     ///
     /// NIP-98 makes `payload` optional, so an event without one is accepted:
@@ -620,7 +633,7 @@ where
             let path = parts.uri.path();
             let method = parts.method.as_str();
 
-            auth.check(path, method).map_err(|e| {
+            auth.check_shared(path, method).await.map_err(|e| {
                 (
                     StatusCode::UNAUTHORIZED,
                     format!("Auth check failed: {}", e),

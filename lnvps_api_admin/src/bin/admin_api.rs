@@ -86,6 +86,11 @@ async fn main() -> Result<(), Error> {
     let db: Arc<dyn LNVpsDb> = Arc::new(db);
 
     // Initialize VM state cache
+    if let Some(redis_config) = &settings.redis {
+        lnvps_api_common::install_shared_seen_set(std::sync::Arc::new(
+            lnvps_api_common::RedisSeenSet::new(&redis_config.url).await?,
+        ));
+    }
     let vm_state_cache = if let Some(redis_config) = &settings.redis {
         VmStateCache::new_with_redis(redis_config.clone()).await?
     } else {
