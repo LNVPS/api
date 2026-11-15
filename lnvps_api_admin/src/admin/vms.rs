@@ -2936,7 +2936,7 @@ mod audit_tests {
         )
         .await
         .unwrap();
-        assert_eq!(f.audit_actions().await, vec!["admin.vm.transfer"]);
+        assert_eq!(f.audit_actions().await, vec!["admin.vm.transfer", "vm.history.transferred"]);
         assert_eq!(f.mock.get_vm(f.vm_id).await.unwrap().user_id, to);
     }
 
@@ -3030,7 +3030,10 @@ mod audit_tests {
         )
         .await
         .unwrap();
-        assert_eq!(f.audit_actions().await, vec!["admin.refund"]);
+        assert_eq!(
+            f.audit_actions().await,
+            vec!["admin.refund", "vm.history.refunded"]
+        );
         let rows = f.mock.list_refunds_for_payment(&payment).await.unwrap();
         assert_eq!(rows.len(), 1);
     }
