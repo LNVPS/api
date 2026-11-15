@@ -134,6 +134,7 @@ pub struct MockDb {
     /// Last raw counter reading per VM.
     pub vm_traffic_samples: Arc<Mutex<HashMap<u64, VmTrafficSample>>>,
     pub webauthn_credentials: Arc<Mutex<HashMap<u64, WebauthnCredential>>>,
+    pub api_tokens: Arc<Mutex<HashMap<u64, lnvps_db::ApiToken>>>,
     pub apps: Arc<Mutex<HashMap<u64, App>>>,
     pub app_tags: Arc<Mutex<HashMap<u64, AppTag>>>,
     /// Assignments as `(app_id, tag_id)` pairs, standing in for the
@@ -647,6 +648,7 @@ impl Default for MockDb {
             router_bgp_routes: Arc::new(Default::default()),
             firewall_rules: Arc::new(Default::default()),
             webauthn_credentials: Arc::new(Default::default()),
+            api_tokens: Arc::new(Default::default()),
             apps: Arc::new(Default::default()),
             app_tags: Arc::new(Default::default()),
             app_tag_assignments: Arc::new(Default::default()),
@@ -805,6 +807,59 @@ impl LNVpsDbBase for MockDb {
             .find(|c| c.cred_id == cred_id)
             .ok_or(anyhow!("no credential"))?
             .clone())
+    }
+
+    async fn insert_api_token(&self, token: &lnvps_db::ApiToken) -> DbResult<u64> {
+        let mut tokens = self.api_tokens.lock().await;
+        let id = *tokens.keys().max().unwrap_or(&0) + 1;
+        tokens.insert(
+            id,
+            lnvps_db::ApiToken {
+                id,
+                created: Utc::now(),
+                ..token.clone()
+            },
+        );
+        Ok(id)
+    }
+
+    async fn get_api_token_by_hash(&self, token_hash: &str) -> DbResult<lnvps_db::ApiToken> {
+        self.api_tokens
+            .lock()
+            .await
+            .values()
+            .find(|t| t.token_hash == token_hash)
+            .cloned()
+            .ok_or_else(|| anyhow!("no such token").into())
+    }
+
+    async fn list_api_tokens(&self, user_id: u64) -> DbResult<Vec<lnvps_db::ApiToken>> {
+        let mut rows: Vec<_> = self
+            .api_tokens
+            .lock()
+            .await
+            .values()
+            .filter(|t| t.user_id == user_id)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|t| t.id);
+        Ok(rows)
+    }
+
+    async fn delete_api_token(&self, id: u64, user_id: u64) -> DbResult<()> {
+        self.api_tokens
+            .lock()
+            .await
+            .retain(|_, t| !(t.id == id && t.user_id == user_id));
+        Ok(())
+    }
+
+    async fn touch_api_token(&self, id: u64, ip: Option<&str>) -> DbResult<()> {
+        if let Some(t) = self.api_tokens.lock().await.get_mut(&id) {
+            t.last_used = Some(Utc::now());
+            t.last_ip = ip.map(str::to_string);
+        }
+        Ok(())
     }
 
     async fn update_webauthn_credential(&self, id: u64, passkey: &str) -> DbResult<()> {

@@ -23,6 +23,7 @@ pub mod routeserver;
 mod subscriptions;
 #[cfg(feature = "agent")]
 mod support;
+pub mod tokens;
 mod vm_addons;
 mod vpn;
 mod webauthn;

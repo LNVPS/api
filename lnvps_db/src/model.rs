@@ -275,6 +275,19 @@ pub struct UserSshKey {
     pub key_data: EncryptedString,
 }
 
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct ApiToken {
+    pub id: u64,
+    pub user_id: u64,
+    pub name: String,
+    pub token_hash: String,
+    pub scope: String,
+    pub created: DateTime<Utc>,
+    pub expires: DateTime<Utc>,
+    pub last_used: Option<DateTime<Utc>>,
+    pub last_ip: Option<String>,
+}
+
 /// A registered WebAuthn / passkey credential belonging to a
 /// [`AccountType::Webauthn`] account. One account may have several (e.g. one
 /// per device).

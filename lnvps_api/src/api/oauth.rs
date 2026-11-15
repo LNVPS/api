@@ -241,7 +241,7 @@ fn resolve_provider(
     Ok((cfg, provider_cfg))
 }
 
-/// Session token lifetime from the shared `[session]` config (default 30 days).
+/// Session token lifetime from the shared `[session]` config (default 7 days).
 fn session_ttl(this: &RouterState) -> u64 {
     this.settings
         .session

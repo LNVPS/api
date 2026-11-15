@@ -25,8 +25,8 @@ use crate::single_use::SingleUseGuard;
 /// disabled and only Nostr (NIP-98) auth is accepted.
 static SESSION_SECRET: OnceLock<Vec<u8>> = OnceLock::new();
 
-/// Default session lifetime (30 days) if the caller does not specify one.
-pub const DEFAULT_SESSION_TTL_SECS: u64 = 60 * 60 * 24 * 30;
+/// Default session lifetime (7 days) if the caller does not specify one.
+pub const DEFAULT_SESSION_TTL_SECS: u64 = 60 * 60 * 24 * 7;
 
 /// Install the session signing secret. Idempotent — the first non-empty secret
 /// wins; subsequent calls are ignored. Returns `true` if this call installed it.

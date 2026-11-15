@@ -111,6 +111,15 @@ pub fn routes() -> Router<RouterState> {
                 post(v1_telegram_link).delete(v1_telegram_unlink),
             )
             .route("/api/v1/account/sessions", delete(v1_revoke_all_sessions))
+            .route(
+                "/api/v1/account/tokens",
+                get(crate::api::tokens::v1_list_api_tokens)
+                    .post(crate::api::tokens::v1_create_api_token),
+            )
+            .route(
+                "/api/v1/account/tokens/{id}",
+                delete(crate::api::tokens::v1_delete_api_token),
+            )
             .route("/api/v1/auth/ticket", post(v1_issue_auth_ticket))
             .route(
                 "/api/v1/account/whatsapp/verify",
@@ -4016,6 +4025,65 @@ mod tests {
         let log = db.audit_log.lock().await;
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].action, "vm.firewall.rule.delete");
+    }
+
+    #[tokio::test]
+    async fn creating_and_revoking_an_api_token_is_audited() {
+        use crate::api::tokens::*;
+        use lnvps_api_common::MockDb;
+        let db = Arc::new(MockDb::default());
+        let state = mock_router_state(db.clone()).await;
+        let created = v1_create_api_token(
+            nostr_auth(6),
+            ClientInfo::default(),
+            State(state.clone()),
+            Json(CreateApiToken {
+                name: "ci".into(),
+                scope: "read".into(),
+                expires_in_days: Some(30),
+            }),
+        )
+        .await
+        .unwrap();
+        let id = created.data.info.id;
+        assert!(created.data.token.starts_with("lnvps_"));
+        let stored = db.api_tokens.lock().await.get(&id).cloned().unwrap();
+        assert_ne!(stored.token_hash, created.data.token);
+        v1_delete_api_token(nostr_auth(6), ClientInfo::default(), State(state), Path(id))
+            .await
+            .unwrap();
+        assert!(db.api_tokens.lock().await.is_empty());
+        let actions: Vec<_> = db
+            .audit_log
+            .lock()
+            .await
+            .iter()
+            .map(|e| e.action.clone())
+            .collect();
+        assert_eq!(actions, vec!["auth.token.create", "auth.token.revoke"]);
+    }
+
+    #[tokio::test]
+    async fn api_token_creation_rejects_bad_scope_and_lifetime() {
+        use crate::api::tokens::*;
+        use lnvps_api_common::MockDb;
+        let db = Arc::new(MockDb::default());
+        let state = mock_router_state(db.clone()).await;
+        for (scope, days) in [("admin", 30u64), ("read", 0), ("read", 4000)] {
+            let r = v1_create_api_token(
+                nostr_auth(6),
+                ClientInfo::default(),
+                State(state.clone()),
+                Json(CreateApiToken {
+                    name: "x".into(),
+                    scope: scope.into(),
+                    expires_in_days: Some(days),
+                }),
+            )
+            .await;
+            assert!(r.is_err(), "{scope} {days}");
+        }
+        assert!(db.audit_log.lock().await.is_empty());
     }
 
     #[tokio::test]

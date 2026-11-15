@@ -183,6 +183,12 @@ pub trait LNVpsDbBase: Send + Sync {
     /// caller can never remove another account's credential.
     async fn delete_webauthn_credential(&self, id: u64, user_id: u64) -> DbResult<()>;
 
+    async fn insert_api_token(&self, token: &ApiToken) -> DbResult<u64>;
+    async fn get_api_token_by_hash(&self, token_hash: &str) -> DbResult<ApiToken>;
+    async fn list_api_tokens(&self, user_id: u64) -> DbResult<Vec<ApiToken>>;
+    async fn delete_api_token(&self, id: u64, user_id: u64) -> DbResult<()>;
+    async fn touch_api_token(&self, id: u64, ip: Option<&str>) -> DbResult<()>;
+
     /// Get a user by id
     async fn get_user(&self, id: u64) -> DbResult<User>;
 

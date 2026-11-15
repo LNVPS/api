@@ -508,6 +508,54 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn insert_api_token(&self, token: &crate::ApiToken) -> DbResult<u64> {
+        Ok(sqlx::query(
+            "insert into api_token(user_id,name,token_hash,scope,expires) values(?,?,?,?,?) returning id",
+        )
+        .bind(token.user_id)
+        .bind(&token.name)
+        .bind(&token.token_hash)
+        .bind(&token.scope)
+        .bind(token.expires)
+        .fetch_one(&self.db)
+        .await?
+        .try_get(0)?)
+    }
+
+    async fn get_api_token_by_hash(&self, token_hash: &str) -> DbResult<crate::ApiToken> {
+        Ok(sqlx::query_as("select * from api_token where token_hash=?")
+            .bind(token_hash)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn list_api_tokens(&self, user_id: u64) -> DbResult<Vec<crate::ApiToken>> {
+        Ok(
+            sqlx::query_as("select * from api_token where user_id=? order by id")
+                .bind(user_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn delete_api_token(&self, id: u64, user_id: u64) -> DbResult<()> {
+        sqlx::query("delete from api_token where id=? and user_id=?")
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn touch_api_token(&self, id: u64, ip: Option<&str>) -> DbResult<()> {
+        sqlx::query("update api_token set last_used=current_timestamp, last_ip=? where id=?")
+            .bind(ip)
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
     async fn update_webauthn_credential(&self, id: u64, passkey: &str) -> DbResult<()> {
         sqlx::query(
             "update user_webauthn_credentials set passkey=?, last_used=current_timestamp where id=?",

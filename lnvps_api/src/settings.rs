@@ -123,7 +123,7 @@ pub struct SessionConfig {
     /// challenge tokens). Must be a strong, stable random string — changing it
     /// invalidates all outstanding sessions.
     pub secret: String,
-    /// Session token lifetime in seconds. Defaults to 30 days.
+    /// Session token lifetime in seconds. Defaults to 7 days.
     #[serde(default = "default_session_ttl")]
     pub ttl: u64,
 }
