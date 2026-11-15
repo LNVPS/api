@@ -295,3 +295,60 @@ mod tests {
         assert!(KINDS.contains(&"admin"));
     }
 }
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::admin::test_support::{admin, fixture};
+    use lnvps_db::LNVpsDbBase;
+
+    fn caller() -> AdminAuth {
+        admin(7, &[(AdminResource::AccountCredit, AdminAction::Update)])
+    }
+
+    fn request() -> AdjustCreditRequest {
+        AdjustCreditRequest {
+            currency: Some("BTC".into()),
+            delta: 5_000,
+            kind: "admin".into(),
+            note: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_credit_adjustment_is_audited() {
+        let f = fixture().await;
+        admin_adjust_user_credit(
+            caller(),
+            lnvps_api_common::ClientInfo::default(),
+            State(f.state.clone()),
+            Path(f.owner_id),
+            Json(request()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(f.audit_actions().await, vec!["admin.credit.adjust"]);
+        let entry = f.mock.audit_log.lock().await[0].clone();
+        assert_eq!(entry.actor_id, Some(7));
+        assert!(entry.after_summary.unwrap().contains("+5000"));
+        let balance = f.mock.get_account_credit(f.owner_id, "BTC").await.unwrap();
+        assert_eq!(balance.balance, 5_000);
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_write_blocks_a_credit_adjustment() {
+        let f = fixture().await;
+        f.break_audit_log();
+        let res = admin_adjust_user_credit(
+            caller(),
+            lnvps_api_common::ClientInfo::default(),
+            State(f.state.clone()),
+            Path(f.owner_id),
+            Json(request()),
+        )
+        .await;
+        assert!(res.is_err());
+        let balance = f.mock.get_account_credit(f.owner_id, "BTC").await;
+        assert!(balance.map(|b| b.balance == 0).unwrap_or(true));
+    }
+}

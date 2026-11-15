@@ -42,6 +42,8 @@ mod roles;
 mod routers;
 mod subscriptions;
 mod swap_orders;
+#[cfg(test)]
+mod test_support;
 mod tunnel_pools;
 mod user_payment_methods;
 mod users;

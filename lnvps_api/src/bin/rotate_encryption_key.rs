@@ -31,12 +31,6 @@ async fn main() -> Result<()> {
     let new_key = std::env::var(lnvps_api::settings::ENCRYPTION_KEY_ENV)
         .context("LNVPS_ENCRYPTION_KEY must hold the new key")?;
     let previous = lnvps_db::encryption::previous_keys_from_env();
-    if previous.is_empty() {
-        bail!(
-            "set {} to the comma separated key(s) being retired",
-            lnvps_db::encryption::PREVIOUS_KEYS_ENV
-        );
-    }
     EncryptionContext::init_from_hex_with_previous(&new_key, &previous)?;
     let ctx = EncryptionContext::get()?;
 

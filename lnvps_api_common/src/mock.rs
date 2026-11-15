@@ -45,6 +45,9 @@ fn paginate<T>(all: Vec<T>, limit: u64, offset: u64) -> (Vec<T>, u64) {
     (page, total)
 }
 
+pub const MOCK_SUPER_ADMIN_USER: u64 = 999;
+pub const MOCK_SUPER_ADMIN_ROLE: u64 = 999;
+
 #[derive(Debug, Clone)]
 pub struct MockDb {
     pub regions: Arc<Mutex<HashMap<u64, Region>>>,
@@ -105,6 +108,8 @@ pub struct MockDb {
     pub ip_orders: Arc<Mutex<HashMap<u64, IpOrder>>>,
     pub ip_order_audits: Arc<Mutex<Vec<IpOrderAudit>>>,
     pub audit_log: Arc<Mutex<Vec<lnvps_db::AuditEntry>>>,
+    pub fail_audit_writes: Arc<std::sync::atomic::AtomicBool>,
+    pub role_assignments: Arc<Mutex<Vec<(u64, u64)>>>,
     pub ip_order_ranges: Arc<Mutex<Vec<IpOrderRange>>>,
     pub vm_addons: Arc<Mutex<HashMap<u64, VmAddon>>>,
     /// `vpn_service_pool`, keyed by pool id because an interface terminates at
@@ -626,6 +631,8 @@ impl Default for MockDb {
             ip_orders: Arc::new(Default::default()),
             ip_order_audits: Arc::new(Default::default()),
             audit_log: Arc::new(Default::default()),
+            fail_audit_writes: Arc::new(Default::default()),
+            role_assignments: Arc::new(Default::default()),
             ip_order_ranges: Arc::new(Default::default()),
             vm_addons: Arc::new(Default::default()),
             vpn_service_pools: Arc::new(Default::default()),
@@ -6242,6 +6249,12 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn append_audit(&self, entry: lnvps_db::NewAuditEntry) -> DbResult<lnvps_db::AuditEntry> {
+        if self
+            .fail_audit_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(anyhow!("audit log write failed").into());
+        }
         let mut log = self.audit_log.lock().await;
         let prev = log
             .last()
@@ -8022,8 +8035,12 @@ impl lnvps_db::AdminDb for MockDb {
         Ok(std::collections::HashSet::new())
     }
 
-    async fn get_user_roles(&self, _user_id: u64) -> DbResult<Vec<u64>> {
-        Ok(vec![])
+    async fn get_user_roles(&self, user_id: u64) -> DbResult<Vec<u64>> {
+        Ok(if user_id == MOCK_SUPER_ADMIN_USER {
+            vec![MOCK_SUPER_ADMIN_ROLE]
+        } else {
+            vec![]
+        })
     }
 
     async fn is_admin_user(&self, _user_id: u64) -> DbResult<bool> {
@@ -8032,14 +8049,19 @@ impl lnvps_db::AdminDb for MockDb {
 
     async fn assign_user_role(
         &self,
-        _user_id: u64,
-        _role_id: u64,
+        user_id: u64,
+        role_id: u64,
         _assigned_by: u64,
     ) -> DbResult<()> {
+        self.role_assignments.lock().await.push((user_id, role_id));
         Ok(())
     }
 
-    async fn revoke_user_role(&self, _user_id: u64, _role_id: u64) -> DbResult<()> {
+    async fn revoke_user_role(&self, user_id: u64, role_id: u64) -> DbResult<()> {
+        self.role_assignments
+            .lock()
+            .await
+            .retain(|a| *a != (user_id, role_id));
         Ok(())
     }
 
@@ -8047,8 +8069,19 @@ impl lnvps_db::AdminDb for MockDb {
         Ok(1)
     }
 
-    async fn get_role(&self, _role_id: u64) -> DbResult<AdminRole> {
-        todo!()
+    async fn get_role(&self, role_id: u64) -> DbResult<AdminRole> {
+        Ok(AdminRole {
+            id: role_id,
+            name: if role_id == MOCK_SUPER_ADMIN_ROLE {
+                "super_admin".to_string()
+            } else {
+                "operator".to_string()
+            },
+            description: None,
+            is_system_role: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
     }
 
     async fn get_role_by_name(&self, _name: &str) -> DbResult<AdminRole> {

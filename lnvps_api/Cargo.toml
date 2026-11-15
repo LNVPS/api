@@ -155,6 +155,7 @@ tempfile = "3"
 env_logger = "0.11"
 tower = { version = "0.5.3", features = ["util"] }
 wiremock = "0.6"
+sqlx = { version = "0.8", default-features = false, features = ["mysql", "runtime-tokio"] }
 
 [build-dependencies]
 openapi-build-gen = { git = "https://github.com/v0l/openapi-build-gen.git", rev = "b4c946ca891d22c5ab16ce13f17b1bf81c91587c", optional = true }

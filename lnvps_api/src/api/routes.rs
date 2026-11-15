@@ -3894,6 +3894,66 @@ mod tests {
         assert_eq!(first_vps_vm_id(&db, &[item]).await, None);
     }
 
+    fn nostr_auth(seed: u8) -> Nip98Auth {
+        use base64::Engine;
+        let keys = nostr::Keys::new(nostr::SecretKey::from_slice(&[seed; 32]).unwrap());
+        let event = nostr::EventBuilder::new(nostr::Kind::HttpAuth, "")
+            .sign_with_keys(&keys)
+            .unwrap();
+        Nip98Auth::from_base64(
+            &base64::engine::general_purpose::STANDARD.encode(nostr::JsonUtil::as_json(&event)),
+        )
+        .unwrap()
+    }
+
+    const TEST_SSH_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl test";
+
+    #[tokio::test]
+    async fn adding_an_ssh_key_is_audited() {
+        use lnvps_api_common::MockDb;
+        let db = Arc::new(MockDb::default());
+        let state = mock_router_state(db.clone()).await;
+        let auth = nostr_auth(5);
+        v1_add_ssh_key(
+            auth,
+            ClientInfo::default(),
+            State(state),
+            Json(CreateSshKey {
+                name: "laptop".to_string(),
+                key_data: TEST_SSH_KEY.to_string(),
+            }),
+        )
+        .await
+        .unwrap();
+        let log = db.audit_log.lock().await;
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].action, "user.ssh_key.add");
+        assert_eq!(log[0].actor_type, "user");
+        assert_eq!(db.user_ssh_keys.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_write_blocks_adding_an_ssh_key() {
+        use lnvps_api_common::MockDb;
+        let db = Arc::new(MockDb::default());
+        let state = mock_router_state(db.clone()).await;
+        db.fail_audit_writes
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let res = v1_add_ssh_key(
+            nostr_auth(5),
+            ClientInfo::default(),
+            State(state),
+            Json(CreateSshKey {
+                name: "laptop".to_string(),
+                key_data: TEST_SSH_KEY.to_string(),
+            }),
+        )
+        .await;
+        assert!(res.is_err());
+        assert!(db.user_ssh_keys.lock().await.is_empty());
+    }
+
     #[tokio::test]
     async fn test_first_vps_vm_id_none_for_non_vps_lines() {
         let mock = std::sync::Arc::new(lnvps_api_common::MockDb::default());
