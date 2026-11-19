@@ -126,3 +126,41 @@ async fn replay_ssh_key_that_cannot_be_deleted_conv_395() {
     assert!(out.contains("\"deletable\": false"));
     println!("AFTER list_my_ssh_keys: {out}");
 }
+
+const HEADER_ONLY: &str = "<pre>Start: 2026-11-19T16:37:07+0000\nHOST: router Loss%   Snt   Last   Avg  Best  Wrst StDev\n</pre>";
+
+#[tokio::test]
+async fn replay_silent_vm_is_not_a_looking_glass_outage_conv_283() {
+    let (server, exec, _db) = stack("185.18.221.221", false).await;
+    server.reset().await;
+    Mock::given(method("GET"))
+        .and(path_regex("^/traceroute/"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(HEADER_ONLY))
+        .mount(&server)
+        .await;
+
+    let ping = exec.execute("ping_vm", r#"{"vm_id":7}"#).await.unwrap();
+    assert!(ping.contains("\"status\": \"no_reply_from_vm\""));
+    assert!(ping.contains("no reply from this VM"));
+    assert!(!ping.contains("unavailable"));
+    println!("BEFORE ping_vm: Error: looking glass returned no traceroute output for 185.18.221.221 - the probe tool on the edge may be unavailable");
+    println!("AFTER ping_vm: {ping}");
+
+    let trace = exec
+        .execute("traceroute_vm", r#"{"vm_id":7}"#)
+        .await
+        .unwrap();
+    assert!(trace.contains("no_reply_from_vm"));
+
+    server.reset().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+    let err = exec
+        .execute("ping_vm", r#"{"vm_id":7}"#)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("looking glass unavailable"));
+}
