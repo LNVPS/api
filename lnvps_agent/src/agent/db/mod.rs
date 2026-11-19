@@ -369,6 +369,7 @@ impl ToolExecutor for DbToolExecutor {
             "price_custom_vm" => pretty(&self.price_custom_vm(&args).await?),
             "get_exchange_rate" => pretty(&self.exchange_rate(&args).await?),
             "list_os_images" => pretty(&self.os_images().await?),
+            "list_payment_methods" => pretty(&self.accepted_payment_methods().await?),
             "get_terms_of_service" => Ok(self.diag.terms_of_service().await?.to_string()),
 
             // ── Diagnostics ──────────────────────────────────────────

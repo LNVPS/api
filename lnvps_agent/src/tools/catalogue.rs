@@ -134,6 +134,13 @@ pub fn list_app_tags() -> FunctionObject {
     )
 }
 
+pub fn list_payment_methods() -> FunctionObject {
+    nullary(
+        "list_payment_methods",
+        "List the payment methods LNVPS currently accepts, with the currencies each supports, processing fees and minimum amounts. Use this for any question about how a customer can pay, including whether a coin or card type is accepted, instead of answering from memory.",
+    )
+}
+
 pub fn get_terms_of_service() -> FunctionObject {
     nullary(
         "get_terms_of_service",
