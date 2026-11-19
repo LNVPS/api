@@ -902,10 +902,9 @@ carries HTTP/WebSocket traffic, **not UDP**. The platform's fixed `expose: udp`
 forwarding is not a fit for this plugin's dynamic sockets, so no UDP port range,
 host networking or additional privileges are configured here.
 
-The developer reports successful same-machine bidirectional encrypted ping and
-restart recovery. Cross-network/VPS traversal remains **unverified**; relay
-signaling or a STUN mapping alone does not prove peer connectivity. Optional FIPS
-WebSocket seeds are a separate carrier, not an automatic fallback after failed
+The developer reports successful bidirectional encrypted FIPS ping between a local
+machine and an LNVPS Alpine VM. The managed Kubernetes networking path remains
+unverified. Optional WebSocket seeds are not an automatic fallback after failed
 UDP traversal.
 
 ### Upgrades and manual VPS verification
