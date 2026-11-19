@@ -57,6 +57,8 @@ pub struct MockRouter {
     addresses: Arc<Mutex<HashMap<String, Vec<String>>>>,
     /// Routes pointing down each tunnel interface
     routes: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    isolated: Arc<Mutex<Option<Vec<String>>>>,
+    mtus: Arc<Mutex<HashMap<String, u16>>>,
 }
 
 impl Default for MockRouter {
@@ -84,6 +86,8 @@ impl MockRouter {
                 Arc::new(Mutex::new(HashMap::new()));
             static TL_ROUTES: Arc<Mutex<HashMap<String, Vec<String>>>> =
                 Arc::new(Mutex::new(HashMap::new()));
+            static TL_ISOLATED: Arc<Mutex<Option<Vec<String>>>> = Arc::new(Mutex::new(None));
+            static TL_MTUS: Arc<Mutex<HashMap<String, u16>>> = Arc::new(Mutex::new(HashMap::new()));
             static TL_DEFAULT_ROUTE: Arc<Mutex<Option<BgpRoute>>> =
                 Arc::new(Mutex::new(Some(BgpRoute {
                     prefix: "0.0.0.0/0".to_string(),
@@ -98,6 +102,8 @@ impl MockRouter {
             default_route: TL_DEFAULT_ROUTE.with(|d| d.clone()),
             addresses: TL_ADDRESSES.with(|a| a.clone()),
             routes: TL_ROUTES.with(|r| r.clone()),
+            isolated: TL_ISOLATED.with(|i| i.clone()),
+            mtus: TL_MTUS.with(|m| m.clone()),
         }
     }
 
@@ -113,6 +119,16 @@ impl MockRouter {
         addresses.clear();
         let mut routes = self.routes.lock().await;
         routes.clear();
+        *self.isolated.lock().await = None;
+        self.mtus.lock().await.clear();
+    }
+
+    pub async fn interface_mtu(&self, interface: &str) -> Option<u16> {
+        self.mtus.lock().await.get(interface).copied()
+    }
+
+    pub async fn isolated_blocks(&self) -> Option<Vec<String>> {
+        self.isolated.lock().await.clone()
     }
 
     /// Addresses configured on a tunnel interface
@@ -335,6 +351,16 @@ impl TunnelRouter for MockRouter {
         Ok(())
     }
 
+    async fn sync_tunnel_mtu(&self, interface: &str, mtu: u16) -> OpResult<()> {
+        self.mtus.lock().await.insert(interface.to_string(), mtu);
+        Ok(())
+    }
+
+    async fn sync_peer_isolation(&self, blocks: &[String]) -> OpResult<()> {
+        *self.isolated.lock().await = Some(blocks.to_vec());
+        Ok(())
+    }
+
     async fn tunnel_traffic(&self) -> OpResult<Vec<TunnelTraffic>> {
         let tunnels = self.tunnels.lock().await;
         Ok(tunnels
@@ -491,6 +517,67 @@ impl LightningNode for MockNode {
     }
 }
 
+/// Mock chain explorer: scripted transaction inputs and outspends.
+///
+/// A txid with no scripted inputs is reported as unknown, i.e. evicted.
+/// `fail` makes every lookup error, so tests can assert that an unreachable
+/// explorer never clears a deposit.
+#[derive(Clone, Debug, Default)]
+pub struct MockChainExplorer {
+    /// Inputs returned for a given deposit txid.
+    pub inputs: Arc<Mutex<HashMap<String, Vec<crate::chain::OutPoint>>>>,
+    /// Spender recorded against an outpoint (`{txid}:{vout}`).
+    pub outspends: Arc<Mutex<HashMap<String, crate::chain::Outspend>>>,
+    pub fail: Arc<Mutex<bool>>,
+}
+
+impl MockChainExplorer {
+    pub async fn set_inputs(&self, txid: &str, inputs: &[&str]) {
+        self.inputs.lock().await.insert(
+            txid.to_string(),
+            inputs
+                .iter()
+                .filter_map(|s| crate::chain::OutPoint::parse(s))
+                .collect(),
+        );
+    }
+
+    pub async fn set_outspend(&self, outpoint: &str, spent_by: Option<&str>, confirmed: bool) {
+        self.outspends.lock().await.insert(
+            outpoint.to_string(),
+            crate::chain::Outspend {
+                spent_by: spent_by.map(|s| s.to_string()),
+                confirmed,
+            },
+        );
+    }
+}
+
+#[async_trait]
+impl crate::chain::ChainExplorer for MockChainExplorer {
+    async fn tx_inputs(&self, txid: &str) -> anyhow::Result<Option<Vec<crate::chain::OutPoint>>> {
+        ensure!(!*self.fail.lock().await, "explorer unavailable");
+        Ok(self.inputs.lock().await.get(txid).cloned())
+    }
+
+    async fn outspend(
+        &self,
+        outpoint: &crate::chain::OutPoint,
+    ) -> anyhow::Result<crate::chain::Outspend> {
+        ensure!(!*self.fail.lock().await, "explorer unavailable");
+        Ok(self
+            .outspends
+            .lock()
+            .await
+            .get(&outpoint.to_string())
+            .cloned()
+            .unwrap_or(crate::chain::Outspend {
+                spent_by: None,
+                confirmed: false,
+            }))
+    }
+}
+
 /// Mock on-chain provider, mirrors [`MockNode`] for on-chain payments.
 ///
 /// Derives unique fake bech32-style addresses and records every request.
@@ -557,6 +644,34 @@ impl OnChainProvider for MockOnChainProvider {
             total_amount: payments_rs::currency::CurrencyAmount::millisats(total_msat),
             fee: None,
             raw_tx: Some(raw_tx),
+        })
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct MockSwapProvider {
+    pub requests: Arc<Mutex<Vec<crate::swap::SwapOrderRequest>>>,
+}
+
+#[async_trait]
+impl crate::swap::SwapProvider for MockSwapProvider {
+    async fn create_order(
+        &self,
+        req: crate::swap::SwapOrderRequest,
+    ) -> anyhow::Result<crate::swap::SwapOrder> {
+        let mut requests = self.requests.lock().await;
+        let n = requests.len();
+        requests.push(req.clone());
+        Ok(crate::swap::SwapOrder {
+            data: crate::swap::SwapData {
+                coin: req.coin.clone(),
+                order_id: format!("MOCK{n}"),
+                order_token: format!("token{n}"),
+                deposit_address: format!("4mockxmr{n:08}"),
+                deposit_amount: "1.5".to_string(),
+                receive_address: req.receive_address,
+            },
+            expires: Utc::now() + chrono::Duration::minutes(30),
         })
     }
 }

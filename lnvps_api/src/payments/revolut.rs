@@ -128,6 +128,10 @@ impl RevolutPaymentHandler {
                 RevolutWebhookEvent::OrderCancelled => {
                     warn!("Order {} was cancelled", msg.order_id);
                 }
+                RevolutWebhookEvent::OrderFailed => {
+                    warn!("Order {} failed", msg.order_id);
+                }
+                RevolutWebhookEvent::Unknown => {}
             }
         }
         Ok(())

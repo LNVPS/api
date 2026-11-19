@@ -11,6 +11,8 @@
 //! - [`control`] — the inbound HTTPS control API, authenticated on every request.
 //! - [`tls`] — the node's TLS identity, whose fingerprint LNVPS pins at
 //!   registration, so the node's *replies* are authenticated too.
+//! - [`images`] — fetching an OS image on the node's own connection, so the
+//!   bytes do not cross the tunnel.
 //! - [`inventory`] — what the node reports about the machine.
 //! - [`api`] — outbound calls to LNVPS, the only direction that works before
 //!   there is a tunnel.
@@ -28,9 +30,14 @@ pub mod control;
 pub mod control_auth;
 pub mod credential;
 pub mod fw;
+pub mod images;
 pub mod inventory;
 pub mod libvirt;
 pub mod net;
-pub mod netns;
+// Entering the data plane's network namespace. Lives in `lnvps_netlink` with
+// the netlink code that needs it, and is re-exported because a node's firewall
+// and libvirt config reach for it by this path.
+pub use lnvps_netlink::netns;
 pub mod tls;
+pub mod underlay;
 pub mod wgkey;

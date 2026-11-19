@@ -109,6 +109,9 @@ pub enum AdminRouterKind {
     Mikrotik,
     OvhAdditionalIp,
     LinuxSsh,
+    /// A route server running `lvd`, the LNVPS VPN daemon, which asks LNVPS
+    /// what to be rather than being told. Serialised as `lvd`.
+    Lvd,
 }
 
 impl From<RouterKind> for AdminRouterKind {
@@ -117,6 +120,7 @@ impl From<RouterKind> for AdminRouterKind {
             RouterKind::Mikrotik => AdminRouterKind::Mikrotik,
             RouterKind::OvhAdditionalIp => AdminRouterKind::OvhAdditionalIp,
             RouterKind::LinuxSsh => AdminRouterKind::LinuxSsh,
+            RouterKind::Lvd => AdminRouterKind::Lvd,
             // MockRouter is a test-only variant and should never appear in production.
             // Map it to Mikrotik as a safe fallback rather than panicking.
             RouterKind::MockRouter => AdminRouterKind::Mikrotik,
@@ -130,6 +134,7 @@ impl From<AdminRouterKind> for RouterKind {
             AdminRouterKind::Mikrotik => RouterKind::Mikrotik,
             AdminRouterKind::OvhAdditionalIp => RouterKind::OvhAdditionalIp,
             AdminRouterKind::LinuxSsh => RouterKind::LinuxSsh,
+            AdminRouterKind::Lvd => RouterKind::Lvd,
         }
     }
 }
@@ -1083,13 +1088,13 @@ impl AdminVmInfo {
             disabled: vm.disabled,
             admin_notes: vm.admin_notes.clone(),
             subscription,
-            traffic: ApiVmTrafficSummary {
+            traffic: ApiVmTrafficSummary::new(
                 transfer_gb,
-                period_start: batch.period_start,
-                period_end: batch.period_end,
-                bytes_out: traffic_out,
-                bytes_in: traffic_in,
-            },
+                batch.period_start,
+                batch.period_end,
+                traffic_out,
+                traffic_in,
+            ),
         })
     }
 }
@@ -1212,6 +1217,9 @@ pub struct AdminHostInfo {
     /// renewals are capped at this date.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sunset_date: Option<chrono::DateTime<chrono::Utc>>,
+    /// Host has been deleted: hidden from host listings, kept only so the VMs
+    /// that ran on it still resolve their host.
+    pub deleted: bool,
 }
 
 #[derive(Serialize)]
@@ -1321,6 +1329,23 @@ pub struct AdminRegionInfo {
     /// Active IPv6 assignments in this region. There is no matching "available"
     /// figure: an IPv6 range's free space is effectively unbounded.
     pub ipv6_assignments: u64,
+    /// IP ranges configured here, enabled or not.
+    pub ip_ranges: u64,
+    /// VM templates sold here, enabled or not.
+    pub vm_templates: u64,
+    /// App clusters here.
+    pub app_clusters: u64,
+    /// Live app deployments on those clusters.
+    pub app_deployments: u64,
+    /// Tunnel pools terminating here.
+    pub tunnel_pools: u64,
+    /// VPN services sold here, counted once each however many interfaces they
+    /// terminate on in this region.
+    pub vpn_services: u64,
+    /// Routers serving the region, through the tunnel pools that terminate here
+    /// and the access policies its IP ranges use. A router has no region column,
+    /// so this is what "routers in a region" can mean.
+    pub routers: u64,
 }
 
 #[derive(Deserialize)]
@@ -1388,6 +1413,7 @@ impl AdminHostInfo {
             ssh_user: host.ssh_user,
             ssh_key_configured,
             sunset_date: host.sunset_date,
+            deleted: host.deleted,
         }
     }
 
@@ -1442,6 +1468,7 @@ impl AdminHostInfo {
             ssh_user: host.ssh_user,
             ssh_key_configured,
             sunset_date: host.sunset_date,
+            deleted: host.deleted,
         }
     }
 
@@ -1502,6 +1529,7 @@ impl AdminHostInfo {
             ssh_user: capacity.host.ssh_user.clone(),
             ssh_key_configured,
             sunset_date: capacity.host.sunset_date,
+            deleted: capacity.host.deleted,
         }
     }
 
@@ -1562,6 +1590,7 @@ impl AdminHostInfo {
             ssh_user: admin_host.host.ssh_user,
             ssh_key_configured,
             sunset_date: admin_host.host.sunset_date,
+            deleted: admin_host.host.deleted,
         }
     }
 
@@ -1628,6 +1657,7 @@ impl AdminHostInfo {
                     ssh_user: capacity.host.ssh_user.clone(),
                     ssh_key_configured,
                     sunset_date: capacity.host.sunset_date,
+                    deleted: capacity.host.deleted,
                 }
             }
             Err(_) => {
@@ -1656,6 +1686,7 @@ pub struct AdminVmOsImageInfo {
     pub active_vm_count: i64, // Number of active (non-deleted) VMs using this image
     pub sha2: Option<String>,
     pub sha2_url: Option<String>,
+    pub encrypted: bool,
 }
 
 #[derive(Deserialize)]
@@ -1671,6 +1702,8 @@ pub struct CreateVmOsImageRequest {
     pub default_username: Option<String>,
     pub sha2: Option<String>,
     pub sha2_url: Option<String>,
+    #[serde(default)]
+    pub encrypted: bool,
 }
 
 #[derive(Deserialize)]
@@ -1698,6 +1731,7 @@ pub struct UpdateVmOsImageRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub sha2_url: Option<Option<String>>,
+    pub encrypted: Option<bool>,
 }
 
 impl AdminVmOsImageInfo {
@@ -1728,6 +1762,7 @@ impl AdminVmOsImageInfo {
             default_username: image.default_username,
             sha2: image.sha2,
             sha2_url: image.sha2_url,
+            encrypted: image.encrypted,
             active_vm_count,
         })
     }
@@ -1751,6 +1786,7 @@ impl From<lnvps_db::VmOsImage> for AdminVmOsImageInfo {
             default_username: image.default_username,
             sha2: image.sha2,
             sha2_url: image.sha2_url,
+            encrypted: image.encrypted,
             active_vm_count: 0, // Default when not using the async method
         }
     }
@@ -1799,6 +1835,7 @@ impl CreateVmOsImageRequest {
             default_username: self.default_username.clone(),
             sha2: self.sha2.clone(),
             sha2_url: self.sha2_url.clone(),
+            encrypted: self.encrypted,
         })
     }
 }
@@ -2062,6 +2099,20 @@ pub struct AdminCustomPricingInfo {
     /// (None = unmetered)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transfer_gb: Option<u32>,
+    pub min_transfer_gb: u32,
+    pub max_transfer_gb: u32,
+    pub transfer_cost_per_tb: u64,
+    pub min_network_mbps: u32,
+    pub max_network_mbps: u32,
+    pub network_cost_per_gbps: u64,
+    /// Billing interval of VMs built from this model. Every rate is the price
+    /// for one such interval.
+    pub interval_amount: u64,
+    pub interval_type: ApiIntervalType,
+    /// Rates (and the disk costs) are in `1/rate_scale` of the currency's
+    /// smallest unit: 1 is plain cents/millisats, a larger scale holds a
+    /// fraction of a cent (e.g. an hourly rate).
+    pub rate_scale: u64,
 }
 
 #[derive(Serialize)]
@@ -2096,9 +2147,17 @@ pub struct AdminCustomTemplateInfo {
     pub region_name: Option<String>,
     /// Currency of `price`, from the pricing model
     pub currency: String,
-    /// Monthly renewal cost in smallest currency units (cents/millisats).
-    /// Custom VMs are always billed monthly.
+    /// Renewal cost of one billing interval (`interval_*`) in smallest currency
+    /// units (cents/millisats), rounded up from the model's finer `rate_scale`.
+    /// For a sub-cent hourly price this overstates what is actually charged;
+    /// use `price_raw` with `rate_scale` for the exact figure.
     pub price: u64,
+    /// The same price in `1/rate_scale` of the smallest unit, unrounded
+    pub price_raw: u64,
+    pub rate_scale: u64,
+    /// The billing interval `price` is for
+    pub interval_amount: u64,
+    pub interval_type: ApiIntervalType,
     pub ip4_count: u16,
     pub ip6_count: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2223,8 +2282,8 @@ pub struct UpdateCustomTemplateRequest {
 #[derive(Serialize)]
 pub struct AdminCustomTemplateUpdateResult {
     pub template: AdminCustomTemplateInfo,
-    /// New monthly renewal amount written to each VM's subscription line item,
-    /// in smallest units of `template.currency`.
+    /// New renewal amount of one billing interval, written to each VM's
+    /// subscription line item, in smallest units of `template.currency`.
     pub renewal_amount: u64,
     /// One job per VM using the template. Empty when nothing had to be applied
     /// to a host (an orphaned template, or a spec-neutral edit).
@@ -2322,6 +2381,17 @@ pub struct UpdateCustomPricingRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub transfer_gb: Option<Option<u32>>,
+    pub min_transfer_gb: Option<u32>,
+    pub max_transfer_gb: Option<u32>,
+    pub transfer_cost_per_tb: Option<u64>,
+    pub min_network_mbps: Option<u32>,
+    pub max_network_mbps: Option<u32>,
+    pub network_cost_per_gbps: Option<u64>,
+    /// Billing interval; defaults to 1 month. Every rate is the price for one interval.
+    pub interval_amount: Option<u64>,
+    pub interval_type: Option<ApiIntervalType>,
+    /// Rates are in `1/rate_scale` of the currency's smallest unit; defaults to 1.
+    pub rate_scale: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -2373,6 +2443,17 @@ pub struct CreateCustomPricingRequest {
     pub cpu_limit: Option<f32>,
     /// Monthly outbound transfer quota in GB (None = unmetered)
     pub transfer_gb: Option<u32>,
+    pub min_transfer_gb: Option<u32>,
+    pub max_transfer_gb: Option<u32>,
+    pub transfer_cost_per_tb: Option<u64>,
+    pub min_network_mbps: Option<u32>,
+    pub max_network_mbps: Option<u32>,
+    pub network_cost_per_gbps: Option<u64>,
+    /// Billing interval; defaults to 1 month. Every rate is the price for one interval.
+    pub interval_amount: Option<u64>,
+    pub interval_type: Option<ApiIntervalType>,
+    /// Rates are in `1/rate_scale` of the currency's smallest unit; defaults to 1.
+    pub rate_scale: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -2390,6 +2471,11 @@ pub struct CopyCustomPricingRequest {
     pub name: String,
     pub region_id: Option<u64>,
     pub enabled: Option<bool>,
+    /// Billing interval for the copy; defaults to the source's. When it
+    /// differs, every rate is converted to the new interval so the copy
+    /// charges the same over time.
+    pub interval_amount: Option<u64>,
+    pub interval_type: Option<ApiIntervalType>,
 }
 
 // Company Management Models
@@ -2511,7 +2597,35 @@ pub struct AdminReferralInfo {
     /// `max(system minimum, this value)`, judged against the referrer's total
     /// outstanding commission across every currency.
     pub payout_threshold: Option<u64>,
+    pub auto_payout_approved: bool,
     pub created: DateTime<Utc>,
+}
+
+#[derive(Serialize)]
+pub struct AdminReferralUsageInfo {
+    pub vm_id: u64,
+    pub user_id: u64,
+    pub created: DateTime<Utc>,
+    pub amount: u64,
+    pub refunded: u64,
+    pub currency: String,
+    pub effective_rate: f32,
+    pub commission: u64,
+}
+
+impl From<lnvps_db::ReferralCostUsage> for AdminReferralUsageInfo {
+    fn from(u: lnvps_db::ReferralCostUsage) -> Self {
+        Self {
+            commission: u.commission(),
+            vm_id: u.vm_id,
+            user_id: u.user_id,
+            created: u.created,
+            amount: u.amount,
+            refunded: u.refunded,
+            currency: u.currency,
+            effective_rate: u.effective_rate,
+        }
+    }
 }
 
 /// Per-currency earned commission for a referral.
@@ -2601,6 +2715,14 @@ impl From<lnvps_db::ReferralPayout> for AdminReferralPayoutInfo {
     }
 }
 
+#[derive(Serialize)]
+pub struct AdminReferralListItem {
+    #[serde(flatten)]
+    pub referral: AdminReferralInfo,
+    pub outstanding_total_msat: u64,
+    pub paid_total_msat: u64,
+}
+
 /// Full referral detail: enrollment + earnings + payout history + counts.
 #[derive(Serialize)]
 pub struct AdminReferralDetail {
@@ -2614,6 +2736,7 @@ pub struct AdminReferralDetail {
     /// with `payout_threshold` (satoshis × 1000) and the system minimum.
     /// Currencies with no available rate are excluded.
     pub outstanding_total_msat: u64,
+    pub paid_total_msat: u64,
     pub payouts: Vec<AdminReferralPayoutInfo>,
     /// Referred VMs that made at least one payment.
     pub referrals_success: u64,
@@ -2644,6 +2767,8 @@ pub struct AdminUpdateReferralRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub payout_threshold: Option<Option<u64>>,
+    #[serde(default)]
+    pub auto_payout_approved: Option<bool>,
 }
 
 /// Create a manual payout record for a referral.
@@ -3283,6 +3408,9 @@ pub enum AdminVmHistoryActionType {
     Transferred,
     Refunded,
     Migrated,
+    SnapshotCreated,
+    SnapshotRestored,
+    SnapshotDeleted,
 }
 
 impl From<VmHistoryActionType> for AdminVmHistoryActionType {
@@ -3304,6 +3432,9 @@ impl From<VmHistoryActionType> for AdminVmHistoryActionType {
             }
             VmHistoryActionType::Transferred => AdminVmHistoryActionType::Transferred,
             VmHistoryActionType::Migrated => AdminVmHistoryActionType::Migrated,
+            VmHistoryActionType::SnapshotCreated => AdminVmHistoryActionType::SnapshotCreated,
+            VmHistoryActionType::SnapshotRestored => AdminVmHistoryActionType::SnapshotRestored,
+            VmHistoryActionType::SnapshotDeleted => AdminVmHistoryActionType::SnapshotDeleted,
         }
     }
 }
@@ -3382,6 +3513,19 @@ pub enum AdminPaymentMethod {
     Paypal,
     Stripe,
     OnChain,
+    #[serde(rename = "fixedfloat")]
+    FixedFloat,
+    Credit,
+}
+
+impl AdminPaymentMethod {
+    pub fn for_payment(method: PaymentMethod, external_data: &str) -> Self {
+        if external_data == "credit" {
+            AdminPaymentMethod::Credit
+        } else {
+            AdminPaymentMethod::from(method)
+        }
+    }
 }
 
 impl From<PaymentMethod> for AdminPaymentMethod {
@@ -3392,6 +3536,7 @@ impl From<PaymentMethod> for AdminPaymentMethod {
             PaymentMethod::Paypal => AdminPaymentMethod::Paypal,
             PaymentMethod::Stripe => AdminPaymentMethod::Stripe,
             PaymentMethod::OnChain => AdminPaymentMethod::OnChain,
+            PaymentMethod::FixedFloat => AdminPaymentMethod::FixedFloat,
         }
     }
 }
@@ -3467,7 +3612,10 @@ pub struct AdminVmPaymentInfo {
     /// it — this only says which code was used and how much came off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discount: Option<AdminPaymentDiscountInfo>,
-    // Note: external_data is omitted as it may contain sensitive payment provider data
+    /// The swap order behind a `fixedfloat` payment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap: Option<AdminSwapInfo>,
+    // Note: external_data is otherwise omitted as it may contain sensitive payment provider data
 }
 
 /// Refunds recorded against one payment, with what is still refundable on it.
@@ -3503,7 +3651,10 @@ impl AdminVmPaymentInfo {
             processing_fee: payment.processing_fee,
             currency: payment.currency.clone(),
             company_base_currency,
-            payment_method: AdminPaymentMethod::from(payment.payment_method),
+            payment_method: AdminPaymentMethod::for_payment(
+                payment.payment_method,
+                payment.external_data.as_str(),
+            ),
             external_id: payment.external_id.clone(),
             is_paid: payment.is_paid,
             paid_at: payment.paid_at,
@@ -3511,6 +3662,7 @@ impl AdminVmPaymentInfo {
             payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
             refunded_payment_id: payment.refunded_payment_id.as_ref().map(hex::encode),
             discount: None,
+            swap: AdminSwapInfo::from_payment(payment.payment_method, &payment.external_data),
         }
     }
 
@@ -3660,6 +3812,8 @@ pub struct AdminCreateVmRequest {
     pub ssh_key_id: u64,
     pub ref_code: Option<String>,
     pub reason: Option<String>,
+    #[serde(default)]
+    pub host_id: Option<u64>,
 }
 
 /// Create a VM from a custom spec, priced against a custom pricing plan.
@@ -3932,6 +4086,10 @@ pub struct AdminSubscriptionLineItemInfo {
     /// Typed reference to the resource this line item bills for, resolved from
     /// `subscription_type` (`null` when there is no linked resource).
     pub resource: Option<ApiSubscriptionLineItemResource>,
+    /// When this line item stopped billing on its own (its resource was
+    /// deleted while the subscription bills other products). `null` while
+    /// active.
+    pub deactivated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Deserialize)]
@@ -3984,6 +4142,7 @@ impl AdminSubscriptionLineItemInfo {
             setup_amount: line_item.setup_amount,
             configuration: line_item.configuration,
             resource,
+            deactivated_at: line_item.deactivated_at,
         }
     }
 }
@@ -4003,6 +4162,38 @@ impl AdminCreateSubscriptionLineItemRequest {
             amount: self.amount,
             setup_amount: self.setup_amount,
             configuration: self.configuration.clone(),
+            deactivated_at: None,
+            parent_line_item_id: None,
+        })
+    }
+}
+
+/// The swap behind a `fixedfloat` payment. The order token is left out: it
+/// authorises actions on the FixedFloat order.
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+pub struct AdminSwapInfo {
+    pub coin: String,
+    pub order_id: String,
+    pub deposit_address: String,
+    pub deposit_amount: String,
+    pub receive_address: String,
+}
+
+impl AdminSwapInfo {
+    pub fn from_payment(
+        method: lnvps_db::PaymentMethod,
+        external_data: &lnvps_db::EncryptedString,
+    ) -> Option<Self> {
+        if method != lnvps_db::PaymentMethod::FixedFloat {
+            return None;
+        }
+        let data = lnvps_api_common::SwapData::parse(external_data.as_str()).ok()?;
+        Some(Self {
+            coin: data.coin,
+            order_id: data.order_id,
+            deposit_address: data.deposit_address,
+            deposit_amount: data.deposit_amount,
+            receive_address: data.receive_address,
         })
     }
 }
@@ -4035,6 +4226,9 @@ pub struct AdminSubscriptionPaymentInfo {
     /// it — this only says which code was used and how much came off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discount: Option<AdminPaymentDiscountInfo>,
+    /// The swap order behind a `fixedfloat` payment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap: Option<AdminSwapInfo>,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -4045,6 +4239,7 @@ pub enum ApiSubscriptionPaymentType {
     /// Money returned to the customer: `amount`/`tax` are magnitudes to
     /// subtract from earnings, not another sale.
     Refund,
+    AddonChange,
 }
 
 impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
@@ -4054,6 +4249,9 @@ impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
             lnvps_db::SubscriptionPaymentType::Renewal => ApiSubscriptionPaymentType::Renewal,
             lnvps_db::SubscriptionPaymentType::Upgrade => ApiSubscriptionPaymentType::Upgrade,
             lnvps_db::SubscriptionPaymentType::Refund => ApiSubscriptionPaymentType::Refund,
+            lnvps_db::SubscriptionPaymentType::AddonChange => {
+                ApiSubscriptionPaymentType::AddonChange
+            }
         }
     }
 }
@@ -4065,12 +4263,16 @@ impl From<ApiSubscriptionPaymentType> for lnvps_db::SubscriptionPaymentType {
             ApiSubscriptionPaymentType::Renewal => lnvps_db::SubscriptionPaymentType::Renewal,
             ApiSubscriptionPaymentType::Upgrade => lnvps_db::SubscriptionPaymentType::Upgrade,
             ApiSubscriptionPaymentType::Refund => lnvps_db::SubscriptionPaymentType::Refund,
+            ApiSubscriptionPaymentType::AddonChange => {
+                lnvps_db::SubscriptionPaymentType::AddonChange
+            }
         }
     }
 }
 
 impl AdminSubscriptionPaymentInfo {
     pub fn new(payment: lnvps_db::SubscriptionPayment, company_base_currency: String) -> Self {
+        let swap = AdminSwapInfo::from_payment(payment.payment_method, &payment.external_data);
         Self {
             id: hex::encode(&payment.id),
             subscription_id: payment.subscription_id,
@@ -4080,7 +4282,10 @@ impl AdminSubscriptionPaymentInfo {
             amount: payment.amount,
             currency: payment.currency,
             company_base_currency,
-            payment_method: AdminPaymentMethod::from(payment.payment_method),
+            payment_method: AdminPaymentMethod::for_payment(
+                payment.payment_method,
+                payment.external_data.as_str(),
+            ),
             payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
             external_id: payment.external_id,
             is_paid: payment.is_paid,
@@ -4091,6 +4296,7 @@ impl AdminSubscriptionPaymentInfo {
             tax: payment.tax,
             processing_fee: payment.processing_fee,
             discount: None,
+            swap,
         }
     }
 
@@ -4104,6 +4310,7 @@ impl AdminSubscriptionPaymentInfo {
     }
 
     pub fn from_with_company(payment: lnvps_db::SubscriptionPaymentWithCompany) -> Self {
+        let swap = AdminSwapInfo::from_payment(payment.payment_method, &payment.external_data);
         Self {
             id: hex::encode(&payment.id),
             subscription_id: payment.subscription_id,
@@ -4113,7 +4320,10 @@ impl AdminSubscriptionPaymentInfo {
             amount: payment.amount,
             currency: payment.currency,
             company_base_currency: payment.company_base_currency,
-            payment_method: AdminPaymentMethod::from(payment.payment_method),
+            payment_method: AdminPaymentMethod::for_payment(
+                payment.payment_method,
+                payment.external_data.as_str(),
+            ),
             payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
             external_id: payment.external_id,
             is_paid: payment.is_paid,
@@ -4124,6 +4334,7 @@ impl AdminSubscriptionPaymentInfo {
             tax: payment.tax,
             processing_fee: payment.processing_fee,
             discount: None,
+            swap,
         }
     }
 }
@@ -4432,6 +4643,7 @@ pub enum AdminPaymentMethodType {
     Paypal,
     Stripe,
     OnChain,
+    FixedFloat,
 }
 
 impl From<lnvps_db::PaymentMethod> for AdminPaymentMethodType {
@@ -4442,6 +4654,7 @@ impl From<lnvps_db::PaymentMethod> for AdminPaymentMethodType {
             lnvps_db::PaymentMethod::Paypal => AdminPaymentMethodType::Paypal,
             lnvps_db::PaymentMethod::Stripe => AdminPaymentMethodType::Stripe,
             lnvps_db::PaymentMethod::OnChain => AdminPaymentMethodType::OnChain,
+            lnvps_db::PaymentMethod::FixedFloat => AdminPaymentMethodType::FixedFloat,
         }
     }
 }
@@ -4454,6 +4667,7 @@ impl From<AdminPaymentMethodType> for lnvps_db::PaymentMethod {
             AdminPaymentMethodType::Paypal => lnvps_db::PaymentMethod::Paypal,
             AdminPaymentMethodType::Stripe => lnvps_db::PaymentMethod::Stripe,
             AdminPaymentMethodType::OnChain => lnvps_db::PaymentMethod::OnChain,
+            AdminPaymentMethodType::FixedFloat => lnvps_db::PaymentMethod::FixedFloat,
         }
     }
 }
@@ -4477,6 +4691,17 @@ pub struct SanitizedOnChainConfig {
     pub address_type: String,
     pub account: Option<String>,
     pub min_confirmations: u32,
+    pub unpaid_purge_grace_hours: u32,
+}
+
+/// Sanitized FixedFloat config (hides api_key and api_secret)
+#[derive(Serialize)]
+pub struct SanitizedFixedFloatConfig {
+    pub url: Option<String>,
+    pub refcode: Option<String>,
+    pub afftax: Option<f32>,
+    pub has_api_key: bool,
+    pub has_api_secret: bool,
 }
 
 /// Sanitized Revolut config (hides token and webhook_secret)
@@ -4519,6 +4744,8 @@ pub enum SanitizedProviderConfig {
     Stripe(SanitizedStripeConfig),
     Paypal(SanitizedPaypalConfig),
     OnChain(SanitizedOnChainConfig),
+    #[serde(rename = "fixedfloat")]
+    FixedFloat(SanitizedFixedFloatConfig),
 }
 
 impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
@@ -4565,6 +4792,16 @@ impl From<&lnvps_db::ProviderConfig> for SanitizedProviderConfig {
                     address_type: format!("{:?}", cfg.address_type),
                     account: cfg.account.clone(),
                     min_confirmations: cfg.min_confirmations,
+                    unpaid_purge_grace_hours: cfg.unpaid_purge_grace_hours,
+                })
+            }
+            lnvps_db::ProviderConfig::FixedFloat(cfg) => {
+                SanitizedProviderConfig::FixedFloat(SanitizedFixedFloatConfig {
+                    url: cfg.url.clone(),
+                    refcode: cfg.refcode.clone(),
+                    afftax: cfg.afftax,
+                    has_api_key: !cfg.api_key.is_empty(),
+                    has_api_secret: !cfg.api_secret.is_empty(),
                 })
             }
         }
@@ -4647,6 +4884,39 @@ pub struct CreatePaymentMethodConfigRequest {
     pub supported_currencies: Option<Vec<String>>,
 }
 
+/// Validate the currency codes an admin sets on a payment method config.
+///
+/// The `fixedfloat` method lists the coins a customer can pay with, which must be
+/// cryptocurrencies other than BTC. Every other method lists billing currencies,
+/// which cannot be a coin because coins have no exchange rate to price against.
+pub fn validate_supported_currencies(
+    method: lnvps_db::PaymentMethod,
+    currencies: &[String],
+) -> anyhow::Result<()> {
+    use payments_rs::currency::Currency;
+    for code in currencies {
+        let currency = code
+            .trim()
+            .parse::<Currency>()
+            .map_err(|_| anyhow!("Unknown currency code: {}", code))?;
+        let is_coin = currency.is_crypto() && currency != Currency::BTC;
+        if method == lnvps_db::PaymentMethod::FixedFloat {
+            if !is_coin {
+                return Err(anyhow!(
+                    "{} is not a coin. The FixedFloat payment method accepts XMR, LTC, ETH and USDTTRC",
+                    code
+                ));
+            }
+        } else if is_coin {
+            return Err(anyhow!(
+                "{} can only be listed on the FixedFloat payment method",
+                code
+            ));
+        }
+    }
+    Ok(())
+}
+
 impl CreatePaymentMethodConfigRequest {
     pub fn to_payment_method_config(&self) -> anyhow::Result<lnvps_db::PaymentMethodConfig> {
         if self.name.trim().is_empty() {
@@ -4686,6 +4956,7 @@ impl CreatePaymentMethodConfigRequest {
             .as_ref()
             .map(|s| s.trim().to_uppercase());
         if let Some(currencies) = &self.supported_currencies {
+            validate_supported_currencies(payment_config.payment_method, currencies)?;
             payment_config.supported_currencies = lnvps_db::CommaSeparated::new(
                 currencies.iter().map(|s| s.trim().to_uppercase()).collect(),
             );
@@ -4789,6 +5060,29 @@ pub struct PartialOnChainConfig {
     )]
     pub account: Option<Option<String>>,
     pub min_confirmations: Option<u32>,
+    pub unpaid_purge_grace_hours: Option<u32>,
+}
+
+/// Partial FixedFloat config for updates
+#[derive(Deserialize)]
+pub struct PartialFixedFloatConfig {
+    pub api_key: Option<String>,
+    pub api_secret: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub url: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub refcode: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub afftax: Option<Option<f32>>,
 }
 
 /// Partial provider configuration for updates - only provided fields will be updated
@@ -4801,6 +5095,8 @@ pub enum PartialProviderConfig {
     Paypal(PartialPaypalConfig),
     #[serde(rename = "onchain")]
     OnChain(PartialOnChainConfig),
+    #[serde(rename = "fixedfloat")]
+    FixedFloat(PartialFixedFloatConfig),
 }
 
 impl PartialProviderConfig {
@@ -4882,7 +5178,23 @@ impl PartialProviderConfig {
                     min_confirmations: partial
                         .min_confirmations
                         .unwrap_or(existing.min_confirmations),
+                    unpaid_purge_grace_hours: partial
+                        .unpaid_purge_grace_hours
+                        .unwrap_or(existing.unpaid_purge_grace_hours),
                 }))
+            }
+            (PartialProviderConfig::FixedFloat(partial), ProviderConfig::FixedFloat(existing)) => {
+                Ok(ProviderConfig::FixedFloat(
+                    lnvps_db::FixedFloatProviderConfig {
+                        api_key: partial.api_key.unwrap_or_else(|| existing.api_key.clone()),
+                        api_secret: partial
+                            .api_secret
+                            .unwrap_or_else(|| existing.api_secret.clone()),
+                        url: partial.url.unwrap_or_else(|| existing.url.clone()),
+                        refcode: partial.refcode.unwrap_or_else(|| existing.refcode.clone()),
+                        afftax: partial.afftax.unwrap_or(existing.afftax),
+                    },
+                ))
             }
             _ => Err(anyhow!(
                 "Cannot change provider type during update. Create a new config instead."
@@ -4898,6 +5210,7 @@ impl PartialProviderConfig {
             PartialProviderConfig::Stripe(_) => "stripe",
             PartialProviderConfig::Paypal(_) => "paypal",
             PartialProviderConfig::OnChain(_) => "onchain",
+            PartialProviderConfig::FixedFloat(_) => "fixedfloat",
         }
     }
 }
@@ -4961,6 +5274,215 @@ pub struct AdminUpdateUserPaymentMethodRequest {
 
 #[cfg(test)]
 mod tests {
+    use lnvps_db::PaymentMethod;
+
+    fn codes(c: &[&str]) -> Vec<String> {
+        c.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn swap_payment(
+        method: lnvps_db::PaymentMethod,
+        external_data: String,
+    ) -> lnvps_db::SubscriptionPayment {
+        lnvps_db::SubscriptionPayment {
+            id: vec![3; 32],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now(),
+            amount: 1000,
+            currency: "BTC".to_string(),
+            payment_method: method,
+            payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
+            external_data: lnvps_db::EncryptedString::new(external_data),
+            external_id: None,
+            is_paid: false,
+            rate: 1.0,
+            time_value: Some(2_592_000),
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+            renewal_source: None,
+        }
+    }
+
+    fn swap_json() -> String {
+        lnvps_api_common::SwapData {
+            coin: "XMR".to_string(),
+            order_id: "ABC123".to_string(),
+            order_token: "secret-token".to_string(),
+            deposit_address: "4deposit".to_string(),
+            deposit_amount: "0.5".to_string(),
+            receive_address: "bc1qours".to_string(),
+        }
+        .to_json()
+        .unwrap()
+    }
+
+    #[test]
+    fn fixedfloat_payment_shows_the_swap_without_the_token() {
+        let payment = swap_payment(lnvps_db::PaymentMethod::FixedFloat, swap_json());
+
+        let sub = AdminSubscriptionPaymentInfo::new(payment.clone(), "EUR".to_string());
+        let vm = AdminVmPaymentInfo::from_subscription_payment(&payment, 7, "EUR".to_string());
+
+        for json in [
+            serde_json::to_value(&sub).unwrap(),
+            serde_json::to_value(&vm).unwrap(),
+        ] {
+            assert_eq!(json["swap"]["coin"], "XMR");
+            assert_eq!(json["swap"]["order_id"], "ABC123");
+            assert_eq!(json["swap"]["deposit_address"], "4deposit");
+            assert_eq!(json["swap"]["deposit_amount"], "0.5");
+            assert_eq!(json["swap"]["receive_address"], "bc1qours");
+            assert!(!json.to_string().contains("secret-token"));
+        }
+    }
+
+    #[test]
+    fn fixedfloat_payment_with_company_shows_the_swap() {
+        let p = swap_payment(lnvps_db::PaymentMethod::FixedFloat, swap_json());
+        let with_company = lnvps_db::SubscriptionPaymentWithCompany {
+            id: p.id,
+            subscription_id: p.subscription_id,
+            user_id: p.user_id,
+            created: p.created,
+            expires: p.expires,
+            amount: p.amount,
+            currency: p.currency,
+            payment_method: p.payment_method,
+            payment_type: p.payment_type,
+            external_data: p.external_data,
+            external_id: p.external_id,
+            is_paid: p.is_paid,
+            rate: p.rate,
+            time_value: p.time_value,
+            metadata: p.metadata,
+            tax: p.tax,
+            processing_fee: p.processing_fee,
+            paid_at: p.paid_at,
+            tax_rate: p.tax_rate,
+            tax_country_code: p.tax_country_code,
+            tax_treatment: p.tax_treatment,
+            tax_evidence: p.tax_evidence,
+            tax_breakdown: p.tax_breakdown,
+            refunded_payment_id: p.refunded_payment_id,
+            renewal_source: p.renewal_source,
+            company_id: 1,
+            company_name: "Co".to_string(),
+            company_base_currency: "EUR".to_string(),
+            vm_id: None,
+            host_id: None,
+            host_name: None,
+            region_id: None,
+            region_name: None,
+            user_country_code: None,
+            user_geo_country_code: None,
+            user_billing_tax_id: None,
+        };
+
+        let json = serde_json::to_value(AdminSubscriptionPaymentInfo::from_with_company(
+            with_company,
+        ))
+        .unwrap();
+
+        assert_eq!(json["swap"]["order_id"], "ABC123");
+        assert!(!json.to_string().contains("secret-token"));
+    }
+
+    #[test]
+    fn other_payments_have_no_swap() {
+        let payment = swap_payment(lnvps_db::PaymentMethod::OnChain, swap_json());
+        let json = serde_json::to_value(AdminSubscriptionPaymentInfo::new(
+            payment.clone(),
+            "EUR".to_string(),
+        ))
+        .unwrap();
+        assert!(json.get("swap").is_none());
+        let json = serde_json::to_value(AdminVmPaymentInfo::from_subscription_payment(
+            &payment,
+            1,
+            "EUR".to_string(),
+        ))
+        .unwrap();
+        assert!(json.get("swap").is_none());
+    }
+
+    #[test]
+    fn fixedfloat_payment_with_unreadable_data_has_no_swap() {
+        let payment = swap_payment(lnvps_db::PaymentMethod::FixedFloat, "not json".to_string());
+        let json = serde_json::to_value(AdminSubscriptionPaymentInfo::new(
+            payment,
+            "EUR".to_string(),
+        ))
+        .unwrap();
+        assert!(json.get("swap").is_none());
+    }
+
+    #[test]
+    fn fixedfloat_method_wire_names() {
+        assert_eq!(
+            serde_json::to_string(&AdminPaymentMethod::FixedFloat).unwrap(),
+            "\"fixedfloat\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AdminPaymentMethodType::FixedFloat).unwrap(),
+            "\"fixedfloat\""
+        );
+        assert_eq!(
+            lnvps_db::PaymentMethod::from(AdminPaymentMethodType::FixedFloat),
+            lnvps_db::PaymentMethod::FixedFloat
+        );
+        assert_eq!(
+            AdminPaymentMethod::from(lnvps_db::PaymentMethod::FixedFloat),
+            AdminPaymentMethod::FixedFloat
+        );
+    }
+
+    #[test]
+    fn fixedfloat_method_lists_only_coins() {
+        assert!(
+            validate_supported_currencies(
+                PaymentMethod::FixedFloat,
+                &codes(&["XMR", "ltc", "ETH", "USDTTRC"])
+            )
+            .is_ok()
+        );
+        assert!(validate_supported_currencies(PaymentMethod::FixedFloat, &[]).is_ok());
+        for bad in ["BTC", "EUR", "USD", "DOGE"] {
+            assert!(
+                validate_supported_currencies(PaymentMethod::FixedFloat, &codes(&[bad])).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_methods_never_list_coins() {
+        for method in [
+            PaymentMethod::Lightning,
+            PaymentMethod::OnChain,
+            PaymentMethod::Revolut,
+            PaymentMethod::Stripe,
+            PaymentMethod::Paypal,
+        ] {
+            assert!(validate_supported_currencies(method, &codes(&["EUR", "BTC", "usd"])).is_ok());
+            for coin in ["XMR", "LTC", "ETH", "USDTTRC"] {
+                assert!(
+                    validate_supported_currencies(method, &codes(&[coin])).is_err(),
+                    "{method} {coin}"
+                );
+            }
+            assert!(validate_supported_currencies(method, &codes(&["DOGE"])).is_err());
+        }
+    }
     use super::*;
 
     /// Per-disk usage is attached to each configured disk, and a disk the
@@ -5144,11 +5666,12 @@ mod tests {
             address_type: OnChainAddressType::WitnessPubkeyHash,
             account: Some("orders".to_string()),
             min_confirmations: 1,
+            unpaid_purge_grace_hours: 24,
         });
 
         // Only change the URL + confirmations; everything else is preserved.
         let partial: PartialProviderConfig = serde_json::from_str(
-            r#"{"type":"onchain","url":"https://new:10009","min_confirmations":3}"#,
+            r#"{"type":"onchain","url":"https://new:10009","min_confirmations":3,"unpaid_purge_grace_hours":72}"#,
         )
         .unwrap();
         let merged = partial.merge_with(&existing).unwrap();
@@ -5156,6 +5679,7 @@ mod tests {
             ProviderConfig::OnChain(c) => {
                 assert_eq!(c.url, "https://new:10009");
                 assert_eq!(c.min_confirmations, 3);
+                assert_eq!(c.unpaid_purge_grace_hours, 72);
                 assert_eq!(c.cert_path, PathBuf::from("/old/tls.cert"));
                 assert_eq!(c.address_type, OnChainAddressType::WitnessPubkeyHash);
                 assert_eq!(c.account, Some("orders".to_string()));
@@ -5167,7 +5691,10 @@ mod tests {
         let clear: PartialProviderConfig =
             serde_json::from_str(r#"{"type":"onchain","account":null}"#).unwrap();
         match clear.merge_with(&existing).unwrap() {
-            ProviderConfig::OnChain(c) => assert_eq!(c.account, None),
+            ProviderConfig::OnChain(c) => {
+                assert_eq!(c.account, None);
+                assert_eq!(c.unpaid_purge_grace_hours, 24);
+            }
             _ => panic!("expected OnChain"),
         }
     }
@@ -5217,6 +5744,24 @@ mod tests {
             req.to_vm_os_image().unwrap().cpu_arch,
             lnvps_db::CpuArch::X86_64
         );
+    }
+
+    #[test]
+    fn test_vm_os_image_requests_carry_encrypted() {
+        let json = r#"{"distribution":"nixos","flavour":"cloudinit","version":"24.11","enabled":true,"release_date":"2026-01-01T00:00:00Z","url":"https://example.com/image.qcow2","encrypted":true}"#;
+        let req: CreateVmOsImageRequest = serde_json::from_str(json).unwrap();
+        let image = req.to_vm_os_image().unwrap();
+        assert!(image.encrypted);
+        assert!(AdminVmOsImageInfo::from(image).encrypted);
+
+        let json = r#"{"distribution":"nixos","flavour":"cloudinit","version":"24.11","enabled":true,"release_date":"2026-01-01T00:00:00Z","url":"https://example.com/image.qcow2"}"#;
+        let req: CreateVmOsImageRequest = serde_json::from_str(json).unwrap();
+        assert!(!req.to_vm_os_image().unwrap().encrypted);
+
+        let req: UpdateVmOsImageRequest = serde_json::from_str(r#"{"encrypted": true}"#).unwrap();
+        assert_eq!(req.encrypted, Some(true));
+        let req: UpdateVmOsImageRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(req.encrypted, None);
     }
 
     #[test]
@@ -5420,6 +5965,7 @@ pub struct AdminAppInfo {
     pub seo_title: Option<String>,
     /// Per-app override for the public page meta description (English only).
     pub seo_description: Option<String>,
+    pub category_translations: Option<std::collections::BTreeMap<String, String>>,
     /// docker-compose-style YAML defining the app.
     pub compose: String,
     /// Recurring price in the smallest currency unit (cents / millisats).
@@ -5533,6 +6079,10 @@ impl AdminAppInfo {
             category: a.category,
             seo_title: a.seo_title,
             seo_description: a.seo_description,
+            category_translations: a
+                .category_translations
+                .as_deref()
+                .and_then(|r| serde_json::from_str(r).ok()),
             compose: a.compose,
             amount: a.amount,
             currency: a.currency,
@@ -5569,6 +6119,9 @@ pub struct AdminCreateAppRequest {
     pub seo_title: Option<String>,
     /// Per-app override for the public page meta description (English only).
     pub seo_description: Option<String>,
+    /// Language code (`de`, `ja`) to translated `category`. Served when the
+    /// request's `Accept-Language` matches; wins over the built-in table.
+    pub category_translations: Option<std::collections::BTreeMap<String, String>>,
     /// docker-compose-style YAML defining the app.
     pub compose: String,
     pub amount: u64,
@@ -5633,6 +6186,11 @@ pub struct AdminUpdateAppRequest {
         deserialize_with = "lnvps_api_common::deserialize_nullable_option"
     )]
     pub seo_description: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "lnvps_api_common::deserialize_nullable_option"
+    )]
+    pub category_translations: Option<Option<std::collections::BTreeMap<String, String>>>,
     pub compose: Option<String>,
     pub amount: Option<u64>,
     pub currency: Option<String>,
@@ -5662,6 +6220,10 @@ pub struct AdminAppClusterInfo {
     pub capacity_cpu_milli: u64,
     pub capacity_memory_bytes: u64,
     pub capacity_storage_bytes: u64,
+    /// DNS server that publishes SRV records for L4 (game server) deployments.
+    pub dns_server_id: Option<u64>,
+    /// Zone on that server holding `ingress_domain`.
+    pub dns_zone_id: Option<String>,
     pub created: DateTime<Utc>,
 }
 
@@ -5676,6 +6238,8 @@ impl From<lnvps_db::AppCluster> for AdminAppClusterInfo {
             capacity_cpu_milli: c.capacity_cpu_milli,
             capacity_memory_bytes: c.capacity_memory_bytes,
             capacity_storage_bytes: c.capacity_storage_bytes,
+            dns_server_id: c.dns_server_id,
+            dns_zone_id: c.dns_zone_id,
             created: c.created,
         }
     }
@@ -5696,6 +6260,8 @@ pub struct AdminAppDeploymentInfo {
     pub name: String,
     pub namespace: String,
     pub hostname: Option<String>,
+    /// Public L4 port allocated for a game server app (`expose: tcp|udp`).
+    pub public_port: Option<u16>,
     /// Customer-owned domain (CNAME'd to `hostname`), served alongside it.
     pub custom_domain: Option<String>,
     /// Whether that domain is served yet. `false` means held: stored, but never
@@ -5734,6 +6300,7 @@ impl From<lnvps_db::AppDeployment> for AdminAppDeploymentInfo {
             name: d.name,
             namespace: d.namespace,
             hostname: d.hostname,
+            public_port: d.public_port,
             custom_domain_verified: d.custom_domain.is_some() && d.custom_domain_verified,
             custom_domain: d.custom_domain,
             desired_state: d.desired_state.to_string(),
@@ -5780,6 +6347,10 @@ pub struct AdminCreateAppClusterRequest {
     pub capacity_memory_bytes: u64,
     #[serde(default)]
     pub capacity_storage_bytes: u64,
+    #[serde(default)]
+    pub dns_server_id: Option<u64>,
+    #[serde(default)]
+    pub dns_zone_id: Option<String>,
 }
 
 /// Update an app cluster (all fields optional; omitted = unchanged).
@@ -5792,6 +6363,12 @@ pub struct AdminUpdateAppClusterRequest {
     pub capacity_cpu_milli: Option<u64>,
     pub capacity_memory_bytes: Option<u64>,
     pub capacity_storage_bytes: Option<u64>,
+    /// Set or clear (`null`) the DNS server; absent leaves it unchanged.
+    #[serde(default, deserialize_with = "crate::admin::model::double_option")]
+    pub dns_server_id: Option<Option<u64>>,
+    /// Set or clear (`null`) the zone; absent leaves it unchanged.
+    #[serde(default, deserialize_with = "crate::admin::model::double_option")]
+    pub dns_zone_id: Option<Option<String>>,
 }
 
 fn default_true() -> bool {

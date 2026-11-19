@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ ! -f /etc/lnvps-node/config.yaml ]; then
+        echo "lnvps-node: no /etc/lnvps-node/config.yaml found." >&2
+        echo "     Copy /etc/lnvps-node/config.example.yaml to config.yaml, set the" >&2
+        echo "     credential, then run:" >&2
+        echo "         chmod 600 /etc/lnvps-node/config.yaml" >&2
+        echo "         lnvps-node check" >&2
+        echo "         systemctl enable --now lnvps-node" >&2
+    else
+        systemctl try-restart lnvps-node.service >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

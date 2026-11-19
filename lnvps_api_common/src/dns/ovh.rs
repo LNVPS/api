@@ -106,6 +106,33 @@ impl DnsServer for OvhDns {
         Ok(())
     }
 
+    async fn list_records(&self, zone: &DnsRef) -> OpResult<Vec<BasicRecord>> {
+        let Some(block) = zone.as_id() else {
+            return Ok(vec![]);
+        };
+        let path_block = block.replace('/', "%2F");
+        let ips: Vec<String> = self
+            .api
+            .get(&format!("v1/ip/{}/reverse", path_block))
+            .await?;
+        let mut records = Vec::new();
+        for ip in ips {
+            let rev: OvhReverse = self
+                .api
+                .get(&format!("v1/ip/{}/reverse/{}", path_block, ip))
+                .await?;
+            records.push(BasicRecord {
+                name: ip.clone(),
+                value: rev.reverse.trim_end_matches('.').to_string(),
+                id: Some(DnsRef::Id(ip.clone())),
+                kind: RecordType::PTR,
+                ip,
+                zone: zone.clone(),
+            });
+        }
+        Ok(records)
+    }
+
     /// OVH reverse DNS is keyed per-IP block and exposes no listable zones.
     async fn list_zones(&self) -> OpResult<Vec<DnsZone>> {
         Ok(vec![])
@@ -124,7 +151,6 @@ struct OvhReverseRequest {
 struct OvhReverse {
     #[allow(dead_code)]
     ip_reverse: String,
-    #[allow(dead_code)]
     reverse: String,
 }
 
@@ -152,6 +178,45 @@ mod tests {
         // No zone -> fall back to the bare IP (standalone service).
         let rec = ptr_record("15.235.3.229", DnsRef::Implicit);
         assert_eq!(OvhDns::block_for(&rec), "15.235.3.229");
+    }
+
+    #[tokio::test]
+    async fn test_list_records_reads_each_reverse_in_block() -> anyhow::Result<()> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/auth/time"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(1_700_000_000i64))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/ip/15.235.3.224%2F28/reverse"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!(["15.235.3.229"])),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/ip/15.235.3.224%2F28/reverse/15.235.3.229"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ipReverse": "15.235.3.229",
+                "reverse": "vm-1.lnvps.cloud."
+            })))
+            .mount(&server)
+            .await;
+
+        let ovh = OvhDns::new(&server.uri(), "ak:as:ck").await?;
+        let zone = DnsRef::Id("15.235.3.224/28".to_string());
+        let records = ovh.list_records(&zone).await?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].ip, "15.235.3.229");
+        assert_eq!(records[0].value, "vm-1.lnvps.cloud");
+        assert_eq!(records[0].id, Some(DnsRef::Id("15.235.3.229".to_string())));
+        assert!(matches!(records[0].kind, RecordType::PTR));
+        assert!(ovh.list_records(&DnsRef::Implicit).await?.is_empty());
+        Ok(())
     }
 
     #[test]

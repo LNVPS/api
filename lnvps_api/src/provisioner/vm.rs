@@ -1,4 +1,7 @@
-use crate::host::{FullVmInfo, VmHostClient, VmResources, get_host_client};
+use crate::host::{
+    FullVmInfo, VmHostClient, VmResources, VmSnapshot, check_new_snapshot, check_restorable,
+    clear_snapshots, get_host_client, validate_snapshot_name,
+};
 use crate::provisioner::VmNetworkProvisioner;
 use crate::router::{ArpEntry, Router, get_router};
 use crate::settings::{ProvisionerConfig, Settings};
@@ -10,13 +13,14 @@ use lnvps_api_common::DnsServer;
 use lnvps_api_common::retry::{OpResult, Pipeline, RetryPolicy};
 use lnvps_api_common::{
     AvailableIp, CostResult, HostCapacityService, NetworkProvisioner, NewPaymentInfo,
-    PricingEngine, UpgradeConfig, UpgradeCostQuote, VmStateCache, round_msat_to_sat,
+    PricingEngine, UpgradeConfig, UpgradeCostQuote, VmStateCache, apply_custom_pricing_limits,
+    round_msat_to_sat, select_custom_pricing, upgrade_bandwidth,
 };
-use lnvps_api_common::{ExchangeRateService, op_fatal};
+use lnvps_api_common::{ExchangeRateService, SnapshotAction, VmHistoryLogger, op_fatal};
 use lnvps_db::{
     CpuArch, IntervalType, IpRange, IpRangeAllocationMode, LNVpsDb, LineItemType, PaymentMethod,
     PaymentType, Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentType,
-    Vm, VmCustomTemplate, VmIpAssignment, VmTemplate,
+    Vm, VmAddonKind, VmCustomTemplate, VmHistoryActionType, VmIpAssignment, VmTemplate,
 };
 
 /// Ensure an OS image's CPU architecture is compatible with the target
@@ -84,6 +88,12 @@ impl VmProvisioner {
         &self.provisioner_config
     }
 
+    /// The database, for the host-client factory: a marketplace node's client
+    /// is built from the node row as well as the config.
+    pub fn db(&self) -> &Arc<dyn LNVpsDb> {
+        &self.db
+    }
+
     /// Do any necessary initialization
     pub async fn init(&self) -> Result<()> {
         Ok(())
@@ -136,6 +146,27 @@ impl VmProvisioner {
         ssh_key_id: u64,
         ref_code: Option<String>,
     ) -> Result<Vm> {
+        self.provision_on_host(user_id, template_id, image_id, ssh_key_id, ref_code, None)
+            .await
+    }
+
+    async fn foreign_ref_code(&self, user_id: u64, ref_code: Option<String>) -> Option<String> {
+        let code = ref_code?;
+        match self.db.get_referral_by_code(&code).await {
+            Ok(referral) if referral.user_id == user_id => None,
+            _ => Some(code),
+        }
+    }
+
+    pub async fn provision_on_host(
+        &self,
+        user_id: u64,
+        template_id: u64,
+        image_id: u64,
+        ssh_key_id: u64,
+        ref_code: Option<String>,
+        host_id: Option<u64>,
+    ) -> Result<Vm> {
         let user = self.db.get_user(user_id).await?;
         let template = self.db.get_vm_template(template_id).await?;
         let image = self.db.get_os_image(image_id).await?;
@@ -160,7 +191,7 @@ impl VmProvisioner {
         // TODO: cache capacity somewhere
         let cap = HostCapacityService::new(self.db.clone());
         let host = cap
-            .get_host_for_template(template.region_id, &template)
+            .get_host_for_template_ip_aware(template.region_id, &template, host_id)
             .await?;
 
         let pick_disk = if let Some(hd) = host.disks.first() {
@@ -202,6 +233,8 @@ impl VmProvisioner {
             amount: cost_plan.amount,
             setup_amount: 0,
             configuration: None,
+            deactivated_at: None,
+            parent_line_item_id: None,
         };
         let (subscription_id, line_item_ids) = self
             .db
@@ -222,7 +255,7 @@ impl VmProvisioner {
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             ssh_host_keys: None,
             deleted: false,
-            ref_code,
+            ref_code: self.foreign_ref_code(user.id, ref_code).await,
             disabled: false,
             fw_policy_in: None,
             fw_policy_out: None,
@@ -281,22 +314,15 @@ impl VmProvisioner {
         }
         ensure_image_arch_compatible(image.cpu_arch, template.cpu_arch)?;
 
+        apply_custom_pricing_limits(&mut template, &pricing);
+
         // Reject out-of-range specs at order time (pricing itself no longer
         // validates, so existing/grandfathered VMs can still be priced/renewed).
         PricingEngine::validate_custom_vm_spec(&self.db, &template).await?;
 
-        // Copy resource limits from the pricing plan into the template
-        template.disk_iops_read = pricing.disk_iops_read;
-        template.disk_iops_write = pricing.disk_iops_write;
-        template.disk_mbps_read = pricing.disk_mbps_read;
-        template.disk_mbps_write = pricing.disk_mbps_write;
-        template.network_mbps = pricing.network_mbps;
-        template.cpu_limit = pricing.cpu_limit;
-        template.transfer_gb = pricing.transfer_gb;
-
         let cap = HostCapacityService::new(self.db.clone());
         let host = cap
-            .get_host_for_template(pricing.region_id, &template)
+            .get_host_for_template_ip_aware(pricing.region_id, &template, None)
             .await?;
 
         let pick_disk = if let Some(hd) = host.disks.first() {
@@ -309,7 +335,9 @@ impl VmProvisioner {
         let template_id = self.db.insert_custom_vm_template(&template).await?;
         let region = self.db.get_host_region(pricing.region_id).await?;
 
-        // Create subscription for this custom VM (1-month interval, amount computed at payment time)
+        // Create subscription for this custom VM. It bills on the pricing model's
+        // interval (monthly unless the model says otherwise); the amount is
+        // computed at payment time.
         let subscription = Subscription {
             id: 0,
             user_id: user.id,
@@ -321,8 +349,8 @@ impl VmProvisioner {
             is_active: false,
             is_setup: false,
             currency: pricing.currency.clone(),
-            interval_amount: 1,
-            interval_type: IntervalType::Month,
+            interval_amount: pricing.interval_amount.max(1),
+            interval_type: pricing.interval_type,
             setup_fee: 0,
             // Default new custom VM subscriptions to auto-renew (see note above).
             auto_renewal_enabled: true,
@@ -340,6 +368,8 @@ impl VmProvisioner {
             amount: 0,
             setup_amount: 0,
             configuration: None,
+            deactivated_at: None,
+            parent_line_item_id: None,
         };
         let (subscription_id, line_item_ids) = self
             .db
@@ -360,7 +390,7 @@ impl VmProvisioner {
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             ssh_host_keys: None,
             deleted: false,
-            ref_code,
+            ref_code: self.foreign_ref_code(user.id, ref_code).await,
             disabled: false,
             fw_policy_in: None,
             fw_policy_out: None,
@@ -380,7 +410,7 @@ impl VmProvisioner {
             .get_subscription_line_item(subscription_line_item_id)
             .await?;
         li.name = format!("VM{} - {}", new_vm.id, pricing.name);
-        // Record the base monthly amount now that the VM id is known. With no IP
+        // Record the base amount per billing interval now that the VM id is known. With no IP
         // assignments yet this prices the base config plus the minimum 1x IPv4/IPv6.
         let price = PricingEngine::get_custom_vm_cost_amount(&self.db, &template).await?;
         li.amount = price.total();
@@ -401,11 +431,18 @@ impl VmProvisioner {
     /// `vmid = db_id + 100`) so that all subsequent lifecycle operations target
     /// the correct host VM.
     pub async fn import_vm(&self, host_id: u64, host_vm_id: i64, user_id: u64) -> Result<Vm> {
+        // A probe's domain name parses to an id past `i64::MAX`, so it arrives
+        // here as a negative number: comparing the unsigned interpretation is
+        // what catches it. Left to the database's unsigned range it would be an
+        // accident rather than a guard, and only after a row was attempted.
+        if crate::provisioner::is_probe(host_vm_id as u64) {
+            bail!("Host VM {host_vm_id} is an LNVPS probe and is not importable");
+        }
         let user = self.db.get_user(user_id).await?;
         let host = self.db.get_host(host_id).await?;
 
         // Discover the VM on the host
-        let client = get_host_client(&host, &self.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.provisioner_config).await?;
         let spec = client
             .list_host_vms()
             .await?
@@ -434,7 +471,13 @@ impl VmProvisioner {
             .list_custom_pricing(host.region_id)
             .await?
             .into_iter()
-            .find(|p| p.enabled && p.expires.map(|e| e > Utc::now()).unwrap_or(true))
+            // Never an hourly model: an imported VM would silently become
+            // credit-only billing, which its owner did not choose.
+            .find(|p| {
+                p.enabled
+                    && p.interval_type != IntervalType::Hour
+                    && p.expires.map(|e| e > Utc::now()).unwrap_or(true)
+            })
             .ok_or_else(|| {
                 anyhow!(
                     "No enabled custom pricing for region {}, cannot import VM",
@@ -504,8 +547,8 @@ impl VmProvisioner {
             is_active: false,
             is_setup: false,
             currency: pricing.currency.clone(),
-            interval_amount: 1,
-            interval_type: IntervalType::Month,
+            interval_amount: pricing.interval_amount.max(1),
+            interval_type: pricing.interval_type,
             setup_fee: 0,
             auto_renewal_enabled: true,
             external_id: None,
@@ -519,6 +562,8 @@ impl VmProvisioner {
             amount: 0,
             setup_amount: 0,
             configuration: None,
+            deactivated_at: None,
+            parent_line_item_id: None,
         };
         let (subscription_id, line_item_ids) = self
             .db
@@ -572,7 +617,7 @@ impl VmProvisioner {
     /// Apply vm config to host
     pub async fn apply_vm_config_to_host(&self, vm_id: u64) -> OpResult<()> {
         let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
-        let client = get_host_client(&info.host, &self.provisioner_config)?;
+        let client = get_host_client(&self.db, &info.host, &self.provisioner_config).await?;
         client.configure_vm(&info).await
     }
 
@@ -590,7 +635,7 @@ impl VmProvisioner {
         let ctx = SpawnVmContext {
             db: self.db.clone(),
             network: self.network.clone(),
-            host_client: get_host_client(&info.host, &self.provisioner_config)?,
+            host_client: get_host_client(&self.db, &info.host, &self.provisioner_config).await?,
             generated_mac: None,
             created_ips: vec![],
             // What the row held before this run touched anything, so a rollback
@@ -770,7 +815,7 @@ impl VmProvisioner {
         let line_item_id = vm.subscription_line_item_id;
         let host = self.db.get_host(vm.host_id).await?;
 
-        let client = get_host_client(&host, &self.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.provisioner_config).await?;
         let pipeline = Pipeline::new((self.db.clone(), client, self.network.clone()))
             .step("host_delete_vm", |ctx| Box::pin(ctx.1.delete_vm(&vm)))
             .step("delete_ips", |ctx| {
@@ -784,13 +829,36 @@ impl VmProvisioner {
                         // Stop billing before soft-deleting: a soft-deleted VM
                         // that keeps an active, auto-renewing subscription is
                         // still invoiced and still reports as active in admin.
-                        if let Ok(mut sub) =
-                            ctx.0.get_subscription_by_line_item_id(line_item_id).await
-                            && (sub.is_active || sub.auto_renewal_enabled)
-                        {
-                            sub.is_active = false;
-                            sub.auto_renewal_enabled = false;
-                            ctx.0.update_subscription(&sub).await?;
+                        // Only this VM's line item stops; the subscription ends
+                        // once nothing on it is active, so other products
+                        // sharing it keep running and billing.
+                        // The VM's line item and its add-ons (e.g. paid
+                        // snapshots) all stop with it.
+                        let item = ctx.0.get_subscription_line_item(line_item_id).await?;
+                        let items = ctx
+                            .0
+                            .list_subscription_line_items(item.subscription_id)
+                            .await?;
+                        let owned = SubscriptionLineItem::with_addons(&items, line_item_id);
+                        for li in items.iter().filter(|li| owned.contains(&li.id)) {
+                            if li.deactivated_at.is_none() {
+                                let mut li = li.clone();
+                                li.deactivated_at = Some(Utc::now());
+                                ctx.0.update_subscription_line_item(&li).await?;
+                            }
+                        }
+                        // Only products independent of this VM keep the
+                        // subscription alive.
+                        let others_active = items
+                            .iter()
+                            .any(|li| !owned.contains(&li.id) && li.is_active());
+                        if !others_active {
+                            let mut sub = ctx.0.get_subscription(item.subscription_id).await?;
+                            if sub.is_active || sub.auto_renewal_enabled {
+                                sub.is_active = false;
+                                sub.auto_renewal_enabled = false;
+                                ctx.0.update_subscription(&sub).await?;
+                            }
                         }
                         Ok(ctx.0.delete_vm(vm_id).await?)
                     }
@@ -813,7 +881,7 @@ impl VmProvisioner {
         }
 
         let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
-        let host_client = get_host_client(&info.host, &self.provisioner_config)?;
+        let host_client = get_host_client(&self.db, &info.host, &self.provisioner_config).await?;
 
         struct ReinstallContext {
             vm_id: u64,
@@ -833,6 +901,18 @@ impl VmProvisioner {
                 Box::pin(async move {
                     info!("Stopping VM {} for reinstall", ctx.vm_id);
                     ctx.client.stop_vm(&ctx.info.vm).await
+                })
+            })
+            .step("clear_snapshots", |ctx| {
+                Box::pin(async move {
+                    let cleared = clear_snapshots(ctx.client.as_ref(), &ctx.info.vm).await?;
+                    if cleared > 0 {
+                        info!(
+                            "Deleted {} snapshots of VM {} for reinstall",
+                            cleared, ctx.vm_id
+                        );
+                    }
+                    Ok(())
                 })
             })
             .step("unlink_disk", |ctx| {
@@ -862,12 +942,121 @@ impl VmProvisioner {
         Ok(())
     }
 
+    async fn snapshot_client(&self, vm_id: u64) -> OpResult<(lnvps_db::Vm, Arc<dyn VmHostClient>)> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let host = self.db.get_host(vm.host_id).await?;
+        let client = get_host_client(&self.db, &host, &self.provisioner_config).await?;
+        Ok((vm, client))
+    }
+
+    pub async fn list_snapshots(&self, vm_id: u64) -> OpResult<Vec<VmSnapshot>> {
+        let (vm, client) = self.snapshot_client(vm_id).await?;
+        client.list_snapshots(&vm).await
+    }
+
+    pub async fn snapshot_slots(&self, vm_id: u64) -> Result<usize> {
+        Ok(self
+            .db
+            .list_vm_addons(vm_id)
+            .await?
+            .into_iter()
+            .find(|a| a.kind == VmAddonKind::Snapshot)
+            .map(|a| a.quantity as usize)
+            .unwrap_or(0))
+    }
+
+    pub async fn trim_snapshots(&self, vm_id: u64, keep: usize) -> OpResult<Vec<String>> {
+        let (vm, client) = self.snapshot_client(vm_id).await?;
+        let mut held = client.list_snapshots(&vm).await?;
+        held.sort_by_key(|s| s.created);
+        let excess = held.len().saturating_sub(keep);
+        let mut deleted = Vec::with_capacity(excess);
+        for s in held.into_iter().take(excess) {
+            info!(
+                "Deleting snapshot {} of VM {} over its slots",
+                s.name, vm_id
+            );
+            client.delete_snapshot(&vm, &s.name).await?;
+            deleted.push(s.name);
+        }
+        Ok(deleted)
+    }
+
+    pub async fn create_snapshot(
+        &self,
+        vm_id: u64,
+        name: &str,
+        description: Option<&str>,
+    ) -> OpResult<()> {
+        if self.read_only {
+            op_fatal!("Cant snapshot VM's in read-only mode");
+        }
+        let (vm, client) = self.snapshot_client(vm_id).await?;
+        let existing = client.list_snapshots(&vm).await?;
+        let limit = self.snapshot_slots(vm_id).await?;
+        check_new_snapshot(&existing, limit, name, description)?;
+        info!("Snapshotting VM {} as {}", vm_id, name);
+        client.create_snapshot(&vm, name, description).await
+    }
+
+    pub async fn rollback_snapshot(&self, vm_id: u64, name: &str) -> OpResult<()> {
+        if self.read_only {
+            op_fatal!("Cant restore VM's in read-only mode");
+        }
+        validate_snapshot_name(name)?;
+        let (vm, client) = self.snapshot_client(vm_id).await?;
+        check_restorable(&client.list_snapshots(&vm).await?, name)?;
+        info!("Restoring VM {} to snapshot {}", vm_id, name);
+        client.rollback_snapshot(&vm, name).await?;
+        let info = FullVmInfo::load(vm_id, self.db.clone()).await?;
+        client.configure_vm(&info).await?;
+        client.start_vm(&vm).await
+    }
+
+    pub async fn delete_snapshot(&self, vm_id: u64, name: &str) -> OpResult<()> {
+        validate_snapshot_name(name)?;
+        let (vm, client) = self.snapshot_client(vm_id).await?;
+        client.delete_snapshot(&vm, name).await
+    }
+
+    pub async fn run_snapshot_action(
+        &self,
+        vm_id: u64,
+        user_id: Option<u64>,
+        action: &SnapshotAction,
+        history: &VmHistoryLogger,
+    ) -> OpResult<()> {
+        let (result, logged) = match action {
+            SnapshotAction::Create { name, description } => (
+                self.create_snapshot(vm_id, name, description.as_deref())
+                    .await,
+                VmHistoryActionType::SnapshotCreated,
+            ),
+            SnapshotAction::Restore { name } => (
+                self.rollback_snapshot(vm_id, name).await,
+                VmHistoryActionType::SnapshotRestored,
+            ),
+            SnapshotAction::Delete { name } => (
+                self.delete_snapshot(vm_id, name).await,
+                VmHistoryActionType::SnapshotDeleted,
+            ),
+        };
+        if result.is_ok()
+            && let Err(e) = history
+                .log_vm_snapshot(vm_id, user_id, logged, action.name())
+                .await
+        {
+            warn!("Failed to log snapshot history for VM {}: {}", vm_id, e);
+        }
+        result
+    }
+
     /// Start a VM
     pub async fn start_vm(&self, vm_id: u64) -> OpResult<()> {
         let vm = self.db.get_vm(vm_id).await?;
         let host = self.db.get_host(vm.host_id).await?;
 
-        let client = get_host_client(&host, &self.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.provisioner_config).await?;
         client.start_vm(&vm).await?;
         Ok(())
     }
@@ -877,7 +1066,7 @@ impl VmProvisioner {
         let vm = self.db.get_vm(vm_id).await?;
         let host = self.db.get_host(vm.host_id).await?;
 
-        let client = get_host_client(&host, &self.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.provisioner_config).await?;
         client.stop_vm(&vm).await?;
         Ok(())
     }
@@ -898,14 +1087,18 @@ impl VmProvisioner {
 
         self.db.update_vm(&vm).await?;
 
-        // Update the subscription to 1-Month billing (custom VMs are always monthly)
+        // Bill the subscription on the custom pricing model's interval
+        let new_pricing = self
+            .db
+            .get_custom_pricing(new_custom_template.pricing_id)
+            .await?;
         let line_item = self
             .db
             .get_subscription_line_item(vm.subscription_line_item_id)
             .await?;
         let mut subscription = self.db.get_subscription(line_item.subscription_id).await?;
-        subscription.interval_amount = 1;
-        subscription.interval_type = IntervalType::Month;
+        subscription.interval_amount = new_pricing.interval_amount.max(1);
+        subscription.interval_type = new_pricing.interval_type;
         self.db.update_subscription(&subscription).await?;
 
         // Calculate the new base-currency cost for the new custom template and update the line
@@ -962,37 +1155,33 @@ impl VmProvisioner {
             .ok_or_else(|| anyhow::anyhow!("VM must have a standard template to upgrade"))?;
         let current_template = self.db.get_vm_template(template_id).await?;
 
-        // Get the custom pricing for the region that supports the required disk type and interface
-        let custom_pricings = self
+        // The same selection the upgrade quote used, so the customer is moved
+        // onto the model they were charged for.
+        let subscription = self
             .db
-            .list_custom_pricing(current_template.region_id)
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
             .await?;
-        let mut compatible_pricing = None;
+        let custom_pricing = select_custom_pricing(
+            &self.db,
+            current_template.region_id,
+            current_template.disk_type,
+            current_template.disk_interface,
+            current_template.cpu_mfg,
+            current_template.cpu_arch,
+            &current_template.cpu_features,
+            Some((
+                subscription.interval_type,
+                subscription.interval_amount.max(1),
+            )),
+        )
+        .await?;
 
-        for pricing in custom_pricings {
-            if !pricing.enabled {
-                continue;
-            }
-
-            // Check if this pricing supports the required disk type and interface
-            let disk_configs = self.db.list_custom_pricing_disk(pricing.id).await?;
-            let has_compatible_disk = disk_configs.iter().any(|disk| {
-                disk.kind == current_template.disk_type
-                    && disk.interface == current_template.disk_interface
-            });
-
-            if has_compatible_disk {
-                compatible_pricing = Some(pricing);
-                break;
-            }
-        }
-
-        let custom_pricing = compatible_pricing
-            .ok_or_else(|| anyhow::anyhow!(
-                "No custom pricing available for this region that supports disk type {:?} with interface {:?}",
-                current_template.disk_type,
-                current_template.disk_interface
-            ))?;
+        let (transfer_gb, network_mbps) = upgrade_bandwidth(
+            cfg,
+            &custom_pricing,
+            current_template.transfer_gb,
+            current_template.network_mbps,
+        )?;
 
         // Build the new custom template with upgraded specs, copying resource limits from pricing
         let new_custom_template = VmCustomTemplate {
@@ -1014,9 +1203,9 @@ impl VmProvisioner {
             disk_iops_write: custom_pricing.disk_iops_write,
             disk_mbps_read: custom_pricing.disk_mbps_read,
             disk_mbps_write: custom_pricing.disk_mbps_write,
-            network_mbps: custom_pricing.network_mbps,
+            network_mbps,
             cpu_limit: custom_pricing.cpu_limit,
-            transfer_gb: custom_pricing.transfer_gb,
+            transfer_gb,
             ..Default::default()
         };
 
@@ -1468,6 +1657,7 @@ mod tests {
         {
             let zones = dns.zones.lock().await;
             assert_eq!(zones.get("mock-rev-zone-id").unwrap().len(), 0);
+            assert_eq!(zones.get("mock-v6-rev-zone-id").unwrap().len(), 0);
             assert_eq!(zones.get("mock-forward-zone-id").unwrap().len(), 0);
         }
 
@@ -1662,6 +1852,8 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await?;
@@ -1705,6 +1897,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let (_, template, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
 
@@ -1735,6 +1928,7 @@ mod tests {
             new_cpu: None,
             new_memory: Some(8 * GB),
             new_disk: None,
+            ..Default::default()
         };
         let (_, template, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
 
@@ -1760,6 +1954,7 @@ mod tests {
             new_cpu: None,
             new_memory: None,
             new_disk: Some(128 * GB),
+            ..Default::default()
         };
         let (_, template, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
 
@@ -1785,6 +1980,7 @@ mod tests {
             new_cpu: Some(8),
             new_memory: Some(16 * GB),
             new_disk: Some(256 * GB),
+            ..Default::default()
         };
         let (_, _, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
 
@@ -1807,6 +2003,7 @@ mod tests {
             new_cpu: None,
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let (_, template, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
 
@@ -1858,6 +2055,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = prov.create_upgrade_template(vm_id, &cfg).await;
         assert!(result.is_err(), "should fail for custom-template VMs");
@@ -1884,6 +2082,7 @@ mod tests {
             new_cpu: Some(1),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = prov.create_upgrade_template(vm_id, &cfg).await;
         assert!(result.is_err(), "should fail for CPU downgrade");
@@ -1911,6 +2110,7 @@ mod tests {
             new_cpu: None,
             new_memory: Some(GB),
             new_disk: None,
+            ..Default::default()
         };
         let result = prov.create_upgrade_template(vm_id, &cfg).await;
         assert!(result.is_err(), "should fail for memory downgrade");
@@ -1938,6 +2138,7 @@ mod tests {
             new_cpu: None,
             new_memory: None,
             new_disk: Some(32 * GB),
+            ..Default::default()
         };
         let result = prov.create_upgrade_template(vm_id, &cfg).await;
         assert!(result.is_err(), "should fail for disk downgrade");
@@ -1965,6 +2166,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = prov.create_upgrade_template(vm_id, &cfg).await;
         assert!(
@@ -2437,6 +2639,203 @@ mod tests {
         Ok(())
     }
 
+    /// A custom pricing model's billing interval seeds the VM's subscription, and
+    /// the line item shows what one interval costs, in whole minor units rounded
+    /// up from the model's finer rate scale.
+    #[tokio::test]
+    async fn test_provision_custom_uses_the_pricing_interval() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let prov = make_provisioner(db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        let pricing_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let template = lnvps_db::VmCustomTemplate {
+            id: 0,
+            cpu: 2,
+            memory: 4 * GB,
+            disk_size: 50 * GB,
+            disk_type: DiskType::SSD,
+            disk_interface: DiskInterface::PCIe,
+            pricing_id,
+            ..Default::default()
+        };
+
+        let monthly_vm = prov
+            .provision_custom(user.id, template.clone(), 1, ssh_key.id, None)
+            .await?;
+        let monthly_item = db
+            .get_subscription_line_item(monthly_vm.subscription_line_item_id)
+            .await?;
+        let monthly_sub = db.get_subscription(monthly_item.subscription_id).await?;
+        assert!(matches!(monthly_sub.interval_type, IntervalType::Month));
+
+        // Re-denominate the same prices per hour at 1/10_000 of a cent.
+        {
+            let mut p = db.custom_pricing.lock().await;
+            let pricing = p.get_mut(&pricing_id).unwrap();
+            pricing.interval_type = IntervalType::Hour;
+            pricing.interval_amount = 1;
+            pricing.rate_scale = 10_000;
+            for v in [
+                &mut pricing.cpu_cost,
+                &mut pricing.memory_cost,
+                &mut pricing.ip4_cost,
+                &mut pricing.ip6_cost,
+            ] {
+                *v = (*v * 10_000).div_ceil(720);
+            }
+        }
+        for d in db.custom_pricing_disk.lock().await.values_mut() {
+            d.cost = (d.cost * 10_000).div_ceil(720);
+        }
+        let hourly_vm = prov
+            .provision_custom(user.id, template, 1, ssh_key.id, None)
+            .await?;
+        let hourly_item = db
+            .get_subscription_line_item(hourly_vm.subscription_line_item_id)
+            .await?;
+        let sub = db.get_subscription(hourly_item.subscription_id).await?;
+        assert!(matches!(sub.interval_type, IntervalType::Hour));
+        assert_eq!(1, sub.interval_amount);
+        // One hour is about 1/720th of the month, in whole cents rounded up
+        // (a fraction of a cent is never given away, nor dropped to zero).
+        assert!(hourly_item.amount >= 1);
+        assert!(hourly_item.amount <= monthly_item.amount.div_ceil(720) + 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_provision_custom_in_milli_euro_keeps_the_fraction() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let prov = make_provisioner(db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        let pricing_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        {
+            let mut p = db.custom_pricing.lock().await;
+            let pricing = p.get_mut(&pricing_id).unwrap();
+            pricing.currency = "MEUR".to_string();
+            pricing.interval_type = IntervalType::Hour;
+            pricing.interval_amount = 1;
+            pricing.rate_scale = 1;
+            pricing.cpu_cost = 137;
+            pricing.memory_cost = 0;
+            pricing.ip4_cost = 0;
+            pricing.ip6_cost = 0;
+        }
+        for d in db.custom_pricing_disk.lock().await.values_mut() {
+            d.cost = 0;
+        }
+        let template = lnvps_db::VmCustomTemplate {
+            id: 0,
+            cpu: 2,
+            memory: 4 * GB,
+            disk_size: 50 * GB,
+            disk_type: DiskType::SSD,
+            disk_interface: DiskInterface::PCIe,
+            pricing_id,
+            ..Default::default()
+        };
+        let vm = prov
+            .provision_custom(user.id, template, 1, ssh_key.id, None)
+            .await?;
+        let item = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let sub = db.get_subscription(item.subscription_id).await?;
+        assert_eq!(sub.currency, "MEUR");
+        assert_eq!(item.amount, 274);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_provision_custom_applies_chosen_bandwidth() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let prov = make_provisioner(db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        let pricing_id = insert_custom_pricing(&db, DiskType::SSD, DiskInterface::PCIe).await?;
+        {
+            let mut p = db.custom_pricing.lock().await;
+            let pricing = p.get_mut(&pricing_id).unwrap();
+            pricing.transfer_gb = Some(1000);
+            pricing.min_transfer_gb = 1000;
+            pricing.max_transfer_gb = 8000;
+            pricing.transfer_cost_per_tb = 100;
+            pricing.network_mbps = Some(500);
+            pricing.min_network_mbps = 500;
+            pricing.max_network_mbps = 500;
+        }
+        let spec = |transfer_gb: Option<u32>| lnvps_db::VmCustomTemplate {
+            cpu: 2,
+            memory: 4 * GB,
+            disk_size: 50 * GB,
+            disk_type: DiskType::SSD,
+            disk_interface: DiskInterface::PCIe,
+            pricing_id,
+            transfer_gb,
+            ..Default::default()
+        };
+
+        let vm = prov
+            .provision_custom(user.id, spec(Some(4000)), 1, ssh_key.id, None)
+            .await?;
+        let template = db
+            .get_custom_vm_template(vm.custom_template_id.unwrap())
+            .await?;
+        assert_eq!(template.transfer_gb, Some(4000));
+        assert_eq!(template.network_mbps, Some(500), "plan default speed");
+        let line_item = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        assert_eq!(line_item.amount, 200 + 200 + 250 + 400);
+
+        assert!(
+            prov.provision_custom(user.id, spec(Some(9000)), 1, ssh_key.id, None)
+                .await
+                .is_err(),
+            "transfer above the plan maximum is refused"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_upgrade_template_carries_bandwidth() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_custom_pricing(&db, DiskType::SSD, DiskInterface::PCIe).await?;
+        db.custom_pricing
+            .lock()
+            .await
+            .get_mut(&pricing_id)
+            .unwrap()
+            .transfer_gb = Some(1000);
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let template_id = db.get_vm(vm_id).await?.template_id.unwrap();
+        db.templates
+            .lock()
+            .await
+            .get_mut(&template_id)
+            .unwrap()
+            .transfer_gb = Some(2000);
+        let prov = make_provisioner(db.clone());
+
+        let cfg = UpgradeConfig {
+            new_cpu: Some(4),
+            ..Default::default()
+        };
+        let (_, _, new_tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
+        assert_eq!(
+            new_tpl.transfer_gb,
+            Some(2000),
+            "the VM keeps its allowance"
+        );
+        assert_eq!(new_tpl.network_mbps, None);
+
+        let cfg = UpgradeConfig {
+            new_transfer_gb: Some(1500),
+            ..Default::default()
+        };
+        assert!(prov.create_upgrade_template(vm_id, &cfg).await.is_err());
+        Ok(())
+    }
+
     // ── subscription line item amount update tests ───────────────────────────
 
     /// Regression: convert_to_custom_template must update line_item.amount to the new
@@ -2461,6 +2860,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         prov.convert_to_custom_template(vm_id, &cfg).await?;
 
@@ -2480,6 +2880,67 @@ mod tests {
             new_line_item.amount > 0,
             "new line_item.amount must be positive"
         );
+        Ok(())
+    }
+
+    /// A standard monthly VM that is upgraded is never converted onto an HOURLY
+    /// custom model, even when that is the only compatible one: hourly is
+    /// credit-only billing the customer never chose, so the upgrade is refused
+    /// and the VM is left exactly as it was.
+    #[tokio::test]
+    async fn test_convert_to_custom_template_refuses_an_hourly_only_region() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let pricing_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        {
+            let mut p = db.custom_pricing.lock().await;
+            let h = p.get_mut(&pricing_id).unwrap();
+            h.interval_type = IntervalType::Hour;
+            h.interval_amount = 1;
+            h.rate_scale = 10_000;
+        }
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let prov = make_provisioner(db.clone());
+
+        let cfg = UpgradeConfig {
+            new_cpu: Some(4),
+            ..Default::default()
+        };
+        assert!(prov.convert_to_custom_template(vm_id, &cfg).await.is_err());
+
+        let vm = db.get_vm(vm_id).await?;
+        assert!(vm.template_id.is_some() && vm.custom_template_id.is_none());
+        let sub = db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await?;
+        assert!(matches!(sub.interval_type, IntervalType::Month));
+        Ok(())
+    }
+
+    /// With both a monthly and an hourly model available, a monthly VM converts
+    /// onto the monthly one whichever the database lists first.
+    #[tokio::test]
+    async fn test_convert_to_custom_template_prefers_the_vms_interval() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let monthly_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        let hourly_id = insert_custom_pricing(&*db, DiskType::SSD, DiskInterface::PCIe).await?;
+        {
+            let mut p = db.custom_pricing.lock().await;
+            let h = p.get_mut(&hourly_id).unwrap();
+            h.interval_type = IntervalType::Hour;
+            h.interval_amount = 1;
+            h.rate_scale = 10_000;
+        }
+        let vm_id = insert_standard_template_vm(&db).await?;
+        let prov = make_provisioner(db.clone());
+        let cfg = UpgradeConfig {
+            new_cpu: Some(4),
+            ..Default::default()
+        };
+        // The mock lists models in arbitrary order; repeat so both orders occur.
+        for _ in 0..8 {
+            let (_, _, tpl) = prov.create_upgrade_template(vm_id, &cfg).await?;
+            assert_eq!(monthly_id, tpl.pricing_id);
+        }
         Ok(())
     }
 
@@ -2708,6 +3169,26 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_provision_drops_own_ref_code() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let prov = make_provisioner(db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        db.insert_referral(&lnvps_db::Referral {
+            user_id: user.id,
+            code: "SELF1".to_string(),
+            ..Default::default()
+        })
+        .await?;
+
+        let vm = prov
+            .provision(user.id, 1, 1, ssh_key.id, Some("SELF1".to_string()))
+            .await?;
+
+        assert_eq!(vm.ref_code, None);
+        Ok(())
+    }
+
     // ── subscription / VM lifecycle tests ────────────────────────────────────
 
     /// Regression (issue #361): soft-deleting a VM must deactivate its
@@ -2749,6 +3230,116 @@ mod tests {
         assert!(
             !sub.auto_renewal_enabled,
             "auto-renewal must be off for a deleted VM"
+        );
+        Ok(())
+    }
+
+    /// Deleting a VM from a subscription that also bills another product
+    /// deactivates only the VM's line item: the subscription stays active and
+    /// renewals keep pricing the other product, without the VM.
+    #[tokio::test]
+    async fn test_delete_vm_on_shared_subscription_deactivates_only_its_line() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let sub_handler = make_sub_handler(db.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let payment = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+        sub_handler.complete_payment(&payment).await?;
+        let mut sub = db.get_subscription(li.subscription_id).await?;
+        sub.auto_renewal_enabled = true;
+        db.update_subscription(&sub).await?;
+        let ip_line = db
+            .insert_subscription_line_item(&SubscriptionLineItem {
+                id: 0,
+                subscription_id: li.subscription_id,
+                subscription_type: LineItemType::IpRange,
+                name: "extra range".to_string(),
+                description: None,
+                amount: 500,
+                setup_amount: 0,
+                configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: None,
+            })
+            .await?;
+
+        provisioner.delete_vm(vm.id, false).await?;
+
+        assert!(db.get_vm(vm.id).await?.deleted);
+        let sub = db.get_subscription(li.subscription_id).await?;
+        assert!(
+            sub.is_active && sub.auto_renewal_enabled,
+            "the IP range still bills"
+        );
+        assert!(
+            !db.get_subscription_line_item(li.id).await?.is_active(),
+            "the VM's line item stops"
+        );
+        assert!(db.get_subscription_line_item(ip_line).await?.is_active());
+
+        // A renewal now prices only the IP range, not the deleted VM.
+        let quote = sub_handler
+            .quote_renewal(li.subscription_id, PaymentMethod::Lightning, 1, None)
+            .await?;
+        // No VM line priced: nothing buys VM time any more. What is left is the
+        // IP range alone.
+        assert_eq!(quote.time_value, 0, "the deleted VM is no longer billed");
+        assert!(quote.amount > 0, "the IP range still is");
+        Ok(())
+    }
+
+    /// Every line on the subscription belongs to the VM (its own line plus a
+    /// paid add-on), so deleting the VM ends the whole subscription.
+    #[tokio::test]
+    async fn test_delete_vm_with_only_addons_ends_the_subscription() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let sub_handler = make_sub_handler(db.clone()).await?;
+        let provisioner = sub_handler.vm_provisioner();
+        let (user, ssh_key) = add_user(&db).await?;
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let payment = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+        sub_handler.complete_payment(&payment).await?;
+        let addon = db
+            .insert_subscription_line_item(&SubscriptionLineItem {
+                id: 0,
+                subscription_id: li.subscription_id,
+                subscription_type: LineItemType::IpRange,
+                name: "snapshots".to_string(),
+                description: None,
+                amount: 200,
+                setup_amount: 0,
+                configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: Some(li.id),
+            })
+            .await?;
+
+        provisioner.delete_vm(vm.id, false).await?;
+
+        let sub = db.get_subscription(li.subscription_id).await?;
+        assert!(
+            !sub.is_active && !sub.auto_renewal_enabled,
+            "nothing left to bill"
+        );
+        assert!(
+            !db.get_subscription_line_item(addon).await?.is_active(),
+            "the add-on stops too"
         );
         Ok(())
     }
@@ -3346,6 +3937,18 @@ mod tests {
             "unexpected error: {}",
             err
         );
+
+        // --- Scenario 5: a probe id is refused, not imported
+        //
+        // A probe domain is named from an id no customer VM can have, so it
+        // parses cleanly and would otherwise be imported; the failure would
+        // come from the column's range, as an accident rather than a guard.
+        let probe = crate::provisioner::probe_vm_id(1) as i64;
+        let err = provisioner
+            .import_vm(1, probe, user.id)
+            .await
+            .expect_err("a probe must not be importable");
+        assert!(err.to_string().contains("probe"), "unexpected: {}", err);
 
         Ok(())
     }

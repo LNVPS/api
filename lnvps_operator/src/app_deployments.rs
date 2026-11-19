@@ -12,17 +12,18 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::Debug;
-use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use hickory_resolver::TokioResolver;
+use hickory_resolver::proto::rr::RData;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use kube::{Client, Resource, ResourceExt};
 use log::{debug, error, info, warn};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use sha2::{Digest, Sha256};
 
 use k8s_openapi::NamespaceResourceScope;
 use lnvps_db::{
@@ -51,6 +52,7 @@ use lnvps_api_common::k8s_names::{
     deployment_files_configmap, deployment_id_from_namespace,
     deployment_namespace as namespace_name, deployment_secret, deployment_volume,
 };
+use lnvps_api_common::{custom_domain_challenge_name, custom_domain_challenge_token};
 use lnvps_compose::{
     Compose, Expose, ROOT_ENTRYPOINT_CAPABILITIES, ResolvedFile, ResolvedInit,
     Service as ComposeService,
@@ -64,7 +66,7 @@ pub const MANAGED_BY: &str = "lnvps-operator";
 pub const APP_NAMESPACE_CLUSTER_ROLE: &str = "lnvps-operator-appns";
 
 /// Common labels applied to every object of a deployment.
-fn labels(deployment_id: u64) -> BTreeMap<String, String> {
+pub(crate) fn labels(deployment_id: u64) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("managed-by".to_string(), MANAGED_BY.to_string()),
         (
@@ -75,7 +77,7 @@ fn labels(deployment_id: u64) -> BTreeMap<String, String> {
 }
 
 /// Per-service selector/labels (adds the compose service name).
-fn service_labels(deployment_id: u64, service: &str) -> BTreeMap<String, String> {
+pub(crate) fn service_labels(deployment_id: u64, service: &str) -> BTreeMap<String, String> {
     let mut l = labels(deployment_id);
     l.insert(
         "app.kubernetes.io/component".to_string(),
@@ -222,6 +224,13 @@ pub fn build_network_policy(deployment_id: u64, ingress_namespace: &str) -> Netw
         }),
         ..Default::default()
     };
+    let internet_v6 = NetworkPolicyPeer {
+        ip_block: Some(IPBlock {
+            cidr: "::/0".to_string(),
+            except: Some(vec!["fc00::/7".to_string(), "fe80::/10".to_string()]),
+        }),
+        ..Default::default()
+    };
     // `..Default::default()` covers the optional `end_port` field, which only
     // exists under some k8s_openapi feature sets; harmless where it doesn't.
     #[allow(clippy::needless_update)]
@@ -275,7 +284,7 @@ pub fn build_network_policy(deployment_id: u64, ingress_namespace: &str) -> Netw
                 },
                 // The public internet (private/cluster/metadata ranges excluded).
                 NetworkPolicyEgressRule {
-                    to: Some(vec![internet]),
+                    to: Some(vec![internet, internet_v6]),
                     ports: None,
                 },
             ]),
@@ -317,7 +326,7 @@ fn scale_bytes(value: &str, multiplier: u32) -> String {
 /// Container requests == limits (Guaranteed QoS, 1:1 — no overcommit) from a
 /// compose service's `resources`, scaled by the deployment's resource
 /// multiplier (1 = the catalog app's base size).
-fn build_resource_requirements(
+pub(crate) fn build_resource_requirements(
     r: &lnvps_compose::Resources,
     multiplier: u32,
 ) -> ResourceRequirements {
@@ -387,7 +396,7 @@ async fn delete_custom_domain_ingress(client: &Client, deployment_id: u64) -> Re
 /// kubelet chowns mounted volumes to that group. Without it a freshly
 /// provisioned PVC is root-owned `0755` and a non-root process cannot write to
 /// it — the app starts and then fails on its first write.
-fn pod_security_context_for(fs_group: Option<i64>) -> PodSecurityContext {
+pub(crate) fn pod_security_context_for(fs_group: Option<i64>) -> PodSecurityContext {
     PodSecurityContext {
         run_as_non_root: Some(true),
         fs_group,
@@ -424,7 +433,7 @@ fn pod_security_context_for(fs_group: Option<i64>) -> PodSecurityContext {
 /// verifies `runAsNonRoot` against the image config and cannot resolve a name,
 /// so without an explicit UID the container is refused with "image has
 /// non-numeric user ... cannot verify user is non-root".
-fn container_security_context_for(
+pub(crate) fn container_security_context_for(
     run_as_non_root: bool,
     run_as_user: Option<i64>,
 ) -> SecurityContext {
@@ -456,6 +465,20 @@ fn container_security_context_for(
 /// cache dir (`mc`, `psql`, `git`) work by pointing `HOME` at it.
 const INIT_TMP_DIR: &str = "/tmp";
 const INIT_TMP_VOLUME: &str = "init-tmp";
+
+/// Pull policy for every app container, set explicitly rather than inherited.
+///
+/// Kubernetes infers the default from the tag: `Always` when the reference ends
+/// in `:latest` or names no tag, `IfNotPresent` otherwise. That makes the policy
+/// an accident of how the catalog document happens to be written, and it means a
+/// `:latest` entry re-pulls on every pod creation, so a re-pushed tag rolls into
+/// running deployments unreviewed.
+///
+/// Catalog images are pinned by digest (`Compose::validate_pinned_images`), so
+/// a cached layer set can only be the right one and re-pulling buys nothing.
+/// `IfNotPresent` also keeps a restart working when the registry is down or
+/// rate-limiting, which `Always` does not.
+pub(crate) const IMAGE_PULL_POLICY: &str = "IfNotPresent";
 
 /// Pod-local name for a `scratch:` path's `emptyDir` (#264).
 ///
@@ -520,6 +543,7 @@ pub fn build_init_container(init: &ResolvedInit, mounts: &[VolumeMount]) -> Cont
     Container {
         name: init.name.clone(),
         image: Some(init.image.clone()),
+        image_pull_policy: Some(IMAGE_PULL_POLICY.to_string()),
         command: init.command.clone(),
         args: init.args.clone(),
         env: Some(
@@ -638,6 +662,13 @@ pub fn build_secret(
     })
 }
 
+fn k8s_protocol(protocol: lnvps_compose::Protocol) -> &'static str {
+    match protocol {
+        lnvps_compose::Protocol::Udp => "UDP",
+        _ => "TCP",
+    }
+}
+
 /// A ClusterIP Service exposing a compose service's declared ports. `None` when
 /// the service declares no ports (purely internal, no addressable endpoint).
 pub fn build_service(
@@ -654,6 +685,7 @@ pub fn build_service(
         .map(|p| ServicePort {
             name: Some(p.name.clone()),
             port: p.container as i32,
+            protocol: Some(k8s_protocol(p.protocol).to_string()),
             target_port: Some(
                 k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(p.container as i32),
             ),
@@ -677,6 +709,23 @@ pub fn build_service(
         }),
         ..Default::default()
     })
+}
+
+pub const FILES_HASH_ANNOTATION: &str = "lnvps.io/files-hash";
+
+fn files_hash(files: &[ResolvedFile]) -> String {
+    let mut h = Sha256::new();
+    for f in files {
+        for part in [
+            f.path.as_bytes(),
+            &[f.sensitive as u8],
+            f.content.as_bytes(),
+        ] {
+            h.update((part.len() as u64).to_le_bytes());
+            h.update(part);
+        }
+    }
+    hex::encode(h.finalize())
 }
 
 /// A Deployment for a compose service. `replicas` is 0 when the deployment is
@@ -809,6 +858,7 @@ pub fn build_deployment(
     let container = Container {
         name: service_name.to_string(),
         image: Some(svc.image.clone()),
+        image_pull_policy: Some(IMAGE_PULL_POLICY.to_string()),
         env: Some(
             env.iter()
                 .map(|(k, v)| EnvVar {
@@ -824,6 +874,7 @@ pub fn build_deployment(
                 .map(|p| ContainerPort {
                     name: Some(p.name.clone()),
                     container_port: p.container as i32,
+                    protocol: Some(k8s_protocol(p.protocol).to_string()),
                     ..Default::default()
                 })
                 .collect(),
@@ -861,6 +912,10 @@ pub fn build_deployment(
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     labels: Some(sel),
+                    annotations: Some(BTreeMap::from([(
+                        FILES_HASH_ANNOTATION.to_string(),
+                        files_hash(files),
+                    )])),
                     ..Default::default()
                 }),
                 spec: Some(PodSpec {
@@ -1041,13 +1096,14 @@ pub fn build_custom_domain_ingress(
     })
 }
 
-/// Whether `domain` resolves to an address `hostname` also resolves to.
+/// Whether `_lnvps-challenge.<domain>` carries this deployment's token.
 ///
-/// Address overlap rather than a CNAME check: a customer may point an A record
-/// at us instead of a CNAME, and either way the question is whether traffic for
-/// the name arrives here. Any resolver failure reads as "not yet" — holding a
-/// domain is recoverable on the next pass, serving one that is not ours is not.
-async fn resolves_to_same_address(domain: &str, hostname: &str) -> bool {
+/// Every deployment shares one load balancer, so a CNAME or A record toward us
+/// proves nothing about who owns the name. Only a TXT record carrying the token
+/// derived from the deployment id and the domain does. Any resolver failure
+/// reads as "not yet": holding a domain is recoverable on the next pass,
+/// serving one that is not ours is not.
+async fn challenge_published(deployment_id: u64, domain: &str) -> bool {
     static RESOLVER: OnceLock<Option<TokioResolver>> = OnceLock::new();
     let resolver =
         RESOLVER.get_or_init(
@@ -1063,30 +1119,36 @@ async fn resolves_to_same_address(domain: &str, hostname: &str) -> bool {
         return false;
     };
 
-    let ours = lookup(resolver, hostname).await;
-    if ours.is_empty() {
-        warn!("custom domain probe: {hostname} resolves to nothing from here");
-        return false;
-    }
-    let theirs = lookup(resolver, domain).await;
-    let matched = shares_an_address(&ours, &theirs);
+    let name = custom_domain_challenge_name(domain);
+    let records = lookup_txt(resolver, &name).await;
+    let matched = txt_proves_ownership(&records, deployment_id, domain);
     if !matched {
-        // Both sides logged: the usual cause of a domain that never releases is
-        // ours resolving to something the customer could never point at.
-        debug!("custom domain probe: {domain} {theirs:?} vs {hostname} {ours:?}");
+        debug!("custom domain probe: {name} TXT {records:?} lacks the token");
     }
     matched
 }
 
-/// Addresses for `name`, empty on any failure.
+/// TXT strings for `name`, empty on any failure.
 ///
 /// Bounded rather than left to the resolver's own retries: this runs inline in
 /// a reconcile pass, once per held domain, and a pass that does not finish
 /// stops every deployment behind it.
-async fn lookup(resolver: &TokioResolver, name: &str) -> Vec<IpAddr> {
+async fn lookup_txt(resolver: &TokioResolver, name: &str) -> Vec<String> {
     const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-    match tokio::time::timeout(PROBE_TIMEOUT, resolver.lookup_ip(name)).await {
-        Ok(Ok(ips)) => ips.iter().collect(),
+    match tokio::time::timeout(PROBE_TIMEOUT, resolver.txt_lookup(name)).await {
+        Ok(Ok(found)) => found
+            .answers()
+            .iter()
+            .filter_map(|r| match &r.data {
+                RData::TXT(txt) => Some(
+                    txt.txt_data
+                        .iter()
+                        .map(|part| String::from_utf8_lossy(part).into_owned())
+                        .collect::<String>(),
+                ),
+                _ => None,
+            })
+            .collect(),
         Ok(Err(_)) => Vec::new(),
         Err(_) => {
             warn!("custom domain probe timed out resolving {name}");
@@ -1095,10 +1157,10 @@ async fn lookup(resolver: &TokioResolver, name: &str) -> Vec<IpAddr> {
     }
 }
 
-/// Whether the two address sets intersect. Empty on either side is no match:
-/// a name that resolves to nothing is not pointed at us.
-fn shares_an_address(ours: &[IpAddr], theirs: &[IpAddr]) -> bool {
-    theirs.iter().any(|t| ours.contains(t))
+/// Whether any TXT record is exactly this deployment's token for `domain`.
+fn txt_proves_ownership(records: &[String], deployment_id: u64, domain: &str) -> bool {
+    let token = custom_domain_challenge_token(deployment_id, domain);
+    records.iter().any(|r| r.trim().trim_matches('"') == token)
 }
 
 /// Generate a random URL-safe secret value of `len` bytes (hex-encoded).
@@ -1135,7 +1197,7 @@ async fn resolve_custom_domain(
     let probe_passed = match deployment.custom_domain.as_deref() {
         // Verified is sticky, so an already-verified domain is never re-probed.
         Some(cd) if !deployment.custom_domain_verified => {
-            resolves_to_same_address(cd, hostname).await
+            challenge_published(deployment.id, cd).await
         }
         _ => false,
     };
@@ -1159,12 +1221,15 @@ async fn apply_custom_domain_probe(
         return Ok(deployment.clone());
     }
     if !probe_passed {
-        info!("app deployment {id} custom domain held: {cd} does not resolve to {hostname}");
+        info!(
+            "app deployment {id} custom domain held: {cd} has no matching TXT challenge (hostname {hostname})"
+        );
         return Ok(deployment.clone());
     }
     db.set_app_deployment_custom_domain_verified(id).await?;
     Ok(AppDeployment {
         custom_domain_verified: true,
+        public_port: None,
         ..deployment.clone()
     })
 }
@@ -1230,6 +1295,28 @@ pub fn build_vars(
     vars
 }
 
+/// Resolve one existing deployment's env exactly as the reconcile loop does,
+/// for callers that need to run a container beside it — a backup Job runs the
+/// service's own image and has to see the same `DATABASE_URL` and generated
+/// password the service does, or the dump command cannot authenticate.
+///
+/// Deliberately **reads** the generated secrets rather than ensuring them:
+/// this runs against a deployment that already exists, and minting a value
+/// here would hand the container a password the running app does not have.
+pub(crate) async fn resolved_env(
+    ctx: &Context,
+    deployment: &AppDeployment,
+    compose: &Compose,
+    ingress_domain: &str,
+) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, String>>> {
+    let generated = read_generated(&ctx.client, deployment.id).await?;
+    let hostname = deployment_hostname(&deployment.name, ingress_domain);
+    let public = public_hostname(&hostname, deployment);
+    let config = parse_config(&deployment.config);
+    let vars = build_vars(compose, &generated, &config, &public);
+    compose.resolve_env(&vars)
+}
+
 /// Ensure every declared secret has a value, generating any that are missing
 /// (preserving existing ones so values are stable across reconciles).
 pub fn ensure_secrets(
@@ -1254,7 +1341,7 @@ pub fn ensure_secrets(
 
 /// Server-side apply a namespaced Kubernetes object, creating or updating it
 /// idempotently.
-async fn apply<K>(client: &Client, obj: &K) -> Result<()>
+pub(crate) async fn apply<K>(client: &Client, obj: &K) -> Result<()>
 where
     K: Resource<Scope = NamespaceResourceScope> + Serialize + DeserializeOwned + Clone + Debug,
     K::DynamicType: Default,
@@ -1268,6 +1355,52 @@ where
     )
     .await?;
     Ok(())
+}
+
+fn storage_request(pvc: &PersistentVolumeClaim) -> Option<&Quantity> {
+    pvc.spec
+        .as_ref()?
+        .resources
+        .as_ref()?
+        .requests
+        .as_ref()?
+        .get("storage")
+}
+
+fn never_shrink(desired: &Quantity, current: Option<&Quantity>) -> Quantity {
+    let bytes = |q: &Quantity| lnvps_compose::parse_bytes(&q.0).ok();
+    match current {
+        Some(cur) if bytes(cur) > bytes(desired) && bytes(desired).is_some() => cur.clone(),
+        _ => desired.clone(),
+    }
+}
+
+async fn apply_pvc(client: &Client, mut pvc: PersistentVolumeClaim) -> Result<()> {
+    let api: Api<PersistentVolumeClaim> =
+        Api::namespaced(client.clone(), &pvc.namespace().unwrap_or_default());
+    let existing = api.get_opt(&pvc.name_any()).await?;
+    let current = existing.as_ref().and_then(storage_request);
+    if let Some(desired) = storage_request(&pvc).cloned() {
+        let size = never_shrink(&desired, current);
+        if size != desired {
+            debug!(
+                "PVC {}/{} keeps {} rather than shrinking to {}",
+                pvc.namespace().unwrap_or_default(),
+                pvc.name_any(),
+                size.0,
+                desired.0
+            );
+        }
+        if let Some(requests) = pvc
+            .spec
+            .as_mut()
+            .and_then(|s| s.resources.as_mut())
+            .and_then(|r| r.requests.as_mut())
+        {
+            requests.insert("storage".to_string(), size);
+        }
+    }
+    apply(client, &pvc).await
 }
 
 /// Server-side apply the (cluster-scoped) Namespace.
@@ -1472,8 +1605,20 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<BTreeSet<u64>> {
 
     let mut active: HashSet<u64> = HashSet::new();
     let mut transitioning: BTreeSet<u64> = BTreeSet::new();
+    let (deployments, l4_failures) = reconcile_l4(ctx, deployments).await;
+    if let Err(e) = reconcile_srv_dns(ctx, &cluster, &deployments, &l4_failures).await {
+        warn!("SRV DNS sync failed: {e}");
+    }
     for d in &deployments {
         active.insert(d.id);
+        if let Some(message) = l4_failures.get(&d.id) {
+            error!("app deployment {} public port: {message}", d.id);
+            let mut errd = d.clone();
+            errd.status = AppDeploymentStatus::Error;
+            errd.status_message = Some(message.clone());
+            let _ = ctx.db.update_app_deployment(&errd).await;
+            continue;
+        }
         match reconcile_one(ctx, d, &cluster.ingress_domain).await {
             Ok(status) => {
                 if is_transitioning(status) {
@@ -1502,6 +1647,109 @@ pub async fn reconcile_app_deployments(ctx: &Context) -> Result<BTreeSet<u64>> {
     // rows are excluded from the active set above).
     gc_namespaces(&ctx.client, &active).await?;
     Ok(transitioning)
+}
+
+async fn l4_want(ctx: &Context, d: &AppDeployment) -> Result<Option<crate::l4::L4Want>> {
+    let app = ctx.db.get_app(d.app_id).await?;
+    let compose = lnvps_compose::Compose::parse(&app.compose)?;
+    let Some(l4) = compose.l4_port() else {
+        return Ok(None);
+    };
+    let sub = ctx
+        .db
+        .get_subscription_by_line_item_id(d.subscription_line_item_id)
+        .await
+        .ok();
+    let gate = gate_running(
+        d.desired_state == lnvps_db::AppDeploymentDesiredState::Running,
+        d.deleted,
+        sub.as_ref(),
+        None,
+        chrono::Utc::now(),
+    );
+    if !provisions_cluster_objects(&gate) {
+        return Ok(None);
+    }
+    Ok(Some(crate::l4::L4Want {
+        deployment: d.clone(),
+        target: crate::l4::L4Target {
+            service: l4.service.to_string(),
+            container_port: l4.port.container,
+            protocol: l4.protocol(),
+        },
+    }))
+}
+
+async fn reconcile_srv_dns(
+    ctx: &Context,
+    cluster: &lnvps_db::AppCluster,
+    deployments: &[AppDeployment],
+    l4_failures: &std::collections::HashMap<u64, String>,
+) -> Result<()> {
+    let (Some(dns_server_id), Some(zone_id)) = (cluster.dns_server_id, cluster.dns_zone_id.clone())
+    else {
+        return Ok(());
+    };
+    let zone = lnvps_api_common::DnsRef::Id(zone_id);
+    let mut desired = Vec::new();
+    for d in deployments {
+        if d.deleted || d.public_port.is_none() || l4_failures.contains_key(&d.id) {
+            continue;
+        }
+        let app = ctx.db.get_app(d.app_id).await?;
+        let compose = lnvps_compose::Compose::parse(&app.compose)?;
+        desired.extend(crate::srv_dns::desired_srv(
+            &compose,
+            &d.name,
+            d.public_port,
+            &cluster.ingress_domain,
+            &zone,
+        ));
+    }
+    let dns = lnvps_api_common::get_dns_server(&ctx.db, dns_server_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("dns server {dns_server_id}: {}", e.inner()))?;
+    crate::srv_dns::sync_srv(dns.as_ref(), &zone, &cluster.ingress_domain, &desired).await?;
+    Ok(())
+}
+
+async fn reconcile_l4(
+    ctx: &Context,
+    deployments: Vec<AppDeployment>,
+) -> (Vec<AppDeployment>, std::collections::HashMap<u64, String>) {
+    let mut failures = std::collections::HashMap::new();
+    let mut wants = Vec::new();
+    for d in &deployments {
+        match l4_want(ctx, d).await {
+            Ok(Some(w)) => wants.push(w),
+            Ok(None) => {}
+            Err(e) => warn!("app deployment {}: could not plan L4 exposure: {e}", d.id),
+        }
+    }
+    let wanting: HashSet<u64> = wants.iter().map(|w| w.deployment.id).collect();
+    match crate::l4::sync_l4(ctx.db.as_ref(), &ctx.l4, &deployments, wants).await {
+        Ok(outcomes) => {
+            for o in outcomes {
+                if let Err(message) = o.result {
+                    failures.insert(o.deployment_id, message);
+                }
+            }
+        }
+        Err(e) => {
+            error!("L4 forwarding ({}) failed: {e}", ctx.l4.forwarder.kind());
+            for id in wanting {
+                failures.insert(id, format!("public port forwarding failed: {e}"));
+            }
+        }
+    }
+    let refreshed = match ctx.db.list_all_app_deployments().await {
+        Ok(all) => {
+            let ids: HashSet<u64> = deployments.iter().map(|d| d.id).collect();
+            all.into_iter().filter(|d| ids.contains(&d.id)).collect()
+        }
+        Err(_) => deployments,
+    };
+    (refreshed, failures)
 }
 
 /// Record what each deployment is consuming, from Prometheus (issue #278).
@@ -1744,6 +1992,10 @@ async fn reconcile_one(
     // An expired deployment scales to 0 but keeps its PVCs (customer data);
     // only real deletion tears it down.
     let replicas = if gate == GateReason::Running { 1 } else { 0 };
+    let quiesced = crate::app_backups::quiesced_services(
+        &compose,
+        &ctx.db.list_app_deployment_backups(id).await?,
+    );
     // Size of this deployment as a multiple of the catalog app's footprint.
     // Legacy rows (pre-multiplier) decode as 0, so clamp to the base size.
     let multiplier = deployment.resource_multiplier.max(1);
@@ -1751,7 +2003,7 @@ async fn reconcile_one(
     // 4. Per service: PVCs, file ConfigMap/Secret, Service, Deployment.
     for (sname, svc) in &compose.services {
         for v in &svc.volumes {
-            apply(client, &build_pvc(id, sname, &v.name, &v.size, multiplier)).await?;
+            apply_pvc(client, build_pvc(id, sname, &v.name, &v.size, multiplier)).await?;
         }
         let sfiles = files.get(sname).cloned().unwrap_or_default();
         if let Some(cm) = build_files_configmap(id, sname, &sfiles) {
@@ -1777,7 +2029,11 @@ async fn reconcile_one(
                 svc,
                 &svc_env,
                 &sfiles,
-                replicas,
+                if quiesced.contains(sname) {
+                    0
+                } else {
+                    replicas
+                },
                 multiplier,
                 init.get(sname).map(Vec::as_slice).unwrap_or_default(),
             ),
@@ -1830,7 +2086,10 @@ async fn reconcile_one(
     // correct, and the API server being briefly unavailable must not undo that
     // or overwrite a true status with a guess.
     let health = match read_workload_health(client, id).await {
-        Ok(h) => Some(h),
+        Ok(mut h) => {
+            h.paused_for_backup = !quiesced.is_empty();
+            Some(h)
+        }
         Err(e) => {
             warn!("app deployment {id}: could not read workload health: {e}");
             None
@@ -1854,6 +2113,7 @@ pub struct WorkloadHealth {
     pub ready: i32,
     /// Containers the kubelet says will not start.
     pub failures: Vec<ContainerFailure>,
+    pub paused_for_backup: bool,
 }
 
 /// One container the kubelet is refusing to run, and why.
@@ -1915,6 +2175,12 @@ pub fn workload_status(health: &WorkloadHealth) -> (AppDeploymentStatus, Option<
             .collect::<Vec<_>>()
             .join("; ");
         return (AppDeploymentStatus::Error, Some(detail));
+    }
+    if health.paused_for_backup {
+        return (
+            AppDeploymentStatus::Pending,
+            Some("paused while a backup copies its data".to_string()),
+        );
     }
     if health.desired > 0 && health.ready >= health.desired {
         return (AppDeploymentStatus::Running, None);
@@ -2078,6 +2344,7 @@ async fn gc_namespaces(client: &Client, active: &HashSet<u64>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::metrics::{ClaimUsage, ContainerUsage};
+    use k8s_openapi::api::networking::v1::IPBlock;
 
     /// Which statuses keep the operator sweeping quickly. A deployment the
     /// customer stopped is settled — the row only changes when someone acts on
@@ -2428,6 +2695,20 @@ config:
     }
 
     #[test]
+    fn a_pvc_request_never_shrinks() {
+        let q = |s: &str| Quantity(s.to_string());
+        assert_eq!(never_shrink(&q("5Gi"), Some(&q("20Gi"))), q("20Gi"));
+        assert_eq!(
+            never_shrink(&q("5368709120"), Some(&q("21474836480"))),
+            q("21474836480")
+        );
+        assert_eq!(never_shrink(&q("20Gi"), Some(&q("5Gi"))), q("20Gi"));
+        assert_eq!(never_shrink(&q("5Gi"), Some(&q("5Gi"))), q("5Gi"));
+        assert_eq!(never_shrink(&q("5Gi"), None), q("5Gi"));
+        assert_eq!(never_shrink(&q("5Gi"), Some(&q("garbage"))), q("5Gi"));
+    }
+
+    #[test]
     fn netpol_isolates_but_allows_internet_egress() {
         let np = build_network_policy(7, "ingress-nginx");
         let spec = np.spec.unwrap();
@@ -2458,15 +2739,26 @@ config:
                 .map(|ps| ps.iter().any(|p| p.protocol.as_deref() == Some("UDP")))
                 .unwrap_or(false)
         }));
-        let internet = egress
+        let ip_blocks: Vec<&IPBlock> = egress
             .iter()
-            .find_map(|r| r.to.as_ref()?.iter().find_map(|p| p.ip_block.as_ref()))
-            .expect("internet ipBlock");
-        assert_eq!(internet.cidr, "0.0.0.0/0");
-        let except = internet.except.as_ref().unwrap();
+            .filter_map(|r| r.to.as_ref())
+            .flatten()
+            .filter_map(|p| p.ip_block.as_ref())
+            .collect();
+        let block = |cidr: &str| {
+            *ip_blocks
+                .iter()
+                .find(|b| b.cidr == cidr)
+                .unwrap_or_else(|| panic!("no {cidr} ipBlock"))
+        };
+        let except = block("0.0.0.0/0").except.as_ref().unwrap();
         assert!(except.contains(&"10.0.0.0/8".to_string()));
         // cloud metadata endpoint is inside the excluded link-local range
         assert!(except.contains(&"169.254.0.0/16".to_string()));
+
+        let except_v6 = block("::/0").except.as_ref().unwrap();
+        assert!(except_v6.contains(&"fc00::/7".to_string()));
+        assert!(except_v6.contains(&"fe80::/10".to_string()));
     }
 
     #[test]
@@ -2600,6 +2892,38 @@ config:
         assert_eq!(conf.name, "files-cm");
         let key = m.iter().find(|x| x.mount_path == "/etc/api.key").unwrap();
         assert_eq!(key.name, "files-secret");
+    }
+
+    #[test]
+    fn file_change_rolls_the_pod() {
+        let c = compose();
+        let annotation = |content: &str| {
+            let files = [ResolvedFile {
+                path: "/etc/web.conf".to_string(),
+                content: content.to_string(),
+                sensitive: false,
+            }];
+            build_deployment(
+                7,
+                "web",
+                &c.services["web"],
+                &BTreeMap::new(),
+                &files,
+                1,
+                1,
+                &[],
+            )
+            .spec
+            .unwrap()
+            .template
+            .metadata
+            .unwrap()
+            .annotations
+            .unwrap()[FILES_HASH_ANNOTATION]
+                .clone()
+        };
+        assert_eq!(annotation("a=1"), annotation("a=1"));
+        assert_ne!(annotation("a=1"), annotation("a=2"));
     }
 
     #[test]
@@ -2906,6 +3230,18 @@ config:
         assert_eq!(
             inits.iter().map(|i| i.name.as_str()).collect::<Vec<_>>(),
             vec!["wait-s3", "make-bucket"]
+        );
+
+        // Both container kinds carry an explicit pull policy. Left unset,
+        // Kubernetes would infer `Always` from these `:latest` tags and re-pull
+        // on every pod creation, which is how a re-pushed tag reaches a running
+        // deployment unreviewed.
+        assert!(
+            app.containers
+                .iter()
+                .chain(inits.iter())
+                .all(|c| c.image_pull_policy.as_deref() == Some("IfNotPresent")),
+            "every container must set imagePullPolicy explicitly"
         );
 
         let wait = &inits[0];
@@ -3468,12 +3804,25 @@ config:
 
             // Each documented app exposes an ingress endpoint.
             assert!(
-                build_ingress(id, &c, &host, None, "letsencrypt-prod", "nginx").is_some(),
-                "{name}: expected an ingress endpoint"
+                build_ingress(id, &c, &host, None, "letsencrypt-prod", "nginx").is_some()
+                    || c.l4_port().is_some(),
+                "{name}: expected an ingress or L4 endpoint"
             );
             // Shared namespace objects render from the footprint.
             let _ = build_network_policy(id, "ingress-nginx");
         }
+    }
+
+    #[test]
+    fn udp_ports_render_udp_on_the_service_and_the_container() {
+        let c = Compose::parse(
+            "services:\n  g:\n    image: x\n    ports:\n      - { name: game, container: 7777, protocol: udp, expose: udp }\n      - { name: q, container: 7778, protocol: tcp, expose: none }\n",
+        )
+        .unwrap();
+        let svc = build_service(3, "g", &c.services["g"]).unwrap();
+        let ports = svc.spec.unwrap().ports.unwrap();
+        assert_eq!(ports[0].protocol.as_deref(), Some("UDP"));
+        assert_eq!(ports[1].protocol.as_deref(), Some("TCP"));
     }
 
     /// `Running` now means the workload is running, not that the bill is paid
@@ -3487,6 +3836,7 @@ config:
             desired: 2,
             ready: 2,
             failures: vec![],
+            ..Default::default()
         });
         assert_eq!(s, AppDeploymentStatus::Running);
         assert_eq!(m, None);
@@ -3496,6 +3846,7 @@ config:
             desired: 2,
             ready: 1,
             failures: vec![],
+            ..Default::default()
         });
         assert_eq!(s, AppDeploymentStatus::Pending);
         assert!(m.unwrap().contains("1/2"));
@@ -3516,6 +3867,7 @@ config:
                 reason: "CrashLoopBackOff".to_string(),
                 detail: Some("InnoDB: Unable to create temporary file\n".to_string()),
             }],
+            ..Default::default()
         });
         assert_eq!(s, AppDeploymentStatus::Error);
         let m = m.unwrap();
@@ -3532,6 +3884,7 @@ config:
                 reason: "ImagePullBackOff".to_string(),
                 detail: None,
             }],
+            ..Default::default()
         });
         assert_eq!(s, AppDeploymentStatus::Error);
 
@@ -3545,9 +3898,18 @@ config:
                 reason: "CrashLoopBackOff".to_string(),
                 detail: Some("x".repeat(5000)),
             }],
+            ..Default::default()
         });
         let m = m.unwrap();
         assert!(m.len() < 400, "message stays renderable: {}", m.len());
+        let (s, m) = workload_status(&WorkloadHealth {
+            desired: 0,
+            ready: 0,
+            failures: vec![],
+            paused_for_backup: true,
+        });
+        assert_eq!(s, AppDeploymentStatus::Pending);
+        assert!(m.unwrap().contains("backup"));
     }
 
     /// A pod is only a failure once the kubelet has settled on one: a container
@@ -3760,15 +4122,30 @@ config:
         );
     }
 
-    /// A domain is pointed at us when its addresses overlap ours, whether the
-    /// customer used a CNAME or an A record. Nothing resolving is not a match.
+    /// Ownership is the token for this deployment and domain, not where the
+    /// name points: another deployment's token, or none, never releases it.
     #[test]
-    fn address_overlap_is_what_counts_as_pointed_at_us() {
-        let ours: Vec<IpAddr> = vec!["185.18.221.87".parse().unwrap(), "2a01::1".parse().unwrap()];
-        assert!(shares_an_address(&ours, &["2a01::1".parse().unwrap()]));
-        assert!(!shares_an_address(&ours, &["1.2.3.4".parse().unwrap()]));
-        assert!(!shares_an_address(&ours, &[]));
-        assert!(!shares_an_address(&[], &["185.18.221.87".parse().unwrap()]));
+    fn only_this_deployments_txt_token_proves_ownership() {
+        let mine = custom_domain_challenge_token(7, "blog.example.com");
+        let theirs = custom_domain_challenge_token(8, "blog.example.com");
+        assert!(txt_proves_ownership(&[mine.clone()], 7, "blog.example.com"));
+        assert!(txt_proves_ownership(
+            &["v=spf1".to_string(), format!("\"{mine}\"")],
+            7,
+            "Blog.Example.com"
+        ));
+        assert!(!txt_proves_ownership(&[theirs], 7, "blog.example.com"));
+        assert!(!txt_proves_ownership(
+            &[mine.clone()],
+            7,
+            "other.example.com"
+        ));
+        assert!(!txt_proves_ownership(
+            &[format!("x{mine}")],
+            7,
+            "blog.example.com"
+        ));
+        assert!(!txt_proves_ownership(&[], 7, "blog.example.com"));
     }
 
     /// The compose is what resolves a claim name: `"{service}-{volume}"` cannot
@@ -3909,6 +4286,7 @@ config:
                 hostname: None,
                 custom_domain: None,
                 custom_domain_verified: false,
+                public_port: None,
                 config: None,
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
@@ -3978,6 +4356,7 @@ config:
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
+                    category_translations: None,
                     compose:
                         "services:\n  a:\n    image: x\n    volumes:\n      - name: data\n        path: /d\n        size: 1Gi\n"
                             .to_string(),
@@ -4103,6 +4482,7 @@ config:
     fn a_verified_custom_domain_becomes_the_apps_public_hostname() {
         let d = AppDeployment {
             custom_domain_verified: true,
+            public_port: None,
             ..deployment_with_custom_domain()
         };
         assert_eq!(servable_custom_domain(&d), Some("relay.example.org"));
@@ -4140,6 +4520,7 @@ config:
             hostname: None,
             custom_domain: Some("relay.example.org".to_string()),
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: lnvps_db::AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Running,

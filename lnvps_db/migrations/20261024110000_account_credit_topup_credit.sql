@@ -1,0 +1,3 @@
+ALTER TABLE account_credit_topup
+    ADD COLUMN credit_currency VARCHAR(4) NULL DEFAULT NULL,
+    ADD COLUMN credit_amount BIGINT UNSIGNED NULL DEFAULT NULL;

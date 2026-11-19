@@ -1,4 +1,4 @@
-use crate::dns::{BasicRecord, DnsRef, DnsServer, DnsZone};
+use crate::dns::{BasicRecord, DnsRef, DnsServer, DnsZone, RecordType};
 use crate::json_api::JsonApi;
 use crate::op_transient;
 use crate::retry::{OpError, OpResult};
@@ -104,12 +104,7 @@ impl DnsServer for Cloudflare {
             .api
             .post(
                 &format!("/client/v4/zones/{zone_id}/dns_records"),
-                CfRecord {
-                    content: record.value.to_string(),
-                    name: record.name.to_string(),
-                    r_type: Some(record.kind.to_string()),
-                    id: None,
-                },
+                CfRecord::for_record(record, None),
             )
             .await;
         let id_response = match posted {
@@ -170,6 +165,7 @@ impl DnsServer for Cloudflare {
                     name: record.name.to_string(),
                     r_type: None,
                     id: None,
+                    data: None,
                 }),
             )
             .await?;
@@ -196,12 +192,7 @@ impl DnsServer for Cloudflare {
             .req(
                 reqwest::Method::PATCH,
                 &format!("/client/v4/zones/{}/dns_records/{}", zone_id, record_id),
-                Some(CfRecord {
-                    content: record.value.to_string(),
-                    name: record.name.to_string(),
-                    r_type: Some(record.kind.to_string()),
-                    id: Some(record_id.to_string()),
-                }),
+                Some(CfRecord::for_record(record, Some(record_id.to_string()))),
             )
             .await?;
         Self::bail_error(&id_response)?;
@@ -244,10 +235,63 @@ impl DnsServer for Cloudflare {
         }
         Ok(zones)
     }
+
+    async fn list_records(&self, zone: &DnsRef) -> OpResult<Vec<BasicRecord>> {
+        let zone_id = zone
+            .as_id()
+            .context("zone id required for Cloudflare records")?;
+        let mut records = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let resp: CfResult<Vec<CfRecord>> = self
+                .api
+                .get(&format!(
+                    "/client/v4/zones/{zone_id}/dns_records?per_page=100&page={page}"
+                ))
+                .await?;
+            Self::bail_error(&resp)?;
+            for r in resp.result {
+                let kind = match r.r_type.as_deref() {
+                    Some("A") => RecordType::A,
+                    Some("AAAA") => RecordType::AAAA,
+                    Some("PTR") => RecordType::PTR,
+                    Some("SRV") => RecordType::SRV,
+                    _ => continue,
+                };
+                let value = match (&kind, &r.data) {
+                    (RecordType::SRV, Some(d)) => d.to_value(),
+                    _ => r.content,
+                };
+                records.push(BasicRecord {
+                    ip: match kind {
+                        RecordType::PTR | RecordType::SRV => String::new(),
+                        _ => value.clone(),
+                    },
+                    name: r.name,
+                    value,
+                    id: r.id.map(DnsRef::Id),
+                    kind,
+                    zone: zone.clone(),
+                });
+            }
+            let total_pages = resp
+                .result_info
+                .as_ref()
+                .map(|i| i.total_pages)
+                .unwrap_or(1)
+                .max(1);
+            if page >= total_pages {
+                break;
+            }
+            page += 1;
+        }
+        Ok(records)
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CfRecord {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub content: String,
     pub name: String,
 
@@ -256,6 +300,57 @@ struct CfRecord {
     pub r_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<CfSrvData>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CfSrvData {
+    pub priority: u16,
+    pub weight: u16,
+    pub port: u16,
+    pub target: String,
+}
+
+impl CfSrvData {
+    fn to_value(&self) -> String {
+        format!(
+            "{} {} {} {}",
+            self.priority, self.weight, self.port, self.target
+        )
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        let mut parts = value.split_whitespace();
+        let data = Self {
+            priority: parts.next()?.parse().ok()?,
+            weight: parts.next()?.parse().ok()?,
+            port: parts.next()?.parse().ok()?,
+            target: parts.next()?.to_string(),
+        };
+        parts.next().is_none().then_some(data)
+    }
+}
+
+impl CfRecord {
+    fn for_record(record: &BasicRecord, id: Option<String>) -> Self {
+        let srv = matches!(record.kind, RecordType::SRV);
+        Self {
+            content: if srv {
+                String::new()
+            } else {
+                record.value.to_string()
+            },
+            name: record.name.to_string(),
+            r_type: Some(record.kind.to_string()),
+            id,
+            data: if srv {
+                CfSrvData::parse(&record.value)
+            } else {
+                None
+            },
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -316,6 +411,103 @@ mod tests {
             "errors": [{ "code": 81058, "message": "An identical record already exists." }],
             "messages": []
         })
+    }
+
+    #[tokio::test]
+    async fn an_srv_record_is_posted_as_structured_data() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .and(wiremock::matchers::body_json(serde_json::json!({
+                "name": "_minecraft._tcp.mc.apps.example.com",
+                "type": "SRV",
+                "data": {
+                    "priority": 0,
+                    "weight": 5,
+                    "port": 25570,
+                    "target": "mc.apps.example.com"
+                }
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "errors": [],
+                "result": {
+                    "id": "srv1",
+                    "name": "_minecraft._tcp.mc.apps.example.com",
+                    "content": "0 5 25570 mc.apps.example.com",
+                    "type": "SRV"
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let cf = Cloudflare::with_base(&server.uri(), "token");
+        let rec = BasicRecord::srv(
+            "_minecraft._tcp.mc.apps.example.com".to_string(),
+            25570,
+            "mc.apps.example.com",
+            DnsRef::Id("zone1".to_string()),
+        );
+        let out = cf.add_record(&rec).await?;
+        assert_eq!(out.id, Some(DnsRef::Id("srv1".to_string())));
+        assert!(matches!(out.kind, RecordType::SRV));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn listed_srv_value_includes_priority_from_data() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "errors": [],
+                "result": [{
+                    "id": "srv1",
+                    "name": "_minecraft._tcp.mc.apps.example.com",
+                    "content": "5 25570 mc.apps.example.com",
+                    "type": "SRV",
+                    "data": {"priority": 0, "weight": 5, "port": 25570, "target": "mc.apps.example.com"}
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let cf = Cloudflare::with_base(&server.uri(), "token");
+        let recs = cf.list_records(&DnsRef::Id("zone1".to_string())).await?;
+        let want = BasicRecord::srv(
+            "_minecraft._tcp.mc.apps.example.com".to_string(),
+            25570,
+            "mc.apps.example.com",
+            DnsRef::Id("zone1".to_string()),
+        );
+        assert_eq!(recs[0].value, want.value);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_records_returns_srv_records() -> anyhow::Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/client/v4/zones/zone1/dns_records"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "success": true,
+                "errors": [],
+                "result": [{
+                    "id": "srv1",
+                    "name": "_minecraft._tcp.mc.apps.example.com",
+                    "content": "0 5 25570 mc.apps.example.com",
+                    "type": "SRV"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        let cf = Cloudflare::with_base(&server.uri(), "token");
+        let recs = cf.list_records(&DnsRef::Id("zone1".to_string())).await?;
+        assert_eq!(recs.len(), 1);
+        assert!(matches!(recs[0].kind, RecordType::SRV));
+        assert_eq!(recs[0].value, "0 5 25570 mc.apps.example.com");
+        Ok(())
     }
 
     #[test]

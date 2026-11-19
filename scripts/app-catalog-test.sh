@@ -34,14 +34,22 @@ SETTLE="${SETTLE:-20}"
 
 # Config values for fields the customer must supply at order time. A required
 # field with no value here fails the render loudly rather than being skipped.
+CONFIG_ARGS=()
 app_config() {
     case "$1" in
         # A real bech32 npub (pubkey 0x…01): HAVEN decodes it at startup, so a
         # merely pattern-shaped string would crashloop the container.
-        haven) echo "--config owner_npub=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqshp52w2" ;;
-        buzz)  echo "--config owner_pubkey=0000000000000000000000000000000000000000000000000000000000000001" ;;
-        appweaver) echo "--config master_pubkey=79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798" ;;
-        *)     echo "" ;;
+        haven) CONFIG_ARGS=(--config owner_npub=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqshp52w2) ;;
+        buzz)  CONFIG_ARGS=(--config owner_pubkey=0000000000000000000000000000000000000000000000000000000000000001) ;;
+        appweaver) CONFIG_ARGS=(--config master_pubkey=79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798) ;;
+        minecraft-java) CONFIG_ARGS=(--config eula=TRUE --config rcon_password=testpass1234) ;;
+        ditto-relay) CONFIG_ARGS=(
+            --config policy_kinds=1
+            --config policy_deny_pubkeys=c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5
+            --config policy_min_pow=8
+            --config policy_max_event_bytes=1000
+        ) ;;
+        *)     CONFIG_ARGS=() ;;
     esac
 }
 
@@ -59,8 +67,8 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> rendering $APP_FILE"
-# shellcheck disable=SC2046  # app_config emits separate arguments on purpose
-RENDER="$("$BIN" "$APP_FILE" --out-dir "$OUT_DIR" --hostname localhost $(app_config "$APP"))"
+app_config "$APP"
+RENDER="$("$BIN" "$APP_FILE" --out-dir "$OUT_DIR" --hostname localhost "${CONFIG_ARGS[@]}")"
 echo "$RENDER"
 
 # Ingress ports are published on loopback at the container number, which on a
@@ -133,7 +141,7 @@ ports="$(grep -oE '127\.0\.0\.1:[0-9]+:' "$COMPOSE_FILE" | cut -d: -f2 | sort -u
 # guard silently, so anything but the two known values fails the run instead.
 doc_body="$(sed 's/^[[:space:]]*#.*$//; s/[[:space:]]#.*$//' "$APP_FILE")"
 unknown="$(printf '%s\n' "$doc_body" | grep -oE 'expose:[[:space:]]*[^,}[:space:]]+' \
-    | grep -vE 'expose:[[:space:]]*"?(none|ingress)"?$' || true)"
+    | grep -vE 'expose:[[:space:]]*"?(none|ingress|tcp|udp)"?$' || true)"
 if [ -n "$unknown" ]; then
     echo "FAIL $APP: unrecognised expose value: $unknown"
     failed=1
@@ -162,6 +170,15 @@ if [ "$failed" -eq 0 ]; then
             code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$port/" 2>/dev/null || true)"
             echo "    open (HTTP ${code:-000})"
         fi
+    done
+fi
+
+APP_CHECK="catalog/tests/$APP/check.sh"
+if [ "$failed" -eq 0 ] && [ -x "$APP_CHECK" ]; then
+    for port in $ports; do
+        echo "==> $APP_CHECK 127.0.0.1:$port"
+        "$APP_CHECK" "127.0.0.1:$port" || { echo "FAIL $APP: $APP_CHECK"; failed=1; }
+        break
     done
 fi
 

@@ -1,5 +1,9 @@
+mod abuse;
+mod app_backups;
+mod app_category;
 mod apps;
 mod contact;
+mod credit;
 mod docs;
 mod ip_space;
 mod legal;
@@ -12,18 +16,25 @@ mod model;
 mod nostr_domain;
 mod oauth;
 mod referral;
+// Public for the same reason `marketplace` is: the e2e harness carries the
+// document across the wire format both ends actually use.
 mod routes;
+pub mod routeserver;
 mod subscriptions;
 #[cfg(feature = "agent")]
 mod support;
+mod vm_addons;
 mod vpn;
 mod webauthn;
 mod webhook;
 
 use crate::settings::Settings;
 use crate::subscription::SubscriptionHandler;
+pub use abuse::router as abuse_router;
+pub use app_backups::router as app_backups_router;
 pub use apps::router as apps_router;
 pub use contact::router as contacts_router;
+pub use credit::router as credit_router;
 pub use docs::router as docs_router;
 pub use ip_space::router as ip_space_router;
 pub use legal::router as legal_router;
@@ -38,9 +49,11 @@ pub use nostr_domain::router as nostr_domain_router;
 pub use oauth::router as oauth_router;
 pub use referral::router as referral_router;
 pub use routes::routes as main_router;
+pub use routeserver::router as routeserver_router;
 use serde::Deserialize;
 use std::sync::Arc;
 pub use subscriptions::router as subscriptions_router;
+pub use vm_addons::router as vm_addons_router;
 pub use vpn::router as vpn_router;
 pub use webauthn::router as webauthn_router;
 pub use webhook::router as webhook_router;
@@ -62,6 +75,9 @@ pub(crate) struct PaymentMethodQuery {
     /// Discount code to apply to this order. A code that cannot be used fails
     /// the request rather than quietly charging full price.
     pub code: Option<String>,
+    /// For `method=fixedfloat`: the coin the customer pays with, one of the
+    /// codes in the method's `coins` metadata (e.g. `XMR`).
+    pub coin: Option<String>,
 }
 
 impl PaymentMethodQuery {
@@ -191,6 +207,22 @@ pub(crate) async fn discount_line(
     })
 }
 
+/// The account credit covering part of a payment, in the payment's currency.
+pub(crate) async fn credit_line(
+    db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
+    payment: &lnvps_db::SubscriptionPayment,
+) -> Option<crate::api::model::ApiCredit> {
+    let debit = db
+        .get_account_credit_debit_by_payment(&payment.id)
+        .await
+        .ok()
+        .flatten()?;
+    Some(crate::api::model::ApiCredit {
+        amount: debit.payment_amount,
+        currency: payment.currency.clone(),
+    })
+}
+
 /// Resolve a payment-method query for *pricing only*.
 ///
 /// Same mapping as [`resolve_payment_mode`] — `nwc` prices as Lightning, `saved`
@@ -207,6 +239,72 @@ pub(crate) fn resolve_quote_method(q: &PaymentMethodQuery) -> lnvps_db::PaymentM
         other => other
             .and_then(|m| PaymentMethod::from_str(m).ok())
             .unwrap_or(PaymentMethod::Lightning),
+    }
+}
+
+pub(crate) fn parse_fixedfloat_coin(
+    coin: Option<&str>,
+) -> Result<payments_rs::currency::Currency, lnvps_api_common::ApiError> {
+    use payments_rs::currency::Currency;
+    use std::str::FromStr;
+
+    let coin = coin
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| {
+            lnvps_api_common::ApiError::from(anyhow::anyhow!(
+                "coin is required for fixedfloat payments"
+            ))
+        })?;
+    Currency::from_str(coin)
+        .ok()
+        .filter(|c| c.is_crypto() && *c != Currency::BTC)
+        .ok_or_else(|| {
+            lnvps_api_common::ApiError::from(anyhow::anyhow!("Unsupported coin: {}", coin))
+        })
+}
+
+pub(crate) fn swap_client_record(
+    user_id: u64,
+    method: lnvps_db::PaymentMethod,
+    payment_id: &[u8],
+    external_data: &str,
+    client: &lnvps_api_common::ClientInfo,
+) -> Option<lnvps_db::SwapOrderClient> {
+    if method != lnvps_db::PaymentMethod::FixedFloat {
+        return None;
+    }
+    let swap = crate::swap::SwapData::parse(external_data).ok()?;
+    Some(lnvps_db::SwapOrderClient {
+        user_id,
+        order_id: swap.order_id,
+        payment_id: payment_id.to_vec(),
+        coin: swap.coin,
+        ip: client.ip.map(|ip| ip.to_string()),
+        user_agent: client.user_agent.clone(),
+        accept_language: client.accept_language.clone(),
+        ..Default::default()
+    })
+}
+
+pub(crate) async fn record_swap_client(
+    this: &RouterState,
+    user_id: u64,
+    method: lnvps_db::PaymentMethod,
+    payment_id: &[u8],
+    external_data: &str,
+    client: &lnvps_api_common::ClientInfo,
+) {
+    let Some(record) = swap_client_record(user_id, method, payment_id, external_data, client)
+    else {
+        return;
+    };
+    if let Err(e) = this.db.insert_swap_order_client(&record).await {
+        log::error!(
+            "Failed to record client for swap order {}: {}",
+            record.order_id,
+            e
+        );
     }
 }
 
@@ -243,6 +341,12 @@ pub(crate) async fn resolve_payment_mode(
                 method_id: q.payment_method_id,
             },
         )),
+        Some("fixedfloat") => Ok((
+            PaymentMethod::FixedFloat,
+            RenewMode::FixedFloat {
+                coin: parse_fixedfloat_coin(q.coin.as_deref())?,
+            },
+        )),
         other => Ok((
             other
                 .and_then(|m| PaymentMethod::from_str(m).ok())
@@ -268,6 +372,7 @@ mod tests {
             save_card: None,
             payment_method_id: None,
             code: None,
+            coin: None,
         }
     }
 
@@ -409,6 +514,80 @@ mod tests {
         );
     }
 
+    #[test]
+    fn swap_client_record_keeps_ip_agent_and_language() {
+        let data = crate::swap::SwapData {
+            coin: "XMR".to_string(),
+            order_id: "ABC123".to_string(),
+            order_token: "tok".to_string(),
+            deposit_address: "addr".to_string(),
+            deposit_amount: "1.5".to_string(),
+            receive_address: "bc1q".to_string(),
+        };
+        let client = lnvps_api_common::ClientInfo {
+            ip: Some("203.0.113.7".parse().unwrap()),
+            user_agent: Some("Mozilla/5.0".to_string()),
+            accept_language: Some("en-GB,en;q=0.9".to_string()),
+        };
+        let record = swap_client_record(
+            7,
+            lnvps_db::PaymentMethod::FixedFloat,
+            &[1, 2, 3],
+            &data.to_json().unwrap(),
+            &client,
+        )
+        .unwrap();
+        assert_eq!(record.user_id, 7);
+        assert_eq!(record.order_id, "ABC123");
+        assert_eq!(record.coin, "XMR");
+        assert_eq!(record.payment_id, vec![1, 2, 3]);
+        assert_eq!(record.ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(record.user_agent.as_deref(), Some("Mozilla/5.0"));
+        assert_eq!(record.accept_language.as_deref(), Some("en-GB,en;q=0.9"));
+    }
+
+    #[test]
+    fn swap_client_record_ignores_other_methods_and_bad_data() {
+        let client = lnvps_api_common::ClientInfo::default();
+        assert!(
+            swap_client_record(1, lnvps_db::PaymentMethod::Lightning, &[1], "{}", &client)
+                .is_none()
+        );
+        assert!(
+            swap_client_record(
+                1,
+                lnvps_db::PaymentMethod::FixedFloat,
+                &[1],
+                "nope",
+                &client
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_fixedfloat_coin_accepts_coins_in_any_case() {
+        use payments_rs::currency::Currency;
+
+        assert_eq!(parse_fixedfloat_coin(Some("XMR")).unwrap(), Currency::XMR);
+        assert_eq!(parse_fixedfloat_coin(Some(" ltc ")).unwrap(), Currency::LTC);
+        assert_eq!(parse_fixedfloat_coin(Some("eth")).unwrap(), Currency::ETH);
+        assert_eq!(
+            parse_fixedfloat_coin(Some("usdttrc")).unwrap(),
+            Currency::USDTTRC
+        );
+    }
+
+    #[test]
+    fn parse_fixedfloat_coin_rejects_missing_and_non_coins() {
+        assert!(parse_fixedfloat_coin(None).is_err());
+        assert!(parse_fixedfloat_coin(Some("")).is_err());
+        assert!(parse_fixedfloat_coin(Some("  ")).is_err());
+        assert!(parse_fixedfloat_coin(Some("BTC")).is_err());
+        assert!(parse_fixedfloat_coin(Some("EUR")).is_err());
+        assert!(parse_fixedfloat_coin(Some("DOGE")).is_err());
+    }
+
     /// The wire shape mirrors the payment: amounts already net of the discount,
     /// with the discount reported as a line to show rather than to re-apply.
     #[test]
@@ -431,6 +610,7 @@ mod tests {
                 amount_off: 100,
                 currency: Currency::EUR,
             }),
+            credit: None,
         };
         let out: ApiRenewalQuote = quote.into();
         assert_eq!(out.amount, 900);
@@ -451,6 +631,62 @@ mod tests {
         assert!(!serde_json::to_string(&out).unwrap().contains("discount"));
     }
 
+    #[tokio::test]
+    async fn credit_line_reports_the_payment_currency() {
+        use lnvps_db::LNVpsDbBase;
+        let mock = lnvps_api_common::MockDb::default();
+        mock.adjust_account_credit(1, "BTC", 5_000_000, "topup", None)
+            .await
+            .unwrap();
+        let id = mock
+            .reserve_account_credit(&lnvps_db::AccountCreditDebit {
+                user_id: 1,
+                amount: 5_000_000,
+                currency: "BTC".to_string(),
+                payment_amount: 500,
+                expires: chrono::Utc::now() + chrono::Duration::hours(1),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        mock.attach_account_credit_debit(id, &vec![3u8; 32], chrono::Utc::now())
+            .await
+            .unwrap();
+        let db: std::sync::Arc<dyn lnvps_db::LNVpsDb> = std::sync::Arc::new(mock);
+        let mut payment = lnvps_db::SubscriptionPayment {
+            id: vec![3u8; 32],
+            subscription_id: 1,
+            user_id: 1,
+            created: chrono::Utc::now(),
+            expires: chrono::Utc::now(),
+            amount: 1000,
+            currency: "EUR".to_string(),
+            payment_method: lnvps_db::PaymentMethod::Revolut,
+            payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
+            external_data: "{}".to_string().into(),
+            external_id: None,
+            is_paid: false,
+            rate: 1.0,
+            time_value: None,
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+            renewal_source: None,
+        };
+        let line = credit_line(&db, &payment).await.expect("credit line");
+        assert_eq!((line.amount, line.currency.as_str()), (500, "EUR"));
+        payment.id = vec![4u8; 32];
+        assert!(credit_line(&db, &payment).await.is_none());
+    }
+
     fn quote_without_discount() -> crate::subscription::RenewalQuote {
         crate::subscription::RenewalQuote {
             amount: 1_000,
@@ -462,6 +698,7 @@ mod tests {
             payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
             tax_lines: vec![],
             discount: None,
+            credit: None,
         }
     }
 }

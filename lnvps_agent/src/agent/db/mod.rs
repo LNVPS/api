@@ -226,6 +226,36 @@ impl DbToolExecutor {
     ///
     /// Conversion is best-effort: a rate service outage must not stop the agent
     /// quoting the real, stored price.
+    async fn priced_scaled(&self, raw: u64, scale: u64, currency: Currency) -> Value {
+        let scale = scale.max(1);
+        if scale == 1 || raw % scale == 0 {
+            return self
+                .priced(CurrencyAmount::from_u64(currency, raw / scale))
+                .await;
+        }
+        // A fraction of a minor unit (an hourly rate): state it in BTC, which is
+        // fine-grained enough, instead of rounding it to a whole cent.
+        let all = match self.rates.as_ref() {
+            Some(rates) => rates.list_rates().await.ok(),
+            None => None,
+        };
+        let exact = all.and_then(|all| {
+            all.iter()
+                .filter(|r| r.can_convert(currency) && r.can_convert(Currency::BTC))
+                .find_map(|r| {
+                    r.convert_scaled(CurrencyAmount::from_u64(currency, raw), scale)
+                        .ok()
+                })
+        });
+        match exact {
+            Some(btc) if btc.currency() == Currency::BTC => self.priced(btc).await,
+            _ => {
+                self.priced(CurrencyAmount::from_u64(currency, raw.div_ceil(scale)))
+                    .await
+            }
+        }
+    }
+
     async fn priced(&self, amount: CurrencyAmount) -> Value {
         let mut out = money(amount);
         let Some(rates) = self.rates.as_ref() else {

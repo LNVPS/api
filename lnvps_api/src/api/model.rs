@@ -60,19 +60,42 @@ pub struct ApiCustomVmPrice {
     /// backward compatibility; will be removed in a future release.
     pub other_price: Vec<ApiPrice>,
     /// Billing period the amount buys, same shape as a standard template's cost
-    /// plan. Custom builds renew monthly, so this is always 1 month.
+    /// plan. Follows the custom pricing model's interval (monthly by default).
     pub interval_amount: u64,
     pub interval_type: ApiIntervalType,
 }
 
 impl ApiCustomVmPrice {
-    /// Build from a base [`CurrencyAmount`], expanding conversions to the other
-    /// supported currencies via the exchange rates.
-    pub async fn from_amount(
-        amount: CurrencyAmount,
+    /// Build from what one billing interval of a custom pricing model costs,
+    /// expanding conversions to the other supported currencies.
+    ///
+    /// `price` is kept in its fine `1/scale` unit. A fiat price per hour is a
+    /// fraction of a cent, which a whole fiat amount can't state, so a price
+    /// that doesn't come out in whole minor units is quoted in BTC millisats
+    /// (as hourly VMs are paid from credit) instead of being rounded up to the
+    /// next cent.
+    pub async fn from_price(
+        price: &PricingData,
         rates: &Arc<dyn ExchangeRateService>,
     ) -> Result<Self> {
         let rate_list = rates.list_rates().await?;
+        let raw = price.total_raw();
+        let amount = if price.scale <= 1 {
+            CurrencyAmount::from_u64(price.currency, raw)
+        } else if raw % price.scale == 0 {
+            CurrencyAmount::from_u64(price.currency, raw / price.scale)
+        } else {
+            // Convert the raw price directly; fall back to rounded-up fiat if
+            // there is no BTC rate to convert with.
+            rate_list
+                .iter()
+                .filter(|r| r.can_convert(price.currency) && r.can_convert(Currency::BTC))
+                .find_map(|r| {
+                    r.convert_scaled(CurrencyAmount::from_u64(price.currency, raw), price.scale)
+                        .ok()
+                })
+                .unwrap_or_else(|| CurrencyAmount::from_u64(price.currency, price.total()))
+        };
         let other_price = alt_prices(&rate_list, amount)
             .into_iter()
             .map(|p| ApiPrice {
@@ -84,8 +107,8 @@ impl ApiCustomVmPrice {
             currency: amount.currency().into(),
             amount: amount.value(),
             other_price,
-            interval_amount: CUSTOM_VM_INTERVAL_AMOUNT,
-            interval_type: CUSTOM_VM_INTERVAL_TYPE.into(),
+            interval_amount: price.interval_amount,
+            interval_type: price.interval_type.into(),
         })
     }
 }
@@ -419,6 +442,11 @@ pub struct ApiVmPayment {
     /// further reduction to apply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discount: Option<ApiDiscount>,
+    /// Account credit applied to this payment, when the balance covered part of
+    /// it. A payment method, not a price change: `amount` is the full (discounted)
+    /// bill; `credit.amount` is the part the balance covered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit: Option<ApiCredit>,
 }
 
 /// A priced renewal order, computed without creating a payment.
@@ -443,6 +471,12 @@ pub struct ApiRenewalQuote {
     /// further reduction to apply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discount: Option<ApiDiscount>,
+    /// Account credit that would be applied, when the user opted in and has a
+    /// positive balance. A payment method, not a price change: `amount`, `tax`
+    /// and `processing_fee` are the full bill; `credit.amount` is the part
+    /// covered by the balance, so the external invoice is for the remainder.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit: Option<ApiCredit>,
 }
 
 impl From<crate::subscription::RenewalQuote> for ApiRenewalQuote {
@@ -457,8 +491,19 @@ impl From<crate::subscription::RenewalQuote> for ApiRenewalQuote {
                 code: d.code,
                 amount_off: d.amount_off,
             }),
+            credit: q.credit.map(|c| ApiCredit {
+                amount: c.amount,
+                currency: c.currency.to_string(),
+            }),
         }
     }
+}
+
+/// Account credit covering part of a bill, in the bill's currency.
+#[derive(Serialize, Deserialize)]
+pub struct ApiCredit {
+    pub amount: u64,
+    pub currency: String,
 }
 
 /// A discount applied to a payment.
@@ -570,6 +615,8 @@ impl ApiVmPayment {
         // payment list down with it (this converter is collected with `?`).
         let data = if is_refund {
             ApiPaymentData::Lightning(String::new())
+        } else if value.external_data.as_str() == crate::subscription::CREDIT_FUNDED_MARKER {
+            ApiPaymentData::Credit
         } else {
             match &value.payment_method {
                 PaymentMethod::Lightning => ApiPaymentData::Lightning(value.external_data.into()),
@@ -577,6 +624,17 @@ impl ApiVmPayment {
                     address: value.external_data.into(),
                     outpoint: value.external_id.clone(),
                 },
+                PaymentMethod::FixedFloat => {
+                    let data = crate::swap::SwapData::parse(value.external_data.as_str()).map_err(
+                        |e| anyhow::anyhow!("Failed to parse FixedFloat payment data: {}", e),
+                    )?;
+                    ApiPaymentData::FixedFloat {
+                        coin: data.coin,
+                        address: data.deposit_address,
+                        amount: data.deposit_amount,
+                        outpoint: value.external_id.clone(),
+                    }
+                }
                 PaymentMethod::Revolut => {
                     #[derive(Deserialize)]
                     struct RevolutData {
@@ -622,6 +680,7 @@ impl ApiVmPayment {
             is_refund,
             // Filled by handlers that have the database to look it up.
             discount: None,
+            credit: None,
         })
     }
 }
@@ -685,6 +744,21 @@ pub enum ApiPaymentData {
         #[serde(skip_serializing_if = "Option::is_none")]
         outpoint: Option<String>,
     },
+    /// A cryptocurrency paid through a swap that settles to our Bitcoin wallet
+    FixedFloat {
+        /// Coin to send, e.g. `XMR`
+        coin: String,
+        /// Deposit address for `coin`
+        address: String,
+        /// Amount of `coin` to send, as a decimal string
+        amount: String,
+        /// Outpoint (`"{txid}:{vout}"`) of the Bitcoin the swap delivered, set
+        /// once it is seen in the mempool. `None` until the swap pays out.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        outpoint: Option<String>,
+    },
+    /// Paid in full from account credit; nothing to pay externally.
+    Credit,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -698,6 +772,19 @@ pub enum ApiPaymentMethod {
     NWC,
     LNURL,
     OnChain,
+    FixedFloat,
+    /// Paid in full from account credit. Only appears on payment records.
+    Credit,
+}
+
+impl ApiPaymentMethod {
+    pub fn for_payment(method: PaymentMethod, external_data: &str) -> Self {
+        if external_data == crate::subscription::CREDIT_FUNDED_MARKER {
+            ApiPaymentMethod::Credit
+        } else {
+            ApiPaymentMethod::from(method)
+        }
+    }
 }
 
 impl From<PaymentMethod> for ApiPaymentMethod {
@@ -708,6 +795,7 @@ impl From<PaymentMethod> for ApiPaymentMethod {
             PaymentMethod::Paypal => ApiPaymentMethod::Paypal,
             PaymentMethod::Stripe => ApiPaymentMethod::Stripe,
             PaymentMethod::OnChain => ApiPaymentMethod::OnChain,
+            PaymentMethod::FixedFloat => ApiPaymentMethod::FixedFloat,
         }
     }
 }
@@ -763,6 +851,30 @@ pub enum ApiVmHistoryInitiator {
     System,
     /// Action initiated by another user
     Other,
+}
+
+#[derive(Serialize)]
+pub struct ApiVmSnapshot {
+    pub name: String,
+    pub description: Option<String>,
+    pub created: Option<DateTime<Utc>>,
+}
+
+impl From<lnvps_api_common::host::VmSnapshot> for ApiVmSnapshot {
+    fn from(value: lnvps_api_common::host::VmSnapshot) -> Self {
+        Self {
+            name: value.name,
+            description: value.description,
+            created: value.created,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CreateVmSnapshotRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -838,6 +950,10 @@ pub struct ApiCustomVmRequest {
     /// IPv6 addresses to assign; defaults to 1.
     #[serde(default = "default_ip_count")]
     pub ip6_count: u16,
+    #[serde(default)]
+    pub transfer_gb: Option<u32>,
+    #[serde(default)]
+    pub network_mbps: Option<u32>,
 }
 
 fn default_ip_count() -> u16 {
@@ -872,6 +988,8 @@ impl From<ApiCustomVmRequest> for VmCustomTemplate {
                 .and_then(|s| s.parse().ok())
                 .unwrap_or_default(),
             cpu_features: cpu_features.into(),
+            transfer_gb: value.transfer_gb,
+            network_mbps: value.network_mbps,
             ..Default::default()
         }
     }
@@ -882,6 +1000,22 @@ pub struct ApiVmUpgradeRequest {
     pub cpu: Option<u16>,
     pub memory: Option<u64>,
     pub disk: Option<u64>,
+    #[serde(default)]
+    pub transfer_gb: Option<u32>,
+    #[serde(default)]
+    pub network_mbps: Option<u32>,
+}
+
+impl From<ApiVmUpgradeRequest> for UpgradeConfig {
+    fn from(req: ApiVmUpgradeRequest) -> Self {
+        Self {
+            new_cpu: req.cpu,
+            new_memory: req.memory,
+            new_disk: req.disk,
+            new_transfer_gb: req.transfer_gb,
+            new_network_mbps: req.network_mbps,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -894,6 +1028,9 @@ pub struct ApiVmUpgradeQuote {
     pub tax: ApiPrice,
     /// Payment processing fee added on top (zero for Lightning).
     pub processing_fee: ApiPrice,
+    /// Account credit that would cover part of the upgrade.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit: Option<ApiCredit>,
 }
 
 // ============================================================================
@@ -1222,6 +1359,10 @@ pub struct ApiSubscriptionLineItem {
     /// Typed reference to the resource this line item bills for, resolved from
     /// the line item's subscription type (`null` when there is no linked resource).
     pub resource: Option<ApiSubscriptionLineItemResource>,
+    /// When this line item stopped billing on its own (its resource was
+    /// deleted while the subscription bills other products). `null` while
+    /// active.
+    pub deactivated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl ApiSubscriptionLineItem {
@@ -1247,6 +1388,7 @@ impl ApiSubscriptionLineItem {
             setup_fee: setup_fee.into(),
             configuration: line_item.configuration,
             resource,
+            deactivated_at: line_item.deactivated_at,
         }
     }
 }
@@ -1272,6 +1414,8 @@ pub struct ApiSubscriptionPayment {
     /// (and `tax`) are already net of it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub discount: Option<ApiDiscount>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credit: Option<ApiCredit>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1282,6 +1426,7 @@ pub enum ApiSubscriptionPaymentType {
     /// Money returned to the customer. `amount`/`tax` are the magnitude
     /// refunded, so a client totalling what a customer paid must subtract it.
     Refund,
+    AddonChange,
 }
 
 impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
@@ -1291,6 +1436,9 @@ impl From<lnvps_db::SubscriptionPaymentType> for ApiSubscriptionPaymentType {
             lnvps_db::SubscriptionPaymentType::Renewal => ApiSubscriptionPaymentType::Renewal,
             lnvps_db::SubscriptionPaymentType::Upgrade => ApiSubscriptionPaymentType::Upgrade,
             lnvps_db::SubscriptionPaymentType::Refund => ApiSubscriptionPaymentType::Refund,
+            lnvps_db::SubscriptionPaymentType::AddonChange => {
+                ApiSubscriptionPaymentType::AddonChange
+            }
         }
     }
 }
@@ -1310,6 +1458,9 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
         // Surface the payment-method data (e.g. the Lightning invoice) so callers
         // can actually pay. Non-lightning external data is best-effort parsed.
         let data = match &payment.payment_method {
+            _ if payment.external_data.as_str() == crate::subscription::CREDIT_FUNDED_MARKER => {
+                ApiPaymentData::Credit
+            }
             PaymentMethod::Lightning => {
                 ApiPaymentData::Lightning(payment.external_data.clone().into())
             }
@@ -1317,6 +1468,16 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
                 address: payment.external_data.clone().into(),
                 outpoint: payment.external_id.clone(),
             },
+            PaymentMethod::FixedFloat => {
+                crate::swap::SwapData::parse(payment.external_data.as_str())
+                    .map(|d| ApiPaymentData::FixedFloat {
+                        coin: d.coin,
+                        address: d.deposit_address,
+                        amount: d.deposit_amount,
+                        outpoint: payment.external_id.clone(),
+                    })
+                    .unwrap_or_else(|_| ApiPaymentData::Lightning(String::new()))
+            }
             PaymentMethod::Revolut => {
                 #[derive(Deserialize)]
                 struct RevolutData {
@@ -1346,7 +1507,10 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
             created: payment.created,
             expires: payment.expires,
             amount: amount.into(),
-            payment_method: ApiPaymentMethod::from(payment.payment_method),
+            payment_method: ApiPaymentMethod::for_payment(
+                payment.payment_method,
+                payment.external_data.as_str(),
+            ),
             payment_type: ApiSubscriptionPaymentType::from(payment.payment_type),
             is_paid: payment.is_paid,
             paid_at: payment.paid_at,
@@ -1355,6 +1519,7 @@ impl From<lnvps_db::SubscriptionPayment> for ApiSubscriptionPayment {
             data,
             // Filled by handlers that have the database to look it up.
             discount: None,
+            credit: None,
         }
     }
 }
@@ -1620,6 +1785,28 @@ pub struct VmTrafficQuery {
 #[cfg(test)]
 mod tests {
 
+    #[test]
+    fn snapshot_request_description_is_optional() {
+        let req: CreateVmSnapshotRequest = serde_json::from_str(r#"{"name":"one"}"#).unwrap();
+        assert_eq!(req.name, "one");
+        assert_eq!(req.description, None);
+    }
+
+    #[test]
+    fn snapshot_converts_to_its_api_form() {
+        let api: ApiVmSnapshot = lnvps_api_common::host::VmSnapshot {
+            name: "one".into(),
+            description: Some("d".into()),
+            created: None,
+        }
+        .into();
+        let json = serde_json::to_value(&api).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"name": "one", "description": "d", "created": null})
+        );
+    }
+
     /// Omitted counts mean the single-IPv4/single-IPv6 offer that predates them
     /// being selectable, so an older client keeps ordering exactly what it did.
     #[test]
@@ -1649,6 +1836,31 @@ mod tests {
         assert_eq!(0, t.ip4_count);
         assert_eq!(3, t.ip6_count);
     }
+
+    #[test]
+    fn custom_vm_request_carries_bandwidth() {
+        let req: ApiCustomVmRequest = serde_json::from_str(
+            r#"{"pricing_id": 1, "cpu": 2, "memory": 2147483648, "disk": 21474836480,
+                "disk_type": "ssd", "disk_interface": "pcie",
+                "transfer_gb": 4000, "network_mbps": 2500}"#,
+        )
+        .unwrap();
+        let t: lnvps_db::VmCustomTemplate = req.into();
+        assert_eq!(Some(4000), t.transfer_gb);
+        assert_eq!(Some(2500), t.network_mbps);
+    }
+
+    #[test]
+    fn upgrade_request_maps_to_config() {
+        let req: ApiVmUpgradeRequest =
+            serde_json::from_str(r#"{"cpu": 4, "transfer_gb": 3000, "network_mbps": 200}"#)
+                .unwrap();
+        let cfg: UpgradeConfig = req.into();
+        assert_eq!(cfg.new_cpu, Some(4));
+        assert_eq!(cfg.new_memory, None);
+        assert_eq!(cfg.new_transfer_gb, Some(3000));
+        assert_eq!(cfg.new_network_mbps, Some(200));
+    }
     use super::*;
 
     /// Exchange-rate feed (#230): a BTC base quotes fiat directly, a fiat base
@@ -1675,6 +1887,176 @@ mod tests {
         assert!((eur.rates["BTC"] - (1.0 / 100_000.0)).abs() < 1e-9);
         assert!((eur.rates["USD"] - 1.1).abs() < 1e-3);
         assert!(!eur.rates.contains_key("EUR"));
+    }
+
+    #[test]
+    fn a_credit_funded_payment_has_credit_data() {
+        let payment = lnvps_db::SubscriptionPayment {
+            id: vec![1u8; 32],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now(),
+            amount: 1000,
+            currency: "EUR".to_string(),
+            payment_method: PaymentMethod::Revolut,
+            payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
+            external_data: crate::subscription::CREDIT_FUNDED_MARKER.to_string().into(),
+            external_id: None,
+            is_paid: true,
+            rate: 1.0,
+            time_value: Some(2_592_000),
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+            renewal_source: None,
+        };
+        let vm = ApiVmPayment::from_subscription_payment(payment.clone(), 1).unwrap();
+        assert!(matches!(vm.data, ApiPaymentData::Credit));
+        assert_eq!(serde_json::to_value(&vm).unwrap()["data"], "credit");
+        let sub = ApiSubscriptionPayment::from(payment);
+        assert!(matches!(sub.data, ApiPaymentData::Credit));
+        assert_eq!(
+            serde_json::to_value(&sub).unwrap()["payment_method"],
+            "credit"
+        );
+    }
+
+    fn fixedfloat_payment(external_data: &str) -> lnvps_db::SubscriptionPayment {
+        lnvps_db::SubscriptionPayment {
+            id: vec![2u8; 16],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now(),
+            amount: 1000,
+            currency: "BTC".to_string(),
+            payment_method: PaymentMethod::FixedFloat,
+            payment_type: lnvps_db::SubscriptionPaymentType::Renewal,
+            external_data: external_data.to_string().into(),
+            external_id: None,
+            is_paid: false,
+            rate: 1.0,
+            time_value: Some(2_592_000),
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+            renewal_source: None,
+        }
+    }
+
+    #[test]
+    fn test_fixedfloat_payment_exposes_coin_address_and_amount() {
+        let data = crate::swap::SwapData {
+            coin: "LTC".to_string(),
+            order_id: "ABC".to_string(),
+            order_token: "secret-token".to_string(),
+            deposit_address: "ltc1qdeposit".to_string(),
+            deposit_amount: "0.42".to_string(),
+            receive_address: "bc1qours".to_string(),
+        }
+        .to_json()
+        .unwrap();
+        let mut payment = fixedfloat_payment(&data);
+
+        let waiting = ApiVmPayment::from_subscription_payment(payment.clone(), 1).unwrap();
+        match &waiting.data {
+            ApiPaymentData::FixedFloat {
+                coin,
+                address,
+                amount,
+                outpoint,
+            } => {
+                assert_eq!(coin, "LTC");
+                assert_eq!(address, "ltc1qdeposit");
+                assert_eq!(amount, "0.42");
+                assert!(outpoint.is_none());
+            }
+            _ => panic!("expected FixedFloat data"),
+        }
+        let json = serde_json::to_value(&waiting).unwrap();
+        assert_eq!(json["data"]["fixedfloat"]["coin"], "LTC");
+        assert!(json["data"]["fixedfloat"].get("outpoint").is_none());
+        let text = json.to_string();
+        assert!(!text.contains("secret-token"), "order token must not leak");
+        assert!(
+            !text.contains("bc1qours"),
+            "our receive address must not leak"
+        );
+
+        payment.external_id = Some("txid:1".to_string());
+        let detected = ApiVmPayment::from_subscription_payment(payment, 1).unwrap();
+        match detected.data {
+            ApiPaymentData::FixedFloat { outpoint, .. } => {
+                assert_eq!(outpoint.as_deref(), Some("txid:1"))
+            }
+            _ => panic!("expected FixedFloat data"),
+        }
+    }
+
+    #[test]
+    fn test_subscription_fixedfloat_payment_exposes_coin() {
+        let data = crate::swap::SwapData {
+            coin: "USDTTRC".to_string(),
+            order_id: "ABC".to_string(),
+            order_token: "secret-token".to_string(),
+            deposit_address: "Tdeposit".to_string(),
+            deposit_amount: "55.1".to_string(),
+            receive_address: "bc1qours".to_string(),
+        }
+        .to_json()
+        .unwrap();
+        let sub = ApiSubscriptionPayment::from(fixedfloat_payment(&data));
+        match sub.data {
+            ApiPaymentData::FixedFloat {
+                coin,
+                address,
+                amount,
+                ..
+            } => {
+                assert_eq!(
+                    (coin.as_str(), address.as_str(), amount.as_str()),
+                    ("USDTTRC", "Tdeposit", "55.1")
+                );
+            }
+            _ => panic!("expected FixedFloat data"),
+        }
+    }
+
+    #[test]
+    fn test_fixedfloat_method_wire_name() {
+        assert_eq!(
+            serde_json::to_string(&ApiPaymentMethod::FixedFloat).unwrap(),
+            "\"fixedfloat\""
+        );
+        assert_eq!(
+            ApiPaymentMethod::from(PaymentMethod::FixedFloat),
+            ApiPaymentMethod::FixedFloat
+        );
+        assert_eq!(
+            serde_json::from_str::<ApiPaymentMethod>("\"fixedfloat\"").unwrap(),
+            ApiPaymentMethod::FixedFloat
+        );
+    }
+
+    #[test]
+    fn test_fixedfloat_payment_with_bad_data_is_an_error() {
+        let payment = fixedfloat_payment("not json");
+        assert!(ApiVmPayment::from_subscription_payment(payment, 1).is_err());
     }
 
     /// On-chain payment data exposes the deposit outpoint (`{txid}:{vout}`) once

@@ -24,6 +24,13 @@ pub fn is_not_found(e: &VirtError) -> bool {
     )
 }
 
+pub fn is_snapshot_not_found(e: &VirtError) -> bool {
+    matches!(
+        e.code().unwrap_or(ErrorNumber::InternalError),
+        ErrorNumber::NoDomainSnapshot
+    )
+}
+
 /// True when retrying the same call can never produce a different result.
 ///
 /// Anything not listed here is treated as transient, which is the safe default:
@@ -34,6 +41,7 @@ fn is_fatal(e: &VirtError) -> bool {
         e.code().unwrap_or(ErrorNumber::InternalError),
         // The object we were told to act on does not exist.
         ErrorNumber::NoDomain
+            | ErrorNumber::NoDomainSnapshot
             | ErrorNumber::NoStorageVolume
             | ErrorNumber::NoStoragePool
             | ErrorNumber::NoNetwork

@@ -1038,8 +1038,13 @@ for a few minutes, measured over SSH, and destroyed. It looks like a regular VM 
 because it is one — which means the probe tests provisioning, the thing a customer hits first
 and the thing a ping says nothing about.
 
-- **IPv6 only.** There is plenty of it and none to spare of v4, and a node that cannot carry a
-  v6 guest cannot carry a dual-stack one either.
+- **IPv4 from the pool's own private block**, not a customer range. The first cut was IPv6 only,
+  but the k8s cluster the worker runs in is IPv4-only and could never reach it. A node at offset
+  `k` in the v4 block gets its probe at offset `size - k`, so marketplace pools only place nodes
+  in the lower half. The guest's prefix is that upper half and its gateway the half's first
+  address, held by the node on the bridge. The gateway has to sit inside the guest's prefix:
+  cloud-init 26.2's networkd renderer drops `on-link: true` and its ENI renderer crashes on a
+  gateway-less link route, so an off-subnet gateway leaves the guest with no default route.
 - **Nothing about a probe VM is stored.** It lives in LNVPS's memory and in the node's desired
   state, nowhere else. That is the failure model, not a shortcut: if the API restarts mid-probe
   the VM is simply absent from the next document the node fetches, and the node tears it down as
@@ -1186,7 +1191,8 @@ node job protocol:
 
 ### Increment 7 — Placement, capacity and templates (M)
 - Feed node telemetry into the existing load factors; overcommit policy per trust tier.
-- Marketplace-eligible templates/regions; user-visible "community compute" flag on offers.
+- Dropped: marketplace-only templates and a "community compute" flag. A marketplace node is a
+  regular host in its region and is invisible to the VM purchase; the probe gate is what admits it.
 - Drain/cordon: stop new placements, optionally migrate or expire existing VMs.
 
 ### Increment 8 — SLA, uptime accounting and enforcement (M)

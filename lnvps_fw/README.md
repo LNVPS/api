@@ -348,6 +348,7 @@ Test binaries (`lnvps_fw_service/tests/`):
 | `carpet_bomb` | thin prefix-wide flood flips the whole prefix |
 | `syn_proxy` | real client completes the cookie handshake + is verified; spoofed never verify |
 | `sni_block` | blocked ClientHello shot + counted (v4/v6), others pass, learning unaffected |
+| `vlan` | 802.1Q / QinQ-tagged frames on a trunk are filtered behind the tag(s); tagged non-IP passes; tagged egress still learns |
 
 See [`docs/agents/fw-testing.md`](../docs/agents/fw-testing.md) (repo root) for
 harness internals, kernel prerequisites, and how to add scenarios.
@@ -423,7 +424,68 @@ interfaces:
 GRE decap parses the outer IP + GRE header (variable length via the C/K/S flag
 bits) and runs the normal per-dest/per-prefix logic on the inner IP. SYN-proxy
 is disabled on the decapsulated path (it can't re-encapsulate a reply); the
-port-filter, source-block, and rate/prefix mitigations all still apply.
+port-filter, source-block, and rate/prefix mitigations all still apply. Any
+router role also defaults `escalation.syn-proxy-syn-pps` to **0** (the cookie
+SYN-ACK is `XDP_TX`'d out the ingress NIC, so on the plain-L2 path of a
+tunneled/asymmetric router it black-holes real services); set it explicitly
+only if every filter NIC is symmetric plain L2.
+
+### VLAN trunk ports
+
+A `filter`/`host` hook may sit on a trunk port (e.g. a bare-metal router with
+one physical NIC carrying the uplink, peering and VM VLANs as sub-interfaces).
+The datapath looks through up to two tags (802.1ad outer + 802.1Q inner)
+on both the XDP and TC hooks, so it works whether or not the NIC strips tags
+in hardware. Two constraints: attach XDP to the **physical** port (a VLAN
+sub-interface is a software device and only gets generic XDP), and keep the
+SYN-proxy off there — its `XDP_TX` reply is not re-tagged, so it would leave
+on the wrong VLAN (`syn-proxy-syn-pps: 0`, the router default; tagged frames
+are never offered to the proxy in any case).
+
+### XDP attach mode and driver side effects
+
+Attaching XDP is not free of side effects, and none of them are visible from
+inside the program: a driver may clear guest/HW offloads (virtio_net drops
+guest TSO/GRO-HW/CSUM), refuse a native attach (jumbo MTU, no multi-buffer
+support for our `xdp.frags` program) and land on the **generic (SKB) path**,
+which copies/linearises every skb and drops the large GRO/TSO ones it cannot
+copy — throughput collapses for exactly the flows that arrive coalesced (e.g.
+from a VM host on the same hypervisor) while nothing is logged and no counter
+in the daemon moves.
+
+So the daemon snapshots each NIC around the attach and logs, per interface,
+the hooks installed, the XDP mode the kernel **actually** picked, the driver,
+MTU and speed, and any offload feature the attach flipped (`warn!` on generic
+mode or a flipped offload). The same appears in `GET /status` → `nics`,
+re-read every `learning.stats-interval-secs` together with the driver's own
+XDP counters (`rx_xdp_drops`). Per interface, `xdp-mode: native` refuses the
+generic fallback and fails startup instead:
+
+```yaml
+interfaces:
+  - { name: ens19, role: filter, xdp-mode: native }
+```
+
+The `STATS` line logged on that interval also warns when packets are being
+dropped with no mitigation, override or block active (a userspace/kernel
+desync — it dumps the enforcing trie entries), and when the driver counts XDP
+drops the program never issued. On a clean stop (`SIGTERM`/`^C`) the daemon
+puts back every offload its attach flipped.
+
+**virtio_net (a router that is itself a VM), measured on 6.12 with KVM/vhost:**
+a *native* attach makes the guest clear its TSO/GRO-HW offloads over the
+control virtqueue **without changing the guest's `ethtool -k`** — the only
+place it shows is the hypervisor's tap (`ethtool -k tapN | grep
+tcp-segmentation`, now `off`). The hypervisor then segments everything it
+sends into the router in software, bursts overflow the tap's default
+1000-packet TX queue, and the resulting loss collapses TCP over a real RTT.
+Only traffic entering the router through a local tap (a VM host on the same
+hypervisor) is affected, only in that direction, and it recovers as soon as
+the program is detached. Mitigations on the hypervisor side: a deeper tap
+queue (`ip link set tapN txqueuelen 10000`), multiqueue virtio for the router
+NIC, or keeping same-hypervisor VM hosts off the filter NIC's tap. A
+*generic* attach instead flips the guest's own `rx-gro-hw` off (visible, and
+left off by the kernel after detach — hence the restore on exit).
 
 ### Scope (`protected`)
 

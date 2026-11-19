@@ -7,7 +7,7 @@ use crate::host::proxmox_config::{
 };
 use crate::host::{
     FullVmInfo, MigrateVmRequest, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient,
-    VmHostDiskInfo, VmHostInfo,
+    VmHostDiskInfo, VmHostInfo, VmSnapshot,
 };
 use crate::retry::{OpError, OpResult, Pipeline, RetryPolicy};
 use crate::ssh_client::SshClient;
@@ -33,9 +33,13 @@ use tokio::time::sleep;
 /// Comment prefix used to tag user-defined firewall rules (#36) on Proxmox so
 /// they can be identified and re-synced without disturbing system rules.
 const USER_FW_MARKER: &str = "lnvps-fw";
+const ISO_DIR: &str = "/var/lib/vz/template/iso";
+
+pub type SshExecFn = Arc<dyn Fn(&str) -> Result<(i32, String)> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct ProxmoxClient {
+    ssh_exec: Option<SshExecFn>,
     api: JsonApi,
     config: QemuConfig,
     ssh: Option<SshConfig>,
@@ -75,6 +79,7 @@ impl ProxmoxClient {
         ssh: Option<SshConfig>,
     ) -> Self {
         Self {
+            ssh_exec: None,
             api: JsonApi::token(base.as_str(), &format!("PVEAPIToken={}", token), true).unwrap(),
             config,
             ssh,
@@ -84,6 +89,11 @@ impl ProxmoxClient {
             ssh_node: Arc::new(OnceCell::new()),
             written_snippets: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_ssh_exec(mut self, exec: SshExecFn) -> Self {
+        self.ssh_exec = Some(exec);
+        self
     }
 
     /// Get version info
@@ -828,6 +838,79 @@ impl ProxmoxClient {
         Ok(TaskId {
             id: rsp.data,
             node: node_str,
+        })
+    }
+
+    pub async fn list_vm_snapshots(
+        &self,
+        node: &str,
+        vm: ProxmoxVmId,
+    ) -> OpResult<Vec<SnapshotInfo>> {
+        let rsp: ResponseBase<Vec<SnapshotInfo>> = self
+            .api
+            .get(&format!("/api2/json/nodes/{}/qemu/{}/snapshot", node, vm))
+            .await?;
+        Ok(rsp.data)
+    }
+
+    pub async fn create_vm_snapshot(
+        &self,
+        node: &str,
+        vm: ProxmoxVmId,
+        req: &CreateSnapshotRequest,
+    ) -> OpResult<TaskId> {
+        let rsp: ResponseBase<String> = self
+            .api
+            .post(
+                &format!("/api2/json/nodes/{}/qemu/{}/snapshot", node, vm),
+                req,
+            )
+            .await?;
+        Ok(TaskId {
+            id: rsp.data,
+            node: node.to_string(),
+        })
+    }
+
+    pub async fn rollback_vm_snapshot(
+        &self,
+        node: &str,
+        vm: ProxmoxVmId,
+        name: &str,
+    ) -> OpResult<TaskId> {
+        let rsp: ResponseBase<String> = self
+            .api
+            .post(
+                &format!(
+                    "/api2/json/nodes/{}/qemu/{}/snapshot/{}/rollback",
+                    node, vm, name
+                ),
+                (),
+            )
+            .await?;
+        Ok(TaskId {
+            id: rsp.data,
+            node: node.to_string(),
+        })
+    }
+
+    pub async fn delete_vm_snapshot(
+        &self,
+        node: &str,
+        vm: ProxmoxVmId,
+        name: &str,
+    ) -> OpResult<TaskId> {
+        let rsp: ResponseBase<String> = self
+            .api
+            .req::<_, ()>(
+                Method::DELETE,
+                &format!("/api2/json/nodes/{}/qemu/{}/snapshot/{}", node, vm, name),
+                None,
+            )
+            .await?;
+        Ok(TaskId {
+            id: rsp.data,
+            node: node.to_string(),
         })
     }
 
@@ -1738,6 +1821,59 @@ impl VmHostClient for ProxmoxClient {
         Ok(out)
     }
 
+    async fn list_snapshots(&self, vm: &Vm) -> OpResult<Vec<VmSnapshot>> {
+        let mut out: Vec<VmSnapshot> = self
+            .list_vm_snapshots(&self.node, vm.id.into())
+            .await?
+            .into_iter()
+            .filter(|s| s.name != "current")
+            .map(VmSnapshot::from)
+            .collect();
+        out.sort_by_key(|s| s.created);
+        Ok(out)
+    }
+
+    async fn create_snapshot(
+        &self,
+        vm: &Vm,
+        name: &str,
+        description: Option<&str>,
+    ) -> OpResult<()> {
+        let task = self
+            .create_vm_snapshot(
+                &self.node,
+                vm.id.into(),
+                &CreateSnapshotRequest {
+                    snapname: name.to_string(),
+                    description: description.map(str::to_string),
+                    vmstate: false,
+                },
+            )
+            .await?;
+        self.wait_for_task(&task).await?;
+        Ok(())
+    }
+
+    async fn rollback_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+        let task = self
+            .rollback_vm_snapshot(&self.node, vm.id.into(), name)
+            .await?;
+        self.wait_for_task(&task).await?;
+        self.wait_for_vm_stopped(vm.id.into()).await
+    }
+
+    async fn delete_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+        let existing = self.list_vm_snapshots(&self.node, vm.id.into()).await?;
+        if !existing.iter().any(|s| s.name == name) {
+            return Ok(());
+        }
+        let task = self
+            .delete_vm_snapshot(&self.node, vm.id.into(), name)
+            .await?;
+        self.wait_for_task(&task).await?;
+        Ok(())
+    }
+
     async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()> {
         let iso_storage = self.get_iso_storage(&self.node).await?;
         let files = self.list_storage_files(&self.node, &iso_storage).await?;
@@ -1882,21 +2018,10 @@ impl VmHostClient for ProxmoxClient {
                 return Ok(());
             }
 
-            // Delete the stale image (and any source-checksum sidecar) first.
-            info!("Deleting stale image {} from {}", storage_name, &self.node);
-            if let Err(e) = self
-                .delete_storage_file(&self.node, &iso_storage, &storage_name)
-                .await
-            {
-                warn!("Failed to delete stale image {}: {}", storage_name, e);
-            }
-            let sidecar = Self::image_source_checksum_path(&storage_name);
-            if let Err(e) = self.ssh_run(format!("rm -f '{sidecar}'")).await {
-                warn!(
-                    "Failed to delete source checksum sidecar for {}: {}",
-                    storage_name, e
-                );
-            }
+            info!(
+                "Replacing stale image {} on {} once its replacement verifies",
+                storage_name, &self.node
+            );
         }
 
         // Fetch the image directly on the host over SSH (wget/curl). We no longer
@@ -1906,7 +2031,8 @@ impl VmHostClient for ProxmoxClient {
         // wget/curl follow redirects natively; integrity is verified via SSH
         // below (see verify_image_checksum) and compressed images are decompressed
         // by us afterwards.
-        self.download_image_ssh(&image.url, &download_name)
+        let part_name = format!("{download_name}.part");
+        self.download_image_ssh(&image.url, &part_name)
             .await
             .map_err(OpError::Fatal)?;
 
@@ -1915,7 +2041,7 @@ impl VmHostClient for ProxmoxClient {
         // images), matching the SHASUMS entry.
         if let (Some(expected), Some(algo)) = (&expected_sha2, &checksum_algorithm) {
             match self
-                .verify_image_checksum(&download_name, &iso_storage, expected, algo)
+                .verify_image_checksum(&part_name, &iso_storage, expected, algo)
                 .await
             {
                 Ok(true) => {
@@ -1927,11 +2053,8 @@ impl VmHostClient for ProxmoxClient {
                         "Post-download checksum mismatch for {}, deleting corrupt file",
                         download_name
                     );
-                    if let Err(e) = self
-                        .delete_storage_file(&self.node, &iso_storage, &download_name)
-                        .await
-                    {
-                        warn!("Failed to delete corrupt image {}: {}", download_name, e);
+                    if let Err(e) = self.ssh_run(format!("rm -f '{ISO_DIR}/{part_name}'")).await {
+                        warn!("Failed to delete corrupt image {}: {}", part_name, e);
                     }
                     return Err(OpError::Fatal(anyhow::anyhow!(
                         "Checksum mismatch after download of {}",
@@ -1946,6 +2069,11 @@ impl VmHostClient for ProxmoxClient {
                 }
             }
         }
+        self.ssh_run(format!(
+            "mv -f '{ISO_DIR}/{part_name}' '{ISO_DIR}/{download_name}'"
+        ))
+        .await
+        .map_err(OpError::Fatal)?;
 
         // Decompress compressed images into the final storage_name and remove
         // the compressed source. Must happen after checksum verification.
@@ -2573,6 +2701,9 @@ impl ProxmoxClient {
     ///
     /// Delegates to [`SshClient::run_command`], which opens a session per call.
     async fn ssh_run(&self, command: String) -> Result<(i32, String)> {
+        if let Some(exec) = &self.ssh_exec {
+            return exec(&command);
+        }
         let ssh_cfg = match &self.ssh {
             Some(s) => s,
             None => anyhow::bail!("SSH not configured"),
@@ -2684,14 +2815,11 @@ impl ProxmoxClient {
     ///
     /// Fetches `url` into `filename` under `/var/lib/vz/template/iso/` using
     /// `wget` (falling back to `curl`), both of which follow HTTP redirects
-    /// natively. The download goes to a `.part` temp file that is atomically
-    /// moved into place on success, so an interrupted download never leaves a
-    /// truncated file at the final path. Used for compressed images, whose real
-    /// filename (e.g. `foo.qcow2.xz`) Proxmox's download-url API rejects.
+    /// natively. Used for compressed images, whose real filename (e.g.
+    /// `foo.qcow2.xz`) Proxmox's download-url API rejects.
     pub async fn download_image_ssh(&self, url: &str, filename: &str) -> Result<()> {
-        let dir = "/var/lib/vz/template/iso";
-        let dst = format!("{dir}/{filename}");
-        let tmp = format!("{dst}.part");
+        let dir = ISO_DIR;
+        let tmp = format!("{dir}/{filename}");
         // Prefer wget; fall back to curl. `-fL`/redirect-following ensures CDN
         // redirects (common for release mirrors) are handled on the host.
         let cmd = format!(
@@ -2700,7 +2828,7 @@ impl ProxmoxClient {
                  wget -q -O '{tmp}' '{url}'; \
              else \
                  curl -fLsS -o '{tmp}' '{url}'; \
-             fi && mv -f '{tmp}' '{dst}'"
+             fi"
         );
 
         let (exit_code, output) = self.ssh_run(cmd).await?;
@@ -2949,6 +3077,39 @@ impl TaskStatus {
     pub fn is_success(&self) -> bool {
         self.is_finished() && self.exit_status == Some("OK".to_string())
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SnapshotInfo {
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(rename = "snaptime")]
+    pub snap_time: Option<i64>,
+}
+
+impl From<SnapshotInfo> for VmSnapshot {
+    fn from(s: SnapshotInfo) -> Self {
+        VmSnapshot {
+            name: s.name,
+            description: s.description.filter(|d| !d.is_empty()),
+            created: s
+                .snap_time
+                .and_then(|t| chrono::DateTime::from_timestamp(t, 0)),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct CreateSnapshotRequest {
+    pub snapname: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(serialize_with = "bool_as_int")]
+    pub vmstate: bool,
+}
+
+fn bool_as_int<S: Serializer>(v: &bool, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_u8(*v as u8)
 }
 
 #[derive(Deserialize)]
@@ -3318,6 +3479,7 @@ pub struct VmConfig {
     /// CPU usage limit as a fraction of allocated cores (e.g. 0.5 = 50%; 0 = uncapped)
     #[serde(rename = "cpulimit")]
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "crate::deserialize_from_str_optional")]
     pub cpu_limit: Option<f32>,
     /// Custom cloud-init config files (e.g. "vendor=local:snippets/lnvps-vendor.yaml")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3766,6 +3928,92 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_stale_image_survives_a_replacement_that_fails_to_download() -> Result<()> {
+        use wiremock::matchers::path;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/storage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "storage": "local", "content": "iso", "type": "dir" }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api2/json/nodes/pve/storage/local/content"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{
+                    "format": "iso",
+                    "size": 1,
+                    "volid": "local:iso/plucky-server-cloudimg-amd64.img"
+                }]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let ran = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = ran.clone();
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        let client = ProxmoxClient::new(server.uri().parse()?, "pve", "", None, q_cfg, None)
+            .with_ssh_exec(Arc::new(move |cmd: &str| {
+                log.lock().unwrap().push(cmd.to_string());
+                if cmd.starts_with("sha256sum") {
+                    Ok((0, format!("{}  x", "0".repeat(64))))
+                } else if cmd.contains("wget") {
+                    Ok((8, "404 Not Found".to_string()))
+                } else {
+                    Ok((0, String::new()))
+                }
+            }));
+        let image = VmOsImage {
+            id: 7,
+            distribution: lnvps_db::OsDistribution::Ubuntu,
+            flavour: "server".to_string(),
+            version: "25.04".to_string(),
+            enabled: true,
+            release_date: chrono::Utc::now(),
+            url: "https://cloud-images.ubuntu.com/plucky/current/plucky-server-cloudimg-amd64.img"
+                .to_string(),
+            cpu_arch: lnvps_db::CpuArch::X86_64,
+            default_username: None,
+            sha2: Some("5".repeat(64)),
+            sha2_url: None,
+            encrypted: false,
+        };
+
+        assert!(client.download_os_image(&image).await.is_err());
+
+        let ran = ran.lock().unwrap().clone();
+        assert!(
+            !ran.iter().any(|c| c.contains("mv -f")
+                || c.starts_with(
+                    "rm -f '/var/lib/vz/template/iso/plucky-server-cloudimg-amd64.img'"
+                )),
+            "the stale image was replaced or removed before its replacement existed: {ran:?}"
+        );
+        assert!(
+            ran.iter()
+                .any(|c| c.contains("plucky-server-cloudimg-amd64.img.part")),
+            "{ran:?}"
+        );
+        Ok(())
+    }
+
     /// The snippet storage lookup must survive exactly one round-trip per
     /// client, no matter how many VMs the sweep walks — `write_snippet` used to
     /// re-issue it on every call.
@@ -4159,6 +4407,28 @@ mod tests {
     }
 
     #[test]
+    fn test_vm_config_reads_a_string_cpulimit() {
+        let config: VmConfig = serde_json::from_str(
+            r#"{"cpulimit":"9","cores":4,"memory":"2048","kvm":1,"net0":"virtio=AA:BB:CC:DD:EE:FF,bridge=vmbr0,firewall=1,rate=125"}"#,
+        )
+        .expect("config with a string cpulimit parses");
+        assert_eq!(config.cpu_limit, Some(9.0));
+
+        let fractional: VmConfig = serde_json::from_str(r#"{"cpulimit":"0.5"}"#).unwrap();
+        assert_eq!(fractional.cpu_limit, Some(0.5));
+        let number: VmConfig = serde_json::from_str(r#"{"cpulimit":2}"#).unwrap();
+        assert_eq!(number.cpu_limit, Some(2.0));
+        let absent: VmConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.cpu_limit, None);
+        let out = serde_json::to_value(&VmConfig {
+            cpu_limit: Some(9.0),
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(out["cpulimit"], serde_json::json!(9.0));
+    }
+
+    #[test]
     fn test_network_rate_converts_mbps_to_mb_per_sec() -> Result<()> {
         // network_mbps is stored in Mbit/s; Proxmox rate= expects MB/s, so we divide by 8
         let mut cfg = mock_full_vm();
@@ -4180,6 +4450,45 @@ mod tests {
         let vm = p.make_config(&cfg, None, None)?;
         // 800 Mbit/s ÷ 8 = 100 MB/s
         assert_eq!(vm.net.unwrap().rate, Some(100.0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_over_transfer_quota_throttles_network_rate() -> Result<()> {
+        let mut cfg = mock_full_vm();
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr1".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
+
+        cfg.transfer_throttled = true;
+        assert_eq!(
+            p.make_config(&cfg, None, None)?.net.unwrap().rate,
+            Some(1.25)
+        );
+
+        cfg.template.as_mut().unwrap().network_mbps = Some(800);
+        assert_eq!(
+            p.make_config(&cfg, None, None)?.net.unwrap().rate,
+            Some(1.25)
+        );
+
+        cfg.template.as_mut().unwrap().network_mbps = Some(4);
+        assert_eq!(
+            p.make_config(&cfg, None, None)?.net.unwrap().rate,
+            Some(0.5)
+        );
+
+        cfg.transfer_throttled = false;
+        cfg.template.as_mut().unwrap().network_mbps = None;
+        assert_eq!(p.make_config(&cfg, None, None)?.net.unwrap().rate, None);
         Ok(())
     }
 
@@ -4639,6 +4948,167 @@ mod tests {
             !net.contains("fd00::"),
             "SLAAC address must not be pinned: {net}"
         );
+        Ok(())
+    }
+
+    fn snapshot_test_client(uri: &str) -> Result<ProxmoxClient> {
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        Ok(ProxmoxClient::new(
+            uri.parse()?,
+            "pve",
+            "",
+            None,
+            q_cfg,
+            None,
+        ))
+    }
+
+    async fn mock_finished_task(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/tasks/.*/status$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "id": "101", "node": "pve", "pid": 1, "pstart": 1, "starttime": 1,
+                    "status": "stopped", "type": "qmsnapshot",
+                    "upid": "UPID:node:0:0:task", "user": "root@pam", "exitstatus": "OK"
+                }
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn snapshot_list_body() -> serde_json::Value {
+        serde_json::json!({"data": [
+            {"name": "later", "snaptime": 1700000200, "description": "second"},
+            {"name": "first", "snaptime": 1700000100, "description": ""},
+            {"name": "current", "description": "You are here!"}
+        ]})
+    }
+
+    #[tokio::test]
+    async fn test_list_snapshots_hides_current_and_orders_by_time() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/qemu/101/snapshot$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(snapshot_list_body()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = snapshot_test_client(&server.uri())?;
+        let mut vm = mock_full_vm().vm;
+        vm.id = 1;
+
+        let snaps = VmHostClient::list_snapshots(&client, &vm)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        assert_eq!(
+            snaps.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["first", "later"]
+        );
+        assert_eq!(snaps[0].description, None);
+        assert_eq!(snaps[1].description.as_deref(), Some("second"));
+        assert_eq!(snaps[0].created.map(|c| c.timestamp()), Some(1700000100));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_create_snapshot_sends_name_without_memory() -> Result<()> {
+        use wiremock::matchers::body_json;
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/qemu/101/snapshot$"))
+            .and(body_json(serde_json::json!({
+                "snapname": "before-upgrade",
+                "description": "safe point",
+                "vmstate": 0
+            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": "UPID:node:0:0:task"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mock_finished_task(&server).await;
+        let client = snapshot_test_client(&server.uri())?;
+        let mut vm = mock_full_vm().vm;
+        vm.id = 1;
+
+        VmHostClient::create_snapshot(&client, &vm, "before-upgrade", Some("safe point"))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_rollback_snapshot_waits_for_the_vm_to_stop() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/qemu/101/snapshot/first/rollback$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": "UPID:node:0:0:task"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mock_finished_task(&server).await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/qemu/101/status/current$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": {"vmid": 101, "status": "stopped"}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = snapshot_test_client(&server.uri())?;
+        let mut vm = mock_full_vm().vm;
+        vm.id = 1;
+
+        VmHostClient::rollback_snapshot(&client, &vm, "first")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_delete_snapshot_is_idempotent() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/qemu/101/snapshot$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(snapshot_list_body()))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(r".*/qemu/101/snapshot/first$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": "UPID:node:0:0:task"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        mock_finished_task(&server).await;
+        let client = snapshot_test_client(&server.uri())?;
+        let mut vm = mock_full_vm().vm;
+        vm.id = 1;
+
+        VmHostClient::delete_snapshot(&client, &vm, "first")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+        VmHostClient::delete_snapshot(&client, &vm, "missing")
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
         Ok(())
     }
 

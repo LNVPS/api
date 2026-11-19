@@ -244,6 +244,7 @@ mod tests {
             category: "Nostr relay".to_string(),
             seo_title: None,
             seo_description: None,
+            category_translations: None,
             compose: String::new(),
             amount,
             currency: "EUR".to_string(),
@@ -268,6 +269,8 @@ mod tests {
             amount: 1000,
             setup_amount: 0,
             configuration: None,
+            deactivated_at: None,
+            parent_line_item_id: None,
         }
     }
 
@@ -304,6 +307,7 @@ mod tests {
             hostname: None,
             custom_domain: None,
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Running,

@@ -51,11 +51,11 @@ mikrotik = []
 linux-ssh = ["lnvps_api_common/linux-ssh"]
 nostr-dm = ["dep:nostr-sdk", "nostr-sdk/nip44", "nostr-sdk/nip59"]
 nostr-dvm = ["dep:nostr-sdk"]
-nostr-domain = ["lnvps_db/nostr-domain", "dep:uuid"]
+nostr-domain = ["lnvps_db/nostr-domain"]
 nostr-nwc = ["dep:nostr-sdk", "dep:nwc", "nostr-sdk/nip47"]
 # Hypervisor host clients now live in lnvps_api_common; forward the features.
 proxmox = ["lnvps_api_common/proxmox"]
-libvirt = ["lnvps_api_common/libvirt", "dep:uuid", "dep:quick-xml"]
+libvirt = ["lnvps_api_common/libvirt", "dep:quick-xml"]
 lnd = ["payments-rs/method-lnd"]
 # On-chain Bitcoin payments (LND wallet backend)
 onchain = ["payments-rs/method-lnd-onchain"]
@@ -92,6 +92,8 @@ base64 = { version = "0.22", features = ["alloc"] }
 # On-chain Bitcoin address validation for referral payouts.
 bitcoin = "0.32"
 urlencoding = "2.1"
+hmac = "0.12"
+sha2 = "0.10"
 rand = "0.9"
 # ES256 signing for the "Sign in with Apple" client-secret JWT (.p8 key).
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
@@ -129,7 +131,7 @@ nwc = { rev = "c69c4ae2bf1a5f340aba70c20d09323f5309a4e2", git = "https://github.
 reqwest = { workspace = true }
 
 #libvirt (host client lives in lnvps_api_common; these remain for local XML/uuid use)
-uuid = { version = "1.16", features = ["v4", "serde"], optional = true }
+uuid = { version = "1.16", features = ["v4", "serde"] }
 quick-xml = { version = "0.39", features = ["serde", "serialize"], optional = true }
 
 [dev-dependencies]

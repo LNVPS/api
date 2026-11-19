@@ -88,6 +88,27 @@ impl NostrConfig {
 /// "not answering" is a more useful result than a long wait.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a node has to fetch an image.
+///
+/// Minutes, not seconds: this call is a download of a gigabyte or two on the
+/// operator's connection, and the node answers only when it is written and
+/// verified. The short timeout above would report failure on every slow link
+/// while the node went on to succeed.
+const IMAGE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// What LNVPS asks a node to fetch, mirroring `lnvps_node::images::FetchRequest`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NodeImageFetch {
+    pub url: String,
+    /// Lowercase hex SHA-2 digest: SHA-256, SHA-384 or SHA-512, as published.
+    /// Required, because without it the node has nothing to check the download
+    /// against and LNVPS has no reason to believe the volume holds the image it
+    /// asked for.
+    pub sha2: String,
+    /// The volume file name LNVPS will look the image up by.
+    pub name: String,
+}
+
 /// What a node reports about itself.
 ///
 /// Everything here is the node's own word. It is worth having — a node that
@@ -99,8 +120,53 @@ pub struct NodeStatus {
     /// Daemon version, so LNVPS can tell what a node is running.
     #[serde(default)]
     pub version: String,
+    /// What the machine is, as the node's own detection reports it.
+    ///
+    /// The same code as the `lnvps-host-info` binary LNVPS runs over SSH on its
+    /// own hypervisors — which is why marketplace nodes are not asked over SSH:
+    /// they have no account to give out, and the answer is already here.
+    #[serde(default)]
+    pub inventory: NodeInventory,
     #[serde(default)]
     pub dataplane: NodeDataPlaneState,
+    #[serde(default)]
+    pub underlay_mtu: Option<u32>,
+}
+
+/// The part of a node's inventory LNVPS records, as `lnvps_node::inventory`
+/// states it. Deliberately a subset: fields nothing reads would be fields free
+/// to drift.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct NodeInventory {
+    #[serde(default)]
+    pub cpu: NodeCpu,
+    #[serde(default)]
+    pub memory: NodeMemory,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct NodeCpu {
+    /// Vendor: `amd`, `intel`, ...
+    #[serde(default)]
+    pub mfg: String,
+    /// Architecture: `x86_64`, `arm64`, ...
+    #[serde(default)]
+    pub arch: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Canonical LNVPS feature names.
+    #[serde(default)]
+    pub features: Vec<String>,
+    #[serde(default)]
+    pub threads: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct NodeMemory {
+    #[serde(default)]
+    pub total_bytes: u64,
+    #[serde(default)]
+    pub available_bytes: u64,
 }
 
 /// The node's view of its own network, as `lnvps_node::net::DataPlaneState`
@@ -181,6 +247,61 @@ impl NodeControl {
         let body = self.get(node, host, "/api/v1/status").await?;
         serde_json::from_str(&body)
             .with_context(|| format!("Node {} returned a status this LNVPS cannot read", node.id))
+    }
+
+    /// Ask a node to fetch an OS image itself.
+    ///
+    /// libvirt can only be handed bytes, so without this LNVPS downloads every
+    /// image into its own datacentre and pushes it down the tunnel: the same
+    /// gigabyte paid for twice, at tunnel speed, for a machine with its own
+    /// connection. The digest is what makes delegating safe — the node fetches
+    /// what it likes, and anything that does not hash to this never becomes a
+    /// volume.
+    pub async fn fetch_image(
+        &self,
+        node: &MarketplaceNode,
+        host: &VmHost,
+        request: &NodeImageFetch,
+    ) -> Result<()> {
+        let body = serde_json::to_vec(request)?;
+        self.post(node, host, "/api/v1/images", &body).await?;
+        Ok(())
+    }
+
+    /// `POST path` against a node, signed over the body and pinned.
+    async fn post(
+        &self,
+        node: &MarketplaceNode,
+        host: &VmHost,
+        path: &str,
+        body: &[u8],
+    ) -> Result<String> {
+        let url = endpoint(host, path)?;
+        let fingerprint = node.tls_fingerprint.clone().context(
+            "This node has no pinned certificate, so there is no way to tell its answers \
+             from anyone else's; it must re-register",
+        )?;
+
+        let auth = self.authorization("POST", &url, body)?;
+        let response = pinned_client(&fingerprint, IMAGE_TIMEOUT)?
+            .post(&url)
+            .header("Authorization", auth)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.to_vec())
+            .send()
+            .await
+            .with_context(|| format!("Cannot reach node {} at {url}", node.id))?;
+
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        if !status.is_success() {
+            bail!(
+                "Node {} refused the request ({status}): {}",
+                node.id,
+                text.trim()
+            );
+        }
+        Ok(text)
     }
 
     /// `GET path` against a node, signed and pinned.

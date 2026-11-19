@@ -14,10 +14,14 @@ lnvps_api_common = { path = "../lnvps_api_common" }
 rand = "0.8"
 hickory-resolver = "0.26"
 chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+hex.workspace = true
+async-trait.workspace = true
 
 # Workspace dependencies
-tokio = { workspace = true, features = ["time", "signal"] }
+tokio = { workspace = true, features = ["time", "signal", "io-util"] }
 uuid.workspace = true
+flate2 = "1"
 anyhow.workspace = true
 log.workspace = true
 env_logger.workspace = true
@@ -26,7 +30,7 @@ serde_json.workspace = true
 config.workspace = true
 reqwest = { workspace = true, features = ["query"] }
 clap = { version = "4.5.21", features = ["derive"] }
-kube = { version = "1.1.0", features = ["runtime", "derive"] }
+kube = { version = "1.1.0", features = ["runtime", "derive", "ws"] }
 k8s-openapi = { version = "0.25.0", features = ["latest"] }
 # kube/sqlx use rustls but the dependency tree doesn't auto-select a default
 # crypto provider, so we install the ring provider explicitly in main().
@@ -35,3 +39,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 [dev-dependencies]
 wiremock = "0.6"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# The uploader-script test stages a data directory and downloads the artifact
+# back to check it really is the archive it claims to be.
+tempfile = "3"

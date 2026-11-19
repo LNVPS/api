@@ -127,6 +127,10 @@ pub trait AdminDb: Send + Sync {
     /// Count hosts in a region
     async fn admin_count_region_hosts(&self, region_id: u64) -> DbResult<u64>;
 
+    /// Delete a host: hard delete (with its disks) when no VM ever ran on it,
+    /// otherwise flag it deleted. Refused while the host has active VMs.
+    async fn admin_delete_host(&self, host_id: u64) -> DbResult<()>;
+
     /// Get comprehensive region statistics
     async fn admin_get_region_stats(&self, region_id: u64) -> DbResult<RegionStats>;
 
@@ -304,6 +308,14 @@ pub trait AdminDb: Send + Sync {
     /// Get a single referral enrollment by its id.
     async fn admin_get_referral(&self, referral_id: u64) -> DbResult<crate::Referral>;
 
+    async fn admin_set_referral_auto_payout(
+        &self,
+        referral_id: u64,
+        approved: bool,
+    ) -> DbResult<()>;
+
+    async fn admin_remove_referred_vm(&self, code: &str, vm_id: u64) -> DbResult<bool>;
+
     // IP Range management methods
     /// List all IP ranges with pagination
     async fn admin_list_ip_ranges(
@@ -415,6 +427,15 @@ pub trait AdminDb: Send + Sync {
         include_deleted: Option<bool>,
     ) -> DbResult<(Vec<crate::VmIpAssignment>, u64)>;
 
+    /// Swap orders with who placed them, newest first.
+    async fn admin_list_swap_order_clients(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        order_id: Option<&str>,
+    ) -> DbResult<(Vec<crate::SwapOrderClient>, u64)>;
+
     /// Get VM IP assignment by ID
     async fn admin_get_vm_ip_assignment(
         &self,
@@ -476,4 +497,57 @@ pub trait AdminDb: Send + Sync {
         start: chrono::DateTime<chrono::Utc>,
         end: chrono::DateTime<chrono::Utc>,
     ) -> DbResult<Vec<crate::ResourceCost>>;
+
+    async fn admin_list_vms_created_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::Vm>, u64)>;
+
+    async fn admin_list_vms_deleted_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::DeletedVm>, u64)>;
+
+    async fn admin_list_vms_expiring_between(
+        &self,
+        from: chrono::DateTime<chrono::Utc>,
+        until: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::Vm>, u64)>;
+
+    async fn admin_list_users_created_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::User>, u64)>;
+
+    async fn admin_list_vpn_subscriptions_created_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::VpnSubscription>, u64)>;
+
+    async fn admin_list_app_deployments_created_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::AppDeployment>, u64)>;
+
+    async fn admin_list_payments_paid_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::PaidSubscriptionPayment>, u64)>;
+
+    async fn admin_list_refunds_paid_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> DbResult<Vec<crate::SubscriptionPayment>>;
+
+    async fn admin_sum_payments_paid_since(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> DbResult<Vec<crate::PaymentTotal>>;
 }

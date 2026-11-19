@@ -12,7 +12,7 @@ Admin API request/response format reference for LLM consumption.
 `"transferred"`
 **AdminPaymentMethod**: `"lightning"`, `"revolut"`, `"paypal"`, `"stripe"`
 **VmHostKind**: `"proxmox"`, `"libvirt"`
-**CostPlanIntervalType**: `"day"`, `"month"`, `"year"`
+**CostPlanIntervalType**: `"hour"`, `"day"`, `"month"`, `"year"`
 **ApiOsDistribution**: `"ubuntu"`, `"debian"`, `"centos"`, `"fedora"`, `"freebsd"`, `"opensuse"`, `"archlinux"`,
 `"redhatenterprise"`, `"almalinux"`, `"rockylinux"`, `"alpine"`, `"nixos"`, `"openbsd"`, `"netbsd"`, `"gentoo"`,
 `"voidlinux"`
@@ -197,6 +197,112 @@ Response:
 - `last_used`: last authentication time (null if never used)
 
 Returns `404` if the user does not exist.
+
+#### Get User Credit Balance
+
+```
+GET /api/admin/v1/users/{id}/credit
+```
+
+Required Permission: `account_credit::view`
+
+The user's account credit balance.
+
+```json
+{
+  "data": {
+    "user_id": 42,
+    "balance": 5000000,
+    "currency": "BTC",
+    "auto_apply": true,
+    "balances": [
+      { "balance": 5000000, "currency": "BTC" },
+      { "balance": 2500, "currency": "EUR" }
+    ]
+  }
+}
+```
+
+- `balance`, `currency`: the BTC balance only (kept for older clients), 0 if none.
+- `balances`: one entry per currency the user holds a balance in, each in minor
+  units of its currency. Credit is per currency and never converted when held.
+- `balance`: minor units of `currency` (msat for BTC). Never negative.
+- `currency`: the balance's base currency. A quote converts it into the
+  payment currency at the current rate.
+- `auto_apply`: whether the customer opted into spending the balance against
+  quotes automatically.
+
+A user who has never topped up returns a zero row, not a 404.
+
+#### Adjust User Credit
+
+```
+PATCH /api/admin/v1/users/{id}/credit
+```
+
+Required Permission: `account_credit::update`
+
+Shifts the balance and records the movement in the ledger. The request body
+is `{ "currency": "EUR", "delta": 5000, "kind": "topup", "note": "goodwill grant" }`.
+`currency` is optional (default `BTC`) and names the balance to adjust; an unknown
+currency is refused (`400`). `delta` is signed minor units of that currency (msat
+for BTC; positive credits, negative claws back) and `kind` is
+one of `topup`, `refund`, `admin`; a negative delta must use `admin`. Refuses
+(`400`) a delta of 0, an unknown `kind`, a negative `topup`/`refund`, or a
+clawback larger than the balance not held by pending orders. The response is the updated row in the same
+shape as the GET.
+
+#### List User Credit Ledger
+
+```
+GET /api/admin/v1/users/{id}/credit/events
+```
+
+Required Permission: `account_credit::view`
+
+The append-only ledger behind the balance, newest first, paginated with the
+standard `limit`/`offset`. Pass `currency` (e.g. `EUR`) to list only that
+currency's rows; `total` then counts only those rows. Each row:
+
+```json
+{
+  "data": [
+    {
+      "id": 7,
+      "kind": "spend",
+      "amount": -1000000,
+      "currency": "BTC",
+      "subscription_payment_id": "a1b2c3…",
+      "note": null,
+      "created": "2026-10-15T12:00:00Z"
+    }
+  ],
+  "total": 7,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+A deposit that reaches an on-chain or FixedFloat address after its order was
+purged is credited here as a `topup` row whose `note` is
+`<txid>:<vout>: late on-chain payment after the order was removed`. When an
+unpaid VM, subscription or app deployment is hard deleted, the receive
+addresses of its on-chain and FixedFloat payments are kept in the
+`onchain_address_owner` table (user, subscription, payment, VM, quoted amount),
+so a later deposit still has an owner. The deposit is credited in BTC for the
+exact amount received, once per outpoint, when it confirms. The customer is told
+when it is first seen and again when it is credited; admins get a notification
+on every credit, and instead of the customer when the customer has no email or
+nostr key. A deposit to an address that was never ours is ignored.
+
+- `kind`: `topup`, `spend`, `refund` or `admin`. `amount` is the signed change
+  to the balance: `spend` rows are negative, `topup` and `refund` positive,
+  `admin` either.
+- `subscription_payment_id`: the payment the row is about, for `spend`; null
+  otherwise. A VM refund that returns credit writes a `refund` row whose
+  `note` names the payment.
+- The balance always equals the ledger sum, so a mismatch is a bug and worth
+  reporting.
 
 #### Revoke User Passkey
 
@@ -460,8 +566,10 @@ Body:
   // Required - SSH key ID (must belong to user)
   "ref_code": "string",
   // Optional - Referral code
-  "reason": "string"
+  "reason": "string",
   // Optional - Admin reason for audit trail
+  "host_id": number
+  // Optional - Place the VM on this host instead of the least-loaded one
 }
 ```
 
@@ -481,6 +589,7 @@ Response:
 - Template must exist
 - Image must exist
 - SSH key must exist and belong to the specified user
+- `host_id`, when given, must be a host in the template's region that is not deleted. It may be disabled: pinning is how an admin places a VM on a host kept out of customer placement. The job still fails if that host has no room for the template.
 
 **Asynchronous Processing:** This endpoint dispatches a `CreateVm` work job for distributed processing. The operation
 returns immediately with a job ID. The VM creation is handled by the provisioner and includes full audit logging with
@@ -526,6 +635,10 @@ Body:
   // Optional - IPv4 addresses to assign, default 1; must be within the plan's range
   "ip6_count": number,
   // Optional - IPv6 addresses to assign, default 1; must be within the plan's range
+  "transfer_gb": number,
+  // Optional - Monthly transfer in GB, default the plan's transfer_gb; must be within the plan's range
+  "network_mbps": number,
+  // Optional - Network speed in Mbit/s, default the plan's network_mbps; must be within the plan's range
   "image_id": number,
   // Required - OS image ID
   "ssh_key_id": number,
@@ -965,7 +1078,7 @@ Every refund recorded against this payment, and what is still refundable on it.
     "payment_id": "a1b2...",
     "currency": "EUR",
     "amount": 1230,
-    // gross originally charged
+    // gross originally charged (net + tax)
     "refunded_total": 615,
     "refundable_remaining": 615,
     "refunds": [
@@ -1008,7 +1121,7 @@ Body (all fields optional):
 
 The refund is stored as a `subscription_payment` row with `payment_type = "Refund"`,
 `refunded_payment_id` pointing at the payment it reverses, and `amount`/`tax` holding
-the **magnitude** returned — the columns are unsigned, so reports subtract refund rows
+the **magnitude** returned (`amount` is the net slice, `tax` the VAT slice, and `amount + tax` equals the gross refunded) — the columns are unsigned, so reports subtract refund rows
 rather than reading a negative number. Currency, exchange `rate`, VAT rate, country and
 treatment are copied from the refunded payment (VAT is owed on what was charged, not on
 today's rates), `tax` is pro-rated and rounded down, `time_value` is null so nothing is
@@ -1352,6 +1465,18 @@ POST /api/admin/v1/subscription_payments/{hex_id}/complete
 
 Required Permission: `subscription_payments::update`
 
+### Record External On-Chain Payment
+```
+POST /api/admin/v1/subscription_payments/external
+```
+Required Permission: `subscription_payments::create`
+
+Body: `{"outpoint": "<txid>:<vout>", "amount_msat": 1100000, "currency": "BTC", "payment_method": "onchain", "subscription_id": 1, "user_id": null, "note": "why"}`
+
+Verifies the outpoint on chain (confirmed, pays our wallet, amount matches). With `subscription_id` inserts a paid, priced renewal keyed by the outpoint and writes a VM history entry with the admin id and note; without it `user_id` is required and the user's account credit is topped up. A repeated outpoint returns 409.
+
+"Pays our wallet" means the output address is one LNVPS issued: it appears on a stored on-chain or FixedFloat payment, an account credit top-up, or a kept `onchain_address_owner` row (purged orders). A deposit to a wallet address that has no such row at all is refused with 400, because `OnChainProvider` cannot list the addresses the wallet owns and the admin API holds no LND connection. Credit those with the account credit adjust endpoint and put the txid in the note. The credit path also writes the admin id, outpoint and note on the `account_credit_event` ledger row.
+
 Manually marks a subscription payment as paid. Sets `is_paid=true`, records `paid_at`, extends the subscription by 30 days, and activates it, then queues the same on-payment handling a Lightning settlement runs (instant app reconcile, applying a VM/app upgrade) on the worker.
 
 Calling it again on an already-paid payment only re-queues that handling (the subscription is not extended twice), so a failed queue dispatch can be retried.
@@ -1510,6 +1635,32 @@ GET /api/admin/v1/hosts/{id}
 ```
 
 Required Permission: `hosts::view`
+
+#### Delete Host
+
+```
+DELETE /api/admin/v1/hosts/{id}
+```
+
+Required Permission: `hosts::delete`
+
+Refused while the host has active VMs: move or delete those first.
+
+A host that never ran a VM is removed outright along with its disk records. A
+host that did keeps its row, flagged `deleted` and forced `enabled: false`,
+because its VMs are billing history that still has to resolve the host it ran
+on. Deleted hosts disappear from `GET /api/admin/v1/hosts`, region host counts
+and region stats, but `GET /api/admin/v1/hosts/{id}` still returns one (with
+`"deleted": true`) so views built from historical VMs keep working.
+
+Response:
+
+```json
+{
+  "success": true,
+  "message": "Host deleted successfully"
+}
+```
 
 #### Update Host Configuration
 
@@ -1793,6 +1944,24 @@ Required Permission: `hosts::view`
 Returns paginated list of VM host regions with configuration details, host counts, and statistics (only active VMs are
 counted). Each region carries `country_code` (ISO 3166-1 alpha-2, or `null` if not set).
 
+Each region also carries counts of what else is configured there, so an operator
+can see what a region holds before touching it:
+
+| Field | Counts |
+|---|---|
+| `ip_ranges` | IP ranges in the region, enabled or not |
+| `vm_templates` | VM templates sold in the region, enabled or not |
+| `app_clusters` | App clusters in the region |
+| `app_deployments` | Live deployments on those clusters (soft-deleted ones are excluded) |
+| `tunnel_pools` | Tunnel pools terminating in the region |
+| `vpn_services` | VPN services sold there, counted once each however many interfaces they terminate on |
+| `routers` | Routers serving the region |
+
+`routers` is derived rather than stored: a router has no region column, so it is
+counted through the tunnel pools that terminate in the region and the access
+policies its IP ranges use, de-duplicated so a router reached both ways counts
+once.
+
 #### Get Region Details
 
 ```
@@ -1909,8 +2078,10 @@ Body:
    // Default SSH username
    "sha2": "string (optional)",
    // SHA-2 checksum (SHA-256, SHA-384, or SHA-512) for image verification
-   "sha2_url": "string (optional)"
+   "sha2_url": "string (optional)",
    // URL to the SHA-2 checksums file (e.g., https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS)
+   "encrypted": boolean (optional, default false)
+   // The image encrypts its root disk and prompts for a passphrase on the serial console
 }
 ```
 
@@ -1938,8 +2109,9 @@ Body (all optional):
    "default_username": "string",
    "sha2": "string (optional)",
    // SHA-2 checksum (SHA-256, SHA-384, or SHA-512) for image verification
-   "sha2_url": "string (optional)"
+   "sha2_url": "string (optional)",
    // URL to the SHA-2 checksums file (e.g., https://cloud.debian.org/images/cloud/trixie/latest/SHA512SUMS)
+   "encrypted": boolean
 }
 ```
 
@@ -2331,6 +2503,26 @@ Body:
   "transfer_gb": number,
   // optional - Monthly outbound transfer allowance in GB granted to VMs built on
   // this plan (omit or null = unmetered)
+  "min_transfer_gb": number,
+  // optional - Smallest monthly transfer a customer may choose, default transfer_gb
+  "max_transfer_gb": number,
+  // optional - Largest monthly transfer a customer may choose, default transfer_gb
+  "transfer_cost_per_tb": number,
+  // optional - Cost per TB (1000 GB) of monthly transfer, billed on the whole
+  // amount chosen, smallest currency units, default 0
+  "min_network_mbps": number,
+  // optional - Slowest network speed a customer may choose, default network_mbps
+  "max_network_mbps": number,
+  // optional - Fastest network speed a customer may choose, default network_mbps
+  "network_cost_per_gbps": number,
+  // optional - Cost per Gbit/s of network speed, billed on the whole speed chosen,
+  // smallest currency units, default 0
+  "interval_amount": number,
+  // optional - Billing interval, default 1 month. Every rate above is the price for one interval
+  "interval_type": "hour" | "day" | "month" | "year",
+  "rate_scale": number,
+  // optional - Rates (and disk costs) are in 1/rate_scale of the smallest currency unit, default 1.
+  // Use 10000 for an hourly model so a rate can be a fraction of a cent
   "disk_pricing": [
     // Array of disk pricing configurations
     {
@@ -2410,6 +2602,17 @@ Body (all optional):
   // Maximum CPU usage as fraction of allocated cores e.g. 0.5 = 50% - send null to clear
   "transfer_gb": "number | null",
   // Monthly outbound transfer allowance in GB - send null for unmetered
+  "min_transfer_gb": number,
+  "max_transfer_gb": number,
+  "transfer_cost_per_tb": number,
+  "min_network_mbps": number,
+  "max_network_mbps": number,
+  "network_cost_per_gbps": number,
+  "interval_amount": number,
+  "interval_type": "hour" | "day" | "month" | "year",
+  // Billing interval; every rate is the price for one interval. Cannot change while VMs use the model
+  "rate_scale": number,
+  // Rates and disk costs are in 1/rate_scale of the smallest currency unit. Cannot change while VMs use the model
   "disk_pricing": [
     {
       "kind": "ssd",
@@ -2426,6 +2629,14 @@ Body (all optional):
   ]
 }
 ```
+
+Customers choose monthly transfer and network speed within `min_*`/`max_*`
+when ordering or upgrading a custom VM, and `transfer_gb`/`network_mbps` is the
+value used when they do not. Both create and update return `400` when a minimum
+exceeds its maximum or the default falls outside its range. A plan with
+`transfer_gb` or `network_mbps` unset sells no transfer or speed, whatever the
+range and cost fields hold. An admin edit of a VM's custom template is not held
+to these ranges.
 
 #### Delete Custom Pricing Model
 
@@ -2469,8 +2680,15 @@ Returns:
   "region_name": "string | null",
   "currency": "string",
   "price": number,
-  // Monthly renewal cost in smallest currency units (cents/millisats). 0 when the
-  // current plan cannot price this spec (a grandfathered VM).
+  // Renewal cost of one billing interval in smallest currency units (cents/millisats), rounded up
+  // from the model's finer rate_scale. 0 when the current plan cannot price this spec (a
+  // grandfathered VM).
+  "price_raw": number,
+  "rate_scale": number,
+  // The same price unrounded, in 1/rate_scale of the smallest unit
+  "interval_amount": number,
+  "interval_type": "hour" | "day" | "month" | "year",
+  // The billing interval `price` is for (the pricing model's)
   "ip4_count": number,
   "ip6_count": number,
   "cpu_mfg": "string (omitted when any)",
@@ -2543,7 +2761,7 @@ for its type/interface, so an out-of-range spec is a 400 rather than a VM that c
 A successful patch also:
 
 1. Rewrites the subscription line item amount for every VM using the template, so the next renewal bills the new spec
-   (custom VMs are always billed monthly).
+   (per billing interval of the pricing model, monthly unless it says otherwise).
 2. Queues host work: a change to `cpu`, `memory` or `disk_size` runs the same upgrade pipeline a paid upgrade uses (stop,
    resize disk, reconfigure, start); a change to disk type/interface or an IO/network/CPU cap queues a reconfigure only;
    a change the API enforces on its own (`pricing_id`, IP counts, `transfer_gb`, `firewall_rule_limit`) queues nothing.
@@ -2555,7 +2773,7 @@ Returns:
   "template": { ... },
   // The stored template, same shape as GET
   "renewal_amount": number,
-  // New monthly renewal amount written to each VM's line item, in smallest currency units
+  // New renewal amount of one billing interval written to each VM's line item, in smallest currency units
   "job_ids": ["string"]
   // One job per VM that needed host work; empty when nothing had to be applied
 }
@@ -2596,8 +2814,12 @@ Body:
   // Name for the new pricing model
   "region_id": number,
   // Target region ID (optional, defaults to source region)
-  "enabled": boolean
+  "enabled": boolean,
   // Enable the new pricing model (optional, default true)
+  "interval_amount": number,
+  "interval_type": "hour" | "day" | "month" | "year"
+  // Billing interval for the copy (optional, defaults to the source's). A different interval
+  // converts every rate so the price over time is unchanged (finer rate_scale when shorter)
 }
 ```
 
@@ -2887,6 +3109,255 @@ Queues a background job (`PatchIpRangeDns`) that re-applies forward + reverse DN
 configuration. Useful after changing a range's `forward_dns_server_id` / `reverse_dns_server_id`
 (e.g. switching reverse DNS to OVH). Per-assignment DNS failures are logged and skipped so one bad
 record can't abort the batch. Returns a `JobResponse` (`{ "job_id": string }`).
+
+### IP Orders (On-Demand IP Purchases)
+
+Buys IP addresses from an upstream provider (first implementation: OVH additional IPs) and registers
+them as `ip_range` rows. This spends real money, so every step is gated:
+
+- the provider must exist (see IP Providers below) and be `enabled`
+- by default (`approval-required: true`) an admin must approve each order before anything is bought
+- the sum of cost for orders placed this calendar month (UTC) plus the new quote must stay within
+  `monthly-spend-cap`, in the provider `currency`
+- a request is idempotent: the same `idempotency_key`, or an identical request still in flight,
+  returns the existing order instead of creating a second one
+
+Order states: `awaiting_approval`, `approved`, `ordering`, `ordered`, `delivered`, `failed`, `rejected`.
+`ordering` means the checkout call was made and its outcome is not yet recorded. A checkout that
+errors leaves the order `failed` with a note to verify with the provider; it is never retried
+automatically, because the purchase may have happened.
+
+Permissions use the `ip_order` resource: `view` (lists), `create` (order), `update` (approve, reject),
+`delete` (release).
+
+Every state change is written to an audit trail and admins are notified on order placed, delivered,
+failed, awaiting approval and released.
+
+Providers are database rows, managed through the endpoints below; the worker reads them on every
+tick (every 5 minutes), so changes need no restart.
+
+A VM purchase in a region with no free IP is refused up front, at quote and order time, with an
+"out of capacity" error, unless the region has an enabled provider rule with `when_no_ip:
+"order_and_wait"` (see On-Demand IP Ordering below). Independently of that, `auto_threshold` on a
+region rule buys capacity ahead of demand. When an order is in flight or awaiting approval, the
+error a buyer sees says so.
+
+#### IP Providers
+
+```
+GET    /api/admin/v1/ip_providers
+POST   /api/admin/v1/ip_providers
+GET    /api/admin/v1/ip_providers/{id}
+PATCH  /api/admin/v1/ip_providers/{id}
+DELETE /api/admin/v1/ip_providers/{id}
+```
+
+Permissions: `ip_order::view`, `create`, `update`, `delete`. Delete is refused (409) while orders
+reference the provider.
+
+```json
+{
+  "name": "ovh",
+  "kind": "ovh",
+  "enabled": false,
+  "url": "https://eu.api.ovh.com",
+  "token": "app_key:app_secret:consumer_key",
+  "subsidiary": "IE",
+  "rir": "ripe",
+  "gateway": "203.0.113.254",
+  "access_policy_id": 1,
+  "approval_required": true,
+  "monthly_spend_cap": 5000,
+  "currency": "EUR",
+  "enable_ranges_on_delivery": true
+}
+```
+
+`token` is write-only and stored encrypted; responses carry `has_token` instead. `enabled` defaults
+to false and `approval_required` to true. `monthly_spend_cap` is in the smallest unit of `currency`
+(a fiat currency). `rir` is `ripe` or `arin`. `PATCH` takes any subset; `access_policy_id: null`
+clears it.
+
+#### IP Provider Region Rules
+
+```
+GET    /api/admin/v1/ip_providers/{id}/regions
+POST   /api/admin/v1/ip_providers/{id}/regions
+GET    /api/admin/v1/ip_providers/{id}/regions/{rule_id}
+PATCH  /api/admin/v1/ip_providers/{id}/regions/{rule_id}
+DELETE /api/admin/v1/ip_providers/{id}/regions/{rule_id}
+```
+
+```json
+{
+  "region_id": 1,
+  "country": "IE",
+  "destination": "ns1234.ip-1-2-3.eu",
+  "prefix_len": 32,
+  "quantity": 2,
+  "auto_threshold": 10,
+  "enabled": true,
+  "when_no_ip": "order_and_wait",
+  "sell_without_capacity": false,
+  "wait_refund_hours": 72
+}
+```
+
+One rule per provider and region. `prefix_len` is 32 or 24 to 30 (blocks need `quantity` 1).
+`auto_threshold` orders `quantity` when the region has fewer free addresses (null disables top-up);
+at most one automatic order per provider and region per day.
+
+`when_no_ip` is `reject` (default) or `order_and_wait`. `sell_without_capacity` and
+`wait_refund_hours` only matter for `order_and_wait`; see below. Setting `order_and_wait` needs the
+provider to have a `gateway`.
+
+#### On-Demand IP Ordering
+
+A region sells VMs without pre-loaded IPs when it has an enabled provider with an enabled rule whose
+`when_no_ip` is `order_and_wait`. Example for a GB region (id 4) with OVH:
+
+```
+POST /api/admin/v1/ip_providers
+{ "name": "ovh-gb", "kind": "ovh", "url": "https://eu.api.ovh.com",
+  "token": "app_key:app_secret:consumer_key", "subsidiary": "GB", "rir": "ripe",
+  "gateway": "203.0.113.254", "approval_required": false,
+  "monthly_spend_cap": 5000, "currency": "EUR", "enabled": true }
+
+POST /api/admin/v1/ip_providers/{id}/regions
+{ "region_id": 4, "country": "UK", "prefix_len": 32, "quantity": 4,
+  "when_no_ip": "order_and_wait", "sell_without_capacity": false, "wait_refund_hours": 72 }
+```
+
+With free addresses, a purchase is unchanged. With none:
+
+- **Sale gate (quote and order time, before payment).** The purchase is accepted only if capacity is
+  covered: free addresses plus addresses on order cover every VM already waiting plus this one. Else,
+  with `sell_without_capacity: true` it is accepted anyway (the customer is told delivery may take
+  longer). Otherwise it is refused with "out of capacity" when the provider needs approval, an order
+  awaits approval, or the monthly spend cap cannot cover another order.
+- **Waiting.** After payment the VM is not spawned. It is recorded as waiting (`status.state`
+  `waitingforip` with a `status_reason` in the customer VM API), the admin and customer are
+  notified, and an order is created immediately: quantity is the larger of the rule `quantity` and
+  every waiting VM's need, minus free and on-order addresses. Ten concurrent purchases make one
+  order; a VM that arrives while that order still awaits approval grows it. A recent failed or
+  rejected order is not retried automatically.
+- **Delivery.** When the order is delivered and the range registered, waiting VMs are released
+  oldest first and spawned, and each customer is notified.
+- **Failure.** The admin is notified and the VMs stay waiting. When `wait_refund_hours` is greater
+  than zero and no order is in flight, a VM that has waited that long is deleted and its payment
+  returned to account credit through the owner-deletion refund path.
+
+Approval and the spend cap apply exactly as for any order.
+
+```
+GET /api/admin/v1/vm_ip_waits?region_id=4
+```
+
+Required Permission: `ip_order::view`. Waiting VMs, oldest first, with `vm_id`, `user_id`,
+`region_id`, `ip4_needed`, `released`, `waiting_since`, `ip_order_id`, `ip_order_state` and
+`ip_order_error`.
+
+#### Create IP Order
+
+```
+POST /api/admin/v1/ip_orders
+```
+
+Required Permission: `ip_order::create`
+
+```json
+{
+  "provider": "ovh",
+  "region_id": 1,
+  "country": "IE",
+  "destination": "ns1234.ip-1-2-3.eu",
+  "prefix_len": 32,
+  "quantity": 2,
+  "idempotency_key": "optional-client-key"
+}
+```
+
+- `provider`: the `name` of an IP provider
+- `prefix_len`: `32` (single addresses, `quantity` of them) or `24` to `30` (one block, `quantity` must be 1). Default 32
+- `country`, `destination`: passed to the provider (OVH `country` and `destination` cart configuration)
+
+Returns an `AdminIpOrder`. Queues the `ProcessIpOrder` job, which quotes the order and either waits
+for approval or, with approval disabled, places it.
+
+#### List IP Orders
+
+```
+GET /api/admin/v1/ip_orders?state=awaiting_approval&region_id=1&limit=50&offset=0
+```
+
+Required Permission: `ip_order::view`. Paginated list of `AdminIpOrder`, newest first.
+
+#### Get IP Order
+
+```
+GET /api/admin/v1/ip_orders/{id}
+```
+
+Required Permission: `ip_order::view`. `AdminIpOrder` plus `ranges` (registered ranges with provider
+and cost) and `audit` (`id`, `event`, `detail`, `actor_user_id`, `created`).
+
+#### Approve / Reject IP Order
+
+```
+POST /api/admin/v1/ip_orders/{id}/approve
+POST /api/admin/v1/ip_orders/{id}/reject
+```
+
+Required Permission: `ip_order::update`. Only `awaiting_approval` orders can be decided (otherwise 409).
+Approving queues `ProcessIpOrder`, which spends the money.
+
+#### List Bought Ranges
+
+```
+GET /api/admin/v1/ip_order_ranges
+```
+
+Required Permission: `ip_order::view`. Paginated `AdminIpOrderRange` (`cidr`, `ip_range_id`,
+`provider`, `cost`, `currency`, `released_at`).
+
+#### Release Range
+
+```
+POST /api/admin/v1/ip_ranges/{id}/release
+```
+
+Required Permission: `ip_order::delete`. Terminates a bought range with its provider and disables the
+`ip_range`. Refused with 409 while the range has any allocated IP, and re-checked by the job. Returns
+a `JobResponse`.
+
+#### AdminIpOrder
+
+```json
+{
+  "id": 1,
+  "provider": "ovh",
+  "region_id": 1,
+  "idempotency_key": null,
+  "country": "IE",
+  "destination": null,
+  "prefix_len": 32,
+  "quantity": 2,
+  "state": "ordered",
+  "provider_order_id": "424242",
+  "cost": 478,
+  "currency": "EUR",
+  "auto": false,
+  "requested_by": 1,
+  "approved_by": 1,
+  "approved_at": "2026-11-04T12:00:00Z",
+  "error": null,
+  "created": "2026-11-04T11:59:00Z",
+  "ordered_at": "2026-11-04T12:00:05Z",
+  "delivered_at": null
+}
+```
+
+`cost` is in the currency's smallest unit (cents), including tax as quoted by the provider.
 
 ### Access Policy Management
 
@@ -3336,6 +3807,65 @@ Required Permission: `dns_server::delete`
 Note: DNS servers referenced by any IP range (forward or reverse) cannot be deleted. Remove the reference from all IP
 ranges first.
 
+### Abuse Cases
+
+Backs section 6.1 of the Terms. A case is one report about one VM. Actions on it (forwarded, restricted, suspended,
+terminated, reinstated, no action) are the decisions. Closed cases are deleted by the worker 12 months after closing, or
+6 months after receipt for a Canadian copyright notice (`kind: copyright_ca`) with no proceedings started.
+
+Permission resource is `abuse` (`create`, `view`, `update`, `delete`), granted to `super_admin` by default.
+
+```
+POST /api/admin/v1/abuse/cases
+GET  /api/admin/v1/abuse/cases?user_id=&vm_id=&open=&limit=&offset=
+GET  /api/admin/v1/abuse/cases/{id}
+POST /api/admin/v1/abuse/cases/{id}/actions
+POST /api/admin/v1/abuse/cases/{id}/close
+POST /api/admin/v1/abuse/cases/{id}/challenges
+POST /api/admin/v1/abuse/challenges/{id}/decision
+```
+
+- **Open a case** (`abuse::create`): `vm_id`, `kind` (`abuse`, `illegal_content`, `copyright_ca`), `reported_ip`,
+  `incident_at`, `reporter_email`, `summary`, `proceedings_started`. The customer is taken from the VM. A reporter email
+  gets a receipt. Each case reports `report_count_for_service`, the number of cases on the same VM, so repeats count.
+- **Record an action** (`abuse::update`): `kind`, `reason`, `facts`, `legal_basis`, `followed_report`,
+  `notice_withheld`. `suspended` and `terminated` disable the VM and queue a reconfigure; `reinstated` re-enables it.
+  Unless `notice_withheld` is set (text saying why the law requires it) or the kind is `no_action`, the customer is
+  emailed a statement of reasons: what was done, the facts, the reason, whether a report led to it, the law or Terms
+  section, and how to challenge. The email goes out whatever the customer's notification preferences. `notified_at`
+  shows when it was delivered. For `illegal_content` cases the reporter is told of the outcome, and for `copyright_ca`
+  when the notice is forwarded.
+- **Record a challenge** (`abuse::create`): `action_id`, `message`. Refused more than 183 days after the action.
+- **Decide a challenge** (`abuse::update`): `outcome` (`upheld`, `reversed`), `response`. `reversed` re-enables a
+  disabled VM. The customer is emailed the result.
+
+Customer endpoints: `GET /api/v1/abuse/cases`, `GET /api/v1/abuse/cases/{id}` (decisions with their reasons, with
+withheld ones left out, and the date each can be challenged until) and `POST /api/v1/abuse/cases/{id}/challenges`.
+The reporter's email and the reported IP are never returned to the customer.
+
+### Swap Order Clients
+
+Every FixedFloat swap order records who placed it and from where. Rows are kept for 13 months (395 days) and then deleted by
+the worker. They survive deletion of the user until then.
+
+#### List Swap Orders
+
+```
+GET /api/admin/v1/swap_orders
+```
+
+Query Parameters:
+
+- `limit`: number (optional) - Items per page (max 100, default 50)
+- `offset`: number (optional) - Pagination offset
+- `user_id`: number (optional) - Filter by user
+- `order_id`: string (optional) - Filter by FixedFloat order id
+
+Required Permission: `subscription_payments::view`
+
+Each row has `id`, `user_id`, `order_id`, `payment_id` (hex, the subscription payment or credit top-up it paid for),
+`coin`, `ip`, `user_agent`, `accept_language` and `created`.
+
 ### VM IP Assignment Management
 
 VM IP assignments bind specific IP addresses from IP ranges to virtual machines. These endpoints provide comprehensive
@@ -3766,7 +4296,7 @@ Context available to a rule (read-only, money in minor units):
 
 | Variable | Fields |
 |---|---|
-| `order` | `amount`, `currency`, `intervals`, `interval_type` (`day`/`month`/`year`), `is_new`, `items` |
+| `order` | `amount`, `currency`, `intervals`, `interval_type` (`hour`/`day`/`month`/`year`), `is_new`, `items` |
 | `user` | `id`, `country` (ISO alpha-3, may be null) |
 | `history` | `orders` (settled payment count) |
 | `now` | unix timestamp (seconds) |
@@ -4027,7 +4557,10 @@ Returns a paginated list of `AdminReferralInfo`:
       "mode": "lightning_address",
       "referral_rate": 12.5,
       "payout_threshold": null,
-      "created": "2026-07-18T10:00:00Z"
+      "auto_payout_approved": false,
+      "created": "2026-07-18T10:00:00Z",
+      "outstanding_total_msat": 30000000,
+      "paid_total_msat": 125000000
     }
   ],
   "total": 1,
@@ -4037,6 +4570,10 @@ Returns a paginated list of `AdminReferralInfo`:
 ```
 
 `referral_rate` is the per-referrer commission override (whole %); `null` means the referred VM's `company.referral_rate` default applies.
+
+`outstanding_total_msat` is everything still owed across currencies, valued in millisats at current rates (the same figure as on the detail endpoint). `paid_total_msat` is the sum of paid payouts as sent, with any non-BTC transfer valued at the current rate. Currencies with no rate are left out of both.
+
+`auto_payout_approved` is false for every new referrer. Until an admin sets it, commission accrues but the payout job does not pay it.
 
 #### Get Referral Detail
 
@@ -4059,6 +4596,7 @@ Returns the referral plus per-currency earned commission, the outstanding balanc
     "mode": "lightning_address",
     "referral_rate": 12.5,
     "payout_threshold": null,
+    "auto_payout_approved": true,
     "created": "2026-07-18T10:00:00Z",
     "earned": [ { "currency": "BTC", "amount": 5000 } ],
     "balances": [
@@ -4066,6 +4604,7 @@ Returns the referral plus per-currency earned commission, the outstanding balanc
       { "currency": "EUR", "earned": 2000, "settled": 1000, "outstanding": 1000, "outstanding_msat": 10000000 }
     ],
     "outstanding_total_msat": 10005000,
+    "paid_total_msat": 5000,
     "payouts": [
       { "id": 1, "amount": 5000, "fee": 0, "currency": "BTC", "sent_amount": 5000, "sent_fee": 0, "sent_currency": "BTC", "rate": 1.0, "rate_collected": null, "created": "2026-07-18T11:00:00Z", "is_paid": true, "mode": "lightning_address", "output": "lnbc...", "pre_image": "<hex>" }
     ],
@@ -4075,7 +4614,7 @@ Returns the referral plus per-currency earned commission, the outstanding balanc
 }
 ```
 
-`earned` is commission (`first payment * effective_rate%`) aggregated per currency (keys upper-cased).
+`earned` is commission (`(first payment - refunds against it) * effective_rate%`) aggregated per currency (keys upper-cased). VMs owned by the referrer themselves earn nothing.
 
 `balances` nets each earned currency against what has already been paid **or reserved** in it (`settled` = payout `amount + fee`, matched on the currency a payout *settles*, not the one it sent) and values the remainder in millisats at current rates. `outstanding_msat` is `null` when no rate is available for that currency, and such balances are excluded from the total.
 
@@ -4100,10 +4639,54 @@ Body:
   // in use by another referral.
   "referral_rate": 12.5,
   // Set (number, >= 0), clear to company default (null), or omit to leave unchanged
-  "payout_threshold": 50000
+  "payout_threshold": 50000,
   // Set (number, satoshis), clear to system minimum (null), or omit to leave unchanged. Admin override is not bounded by the system minimum.
+  "auto_payout_approved": true
+  // Approve (true) or revoke (false) automated payouts, or omit to leave unchanged.
 }
 ```
+
+#### List Referred VMs
+
+```
+GET /api/admin/v1/referrals/{id}/usage?limit={limit}&offset={offset}
+```
+
+Required Permission: `referral::view`
+
+One row per referred VM that made a first payment, most recent first. `limit` defaults to 50 (max 100).
+
+```json
+{
+  "data": [
+    {
+      "vm_id": 812,
+      "user_id": 977,
+      "created": "2026-10-01T09:00:00Z",
+      "amount": 8400,
+      "refunded": 0,
+      "currency": "EUR",
+      "effective_rate": 33.0,
+      "commission": 2772
+    }
+  ],
+  "total": 1,
+  "limit": 50,
+  "offset": 0
+}
+```
+
+`amount` is the VM's first payment and `refunded` the total refunded against it, both in the smallest unit of `currency`. `commission = (amount - refunded) * effective_rate%`.
+
+#### Remove Referred VM
+
+```
+DELETE /api/admin/v1/referrals/{id}/usage/{vm_id}
+```
+
+Required Permission: `referral::delete`
+
+Clears the VM's referral code so it stops earning this referrer commission. Commission already paid on it then nets against the referrer's future earnings. Returns `404` when the VM was not referred by this referral.
 
 #### List Referral Payouts
 
@@ -4566,6 +5149,26 @@ push is corrected without an admin doing anything. A peer on an LNVPS-managed
 interface that no allocation accounts for is **removed**: `wgln*` interfaces are
 LNVPS's, so an unclaimed key there is either a revoked node or somebody else's.
 
+### VM Add-on Prices
+
+The catalog of paid VM extras, one row per region and kind. `kind` is `snapshot` (one snapshot slot). `monthly_amount` is the price of one unit per month in `currency`'s smallest unit; it is scaled to each VM's billing interval and converted to the subscription's currency. Use a milli currency such as `MEUR` for prices below a cent an hour. `max_quantity` caps what one VM can buy. Turning `enabled` off stops new purchases; VMs keep what they bought.
+
+Required Permission: `vm_addon_price::view`, `::create`, `::update`, `::delete`
+
+```
+GET    /api/admin/v1/vm_addon_prices?limit=&offset=
+GET    /api/admin/v1/vm_addon_prices/{id}
+POST   /api/admin/v1/vm_addon_prices
+PATCH  /api/admin/v1/vm_addon_prices/{id}
+DELETE /api/admin/v1/vm_addon_prices/{id}
+```
+
+`POST` body: `{ "region_id": number, "kind": "snapshot", "currency": string, "monthly_amount": number, "max_quantity": number, "enabled"?: bool }`. A region holds one price per kind.
+
+`PATCH` body: any of `currency`, `monthly_amount`, `max_quantity`, `enabled`. A new price applies to purchases and quantity changes from then on; existing add-on lines keep their amount until changed.
+
+Response: `{ "id", "region_id", "kind", "currency", "monthly_amount", "max_quantity", "enabled", "created" }`
+
 ### VPN Services
 
 The VPN product an account subscribes to, and the interfaces that terminate it.
@@ -4698,6 +5301,62 @@ A device id belonging to a different plan is refused rather than revoked
 through the plan in the path.
 
 ### Reports
+
+#### Activity Report
+
+```
+GET /api/admin/v1/reports/activity
+```
+
+Query Parameters:
+
+- `days`: number (optional) - look-back window in days, 1-90, default 7
+- `expiring_days`: number (optional) - look-ahead window for expiring VMs in days, 1-90, default 7
+- `limit`: number (optional) - max items per list, 1-100, default 20
+
+Required Permission: `analytics::view`
+
+Returns everything that happened since `now - days`. Every list is an object `{ "total": number, "items": [...] }`
+where `total` counts every match and `items` holds the newest `limit` of them. Orders whose subscription was never
+paid (`is_setup = false`) are left out of the VM, VPN and app lists.
+
+```json
+{
+  "since": "string (ISO 8601)",
+  "expiring_until": "string (ISO 8601)",
+  "new_users": { "total": number, "items": [{ "id": number, "pubkey": "string (hex)", "created": "string (ISO 8601)" }] },
+  "new_vms": { "total": number, "items": ["AdminVmInfo"] },
+  // Paid VMs whose subscription was created in the window, newest first
+  "deleted_vms": { "total": number, "items": ["AdminVmInfo + deleted_at + delete_reason"] },
+  // Paid VMs with a `deleted` history entry in the window, most recent deletion first.
+  // Each item is an AdminVmInfo with two extra fields:
+  //   "deleted_at": "string (ISO 8601)", "delete_reason": "string | null"
+  "expiring_vms": { "total": number, "items": ["AdminVmInfo"] },
+  // Live paid VMs whose expiry falls between `since` and `expiring_until`, soonest first.
+  // Includes VMs that already lapsed in the window but have not been deleted yet.
+  "new_vpn_subscriptions": { "total": number, "items": ["AdminVpnSubscriptionInfo"] },
+  "new_app_deployments": { "total": number, "items": ["AdminAppDeploymentInfo"] },
+  "payments": { "total": number, "items": ["AdminSubscriptionPaymentInfo + subscription_name + vm_id + refund_trigger"] },
+  // `vm_id`: the VM on the payment's subscription (via its VPS line item), null when there is none.
+  // `refund_trigger`: null unless `payment_type` is "Refund", then one of
+  //   "owner_delete" (customer deleted the VM; `metadata.refund.by_owner_user_id` set),
+  //   "admin_delete" (an admin deleted the VM and the refund was recorded by that admin after the deletion),
+  //   "admin" (admin Lightning payout, the row carries the paid invoice),
+  //   "manual" (admin recorded a refund made out of band).
+  // Paid payments with `paid_at` in the window, newest first. Refunds are included
+  // (`payment_type: "Refund"`); their amount is a magnitude to subtract.
+  "payment_totals": [
+    {
+      "currency": "string",
+      "payment_type": "Purchase" | "Renewal" | "Upgrade" | "Refund",
+      "count": number,
+      "amount": number,
+      // Sum of amounts in cents/millisats
+      "tax": number
+    }
+  ]
+}
+```
 
 #### Time Series Report
 
@@ -5044,11 +5703,78 @@ Response:
   `out_of_scope` sales are excluded (domestic sales belong on the national VAT
   return, not the OSS return).
 - Uses each payment's frozen per-line `tax_breakdown` when present, else the
-  payment's summary tax fields when the whole payment was treated as `oss_b2c`.
+  payment's summary tax fields when the whole payment was treated as `oss_b2c`,
+  with the payment `amount` as the net.
+- Payments with no recorded treatment are left out; `GET /api/admin/v1/reports/vat`
+  reports them with an inferred country.
 - `country_code` is the destination member state (ISO 3166-1 alpha-3).
 - Amounts are in smallest currency units (cents for fiat, millisats for BTC).
 - Payments whose currency cannot be converted to the company base currency are
   skipped.
+
+#### VAT Report
+
+```
+GET /api/admin/v1/reports/vat
+```
+
+Every paid sale bucketed by tax treatment, so one call covers both the national
+VAT return (the `domestic` rows) and the OSS return (the `oss_b2c` rows). Takes
+the same query parameters as the OSS report and follows the same rules: amounts
+are in each company's base currency at the rate frozen on the payment, refunds
+net off against the bucket they reverse, and `net_total`/`tax_total` are signed.
+
+Rows are keyed by `(period, company, treatment, country, VAT rate, inferred)`.
+
+Query Parameters:
+
+- `start_date`: string (required) - YYYY-MM-DD
+- `end_date`: string (required) - YYYY-MM-DD
+- `company_id`: number (optional) - filter to one seller company; `0`/omitted = all companies.
+- `period`: `quarter` (default) | `bimonthly`.
+
+Required Permission: `analytics::view`
+
+Response:
+
+```json
+{
+  "data": {
+    "start_date": "2026-01-01",
+    "end_date": "2026-02-28",
+    "period": "bimonthly",
+    "rows": [
+      {
+        "period": "2026-B1",
+        "company_id": 1,
+        "company_name": "LNVPS",
+        "currency": "EUR",
+        "treatment": "domestic",
+        "country_code": "IRL",
+        "vat_rate": 23.0,
+        "net_total": 480000,
+        "tax_total": 110400,
+        "transaction_count": 41,
+        "inferred": false
+      }
+    ]
+  }
+}
+```
+
+**Notes:**
+
+- `treatment` is one of `domestic`, `oss_b2c`, `reverse_charge`,
+  `out_of_scope` or `undetermined_default`.
+- `inferred: true` marks a payment that recorded no tax treatment, which is
+  every payment from before tax calculation shipped. Its country and treatment
+  are worked out now from the customer's **current** declared country, IP
+  country and VAT number, using the same rules checkout applies, so they may not
+  match where the customer was at the time. `vat_rate` and `tax_total` are what
+  was actually charged, normally `0`.
+- A customer with no country at all lands in `undetermined_default` under the
+  seller's country.
+- `country_code` is null only for a seller outside the EU VAT area.
 
 #### Fleet Traffic Report
 
@@ -5113,7 +5839,8 @@ Same `start`/`end` parameters and same 400-day cap as the report above.
     "period_start": "2026-08-01",
     "period_end": "2026-08-31",
     "bytes_out": 41231000000,
-    "bytes_in": 8800000000
+    "bytes_in": 8800000000,
+    "throttled": false
   },
   "days": [
     { "day": "2026-08-24", "bytes_in": 310000000, "bytes_out": 2250000000 }
@@ -5124,7 +5851,8 @@ Same `start`/`end` parameters and same 400-day cap as the report above.
 `summary` always describes the **current** calendar month whatever range was
 requested, and is the same object carried by `traffic` on `AdminVmInfo` and on
 the customer-facing `VmStatus`. `transfer_gb` is the plan's outbound allowance
-(omitted when unmetered); exceeding it currently has no automatic effect.
+(omitted when unmetered). A VM whose `bytes_out` reaches it is limited to
+10 Mbit/s until the 1st, and `throttled` is true.
 
 ### App Deployments — Catalog & Clusters
 
@@ -5213,7 +5941,7 @@ Required Permission: `app::create`. Body:
   "currency": "USD",
   "interval_amount": 1,
   "interval_type": "month",
-  // Required pricing (amount in smallest units; interval_type: day|month|year).
+  // Required pricing (amount in smallest units; interval_type: hour|day|month|year).
   "setup_amount": 0,
   // Optional one-off setup fee (default 0).
   "enabled": true
@@ -5312,6 +6040,8 @@ These use the dedicated **`app_deployment`** RBAC resource (distinct from the ca
   "namespace": "app-1",
   "hostname": "my-relay.apps.lnvps.tld",
   "custom_domain": "blog.example.com",
+  "public_port": 25570,
+  // Allocated public L4 port for game server apps, null otherwise.
   "custom_domain_verified": true,
   "desired_state": "running",
   "status": "running",
@@ -5360,8 +6090,8 @@ Deletion is a soft delete, so `include_deleted=true` is the only way to inspect 
   "name": "new-name",               // DNS-safe; unique per cluster
   "custom_domain": "blog.example.com", // set; "" or null clears. A changed
                                        // domain is held (custom_domain_verified
-                                       // false) until the operator sees it
-                                       // resolve to the deployment hostname
+                                       // false) until the operator sees the
+                                       // _lnvps-challenge.<domain> TXT token
   "config": { "relay_name": "New" }  // validated against the app compose schema; replaces the stored config wholesale
 }
 ```
@@ -5424,6 +6154,11 @@ Required Permissions: `app::view` / `app::create` / `app::update` / `app::delete
   "capacity_storage_bytes": 107374182400,
   // Static total capacity available for deployments (millicores / bytes / bytes).
   // A cluster with 0 capacity accepts no deployments (1:1, no overcommit).
+  "dns_server_id": 1,
+  "dns_zone_id": "cloudflare-zone-id",
+  // Optional. When both are set the operator publishes SRV records for L4
+  // (game server) deployments on a non-default port in this zone, and removes
+  // them on deletion. `null` on PATCH clears.
   "created": "2026-07-24T10:00:00Z"
 }
 ```
@@ -5627,6 +6362,7 @@ The RBAC system uses the following permission format: `resource::action`
 - `marketplace_operator` - Marketplace operator revenue share and payout configuration
 - `support_agent` - Support-agent transcripts and the agent's memory of a customer
 - `discount` - Discount campaigns: codes, their rules and redemption reporting
+- `account_credit` - Customer account credit balances: read the balance and ledger, and adjust them
 
 ### Actions:
 
@@ -5806,7 +6542,7 @@ The RBAC system uses the following permission format: `resource::action`
     "is_active": boolean,
     "auto_renewal_enabled": boolean,
     "interval_amount": number,
-    "interval_type": "day" | "month" | "year",
+    "interval_type": "hour" | "day" | "month" | "year",
     "currency": "string",
     "payment_count": number,
     "line_items": [
@@ -6034,7 +6770,7 @@ The RBAC system uses the following permission format: `resource::action`
   "company_base_currency": "string",
   // Base currency of the company that owns this VM (e.g., "EUR")
   "payment_method": "lightning",
-  // AdminPaymentMethod enum: "lightning", "revolut", "paypal", "stripe"
+  // AdminPaymentMethod enum: "lightning", "revolut", "paypal", "stripe", "onchain", "fixedfloat"
   "external_id": "string | null",
   // External payment provider ID
   "is_paid": boolean,
@@ -6043,9 +6779,28 @@ The RBAC system uses the following permission format: `resource::action`
   // When payment was completed (null if unpaid)
   "rate": number,
   // Exchange rate to company_base_currency
-  "discount": AdminPaymentDiscountInfo
+  "discount": AdminPaymentDiscountInfo,
   // The discount applied to this payment; omitted when there was none.
   // `amount` is already net of it.
+  "swap": AdminSwapInfo
+  // The swap order behind a `fixedfloat` payment; omitted for every other method.
+}
+```
+
+### AdminSwapInfo
+
+```json
+{
+  "coin": "string",
+  // XMR, LTC, ETH or USDTTRC
+  "order_id": "string",
+  // FixedFloat order id, as shown on ff.io/order/{order_id}
+  "deposit_address": "string",
+  // Where the customer sends `coin`
+  "deposit_amount": "string",
+  // Amount of `coin` the customer must send
+  "receive_address": "string"
+  // Our on-chain address FixedFloat pays the Bitcoin to
 }
 ```
 
@@ -6178,9 +6933,11 @@ The RBAC system uses the following permission format: `resource::action`
   // Tax amount in cents/millisats
   "processing_fee": number,
   // Processing fee in cents/millisats
-  "discount": AdminPaymentDiscountInfo
+  "discount": AdminPaymentDiscountInfo,
   // The discount applied to this payment; omitted when there was none.
   // `amount` is already net of it.
+  "swap": AdminSwapInfo
+  // The swap order behind a `fixedfloat` payment; omitted for every other method.
 }
 ```
 
@@ -6201,8 +6958,10 @@ The RBAC system uses the following permission format: `resource::action`
   // Number of active (non-deleted) VMs using this image
   "sha2": "string | null",
   // SHA-256 checksum of the image file (omitted if not set)
-  "sha2_url": "string | null"
+  "sha2_url": "string | null",
   // URL to a file containing the SHA-256 checksum (omitted if not set)
+  "encrypted": boolean
+  // The image encrypts its root disk and prompts for a passphrase on the serial console
 }
 ```
 
@@ -6313,6 +7072,17 @@ The RBAC system uses the following permission format: `resource::action`
   // Maximum CPU usage as a fraction of allocated cores e.g. 0.5 = 50% - omitted when uncapped
   "transfer_gb": number,
   // Monthly outbound transfer allowance in GB - omitted when unmetered
+  "min_transfer_gb": number,
+  "max_transfer_gb": number,
+  "transfer_cost_per_tb": number,
+  "min_network_mbps": number,
+  "max_network_mbps": number,
+  "network_cost_per_gbps": number,
+  "interval_amount": number,
+  "interval_type": "hour" | "day" | "month" | "year",
+  // Billing interval; every rate is the price for one interval
+  "rate_scale": number,
+  // Rates and disk costs are in 1/rate_scale of the smallest currency unit
   "disk_pricing": [
     // Array of disk pricing configurations
     {
@@ -7645,7 +8415,8 @@ All fields except `webhook_secret` are required when creating:
 | `revolut`     | revolut        | `url`, `token`, `api_version`, `public_key` (webhook_secret optional) |
 | `stripe`      | stripe         | `secret_key`, `publishable_key`, `webhook_secret`                     |
 | `paypal`      | paypal         | `client_id`, `client_secret`, `mode`                                  |
-| `onchain`     | onchain        | `url`, `cert_path`, `macaroon_path` (`address_type`, `account`, `min_confirmations` optional) |
+| `onchain`     | onchain        | `url`, `cert_path`, `macaroon_path` (`address_type`, `account`, `min_confirmations`, `unpaid_purge_grace_hours` optional) |
+| `fixedfloat`  | fixedfloat     | `api_key`, `api_secret` (`url`, `refcode`, `afftax` optional)         |
 
 ### PartialProviderConfig (Tagged Union) - For Updates
 
@@ -7658,7 +8429,8 @@ Only the `type` field is required; all other fields are optional and will keep t
 | `revolut`     | `url`, `token`, `api_version`, `public_key`, `webhook_secret` |
 | `stripe`      | `secret_key`, `publishable_key`, `webhook_secret`             |
 | `paypal`      | `client_id`, `client_secret`, `mode`                          |
-| `onchain`     | `url`, `cert_path`, `macaroon_path`, `address_type`, `account` (null clears), `min_confirmations` |
+| `onchain`     | `url`, `cert_path`, `macaroon_path`, `address_type`, `account` (null clears), `min_confirmations`, `unpaid_purge_grace_hours` |
+| `fixedfloat`  | `api_key`, `api_secret`, `url` (null clears), `refcode` (null clears), `afftax` (null clears) |
 
 ### Notes
 
@@ -7669,6 +8441,7 @@ Only the `type` field is required; all other fields are optional and will keep t
 - `stripe` - Stripe Payments API
 - `paypal` - PayPal REST API
 - `onchain` - On-chain Bitcoin payments (LND wallet backend). `address_type` is one of `witness_pubkey_hash`, `nested_pubkey_hash`, `taproot_pubkey`.
+- `fixedfloat` - Cryptocurrency payments through the FixedFloat exchange API (payment method `fixedfloat`). The customer picks a coin per payment (`coin` query parameter). The coins a company accepts are the config's `supported_currencies`, which for `fixedfloat` must be coins from `XMR`, `LTC`, `ETH` and `USDTTRC`; an empty list accepts all four. Coins are rejected on every other payment method, and a coin cannot be a company or plan currency. Each payment creates a FixedFloat order into that coin whose BTC destination is a fresh address from the company's `onchain` config, so an enabled `onchain` payment method is required as well: creating or enabling a `fixedfloat` config is rejected without one. Changes to the config apply to new payments without a restart. The BTC that arrives is settled by the on-chain watcher at the rate current on arrival. The response hides `api_key` and `api_secret` and returns `has_api_key` and `has_api_secret`. `afftax` is only sent together with `refcode`.
 
 **Multiple Configurations:**
 A company can have multiple payment method configurations for the same payment method type. This allows keeping disabled
@@ -7853,7 +8626,7 @@ field to leave it unchanged, or send `null` to clear it.
 | amount          | u64                        | Smallest currency units; per-IP for ip_range      |
 | currency        | string                     | e.g. `USD`, `EUR`                                 |
 | interval_amount | u64 \| null                | Required for `recurring`; null for `one_time`     |
-| interval_type   | `day`\|`month`\|`year`\|null | Billing interval unit                           |
+| interval_type   | `hour`\|`day`\|`month`\|`year`\|null | Billing interval unit                           |
 | billing_start   | datetime \| null           | Cost start / one-time purchase date               |
 | billing_end     | datetime \| null           | Cost end date; null = still active/ongoing         |
 | depreciation_months | u64 \| null            | Useful life for a `one_time` cost; null = expensed immediately |

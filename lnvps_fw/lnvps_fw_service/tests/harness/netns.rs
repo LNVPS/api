@@ -255,6 +255,88 @@ impl NetnsTopology {
     pub fn filter_ns_path(&self) -> String {
         format!("/var/run/netns/{}", self.filter_ns)
     }
+
+    /// MAC address of `ifname` inside namespace `ns`.
+    pub fn mac_of(ns: &str, ifname: &str) -> std::io::Result<[u8; 6]> {
+        let out = Command::new("ip")
+            .args(["-n", ns, "-j", "link", "show", "dev", ifname])
+            .output()?;
+        if !out.status.success() {
+            return Err(std::io::Error::other(format!(
+                "ip link show {ifname} in {ns} failed"
+            )));
+        }
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout)
+            .map_err(|e| std::io::Error::other(format!("ip -j output: {e}")))?;
+        let addr = v[0]["address"]
+            .as_str()
+            .ok_or_else(|| std::io::Error::other("no address in ip -j output"))?;
+        let mut mac = [0u8; 6];
+        for (i, part) in addr.split(':').enumerate().take(6) {
+            mac[i] = u8::from_str_radix(part, 16)
+                .map_err(|e| std::io::Error::other(format!("bad mac {addr}: {e}")))?;
+        }
+        Ok(mac)
+    }
+
+    /// Add an 802.1Q sub-interface `name` (VLAN `id`) on `parent` inside `ns`
+    /// with `addr` (CIDR), and turn off TX VLAN offload on the parent so the
+    /// tag is inserted into the frame data (not carried as skb metadata),
+    /// which is how a TC hook on the parent sees it.
+    pub fn add_vlan(
+        ns: &str,
+        parent: &str,
+        name: &str,
+        id: u16,
+        addr: &str,
+    ) -> std::io::Result<()> {
+        run(
+            "ip",
+            &[
+                "-n",
+                ns,
+                "link",
+                "add",
+                "link",
+                parent,
+                "name",
+                name,
+                "type",
+                "vlan",
+                "id",
+                &id.to_string(),
+            ],
+        )?;
+        run("ip", &["-n", ns, "addr", "add", addr, "dev", name])?;
+        run("ip", &["-n", ns, "link", "set", name, "up"])?;
+        run(
+            "ip",
+            &[
+                "netns", "exec", ns, "ethtool", "-K", parent, "txvlan", "off",
+            ],
+        )
+    }
+
+    /// Pin a static neighbour entry so a datagram to `ip` leaves `dev` at once
+    /// instead of waiting on an ARP reply nobody will send.
+    pub fn add_static_neigh(ns: &str, dev: &str, ip: &str, mac: &str) -> std::io::Result<()> {
+        run(
+            "ip",
+            &[
+                "-n",
+                ns,
+                "neigh",
+                "replace",
+                ip,
+                "lladdr",
+                mac,
+                "dev",
+                dev,
+                "nud",
+                "permanent",
+            ],
+        )
+    }
 }
 
 impl Drop for NetnsTopology {

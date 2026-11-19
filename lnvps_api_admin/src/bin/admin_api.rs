@@ -138,6 +138,10 @@ async fn main() -> Result<(), Error> {
         Some(i) => i.parse()?,
         None => SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 8001),
     };
+    #[cfg(feature = "demo")]
+    warn!(
+        "DEMO BUILD: /api/admin/v1/me/roles auto-assigns the admin role to any key when LNVPS_DEMO_OPEN_ADMIN=1 - never expose a demo build to the public internet"
+    );
     let listener = bind_address(ip).await?;
     info!("Listening on {}", ip);
     let router = admin_router(
@@ -154,6 +158,12 @@ async fn main() -> Result<(), Error> {
             None => None,
         },
         vat,
+        settings.chain_explorer_url.as_ref().map(|url| {
+            Arc::new(lnvps_api_admin::admin::chain::MempoolOutputLookup::new(
+                url,
+                db.clone(),
+            )) as Arc<dyn lnvps_api_admin::admin::chain::ChainOutputLookup>
+        }),
     );
 
     // Same cross-cutting stack as the public API. The admin surface previously

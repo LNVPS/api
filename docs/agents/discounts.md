@@ -70,6 +70,7 @@ the thing being bought instead of a single scalar the engine picked on its behal
 | `asn_sponsoring` | `subscription_id`, `asn`, `registry` |
 | `dns_hosting` | — |
 | `marketplace_node_fee` | `node_id` |
+| `vm_addon` | `vm_id`, `kind`, `quantity` |
 
 **Type is certain, detail is best-effort.** The line item itself says what it bills for, so `type`
 is always right; the detail comes from the product row behind it, which may not exist yet (an IP

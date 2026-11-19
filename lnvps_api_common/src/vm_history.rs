@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::Utc;
 use lnvps_db::{LNVpsDb, Vm, VmHistory, VmHistoryActionType};
 use payments_rs::currency::{Currency, CurrencyAmount};
@@ -148,6 +148,37 @@ impl VmHistoryLogger {
             new_state: None,
             metadata: serialize_json_to_bytes(metadata),
             description: Some("VM stopped".to_string()),
+        };
+
+        self.db.insert_vm_history(&history).await?;
+        Ok(())
+    }
+
+    pub async fn log_vm_snapshot(
+        &self,
+        vm_id: u64,
+        initiated_by_user: Option<u64>,
+        action_type: VmHistoryActionType,
+        snapshot: &str,
+    ) -> Result<()> {
+        let description = match action_type {
+            VmHistoryActionType::SnapshotCreated => format!("Snapshot {snapshot} created"),
+            VmHistoryActionType::SnapshotRestored => format!(
+                "VM restored to snapshot {snapshot}, the disk is as it was when it was taken"
+            ),
+            VmHistoryActionType::SnapshotDeleted => format!("Snapshot {snapshot} deleted"),
+            _ => bail!("{action_type} is not a snapshot action"),
+        };
+        let history = VmHistory {
+            id: 0,
+            vm_id,
+            action_type,
+            timestamp: Utc::now(),
+            initiated_by_user,
+            previous_state: None,
+            new_state: None,
+            metadata: serialize_json_to_bytes(Some(json!({"snapshot": snapshot}))),
+            description: Some(description),
         };
 
         self.db.insert_vm_history(&history).await?;
@@ -449,7 +480,11 @@ impl VmHistoryLogger {
         meta["refund_payment_id"] = json!(hex::encode(refund_payment_id));
         meta["amount"] = json!(amount);
         meta["currency"] = json!(currency);
-        meta["admin_action"] = json!(true);
+        // A caller (the owner deleting their own VM) may say this was not an
+        // admin action; anything else is one.
+        if meta.get("admin_action").is_none() {
+            meta["admin_action"] = json!(true);
+        }
         if let Some(r) = reason {
             meta["reason"] = json!(r);
         }
@@ -737,6 +772,44 @@ mod tests {
     fn make_logger() -> VmHistoryLogger {
         let db = Arc::new(MockDb::empty());
         VmHistoryLogger::new(db)
+    }
+
+    /// A refund is an admin action unless the caller says otherwise: the owner
+    /// deleting their own VM is not.
+    #[tokio::test]
+    async fn refund_admin_action_defaults_true_and_can_be_cleared() {
+        let logger = make_logger();
+        logger
+            .log_vm_refunded(31, Some(1), &[1], &[2], 10, "BTC", None, None)
+            .await
+            .unwrap();
+        logger
+            .log_vm_refunded(
+                31,
+                Some(1),
+                &[1],
+                &[3],
+                10,
+                "BTC",
+                None,
+                Some(json!({ "admin_action": false })),
+            )
+            .await
+            .unwrap();
+        let flags: Vec<Value> = logger
+            .db
+            .list_vm_history(31)
+            .await
+            .unwrap()
+            .iter()
+            .map(|h| {
+                serde_json::from_slice::<Value>(h.metadata.as_ref().unwrap()).unwrap()
+                    ["admin_action"]
+                    .clone()
+            })
+            .collect();
+        assert!(flags.contains(&json!(true)));
+        assert!(flags.contains(&json!(false)));
     }
 
     /// Regression test for d88e153: log_vm_payment_received must format the payment amount
@@ -1050,6 +1123,50 @@ mod tests {
         let history = logger.db.list_vm_history(7).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].action_type.to_string(), "started");
+    }
+
+    #[tokio::test]
+    async fn test_log_vm_snapshot() {
+        let logger = make_logger();
+        for (action, text) in [
+            (VmHistoryActionType::SnapshotCreated, "Snapshot s1 created"),
+            (
+                VmHistoryActionType::SnapshotRestored,
+                "restored to snapshot s1",
+            ),
+            (VmHistoryActionType::SnapshotDeleted, "Snapshot s1 deleted"),
+        ] {
+            logger
+                .log_vm_snapshot(40, Some(1), action, "s1")
+                .await
+                .unwrap();
+            let history = logger.db.list_vm_history(40).await.unwrap();
+            assert!(
+                history
+                    .iter()
+                    .any(|h| h.description.as_deref().unwrap().contains(text)),
+                "{text}"
+            );
+        }
+        assert!(
+            logger
+                .log_vm_snapshot(40, None, VmHistoryActionType::Started, "s1")
+                .await
+                .is_err()
+        );
+        let mut kinds: Vec<_> = logger
+            .db
+            .list_vm_history(40)
+            .await
+            .unwrap()
+            .iter()
+            .map(|h| h.action_type.to_string())
+            .collect();
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            ["snapshot_created", "snapshot_deleted", "snapshot_restored"]
+        );
     }
 
     #[tokio::test]

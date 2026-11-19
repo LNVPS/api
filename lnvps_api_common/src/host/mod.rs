@@ -14,12 +14,13 @@ use lnvps_db::{
 use crate::HostVmSpec;
 use crate::VmRunningState;
 use crate::host::config::ProvisionerConfig;
-use crate::retry::OpResult;
+use crate::retry::{OpError, OpResult};
 
 pub mod cloud_init;
 pub mod config;
 #[cfg(feature = "libvirt")]
 mod libvirt;
+pub mod marketplace_node;
 pub mod marketplace_pki;
 #[cfg(feature = "proxmox")]
 mod proxmox;
@@ -46,6 +47,133 @@ pub struct MigrateVmRequest {
     /// whether that pool is shared (nothing to copy) or node-local (the disk
     /// must travel, under the same name).
     pub target_storage: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmSnapshot {
+    pub name: String,
+    pub description: Option<String>,
+    pub created: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotRejection {
+    Invalid(String),
+    Conflict(String),
+    NotFound(String),
+}
+
+impl std::fmt::Display for SnapshotRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (Self::Invalid(m) | Self::Conflict(m) | Self::NotFound(m)) = self;
+        f.write_str(m)
+    }
+}
+
+impl std::error::Error for SnapshotRejection {}
+
+impl SnapshotRejection {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Invalid(_) => "invalid",
+            Self::Conflict(_) => "conflict",
+            Self::NotFound(_) => "not_found",
+        }
+    }
+
+    pub fn from_kind(kind: &str, message: String) -> Option<Self> {
+        match kind {
+            "invalid" => Some(Self::Invalid(message)),
+            "conflict" => Some(Self::Conflict(message)),
+            "not_found" => Some(Self::NotFound(message)),
+            _ => None,
+        }
+    }
+}
+
+pub fn check_restorable(existing: &[VmSnapshot], name: &str) -> Result<(), SnapshotRejection> {
+    let Some(at) = existing.iter().position(|s| s.name == name) else {
+        return Err(SnapshotRejection::NotFound(format!(
+            "Snapshot {name} does not exist"
+        )));
+    };
+    let newer: Vec<&str> = existing[at + 1..].iter().map(|s| s.name.as_str()).collect();
+    if !newer.is_empty() {
+        return Err(SnapshotRejection::Conflict(format!(
+            "Only the newest snapshot can be restored, delete {} first",
+            newer.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+impl From<SnapshotRejection> for OpError<anyhow::Error> {
+    fn from(value: SnapshotRejection) -> Self {
+        OpError::Fatal(value.into())
+    }
+}
+
+pub fn validate_snapshot_name(name: &str) -> Result<(), SnapshotRejection> {
+    let mut chars = name.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_alphabetic());
+    if !first_ok
+        || name == "current"
+        || name.len() < 2
+        || name.len() > 40
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(SnapshotRejection::Invalid(
+            "Snapshot name must start with a letter and use only letters, digits, '_' and '-' (2 to 40 characters)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_snapshot_description(description: &str) -> Result<(), SnapshotRejection> {
+    if description.chars().count() > 200 || description.chars().any(|c| c.is_control()) {
+        return Err(SnapshotRejection::Invalid(
+            "Snapshot description must be at most 200 characters on a single line".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn check_new_snapshot(
+    existing: &[VmSnapshot],
+    limit: usize,
+    name: &str,
+    description: Option<&str>,
+) -> Result<(), SnapshotRejection> {
+    validate_snapshot_name(name)?;
+    if let Some(d) = description {
+        validate_snapshot_description(d)?;
+    }
+    if existing.iter().any(|s| s.name == name) {
+        return Err(SnapshotRejection::Conflict(format!(
+            "A snapshot named {name} already exists"
+        )));
+    }
+    if limit == 0 {
+        return Err(SnapshotRejection::Conflict(
+            "Buy snapshot slots for this VM first".to_string(),
+        ));
+    }
+    if existing.len() >= limit {
+        return Err(SnapshotRejection::Conflict(format!(
+            "This VM has {limit} snapshot slots, delete a snapshot or buy more slots"
+        )));
+    }
+    Ok(())
+}
+
+pub async fn clear_snapshots(client: &dyn VmHostClient, vm: &Vm) -> OpResult<usize> {
+    let snapshots = client.list_snapshots(vm).await?;
+    for snapshot in &snapshots {
+        client.delete_snapshot(vm, &snapshot.name).await?;
+    }
+    Ok(snapshots.len())
 }
 
 pub struct TerminalStream {
@@ -101,6 +229,15 @@ pub trait VmHostClient: Send + Sync {
         )))
     }
 
+    async fn list_snapshots(&self, vm: &Vm) -> OpResult<Vec<VmSnapshot>>;
+
+    async fn create_snapshot(&self, vm: &Vm, name: &str, description: Option<&str>)
+    -> OpResult<()>;
+
+    async fn rollback_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()>;
+
+    async fn delete_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()>;
+
     /// Download OS image to the host
     async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()>;
 
@@ -131,6 +268,21 @@ pub trait VmHostClient: Send + Sync {
     /// that are detached from the running config (e.g. Proxmox `unused[n]`
     /// entries accumulated by repeated reinstalls). Defaults to a no-op for
     /// hosts that don't support the concept.
+    /// The volume name this host caches an OS image under, when it caches them
+    /// as named volumes. `None` for hosts that do not, which is how a caller
+    /// asks whether the image can be written by something other than us.
+    fn os_image_volume_name(&self, _image: &VmOsImage) -> Option<String> {
+        None
+    }
+
+    /// Re-read the image pool, after something other than this client wrote to
+    /// it — a marketplace node fetching an image itself. libvirt lists a
+    /// directory pool from its own cache, so without this the file is on disk
+    /// and the volume does not exist.
+    async fn refresh_image_pool(&self) -> OpResult<()> {
+        Ok(())
+    }
+
     async fn delete_unused_disks(&self, _vm: &Vm) -> OpResult<()> {
         Ok(())
     }
@@ -180,11 +332,11 @@ pub async fn get_vm_host_client(
 ) -> Result<Arc<dyn VmHostClient>> {
     let vm = db.get_vm(vm_id).await?;
     let host = db.get_host(vm.host_id).await?;
-    let client = get_host_client(&host, cfg)?;
-    Ok(client)
+    get_host_client(db, &host, cfg).await
 }
 
-pub fn get_host_client(
+pub async fn get_host_client(
+    db: &Arc<dyn LNVpsDb>,
     host: &VmHost,
     // Only read by the hypervisor-specific arms below, so it is unused when the
     // crate is built with neither `proxmox` nor `libvirt` enabled.
@@ -225,6 +377,14 @@ pub fn get_host_client(
                 .marketplace_node_id
                 .ok_or_else(|| anyhow::anyhow!("Host {} is not backed by a node", host.id))?;
             let pki = marketplace_pki::node_pki_path(&marketplace, node_id);
+            // The control endpoint is the node's tunnel address, filled in when
+            // its tunnel is allocated. A node can register its certificate
+            // before that, so the anchor can exist while the address is still
+            // blank; dialling it would fail later as an opaque libvirt connect
+            // error rather than the named one.
+            if host.ip.trim().is_empty() {
+                bail!("Node {node_id} has no tunnel address yet, so there is nothing to dial");
+            }
             // Written when the node presents its certificate. Absent means it
             // never has, and connecting without it would mean not checking
             // which machine answered.
@@ -235,7 +395,20 @@ pub fn get_host_client(
                 );
             }
             let uri = marketplace_pki::connection_uri(&host.ip, &pki);
-            Arc::new(libvirt::LibVirtHost::new(&uri, libvirt)?)
+            let inner: Arc<dyn VmHostClient> = Arc::new(libvirt::LibVirtHost::new(&uri, libvirt)?);
+            // With a control key the node can be asked to fetch its own OS
+            // images, which is the difference between LNVPS paying for every
+            // gigabyte twice and the machine using the connection it has.
+            // Without one it is still driven, just fed.
+            match marketplace.control_key.as_deref() {
+                Some(key) => Arc::new(marketplace_node::MarketplaceNodeHost::new(
+                    inner,
+                    crate::node_control::NodeControl::new(key)?,
+                    db.get_marketplace_node(node_id).await?,
+                    host.clone(),
+                )),
+                None => inner,
+            }
         }
         VmHostKind::Dummy => {
             if cfg!(test) {
@@ -270,6 +443,7 @@ pub struct FullVmInfo {
     pub ssh_key: UserSshKey,
     /// User-configured firewall rules for this VM (ordered by priority)
     pub firewall_rules: Vec<VmFirewallRule>,
+    pub transfer_throttled: bool,
 }
 
 impl FullVmInfo {
@@ -303,6 +477,14 @@ impl FullVmInfo {
             None
         };
         let firewall_rules = db.list_vm_firewall_rules(vm_id).await?;
+        let transfer_gb = match (&template, &custom_template) {
+            (Some(t), _) => t.transfer_gb,
+            (_, Some(t)) => t.transfer_gb,
+            _ => None,
+        };
+        let transfer_throttled =
+            crate::vm_over_transfer_quota(&db, vm_id, transfer_gb, chrono::Utc::now().date_naive())
+                .await?;
         // create VM
         Ok(FullVmInfo {
             vm,
@@ -315,6 +497,7 @@ impl FullVmInfo {
             ranges,
             ssh_key,
             firewall_rules,
+            transfer_throttled,
         })
     }
 
@@ -375,6 +558,14 @@ impl FullVmInfo {
     /// Resource limits for this VM (derived from template or custom template).
     /// Returns `VmLimits::default()` (all `None`) if no limits are configured.
     pub fn limits(&self) -> VmLimits {
+        let mut limits = self.plan_limits();
+        if self.transfer_throttled {
+            limits.network_mbps = Some(crate::throttled_network_mbps(limits.network_mbps));
+        }
+        limits
+    }
+
+    fn plan_limits(&self) -> VmLimits {
         if let Some(t) = &self.template {
             VmLimits {
                 disk_iops_read: t.disk_iops_read,
@@ -460,13 +651,118 @@ pub struct VmHostDiskInfo {
 
 #[cfg(test)]
 mod tests {
-    use crate::host::FullVmInfo;
+    use crate::host::{
+        FullVmInfo, SnapshotRejection, VmSnapshot, check_new_snapshot, check_restorable,
+        validate_snapshot_description, validate_snapshot_name,
+    };
     use crate::{GB, TB};
     use chrono::Utc;
     use lnvps_db::{
         CpuArch, DiskInterface, DiskType, IpRange, IpRangeAllocationMode, OsDistribution,
         UserSshKey, Vm, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
     };
+
+    #[test]
+    fn snapshot_names_follow_the_strictest_host_rule() {
+        for ok in ["ab", "before-upgrade", "Snap_1", &"a".repeat(40)] {
+            assert!(validate_snapshot_name(ok).is_ok(), "{ok}");
+        }
+        for bad in [
+            "",
+            "a",
+            "1abc",
+            "-a",
+            "a b",
+            "a/b",
+            "a.b",
+            "naïve",
+            "current",
+            &"a".repeat(41),
+        ] {
+            assert!(validate_snapshot_name(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn new_snapshots_are_checked_against_the_vm() {
+        let held = |n: &str| VmSnapshot {
+            name: n.to_string(),
+            description: None,
+            created: None,
+        };
+        assert!(check_new_snapshot(&[], 3, "one", Some("fine")).is_ok());
+        assert!(matches!(
+            check_new_snapshot(&[], 3, "1", None),
+            Err(SnapshotRejection::Invalid(_))
+        ));
+        assert!(matches!(
+            check_new_snapshot(&[], 3, "one", Some("a\nb")),
+            Err(SnapshotRejection::Invalid(_))
+        ));
+        assert!(matches!(
+            check_new_snapshot(&[held("one")], 3, "one", None),
+            Err(SnapshotRejection::Conflict(_))
+        ));
+        let full: Vec<_> = ["s1", "s2", "s3"].into_iter().map(held).collect();
+        assert!(matches!(
+            check_new_snapshot(&full, 3, "s4", None),
+            Err(SnapshotRejection::Conflict(m)) if m.contains('3')
+        ));
+        assert!(check_new_snapshot(&full, 4, "s4", None).is_ok());
+        assert!(matches!(
+            check_new_snapshot(&[], 0, "one", None),
+            Err(SnapshotRejection::Conflict(m)) if m.contains("Buy")
+        ));
+        assert_eq!(
+            SnapshotRejection::NotFound("gone".into()).to_string(),
+            "gone"
+        );
+    }
+
+    #[test]
+    fn only_the_newest_snapshot_is_restorable() {
+        let held: Vec<_> = ["a", "b", "c"]
+            .into_iter()
+            .map(|n| VmSnapshot {
+                name: n.to_string(),
+                description: None,
+                created: None,
+            })
+            .collect();
+        assert!(check_restorable(&held, "c").is_ok());
+        assert!(matches!(
+            check_restorable(&held, "a"),
+            Err(SnapshotRejection::Conflict(m)) if m.contains("b, c")
+        ));
+        assert!(matches!(
+            check_restorable(&held, "x"),
+            Err(SnapshotRejection::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_rejections_round_trip_through_their_kind() {
+        for r in [
+            SnapshotRejection::Invalid("i".into()),
+            SnapshotRejection::Conflict("c".into()),
+            SnapshotRejection::NotFound("n".into()),
+        ] {
+            assert_eq!(
+                SnapshotRejection::from_kind(r.kind(), r.to_string()),
+                Some(r)
+            );
+        }
+        assert_eq!(SnapshotRejection::from_kind("other", "x".into()), None);
+    }
+
+    #[test]
+    fn snapshot_descriptions_are_short_and_single_line() {
+        assert!(validate_snapshot_description("").is_ok());
+        assert!(validate_snapshot_description("before the big change").is_ok());
+        assert!(validate_snapshot_description(&"x".repeat(200)).is_ok());
+        assert!(validate_snapshot_description(&"x".repeat(201)).is_err());
+        assert!(validate_snapshot_description("two\nlines").is_err());
+    }
 
     pub fn mock_full_vm() -> FullVmInfo {
         let template = VmTemplate {
@@ -529,6 +825,7 @@ mod tests {
                 ssh_key: None,
                 sunset_date: None,
                 marketplace_node_id: None,
+                deleted: false,
             },
             disk: VmHostDisk {
                 id: 1,
@@ -553,6 +850,7 @@ mod tests {
                 default_username: None,
                 sha2: None,
                 sha2_url: None,
+                encrypted: false,
             },
             ips: vec![
                 VmIpAssignment {
@@ -627,6 +925,7 @@ mod tests {
                 key_data: "ssh-ed25519 AAA=".into(),
             },
             firewall_rules: vec![],
+            transfer_throttled: false,
         }
     }
 }
@@ -638,6 +937,13 @@ mod marketplace_client_tests {
 
     use super::config::{MarketplaceLibvirtConfig, ProvisionerConfig, QemuConfig};
     use super::*;
+
+    /// A database the marketplace arm can read a node row from. None of these
+    /// tests get far enough to need one that has the node in it: they all fail
+    /// before the lookup, which is the point.
+    fn db() -> Arc<dyn LNVpsDb> {
+        Arc::new(crate::MockDb::default())
+    }
 
     fn host(node_id: Option<u64>) -> VmHost {
         VmHost {
@@ -677,6 +983,7 @@ mod marketplace_client_tests {
                 client_cert: dir.path().join("client.pem"),
                 client_key: dir.path().join("client.key"),
                 pki_dir: dir.path().join("pki"),
+                control_key: None,
             }),
         }
     }
@@ -685,10 +992,11 @@ mod marketplace_client_tests {
     /// dialled. Connecting without one would mean not checking which machine
     /// answered — and the machine is the operator's, on an address their own
     /// guests share a namespace with.
-    #[test]
-    fn an_unverifiable_node_is_not_dialled() {
+    #[tokio::test]
+    async fn an_unverifiable_node_is_not_dialled() {
         let dir = TempDir::new().unwrap();
-        let err = get_host_client(&host(Some(9)), &config(&dir))
+        let err = get_host_client(&db(), &host(Some(9)), &config(&dir))
+            .await
             .err()
             .expect("an unverifiable node must not produce a client");
 
@@ -697,10 +1005,11 @@ mod marketplace_client_tests {
 
     /// A marketplace host with no node behind it is a broken row, and is named
     /// as such rather than producing a connection to nowhere.
-    #[test]
-    fn a_host_with_no_node_is_an_error() {
+    #[tokio::test]
+    async fn a_host_with_no_node_is_an_error() {
         let dir = TempDir::new().unwrap();
-        let err = get_host_client(&host(None), &config(&dir))
+        let err = get_host_client(&db(), &host(None), &config(&dir))
+            .await
             .err()
             .expect("a host with no node must not produce a client");
 
@@ -710,12 +1019,37 @@ mod marketplace_client_tests {
     /// Without a client identity, no VM is placed on a node at all. The
     /// alternative is an unauthenticated hypervisor connection over the tunnel,
     /// which is worse than not having the feature.
-    #[test]
-    fn no_client_identity_means_no_marketplace_hosts() {
+    #[tokio::test]
+    async fn no_client_identity_means_no_marketplace_hosts() {
         let dir = TempDir::new().unwrap();
         let mut cfg = config(&dir);
         cfg.marketplace = None;
 
-        assert!(get_host_client(&host(Some(9)), &cfg).is_err());
+        assert!(get_host_client(&db(), &host(Some(9)), &cfg).await.is_err());
+    }
+
+    /// A node can register its certificate before its tunnel is allocated, so
+    /// the anchor can exist while the host's address is still blank. Dialling
+    /// that would fail later as an opaque libvirt connect error rather than the
+    /// named one the design calls for.
+    #[tokio::test]
+    async fn a_node_with_no_tunnel_address_is_not_dialled() {
+        let dir = TempDir::new().unwrap();
+        let cfg = config(&dir);
+
+        // The anchor the node would have written, so only the blank address can
+        // be what refuses it.
+        let pki = dir.path().join("pki").join("9");
+        std::fs::create_dir_all(&pki).unwrap();
+        std::fs::write(pki.join("cacert.pem"), b"node-ca").unwrap();
+
+        let mut host = host(Some(9));
+        host.ip = String::new();
+
+        let err = get_host_client(&db(), &host, &cfg)
+            .await
+            .err()
+            .expect("a node with no address must not produce a client");
+        assert!(err.to_string().contains("no tunnel address"), "{err}");
     }
 }

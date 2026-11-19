@@ -119,7 +119,9 @@ async fn a_paid_plan_with_device(
     let device = register_vpn_device(db, &plan, "phone", &[7u8; 32]).await?;
     // The peer is what a config is built from; the device row is just the label
     // and the slot.
-    Ok((plan, db.get_tunnel(device.tunnel_id).await?))
+    // A device has one peer per region, identical in key and address.
+    let peer = db.list_vpn_device_tunnels(device.id).await?.remove(0);
+    Ok((plan, peer))
 }
 
 /// The `[Interface]` block is identical everywhere and only the `[Peer]`

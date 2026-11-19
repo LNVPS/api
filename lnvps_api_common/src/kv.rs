@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use redis::AsyncCommands;
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -14,7 +14,7 @@ pub trait KeyValueStore: Send + Sync {
 }
 
 pub struct RedisKeyValueStore {
-    conn: MultiplexedConnection,
+    conn: ConnectionManager,
 }
 
 impl RedisKeyValueStore {
@@ -24,7 +24,7 @@ impl RedisKeyValueStore {
     }
 
     pub async fn from_client(client: redis::Client) -> Result<Self> {
-        let conn = client.get_multiplexed_async_connection().await?;
+        let conn = ConnectionManager::new(client.clone()).await?;
         Ok(Self { conn })
     }
 }

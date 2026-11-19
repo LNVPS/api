@@ -1,6 +1,6 @@
 services:
   db:
-    image: postgres:17-alpine
+    image: postgres:17-alpine@sha256:18cfe3ef5e6815560c98237d6216d1e5119702fb0f3894c8785dd58b8bbe5d73
     user: root    # postgres' entrypoint starts as root, then drops to `postgres`
     resources: { cpu: 500m, memory: 1Gi }
     # A port block is what gives the service a DNS name inside the namespace:
@@ -15,16 +15,19 @@ services:
       # initdb refuses a non-empty directory, and a fresh ext4 PVC has lost+found
       PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
-      - { name: data, path: /var/lib/postgresql/data, size: 20Gi, label: database }
+      - { name: data, path: /var/lib/postgresql/data, size: 5Gi, label: database }
     scratch:
       # readOnlyRootFilesystem: the postmaster lock + unix socket need a
       # writable dir, but not a persistent one
       - { path: /var/run/postgresql, size: 32Mi }
     backup:
-      command: ["sh", "-c", "exec pg_dumpall -U buzz"]
+      # Runs in its own pod on this image, so it connects to the service over
+      # the network (-h db); the default unix socket exists only inside
+      # postgres' own container. PGPASSWORD comes from the service's env.
+      command: ["sh", "-c", "PGPASSWORD=$POSTGRES_PASSWORD exec pg_dumpall -h db -U buzz"]
       artifact: buzz.sql
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:ff02b58f971e7d7d156a1267e283fcbbeee91773b6aa36c49dac28ecfe28eadf
     user: root    # redis' entrypoint starts as root, then drops to `redis`
     resources: { cpu: 250m, memory: 512Mi }
     ports:
@@ -34,7 +37,7 @@ services:
       # refuses writes with MISCONF
       - { name: data, path: /data, size: 2Gi }
   s3:
-    image: rustfs/rustfs:1.0.0-beta.11
+    image: rustfs/rustfs:1.0.0-beta.11@sha256:84ce557a0245a06a9aae5516f55ee0f007fca78d41df356f419306fdc0cb168c
     user: "10001"    # image sets `USER rustfs` (a name); uid 10001 per its Dockerfile
     resources: { cpu: 500m, memory: 1Gi }
     ports:
@@ -51,11 +54,11 @@ services:
       RUSTFS_OBS_USE_STDOUT: "true"
       RUSTFS_OBS_LOGGER_LEVEL: warn
     volumes:
-      - { name: blobs, path: /data, size: 50Gi, label: media }
+      - { name: blobs, path: /data, size: 5Gi, label: media }
     backup:
       volume: blobs
   relay:
-    image: ghcr.io/block/buzz:latest
+    image: ghcr.io/block/buzz:latest@sha256:4e31b7c7abb7d00b6f513dc559e58d2b980416f1dc400aa01bcf762cf2989cfc
     user: "1000"    # image sets `USER buzz:buzz` (a name); uid 1000 per its Dockerfile
     resources: { cpu: 1, memory: 2Gi }
     depends_on: [db, redis, s3]
@@ -67,21 +70,26 @@ services:
     # the relay cannot start before the bucket exists.
     init:
       - name: create-media-bucket
-        image: minio/mc:latest
+        image: rclone/rclone:1.75.1@sha256:45401ad7410db1d67ffdb58e19059ad20b0d8e0285a60e38bbec55cc1019c7a5
         user: "65534"    # only talks to the in-namespace S3 service
         env:
-          MC_HOST_s3: "http://${S3_ACCESS_KEY}:${S3_SECRET_KEY}@s3:9000"
-          MC_CONFIG_DIR: /tmp/mc
+          RCLONE_CONFIG: /tmp/rclone.conf
+          RCLONE_CONFIG_S3_TYPE: s3
+          RCLONE_CONFIG_S3_PROVIDER: Other
+          RCLONE_CONFIG_S3_ENDPOINT: "http://s3:9000"
+          RCLONE_CONFIG_S3_REGION: us-east-1
+          RCLONE_CONFIG_S3_ACCESS_KEY_ID: "${S3_ACCESS_KEY}"
+          RCLONE_CONFIG_S3_SECRET_ACCESS_KEY: "${S3_SECRET_KEY}"
         command:
           - sh
           - -c
           - |
             set -e
-            until mc --quiet ls s3 >/dev/null 2>&1; do
+            until rclone lsd s3: >/dev/null 2>&1; do
               echo "waiting for http://s3:9000"
               sleep 2
             done
-            mc mb -p s3/buzz-media
+            rclone mkdir s3:buzz-media
     env:
       # --- identity / public URL ---
       RELAY_URL: "wss://${HOSTNAME}"
@@ -104,11 +112,19 @@ services:
       BUZZ_S3_ACCESS_KEY: "${S3_ACCESS_KEY}"
       BUZZ_S3_SECRET_KEY: "${S3_SECRET_KEY}"
       # --- access control ---
-      BUZZ_REQUIRE_AUTH_TOKEN: "true"
-      BUZZ_REQUIRE_RELAY_MEMBERSHIP: "true"
-      BUZZ_ALLOW_NIP_OA_AUTH: "true"
-      BUZZ_PUBKEY_ALLOWLIST: "false"
-      BUZZ_REQUIRE_MEDIA_GET_AUTH: "false"
+      BUZZ_REQUIRE_AUTH_TOKEN: "${require_auth_token}"
+      BUZZ_REQUIRE_RELAY_MEMBERSHIP: "${require_relay_membership}"
+      BUZZ_ALLOW_NIP_OA_AUTH: "${allow_nip_oa_auth}"
+      BUZZ_PUBKEY_ALLOWLIST: "${pubkey_allowlist}"
+      BUZZ_AGE_ATTESTATION_REQUIRED: "${age_attestation_required}"
+      BUZZ_TERMS_OF_SERVICE_MARKDOWN: "${terms_of_service}"
+      BUZZ_PRIVACY_POLICY_MARKDOWN: "${privacy_policy}"
+      BUZZ_AUDIT_ENABLED: "${audit_enabled}"
+      BUZZ_MAX_IMAGE_BYTES: "${max_image_bytes}"
+      BUZZ_MAX_GIF_BYTES: "${max_gif_bytes}"
+      BUZZ_MAX_VIDEO_BYTES: "${max_video_bytes}"
+      BUZZ_MAX_FILE_BYTES: "${max_file_bytes}"
+      BUZZ_MEDIA_UPLOADS_PER_MINUTE: "${media_uploads_per_minute}"
       # --- git on object storage ---
       BUZZ_GIT_REPO_PATH: "/var/lib/buzz/git"
       BUZZ_GIT_PACK_CACHE_PATH: "/var/cache/buzz/git-packs"
@@ -117,11 +133,35 @@ services:
       # probe is startup-fatal, so keep the race narrow (verified: 4x1 passes)
       BUZZ_GIT_PROBE_WRITERS: "4"
       BUZZ_GIT_PROBE_ROUNDS: "1"
+      BUZZ_GIT_MAX_PACK_BYTES: "${git_max_pack_bytes}"
+      BUZZ_GIT_MAX_REPO_BYTES: "${git_max_repo_bytes}"
+      BUZZ_GIT_MAX_REPOS_PER_PUBKEY: "${git_max_repos_per_pubkey}"
+      BUZZ_SERVE_GIT_WEB_GUI: "${serve_git_web_gui}"
       # --- capacity / logging ---
-      BUZZ_MAX_CONNECTIONS: "2000"
-      RUST_LOG: "info"
+      BUZZ_MAX_CONNECTIONS: "${max_connections}"
+      RUST_LOG: "${log_level}"
+    env_from: extra_env
+    env_allow:
+      - BUZZ_RATE_LIMIT_*
+      - BUZZ_MAX_CONCURRENT_HANDLERS
+      - BUZZ_MAX_FRAME_BYTES
+      - BUZZ_SLOW_CLIENT_GRACE_LIMIT
+      - BUZZ_SEND_BUFFER
+      - BUZZ_CORS_ORIGINS
+      - BUZZ_DB_POOL_SIZE
+      - BUZZ_REDIS_POOL_SIZE
+      - BUZZ_MEDIA_MAX_CONCURRENT_UPLOADS
+      - BUZZ_MEDIA_MAX_CONCURRENT_UPLOADS_PER_PUBKEY
+      - BUZZ_EPHEMERAL_TTL_OVERRIDE
+      - BUZZ_GIT_MAX_CONCURRENT_OPS
+      - BUZZ_GIT_PACK_CACHE_MAX_BYTES
+      - BUZZ_REQUIRE_MEDIA_GET_AUTH
+      - BUZZ_REQUIRE_MEDIA_READ_AUTH
+      - BUZZ_HUDDLE_AUDIO_AVAILABLE
+      - BUZZ_MAX_COMMUNITIES_PER_OWNER
+      - RELAY_INACTIVE_CLEANUP_TIME
     volumes:
-      - { name: git, path: /var/lib/buzz/git, size: 20Gi, label: git repositories }
+      - { name: git, path: /var/lib/buzz/git, size: 5Gi, label: git repositories }
       - { name: packs, path: /var/cache/buzz/git-packs, size: 5Gi }
 secrets:
   - { name: DB_PASSWORD, generate: password }
@@ -134,3 +174,26 @@ secrets:
 config:
   - { name: owner_pubkey, label: "Owner pubkey (64-char hex)", type: string, required: true,
       pattern: "[0-9a-fA-F]{64}" }
+  - { name: require_auth_token, label: "Require auth for every connection", type: bool, default: "true", group: "Access" }
+  - { name: require_relay_membership, label: "Only relay members can use the relay", type: bool, default: "true", group: "Access" }
+  - { name: allow_nip_oa_auth, label: "Allow agent auth (NIP-OA)", type: bool, default: "true", group: "Access" }
+  - { name: pubkey_allowlist, label: "Enforce the pubkey allowlist", type: bool, default: "false", group: "Access" }
+  - { name: age_attestation_required, label: "Require age attestation to join", type: bool, default: "false", group: "Access" }
+  - { name: terms_of_service, label: "Terms of service (markdown)", type: file, default: "", group: "Policies" }
+  - { name: privacy_policy, label: "Privacy policy (markdown)", type: file, default: "", group: "Policies" }
+  - { name: max_image_bytes, label: "Max image upload (bytes)", type: int, default: "52428800", pattern: "[1-9][0-9]*", group: "Media limits" }
+  - { name: max_gif_bytes, label: "Max GIF upload (bytes)", type: int, default: "10485760", pattern: "[1-9][0-9]*", group: "Media limits" }
+  - { name: max_video_bytes, label: "Max video upload (bytes)", type: int, default: "524288000", pattern: "[1-9][0-9]*", group: "Media limits" }
+  - { name: max_file_bytes, label: "Max file upload (bytes)", type: int, default: "104857600", pattern: "[1-9][0-9]*", group: "Media limits" }
+  - { name: media_uploads_per_minute, label: "Media uploads per minute per user", type: int, default: "30", pattern: "[1-9][0-9]*", group: "Media limits" }
+  - { name: git_max_pack_bytes, label: "Max git push (bytes)", type: int, default: "524288000", pattern: "[1-9][0-9]*", group: "Git" }
+  - { name: git_max_repo_bytes, label: "Max git repository size (bytes)", type: int, default: "1048576000", pattern: "[1-9][0-9]*", group: "Git" }
+  - { name: git_max_repos_per_pubkey, label: "Max git repositories per user", type: int, default: "100", pattern: "[1-9][0-9]*", group: "Git" }
+  - { name: serve_git_web_gui, label: "Serve the git web viewer", type: bool, default: "false", group: "Git" }
+  - { name: audit_enabled, label: "Audit log", type: bool, default: "true", group: "Advanced" }
+  - { name: max_connections, label: "Max connections", type: int, default: "2000", pattern: "[1-9][0-9]*", group: "Advanced" }
+  - { name: log_level, label: "Log level (RUST_LOG)", type: string, default: "info", pattern: "[A-Za-z0-9_:=,.-]+", group: "Advanced" }
+  - { name: extra_env, label: "Advanced: extra settings (allowed NAME=value lines only)", type: file, default: "", group: "Advanced" }
+# Daily at 03:00 UTC, keeping a week of restore points. Each run captures
+# every service that declares a `backup:` method above, at one point in time.
+backup: { schedule: "0 3 * * *", retention: 7 }

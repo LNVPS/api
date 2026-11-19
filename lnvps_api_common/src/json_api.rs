@@ -155,7 +155,12 @@ impl JsonApi {
             if let Some(token_gen) = self.token_gen.as_ref() {
                 req = token_gen.generate_token(method.clone(), &url, Some(&body), req)?;
             }
-            debug!(">> {} {}: {}", method.clone(), path, &body);
+            debug!(
+                ">> {} {}: {} bytes",
+                method,
+                without_query(path),
+                body.len()
+            );
             req.header(CONTENT_TYPE, "application/json; charset=utf-8")
                 .body(body)
                 .build()?
@@ -165,7 +170,6 @@ impl JsonApi {
             }
             req.build()?
         };
-        debug!(">> HEADERS {:?}", req.headers());
         Ok(req)
     }
 
@@ -186,11 +190,16 @@ impl JsonApi {
                     attempt += 1;
                     debug!(
                         "Stale connection on {} {} (attempt {}/{}), retrying on fresh connection: {}",
-                        method, path, attempt, STALE_CONNECTION_RETRIES, e
+                        method,
+                        without_query(path),
+                        attempt,
+                        STALE_CONNECTION_RETRIES,
+                        e.without_url()
                     );
                     continue;
                 }
                 Err(e) => {
+                    let e = e.without_url();
                     // Build a detailed error message from the reqwest error chain
                     let mut details = Vec::new();
                     if e.is_connect() {
@@ -199,7 +208,7 @@ impl JsonApi {
                     if e.is_timeout() {
                         details.push("timeout".to_string());
                     }
-                    if let Some(url) = e.url() {
+                    if let Ok(url) = self.base.join(without_query(path)) {
                         details.push(format!("url={}", url));
                     }
                     // Walk the error chain for more context
@@ -226,17 +235,22 @@ impl JsonApi {
             match serde_json::from_str(&text) {
                 Ok(t) => Ok(t),
                 Err(e) => {
-                    op_fatal!("Failed to parse JSON from {}: {} {}", path, text, e);
+                    op_fatal!(
+                        "Failed to parse JSON from {}: {} {}",
+                        without_query(path),
+                        text,
+                        e
+                    );
                 }
             }
         } else if is_retryable_status(status) && !is_missing_resource_body(&text) {
-            op_transient!("{} {}: {}: {}", method, path, status, &text);
+            op_transient!("{} {}: {}: {}", method, without_query(path), status, &text);
         } else {
             // Definitive client errors (404/401/403/400 ...) must not be retried:
             // e.g. a 404 means the resource really is gone, not a transient outage.
             // Proxmox reports a missing config as a 5xx with a "does not exist"
             // body — that is definitive too, so treat it as fatal (not-found).
-            op_fatal!("{} {}: {}: {}", method, path, status, &text);
+            op_fatal!("{} {}: {}: {}", method, without_query(path), status, &text);
         }
     }
 
@@ -271,11 +285,15 @@ impl JsonApi {
                     attempt += 1;
                     debug!(
                         "Stale connection on {} {} (attempt {}/{}), retrying on fresh connection: {}",
-                        method, path, attempt, STALE_CONNECTION_RETRIES, e
+                        method,
+                        without_query(path),
+                        attempt,
+                        STALE_CONNECTION_RETRIES,
+                        e.without_url()
                     );
                     continue;
                 }
-                Err(e) => return Err(OpError::Transient(anyhow!(e))),
+                Err(e) => return Err(OpError::Transient(anyhow!(e.without_url()))),
             }
         };
 
@@ -289,11 +307,15 @@ impl JsonApi {
         if status.is_success() {
             Ok(status.as_u16())
         } else if is_retryable_status(status) && !is_missing_resource_body(&text) {
-            op_transient!("{} {}: {}: {}", method, path, status, &text);
+            op_transient!("{} {}: {}: {}", method, without_query(path), status, &text);
         } else {
-            op_fatal!("{} {}: {}: {}", method, path, status, &text);
+            op_fatal!("{} {}: {}: {}", method, without_query(path), status, &text);
         }
     }
+}
+
+fn without_query(path: &str) -> &str {
+    path.split_once('?').map_or(path, |(p, _)| p)
 }
 
 /// HTTP status codes that are worth retrying: server errors (5xx) plus the two
@@ -392,5 +414,47 @@ mod tests {
         assert!(!is_stale_connection_message("dns error: failed to lookup"));
         assert!(!is_stale_connection_message("invalid status code: 500"));
         assert!(!is_stale_connection_message(""));
+    }
+
+    #[tokio::test]
+    async fn errors_do_not_carry_the_query_string() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&server)
+            .await;
+        let api = super::JsonApi::new(&server.uri()).unwrap();
+        let err = api
+            .post::<serde_json::Value, _>("/ripe/route?password=hunter2", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        let msg = format!("{:#}", err.inner());
+        assert!(msg.contains("/ripe/route"), "{msg}");
+        assert!(!msg.contains("hunter2"), "{msg}");
+
+        let status = api
+            .req_status(
+                reqwest::Method::POST,
+                "/ripe/route?password=hunter2",
+                Some(serde_json::json!({})),
+            )
+            .await
+            .unwrap_err();
+        assert!(!format!("{:#}", status.inner()).contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn connection_errors_do_not_carry_the_query_string() {
+        let api = super::JsonApi::new("http://127.0.0.1:1").unwrap();
+        let err = api
+            .get::<serde_json::Value>("/ripe/route?password=hunter2")
+            .await
+            .unwrap_err();
+        let msg = format!("{:#}", err.inner());
+        assert!(msg.contains("/ripe/route"), "{msg}");
+        assert!(!msg.contains("hunter2"), "{msg}");
     }
 }

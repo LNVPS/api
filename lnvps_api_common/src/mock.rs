@@ -4,21 +4,23 @@ use chrono::{DateTime, Days, Months, NaiveDate, TimeDelta, Utc};
 use lnvps_db::nostr::LNVPSNostrDb;
 use lnvps_db::{
     AccessPolicy, AgentConversation, AgentConversationFilter, AgentConversationOverview,
-    AgentMessage, App, AppCluster, AppDeployment, AppDeploymentDesiredState, AppDeploymentFilter,
-    AppDeploymentServiceUsage, AppDeploymentStatus, AppDeploymentVolumeUsage, AppTag,
-    AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace, BulkMessageTarget, Company, CpuArch,
-    CpuMfg, DbError, DbResult, Discount, DiscountRedemption, DiskInterface, DiskType, DnsServer,
-    DnsServerKind, EncryptedString, IntervalType, IpRange, IpRangeAllocationMode,
-    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth,
-    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, NostrDomain, NostrDomainHandle,
-    OsDistribution, PaymentMethod, PaymentMethodConfig, Referral, ReferralCostUsage,
-    ReferralPayout, Region, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel,
-    RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    SubscriptionPaymentWithCompany, Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod,
-    UserSshKey, Vm, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    AgentMessage, App, AppBackupState, AppCluster, AppDeployment, AppDeploymentBackup,
+    AppDeploymentDesiredState, AppDeploymentFilter, AppDeploymentServiceUsage, AppDeploymentStatus,
+    AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
+    BulkMessageTarget, Company, CpuArch, CpuMfg, DbError, DbResult, Discount, DiscountRedemption,
+    DiskInterface, DiskType, DnsServer, DnsServerKind, EncryptedString, IntervalType, IpOrder,
+    IpOrderAudit, IpOrderRange, IpOrderState, IpProvider, IpProviderRegion, IpRange,
+    IpRangeAllocationMode, IpRangeSubscription, IpSpacePricing, LNVpsDbBase, LineItemType,
+    MarketplaceNode, MarketplaceNodeHealth, MarketplaceNodeStatus, MarketplaceOperator,
+    NewAgentMessage, NostrDomain, NostrDomainHandle, OsDistribution, PaymentMethod,
+    PaymentMethodConfig, Referral, ReferralCostUsage, ReferralPayout, Region, Router,
+    RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelKind, RouterTunnelTraffic,
+    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany,
+    Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind,
+    VmAddonPrice, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
     VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment,
-    VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice, VpnService,
-    VpnSubscription, WebauthnCredential,
+    VmIpWait, VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice,
+    VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
 };
 
 use async_trait::async_trait;
@@ -79,17 +81,37 @@ pub struct MockDb {
     pub referrals: Arc<Mutex<HashMap<u64, Referral>>>,
     pub discounts: Arc<Mutex<HashMap<u64, Discount>>>,
     pub discount_redemptions: Arc<Mutex<Vec<DiscountRedemption>>>,
+    pub account_credits: Arc<Mutex<HashMap<(u64, String), lnvps_db::AccountCredit>>>,
+    pub account_credit_events: Arc<Mutex<Vec<lnvps_db::AccountCreditEvent>>>,
+    pub account_credit_debits: Arc<Mutex<Vec<lnvps_db::AccountCreditDebit>>>,
+    pub account_credit_topups: Arc<Mutex<Vec<lnvps_db::AccountCreditTopup>>>,
+    pub onchain_address_owners: Arc<Mutex<Vec<lnvps_db::OnchainAddressOwner>>>,
+    pub swap_order_clients: Arc<Mutex<Vec<lnvps_db::SwapOrderClient>>>,
+    pub abuse_cases: Arc<Mutex<Vec<lnvps_db::AbuseCase>>>,
+    pub abuse_actions: Arc<Mutex<Vec<lnvps_db::AbuseAction>>>,
+    pub abuse_challenges: Arc<Mutex<Vec<lnvps_db::AbuseChallenge>>>,
     pub marketplace_operators: Arc<Mutex<HashMap<u64, MarketplaceOperator>>>,
     pub marketplace_nodes: Arc<Mutex<HashMap<u64, MarketplaceNode>>>,
     pub marketplace_node_health: Arc<Mutex<HashMap<u64, MarketplaceNodeHealth>>>,
     pub tunnels: Arc<Mutex<HashMap<u64, Tunnel>>>,
     pub tunnel_pools: Arc<Mutex<HashMap<u64, TunnelPool>>>,
     pub vpn_services: Arc<Mutex<HashMap<u64, VpnService>>>,
+    pub vm_addon_prices: Arc<Mutex<HashMap<u64, VmAddonPrice>>>,
+    pub ip_providers: Arc<Mutex<HashMap<u64, IpProvider>>>,
+    pub ip_provider_regions: Arc<Mutex<HashMap<u64, IpProviderRegion>>>,
+    pub vm_ip_waits: Arc<Mutex<Vec<VmIpWait>>>,
+    pub ip_orders: Arc<Mutex<HashMap<u64, IpOrder>>>,
+    pub ip_order_audits: Arc<Mutex<Vec<IpOrderAudit>>>,
+    pub ip_order_ranges: Arc<Mutex<Vec<IpOrderRange>>>,
+    pub vm_addons: Arc<Mutex<HashMap<u64, VmAddon>>>,
     /// `vpn_service_pool`, keyed by pool id because an interface terminates at
     /// most one service.
     pub vpn_service_pools: Arc<Mutex<HashMap<u64, u64>>>,
     pub vpn_subscriptions: Arc<Mutex<HashMap<u64, VpnSubscription>>>,
     pub vpn_devices: Arc<Mutex<HashMap<u64, VpnDevice>>>,
+    /// A device's peers, one per interface its service terminates. Mirrors
+    /// `vpn_device_tunnel`: device id -> tunnel ids.
+    pub vpn_device_tunnels: Arc<Mutex<HashMap<u64, Vec<u64>>>>,
     /// `tunnel_route`, keyed by tunnel: the prefixes behind that peer.
     pub tunnel_routes: Arc<Mutex<HashMap<u64, Vec<String>>>>,
     pub referral_payouts: Arc<Mutex<Vec<ReferralPayout>>>,
@@ -112,6 +134,7 @@ pub struct MockDb {
     pub app_tag_assignments: Arc<Mutex<Vec<(u64, u64)>>>,
     pub app_clusters: Arc<Mutex<HashMap<u64, AppCluster>>>,
     pub app_deployments: Arc<Mutex<HashMap<u64, AppDeployment>>>,
+    pub app_deployment_backups: Arc<Mutex<HashMap<u64, AppDeploymentBackup>>>,
     #[allow(clippy::type_complexity)]
     pub app_deployment_usage_breakdown: Arc<
         Mutex<
@@ -134,6 +157,66 @@ pub struct MockDb {
 }
 
 impl MockDb {
+    async fn record_onchain_address_owners(&self, subscription_id: u64, vm_id: Option<u64>) {
+        let payments = self.subscription_payments.lock().await;
+        let debits = self.account_credit_debits.lock().await;
+        let mut owners = self.onchain_address_owners.lock().await;
+        let (unpaid, paid): (Vec<_>, Vec<_>) = payments
+            .iter()
+            .filter(|p| p.subscription_id == subscription_id)
+            .partition(|p| !p.is_paid);
+        for p in unpaid.into_iter().chain(paid) {
+            let Some(address) = p.onchain_receive_address() else {
+                continue;
+            };
+            let hash = lnvps_db::onchain_address_hash(&address);
+            if owners.iter().any(|o| o.address_hash == hash) {
+                continue;
+            }
+            let covered = debits
+                .iter()
+                .find(|d| d.subscription_payment_id.as_ref() == Some(&p.id))
+                .map(|d| d.payment_amount)
+                .unwrap_or(0);
+            let id = owners.len() as u64 + 1;
+            owners.push(lnvps_db::OnchainAddressOwner {
+                id,
+                address: address.into(),
+                address_hash: hash,
+                user_id: p.user_id,
+                subscription_id: Some(p.subscription_id),
+                payment_id: Some(p.id.clone()),
+                vm_id,
+                created: Utc::now(),
+                expires: Some(p.expires),
+                currency: Some(p.currency.clone()),
+                amount: (!p.is_paid).then(|| {
+                    (p.amount + p.tax + p.processing_fee)
+                        .saturating_sub(covered)
+                        .div_ceil(1000)
+                        * 1000
+                }),
+                ..Default::default()
+            });
+        }
+    }
+
+    #[cfg(feature = "admin")]
+    async fn paid_subscriptions_by_line_item(&self) -> HashMap<u64, Subscription> {
+        let subscriptions = self.subscriptions.lock().await;
+        self.subscription_line_items
+            .lock()
+            .await
+            .values()
+            .filter_map(|li| {
+                subscriptions
+                    .get(&li.subscription_id)
+                    .filter(|s| s.is_setup)
+                    .map(|s| (li.id, s.clone()))
+            })
+            .collect()
+    }
+
     /// Set a company's one-off marketplace node listing fee.
     ///
     /// Test support: the fee is normally set through the admin API, which is
@@ -199,9 +282,6 @@ impl MockDb {
                     candidate.slot
                 )
                 .into());
-            }
-            if other.tunnel_id == candidate.tunnel_id {
-                return Err(anyhow!("That tunnel already terminates a device").into());
             }
         }
         Ok(())
@@ -381,6 +461,7 @@ impl Default for MockDb {
                 ssh_key: None,
                 sunset_date: None,
                 marketplace_node_id: None,
+                deleted: false,
             },
         );
         let mut host_disks = HashMap::new();
@@ -415,6 +496,7 @@ impl Default for MockDb {
                 default_username: None,
                 sha2: None,
                 sha2_url: None,
+                encrypted: false,
             },
         );
         Self {
@@ -504,6 +586,8 @@ impl Default for MockDb {
                         amount: 1000,
                         setup_amount: 0,
                         configuration: None,
+                        deactivated_at: None,
+                        parent_line_item_id: None,
                     },
                 );
                 m
@@ -516,15 +600,33 @@ impl Default for MockDb {
             referrals: Arc::new(Default::default()),
             discounts: Arc::new(Default::default()),
             discount_redemptions: Arc::new(Default::default()),
+            account_credits: Arc::new(Default::default()),
+            account_credit_events: Arc::new(Default::default()),
+            account_credit_debits: Arc::new(Default::default()),
+            account_credit_topups: Arc::new(Default::default()),
+            onchain_address_owners: Arc::new(Default::default()),
+            swap_order_clients: Arc::new(Default::default()),
+            abuse_cases: Arc::new(Default::default()),
+            abuse_actions: Arc::new(Default::default()),
+            abuse_challenges: Arc::new(Default::default()),
             marketplace_operators: Arc::new(Default::default()),
             marketplace_nodes: Arc::new(Default::default()),
             marketplace_node_health: Arc::new(Default::default()),
             tunnels: Arc::new(Default::default()),
             tunnel_pools: Arc::new(Default::default()),
             vpn_services: Arc::new(Default::default()),
+            vm_addon_prices: Arc::new(Default::default()),
+            ip_providers: Arc::new(Default::default()),
+            ip_provider_regions: Arc::new(Default::default()),
+            vm_ip_waits: Arc::new(Default::default()),
+            ip_orders: Arc::new(Default::default()),
+            ip_order_audits: Arc::new(Default::default()),
+            ip_order_ranges: Arc::new(Default::default()),
+            vm_addons: Arc::new(Default::default()),
             vpn_service_pools: Arc::new(Default::default()),
             vpn_subscriptions: Arc::new(Default::default()),
             vpn_devices: Arc::new(Default::default()),
+            vpn_device_tunnels: Arc::new(Default::default()),
             tunnel_routes: Arc::new(Default::default()),
             referral_payouts: Arc::new(Default::default()),
             router_tunnels: Arc::new(Default::default()),
@@ -538,11 +640,62 @@ impl Default for MockDb {
             app_tag_assignments: Arc::new(Default::default()),
             app_clusters: Arc::new(Default::default()),
             app_deployments: Arc::new(Default::default()),
+            app_deployment_backups: Arc::new(Default::default()),
             app_deployment_usage_breakdown: Arc::new(Default::default()),
             failing_usage_writes: Arc::new(Default::default()),
             failing_usage_breakdown_writes: Arc::new(Default::default()),
         }
     }
+}
+
+fn empty_account_credit(
+    credits: &HashMap<(u64, String), lnvps_db::AccountCredit>,
+    user_id: u64,
+    currency: &str,
+) -> lnvps_db::AccountCredit {
+    lnvps_db::AccountCredit {
+        user_id,
+        balance: 0,
+        currency: currency.to_string(),
+        auto_apply: credits
+            .iter()
+            .any(|((u, _), c)| *u == user_id && c.auto_apply),
+        updated: Utc::now(),
+    }
+}
+
+fn credit_row<'a>(
+    credits: &'a mut HashMap<(u64, String), lnvps_db::AccountCredit>,
+    user_id: u64,
+    currency: &str,
+) -> &'a mut lnvps_db::AccountCredit {
+    if !credits.contains_key(&(user_id, currency.to_string())) {
+        let row = empty_account_credit(credits, user_id, currency);
+        credits.insert((user_id, currency.to_string()), row);
+    }
+    credits
+        .get_mut(&(user_id, currency.to_string()))
+        .expect("inserted above")
+}
+
+fn reserved_credit(
+    debits: &[lnvps_db::AccountCreditDebit],
+    user_id: u64,
+    currency: &str,
+    exclude: Option<u64>,
+) -> u64 {
+    let now = Utc::now();
+    debits
+        .iter()
+        .filter(|d| {
+            d.user_id == user_id
+                && d.currency == currency
+                && !d.settled
+                && d.expires > now
+                && Some(d.id) != exclude
+        })
+        .map(|d| d.amount)
+        .sum()
 }
 
 #[async_trait]
@@ -843,6 +996,202 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn insert_swap_order_client(&self, record: &lnvps_db::SwapOrderClient) -> DbResult<u64> {
+        let mut rows = self.swap_order_clients.lock().await;
+        if rows.iter().any(|r| r.order_id == record.order_id) {
+            return Err(DbError::Other(anyhow!("duplicate swap order")));
+        }
+        let id = rows.len() as u64 + 1;
+        rows.push(lnvps_db::SwapOrderClient {
+            id,
+            created: Utc::now(),
+            ..record.clone()
+        });
+        Ok(id)
+    }
+
+    async fn purge_swap_order_clients(&self, days: u32) -> DbResult<u64> {
+        let cutoff = Utc::now() - chrono::Duration::days(days as i64);
+        let mut rows = self.swap_order_clients.lock().await;
+        let before = rows.len();
+        rows.retain(|r| r.created >= cutoff);
+        Ok((before - rows.len()) as u64)
+    }
+
+    async fn purge_user_geo_ips(&self, days: u32) -> DbResult<u64> {
+        let cutoff = Utc::now() - chrono::Duration::days(days as i64);
+        let mut users = self.users.lock().await;
+        let mut cleared = 0;
+        for u in users.values_mut() {
+            if u.geo_ip.is_some() && u.geo_updated.is_some_and(|t| t < cutoff) {
+                u.geo_ip = None;
+                cleared += 1;
+            }
+        }
+        Ok(cleared)
+    }
+
+    async fn insert_abuse_case(&self, case: &lnvps_db::AbuseCase) -> DbResult<u64> {
+        let mut rows = self.abuse_cases.lock().await;
+        let id = rows.len() as u64 + 1;
+        rows.push(lnvps_db::AbuseCase {
+            id,
+            created: Utc::now(),
+            closed_at: None,
+            ..case.clone()
+        });
+        Ok(id)
+    }
+
+    async fn get_abuse_case(&self, id: u64) -> DbResult<lnvps_db::AbuseCase> {
+        let rows = self.abuse_cases.lock().await;
+        rows.iter()
+            .find(|c| c.id == id)
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow!("no abuse case")))
+    }
+
+    async fn list_abuse_cases(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        vm_id: Option<u64>,
+        open: Option<bool>,
+    ) -> DbResult<(Vec<lnvps_db::AbuseCase>, u64)> {
+        let rows = self.abuse_cases.lock().await;
+        let mut matched: Vec<_> = rows
+            .iter()
+            .filter(|c| user_id.is_none_or(|u| c.user_id == Some(u)))
+            .filter(|c| vm_id.is_none_or(|v| c.vm_id == Some(v)))
+            .filter(|c| open.is_none_or(|o| c.closed_at.is_none() == o))
+            .cloned()
+            .collect();
+        matched.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = matched.len() as u64;
+        let page = matched
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, total))
+    }
+
+    async fn close_abuse_case(&self, id: u64) -> DbResult<()> {
+        let mut rows = self.abuse_cases.lock().await;
+        if let Some(c) = rows
+            .iter_mut()
+            .find(|c| c.id == id && c.closed_at.is_none())
+        {
+            c.closed_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn insert_abuse_action(&self, action: &lnvps_db::AbuseAction) -> DbResult<u64> {
+        let mut rows = self.abuse_actions.lock().await;
+        let id = rows.len() as u64 + 1;
+        rows.push(lnvps_db::AbuseAction {
+            id,
+            created: Utc::now(),
+            notified_at: None,
+            ..action.clone()
+        });
+        Ok(id)
+    }
+
+    async fn get_abuse_action(&self, id: u64) -> DbResult<lnvps_db::AbuseAction> {
+        let rows = self.abuse_actions.lock().await;
+        rows.iter()
+            .find(|a| a.id == id)
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow!("no abuse action")))
+    }
+
+    async fn list_abuse_actions(&self, case_id: u64) -> DbResult<Vec<lnvps_db::AbuseAction>> {
+        let rows = self.abuse_actions.lock().await;
+        Ok(rows
+            .iter()
+            .filter(|a| a.case_id == case_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn set_abuse_action_notified(&self, id: u64) -> DbResult<()> {
+        let mut rows = self.abuse_actions.lock().await;
+        if let Some(a) = rows.iter_mut().find(|a| a.id == id) {
+            a.notified_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn insert_abuse_challenge(&self, challenge: &lnvps_db::AbuseChallenge) -> DbResult<u64> {
+        let mut rows = self.abuse_challenges.lock().await;
+        let id = rows.len() as u64 + 1;
+        rows.push(lnvps_db::AbuseChallenge {
+            id,
+            received_at: Utc::now(),
+            outcome: None,
+            response: None,
+            decided_at: None,
+            decided_by: None,
+            ..challenge.clone()
+        });
+        Ok(id)
+    }
+
+    async fn get_abuse_challenge(&self, id: u64) -> DbResult<lnvps_db::AbuseChallenge> {
+        let rows = self.abuse_challenges.lock().await;
+        rows.iter()
+            .find(|c| c.id == id)
+            .cloned()
+            .ok_or_else(|| DbError::Other(anyhow!("no abuse challenge")))
+    }
+
+    async fn list_abuse_challenges(&self, case_id: u64) -> DbResult<Vec<lnvps_db::AbuseChallenge>> {
+        let rows = self.abuse_challenges.lock().await;
+        Ok(rows
+            .iter()
+            .filter(|c| c.case_id == case_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn decide_abuse_challenge(
+        &self,
+        id: u64,
+        outcome: lnvps_db::AbuseChallengeOutcome,
+        response: &str,
+        decided_by: u64,
+    ) -> DbResult<()> {
+        let mut rows = self.abuse_challenges.lock().await;
+        if let Some(c) = rows.iter_mut().find(|c| c.id == id) {
+            c.outcome = Some(outcome);
+            c.response = Some(response.to_string());
+            c.decided_by = Some(decided_by);
+            c.decided_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn purge_abuse_cases(&self) -> DbResult<u64> {
+        let now = Utc::now();
+        let mut rows = self.abuse_cases.lock().await;
+        let before = rows.len();
+        rows.retain(|c| {
+            let Some(closed) = c.closed_at else {
+                return true;
+            };
+            let (start, days) = if c.kind == lnvps_db::AbuseCaseKind::CopyrightCa {
+                (c.created, if c.proceedings_started { 365 } else { 183 })
+            } else {
+                (closed, 365)
+            };
+            start >= now - chrono::Duration::days(days)
+        });
+        Ok((before - rows.len()) as u64)
+    }
+
     async fn list_users(&self) -> DbResult<Vec<User>> {
         let users = self.users.lock().await;
         Ok(users.values().cloned().collect())
@@ -1007,6 +1356,7 @@ impl LNVpsDbBase for MockDb {
             .values()
             .filter(|h| {
                 h.enabled
+                    && !h.deleted
                     && regions
                         .get(&h.region_id)
                         .map(|r| r.enabled)
@@ -1023,7 +1373,11 @@ impl LNVpsDbBase for MockDb {
 
     async fn list_hosts_paginated(&self, limit: u64, offset: u64) -> DbResult<(Vec<VmHost>, u64)> {
         let hosts = self.hosts.lock().await;
-        let filtered_hosts: Vec<VmHost> = hosts.values().filter(|h| h.enabled).cloned().collect();
+        let filtered_hosts: Vec<VmHost> = hosts
+            .values()
+            .filter(|h| h.enabled && !h.deleted)
+            .cloned()
+            .collect();
         let total = filtered_hosts.len() as u64;
         let paginated: Vec<VmHost> = filtered_hosts
             .into_iter()
@@ -1040,7 +1394,11 @@ impl LNVpsDbBase for MockDb {
     ) -> DbResult<(Vec<(VmHost, Region)>, u64)> {
         let hosts = self.hosts.lock().await;
         let regions = self.regions.lock().await;
-        let filtered_hosts: Vec<VmHost> = hosts.values().filter(|h| h.enabled).cloned().collect();
+        let filtered_hosts: Vec<VmHost> = hosts
+            .values()
+            .filter(|h| h.enabled && !h.deleted)
+            .cloned()
+            .collect();
         let total = filtered_hosts.len() as u64;
 
         let mut hosts_with_regions = Vec::new();
@@ -1620,6 +1978,8 @@ impl LNVpsDbBase for MockDb {
         self.vm_traffic_samples.lock().await.remove(&vm_id);
 
         if let Some(subscription_id) = subscription_id {
+            self.record_onchain_address_owners(subscription_id, Some(vm_id))
+                .await;
             self.subscription_payments
                 .lock()
                 .await
@@ -2840,6 +3200,19 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
+    async fn list_never_paid_subscriptions(
+        &self,
+        older_than_seconds: u64,
+    ) -> DbResult<Vec<Subscription>> {
+        let cutoff = Utc::now() - chrono::Duration::seconds(older_than_seconds as i64);
+        let subscriptions = self.subscriptions.lock().await;
+        Ok(subscriptions
+            .values()
+            .filter(|s| !s.is_setup && s.created < cutoff)
+            .cloned()
+            .collect())
+    }
+
     async fn deactivate_subscription(&self, id: u64) -> DbResult<()> {
         let mut subscriptions = self.subscriptions.lock().await;
         if let Some(sub) = subscriptions.get_mut(&id) {
@@ -2961,6 +3334,7 @@ impl LNVpsDbBase for MockDb {
             )));
         }
 
+        self.record_onchain_address_owners(id, None).await;
         self.subscription_payments
             .lock()
             .await
@@ -3237,6 +3611,9 @@ impl LNVpsDbBase for MockDb {
             region_id: None,
             region_name: None,
             renewal_source: None,
+            user_country_code: None,
+            user_geo_country_code: None,
+            user_billing_tax_id: None,
         })
     }
 
@@ -3322,6 +3699,9 @@ impl LNVpsDbBase for MockDb {
                 } else {
                     // Regular subscription path: use interval from subscription
                     match subscription.interval_type {
+                        IntervalType::Hour => {
+                            base.add(TimeDelta::hours(subscription.interval_amount as i64))
+                        }
                         IntervalType::Day => base.add(Days::new(subscription.interval_amount)),
                         IntervalType::Month => {
                             base.add(Months::new(subscription.interval_amount as u32))
@@ -3965,12 +4345,15 @@ impl LNVpsDbBase for MockDb {
         let line_items = self.subscription_line_items.lock().await;
         let sub_payments = self.subscription_payments.lock().await;
         // Effective rate: referrer override, else the default company's rate.
-        let effective_rate = {
+        let (referrer_id, override_rate) = {
             let referrals = self.referrals.lock().await;
-            let override_rate = referrals
-                .values()
-                .find(|r| r.code == code)
-                .and_then(|r| r.referral_rate);
+            let referral = referrals.values().find(|r| r.code == code);
+            (
+                referral.map(|r| r.user_id),
+                referral.and_then(|r| r.referral_rate),
+            )
+        };
+        let effective_rate = {
             match override_rate {
                 Some(r) => r,
                 None => self
@@ -3983,7 +4366,11 @@ impl LNVpsDbBase for MockDb {
             }
         };
         let mut result = Vec::new();
-        for vm in vms.values().filter(|v| v.ref_code.as_deref() == Some(code)) {
+        for vm in vms
+            .values()
+            .filter(|v| v.ref_code.as_deref() == Some(code))
+            .filter(|v| referrer_id != Some(v.user_id))
+        {
             let subscription_id = line_items
                 .get(&vm.subscription_line_item_id)
                 .map(|sli| sli.subscription_id);
@@ -3991,14 +4378,23 @@ impl LNVpsDbBase for MockDb {
                 let mut vm_payments: Vec<&SubscriptionPayment> = sub_payments
                     .iter()
                     .filter(|p| p.subscription_id == sid && p.is_paid)
+                    .filter(|p| !p.payment_type.is_refund())
                     .collect();
                 vm_payments.sort_by_key(|p| p.created);
                 if let Some(first) = vm_payments.first() {
+                    let refunded = sub_payments
+                        .iter()
+                        .filter(|p| p.is_paid && p.payment_type.is_refund())
+                        .filter(|p| p.refunded_payment_id.as_ref() == Some(&first.id))
+                        .map(|p| p.amount)
+                        .sum();
                     result.push(ReferralCostUsage {
                         vm_id: vm.id,
+                        user_id: vm.user_id,
                         ref_code: code.to_string(),
                         created: first.created,
                         amount: first.amount,
+                        refunded,
                         currency: first.currency.clone(),
                         rate: first.rate,
                         base_currency: "EUR".to_string(),
@@ -4028,12 +4424,20 @@ impl LNVpsDbBase for MockDb {
     }
 
     async fn count_failed_referrals(&self, code: &str) -> DbResult<u64> {
+        let referrer_id = self
+            .referrals
+            .lock()
+            .await
+            .values()
+            .find(|r| r.code == code)
+            .map(|r| r.user_id);
         let vms = self.vms.lock().await;
         let line_items = self.subscription_line_items.lock().await;
         let sub_payments = self.subscription_payments.lock().await;
         Ok(vms
             .values()
             .filter(|v| v.ref_code.as_deref() == Some(code))
+            .filter(|v| referrer_id != Some(v.user_id))
             .filter(|v| {
                 let sid = line_items
                     .get(&v.subscription_line_item_id)
@@ -4253,6 +4657,501 @@ impl LNVpsDbBase for MockDb {
             *totals.entry(r.currency.clone()).or_default() += r.amount_off;
         }
         Ok(totals.into_iter().collect())
+    }
+
+    // ========================================================================
+    // Account credit
+    // ========================================================================
+
+    async fn get_account_credit(
+        &self,
+        user_id: u64,
+        currency: &str,
+    ) -> DbResult<lnvps_db::AccountCredit> {
+        let credits = self.account_credits.lock().await;
+        Ok(credits
+            .get(&(user_id, currency.to_string()))
+            .cloned()
+            .unwrap_or_else(|| empty_account_credit(&credits, user_id, currency)))
+    }
+
+    async fn list_account_credits(&self, user_id: u64) -> DbResult<Vec<lnvps_db::AccountCredit>> {
+        let credits = self.account_credits.lock().await;
+        let mut rows: Vec<_> = credits
+            .values()
+            .filter(|c| c.user_id == user_id)
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| a.currency.cmp(&b.currency));
+        Ok(rows)
+    }
+
+    async fn set_account_credit_auto_apply(&self, user_id: u64, auto_apply: bool) -> DbResult<()> {
+        let mut credits = self.account_credits.lock().await;
+        if !credits.keys().any(|(u, _)| *u == user_id) {
+            credit_row(&mut credits, user_id, "BTC");
+        }
+        for row in credits.values_mut().filter(|c| c.user_id == user_id) {
+            row.auto_apply = auto_apply;
+            row.updated = Utc::now();
+        }
+        Ok(())
+    }
+
+    async fn get_account_credit_reserved(&self, user_id: u64, currency: &str) -> DbResult<u64> {
+        let debits = self.account_credit_debits.lock().await;
+        Ok(reserved_credit(&debits, user_id, currency, None))
+    }
+
+    async fn insert_refund_to_credit(
+        &self,
+        refund: &SubscriptionPayment,
+        credits: &[(String, u64)],
+        note: Option<&str>,
+    ) -> DbResult<bool> {
+        if self
+            .subscription_payments
+            .lock()
+            .await
+            .iter()
+            .any(|p| p.id == refund.id)
+        {
+            return Ok(false);
+        }
+        self.insert_subscription_payment(refund).await?;
+        let mut balances = self.account_credits.lock().await;
+        let mut events = self.account_credit_events.lock().await;
+        for (currency, credit) in credits.iter().filter(|(_, c)| *c > 0) {
+            let row = credit_row(&mut balances, refund.user_id, currency);
+            row.balance += credit;
+            row.updated = Utc::now();
+            let event_id = events.len() as u64 + 1;
+            events.push(lnvps_db::AccountCreditEvent {
+                id: event_id,
+                user_id: refund.user_id,
+                kind: "refund".to_string(),
+                amount: *credit as i64,
+                currency: currency.clone(),
+                subscription_payment_id: Some(refund.id.clone()),
+                note: note.map(str::to_string),
+                created: Utc::now(),
+            });
+        }
+        Ok(true)
+    }
+
+    async fn adjust_account_credit(
+        &self,
+        user_id: u64,
+        currency: &str,
+        delta: i64,
+        kind: &str,
+        note: Option<&str>,
+    ) -> DbResult<lnvps_db::AccountCredit> {
+        let mut credits = self.account_credits.lock().await;
+        let debits = self.account_credit_debits.lock().await;
+        let mut events = self.account_credit_events.lock().await;
+        let row = credit_row(&mut credits, user_id, currency);
+        if delta == 0 {
+            return Ok(row.clone());
+        }
+        if delta > 0 {
+            row.balance += delta.unsigned_abs();
+        } else {
+            let available = row
+                .balance
+                .saturating_sub(reserved_credit(&debits, user_id, currency, None));
+            if delta.unsigned_abs() > available {
+                return Err(anyhow!(
+                    "account credit for user {user_id} has {available} unreserved, cannot remove {}",
+                    delta.unsigned_abs()
+                )
+                .into());
+            }
+            row.balance -= delta.unsigned_abs();
+        }
+        row.updated = Utc::now();
+        let event_id = events.len() as u64 + 1;
+        events.push(lnvps_db::AccountCreditEvent {
+            id: event_id,
+            user_id,
+            kind: kind.to_string(),
+            amount: delta,
+            currency: currency.to_string(),
+            subscription_payment_id: None,
+            note: note.map(str::to_string),
+            created: Utc::now(),
+        });
+        Ok(row.clone())
+    }
+
+    async fn list_account_credit_events_in_currency(
+        &self,
+        user_id: u64,
+        currency: &str,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<lnvps_db::AccountCreditEvent>, u64)> {
+        let events = self.account_credit_events.lock().await;
+        let mut all: Vec<lnvps_db::AccountCreditEvent> = events
+            .iter()
+            .filter(|e| e.user_id == user_id && e.currency == currency)
+            .cloned()
+            .collect();
+        all.sort_by_key(|e| std::cmp::Reverse(e.id));
+        let total = all.len() as u64;
+        Ok((
+            all.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn list_account_credit_events(
+        &self,
+        user_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<lnvps_db::AccountCreditEvent>, u64)> {
+        let events = self.account_credit_events.lock().await;
+        let mut all: Vec<lnvps_db::AccountCreditEvent> = events
+            .iter()
+            .filter(|e| e.user_id == user_id)
+            .cloned()
+            .collect();
+        all.sort_by_key(|e| std::cmp::Reverse(e.id));
+        let total = all.len() as u64;
+        Ok((
+            all.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn reserve_account_credit(
+        &self,
+        debit: &lnvps_db::AccountCreditDebit,
+    ) -> DbResult<Option<u64>> {
+        let credits = self.account_credits.lock().await;
+        let mut debits = self.account_credit_debits.lock().await;
+        let balance = credits
+            .get(&(debit.user_id, debit.currency.clone()))
+            .map(|c| c.balance)
+            .unwrap_or(0);
+        if balance.saturating_sub(reserved_credit(
+            &debits,
+            debit.user_id,
+            &debit.currency,
+            None,
+        )) < debit.amount
+        {
+            return Ok(None);
+        }
+        let id = debits.len() as u64 + 1;
+        debits.push(lnvps_db::AccountCreditDebit {
+            id,
+            subscription_payment_id: None,
+            settled: false,
+            settled_at: None,
+            created: Utc::now(),
+            ..debit.clone()
+        });
+        Ok(Some(id))
+    }
+
+    async fn attach_account_credit_debit(
+        &self,
+        id: u64,
+        subscription_payment_id: &Vec<u8>,
+        expires: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let mut debits = self.account_credit_debits.lock().await;
+        if let Some(d) = debits.iter_mut().find(|d| d.id == id && !d.settled) {
+            d.subscription_payment_id = Some(subscription_payment_id.clone());
+            d.expires = expires;
+        }
+        Ok(())
+    }
+
+    async fn release_account_credit_debit(&self, id: u64) -> DbResult<()> {
+        let mut debits = self.account_credit_debits.lock().await;
+        debits.retain(|d| d.id != id || d.settled);
+        Ok(())
+    }
+
+    async fn get_account_credit_debit_by_payment(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<lnvps_db::AccountCreditDebit>> {
+        let debits = self.account_credit_debits.lock().await;
+        Ok(debits
+            .iter()
+            .find(|d| d.subscription_payment_id.as_ref() == Some(subscription_payment_id))
+            .cloned())
+    }
+
+    async fn settle_account_credit_debit(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<lnvps_db::AccountCreditDebit>> {
+        let mut credits = self.account_credits.lock().await;
+        let mut debits = self.account_credit_debits.lock().await;
+        let mut events = self.account_credit_events.lock().await;
+        let Some(idx) = debits.iter().position(|d| {
+            d.subscription_payment_id.as_ref() == Some(subscription_payment_id) && !d.settled
+        }) else {
+            return Ok(None);
+        };
+        let user_id = debits[idx].user_id;
+        let currency = debits[idx].currency.clone();
+        let row = credit_row(&mut credits, user_id, &currency);
+        let available = if debits[idx].expires > Utc::now() {
+            row.balance
+        } else {
+            row.balance.saturating_sub(reserved_credit(
+                &debits,
+                user_id,
+                &currency,
+                Some(debits[idx].id),
+            ))
+        };
+        let debit = &mut debits[idx];
+        debit.clamp_to(available);
+        debit.settled = true;
+        debit.settled_at = Some(Utc::now());
+        row.balance -= debit.amount;
+        row.updated = Utc::now();
+        let event_id = events.len() as u64 + 1;
+        events.push(lnvps_db::AccountCreditEvent {
+            id: event_id,
+            user_id,
+            kind: "spend".to_string(),
+            amount: -(debit.amount as i64),
+            currency: debit.currency.clone(),
+            subscription_payment_id: debit.subscription_payment_id.clone(),
+            note: None,
+            created: Utc::now(),
+        });
+        Ok(Some(debit.clone()))
+    }
+
+    async fn insert_account_credit_topup(
+        &self,
+        topup: &lnvps_db::AccountCreditTopup,
+    ) -> DbResult<u64> {
+        let mut topups = self.account_credit_topups.lock().await;
+        let new_id = topups.len() as u64 + 1;
+        topups.push(lnvps_db::AccountCreditTopup {
+            id: new_id,
+            is_paid: false,
+            paid_at: None,
+            created: Utc::now(),
+            ..topup.clone()
+        });
+        Ok(new_id)
+    }
+
+    async fn get_account_credit_topup_by_hash(
+        &self,
+        invoice_hash: &Vec<u8>,
+    ) -> DbResult<Option<lnvps_db::AccountCreditTopup>> {
+        let topups = self.account_credit_topups.lock().await;
+        Ok(topups
+            .iter()
+            .find(|t| &t.invoice_hash == invoice_hash)
+            .cloned())
+    }
+
+    async fn get_account_credit_topup_by_ext_id(
+        &self,
+        external_id: &str,
+    ) -> DbResult<Option<lnvps_db::AccountCreditTopup>> {
+        let topups = self.account_credit_topups.lock().await;
+        Ok(topups
+            .iter()
+            .find(|t| t.external_id.as_deref() == Some(external_id))
+            .cloned())
+    }
+
+    async fn list_account_credit_topups_by_method(
+        &self,
+        method: PaymentMethod,
+    ) -> DbResult<Vec<lnvps_db::AccountCreditTopup>> {
+        let topups = self.account_credit_topups.lock().await;
+        Ok(topups
+            .iter()
+            .filter(|t| t.payment_method == method)
+            .cloned()
+            .collect())
+    }
+
+    async fn set_account_credit_topup_deposit(
+        &self,
+        id: u64,
+        external_id: &str,
+        amount: u64,
+    ) -> DbResult<()> {
+        let mut topups = self.account_credit_topups.lock().await;
+        if let Some(t) = topups.iter_mut().find(|t| t.id == id && !t.is_paid) {
+            t.external_id = Some(external_id.to_string());
+            t.amount = amount;
+        }
+        Ok(())
+    }
+
+    async fn get_account_credit_topup(
+        &self,
+        id: u64,
+    ) -> DbResult<Option<lnvps_db::AccountCreditTopup>> {
+        let topups = self.account_credit_topups.lock().await;
+        Ok(topups.iter().find(|t| t.id == id).cloned())
+    }
+
+    async fn settle_account_credit_topup_noted(
+        &self,
+        id: u64,
+        credit_currency: &str,
+        credit_amount: u64,
+        note: Option<&str>,
+    ) -> DbResult<Option<lnvps_db::AccountCreditTopup>> {
+        let mut topups = self.account_credit_topups.lock().await;
+        let mut credits = self.account_credits.lock().await;
+        let mut events = self.account_credit_events.lock().await;
+        let Some(row) = topups.iter_mut().find(|t| t.id == id && !t.is_paid) else {
+            return Ok(None);
+        };
+        row.is_paid = true;
+        row.paid_at = Some(Utc::now());
+        row.credit_currency = Some(credit_currency.to_string());
+        row.credit_amount = Some(credit_amount);
+        let settled = row.clone();
+        let entry = credit_row(&mut credits, settled.user_id, credit_currency);
+        entry.balance += credit_amount;
+        entry.updated = Utc::now();
+        let event_id = events.len() as u64 + 1;
+        events.push(lnvps_db::AccountCreditEvent {
+            id: event_id,
+            user_id: settled.user_id,
+            kind: "topup".to_string(),
+            amount: credit_amount as i64,
+            currency: credit_currency.to_string(),
+            subscription_payment_id: None,
+            note: note.map(str::to_string),
+            created: Utc::now(),
+        });
+        Ok(Some(settled))
+    }
+
+    async fn list_account_credit_topups(
+        &self,
+        user_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<lnvps_db::AccountCreditTopup>, u64)> {
+        let topups = self.account_credit_topups.lock().await;
+        let mut all: Vec<lnvps_db::AccountCreditTopup> = topups
+            .iter()
+            .filter(|t| t.user_id == user_id)
+            .cloned()
+            .collect();
+        all.sort_by_key(|t| std::cmp::Reverse(t.id));
+        let total = all.len() as u64;
+        Ok((
+            all.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn get_onchain_address_owner(
+        &self,
+        address: &str,
+    ) -> DbResult<Option<lnvps_db::OnchainAddressOwner>> {
+        let hash = lnvps_db::onchain_address_hash(address);
+        Ok(self
+            .onchain_address_owners
+            .lock()
+            .await
+            .iter()
+            .find(|o| o.address_hash == hash)
+            .cloned())
+    }
+
+    async fn mark_onchain_address_owner_notified(&self, id: u64, outpoint: &str) -> DbResult<bool> {
+        let mut owners = self.onchain_address_owners.lock().await;
+        let Some(o) = owners.iter_mut().find(|o| o.id == id) else {
+            return Ok(false);
+        };
+        let told_and_pending =
+            o.notified_outpoint.is_some() && o.notified_outpoint != o.credited_outpoint;
+        if told_and_pending || o.credited_outpoint.as_deref() == Some(outpoint) {
+            return Ok(false);
+        }
+        o.notified_outpoint = Some(outpoint.to_string());
+        Ok(true)
+    }
+
+    async fn credit_onchain_address_owner(
+        &self,
+        id: u64,
+        outpoint: &str,
+        amount_msat: u64,
+        note: &str,
+    ) -> DbResult<Option<u64>> {
+        let mut owners = self.onchain_address_owners.lock().await;
+        let Some(owner) = owners.iter_mut().find(|o| o.id == id) else {
+            return Ok(None);
+        };
+        let mut topups = self.account_credit_topups.lock().await;
+        if topups
+            .iter()
+            .any(|t| t.external_id.as_deref() == Some(outpoint))
+        {
+            return Ok(None);
+        }
+        let topup_id = topups.len() as u64 + 1;
+        topups.push(lnvps_db::AccountCreditTopup {
+            id: topup_id,
+            user_id: owner.user_id,
+            amount: amount_msat,
+            currency: "BTC".to_string(),
+            payment_method: PaymentMethod::OnChain,
+            invoice_hash: lnvps_db::onchain_address_hash(&format!("late:{outpoint}")),
+            external_data: String::new(),
+            external_id: Some(outpoint.to_string()),
+            is_paid: true,
+            paid_at: Some(Utc::now()),
+            created: Utc::now(),
+            credit_currency: Some("BTC".to_string()),
+            credit_amount: Some(amount_msat),
+        });
+        let mut credits = self.account_credits.lock().await;
+        let row = credit_row(&mut credits, owner.user_id, "BTC");
+        row.balance += amount_msat;
+        row.updated = Utc::now();
+        let balance = row.balance;
+        let mut events = self.account_credit_events.lock().await;
+        let event_id = events.len() as u64 + 1;
+        events.push(lnvps_db::AccountCreditEvent {
+            id: event_id,
+            user_id: owner.user_id,
+            kind: "topup".to_string(),
+            amount: amount_msat as i64,
+            currency: "BTC".to_string(),
+            subscription_payment_id: None,
+            note: Some(note.to_string()),
+            created: Utc::now(),
+        });
+        owner.status = lnvps_db::OnchainAddressOwnerStatus::Credited;
+        owner.credited_outpoint = Some(outpoint.to_string());
+        owner.notified_outpoint = Some(outpoint.to_string());
+        Ok(Some(balance))
     }
 
     // ----- Marketplace (operator-run compute nodes) -----
@@ -4484,14 +5383,12 @@ impl LNVpsDbBase for MockDb {
             id,
             MarketplaceNodeHealth {
                 id,
-                // The column defaults to now; rows written without one would
-                // otherwise all sort equal and a "most recent first" list would
-                // return them in whatever order the map happened to hold.
-                created: if health.created == DateTime::<Utc>::default() {
-                    Utc::now()
-                } else {
-                    health.created
-                },
+                // The real insert names neither column, so the table's
+                // `DEFAULT CURRENT_TIMESTAMP` wins and a caller-supplied
+                // `created` is ignored. Matching that here keeps a test from
+                // backdating a row against the mock and finding the real
+                // database cannot reproduce it.
+                created: Utc::now(),
                 ..health.clone()
             },
         );
@@ -4854,6 +5751,15 @@ impl LNVpsDbBase for MockDb {
         Ok(id)
     }
 
+    async fn bump_tunnel_pool_generation(&self, id: u64) -> DbResult<u64> {
+        let mut pools = self.tunnel_pools.lock().await;
+        let pool = pools
+            .get_mut(&id)
+            .ok_or_else(|| DbError::Other(anyhow!("Tunnel pool {} not found", id)))?;
+        pool.generation += 1;
+        Ok(pool.generation)
+    }
+
     async fn update_tunnel_pool(&self, pool: &TunnelPool) -> DbResult<()> {
         if pool.cidr4.is_none() && pool.cidr6.is_none() {
             return Err(anyhow!(
@@ -4930,6 +5836,598 @@ impl LNVpsDbBase for MockDb {
         }
         self.tunnel_pools.lock().await.remove(&id);
         Ok(())
+    }
+
+    // ----- VM add-ons -----
+
+    async fn list_ip_providers(&self) -> DbResult<Vec<IpProvider>> {
+        let mut v: Vec<IpProvider> = self.ip_providers.lock().await.values().cloned().collect();
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(v)
+    }
+
+    async fn get_ip_provider(&self, id: u64) -> DbResult<IpProvider> {
+        self.ip_providers
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("IP provider {id} not found").into())
+    }
+
+    async fn get_ip_provider_by_name(&self, name: &str) -> DbResult<Option<IpProvider>> {
+        Ok(self
+            .ip_providers
+            .lock()
+            .await
+            .values()
+            .find(|p| p.name == name)
+            .cloned())
+    }
+
+    async fn insert_ip_provider(&self, p: &IpProvider) -> DbResult<u64> {
+        let mut m = self.ip_providers.lock().await;
+        if m.values().any(|e| e.name == p.name) {
+            return Err(anyhow!("Duplicate IP provider name").into());
+        }
+        let id = m.keys().max().copied().unwrap_or(0) + 1;
+        let mut n = p.clone();
+        n.id = id;
+        m.insert(id, n);
+        Ok(id)
+    }
+
+    async fn update_ip_provider(&self, p: &IpProvider) -> DbResult<()> {
+        let mut m = self.ip_providers.lock().await;
+        if m.values().any(|e| e.name == p.name && e.id != p.id) {
+            return Err(anyhow!("Duplicate IP provider name").into());
+        }
+        m.insert(p.id, p.clone());
+        Ok(())
+    }
+
+    async fn delete_ip_provider(&self, id: u64) -> DbResult<()> {
+        let p = self.get_ip_provider(id).await?;
+        if self
+            .ip_orders
+            .lock()
+            .await
+            .values()
+            .any(|o| o.provider == p.name)
+        {
+            return Err(anyhow!("Cannot delete IP provider: orders reference it").into());
+        }
+        self.ip_providers.lock().await.remove(&id);
+        self.ip_provider_regions
+            .lock()
+            .await
+            .retain(|_, r| r.provider_id != id);
+        Ok(())
+    }
+
+    async fn list_ip_provider_regions(
+        &self,
+        provider_id: Option<u64>,
+        region_id: Option<u64>,
+    ) -> DbResult<Vec<IpProviderRegion>> {
+        let mut v: Vec<IpProviderRegion> = self
+            .ip_provider_regions
+            .lock()
+            .await
+            .values()
+            .filter(|r| provider_id.is_none_or(|p| r.provider_id == p))
+            .filter(|r| region_id.is_none_or(|g| r.region_id == g))
+            .cloned()
+            .collect();
+        v.sort_by_key(|r| r.id);
+        Ok(v)
+    }
+
+    async fn get_ip_provider_region(&self, id: u64) -> DbResult<IpProviderRegion> {
+        self.ip_provider_regions
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("IP provider region {id} not found").into())
+    }
+
+    async fn insert_ip_provider_region(&self, r: &IpProviderRegion) -> DbResult<u64> {
+        let mut m = self.ip_provider_regions.lock().await;
+        if m.values()
+            .any(|e| e.provider_id == r.provider_id && e.region_id == r.region_id)
+        {
+            return Err(anyhow!("Duplicate IP provider region").into());
+        }
+        let id = m.keys().max().copied().unwrap_or(0) + 1;
+        let mut n = r.clone();
+        n.id = id;
+        m.insert(id, n);
+        Ok(id)
+    }
+
+    async fn update_ip_provider_region(&self, r: &IpProviderRegion) -> DbResult<()> {
+        self.ip_provider_regions
+            .lock()
+            .await
+            .insert(r.id, r.clone());
+        Ok(())
+    }
+
+    async fn delete_ip_provider_region(&self, id: u64) -> DbResult<()> {
+        self.ip_provider_regions.lock().await.remove(&id);
+        Ok(())
+    }
+
+    async fn get_vm_ip_wait(&self, vm_id: u64) -> DbResult<Option<VmIpWait>> {
+        Ok(self
+            .vm_ip_waits
+            .lock()
+            .await
+            .iter()
+            .find(|w| w.vm_id == vm_id)
+            .cloned())
+    }
+
+    async fn insert_vm_ip_wait(&self, w: &VmIpWait) -> DbResult<u64> {
+        let mut m = self.vm_ip_waits.lock().await;
+        if m.iter().any(|e| e.vm_id == w.vm_id) {
+            return Err(anyhow!("VM {} already waits for an IP", w.vm_id).into());
+        }
+        let id = m.iter().map(|e| e.id).max().unwrap_or(0) + 1;
+        let mut n = w.clone();
+        n.id = id;
+        m.push(n);
+        Ok(id)
+    }
+
+    async fn list_vm_ip_waits(&self, region_id: Option<u64>) -> DbResult<Vec<VmIpWait>> {
+        let mut v: Vec<VmIpWait> = self
+            .vm_ip_waits
+            .lock()
+            .await
+            .iter()
+            .filter(|w| region_id.is_none_or(|r| w.region_id == r))
+            .cloned()
+            .collect();
+        v.sort_by_key(|w| (w.created, w.id));
+        Ok(v)
+    }
+
+    async fn set_vm_ip_wait_order(&self, vm_id: u64, ip_order_id: Option<u64>) -> DbResult<()> {
+        if let Some(w) = self
+            .vm_ip_waits
+            .lock()
+            .await
+            .iter_mut()
+            .find(|w| w.vm_id == vm_id)
+        {
+            w.ip_order_id = ip_order_id;
+        }
+        Ok(())
+    }
+
+    async fn set_vm_ip_wait_released(&self, vm_id: u64, released: bool) -> DbResult<()> {
+        if let Some(w) = self
+            .vm_ip_waits
+            .lock()
+            .await
+            .iter_mut()
+            .find(|w| w.vm_id == vm_id)
+        {
+            w.released = released;
+        }
+        Ok(())
+    }
+
+    async fn delete_vm_ip_wait(&self, vm_id: u64) -> DbResult<()> {
+        self.vm_ip_waits.lock().await.retain(|w| w.vm_id != vm_id);
+        Ok(())
+    }
+
+    async fn insert_ip_order(&self, order: &IpOrder) -> DbResult<u64> {
+        let mut orders = self.ip_orders.lock().await;
+        if let Some(k) = &order.idempotency_key {
+            if orders
+                .values()
+                .any(|o| o.idempotency_key.as_ref() == Some(k))
+            {
+                return Err(anyhow!("Duplicate ip order key {k}").into());
+            }
+        }
+        let id = orders.keys().max().copied().unwrap_or(0) + 1;
+        let mut o = order.clone();
+        o.id = id;
+        orders.insert(id, o);
+        Ok(id)
+    }
+
+    async fn get_ip_order(&self, id: u64) -> DbResult<IpOrder> {
+        self.ip_orders
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("IP order {id} not found").into())
+    }
+
+    async fn get_ip_order_by_key(&self, key: &str) -> DbResult<Option<IpOrder>> {
+        Ok(self
+            .ip_orders
+            .lock()
+            .await
+            .values()
+            .find(|o| o.idempotency_key.as_deref() == Some(key))
+            .cloned())
+    }
+
+    async fn update_ip_order(&self, order: &IpOrder) -> DbResult<()> {
+        let mut orders = self.ip_orders.lock().await;
+        let o = orders
+            .get_mut(&order.id)
+            .ok_or_else(|| anyhow!("IP order {} not found", order.id))?;
+        o.state = order.state;
+        o.quantity = order.quantity;
+        o.provider_order_id = order.provider_order_id.clone();
+        o.cost = order.cost;
+        o.currency = order.currency.clone();
+        o.approved_by = order.approved_by;
+        o.approved_at = order.approved_at;
+        o.error = order.error.clone();
+        o.ordered_at = order.ordered_at;
+        o.delivered_at = order.delivered_at;
+        Ok(())
+    }
+
+    async fn grow_ip_order_quantity(&self, id: u64, quantity: u32) -> DbResult<bool> {
+        let mut orders = self.ip_orders.lock().await;
+        match orders.get_mut(&id) {
+            Some(o) if o.state == IpOrderState::AwaitingApproval && o.quantity < quantity => {
+                o.quantity = quantity;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn transition_ip_order(
+        &self,
+        id: u64,
+        from: IpOrderState,
+        to: IpOrderState,
+    ) -> DbResult<bool> {
+        let mut orders = self.ip_orders.lock().await;
+        match orders.get_mut(&id) {
+            Some(o) if o.state == from => {
+                o.state = to;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    async fn list_ip_orders(
+        &self,
+        state: Option<IpOrderState>,
+        region_id: Option<u64>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpOrder>, u64)> {
+        let orders = self.ip_orders.lock().await;
+        let mut v: Vec<IpOrder> = orders
+            .values()
+            .filter(|o| state.is_none_or(|s| o.state == s))
+            .filter(|o| region_id.is_none_or(|r| o.region_id == r))
+            .cloned()
+            .collect();
+        v.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = v.len() as u64;
+        Ok((
+            v.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn sum_ip_order_cost_since(&self, since: DateTime<Utc>, currency: &str) -> DbResult<u64> {
+        Ok(self
+            .ip_orders
+            .lock()
+            .await
+            .values()
+            .filter(|o| o.state.is_spent() && o.currency == currency)
+            .filter(|o| o.ordered_at.unwrap_or(o.created) >= since)
+            .map(|o| o.cost)
+            .sum())
+    }
+
+    async fn insert_ip_order_audit(
+        &self,
+        ip_order_id: u64,
+        event: &str,
+        detail: Option<&str>,
+        actor_user_id: Option<u64>,
+    ) -> DbResult<u64> {
+        let mut a = self.ip_order_audits.lock().await;
+        let id = a.len() as u64 + 1;
+        a.push(IpOrderAudit {
+            id,
+            ip_order_id,
+            event: event.to_string(),
+            detail: detail.map(|d| d.to_string()),
+            actor_user_id,
+            created: Utc::now(),
+        });
+        Ok(id)
+    }
+
+    async fn list_ip_order_audit(&self, ip_order_id: u64) -> DbResult<Vec<IpOrderAudit>> {
+        Ok(self
+            .ip_order_audits
+            .lock()
+            .await
+            .iter()
+            .filter(|a| a.ip_order_id == ip_order_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn insert_ip_order_range(
+        &self,
+        ip_order_id: u64,
+        ip_range_id: u64,
+        cidr: &str,
+    ) -> DbResult<u64> {
+        let mut r = self.ip_order_ranges.lock().await;
+        let id = r.len() as u64 + 1;
+        r.push(IpOrderRange {
+            id,
+            ip_order_id,
+            ip_range_id,
+            cidr: cidr.to_string(),
+            released_at: None,
+        });
+        Ok(id)
+    }
+
+    async fn list_ip_order_ranges_for_order(
+        &self,
+        ip_order_id: u64,
+    ) -> DbResult<Vec<IpOrderRange>> {
+        Ok(self
+            .ip_order_ranges
+            .lock()
+            .await
+            .iter()
+            .filter(|r| r.ip_order_id == ip_order_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn list_ip_order_ranges(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpOrderRange>, u64)> {
+        let r = self.ip_order_ranges.lock().await;
+        let total = r.len() as u64;
+        Ok((
+            r.iter()
+                .rev()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .cloned()
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn get_ip_order_range_by_range(
+        &self,
+        ip_range_id: u64,
+    ) -> DbResult<Option<IpOrderRange>> {
+        Ok(self
+            .ip_order_ranges
+            .lock()
+            .await
+            .iter()
+            .find(|r| r.ip_range_id == ip_range_id)
+            .cloned())
+    }
+
+    async fn mark_ip_order_range_released(&self, id: u64) -> DbResult<()> {
+        if let Some(r) = self
+            .ip_order_ranges
+            .lock()
+            .await
+            .iter_mut()
+            .find(|r| r.id == id)
+        {
+            r.released_at = Some(Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn insert_ip_range(&self, range: &IpRange) -> DbResult<u64> {
+        let mut ranges = self.ip_range.lock().await;
+        if ranges.values().any(|r| r.cidr == range.cidr) {
+            return Err(anyhow!("Duplicate cidr {}", range.cidr).into());
+        }
+        let id = ranges.keys().max().copied().unwrap_or(0) + 1;
+        let mut r = range.clone();
+        r.id = id;
+        ranges.insert(id, r);
+        Ok(id)
+    }
+
+    async fn get_ip_range_by_cidr(&self, cidr: &str) -> DbResult<Option<IpRange>> {
+        Ok(self
+            .ip_range
+            .lock()
+            .await
+            .values()
+            .find(|r| r.cidr == cidr)
+            .cloned())
+    }
+
+    async fn set_ip_range_enabled(&self, id: u64, enabled: bool) -> DbResult<()> {
+        if let Some(r) = self.ip_range.lock().await.get_mut(&id) {
+            r.enabled = enabled;
+        }
+        Ok(())
+    }
+
+    async fn list_vm_addon_prices(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmAddonPrice>, u64)> {
+        let prices = self.vm_addon_prices.lock().await;
+        let mut all: Vec<_> = prices.values().cloned().collect();
+        all.sort_by_key(|p| std::cmp::Reverse(p.id));
+        let total = all.len() as u64;
+        Ok((
+            all.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn get_vm_addon_price(&self, id: u64) -> DbResult<VmAddonPrice> {
+        self.vm_addon_prices
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("VM add-on price {id} not found").into())
+    }
+
+    async fn get_vm_addon_price_for_region(
+        &self,
+        region_id: u64,
+        kind: VmAddonKind,
+    ) -> DbResult<Option<VmAddonPrice>> {
+        Ok(self
+            .vm_addon_prices
+            .lock()
+            .await
+            .values()
+            .find(|p| p.region_id == region_id && p.kind == kind)
+            .cloned())
+    }
+
+    async fn insert_vm_addon_price(&self, price: &VmAddonPrice) -> DbResult<u64> {
+        let mut prices = self.vm_addon_prices.lock().await;
+        if prices
+            .values()
+            .any(|p| p.region_id == price.region_id && p.kind == price.kind)
+        {
+            return Err(anyhow!("Duplicate VM add-on price").into());
+        }
+        let id = prices.keys().max().copied().unwrap_or(0) + 1;
+        let mut p = price.clone();
+        p.id = id;
+        prices.insert(id, p);
+        Ok(id)
+    }
+
+    async fn update_vm_addon_price(&self, price: &VmAddonPrice) -> DbResult<()> {
+        let mut prices = self.vm_addon_prices.lock().await;
+        let p = prices
+            .get_mut(&price.id)
+            .ok_or_else(|| anyhow!("VM add-on price {} not found", price.id))?;
+        p.currency = price.currency.clone();
+        p.monthly_amount = price.monthly_amount;
+        p.max_quantity = price.max_quantity;
+        p.enabled = price.enabled;
+        Ok(())
+    }
+
+    async fn delete_vm_addon_price(&self, id: u64) -> DbResult<()> {
+        self.vm_addon_prices.lock().await.remove(&id);
+        Ok(())
+    }
+
+    async fn list_vm_addons(&self, vm_id: u64) -> DbResult<Vec<VmAddon>> {
+        let mut out: Vec<_> = self
+            .vm_addons
+            .lock()
+            .await
+            .values()
+            .filter(|a| a.vm_id == vm_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|a| a.kind as u16);
+        Ok(out)
+    }
+
+    async fn get_vm_addon_by_line_item(&self, line_item_id: u64) -> DbResult<Option<VmAddon>> {
+        Ok(self
+            .vm_addons
+            .lock()
+            .await
+            .values()
+            .find(|a| a.subscription_line_item_id == line_item_id)
+            .cloned())
+    }
+
+    async fn set_vm_addon(
+        &self,
+        vm_id: u64,
+        kind: VmAddonKind,
+        quantity: u32,
+        amount: u64,
+        name: &str,
+    ) -> DbResult<VmAddon> {
+        let vm = self.get_vm(vm_id).await?;
+        let parent = self
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let deactivated_at = (quantity == 0).then(Utc::now);
+        let mut addons = self.vm_addons.lock().await;
+        if let Some(a) = addons
+            .values_mut()
+            .find(|a| a.vm_id == vm_id && a.kind == kind)
+        {
+            a.quantity = quantity;
+            let mut items = self.subscription_line_items.lock().await;
+            let li = items
+                .get_mut(&a.subscription_line_item_id)
+                .ok_or_else(|| anyhow!("add-on line item missing"))?;
+            li.name = name.to_string();
+            li.amount = amount;
+            li.deactivated_at = deactivated_at;
+            return Ok(a.clone());
+        }
+        let line_item_id = self
+            .insert_subscription_line_item(&SubscriptionLineItem {
+                id: 0,
+                subscription_id: parent.subscription_id,
+                subscription_type: LineItemType::VmAddon,
+                name: name.to_string(),
+                description: None,
+                amount,
+                setup_amount: 0,
+                configuration: None,
+                deactivated_at,
+                parent_line_item_id: Some(parent.id),
+            })
+            .await?;
+        let id = addons.keys().max().copied().unwrap_or(0) + 1;
+        let addon = VmAddon {
+            id,
+            vm_id,
+            kind,
+            quantity,
+            subscription_line_item_id: line_item_id,
+            created: Utc::now(),
+        };
+        addons.insert(id, addon.clone());
+        Ok(addon)
     }
 
     // ----- VPN -----
@@ -5083,10 +6581,94 @@ impl LNVpsDbBase for MockDb {
             .lock()
             .await
             .insert(tunnel_pool_id, vpn_service_id);
+
+        // Linking an interface and giving it the service's devices is one
+        // operation: a link without the peers is a region a customer can select
+        // and cannot reach.
+        let router_id = self
+            .tunnel_pools
+            .lock()
+            .await
+            .get(&tunnel_pool_id)
+            .map(|p| p.router_id);
+        let plans: Vec<u64> = self
+            .vpn_subscriptions
+            .lock()
+            .await
+            .values()
+            .filter(|s| s.vpn_service_id == vpn_service_id)
+            .map(|s| s.id)
+            .collect();
+        let devices: Vec<u64> = self
+            .vpn_devices
+            .lock()
+            .await
+            .values()
+            .filter(|d| plans.contains(&d.vpn_subscription_id))
+            .map(|d| d.id)
+            .collect();
+
+        for device_id in devices {
+            // Copied from a peer it already has: same key, same addresses,
+            // because that identity working in every region is the product.
+            let existing = {
+                let links = self.vpn_device_tunnels.lock().await;
+                let tunnels = self.tunnels.lock().await;
+                links
+                    .get(&device_id)
+                    .and_then(|ids| ids.first().and_then(|id| tunnels.get(id).cloned()))
+            };
+            let Some(existing) = existing else { continue };
+            let new_id = {
+                let mut tunnels = self.tunnels.lock().await;
+                let new_id = tunnels.keys().max().copied().unwrap_or(0) + 1;
+                tunnels.insert(
+                    new_id,
+                    Tunnel {
+                        id: new_id,
+                        router_id,
+                        pool_id: Some(tunnel_pool_id),
+                        created: Utc::now(),
+                        ..existing
+                    },
+                );
+                new_id
+            };
+            self.vpn_device_tunnels
+                .lock()
+                .await
+                .entry(device_id)
+                .or_default()
+                .push(new_id);
+        }
         Ok(())
     }
 
     async fn unlink_vpn_service_pool(&self, tunnel_pool_id: u64) -> DbResult<()> {
+        // Withdrawing a region takes its peers with it: rows still claiming an
+        // interface that no longer terminates the service would be configured
+        // by the planner, so an unlinked region would keep working. The devices
+        // keep every other region and their addresses.
+        let doomed: Vec<u64> = {
+            let tunnels = self.tunnels.lock().await;
+            tunnels
+                .values()
+                .filter(|t| t.pool_id == Some(tunnel_pool_id))
+                .map(|t| t.id)
+                .collect()
+        };
+        {
+            let mut links = self.vpn_device_tunnels.lock().await;
+            let mut tunnels = self.tunnels.lock().await;
+            let mut routes = self.tunnel_routes.lock().await;
+            for id in &doomed {
+                for peers in links.values_mut() {
+                    peers.retain(|t| t != id);
+                }
+                tunnels.remove(id);
+                routes.remove(id);
+            }
+        }
         self.vpn_service_pools.lock().await.remove(&tunnel_pool_id);
         Ok(())
     }
@@ -5258,13 +6840,15 @@ impl LNVpsDbBase for MockDb {
         else {
             return Ok(None);
         };
-        Ok(self
-            .vpn_devices
-            .lock()
-            .await
-            .values()
-            .find(|d| d.tunnel_id == tunnel.id)
-            .cloned())
+        let links = self.vpn_device_tunnels.lock().await;
+        let device_id = links
+            .iter()
+            .find(|(_, tunnel_ids)| tunnel_ids.contains(&tunnel.id))
+            .map(|(device_id, _)| *device_id);
+        Ok(match device_id {
+            Some(id) => self.vpn_devices.lock().await.get(&id).cloned(),
+            None => None,
+        })
     }
 
     async fn list_vpn_devices(&self, vpn_subscription_id: u64) -> DbResult<Vec<VpnDevice>> {
@@ -5287,16 +6871,23 @@ impl LNVpsDbBase for MockDb {
             .collect();
         let devices = self.vpn_devices.lock().await;
         let tunnels = self.tunnels.lock().await;
+        let links = self.vpn_device_tunnels.lock().await;
         let mut out: Vec<Tunnel> = devices
             .values()
             .filter(|d| plans.contains(&d.vpn_subscription_id))
-            .filter_map(|d| tunnels.get(&d.tunnel_id).cloned())
+            .flat_map(|d| {
+                links
+                    .get(&d.id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tid| tunnels.get(tid).cloned())
+            })
             .collect();
         out.sort_by_key(|t| t.id);
         Ok(out)
     }
 
-    async fn list_active_vpn_tunnels(&self, vpn_service_id: u64) -> DbResult<Vec<Tunnel>> {
+    async fn list_active_vpn_tunnels_in_pool(&self, tunnel_pool_id: u64) -> DbResult<Vec<Tunnel>> {
         let subs = self.vpn_subscriptions.lock().await;
         let line_items = self.subscription_line_items.lock().await;
         let subscriptions = self.subscriptions.lock().await;
@@ -5307,7 +6898,6 @@ impl LNVpsDbBase for MockDb {
         // its peers simply leave the set.
         let live: Vec<u64> = subs
             .values()
-            .filter(|s| s.vpn_service_id == vpn_service_id)
             .filter(|s| {
                 line_items
                     .get(&s.subscription_line_item_id)
@@ -5321,11 +6911,32 @@ impl LNVpsDbBase for MockDb {
 
         let devices = self.vpn_devices.lock().await;
         let tunnels = self.tunnels.lock().await;
+        let links = self.vpn_device_tunnels.lock().await;
         let mut out: Vec<Tunnel> = devices
             .values()
             .filter(|d| live.contains(&d.vpn_subscription_id))
-            .filter_map(|d| tunnels.get(&d.tunnel_id).cloned())
-            .filter(|t| t.enabled)
+            .flat_map(|d| {
+                links
+                    .get(&d.id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tid| tunnels.get(tid).cloned())
+            })
+            // The pool selects its own rows; a device has one per interface.
+            .filter(|t| t.pool_id == Some(tunnel_pool_id) && t.enabled)
+            .collect();
+        out.sort_by_key(|t| t.id);
+        Ok(out)
+    }
+
+    async fn list_vpn_device_tunnels(&self, vpn_device_id: u64) -> DbResult<Vec<Tunnel>> {
+        let links = self.vpn_device_tunnels.lock().await;
+        let tunnels = self.tunnels.lock().await;
+        let mut out: Vec<Tunnel> = links
+            .get(&vpn_device_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|tid| tunnels.get(tid).cloned())
             .collect();
         out.sort_by_key(|t| t.id);
         Ok(out)
@@ -5364,33 +6975,101 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn insert_vpn_device(&self, device: &VpnDevice) -> DbResult<u64> {
+    async fn insert_vpn_device_with_peers(
+        &self,
+        device: &VpnDevice,
+        peer: &VpnPeerTemplate,
+    ) -> DbResult<u64> {
         // FK vpn_device.vpn_subscription_id
-        if !self
-            .vpn_subscriptions
+        let service_id = {
+            let subs = self.vpn_subscriptions.lock().await;
+            match subs.get(&device.vpn_subscription_id) {
+                Some(s) => s.vpn_service_id,
+                None => {
+                    return Err(anyhow!(
+                        "VPN subscription {} not found",
+                        device.vpn_subscription_id
+                    )
+                    .into());
+                }
+            }
+        };
+
+        let device_id = {
+            let mut devices = self.vpn_devices.lock().await;
+            Self::check_vpn_device_uniqueness(&devices, device, None)?;
+            let new_id = devices.keys().max().copied().unwrap_or(0) + 1;
+            devices.insert(
+                new_id,
+                VpnDevice {
+                    id: new_id,
+                    created: Utc::now(),
+                    ..device.clone()
+                },
+            );
+            new_id
+        };
+
+        // One peer per interface the service terminates, all carrying the same
+        // key and addresses.
+        let pool_ids: Vec<u64> = {
+            let links = self.vpn_service_pools.lock().await;
+            let mut ids: Vec<u64> = links
+                .iter()
+                .filter(|(_, sid)| **sid == service_id)
+                .map(|(pool_id, _)| *pool_id)
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+
+        let mut tunnel_ids = Vec::with_capacity(pool_ids.len());
+        for pool_id in pool_ids {
+            let router_id = {
+                let pools = self.tunnel_pools.lock().await;
+                pools.get(&pool_id).map(|p| p.router_id)
+            };
+            let mut tunnels = self.tunnels.lock().await;
+            // uk_tunnel_pool_address4/6 and uk_tunnel_pool_peer_pubkey: unique
+            // within an interface, not globally.
+            if tunnels.values().any(|t| {
+                t.pool_id == Some(pool_id)
+                    && (t.peer_pubkey.as_deref() == Some(peer.peer_pubkey.as_slice())
+                        || (t.address4.is_some() && t.address4 == peer.address4)
+                        || (t.address6.is_some() && t.address6 == peer.address6))
+            }) {
+                return Err(anyhow!(
+                    "A peer with that key or address already exists on tunnel pool {pool_id}"
+                )
+                .into());
+            }
+            let new_id = tunnels.keys().max().copied().unwrap_or(0) + 1;
+            tunnels.insert(
+                new_id,
+                Tunnel {
+                    id: new_id,
+                    kind: RouterTunnelKind::Wireguard,
+                    user_id: peer.user_id,
+                    router_id,
+                    pool_id: Some(pool_id),
+                    name: peer.name.clone(),
+                    peer_pubkey: Some(peer.peer_pubkey.clone()),
+                    peer_endpoint: None,
+                    address4: peer.address4.clone(),
+                    address6: peer.address6.clone(),
+                    keepalive: None,
+                    enabled: true,
+                    created: Utc::now(),
+                },
+            );
+            tunnel_ids.push(new_id);
+        }
+
+        self.vpn_device_tunnels
             .lock()
             .await
-            .contains_key(&device.vpn_subscription_id)
-        {
-            return Err(
-                anyhow!("VPN subscription {} not found", device.vpn_subscription_id).into(),
-            );
-        }
-        if !self.tunnels.lock().await.contains_key(&device.tunnel_id) {
-            return Err(anyhow!("Tunnel {} not found", device.tunnel_id).into());
-        }
-        let mut devices = self.vpn_devices.lock().await;
-        Self::check_vpn_device_uniqueness(&devices, device, None)?;
-        let new_id = devices.keys().max().copied().unwrap_or(0) + 1;
-        devices.insert(
-            new_id,
-            VpnDevice {
-                id: new_id,
-                created: Utc::now(),
-                ..device.clone()
-            },
-        );
-        Ok(new_id)
+            .insert(device_id, tunnel_ids);
+        Ok(device_id)
     }
 
     async fn update_vpn_device(&self, device: &VpnDevice) -> DbResult<()> {
@@ -5413,15 +7092,35 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn delete_vpn_subscription(&self, id: u64) -> DbResult<()> {
+        let device_ids: Vec<u64> = self
+            .vpn_devices
+            .lock()
+            .await
+            .values()
+            .filter(|d| d.vpn_subscription_id == id)
+            .map(|d| d.id)
+            .collect();
+        for device_id in device_ids {
+            self.delete_vpn_device(device_id).await?;
+        }
+        self.vpn_subscriptions.lock().await.remove(&id);
+        Ok(())
+    }
+
     async fn delete_vpn_device(&self, id: u64) -> DbResult<()> {
-        // The tunnel goes with the device: only this row knows which tunnel
-        // belongs to the customer, so deleting the link alone leaves a tunnel
-        // no query can see, still holding a public key.
-        let removed = self.vpn_devices.lock().await.remove(&id);
-        if let Some(device) = removed {
-            self.tunnels.lock().await.remove(&device.tunnel_id);
-            // ON DELETE CASCADE off `tunnel`.
-            self.tunnel_routes.lock().await.remove(&device.tunnel_id);
+        // The peers go with the device: only the link rows know which tunnels
+        // belong to the customer, so deleting the device alone would leave
+        // tunnels no query can see, still holding a public key.
+        self.vpn_devices.lock().await.remove(&id);
+        if let Some(tunnel_ids) = self.vpn_device_tunnels.lock().await.remove(&id) {
+            let mut tunnels = self.tunnels.lock().await;
+            let mut routes = self.tunnel_routes.lock().await;
+            for tunnel_id in tunnel_ids {
+                tunnels.remove(&tunnel_id);
+                // ON DELETE CASCADE off `tunnel`.
+                routes.remove(&tunnel_id);
+            }
         }
         Ok(())
     }
@@ -5838,6 +7537,19 @@ impl LNVpsDbBase for MockDb {
             .cloned())
     }
 
+    async fn find_app_deployment_by_custom_domain(
+        &self,
+        domain: &str,
+    ) -> DbResult<Option<AppDeployment>> {
+        Ok(self
+            .app_deployments
+            .lock()
+            .await
+            .values()
+            .find(|x| x.custom_domain.as_deref() == Some(domain) && !x.deleted)
+            .cloned())
+    }
+
     async fn insert_app_deployment(&self, deployment: &AppDeployment) -> DbResult<u64> {
         let mut d = self.app_deployments.lock().await;
         let new_id = d.keys().max().copied().unwrap_or(0) + 1;
@@ -5863,6 +7575,14 @@ impl LNVpsDbBase for MockDb {
         let mut d = self.app_deployments.lock().await;
         if let Some(x) = d.get_mut(&id) {
             x.custom_domain_verified = true;
+        }
+        Ok(())
+    }
+
+    async fn set_app_deployment_public_port(&self, id: u64, port: Option<u16>) -> DbResult<()> {
+        let mut d = self.app_deployments.lock().await;
+        if let Some(x) = d.get_mut(&id) {
+            x.public_port = port;
         }
         Ok(())
     }
@@ -5927,10 +7647,120 @@ impl LNVpsDbBase for MockDb {
         Ok((services, volumes))
     }
 
+    async fn list_app_deployment_backups(
+        &self,
+        deployment_id: u64,
+    ) -> DbResult<Vec<AppDeploymentBackup>> {
+        let b = self.app_deployment_backups.lock().await;
+        let mut out: Vec<AppDeploymentBackup> = b
+            .values()
+            .filter(|x| x.deployment_id == deployment_id && !x.deleted)
+            .cloned()
+            .collect();
+        out.sort_by(|a, b| b.created.cmp(&a.created).then(b.id.cmp(&a.id)));
+        Ok(out)
+    }
+
+    async fn list_app_deployment_backups_paginated(
+        &self,
+        deployment_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AppDeploymentBackup>, u64)> {
+        let all = self.list_app_deployment_backups(deployment_id).await?;
+        let total = all.len() as u64;
+        Ok((
+            all.into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn get_app_deployment_backup(&self, id: u64) -> DbResult<AppDeploymentBackup> {
+        self.app_deployment_backups
+            .lock()
+            .await
+            .get(&id)
+            .filter(|b| !b.deleted)
+            .cloned()
+            .ok_or_else(|| anyhow!("app deployment backup not found").into())
+    }
+
+    async fn insert_app_deployment_backup(&self, backup: &AppDeploymentBackup) -> DbResult<u64> {
+        let mut b = self.app_deployment_backups.lock().await;
+        let new_id = b.keys().max().copied().unwrap_or(0) + 1;
+        b.insert(
+            new_id,
+            AppDeploymentBackup {
+                id: new_id,
+                ..backup.clone()
+            },
+        );
+        Ok(new_id)
+    }
+
+    async fn update_app_deployment_backup(&self, backup: &AppDeploymentBackup) -> DbResult<()> {
+        let mut b = self.app_deployment_backups.lock().await;
+        if let Some(x) = b.get_mut(&backup.id) {
+            // Mirrors the UPDATE's column list: everything else is immutable
+            // once the row exists.
+            x.object_key = backup.object_key.clone();
+            x.size_bytes = backup.size_bytes;
+            x.state = backup.state;
+            x.message = backup.message.clone();
+            x.started = backup.started;
+            x.completed = backup.completed;
+        }
+        Ok(())
+    }
+
+    async fn list_active_app_deployment_backups(
+        &self,
+        cluster_id: u64,
+    ) -> DbResult<Vec<AppDeploymentBackup>> {
+        let deployments = self.app_deployments.lock().await;
+        let b = self.app_deployment_backups.lock().await;
+        let mut out: Vec<AppDeploymentBackup> = b
+            .values()
+            .filter(|x| {
+                !x.deleted
+                    && matches!(x.state, AppBackupState::Pending | AppBackupState::Running)
+                    && deployments
+                        .get(&x.deployment_id)
+                        .is_some_and(|d| d.cluster_id == cluster_id)
+            })
+            .cloned()
+            .collect();
+        out.sort_by_key(|x| x.id);
+        Ok(out)
+    }
+
+    async fn last_scheduled_app_deployment_backup(
+        &self,
+        deployment_id: u64,
+    ) -> DbResult<Option<DateTime<Utc>>> {
+        let b = self.app_deployment_backups.lock().await;
+        Ok(b.values()
+            .filter(|x| x.deployment_id == deployment_id && x.scheduled)
+            .map(|x| x.created)
+            .max())
+    }
+
+    async fn delete_app_deployment_backup(&self, id: u64) -> DbResult<()> {
+        let mut b = self.app_deployment_backups.lock().await;
+        if let Some(x) = b.get_mut(&id) {
+            x.deleted = true;
+        }
+        Ok(())
+    }
+
     async fn delete_app_deployment(&self, id: u64) -> DbResult<()> {
         let mut d = self.app_deployments.lock().await;
         if let Some(x) = d.get_mut(&id) {
             x.deleted = true;
+            x.public_port = None;
         }
         Ok(())
     }
@@ -5974,6 +7804,8 @@ impl LNVpsDbBase for MockDb {
                     .any(|d| line_item_ids.contains(&d.subscription_line_item_id));
 
             if !still_billed {
+                self.record_onchain_address_owners(subscription_id, None)
+                    .await;
                 self.subscription_payments
                     .lock()
                     .await
@@ -6238,6 +8070,35 @@ impl lnvps_db::AdminDb for MockDb {
     async fn admin_count_region_hosts(&self, _region_id: u64) -> DbResult<u64> {
         Ok(0)
     }
+    async fn admin_delete_host(&self, host_id: u64) -> DbResult<()> {
+        let mut hosts = self.hosts.lock().await;
+        let host = hosts.get_mut(&host_id).ok_or(anyhow!("no host"))?;
+        if host.deleted {
+            return Err(anyhow!("Host is already deleted").into());
+        }
+
+        let vms = self.vms.lock().await;
+        let active_vms = vms
+            .values()
+            .filter(|v| v.host_id == host_id && !v.deleted)
+            .count();
+        if active_vms > 0 {
+            return Err(anyhow!("Cannot delete host with {} active VMs", active_vms).into());
+        }
+        // A host that ever ran a VM keeps its row so history still resolves.
+        if vms.values().any(|v| v.host_id == host_id) {
+            host.deleted = true;
+            host.enabled = false;
+            return Ok(());
+        }
+
+        hosts.remove(&host_id);
+        self.host_disks
+            .lock()
+            .await
+            .retain(|_, d| d.host_id != host_id);
+        Ok(())
+    }
     async fn admin_get_region_stats(&self, region_id: u64) -> DbResult<RegionStats> {
         let hosts = self.hosts.lock().await;
         let region_hosts: Vec<&VmHost> = hosts
@@ -6271,6 +8132,50 @@ impl lnvps_db::AdminDb for MockDb {
             }
         }
 
+        let region_ranges: Vec<&IpRange> = ranges
+            .values()
+            .filter(|r| r.region_id == region_id)
+            .collect();
+
+        let templates = self.templates.lock().await;
+        let clusters = self.app_clusters.lock().await;
+        let region_clusters: Vec<u64> = clusters
+            .values()
+            .filter(|c| c.region_id == region_id)
+            .map(|c| c.id)
+            .collect();
+        let deployments = self.app_deployments.lock().await;
+        let app_deployments = deployments
+            .values()
+            .filter(|d| !d.deleted && region_clusters.contains(&d.cluster_id))
+            .count() as u64;
+
+        let pools = self.tunnel_pools.lock().await;
+        let region_pools: Vec<&TunnelPool> = pools
+            .values()
+            .filter(|p| p.region_id == region_id)
+            .collect();
+        let service_pools = self.vpn_service_pools.lock().await;
+        let vpn_services: HashSet<u64> = region_pools
+            .iter()
+            .filter_map(|p| service_pools.get(&p.id).copied())
+            .collect();
+
+        // A router has no region of its own, so it belongs to one through the
+        // pools terminating here and the access policies the region's ranges
+        // use. A set, because a router reached both ways is still one router.
+        let policies = self.access_policy.lock().await;
+        let mut routers: HashSet<u64> = region_pools.iter().map(|p| p.router_id).collect();
+        for range in &region_ranges {
+            if let Some(router_id) = range
+                .access_policy_id
+                .and_then(|id| policies.get(&id))
+                .and_then(|p| p.router_id)
+            {
+                routers.insert(router_id);
+            }
+        }
+
         Ok(RegionStats {
             host_count: region_hosts.len() as u64,
             total_vms: region_vms.len() as u64,
@@ -6279,6 +8184,16 @@ impl lnvps_db::AdminDb for MockDb {
             total_ip_assignments,
             ipv4_assignments,
             ipv6_assignments,
+            ip_ranges: region_ranges.len() as u64,
+            vm_templates: templates
+                .values()
+                .filter(|t| t.region_id == region_id)
+                .count() as u64,
+            app_clusters: region_clusters.len() as u64,
+            app_deployments,
+            tunnel_pools: region_pools.len() as u64,
+            vpn_services: vpn_services.len() as u64,
+            routers: routers.len() as u64,
         })
     }
     async fn admin_transfer_vm(&self, vm_id: u64, new_user_id: u64) -> DbResult<()> {
@@ -6528,6 +8443,7 @@ impl lnvps_db::AdminDb for MockDb {
         let hosts = self.hosts.lock().await;
         let regions = self.regions.lock().await;
         let companies = self.companies.lock().await;
+        let users = self.users.lock().await;
 
         let mut result = Vec::new();
 
@@ -6585,6 +8501,7 @@ impl lnvps_db::AdminDb for MockDb {
                 continue;
             }
             if let Some(company) = companies.get(&cid) {
+                let user = users.get(&payment.user_id);
                 result.push(SubscriptionPaymentWithCompany {
                     id: payment.id.clone(),
                     subscription_id: payment.subscription_id,
@@ -6619,6 +8536,9 @@ impl lnvps_db::AdminDb for MockDb {
                     region_id,
                     region_name,
                     renewal_source: None,
+                    user_country_code: user.and_then(|u| u.country_code.clone()),
+                    user_geo_country_code: user.and_then(|u| u.geo_country_code.clone()),
+                    user_billing_tax_id: user.and_then(|u| u.billing_tax_id.clone()),
                 });
             }
         }
@@ -6668,6 +8588,30 @@ impl lnvps_db::AdminDb for MockDb {
             .get(&referral_id)
             .cloned()
             .ok_or_else(|| DbError::Other(anyhow!("referral not found")))
+    }
+
+    async fn admin_set_referral_auto_payout(
+        &self,
+        referral_id: u64,
+        approved: bool,
+    ) -> DbResult<()> {
+        let mut referrals = self.referrals.lock().await;
+        let referral = referrals
+            .get_mut(&referral_id)
+            .ok_or_else(|| DbError::Other(anyhow!("referral not found")))?;
+        referral.auto_payout_approved = approved;
+        Ok(())
+    }
+
+    async fn admin_remove_referred_vm(&self, code: &str, vm_id: u64) -> DbResult<bool> {
+        let mut vms = self.vms.lock().await;
+        match vms.get_mut(&vm_id) {
+            Some(vm) if vm.ref_code.as_deref() == Some(code) => {
+                vm.ref_code = None;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn admin_list_ip_ranges(
@@ -6862,6 +8806,30 @@ impl lnvps_db::AdminDb for MockDb {
         Ok((vec![], 0))
     }
 
+    async fn admin_list_swap_order_clients(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        order_id: Option<&str>,
+    ) -> DbResult<(Vec<lnvps_db::SwapOrderClient>, u64)> {
+        let rows = self.swap_order_clients.lock().await;
+        let mut matched: Vec<_> = rows
+            .iter()
+            .filter(|r| user_id.is_none_or(|u| r.user_id == u))
+            .filter(|r| order_id.is_none_or(|o| r.order_id == o))
+            .cloned()
+            .collect();
+        matched.sort_by(|a, b| b.id.cmp(&a.id));
+        let total = matched.len() as u64;
+        let page = matched
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        Ok((page, total))
+    }
+
     async fn admin_get_vm_ip_assignment(
         &self,
         _assignment_id: u64,
@@ -6932,6 +8900,236 @@ impl lnvps_db::AdminDb for MockDb {
     ) -> DbResult<Vec<lnvps_db::ResourceCost>> {
         Ok(vec![])
     }
+
+    async fn admin_list_vms_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<Vm>, u64)> {
+        let paid = self.paid_subscriptions_by_line_item().await;
+        let rows = self
+            .vms
+            .lock()
+            .await
+            .values()
+            .filter_map(|v| {
+                paid.get(&v.subscription_line_item_id)
+                    .filter(|s| s.created >= since)
+                    .map(|s| (std::cmp::Reverse((s.created, v.id)), v.clone()))
+            })
+            .collect();
+        Ok(take_sorted(rows, limit))
+    }
+
+    async fn admin_list_vms_deleted_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<lnvps_db::DeletedVm>, u64)> {
+        let paid = self.paid_subscriptions_by_line_item().await;
+        let history = self.vm_history.lock().await;
+        let mut last_delete: HashMap<u64, &VmHistory> = HashMap::new();
+        for h in history.values().filter(|h| {
+            matches!(h.action_type, lnvps_db::VmHistoryActionType::Deleted) && h.timestamp >= since
+        }) {
+            let newer = last_delete
+                .get(&h.vm_id)
+                .is_none_or(|prev| (h.timestamp, h.id) > (prev.timestamp, prev.id));
+            if newer {
+                last_delete.insert(h.vm_id, h);
+            }
+        }
+        let rows = self
+            .vms
+            .lock()
+            .await
+            .values()
+            .filter(|v| v.deleted && paid.contains_key(&v.subscription_line_item_id))
+            .filter_map(|v| {
+                last_delete.get(&v.id).map(|h| {
+                    (
+                        std::cmp::Reverse((h.timestamp, v.id)),
+                        lnvps_db::DeletedVm {
+                            vm: v.clone(),
+                            deleted_at: h.timestamp,
+                            delete_reason: h.description.clone(),
+                        },
+                    )
+                })
+            })
+            .collect();
+        Ok(take_sorted(rows, limit))
+    }
+
+    async fn admin_list_vms_expiring_between(
+        &self,
+        from: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<Vm>, u64)> {
+        let paid = self.paid_subscriptions_by_line_item().await;
+        let rows = self
+            .vms
+            .lock()
+            .await
+            .values()
+            .filter(|v| !v.deleted)
+            .filter_map(|v| {
+                paid.get(&v.subscription_line_item_id)
+                    .and_then(|s| s.expires)
+                    .filter(|e| *e >= from && *e < until)
+                    .map(|e| ((e, v.id), v.clone()))
+            })
+            .collect();
+        Ok(take_sorted(rows, limit))
+    }
+
+    async fn admin_list_users_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<User>, u64)> {
+        let rows = self
+            .users
+            .lock()
+            .await
+            .values()
+            .filter(|u| u.created >= since)
+            .map(|u| (std::cmp::Reverse((u.created, u.id)), u.clone()))
+            .collect();
+        Ok(take_sorted(rows, limit))
+    }
+
+    async fn admin_list_vpn_subscriptions_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<VpnSubscription>, u64)> {
+        let paid = self.paid_subscriptions_by_line_item().await;
+        let rows = self
+            .vpn_subscriptions
+            .lock()
+            .await
+            .values()
+            .filter(|p| p.created >= since && paid.contains_key(&p.subscription_line_item_id))
+            .map(|p| (std::cmp::Reverse((p.created, p.id)), p.clone()))
+            .collect();
+        Ok(take_sorted(rows, limit))
+    }
+
+    async fn admin_list_app_deployments_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<AppDeployment>, u64)> {
+        let paid = self.paid_subscriptions_by_line_item().await;
+        let rows = self
+            .app_deployments
+            .lock()
+            .await
+            .values()
+            .filter(|d| d.created >= since && paid.contains_key(&d.subscription_line_item_id))
+            .map(|d| (std::cmp::Reverse((d.created, d.id)), d.clone()))
+            .collect();
+        Ok(take_sorted(rows, limit))
+    }
+
+    async fn admin_list_payments_paid_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<lnvps_db::PaidSubscriptionPayment>, u64)> {
+        let subscriptions = self.subscriptions.lock().await;
+        let companies = self.companies.lock().await;
+        let rows = self
+            .subscription_payments
+            .lock()
+            .await
+            .iter()
+            .filter(|p| p.is_paid && p.paid_at.is_some_and(|at| at >= since))
+            .filter_map(|p| {
+                let sub = subscriptions.get(&p.subscription_id)?;
+                let company = companies.get(&sub.company_id)?;
+                Some((
+                    std::cmp::Reverse((p.paid_at, p.created)),
+                    lnvps_db::PaidSubscriptionPayment {
+                        payment: p.clone(),
+                        subscription_name: sub.name.clone(),
+                        company_base_currency: company.base_currency.clone(),
+                    },
+                ))
+            })
+            .collect();
+        Ok(take_sorted(rows, limit))
+    }
+
+    async fn admin_list_refunds_paid_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> DbResult<Vec<lnvps_db::SubscriptionPayment>> {
+        let mut rows: Vec<_> = self
+            .subscription_payments
+            .lock()
+            .await
+            .iter()
+            .filter(|p| {
+                p.is_paid && p.payment_type.is_refund() && p.paid_at.is_some_and(|at| at >= since)
+            })
+            .cloned()
+            .collect();
+        rows.sort_by(|a, b| (b.paid_at, b.created).cmp(&(a.paid_at, a.created)));
+        Ok(rows)
+    }
+
+    async fn admin_sum_payments_paid_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> DbResult<Vec<lnvps_db::PaymentTotal>> {
+        let mut totals: Vec<lnvps_db::PaymentTotal> = Vec::new();
+        for p in self
+            .subscription_payments
+            .lock()
+            .await
+            .iter()
+            .filter(|p| p.is_paid && p.paid_at.is_some_and(|at| at >= since))
+        {
+            match totals
+                .iter_mut()
+                .find(|t| t.currency == p.currency && t.payment_type == p.payment_type)
+            {
+                Some(t) => {
+                    t.count += 1;
+                    t.amount += p.amount;
+                    t.tax += p.tax;
+                }
+                None => totals.push(lnvps_db::PaymentTotal {
+                    currency: p.currency.clone(),
+                    payment_type: p.payment_type,
+                    count: 1,
+                    amount: p.amount,
+                    tax: p.tax,
+                }),
+            }
+        }
+        totals.sort_by(|a, b| {
+            (a.currency.as_str(), a.payment_type as u16)
+                .cmp(&(b.currency.as_str(), b.payment_type as u16))
+        });
+        Ok(totals)
+    }
+}
+
+#[cfg(feature = "admin")]
+fn take_sorted<K: Ord, T>(mut rows: Vec<(K, T)>, limit: u64) -> (Vec<T>, u64) {
+    let total = rows.len() as u64;
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    (
+        rows.into_iter()
+            .take(limit as usize)
+            .map(|(_, row)| row)
+            .collect(),
+        total,
+    )
 }
 
 // Nostr trait implementation with stub methods
@@ -7017,8 +9215,10 @@ impl LNVPSNostrDb for MockDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Duration;
     use lnvps_db::{
-        AgentChannel, AgentMessageRole, IntervalType, LNVpsDbBase, SubscriptionPaymentType,
+        AgentChannel, AgentMessageRole, AppBackupMethod, IntervalType, LNVpsDbBase,
+        SubscriptionPaymentType,
     };
 
     fn user_msg(text: &str, channel: AgentChannel) -> NewAgentMessage {
@@ -7369,6 +9569,7 @@ mod tests {
             referral_rate: None,
             payout_threshold: None,
             created: Utc::now(),
+            auto_payout_approved: false,
         };
         let id_a = db.insert_referral(&mk("AAA")).await.unwrap();
         db.insert_referral(&mk("BBB")).await.unwrap();
@@ -7396,6 +9597,7 @@ mod tests {
             referral_rate: None,
             payout_threshold: None,
             created: Utc::now(),
+            auto_payout_approved: false,
         };
         let ref_id = db.insert_referral(&referral).await.unwrap();
 
@@ -7445,6 +9647,49 @@ mod tests {
         assert_eq!(vms[&3].ref_code.as_deref(), Some("OTHER"));
     }
 
+    #[cfg(feature = "admin")]
+    #[tokio::test]
+    async fn test_admin_referral_approval_and_vm_removal() {
+        use lnvps_db::{AdminDb, Referral};
+
+        let db = MockDb::default();
+        let id = db
+            .insert_referral(&Referral {
+                user_id: 1,
+                code: "REF".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(
+            !db.admin_get_referral(id)
+                .await
+                .unwrap()
+                .auto_payout_approved
+        );
+        db.admin_set_referral_auto_payout(id, true).await.unwrap();
+        assert!(
+            db.admin_get_referral(id)
+                .await
+                .unwrap()
+                .auto_payout_approved
+        );
+        assert!(db.admin_set_referral_auto_payout(99, true).await.is_err());
+
+        db.vms.lock().await.insert(
+            7,
+            Vm {
+                id: 7,
+                ref_code: Some("REF".to_string()),
+                ..MockDb::mock_vm()
+            },
+        );
+        assert!(!db.admin_remove_referred_vm("OTHER", 7).await.unwrap());
+        assert!(db.admin_remove_referred_vm("REF", 7).await.unwrap());
+        assert_eq!(db.vms.lock().await[&7].ref_code, None);
+        assert!(!db.admin_remove_referred_vm("REF", 7).await.unwrap());
+    }
+
     /// admin_list_referrals (pagination + code search) and admin_get_referral.
     #[cfg(feature = "admin")]
     #[tokio::test]
@@ -7461,6 +9706,7 @@ mod tests {
             referral_rate: None,
             payout_threshold: None,
             created: Utc::now(),
+            auto_payout_approved: false,
         };
         let id_a = db.insert_referral(&mk("ALPHA123")).await.unwrap();
         db.insert_referral(&mk("BETA456")).await.unwrap();
@@ -7966,6 +10212,32 @@ mod tests {
         );
     }
 
+    /// Regular subscription path: hour interval extends by N hours.
+    #[tokio::test]
+    async fn test_subscription_payment_paid_interval_hour() {
+        let db = MockDb::default();
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&1).unwrap();
+            sub.interval_amount = 3;
+            sub.interval_type = IntervalType::Hour;
+        }
+        let payment = make_payment(1, None);
+        db.insert_subscription_payment(&payment).await.unwrap();
+
+        let before = Utc::now();
+        db.subscription_payment_paid(&payment).await.unwrap();
+
+        let subs = db.subscriptions.lock().await;
+        let expires = subs.get(&1).unwrap().expires.unwrap();
+        assert!(
+            expires >= before + chrono::Duration::hours(3)
+                && expires <= before + chrono::Duration::hours(3) + chrono::Duration::minutes(1),
+            "expires {} not 3 hours out",
+            expires
+        );
+    }
+
     /// Regular subscription path: day interval extends by N days.
     #[tokio::test]
     async fn test_subscription_payment_paid_interval_day() {
@@ -8061,6 +10333,54 @@ mod tests {
         let host = db.get_host(vm.host_id).await.ok();
         let res = vm_to_status(&db, vm, host, None, 0, 365).await;
         assert!(res.is_err(), "expected error, not a panic");
+    }
+
+    #[tokio::test]
+    async fn test_vm_to_status_reports_waiting_for_ip_with_a_reason() {
+        use crate::model::vm_to_status;
+        use lnvps_db::{LNVpsDb, UserSshKey, VmIpWait};
+
+        let db = MockDb::default();
+        db.vms.lock().await.insert(1, MockDb::mock_vm());
+        db.insert_user_ssh_key(&UserSshKey {
+            id: 0,
+            name: "k".to_string(),
+            user_id: 1,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let wait = VmIpWait {
+            id: 0,
+            vm_id: 1,
+            region_id: 1,
+            ip4_needed: 1,
+            ip_order_id: None,
+            released: false,
+            created: Utc::now(),
+        };
+        db.insert_vm_ip_wait(&wait).await.unwrap();
+        let db: std::sync::Arc<dyn LNVpsDb> = std::sync::Arc::new(db);
+
+        let vm = db.get_vm(1).await.unwrap();
+        let host = db.get_host(vm.host_id).await.ok();
+        let waiting = vm_to_status(&db, vm.clone(), host.clone(), None, 0, 365)
+            .await
+            .unwrap();
+        assert_eq!(waiting.status.state, crate::VmRunningStates::WaitingForIp);
+        let json = serde_json::to_value(&waiting).unwrap();
+        assert_eq!(json["status"]["state"], "waitingforip");
+        assert!(
+            json["status_reason"]
+                .as_str()
+                .unwrap()
+                .contains("IP address")
+        );
+
+        db.set_vm_ip_wait_released(1, true).await.unwrap();
+        let released = vm_to_status(&db, vm, host, None, 0, 365).await.unwrap();
+        assert_ne!(released.status.state, crate::VmRunningStates::WaitingForIp);
+        assert!(released.status_reason.is_none());
     }
 
     /// A VM's captured host keys reach the customer parsed, and a VM with none
@@ -8783,6 +11103,8 @@ mod tests {
                 amount: 1000,
                 setup_amount: 0,
                 configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: None,
             },
         );
 
@@ -8896,6 +11218,8 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 },
             );
             db.vms.lock().await.insert(
@@ -8943,6 +11267,7 @@ mod tests {
             category: "Nostr relay".to_string(),
             seo_title: None,
             seo_description: None,
+            category_translations: None,
             compose: "services: {}".to_string(),
             amount: 1000,
             currency: "USD".to_string(),
@@ -9061,6 +11386,7 @@ mod tests {
             category: "Nostr relay".to_string(),
             seo_title: None,
             seo_description: None,
+            category_translations: None,
             compose: "services: {}".to_string(),
             amount: 1000,
             currency: "USD".to_string(),
@@ -9201,6 +11527,8 @@ mod tests {
                 capacity_cpu_milli: 100_000,
                 capacity_memory_bytes: 100u64 * 1024 * 1024 * 1024,
                 capacity_storage_bytes: 1024u64 * 1024 * 1024 * 1024,
+                dns_server_id: None,
+                dns_zone_id: None,
                 created: Utc::now(),
             })
             .await
@@ -9233,6 +11561,8 @@ mod tests {
                 capacity_cpu_milli: 100_000,
                 capacity_memory_bytes: 100u64 * 1024 * 1024 * 1024,
                 capacity_storage_bytes: 1024u64 * 1024 * 1024 * 1024,
+                dns_server_id: None,
+                dns_zone_id: None,
                 created: Utc::now(),
             })
             .await
@@ -9250,6 +11580,7 @@ mod tests {
             hostname: None,
             custom_domain: None,
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
@@ -9294,6 +11625,170 @@ mod tests {
         assert!(db.get_app_deployment(d1).await.unwrap().deleted);
     }
 
+    #[tokio::test]
+    async fn test_app_deployment_backup_crud() {
+        let db = MockDb::default();
+        let app_id = db.insert_app(&mk_app("relay")).await.unwrap();
+        let cluster_a = db.insert_app_cluster(&mk_cluster("a", 1)).await.unwrap();
+        let cluster_b = db.insert_app_cluster(&mk_cluster("b", 1)).await.unwrap();
+
+        let mk_dep = |cluster_id: u64, li: u64, name: &str| AppDeployment {
+            id: 0,
+            user_id: 1,
+            app_id,
+            cluster_id,
+            resource_multiplier: 1,
+            subscription_line_item_id: li,
+            name: name.to_string(),
+            namespace: format!("app-{name}"),
+            hostname: None,
+            custom_domain: None,
+            custom_domain_verified: false,
+            public_port: None,
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Running,
+            status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
+            created: Utc::now(),
+            deleted: false,
+        };
+        let here = db
+            .insert_app_deployment(&mk_dep(cluster_a, 10, "here"))
+            .await
+            .unwrap();
+        let elsewhere = db
+            .insert_app_deployment(&mk_dep(cluster_b, 11, "elsewhere"))
+            .await
+            .unwrap();
+
+        let mk_backup =
+            |deployment_id: u64, service: &str, scheduled: bool, created: DateTime<Utc>| {
+                AppDeploymentBackup {
+                    id: 0,
+                    deployment_id,
+                    run_id: "run-1".to_string(),
+                    service: service.to_string(),
+                    method: AppBackupMethod::Command,
+                    artifact: format!("{service}.sql.gz"),
+                    object_key: None,
+                    size_bytes: None,
+                    state: AppBackupState::Pending,
+                    message: None,
+                    scheduled,
+                    created,
+                    started: None,
+                    completed: None,
+                    deleted: false,
+                }
+            };
+
+        let older = Utc::now() - Duration::hours(2);
+        let db_backup = db
+            .insert_app_deployment_backup(&mk_backup(here, "db", true, older))
+            .await
+            .unwrap();
+        let blobs = db
+            .insert_app_deployment_backup(&mk_backup(here, "blobs", false, Utc::now()))
+            .await
+            .unwrap();
+        let other = db
+            .insert_app_deployment_backup(&mk_backup(elsewhere, "db", false, Utc::now()))
+            .await
+            .unwrap();
+
+        // Listed newest first, and scoped to the deployment.
+        let listed = db.list_app_deployment_backups(here).await.unwrap();
+        assert_eq!(
+            listed.iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![blobs, db_backup]
+        );
+
+        let (page, total) = db
+            .list_app_deployment_backups_paginated(here, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(
+            page.iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![db_backup]
+        );
+
+        // The operator only sees the backups on its own cluster.
+        let active = db
+            .list_active_app_deployment_backups(cluster_a)
+            .await
+            .unwrap();
+        assert_eq!(
+            active.iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![db_backup, blobs]
+        );
+        assert_eq!(
+            db.list_active_app_deployment_backups(cluster_b)
+                .await
+                .unwrap()
+                .iter()
+                .map(|b| b.id)
+                .collect::<Vec<_>>(),
+            vec![other]
+        );
+
+        // Progress write-back, and a completed backup drops out of the sweep.
+        let mut b = db.get_app_deployment_backup(db_backup).await.unwrap();
+        b.state = AppBackupState::Completed;
+        b.object_key = Some("deployments/1/run-1/db.sql.gz".to_string());
+        b.size_bytes = Some(4096);
+        b.completed = Some(Utc::now());
+        db.update_app_deployment_backup(&b).await.unwrap();
+        let reloaded = db.get_app_deployment_backup(db_backup).await.unwrap();
+        assert_eq!(reloaded.state, AppBackupState::Completed);
+        assert_eq!(reloaded.size_bytes, Some(4096));
+        assert_eq!(
+            db.list_active_app_deployment_backups(cluster_a)
+                .await
+                .unwrap()
+                .iter()
+                .map(|b| b.id)
+                .collect::<Vec<_>>(),
+            vec![blobs]
+        );
+
+        // Only scheduled runs answer "when did the schedule last run" — an
+        // on-demand backup must not push the automatic one back.
+        assert_eq!(
+            db.last_scheduled_app_deployment_backup(here).await.unwrap(),
+            Some(older)
+        );
+        assert_eq!(
+            db.last_scheduled_app_deployment_backup(elsewhere)
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Soft delete hides the row from both reads.
+        db.delete_app_deployment_backup(blobs).await.unwrap();
+        assert_eq!(
+            db.list_app_deployment_backups(here)
+                .await
+                .unwrap()
+                .iter()
+                .map(|b| b.id)
+                .collect::<Vec<_>>(),
+            vec![db_backup]
+        );
+        assert!(db.get_app_deployment_backup(blobs).await.is_err());
+        assert!(
+            db.list_active_app_deployment_backups(cluster_a)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     fn mk_cluster(name: &str, region_id: u64) -> AppCluster {
         AppCluster {
             id: 0,
@@ -9304,6 +11799,8 @@ mod tests {
             capacity_cpu_milli: 100_000,
             capacity_memory_bytes: 100u64 * 1024 * 1024 * 1024,
             capacity_storage_bytes: 1024u64 * 1024 * 1024 * 1024,
+            dns_server_id: None,
+            dns_zone_id: None,
             created: Utc::now(),
         }
     }
@@ -9437,6 +11934,7 @@ mod tests {
             hostname: Some(format!("{name}.apps.example.com")),
             custom_domain: None,
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
@@ -9635,6 +12133,8 @@ mod tests {
                 amount: 1000,
                 setup_amount: 0,
                 configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: None,
             })
             .await
             .unwrap();
@@ -9667,6 +12167,7 @@ mod tests {
                 hostname: None,
                 custom_domain: None,
                 custom_domain_verified: false,
+                public_port: None,
                 config: None,
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
@@ -9721,6 +12222,7 @@ mod tests {
                 hostname: None,
                 custom_domain: None,
                 custom_domain_verified: false,
+                public_port: None,
                 config: None,
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
@@ -9780,6 +12282,7 @@ mod tests {
                 hostname: None,
                 custom_domain: None,
                 custom_domain_verified: false,
+                public_port: None,
                 config: None,
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
@@ -9830,6 +12333,8 @@ mod tests {
                 capacity_cpu_milli: 1500,
                 capacity_memory_bytes: 3 * 512 * 1024 * 1024,
                 capacity_storage_bytes: 3 * 1024 * 1024 * 1024,
+                dns_server_id: None,
+                dns_zone_id: None,
                 created: Utc::now(),
             })
             .await
@@ -9856,6 +12361,7 @@ mod tests {
             hostname: None,
             custom_domain: None,
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
@@ -9917,6 +12423,7 @@ pub struct MockDnsServer {
     /// When set, `add_record` fails for records whose kind matches (e.g. "PTR",
     /// "A", "AAAA") or "*" for all. Used to simulate DNS provider failures.
     fail_kind: Arc<Mutex<Option<String>>>,
+    fail_delete: Arc<Mutex<bool>>,
 }
 
 pub struct MockDnsEntry {
@@ -9939,11 +12446,17 @@ impl MockDnsServer {
             static TL_ZONES: Arc<Mutex<HashMap<String, HashMap<String, MockDnsEntry>>>> =
                 Arc::new(Mutex::new(HashMap::new()));
             static TL_FAIL: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+            static TL_FAIL_DELETE: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         }
         Self {
             zones: TL_ZONES.with(|z| z.clone()),
             fail_kind: TL_FAIL.with(|f| f.clone()),
+            fail_delete: TL_FAIL_DELETE.with(|f| f.clone()),
         }
+    }
+
+    pub async fn fail_deletes(fail: bool) {
+        *Self::new().fail_delete.lock().await = fail;
     }
 
     /// Make `add_record` fail for records of the given kind ("A", "AAAA",
@@ -9960,6 +12473,7 @@ impl MockDnsServer {
     pub async fn reset() {
         Self::new().zones.lock().await.clear();
         *Self::new().fail_kind.lock().await = None;
+        *Self::new().fail_delete.lock().await = false;
     }
 }
 
@@ -10010,6 +12524,7 @@ impl crate::dns::DnsServer for MockDnsServer {
         Ok(BasicRecord {
             name: match record.kind {
                 RecordType::PTR => format!("{}.X.Y.Z.addr.in-arpa", record.name),
+                RecordType::SRV => record.name.clone(),
                 _ => format!("{}.lnvps.mock", record.name),
             },
             value: record.value.clone(),
@@ -10021,6 +12536,11 @@ impl crate::dns::DnsServer for MockDnsServer {
     }
 
     async fn delete_record(&self, record: &BasicRecord) -> OpResult<()> {
+        if *self.fail_delete.lock().await {
+            return Err(OpError::Fatal(anyhow::anyhow!(
+                "Injected DNS delete failure"
+            )));
+        }
         let zone_id = record
             .zone
             .as_id()
@@ -10073,6 +12593,39 @@ impl crate::dns::DnsServer for MockDnsServer {
             id: "mock-zone-id".to_string(),
             name: "mock.example.com".to_string(),
         }])
+    }
+
+    async fn list_records(&self, zone: &DnsRef) -> OpResult<Vec<BasicRecord>> {
+        let Some(zone_id) = zone.as_id() else {
+            return Ok(vec![]);
+        };
+        let zones = self.zones.lock().await;
+        Ok(zones
+            .get(zone_id)
+            .map(|t| {
+                t.iter()
+                    .map(|(id, e)| {
+                        let kind = match e.kind.as_str() {
+                            "A" => RecordType::A,
+                            "AAAA" => RecordType::AAAA,
+                            "SRV" => RecordType::SRV,
+                            _ => RecordType::PTR,
+                        };
+                        BasicRecord {
+                            name: e.name.clone(),
+                            value: e.value.clone(),
+                            id: Some(DnsRef::Id(id.clone())),
+                            ip: match kind {
+                                RecordType::PTR | RecordType::SRV => String::new(),
+                                _ => e.value.clone(),
+                            },
+                            kind,
+                            zone: zone.clone(),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 }
 
@@ -10140,6 +12693,8 @@ mod marketplace_tests {
                 amount: *amount,
                 setup_amount: *setup_amount,
                 configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: None,
             })
             .collect();
         let (sub_id, _) = db
@@ -10819,6 +13374,44 @@ mod marketplace_tests {
         // A tunnel cannot be allocated to a user who does not exist.
         assert!(db.insert_tunnel(&tunnel(999, "wg-ghost")).await.is_err());
     }
+
+    /// A caller-supplied `created` is ignored, as the real insert ignores it.
+    ///
+    /// MySQL takes the column's `DEFAULT CURRENT_TIMESTAMP` because the insert
+    /// never names it. A mock that honoured the field would let a test backdate
+    /// a health row to exercise trend or retention logic and pass, while the
+    /// real database could not reproduce it.
+    #[tokio::test]
+    async fn a_health_rows_created_time_is_its_own() {
+        let db = MockDb::default();
+        let u = user(&db, 1).await;
+        let op = db.insert_marketplace_operator(&operator(u)).await.unwrap();
+        let node_id = db.insert_marketplace_node(&node(op, "a")).await.unwrap();
+
+        let backdated = Utc::now() - chrono::Duration::days(30);
+        db.insert_marketplace_node_health(&MarketplaceNodeHealth {
+            id: 0,
+            node_id,
+            created: backdated,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let (rows, _) = db
+            .list_marketplace_node_health(node_id, 1, 0)
+            .await
+            .unwrap();
+        let created = rows.first().unwrap().created;
+        assert!(
+            created > backdated,
+            "the caller's timestamp must not be stored"
+        );
+        assert!(
+            Utc::now() - created < chrono::Duration::minutes(1),
+            "created should be now, got {created}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -11418,18 +14011,57 @@ mod vpn_tests {
 
     /// A service with a block, and a paid plan on it, which is the starting
     /// point for everything below.
-    async fn vpn_service(db: &MockDb) -> u64 {
+    /// A service and the one interface terminating it.
+    ///
+    /// The interface is not optional scenery: a device is a peer *on* an
+    /// interface, so a service with none has no peers to allocate and no block
+    /// to allocate them from.
+    async fn vpn_service(db: &MockDb) -> (u64, u64) {
         let company_id = a_company(db).await;
-        db.insert_vpn_service(&VpnService {
-            name: "eu".to_string(),
-            company_id,
-            currency: "EUR".to_string(),
-            default_device_limit: 5,
-            enabled: true,
-            ..Default::default()
-        })
-        .await
-        .unwrap()
+        let service = db
+            .insert_vpn_service(&VpnService {
+                name: "eu".to_string(),
+                company_id,
+                currency: "EUR".to_string(),
+                default_device_limit: 5,
+                enabled: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let router_id = {
+            let mut routers = db.router.lock().await;
+            let id = routers.keys().max().copied().unwrap_or(0) + 1;
+            routers.insert(
+                id,
+                Router {
+                    id,
+                    name: format!("rs{id}"),
+                    enabled: true,
+                    kind: lnvps_db::RouterKind::MockRouter,
+                    url: "mock://rs".to_string(),
+                    token: "t".into(),
+                },
+            );
+            id
+        };
+        let pool = db
+            .insert_tunnel_pool(&TunnelPool {
+                router_id,
+                region_id: 1,
+                name: "eu-1".to_string(),
+                listen_addr: "rs.example".to_string(),
+                listen_port: 51820 + service as u16,
+                public_key: vec![0x33; 32],
+                cidr4: Some("10.64.0.0/24".to_string()),
+                mtu: 1420,
+                enabled: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.link_vpn_service_pool(service, pool).await.unwrap();
+        (service, pool)
     }
 
     /// A subscription line item in the given billing state, for a fresh user.
@@ -11470,6 +14102,8 @@ mod vpn_tests {
                     amount: 500,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -11491,33 +14125,25 @@ mod vpn_tests {
     }
 
     /// A device is a link from a plan to a peer, so a peer has to exist first.
-    async fn device(db: &MockDb, plan: u64, slot: u8, seed: u8) -> VpnDevice {
-        let user_id = db
-            .vpn_subscriptions
-            .lock()
-            .await
-            .get(&plan)
-            .map(|p| p.user_id)
-            .unwrap_or(1);
-        let tunnel_id = db
-            .insert_tunnel(&Tunnel {
-                kind: lnvps_db::RouterTunnelKind::Wireguard,
-                user_id,
-                name: format!("vpn-{plan}-{slot}"),
-                peer_pubkey: Some(vec![seed; 32]),
-                address4: Some(format!("10.64.0.{seed}/32")),
-                enabled: true,
+    /// Register a device, letting the database fan its peer out over every
+    /// interface the service terminates.
+    async fn device(db: &MockDb, plan: u64, slot: u8, seed: u8) -> DbResult<u64> {
+        db.insert_vpn_device_with_peers(
+            &VpnDevice {
+                vpn_subscription_id: plan,
+                slot,
+                name: format!("device-{seed}"),
                 ..Default::default()
-            })
-            .await
-            .unwrap();
-        VpnDevice {
-            vpn_subscription_id: plan,
-            slot,
-            name: format!("device-{seed}"),
-            tunnel_id,
-            ..Default::default()
-        }
+            },
+            &VpnPeerTemplate {
+                user_id: 1,
+                name: format!("device-{seed}"),
+                peer_pubkey: vec![seed; 32],
+                address4: Some(format!("10.64.0.{seed}/32")),
+                address6: None,
+            },
+        )
+        .await
     }
 
     /// A service has no block of its own: a device is addressed from the block
@@ -11527,7 +14153,7 @@ mod vpn_tests {
     #[tokio::test]
     async fn every_interface_on_a_service_shares_one_block() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
 
         let mut pools = db.tunnel_pools.lock().await;
         for (id, cidr) in [
@@ -11574,7 +14200,7 @@ mod vpn_tests {
     #[tokio::test]
     async fn a_service_can_be_taken_off_sale() {
         let db = MockDb::default();
-        let id = vpn_service(&db).await;
+        let (id, _pool) = vpn_service(&db).await;
         assert_eq!(db.list_vpn_services(true).await.unwrap().len(), 1);
 
         let mut svc = db.get_vpn_service(id).await.unwrap();
@@ -11591,7 +14217,7 @@ mod vpn_tests {
     #[tokio::test]
     async fn a_vpn_service_in_use_cannot_be_deleted() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
 
         let plan = paid_plan(&db, 1, service).await;
         assert!(
@@ -11636,32 +14262,43 @@ mod vpn_tests {
     #[tokio::test]
     async fn an_interface_terminates_at_most_one_service() {
         let db = MockDb::default();
-        let a = vpn_service(&db).await;
-        let b = db
-            .insert_vpn_service(&VpnService {
-                name: "b".to_string(),
-                company_id: a_company(&db).await,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        for id in [1u64, 2] {
+        // Bare services, not the `vpn_service` fixture: that links an interface
+        // of its own, and this test is about which interfaces end up linked.
+        let company_id = a_company(&db).await;
+        let mut bare = Vec::new();
+        for name in ["a", "b"] {
+            bare.push(
+                db.insert_vpn_service(&VpnService {
+                    name: name.to_string(),
+                    company_id,
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            );
+        }
+        let (a, b) = (bare[0], bare[1]);
+        for id in [90u64, 91] {
             db.tunnel_pools.lock().await.insert(
                 id,
                 TunnelPool {
                     id,
+                    // The same block the fixture's interfaces carry: every
+                    // interface on a service shares one, so a block-less pool
+                    // is refused by the rule this test is not about.
+                    cidr4: Some("10.64.0.0/24".to_string()),
                     ..Default::default()
                 },
             );
         }
 
         // An unlinked pool is a marketplace pool and behaves as it always has.
-        assert!(db.get_vpn_service_for_pool(1).await.unwrap().is_none());
+        assert!(db.get_vpn_service_for_pool(90).await.unwrap().is_none());
 
-        db.link_vpn_service_pool(a, 1).await.unwrap();
-        db.link_vpn_service_pool(a, 2).await.unwrap();
+        db.link_vpn_service_pool(a, 90).await.unwrap();
+        db.link_vpn_service_pool(a, 91).await.unwrap();
         assert_eq!(
-            db.get_vpn_service_for_pool(1).await.unwrap().map(|s| s.id),
+            db.get_vpn_service_for_pool(90).await.unwrap().map(|s| s.id),
             Some(a)
         );
         assert_eq!(
@@ -11671,14 +14308,14 @@ mod vpn_tests {
                 .iter()
                 .map(|p| p.id)
                 .collect::<Vec<_>>(),
-            vec![1, 2],
+            vec![90, 91],
             "every interface on a service carries the same device peer set"
         );
 
         // Repointing replaces the link rather than adding a second one.
-        db.link_vpn_service_pool(b, 2).await.unwrap();
+        db.link_vpn_service_pool(b, 91).await.unwrap();
         assert_eq!(
-            db.get_vpn_service_for_pool(2).await.unwrap().map(|s| s.id),
+            db.get_vpn_service_for_pool(91).await.unwrap().map(|s| s.id),
             Some(b)
         );
         assert_eq!(
@@ -11688,7 +14325,7 @@ mod vpn_tests {
                 .iter()
                 .map(|p| p.id)
                 .collect::<Vec<_>>(),
-            vec![1]
+            vec![90]
         );
 
         // Neither side may be invented.
@@ -11705,7 +14342,7 @@ mod vpn_tests {
     #[tokio::test]
     async fn one_vpn_plan_per_account() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
         let plan = paid_plan(&db, 1, service).await;
 
         let stored = db.get_vpn_subscription(plan).await.unwrap();
@@ -11770,7 +14407,7 @@ mod vpn_tests {
     #[tokio::test]
     async fn a_vpn_plan_is_repointed_not_moved() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
         let other_service = db
             .insert_vpn_service(&VpnService {
                 name: "other".to_string(),
@@ -11817,51 +14454,21 @@ mod vpn_tests {
     #[tokio::test]
     async fn a_device_slot_cannot_be_claimed_twice() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
         let plan = paid_plan(&db, 1, service).await;
 
-        db.insert_vpn_device(&device(&db, plan, 0, 1).await)
-            .await
-            .unwrap();
+        device(&db, plan, 0, 1).await.unwrap();
         assert!(
-            db.insert_vpn_device(&device(&db, plan, 0, 2).await)
-                .await
-                .is_err(),
+            device(&db, plan, 0, 2).await.is_err(),
             "two devices in one slot is a sixth device on a five-device plan"
-        );
-
-        // A tunnel terminates one peer, so two devices cannot share one.
-        let first = db.list_vpn_devices(plan).await.unwrap()[0].clone();
-        assert!(
-            db.insert_vpn_device(&VpnDevice {
-                slot: 1,
-                tunnel_id: first.tunnel_id,
-                ..device(&db, plan, 1, 3).await
-            })
-            .await
-            .is_err()
         );
 
         // The slot is per plan, so another customer's slot 0 is free.
         let other = paid_plan(&db, 2, service).await;
-        db.insert_vpn_device(&device(&db, other, 0, 6).await)
-            .await
-            .unwrap();
+        device(&db, other, 0, 6).await.unwrap();
 
         // Neither a plan nor a peer may be invented.
-        assert!(
-            db.insert_vpn_device(&device(&db, 9999, 0, 7).await)
-                .await
-                .is_err()
-        );
-        assert!(
-            db.insert_vpn_device(&VpnDevice {
-                tunnel_id: 9999,
-                ..device(&db, plan, 2, 8).await
-            })
-            .await
-            .is_err()
-        );
+        assert!(device(&db, 9999, 0, 7).await.is_err());
     }
 
     /// Suspension is not a write. A plan that is unpaid, deactivated or expired
@@ -11871,12 +14478,10 @@ mod vpn_tests {
     #[tokio::test]
     async fn only_paid_plans_are_configured() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
 
         let paid = paid_plan(&db, 1, service).await;
-        db.insert_vpn_device(&device(&db, paid, 0, 1).await)
-            .await
-            .unwrap();
+        device(&db, paid, 0, 1).await.unwrap();
 
         // Never paid.
         let (uid, item) = billed_line_item(&db, 2, true, false, None).await;
@@ -11889,9 +14494,7 @@ mod vpn_tests {
             })
             .await
             .unwrap();
-        db.insert_vpn_device(&device(&db, unpaid, 0, 2).await)
-            .await
-            .unwrap();
+        device(&db, unpaid, 0, 2).await.unwrap();
 
         // Paid once, then lapsed.
         let (uid, item) =
@@ -11905,9 +14508,7 @@ mod vpn_tests {
             })
             .await
             .unwrap();
-        db.insert_vpn_device(&device(&db, expired, 0, 3).await)
-            .await
-            .unwrap();
+        device(&db, expired, 0, 3).await.unwrap();
 
         // Cancelled by an admin.
         let (uid, item) = billed_line_item(&db, 4, false, true, None).await;
@@ -11920,11 +14521,9 @@ mod vpn_tests {
             })
             .await
             .unwrap();
-        db.insert_vpn_device(&device(&db, cancelled, 0, 4).await)
-            .await
-            .unwrap();
+        device(&db, cancelled, 0, 4).await.unwrap();
 
-        let active = db.list_active_vpn_tunnels(service).await.unwrap();
+        let active = db.list_active_vpn_tunnels_in_pool(pool).await.unwrap();
         assert_eq!(
             active
                 .iter()
@@ -11940,14 +14539,19 @@ mod vpn_tests {
         t.enabled = false;
         db.update_tunnel(&t).await.unwrap();
         assert!(
-            db.list_active_vpn_tunnels(service)
+            db.list_active_vpn_tunnels_in_pool(pool)
                 .await
                 .unwrap()
                 .is_empty()
         );
 
         // And another service's peers are not this one's.
-        assert!(db.list_active_vpn_tunnels(9999).await.unwrap().is_empty());
+        assert!(
+            db.list_active_vpn_tunnels_in_pool(9999)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// A device row carries only the customer's label; its slot, its plan and
@@ -11955,20 +14559,23 @@ mod vpn_tests {
     #[tokio::test]
     async fn renaming_a_device_leaves_everything_else_alone() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
         let plan = paid_plan(&db, 1, service).await;
-        let id = db
-            .insert_vpn_device(&device(&db, plan, 0, 1).await)
-            .await
-            .unwrap();
+        let id = device(&db, plan, 0, 1).await.unwrap();
         let before = db.get_vpn_device(id).await.unwrap();
+        let peers_before: Vec<u64> = db
+            .list_vpn_device_tunnels(id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
 
         db.update_vpn_device(&VpnDevice {
             id,
             vpn_subscription_id: 9999,
             slot: 4,
             name: "laptop".to_string(),
-            tunnel_id: 9999,
             created: Utc::now(),
         })
         .await
@@ -11976,7 +14583,14 @@ mod vpn_tests {
 
         let after = db.get_vpn_device(id).await.unwrap();
         assert_eq!(after.name, "laptop");
-        assert_eq!(after.tunnel_id, before.tunnel_id, "the peer must not move");
+        let peers_after: Vec<u64> = db
+            .list_vpn_device_tunnels(id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(peers_after, peers_before, "the peers must not move");
         assert_eq!(after.slot, before.slot);
         assert_eq!(after.vpn_subscription_id, before.vpn_subscription_id);
         assert_eq!(after.created, before.created);
@@ -11999,9 +14613,7 @@ mod vpn_tests {
 
         // Listing is in slot order, and includes devices whose peer is disabled
         // because a disabled peer still owns its slot and its address.
-        db.insert_vpn_device(&device(&db, plan, 1, 7).await)
-            .await
-            .unwrap();
+        device(&db, plan, 1, 7).await.unwrap();
         let listed = db.list_vpn_devices(plan).await.unwrap();
         assert_eq!(
             listed.iter().map(|d| d.slot).collect::<Vec<_>>(),
@@ -12021,18 +14633,20 @@ mod vpn_tests {
     #[tokio::test]
     async fn tunnel_routes_are_replaced_not_merged() {
         let db = MockDb::default();
-        let service = vpn_service(&db).await;
+        let (service, pool) = vpn_service(&db).await;
         let plan = paid_plan(&db, 1, service).await;
-        let d = device(&db, plan, 0, 1).await;
-        db.insert_vpn_device(&d).await.unwrap();
+        let device_id = device(&db, plan, 0, 1).await.unwrap();
+        // Routes hang off a peer, and a device has one per interface; this
+        // service has a single interface, so it has a single peer.
+        let peer = db.list_vpn_device_tunnels(device_id).await.unwrap()[0].id;
 
         db.replace_tunnel_routes(
-            d.tunnel_id,
+            peer,
             &["203.0.113.0/24".to_string(), "198.51.100.5/32".to_string()],
         )
         .await
         .unwrap();
-        let routes = db.list_tunnel_routes(&[d.tunnel_id]).await.unwrap();
+        let routes = db.list_tunnel_routes(&[peer]).await.unwrap();
         assert_eq!(
             routes.iter().map(|r| r.prefix.as_str()).collect::<Vec<_>>(),
             vec!["198.51.100.5/32", "203.0.113.0/24"]
@@ -12040,24 +14654,558 @@ mod vpn_tests {
 
         // Replacing with a shorter set drops what is no longer behind the peer,
         // which is what stops a released address staying routed.
-        db.replace_tunnel_routes(d.tunnel_id, &["203.0.113.0/24".to_string()])
+        db.replace_tunnel_routes(peer, &["203.0.113.0/24".to_string()])
             .await
             .unwrap();
-        assert_eq!(
-            db.list_tunnel_routes(&[d.tunnel_id]).await.unwrap().len(),
-            1
-        );
+        assert_eq!(db.list_tunnel_routes(&[peer]).await.unwrap().len(), 1);
 
-        db.replace_tunnel_routes(d.tunnel_id, &[]).await.unwrap();
-        assert!(
-            db.list_tunnel_routes(&[d.tunnel_id])
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        db.replace_tunnel_routes(peer, &[]).await.unwrap();
+        assert!(db.list_tunnel_routes(&[peer]).await.unwrap().is_empty());
 
         // Nothing to fetch for a peer nobody asked about, and no such peer.
         assert!(db.list_tunnel_routes(&[]).await.unwrap().is_empty());
         assert!(db.replace_tunnel_routes(9999, &[]).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod account_credit_tests {
+    use super::*;
+    use lnvps_db::{AccountCreditDebit, AccountCreditTopup, LNVpsDbBase};
+
+    fn hold(user_id: u64, amount: u64, expires_in: i64) -> AccountCreditDebit {
+        AccountCreditDebit {
+            user_id,
+            amount,
+            currency: "BTC".to_string(),
+            payment_amount: amount / 10,
+            expires: Utc::now() + TimeDelta::seconds(expires_in),
+            ..Default::default()
+        }
+    }
+
+    async fn ledger_sum(db: &MockDb, user_id: u64) -> i64 {
+        let (events, _) = db
+            .list_account_credit_events(user_id, 1000, 0)
+            .await
+            .unwrap();
+        events.iter().map(|e| e.amount).sum()
+    }
+
+    #[tokio::test]
+    async fn get_credit_returns_zero_row_for_unknown_user() {
+        let db = MockDb::default();
+        let row = db.get_account_credit(42, "BTC").await.unwrap();
+        assert_eq!(row.user_id, 42);
+        assert_eq!(row.balance, 0);
+        assert_eq!(row.currency, "BTC");
+        assert!(!row.auto_apply);
+    }
+
+    #[tokio::test]
+    async fn set_auto_apply_keeps_the_balance() {
+        let db = MockDb::default();
+        db.adjust_account_credit(7, "BTC", 500, "topup", None)
+            .await
+            .unwrap();
+        db.set_account_credit_auto_apply(7, true).await.unwrap();
+        let row = db.get_account_credit(7, "BTC").await.unwrap();
+        assert!(row.auto_apply);
+        assert_eq!(row.balance, 500);
+        db.set_account_credit_auto_apply(7, false).await.unwrap();
+        let row = db.get_account_credit(7, "BTC").await.unwrap();
+        assert!(!row.auto_apply);
+        assert_eq!(row.balance, 500);
+    }
+
+    #[tokio::test]
+    async fn ledger_is_signed_and_sums_to_the_balance() {
+        let db = MockDb::default();
+        db.adjust_account_credit(1, "BTC", 1000, "topup", None)
+            .await
+            .unwrap();
+        db.adjust_account_credit(1, "BTC", -300, "admin", Some("clawback"))
+            .await
+            .unwrap();
+        let id = db
+            .reserve_account_credit(&hold(1, 200, 600))
+            .await
+            .unwrap()
+            .unwrap();
+        db.attach_account_credit_debit(id, &vec![1u8; 32], Utc::now() + TimeDelta::minutes(10))
+            .await
+            .unwrap();
+        db.settle_account_credit_debit(&vec![1u8; 32])
+            .await
+            .unwrap();
+
+        let (events, total) = db.list_account_credit_events(1, 10, 0).await.unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(
+            events
+                .iter()
+                .map(|e| (e.kind.as_str(), e.amount))
+                .collect::<Vec<_>>(),
+            vec![("spend", -200), ("admin", -300), ("topup", 1000)]
+        );
+        assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 500);
+        assert_eq!(ledger_sum(&db, 1).await, 500);
+    }
+
+    #[tokio::test]
+    async fn ledger_is_paginated_newest_first() {
+        let db = MockDb::default();
+        for i in 1..=5 {
+            db.adjust_account_credit(1, "BTC", i * 100, "topup", None)
+                .await
+                .unwrap();
+        }
+        db.adjust_account_credit(2, "BTC", 1, "topup", None)
+            .await
+            .unwrap();
+
+        let (page, total) = db.list_account_credit_events(1, 3, 0).await.unwrap();
+        assert_eq!(total, 5);
+        assert_eq!(page.len(), 3);
+        assert!(page[0].id > page[1].id && page[1].id > page[2].id);
+        let (page2, _) = db.list_account_credit_events(1, 3, 3).await.unwrap();
+        assert_eq!(page2.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_reservation_holds_credit_until_it_expires() {
+        let db = MockDb::default();
+        db.adjust_account_credit(1, "BTC", 1000, "topup", None)
+            .await
+            .unwrap();
+
+        assert!(
+            db.reserve_account_credit(&hold(1, 700, 600))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(db.get_account_credit_reserved(1, "BTC").await.unwrap(), 700);
+        assert!(
+            db.reserve_account_credit(&hold(1, 700, 600))
+                .await
+                .unwrap()
+                .is_none(),
+            "the same credit cannot be promised twice"
+        );
+        assert!(
+            db.reserve_account_credit(&hold(1, 300, 600))
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let other = MockDb::default();
+        other
+            .adjust_account_credit(1, "BTC", 1000, "topup", None)
+            .await
+            .unwrap();
+        other
+            .reserve_account_credit(&hold(1, 700, -1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            other.get_account_credit_reserved(1, "BTC").await.unwrap(),
+            0
+        );
+        assert!(
+            other
+                .reserve_account_credit(&hold(1, 1000, 600))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_released_reservation_frees_the_credit() {
+        let db = MockDb::default();
+        db.adjust_account_credit(1, "BTC", 1000, "topup", None)
+            .await
+            .unwrap();
+        let id = db
+            .reserve_account_credit(&hold(1, 1000, 600))
+            .await
+            .unwrap()
+            .unwrap();
+        db.release_account_credit_debit(id).await.unwrap();
+        assert_eq!(db.get_account_credit_reserved(1, "BTC").await.unwrap(), 0);
+        assert!(
+            db.reserve_account_credit(&hold(1, 1000, 600))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_moves_the_balance_once() {
+        let db = MockDb::default();
+        db.adjust_account_credit(1, "BTC", 1000, "topup", None)
+            .await
+            .unwrap();
+        let pid = vec![1u8; 32];
+        let id = db
+            .reserve_account_credit(&hold(1, 400, 600))
+            .await
+            .unwrap()
+            .unwrap();
+        db.attach_account_credit_debit(id, &pid, Utc::now() + TimeDelta::minutes(10))
+            .await
+            .unwrap();
+        let row = db
+            .get_account_credit_debit_by_payment(&pid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!row.settled);
+
+        let settled = db.settle_account_credit_debit(&pid).await.unwrap().unwrap();
+        assert_eq!(settled.amount, 400);
+        assert!(settled.settled);
+        assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 600);
+        assert_eq!(db.get_account_credit_reserved(1, "BTC").await.unwrap(), 0);
+
+        assert!(
+            db.settle_account_credit_debit(&pid)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 600);
+        assert!(
+            db.settle_account_credit_debit(&vec![2u8; 32])
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_settle_cannot_take_credit_promised_to_a_live_order() {
+        let db = MockDb::default();
+        db.adjust_account_credit(1, "BTC", 1000, "topup", None)
+            .await
+            .unwrap();
+        let late = vec![1u8; 32];
+        let id = db
+            .reserve_account_credit(&hold(1, 800, 600))
+            .await
+            .unwrap()
+            .unwrap();
+        db.attach_account_credit_debit(id, &late, Utc::now() - TimeDelta::seconds(1))
+            .await
+            .unwrap();
+        db.reserve_account_credit(&hold(1, 700, 600))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let settled = db
+            .settle_account_credit_debit(&late)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(settled.amount, 300, "only what the live order left over");
+        assert_eq!(settled.payment_amount, 30, "payment figure scaled with it");
+        assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 700);
+        assert_eq!(ledger_sum(&db, 1).await, 700);
+    }
+
+    #[tokio::test]
+    async fn a_clawback_cannot_take_reserved_credit() {
+        let db = MockDb::default();
+        db.adjust_account_credit(1, "BTC", 1000, "topup", None)
+            .await
+            .unwrap();
+        db.reserve_account_credit(&hold(1, 600, 600))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            db.adjust_account_credit(1, "BTC", -401, "admin", None)
+                .await
+                .is_err()
+        );
+        assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 1000);
+        let row = db
+            .adjust_account_credit(1, "BTC", -400, "admin", None)
+            .await
+            .unwrap();
+        assert_eq!(row.balance, 600);
+        assert_eq!(
+            db.adjust_account_credit(1, "BTC", 0, "admin", None)
+                .await
+                .unwrap()
+                .balance,
+            600
+        );
+    }
+
+    #[tokio::test]
+    async fn settle_topup_increases_balance_and_is_idempotent() {
+        let db = MockDb::default();
+        let hash = vec![5u8; 32];
+        let id = db
+            .insert_account_credit_topup(&AccountCreditTopup {
+                user_id: 1,
+                amount: 2500,
+                currency: "BTC".to_string(),
+                invoice_hash: hash.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let found = db
+            .get_account_credit_topup_by_hash(&hash)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, id);
+        assert!(!found.is_paid);
+        assert!(
+            db.get_account_credit_topup_by_hash(&vec![6u8; 32])
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let settled = db
+            .settle_account_credit_topup(id, "BTC", 2500)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(settled.is_paid);
+        assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 2500);
+        assert_eq!(ledger_sum(&db, 1).await, 2500);
+
+        assert!(
+            db.settle_account_credit_topup(id, "BTC", 2500)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(db.get_account_credit(1, "BTC").await.unwrap().balance, 2500);
+        assert!(
+            db.settle_account_credit_topup(9999, "BTC", 1)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn topup_history_is_paginated_per_user() {
+        let db = MockDb::default();
+        for i in 0..3 {
+            db.insert_account_credit_topup(&AccountCreditTopup {
+                user_id: 1,
+                amount: i + 1,
+                invoice_hash: vec![i as u8; 32],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        db.insert_account_credit_topup(&AccountCreditTopup {
+            user_id: 2,
+            amount: 99,
+            invoice_hash: vec![9u8; 32],
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let (page, total) = db.list_account_credit_topups(1, 2, 0).await.unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(page.len(), 2);
+        assert!(page[0].id > page[1].id);
+        let (rest, _) = db.list_account_credit_topups(1, 2, 2).await.unwrap();
+        assert_eq!(rest.len(), 1);
+    }
+
+    #[cfg(feature = "admin")]
+    #[tokio::test]
+    async fn swap_order_clients_filter_by_user_and_order() {
+        use lnvps_db::AdminDb;
+        let db = MockDb::default();
+        for (user_id, order) in [(1u64, "A"), (2, "B"), (1, "C")] {
+            db.insert_swap_order_client(&lnvps_db::SwapOrderClient {
+                user_id,
+                order_id: order.to_string(),
+                payment_id: vec![user_id as u8],
+                coin: "XMR".to_string(),
+                ip: Some("203.0.113.7".to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        let (all, total) = db
+            .admin_list_swap_order_clients(10, 0, None, None)
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(all[0].order_id, "C");
+        let (mine, total) = db
+            .admin_list_swap_order_clients(10, 0, Some(1), None)
+            .await
+            .unwrap();
+        assert_eq!(total, 2);
+        assert!(mine.iter().all(|r| r.user_id == 1));
+        let (one, total) = db
+            .admin_list_swap_order_clients(10, 0, None, Some("B"))
+            .await
+            .unwrap();
+        assert_eq!((one.len(), total), (1, 1));
+        let (page, total) = db
+            .admin_list_swap_order_clients(1, 1, None, None)
+            .await
+            .unwrap();
+        assert_eq!((page.len(), total), (1, 3));
+    }
+
+    #[tokio::test]
+    async fn swap_order_client_rejects_a_duplicate_order() {
+        let db = MockDb::default();
+        let record = lnvps_db::SwapOrderClient {
+            user_id: 1,
+            order_id: "A".to_string(),
+            ..Default::default()
+        };
+        db.insert_swap_order_client(&record).await.unwrap();
+        assert!(db.insert_swap_order_client(&record).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn purge_removes_only_swap_order_clients_past_the_cutoff() {
+        let db = MockDb::default();
+        let old = Utc::now() - chrono::Duration::days(400);
+        let recent = Utc::now() - chrono::Duration::days(30);
+        {
+            let mut rows = db.swap_order_clients.lock().await;
+            for (id, order, created) in [(1u64, "OLD", old), (2, "NEW", recent)] {
+                rows.push(lnvps_db::SwapOrderClient {
+                    id,
+                    order_id: order.to_string(),
+                    created,
+                    ..Default::default()
+                });
+            }
+        }
+        assert_eq!(db.purge_swap_order_clients(395).await.unwrap(), 1);
+        let rows = db.swap_order_clients.lock().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].order_id, "NEW");
+    }
+
+    fn aged_case(
+        id: u64,
+        kind: lnvps_db::AbuseCaseKind,
+        closed_days_ago: Option<i64>,
+        proceedings: bool,
+    ) -> lnvps_db::AbuseCase {
+        let closed = closed_days_ago.map(|d| Utc::now() - chrono::Duration::days(d));
+        lnvps_db::AbuseCase {
+            id,
+            kind,
+            proceedings_started: proceedings,
+            created: closed.unwrap_or_else(Utc::now) - chrono::Duration::days(1),
+            closed_at: closed,
+            summary: "s".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn abuse_cases_are_purged_a_year_after_closing_and_open_ones_are_kept() {
+        use lnvps_db::AbuseCaseKind::Abuse;
+        let db = MockDb::default();
+        {
+            let mut rows = db.abuse_cases.lock().await;
+            rows.push(aged_case(1, Abuse, Some(400), false));
+            rows.push(aged_case(2, Abuse, Some(300), false));
+            rows.push(aged_case(3, Abuse, None, false));
+        }
+        assert_eq!(db.purge_abuse_cases().await.unwrap(), 1);
+        let ids: Vec<_> = db.abuse_cases.lock().await.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn a_canadian_copyright_record_goes_after_six_months_unless_proceedings_started() {
+        use lnvps_db::AbuseCaseKind::CopyrightCa;
+        let db = MockDb::default();
+        {
+            let mut rows = db.abuse_cases.lock().await;
+            rows.push(aged_case(1, CopyrightCa, Some(200), false));
+            rows.push(aged_case(2, CopyrightCa, Some(200), true));
+            rows.push(aged_case(3, CopyrightCa, Some(100), false));
+        }
+        assert_eq!(db.purge_abuse_cases().await.unwrap(), 1);
+        let ids: Vec<_> = db.abuse_cases.lock().await.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn abuse_case_lists_filter_by_customer_service_and_state() {
+        let db = MockDb::default();
+        for (user, vm) in [(1u64, 10u64), (2, 20), (1, 10)] {
+            db.insert_abuse_case(&lnvps_db::AbuseCase {
+                user_id: Some(user),
+                vm_id: Some(vm),
+                summary: "s".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        db.close_abuse_case(1).await.unwrap();
+        let (mine, total) = db
+            .list_abuse_cases(10, 0, Some(1), None, None)
+            .await
+            .unwrap();
+        assert_eq!((mine.len(), total), (2, 2));
+        let (open, _) = db
+            .list_abuse_cases(10, 0, Some(1), None, Some(true))
+            .await
+            .unwrap();
+        assert_eq!(open.len(), 1);
+        let (svc, _) = db
+            .list_abuse_cases(10, 0, None, Some(20), None)
+            .await
+            .unwrap();
+        assert_eq!(svc.len(), 1);
+        let (page, total) = db.list_abuse_cases(1, 1, None, None, None).await.unwrap();
+        assert_eq!((page.len(), total), (1, 3));
+        db.close_abuse_case(1).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_abuse_action_records_when_the_customer_was_told() {
+        let db = MockDb::default();
+        let case = db
+            .insert_abuse_case(&lnvps_db::AbuseCase::default())
+            .await
+            .unwrap();
+        let id = db
+            .insert_abuse_action(&lnvps_db::AbuseAction {
+                case_id: case,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(db.get_abuse_action(id).await.unwrap().notified_at.is_none());
+        db.set_abuse_action_notified(id).await.unwrap();
+        assert!(db.get_abuse_action(id).await.unwrap().notified_at.is_some());
+        assert_eq!(db.list_abuse_actions(case).await.unwrap().len(), 1);
+        assert!(db.get_abuse_action(99).await.is_err());
+        assert!(db.get_abuse_case(99).await.is_err());
+        assert!(db.get_abuse_challenge(99).await.is_err());
     }
 }

@@ -1,6 +1,6 @@
 use crate::Template;
 use crate::network::parse_gateway;
-use anyhow::Result;
+use anyhow::{Result, bail};
 use chrono::Utc;
 use futures::future::join_all;
 use ipnetwork::{IpNetwork, NetworkSize};
@@ -17,6 +17,8 @@ use std::sync::Arc;
 pub enum CapacityError {
     /// No host in the region can accommodate the requested configuration.
     NoAvailableHosts,
+    /// The region has no free IPv4 address for the purchase and none is on the way.
+    OutOfIpCapacity(String),
 }
 
 impl std::fmt::Display for CapacityError {
@@ -26,6 +28,7 @@ impl std::fmt::Display for CapacityError {
                 f,
                 "No hosts with enough capacity are currently available in this region for the selected configuration"
             ),
+            CapacityError::OutOfIpCapacity(m) => write!(f, "{m}"),
         }
     }
 }
@@ -55,14 +58,22 @@ impl HostCapacityService {
             join_all(hosts.iter().map(|h| self.get_host_capacity(h, None, None))).await;
         let caps: Vec<HostCapacity> = caps.into_iter().filter_map(Result::ok).collect();
 
-        Ok(templates
-            .into_iter()
-            .filter(|t| {
-                caps.iter()
-                    .filter(|c| c.host.region_id == t.region_id)
-                    .any(|c| c.can_accommodate(t))
-            })
-            .collect())
+        let mut out = Vec::new();
+        for t in templates {
+            let in_region = || caps.iter().filter(|c| c.host.region_id == t.region_id);
+            let ok = in_region().any(|c| c.can_accommodate(&t))
+                || (in_region().any(|c| c.can_accommodate_with(&t, false))
+                    && crate::ip_provider::sells_without_stock(
+                        self.db.as_ref(),
+                        t.region_id,
+                        t.ip4_count,
+                    )
+                    .await);
+            if ok {
+                out.push(t);
+            }
+        }
+        Ok(out)
     }
 
     /// Pick a host for the purposes of provisioning a new VM
@@ -71,20 +82,77 @@ impl HostCapacityService {
         region_id: u64,
         template: &impl Template,
     ) -> Result<HostCapacity> {
-        let hosts = self.db.list_hosts().await?;
-        let caps: Vec<Result<HostCapacity>> =
-            join_all(hosts.iter().filter(|h| h.region_id == region_id).map(|h| {
-                self.get_host_capacity(
-                    h,
-                    Some(template.disk_type()),
-                    Some(template.disk_interface()),
-                )
-            }))
+        self.get_host_for_template_on(region_id, template, None)
+            .await
+    }
+
+    pub async fn get_host_for_template_on(
+        &self,
+        region_id: u64,
+        template: &impl Template,
+        host_id: Option<u64>,
+    ) -> Result<HostCapacity> {
+        self.get_host_for_template_with(region_id, template, host_id, true)
+            .await
+    }
+
+    pub async fn get_host_for_template_ip_aware(
+        &self,
+        region_id: u64,
+        template: &impl Template,
+        host_id: Option<u64>,
+    ) -> Result<HostCapacity> {
+        let first = self
+            .get_host_for_template_with(region_id, template, host_id, true)
             .await;
+        let Err(err) = first else {
+            return first;
+        };
+        let Ok(stockless) = self
+            .get_host_for_template_with(region_id, template, host_id, false)
+            .await
+        else {
+            return Err(err);
+        };
+        match crate::ip_provider::sale_decision(self.db.as_ref(), region_id, template.ip4_count())
+            .await?
+        {
+            crate::ip_provider::IpSale::WaitForIp | crate::ip_provider::IpSale::InStock => {
+                Ok(stockless)
+            }
+            crate::ip_provider::IpSale::OutOfCapacity(m) => {
+                Err(CapacityError::OutOfIpCapacity(m).into())
+            }
+        }
+    }
+
+    pub async fn get_host_for_template_with(
+        &self,
+        region_id: u64,
+        template: &impl Template,
+        host_id: Option<u64>,
+        require_ip4: bool,
+    ) -> Result<HostCapacity> {
+        let hosts = match host_id {
+            Some(id) => vec![self.db.get_host(id).await?]
+                .into_iter()
+                .filter(|h| !h.deleted)
+                .collect(),
+            None => self.db.list_hosts().await?,
+        };
+        let eligible = hosts.iter().filter(|h| h.region_id == region_id);
+        let caps: Vec<Result<HostCapacity>> = join_all(eligible.map(|h| {
+            self.get_host_capacity(
+                h,
+                Some(template.disk_type()),
+                Some(template.disk_interface()),
+            )
+        }))
+        .await;
         let mut host_cap: Vec<HostCapacity> = caps
             .into_iter()
             .filter_map(|v| v.ok())
-            .filter(|v| v.can_accommodate(template))
+            .filter(|v| v.can_accommodate_with(template, require_ip4))
             .collect();
 
         // `total_cmp` rather than `partial_cmp().unwrap()`: a host whose
@@ -95,10 +163,12 @@ impl HostCapacityService {
         // simply never the least-loaded pick.
         host_cap.sort_by(|a, b| a.load().total_cmp(&b.load()));
 
-        if let Some(f) = host_cap.into_iter().next() {
-            Ok(f)
-        } else {
-            Err(CapacityError::NoAvailableHosts.into())
+        match (host_cap.into_iter().next(), host_id) {
+            (Some(f), _) => Ok(f),
+            (None, Some(id)) => bail!(
+                "Host {id} is deleted, outside region {region_id}, or has no room for this template"
+            ),
+            (None, None) => Err(CapacityError::NoAvailableHosts.into()),
         }
     }
 
@@ -114,6 +184,17 @@ impl HostCapacityService {
 
         // make a copy for modification
         let mut templates = templates.clone();
+
+        let mut stockless: HashSet<u64> = HashSet::new();
+        let mut checked: HashSet<u64> = HashSet::new();
+        for t in templates.iter() {
+            if checked.insert(t.region.id)
+                && crate::ip_provider::sells_without_stock(self.db.as_ref(), t.region.id, t.min_ip4)
+                    .await
+            {
+                stockless.insert(t.region.id);
+            }
+        }
 
         // Get distinct region IDs from the templates
         let region_ids: HashSet<u64> = templates.iter().map(|t| t.region.id).collect();
@@ -166,7 +247,9 @@ impl HostCapacityService {
             // this plan sells. A plan whose minimum cannot be met is not
             // orderable at all.
             let min_ip4 = template.min_ip4;
-            let host_has_ipv4 = move |h: &&HostCapacity| h.available_ip4() >= min_ip4 as u128;
+            let sells_stockless = stockless.contains(&template.region.id);
+            let host_has_ipv4 =
+                move |h: &&HostCapacity| sells_stockless || h.available_ip4() >= min_ip4 as u128;
 
             // Limit disk maximums based on actual host capacity.
             //
@@ -238,7 +321,9 @@ impl HostCapacityService {
                 .map(|h| h.available_ip4())
                 .max()
                 .unwrap_or(0);
-            template.max_ip4 = template.max_ip4.min(max_ip4.min(u16::MAX as u128) as u16);
+            if !sells_stockless {
+                template.max_ip4 = template.max_ip4.min(max_ip4.min(u16::MAX as u128) as u16);
+            }
         }
 
         // remove templates with 0 max cpu/ram/disk, or that cannot supply the
@@ -461,6 +546,10 @@ impl HostCapacity {
 
     /// Can this host and its available capacity accommodate the given template
     pub fn can_accommodate(&self, template: &impl Template) -> bool {
+        self.can_accommodate_with(template, true)
+    }
+
+    pub fn can_accommodate_with(&self, template: &impl Template, require_ip4: bool) -> bool {
         // Check cpu manufacturer match (Unknown means any)
         let mfg_ok =
             template.cpu_mfg() == CpuMfg::Unknown || self.host.cpu_mfg == template.cpu_mfg();
@@ -483,7 +572,7 @@ impl HostCapacity {
                 .disks
                 .iter()
                 .any(|d| d.available_capacity() >= template.disk_size())
-            && self.available_ip4() >= template.ip4_count() as u128
+            && (!require_ip4 || self.available_ip4() >= template.ip4_count() as u128)
     }
 
     /// Free IPv4 addresses across every range in the host's region.
@@ -968,6 +1057,74 @@ mod tests {
         Ok(())
     }
 
+    async fn a_second_host(db: &MockDb, enabled: bool, region_id: u64) {
+        let mut host = db.hosts.lock().await.get(&1).unwrap().clone();
+        host.id = 2;
+        host.name = "second".to_string();
+        host.enabled = enabled;
+        host.region_id = region_id;
+        db.hosts.lock().await.insert(2, host);
+        let mut disk = db.host_disks.lock().await.get(&1).unwrap().clone();
+        disk.id = 2;
+        disk.host_id = 2;
+        db.host_disks.lock().await.insert(2, disk);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_host_is_the_one_used() -> Result<()> {
+        let mock = MockDb::default();
+        a_second_host(&mock, true, 1).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let hc = HostCapacityService::new(db.clone());
+        let template = db.get_vm_template(1).await?;
+
+        for id in [1, 2] {
+            let host = hc
+                .get_host_for_template_on(template.region_id, &template, Some(id))
+                .await?;
+            assert_eq!(host.host.id, id);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pinned_host_may_be_disabled() -> Result<()> {
+        let mock = MockDb::default();
+        a_second_host(&mock, false, 1).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+        let hc = HostCapacityService::new(db.clone());
+        let template = db.get_vm_template(1).await?;
+
+        let pinned = hc
+            .get_host_for_template_on(template.region_id, &template, Some(2))
+            .await?;
+        assert_eq!(pinned.host.id, 2);
+        let placed = hc
+            .get_host_for_template(template.region_id, &template)
+            .await?;
+        assert_eq!(placed.host.id, 1, "normal placement used a disabled host");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_pinned_host_must_be_live_and_in_the_region() -> Result<()> {
+        for (deleted, region_id) in [(true, 1), (false, 2)] {
+            let mock = MockDb::default();
+            a_second_host(&mock, true, region_id).await;
+            mock.hosts.lock().await.get_mut(&2).unwrap().deleted = deleted;
+            let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+            let hc = HostCapacityService::new(db.clone());
+            let template = db.get_vm_template(1).await?;
+
+            let err = hc
+                .get_host_for_template_on(template.region_id, &template, Some(2))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("Host 2"), "{err}");
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn expired_doesnt_count() -> Result<()> {
         let db = MockDb::default();
@@ -1402,7 +1559,11 @@ mod tests {
                 disk_type: ApiDiskType::SSD,
                 disk_interface: ApiDiskInterface::PCIe,
             }],
+            interval_amount: 1,
+            interval_type: crate::ApiIntervalType::Month,
             transfer_gb: None,
+            transfer: None,
+            network: None,
             limits: Default::default(),
         }
     }
@@ -1503,6 +1664,7 @@ mod tests {
                     ssh_key: None,
                     sunset_date: None,
                     marketplace_node_id: None,
+                    deleted: false,
                 },
             );
             let mut disks = db.host_disks.lock().await;
@@ -1578,6 +1740,7 @@ mod tests {
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
+                    category_translations: None,
                     compose: String::new(),
                     amount: 1000,
                     currency: "EUR".to_string(),
@@ -1603,6 +1766,8 @@ mod tests {
                     capacity_cpu_milli: 10_000,
                     capacity_memory_bytes: 100_000,
                     capacity_storage_bytes: 100_000,
+                    dns_server_id: None,
+                    dns_zone_id: None,
                     created: Utc::now(),
                 },
             );
@@ -1619,6 +1784,7 @@ mod tests {
                 hostname: None,
                 custom_domain: None,
                 custom_domain_verified: false,
+                public_port: None,
                 config: None,
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
@@ -1673,6 +1839,8 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 },
             );
             subs.insert(
@@ -1725,6 +1893,7 @@ mod tests {
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
+                    category_translations: None,
                     compose: String::new(),
                     amount: 1000,
                     currency: "EUR".to_string(),
@@ -1750,6 +1919,8 @@ mod tests {
                     capacity_cpu_milli: 10_000,
                     capacity_memory_bytes: 100_000,
                     capacity_storage_bytes: 100_000,
+                    dns_server_id: None,
+                    dns_zone_id: None,
                     created: Utc::now(),
                 },
             );
@@ -1766,6 +1937,7 @@ mod tests {
                 hostname: None,
                 custom_domain: None,
                 custom_domain_verified: false,
+                public_port: None,
                 config: None,
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,
@@ -1825,6 +1997,7 @@ mod tests {
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
+                    category_translations: None,
                     compose: String::new(),
                     amount: 1000,
                     currency: "EUR".to_string(),
@@ -1850,6 +2023,8 @@ mod tests {
                     capacity_cpu_milli: 10_000,
                     capacity_memory_bytes: 100_000,
                     capacity_storage_bytes: 100_000,
+                    dns_server_id: None,
+                    dns_zone_id: None,
                     created: Utc::now(),
                 },
             );
@@ -1869,6 +2044,7 @@ mod tests {
                     hostname: None,
                     custom_domain: None,
                     custom_domain_verified: false,
+                    public_port: None,
                     config: None,
                     desired_state: AppDeploymentDesiredState::Running,
                     status: AppDeploymentStatus::Running,

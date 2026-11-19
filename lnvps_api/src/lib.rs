@@ -1,4 +1,5 @@
 pub mod api;
+pub mod chain;
 pub mod data_migration;
 pub mod fee_estimate;
 pub mod notifications;
@@ -10,6 +11,7 @@ pub mod refund;
 pub mod router;
 pub mod settings;
 pub mod subscription;
+pub mod swap;
 pub mod worker;
 
 #[cfg(test)]

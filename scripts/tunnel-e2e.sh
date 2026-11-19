@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # tunnel-e2e.sh — Run the marketplace tunnel harness: both ends, real kernel.
 #
-# The harness (lnvps_e2e/tests/tunnel_netns.rs) builds a route server and a node
-# out of network namespaces, configures each end with the real production code
-# paths, and pings across the tunnel — including to a guest sitting behind the
-# node, which is the path a customer's traffic takes.
+# tunnel_netns builds a route server and a node out of network namespaces,
+# configures each end with the real production code paths, and pings across the
+# tunnel, including to a guest sitting behind the node, which is the path a
+# customer's traffic takes.
+#
+# The VPN harness is not here: it needs a running stack as well as root, so it
+# lives in scripts/vpn-e2e.sh.
 #
 # It needs root (namespaces, veth, WireGuard), so the tests are #[ignore]d and
 # only run from here.

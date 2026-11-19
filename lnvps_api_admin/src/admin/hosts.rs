@@ -15,7 +15,7 @@ use lnvps_api_common::{
 };
 use lnvps_db::{AdminAction, AdminResource};
 use log::info;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 pub fn router() -> Router<RouterState> {
@@ -26,7 +26,9 @@ pub fn router() -> Router<RouterState> {
         )
         .route(
             "/api/admin/v1/hosts/{id}",
-            get(admin_get_host).patch(admin_update_host),
+            get(admin_get_host)
+                .patch(admin_update_host)
+                .delete(admin_delete_host),
         )
         // Host disk management
         .route(
@@ -100,6 +102,34 @@ async fn admin_get_host(
     };
     let host_info = AdminHostInfo::from_admin_vm_host_with_capacity(&this.db, admin_host).await;
     ApiData::ok(host_info)
+}
+
+/// Delete a host
+///
+/// Refused while the host has active VMs. A host that ever ran a VM keeps its
+/// row (flagged deleted, hidden from listings) because those VMs are billing
+/// history that still has to resolve its host; one that never did is removed
+/// outright along with its disks.
+async fn admin_delete_host(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<HostDeleteResponse> {
+    // Check permission
+    auth.require_permission(AdminResource::Hosts, AdminAction::Delete)?;
+
+    this.db.admin_delete_host(id).await?;
+
+    ApiData::ok(HostDeleteResponse {
+        success: true,
+        message: "Host deleted successfully".to_string(),
+    })
+}
+
+#[derive(Serialize)]
+struct HostDeleteResponse {
+    success: bool,
+    message: String,
 }
 
 /// Update host configuration
@@ -268,6 +298,7 @@ async fn admin_create_host(
         sunset_date: req.sunset_date,
         // Only node approval creates a marketplace-backed host (guarded above).
         marketplace_node_id: None,
+        deleted: false,
     };
 
     // Create host in database
@@ -646,6 +677,71 @@ async fn admin_patch_host(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lnvps_api_common::MockDb;
+    use lnvps_db::{LNVpsDb, Vm};
+    use std::sync::Arc;
+
+    async fn insert_vm_on_host(db: &MockDb, id: u64, host_id: u64, deleted: bool) {
+        db.vms.lock().await.insert(
+            id,
+            Vm {
+                id,
+                host_id,
+                disk_id: 1,
+                deleted,
+                ..Default::default()
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_host_without_history_removes_the_host_and_its_disks() {
+        let db = MockDb::default();
+        let dyn_db: Arc<dyn LNVpsDb> = Arc::new(db.clone());
+        dyn_db.admin_delete_host(1).await.unwrap();
+
+        assert!(dyn_db.get_host(1).await.is_err());
+        assert!(dyn_db.list_host_disks(1).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_host_is_refused_while_the_host_has_active_vms() {
+        let db = MockDb::default();
+        let dyn_db: Arc<dyn LNVpsDb> = Arc::new(db.clone());
+        insert_vm_on_host(&db, 1, 1, false).await;
+
+        let err = dyn_db.admin_delete_host(1).await.unwrap_err().to_string();
+        assert!(err.contains("1 active VMs"), "unexpected error: {err}");
+
+        let host = dyn_db.get_host(1).await.unwrap();
+        assert!(!host.deleted);
+        assert!(host.enabled);
+    }
+
+    #[tokio::test]
+    async fn delete_host_with_history_is_flagged_rather_than_removed() {
+        let db = MockDb::default();
+        let dyn_db: Arc<dyn LNVpsDb> = Arc::new(db.clone());
+        // A soft-deleted VM still points at the host and its disk, so the row
+        // has to stay for that history to resolve.
+        insert_vm_on_host(&db, 1, 1, true).await;
+
+        dyn_db.admin_delete_host(1).await.unwrap();
+
+        let host = dyn_db.get_host(1).await.unwrap();
+        assert!(host.deleted);
+        assert!(!host.enabled);
+        assert!(!dyn_db.list_host_disks(1).await.unwrap().is_empty());
+
+        // Deleting it twice is an error rather than a silent no-op
+        assert!(dyn_db.admin_delete_host(1).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_host_errors_for_an_unknown_host() {
+        let dyn_db: Arc<dyn LNVpsDb> = Arc::new(MockDb::default());
+        assert!(dyn_db.admin_delete_host(999).await.is_err());
+    }
 
     #[test]
     fn test_host_update_cpu_mfg_can_be_unset_with_null() {

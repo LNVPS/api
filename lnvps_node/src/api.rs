@@ -118,7 +118,13 @@ async fn decode<T: serde::de::DeserializeOwned>(
             }
             match parsed.data {
                 Some(data) => Ok(data),
-                None => bail!("{url}: response carried neither data nor an error"),
+                // An endpoint that returns nothing answers `data: null`, which
+                // is a success with an empty body, not a malformed response.
+                // `()` deserialises from null; a type that needs a body still
+                // fails here, with its own serde message.
+                None => serde_json::from_str::<T>("null").map_err(|_| {
+                    anyhow::anyhow!("{url}: response carried neither data nor an error")
+                }),
             }
         }
         // Not an LNVPS envelope at all: a proxy error page, or the wrong URL.
@@ -189,6 +195,19 @@ mod tests {
     #[tokio::test]
     async fn an_empty_envelope_is_an_error() {
         assert!(decode::<Thing>(response(200, "{}"), "u").await.is_err());
+    }
+
+    /// An endpoint that returns nothing answers `data: null`. Treating that as
+    /// malformed made every libvirt certificate registration log an error for a
+    /// call that had in fact succeeded, once a minute, on every node.
+    #[tokio::test]
+    async fn an_endpoint_that_returns_nothing_is_a_success() {
+        decode::<()>(response(200, r#"{"data":null}"#), "u")
+            .await
+            .expect("a null data with no error is an empty success");
+        decode::<()>(response(200, "{}"), "u")
+            .await
+            .expect("and so is an envelope with neither field");
     }
 
     fn credential() -> Credential {

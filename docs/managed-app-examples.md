@@ -54,9 +54,74 @@ form fields, injected as `${name}`). Per service:
 `image`, `resources: { cpu, memory }`, `ports` (`expose: none|ingress`, ingress
 is HTTP only), `env`, `volumes` (PVCs, read-write), `files` (ConfigMap/Secret,
 read-only, mounted via subPath), `depends_on`, `backup`, `user`,
-`init`. Volumes take an optional `label` (see below). `${HOSTNAME}`
+`init`, `env_from`. A file may also take `merge_from` and `format`. Volumes take an optional `label` (see below). `${HOSTNAME}`
 resolves to `{deployment-name}.{cluster-ingress-domain}`; a service name
 resolves to its in-namespace DNS (e.g. `db:3306`).
+
+**`backup`** — per service, one of `command:` (an app-native dump run in its own
+pod, whose stdout becomes the artifact), `exec:` (the app's own export run inside
+its running container, whose stdout becomes the artifact) or `volume:` (a tar of
+one named volume), plus an optional `artifact:` filename. A top-level `backup: { schedule, retention }`
+turns it into an automatic run: a 5-field cron expression in **UTC** (no faster
+than hourly) and how many runs to keep. A run captures every service that
+declares a method, at one point in time.
+
+The capture runs in its **own pod**, not in the app's container, so a
+`command:` must reach its service over the network by the compose service name:
+
+```yaml
+  db:
+    ports:                      # a service with no ports has no DNS name
+      - { name: postgres, container: 5432, protocol: tcp, expose: none }
+    backup:
+      command: ["sh", "-c", "PGPASSWORD=$POSTGRES_PASSWORD exec pg_dumpall -h db -U buzz"]
+      artifact: buzz.sql
+  blobs:
+    backup:
+      volume: media             # tarred from a read-only mount of the PVC
+backup: { schedule: "0 3 * * *", retention: 7 }
+```
+
+`pg_dumpall` or `mariadb-dump` left to its default connects to a unix socket
+that exists only inside the service's own container, and fails there. The dump
+sees the service's resolved env, so a generated password is available to it as
+the app has it.
+
+**An app that declares a volume must declare at least one `backup:` method.**
+App create and update refuse it otherwise, and so does `compose-validate`: a
+customer has to be able to take their data away. It is an authoring rule like
+the others in `validate_declarations`, so a stored app that predates it keeps
+reconciling. A stateless app with no volumes needs none.
+
+A `backup:` method without a top-level schedule still lets the customer start a
+run from the deployment page (`POST /api/v1/app-deployments/{id}/backups`) and
+download the result. Those runs keep the newest 7, the same default a schedule
+gets. A service declares one method, so HAVEN backs up its event store and not
+its Blossom media.
+
+**Never tar a live database.** A tar of an LMDB, SQLite or Badger store taken
+while the app writes to it is a torn copy: the first strfry backup came back
+with valid gzip, a valid tar, and a database that `strfry scan --count` read as
+0 events out of 39,436, because tar read the meta pages before strfry reused
+the pages they pointed at. Pick one of the two methods that give a consistent
+copy:
+
+- **`exec:`** when the image ships a tool that reads its own store while the app
+  runs. The operator runs the argv inside the running container, gzips its
+  stdout as it arrives and sends it to the bucket as a multipart upload, so no
+  Job and no staging disk is involved. (Streaming it into a Job's stdin was the
+  first design; exec stdin on this cluster stops after about 128 KiB.) `${…}` is refused in
+  the argv. strfry uses `["/app/strfry", "export"]` (JSONL, restored with
+  `strfry import`) and nostr-rs-relay `["sqlite3", "/usr/src/app/db/nostr.db",
+  ".dump"]` (SQL, restored with `sqlite3 nostr.db < dump`).
+- **`volume:` with `quiesce: true`** when it does not. The operator scales the
+  service to 0, tars the volume once its pods are gone, and scales it back. The
+  app is down for the copy and reports `pending` with "paused while a backup
+  copies its data". HAVEN (Badger holds an exclusive lock), pyramid (LMDB, no
+  export tool), yalr and blossom (SQLite, no `sqlite3` in the image) use this.
+
+A plain `volume:` is only right for files nobody rewrites in place, such as
+route96's content-addressed blobs.
 
 **`volumes[].label`** — optional, and what a **buyer** gets from that volume:
 `events`, `media`, `database`, `files`. Surfaced per volume on
@@ -122,17 +187,21 @@ services:
       - { name: http, container: 3000, protocol: http, expose: ingress }
     init:
       - name: create-bucket           # DNS label, unique within the service
-        image: minio/mc:latest
+        image: rclone/rclone:1.75.1
         env:                          # ${…} is resolved here, and only here
-          MC_HOST_s3: http://${S3_ACCESS_KEY}:${S3_SECRET_KEY}@s3:9000
-          MC_CONFIG_DIR: /tmp/mc
+          RCLONE_CONFIG: /tmp/rclone.conf
+          RCLONE_CONFIG_S3_TYPE: s3
+          RCLONE_CONFIG_S3_PROVIDER: Other
+          RCLONE_CONFIG_S3_ENDPOINT: http://s3:9000
+          RCLONE_CONFIG_S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY}
+          RCLONE_CONFIG_S3_SECRET_ACCESS_KEY: ${S3_SECRET_KEY}
         command:
           - sh
           - -c
           - |
             set -e
-            until mc --quiet ls s3 >/dev/null 2>&1; do sleep 2; done
-            mc mb -p s3/media
+            until rclone lsd s3: >/dev/null 2>&1; do sleep 2; done
+            rclone mkdir s3:media
         # resources: { cpu: 50m, memory: 64Mi }   # the default
         # user: "65534"                           # defaults to the service's
 secrets:
@@ -267,6 +336,41 @@ when the tag moves.** Nothing in validation can catch this: the compose is
 well-formed, and the operator only learns the image's `USER` when the kubelet
 refuses the pod.
 
+**Every image must be pinned to a digest** (`repo:tag@sha256:...`), services and
+`init:` steps alike, and app create/update refuses one that is not. A tag is a
+mutable pointer: the publisher can re-push it and change the code running in
+every deployment, with nobody here having approved anything. Kubernetes makes
+that likelier rather than less likely, because `imagePullPolicy` defaults to
+`Always` for a `:latest` tag, so new bytes land on the next pod creation. The
+operator now sets `IfNotPresent` explicitly, and a digest means a cached layer
+set can only be the right one.
+
+Keep the tag in front of the digest. The tag is what a human reads in a diff;
+the digest is what the runtime honours.
+
+```bash
+# Resolve the tag to the digest to pin. Use the index digest (not a
+# per-platform manifest digest) so the pin still works on every architecture.
+docker buildx imagetools inspect voidic/route96:latest --format '{{.Manifest.Digest}}'
+```
+
+```yaml
+image: voidic/route96:latest@sha256:90712a96eed391b43bd82280d22ed909899c9b94a5ff162178ca78803d46d4d5
+```
+
+This buys immutability, not trust. An image that is hostile the day you pin it
+is pinned hostile, and a pinned base stops receiving CVE fixes until somebody
+bumps it. That is the trade being made deliberately: the bump becomes a
+reviewable change instead of a silent rollout. `scripts/catalog-digest-drift.sh`
+resolves every pinned tag and reports the ones that have moved, and the weekly
+`app-catalog.yml` run does the same, so an upstream release arrives as something
+to review, test and re-pin.
+
+A pin also cannot help with an image that fetches its own code at runtime. If
+the entrypoint clones a repository or installs dependencies on boot, the digest
+fixes the wrapper and nothing that matters. Such an image needs its application
+baked in at build time before it belongs in the catalog.
+
 ### Checking an image, and proving the choice works
 
 ```bash
@@ -378,6 +482,75 @@ string if it has none, and logs a warning. So a compose change is safe to roll
 out to already-deployed instances; give any new field a sensible `default` if a
 blank would break the app.
 
+**`config[].group`**: the form section a field is shown in. Fields with no
+group are shown first, then each group as a collapsed section named by its
+group, in the order the group first appears. Keep the ungrouped set to what a
+buyer actually decides at order time (a name, an owner key) and group the rest:
+an app with 40 settings otherwise renders a 40-box order form. A group holding a
+required field with no value opens by itself. At most 40 characters, and
+declare each group's fields together so the sections come out in a sensible
+order.
+
+```yaml
+config:
+  - { name: relay_name, label: "Relay name", type: string, default: "My relay" }
+  - { name: max_event_size, label: "Max event size (bytes)", type: int, default: "65536", group: "Event limits" }
+  - { name: config_overrides, label: "Advanced: config.toml overrides", type: file, default: "", group: "Advanced" }
+```
+
+**Customer overrides: `files[].merge_from` and `env_from`.** Two ways to let a
+customer write the app's own config directly, on top of whatever the catalog
+renders. Both name a `config:` field of `type: file`, so the order form shows a
+text box.
+
+```yaml
+services:
+  relay:
+    env:
+      RUST_LOG: "${log_level}"
+    env_from: extra_env              # KEY=value per line, only names in env_allow
+    env_allow: [EXTRA_*]
+    files:
+      - path: /app/config.yaml
+        merge_from: config_overrides # deep-merged over the rendered content
+        content: |
+          listen: "0.0.0.0:8000"
+          max_upload_bytes: ${max_upload_bytes}
+config:
+  - { name: config_overrides, label: "Advanced: config.yaml overrides", type: file, default: "" }
+  - { name: extra_env, label: "Advanced: extra environment variables (KEY=value per line)", type: file, default: "" }
+```
+
+`merge_from` renders the inline `content` as usual, parses it and the
+customer's text in the same format, and merges them: mappings merge key by key
+at every depth, anything else (a scalar, a list) is replaced, and in YAML or
+JSON a `null` removes the key. The format comes from the path's extension
+(`.yaml`/`.yml`, `.toml`, `.json`); a file with any other extension needs
+`format: yaml|toml|json`. A file whose format has no merge (strfry's `.conf`)
+cannot use it, so every setting it has needs its own field.
+
+`env_from` lines are `KEY=value`; blank lines, `#` comments and a leading
+`export` are allowed, and one pair of surrounding quotes is stripped from the
+value. The service must also list `env_allow`, the names (or `PREFIX_*`) the
+customer may set, taken from the variables the app documents. A name off the list
+is refused at order time and ignored if one is already stored. A name in
+`env_allow` must be UPPER_CASE and may not match `forbidden_env_name`, which
+refuses library-loading, interpreter and command-naming variables as a backstop.
+A key the service already sets cannot be listed. yalr has no `extra_env` field
+because it documents no environment beyond what the catalog sets.
+The value is literal: no
+`${…}`, so an override cannot pull a generated secret into somewhere else.
+
+Both are checked when the customer submits them: text that does not parse, a
+YAML list where a mapping belongs, or a malformed env line is refused with the
+field's label, as is anything over 256 KiB. A blank value leaves the rendered
+file byte for byte as it was, so adding an override field to an app does not
+restart its deployments. Admission also renders each `merge_from` template with
+the declared defaults and refuses one whose output does not parse, since no
+override could ever merge into it. Quoted strings in a template are where that
+bites: give such a field a pattern like `'[^"\\\r\n]*'` so a customer's quote
+cannot end the string early.
+
 ## Validating a compose document
 
 Before pasting a `compose` into the admin API, validate it locally with the
@@ -486,6 +659,12 @@ fails the render loudly.
   to `127.0.0.1` (must be `0.0.0.0` in a container), port `7777`, data in
   `./strfry-db/`. The `dockurr/strfry` image reads `/etc/strfry.conf`.
 
+- **Config:** every key the pinned binary (1.1.3) reads is a field, except
+  `db`, `dbParams`, `nofiles`, `numThreads`, `writePolicy` and the bind address
+  and port. `stream_from_relays` feeds the image's own `STREAMS` env, which runs
+  `strfry stream wss://<host> --dir down` per comma-separated host, so the
+  pattern only admits bare hosts.
+
 **Document:** [`catalog/strfry.yaml`](../catalog/strfry.yaml) —
 `scripts/app-catalog-test.sh catalog/strfry.yaml` starts it locally.
 
@@ -526,6 +705,13 @@ fails the render loudly.
   at `/usr/src/app/config.toml`; listens on `8080`; SQLite DB under
   `/usr/src/app/db`. Set `network.address = "0.0.0.0"` so it's reachable in the
   pod.
+
+- **Config:** the `[info]` name and description, `[options]`, `[limits]`,
+  NIP-42 and NIP-05 settings are fields. `pubkey`, `contact` and `relay_icon`
+  are not: the relay serves an empty string as-is in NIP-11, and TOML has no
+  way to leave a key out, so they go through `config_overrides` along with
+  `pubkey_whitelist`, `event_kind_allowlist` and the NIP-05 domain lists. An
+  empty `event_kind_allowlist` would reject every event.
 
 **Document:** [`catalog/nostr-rs-relay.yaml`](../catalog/nostr-rs-relay.yaml) —
 `scripts/app-catalog-test.sh catalog/nostr-rs-relay.yaml` starts it locally.
@@ -575,6 +761,14 @@ fails the render loudly.
   `wss://`). A fix to bake the templates into the image is proposed upstream
   (<https://github.com/HolgerHatGarKeineNode/haven-docker/pull/8>); once merged
   and released the dashboard works out of the box.
+
+- **Config:** all four relays' name, description and icon, the import and
+  broadcast relay lists, the white and black lists, web of trust and the log
+  level are fields. The lists are JSON written into the files HAVEN reads, and
+  a list that does not parse is `log.Fatalf` at startup, so each has a pattern.
+  The 32 rate limiter variables and the import timeouts go through `extra_env`.
+  `DB_ENGINE` and `BACKUP_PROVIDER` stay fixed: changing the engine orphans the
+  existing data, and backups are the platform's.
 
 **Document:** [`catalog/haven.yaml`](../catalog/haven.yaml) —
 `scripts/app-catalog-test.sh catalog/haven.yaml` starts it locally.
@@ -648,30 +842,226 @@ where the image allows it.
 
 ## AppWeaver — AI-powered app hub
 
-- **Image:** `ghcr.io/getappweaver/core:alpine` — published from
-  <https://github.com/getappweaver/core>. The Alpine runtime includes Bun,
-  OpenCode, ngit and Piper, but deliberately excludes Chromium, Playwright
-  browsers, Cursor Agent and VNC.
-- **Repo:** <https://github.com/getappweaver/core> — the entrypoint clones the
-  core repository into the persistent workspace on first boot, installs its
-  locked dependencies and starts the setup web UI on port `5551`. The workspace
-  volume retains configuration, credentials, installed apps and app data across
-  image upgrades.
-- **Authentication:** API-key and device-code OpenCode providers work through
-  the setup web UI. A provider that requires a callback to the user's localhost
-  cannot be authenticated without a separate tunnel and should not be selected
-  for a managed deployment.
+- **Image:** `ghcr.io/getappweaver/core:alpine-v14.27.4@sha256:1ecd9562ce8cd7e005093a0442599503fee2b6d4c8856c3994e42c3246f4a8e2`
+  — the reduced `linux/amd64` runtime published from
+  <https://github.com/getappweaver/core>. It includes Bun, OpenCode,
+  ngit and Python/Piper, but deliberately excludes browser automation, Chromium,
+  Playwright browsers, desktop and VNC functionality. Node/npm are not installed
+  in this reduced image; apps needing them require separate runtime support.
+- **Application source:** AppWeaver **14.27.4**, commit
+  `88e8cb53b4119461738887c4d5a72c7cc5d17e3d`, fixed by `APPWEAVER_GIT_SHA` in
+  both the image and catalog. On an empty workspace the entrypoint fetches that
+  commit, verifies it and checks it out detached. Every start verifies the
+  repository root, HEAD and absence of staged/unstaged changes to tracked core
+  files before `bun install --frozen-lockfile` and `bun run start`. Ignored or
+  untracked plugin code and generated files are outside this check. The image
+  digest pins the runtime; its commit-named tag alone is not immutable.
+- **Runtime:** runs as UID 1000, binds plain HTTP on `0.0.0.0:5551`, and builds
+  the web UI at startup. TLS is terminated by the platform ingress; do not run
+  the bare-metal Alpine setup script, Caddy or SSH server inside the container.
+  GitHub, dependency downloads, provider APIs and Nostr relays need outbound
+  connectivity. Piper and OpenCode are internal services, not extra public ports.
+- **Authentication:** API-key and device-code OpenCode providers are the intended
+  managed flows; verify the selected provider on the VPS. Localhost browser
+  callbacks (for example port `1455`) require a separate operator-arranged tunnel
+  into the container. The bare-metal SSH forwarding instructions do not provide
+  that tunnel for a managed pod, and HTTPS ingress does not replace it.
 - **Setup access:** the order form requires the owner's 64-character lowercase
-  hex Nostr pubkey. AppWeaver receives it as `BOT_MASTER_PUBKEY`; `/setup`
-  requires a matching NIP-98 signature before issuing an in-memory setup
-  session, so the customer does not need access to container logs.
+  hex Nostr pubkey. AppWeaver receives it as `BOT_MASTER_PUBKEY`; the `/setup`
+  page uses a matching NIP-98 signature to obtain an in-memory setup session.
+  This does not use the bare-metal generated-secret link or require container
+  log access. Restarting the process requires setup-session authentication again.
+- **Storage and backups:** the 20Gi workspace at `/workspace/appweaver` retains
+  the checkout, `.env`, core databases, installed plugins/apps, their databases
+  and files, and HOME/XDG credentials under `.data/`. The whole volume is backed
+  up with `quiesce: true`: the operator stops the service before copying SQLite
+  databases and their sidecars, then restarts it. Daily backups run at 03:00 UTC,
+  retaining seven runs; expect downtime during the copy. Preserve the original
+  encryption key material (including externally supplied secrets) alongside the
+  backup. Do not independently copy live SQLite files.
+- **Health:** `GET /api/health` returns `{ ok: true, version: ... }` even in setup
+  mode. This proves the HTTP handler is serving, not that provider authentication,
+  Piper or FIPS connectivity works. The current operator does not render
+  application startup/readiness/liveness probes; pod running status and the local
+  catalog script's listening-port check are not end-to-end application health.
+
+### Optional FIPS networking
+
+The current FIPS plugin uses ordinary Nostr relays over WebSocket for signaling,
+outbound UDP STUN (defaults include ports `19302` and `3478`), and dynamically
+allocated IPv4 UDP sockets for peer traversal. It has no fixed UDP listening-port
+mode. Its `plugins/fips/db.sqlite` stores identity, pairing records, peers and
+relay settings; preserve it and the core encryption key material on upgrades.
+
+The operator's NetworkPolicy allows DNS, same-namespace traffic, and public
+IPv4/IPv6 egress without port restrictions, excluding private/internal ranges.
+Ingress is restricted to the deployment's own namespace and ingress-controller
+namespace. Actual UDP reply/traversal behavior depends on CNI policy enforcement,
+connection tracking, pod/node NAT and VPS/provider firewalls. HTTPS ingress
+carries HTTP/WebSocket traffic, **not UDP**. The platform's fixed `expose: udp`
+forwarding is not a fit for this plugin's dynamic sockets, so no UDP port range,
+host networking or additional privileges are configured here.
+
+The developer reports successful same-machine bidirectional encrypted ping and
+restart recovery. Cross-network/VPS traversal remains **unverified**; relay
+signaling or a STUN mapping alone does not prove peer connectivity. Optional FIPS
+WebSocket seeds are a separate carrier, not an automatic fallback after failed
+UDP traversal.
+
+### Upgrades and manual VPS verification
+
+Registry metadata and the published entrypoint were inspected for the pinned
+digest: its embedded source SHA and OCI revision match the commit above, and
+the [14.27.4 publication workflow](https://github.com/getappweaver/core/actions/runs/44606929834)
+succeeded. These are artifact/static checks; this revision has not been started
+or reconciled on a live cluster as part of this update.
+
+1. On an amd64 app node, inspect the resolved image digest and
+   `APPWEAVER_GIT_SHA`. Provision a UID/GID-1000-writable workspace that is truly
+   empty for first boot (filesystem metadata such as `lost+found` also causes the
+   entrypoint to refuse cloning). Confirm the actual PVC layout with the storage
+   provisioner; do not delete existing volume contents to force initialization.
+2. Deploy with the catalog's read-only root filesystem, dropped capabilities,
+   writable workspace and `/tmp`. Allow initial fetch/install/web-build time;
+   check logs for `AppWeaver core HEAD verified:` and the exact SHA above.
+3. Check `/`, `/setup`, `/api/setup/auth` and `/api/health` through HTTPS ingress.
+   Confirm the reported version is `14.27.4`, owner-signed setup succeeds, and
+   unsigned/wrong-owner requests to `POST /api/setup/session` are rejected.
+4. Finish provider setup using an API key or supported device-code flow. Exercise
+   an AI request, Nostr relay connection, Piper output and web UI WebSocket path
+   separately; health HTTP 200 is not a substitute.
+5. Install/configure FIPS explicitly if required. Pair with a peer on a different
+   network, confirm signaling relay acceptance and STUN results, and run encrypted
+   `/fips ping <id>` in both directions. Diagnose traversal against the real CNI,
+   NAT and firewalls if it fails; do not widen UDP exposure without discussion.
+6. Restart/recreate the pod and verify credentials, core data, FIPS identity,
+   pairing/relay settings and bidirectional ping recover without re-pairing. Run
+   a quiesced backup and restore into a separate stopped workspace to check
+   completeness and decryptability before relying on it.
+7. For an existing workspace, stop all writers and take a complete pre-upgrade
+   backup. An image change does not upgrade its checkout. Preserve local tracked
+   edits separately, fetch/verify the intended full SHA, and explicitly check it
+   out detached without forced reset/clean. Tracked core files must match the
+   selected commit before restart. Follow the pinned source's
+   [Alpine container upgrade instructions](https://github.com/getappweaver/core/blob/88e8cb53b4119461738887c4d5a72c7cc5d17e3d/ALPINE_DOCKER.md#updates-and-persistent-state).
+   Keep the matching old image/SHA and full snapshot for rollback; database
+   migrations may require restoring the snapshot rather than only old code.
 
 **Document:** [`catalog/appweaver.yaml`](../catalog/appweaver.yaml) —
 `scripts/app-catalog-test.sh catalog/appweaver.yaml` starts it locally.
 
 ---
 
+## YALR: LLM router
+
+- **Image:** `voidic/yalr` (official, built from the repo on every push to
+  `master`): <https://hub.docker.com/r/voidic/yalr>.
+- **Repo:** <https://github.com/v0l/yalr>. YAML config at `/app/config.yaml`,
+  SQLite under `/app/data`, port `3000`, admin UI served by the app. Providers,
+  routing, users and API keys live in the database and are managed in the
+  admin UI, so the config file only carries the database path and the Anthropic
+  prompt cache toggle. `auth.enabled` and `auth.allowed_pubkeys` are parsed but
+  never enforced, so they are not offered.
+- **Setup:** the first `POST /api/auth/setup` creates the admin user, and any
+  visitor can make it. Open the hostname and finish setup as soon as the
+  deployment is ready.
+
+**Document:** [`catalog/yalr.yaml`](../catalog/yalr.yaml).
+`scripts/app-catalog-test.sh catalog/yalr.yaml` starts it locally.
+
+---
+
+## Ditto Relay
+
+- **Image:** `registry.v0l.io/ditto-relay`, built from
+  [`catalog/images/ditto-relay/Dockerfile`](../catalog/images/ditto-relay/Dockerfile)
+  against the relay's source tree (`docker build -f catalog/images/ditto-relay/Dockerfile <source>`).
+  Runs as uid 1000 with `HOME` and the data dir at `/data`.
+- **Relay:** Rust, LMDB, NIP-45 COUNT with HyperLogLog, NIP-50 search, NIP-77
+  negentropy. Config is a TOML file at `/etc/ditto-relay/ditto-relay.toml`;
+  it listens on `13131` and keeps its database, search index and signing key
+  under `data_dir`.
+- **Write policy:** a fixed policy baked into the image (`/usr/local/bin/ditto-policy`,
+  a `jq` filter, `catalog/images/ditto-relay/policy.jq`) that the relay runs as its
+  strfry-style plugin. Customers never supply code: the `policy_*` fields (allowed
+  kinds, pubkey allow and deny lists, minimum PoW bits, max event size, events per
+  address per minute, require AUTH) are rendered into `/etc/ditto-relay/policy.json`
+  as data, and each has a strict `pattern`. The app has no `type: file` field and no
+  `config_overrides` or `env_from`, so nothing a customer types reaches a shell, a
+  TOML key or an argv.
+- **Backup:** `exec:` of `ditto-relay export` (JSONL, restored with
+  `ditto-relay import`), consistent while the relay runs.
+
+**Document:** [`catalog/ditto-relay.yaml`](../catalog/ditto-relay.yaml).
+`scripts/app-catalog-test.sh catalog/ditto-relay.yaml` starts it locally, then
+runs [`catalog/tests/ditto-relay/check.sh`](../catalog/tests/ditto-relay/check.sh)
+against the running relay: it renders the document with a kind filter, a blocked
+pubkey, a PoW floor and a size cap, asserts NIP-11 lists NIP-45, that each of four
+events the policy refuses gets `["OK", id, false, "<reason>"]`, that the accepted one
+gets `true`, and that `COUNT` then returns exactly 1. `policy-test.sh` (run first)
+checks the filter alone per option, including that hostile text in every field is
+never executed. A script
+named `catalog/tests/<app>/check.sh` is run this way for any app.
+
+**Pricing:** 2.00 EUR per month, no setup fee. strfry, Pyramid and
+nostr-rs-relay are 1.50 EUR with 512Mi and 5Gi events storage, HAVEN is 2.00 EUR
+with 512Mi and 10Gi. Ditto has the same 5Gi but asks for 1Gi memory (LMDB plus
+the search index), so it sits at the HAVEN price.
+
+**Create the row** (admin key with `app::create`; created disabled, enable it
+after checking the app cluster has room):
+
+```bash
+jq -n --rawfile compose catalog/ditto-relay.yaml '{
+  name: "ditto-relay",
+  display_name: "Ditto Relay",
+  description: "A fast personal Nostr relay with NIP-45 counts, NIP-50 search, NIP-77 sync and a built-in write policy.",
+  category: "Nostr relay",
+  tags: ["nostr", "relay"],
+  compose: $compose,
+  amount: 200,
+  currency: "EUR",
+  interval_amount: 1,
+  interval_type: "month",
+  setup_amount: 0,
+  enabled: false
+}' > /tmp/ditto-relay-app.json
+
+NOSTR_SECRET_KEY=$(cat ~/.nostr/lnvps-admin.nsec) nak curl -X POST \
+  -H "Content-Type: application/json" -d @/tmp/ditto-relay-app.json \
+  https://admin-api.lnvps.net/api/admin/v1/apps
+
+NOSTR_SECRET_KEY=$(cat ~/.nostr/lnvps-admin.nsec) nak curl -X PATCH \
+  -H "Content-Type: application/json" -d '{"enabled": true}' \
+  https://admin-api.lnvps.net/api/admin/v1/apps/<id from the POST response>
+```
+
+---
+### Minecraft Java (game server)
+
+**Document:** [`catalog/minecraft-java.yaml`](../catalog/minecraft-java.yaml).
+Vanilla only: `TYPE=VANILLA` is fixed, the version comes from a short allowed
+list, and no field can reach `MODS`, `PLUGINS`, `MODPACK`, `*_URL` or any other
+setting that makes the image fetch or run customer code. Typed fields cover
+difficulty, max players, MOTD, whitelist and the RCON password. The game port is
+`expose: tcp` with `srv: minecraft`, so the operator allocates a public port and
+the API reports `connect_address` (and an SRV record when the port is not 25565).
+`scripts/app-catalog-test.sh catalog/minecraft-java.yaml` starts it, then
+[`catalog/tests/minecraft-java/check.sh`](../catalog/tests/minecraft-java/check.sh)
+sends a real Minecraft status ping to the published port and checks the version,
+slots and MOTD. The server runs with CPU and memory requests equal to limits
+(Guaranteed QoS).
+
 ## Notes on other apps
 
 - **zap-stream-core** — needs raw TCP/UDP ingest (RTMP `1935/tcp`, SRT), i.e.
-  the not-yet-implemented `expose: tcp|udp` path.
+  the `expose: tcp|udp` path (see the operator README, "Game servers").
+
+## Catalog security rule
+
+A catalog app must never execute customer-supplied code: no script or plugin
+file, no command, no environment the image evaluates. Customers set data through
+typed fields with a strict `pattern`; any logic is fixed and baked into the image.
+`catalog_never_takes_customer_code` in `lnvps_compose` enforces the parts that can
+be checked on the document (no `content_from`, no script paths, no config in a
+backup or init command, every `file` field is a checked override or a plain env value).

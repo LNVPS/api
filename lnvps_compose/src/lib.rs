@@ -15,8 +15,14 @@
 //! resolves `${…}` references. The Kubernetes object mapping lives elsewhere.
 
 use anyhow::{Result, anyhow, bail};
+use chrono::{DateTime, Utc};
+use croner::Cron;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::str::FromStr;
+
+mod merge;
+pub use merge::{FileFormat, forbidden_env_name, parse_env_lines};
 
 /// A parsed app compose document.
 #[derive(Debug, Clone, Deserialize)]
@@ -30,7 +36,127 @@ pub struct Compose {
     /// Customer-provided configuration fields (the deploy form).
     #[serde(default)]
     pub config: Vec<ConfigField>,
+    /// Automatic backup policy for the whole app. Omit for an app that is only
+    /// backed up when the customer asks.
+    #[serde(default)]
+    pub backup: Option<BackupPolicy>,
 }
+
+/// How often the operator runs an app's backups, and how many runs it keeps.
+///
+/// The policy is app-wide while the *method* is per service, because a run has
+/// to be a single point in time across the whole app: a relay's database dump
+/// and its blob volume taken hours apart do not restore into a consistent
+/// instance.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BackupPolicy {
+    /// When runs start, as a standard 5-field cron expression
+    /// (`minute hour day-of-month month day-of-week`) interpreted in **UTC**.
+    /// `0 3 * * *` is the common case: every day at 03:00.
+    ///
+    /// UTC rather than a customer timezone because the deployment has no
+    /// timezone of its own, and a schedule that silently shifted by an hour
+    /// twice a year is worse than one that is always where it was written.
+    pub schedule: String,
+    /// How many completed runs to keep; older ones are pruned with their
+    /// artifacts. Defaults to [`DEFAULT_BACKUP_RETENTION`].
+    #[serde(default)]
+    pub retention: Option<u32>,
+}
+
+impl BackupPolicy {
+    /// Declared retention, or [`DEFAULT_BACKUP_RETENTION`].
+    pub fn retention_or_default(&self) -> u32 {
+        self.retention.unwrap_or(DEFAULT_BACKUP_RETENTION)
+    }
+
+    /// The parsed schedule.
+    ///
+    /// Parsing at every use rather than caching one: a `Compose` is
+    /// deserialised from a stored row and cloned around, and the operator
+    /// evaluates this once per deployment per sweep, which is nowhere near
+    /// often enough to be worth a lazily-initialised field.
+    pub fn cron(&self) -> Result<Cron> {
+        Cron::from_str(&self.schedule).map_err(|e| {
+            anyhow!(
+                "backup schedule '{}' is not a valid cron: {e}",
+                self.schedule
+            )
+        })
+    }
+
+    /// The first run due strictly after `after`, in UTC.
+    pub fn next_run_after(&self, after: DateTime<Utc>) -> Result<DateTime<Utc>> {
+        self.cron()?
+            .find_next_occurrence(&after, false)
+            .map_err(|e| {
+                anyhow!(
+                    "backup schedule '{}' has no next occurrence after {after}: {e}",
+                    self.schedule
+                )
+            })
+    }
+
+    /// Whether a run is due now, given when the schedule last ran.
+    ///
+    /// `since` is the last scheduled run, or the deployment's creation time
+    /// when the schedule has never run — so a deployment does not get a backup
+    /// the instant it is created, and one that has been down past several
+    /// occurrences gets a single catch-up run rather than one per missed slot.
+    pub fn is_due(&self, since: DateTime<Utc>, now: DateTime<Utc>) -> Result<bool> {
+        Ok(self.next_run_after(since)? <= now)
+    }
+
+    /// Reject a schedule that fires faster than [`MIN_BACKUP_INTERVAL_MINUTES`].
+    ///
+    /// `* * * * *` is a valid cron and a way to fill a bucket with a copy of a
+    /// customer's data every minute, so the floor is enforced where the catalog
+    /// entry is written rather than discovered in a storage bill. Checked over
+    /// several consecutive occurrences because a pattern can be sparse in one
+    /// place and dense in another (`0,1 3 * * *` fires twice a minute apart).
+    fn validate_frequency(&self) -> Result<()> {
+        let cron = self.cron()?;
+        // A fixed reference instant, so the check does not depend on when it
+        // runs: 1 Jan, which every calendar-based pattern reaches.
+        let mut at = DateTime::<Utc>::from_timestamp(1_735_689_600, 0)
+            .ok_or_else(|| anyhow!("internal: bad reference time"))?;
+        for _ in 0..SCHEDULE_SAMPLES {
+            let next = cron.find_next_occurrence(&at, false).map_err(|e| {
+                anyhow!(
+                    "backup schedule '{}' has no next occurrence after {at}: {e}",
+                    self.schedule
+                )
+            })?;
+            if (next - at).num_minutes() < MIN_BACKUP_INTERVAL_MINUTES as i64 {
+                bail!(
+                    "backup schedule '{}' fires more often than every \
+                     {MIN_BACKUP_INTERVAL_MINUTES} minutes — each run stores a full copy of the \
+                     app's data",
+                    self.schedule
+                );
+            }
+            at = next;
+        }
+        Ok(())
+    }
+}
+
+/// How many consecutive occurrences [`BackupPolicy::validate_frequency`]
+/// inspects. Enough to catch a pattern that is dense in one part of the day
+/// and sparse elsewhere, without walking a year of a rare expression.
+const SCHEDULE_SAMPLES: usize = 24;
+
+/// Closest two scheduled runs may be. A full copy of the app's data is stored
+/// per run, so this is a storage floor, not a scheduling nicety.
+pub const MIN_BACKUP_INTERVAL_MINUTES: u32 = 60;
+
+/// Runs kept for an app whose `backup:` policy does not say.
+pub const DEFAULT_BACKUP_RETENTION: u32 = 7;
+
+/// Most runs an app may retain. Each retained run holds a full copy of every
+/// backed-up volume, so retention is storage the customer did not buy; a
+/// customer who wants a deeper history downloads the artifacts.
+pub const MAX_BACKUP_RETENTION: u32 = 30;
 
 /// A single service/container within an app.
 #[derive(Debug, Clone, Deserialize)]
@@ -86,6 +212,22 @@ pub struct Service {
     /// own container starts. See [`InitContainer`].
     #[serde(default)]
     pub init: Vec<InitContainer>,
+    #[serde(default)]
+    pub env_from: Option<String>,
+    /// Names `env_from` may set: exact names, or a prefix ending in `*`. A
+    /// customer's environment is data for the variables the app documents,
+    /// so anything else is refused rather than screened by a denylist.
+    #[serde(default)]
+    pub env_allow: Vec<String>,
+}
+
+impl Service {
+    pub fn env_name_allowed(&self, name: &str) -> bool {
+        self.env_allow.iter().any(|a| match a.strip_suffix('*') {
+            Some(prefix) => name.starts_with(prefix),
+            None => a == name,
+        })
+    }
 }
 
 /// A setup step that must succeed before its service's container starts.
@@ -284,9 +426,19 @@ pub struct File {
     /// Name of a `config` field whose value is used as the file content.
     #[serde(default)]
     pub content_from: Option<String>,
+    #[serde(default)]
+    pub merge_from: Option<String>,
+    #[serde(default)]
+    pub format: Option<FileFormat>,
     /// Render into a Secret instead of a ConfigMap (holds secret material).
     #[serde(default)]
     pub sensitive: bool,
+}
+
+impl File {
+    pub fn merge_format(&self) -> Option<FileFormat> {
+        self.format.or_else(|| FileFormat::from_path(&self.path))
+    }
 }
 
 /// How a port is exposed.
@@ -298,9 +450,10 @@ pub enum Expose {
     None,
     /// Public HTTP(S) via nginx Ingress + cert-manager TLS (http protocol only).
     Ingress,
-    /// Raw L4 TCP (ingress-controller TCP passthrough / NodePort). Not in MVP.
+    /// Raw L4 TCP. The app only says it needs a public TCP port; the
+    /// operator's configured forwarder decides how it is delivered.
     Tcp,
-    /// Raw L4 UDP. Not in MVP.
+    /// Raw L4 UDP, delivered the same way as [`Expose::Tcp`].
     Udp,
 }
 
@@ -328,6 +481,49 @@ pub struct Port {
     /// Ingress path (defaults to `/`), only meaningful for `expose: ingress`.
     #[serde(default)]
     pub path: Option<String>,
+    /// DNS SRV service label (`minecraft` gives `_minecraft._tcp`), only
+    /// meaningful for `expose: tcp|udp`. When the public port differs from
+    /// `container`, clients that honour SRV are told where to connect.
+    #[serde(default)]
+    pub srv: Option<String>,
+}
+
+/// The one port of a compose that needs a public L4 listener.
+#[derive(Debug, Clone, Copy)]
+pub struct L4Port<'a> {
+    pub service: &'a str,
+    pub port: &'a Port,
+}
+
+impl L4Port<'_> {
+    pub fn protocol(&self) -> L4Protocol {
+        match self.port.expose {
+            Expose::Udp => L4Protocol::Udp,
+            _ => L4Protocol::Tcp,
+        }
+    }
+
+    pub fn srv_name(&self, host: &str) -> Option<String> {
+        self.port
+            .srv
+            .as_deref()
+            .map(|label| format!("_{label}._{}.{host}", self.protocol().as_str()))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum L4Protocol {
+    Tcp,
+    Udp,
+}
+
+impl L4Protocol {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            L4Protocol::Tcp => "tcp",
+            L4Protocol::Udp => "udp",
+        }
+    }
 }
 
 /// A persistent volume mounted into a service → one PVC.
@@ -531,7 +727,11 @@ pub struct ConfigField {
     /// content is arbitrary.
     #[serde(default)]
     pub pattern: Option<String>,
+    #[serde(default)]
+    pub group: Option<String>,
 }
+
+pub const MAX_CONFIG_GROUP_LEN: usize = 40;
 
 /// Longest accepted `pattern`. Long enough for the character-class patterns a
 /// catalog field needs (an npub, a domain, a hex key) and short enough that the
@@ -608,6 +808,57 @@ fn compile_pattern(pattern: &str) -> Result<regex::Regex> {
         .map_err(|e| anyhow!("pattern '{pattern}' is not a valid regex: {e}"))
 }
 
+impl Backup {
+    pub fn artifact_name(&self, service: &str) -> String {
+        match (&self.command, &self.volume) {
+            (Some(_), _) => format!(
+                "{}.gz",
+                self.artifact
+                    .clone()
+                    .unwrap_or_else(|| format!("{service}.dump"))
+            ),
+            (_, Some(volume)) => format!(
+                "{}.tar.gz",
+                self.artifact
+                    .clone()
+                    .unwrap_or_else(|| format!("{service}-{volume}"))
+            ),
+            _ if self.exec.is_some() => format!(
+                "{}.gz",
+                self.artifact
+                    .clone()
+                    .unwrap_or_else(|| format!("{service}.dump"))
+            ),
+            _ => format!("{service}.gz"),
+        }
+    }
+}
+
+/// Longest accepted `backup.artifact` filename.
+const MAX_ARTIFACT_NAME_LEN: usize = 64;
+
+/// A `backup.artifact` is a filename, not a path.
+fn validate_artifact_name(service: &str, name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > MAX_ARTIFACT_NAME_LEN {
+        bail!(
+            "service '{service}': backup artifact name must be 1-{MAX_ARTIFACT_NAME_LEN} characters"
+        );
+    }
+    if name.starts_with('.') {
+        bail!("service '{service}': backup artifact '{name}' must not start with a dot");
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        bail!(
+            "service '{service}': backup artifact '{name}' may only contain letters, digits, \
+             '.', '-' and '_'"
+        );
+    }
+    Ok(())
+}
+
 /// Config field input type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -622,14 +873,30 @@ pub enum FieldType {
 }
 
 /// A service's backup method.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// Whichever is used, the capture runs in a **separate pod**, not in the
+/// service's own container: the operator creates a Job per artifact, so a
+/// backup is not tied to a running app pod and cannot disturb it.
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct Backup {
     /// App-consistent dump command; stdout is captured as the artifact.
+    ///
+    /// It runs on this service's **image**, with this service's resolved env,
+    /// in its own pod. So it must reach the service **over the network**, by
+    /// the compose service name (`pg_dumpall -h db`, `mariadb-dump -h db`): a
+    /// tool left to its default connects to a unix socket that exists only
+    /// inside the service's own container, and fails there with a message
+    /// about a missing socket file. Addressing a service by name also means
+    /// that service must declare `ports:`, which is what gives it a DNS name.
     #[serde(default)]
     pub command: Option<Vec<String>>,
     /// Alternatively, raw tar of this named volume (append-only data only).
     #[serde(default)]
     pub volume: Option<String>,
+    #[serde(default)]
+    pub exec: Option<Vec<String>>,
+    #[serde(default)]
+    pub quiesce: bool,
     /// Suggested artifact filename.
     #[serde(default)]
     pub artifact: Option<String>,
@@ -654,6 +921,43 @@ impl Compose {
             .iter()
             .filter_map(|f| f.default.clone().map(|d| (f.name.clone(), d)))
             .collect()
+    }
+
+    /// Every image must be pinned to a content digest (`@sha256:...`).
+    ///
+    /// **An authoring rule, checked at admission only**, for the same reason as
+    /// [`Self::validate_declarations`]: the operator re-parses the stored
+    /// compose on every reconcile, and an app admitted before this rule existed
+    /// must keep reconciling rather than go offline.
+    ///
+    /// A tag is a mutable pointer. `voidic/route96:latest` is whatever that
+    /// name resolved to the last time a node pulled it, so a publisher (or
+    /// anyone who takes their account) can change the code running in every
+    /// deployment by re-pushing, with nobody here having approved anything.
+    /// Kubernetes makes that worse rather than better: `imagePullPolicy`
+    /// defaults to `Always` for a `:latest` tag, so the new bytes arrive on the
+    /// next pod creation.
+    ///
+    /// A digest is the content address of the image, so the deployment keeps
+    /// running the exact artifact that was reviewed. Keep the tag as well and
+    /// pin behind it (`repo:v1.2.3@sha256:...`): the tag stays readable to a
+    /// human, and the digest is what the container runtime honours.
+    ///
+    /// This buys immutability, not trust. A hostile image pinned on day one is
+    /// pinned hostile, and a pinned base stops receiving CVE fixes until
+    /// somebody bumps it. That is the point: the bump is then a reviewable
+    /// change rather than a silent rollout.
+    pub fn validate_pinned_images(&self) -> Result<()> {
+        for (sname, svc) in &self.services {
+            validate_image_digest(&format!("service '{sname}'"), &svc.image)?;
+            for init in &svc.init {
+                validate_image_digest(
+                    &format!("service '{sname}': init '{}'", init.name),
+                    &init.image,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     /// Every `${...}` must be declared in `config:`/`secrets:` or be a builtin.
@@ -736,6 +1040,17 @@ impl Compose {
                 );
             }
         }
+        if self.services.values().any(|s| !s.volumes.is_empty())
+            && self.backup_services().is_empty()
+        {
+            bail!(
+                "the app stores data in volumes but no service declares a `backup:` method, so a \
+                 customer could never take their data away. Add `backup: {{ volume: <name> }}` (a \
+                 tar of the volume) or `backup: {{ command: [...] }}` (an app-native dump) to the \
+                 service that holds it"
+            );
+        }
+        self.validate_merge_templates()?;
         for name in self.referenced_vars() {
             let declared = self.config.iter().any(|c| c.name == name)
                 || self.secrets.iter().any(|s| s.name == name)
@@ -752,27 +1067,23 @@ impl Compose {
     }
 
     /// Check this compose against the one it would replace: a persistent
-    /// volume may grow, but it may not shrink, vanish or be renamed.
+    /// volume may grow or shrink, but it may not vanish or be renamed.
     ///
     /// An authoring rule, checked at admission only, like
     /// [`Self::validate_declarations`]: a row that already violates it has to
     /// keep reconciling rather than disappear.
     ///
-    /// Volumes are matched on `(service, volume name)` — the PVC identity the
-    /// operator builds — and compared in bytes, so a change of unit alone
-    /// passes. An unparseable *previous* document is the caller's problem, not
-    /// this function's.
+    /// Volumes are matched on `(service, volume name)`, the PVC identity the
+    /// operator builds. An unparseable *previous* document is the caller's
+    /// problem, not this function's.
     pub fn validate_volume_changes(&self, previous: &Compose) -> Result<()> {
         for (sname, prev_svc) in &previous.services {
             for prev in &prev_svc.volumes {
-                let prev_bytes = parse_bytes(&prev.size).map_err(|e| {
-                    anyhow!("stored service '{sname}': volume '{}': {e}", prev.name)
-                })?;
-                let current = self
+                let kept = self
                     .services
                     .get(sname)
-                    .and_then(|s| s.volumes.iter().find(|v| v.name == prev.name));
-                let Some(current) = current else {
+                    .is_some_and(|s| s.volumes.iter().any(|v| v.name == prev.name));
+                if !kept {
                     bail!(
                         "service '{sname}': volume '{}' is missing — the operator cannot prune \
                          a PVC it stops applying, so it would survive unmounted with the \
@@ -780,25 +1091,21 @@ impl Compose {
                          the same way.",
                         prev.name
                     );
-                };
-                let bytes = parse_bytes(&current.size)
-                    .map_err(|e| anyhow!("service '{sname}': volume '{}': {e}", current.name))?;
-                if bytes < prev_bytes {
-                    bail!(
-                        "service '{sname}': volume '{}' shrinks from {} to {} — Kubernetes permits \
-                         PVC expansion only, so every existing deployment of this app would fail \
-                         to reconcile with a 422 until the size is put back. The floor checked \
-                         here is this row's stored size; the real floor is whatever capacity the \
-                         PVCs were provisioned at, which can be larger if the row was lowered \
-                         before this rule existed.",
-                        current.name,
-                        prev.size.trim(),
-                        current.size.trim()
-                    );
                 }
             }
         }
         Ok(())
+    }
+
+    /// The port that needs a public L4 listener, if any. At most one is
+    /// allowed per app (see [`Self::validate`]).
+    pub fn l4_port(&self) -> Option<L4Port<'_>> {
+        self.services.iter().find_map(|(service, svc)| {
+            svc.ports
+                .iter()
+                .find(|p| matches!(p.expose, Expose::Tcp | Expose::Udp))
+                .map(|port| L4Port { service, port })
+        })
     }
 
     /// Validate structural + policy rules. Enforced at parse time so the
@@ -811,7 +1118,18 @@ impl Compose {
             bail!("compose must define at least one service");
         }
 
+        let l4_ports = self
+            .services
+            .values()
+            .flat_map(|s| &s.ports)
+            .filter(|p| matches!(p.expose, Expose::Tcp | Expose::Udp))
+            .count();
+        if l4_ports > 1 {
+            bail!("at most one port per app may use expose: tcp or udp, found {l4_ports}");
+        }
+
         for (sname, svc) in &self.services {
+            validate_service_name(sname)?;
             if svc.image.trim().is_empty() {
                 bail!("service '{sname}': image is required");
             }
@@ -822,6 +1140,36 @@ impl Compose {
                         "service '{sname}' port '{}': expose: ingress requires protocol: http",
                         p.name
                     );
+                }
+                match (p.expose, p.protocol) {
+                    (Expose::Tcp, Protocol::Tcp) | (Expose::Udp, Protocol::Udp) => {}
+                    (Expose::Tcp, _) => bail!(
+                        "service '{sname}' port '{}': expose: tcp requires protocol: tcp",
+                        p.name
+                    ),
+                    (Expose::Udp, _) => bail!(
+                        "service '{sname}' port '{}': expose: udp requires protocol: udp",
+                        p.name
+                    ),
+                    _ => {}
+                }
+                if let Some(srv) = p.srv.as_deref() {
+                    if !matches!(p.expose, Expose::Tcp | Expose::Udp) {
+                        bail!(
+                            "service '{sname}' port '{}': srv is only valid with expose: tcp or udp",
+                            p.name
+                        );
+                    }
+                    if srv.is_empty()
+                        || !srv
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                    {
+                        bail!(
+                            "service '{sname}' port '{}': srv must be lowercase letters, digits and hyphens",
+                            p.name
+                        );
+                    }
                 }
             }
             // `user:` must be root or a numeric UID. A name (e.g. `nonroot`)
@@ -951,6 +1299,26 @@ impl Compose {
                         }
                     }
                 }
+                if let Some(field) = &f.merge_from {
+                    if f.content.is_none() {
+                        bail!(
+                            "service '{sname}': file '{}' merge_from needs inline content to merge into",
+                            f.path
+                        );
+                    }
+                    self.require_file_field(
+                        sname,
+                        &format!("file '{}' merge_from", f.path),
+                        field,
+                    )?;
+                    if f.merge_format().is_none() {
+                        bail!(
+                            "service '{sname}': file '{}' merge_from needs `format: yaml|toml|json` \
+                             (the path has no recognised extension)",
+                            f.path
+                        );
+                    }
+                }
                 // A config file must not land inside a read-write data volume.
                 for v in &svc.volumes {
                     if f.path == v.path || path_is_within(&f.path, &v.path) {
@@ -976,21 +1344,81 @@ impl Compose {
                 }
             }
 
-            // A backup entry is exactly one of command | volume.
+            if let Some(field) = &svc.env_from {
+                self.require_file_field(sname, "env_from", field)?;
+                if svc.env_allow.is_empty() {
+                    bail!("service '{sname}': env_from needs env_allow, the names it may set");
+                }
+            } else if !svc.env_allow.is_empty() {
+                bail!("service '{sname}': env_allow without env_from");
+            }
+            for allowed in &svc.env_allow {
+                let name = allowed.strip_suffix('*').unwrap_or(allowed);
+                let shaped = !name.is_empty()
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_');
+                if !shaped {
+                    bail!(
+                        "service '{sname}': env_allow '{allowed}' must be UPPER_CASE_NAME or PREFIX_*"
+                    );
+                }
+                if svc.env.contains_key(name) || svc.env.keys().any(|k| svc.env_name_allowed(k)) {
+                    bail!(
+                        "service '{sname}': env_allow '{allowed}' covers a variable the service sets itself"
+                    );
+                }
+                if let Some(reason) = forbidden_env_name(name) {
+                    bail!("service '{sname}': env_allow '{allowed}' is not allowed ({reason})");
+                }
+            }
+
+            // A backup entry is exactly one of command | volume, and the
+            // artifact name is a filename we control the shape of (it becomes
+            // the tail of an object key).
             if let Some(b) = &svc.backup {
-                match (&b.command, &b.volume) {
-                    (Some(_), Some(_)) => {
-                        bail!("service '{sname}': backup has both command and volume")
+                let methods = [b.command.is_some(), b.volume.is_some(), b.exec.is_some()]
+                    .iter()
+                    .filter(|m| **m)
+                    .count();
+                if b.command.is_some() && b.volume.is_some() {
+                    bail!("service '{sname}': backup has both command and volume");
+                }
+                if methods > 1 {
+                    bail!(
+                        "service '{sname}': backup declares more than one of command, volume and exec"
+                    );
+                }
+                if methods == 0 {
+                    bail!("service '{sname}': backup needs one of command, volume or exec");
+                }
+                if let Some(vol) = &b.volume
+                    && !svc.volumes.iter().any(|v| &v.name == vol)
+                {
+                    bail!("service '{sname}': backup volume '{vol}' is not declared");
+                }
+                if b.quiesce && b.volume.is_none() {
+                    bail!(
+                        "service '{sname}': backup `quiesce` only applies to a `volume:` backup, \
+                         which is the method that copies files the app is writing"
+                    );
+                }
+                if let Some(argv) = &b.exec {
+                    if argv.is_empty() {
+                        bail!("service '{sname}': backup exec is empty");
                     }
-                    (None, None) => {
-                        bail!("service '{sname}': backup needs either command or volume")
+                    if argv.iter().any(|a| !extract_refs(a).is_empty()) {
+                        bail!(
+                            "service '{sname}': backup exec must not contain '${{…}}': it runs \
+                             inside the customer's container as written"
+                        );
                     }
-                    (None, Some(vol)) => {
-                        if !svc.volumes.iter().any(|v| &v.name == vol) {
-                            bail!("service '{sname}': backup volume '{vol}' is not declared");
-                        }
-                    }
-                    _ => {}
+                }
+                // The artifact name is appended to a server-derived object key
+                // and shown as a download filename, so it is a plain filename:
+                // no directory separators, no traversal, no leading dot.
+                if let Some(a) = &b.artifact {
+                    validate_artifact_name(sname, a)?;
                 }
             }
 
@@ -1062,8 +1490,100 @@ impl Compose {
             if let Some(pattern) = &f.pattern {
                 compile_pattern(pattern).map_err(|e| anyhow!("config field '{}': {e}", f.name))?;
             }
+            if let Some(group) = &f.group
+                && (group.trim().is_empty() || group.trim().chars().count() > MAX_CONFIG_GROUP_LEN)
+            {
+                bail!(
+                    "config field '{}': group must be 1-{MAX_CONFIG_GROUP_LEN} characters",
+                    f.name
+                );
+            }
+        }
+
+        // A schedule with nothing to run would bill storage and produce empty
+        // runs forever, and reads in the catalog as if the app were protected.
+        if let Some(policy) = &self.backup {
+            if !self.services.values().any(|s| s.backup.is_some()) {
+                bail!(
+                    "backup schedule is set but no service declares a `backup:` method — there \
+                     would be nothing to capture"
+                );
+            }
+            let retention = policy.retention_or_default();
+            if !(1..=MAX_BACKUP_RETENTION).contains(&retention) {
+                bail!(
+                    "backup retention must be between 1 and {MAX_BACKUP_RETENTION} (got \
+                     {retention})"
+                );
+            }
+            policy.validate_frequency()?;
         }
         Ok(())
+    }
+
+    fn validate_merge_templates(&self) -> Result<()> {
+        let mut vars: HashMap<String, String> = self
+            .config
+            .iter()
+            .map(|c| {
+                let placeholder = match c.r#type {
+                    FieldType::Int => "0",
+                    FieldType::Bool => "false",
+                    FieldType::String | FieldType::File => "x",
+                };
+                (
+                    c.name.clone(),
+                    c.default.clone().unwrap_or_else(|| placeholder.to_string()),
+                )
+            })
+            .collect();
+        for s in &self.secrets {
+            vars.insert(s.name.clone(), "x".to_string());
+        }
+        vars.insert("HOSTNAME".to_string(), "app.example.com".to_string());
+        for (sname, svc) in &self.services {
+            for f in &svc.files {
+                let (Some(_), Some(content), Some(format)) =
+                    (&f.merge_from, &f.content, f.merge_format())
+                else {
+                    continue;
+                };
+                let rendered = substitute(content, &vars)?;
+                format.check_document(&rendered).map_err(|e| {
+                    anyhow!(
+                        "service '{sname}': file '{}' merge_from: the rendered content is not valid \
+                         {}, so a customer override can never be merged into it: {e}",
+                        f.path,
+                        format.name()
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn require_file_field(&self, service: &str, context: &str, field: &str) -> Result<()> {
+        match self.config.iter().find(|c| c.name == field) {
+            None => {
+                bail!("service '{service}': {context} references unknown config field '{field}'")
+            }
+            Some(c) if c.r#type != FieldType::File => {
+                bail!("service '{service}': {context} field '{field}' must be `type: file`")
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Services that declare a backup method, in a stable order so a run's
+    /// artifacts are created the same way every time.
+    pub fn backup_services(&self) -> Vec<(&str, &Backup)> {
+        let mut out: Vec<(&str, &Backup)> = self
+            .services
+            .iter()
+            .filter_map(|(name, svc)| svc.backup.as_ref().map(|b| (name.as_str(), b)))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(b.0));
+        out
     }
 
     /// Every distinct env var name referenced as `${…}` across all services —
@@ -1151,6 +1671,11 @@ impl Compose {
             for (k, v) in &svc.env {
                 resolved.insert(k.clone(), substitute(v, vars)?);
             }
+            if let Some(overrides) = svc.env_from.as_ref().and_then(|f| vars.get(f))
+                && let Ok(lines) = parse_env_lines(overrides)
+            {
+                resolved.extend(lines.into_iter().filter(|(k, _)| svc.env_name_allowed(k)));
+            }
             out.insert(sname.clone(), resolved);
         }
         Ok(out)
@@ -1174,6 +1699,15 @@ impl Compose {
                     // the reconcile.
                     (_, Some(field)) => vars.get(field).cloned().unwrap_or_default(),
                     (None, None) => bail!("file '{}': no content source", f.path),
+                };
+                let content = match (
+                    f.merge_from.as_ref().and_then(|m| vars.get(m)),
+                    f.merge_format(),
+                ) {
+                    (Some(overlay), Some(format)) => {
+                        format.merge(&content, overlay).unwrap_or(content)
+                    }
+                    _ => content,
                 };
                 files.push(ResolvedFile {
                     path: f.path.clone(),
@@ -1405,6 +1939,7 @@ pub fn resolve_config(
         match submitted_value.or(field.default.as_ref()) {
             Some(v) => {
                 field.check_value(v)?;
+                check_override(compose, field, v)?;
                 out.insert(field.name.clone(), v.clone());
             }
             None if field.required => {
@@ -1414,6 +1949,44 @@ pub fn resolve_config(
         }
     }
     Ok(out)
+}
+
+fn check_override(compose: &Compose, field: &ConfigField, value: &str) -> Result<()> {
+    let label = field.display_label();
+    let overrides = compose.services.values().any(|s| {
+        s.env_from.as_deref() == Some(field.name.as_str())
+            || s.files
+                .iter()
+                .any(|f| f.merge_from.as_deref() == Some(field.name.as_str()))
+    });
+    if overrides && value.len() > MAX_FILE_BYTES {
+        bail!("config field '{label}' exceeds {MAX_FILE_BYTES} bytes");
+    }
+    for svc in compose.services.values() {
+        if svc.env_from.as_deref() == Some(field.name.as_str()) {
+            let lines =
+                parse_env_lines(value).map_err(|e| anyhow!("config field '{label}': {e}"))?;
+            for (key, _) in lines {
+                if !svc.env_name_allowed(&key) {
+                    bail!(
+                        "config field '{label}': '{key}' is not a setting this app accepts (allowed: {})",
+                        svc.env_allow.join(", ")
+                    );
+                }
+            }
+        }
+        for f in &svc.files {
+            if f.merge_from.as_deref() != Some(field.name.as_str()) {
+                continue;
+            }
+            if let Some(format) = f.merge_format() {
+                format.check_document(value).map_err(|e| {
+                    anyhow!("config field '{label}' is not valid {}: {e}", format.name())
+                })?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A config file with its final rendered content, ready to become a ConfigMap
@@ -1471,6 +2044,37 @@ fn addresses_host(text: &str, host: &str) -> bool {
 /// which Kubernetes rejects outright if it is not one — and a rejected pod spec
 /// is a deployment that never becomes ready, with the reason buried in the
 /// operator's log rather than returned to whoever typed the name.
+/// Require one image reference to carry a `@sha256:<64 hex>` digest.
+///
+/// The digest is checked for shape only. Whether it exists in the registry is
+/// the puller's problem, and a wrong one fails loudly at pull time rather than
+/// silently running something else, which is the whole point of pinning.
+fn validate_image_digest(context: &str, image: &str) -> Result<()> {
+    let Some((name, digest)) = image.split_once("@sha256:") else {
+        bail!(
+            "{context}: image '{image}' is not pinned to a digest. A tag is a mutable pointer: the \
+             publisher can re-push it and change what every deployment runs. Resolve it once \
+             (`docker buildx imagetools inspect {image} --format '{{{{.Manifest.Digest}}}}'`) and \
+             keep the tag for readability, e.g. `{image}@sha256:<digest>`"
+        );
+    };
+    if name.is_empty() {
+        bail!("{context}: image '{image}' has a digest but no image name");
+    }
+    if digest.len() != 64
+        || !digest
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+    {
+        bail!(
+            "{context}: image '{image}' has a malformed digest: expected 64 lower-case hex \
+             characters after `@sha256:`, got {} character(s)",
+            digest.len()
+        );
+    }
+    Ok(())
+}
+
 fn validate_init_name(service: &str, name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 40 {
         bail!("service '{service}': init name '{name}' must be 1–40 characters");
@@ -1499,6 +2103,29 @@ fn check_abs_no_traversal(service: &str, label: &str, path: &str) -> Result<()> 
     }
     if path.split('/').any(|seg| seg == "..") {
         bail!("service '{service}': {label} path '{path}' must not contain '..'");
+    }
+    Ok(())
+}
+
+/// A service name is a DNS-safe slug.
+///
+/// It is a Kubernetes object name (`<service>-secret`, the PVC, the Service),
+/// and it is also the default artifact filename, which the operator
+/// interpolates into the backup Job's shell. The API server would reject a bad
+/// object name late, in a reconcile; the shell would not reject anything.
+fn validate_service_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 40
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && !name.starts_with('-')
+        && !name.ends_with('-');
+    if !ok {
+        bail!(
+            "service '{name}': name must be a DNS-safe label (lowercase letters, digits and \
+             hyphens, not starting or ending with a hyphen)"
+        );
     }
     Ok(())
 }
@@ -1573,6 +2200,10 @@ fn substitute(s: &str, vars: &HashMap<String, String>) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A syntactically valid digest, for fixtures that only care that an image
+    /// is pinned.
+    const DIGEST: &str = "sha256:0000000000000000000000000000000000000000000000000000000000000001";
+
     use super::*;
 
     const ROUTE96: &str = r#"
@@ -1980,6 +2611,77 @@ config:
         assert!(Compose::parse(yaml).is_err());
     }
 
+    fn l4_doc(ports: &str) -> String {
+        format!("services:\n  a:\n    image: x\n    ports:\n{ports}\n")
+    }
+
+    #[test]
+    fn l4_expose_accepts_matching_protocol_and_reports_the_port() {
+        let c = Compose::parse(&l4_doc(
+            "      - { name: game, container: 25565, protocol: tcp, expose: tcp, srv: minecraft }",
+        ))
+        .unwrap();
+        let l4 = c.l4_port().unwrap();
+        assert_eq!(l4.service, "a");
+        assert_eq!(l4.port.container, 25565);
+        assert_eq!(l4.protocol(), L4Protocol::Tcp);
+        assert_eq!(l4.port.srv.as_deref(), Some("minecraft"));
+
+        let c = Compose::parse(&l4_doc(
+            "      - { name: game, container: 7777, protocol: udp, expose: udp }",
+        ))
+        .unwrap();
+        assert_eq!(c.l4_port().unwrap().protocol(), L4Protocol::Udp);
+    }
+
+    #[test]
+    fn l4_expose_rejects_mismatched_protocol_and_multiple_ports() {
+        let err = Compose::parse(&l4_doc(
+            "      - { name: g, container: 5, protocol: udp, expose: tcp }",
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expose: tcp requires protocol: tcp")
+        );
+        let err = Compose::parse(&l4_doc(
+            "      - { name: g, container: 5, protocol: tcp, expose: udp }",
+        ))
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expose: udp requires protocol: udp")
+        );
+        let err = Compose::parse(&l4_doc(
+            "      - { name: g, container: 5, protocol: tcp, expose: tcp }\n      - { name: h, container: 6, protocol: udp, expose: udp }",
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("at most one port"));
+    }
+
+    #[test]
+    fn srv_label_needs_l4_expose_and_a_dns_safe_value() {
+        let err = Compose::parse(&l4_doc(
+            "      - { name: g, container: 5, protocol: tcp, expose: none, srv: minecraft }",
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("srv is only valid"));
+        let err = Compose::parse(&l4_doc(
+            "      - { name: g, container: 5, protocol: tcp, expose: tcp, srv: Mine_Craft }",
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("srv must be"));
+    }
+
+    #[test]
+    fn app_without_l4_port_has_none() {
+        let c = Compose::parse(&l4_doc(
+            "      - { name: p, container: 5, protocol: tcp, expose: none }",
+        ))
+        .unwrap();
+        assert!(c.l4_port().is_none());
+    }
+
     #[test]
     fn rejects_bad_mount_paths() {
         // relative
@@ -2019,6 +2721,25 @@ config:
         // An undeclared size falls back rather than being unbounded: an
         // emptyDir with no sizeLimit can fill the node's disk.
         assert_eq!(s[1].size_or_default(), DEFAULT_SCRATCH_SIZE);
+    }
+
+    /// A service name reaches a Kubernetes object name and the backup Job's
+    /// shell, where the default artifact filename is built from it. Neither
+    /// place can be trusted to reject one that is not a plain slug.
+    #[test]
+    fn validate_rejects_a_service_name_that_is_not_a_slug() {
+        let app = |name: &str| {
+            Compose::parse(&format!("services:\n  \"{name}\":\n    image: x\n"))
+                .and_then(|c| c.validate())
+        };
+        assert!(app("db").is_ok());
+        assert!(app("route96-db").is_ok());
+        assert!(app("db; rm -rf /").is_err());
+        assert!(app("db data").is_err());
+        assert!(app("Db").is_err());
+        assert!(app("db_1").is_err());
+        assert!(app("-db").is_err());
+        assert!(app("").is_err());
     }
 
     /// Scratch paths are bounded, absolute, and may not overlap anything that
@@ -2248,7 +2969,8 @@ config:
         let svc = |user: &str| {
             format!(
                 "services:\n  a:\n    image: x\n{user}    \
-                 volumes:\n      - {{ name: data, path: /data, size: 1Gi }}\n"
+                 volumes:\n      - {{ name: data, path: /data, size: 1Gi }}\n    \
+                 backup: {{ volume: data }}\n"
             )
         };
 
@@ -2289,11 +3011,11 @@ config:
         assert!(Compose::parse(&svc("")).is_ok());
     }
 
-    /// A stored persistent volume may grow, but it may not shrink, vanish or
-    /// be renamed (#292) — each of those is unrecoverable once a deployment
-    /// exists.
+    /// A stored persistent volume may grow or shrink, but it may not vanish
+    /// or be renamed (#292). A shrink is safe because the operator never asks
+    /// an existing PVC for less than it already has.
     #[test]
-    fn volumes_may_grow_but_not_shrink_or_vanish() {
+    fn volumes_may_resize_but_not_vanish() {
         let app = |vols: &str| {
             Compose::parse(&format!(
                 "services:\n  db:\n    image: x\n    user: \"1000\"\n    volumes:\n{vols}"
@@ -2327,12 +3049,11 @@ config:
             .is_ok()
         );
 
-        // Shrink: the 422 loop.
-        let err = app("      - { name: data, path: /data, size: 1Gi }\n")
-            .validate_volume_changes(&stored)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("shrinks from 5Gi to 1Gi"), "{err}");
+        assert!(
+            app("      - { name: data, path: /data, size: 1Gi }\n")
+                .validate_volume_changes(&stored)
+                .is_ok()
+        );
 
         // Removal: the PVC survives unmounted, holding the customer's data.
         let err = Compose::parse("services:\n  db:\n    image: x\n")
@@ -2380,6 +3101,128 @@ config:
             Compose::parse("services:\n  a:\n    image: x\n    backup: { volume: nope }\n")
                 .is_err()
         );
+    }
+
+    /// The app-wide `backup:` policy: what it accepts, and the two ways it can
+    /// be written such that a customer would believe they had backups when
+    /// they did not.
+    #[test]
+    fn backup_policy_grammar() {
+        let with = |policy: &str, method: &str| {
+            Compose::parse(&format!(
+                "services:\n  db:\n    image: x\n    volumes:\n      - {{ name: data, path: \
+                 /data, size: 5Gi }}\n{method}{policy}"
+            ))
+        };
+        let method = "    backup: { volume: data }\n";
+
+        let c = with("backup: { schedule: \"0 3 * * *\" }\n", method).unwrap();
+        let policy = c.backup.as_ref().unwrap();
+        assert_eq!(policy.schedule, "0 3 * * *");
+        // Unset retention is the default, not "keep nothing".
+        assert_eq!(policy.retention_or_default(), DEFAULT_BACKUP_RETENTION);
+        assert_eq!(c.backup_services().len(), 1);
+        assert_eq!(c.backup_services()[0].0, "db");
+
+        assert_eq!(
+            with(
+                "backup: { schedule: \"0 4 * * 0\", retention: 2 }\n",
+                method
+            )
+            .unwrap()
+            .backup
+            .unwrap()
+            .retention_or_default(),
+            2
+        );
+
+        // A schedule with no service method captures nothing, but would read
+        // in the catalog as if the app were protected.
+        assert!(with("backup: { schedule: \"0 3 * * *\" }\n", "").is_err());
+        // Retention outside the accepted range, in both directions.
+        assert!(
+            with(
+                "backup: { schedule: \"0 3 * * *\", retention: 0 }\n",
+                method
+            )
+            .is_err()
+        );
+        assert!(
+            with(
+                "backup: { schedule: \"0 3 * * *\", retention: 31 }\n",
+                method
+            )
+            .is_err()
+        );
+        // Not a cron expression at all.
+        assert!(with("backup: { schedule: daily }\n", method).is_err());
+        assert!(with("backup: { schedule: \"0 3 * *\" }\n", method).is_err());
+        // Faster than the floor: every minute, and twice a minute apart within
+        // an otherwise daily pattern.
+        assert!(with("backup: { schedule: \"* * * * *\" }\n", method).is_err());
+        assert!(with("backup: { schedule: \"0,1 3 * * *\" }\n", method).is_err());
+        assert!(with("backup: { schedule: \"*/30 * * * *\" }\n", method).is_err());
+        // Exactly at the floor is allowed.
+        assert!(with("backup: { schedule: \"0 * * * *\" }\n", method).is_ok());
+        // No policy at all stays valid: on-demand backups need no schedule.
+        assert!(with("", method).unwrap().backup.is_none());
+    }
+
+    /// The operator asks one question of a schedule: is a run due? Answered
+    /// from the last run, so a deployment that was down through several
+    /// occurrences gets one catch-up run rather than one per missed slot.
+    #[test]
+    fn backup_schedule_due_from_last_run() {
+        let c = Compose::parse(
+            "services:\n  db:\n    image: x\n    backup: { command: [\"sh\"] }\nbackup: { \
+             schedule: \"0 3 * * *\" }\n",
+        )
+        .unwrap();
+        let policy = c.backup.as_ref().unwrap();
+        let at = |s: &str| DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc);
+
+        // Next 03:00 UTC after a mid-morning run.
+        assert_eq!(
+            policy.next_run_after(at("2026-03-01T09:15:00Z")).unwrap(),
+            at("2026-03-02T03:00:00Z")
+        );
+
+        // Ran this morning, so nothing is due until tomorrow.
+        assert!(
+            !policy
+                .is_due(at("2026-03-01T03:00:00Z"), at("2026-03-01T23:00:00Z"))
+                .unwrap()
+        );
+        assert!(
+            policy
+                .is_due(at("2026-03-01T03:00:00Z"), at("2026-03-02T03:00:00Z"))
+                .unwrap()
+        );
+        // Down for a week: due, once.
+        assert!(
+            policy
+                .is_due(at("2026-03-01T03:00:00Z"), at("2026-03-08T12:00:00Z"))
+                .unwrap()
+        );
+    }
+
+    /// `artifact:` becomes the tail of an object key and the download
+    /// filename, so it is a filename and nothing else.
+    #[test]
+    fn backup_artifact_must_be_a_plain_filename() {
+        let app = |artifact: &str| {
+            Compose::parse(&format!(
+                "services:\n  db:\n    image: x\n    backup:\n      command: [\"sh\"]\n      \
+                 artifact: {artifact}\n"
+            ))
+        };
+        assert!(app("dump.sql").is_ok());
+        assert!(app("route96_db-1.sql").is_ok());
+        assert!(app("\"../../etc/passwd\"").is_err());
+        assert!(app("\"sub/dir.sql\"").is_err());
+        assert!(app("\".hidden\"").is_err());
+        assert!(app("\"\"").is_err());
+        assert!(app(&format!("\"{}\"", "a".repeat(65))).is_err());
     }
 
     #[test]
@@ -2658,6 +3501,828 @@ config:
                 "services:\n  a:\n    image: x\n    files:\n      - { path: /app/db/f.conf, content: 'y' }\n    volumes:\n      - { name: db, path: /app/db, size: 1Gi }\n"
             )
             .is_err()
+        );
+    }
+
+    /// A digest-pinned document passes, tag and all.
+    #[test]
+    fn accepts_digest_pinned_images() {
+        let c = Compose::parse(&format!(
+            "services:\n  app:\n    image: example/app:v1.2.3@{DIGEST}\n    user: \"1000\"\n    \
+             init:\n      - name: setup\n        image: busybox:1.36@{DIGEST}\n        command: \
+             [\"true\"]\n"
+        ))
+        .unwrap();
+        c.validate_pinned_images().unwrap();
+    }
+
+    /// An unpinned service image is refused, and the message names the service
+    /// and the image rather than saying "invalid compose".
+    #[test]
+    fn rejects_unpinned_service_image() {
+        let c = Compose::parse("services:\n  app:\n    image: example/app:latest\n").unwrap();
+        let err = c.validate_pinned_images().unwrap_err().to_string();
+        assert!(err.contains("service 'app'"), "{err}");
+        assert!(err.contains("example/app:latest"), "{err}");
+        assert!(err.contains("not pinned to a digest"), "{err}");
+    }
+
+    /// An init step is an image the cluster runs too, so it is held to the same
+    /// rule as the service that declares it.
+    #[test]
+    fn rejects_unpinned_init_image() {
+        let c = Compose::parse(&format!(
+            "services:\n  app:\n    image: example/app:v1@{DIGEST}\n    init:\n      - name: \
+             setup\n        image: minio/mc:latest\n        command: [\"true\"]\n"
+        ))
+        .unwrap();
+        let err = c.validate_pinned_images().unwrap_err().to_string();
+        assert!(err.contains("init 'setup'"), "{err}");
+        assert!(err.contains("minio/mc:latest"), "{err}");
+    }
+
+    /// A digest that is not 64 lower-case hex characters is a typo, not a pin.
+    /// Accepting one would give the appearance of pinning while failing at pull
+    /// time, or (for an upper-case variant) not matching what the registry
+    /// serves.
+    #[test]
+    fn rejects_malformed_digest() {
+        for image in [
+            "example/app:v1@sha256:abc123",
+            "example/app:v1@sha256:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            &format!("example/app:v1@{}", DIGEST.to_uppercase()),
+            &format!("@{DIGEST}"),
+        ] {
+            let c =
+                Compose::parse(&format!("services:\n  app:\n    image: \"{image}\"\n")).unwrap();
+            assert!(
+                c.validate_pinned_images().is_err(),
+                "accepted malformed image '{image}'"
+            );
+        }
+    }
+
+    /// The rule is admission-only: `parse`/`validate` must keep accepting an
+    /// unpinned document, or the operator would stop reconciling every app
+    /// admitted before the rule existed.
+    #[test]
+    fn pinning_is_not_enforced_by_validate() {
+        let c = Compose::parse("services:\n  app:\n    image: example/app:latest\n").unwrap();
+        c.validate().unwrap();
+        assert!(c.validate_pinned_images().is_err());
+    }
+
+    const MERGE_DOC: &str = r#"
+services:
+  app:
+    image: x
+    env:
+      PORT: "8080"
+      NAME: "${name}"
+    env_from: extra_env
+    env_allow: [EXTRA, NEW, "APP_*"]
+    files:
+      - path: /app/config.yml
+        merge_from: extra_yaml
+        content: |
+          listen: "0.0.0.0:8000"
+          public_url: "https://${HOSTNAME}"
+          upload:
+            enabled: true
+            max: 100
+      - path: /app/config.toml
+        merge_from: extra_toml
+        content: |
+          [info]
+          name = "${name}"
+      - path: /app/settings
+        format: json
+        merge_from: extra_json
+        content: '{"a": {"b": 1}}'
+config:
+  - { name: name, type: string, default: "relay" }
+  - { name: extra_env, type: file, default: "" }
+  - { name: extra_yaml, type: file, default: "" }
+  - { name: extra_toml, type: file, default: "" }
+  - { name: extra_json, type: file, default: "" }
+"#;
+
+    fn merge_vars(config: &std::collections::BTreeMap<String, String>) -> HashMap<String, String> {
+        let mut vars: HashMap<String, String> = config.clone().into_iter().collect();
+        vars.insert("HOSTNAME".into(), "h.example.com".into());
+        vars
+    }
+
+    #[test]
+    fn merge_from_and_env_from_apply_customer_overrides() {
+        let c = Compose::parse(MERGE_DOC).unwrap();
+        c.validate_declarations().unwrap();
+        let mut submitted = std::collections::BTreeMap::new();
+        submitted.insert("extra_env".to_string(), "EXTRA=9000\nNEW=1\n".to_string());
+        submitted.insert(
+            "extra_yaml".to_string(),
+            "upload:\n  max: 5\nwhitelist: [\"aa\"]\n".to_string(),
+        );
+        submitted.insert(
+            "extra_toml".to_string(),
+            "[limits]\nmessages_per_sec = 5\n".to_string(),
+        );
+        submitted.insert("extra_json".to_string(), "{\"a\": {\"c\": 2}}".to_string());
+        let config = resolve_config(&c, &submitted).unwrap();
+        let vars = merge_vars(&config);
+
+        let env = &c.resolve_env(&vars).unwrap()["app"];
+        assert_eq!(env["EXTRA"], "9000");
+        assert_eq!(env["NEW"], "1");
+        assert_eq!(env["NAME"], "relay");
+
+        let files = &c.resolve_files(&vars).unwrap()["app"];
+        let yaml: serde_yaml_ng::Value = serde_yaml_ng::from_str(&files[0].content).unwrap();
+        assert_eq!(yaml["upload"]["max"], 5);
+        assert_eq!(yaml["upload"]["enabled"], true);
+        assert_eq!(yaml["public_url"], "https://h.example.com");
+        assert_eq!(yaml["whitelist"][0], "aa");
+        let toml_doc: toml::Table = files[1].content.parse().unwrap();
+        assert_eq!(toml_doc["info"]["name"].as_str(), Some("relay"));
+        assert_eq!(toml_doc["limits"]["messages_per_sec"].as_integer(), Some(5));
+        let json: serde_json::Value = serde_json::from_str(&files[2].content).unwrap();
+        assert_eq!(json["a"]["b"], 1);
+        assert_eq!(json["a"]["c"], 2);
+    }
+
+    #[test]
+    fn blank_overrides_render_the_template_unchanged() {
+        let c = Compose::parse(MERGE_DOC).unwrap();
+        let config = resolve_config(&c, &std::collections::BTreeMap::new()).unwrap();
+        let vars = merge_vars(&config);
+        let files = &c.resolve_files(&vars).unwrap()["app"];
+        assert!(files[0].content.starts_with("listen: \"0.0.0.0:8000\"\n"));
+        assert_eq!(c.resolve_env(&vars).unwrap()["app"]["PORT"], "8080");
+    }
+
+    #[test]
+    fn invalid_overrides_are_refused_at_order_time() {
+        let c = Compose::parse(MERGE_DOC).unwrap();
+        for (field, value) in [
+            ("extra_env", "not an env line"),
+            ("extra_yaml", "upload: ["),
+            ("extra_yaml", "- a list"),
+            ("extra_toml", "a = "),
+            ("extra_json", "[1]"),
+        ] {
+            let mut submitted = std::collections::BTreeMap::new();
+            submitted.insert(field.to_string(), value.to_string());
+            let err = resolve_config(&c, &submitted).unwrap_err().to_string();
+            assert!(err.contains(field), "{field}: {err}");
+        }
+        let mut huge = std::collections::BTreeMap::new();
+        huge.insert(
+            "extra_yaml".to_string(),
+            format!("a: \"{}\"", "x".repeat(MAX_FILE_BYTES)),
+        );
+        assert!(
+            resolve_config(&c, &huge)
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds")
+        );
+    }
+
+    #[test]
+    fn stored_invalid_override_falls_back_to_the_template() {
+        let c = Compose::parse(MERGE_DOC).unwrap();
+        let mut vars = merge_vars(&std::collections::BTreeMap::new());
+        vars.insert("extra_yaml".into(), "upload: [".into());
+        vars.insert("extra_env".into(), "garbage".into());
+        let files = &c.resolve_files(&vars).unwrap()["app"];
+        assert!(files[0].content.starts_with("listen:"));
+        assert_eq!(c.resolve_env(&vars).unwrap()["app"]["PORT"], "8080");
+    }
+
+    #[test]
+    fn merge_and_env_from_declarations_are_validated() {
+        let cases = [
+            "services:\n  a:\n    image: x\n    env_from: nope\n",
+            "services:\n  a:\n    image: x\n    env_from: s\nconfig:\n  - { name: s, type: string }\n",
+            "services:\n  a:\n    image: x\n    files:\n      - { path: /c.yml, content: 'a: 1', merge_from: nope }\n",
+            "services:\n  a:\n    image: x\n    files:\n      - { path: /c.yml, content: 'a: 1', merge_from: s }\nconfig:\n  - { name: s, type: int }\n",
+            "services:\n  a:\n    image: x\n    files:\n      - { path: /c.yml, content_from: f, merge_from: f }\nconfig:\n  - { name: f, type: file }\n",
+            "services:\n  a:\n    image: x\n    files:\n      - { path: /c.conf, content: 'a: 1', merge_from: f }\nconfig:\n  - { name: f, type: file }\n",
+        ];
+        for doc in cases {
+            assert!(Compose::parse(doc).is_err(), "accepted: {doc}");
+        }
+        let explicit = "services:\n  a:\n    image: x\n    files:\n      - { path: /c.conf, format: toml, content: 'a = 1', merge_from: f }\nconfig:\n  - { name: f, type: file }\n";
+        Compose::parse(explicit)
+            .unwrap()
+            .validate_declarations()
+            .unwrap();
+    }
+
+    #[test]
+    fn merge_template_must_render_to_its_format() {
+        let doc = "services:\n  a:\n    image: x\n    files:\n      - path: /c.toml\n        merge_from: f\n        content: |\n          port = ${port}\n          name = ${name}\nconfig:\n  - { name: f, type: file }\n  - { name: port, type: int }\n  - { name: name, type: string, default: \"bare\" }\n";
+        let err = Compose::parse(doc)
+            .unwrap()
+            .validate_declarations()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not valid TOML"), "{err}");
+        let ok = doc.replace("name = ${name}", "name = \"${name}\"");
+        Compose::parse(&ok)
+            .unwrap()
+            .validate_declarations()
+            .unwrap();
+        let with_secret = "services:\n  a:\n    image: x\n    files:\n      - path: /c.json\n        merge_from: f\n        content: '{\"k\": \"${S}\", \"on\": ${b}}'\nsecrets:\n  - { name: S, generate: password }\nconfig:\n  - { name: f, type: file }\n  - { name: b, type: bool }\n";
+        Compose::parse(with_secret)
+            .unwrap()
+            .validate_declarations()
+            .unwrap();
+    }
+
+    #[test]
+    fn config_group_is_parsed_and_bounded() {
+        let c = Compose::parse(
+            "services:\n  a:\n    image: x\nconfig:\n  - { name: a, group: Limits }\n  - { name: b }\n",
+        )
+        .unwrap();
+        assert_eq!(c.config[0].group.as_deref(), Some("Limits"));
+        assert_eq!(c.config[1].group, None);
+        let long = "x".repeat(MAX_CONFIG_GROUP_LEN + 1);
+        for group in ["''", "'  '", long.as_str()] {
+            let doc = format!(
+                "services:\n  a:\n    image: x\nconfig:\n  - {{ name: a, group: {group} }}\n"
+            );
+            assert!(Compose::parse(&doc).is_err(), "accepted group {group}");
+        }
+    }
+
+    #[test]
+    fn backup_artifact_names() {
+        let named = Backup {
+            command: Some(vec!["sh".into()]),
+            volume: None,
+            artifact: Some("route96.sql".into()),
+            ..Default::default()
+        };
+        assert_eq!(named.artifact_name("db"), "route96.sql.gz");
+        let dump = Backup {
+            command: Some(vec!["sh".into()]),
+            volume: None,
+            artifact: None,
+            ..Default::default()
+        };
+        assert_eq!(dump.artifact_name("db"), "db.dump.gz");
+        let volume = Backup {
+            command: None,
+            volume: Some("data".into()),
+            artifact: None,
+            ..Default::default()
+        };
+        assert_eq!(volume.artifact_name("relay"), "relay-data.tar.gz");
+        let neither = Backup {
+            command: None,
+            volume: None,
+            artifact: None,
+            ..Default::default()
+        };
+        assert_eq!(neither.artifact_name("x"), "x.gz");
+        let exec = Backup {
+            exec: Some(vec!["/app/strfry".into(), "export".into()]),
+            artifact: Some("strfry-events.jsonl".into()),
+            ..Default::default()
+        };
+        assert_eq!(exec.artifact_name("strfry"), "strfry-events.jsonl.gz");
+        let bare_exec = Backup {
+            exec: Some(vec!["x".into()]),
+            ..Default::default()
+        };
+        assert_eq!(bare_exec.artifact_name("relay"), "relay.dump.gz");
+    }
+
+    #[test]
+    fn apps_with_volumes_must_declare_a_backup() {
+        let without = Compose::parse(
+            "services:\n  a:\n    image: x\n    user: \"1000\"\n    volumes:\n      - { name: d, path: /d, size: 1Gi }\n",
+        )
+        .unwrap();
+        let err = without.validate_declarations().unwrap_err().to_string();
+        assert!(
+            err.contains("no service declares a `backup:` method"),
+            "{err}"
+        );
+        without.validate().unwrap();
+
+        Compose::parse(
+            "services:\n  a:\n    image: x\n    user: \"1000\"\n    volumes:\n      - { name: d, path: /d, size: 1Gi }\n    backup: { volume: d }\n",
+        )
+        .unwrap()
+        .validate_declarations()
+        .unwrap();
+        Compose::parse("services:\n  a:\n    image: x\n")
+            .unwrap()
+            .validate_declarations()
+            .unwrap();
+    }
+
+    #[test]
+    fn backup_methods_are_exclusive_and_checked() {
+        let svc = |backup: &str| {
+            format!(
+                "services:\n  a:\n    image: x\n    user: \"1000\"\n    volumes:\n      - {{ name: d, path: /d, size: 1Gi }}\n    backup: {backup}\n"
+            )
+        };
+        for (backup, message) in [
+            (
+                "{ exec: [\"x\"], volume: d }",
+                "more than one of command, volume and exec",
+            ),
+            (
+                "{ exec: [\"x\"], command: [\"y\"] }",
+                "more than one of command, volume and exec",
+            ),
+            ("{ artifact: a }", "needs one of command, volume or exec"),
+            ("{ exec: [] }", "backup exec is empty"),
+            ("{ exec: [\"echo\", \"${X}\"] }", "must not contain"),
+            (
+                "{ exec: [\"x\"], quiesce: true }",
+                "only applies to a `volume:` backup",
+            ),
+            (
+                "{ command: [\"x\"], quiesce: true }",
+                "only applies to a `volume:` backup",
+            ),
+        ] {
+            let err = Compose::parse(&svc(backup)).unwrap_err().to_string();
+            assert!(err.contains(message), "{backup}: {err}");
+        }
+        let exec = Compose::parse(&svc("{ exec: [\"/app/strfry\", \"export\"] }")).unwrap();
+        exec.validate_declarations().unwrap();
+        let quiesced = Compose::parse(&svc("{ volume: d, quiesce: true }")).unwrap();
+        assert!(quiesced.services["a"].backup.as_ref().unwrap().quiesce);
+    }
+
+    fn minecraft() -> Compose {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../catalog/minecraft-java.yaml"
+        );
+        let doc = std::fs::read_to_string(path).unwrap();
+        let c = Compose::parse(&doc).unwrap();
+        c.validate_declarations().unwrap();
+        c.validate_pinned_images().unwrap();
+        c
+    }
+
+    fn minecraft_config(extra: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        let mut m: std::collections::BTreeMap<String, String> =
+            [("eula", "TRUE"), ("rcon_password", "testpass1234")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        for (k, v) in extra {
+            m.insert(k.to_string(), v.to_string());
+        }
+        m
+    }
+
+    #[test]
+    fn minecraft_env_is_a_fixed_vanilla_allowlist() {
+        let c = minecraft();
+        let env = &c.services["server"].env;
+        let allowed = [
+            "EULA",
+            "TYPE",
+            "VERSION",
+            "MEMORY",
+            "DIFFICULTY",
+            "MAX_PLAYERS",
+            "MOTD",
+            "ENABLE_WHITELIST",
+            "WHITELIST",
+            "ENABLE_RCON",
+            "RCON_PASSWORD",
+        ];
+        for key in env.keys() {
+            assert!(allowed.contains(&key.as_str()), "unexpected env var {key}");
+        }
+        assert_eq!(env["TYPE"], "VANILLA");
+        assert_eq!(c.services.len(), 1);
+        assert!(c.services["server"].init.is_empty());
+    }
+
+    #[test]
+    fn minecraft_cannot_set_code_loading_env_vars() {
+        let c = minecraft();
+        let forbidden = [
+            "MODS",
+            "PLUGINS",
+            "MODPACK",
+            "GENERIC_PACK",
+            "CF_",
+            "MODRINTH_",
+            "SPIGET_",
+            "_URL",
+            "DATAPACK",
+            "WORLD",
+            "ICON",
+            "CUSTOM_SERVER",
+            "EXEC",
+            "TYPE",
+            "JVM",
+            "USE_AIKAR",
+        ];
+        for field in &c.config {
+            let name = field.name.to_uppercase();
+            assert!(
+                !forbidden.iter().any(|f| name.contains(f)),
+                "config field {} could reach the image's code loading",
+                field.name
+            );
+            assert!(
+                field.r#type != FieldType::File,
+                "{} accepts a file",
+                field.name
+            );
+        }
+        for key in c.services["server"].env.keys() {
+            assert!(
+                !forbidden
+                    .iter()
+                    .filter(|f| **f != "TYPE")
+                    .any(|f| key.contains(f)),
+                "env var {key} loads code"
+            );
+        }
+        assert!(c.services["server"].files.is_empty());
+        let svc = &c.services["server"];
+        for (key, value) in &svc.env {
+            if key == "TYPE" {
+                continue;
+            }
+            let refs: Vec<&str> = value.matches("${").collect();
+            assert!(refs.len() <= 1, "{key} mixes several fields");
+        }
+    }
+
+    #[test]
+    fn minecraft_rejects_customer_values_that_would_fetch_or_run_code() {
+        let c = minecraft();
+        let ok = resolve_config(&c, &minecraft_config(&[])).unwrap();
+        assert_eq!(ok["version"], "1.21.4");
+        let bad: &[(&str, &str)] = &[
+            ("version", "LATEST"),
+            ("version", "https://example.com/server.jar"),
+            ("version", "1.21.4\nTYPE=PAPER"),
+            ("difficulty", "hard\nMODS=x"),
+            ("motd", "hi\nPLUGINS=http://evil/x.jar"),
+            ("max_players", "20; rm -rf /"),
+            ("whitelist", "bob,http://evil"),
+            ("rcon_password", "short"),
+            ("rcon_password", "pass word 1234"),
+        ];
+        for (k, v) in bad {
+            assert!(
+                resolve_config(&c, &minecraft_config(&[(k, v)])).is_err(),
+                "{k}={v:?} was accepted"
+            );
+        }
+        let unknown = minecraft_config(&[("MODS", "https://example.com/mod.jar")]);
+        assert!(resolve_config(&c, &unknown).is_err());
+        let unknown = minecraft_config(&[("TYPE", "PAPER")]);
+        assert!(resolve_config(&c, &unknown).is_err());
+    }
+
+    #[test]
+    fn minecraft_requests_guaranteed_resources_and_a_world_volume() {
+        let c = minecraft();
+        let svc = &c.services["server"];
+        assert_eq!(svc.resources.cpu, "1000m");
+        assert_eq!(svc.resources.memory, "2Gi");
+        assert_eq!(svc.volumes[0].path, "/data");
+        let l4 = c.l4_port().unwrap();
+        assert_eq!(l4.port.container, 25565);
+        assert_eq!(l4.port.srv.as_deref(), Some("minecraft"));
+        assert!(
+            c.services["server"]
+                .ports
+                .iter()
+                .any(|p| p.container == 25575 && p.expose == Expose::None)
+        );
+    }
+
+    fn catalog_documents() -> Vec<(String, String)> {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../catalog");
+        let mut out: Vec<(String, String)> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "yaml"))
+            .map(|p| {
+                (
+                    p.file_stem().unwrap().to_string_lossy().into_owned(),
+                    std::fs::read_to_string(&p).unwrap(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn ditto() -> Compose {
+        let yaml = catalog_documents()
+            .into_iter()
+            .find(|(n, _)| n == "ditto-relay")
+            .unwrap()
+            .1;
+        Compose::parse(&yaml).unwrap()
+    }
+
+    #[test]
+    fn catalog_env_overrides_are_allowlisted() {
+        for (name, yaml) in catalog_documents() {
+            let c = Compose::parse(&yaml).unwrap();
+            for (sname, svc) in &c.services {
+                if svc.env_from.is_none() {
+                    continue;
+                }
+                assert!(!svc.env_allow.is_empty(), "{name}/{sname}");
+                for dangerous in [
+                    "LD_AUDIT",
+                    "LD_PRELOAD",
+                    "PYTHONSTARTUP",
+                    "PERL5OPT",
+                    "RUBYOPT",
+                    "JAVA_TOOL_OPTIONS",
+                    "GCONV_PATH",
+                    "NODE_OPTIONS",
+                    "BASH_ENV",
+                    "PATH",
+                    "DATABASE_URL",
+                    "BUZZ_RELAY_PRIVATE_KEY",
+                    "RUST_LOG",
+                    "HOME",
+                    "HOSTALIASES",
+                    "MALLOC_CONF",
+                    "SSL_CERT_FILE",
+                    "HTTP_PROXY",
+                    "OWNER_NPUB",
+                    "RELAY_URL",
+                ] {
+                    assert!(
+                        !svc.env_name_allowed(dangerous),
+                        "{name}/{sname} allows {dangerous}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn env_overrides_off_the_allowlist_are_refused() {
+        let c = Compose::parse(MERGE_DOC).unwrap();
+        for bad in [
+            "LD_AUDIT=/x.so",
+            "PERL5OPT=-Mevil",
+            "RUBYOPT=-r/x",
+            "UNLISTED=1",
+            "NAME=override",
+            "APP=1",
+            "EXTRA=1\nLD_PRELOAD=/x",
+            "PORT=1",
+        ] {
+            let mut submitted = std::collections::BTreeMap::new();
+            submitted.insert("extra_env".to_string(), bad.to_string());
+            let err = resolve_config(&c, &submitted).unwrap_err().to_string();
+            assert!(
+                err.contains("extra_env")
+                    || err.contains("Extra")
+                    || err.contains("accepts")
+                    || err.contains("not allowed"),
+                "{bad}: {err}"
+            );
+        }
+        let mut ok = std::collections::BTreeMap::new();
+        ok.insert("extra_env".to_string(), "EXTRA=1\nAPP_MODE=x".to_string());
+        resolve_config(&c, &ok).unwrap();
+    }
+
+    #[test]
+    fn stored_env_off_the_allowlist_is_not_applied() {
+        let c = Compose::parse(MERGE_DOC).unwrap();
+        let mut vars = merge_vars(&std::collections::BTreeMap::new());
+        vars.insert(
+            "extra_env".into(),
+            "UNLISTED=/x\nEXTRA=9\nPORT=7\nAPP_X=1".into(),
+        );
+        let env = &c.resolve_env(&vars).unwrap()["app"];
+        assert_eq!(env["EXTRA"], "9");
+        assert_eq!(env["PORT"], "8080");
+        assert_eq!(env["APP_X"], "1");
+        assert!(!env.contains_key("UNLISTED"));
+    }
+
+    #[test]
+    fn env_from_requires_a_valid_allowlist() {
+        for allow in [
+            "",
+            "    env_allow: []\n",
+            "    env_allow: [ld_audit]\n",
+            "    env_allow: [LD_*]\n",
+            "    env_allow: [PATH]\n",
+            "    env_allow: [\"*\"]\n",
+            "    env_allow: [A]\n    env:\n      A: x\n",
+        ] {
+            let doc = format!(
+                "services:\n  a:\n    image: x\n    env_from: s\n{allow}config:\n  - {{ name: s, type: file }}\n"
+            );
+            assert!(
+                Compose::parse(&doc).and_then(|c| c.validate()).is_err(),
+                "accepted: {allow}"
+            );
+        }
+        assert!(
+            Compose::parse(
+                "services:
+  a:
+    image: x
+    env_allow: [A]
+"
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn catalog_never_takes_customer_code() {
+        for (name, yaml) in catalog_documents() {
+            let c = Compose::parse(&yaml).unwrap();
+            for (sname, svc) in &c.services {
+                for f in &svc.files {
+                    assert!(
+                        f.content_from.is_none(),
+                        "{name}/{sname}: {} takes a whole customer file",
+                        f.path
+                    );
+                    assert!(
+                        !f.path.ends_with(".sh")
+                            && !f.path.ends_with(".py")
+                            && !f.path.ends_with(".js"),
+                        "{name}/{sname}: {} looks like a script",
+                        f.path
+                    );
+                }
+                for init in &svc.init {
+                    for text in init.command.iter().chain(init.args.iter()).flatten() {
+                        assert!(
+                            !text.contains("${"),
+                            "{name}/{sname}: init step interpolates config"
+                        );
+                    }
+                }
+                if let Some(b) = &svc.backup {
+                    for text in b.command.iter().chain(b.exec.iter()).flatten() {
+                        assert!(
+                            !text.contains("${"),
+                            "{name}/{sname}: backup interpolates config"
+                        );
+                    }
+                }
+            }
+            for field in c.config.iter().filter(|f| f.r#type == FieldType::File) {
+                let overrides = c.services.values().any(|s| {
+                    s.env_from.as_deref() == Some(field.name.as_str())
+                        || s.files
+                            .iter()
+                            .any(|f| f.merge_from.as_deref() == Some(field.name.as_str()))
+                });
+                let as_env_value = c.services.values().any(|s| {
+                    s.env
+                        .values()
+                        .any(|v| v.contains(&format!("${{{}}}", field.name)))
+                });
+                assert!(
+                    overrides || as_env_value,
+                    "{name}: file field '{}' is neither a checked override nor a plain env value",
+                    field.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ditto_has_no_write_policy_plugin_field_or_override() {
+        let c = ditto();
+        let svc = &c.services["relay"];
+        assert!(svc.env_from.is_none());
+        assert!(
+            c.config
+                .iter()
+                .all(|f| f.r#type != FieldType::File && f.name != "write_policy")
+        );
+        for f in &svc.files {
+            assert!(
+                f.merge_from.is_none() && f.content_from.is_none(),
+                "{}",
+                f.path
+            );
+        }
+        let toml = svc
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("ditto-relay.toml"))
+            .unwrap();
+        assert!(
+            toml.content
+                .as_ref()
+                .unwrap()
+                .contains("write_policy_plugin = \"/usr/local/bin/ditto-policy\"")
+        );
+    }
+
+    #[test]
+    fn ditto_policy_fields_refuse_metacharacters() {
+        let c = ditto();
+        let hostile = [
+            "1; touch /tmp/x",
+            "1,$(id)",
+            "1`id`",
+            "1\"\n[evil]",
+            "1\\",
+            "1 && id",
+            "1|id",
+            "1\n2",
+            "../etc",
+            "true; id",
+            "-1",
+            "1e9",
+            " 1",
+        ];
+        let pubkey = "ab".repeat(32);
+        let fields = [
+            "policy_kinds",
+            "policy_allow_pubkeys",
+            "policy_deny_pubkeys",
+            "policy_min_pow",
+            "policy_max_event_bytes",
+            "policy_events_per_minute",
+            "policy_require_auth",
+            "write_policy_timeout_seconds",
+            "auth_kinds",
+        ];
+        for name in fields {
+            for bad in hostile.iter().copied().chain([
+                format!("{pubkey};id").as_str(),
+                format!("{pubkey},{pubkey}\n{pubkey}").as_str(),
+                "AB".repeat(32).as_str(),
+            ]) {
+                let mut submitted = std::collections::BTreeMap::new();
+                submitted.insert(name.to_string(), bad.to_string());
+                assert!(
+                    resolve_config(&c, &submitted).is_err(),
+                    "{name} accepted {bad:?}"
+                );
+            }
+        }
+        let mut good = std::collections::BTreeMap::new();
+        good.insert("policy_kinds".to_string(), "1,7,30023".to_string());
+        good.insert(
+            "policy_allow_pubkeys".to_string(),
+            format!("{pubkey},{pubkey}"),
+        );
+        good.insert("policy_deny_pubkeys".to_string(), pubkey.clone());
+        good.insert("policy_min_pow".to_string(), "20".to_string());
+        good.insert("policy_max_event_bytes".to_string(), "65536".to_string());
+        good.insert("policy_events_per_minute".to_string(), "60".to_string());
+        good.insert("policy_require_auth".to_string(), "true".to_string());
+        resolve_config(&c, &good).unwrap();
+    }
+
+    #[test]
+    fn ditto_policy_json_renders_as_data_only() {
+        let c = ditto();
+        let mut submitted = std::collections::BTreeMap::new();
+        submitted.insert("policy_kinds".to_string(), "1,7".to_string());
+        submitted.insert("policy_min_pow".to_string(), "12".to_string());
+        let config = resolve_config(&c, &submitted).unwrap();
+        let mut vars: HashMap<String, String> = config.into_iter().collect();
+        vars.insert("HOSTNAME".into(), "h.example.com".into());
+        let files = &c.resolve_files(&vars).unwrap()["relay"];
+        let policy = files
+            .iter()
+            .find(|f| f.path == "/etc/ditto-relay/policy.json")
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&policy.content).unwrap();
+        assert_eq!(json["kinds"], "1,7");
+        assert_eq!(json["min_pow"], "12");
+        assert_eq!(json["require_auth"], "false");
+        let toml = files
+            .iter()
+            .find(|f| f.path.ends_with("ditto-relay.toml"))
+            .unwrap();
+        let doc: toml::Table = toml.content.parse().unwrap();
+        assert_eq!(
+            doc["write_policy_plugin"].as_str(),
+            Some("/usr/local/bin/ditto-policy")
         );
     }
 }

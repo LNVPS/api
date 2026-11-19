@@ -107,6 +107,13 @@ fn validate_app_fields(
                     "invalid compose: {e}"
                 )));
             }
+            // Also authoring-time only: every image must be digest-pinned, so
+            // an upstream re-push cannot change what a deployment runs.
+            if let Err(e) = c.validate_pinned_images() {
+                return Err(lnvps_api_common::ApiError::new(format!(
+                    "invalid compose: {e}"
+                )));
+            }
         }
     }
     if currency.trim().is_empty() {
@@ -143,6 +150,15 @@ async fn resolve_tag_slugs(
         }
     }
     Ok(ids)
+}
+
+fn require_tags(tag_ids: &[u64]) -> Result<(), lnvps_api_common::ApiError> {
+    if tag_ids.is_empty() {
+        return Err(lnvps_api_common::ApiError::new(
+            "at least one tag is required",
+        ));
+    }
+    Ok(())
 }
 
 /// Load one app's tags in the admin wire shape.
@@ -198,6 +214,34 @@ fn validate_tag_display_name(name: String) -> Result<String, lnvps_api_common::A
 /// string cannot reach the column on either. Returning the trimmed value
 /// rather than validating in place is what makes it impossible to store the
 /// untrimmed one by accident.
+fn encode_category_translations(
+    map: Option<std::collections::BTreeMap<String, String>>,
+) -> Result<Option<String>, lnvps_api_common::ApiError> {
+    let Some(map) = map else { return Ok(None) };
+    let mut clean = std::collections::BTreeMap::new();
+    for (lang, text) in map {
+        let lang = lang.trim().to_ascii_lowercase();
+        let text = text.trim();
+        let valid_lang =
+            (2..=3).contains(&lang.len()) && lang.chars().all(|c| c.is_ascii_lowercase());
+        if !valid_lang {
+            return Err(lnvps_api_common::ApiError::new(format!(
+                "category_translations key '{lang}' must be a 2 or 3 letter language code"
+            )));
+        }
+        if text.is_empty() {
+            return Err(lnvps_api_common::ApiError::new(format!(
+                "category_translations value for '{lang}' is empty"
+            )));
+        }
+        clean.insert(lang, text.to_string());
+    }
+    if clean.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(&clean).unwrap_or_default()))
+}
+
 fn validate_category(category: String) -> Result<String, lnvps_api_common::ApiError> {
     let category = category.trim();
     if category.is_empty() {
@@ -206,7 +250,7 @@ fn validate_category(category: String) -> Result<String, lnvps_api_common::ApiEr
     Ok(category.to_string())
 }
 
-/// Refuse an edit that shrinks, drops or renames a persistent volume (#292).
+/// Refuse an edit that drops or renames a persistent volume (#292).
 ///
 /// Update only: there is no stored row to compare against on create, and an
 /// app's first compose declares whatever it likes.
@@ -305,10 +349,8 @@ async fn admin_create_app(
     let category = validate_category(req.category)?;
     // Resolve before the insert: an unknown slug should fail the whole request
     // rather than leave a created-but-untagged app behind.
-    let tag_ids = match &req.tags {
-        Some(slugs) => Some(resolve_tag_slugs(&this.db, slugs).await?),
-        None => None,
-    };
+    let tag_ids = resolve_tag_slugs(&this.db, req.tags.as_deref().unwrap_or_default()).await?;
+    require_tags(&tag_ids)?;
     let footprint = compose_footprint(&req.compose)?;
 
     let app = App {
@@ -321,6 +363,7 @@ async fn admin_create_app(
         category,
         seo_title: req.seo_title.filter(|s| !s.trim().is_empty()),
         seo_description: req.seo_description.filter(|s| !s.trim().is_empty()),
+        category_translations: encode_category_translations(req.category_translations)?,
         compose: req.compose,
         amount: req.amount,
         currency: req.currency.trim().to_uppercase(),
@@ -334,9 +377,7 @@ async fn admin_create_app(
         created: chrono::Utc::now(),
     };
     let id = this.db.insert_app(&app).await?;
-    if let Some(tag_ids) = tag_ids {
-        this.db.set_app_tags(id, &tag_ids).await?;
-    }
+    this.db.set_app_tags(id, &tag_ids).await?;
     let tags = app_tag_refs(&this.db, id).await?;
     ApiData::ok(AdminAppInfo::from_app(this.db.get_app(id).await?, tags))
 }
@@ -379,6 +420,9 @@ async fn admin_update_app(
     if let Some(seo_description) = req.seo_description {
         app.seo_description = seo_description.filter(|s| !s.trim().is_empty());
     }
+    if let Some(translations) = req.category_translations {
+        app.category_translations = encode_category_translations(translations)?;
+    }
     if let Some(compose) = req.compose {
         app.compose = compose;
     }
@@ -406,7 +450,11 @@ async fn admin_update_app(
     // Resolve before any write, so an unknown slug leaves the app untouched
     // rather than half-applying the rest of the patch.
     let tag_ids = match &req.tags {
-        Some(slugs) => Some(resolve_tag_slugs(&this.db, slugs).await?),
+        Some(slugs) => {
+            let ids = resolve_tag_slugs(&this.db, slugs).await?;
+            require_tags(&ids)?;
+            Some(ids)
+        }
         None => None,
     };
     // Recompute the footprint from the (possibly updated) compose.
@@ -709,9 +757,17 @@ async fn admin_list_app_deployments(
         .db
         .admin_list_app_deployments_filtered(limit, offset, &filter)
         .await?;
+    let rows = deployment_infos(this.db.as_ref(), deployments).await?;
+    ApiPaginatedData::ok(rows, total, limit, offset)
+}
+
+pub(crate) async fn deployment_infos(
+    db: &dyn lnvps_db::LNVpsDb,
+    deployments: Vec<lnvps_db::AppDeployment>,
+) -> Result<Vec<AdminAppDeploymentInfo>, lnvps_api_common::ApiError> {
     let ids: Vec<u64> = deployments.iter().map(|d| d.id).collect();
-    let (services, volumes) = this.db.list_app_deployment_usage_breakdown(&ids).await?;
-    let rows: Vec<AdminAppDeploymentInfo> = deployments
+    let (services, volumes) = db.list_app_deployment_usage_breakdown(&ids).await?;
+    Ok(deployments
         .into_iter()
         .map(|d| {
             let mut info = AdminAppDeploymentInfo::from(d.clone());
@@ -730,8 +786,7 @@ async fn admin_list_app_deployments(
             );
             info
         })
-        .collect();
-    ApiPaginatedData::ok(rows, total, limit, offset)
+        .collect())
 }
 
 /// Fill in a deployment's usage from the stored totals and breakdown.
@@ -817,17 +872,7 @@ async fn admin_update_app_deployment(
     // the operator sees it resolve to us, the same as on the customer endpoint
     // — an admin edit cannot vouch for someone else's DNS either.
     if let Some(cd) = &req.custom_domain {
-        let new_domain = match cd {
-            Some(v) if !v.trim().is_empty() => Some(
-                lnvps_compose::validate_custom_domain(v)
-                    .map_err(|e| lnvps_api_common::ApiError::new(e.to_string()))?,
-            ),
-            _ => None,
-        };
-        if new_domain != d.custom_domain {
-            d.custom_domain_verified = false;
-        }
-        d.custom_domain = new_domain;
+        apply_custom_domain(this.db.as_ref(), &mut d, cd.as_deref()).await?;
     }
 
     this.db.update_app_deployment(&d).await?;
@@ -984,6 +1029,8 @@ async fn admin_create_app_cluster(
         capacity_cpu_milli: req.capacity_cpu_milli,
         capacity_memory_bytes: req.capacity_memory_bytes,
         capacity_storage_bytes: req.capacity_storage_bytes,
+        dns_server_id: req.dns_server_id,
+        dns_zone_id: req.dns_zone_id,
         created: chrono::Utc::now(),
     };
     let id = this.db.insert_app_cluster(&cluster).await?;
@@ -1021,6 +1068,15 @@ async fn admin_update_app_cluster(
     if let Some(v) = req.capacity_storage_bytes {
         cluster.capacity_storage_bytes = v;
     }
+    if let Some(v) = req.dns_server_id {
+        if let Some(id) = v {
+            this.db.get_dns_server(id).await?;
+        }
+        cluster.dns_server_id = v;
+    }
+    if let Some(v) = req.dns_zone_id {
+        cluster.dns_zone_id = v;
+    }
 
     this.db.update_app_cluster(&cluster).await?;
     ApiData::ok(this.db.get_app_cluster(id).await?.into())
@@ -1040,11 +1096,136 @@ async fn admin_delete_app_cluster(
     ApiData::ok(true)
 }
 
+async fn apply_custom_domain(
+    db: &dyn lnvps_db::LNVpsDb,
+    d: &mut lnvps_db::AppDeployment,
+    requested: Option<&str>,
+) -> Result<(), lnvps_api_common::ApiError> {
+    let new_domain = match requested {
+        Some(v) if !v.trim().is_empty() => Some(
+            lnvps_compose::validate_custom_domain(v)
+                .map_err(|e| lnvps_api_common::ApiError::new(e.to_string()))?,
+        ),
+        _ => None,
+    };
+    if new_domain != d.custom_domain {
+        if let Some(domain) = &new_domain {
+            lnvps_api_common::ensure_custom_domain_free(db, domain, d.id).await?;
+        }
+        d.custom_domain_verified = false;
+    }
+    d.custom_domain = new_domain;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const VALID_COMPOSE: &str = "services:\n  relay:\n    image: example/relay:latest\n";
+    const VALID_COMPOSE: &str = "services:\n  relay:\n    image: \
+         example/relay:v1@sha256:0000000000000000000000000000000000000000000000000000000000000001\n";
+
+    #[tokio::test]
+    async fn admin_deployment_info_shows_the_allocated_public_port() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::LNVpsDbBase;
+        let db = MockDb::default();
+        let mut d = lnvps_db::AppDeployment {
+            id: 0,
+            user_id: 1,
+            app_id: 1,
+            cluster_id: 1,
+            resource_multiplier: 1,
+            subscription_line_item_id: 0,
+            name: "mc".to_string(),
+            namespace: "ns-mc".to_string(),
+            hostname: None,
+            custom_domain: None,
+            custom_domain_verified: false,
+            public_port: Some(25570),
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Pending,
+            status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
+            created: chrono::Utc::now(),
+            deleted: false,
+        };
+        d.id = db.insert_app_deployment(&d).await.unwrap();
+        let infos = deployment_infos(&db, vec![d]).await.unwrap();
+        assert_eq!(infos[0].public_port, Some(25570));
+        assert_eq!(
+            serde_json::to_value(&infos[0]).unwrap()["public_port"],
+            25570
+        );
+    }
+
+    #[test]
+    fn app_without_tags_is_rejected() {
+        assert!(require_tags(&[]).is_err());
+        assert!(require_tags(&[1]).is_ok());
+    }
+
+    #[tokio::test]
+    async fn blank_tag_slugs_resolve_to_no_tags() {
+        use lnvps_api_common::MockDb;
+        let db: std::sync::Arc<dyn lnvps_db::LNVpsDb> = std::sync::Arc::new(MockDb::default());
+        let ids = resolve_tag_slugs(&db, &["  ".to_string()]).await.unwrap();
+        assert!(require_tags(&ids).is_err());
+    }
+
+    #[tokio::test]
+    async fn admin_cannot_assign_a_taken_custom_domain() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::{AppDeploymentDesiredState, LNVpsDbBase};
+
+        let mk = |name: &str, domain: Option<&str>| lnvps_db::AppDeployment {
+            id: 0,
+            user_id: 1,
+            app_id: 1,
+            cluster_id: 1,
+            resource_multiplier: 1,
+            subscription_line_item_id: 0,
+            name: name.to_string(),
+            namespace: format!("ns-{name}"),
+            hostname: None,
+            custom_domain: domain.map(str::to_string),
+            custom_domain_verified: true,
+            public_port: None,
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Pending,
+            status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
+            created: chrono::Utc::now(),
+            deleted: false,
+        };
+        let db = MockDb::default();
+        db.insert_app_deployment(&mk("a", Some("blog.myrelay.org")))
+            .await
+            .unwrap();
+        let id = db.insert_app_deployment(&mk("b", None)).await.unwrap();
+        let mut b = db.get_app_deployment(id).await.unwrap();
+
+        let err = apply_custom_domain(&db, &mut b, Some("blog.myrelay.org"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, axum::http::StatusCode::CONFLICT);
+        assert!(err.error.contains("already in use"), "{}", err.error);
+        assert_eq!(b.custom_domain, None);
+
+        apply_custom_domain(&db, &mut b, Some("free.myrelay.org"))
+            .await
+            .unwrap();
+        assert_eq!(b.custom_domain.as_deref(), Some("free.myrelay.org"));
+        assert!(!b.custom_domain_verified);
+    }
 
     #[test]
     fn test_validate_app_fields() {
@@ -1074,6 +1255,15 @@ mod tests {
                 "USD"
             )
             .is_err()
+        );
+
+        // An image on a bare tag is refused: the publisher could re-push it and
+        // change what every deployment of this app runs.
+        let unpinned = "services:\n  relay:\n    image: example/relay:latest\n";
+        let err = validate_app_fields("relay", "R", unpinned, "USD").unwrap_err();
+        assert!(
+            format!("{err:?}").contains("not pinned to a digest"),
+            "{err:?}"
         );
     }
 
@@ -1116,6 +1306,27 @@ mod tests {
     }
 
     #[test]
+    fn category_translations_are_normalised_and_validated() {
+        use std::collections::BTreeMap;
+        let ok = |pairs: &[(&str, &str)]| {
+            encode_category_translations(Some(
+                pairs
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect::<BTreeMap<_, _>>(),
+            ))
+        };
+        assert_eq!(
+            ok(&[(" DE ", " Git-Server ")]).ok().flatten().as_deref(),
+            Some(r#"{"de":"Git-Server"}"#)
+        );
+        assert_eq!(encode_category_translations(None).ok().flatten(), None);
+        assert_eq!(ok(&[]).ok().flatten(), None);
+        assert!(ok(&[("de-DE", "x")]).is_err());
+        assert!(ok(&[("de", "  ")]).is_err());
+    }
+
+    #[test]
     fn test_validate_category() {
         // Returns the trimmed value, so an untrimmed one cannot reach the
         // column: the stored string is rendered verbatim into `<title>`.
@@ -1151,6 +1362,7 @@ mod tests {
             hostname: None,
             custom_domain: None,
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,

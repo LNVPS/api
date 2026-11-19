@@ -1,11 +1,14 @@
 services:
   appweaver:
-    image: ghcr.io/getappweaver/core:alpine-3e4b413@sha256:de1d200aba4cfc908eb1466fe3a1fea750f07ee9c79edb793b6174212a36613a
+    image: ghcr.io/getappweaver/core:alpine-v14.27.4@sha256:1ecd9562ce8cd7e005093a0442599503fee2b6d4c8856c3994e42c3246f4a8e2
     user: "1000"
     resources: { cpu: 1, memory: 2Gi }
     ports:
       - { name: http, container: 5551, protocol: http, expose: ingress }
     env:
+      # Pin the source fetched into the volume as well as the runtime image.
+      # Existing checkouts must be upgraded explicitly; mismatches fail startup.
+      APPWEAVER_GIT_SHA: "88e8cb53b4119461738887c4d5a72c7cc5d17e3d"
       BOT_SETUP_UI_ORIGIN: "https://${HOSTNAME}"
       BOT_MASTER_PUBKEY: "${master_pubkey}"
     volumes:
@@ -14,6 +17,9 @@ services:
       - { path: /tmp, size: 256Mi }
     backup:
       volume: workspace
+      # Core and plugins keep SQLite databases alongside credentials and files.
+      quiesce: true
 config:
   - { name: master_pubkey, label: "Master pubkey (64-character lowercase hex)", type: string,
       required: true, pattern: "[0-9a-f]{64}" }
+backup: { schedule: "0 3 * * *", retention: 7 }

@@ -50,17 +50,17 @@ The database connection string does not go in the ConfigMap. See
 ### 3. Deploy the Operator
 
 ```bash
-kubectl apply -f lnvps_operator/k8s-deployment.yaml
+kubectl apply -f lnvps_operator/k8s-minimal.yaml
 ```
 
 ### 4. Verify Deployment
 
 ```bash
 # Check if operator is running
-kubectl get pods -n lnvps-system
+kubectl get pods -n lnvps
 
 # Check operator logs
-kubectl logs -n lnvps-system deployment/lnvps-operator
+kubectl logs -n lnvps deployment/lnvps-operator
 
 # Check if Ingress is created (when domains exist)
 kubectl get ingress -n your-namespace
@@ -72,6 +72,7 @@ kubectl get ingress -n your-namespace
 |--------|------|---------|-------------|
 | `db` | string | **required** | MySQL connection string |
 | `namespace` | string | `"default"` | Kubernetes namespace to manage |
+| `nostr-domains` | boolean | `true` | Reconcile the nostr domains Ingress. Set `false` on an operator that only serves an app cluster, so a second operator elsewhere can own the domains |
 | `reconcile-interval` | number | `60` | Seconds between reconciliation runs |
 | `error-retry-interval` | number | `30` | Seconds to wait before retrying on errors |
 | `verbose` | boolean | `false` | Enable verbose logging |
@@ -83,11 +84,47 @@ kubectl get ingress -n your-namespace
 | `annotations` | object | `{}` | Additional ingress annotations |
 | `prometheus.url` | string | unset | Prometheus HTTP API to read deployment CPU/memory/volume usage from. Omit to collect no usage |
 | `prometheus.timeout-seconds` | number | `10` | Per-query timeout; collection is best-effort and never blocks a reconcile |
+| `l4.forwarder` | string | `"ingress-nginx"` | Who delivers `expose: tcp\|udp` ports. `nodeport` and `loadbalancer` are recognised but refused at startup with a "not supported yet" error |
+| `l4.port-range.start` / `end` | number | `25565` / `25584` | Public ports allocated to deployments, lowest free first |
+| `l4.ingress-nginx.namespace` | string | `"ingress-nginx"` | Namespace holding the controller's port-map ConfigMaps |
+| `l4.ingress-nginx.tcp-configmap` / `udp-configmap` | string | `"tcp-services"` / `"udp-services"` | ConfigMap names |
 
 Usage collection needs a Prometheus scraping cAdvisor (`container_cpu_usage_seconds_total`,
 `container_memory_working_set_bytes`) and, for volume usage, the kubelet
 (`kubelet_volume_stats_used_bytes`). Without the kubelet series, CPU and memory are still
 reported and `storage_bytes` is null.
+
+
+## Game servers (L4 exposure)
+
+An app declares `expose: tcp` or `expose: udp` on one port. That is all the app
+says: the operator's configured forwarder decides how the port is delivered.
+
+With the `ingress-nginx` forwarder the operator allocates a public port from
+`l4.port-range`, stores it on the deployment (`public_port`), and writes
+`"<port>": "app-<id>/<service>:<container-port>"` into the `tcp-services` or
+`udp-services` ConfigMap. Entries whose value does not point at an `app-<id>`
+namespace are never touched or overwritten, so a static entry such as
+`"22": git/gitea-ssh:22` survives. Entries for deployments that are gone are
+removed on the next reconcile, which also frees the port. If the range is
+exhausted the deployment goes to `error` with
+`no public port available: all of 25565-25584 are in use`.
+
+The cluster needs, none of which the operator creates:
+
+- the controller started with `--tcp-services-configmap=ingress-nginx/tcp-services`
+  (and `--udp-services-configmap=ingress-nginx/udp-services` for UDP apps);
+- both ConfigMaps to exist (an empty `data` is fine);
+- the controller Service exposing every port in the range, for example 25565-25584
+  for TCP. A MetalLB `LoadBalancer` Service needs each port listed; the range is
+  the place to size that;
+- the `lnvps-operator-l4` Role in [`k8s-minimal.yaml`](k8s-minimal.yaml).
+
+The deployment namespace NetworkPolicy already admits the ingress namespace, so
+forwarded traffic reaches the pod. The customer API returns `public_port`,
+`connect_address` and, when the app names an SRV service and the port is not the
+app's own, an `srv` record to publish (`_minecraft._tcp.<host>` pointing at
+`<host>:<port>`).
 
 ## Example Generated Ingress
 
@@ -146,6 +183,10 @@ secret verbs: `rolebindings: create, patch`, and `bind` on
 `lnvps-operator-appns` by name. `bind` exists for exactly this — it permits a
 binding to a named role without holding that role's permissions.
 
+`lnvps-operator-appns` also carries `pods/exec` (`get`, `create`): an `exec:`
+backup runs the app's export inside its own container and the operator streams
+its stdout to the bucket.
+
 **What this does and does not buy.** Those two rules are themselves
 cluster-wide — a ClusterRole cannot scope `rolebindings` to namespaces that do
 not exist yet — so a stolen token can write the same binding into `kube-system`
@@ -196,9 +237,10 @@ environment wins when both are set.
 
 It reads nostr domains, apps, app clusters, app deployments and the
 subscription rows that decide whether a deployment is paid for, and it writes
-to three: the status and usage totals on `app_deployment`, and the per-service
-and per-volume usage breakdown, which it rewrites each pass rather than
-accumulating. It never runs migrations, so it needs no DDL:
+to four: the status and usage totals on `app_deployment`, the per-service and
+per-volume usage breakdown, which it rewrites each pass rather than
+accumulating, and `app_deployment_backup`, where it records the runs it starts
+and their outcome. It never runs migrations, so it needs no DDL:
 
 ```sql
 CREATE USER 'lnvps_operator'@'%' IDENTIFIED BY '<password>';
@@ -206,10 +248,13 @@ GRANT SELECT ON lnvps.* TO 'lnvps_operator'@'%';
 GRANT UPDATE ON lnvps.app_deployment TO 'lnvps_operator'@'%';
 GRANT INSERT, DELETE ON lnvps.app_deployment_service_usage TO 'lnvps_operator'@'%';
 GRANT INSERT, DELETE ON lnvps.app_deployment_volume_usage TO 'lnvps_operator'@'%';
+-- Backups: the operator inserts scheduled runs, updates their state, and marks
+-- pruned ones deleted. Rows are soft-deleted, so no DELETE is needed.
+GRANT INSERT, UPDATE ON lnvps.app_deployment_backup TO 'lnvps_operator'@'%';
 ```
 
 ```bash
-kubectl -n lnvps-system create secret generic lnvps-operator-db \
+kubectl -n lnvps create secret generic lnvps-operator-db \
   --from-literal=url='mysql://lnvps_operator:<password>@mysql-service:3306/lnvps'
 ```
 
@@ -235,10 +280,10 @@ The deployment includes:
 
 ```bash
 # Check pod status
-kubectl get pods -n lnvps-system
+kubectl get pods -n lnvps
 
 # Check logs for errors
-kubectl logs -n lnvps-system deployment/lnvps-operator
+kubectl logs -n lnvps deployment/lnvps-operator
 ```
 
 ### Database Connection Issues
@@ -253,7 +298,7 @@ kubectl run mysql-test --rm -it --image=mysql:8 -- \
 
 ```bash
 # Check if ServiceAccount exists
-kubectl get sa lnvps-operator -n lnvps-system
+kubectl get sa lnvps-operator -n lnvps
 
 # Check ClusterRoleBinding
 kubectl get clusterrolebinding lnvps-operator

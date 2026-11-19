@@ -22,7 +22,7 @@ use lnvps_api_common::{
 };
 use lnvps_db::{
     LNVpsDb, LineItemType, PaymentMethod, RenewalSource, Subscription, SubscriptionLineItem,
-    SubscriptionPayment, SubscriptionPaymentType, User, UserPaymentMethod,
+    SubscriptionPayment, SubscriptionPaymentType, User, UserPaymentMethod, VmAddonKind,
 };
 use log::{debug, info, warn};
 use payments_rs::currency::{Currency, CurrencyAmount};
@@ -34,10 +34,13 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::swap::{SwapOrder, SwapOrderRequest, SwapProvider};
+
 mod app;
 mod ip_range;
 mod marketplace_node_fee;
 mod vm;
+mod vm_addon;
 mod vpn;
 
 use crate::provisioner::{IpRangeProvisioner, VmProvisioner};
@@ -92,12 +95,33 @@ pub enum RenewMode {
     /// NWC (Lightning) wallet pays the invoice. `method_id` selects a specific
     /// saved method; `None` uses the user's default for the chosen provider.
     Saved { method_id: Option<u64> },
+    /// Pay with a cryptocurrency swapped to Bitcoin; `coin` is the exchange's
+    /// code for what the customer sends (e.g. `XMR`).
+    FixedFloat { coin: Currency },
 }
 
 impl Default for RenewMode {
     fn default() -> Self {
         RenewMode::Interactive { save_card: false }
     }
+}
+
+/// Whether `coin` may be paid on a FixedFloat payment method config. An empty
+/// `supported_currencies` accepts every coin the swap provider supports.
+pub(crate) fn fixedfloat_coin_accepted(
+    config: &lnvps_db::PaymentMethodConfig,
+    coin: Currency,
+) -> bool {
+    if !coin.is_crypto() || coin == Currency::BTC {
+        return false;
+    }
+    if config.supported_currencies.is_empty() {
+        return true;
+    }
+    config
+        .supported_currencies
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case(&coin.to_string()))
 }
 
 /// A priced renewal order: exactly what the renewal would charge, with nothing
@@ -124,6 +148,82 @@ pub struct RenewalQuote {
     pub tax_lines: Vec<lnvps_api_common::TaxLine>,
     /// The discount applied, when a code was supplied.
     pub discount: Option<lnvps_api_common::AppliedDiscount>,
+    /// Account credit applied to this order. [`Self::amount`] and
+    /// [`Self::tax`] are the full bill, [`Self::processing_fee`] is charged on
+    /// what credit leaves to collect.
+    pub credit: Option<AppliedCredit>,
+}
+
+/// Account credit applied to an order: `amount` of the bill's net + tax, in
+/// the payment currency, backed by `base_amount` of the balance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AppliedCredit {
+    /// The user whose balance covers this.
+    pub user_id: u64,
+    /// Minor units of `currency` covered by the balance, as shown on the quote.
+    pub amount: u64,
+    /// Payment currency of [`Self::amount`].
+    pub currency: Currency,
+    /// The same value in the balance's base currency: what the ledger deducts.
+    /// May differ from `amount` when the payment currency is not the base
+    /// currency, because the conversion floors in both directions.
+    pub base_amount: u64,
+    /// The balance's currency.
+    pub base_currency: Currency,
+}
+
+/// The `external_data` of a payment fully funded by account credit.
+pub(crate) const CREDIT_FUNDED_MARKER: &str = "credit";
+
+impl AppliedCredit {
+    fn reduce_to(&mut self, amount: u64) {
+        if self.amount > 0 {
+            self.base_amount =
+                (self.base_amount as u128 * amount as u128 / self.amount as u128) as u64;
+        }
+        self.amount = amount;
+    }
+}
+
+fn credit_amount(credit: Option<&AppliedCredit>) -> u64 {
+    credit.map(|c| c.amount).unwrap_or(0)
+}
+
+fn credit_covers(credit: Option<&AppliedCredit>, net: u64, tax: u64) -> bool {
+    credit.is_some_and(|c| c.amount >= net + tax)
+}
+
+/// Hourly subscriptions are paid from account credit only.
+///
+/// An hourly plan renews every hour, so collecting it through a Lightning
+/// invoice or a card charge would mean a payment per hour. The order must be
+/// fully covered by the customer's credit, which also needs them to have opted
+/// in to spending it (`auto_apply`). Every other interval is unaffected.
+fn ensure_credit_funded_if_hourly(
+    subscription: &Subscription,
+    credit: Option<&AppliedCredit>,
+    net: u64,
+    tax: u64,
+) -> Result<()> {
+    if subscription.interval_type != lnvps_db::IntervalType::Hour || credit_covers(credit, net, tax)
+    {
+        return Ok(());
+    }
+    bail!(
+        "Hourly billing is paid from account credit. Top up your credit and turn on \
+         'apply credit automatically' so your balance covers the next hour."
+    )
+}
+
+fn scale_fee(fee: u64, collected: u64, billable: u64) -> u64 {
+    if billable == 0 {
+        return 0;
+    }
+    (fee as u128 * collected as u128 / billable as u128) as u64
+}
+
+fn credit_hold_expiry() -> chrono::DateTime<Utc> {
+    Utc::now() + chrono::Duration::hours(1)
 }
 
 /// Outcome of pricing a renewal order.
@@ -153,6 +253,7 @@ pub struct SubscriptionHandler {
     node: Arc<dyn LightningNode>,
     onchain: Arc<dyn OnChainProvider>,
     revolut: Option<Arc<dyn FiatPaymentService>>,
+    swap: Option<Arc<dyn SwapProvider>>,
 
     pe: PricingEngine,
     vm_provisioner: VmProvisioner,
@@ -181,6 +282,7 @@ impl SubscriptionHandler {
         let max_prepay_days = settings.max_prepay_days;
         Ok(Self {
             revolut,
+            swap: None,
             pe: PricingEngine::new(db.clone(), rates, vat),
             vm_provisioner: VmProvisioner::new(settings, db.clone()),
             ip_range_provisioner: IpRangeProvisioner::new(db.clone(), tx.clone()),
@@ -192,6 +294,12 @@ impl SubscriptionHandler {
             saved_payment_settle_timeout: SAVED_PAYMENT_SETTLE_TIMEOUT,
             max_prepay_days,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_swap(mut self, swap: Option<Arc<dyn SwapProvider>>) -> Self {
+        self.swap = swap;
+        self
     }
 
     pub fn work_commander(&self) -> Arc<dyn WorkCommander> {
@@ -208,6 +316,10 @@ impl SubscriptionHandler {
 
     pub fn db(&self) -> Arc<dyn LNVpsDb> {
         self.db.clone()
+    }
+
+    pub fn node(&self) -> Arc<dyn LightningNode> {
+        self.node.clone()
     }
 
     /// Derive a fresh on-chain receive address for a new payment.
@@ -228,6 +340,142 @@ impl SubscriptionHandler {
             })
             .await?;
         Ok(resp.address)
+    }
+
+    async fn new_fixedfloat_swap(
+        &self,
+        company_id: u64,
+        mode: &RenewMode,
+        currency: Currency,
+        amount_msat: u64,
+        memo: String,
+        label: String,
+    ) -> Result<SwapOrder> {
+        ensure!(
+            currency == Currency::BTC,
+            "Cannot create FixedFloat payments for non-BTC currency"
+        );
+        let RenewMode::FixedFloat { coin } = mode else {
+            bail!("A coin is required for fixedfloat payments");
+        };
+        let config = self
+            .db
+            .get_payment_method_config_for_company(company_id, PaymentMethod::FixedFloat)
+            .await
+            .context("FixedFloat payments are not configured")?;
+        ensure!(config.enabled, "FixedFloat payments are not enabled");
+        ensure!(
+            fixedfloat_coin_accepted(&config, *coin),
+            "{} is not accepted for FixedFloat payments",
+            coin
+        );
+        let swap = match &self.swap {
+            Some(swap) => swap.clone(),
+            None => crate::swap::provider_for_config(&config)?,
+        };
+        let receive_address = self.new_onchain_address(amount_msat, memo, label).await?;
+        swap.create_order(SwapOrderRequest {
+            coin: coin.to_string(),
+            receive_sats: amount_msat / 1000,
+            receive_address,
+        })
+        .await
+    }
+
+    pub async fn topup_currency(&self, user_id: u64) -> Currency {
+        let from_subscription = async {
+            let mut subs = self.db.list_subscriptions_by_user(user_id).await.ok()?;
+            subs.sort_by_key(|s| std::cmp::Reverse(s.created));
+            let company = self.db.get_company(subs.first()?.company_id).await.ok()?;
+            Currency::from_str(&company.base_currency).ok()
+        };
+        if let Some(c) = from_subscription.await {
+            return c;
+        }
+        self.db
+            .list_companies()
+            .await
+            .ok()
+            .and_then(|cs| {
+                cs.into_iter()
+                    .find_map(|c| Currency::from_str(&c.base_currency).ok())
+            })
+            .unwrap_or(Currency::BTC)
+    }
+
+    pub async fn settle_credit_topup(
+        &self,
+        id: u64,
+    ) -> Result<Option<lnvps_db::AccountCreditTopup>> {
+        let Some(topup) = self.db.get_account_credit_topup(id).await? else {
+            return Ok(None);
+        };
+        if topup.is_paid {
+            return Ok(None);
+        }
+        let paid = Currency::from_str(&topup.currency)
+            .map_err(|_| anyhow::anyhow!("invalid top-up currency {}", topup.currency))?;
+        let wanted = self.topup_currency(topup.user_id).await;
+        let (target, credited) = match self
+            .pe
+            .convert_currency(CurrencyAmount::from_u64(paid, topup.amount), wanted)
+            .await
+        {
+            Ok(v) => (wanted, v.value()),
+            Err(e) => {
+                warn!("Top-up {id} cannot be converted to {wanted}, crediting {paid} instead: {e}");
+                (paid, topup.amount)
+            }
+        };
+        Ok(self
+            .db
+            .settle_account_credit_topup(id, &target.to_string(), credited)
+            .await?)
+    }
+
+    pub async fn new_credit_topup_address(
+        &self,
+        amount_msat: u64,
+        label: String,
+    ) -> Result<String> {
+        let enabled = self
+            .db
+            .list_payment_method_configs()
+            .await?
+            .iter()
+            .any(|c| c.enabled && c.payment_method == PaymentMethod::OnChain);
+        ensure!(enabled, "On-chain payments are not enabled");
+        self.new_onchain_address(amount_msat, "LNVPS credit top-up".to_string(), label)
+            .await
+    }
+
+    pub async fn new_credit_topup_swap(
+        &self,
+        coin: Currency,
+        amount_msat: u64,
+        label: String,
+    ) -> Result<SwapOrder> {
+        let company_id = self
+            .db
+            .list_payment_method_configs()
+            .await?
+            .iter()
+            .find(|c| {
+                c.enabled
+                    && c.payment_method == PaymentMethod::FixedFloat
+                    && fixedfloat_coin_accepted(c, coin)
+            })
+            .map(|c| c.company_id)
+            .context("FixedFloat payments are not enabled for this coin")?;
+        self.new_fixedfloat_swap(
+            company_id,
+            &RenewMode::FixedFloat { coin },
+            Currency::BTC,
+            amount_msat,
+            "LNVPS credit top-up".to_string(),
+            label,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -293,6 +541,7 @@ impl SubscriptionHandler {
             // so reaching this is a wiring bug — fail loud instead of a swallowed
             // Err (the callers only `warn!` on Err, which is how a missing App
             // handler previously went unnoticed).
+            LineItemType::VmAddon => Ok(Box::new(vm_addon::VmAddonLineItemHandler)),
             t @ (LineItemType::AsnSponsoring | LineItemType::DnsHosting) => {
                 panic!("no subscription line item handler implemented for {t:?}")
             }
@@ -343,10 +592,44 @@ impl SubscriptionHandler {
             ),
         }
 
+        let held = self
+            .db
+            .get_account_credit_debit_by_payment(&payment.id)
+            .await
+            .ok()
+            .flatten()
+            .map(|d| d.amount);
+        match self.db.settle_account_credit_debit(&payment.id).await {
+            Ok(Some(d)) if held.is_some_and(|h| h > d.amount) => warn!(
+                "Account credit on payment {} fell short: {} of {} {} spent",
+                hex::encode(&payment.id),
+                d.amount,
+                held.unwrap_or_default(),
+                d.currency
+            ),
+            Ok(Some(d)) => info!(
+                "Account credit {} {} spent on payment {}",
+                d.amount,
+                d.currency,
+                hex::encode(&payment.id)
+            ),
+            Ok(None) => {}
+            Err(e) => warn!(
+                "Failed to settle account credit for payment {}: {}",
+                hex::encode(&payment.id),
+                e
+            ),
+        }
+
         let line_items = self
             .db
             .list_subscription_line_items(payment.subscription_id)
-            .await?;
+            .await?
+            .into_iter()
+            // A deactivated item's resource is gone: it is not billed,
+            // renewed or handed lifecycle events.
+            .filter(|li| li.is_active())
+            .collect::<Vec<_>>();
         for li in &line_items {
             match self.make_line_item_handler(li).await {
                 Ok(handler) => {
@@ -364,6 +647,16 @@ impl SubscriptionHandler {
                     );
                 }
             }
+        }
+
+        if payment.payment_type == SubscriptionPaymentType::AddonChange
+            && let Err(e) = self.apply_paid_vm_addon(payment).await
+        {
+            warn!(
+                "Failed to apply add-on payment {}: {}",
+                hex::encode(&payment.id),
+                e
+            );
         }
 
         info!(
@@ -622,10 +915,33 @@ impl SubscriptionHandler {
                     payment_type: payment.payment_type,
                     tax_lines: vec![],
                     discount,
+                    credit: self.credit_for_payment(&payment).await?,
                 })
             }
             PricedRenewal::Priced { quote, .. } => Ok(quote),
         }
+    }
+
+    async fn credit_for_payment(
+        &self,
+        payment: &SubscriptionPayment,
+    ) -> Result<Option<AppliedCredit>> {
+        let Some(debit) = self
+            .db
+            .get_account_credit_debit_by_payment(&payment.id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(AppliedCredit {
+            user_id: debit.user_id,
+            amount: debit.payment_amount,
+            currency: Currency::from_str(&payment.currency)
+                .map_err(|_| anyhow::anyhow!("Invalid payment currency"))?,
+            base_amount: debit.amount,
+            base_currency: Currency::from_str(&debit.currency)
+                .map_err(|_| anyhow::anyhow!("Invalid credit currency"))?,
+        }))
     }
 
     /// Create a renewal/purchase payment for a subscription.
@@ -664,6 +980,7 @@ impl SubscriptionHandler {
             payment_type,
             tax_lines,
             discount,
+            credit,
         } = quote;
 
         let tax_summary = lnvps_api_common::summarize_tax_lines(&tax_lines);
@@ -676,31 +993,41 @@ impl SubscriptionHandler {
                 .evidence_json(),
         );
 
-        // Generate payment based on method
-        let subscription_payment = self
-            .build_payment(
-                subscription_id,
-                &subscription,
-                &user,
-                method,
-                &mode,
-                payment_type,
-                converted_amount,
-                converted_currency,
-                tax,
-                processing_fee,
-                rate,
-                time_value,
-                &tax_summary,
-                tax_evidence,
-                tax_breakdown,
-                source,
-            )
-            .await?;
-
-        // Save payment to database
-        self.db
-            .insert_subscription_payment(&subscription_payment)
+        let reservation = self.reserve_credit(credit.as_ref()).await?;
+        let created = async {
+            let payment = self
+                .build_payment(
+                    subscription_id,
+                    &subscription,
+                    &user,
+                    method,
+                    &mode,
+                    payment_type,
+                    converted_amount,
+                    converted_currency,
+                    tax,
+                    processing_fee,
+                    rate,
+                    time_value,
+                    &tax_summary,
+                    tax_evidence,
+                    tax_breakdown,
+                    source,
+                    credit.as_ref(),
+                )
+                .await?;
+            self.db.insert_subscription_payment(&payment).await?;
+            Ok::<_, anyhow::Error>(payment)
+        }
+        .await;
+        let mut subscription_payment = match created {
+            Ok(p) => p,
+            Err(e) => {
+                self.release_credit(reservation).await;
+                return Err(e);
+            }
+        };
+        self.attach_credit(reservation, &subscription_payment)
             .await?;
 
         // Record the discount against the payment, unsettled. It consumes no
@@ -718,6 +1045,9 @@ impl SubscriptionHandler {
                 })
                 .await?;
         }
+
+        self.settle_if_credit_funded(&mut subscription_payment)
+            .await?;
 
         // For saved-method payments, charge on the spot and wait for settlement.
         self.collect_saved_payment(subscription_payment, &mode)
@@ -743,8 +1073,16 @@ impl SubscriptionHandler {
         let line_items = self
             .db
             .list_subscription_line_items(subscription_id)
-            .await?;
-        ensure!(!line_items.is_empty(), "Subscription has no line items");
+            .await?
+            .into_iter()
+            // A deactivated item's resource is gone: it is not billed,
+            // renewed or handed lifecycle events.
+            .filter(|li| li.is_active())
+            .collect::<Vec<_>>();
+        ensure!(
+            !line_items.is_empty(),
+            "Subscription has no active line items"
+        );
 
         // Get user for tax calculation
         let user = self.db.get_user(subscription.user_id).await?;
@@ -988,21 +1326,35 @@ impl SubscriptionHandler {
         let converted_amount = total_amount;
         let converted_currency = payment_currency;
 
+        let (processing_fee, credit) = self
+            .price_credit(
+                subscription.user_id,
+                subscription.company_id,
+                method,
+                converted_amount,
+                tax,
+                processing_fee,
+                converted_currency,
+            )
+            .await?;
+
+        ensure_credit_funded_if_hourly(&subscription, credit.as_ref(), converted_amount, tax)?;
+
         // Reject payments below the method's configured minimum (gross = net + tax
         // + processing fee). Prevents uneconomic small charges (e.g. Revolut's
         // flat 20c base fee dominating a tiny payment). Enforced here rather than
         // at invoice creation so a quote refuses an uneconomic order at the same
         // point the renewal would.
-        self.pe
-            .enforce_min_amount(
-                subscription.company_id,
-                method,
-                CurrencyAmount::from_u64(
-                    converted_currency,
-                    converted_amount + tax + processing_fee,
-                ),
-            )
-            .await?;
+        let due = converted_amount + tax + processing_fee - credit_amount(credit.as_ref());
+        if due > 0 {
+            self.pe
+                .enforce_min_amount(
+                    subscription.company_id,
+                    method,
+                    CurrencyAmount::from_u64(converted_currency, due),
+                )
+                .await?;
+        }
 
         Ok(PricedRenewal::Priced {
             quote: RenewalQuote {
@@ -1015,6 +1367,7 @@ impl SubscriptionHandler {
                 payment_type,
                 tax_lines,
                 discount,
+                credit,
             },
             subscription,
             user,
@@ -1042,8 +1395,44 @@ impl SubscriptionHandler {
         tax_evidence: Option<serde_json::Value>,
         tax_breakdown: Option<serde_json::Value>,
         source: RenewalSource,
+        credit: Option<&AppliedCredit>,
     ) -> Result<SubscriptionPayment> {
-        let subscription = &*subscription;
+        if credit_covers(credit, converted_amount, tax) {
+            info!("Credit fully funds subscription {subscription_id} payment: no invoice");
+            let new_id: [u8; 32] = rand::random();
+            return Ok(SubscriptionPayment {
+                renewal_source: Some(source),
+                id: new_id.to_vec(),
+                subscription_id,
+                user_id: subscription.user_id,
+                created: Utc::now(),
+                expires: Utc::now().add(Duration::from_secs(600)),
+                amount: converted_amount,
+                currency: converted_currency.to_string(),
+                payment_method: method,
+                payment_type,
+                external_data: CREDIT_FUNDED_MARKER.into(),
+                external_id: None,
+                is_paid: false,
+                rate,
+                time_value: if time_value > 0 {
+                    Some(time_value)
+                } else {
+                    None
+                },
+                metadata: None,
+                tax,
+                processing_fee,
+                paid_at: None,
+                tax_rate: tax_summary.rate,
+                tax_country_code: tax_summary.country_code.clone(),
+                tax_treatment: tax_summary.treatment.clone(),
+                tax_evidence,
+                tax_breakdown,
+                refunded_payment_id: None,
+            });
+        }
+        let credit_covered = credit_amount(credit);
         Ok(match method {
             PaymentMethod::Lightning => {
                 ensure!(
@@ -1051,8 +1440,7 @@ impl SubscriptionHandler {
                     "Lightning payment must be in BTC"
                 );
                 const INVOICE_EXPIRE: u64 = 600;
-                // Round to nearest satoshi for wallet compatibility
-                let invoice_amount = round_msat_to_sat(converted_amount + tax);
+                let invoice_amount = round_msat_to_sat(converted_amount + tax - credit_covered);
                 let desc = match payment_type {
                     SubscriptionPaymentType::Purchase => {
                         format!("Subscription purchase: {}", subscription.name)
@@ -1062,6 +1450,9 @@ impl SubscriptionHandler {
                     }
                     SubscriptionPaymentType::Upgrade => {
                         format!("Subscription upgrade: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::AddonChange => {
+                        format!("Subscription add-ons: {}", subscription.name)
                     }
                     // Refunds are recorded, never invoiced: nothing here creates
                     // one, and an invoice for money we owe the customer would be
@@ -1073,9 +1464,10 @@ impl SubscriptionHandler {
                 };
 
                 info!(
-                    "Creating invoice for subscription {} for {} sats",
+                    "Creating invoice for subscription {} for {} sats ({} sats from credit)",
                     subscription_id,
-                    invoice_amount / 1000
+                    invoice_amount / 1000,
+                    credit_covered / 1000
                 );
 
                 let invoice = self
@@ -1140,6 +1532,9 @@ impl SubscriptionHandler {
                     SubscriptionPaymentType::Upgrade => {
                         format!("Subscription upgrade: {}", subscription.name)
                     }
+                    SubscriptionPaymentType::AddonChange => {
+                        format!("Subscription add-ons: {}", subscription.name)
+                    }
                     // Refunds are recorded, never invoiced: nothing here creates
                     // one, and an invoice for money we owe the customer would be
                     // nonsense. Kept explicit so a future path that does reach
@@ -1149,10 +1544,8 @@ impl SubscriptionHandler {
                     }
                 };
 
-                let order_amount = CurrencyAmount::from_u64(
-                    converted_currency,
-                    converted_amount + tax + processing_fee,
-                );
+                let external_amount = converted_amount + tax + processing_fee - credit_covered;
+                let order_amount = CurrencyAmount::from_u64(converted_currency, external_amount);
                 let (external_id, raw_data) = match &mode {
                     RenewMode::Saved { method_id } => {
                         // Merchant-initiated charge against a saved Revolut
@@ -1174,6 +1567,9 @@ impl SubscriptionHandler {
                             )
                             .await?;
                         (info.external_id, info.raw_data)
+                    }
+                    RenewMode::FixedFloat { .. } => {
+                        bail!("A coin cannot be used with this payment method")
                     }
                     RenewMode::Interactive { save_card } => {
                         self.create_revolut_order(
@@ -1230,7 +1626,7 @@ impl SubscriptionHandler {
                 // On-chain payments need time for the tx to be broadcast and
                 // confirmed; hold the quoted rate for longer than Lightning.
                 const ONCHAIN_EXPIRE: u64 = 3600;
-                let invoice_amount = round_msat_to_sat(converted_amount + tax);
+                let invoice_amount = round_msat_to_sat(converted_amount + tax - credit_covered);
                 let desc = match payment_type {
                     SubscriptionPaymentType::Purchase => {
                         format!("Subscription purchase: {}", subscription.name)
@@ -1240,6 +1636,9 @@ impl SubscriptionHandler {
                     }
                     SubscriptionPaymentType::Upgrade => {
                         format!("Subscription upgrade: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::AddonChange => {
+                        format!("Subscription add-ons: {}", subscription.name)
                     }
                     // Refunds are recorded, never invoiced: nothing here creates
                     // one, and an invoice for money we owe the customer would be
@@ -1289,9 +1688,263 @@ impl SubscriptionHandler {
                     refunded_payment_id: None,
                 }
             }
+            PaymentMethod::FixedFloat => {
+                let desc = match payment_type {
+                    SubscriptionPaymentType::Purchase => {
+                        format!("Subscription purchase: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::Renewal => {
+                        format!("Subscription renewal: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::Upgrade => {
+                        format!("Subscription upgrade: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::AddonChange => {
+                        format!("Subscription add-ons: {}", subscription.name)
+                    }
+                    SubscriptionPaymentType::Refund => {
+                        bail!("Cannot create an invoice for a refund")
+                    }
+                };
+                let receive_amount =
+                    round_msat_to_sat(converted_amount + tax + processing_fee - credit_covered);
+                let new_id: [u8; 32] = rand::random();
+                let order = self
+                    .new_fixedfloat_swap(
+                        subscription.company_id,
+                        mode,
+                        converted_currency,
+                        receive_amount,
+                        desc,
+                        hex::encode(new_id),
+                    )
+                    .await?;
+
+                SubscriptionPayment {
+                    renewal_source: Some(source),
+                    id: new_id.to_vec(),
+                    subscription_id,
+                    user_id: subscription.user_id,
+                    created: Utc::now(),
+                    expires: order.expires,
+                    amount: converted_amount,
+                    currency: converted_currency.to_string(),
+                    payment_method: method,
+                    payment_type,
+                    external_data: order.data.to_json()?.into(),
+                    external_id: None,
+                    is_paid: false,
+                    rate,
+                    time_value: if time_value > 0 {
+                        Some(time_value)
+                    } else {
+                        None
+                    },
+                    metadata: None,
+                    tax,
+                    processing_fee,
+                    paid_at: None,
+                    tax_rate: tax_summary.rate,
+                    tax_country_code: tax_summary.country_code.clone(),
+                    tax_treatment: tax_summary.treatment.clone(),
+                    tax_evidence: tax_evidence.clone(),
+                    tax_breakdown: tax_breakdown.clone(),
+                    refunded_payment_id: None,
+                }
+            }
             PaymentMethod::Paypal => bail!("PayPal not implemented"),
             PaymentMethod::Stripe => bail!("Stripe not implemented"),
         })
+    }
+
+    /// The credit to apply to a bill of `gross` in `currency`: the user's
+    /// unreserved balance, converted and clamped. `None` unless opted in.
+    async fn quote_credit(
+        &self,
+        user_id: u64,
+        gross: u64,
+        currency: Currency,
+    ) -> Result<Option<AppliedCredit>> {
+        let credits = self.db.list_account_credits(user_id).await?;
+        if !credits.iter().any(|c| c.auto_apply) || gross == 0 {
+            return Ok(None);
+        }
+        let mut spendable = Vec::new();
+        for c in credits {
+            let reserved = self
+                .db
+                .get_account_credit_reserved(user_id, &c.currency)
+                .await?;
+            let available = c.balance.saturating_sub(reserved);
+            if available > 0 {
+                spendable.push((c.currency, available));
+            }
+        }
+        let chosen = spendable
+            .iter()
+            .find(|(c, _)| *c == currency.to_string())
+            .or_else(|| spendable.first());
+        let Some((balance_currency, available)) = chosen.cloned() else {
+            return Ok(None);
+        };
+        let base_currency = Currency::from_str(&balance_currency)
+            .map_err(|_| anyhow::anyhow!("Invalid credit currency"))?;
+        let converted = self
+            .pe
+            .convert_currency(CurrencyAmount::from_u64(base_currency, available), currency)
+            .await?
+            .value();
+        let applied = converted.min(gross);
+        if applied == 0 {
+            return Ok(None);
+        }
+        let base_amount = if base_currency == currency {
+            applied
+        } else {
+            ((applied as u128 * available as u128) / converted as u128) as u64
+        }
+        .min(available);
+        Ok(Some(AppliedCredit {
+            user_id,
+            amount: applied,
+            currency,
+            base_amount,
+            base_currency,
+        }))
+    }
+
+    /// Apply the user's credit to a bill of `net + tax`, returning the
+    /// processing fee on what is still collected and the credit. When the
+    /// remainder would fall below the method's minimum, less credit is used so
+    /// the remainder meets it.
+    #[allow(clippy::too_many_arguments)]
+    async fn price_credit(
+        &self,
+        user_id: u64,
+        company_id: u64,
+        method: PaymentMethod,
+        net: u64,
+        tax: u64,
+        fee: u64,
+        currency: Currency,
+    ) -> Result<(u64, Option<AppliedCredit>)> {
+        let billable = net + tax;
+        let Some(mut credit) = self.quote_credit(user_id, billable, currency).await? else {
+            return Ok((fee, None));
+        };
+        let due = |covered: u64| {
+            let collected = billable - covered;
+            collected + scale_fee(fee, collected, billable)
+        };
+        let min = self.pe.min_amount_in(company_id, method, currency).await?;
+        let remainder = due(credit.amount);
+        if remainder > 0 && remainder < min {
+            let shortfall = min - remainder;
+            if shortfall >= credit.amount {
+                return Ok((fee, None));
+            }
+            credit.reduce_to(credit.amount - shortfall);
+        }
+        Ok((
+            scale_fee(fee, billable - credit.amount, billable),
+            Some(credit),
+        ))
+    }
+
+    /// Price the credit for an upgrade quote of `vm_id`, as
+    /// [`Self::create_vm_upgrade_payment`] will.
+    pub async fn quote_vm_upgrade_credit(
+        &self,
+        vm_id: u64,
+        method: PaymentMethod,
+        net: u64,
+        tax: u64,
+        fee: u64,
+        currency: Currency,
+    ) -> Result<(u64, Option<AppliedCredit>)> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let line_item = self
+            .db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let subscription = self.db.get_subscription(line_item.subscription_id).await?;
+        self.price_credit(
+            vm.user_id,
+            subscription.company_id,
+            method,
+            net,
+            tax,
+            fee,
+            currency,
+        )
+        .await
+    }
+
+    async fn reserve_credit(&self, credit: Option<&AppliedCredit>) -> Result<Option<u64>> {
+        let Some(c) = credit else {
+            return Ok(None);
+        };
+        self.db
+            .reserve_account_credit(&lnvps_db::AccountCreditDebit {
+                user_id: c.user_id,
+                amount: c.base_amount,
+                currency: c.base_currency.to_string(),
+                payment_amount: c.amount,
+                expires: credit_hold_expiry(),
+                ..Default::default()
+            })
+            .await?
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("Account credit balance changed, please try again"))
+    }
+
+    async fn release_credit(&self, reservation: Option<u64>) {
+        if let Some(id) = reservation
+            && let Err(e) = self.db.release_account_credit_debit(id).await
+        {
+            warn!("Failed to release account credit reservation {id}: {e}");
+        }
+    }
+
+    async fn attach_credit(
+        &self,
+        reservation: Option<u64>,
+        payment: &SubscriptionPayment,
+    ) -> Result<()> {
+        if let Some(id) = reservation {
+            self.db
+                .attach_account_credit_debit(id, &payment.id, payment.expires)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Spend the credit on a payment with no external invoice and run the
+    /// settlement funnel.
+    async fn settle_if_credit_funded(&self, payment: &mut SubscriptionPayment) -> Result<()> {
+        if payment.external_data.as_str() != CREDIT_FUNDED_MARKER {
+            return Ok(());
+        }
+        let held = self
+            .db
+            .get_account_credit_debit_by_payment(&payment.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Credit-funded payment has no credit held"))?;
+        let spent = self
+            .db
+            .settle_account_credit_debit(&payment.id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Credit-funded payment was already settled"))?;
+        ensure!(
+            spent.amount == held.amount,
+            "Account credit fell short on payment {}: {} of {} spent",
+            hex::encode(&payment.id),
+            spent.amount,
+            held.amount
+        );
+        self.complete_payment(payment).await?;
+        payment.is_paid = true;
+        Ok(())
     }
 
     /// Resolve a discount code for an order, in the payment currency.
@@ -1351,6 +2004,7 @@ impl SubscriptionHandler {
             SubscriptionPaymentType::Renewal,
             None,
             RenewMode::Interactive { save_card: false },
+            false,
         )
         .await
     }
@@ -1363,6 +2017,7 @@ impl SubscriptionHandler {
         payment_type: SubscriptionPaymentType,
         metadata: Option<serde_json::Value>,
         mode: RenewMode,
+        apply_credit: bool,
     ) -> Result<SubscriptionPayment> {
         let (subscription_id, user_id, desc) = match &price {
             CostResult::Existing(_) => (0, 0, String::new()),
@@ -1377,6 +2032,7 @@ impl SubscriptionHandler {
                         format!("VM renewal {vm_id} to {}", p.new_expiry)
                     }
                     SubscriptionPaymentType::Upgrade => format!("VM upgrade {vm_id}"),
+                    SubscriptionPaymentType::AddonChange => format!("VM add-ons {vm_id}"),
                     SubscriptionPaymentType::Purchase => format!("VM purchase {vm_id}"),
                     // A refund is recorded against an existing payment, never
                     // priced and invoiced like a sale.
@@ -1396,6 +2052,7 @@ impl SubscriptionHandler {
             payment_type,
             metadata,
             mode,
+            apply_credit,
         )
         .await
     }
@@ -1417,211 +2074,348 @@ impl SubscriptionHandler {
         payment_type: SubscriptionPaymentType,
         metadata: Option<serde_json::Value>,
         mode: RenewMode,
+        apply_credit: bool,
     ) -> Result<SubscriptionPayment> {
-        match price {
-            CostResult::Existing(p) => Ok(p),
-            CostResult::New(p) => {
-                // Record the tax values on the payment. Single line item, so the
-                // breakdown has exactly one entry.
-                let tax_lines = vec![p.tax_details.to_line(p.amount)];
-                let tax_summary = lnvps_api_common::summarize_tax_lines(&tax_lines);
-                let tax_breakdown = serde_json::to_value(&tax_lines).ok();
-                let tax_evidence = Some(p.tax_details.evidence_json());
-                let payment = match method {
-                    PaymentMethod::Lightning => {
-                        ensure!(
-                            p.currency == Currency::BTC,
-                            "Cannot create invoices for non-BTC currency"
-                        );
-                        const INVOICE_EXPIRE: u64 = 600;
-                        let total_amount = round_msat_to_sat(p.amount + p.tax);
-                        info!(
-                            "Creating invoice for subscription {subscription_id} for {} sats",
-                            total_amount / 1000
-                        );
-                        let invoice = self
-                            .node
-                            .add_invoice(AddInvoiceRequest {
-                                memo: Some(desc),
-                                amount: total_amount,
-                                expire: Some(INVOICE_EXPIRE as u32),
-                            })
+        let mut p = match price {
+            CostResult::Existing(p) => return Ok(p),
+            CostResult::New(p) => p,
+        };
+        let subscription = self.db.get_subscription(subscription_id).await?;
+        let credit = if apply_credit {
+            let (fee, credit) = self
+                .price_credit(
+                    user_id,
+                    subscription.company_id,
+                    method,
+                    p.amount,
+                    p.tax,
+                    p.processing_fee,
+                    p.currency,
+                )
+                .await?;
+            p.processing_fee = fee;
+            credit
+        } else {
+            None
+        };
+        ensure_credit_funded_if_hourly(&subscription, credit.as_ref(), p.amount, p.tax)?;
+        let reservation = self.reserve_credit(credit.as_ref()).await?;
+        let created = async {
+            let payment = self
+                .build_priced_payment(
+                    subscription_id,
+                    user_id,
+                    desc,
+                    method,
+                    &p,
+                    payment_type,
+                    metadata,
+                    &mode,
+                    credit.as_ref(),
+                )
+                .await?;
+            self.db.insert_subscription_payment(&payment).await?;
+            Ok::<_, anyhow::Error>(payment)
+        }
+        .await;
+        let mut payment = match created {
+            Ok(p) => p,
+            Err(e) => {
+                self.release_credit(reservation).await;
+                return Err(e);
+            }
+        };
+        self.attach_credit(reservation, &payment).await?;
+        self.settle_if_credit_funded(&mut payment).await?;
+
+        // For saved-method payments, charge on the spot and wait for
+        // settlement before returning.
+        self.collect_saved_payment(payment, &mode).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_priced_payment(
+        &self,
+        subscription_id: u64,
+        user_id: u64,
+        desc: String,
+        method: PaymentMethod,
+        p: &NewPaymentInfo,
+        payment_type: SubscriptionPaymentType,
+        metadata: Option<serde_json::Value>,
+        mode: &RenewMode,
+        credit: Option<&AppliedCredit>,
+    ) -> Result<SubscriptionPayment> {
+        // Record the tax values on the payment. Single line item, so the
+        // breakdown has exactly one entry.
+        let tax_lines = vec![p.tax_details.to_line(p.amount)];
+        let tax_summary = lnvps_api_common::summarize_tax_lines(&tax_lines);
+        let tax_breakdown = serde_json::to_value(&tax_lines).ok();
+        let tax_evidence = Some(p.tax_details.evidence_json());
+        if credit_covers(credit, p.amount, p.tax) {
+            info!("Credit fully funds subscription {subscription_id} payment: no invoice");
+            let new_id: [u8; 32] = rand::random();
+            return Ok(SubscriptionPayment {
+                // Every caller here is a customer action (renew, upgrade, purchase);
+                // worker-initiated renewals go through renew_subscription_inner.
+                renewal_source: Some(RenewalSource::Manual),
+                id: new_id.to_vec(),
+                subscription_id,
+                user_id,
+                created: Utc::now(),
+                expires: Utc::now().add(Duration::from_secs(600)),
+                amount: p.amount,
+                currency: p.currency.to_string(),
+                payment_method: method,
+                payment_type,
+                external_data: CREDIT_FUNDED_MARKER.into(),
+                external_id: None,
+                is_paid: false,
+                rate: p.rate.rate,
+                time_value: Some(p.time_value),
+                metadata,
+                tax: p.tax,
+                processing_fee: p.processing_fee,
+                paid_at: None,
+                tax_rate: tax_summary.rate,
+                tax_country_code: tax_summary.country_code.clone(),
+                tax_treatment: tax_summary.treatment.clone(),
+                tax_evidence,
+                tax_breakdown,
+                refunded_payment_id: None,
+            });
+        }
+        let credit_covered = credit_amount(credit);
+        Ok(match method {
+            PaymentMethod::Lightning => {
+                ensure!(
+                    p.currency == Currency::BTC,
+                    "Cannot create invoices for non-BTC currency"
+                );
+                const INVOICE_EXPIRE: u64 = 600;
+                let total_amount = round_msat_to_sat(p.amount + p.tax - credit_covered);
+                info!(
+                    "Creating invoice for subscription {subscription_id} for {} sats ({} sats from credit)",
+                    total_amount / 1000,
+                    credit_covered / 1000
+                );
+                let invoice = self
+                    .node
+                    .add_invoice(AddInvoiceRequest {
+                        memo: Some(desc),
+                        amount: total_amount,
+                        expire: Some(INVOICE_EXPIRE as u32),
+                    })
+                    .await?;
+                SubscriptionPayment {
+                    // Every caller here is a customer action (renew, upgrade, purchase);
+                    // worker-initiated renewals go through renew_subscription_inner.
+                    renewal_source: Some(RenewalSource::Manual),
+                    id: hex::decode(invoice.payment_hash())?,
+                    subscription_id,
+                    user_id,
+                    created: Utc::now(),
+                    expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
+                    amount: p.amount,
+                    currency: p.currency.to_string(),
+                    payment_method: method,
+                    payment_type,
+                    external_data: invoice.pr().into(),
+                    external_id: invoice.external_id,
+                    is_paid: false,
+                    rate: p.rate.rate,
+                    time_value: Some(p.time_value),
+                    metadata,
+                    tax: p.tax,
+                    processing_fee: p.processing_fee,
+                    paid_at: None,
+                    tax_rate: tax_summary.rate,
+                    tax_country_code: tax_summary.country_code.clone(),
+                    tax_treatment: tax_summary.treatment.clone(),
+                    tax_evidence: tax_evidence.clone(),
+                    tax_breakdown: tax_breakdown.clone(),
+                    refunded_payment_id: None,
+                }
+            }
+            PaymentMethod::Revolut => {
+                let rev = if let Some(r) = &self.revolut {
+                    r
+                } else {
+                    bail!("Revolut not configured")
+                };
+                ensure!(
+                    p.currency != Currency::BTC,
+                    "Cannot create revolut orders for BTC currency"
+                );
+                let subscription = self.db.get_subscription(subscription_id).await?;
+                let user = self.db.get_user(user_id).await?;
+                let external_amount = p.amount + p.tax + p.processing_fee - credit_covered;
+                let order_amount = CurrencyAmount::from_u64(p.currency, external_amount);
+                let (external_id, raw_data) = match &mode {
+                    RenewMode::Saved { method_id } => {
+                        // Merchant-initiated off-session charge against a
+                        // saved Revolut card (e.g. for an upgrade paid with
+                        // a saved method) — no customer interaction.
+                        let method = self.revolut_payment_method(user.id, *method_id).await?;
+                        let customer_id: String = method
+                            .external_customer_id
+                            .clone()
+                            .ok_or_else(|| anyhow::anyhow!("Revolut method missing customer id"))?
+                            .into();
+                        let payment_method_id: String = method.external_id.clone().into();
+                        let info = rev
+                            .charge_subscription(
+                                &customer_id,
+                                &payment_method_id,
+                                order_amount,
+                                &desc,
+                            )
                             .await?;
-                        SubscriptionPayment {
-                            // Every caller here is a customer action (renew, upgrade, purchase);
-                            // worker-initiated renewals go through renew_subscription_inner.
-                            renewal_source: Some(RenewalSource::Manual),
-                            id: hex::decode(invoice.payment_hash())?,
-                            subscription_id,
-                            user_id: user_id,
-                            created: Utc::now(),
-                            expires: Utc::now().add(Duration::from_secs(INVOICE_EXPIRE)),
-                            amount: p.amount,
-                            currency: p.currency.to_string(),
-                            payment_method: method,
-                            payment_type,
-                            external_data: invoice.pr().into(),
-                            external_id: invoice.external_id,
-                            is_paid: false,
-                            rate: p.rate.rate,
-                            time_value: Some(p.time_value),
-                            metadata,
-                            tax: p.tax,
-                            processing_fee: p.processing_fee,
-                            paid_at: None,
-                            tax_rate: tax_summary.rate,
-                            tax_country_code: tax_summary.country_code.clone(),
-                            tax_treatment: tax_summary.treatment.clone(),
-                            tax_evidence: tax_evidence.clone(),
-                            tax_breakdown: tax_breakdown.clone(),
-                            refunded_payment_id: None,
-                        }
+                        (info.external_id, info.raw_data)
                     }
-                    PaymentMethod::Revolut => {
-                        let rev = if let Some(r) = &self.revolut {
-                            r
-                        } else {
-                            bail!("Revolut not configured")
-                        };
-                        ensure!(
-                            p.currency != Currency::BTC,
-                            "Cannot create revolut orders for BTC currency"
-                        );
-                        let subscription = self.db.get_subscription(subscription_id).await?;
-                        let user = self.db.get_user(user_id).await?;
-                        let order_amount = CurrencyAmount::from_u64(
-                            p.currency,
-                            p.amount + p.tax + p.processing_fee,
-                        );
-                        let (external_id, raw_data) = match &mode {
-                            RenewMode::Saved { method_id } => {
-                                // Merchant-initiated off-session charge against a
-                                // saved Revolut card (e.g. for an upgrade paid with
-                                // a saved method) — no customer interaction.
-                                let method =
-                                    self.revolut_payment_method(user.id, *method_id).await?;
-                                let customer_id: String = method
-                                    .external_customer_id
-                                    .clone()
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!("Revolut method missing customer id")
-                                    })?
-                                    .into();
-                                let payment_method_id: String = method.external_id.clone().into();
-                                let info = rev
-                                    .charge_subscription(
-                                        &customer_id,
-                                        &payment_method_id,
-                                        order_amount,
-                                        &desc,
-                                    )
-                                    .await?;
-                                (info.external_id, info.raw_data)
-                            }
-                            RenewMode::Interactive { save_card } => {
-                                self.create_revolut_order(
-                                    rev,
-                                    &subscription,
-                                    &user,
-                                    payment_type,
-                                    &desc,
-                                    order_amount,
-                                    *save_card,
-                                )
-                                .await?
-                            }
-                        };
-                        let new_id: [u8; 32] = rand::random();
-                        SubscriptionPayment {
-                            // Every caller here is a customer action (renew, upgrade, purchase);
-                            // worker-initiated renewals go through renew_subscription_inner.
-                            renewal_source: Some(RenewalSource::Manual),
-                            id: new_id.to_vec(),
-                            subscription_id,
-                            user_id: user_id,
-                            created: Utc::now(),
-                            expires: Utc::now().add(Duration::from_secs(3600)),
-                            amount: p.amount,
-                            currency: p.currency.to_string(),
-                            payment_method: method,
-                            payment_type,
-                            external_data: raw_data.into(),
-                            external_id: Some(external_id),
-                            is_paid: false,
-                            rate: p.rate.rate,
-                            time_value: Some(p.time_value),
-                            metadata,
-                            tax: p.tax,
-                            processing_fee: p.processing_fee,
-                            paid_at: None,
-                            tax_rate: tax_summary.rate,
-                            tax_country_code: tax_summary.country_code.clone(),
-                            tax_treatment: tax_summary.treatment.clone(),
-                            tax_evidence: tax_evidence.clone(),
-                            tax_breakdown: tax_breakdown.clone(),
-                            refunded_payment_id: None,
-                        }
+                    RenewMode::FixedFloat { .. } => {
+                        bail!("A coin cannot be used with this payment method")
                     }
-                    PaymentMethod::OnChain => {
-                        ensure!(
-                            p.currency == Currency::BTC,
-                            "Cannot create on-chain payments for non-BTC currency"
-                        );
-                        const ONCHAIN_EXPIRE: u64 = 3600;
-                        let total_amount = round_msat_to_sat(p.amount + p.tax);
-                        info!(
-                            "Creating on-chain address for subscription {subscription_id} for {} sats",
-                            total_amount / 1000
-                        );
-                        let new_id: [u8; 32] = rand::random();
-                        let address = self
-                            .new_onchain_address(total_amount, desc, hex::encode(new_id))
-                            .await?;
-                        SubscriptionPayment {
-                            // Every caller here is a customer action (renew, upgrade, purchase);
-                            // worker-initiated renewals go through renew_subscription_inner.
-                            renewal_source: Some(RenewalSource::Manual),
-                            id: new_id.to_vec(),
-                            subscription_id,
-                            user_id: user_id,
-                            created: Utc::now(),
-                            expires: Utc::now().add(Duration::from_secs(ONCHAIN_EXPIRE)),
-                            amount: p.amount,
-                            currency: p.currency.to_string(),
-                            payment_method: method,
+                    RenewMode::Interactive { save_card } => {
+                        self.create_revolut_order(
+                            rev,
+                            &subscription,
+                            &user,
                             payment_type,
-                            external_data: address.into(),
-                            // txid is filled in by the chain watcher when the
-                            // deposit is seen.
-                            external_id: None,
-                            is_paid: false,
-                            rate: p.rate.rate,
-                            time_value: Some(p.time_value),
-                            metadata,
-                            tax: p.tax,
-                            processing_fee: p.processing_fee,
-                            paid_at: None,
-                            tax_rate: tax_summary.rate,
-                            tax_country_code: tax_summary.country_code.clone(),
-                            tax_treatment: tax_summary.treatment.clone(),
-                            tax_evidence: tax_evidence.clone(),
-                            tax_breakdown: tax_breakdown.clone(),
-                            refunded_payment_id: None,
-                        }
-                    }
-                    PaymentMethod::Paypal => bail!("PayPal not implemented"),
-                    PaymentMethod::Stripe => {
-                        bail!("Stripe payment creation not yet implemented")
+                            &desc,
+                            order_amount,
+                            *save_card,
+                        )
+                        .await?
                     }
                 };
-
-                self.db.insert_subscription_payment(&payment).await?;
-
-                // For saved-method payments, charge on the spot and wait for
-                // settlement before returning.
-                self.collect_saved_payment(payment, &mode).await
+                let new_id: [u8; 32] = rand::random();
+                SubscriptionPayment {
+                    // Every caller here is a customer action (renew, upgrade, purchase);
+                    // worker-initiated renewals go through renew_subscription_inner.
+                    renewal_source: Some(RenewalSource::Manual),
+                    id: new_id.to_vec(),
+                    subscription_id,
+                    user_id,
+                    created: Utc::now(),
+                    expires: Utc::now().add(Duration::from_secs(3600)),
+                    amount: p.amount,
+                    currency: p.currency.to_string(),
+                    payment_method: method,
+                    payment_type,
+                    external_data: raw_data.into(),
+                    external_id: Some(external_id),
+                    is_paid: false,
+                    rate: p.rate.rate,
+                    time_value: Some(p.time_value),
+                    metadata,
+                    tax: p.tax,
+                    processing_fee: p.processing_fee,
+                    paid_at: None,
+                    tax_rate: tax_summary.rate,
+                    tax_country_code: tax_summary.country_code.clone(),
+                    tax_treatment: tax_summary.treatment.clone(),
+                    tax_evidence: tax_evidence.clone(),
+                    tax_breakdown: tax_breakdown.clone(),
+                    refunded_payment_id: None,
+                }
             }
-        }
+            PaymentMethod::OnChain => {
+                ensure!(
+                    p.currency == Currency::BTC,
+                    "Cannot create on-chain payments for non-BTC currency"
+                );
+                const ONCHAIN_EXPIRE: u64 = 3600;
+                let total_amount = round_msat_to_sat(p.amount + p.tax - credit_covered);
+                info!(
+                    "Creating on-chain address for subscription {subscription_id} for {} sats ({} sats from credit)",
+                    total_amount / 1000,
+                    credit_covered / 1000
+                );
+                let new_id: [u8; 32] = rand::random();
+                let address = self
+                    .new_onchain_address(total_amount, desc, hex::encode(new_id))
+                    .await?;
+                SubscriptionPayment {
+                    // Every caller here is a customer action (renew, upgrade, purchase);
+                    // worker-initiated renewals go through renew_subscription_inner.
+                    renewal_source: Some(RenewalSource::Manual),
+                    id: new_id.to_vec(),
+                    subscription_id,
+                    user_id,
+                    created: Utc::now(),
+                    expires: Utc::now().add(Duration::from_secs(ONCHAIN_EXPIRE)),
+                    amount: p.amount,
+                    currency: p.currency.to_string(),
+                    payment_method: method,
+                    payment_type,
+                    external_data: address.into(),
+                    // txid is filled in by the chain watcher when the
+                    // deposit is seen.
+                    external_id: None,
+                    is_paid: false,
+                    rate: p.rate.rate,
+                    time_value: Some(p.time_value),
+                    metadata,
+                    tax: p.tax,
+                    processing_fee: p.processing_fee,
+                    paid_at: None,
+                    tax_rate: tax_summary.rate,
+                    tax_country_code: tax_summary.country_code.clone(),
+                    tax_treatment: tax_summary.treatment.clone(),
+                    tax_evidence: tax_evidence.clone(),
+                    tax_breakdown: tax_breakdown.clone(),
+                    refunded_payment_id: None,
+                }
+            }
+            PaymentMethod::FixedFloat => {
+                let receive_amount =
+                    round_msat_to_sat(p.amount + p.tax + p.processing_fee - credit_covered);
+                let new_id: [u8; 32] = rand::random();
+                let company_id = self.db.get_subscription(subscription_id).await?.company_id;
+                let order = self
+                    .new_fixedfloat_swap(
+                        company_id,
+                        mode,
+                        p.currency,
+                        receive_amount,
+                        desc,
+                        hex::encode(new_id),
+                    )
+                    .await?;
+                SubscriptionPayment {
+                    renewal_source: Some(RenewalSource::Manual),
+                    id: new_id.to_vec(),
+                    subscription_id,
+                    user_id,
+                    created: Utc::now(),
+                    expires: order.expires,
+                    amount: p.amount,
+                    currency: p.currency.to_string(),
+                    payment_method: method,
+                    payment_type,
+                    external_data: order.data.to_json()?.into(),
+                    external_id: None,
+                    is_paid: false,
+                    rate: p.rate.rate,
+                    time_value: Some(p.time_value),
+                    metadata,
+                    tax: p.tax,
+                    processing_fee: p.processing_fee,
+                    paid_at: None,
+                    tax_rate: tax_summary.rate,
+                    tax_country_code: tax_summary.country_code.clone(),
+                    tax_treatment: tax_summary.treatment.clone(),
+                    tax_evidence: tax_evidence.clone(),
+                    tax_breakdown: tax_breakdown.clone(),
+                    refunded_payment_id: None,
+                }
+            }
+            PaymentMethod::Paypal => bail!("PayPal not implemented"),
+            PaymentMethod::Stripe => {
+                bail!("Stripe payment creation not yet implemented")
+            }
+        })
     }
 
     /// The user's default usable (enabled, non-expired) saved payment method,
@@ -1647,11 +2441,55 @@ impl SubscriptionHandler {
             .ok_or_else(|| anyhow::anyhow!("No NWC payment method configured"))
     }
 
+    async fn has_spendable_credit(&self, user_id: u64) -> Result<bool> {
+        let credits = self.db.list_account_credits(user_id).await?;
+        Ok(credits.iter().any(|c| c.auto_apply && c.balance > 0))
+    }
+
+    pub async fn credit_covers_renewal(&self, sub_id: u64) -> Result<bool> {
+        let sub = self.db.get_subscription(sub_id).await?;
+        if !self.has_spendable_credit(sub.user_id).await? {
+            return Ok(false);
+        }
+        let quote = self
+            .quote_renewal(sub_id, PaymentMethod::Lightning, 1, None)
+            .await?;
+        Ok(credit_covers(
+            quote.credit.as_ref(),
+            quote.amount,
+            quote.tax,
+        ))
+    }
+
     /// Attempt automatic renewal using the user's default saved payment method,
     /// dispatching by provider (NWC Lightning wallet or Revolut card).
     pub async fn auto_renew(&self, sub_id: u64) -> Result<SubscriptionPayment> {
         let sub = self.db.get_subscription(sub_id).await?;
-        let method = self.default_payment_method(sub.user_id).await?;
+
+        if self.credit_covers_renewal(sub_id).await? {
+            let payment = self
+                .renew_subscription_inner(
+                    sub_id,
+                    PaymentMethod::Lightning,
+                    1,
+                    RenewMode::default(),
+                    None,
+                    RenewalSource::Auto,
+                )
+                .await?;
+            info!("Subscription {sub_id} renewed on account credit");
+            return Ok(payment);
+        }
+
+        let method = match self.default_payment_method(sub.user_id).await {
+            Ok(m) => m,
+            Err(_) if self.has_spendable_credit(sub.user_id).await? => {
+                bail!(
+                    "Account credit does not cover the renewal and no saved payment method is set"
+                )
+            }
+            Err(e) => return Err(e),
+        };
         match method.provider.as_str() {
             "nwc" => {
                 #[cfg(feature = "nostr-nwc")]
@@ -1708,7 +2546,7 @@ impl SubscriptionHandler {
         payment: SubscriptionPayment,
         mode: &RenewMode,
     ) -> Result<SubscriptionPayment> {
-        if !matches!(mode, RenewMode::Saved { .. }) {
+        if !matches!(mode, RenewMode::Saved { .. }) || payment.is_paid {
             return Ok(payment);
         }
 
@@ -1833,6 +2671,7 @@ impl SubscriptionHandler {
             SubscriptionPaymentType::Upgrade,
             Some(metadata),
             mode,
+            true,
         )
         .await
     }
@@ -1884,9 +2723,129 @@ impl SubscriptionHandler {
             SubscriptionPaymentType::Upgrade,
             Some(metadata),
             mode,
+            true,
         )
         .await
     }
+
+    pub async fn change_vm_addon(
+        &self,
+        vm_id: u64,
+        kind: VmAddonKind,
+        quantity: u32,
+        method: PaymentMethod,
+        mode: RenewMode,
+    ) -> Result<VmAddonChange> {
+        let quote = self
+            .pe
+            .calculate_vm_addon_cost(vm_id, kind, quantity, method)
+            .await?;
+        if quote.quantity == quote.current {
+            return Ok(VmAddonChange::Applied);
+        }
+        if quote.quantity < quote.current || quote.is_free() {
+            self.apply_vm_addon(vm_id, kind, quantity).await?;
+            return Ok(VmAddonChange::Applied);
+        }
+        let vm = self.db.get_vm(vm_id).await?;
+        let line_item = self
+            .db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let payment = NewPaymentInfo {
+            amount: quote.charge.amount.value(),
+            currency: quote.charge.amount.currency(),
+            rate: quote.charge.rate,
+            time_value: 0,
+            new_expiry: Default::default(),
+            tax: quote.tax.amount,
+            tax_details: quote.tax,
+            processing_fee: quote.processing_fee,
+        };
+        let metadata = serde_json::to_value(VmAddonConfig { kind, quantity })?;
+        let payment = self
+            .price_to_payment_for_subscription(
+                line_item.subscription_id,
+                vm.user_id,
+                format!("VM{vm_id} {kind} add-on x{quantity}"),
+                method,
+                CostResult::New(payment),
+                SubscriptionPaymentType::AddonChange,
+                Some(metadata),
+                mode,
+                true,
+            )
+            .await?;
+        Ok(VmAddonChange::Payment(Box::new(payment)))
+    }
+
+    pub async fn apply_vm_addon(&self, vm_id: u64, kind: VmAddonKind, quantity: u32) -> Result<()> {
+        let price = self.pe.vm_addon_price(vm_id, kind).await?;
+        let vm = self.db.get_vm(vm_id).await?;
+        let subscription = self
+            .db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await?;
+        let amount = self
+            .pe
+            .vm_addon_interval_amount(&price, quantity, &subscription)
+            .await?;
+        self.db
+            .set_vm_addon(
+                vm_id,
+                kind,
+                quantity,
+                amount,
+                &format!("VM{vm_id} - {quantity}x {kind}"),
+            )
+            .await?;
+        for mut pending in self.db.list_pending_vm_subscription_payments(vm_id).await? {
+            if pending.payment_type == SubscriptionPaymentType::Renewal {
+                pending.expires = Utc::now();
+                self.db.update_subscription_payment(&pending).await?;
+            }
+        }
+        if kind == VmAddonKind::Snapshot {
+            let deleted = self
+                .vm_provisioner
+                .trim_snapshots(vm_id, quantity as usize)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if !deleted.is_empty() {
+                info!(
+                    "Deleted snapshots {} of VM {vm_id} over its {quantity} slots",
+                    deleted.join(", ")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_paid_vm_addon(&self, payment: &SubscriptionPayment) -> Result<()> {
+        let config: VmAddonConfig = serde_json::from_value(
+            payment
+                .metadata
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Add-on payment has no metadata"))?,
+        )?;
+        let vm = self
+            .db
+            .get_vm_by_subscription(payment.subscription_id)
+            .await?;
+        self.apply_vm_addon(vm.id, config.kind, config.quantity)
+            .await
+    }
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct VmAddonConfig {
+    pub kind: VmAddonKind,
+    pub quantity: u32,
+}
+
+pub enum VmAddonChange {
+    Applied,
+    Payment(Box<SubscriptionPayment>),
 }
 
 /// Upgrade bookkeeping recorded on a managed-app upgrade payment.
@@ -2010,6 +2969,8 @@ mod revolut_autorenew_tests {
                     amount: 999, // €9.99
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await?;
@@ -2178,6 +3139,8 @@ pub(crate) mod revolut_offline_tests {
                     amount: 999,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -2255,6 +3218,8 @@ pub(crate) mod revolut_offline_tests {
                     amount: 100_000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -2333,6 +3298,8 @@ pub(crate) mod revolut_offline_tests {
                     amount: 100, // 1.00 EUR
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -2408,6 +3375,8 @@ pub(crate) mod revolut_offline_tests {
                     amount: 100_000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -2438,6 +3407,242 @@ pub(crate) mod revolut_offline_tests {
         let addresses = onchain.addresses.lock().await;
         assert_eq!(addresses.len(), 1);
         assert_eq!(payment.external_data.as_str(), addresses[0]);
+    }
+
+    async fn fixedfloat_setup(
+        currency: &str,
+        with_swap: bool,
+        coins: &[&str],
+        enabled: bool,
+    ) -> (
+        SubscriptionHandler,
+        Arc<MockOnChainProvider>,
+        Arc<crate::mocks::MockSwapProvider>,
+        u64,
+    ) {
+        use lnvps_db::{FixedFloatProviderConfig, PaymentMethodConfig, ProviderConfig};
+        let db = Arc::new(MockDb::default());
+        let onchain = Arc::new(MockOnChainProvider::default());
+        let swap = Arc::new(crate::mocks::MockSwapProvider::default());
+        let user_id = db.upsert_user(&[23u8; 32]).await.unwrap();
+        let mut config = PaymentMethodConfig::new_with_config(
+            1,
+            PaymentMethod::FixedFloat,
+            "FixedFloat".to_string(),
+            enabled,
+            ProviderConfig::FixedFloat(FixedFloatProviderConfig {
+                api_key: "k".to_string(),
+                api_secret: "s".to_string(),
+                url: Some("http://127.0.0.1:1".to_string()),
+                refcode: None,
+                afftax: None,
+            }),
+        );
+        config.supported_currencies =
+            lnvps_db::CommaSeparated::new(coins.iter().map(|c| c.to_string()).collect());
+        db.insert_payment_method_config(&config).await.unwrap();
+        let (sub_id, _items) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "s".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: true,
+                    is_setup: true,
+                    currency: currency.to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: LineItemType::IpRange,
+                    name: "hosting".to_string(),
+                    description: None,
+                    amount: 100_000,
+                    setup_amount: 0,
+                    configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let rates = Arc::new(MockExchangeRate::default());
+        rates
+            .set_rate(
+                lnvps_api_common::Ticker::btc_rate("EUR").unwrap(),
+                100_000.0,
+            )
+            .await;
+        let handler = SubscriptionHandler::new(
+            mock_settings(),
+            db,
+            Arc::new(MockNode::default()),
+            onchain.clone(),
+            None,
+            rates,
+            VatClient::new(),
+            Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
+        )
+        .unwrap()
+        .with_swap(if with_swap {
+            Some(swap.clone() as Arc<dyn SwapProvider>)
+        } else {
+            None
+        });
+        (handler, onchain, swap, sub_id)
+    }
+
+    async fn renew_with_coin(
+        sub: &SubscriptionHandler,
+        sub_id: u64,
+        coin: Currency,
+    ) -> Result<SubscriptionPayment> {
+        sub.renew_subscription_with_mode(
+            sub_id,
+            PaymentMethod::FixedFloat,
+            1,
+            RenewMode::FixedFloat { coin },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_fixedfloat_creates_swap_to_onchain_address() {
+        let (sub, onchain, swap, sub_id) = fixedfloat_setup("BTC", true, &[], true).await;
+
+        let payment = renew_with_coin(&sub, sub_id, Currency::XMR).await.unwrap();
+
+        assert_eq!(payment.payment_method, PaymentMethod::FixedFloat);
+        assert!(!payment.is_paid);
+        assert_eq!(payment.external_id, None);
+        let data = crate::swap::SwapData::parse(payment.external_data.as_str()).unwrap();
+        let addresses = onchain.addresses.lock().await;
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(data.coin, "XMR");
+        assert_eq!(data.receive_address, addresses[0]);
+        assert_eq!(data.deposit_address, "4mockxmr00000000");
+        let requests = swap.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].coin, "XMR");
+        assert_eq!(requests[0].receive_address, addresses[0]);
+        assert_eq!(
+            requests[0].receive_sats * 1000,
+            payment.amount + payment.tax + payment.processing_fee
+        );
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_fixedfloat_orders_the_requested_coin() {
+        let (sub, _onchain, swap, sub_id) =
+            fixedfloat_setup("BTC", true, &["XMR", "LTC"], true).await;
+
+        renew_with_coin(&sub, sub_id, Currency::LTC).await.unwrap();
+
+        assert_eq!(swap.requests.lock().await[0].coin, "LTC");
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_fixedfloat_builds_the_provider_from_the_config() {
+        let (sub, _onchain, swap, sub_id) = fixedfloat_setup("BTC", false, &[], true).await;
+
+        let err = renew_with_coin(&sub, sub_id, Currency::XMR)
+            .await
+            .unwrap_err();
+
+        assert!(!err.to_string().contains("not configured"), "{err}");
+        assert!(swap.requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_fixedfloat_rejects_a_coin_the_config_does_not_list() {
+        let (sub, onchain, swap, sub_id) = fixedfloat_setup("BTC", true, &["XMR"], true).await;
+
+        let err = renew_with_coin(&sub, sub_id, Currency::ETH)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("ETH is not accepted"), "{err}");
+        assert!(onchain.addresses.lock().await.is_empty());
+        assert!(swap.requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_fixedfloat_rejects_a_disabled_config() {
+        let (sub, onchain, _swap, sub_id) = fixedfloat_setup("BTC", true, &[], false).await;
+
+        assert!(renew_with_coin(&sub, sub_id, Currency::XMR).await.is_err());
+        assert!(onchain.addresses.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_fixedfloat_requires_a_coin() {
+        let (sub, onchain, _swap, sub_id) = fixedfloat_setup("BTC", true, &[], true).await;
+
+        let err = sub
+            .renew_subscription(sub_id, PaymentMethod::FixedFloat, 1)
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("coin is required"), "{err}");
+        assert!(onchain.addresses.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn renew_subscription_fixedfloat_for_fiat_subscription_is_btc() {
+        let (sub, _onchain, swap, sub_id) = fixedfloat_setup("EUR", true, &[], true).await;
+
+        let payment = renew_with_coin(&sub, sub_id, Currency::XMR).await.unwrap();
+
+        assert_eq!(payment.currency, "BTC");
+        assert_eq!(swap.requests.lock().await.len(), 1);
+    }
+
+    #[test]
+    fn fixedfloat_coin_accepted_follows_the_config_list() {
+        use lnvps_db::{FixedFloatProviderConfig, PaymentMethodConfig, ProviderConfig};
+        let mut config = PaymentMethodConfig::new_with_config(
+            1,
+            PaymentMethod::FixedFloat,
+            "FixedFloat".to_string(),
+            true,
+            ProviderConfig::FixedFloat(FixedFloatProviderConfig {
+                api_key: String::new(),
+                api_secret: String::new(),
+                url: None,
+                refcode: None,
+                afftax: None,
+            }),
+        );
+        for coin in [
+            Currency::XMR,
+            Currency::LTC,
+            Currency::ETH,
+            Currency::USDTTRC,
+        ] {
+            assert!(
+                fixedfloat_coin_accepted(&config, coin),
+                "empty list accepts {coin}"
+            );
+        }
+        assert!(!fixedfloat_coin_accepted(&config, Currency::BTC));
+        assert!(!fixedfloat_coin_accepted(&config, Currency::EUR));
+
+        config.supported_currencies =
+            lnvps_db::CommaSeparated::new(vec!["xmr".to_string(), "USDTTRC".to_string()]);
+        assert!(fixedfloat_coin_accepted(&config, Currency::XMR));
+        assert!(fixedfloat_coin_accepted(&config, Currency::USDTTRC));
+        assert!(!fixedfloat_coin_accepted(&config, Currency::LTC));
+        assert!(!fixedfloat_coin_accepted(&config, Currency::BTC));
     }
 
     #[tokio::test]
@@ -2691,6 +3896,243 @@ pub(crate) mod revolut_offline_tests {
 }
 
 #[cfg(test)]
+mod addon_tests {
+    use super::*;
+    use crate::mocks::{MockNode, MockOnChainProvider};
+    use crate::settings::mock_settings;
+    use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VmStateCache};
+    use lnvps_db::{IntervalType, LNVpsDbBase, Vm, VmAddonPrice};
+
+    const MONTH: i64 = 30 * 24 * 3600;
+
+    async fn setup(
+        expires_in: i64,
+        currency: &str,
+        interval_type: IntervalType,
+    ) -> (Arc<MockDb>, SubscriptionHandler, u64, u64) {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[6u8; 32]).await.unwrap();
+        let (sub_id, ids) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "s".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: Some(Utc::now() + chrono::Duration::seconds(expires_in)),
+                    is_active: true,
+                    is_setup: true,
+                    currency: currency.to_string(),
+                    interval_amount: 1,
+                    interval_type,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: LineItemType::Vps,
+                    name: "vm".to_string(),
+                    description: None,
+                    amount: 1000,
+                    setup_amount: 0,
+                    configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let vm_id = db
+            .insert_vm(&Vm {
+                host_id: 1,
+                user_id,
+                image_id: 1,
+                template_id: Some(1),
+                subscription_line_item_id: ids[0],
+                disk_id: 1,
+                mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.insert_vm_addon_price(&VmAddonPrice {
+            id: 0,
+            region_id: 1,
+            kind: VmAddonKind::Snapshot,
+            currency: "EUR".to_string(),
+            monthly_amount: 100,
+            max_quantity: 5,
+            enabled: true,
+            created: Utc::now(),
+        })
+        .await
+        .unwrap();
+        let rates = Arc::new(MockExchangeRate::default());
+        rates
+            .set_rate(
+                lnvps_api_common::Ticker::btc_rate("EUR").unwrap(),
+                100_000.0,
+            )
+            .await;
+        let sub = SubscriptionHandler::new(
+            mock_settings(),
+            db.clone(),
+            Arc::new(MockNode::default()),
+            Arc::new(MockOnChainProvider::default()),
+            None,
+            rates,
+            VatClient::new(),
+            Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
+        )
+        .unwrap();
+        (db, sub, vm_id, sub_id)
+    }
+
+    async fn change(sub: &SubscriptionHandler, vm_id: u64, quantity: u32) -> Result<VmAddonChange> {
+        sub.change_vm_addon(
+            vm_id,
+            VmAddonKind::Snapshot,
+            quantity,
+            PaymentMethod::Lightning,
+            RenewMode::default(),
+        )
+        .await
+    }
+
+    async fn addon_line(db: &MockDb, sub_id: u64) -> Option<SubscriptionLineItem> {
+        db.list_subscription_line_items(sub_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|li| li.subscription_type == LineItemType::VmAddon)
+    }
+
+    #[tokio::test]
+    async fn buying_slots_charges_the_rest_of_the_period_and_applies_on_payment() {
+        let (db, sub, vm_id, sub_id) = setup(MONTH / 2, "EUR", IntervalType::Month).await;
+
+        let quote = sub
+            .pricing_engine()
+            .calculate_vm_addon_cost(vm_id, VmAddonKind::Snapshot, 2, PaymentMethod::Lightning)
+            .await
+            .unwrap();
+        assert_eq!(
+            quote.interval_amount,
+            CurrencyAmount::from_u64(Currency::EUR, 200)
+        );
+        assert_eq!(quote.charge.amount.currency(), Currency::BTC);
+        assert_eq!(quote.charge.amount.value(), 1_000_000);
+
+        let VmAddonChange::Payment(payment) = change(&sub, vm_id, 2).await.unwrap() else {
+            panic!("an increase needs paying for");
+        };
+        assert_eq!(payment.payment_type, SubscriptionPaymentType::AddonChange);
+        assert_eq!(payment.time_value, Some(0));
+        assert!(
+            addon_line(&db, sub_id).await.is_none(),
+            "nothing until paid"
+        );
+        assert_eq!(sub.vm_provisioner().snapshot_slots(vm_id).await.unwrap(), 0);
+
+        let expires = db.get_subscription(sub_id).await.unwrap().expires;
+        sub.complete_payment(&payment).await.unwrap();
+        assert_eq!(sub.vm_provisioner().snapshot_slots(vm_id).await.unwrap(), 2);
+        let line = addon_line(&db, sub_id).await.unwrap();
+        assert_eq!(line.amount, 200);
+        assert!(line.is_active());
+        assert_eq!(
+            line.parent_line_item_id,
+            Some(db.get_vm(vm_id).await.unwrap().subscription_line_item_id)
+        );
+        assert_eq!(db.get_subscription(sub_id).await.unwrap().expires, expires);
+    }
+
+    #[tokio::test]
+    async fn removing_slots_is_free_immediate_and_trims_snapshots() {
+        let (db, sub, vm_id, sub_id) = setup(MONTH, "EUR", IntervalType::Month).await;
+        sub.apply_vm_addon(vm_id, VmAddonKind::Snapshot, 3)
+            .await
+            .unwrap();
+        assert_eq!(addon_line(&db, sub_id).await.unwrap().amount, 300);
+
+        assert!(matches!(
+            change(&sub, vm_id, 1).await.unwrap(),
+            VmAddonChange::Applied
+        ));
+        assert_eq!(addon_line(&db, sub_id).await.unwrap().amount, 100);
+        assert_eq!(sub.vm_provisioner().snapshot_slots(vm_id).await.unwrap(), 1);
+        assert!(db.subscription_payments.lock().await.is_empty());
+
+        assert!(matches!(
+            change(&sub, vm_id, 0).await.unwrap(),
+            VmAddonChange::Applied
+        ));
+        assert!(!addon_line(&db, sub_id).await.unwrap().is_active());
+    }
+
+    #[tokio::test]
+    async fn slots_are_limited_and_need_a_price() {
+        let (db, sub, vm_id, _) = setup(MONTH, "EUR", IntervalType::Month).await;
+        assert!(change(&sub, vm_id, 6).await.is_err());
+        db.vm_addon_prices
+            .lock()
+            .await
+            .values_mut()
+            .for_each(|p| p.enabled = false);
+        let err = change(&sub, vm_id, 1).await.err().unwrap().to_string();
+        assert!(err.contains("not sold"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn renewal_includes_the_addon_line() {
+        let (db, sub, vm_id, sub_id) = setup(MONTH, "EUR", IntervalType::Month).await;
+        let plain = sub
+            .quote_renewal(sub_id, PaymentMethod::Lightning, 1, None)
+            .await
+            .unwrap();
+        let before = plain.amount;
+        sub.apply_vm_addon(vm_id, VmAddonKind::Snapshot, 2)
+            .await
+            .unwrap();
+        let after = sub
+            .quote_renewal(sub_id, PaymentMethod::Lightning, 1, None)
+            .await
+            .unwrap()
+            .amount;
+        assert_eq!(after - before, 2_000_000);
+        assert!(addon_line(&db, sub_id).await.is_some());
+
+        let by_amount = sub
+            .pricing_engine()
+            .get_cost_by_amount(
+                vm_id,
+                CurrencyAmount::millisats(after),
+                PaymentMethod::Lightning,
+            )
+            .await
+            .unwrap();
+        let CostResult::New(p) = by_amount else {
+            panic!("a fresh price")
+        };
+        assert_eq!(p.time_value, plain.time_value);
+    }
+
+    #[tokio::test]
+    async fn an_hourly_milli_euro_vm_pays_a_fraction_of_a_cent_an_hour() {
+        let (db, sub, vm_id, sub_id) = setup(3600, "MEUR", IntervalType::Hour).await;
+        sub.apply_vm_addon(vm_id, VmAddonKind::Snapshot, 1)
+            .await
+            .unwrap();
+        assert_eq!(addon_line(&db, sub_id).await.unwrap().amount, 139);
+    }
+}
+
+#[cfg(test)]
 mod sunset_tests {
     use super::*;
     use crate::mocks::{MockNode, MockOnChainProvider};
@@ -2735,6 +4177,8 @@ mod sunset_tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -2906,6 +4350,8 @@ mod discount_tests {
                     amount: 1_000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await
@@ -3320,5 +4766,910 @@ mod quote_tests {
         assert_eq!(quoted.amount, payment.amount);
         assert_eq!(quoted.tax, payment.tax);
         assert_eq!(quoted.processing_fee, payment.processing_fee);
+    }
+}
+
+#[cfg(test)]
+mod credit_tests {
+    use super::*;
+    use crate::mocks::{MockNode, MockOnChainProvider};
+    use crate::settings::mock_settings;
+    use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VmStateCache};
+    use lnvps_db::{IntervalType, LNVpsDbBase, LineItemType, Subscription, SubscriptionLineItem};
+
+    /// An IpRange subscription (10.00 EUR/month) so the credit maths are cents
+    /// against a known conversion rate: 1 BTC = 100,000 EUR, so 1,000,000 sats
+    /// = 10.00 EUR.
+    async fn setup() -> (Arc<MockDb>, SubscriptionHandler, u64, u64) {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[7u8; 32]).await.unwrap();
+        let (sub_id, _items) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "s".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: None,
+                    is_active: true,
+                    is_setup: true,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: LineItemType::IpRange,
+                    name: "hosting".to_string(),
+                    description: None,
+                    amount: 1_000,
+                    setup_amount: 0,
+                    configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+
+        let rates = Arc::new(MockExchangeRate::default());
+        rates
+            .set_rate(
+                lnvps_api_common::Ticker::btc_rate("EUR").unwrap(),
+                100_000.0,
+            )
+            .await;
+        let mut sub = SubscriptionHandler::new(
+            mock_settings(),
+            db.clone(),
+            Arc::new(MockNode::default()),
+            Arc::new(MockOnChainProvider::default()),
+            None,
+            rates,
+            VatClient::new(),
+            Arc::new(ChannelWorkCommander::new()),
+            VmStateCache::new(),
+        )
+        .unwrap();
+        sub.set_revolut_for_test(Arc::new(super::revolut_offline_tests::MockFiat::default()));
+        sub.set_settle_timeout_for_test(Duration::ZERO);
+        (db, sub, user_id, sub_id)
+    }
+
+    async fn give_credit(db: &MockDb, user_id: u64, balance: u64, auto_apply: bool) {
+        if balance > 0 {
+            db.adjust_account_credit(user_id, "BTC", balance as i64, "topup", None)
+                .await
+                .unwrap();
+        }
+        db.set_account_credit_auto_apply(user_id, auto_apply)
+            .await
+            .unwrap();
+    }
+
+    async fn revolut_config(db: &MockDb, fee_base: u64, min_amount: u64) {
+        use lnvps_db::{PaymentMethodConfig, ProviderConfig, RevolutProviderConfig};
+        let mut config = PaymentMethodConfig::new_with_config(
+            1,
+            PaymentMethod::Revolut,
+            "Revolut".to_string(),
+            true,
+            ProviderConfig::Revolut(RevolutProviderConfig {
+                url: "https://api.revolut.com".to_string(),
+                token: "test-token".to_string(),
+                api_version: "2024-09-01".to_string(),
+                public_key: "pk_test".to_string(),
+                webhook_secret: None,
+            }),
+        );
+        config.id = 1;
+        config.processing_fee_rate = Some(0.0);
+        config.processing_fee_base = Some(fee_base);
+        config.processing_fee_currency = Some("EUR".to_string());
+        config.min_amount = Some(min_amount);
+        config.min_amount_currency = Some("EUR".to_string());
+        db.payment_method_configs.lock().await.insert(1, config);
+    }
+
+    async fn quote(sub: &SubscriptionHandler, sub_id: u64) -> Result<RenewalQuote> {
+        sub.quote_renewal(sub_id, PaymentMethod::Revolut, 1, None)
+            .await
+    }
+
+    async fn renew(sub: &SubscriptionHandler, sub_id: u64) -> Result<SubscriptionPayment> {
+        sub.renew_subscription_with_mode(
+            sub_id,
+            PaymentMethod::Revolut,
+            1,
+            RenewMode::Interactive { save_card: false },
+        )
+        .await
+    }
+
+    async fn ledger_sum(db: &MockDb, user_id: u64) -> i64 {
+        let (events, _) = db
+            .list_account_credit_events(user_id, 100, 0)
+            .await
+            .unwrap();
+        events.iter().map(|e| e.amount).sum()
+    }
+
+    #[tokio::test]
+    async fn credit_is_not_applied_without_opt_in_or_balance() {
+        let (db, sub, user_id, _sub_id) = setup().await;
+        assert!(
+            sub.quote_credit(user_id, 10_000, Currency::EUR)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        give_credit(&db, user_id, 0, true).await;
+        assert!(
+            sub.quote_credit(user_id, 10_000, Currency::EUR)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        give_credit(&db, user_id, 10_000_000, false).await;
+        assert!(
+            sub.quote_credit(user_id, 10_000, Currency::EUR)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        give_credit(&db, user_id, 0, true).await;
+        assert!(
+            sub.quote_credit(user_id, 0, Currency::EUR)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn credit_converts_and_clamps_to_the_bill() {
+        let (db, sub, user_id, _sub_id) = setup().await;
+        give_credit(&db, user_id, 5_000_000, true).await;
+
+        let applied = sub
+            .quote_credit(user_id, 10_000, Currency::EUR)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.amount, 500);
+        assert_eq!(applied.base_amount, 5_000_000);
+        assert_eq!(applied.currency, Currency::EUR);
+
+        let applied = sub
+            .quote_credit(user_id, 300, Currency::EUR)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(applied.amount, 300);
+        assert_eq!(applied.base_amount, 3_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_quote_reports_credit_and_leaves_the_bill_intact() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        give_credit(&db, user_id, 5_000_000, true).await;
+
+        let quoted = quote(&sub, sub_id).await.unwrap();
+        assert_eq!(quoted.amount, 1_000);
+        assert_eq!(quoted.credit.expect("credit on the quote").amount, 500);
+        assert!(db.subscription_payments.lock().await.is_empty());
+        assert!(db.account_credit_debits.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_topup_is_credited_in_the_company_base_currency() {
+        let (db, sub, user_id, _) = setup().await;
+        let id = db
+            .insert_account_credit_topup(&lnvps_db::AccountCreditTopup {
+                user_id,
+                amount: 100_000_000,
+                currency: "BTC".to_string(),
+                invoice_hash: vec![9u8; 32],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let settled = sub.settle_credit_topup(id).await.unwrap().unwrap();
+        assert_eq!(settled.credit_currency.as_deref(), Some("EUR"));
+        let credited = settled.credit_amount.unwrap();
+        assert!(credited > 0);
+        assert_eq!(
+            db.get_account_credit(user_id, "EUR").await.unwrap().balance,
+            credited
+        );
+        assert_eq!(
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
+            0
+        );
+        assert!(sub.settle_credit_topup(id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_balance_in_the_bill_currency_is_spent_before_another_one() {
+        let (db, sub, user_id, _) = setup().await;
+        give_credit(&db, user_id, 500_000_000, true).await;
+        db.adjust_account_credit(user_id, "EUR", 4_000, "refund", None)
+            .await
+            .unwrap();
+
+        let credit = sub
+            .quote_credit(user_id, 10_000, Currency::EUR)
+            .await
+            .unwrap()
+            .expect("credit applies");
+        assert_eq!(
+            (credit.base_currency, credit.base_amount, credit.amount),
+            (Currency::EUR, 4_000, 4_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_balance_in_another_currency_is_converted_when_none_matches() {
+        let (db, sub, user_id, _) = setup().await;
+        give_credit(&db, user_id, 500_000_000, true).await;
+
+        let credit = sub
+            .quote_credit(user_id, 10_000, Currency::EUR)
+            .await
+            .unwrap()
+            .expect("credit applies");
+        assert_eq!(credit.base_currency, Currency::BTC);
+    }
+
+    #[tokio::test]
+    async fn a_partly_credit_funded_renewal_holds_the_credit() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        give_credit(&db, user_id, 5_000_000, true).await;
+
+        let payment = renew(&sub, sub_id).await.unwrap();
+        assert_eq!(payment.amount, 1_000);
+        let debit = db
+            .get_account_credit_debit_by_payment(&payment.id)
+            .await
+            .unwrap()
+            .expect("credit held");
+        assert_eq!(debit.amount, 5_000_000);
+        assert_eq!(debit.payment_amount, 500);
+        assert_eq!(debit.expires, payment.expires);
+        assert!(!debit.settled);
+        assert_eq!(
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
+            5_000_000
+        );
+        assert_eq!(
+            db.get_account_credit_reserved(user_id, "BTC")
+                .await
+                .unwrap(),
+            5_000_000
+        );
+
+        let credit = sub.credit_for_payment(&payment).await.unwrap().unwrap();
+        assert_eq!((credit.amount, credit.currency), (500, Currency::EUR));
+        assert_eq!(credit.base_amount, 5_000_000);
+
+        sub.apply_payment(&payment).await.unwrap();
+        assert_eq!(
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_payment_settled_after_its_hold_lapsed_spends_only_what_is_left() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        give_credit(&db, user_id, 5_000_000, true).await;
+        let payment = renew(&sub, sub_id).await.unwrap();
+        let held = db
+            .get_account_credit_debit_by_payment(&payment.id)
+            .await
+            .unwrap()
+            .unwrap();
+        db.attach_account_credit_debit(
+            held.id,
+            &payment.id,
+            Utc::now() - chrono::Duration::seconds(1),
+        )
+        .await
+        .unwrap();
+        db.reserve_account_credit(&lnvps_db::AccountCreditDebit {
+            user_id,
+            amount: 3_000_000,
+            currency: "BTC".to_string(),
+            payment_amount: 300,
+            expires: Utc::now() + chrono::Duration::hours(1),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        sub.apply_payment(&payment).await.unwrap();
+        let spent = db
+            .get_account_credit_debit_by_payment(&payment.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((spent.amount, spent.payment_amount), (2_000_000, 200));
+        assert_eq!(
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
+            3_000_000
+        );
+    }
+
+    #[tokio::test]
+    async fn held_credit_is_not_offered_to_a_second_order() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        give_credit(&db, user_id, 5_000_000, true).await;
+
+        renew(&sub, sub_id).await.unwrap();
+        assert!(quote(&sub, sub_id).await.unwrap().credit.is_none());
+        let second = renew(&sub, sub_id).await.unwrap();
+        assert!(
+            db.get_account_credit_debit_by_payment(&second.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_order_releases_its_credit() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        give_credit(&db, user_id, 5_000_000, true).await;
+
+        let res = sub
+            .renew_subscription_with_mode(
+                sub_id,
+                PaymentMethod::Revolut,
+                1,
+                RenewMode::Saved { method_id: None },
+            )
+            .await;
+        assert!(res.is_err(), "no saved card to charge");
+        assert_eq!(
+            db.get_account_credit_reserved(user_id, "BTC")
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(db.account_credit_debits.lock().await.is_empty());
+    }
+
+    async fn make_hourly(db: &MockDb, sub_id: u64) {
+        db.subscriptions
+            .lock()
+            .await
+            .get_mut(&sub_id)
+            .unwrap()
+            .interval_type = lnvps_db::IntervalType::Hour;
+    }
+
+    /// An hourly subscription is credit-only: with no credit, or credit the
+    /// customer has not opted to spend, no invoice or card charge is created.
+    #[tokio::test]
+    async fn an_hourly_order_without_credit_is_refused() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        make_hourly(&db, sub_id).await;
+
+        let err = renew(&sub, sub_id).await.unwrap_err().to_string();
+        assert!(err.contains("paid from account credit"), "{err}");
+        assert!(quote(&sub, sub_id).await.is_err(), "quotes refuse too");
+        assert!(db.subscription_payments.lock().await.is_empty());
+
+        // A balance that is not opted in is still no use.
+        give_credit(&db, user_id, 500_000_000, false).await;
+        assert!(renew(&sub, sub_id).await.is_err());
+        assert!(db.subscription_payments.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_hourly_milli_euro_order_charges_a_fraction_of_a_cent() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        make_hourly(&db, sub_id).await;
+        db.subscriptions
+            .lock()
+            .await
+            .get_mut(&sub_id)
+            .unwrap()
+            .currency = "MEUR".to_string();
+        for li in db.subscription_line_items.lock().await.values_mut() {
+            li.amount = 137;
+        }
+        give_credit(&db, user_id, 500_000_000, true).await;
+
+        let payment = sub
+            .renew_subscription_with_mode(sub_id, PaymentMethod::Lightning, 1, RenewMode::default())
+            .await
+            .unwrap();
+        assert!(payment.is_paid);
+        assert_eq!(payment.currency, "BTC");
+        assert_eq!(payment.amount, 2_000);
+        assert_eq!(
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
+            500_000_000 - 2_000
+        );
+    }
+
+    /// Credit that covers only part of the hour is refused rather than topped
+    /// up with an invoice, and nothing stays held.
+    #[tokio::test]
+    async fn an_hourly_order_partly_covered_is_refused() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        make_hourly(&db, sub_id).await;
+        give_credit(&db, user_id, 1_000, true).await;
+
+        assert!(renew(&sub, sub_id).await.is_err());
+        assert!(db.subscription_payments.lock().await.is_empty());
+        assert_eq!(
+            db.get_account_credit_reserved(user_id, "BTC")
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(db.account_credit_debits.lock().await.is_empty());
+    }
+
+    /// With enough opted-in credit an hourly order settles with no invoice.
+    #[tokio::test]
+    async fn an_hourly_order_covered_by_credit_settles() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        make_hourly(&db, sub_id).await;
+        give_credit(&db, user_id, 500_000_000, true).await;
+
+        let payment = renew(&sub, sub_id).await.unwrap();
+        assert!(payment.is_paid);
+        assert_eq!(payment.external_data.as_str(), CREDIT_FUNDED_MARKER);
+        assert!(db.get_account_credit(user_id, "BTC").await.unwrap().balance < 500_000_000);
+    }
+
+    /// Other intervals are untouched: the same unfunded order is still created.
+    #[tokio::test]
+    async fn a_monthly_order_without_credit_is_still_invoiced() {
+        let (_db, sub, _user_id, sub_id) = setup().await;
+        let payment = renew(&sub, sub_id).await.unwrap();
+        assert!(!payment.is_paid);
+    }
+
+    #[tokio::test]
+    async fn a_fully_credit_funded_renewal_settles_immediately() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        give_credit(&db, user_id, 20_000_000, true).await;
+        let before = Utc::now();
+
+        let payment = renew(&sub, sub_id).await.unwrap();
+        assert!(payment.is_paid);
+        assert_eq!(payment.external_data.as_str(), CREDIT_FUNDED_MARKER);
+        let debit = db
+            .get_account_credit_debit_by_payment(&payment.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(debit.settled);
+        assert_eq!(debit.amount, 10_000_000);
+        assert_eq!(
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
+            10_000_000
+        );
+
+        let added = db.get_subscription(sub_id).await.unwrap().expires.unwrap() - before;
+        assert!((29..=31).contains(&added.num_days()));
+    }
+
+    #[tokio::test]
+    async fn the_fee_is_charged_only_on_what_is_collected() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        revolut_config(&db, 20, 0).await;
+        give_credit(&db, user_id, 5_000_000, true).await;
+        let quoted = quote(&sub, sub_id).await.unwrap();
+        assert_eq!(quoted.processing_fee, 10, "half the bill is collected");
+
+        let (db, sub, user_id, sub_id) = setup().await;
+        revolut_config(&db, 20, 0).await;
+        give_credit(&db, user_id, 20_000_000, true).await;
+        assert_eq!(quote(&sub, sub_id).await.unwrap().processing_fee, 0);
+        let payment = renew(&sub, sub_id).await.unwrap();
+        assert!(payment.is_paid, "nothing left to collect");
+        assert_eq!(payment.processing_fee, 0);
+    }
+
+    #[tokio::test]
+    async fn a_remainder_below_the_minimum_uses_less_credit() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        revolut_config(&db, 0, 300).await;
+        give_credit(&db, user_id, 9_000_000, true).await;
+
+        let quoted = quote(&sub, sub_id).await.unwrap();
+        let credit = quoted.credit.unwrap();
+        assert_eq!(credit.amount, 700);
+        assert_eq!(credit.base_amount, 7_000_000);
+
+        let (db, sub, user_id, sub_id) = setup().await;
+        revolut_config(&db, 0, 300).await;
+        give_credit(&db, user_id, 2_000_000, true).await;
+        assert_eq!(
+            quote(&sub, sub_id).await.unwrap().credit.unwrap().amount,
+            200
+        );
+    }
+
+    async fn upgradable_vm(db: &MockDb, user_id: u64) -> u64 {
+        use lnvps_db::{DiskInterface, DiskType, VmCustomPricing, VmCustomPricingDisk};
+        db.custom_pricing.lock().await.insert(
+            1,
+            VmCustomPricing {
+                id: 1,
+                name: "custom".to_string(),
+                enabled: true,
+                created: Utc::now(),
+                expires: None,
+                region_id: 1,
+                currency: "EUR".to_string(),
+                cpu_cost: 200,
+                memory_cost: 100,
+                min_cpu: 1,
+                max_cpu: 16,
+                min_memory: lnvps_api_common::GB,
+                max_memory: 64 * lnvps_api_common::GB,
+                min_ip4: 1,
+                max_ip4: 4,
+                min_ip6: 1,
+                max_ip6: 4,
+                ..Default::default()
+            },
+        );
+        db.custom_pricing_disk.lock().await.insert(
+            1,
+            VmCustomPricingDisk {
+                id: 1,
+                pricing_id: 1,
+                kind: DiskType::SSD,
+                interface: DiskInterface::PCIe,
+                cost: 50,
+                min_disk_size: 5 * lnvps_api_common::GB,
+                max_disk_size: lnvps_api_common::TB,
+            },
+        );
+        let (_sub_id, items) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "vm".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: Some(Utc::now() + chrono::Duration::days(15)),
+                    is_active: true,
+                    is_setup: true,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: LineItemType::Vps,
+                    name: "vm".to_string(),
+                    description: None,
+                    amount: 1000,
+                    setup_amount: 0,
+                    configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        db.insert_vm(&lnvps_db::Vm {
+            host_id: 1,
+            user_id,
+            image_id: 1,
+            template_id: Some(1),
+            subscription_line_item_id: items[0],
+            disk_id: 1,
+            mac_address: "aa:bb:cc:dd:ee:ff".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_is_quoted_and_paid_with_credit() {
+        let (db, sub, user_id, _sub_id) = setup().await;
+        let vm_id = upgradable_vm(&db, user_id).await;
+        give_credit(&db, user_id, 100_000_000_000, true).await;
+        let cfg = lnvps_api_common::UpgradeConfig {
+            new_cpu: Some(4),
+            ..Default::default()
+        };
+        let cost = sub
+            .pricing_engine()
+            .calculate_vm_upgrade_cost(vm_id, &cfg, PaymentMethod::Lightning)
+            .await
+            .unwrap();
+        let net = cost.upgrade.amount.value();
+        let (fee, credit) = sub
+            .quote_vm_upgrade_credit(
+                vm_id,
+                PaymentMethod::Lightning,
+                net,
+                cost.tax.amount,
+                cost.processing_fee,
+                Currency::BTC,
+            )
+            .await
+            .unwrap();
+        assert_eq!(fee, 0);
+        assert_eq!(credit.unwrap().amount, net + cost.tax.amount);
+
+        let payment = sub
+            .create_vm_upgrade_payment(vm_id, &cfg, PaymentMethod::Lightning, RenewMode::default())
+            .await
+            .unwrap();
+        assert!(payment.is_paid);
+        assert_eq!(payment.external_data.as_str(), CREDIT_FUNDED_MARKER);
+        assert_eq!(payment.payment_type, SubscriptionPaymentType::Upgrade);
+        assert_eq!(
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
+            100_000_000_000 - (payment.amount + payment.tax)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_partly_paid_with_credit_invoices_the_rest() {
+        let (db, sub, user_id, _sub_id) = setup().await;
+        let vm_id = upgradable_vm(&db, user_id).await;
+        give_credit(&db, user_id, 1_000, true).await;
+        let cfg = lnvps_api_common::UpgradeConfig {
+            new_cpu: Some(4),
+            ..Default::default()
+        };
+        let payment = sub
+            .create_vm_upgrade_payment(vm_id, &cfg, PaymentMethod::Lightning, RenewMode::default())
+            .await
+            .unwrap();
+        assert!(!payment.is_paid);
+        let debit = db
+            .get_account_credit_debit_by_payment(&payment.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(debit.amount, 1_000);
+        assert_eq!(
+            db.get_account_credit_reserved(user_id, "BTC")
+                .await
+                .unwrap(),
+            1_000
+        );
+    }
+
+    #[tokio::test]
+    async fn ledger_and_balance_stay_consistent() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        let topup_id = db
+            .insert_account_credit_topup(&lnvps_db::AccountCreditTopup {
+                user_id,
+                amount: 10_000_000,
+                currency: "BTC".to_string(),
+                invoice_hash: vec![1u8; 32],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.settle_account_credit_topup(topup_id, "BTC", 10_000_000)
+            .await
+            .unwrap();
+        give_credit(&db, user_id, 0, true).await;
+
+        let first = renew(&sub, sub_id).await.unwrap();
+        assert!(first.is_paid);
+        assert_eq!(
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
+            0
+        );
+
+        let second = renew(&sub, sub_id).await.unwrap();
+        assert!(!second.is_paid);
+
+        let (events, total) = db.list_account_credit_events(user_id, 10, 0).await.unwrap();
+        assert_eq!(total, 2);
+        assert_eq!(events[0].kind, "spend");
+        assert_eq!(events[0].amount, -10_000_000);
+        assert_eq!(ledger_sum(&db, user_id).await, 0);
+    }
+
+    /// Auto-renewal uses the credit balance when opted in: fully covered means
+    /// the payment settles immediately with no saved payment method at all.
+    #[tokio::test]
+    async fn auto_renew_fully_covered_by_credit() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        // 15.00 EUR of credit against a 10.00 EUR bill.
+        give_credit(&db, user_id, 15_000_000, true).await;
+        // Enable auto-renewal, and make the subscription "expiring soon" by
+        // dating its expiry inside the lead window.
+        let mut s = db.get_subscription(sub_id).await.unwrap();
+        s.auto_renewal_enabled = true;
+        s.expires = Some(Utc::now() + chrono::Duration::hours(1));
+        db.update_subscription(&s).await.unwrap();
+
+        let payment = sub.auto_renew(sub_id).await.unwrap();
+        assert!(payment.is_paid, "fully credit-funded settles immediately");
+        assert_eq!(payment.external_data.as_str(), CREDIT_FUNDED_MARKER);
+        assert_eq!(
+            db.get_account_credit(user_id, "BTC").await.unwrap().balance,
+            15_000_000 - 10_000_000,
+            "the bill is spent from the balance"
+        );
+    }
+
+    /// A user with credit opted in but no saved payment method can still
+    /// auto-renew: the worker counts credit as a method.
+    #[tokio::test]
+    async fn auto_renew_credit_counts_when_no_saved_method() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        give_credit(&db, user_id, 15_000_000, true).await;
+        let mut s = db.get_subscription(sub_id).await.unwrap();
+        s.auto_renewal_enabled = true;
+        s.expires = Some(Utc::now() + chrono::Duration::hours(1));
+        db.update_subscription(&s).await.unwrap();
+
+        // No saved payment method exists at all.
+        assert!(
+            db.list_user_payment_methods(user_id, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // The worker's gate would pass with credit alone; the handler itself
+        // must also succeed.
+        assert!(sub.auto_renew(sub_id).await.is_ok());
+    }
+
+    fn revolut_card(user_id: u64) -> lnvps_db::UserPaymentMethod {
+        lnvps_db::UserPaymentMethod {
+            id: 0,
+            user_id,
+            created: Utc::now(),
+            provider: "revolut".to_string(),
+            name: None,
+            external_customer_id: Some("cust1".to_string().into()),
+            external_id: "pm1".to_string().into(),
+            card_brand: Some("VISA".to_string()),
+            card_last_four: Some("5709".to_string()),
+            exp_month: Some(12),
+            exp_year: Some(2999),
+            is_default: true,
+            enabled: true,
+        }
+    }
+
+    async fn auto_renewing_sub(db: &MockDb, sub_id: u64) {
+        let mut s = db.get_subscription(sub_id).await.unwrap();
+        s.auto_renewal_enabled = true;
+        s.expires = Some(Utc::now() + chrono::Duration::hours(1));
+        db.update_subscription(&s).await.unwrap();
+    }
+
+    /// Opted in but with nothing to spend, a card-only user still renews on the card.
+    #[tokio::test]
+    async fn auto_renew_opted_in_with_zero_balance_charges_the_card() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        give_credit(&db, user_id, 0, true).await;
+        db.insert_user_payment_method(&revolut_card(user_id))
+            .await
+            .unwrap();
+        auto_renewing_sub(&db, sub_id).await;
+
+        let payment = sub.auto_renew(sub_id).await.unwrap();
+        assert_eq!(payment.payment_method, PaymentMethod::Revolut);
+        assert!(
+            db.get_account_credit_debit_by_payment(&payment.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Partial credit with a saved card: the card is charged the remainder.
+    #[tokio::test]
+    async fn auto_renew_partial_credit_charges_the_remainder_to_the_card() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        give_credit(&db, user_id, 4_000_000, true).await;
+        db.insert_user_payment_method(&revolut_card(user_id))
+            .await
+            .unwrap();
+        auto_renewing_sub(&db, sub_id).await;
+
+        let payment = sub.auto_renew(sub_id).await.unwrap();
+        assert_eq!(payment.payment_method, PaymentMethod::Revolut);
+        let debit = db
+            .get_account_credit_debit_by_payment(&payment.id)
+            .await
+            .unwrap()
+            .expect("credit applied");
+        assert_eq!(debit.amount, 4_000_000);
+    }
+
+    /// Partial credit and no saved method cannot complete: it errors without
+    /// leaving an unpaid invoice behind.
+    #[tokio::test]
+    async fn auto_renew_partial_credit_without_a_method_errors() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        give_credit(&db, user_id, 4_000_000, true).await;
+        auto_renewing_sub(&db, sub_id).await;
+        let err = sub.auto_renew(sub_id).await.unwrap_err();
+        assert!(err.to_string().contains("does not cover"), "{err}");
+        assert!(
+            db.list_subscription_payments(sub_id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Credit covering the whole bill settles on credit even with a card saved:
+    /// the card is not charged the processing fee.
+    #[tokio::test]
+    async fn auto_renew_full_credit_does_not_touch_the_card() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        give_credit(&db, user_id, 15_000_000, true).await;
+        db.insert_user_payment_method(&revolut_card(user_id))
+            .await
+            .unwrap();
+        auto_renewing_sub(&db, sub_id).await;
+
+        let payment = sub.auto_renew(sub_id).await.unwrap();
+        assert!(payment.is_paid);
+        assert_eq!(payment.payment_method, PaymentMethod::Lightning);
+        assert_eq!(payment.external_data.as_str(), CREDIT_FUNDED_MARKER);
+    }
+
+    /// Auto-renewal is unchanged for a user without credit: no saved method
+    /// means the usual error, not a credit-funnel surprise.
+    #[tokio::test]
+    async fn auto_renew_without_credit_falls_back_to_saved_method() {
+        let (_db, sub, _user_id, sub_id) = setup().await;
+        let err = sub.auto_renew(sub_id).await.unwrap_err();
+        assert!(
+            err.to_string().contains("No usable saved payment method"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn credit_covers_renewal_only_when_it_pays_the_whole_bill() {
+        let (db, sub, user_id, sub_id) = setup().await;
+        assert!(!sub.credit_covers_renewal(sub_id).await.unwrap());
+
+        give_credit(&db, user_id, 4_000_000, true).await;
+        assert!(!sub.credit_covers_renewal(sub_id).await.unwrap());
+
+        give_credit(&db, user_id, 6_000_000, false).await;
+        assert!(!sub.credit_covers_renewal(sub_id).await.unwrap());
+
+        db.set_account_credit_auto_apply(user_id, true)
+            .await
+            .unwrap();
+        assert!(sub.credit_covers_renewal(sub_id).await.unwrap());
     }
 }

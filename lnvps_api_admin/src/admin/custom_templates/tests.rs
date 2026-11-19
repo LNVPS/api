@@ -100,6 +100,8 @@ async fn seed_vm(db: &MockDb, template_id: u64, amount: u64) -> (u64, u64) {
             amount,
             setup_amount: 0,
             configuration: None,
+            deactivated_at: None,
+            parent_line_item_id: None,
         })
         .await
         .unwrap();
@@ -123,6 +125,7 @@ fn state(db: &Arc<dyn LNVpsDb>) -> RouterState {
         vm_state_cache: VmStateCache::new(),
         exchange: Arc::new(MockExchangeRate::default()),
         vat: VatClient::new(),
+        chain: None,
     }
 }
 

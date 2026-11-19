@@ -224,6 +224,14 @@ mod tests {
             "max_ip4": 2,
             "min_ip6": 0,
             "max_ip6": 1,
+            "transfer_gb": 1000,
+            "min_transfer_gb": 500,
+            "max_transfer_gb": 5000,
+            "transfer_cost_per_tb": 100,
+            "network_mbps": 1000,
+            "min_network_mbps": 100,
+            "max_network_mbps": 10000,
+            "network_cost_per_gbps": 200,
             "disk_pricing": [{
                 "kind": "ssd",
                 "interface": "pcie",
@@ -1495,6 +1503,25 @@ mod tests {
             .await
             .unwrap();
 
+            let oc3_user = crate::db::ensure_user(&pool, &nostr::Keys::generate())
+                .await
+                .unwrap();
+            let (oc3_ref_id, oc3_vm_id) = crate::db::seed_referrer_with_commission(
+                &pool,
+                oc3_user,
+                referred_user,
+                &format!("{ref_code}OC3"),
+                3,
+                Some(&crate::onchain::new_regtest_address().await.unwrap()),
+                6000,
+                vm_id,
+            )
+            .await
+            .unwrap();
+            crate::db::set_referral_auto_payout(&pool, oc3_ref_id, false)
+                .await
+                .unwrap();
+
             // Trigger the payout job and wait for both on-chain referrers to be
             // paid.
             crate::worker::publish_job("\"ProcessReferralPayouts\"")
@@ -1546,6 +1573,13 @@ mod tests {
                     ln_payouts.is_empty(),
                     "unresolvable Lightning payout leaves no row"
                 );
+                assert!(
+                    crate::db::list_referral_payouts(&pool, oc3_ref_id)
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "a referrer without auto-payout approval is not paid"
+                );
 
                 // Idempotency: re-running the job pays nothing new.
                 //
@@ -1593,11 +1627,56 @@ mod tests {
                 );
             }
 
+            let list = json_ok(
+                admin
+                    .get_auth(&format!("/api/admin/v1/referrals?search={ref_code}OC3"))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(list["data"][0]["id"].as_u64(), Some(oc3_ref_id));
+            assert_eq!(
+                list["data"][0]["outstanding_total_msat"].as_u64(),
+                Some(6_000_000)
+            );
+            assert_eq!(list["data"][0]["paid_total_msat"].as_u64(), Some(0));
+
+            let usage_path = format!("/api/admin/v1/referrals/{oc3_ref_id}/usage");
+            let usage = json_ok(admin.get_auth(&usage_path).await.unwrap()).await;
+            assert_eq!(usage["total"].as_u64(), Some(1));
+            assert_eq!(usage["data"][0]["vm_id"].as_u64(), Some(oc3_vm_id));
+            assert_eq!(usage["data"][0]["user_id"].as_u64(), Some(referred_user));
+            assert_eq!(usage["data"][0]["commission"].as_u64(), Some(6_000_000));
+
+            let row_path = format!("{usage_path}/{oc3_vm_id}");
+            let resp = admin.delete_auth(&row_path).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let resp = admin.delete_auth(&row_path).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            let usage = json_ok(admin.get_auth(&usage_path).await.unwrap()).await;
+            assert_eq!(usage["total"].as_u64(), Some(0));
+
+            let approved = json_ok(
+                admin
+                    .patch_auth(
+                        &format!("/api/admin/v1/referrals/{oc3_ref_id}"),
+                        &serde_json::json!({ "auto_payout_approved": true }),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                approved["data"]["auto_payout_approved"].as_bool(),
+                Some(true)
+            );
+            eprintln!("Admin referral approval and referred VM removal verified");
+
             // Clean up seeded rows.
-            for vm in [oc1_vm_id, oc2_vm_id, ln_vm_id] {
+            for vm in [oc1_vm_id, oc2_vm_id, ln_vm_id, oc3_vm_id] {
                 crate::db::hard_delete_vm(&pool, vm).await.ok();
             }
-            for r in [oc1_ref_id, oc2_ref_id, ln_ref_id] {
+            for r in [oc1_ref_id, oc2_ref_id, ln_ref_id, oc3_ref_id] {
                 crate::db::hard_delete_referral(&pool, r).await.ok();
             }
             pool.close().await;
@@ -1629,6 +1708,19 @@ mod tests {
         // ----------------------------------------------------------------
         // 15. Upgrade quote
         // ----------------------------------------------------------------
+        let options = json_ok(
+            user.get_auth(&format!("/api/v1/vm/{vm_id}/upgrade/options"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            options["data"]["id"].as_u64(),
+            Some(custom_pricing_id),
+            "a standard VM upgrades onto its region's custom plan"
+        );
+        assert_eq!(options["data"]["transfer"]["max"], 5000);
+
         let body = serde_json::json!({ "cpu": 2, "memory": 2147483648_u64 });
         let resp = user
             .post_auth(&format!("/api/v1/vm/{vm_id}/upgrade/quote"), &body)
@@ -1699,7 +1791,7 @@ mod tests {
                 let vm_upgraded_data = &vm_admin_upgraded["data"];
                 let sub_after_upgrade = &vm_upgraded_data["subscription"];
 
-                // Custom VMs are always billed monthly
+                // Custom VMs bill on their pricing model's interval
                 assert!(
                     sub_after_upgrade["is_active"].as_bool().unwrap_or(false),
                     "Subscription should still be active after upgrade"
@@ -1959,6 +2051,47 @@ mod tests {
             "Should have at least one history entry, got {history_count}"
         );
         eprintln!("VM {vm_id} has {history_count} history entries");
+
+        let price_of = |extra: Value| {
+            let mut body = serde_json::json!({
+                "pricing_id": custom_pricing_id,
+                "cpu": 1,
+                "memory": 1073741824_u64,
+                "disk": 10737418240_u64,
+                "disk_type": "ssd",
+                "disk_interface": "pcie"
+            });
+            for (k, v) in extra.as_object().unwrap() {
+                body[k] = v.clone();
+            }
+            let user = &user;
+            async move {
+                user.post_auth("/api/v1/vm/custom-template/price", &body)
+                    .await
+                    .unwrap()
+            }
+        };
+        let default_price = json_ok(price_of(serde_json::json!({})).await).await["data"]["amount"]
+            .as_u64()
+            .unwrap();
+        let more_bandwidth = json_ok(
+            price_of(serde_json::json!({ "transfer_gb": 3000, "network_mbps": 2000 })).await,
+        )
+        .await["data"]["amount"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(
+            more_bandwidth - default_price,
+            200 + 200,
+            "2 TB more transfer at 100/TB and 1 Gbit/s more at 200/Gbit/s"
+        );
+        let resp = price_of(serde_json::json!({ "transfer_gb": 9000 })).await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::OK,
+            "transfer above the plan maximum must not be quotable"
+        );
+        eprintln!("Custom price follows bandwidth ({default_price} -> {more_bandwidth}) ✓");
 
         // ----------------------------------------------------------------
         // 19. Custom VM order (if custom pricing is set up)

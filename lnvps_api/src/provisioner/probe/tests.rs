@@ -77,6 +77,7 @@ async fn a_catalogue(mock: &MockDb) {
             default_username: Some("debian".to_string()),
             sha2: None,
             sha2_url: None,
+            encrypted: false,
         },
     );
     mock.os_images.lock().await.insert(
@@ -93,6 +94,7 @@ async fn a_catalogue(mock: &MockDb) {
             default_username: Some("debian".to_string()),
             sha2: None,
             sha2_url: None,
+            encrypted: false,
         },
     );
 }
@@ -156,6 +158,7 @@ async fn a_node(db: &Arc<dyn LNVpsDb>) -> Result<MarketplaceNode> {
         region_id: 1,
         name: "node".to_string(),
         enabled: false,
+        cpu_arch: lnvps_db::CpuArch::X86_64,
         marketplace_node_id: Some(node_id),
         ..Default::default()
     })
@@ -235,6 +238,97 @@ async fn a_probe_uses_what_customers_buy() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn a_probe_runs_without_the_templates_limits() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+    mock.templates.lock().await.insert(
+        1,
+        lnvps_db::VmTemplate {
+            cpu_arch: lnvps_db::CpuArch::X86_64,
+            disk_iops_read: Some(1000),
+            disk_iops_write: Some(1000),
+            disk_mbps_read: Some(200),
+            disk_mbps_write: Some(200),
+            network_mbps: Some(1000),
+            cpu_limit: Some(0.5),
+            ..MockDb::mock_template()
+        },
+    );
+    let node = a_node(&db).await?;
+
+    let spec = ProbeSpec::build(&db, &node, KEY.to_string()).await?;
+    let limits = spec.vm_info().limits();
+
+    assert_eq!(spec.template.id, 1);
+    assert_eq!(limits.disk_iops_read, None);
+    assert_eq!(limits.disk_iops_write, None);
+    assert_eq!(limits.disk_mbps_read, None);
+    assert_eq!(limits.disk_mbps_write, None);
+    assert_eq!(limits.network_mbps, None);
+    assert_eq!(limits.cpu_limit, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_probe_boots_alpine_when_the_catalogue_has_it() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+    let alpine = |id: u64, arch: lnvps_db::CpuArch, age_days: i64| lnvps_db::VmOsImage {
+        id,
+        distribution: lnvps_db::OsDistribution::Alpine,
+        flavour: "cloudinit".to_string(),
+        version: "3.24".to_string(),
+        enabled: true,
+        release_date: chrono::Utc::now() - chrono::Duration::days(age_days),
+        url: format!("https://example.com/alpine-{id}.qcow2"),
+        cpu_arch: arch,
+        default_username: Some("alpine".to_string()),
+        sha2: None,
+        sha2_url: None,
+        encrypted: false,
+    };
+    mock.os_images
+        .lock()
+        .await
+        .insert(3, alpine(3, lnvps_db::CpuArch::X86_64, 400));
+    mock.os_images
+        .lock()
+        .await
+        .insert(4, alpine(4, lnvps_db::CpuArch::ARM64, 1));
+    let node = a_node(&db).await?;
+
+    let spec = ProbeSpec::build(&db, &node, KEY.to_string()).await?;
+
+    assert_eq!(spec.image.id, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_template_with_no_architecture_falls_back_to_the_hosts() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+    mock.templates.lock().await.insert(
+        1,
+        lnvps_db::VmTemplate {
+            cpu_arch: lnvps_db::CpuArch::Unknown,
+            ..MockDb::mock_template()
+        },
+    );
+    let node = a_node(&db).await?;
+
+    let spec = ProbeSpec::build(&db, &node, KEY.to_string()).await?;
+
+    assert_eq!(spec.image.cpu_arch, lnvps_db::CpuArch::X86_64);
+    Ok(())
+}
+
 /// The VM the client is handed carries the probe's own address and MAC, which
 /// are the two things the node's filter binds together. Getting either wrong
 /// produces a VM that boots and cannot be reached, which looks exactly like a
@@ -255,9 +349,62 @@ async fn the_probe_vm_is_addressed_as_the_node_expects() -> Result<()> {
     // an address and silently drops anything carrying a prefix, which boots a
     // guest with no network on a node that is perfectly fine.
     assert_eq!(info.ips[0].ip, spec.ip());
-    assert_eq!(spec.address, format!("{}/128", spec.ip()));
-    assert!(spec.address.contains(':'), "probes are IPv6 only");
+    assert_eq!(spec.address, format!("{}/32", spec.ip()));
+    assert_eq!(spec.address, "10.66.0.254/32");
     assert_eq!(info.vm.id, probe_vm_id(node.id));
+    Ok(())
+}
+
+/// The probe builds its disk in the pool the node registered, not a constant. A
+/// node whose pool has another name would otherwise fail the probe, or measure
+/// a pool no customer is placed on.
+#[tokio::test]
+async fn the_probe_uses_the_nodes_own_storage_pool() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+    let node = a_node(&db).await?;
+    let host = db.get_marketplace_node_host(node.id).await?.unwrap();
+
+    // No pool of its own yet: libvirt's default is the fallback.
+    let spec = ProbeSpec::build(&db, &node, KEY.to_string()).await?;
+    assert_eq!(spec.disk_name, "default");
+
+    db.create_host_disk(&VmHostDisk {
+        id: 0,
+        host_id: host.id,
+        name: "nvme".to_string(),
+        size: 1_000_000_000_000,
+        kind: DiskType::SSD,
+        interface: DiskInterface::PCIe,
+        enabled: true,
+    })
+    .await?;
+
+    let spec = ProbeSpec::build(&db, &node, KEY.to_string()).await?;
+    assert_eq!(spec.disk_name, "nvme");
+    assert_eq!(spec.vm_info().disk.name, "nvme");
+    Ok(())
+}
+
+/// Node- and guest-controlled text is cut to what its column holds. Over the
+/// cap a strict-mode MySQL rejects the whole row, so the probe that failed is
+/// the one whose result is never recorded — and a node with no health row has
+/// no cooldown, so it is re-probed on the next sweep and builds another VM.
+#[tokio::test]
+async fn long_health_text_is_cut_to_the_column() -> Result<()> {
+    let mock = Arc::new(MockDb::empty());
+    let db: Arc<dyn LNVpsDb> = mock.clone();
+    a_pool(&db, &mock).await?;
+    a_catalogue(&mock).await;
+    let node = a_node(&db).await?;
+    let mut spec = dummy_spec(&db, &node).await?;
+    spec.image.url = "u".repeat(1000);
+
+    let health = ProbeResult::failed("f".repeat(70_000)).into_health(node.id, &spec);
+    assert_eq!(health.failure.as_deref().unwrap().len(), MAX_FAILURE_LEN);
+    assert_eq!(health.image.len(), MAX_IMAGE_LEN);
     Ok(())
 }
 
@@ -450,7 +597,7 @@ async fn a_probe_cleans_up_after_itself() -> Result<()> {
     // waits for is the whole thing, not the part that thought to measure itself.
     assert!(result.provision_ms.is_some());
 
-    let client = lnvps_api_common::host::get_host_client(&spec.host, &dummy_cfg())?;
+    let client = lnvps_api_common::host::get_host_client(&db, &spec.host, &dummy_cfg()).await?;
     assert!(
         client.get_vm_state(&spec.vm_info().vm).await.is_err(),
         "the probe VM outlived its probe"
@@ -483,7 +630,7 @@ async fn a_failed_measurement_still_destroys_the_vm() -> Result<()> {
             .contains("could not log in")
     );
 
-    let client = lnvps_api_common::host::get_host_client(&spec.host, &dummy_cfg())?;
+    let client = lnvps_api_common::host::get_host_client(&db, &spec.host, &dummy_cfg()).await?;
     assert!(client.get_vm_state(&spec.vm_info().vm).await.is_err());
     Ok(())
 }
@@ -501,7 +648,7 @@ async fn a_stale_probe_is_cleared_first() -> Result<()> {
     let spec = dummy_spec(&db, &node).await?;
 
     // A probe VM from a run that never finished.
-    let client = lnvps_api_common::host::get_host_client(&spec.host, &dummy_cfg())?;
+    let client = lnvps_api_common::host::get_host_client(&db, &spec.host, &dummy_cfg()).await?;
     client.create_vm(&spec.vm_info()).await?;
     assert!(client.get_vm_state(&spec.vm_info().vm).await.is_ok());
 
@@ -686,19 +833,15 @@ async fn a_probe_can_reach_its_gateway() -> Result<()> {
     let info = spec.vm_info();
     let network = lnvps_api_common::host::cloud_init::network_config(&info)?;
 
-    // A host prefix: the guest's own address and nothing else is on-link, so
-    // everything it sends goes to the node — the only thing on that bridge that
-    // can route. A wider prefix would make the route server look on-link, and
-    // the guest would resolve it on a link where nothing answers.
+    assert!(network.yaml.contains("10.66.0.254/25"), "{}", network.yaml);
     assert!(
-        network.yaml.contains(&format!("{}/128", spec.ip())),
+        network.yaml.contains("via: \"10.66.0.129\""),
         "{}",
         network.yaml
     );
-    // ...which requires the gateway to be marked reachable anyway.
     assert!(
-        network.yaml.contains("on-link: true"),
-        "a gateway outside the guest's prefix is unusable without this:\n{}",
+        !network.yaml.contains("on-link"),
+        "cloud-init's networkd renderer drops on-link, so a probe must not need it:\n{}",
         network.yaml
     );
     Ok(())
@@ -734,6 +877,34 @@ impl lnvps_api_common::host::VmHostClient for RecordingHost {
     async fn get_info(
         &self,
     ) -> lnvps_api_common::retry::OpResult<lnvps_api_common::host::VmHostInfo> {
+        unsupported!()
+    }
+    async fn list_snapshots(
+        &self,
+        _vm: &Vm,
+    ) -> lnvps_api_common::retry::OpResult<Vec<lnvps_api_common::host::VmSnapshot>> {
+        unsupported!()
+    }
+    async fn create_snapshot(
+        &self,
+        _vm: &Vm,
+        _name: &str,
+        _description: Option<&str>,
+    ) -> lnvps_api_common::retry::OpResult<()> {
+        unsupported!()
+    }
+    async fn rollback_snapshot(
+        &self,
+        _vm: &Vm,
+        _name: &str,
+    ) -> lnvps_api_common::retry::OpResult<()> {
+        unsupported!()
+    }
+    async fn delete_snapshot(
+        &self,
+        _vm: &Vm,
+        _name: &str,
+    ) -> lnvps_api_common::retry::OpResult<()> {
         unsupported!()
     }
     async fn download_os_image(
@@ -904,4 +1075,25 @@ async fn a_panicking_probe_still_destroys_its_vm() -> Result<()> {
         "a probe that panicked left its VM running on the operator's node"
     );
     Ok(())
+}
+
+#[test]
+fn an_underlay_that_cannot_carry_the_pool_mtu_is_rejected() {
+    let pool = lnvps_db::TunnelPool {
+        listen_addr: "185.18.221.1".to_string(),
+        mtu: 1420,
+        ..Default::default()
+    };
+    assert_eq!(underlay_shortfall(&pool, Some(1480)), None);
+    let short = underlay_shortfall(&pool, Some(1476)).unwrap();
+    assert!(short.contains("1476") && short.contains("1480"), "{short}");
+    assert!(underlay_shortfall(&pool, None).is_some());
+
+    let v6 = lnvps_db::TunnelPool {
+        listen_addr: "2001:db8::1".to_string(),
+        mtu: 1420,
+        ..Default::default()
+    };
+    assert!(underlay_shortfall(&v6, Some(1480)).is_some());
+    assert_eq!(underlay_shortfall(&v6, Some(1500)), None);
 }

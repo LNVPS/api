@@ -374,9 +374,10 @@ fn service_mapping(name: &str, svc: &Service, r: &Rendered) -> Result<Mapping> {
     let mut ports: Vec<Value> = Vec::new();
     for p in &svc.ports {
         expose.push(Value::from(p.container.to_string()));
-        if r.publish && p.expose == Expose::Ingress {
+        if r.publish && matches!(p.expose, Expose::Ingress | Expose::Tcp | Expose::Udp) {
+            let proto = if p.expose == Expose::Udp { "/udp" } else { "" };
             ports.push(Value::from(format!(
-                "127.0.0.1:{}:{}",
+                "127.0.0.1:{}:{}{proto}",
                 p.container, p.container
             )));
         }

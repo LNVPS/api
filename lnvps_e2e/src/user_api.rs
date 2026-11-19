@@ -538,6 +538,32 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_vm_snapshots_require_auth() {
+        let client = user_client_no_auth();
+        for (method, path) in [
+            (reqwest::Method::GET, "/api/v1/vm/1/snapshots"),
+            (reqwest::Method::POST, "/api/v1/vm/1/snapshots"),
+            (reqwest::Method::DELETE, "/api/v1/vm/1/snapshots/one"),
+            (reqwest::Method::PATCH, "/api/v1/vm/1/snapshots/one/restore"),
+            (reqwest::Method::GET, "/api/v1/vm/1/addons"),
+            (reqwest::Method::PUT, "/api/v1/vm/1/addons"),
+            (reqwest::Method::POST, "/api/v1/vm/1/addons/quote"),
+        ] {
+            let resp = client
+                .http
+                .request(method.clone(), client.url(path))
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                resp.status() == StatusCode::FORBIDDEN || resp.status() == StatusCode::UNAUTHORIZED,
+                "{method} {path} without auth should return 401/403, got: {}",
+                resp.status()
+            );
+        }
+    }
+
     // ========================================================================
     // Authenticated User Endpoints
     // ========================================================================
@@ -1790,7 +1816,7 @@ mod tests {
         let resp = client
             .patch_auth(
                 &format!("/api/v1/app-deployments/{dep2_id}"),
-                &serde_json::json!({"custom_domain": "Blog.Example.com"}),
+                &serde_json::json!({"custom_domain": "Blog.MyRelay.com"}),
             )
             .await
             .unwrap();
@@ -1802,7 +1828,7 @@ mod tests {
         let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         assert_eq!(
             body["data"]["custom_domain"].as_str().unwrap(),
-            "blog.example.com",
+            "blog.myrelay.com",
             "custom_domain normalized to lowercase"
         );
         // Accepted but held: nothing serves the domain, and no certificate is
@@ -1812,8 +1838,15 @@ mod tests {
             Some(false),
             "a domain nobody has pointed at us yet is held"
         );
-        // An invalid domain (no dot / scheme / bad label) is rejected.
-        for bad in ["localhost", "https://blog.example.com", "-bad.example.com"] {
+        // An invalid domain (no dot / scheme / bad label), a reserved example
+        // domain, and one of LNVPS's own hostnames are all rejected.
+        for bad in [
+            "localhost",
+            "https://blog.myrelay.com",
+            "-bad.myrelay.com",
+            "blog.example.com",
+            "api.lnvps.net",
+        ] {
             let resp = client
                 .patch_auth(
                     &format!("/api/v1/app-deployments/{dep2_id}"),

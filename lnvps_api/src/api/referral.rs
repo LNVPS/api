@@ -56,6 +56,7 @@ pub struct ApiReferral {
     /// **total** outstanding commission across every currency (fiat balances
     /// valued in sats at the current rate), not on each currency separately.
     pub payout_threshold: Option<u64>,
+    pub auto_payout_approved: bool,
     /// When the referral was created
     pub created: chrono::DateTime<Utc>,
 }
@@ -71,6 +72,7 @@ impl From<Referral> for ApiReferral {
             effective_referral_rate: r.referral_rate.unwrap_or(0.0),
             referral_rate: r.referral_rate,
             payout_threshold: r.payout_threshold,
+            auto_payout_approved: r.auto_payout_approved,
             created: r.created,
         }
     }
@@ -226,8 +228,10 @@ pub struct ApiReferralUsage {
     pub currency: String,
     /// Effective commission rate applied (whole %).
     pub effective_rate: f32,
-    /// Commission earned = amount * effective_rate% (smallest currency unit).
+    /// Commission earned = (amount - refunded) * effective_rate% (smallest
+    /// currency unit).
     pub commission: u64,
+    pub payable_after: Option<chrono::DateTime<Utc>>,
 }
 
 /// Request to sign up for the referral program
@@ -502,6 +506,7 @@ async fn v1_signup_referral(
         referral_rate: None,
         payout_threshold: req.payout_threshold,
         created: Utc::now(),
+        auto_payout_approved: false,
     };
 
     let id = this.db.insert_referral(&referral).await?;
@@ -626,9 +631,15 @@ async fn v1_get_referral_usage(
         .db
         .list_referral_usage_paginated(&referral.code, limit, offset)
         .await?;
+    let hold = this
+        .settings
+        .referral
+        .as_ref()
+        .map(|r| chrono::Duration::days(r.commission_hold_days as i64));
     let out: Vec<ApiReferralUsage> = usage
         .into_iter()
         .map(|u| ApiReferralUsage {
+            payable_after: hold.map(|h| u.created + h),
             created: u.created,
             amount: u.amount,
             commission: u.commission(),
@@ -743,6 +754,7 @@ mod tests {
             min_onchain_payout_sats: Some(5_000),
             max_onchain_fee_per_vbyte: 50,
             fee_estimator: FeeEstimatorConfig::default(),
+            commission_hold_days: 30,
         };
 
         // Lightning uses min_payout_sats (1000).

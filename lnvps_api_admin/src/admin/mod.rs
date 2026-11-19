@@ -6,22 +6,29 @@ use lnvps_api_common::{
 use lnvps_db::LNVpsDb;
 use std::sync::Arc;
 
+mod abuse;
 mod access_policies;
+mod activity;
 mod agent;
 mod apps;
 mod auth;
 mod bulk_message;
+pub mod chain;
 mod companies;
 mod cost_plans;
 mod costs;
+mod credit;
 mod custom_pricing;
 mod custom_templates;
 mod discounts;
 mod dns_servers;
 mod docs;
 mod hosts;
+mod ip_orders;
+mod ip_providers;
 mod ip_ranges;
 mod ip_space;
+mod ip_waits;
 mod marketplace;
 mod model;
 mod passkeys;
@@ -32,9 +39,11 @@ mod reports;
 mod roles;
 mod routers;
 mod subscriptions;
+mod swap_orders;
 mod tunnel_pools;
 mod user_payment_methods;
 mod users;
+mod vm_addon_prices;
 mod vm_ip_assignments;
 mod vm_os_images;
 mod vm_templates;
@@ -58,6 +67,7 @@ pub(crate) struct RouterState {
     /// caller that reports a rate must check [`VatClient::rate_count`] before
     /// presenting 0% as a determination rather than as "not loaded yet".
     pub vat: VatClient,
+    pub chain: Option<Arc<dyn chain::ChainOutputLookup>>,
 }
 
 pub fn admin_router(
@@ -68,9 +78,11 @@ pub fn admin_router(
     feedback: Option<RedisWorkFeedback>,
     node_control: Option<lnvps_api_common::node_control::NodeControl>,
     vat: VatClient,
+    chain: Option<Arc<dyn chain::ChainOutputLookup>>,
 ) -> Router {
     Router::new()
         .merge(docs::router())
+        .merge(activity::router())
         .merge(users::router())
         .merge(agent::router())
         .merge(passkeys::router())
@@ -82,6 +94,9 @@ pub fn admin_router(
         .merge(vm_os_images::router())
         .merge(vm_templates::router())
         .merge(companies::router())
+        .merge(abuse::router())
+        .merge(credit::router())
+        .merge(swap_orders::router())
         .merge(cost_plans::router())
         .merge(costs::router())
         .merge(custom_pricing::router())
@@ -97,6 +112,10 @@ pub fn admin_router(
         .merge(referrals::router())
         .merge(marketplace::router())
         .merge(tunnel_pools::router())
+        .merge(vm_addon_prices::router())
+        .merge(ip_orders::router())
+        .merge(ip_providers::router())
+        .merge(ip_waits::router())
         .merge(vpn_services::router())
         .merge(vpn_subscriptions::router())
         .merge(apps::router())
@@ -112,5 +131,6 @@ pub fn admin_router(
             feedback,
             exchange,
             vat,
+            chain,
         })
 }

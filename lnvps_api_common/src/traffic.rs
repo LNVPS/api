@@ -5,8 +5,8 @@
 //! reading is differenced against the previous one and the difference is added
 //! to the current UTC day's row.
 //!
-//! Nothing here enforces anything: a VM over its `transfer_gb` quota is still
-//! served at full speed, and the quota only drives display and warnings.
+//! A VM over its `transfer_gb` quota has its NIC throttled to
+//! [`TRANSFER_THROTTLE_MBPS`] until the quota period resets.
 
 use anyhow::Result;
 use chrono::{Datelike, NaiveDate, Utc};
@@ -48,6 +48,30 @@ pub fn quota_period(day: NaiveDate) -> (NaiveDate, NaiveDate) {
     .and_then(|d| d.pred_opt())
     .unwrap_or(day);
     (start, end)
+}
+
+pub const TRANSFER_THROTTLE_MBPS: u32 = 10;
+
+pub fn transfer_quota_exceeded(bytes_out: u64, quota_gb: u32) -> bool {
+    quota_gb > 0 && bytes_out >= quota_gb as u64 * 1_000_000_000
+}
+
+pub fn throttled_network_mbps(network_mbps: Option<u32>) -> u32 {
+    network_mbps.map_or(TRANSFER_THROTTLE_MBPS, |m| m.min(TRANSFER_THROTTLE_MBPS))
+}
+
+pub async fn vm_over_transfer_quota(
+    db: &Arc<dyn LNVpsDb>,
+    vm_id: u64,
+    quota_gb: Option<u32>,
+    day: NaiveDate,
+) -> Result<bool> {
+    let Some(quota_gb) = quota_gb.filter(|g| *g > 0) else {
+        return Ok(false);
+    };
+    let (start, end) = quota_period(day);
+    let (_, bytes_out) = db.get_vm_traffic_total(vm_id, start, end).await?;
+    Ok(transfer_quota_exceeded(bytes_out, quota_gb))
 }
 
 /// Longest range a single traffic query may span, in days.
@@ -207,6 +231,40 @@ mod tests {
     /// One hour of headroom, so the clamp is never what a test is measuring
     /// unless it says so.
     const HOUR: u64 = 3600;
+
+    #[test]
+    fn test_transfer_quota_exceeded_at_the_allowance() {
+        assert!(!transfer_quota_exceeded(99_999_999_999, 100));
+        assert!(transfer_quota_exceeded(100_000_000_000, 100));
+        assert!(!transfer_quota_exceeded(u64::MAX, 0));
+    }
+
+    #[test]
+    fn test_throttle_never_raises_a_lower_plan_rate() {
+        assert_eq!(throttled_network_mbps(None), TRANSFER_THROTTLE_MBPS);
+        assert_eq!(throttled_network_mbps(Some(1000)), TRANSFER_THROTTLE_MBPS);
+        assert_eq!(throttled_network_mbps(Some(4)), 4);
+    }
+
+    #[tokio::test]
+    async fn test_vm_over_transfer_quota_uses_the_days_period() -> Result<()> {
+        let mock = Arc::new(MockDb::default());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let day = NaiveDate::from_ymd_opt(2026, 8, 24).unwrap();
+        mock.add_vm_traffic(
+            1,
+            NaiveDate::from_ymd_opt(2026, 7, 31).unwrap(),
+            0,
+            5_000_000_000,
+        )
+        .await?;
+        assert!(!vm_over_transfer_quota(&db, 1, Some(1), day).await?);
+        mock.add_vm_traffic(1, day, 0, 1_000_000_000).await?;
+        assert!(vm_over_transfer_quota(&db, 1, Some(1), day).await?);
+        assert!(!vm_over_transfer_quota(&db, 1, None, day).await?);
+        assert!(!vm_over_transfer_quota(&db, 1, Some(0), day).await?);
+        Ok(())
+    }
 
     #[test]
     fn quota_period_spans_the_whole_calendar_month() {

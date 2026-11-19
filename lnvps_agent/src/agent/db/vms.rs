@@ -204,7 +204,7 @@ impl DbToolExecutor {
         };
 
         let host = self.db.get_host(vm.host_id).await?;
-        let client = get_host_client(&host, provisioner)?;
+        let client = get_host_client(&self.db, &host, provisioner).await?;
 
         match action {
             PowerAction::Start => client.start_vm(vm).await?,
@@ -277,7 +277,7 @@ impl DbToolExecutor {
             bail!("VM metrics are not available in this session");
         };
         let host = self.db.get_host(vm.host_id).await?;
-        let client = get_host_client(&host, provisioner)?;
+        let client = get_host_client(&self.db, &host, provisioner).await?;
         let series = client.get_time_series_data(vm, TimeSeries::Hourly).await?;
         Ok(json!({
             "vm_id": vm.id,

@@ -2,7 +2,9 @@ use anyhow::Result;
 use clap::Parser;
 use config::{Config as ConfigBuilder, File};
 use kube::Client;
-use lnvps_api_common::{RedisWorkCommander, WorkCommander, WorkJob, app_cluster_stream};
+use lnvps_api_common::{
+    ObjectStore, ObjectStoreConfig, RedisWorkCommander, WorkCommander, WorkJob, app_cluster_stream,
+};
 use lnvps_db::{LNVpsDb, LNVpsDbMysql};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -14,9 +16,12 @@ use std::time::Duration;
 use tokio::signal;
 use tokio::sync::Notify;
 
+mod app_backups;
 mod app_deployments;
+mod l4;
 mod metrics;
 mod nostr_domains;
+mod srv_dns;
 
 use crate::metrics::PrometheusClient;
 
@@ -57,6 +62,8 @@ pub struct Settings {
     /// `app_deployment` rows whose `cluster_id` matches this into Kubernetes.
     /// When unset, app-deployment reconciliation is disabled.
     pub app_cluster_id: Option<u64>,
+
+    pub nostr_domains: Option<bool>,
 
     /// Reconciliation interval in seconds (defaults to 60)
     pub reconcile_interval: Option<u64>,
@@ -117,6 +124,11 @@ pub struct Settings {
     /// unknown; everything else reconciles as before.
     pub prometheus: Option<PrometheusConfig>,
 
+    /// Object storage for app-deployment backup artifacts (optional). Without
+    /// it, backups are disabled: nothing is scheduled and nothing runs, which
+    /// is the behaviour of every operator that shipped before backups existed.
+    pub backups: Option<BackupConfig>,
+
     /// Redis URL carrying reconcile triggers for this operator's app cluster
     /// (optional; issue #254).
     ///
@@ -126,6 +138,40 @@ pub struct Settings {
     /// exactly as before: the periodic reconcile is the only trigger, and it
     /// remains the backstop either way.
     pub redis: Option<String>,
+
+    /// Who does L4 (TCP/UDP) forwarding for apps that declare `expose: tcp|udp`,
+    /// and the public port range deployments are allocated from. Defaults to
+    /// ingress-nginx's `tcp-services`/`udp-services` ConfigMaps.
+    #[serde(default)]
+    pub l4: l4::L4Config,
+}
+
+/// Where backup artifacts go, and how the Jobs that produce them are bounded.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct BackupConfig {
+    /// S3-compatible bucket the artifacts are uploaded to.
+    #[serde(flatten)]
+    pub store: ObjectStoreConfig,
+
+    /// Image that tars, compresses and uploads. Defaults to a stock `curl`
+    /// image, whose busybox userland already has `tar` and `gzip`. Override to
+    /// pin it by digest, or to point at an internal mirror.
+    pub uploader_image: Option<String>,
+
+    /// How long a signed upload URL stays valid, in hours (default 6).
+    pub upload_url_expiry_hours: Option<u64>,
+
+    /// How long a backup Job may run, in hours (default 5). Kept below the
+    /// URL's life so a Job cannot outlive its own upload URL and then fail
+    /// with a signature error that reads as a storage fault.
+    pub job_deadline_hours: Option<u64>,
+
+    /// How many backup Jobs may run at once on this cluster (default 3).
+    /// Every app on the same daily schedule comes due in the same minute, and
+    /// each Job reads a whole volume on a node that is also serving customers'
+    /// apps.
+    pub max_concurrent: Option<usize>,
 }
 
 /// Prometheus the operator queries for deployment usage.
@@ -155,6 +201,60 @@ pub struct Context {
     /// Usage source, built once so its connection pool survives between
     /// reconcile passes. `None` when no Prometheus is configured.
     pub metrics: Option<PrometheusClient>,
+    /// Backup artifact storage. `None` when no bucket is configured, which
+    /// disables backups entirely.
+    pub object_store: Option<ObjectStore>,
+    pub exec_pumps: std::sync::Mutex<std::collections::HashSet<u64>>,
+    pub l4: l4::L4Runtime,
+}
+
+impl Settings {
+    pub fn reconciles_nostr_domains(&self) -> bool {
+        self.nostr_domains.unwrap_or(true)
+    }
+
+    /// Image the backup uploader container runs.
+    pub fn backup_uploader_image(&self) -> &str {
+        self.backups
+            .as_ref()
+            .and_then(|b| b.uploader_image.as_deref())
+            .unwrap_or(app_backups::DEFAULT_UPLOADER_IMAGE)
+    }
+
+    /// How many backup Jobs may be in flight on this cluster.
+    pub fn max_concurrent_backups(&self) -> usize {
+        self.backups
+            .as_ref()
+            .and_then(|b| b.max_concurrent)
+            .unwrap_or(app_backups::DEFAULT_MAX_CONCURRENT_BACKUPS)
+            .max(1)
+    }
+
+    /// How long a signed upload URL is good for.
+    pub fn backup_url_expiry(&self) -> Duration {
+        Duration::from_secs(
+            3600 * self
+                .backups
+                .as_ref()
+                .and_then(|b| b.upload_url_expiry_hours)
+                .unwrap_or(app_backups::DEFAULT_UPLOAD_URL_HOURS)
+                .max(1),
+        )
+    }
+
+    /// How long a backup Job may run before Kubernetes kills it. Never longer
+    /// than the upload URL it was given.
+    pub fn backup_job_deadline(&self) -> Duration {
+        let configured = Duration::from_secs(
+            3600 * self
+                .backups
+                .as_ref()
+                .and_then(|b| b.job_deadline_hours)
+                .unwrap_or(app_backups::DEFAULT_JOB_DEADLINE_HOURS)
+                .max(1),
+        );
+        configured.min(self.backup_url_expiry())
+    }
 }
 
 /// Default gap between app-deployment sweeps while something is transitioning.
@@ -186,6 +286,9 @@ fn database_url(configured: &str, from_env: Option<String>) -> Result<String> {
     Ok(url.to_string())
 }
 
+/// Apply environment-supplied bucket credentials over whatever the config file
+/// carried, so the keys can live in a Secret while the rest stays in a
+/// ConfigMap. An empty or unset variable leaves the file's value alone.
 #[tokio::main]
 async fn main() -> Result<()> {
     // kube (via hyper-rustls) and sqlx's TLS both use rustls, but the dependency
@@ -234,19 +337,40 @@ async fn main() -> Result<()> {
         None => None,
     };
 
+    // Backups are opt-in: without a bucket, nothing is scheduled and nothing
+    // runs, which is how every operator behaved before backups existed.
+    let object_store = match settings.backups.as_ref() {
+        Some(cfg) => Some(ObjectStore::new(cfg.store.clone().with_env_credentials())?),
+        None => {
+            if settings.app_cluster_id.is_some() {
+                info!("No backup storage configured; app deployment backups are disabled");
+            }
+            None
+        }
+    };
+
+    let l4 = l4::L4Runtime::new(&settings.l4, Arc::new(l4::KubeConfigMaps(client.clone())))?;
+
     let context = Arc::new(Context {
         client: client.clone(),
         db: Arc::new(db) as Arc<dyn LNVpsDb>,
         settings: settings.clone(),
         metrics,
+        object_store,
+        exec_pumps: Default::default(),
+        l4,
     });
 
     info!("LNVPS Operator is running and watching for resources...");
 
     // Initial reconciliation of nostr domains
-    info!("Starting initial nostr domain reconciliation...");
-    if let Err(e) = nostr_domains::reconcile_nostr_domains(&context).await {
-        error!("Failed to reconcile nostr domains: {}", e);
+    if context.settings.reconciles_nostr_domains() {
+        info!("Starting initial nostr domain reconciliation...");
+        if let Err(e) = nostr_domains::reconcile_nostr_domains(&context).await {
+            error!("Failed to reconcile nostr domains: {}", e);
+        }
+    } else {
+        info!("Nostr domain reconciliation disabled");
     }
     // Shared with the trigger listener so a payment-triggered sweep that leaves
     // a deployment provisioning also puts the timer on the fast cadence.
@@ -276,6 +400,9 @@ async fn main() -> Result<()> {
     // the steady interval while app deployments run their own cadence.
     let nostr_context = context.clone();
     let nostr_task = async move {
+        if !nostr_context.settings.reconciles_nostr_domains() {
+            return std::future::pending::<()>().await;
+        }
         let mut interval = tokio::time::interval(reconcile_interval);
         interval.tick().await;
         loop {
@@ -318,6 +445,12 @@ async fn main() -> Result<()> {
                     // An unknown outcome is not a reason to poll fast forever.
                     app_transitioning.lock().unwrap().clear();
                 }
+            }
+            // After the deployments, so a backup Job is only ever created for a
+            // deployment this pass has already reconciled.
+            match app_backups::reconcile_app_backups(&app_context).await {
+                Ok(active) => app_transitioning.lock().unwrap().extend(active),
+                Err(e) => error!("Failed to reconcile app backups: {}", e),
             }
         }
     };
@@ -377,17 +510,16 @@ async fn trigger_listener(
     // process: two operators serving the same cluster then share the work
     // rather than each reconciling every trigger.
     let consumer = format!("operator-{}", uuid::Uuid::new_v4());
-    let connected =
-        RedisWorkCommander::new_for_stream(&redis_url, &stream, "operator", &consumer).await;
-    let commander = match connected {
-        Ok(c) => c,
-        Err(e) => {
-            error!(
-                "Could not connect to redis at {redis_url} for {stream}: {e} — falling back to \
-                 the periodic reconcile only"
-            );
-            std::future::pending::<()>().await;
-            return;
+    let commander = loop {
+        match RedisWorkCommander::new_for_stream(&redis_url, &stream, "operator", &consumer).await {
+            Ok(c) => break c,
+            Err(e) => {
+                error!(
+                    "Could not connect to redis at {redis_url} for {stream}: {e}, retrying in \
+                     30s (the periodic reconcile continues meanwhile)"
+                );
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
         }
     };
     info!("Listening for reconcile triggers on {stream} as {consumer}");
@@ -484,6 +616,7 @@ mod tests {
         // and encryption settings.
         let full = load("config.yaml");
         assert!(full.app_cluster_id.is_some());
+        assert!(!full.reconciles_nostr_domains());
         assert!(full.encryption.is_some());
         assert_eq!(full.ingress_namespace.as_deref(), Some("ingress-nginx"));
         assert_eq!(full.redis.as_deref(), Some("redis://localhost:6379"));
@@ -491,18 +624,127 @@ mod tests {
         assert_eq!(prom.url, "http://prometheus.monitoring:9090");
         assert_eq!(prom.timeout_seconds, Some(10));
         assert_eq!(
-            full.encryption.unwrap().key_file,
+            full.encryption.clone().unwrap().key_file,
             PathBuf::from("/etc/lnvps/encryption.key")
         );
+        let backups = full.backups.clone().expect("backups example");
+        assert_eq!(backups.store.bucket, "lnvps-app-backups");
+        assert_eq!(backups.store.region, "eu-central-1");
+        assert!(backups.store.path_style);
+        assert_eq!(full.backup_url_expiry(), Duration::from_secs(6 * 3600));
+        assert_eq!(full.backup_job_deadline(), Duration::from_secs(5 * 3600));
+        assert_eq!(full.backup_uploader_image(), "curlimages/curl:8.11.1");
+        assert_eq!(full.max_concurrent_backups(), 2);
+        assert_eq!(full.l4.forwarder, l4::ForwarderKind::IngressNginx);
+        assert_eq!(full.l4.port_range.start, 25565);
+        assert_eq!(full.l4.port_range.end, 25584);
+        assert_eq!(full.l4.ingress_nginx.namespace, "ingress-nginx");
+        assert_eq!(full.l4.ingress_nginx.tcp_configmap, "tcp-services");
+        assert_eq!(full.l4.ingress_nginx.udp_configmap, "udp-services");
+        full.l4.validate().unwrap();
 
         // Minimal config (app-deployment keys commented out) still loads.
         let minimal = load("config.minimal.yaml");
         assert!(minimal.app_cluster_id.is_none());
+        assert!(minimal.reconciles_nostr_domains());
         assert!(minimal.encryption.is_none());
         // No redis: the periodic reconcile is the only trigger, which is what
         // the operator did before #254.
         assert!(minimal.redis.is_none());
         // No prometheus: no usage is collected and the API reports it unknown.
         assert!(minimal.prometheus.is_none());
+        // No backups: nothing is scheduled and nothing runs.
+        assert!(minimal.backups.is_none());
+        assert_eq!(minimal.l4.forwarder, l4::ForwarderKind::IngressNginx);
+        // The defaults still answer, so the code paths that read them do not
+        // have to care whether backups are configured.
+        assert_eq!(minimal.backup_url_expiry(), Duration::from_secs(6 * 3600));
+        assert_eq!(
+            minimal.backup_uploader_image(),
+            app_backups::DEFAULT_UPLOADER_IMAGE
+        );
+    }
+
+    /// A Job that outlived its upload URL would fail with a signature error
+    /// that reads as a storage fault, so the deadline is capped at the URL.
+    #[test]
+    fn a_job_never_outlives_its_upload_url() {
+        let settings = |url_hours: u64, job_hours: u64| Settings {
+            db: String::new(),
+            namespace: None,
+            app_cluster_id: None,
+            nostr_domains: None,
+            reconcile_interval: None,
+            transition_reconcile_interval: None,
+            error_retry_interval: None,
+            verbose: None,
+            service_name: None,
+            port_name: None,
+            cluster_issuer: None,
+            ingress_class: None,
+            app_tls_secret: None,
+            ingress_namespace: None,
+            annotations: None,
+            encryption: None,
+            prometheus: None,
+            backups: Some(BackupConfig {
+                store: ObjectStoreConfig {
+                    endpoint: "https://s3.example.com".to_string(),
+                    region: "us-east-1".to_string(),
+                    bucket: "b".to_string(),
+                    access_key: "k".to_string(),
+                    secret_key: "s".to_string(),
+                    path_style: true,
+                },
+                uploader_image: None,
+                upload_url_expiry_hours: Some(url_hours),
+                job_deadline_hours: Some(job_hours),
+                max_concurrent: None,
+            }),
+            redis: None,
+            l4: Default::default(),
+        };
+        assert_eq!(
+            settings(2, 9).backup_job_deadline(),
+            Duration::from_secs(2 * 3600),
+            "a longer deadline than the URL is capped at the URL"
+        );
+        assert_eq!(
+            settings(9, 2).backup_job_deadline(),
+            Duration::from_secs(2 * 3600)
+        );
+        // Zero is not a duration anything can finish in.
+        assert_eq!(
+            settings(0, 0).backup_url_expiry(),
+            Duration::from_secs(3600)
+        );
+    }
+
+    #[test]
+    fn shipped_manifest_and_readme_target_the_deployed_namespace() {
+        let manifest = include_str!("../k8s-minimal.yaml");
+        let readme = include_str!("../README.md");
+        assert!(!manifest.contains("lnvps-system"));
+        assert!(!readme.contains("lnvps-system"));
+        let subject_namespace = manifest
+            .split("kind: ClusterRoleBinding")
+            .nth(1)
+            .and_then(|b| b.lines().find(|l| l.trim_start().starts_with("namespace:")))
+            .map(|l| l.trim().trim_start_matches("namespace:").trim());
+        assert_eq!(subject_namespace, Some("lnvps"));
+    }
+
+    #[test]
+    fn readme_deploys_a_manifest_that_exists() {
+        let readme = include_str!("../README.md");
+        assert!(!readme.contains("k8s-deployment.yaml"));
+        assert!(readme.contains("kubectl apply -f lnvps_operator/k8s-minimal.yaml"));
+    }
+
+    #[test]
+    fn shipped_manifest_wires_backup_credentials_from_secret() {
+        let manifest = include_str!("../k8s-minimal.yaml");
+        assert!(manifest.contains("name: LNVPS_BACKUP_ACCESS_KEY"));
+        assert!(manifest.contains("name: LNVPS_BACKUP_SECRET_KEY"));
     }
 }

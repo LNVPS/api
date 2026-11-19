@@ -37,26 +37,34 @@ pub fn derive_refund_payment_id(
     h.finalize().to_vec()
 }
 
-/// The tax to reverse when refunding `amount` of `original`.
+/// What the customer was charged for the service: net price plus tax.
+/// Processor fees are not part of it, because they are not returned.
+pub fn gross_charged(payment: &SubscriptionPayment) -> u64 {
+    payment.amount + payment.tax
+}
+
+/// The tax inside a gross refund of `gross` against `original`.
 ///
-/// Pro-rated against the original payment's own gross/tax split, so the VAT
-/// returned is a slice of the VAT that was actually declared — never a fresh
+/// Pro-rated against the original payment's own net/tax split, so the VAT
+/// returned is a slice of the VAT that was actually declared, never a fresh
 /// calculation at today's rate, which would drift from what the customer was
 /// charged and misstate the OSS return.
 ///
-/// A full refund (`amount == original.amount`) returns exactly `original.tax`;
-/// integer division only rounds on partial refunds, and rounds **down**, so
-/// repeated partial refunds can never return more VAT than was collected.
-pub fn prorated_refund_tax(original: &SubscriptionPayment, amount: u64) -> u64 {
-    if original.amount == 0 || original.tax == 0 {
+/// A full refund (`gross == gross_charged(original)`) returns exactly
+/// `original.tax`; integer division only rounds on partial refunds, and rounds
+/// **down**, so repeated partial refunds can never return more VAT than was
+/// collected.
+pub fn prorated_refund_tax(original: &SubscriptionPayment, gross: u64) -> u64 {
+    let charged = gross_charged(original);
+    if charged == 0 || original.tax == 0 {
         return 0;
     }
-    let amount = amount.min(original.amount);
-    ((amount as u128 * original.tax as u128) / original.amount as u128) as u64
+    let gross = gross.min(charged);
+    ((gross as u128 * original.tax as u128) / charged as u128) as u64
 }
 
-/// What is still refundable on `payment` given the refunds already recorded
-/// against it.
+/// What is still refundable on `payment`, gross (net + tax), given the refunds
+/// already recorded against it.
 ///
 /// Partial refunds are allowed, so the ceiling is the payment minus everything
 /// already returned. Without it a payment could be refunded twice over and the
@@ -65,8 +73,13 @@ pub fn refundable_remaining(
     payment: &SubscriptionPayment,
     existing: &[SubscriptionPayment],
 ) -> u64 {
-    let already: u64 = existing.iter().map(|r| r.amount).sum();
-    payment.amount.saturating_sub(already)
+    let already: u64 = existing.iter().map(refunded_gross).sum();
+    gross_charged(payment).saturating_sub(already)
+}
+
+/// The gross (net + tax) a refund row returned.
+pub fn refunded_gross(refund: &SubscriptionPayment) -> u64 {
+    refund.amount + refund.tax
 }
 
 /// Split `total` across `payments` in the order given, taking as much as each
@@ -117,7 +130,10 @@ pub struct RefundEvidence<'a> {
     pub instrument: Option<&'a str>,
 }
 
-/// Build the accounting row that reverses `amount` of `original`.
+/// Build the accounting row that reverses `gross` of `original`.
+///
+/// `gross` is what goes back to the customer, tax included. The row splits it
+/// the way the sale was split: `tax` is the VAT slice and `amount` the net.
 ///
 /// The row is deliberately a copy of the payment it reverses rather than a
 /// fresh calculation: same currency, same frozen exchange `rate`, same VAT
@@ -128,11 +144,13 @@ pub struct RefundEvidence<'a> {
 /// The evidence attached to a refund row travels in `evidence`.
 pub fn build_refund_row(
     original: &SubscriptionPayment,
-    amount: u64,
+    gross: u64,
     refunded_at: DateTime<Utc>,
     admin_user_id: u64,
     evidence: RefundEvidence<'_>,
 ) -> SubscriptionPayment {
+    let tax = prorated_refund_tax(original, gross);
+    let amount = gross - tax;
     let RefundEvidence {
         reason,
         external_ref,
@@ -152,7 +170,7 @@ pub fn build_refund_row(
     }
 
     SubscriptionPayment {
-        id: derive_refund_payment_id(&original.id, amount, refunded_at, admin_user_id),
+        id: derive_refund_payment_id(&original.id, gross, refunded_at, admin_user_id),
         subscription_id: original.subscription_id,
         user_id: original.user_id,
         created: refunded_at,
@@ -178,7 +196,7 @@ pub fn build_refund_row(
         // refund must not touch expiry — the VM's fate is a separate decision.
         time_value: None,
         metadata: Some(metadata),
-        tax: prorated_refund_tax(original, amount),
+        tax,
         // Processor fees are not returned on a refund, so the fee stays a sunk
         // cost on the original payment rather than being reversed here.
         processing_fee: 0,
@@ -233,24 +251,25 @@ mod tests {
         }
     }
 
-    /// A full refund returns exactly the VAT that was collected — no rounding
-    /// drift, or the OSS return stops matching the payments it is built from.
+    /// A full gross refund returns exactly the VAT that was collected, with no
+    /// rounding drift, or the OSS return stops matching the payments it is
+    /// built from.
     #[test]
     fn full_refund_returns_the_whole_tax() {
-        let p = payment(1230, 230);
-        assert_eq!(prorated_refund_tax(&p, p.amount), 230);
+        let p = payment(1000, 230);
+        assert_eq!(gross_charged(&p), 1230);
+        assert_eq!(prorated_refund_tax(&p, 1230), 230);
     }
 
     /// Partial refunds take a proportional slice, rounded down, so refunding a
     /// payment in pieces never returns more VAT than was declared on it.
     #[test]
     fn partial_refunds_never_exceed_the_collected_tax() {
-        let p = payment(1230, 230);
+        let p = payment(1000, 230);
         let halves = prorated_refund_tax(&p, 615) * 2;
         assert!(halves <= p.tax, "{halves} > {}", p.tax);
         assert_eq!(prorated_refund_tax(&p, 615), 115);
 
-        // Thirds: 76 + 76 + 76 = 228 <= 230.
         let third = prorated_refund_tax(&p, 410);
         assert_eq!(third, 76);
         assert!(third * 3 <= p.tax);
@@ -289,7 +308,7 @@ mod tests {
     #[tokio::test]
     async fn refunds_accumulate_against_the_payment_they_reverse() {
         let db = MockDb::default();
-        let original = payment(1230, 230);
+        let original = payment(1000, 230);
         db.insert_subscription_payment(&original).await.unwrap();
 
         assert!(
@@ -301,14 +320,16 @@ mod tests {
         );
 
         let at = Utc::now();
-        let mut first = payment(500, prorated_refund_tax(&original, 500));
+        let first_tax = prorated_refund_tax(&original, 500);
+        let mut first = payment(500 - first_tax, first_tax);
         first.id = derive_refund_payment_id(&original.id, 500, at, 1);
         first.payment_type = SubscriptionPaymentType::Refund;
         first.refunded_payment_id = Some(original.id.clone());
         first.time_value = None;
         db.insert_subscription_payment(&first).await.unwrap();
 
-        let mut second = payment(300, prorated_refund_tax(&original, 300));
+        let second_tax = prorated_refund_tax(&original, 300);
+        let mut second = payment(300 - second_tax, second_tax);
         second.id = derive_refund_payment_id(&original.id, 300, at, 1);
         second.payment_type = SubscriptionPaymentType::Refund;
         second.refunded_payment_id = Some(original.id.clone());
@@ -318,9 +339,9 @@ mod tests {
         let refunds = db.list_refunds_for_payment(&original.id).await.unwrap();
         assert_eq!(refunds.len(), 2);
         assert!(refunds.iter().all(|r| r.payment_type.is_refund()));
-        let refunded: u64 = refunds.iter().map(|r| r.amount).sum();
+        let refunded: u64 = refunds.iter().map(refunded_gross).sum();
         assert_eq!(refunded, 800);
-        assert_eq!(original.amount - refunded, 430, "still refundable");
+        assert_eq!(refundable_remaining(&original, &refunds), 430);
 
         // Refunded tax never exceeds the tax collected, however it is sliced.
         let refunded_tax: u64 = refunds.iter().map(|r| r.tax).sum();
@@ -384,11 +405,11 @@ mod tests {
     #[test]
     fn remaining_is_the_payment_less_what_already_went_back() {
         let p = payment(1000, 230);
-        assert_eq!(refundable_remaining(&p, &[]), 1000);
+        assert_eq!(refundable_remaining(&p, &[]), 1230);
         let mut part = payment(400, 0);
         part.payment_type = SubscriptionPaymentType::Refund;
-        assert_eq!(refundable_remaining(&p, std::slice::from_ref(&part)), 600);
-        let mut rest = payment(600, 0);
+        assert_eq!(refundable_remaining(&p, std::slice::from_ref(&part)), 830);
+        let mut rest = payment(830, 0);
         rest.payment_type = SubscriptionPaymentType::Refund;
         assert_eq!(refundable_remaining(&p, &[part, rest]), 0);
     }
@@ -397,7 +418,7 @@ mod tests {
     /// buys no time.
     #[test]
     fn refund_row_copies_the_terms_it_reverses() {
-        let original = payment(1230, 230);
+        let original = payment(1000, 230);
         let at = Utc::now();
         let row = build_refund_row(
             &original,
@@ -413,8 +434,12 @@ mod tests {
 
         assert_eq!(row.payment_type, SubscriptionPaymentType::Refund);
         assert_eq!(row.refunded_payment_id.as_ref(), Some(&original.id));
-        assert_eq!(row.amount, 615);
         assert_eq!(row.tax, prorated_refund_tax(&original, 615));
+        assert_eq!(
+            row.amount + row.tax,
+            615,
+            "gross returned is the gross asked"
+        );
         assert_eq!(row.currency, original.currency);
         assert_eq!(row.rate, original.rate, "frozen at the charged rate");
         assert_eq!(row.tax_rate, original.tax_rate);

@@ -26,6 +26,19 @@ interfaces:
 #   - { name: ens20, role: filter }
 #   - { name: interix, role: filter } # direct L2 peering
 #   - { name: ens21, role: learn }    # VM network (learn open ports)
+#
+# XDP attach mode (host / filter roles), `xdp-mode: auto | native | generic`:
+#   auto     (default) ask the kernel for native and fall back to the generic
+#            SKB path if the driver refuses.
+#   native   require the driver path and FAIL STARTUP otherwise. Prefer this on
+#            production routers: generic XDP copies/linearises every skb and
+#            drops the large GRO/TSO ones it cannot copy, which collapses
+#            throughput for exactly the flows that arrive coalesced (e.g. from
+#            a VM host on the same hypervisor) while logging nothing.
+#   generic  force the SKB path (veth, drivers without XDP support).
+# The mode the kernel actually installed, the driver, and any offload feature
+# the attach flipped are logged at startup and shown in GET /status `nics`.
+#   - { name: ens19, role: filter, xdp-mode: native }
 
 # Protected prefixes this host/router defends. This is the SCOPE of the whole
 # firewall:
@@ -62,7 +75,10 @@ learning:
   udp-port-ttl-secs: 120
   # How often the userspace GC sweeps expired learned ports.
   gc-interval-secs: 60
-  # How often per-destination stats are logged (0 disables logging).
+  # How often a one-line STATS summary is logged (0 disables it). The same
+  # tick re-reads the NIC driver's XDP counters for /status and warns when
+  # packets are being dropped with no mitigation/override/block active, or
+  # when the driver counts XDP drops the program never issued.
   stats-interval-secs: 5
 
 # Attack-detection thresholds and hysteresis per destination IP.
@@ -103,12 +119,15 @@ escalation:
   escalate-pass-pps: 50000
   # Enable the SYN-proxy (SYN-cookie handshake validation) on a mitigating
   # dest/prefix once its SYN rate reaches this many SYNs/second.
-  # 0 DISABLES the SYN-proxy entirely -- set 0 on tunneled / asymmetric-routed
-  # routers (GRE-backed VMs, non-GRE tunnels, or reply traffic on a different
-  # NIC): the SYN-proxy XDP_TX's a cookie SYN-ACK out the ingress NIC and
-  # cannot re-encapsulate it or steer it to another egress, so it would
+  # 0 DISABLES the SYN-proxy entirely -- required on tunneled / asymmetric-
+  # routed routers (GRE-backed VMs, non-GRE tunnels, or reply traffic on a
+  # different NIC): the SYN-proxy XDP_TX's a cookie SYN-ACK out the ingress NIC
+  # and cannot re-encapsulate it or steer it to another egress, so it would
   # black-hole real services rather than protect them.
-  syn-proxy-syn-pps: 5000
+  # When UNSET the default is 5000 on a single-NIC host and 0 on a router (any
+  # `filter` / `learn` role). An explicit non-zero value on a router is honoured
+  # but logged as a warning.
+  # syn-proxy-syn-pps: 5000
   # Per-destination budget of NEW distinct-port probes/second the port filter
   # leaks through while mitigating, so a genuinely-open TCP or UDP port that was
   # not learned before the flood can still answer and be learned. Each unknown

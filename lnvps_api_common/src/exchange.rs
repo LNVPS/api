@@ -1,5 +1,5 @@
 use crate::RedisConfig;
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Result, anyhow, bail, ensure};
 use async_trait::async_trait;
 use log::{error, info, trace};
 use payments_rs::currency::{Currency, CurrencyAmount};
@@ -77,7 +77,8 @@ impl Sub for ConvertedCurrencyAmount {
 
 impl TickerRate {
     pub fn can_convert(&self, currency: Currency) -> bool {
-        currency == self.ticker.0 || currency == self.ticker.1
+        let c = currency.base();
+        c == self.ticker.0.base() || c == self.ticker.1.base()
     }
 
     /// Convert from the source currency into the target currency.
@@ -87,29 +88,54 @@ impl TickerRate {
     /// `f32`/`value_f32()` (as an earlier version did) lost precision — e.g.
     /// €1.00 at 100,000 EUR/BTC produced 999,999 msat instead of 1,000,000.
     pub fn convert(&self, source: CurrencyAmount) -> Result<CurrencyAmount> {
+        self.convert_scaled(source, 1)
+    }
+
+    /// Like [`Self::convert`], for a `source` held in `1/scale` of its smallest
+    /// unit (custom pricing rates: a fraction of a cent per hour). The division
+    /// happens before rounding, so the fraction is converted rather than lost.
+    pub fn convert_scaled(&self, source: CurrencyAmount, scale: u64) -> Result<CurrencyAmount> {
         ensure!(
             self.can_convert(source.currency()),
             "Cant convert, currency doesnt match"
         );
-        let rate = self.rate as f64;
-        let (target, factor) = if source.currency() == self.ticker.0 {
-            (self.ticker.1, rate)
+        let target = if source.currency().base() == self.ticker.0.base() {
+            self.ticker.1
         } else {
-            (self.ticker.0, 1.0 / rate)
+            self.ticker.0
         };
-        let src_standard = source.value() as f64 / Self::scale(source.currency());
-        let dst_standard = src_standard * factor;
-        let dst_smallest = (dst_standard * Self::scale(target)).round() as u64;
+        self.convert_into(source, scale, target.base())
+    }
+
+    pub fn convert_into(
+        &self,
+        source: CurrencyAmount,
+        scale: u64,
+        target: Currency,
+    ) -> Result<CurrencyAmount> {
+        let (from, to) = (source.currency().base(), target.base());
+        let factor = if (from, to) == (self.ticker.0.base(), self.ticker.1.base()) {
+            self.rate as f64
+        } else if (from, to) == (self.ticker.1.base(), self.ticker.0.base()) {
+            1.0 / self.rate as f64
+        } else {
+            bail!("Cant convert {} to {} with {}", from, to, self.ticker);
+        };
+        let src_standard =
+            source.value() as f64 / (Self::scale(source.currency()) * scale.max(1) as f64);
+        let dst = src_standard * factor * Self::scale(target);
+        let dst_smallest = if source.currency().is_milli() {
+            (dst - 1e-6).ceil().max(0.0) as u64
+        } else {
+            dst.round() as u64
+        };
         Ok(CurrencyAmount::from_u64(target, dst_smallest))
     }
 
     /// Number of smallest units per standard unit for a currency, matching
     /// `payments_rs` (BTC = 1e11 milli-sats, all fiat = 100 cents).
     fn scale(currency: Currency) -> f64 {
-        match currency {
-            Currency::BTC => 1.0e11,
-            _ => 100.0,
-        }
+        currency.scale()
     }
 
     pub fn passthrough(currency: Currency) -> Self {
@@ -121,7 +147,16 @@ impl TickerRate {
 
     /// Convert from the source currency into the target currency and return ConvertedCurrencyAmount
     pub fn convert_with_rate(&self, source: CurrencyAmount) -> Result<ConvertedCurrencyAmount> {
-        let converted_amount = self.convert(source)?;
+        self.convert_scaled_with_rate(source, 1)
+    }
+
+    /// [`Self::convert_with_rate`] for a `source` held in `1/scale` of its smallest unit.
+    pub fn convert_scaled_with_rate(
+        &self,
+        source: CurrencyAmount,
+        scale: u64,
+    ) -> Result<ConvertedCurrencyAmount> {
+        let converted_amount = self.convert_scaled(source, scale)?;
         Ok(ConvertedCurrencyAmount {
             amount: converted_amount,
             rate: *self,
@@ -525,6 +560,25 @@ struct MempoolRates {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scale_matches_payments_rs_for_every_currency() {
+        for c in Currency::ALL {
+            let expected = if c.is_crypto() {
+                1.0e11
+            } else if c.is_milli() {
+                1.0e5
+            } else {
+                100.0
+            };
+            assert_eq!(TickerRate::scale(c), expected, "{c}");
+            assert_eq!(
+                CurrencyAmount::from_f32(c, 1.0).value() as f64,
+                expected,
+                "{c}"
+            );
+        }
+    }
+
     use super::*;
 
     const RATE: f32 = 95_000.0;
@@ -547,6 +601,39 @@ mod tests {
         assert!(!f.can_convert(Currency::USD));
         assert!(f.can_convert(Currency::EUR));
         assert!(f.can_convert(Currency::BTC));
+    }
+
+    #[test]
+    fn convert_milli_uses_base_rate() {
+        let f = TickerRate {
+            ticker: Ticker::btc_rate("EUR").unwrap(),
+            rate: RATE,
+        };
+        assert!(f.can_convert(Currency::MEUR));
+        assert!(!f.can_convert(Currency::MUSD));
+        assert_eq!(
+            f.convert(CurrencyAmount::from_u64(Currency::MEUR, 500_000))
+                .unwrap(),
+            CurrencyAmount::millisats(5_263_158)
+        );
+        let usd = TickerRate {
+            ticker: Ticker(Currency::EUR, Currency::USD),
+            rate: 1.0,
+        };
+        assert_eq!(
+            usd.convert(CurrencyAmount::from_u64(Currency::MEUR, 137))
+                .unwrap(),
+            CurrencyAmount::from_u64(Currency::USD, 1)
+        );
+        assert_eq!(
+            usd.convert(CurrencyAmount::from_u64(Currency::MEUR, 2_000))
+                .unwrap(),
+            CurrencyAmount::from_u64(Currency::USD, 2)
+        );
+        assert_eq!(
+            f.convert(CurrencyAmount::millisats(100_000_000)).unwrap(),
+            CurrencyAmount::from_u64(Currency::EUR, 9500)
+        );
     }
 
     #[tokio::test]

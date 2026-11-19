@@ -30,6 +30,10 @@ base64urlsafedata = "0.5"
 # The node daemon's production code, so the stack fixture builds a real node
 # rather than a description of one.
 lnvps_node = { path = "../lnvps_node" }
+# The route server daemon and the netlink layer under it, so the VPN harness
+# builds its interfaces with the code that runs in production.
+lnvps_vpn = { path = "../lnvps_vpn" }
+lnvps_netlink = { path = "../lnvps_netlink" }
 # The libvirt feature is what carries the marketplace host client: without it
 # get_host_client has no arm for a marketplace node and a probe fails with
 # "unknown host config", which reads like a bad database row.

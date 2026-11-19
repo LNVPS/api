@@ -1,0 +1,34 @@
+services:
+  server:
+    image: itzg/minecraft-server:java21@sha256:49544c0a15ede66914451b3c6cb880cb0bd2470b2bfa6f39794f14da02cca79a
+    user: "1000"
+    resources: { cpu: 1000m, memory: 2Gi }
+    ports:
+      - { name: game, container: 25565, protocol: tcp, expose: tcp, srv: minecraft }
+      - { name: rcon, container: 25575, protocol: tcp, expose: none }
+    env:
+      EULA: "${eula}"
+      TYPE: "VANILLA"
+      VERSION: "${version}"
+      MEMORY: "1536M"
+      DIFFICULTY: "${difficulty}"
+      MAX_PLAYERS: "${max_players}"
+      MOTD: "${motd}"
+      ENABLE_WHITELIST: "${enable_whitelist}"
+      WHITELIST: "${whitelist}"
+      ENABLE_RCON: "true"
+      RCON_PASSWORD: "${rcon_password}"
+    volumes:
+      - { name: data, path: /data, size: 10Gi, label: world }
+    scratch:
+      - { path: /tmp }
+    backup: { volume: data }
+config:
+  - { name: eula, label: "I accept the Minecraft EULA (type TRUE)", type: string, required: true, pattern: "TRUE", group: "Server" }
+  - { name: version, label: "Minecraft version", type: string, default: "1.21.4", pattern: "1\\.21\\.4|1\\.21\\.1|1\\.20\\.6|1\\.20\\.4", group: "Server" }
+  - { name: difficulty, label: "Difficulty", type: string, default: "normal", pattern: "peaceful|easy|normal|hard", group: "Gameplay" }
+  - { name: max_players, label: "Max players", type: int, default: "20", pattern: "[1-9][0-9]{0,2}", group: "Gameplay" }
+  - { name: motd, label: "Message of the day", type: string, default: "A Minecraft server", pattern: "[A-Za-z0-9 .,!?'-]{0,59}", group: "Gameplay" }
+  - { name: enable_whitelist, label: "Only allow whitelisted players", type: bool, default: "false", group: "Access" }
+  - { name: whitelist, label: "Whitelisted players (comma-separated usernames)", type: string, default: "", pattern: "([A-Za-z0-9_]{3,16}(,[A-Za-z0-9_]{3,16})*)?", group: "Access" }
+  - { name: rcon_password, label: "RCON password (8-64 letters and digits)", type: string, required: true, pattern: "[A-Za-z0-9]{8,64}", group: "Access" }

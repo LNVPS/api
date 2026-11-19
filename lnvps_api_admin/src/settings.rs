@@ -29,6 +29,13 @@ pub struct Settings {
     /// one address).
     #[serde(default)]
     pub rate_limit: lnvps_api_common::RateLimitConfig,
+
+    #[serde(default = "default_chain_explorer_url")]
+    pub chain_explorer_url: Option<String>,
+}
+
+fn default_chain_explorer_url() -> Option<String> {
+    Some("https://mempool.space".to_string())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

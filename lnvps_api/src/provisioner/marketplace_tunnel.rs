@@ -249,6 +249,7 @@ impl MarketplaceTunnels {
                     let control_address = allocation.control_address()?;
                     let mut host = host;
                     host.ip = control_address;
+                    host.mtu = Some(allocation.pool.mtu);
                     self.db.update_host(&host).await?;
 
                     return Ok(allocation);
@@ -276,17 +277,13 @@ impl MarketplaceTunnels {
         //
         // It costs one address in an anti-spoof list. What it buys is that the
         // check LNVPS makes on an operator's machine never depends on timing.
-        if let Some(address) = super::probe_address(&tunnel.tunnel) {
+        if let (Some(address), Some(gateway)) = (
+            super::probe_address(&tunnel.tunnel, &tunnel.pool),
+            super::probe_gateway(&tunnel.pool),
+        ) {
             guests.push(GuestAddress {
                 address,
-                // The node's own address for probes, which it answers for on the
-                // bridge. Deliberately not the route server's: the node holds its
-                // guests' gateways itself, so sharing that address with the route
-                // server means the guest's replies are delivered to the node and
-                // the route server never sees them.
-                gateway: super::probe_gateway(&tunnel.tunnel)
-                    .and_then(|g| g.split('/').next().map(str::to_string))
-                    .unwrap_or_default(),
+                gateway: gateway.to_string(),
                 mac: Some(super::probe_mac(node.id)),
             });
         }
@@ -332,6 +329,26 @@ impl MarketplaceTunnels {
         Ok(out)
     }
 
+    pub async fn sync_host_mtus(&self, pool: &TunnelPool) -> Result<()> {
+        for tunnel in self.db.list_tunnels_in_pool(pool.id).await? {
+            let Some(node) = self.db.get_marketplace_node_by_tunnel(tunnel.id).await? else {
+                continue;
+            };
+            let Some(host) = self.db.get_marketplace_node_host(node.id).await? else {
+                continue;
+            };
+            if host.mtu != Some(pool.mtu) {
+                self.db
+                    .update_host(&lnvps_db::VmHost {
+                        mtu: Some(pool.mtu),
+                        ..host
+                    })
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Recompute what is routed behind every marketplace node peer in `pool`.
     ///
     /// The planner reads `tunnel_route` and asks no questions; this is where the
@@ -350,7 +367,7 @@ impl MarketplaceTunnels {
             // between polls, and reconfiguring the route server for the few minutes
             // one exists would mean a probe that fails because the routing had not
             // caught up. It costs one host route on a peer that already has one.
-            prefixes.extend(super::probe_address(&tunnel));
+            prefixes.extend(super::probe_address(&tunnel, pool));
             self.db.replace_tunnel_routes(tunnel.id, &prefixes).await?;
         }
         Ok(())

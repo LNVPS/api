@@ -14,8 +14,8 @@ use lightning_invoice::Bolt11Invoice;
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, ApiVmTrafficSummary,
     PageQuery, PricingEngine, RefundEvidence, UpgradeConfig, VatClient, VmHistoryLogger,
-    VmRunningState, VmStateCache, WorkJob, build_refund_row, quota_period, refundable_remaining,
-    resolve_traffic_range,
+    VmRunningState, VmStateCache, WorkJob, build_refund_row, gross_charged, quota_period,
+    refundable_remaining, refunded_gross, resolve_traffic_range,
 };
 use lnvps_db::{AdminAction, AdminResource, SubscriptionPaymentType};
 use log::{error, info};
@@ -114,7 +114,7 @@ struct ListVmsQuery {
 /// view and the bulk status endpoint — goes through here, so they cannot drift
 /// apart in shape, and none of them can reintroduce a per-VM query: all the
 /// data comes from [`AdminVmBatch`], which bulk-loads one table at a time.
-async fn load_admin_vm_infos(
+pub(crate) async fn load_admin_vm_infos(
     db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
     vm_state_cache: &VmStateCache,
     vms: &[lnvps_db::Vm],
@@ -702,6 +702,7 @@ async fn admin_delete_vm(
         reason: req.reason.clone(),
         admin_user_id: Some(auth.user_id),
         purge,
+        by_owner: false,
     };
 
     match this.work_commander.send(delete_job).await {
@@ -929,13 +930,13 @@ async fn admin_get_vm_traffic(
     ApiData::ok(AdminVmTrafficInfo {
         vm_id,
         user_id: vm.user_id,
-        summary: ApiVmTrafficSummary {
+        summary: ApiVmTrafficSummary::new(
             transfer_gb,
             period_start,
             period_end,
             bytes_out,
             bytes_in,
-        },
+        ),
         days: days
             .into_iter()
             .map(|d| AdminVmTrafficDay {
@@ -1326,12 +1327,12 @@ async fn admin_record_payment_refund(
     // ones already recorded. Without this, a payment could be refunded twice
     // over and the ledger would owe the customer money we never sent.
     let existing = this.db.list_refunds_for_payment(&payment.id).await?;
-    let already: u64 = existing.iter().map(|r| r.amount).sum();
+    let already: u64 = existing.iter().map(refunded_gross).sum();
     let refundable = refundable_remaining(&payment, &existing);
     if refundable == 0 {
         return Err(ApiError::conflict(format!(
             "Payment {payment_id} is already fully refunded ({already} of {})",
-            payment.amount
+            gross_charged(&payment)
         )));
     }
 
@@ -1345,7 +1346,7 @@ async fn admin_record_payment_refund(
         return Err(ApiError::conflict(format!(
             "Refund of {amount} exceeds the {refundable} still refundable on payment \
              {payment_id} ({already} of {} already refunded)",
-            payment.amount
+            gross_charged(&payment)
         )));
     }
 
@@ -1424,13 +1425,13 @@ async fn admin_list_payment_refunds(
     let refunds = this.db.list_refunds_for_payment(&payment.id).await?;
     let base_currency = this.db.get_vm_base_currency(vm_id).await?;
 
-    let refunded_total: u64 = refunds.iter().map(|r| r.amount).sum();
+    let refunded_total: u64 = refunds.iter().map(refunded_gross).sum();
     ApiData::ok(AdminPaymentRefundsInfo {
         payment_id: hex::encode(&payment.id),
         currency: payment.currency.clone(),
-        amount: payment.amount,
+        amount: gross_charged(&payment),
         refunded_total,
-        refundable_remaining: payment.amount.saturating_sub(refunded_total),
+        refundable_remaining: gross_charged(&payment).saturating_sub(refunded_total),
         // A refund row carries no discount of its own: the discount is on the
         // payment it reverses, which the caller already has.
         refunds: refunds
@@ -1474,7 +1475,19 @@ async fn admin_create_vm(
     let _user = this.db.get_user(req.user_id).await?;
 
     // Verify template exists
-    let _template = this.db.get_vm_template(req.template_id).await?;
+    let template = this.db.get_vm_template(req.template_id).await?;
+    if let Some(host_id) = req.host_id {
+        let host = this.db.get_host(host_id).await?;
+        if host.region_id != template.region_id {
+            return Err(ApiError::bad_request(format!(
+                "Host {host_id} is not in template {}'s region",
+                template.id
+            )));
+        }
+        if host.deleted {
+            return Err(ApiError::bad_request(format!("Host {host_id} is deleted")));
+        }
+    }
 
     // Verify image exists
     let _image = this.db.get_os_image(req.image_id).await?;
@@ -1493,6 +1506,7 @@ async fn admin_create_vm(
         ref_code: req.ref_code,
         admin_user_id: auth.user_id,
         reason: req.reason,
+        host_id: req.host_id,
     };
 
     match this.work_commander.send(create_job).await {
@@ -1674,6 +1688,42 @@ mod tests {
         assert!(!infos[0].region_name.is_empty());
     }
 
+    /// Regression: a deleted host must still resolve for admin VM listings.
+    /// Deleting a host that has history flags it rather than removing the row
+    /// precisely so its VMs keep rendering, and listing VMs with
+    /// `include_deleted` returns exactly those VMs, so the batch's
+    /// `list_hosts_all()` must not filter deleted hosts out.
+    #[tokio::test]
+    async fn admin_vm_batch_resolves_deleted_host() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::{AdminDb, LNVpsDbBase};
+
+        let db = MockDb::default();
+        let user_id = db.upsert_user(&[1u8; 32]).await.unwrap();
+        let mut vm = MockDb::mock_vm();
+        vm.user_id = user_id;
+        vm.ssh_key_id = None;
+        let vm_id = db.insert_vm(&vm).await.unwrap();
+        db.delete_vm(vm_id).await.unwrap();
+        // The host has VM history, so this flags it instead of removing it
+        db.admin_delete_host(1).await.unwrap();
+
+        let db: std::sync::Arc<dyn lnvps_db::LNVpsDb> = std::sync::Arc::new(db);
+        assert!(
+            db.list_hosts_all().await.unwrap().iter().any(|h| h.id == 1),
+            "precondition: list_hosts_all() keeps deleted hosts"
+        );
+
+        let vms = vec![db.get_vm(vm_id).await.unwrap()];
+        let infos = load_admin_vm_infos(&db, &VmStateCache::new(), &vms)
+            .await
+            .unwrap();
+        assert_eq!(infos.len(), 1);
+        assert_eq!(infos[0].host_id, 1);
+        assert!(!infos[0].host_name.is_empty());
+        assert!(!infos[0].region_name.is_empty());
+    }
+
     /// The list, single-VM and bulk-status endpoints all build their payload
     /// through [`AdminVmBatch`], which bulk-loads each table once.
     #[tokio::test]
@@ -1773,6 +1823,8 @@ mod tests {
                 amount: 999,
                 setup_amount: 0,
                 configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: None,
             })
             .await
             .unwrap();
@@ -1851,6 +1903,7 @@ mod tests {
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
             vat: VatClient::new(),
+            chain: None,
         };
         let auth = |permissions: Vec<Permission>| AdminAuth {
             user_id: 1,
@@ -2065,6 +2118,7 @@ mod tests {
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
             vat: VatClient::new(),
+            chain: None,
         };
         let admin = || AdminAuth {
             user_id: 1,
@@ -2312,5 +2366,99 @@ mod tests {
         let t = req.spec.to_template().unwrap();
         assert_eq!(t.pricing_id, 2);
         assert_eq!(t.disk_type, lnvps_db::DiskType::SSD);
+    }
+
+    #[tokio::test]
+    async fn admin_create_vm_pins_any_live_host_in_the_templates_region() {
+        use crate::admin::model::Permission;
+        use lnvps_api_common::{
+            ChannelWorkCommander, MockDb, MockExchangeRate, VatClient, VmStateCache, WorkCommander,
+        };
+        use lnvps_db::LNVpsDbBase;
+        use std::sync::Arc;
+
+        let mock = MockDb::default();
+        let user_id = mock.upsert_user(&[9u8; 32]).await.unwrap();
+        let key_id = mock
+            .insert_user_ssh_key(&lnvps_db::UserSshKey {
+                user_id,
+                name: "k".to_string(),
+                key_data: "ssh-ed25519 AAAA".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let mut elsewhere = mock.hosts.lock().await.get(&1).unwrap().clone();
+        elsewhere.id = 2;
+        elsewhere.region_id = 2;
+        mock.hosts.lock().await.insert(2, elsewhere);
+        let mut gone = mock.hosts.lock().await.get(&1).unwrap().clone();
+        gone.id = 3;
+        gone.deleted = true;
+        mock.hosts.lock().await.insert(3, gone);
+        let mut off = mock.hosts.lock().await.get(&1).unwrap().clone();
+        off.id = 4;
+        off.enabled = false;
+        mock.hosts.lock().await.insert(4, off);
+
+        let jobs = Arc::new(ChannelWorkCommander::new());
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(mock);
+        let this = RouterState {
+            node_control: None,
+            db,
+            work_commander: jobs.clone(),
+            feedback: None,
+            vm_state_cache: VmStateCache::new(),
+            exchange: Arc::new(MockExchangeRate::default()),
+            vat: VatClient::new(),
+            chain: None,
+        };
+        let admin = || AdminAuth {
+            user_id: 1,
+            pubkey: vec![1u8; 32],
+            permissions: [Permission {
+                resource: AdminResource::VirtualMachines,
+                action: AdminAction::Create,
+            }]
+            .into_iter()
+            .collect(),
+            nip98_auth: None,
+        };
+        let request = |host_id| AdminCreateVmRequest {
+            user_id,
+            template_id: 1,
+            image_id: 1,
+            ssh_key_id: key_id,
+            ref_code: None,
+            reason: None,
+            host_id,
+        };
+
+        for host_id in [2, 3] {
+            assert!(
+                admin_create_vm(admin(), State(this.clone()), Json(request(Some(host_id))))
+                    .await
+                    .is_err(),
+                "host {host_id} was accepted"
+            );
+        }
+
+        admin_create_vm(admin(), State(this.clone()), Json(request(Some(4))))
+            .await
+            .unwrap();
+        let queued = tokio::time::timeout(std::time::Duration::from_millis(200), jobs.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            queued.iter().any(|m| matches!(
+                m.job,
+                WorkJob::CreateVm {
+                    host_id: Some(4),
+                    ..
+                }
+            )),
+            "the pinned disabled host was not passed to the job"
+        );
     }
 }

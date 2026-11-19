@@ -71,6 +71,30 @@ mod tests {
             self.inner.generate_mac(vm).await
         }
 
+        async fn list_snapshots(
+            &self,
+            vm: &Vm,
+        ) -> OpResult<Vec<lnvps_api_common::host::VmSnapshot>> {
+            self.inner.list_snapshots(vm).await
+        }
+
+        async fn create_snapshot(
+            &self,
+            vm: &Vm,
+            name: &str,
+            description: Option<&str>,
+        ) -> OpResult<()> {
+            self.inner.create_snapshot(vm, name, description).await
+        }
+
+        async fn rollback_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+            self.inner.rollback_snapshot(vm, name).await
+        }
+
+        async fn delete_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+            self.inner.delete_snapshot(vm, name).await
+        }
+
         async fn start_vm(&self, vm: &Vm) -> OpResult<()> {
             let fails = self.start_vm_fail_count.load(Ordering::SeqCst);
             if fails > 0 {

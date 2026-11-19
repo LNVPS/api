@@ -14,7 +14,9 @@
 
 mod admin_api;
 mod agent_chat;
+mod app_backups;
 pub mod client;
+mod credit;
 pub mod db;
 mod discounts;
 mod lifecycle;
@@ -26,5 +28,6 @@ pub mod soft_authenticator;
 /// A disposable marketplace-node stack on real namespaces.
 pub mod stack;
 mod user_api;
+mod vpn;
 mod webauthn;
 pub mod worker;

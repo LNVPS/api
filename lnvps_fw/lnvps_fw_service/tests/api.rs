@@ -198,11 +198,31 @@ async fn events_poll_incrementally() {
 
     // Poll from the returned cursor -> nothing new.
     let res = app
+        .clone()
         .oneshot(req("GET", "/api/v1/events?since=2", Some("tok"), None))
         .await
         .unwrap();
     let ev: EventsResponse = body_json(res).await;
     assert!(ev.events.is_empty());
+
+    // Rule-change kinds are recorded alongside and serialise with explicit
+    // snake_case names (the dashboard/lnvps_api treat `kind` as a string).
+    st.record_event(EventKind::ManualStart, "192.0.2.9/32".into(), 9, 0, 0, 0);
+    st.record_event(EventKind::SniStop, "c2.example".into(), 0, 0, 0, 0);
+    let res = app
+        .oneshot(req("GET", "/api/v1/events?since=2", Some("tok"), None))
+        .await
+        .unwrap();
+    let raw: serde_json::Value = body_json(res).await;
+    let kinds: Vec<&str> = raw["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, vec!["manual_start", "sni_stop"]);
+    assert_eq!(raw["events"][0]["flags"], 9);
+    assert_eq!(raw["events"][1]["cidr"], "c2.example");
 }
 
 #[tokio::test]

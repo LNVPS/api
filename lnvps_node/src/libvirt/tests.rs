@@ -262,6 +262,28 @@ fn the_key_is_owner_only() {
     assert_eq!(mode & 0o777, 0o600, "key mode {mode:o}");
 }
 
+/// A key left permissive is tightened on the next apply even though its
+/// contents did not change: the short-circuit is about not rewriting the file,
+/// not about skipping the mode.
+#[test]
+#[cfg(unix)]
+fn a_permissive_existing_key_is_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = TempDir::new().unwrap();
+    let p = paths(&dir);
+    let id = generate_identity(params().listen).unwrap();
+    apply(&p, &params(), &id).unwrap();
+
+    // Same contents, looser mode, as a restore or an older build would leave it.
+    let key = p.key();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+    apply(&p, &params(), &id).unwrap();
+
+    let mode = fs::metadata(&key).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600, "key mode {mode:o}");
+}
+
 /// A failing systemctl is reported rather than swallowed: a node that believes
 /// it is serving VMs while its libvirtd is dead is one LNVPS keeps placing
 /// customers on.
@@ -402,6 +424,34 @@ fn the_instance_defines_the_pool_lnvps_builds_in() {
         p.pool_dir().is_dir(),
         "libvirt will not start a pool with no target"
     );
+}
+
+#[test]
+fn qemu_can_reach_the_pool_through_an_owner_only_state_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let secrets = dir.path().join("tls");
+    fs::create_dir_all(&secrets).unwrap();
+    fs::set_permissions(&secrets, fs::Permissions::from_mode(0o700)).unwrap();
+    let p = paths(&dir);
+    let id = generate_identity(params().listen).unwrap();
+
+    apply(&p, &params(), &id).unwrap();
+
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    for path in [dir.path(), p.root.as_path(), p.pool_dir().as_path()] {
+        assert_eq!(
+            mode(path) & 0o001,
+            0o001,
+            "{} is {:o}",
+            path.display(),
+            mode(path)
+        );
+    }
+    assert_eq!(mode(dir.path()), 0o711);
+    assert_eq!(mode(&secrets), 0o700);
+    assert_eq!(mode(&p.key()) & 0o077, 0, "the libvirt key became readable");
 }
 
 /// The pool starts with libvirtd. A pool that has to be started by hand is a

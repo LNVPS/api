@@ -1244,6 +1244,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
+name = "croner"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aa42bcd3d846ebf66e15bd528d1087f75d1c6c1c66ebff626178a106353c576"
+dependencies = [
+ "chrono",
+ "derive_builder",
+ "strum",
+]
+
+[[package]]
 name = "crossbeam-channel"
 version = "0.5.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1254,9 +1265,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -1296,9 +1307,9 @@ dependencies = [
 
 [[package]]
 name = "crypto-bigint"
-version = "0.7.5"
+version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a52aa3fcda4e6302a9f48734f234d35d4721b96f8fe07d073f07ce9df4f0271"
+checksum = "6bb08299a6046833a879ace115697f12fd2bd6c8d3e93c909ffc9e0738e7cae0"
 dependencies = [
  "cpubits",
  "ctutils",
@@ -1339,7 +1350,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3633a51a39c69ebbaa4feaa694bd83d241e4093901c84a0963b19d9bb3f0cf8f"
 dependencies = [
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.6",
  "rand_core 0.10.1",
 ]
 
@@ -1363,9 +1374,9 @@ dependencies = [
 
 [[package]]
 name = "ctutils"
-version = "0.4.2"
+version = "0.4.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+checksum = "a2376ffd6f96d8a9db59875b4b6b0237d6900b5baf64279714e05493ce64828a"
 dependencies = [
  "cmov",
  "subtle",
@@ -1814,7 +1825,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d65aa39b3a5c1c9c1b745c9a019234bb7a21b77abcb4f4d266d706e2d577d65"
 dependencies = [
  "base16ct 1.0.0",
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.6",
  "crypto-common 0.2.2",
  "digest 0.11.3",
  "ff 0.14.0",
@@ -2369,9 +2380,9 @@ dependencies = [
 
 [[package]]
 name = "h2"
-version = "0.4.15"
+version = "0.4.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6cb093c84e8bd9b188d4c4a8cb6579fc016968d14c99882163cd3ff402a4f155"
+checksum = "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -3318,6 +3329,7 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite 0.26.2",
  "tokio-util",
  "tower",
  "tower-http",
@@ -3536,7 +3548,7 @@ dependencies = [
  "lnvps_api_common",
  "lnvps_db",
  "log 0.4.32",
- "nostr 0.44.3",
+ "nostr 0.44.7",
  "nostr-sdk",
  "payments-rs",
  "reqwest 0.13.4",
@@ -3566,6 +3578,7 @@ dependencies = [
  "futures",
  "hex",
  "hickory-resolver",
+ "hmac 0.12.1",
  "humantime",
  "ipnetwork",
  "isocountry",
@@ -3578,7 +3591,7 @@ dependencies = [
  "lnvps_db",
  "log 0.4.32",
  "mustache",
- "nostr 0.44.3",
+ "nostr 0.44.7",
  "nostr-sdk",
  "nwc",
  "openapi-build-gen",
@@ -3591,6 +3604,7 @@ dependencies = [
  "russh",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "ssh-key 0.6.7",
  "tempfile",
  "tokio",
@@ -3626,6 +3640,7 @@ dependencies = [
  "log 0.4.32",
  "payments-rs",
  "rand 0.9.4",
+ "reqwest 0.13.4",
  "serde",
  "serde_json",
  "serde_urlencoded",
@@ -3654,7 +3669,7 @@ dependencies = [
  "lnvps_db",
  "log 0.4.32",
  "maxminddb",
- "nostr 0.44.3",
+ "nostr 0.44.7",
  "payments-rs",
  "quick-xml",
  "rand 0.10.1",
@@ -3687,10 +3702,14 @@ name = "lnvps_compose"
 version = "0.4.7"
 dependencies = [
  "anyhow",
+ "chrono",
+ "croner",
  "rand 0.9.4",
  "regex",
  "serde",
+ "serde_json",
  "serde_yaml_ng",
+ "toml",
 ]
 
 [[package]]
@@ -3730,9 +3749,11 @@ dependencies = [
  "lnvps_api",
  "lnvps_api_common",
  "lnvps_db",
+ "lnvps_netlink",
  "lnvps_node",
+ "lnvps_vpn",
  "nix 0.30.1",
- "nostr 0.44.3",
+ "nostr 0.44.7",
  "p256 0.13.2",
  "rand_core 0.6.4",
  "rcgen",
@@ -3780,8 +3801,26 @@ dependencies = [
 ]
 
 [[package]]
-name = "lnvps_node"
+name = "lnvps_netlink"
 version = "0.4.7"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64 0.22.1",
+ "defguard_wireguard_rs",
+ "futures-util",
+ "ipnetwork",
+ "log 0.4.32",
+ "netlink-packet-route 0.30.0",
+ "nix 0.30.1",
+ "rtnetlink",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
+name = "lnvps_node"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3798,11 +3837,12 @@ dependencies = [
  "if-addrs",
  "ipnetwork",
  "lnvps_host_util",
+ "lnvps_netlink",
  "log 0.4.32",
  "netlink-packet-route 0.30.0",
  "nftables",
  "nix 0.30.1",
- "nostr 0.44.3",
+ "nostr 0.44.7",
  "rand 0.9.4",
  "rcgen",
  "reqwest 0.12.28",
@@ -3810,6 +3850,8 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "socket2 0.6.4",
  "tempfile",
  "tokio",
  "tokio-rustls",
@@ -3838,10 +3880,13 @@ name = "lnvps_operator"
 version = "0.4.7"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "clap",
  "config",
  "env_logger",
+ "flate2",
+ "hex",
  "hickory-resolver",
  "k8s-openapi",
  "kube",
@@ -3854,9 +3899,29 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "lnvps_vpn"
+version = "0.1.0-rc1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "clap",
+ "env_logger",
+ "ipnetwork",
+ "lnvps_netlink",
+ "log 0.4.32",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "serde_yaml_ng",
+ "tokio",
 ]
 
 [[package]]
@@ -4071,9 +4136,9 @@ checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
 name = "negentropy"
-version = "0.5.0"
+version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0efe882e02d206d8d279c20eb40e03baf7cb5136a1476dc084a324fbc3ec42d"
+checksum = "a3d66662cb5ca384d4991509755ed5a42dd8e31c4282bf881938e506fc3146ec"
 
 [[package]]
 name = "netlink-packet-core"
@@ -4254,9 +4319,9 @@ dependencies = [
 
 [[package]]
 name = "nostr"
-version = "0.44.3"
+version = "0.44.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d8f0fe13526800300a36bf3b7c5f752e62e32ab81c74a8e5caa2865708625a"
+checksum = "c7d3d987ea7078dc36947cde532637c472a229426702e4331dd7667325378bd9"
 dependencies = [
  "base64 0.22.1",
  "bech32",
@@ -4708,9 +4773,9 @@ checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "payments-rs"
-version = "0.7.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63f5385002f244049c430ece91ea139574c1b0ab552c0b79a32e146d410f4e72"
+checksum = "3664f912b8453114d6ec0e03fd5542d75b560a19d104829f105fcbd683cb3dbd"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5063,7 +5128,7 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c555a6e4eb7d4e158fcb028c835c3b8642206ddc279b5c6b202ef9a8bdb592f4"
 dependencies = [
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.6",
  "crypto-common 0.2.2",
  "ff 0.14.0",
  "rand_core 0.10.1",
@@ -5396,12 +5461,15 @@ version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9fd510128eda94d1d49b9f81487744d5c451422431cce41238fe2853d29f4cc"
 dependencies = [
+ "arc-swap",
  "arcstr",
  "async-lock",
+ "backon",
  "bytes",
  "cfg-if",
  "combine",
  "crc16",
+ "futures-channel",
  "futures-util",
  "itoa",
  "num-bigint",
@@ -5612,7 +5680,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4a459cddafb3fe76b31fd8f1108007566c40301feb64dc7b54656eb7388172b"
 dependencies = [
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.6",
  "hmac 0.13.0",
 ]
 
@@ -5672,7 +5740,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "30b2aa4ba0d89f73d1e332df05be0eeab8840351c36ca5654341dfdb57bb3caf"
 dependencies = [
  "const-oid 0.10.2",
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.6",
  "crypto-primes",
  "digest 0.11.3",
  "pkcs1 0.8.0-rc.4",
@@ -5716,7 +5784,7 @@ dependencies = [
  "bytes",
  "cbc 0.2.1",
  "cipher 0.5.2",
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.6",
  "ctr 0.10.1",
  "curve25519-dalek 5.0.0",
  "data-encoding",
@@ -6834,7 +6902,7 @@ checksum = "7b54d0ed0498daf3f78d82e00e28c8eec9d75a067c4cfbcc7a0f7d0f4077749e"
 dependencies = [
  "base64ct",
  "bytes",
- "crypto-bigint 0.7.5",
+ "crypto-bigint 0.7.6",
  "ctutils",
  "digest 0.11.3",
  "pem-rfc7468 1.0.0",
@@ -6927,6 +6995,9 @@ name = "strum"
 version = "0.27.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
+dependencies = [
+ "strum_macros",
+]
 
 [[package]]
 name = "strum_macros"
@@ -7266,10 +7337,12 @@ version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81f3d15e84cbcd896376e6730314d59fb5a87f31e4b038454184435cd57defee"
 dependencies = [
+ "indexmap",
  "serde_core",
  "serde_spanned",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
@@ -7290,6 +7363,12 @@ checksum = "a2abe9b86193656635d2411dc43050282ca48aa31c2451210f4202550afb7526"
 dependencies = [
  "winnow",
 ]
+
+[[package]]
+name = "toml_writer"
+version = "1.1.3+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
 name = "tonic"

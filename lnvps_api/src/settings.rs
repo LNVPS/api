@@ -57,6 +57,16 @@ pub struct Settings {
     /// public host of lnvps_nostr service
     pub nostr_address_host: Option<String>,
 
+    /// Extra domains customers may not register a NIP-05 domain under, on top
+    /// of the ones derived from `public_url` and `nostr_address_host`. Each
+    /// entry covers itself and everything below it.
+    ///
+    /// A registered domain becomes an Ingress rule claiming that hostname in
+    /// the operator's own cluster, so anything the operator serves that is not
+    /// in this config has to be listed here.
+    #[serde(default)]
+    pub reserved_domains: Vec<String>,
+
     /// Redis configuration for shared VM state cache
     pub redis: Option<RedisConfig>,
 
@@ -66,6 +76,12 @@ pub struct Settings {
 
     /// Captcha config
     pub captcha: Option<CaptchaConfig>,
+
+    /// Read-only chain lookups used to spot on-chain deposits whose transaction
+    /// was replaced (RBF), so a payment that will never confirm stops blocking
+    /// deletion of the resource it was for. Defaults to mempool.space.
+    #[serde(default)]
+    pub chain_explorer: ChainExplorerConfig,
 
     /// Path to a MaxMind GeoLite2/GeoIP2 Country database (`.mmdb`) used to
     /// resolve client IPs to a country as VAT place-of-supply evidence. When
@@ -95,6 +111,9 @@ pub struct Settings {
     /// configured — both issue the same stateless session JWTs. When omitted,
     /// `Bearer` session auth is disabled and only Nostr (NIP-98) auth works.
     pub session: Option<SessionConfig>,
+
+    #[serde(default)]
+    pub app_backups: Option<lnvps_api_common::object_store::ObjectStoreConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -379,6 +398,10 @@ fn default_max_onchain_fee_per_vbyte() -> u64 {
     50
 }
 
+fn default_commission_hold_days() -> u64 {
+    30
+}
+
 fn default_mempool_url() -> String {
     "https://mempool.space".to_string()
 }
@@ -419,6 +442,31 @@ pub struct ReferralConfig {
     /// to mempool.space; a fixed rate can be configured for regtest/testing.
     #[serde(default)]
     pub fee_estimator: FeeEstimatorConfig,
+    #[serde(default = "default_commission_hold_days")]
+    pub commission_hold_days: u64,
+}
+
+/// Source of read-only chain lookups used to spot replaced (RBF'd) deposits.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChainExplorerConfig {
+    /// Query a mempool.space/esplora-compatible instance at `url`.
+    #[serde(rename_all = "kebab-case")]
+    Mempool {
+        #[serde(default = "default_mempool_url")]
+        url: String,
+    },
+    /// No explorer: replaced deposits are not detected, and a detected deposit
+    /// keeps blocking deletion of the resource it paid for.
+    None,
+}
+
+impl Default for ChainExplorerConfig {
+    fn default() -> Self {
+        ChainExplorerConfig::Mempool {
+            url: default_mempool_url(),
+        }
+    }
 }
 
 /// Source of on-chain fee-rate estimates for referral payouts.
@@ -671,6 +719,7 @@ pub fn mock_settings() -> Settings {
         #[cfg(feature = "agent")]
         agent: None,
         rate_limit: Default::default(),
+        chain_explorer: ChainExplorerConfig::None,
         db: "".to_string(),
         encryption: None,
         public_url: "http://localhost:8000".to_string(),
@@ -704,6 +753,7 @@ pub fn mock_settings() -> Settings {
         telegram: None,
         whatsapp: None,
         nostr_address_host: None,
+        reserved_domains: vec![],
         redis: None,
         captcha: None,
         geoip_database: None,
@@ -711,6 +761,7 @@ pub fn mock_settings() -> Settings {
         oauth: None,
         webauthn: None,
         session: None,
+        app_backups: None,
     }
 }
 
@@ -730,6 +781,24 @@ mod tests {
             balloon_min_pct: pct,
             firewall_config: None,
         }
+    }
+
+    #[test]
+    fn test_chain_explorer_config_parses() {
+        let cfg: ChainExplorerConfig =
+            serde_json::from_value(serde_json::json!({"mempool": {"url": "https://example.com"}}))
+                .unwrap();
+        assert!(
+            matches!(cfg, ChainExplorerConfig::Mempool { url } if url == "https://example.com")
+        );
+        assert!(matches!(
+            serde_json::from_value::<ChainExplorerConfig>(serde_json::json!("none")).unwrap(),
+            ChainExplorerConfig::None
+        ));
+        assert!(matches!(
+            ChainExplorerConfig::default(),
+            ChainExplorerConfig::Mempool { .. }
+        ));
     }
 
     #[test]

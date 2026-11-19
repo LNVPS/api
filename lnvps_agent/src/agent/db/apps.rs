@@ -273,6 +273,7 @@ mod tests {
                 category: "Nostr relay".to_string(),
                 seo_title: None,
                 seo_description: None,
+                category_translations: None,
                 compose: "services: {}".to_string(),
                 amount: 500,
                 currency: "EUR".to_string(),
@@ -308,6 +309,8 @@ mod tests {
                 capacity_cpu_milli: 100_000,
                 capacity_memory_bytes: 1024 * GB,
                 capacity_storage_bytes: 10_000 * GB,
+                dns_server_id: None,
+                dns_zone_id: None,
                 created: Utc::now(),
             },
         );
@@ -326,6 +329,8 @@ mod tests {
                 amount: 500,
                 setup_amount: 0,
                 configuration: None,
+                deactivated_at: None,
+                parent_line_item_id: None,
             },
         );
         db.app_deployments.lock().await.insert(
@@ -342,6 +347,7 @@ mod tests {
                 hostname: Some("my-relay.apps.lnvps.tld".to_string()),
                 custom_domain: None,
                 custom_domain_verified: false,
+                public_port: None,
                 config: Some("SECRET-APP-CONFIG".to_string().into()),
                 desired_state: AppDeploymentDesiredState::Running,
                 status: AppDeploymentStatus::Running,

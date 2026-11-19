@@ -1,6 +1,6 @@
 services:
   pyramid:
-    image: ghcr.io/fiatjaf/pyramid:latest
+    image: ghcr.io/fiatjaf/pyramid:latest@sha256:2442285da28a1d9e78ddb27a60e3aec07f1608394e8b1d7409c3064021512685
     user: "1000"    # image declares no USER, so it would run as root and be refused
     resources: { cpu: 500m, memory: 512Mi }
     ports:
@@ -11,4 +11,5 @@ services:
       DATA_PATH: "/app/data"
       NO_AUTO_UPDATES: "true"
     volumes:
-      - { name: data, path: /app/data, size: 20Gi, label: events }
+      - { name: data, path: /app/data, size: 5Gi, label: events }
+    backup: { volume: data, quiesce: true, artifact: pyramid-data }

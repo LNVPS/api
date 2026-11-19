@@ -2,7 +2,9 @@
 
 **Status:** in-progress
 **Started:** 2026-07-24
-**Last updated:** 2026-07-25 (MVP increments 1–5 complete; backups (6) + L4/zap-stream (7) remain)
+**Last updated:** 2026-08-29 (increments 1–5 shipped, plus custom domains, usage reporting,
+resource multiplier, init/scratch/setup steps and the `catalog/` app set; backups (6) is the
+current work, L4/zap-stream (7) still open)
 
 ## Goal
 
@@ -152,17 +154,89 @@ images (higher isolation risk — design the boundary in now).
 - [x] **HAVEN / zap-stream** documented as not-yet-deployable: HAVEN needs a mounted `templates/`
       dir of binary assets + JSON lists (no self-contained image); zap-stream needs `expose: tcp/udp`.
 
-### Increment 6 — Volume backups (post-MVP)
-- [ ] Compose `backup:` grammar (per-service `command:` app-native dump | `volume:` raw tar;
-      top-level `backup: { schedule, retention }`).
-- [ ] Operator backup/restore **Jobs** in the deployment namespace (PVC mounted RO for backup;
-      app scaled to 0 for restore). Prefer logical dumps; CSI VolumeSnapshots for fast PITR if
-      the storage class supports it.
-- [ ] Delivery: on-demand artifact (LNVPS object storage) with one-time, Nip98-auth, time-boxed
-      download URLs; OR scheduled push to a customer-owned target (S3/WebDAV/**Blossom**).
-- [ ] API: `POST/GET /api/v1/app-deployments/{id}/backups`, `GET .../backups/{bid}` (download),
-      `POST .../backups/{bid}/restore`, `PATCH .../backup-config`.
-- [ ] **Security (see "Volume security" below) — mandatory before shipping.**
+### Increment 6 — Volume backups
+
+Scope decided with the user: artifacts land in **LNVPS-run S3-compatible object storage** with
+time-boxed signed download URLs; runs are **on-demand and scheduled**; **restore is a later
+increment** (it carries the archive-extraction risk documented under "Volume security").
+
+Per-service `backup:` (`command:` | `volume:` | `artifact:`) already parses in `lnvps_compose`
+and `catalog/route96.yaml` + `catalog/buzz.yaml` already declare it — nothing consumes it yet.
+
+Design (see "Backup execution" below for the detail):
+
+- A **run** covers the whole deployment; each service that declares `backup:` produces one
+  artifact, so one `app_deployment_backup` row per (run, service), grouped by `run_id`.
+- The operator, not Kubernetes, owns scheduling: a `CronJob` cannot write the DB row or hold a
+  fresh signed URL, so the reconcile loop evaluates the schedule and creates the run.
+- The Job never holds object-storage credentials. The operator signs a `PUT` URL, puts it in a
+  namespace Secret, and the Job uploads to it.
+
+#### 6a — Grammar + schema (no behaviour change)
+- [x] `lnvps_compose`: top-level `backup: { schedule, retention }`; cron schedule (UTC, 5-field,
+      hourly floor) + retention range; reject a top-level `backup:` on an app where no service
+      declares one; `next_run_after` / `is_due` for the operator.
+- [x] Migration + `AppDeploymentBackup` model (`run_id`, `service`, `method`, `artifact`,
+      `object_key`, `size_bytes`, `state`, `message`, `scheduled`, timestamps) +
+      `AppBackupMethod` / `AppBackupState`.
+- [x] DB trait (`list_app_deployment_backups`, `get_app_deployment_backup`, insert, update,
+      `list_active_app_deployment_backups` for the operator's sweep,
+      `last_scheduled_app_deployment_backup`, soft delete) + mysql impl + MockDb + unit tests.
+
+#### 6b — Object storage client
+- [x] `lnvps_api_common::object_store`: S3-compatible SigV4 presign (`hmac`/`sha2` were already
+      dependencies — no SDK), `presign_put` / `presign_get` (signed download filename), `size`
+      (HEAD) and `delete` (retention). Config: endpoint, region, bucket, keys, path-style
+      (defaulting to path style, which is what self-hosted MinIO/Garage accept).
+- [x] **Every** operation goes out as a presigned URL, including the ones the operator issues
+      itself. Signing one way for everything means the signer is exercised by every call, not
+      only by the rare one.
+- [x] Unit tests: the published AWS SigV4 presign vector, path vs virtual-hosted signing, method
+      and key separation, filename sanitising, and wiremock coverage of `size`/`delete`
+      (missing object → `None`, absent object → delete still succeeds, 403 → error).
+- [x] Config wiring lands with its consumers: the operator in 6c, the API in 6d.
+- [x] Checked against a **real** S3 server (the compose `rustfs`, the same implementation the app
+      catalog ships): presigned round trip, an upload URL granting nothing beyond its own key or
+      method, and expiry actually being enforced. The AWS vector proves the arithmetic; only a
+      server proves the canonical request. Run by `scripts/run-e2e.sh`, skipped without the stack.
+
+#### 6c — Operator: run the backups
+- [x] `lnvps_operator/src/app_backups.rs`: per-artifact Job in the deployment namespace.
+      `volume:` tars the PVC mounted **read-only**, pinned by pod affinity to the node already
+      holding the RWO claim (without it the Job schedules anywhere and sits in `Multi-Attach
+      error`). `command:` runs the dump in an init container on the app's own image with the
+      service's resolved env into a shared `emptyDir`; the uploader container gzips and `PUT`s it.
+- [x] The upload URL arrives as an env var from a Secret, never on a command line where every
+      other process in the pod could read it, and the Secret is deleted with the Job.
+- [x] Schedule evaluation + retention pruning (delete the object, then tombstone the row; a
+      failed delete keeps the row, or the object is orphaned with nothing pointing at it).
+- [x] Job status → DB write-back (size from a signed `HEAD`; a Job that "succeeded" with nothing
+      in the bucket is recorded as failed rather than offered as a restore point).
+- [x] Concurrency cap (default 3/cluster): every app on the same daily schedule comes due in the
+      same minute, and the pending rows are the queue, so waiting a sweep loses nothing.
+- [x] Operator config (`backups:` block, credentials overridable from the environment because the
+      config file lives in a ConfigMap), RBAC for `batch/jobs` and Secret `delete` in the
+      per-namespace role, and the DB grant on `app_deployment_backup`.
+- [x] The uploader's **actual command line** is run in the image the Job names, against rustfs,
+      and the artifact is downloaded back and checked to be the archive it claims to be. A
+      busybox `tar` flag or a `curl` invocation a real S3 server refuses would otherwise be a
+      backup that silently never existed until somebody tried to restore it.
+- [x] **A `command:` runs in its own pod**, so it must address its service over the network
+      (`-h db`) rather than the default unix socket. Documented in the compose grammar and fixed
+      in `catalog/route96.yaml` and `catalog/buzz.yaml`, which both now carry a daily schedule.
+
+#### 6d — Customer API + docs
+- [x] `POST /api/v1/app-deployments/{id}/backups` (start a run), `GET .../backups` (list),
+      `GET .../backups/{bid}/download` (JSON with a one-hour signed URL rather than a redirect,
+      because the web client authenticates with a header a browser navigation cannot send),
+      `DELETE .../{bid}`.
+- [x] Ownership checks on every route, opaque IDs only (never a client-supplied path).
+- [x] e2e test, API_DOCUMENTATION.md, API_CHANGELOG.md.
+
+#### Deferred to increment 6e — restore
+- [ ] Scale to 0, sanitized extraction (canonicalized entries, reject absolute paths / `..` /
+      out-of-tree links / device files), scale back up. See "Volume security".
+- [ ] `POST .../backups/{bid}/restore`, `PATCH .../backup-config`.
 
 ### Increment 7 (optional) — L4 apps + zap-stream-core
 - [ ] `expose: tcp/udp` via ingress-controller TCP/UDP ConfigMap (or NodePort); seed
@@ -291,9 +365,58 @@ config:                                       # rendered as the customer's deplo
   data). Top-level `backup: { schedule, retention }` for automatic runs.
 - Backup/restore run as **Jobs** in the deployment namespace: backup mounts the PVC **read-only**;
   restore scales the app to 0, prefers `mysql < dump`, else guarded untar, then scales back up.
-- Delivery: on-demand artifact in LNVPS object storage with one-time / time-boxed / Nip98-auth
-  download URLs; OR scheduled push to a customer-owned S3/WebDAV/**Blossom** target (keeps the
-  customer as data custodian; Blossom target is Nostr-native).
+- Delivery: on-demand artifact in LNVPS object storage with time-boxed signed download URLs. A
+  scheduled push to a customer-owned S3/WebDAV/**Blossom** target (customer stays data custodian)
+  is a later addition behind the same storage abstraction.
+
+## Backup execution (increment 6 design)
+
+**Why the operator schedules, not Kubernetes.** A `CronJob` fires inside the cluster, where there
+is no DB row to record the run against and no way to obtain a signed upload URL that has not
+expired. So the reconcile loop evaluates each deployment's `backup.schedule` against its last
+run, creates the rows, and creates the Jobs. On-demand runs enter the same path — the API only
+writes `pending` rows.
+
+**Schedule grammar.** `schedule:` is a standard 5-field cron expression in **UTC** (`0 3 * * *`
+is the expected shape for nearly every app), plus `retention: <count of runs>`. UTC because a
+deployment has no timezone of its own and a schedule that shifted by an hour twice a year is
+worse than one that stays where it was written. Parsed with `croner` (5-field, no seconds column
+to trip up a catalog author). A schedule may not fire more often than hourly — `* * * * *` is
+valid cron and a way to store a full copy of a customer's data every minute, so the floor is
+enforced at catalog admission across 24 consecutive occurrences, which also catches a pattern
+that is sparse overall but dense in one slot (`0,1 3 * * *`).
+
+**Due-ness is measured from the last run, not from the clock.** The operator asks
+`next_run_after(last_scheduled_run) <= now`, seeded from the deployment's creation time when the
+schedule has never run. A deployment that was down through several occurrences therefore gets one
+catch-up run rather than one per missed slot, and a fresh deployment does not get a backup the
+instant it is created.
+
+**One Job per artifact.** Two services in one deployment back up with different images and
+different PVCs, and a pod has one filesystem view per container set, so a run fans out to one Job
+per service. `run_id` groups them for the client.
+
+**The Job never sees storage credentials.** The operator signs a `PUT` URL valid for a few hours
+and writes it into a namespace Secret consumed as env. A compromised app image gets one
+write-only URL to its own key, not the bucket. The key is server-derived
+(`deployments/{deployment_id}/{run_id}/{service}.{ext}`) and never client-supplied.
+
+- `volume: <name>` — uploader container mounts that PVC **read-only**, `tar -czf` into an
+  `emptyDir`, then uploads. Read-only is what makes a backup of a compromised app safe to run.
+- `command: […]` — an **init container** on the *app's* image, with the service's resolved env
+  (so `$MARIADB_ROOT_PASSWORD` in the dump command resolves), stdout redirected through `gzip`
+  into a shared `emptyDir`; the uploader container then `PUT`s that file. It has to be a separate
+  container because the app image is not guaranteed to contain an HTTP client.
+
+**Why a file and not a stream.** A presigned `PUT` needs `Content-Length`; piping `tar` straight
+into `curl` forces chunked transfer encoding, which S3 rejects. The dump therefore lands in an
+`emptyDir` sized from the deployment's storage footprint before it is uploaded. That also caps a
+single artifact at the 5 GiB single-`PUT` limit — multipart is a later concern, and the catalog's
+current volumes are well under it.
+
+**Uploader image.** A stock `curl` image (busybox userland, so `tar` and `gzip` are present),
+pinned by digest and overridable in the operator config, so nothing new has to be built or
+published for this increment.
 
 ## Volume security (directory-traversal) — mandatory for increment 6
 

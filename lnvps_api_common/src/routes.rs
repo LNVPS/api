@@ -190,6 +190,14 @@ impl From<lnvps_db::DbError> for ApiError {
 
 impl From<crate::retry::OpError<anyhow::Error>> for ApiError {
     fn from(value: crate::retry::OpError<anyhow::Error>) -> Self {
+        use crate::host::SnapshotRejection;
+        if let Some(rejection) = value.inner().downcast_ref::<SnapshotRejection>() {
+            return match rejection {
+                SnapshotRejection::Invalid(m) => Self::bad_request(m),
+                SnapshotRejection::Conflict(m) => Self::conflict(m),
+                SnapshotRejection::NotFound(m) => Self::not_found(m),
+            };
+        }
         Self::internal(value)
     }
 }
@@ -218,15 +226,83 @@ impl IntoResponse for ApiError {
     }
 }
 
+pub async fn ensure_custom_domain_free(
+    db: &dyn lnvps_db::LNVpsDb,
+    domain: &str,
+    deployment_id: u64,
+) -> Result<(), ApiError> {
+    match db.find_app_deployment_by_custom_domain(domain).await? {
+        Some(existing) if existing.id != deployment_id => Err(ApiError::conflict(
+            "This custom domain is already in use by another deployment",
+        )),
+        _ => Ok(()),
+    }
+}
+
+pub const CUSTOM_DOMAIN_CHALLENGE_LABEL: &str = "_lnvps-challenge";
+
+pub fn custom_domain_challenge_name(domain: &str) -> String {
+    format!("{CUSTOM_DOMAIN_CHALLENGE_LABEL}.{domain}")
+}
+
+pub fn custom_domain_challenge_token(deployment_id: u64, domain: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(format!(
+        "lnvps-custom-domain:{deployment_id}:{}",
+        domain.trim_end_matches('.').to_ascii_lowercase()
+    ));
+    format!("lnvps-verify={}", hex::encode(&digest[..16]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn challenge_token_is_bound_to_deployment_and_domain() {
+        let t = custom_domain_challenge_token(1, "blog.example.com");
+        assert_eq!(t, custom_domain_challenge_token(1, "Blog.Example.com."));
+        assert_ne!(t, custom_domain_challenge_token(2, "blog.example.com"));
+        assert_ne!(t, custom_domain_challenge_token(1, "other.example.com"));
+        assert!(t.starts_with("lnvps-verify="));
+        assert_eq!(
+            custom_domain_challenge_name("blog.example.com"),
+            "_lnvps-challenge.blog.example.com"
+        );
+    }
 
     #[test]
     fn test_api_error_json_format() {
         let error = ApiError::new("Something went wrong");
         let json = serde_json::to_string(&error).unwrap();
         assert_eq!(json, r#"{"error":"Something went wrong"}"#);
+    }
+
+    #[test]
+    fn snapshot_rejections_map_to_client_errors() {
+        use crate::host::SnapshotRejection;
+        use crate::retry::OpError;
+        for (rejection, code) in [
+            (
+                SnapshotRejection::Invalid("a".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                SnapshotRejection::Conflict("b".into()),
+                StatusCode::CONFLICT,
+            ),
+            (
+                SnapshotRejection::NotFound("c".into()),
+                StatusCode::NOT_FOUND,
+            ),
+        ] {
+            let message = rejection.to_string();
+            let err = ApiError::from(OpError::from(rejection));
+            assert_eq!(err.code, code);
+            assert_eq!(err.error, message);
+        }
+        let other = ApiError::from(OpError::Fatal(anyhow::anyhow!("host exploded")));
+        assert_eq!(other.code, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

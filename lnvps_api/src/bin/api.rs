@@ -104,7 +104,9 @@ async fn main() -> Result<(), Error> {
                 builder = builder.add_source(File::from(path.clone()));
             }
         }
-        builder.build()?.try_deserialize()?
+        let mut settings: Settings = builder.build()?.try_deserialize()?;
+        settings.app_backups = settings.app_backups.map(|c| c.with_env_credentials());
+        settings
     };
 
     // Email verification gates VM ordering, but it can only be delivered over
@@ -332,6 +334,9 @@ async fn main() -> Result<(), Error> {
         // #66). Every 10 minutes: it lists the VMs on every host, and a stale
         // host_id breaks that VM's lifecycle operations until it is corrected.
         tasks.push(worker.spawn_job_interval(WorkJob::ReconcileVmHosts, Duration::from_secs(600)));
+        tasks.push(
+            worker.spawn_job_interval(WorkJob::RefreshOsImageChecksums, Duration::from_secs(21600)),
+        );
         // Automated referral payouts are opt-in (config-gated); run hourly.
         if settings.referral.is_some() {
             tasks.push(
@@ -339,6 +344,10 @@ async fn main() -> Result<(), Error> {
                     .spawn_job_interval(WorkJob::ProcessReferralPayouts, Duration::from_secs(3600)),
             );
         }
+        tasks.push(
+            worker.spawn_job_interval(WorkJob::PurgeExpiredRecords, Duration::from_secs(86400)),
+        );
+        tasks.push(worker.spawn_job_interval(WorkJob::CheckIpOrders, Duration::from_secs(300)));
         tasks.push(worker.spawn_handler_loop());
 
         // check all nostr domains every 10 minutes for CNAME entries (enable/disable as needed)
@@ -475,9 +484,14 @@ async fn main() -> Result<(), Error> {
             .merge(subscriptions_router())
             .merge(ip_space_router())
             .merge(referral_router())
+            .merge(credit_router())
+            .merge(abuse_router())
             .merge(marketplace_router())
             .merge(apps_router())
+            .merge(vm_addons_router())
+            .merge(app_backups_router())
             .merge(vpn_router())
+            .merge(routeserver_router())
             .merge(legal_router())
             .merge(oauth_router())
             .merge(webauthn_router());

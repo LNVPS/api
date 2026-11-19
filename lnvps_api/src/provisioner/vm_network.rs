@@ -104,6 +104,7 @@ impl VmNetworkProvisioner {
     /// Delete DNS on the dns server, does not save to database!
     pub async fn remove_ip_dns(&self, assignment: &mut VmIpAssignment) -> OpResult<()> {
         let range = self.db.get_ip_range(assignment.ip_range_id).await?;
+        let mut first_error: Option<anyhow::Error> = None;
 
         // Delete reverse dns
         if let (Some(dns_id), Some(_ref)) =
@@ -113,15 +114,20 @@ impl VmNetworkProvisioner {
             let rev =
                 BasicRecord::reverse(assignment, DnsRef::from_opt(range.reverse_zone_id.clone()))?;
 
-            if let Err(e) = retry_async(self.retry_policy.clone(), || async {
+            match retry_async(self.retry_policy.clone(), || async {
                 dns.delete_record(&rev).await
             })
             .await
             {
-                warn!("Failed to delete reverse record after retries: {}", e);
+                Ok(_) => {
+                    assignment.dns_reverse_ref = None;
+                    assignment.dns_reverse = None;
+                }
+                Err(e) => {
+                    warn!("Failed to delete reverse record after retries: {}", e);
+                    first_error.get_or_insert(e);
+                }
             }
-            assignment.dns_reverse_ref = None;
-            assignment.dns_reverse = None;
         }
 
         // Delete forward dns
@@ -132,17 +138,25 @@ impl VmNetworkProvisioner {
             let fwd =
                 BasicRecord::forward(assignment, DnsRef::from_opt(range.forward_zone_id.clone()))?;
 
-            if let Err(e) = retry_async(self.retry_policy.clone(), || async {
+            match retry_async(self.retry_policy.clone(), || async {
                 dns.delete_record(&fwd).await
             })
             .await
             {
-                warn!("Failed to delete forward record after retries: {}", e);
+                Ok(_) => {
+                    assignment.dns_forward_ref = None;
+                    assignment.dns_forward = None;
+                }
+                Err(e) => {
+                    warn!("Failed to delete forward record after retries: {}", e);
+                    first_error.get_or_insert(e);
+                }
             }
-            assignment.dns_forward_ref = None;
-            assignment.dns_forward = None;
         }
-        Ok(())
+        match first_error {
+            Some(e) => Err(OpError::Fatal(e)),
+            None => Ok(()),
+        }
     }
 
     /// Update DNS on the dns server, does not save to database!
@@ -214,9 +228,10 @@ impl VmNetworkProvisioner {
         range: &IpRange,
     ) -> OpResult<()> {
         // remove access policy and dns
-        self.rollback_ip_assignment_policy(ip, range).await?;
-        // save arp/dns changes
+        let cleanup = self.rollback_ip_assignment_policy(ip, range).await;
+        // save arp/dns changes, including a partial cleanup
         self.db.update_vm_ip_assignment(ip).await?;
+        cleanup?;
         // mark as deleted
         self.db.delete_vm_ip_assignment(ip.id).await?;
 

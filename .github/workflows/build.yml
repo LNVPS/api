@@ -33,6 +33,9 @@ env:
   REGISTRY: registry.v0l.io
   HOST_INFO_IMAGE: registry.v0l.io/lnvps-host-info
 
+permissions:
+  contents: read
+
 jobs:
   # Decide, once, what tag to publish and whether to push:
   #   * master push        -> :latest        (rolling dev images)
@@ -197,7 +200,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        run: rustup toolchain install
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -205,10 +208,16 @@ jobs:
           shared-key: unit-tests
 
       - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+        # libvirt-dev, because these are tested with the feature set the images
+        # are built with: `libvirt` carries the marketplace host client, and a
+        # build without it is the one that shipped unable to dial a node.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler pkg-config libssl-dev libvirt-dev
 
       - name: Run unit tests
-        run: cargo test --locked --package lnvps_api --package lnvps_agent -- --test-threads=1
+        run: cargo test --locked --package lnvps_api --package lnvps_agent --features lnvps_api/libvirt -- --test-threads=1
+
+      - name: Check migration versions
+        run: cargo test --locked -p lnvps_db --test migration_versions
 
   # Build all 5 main images from the single shared Dockerfile via buildx bake:
   # the workspace is compiled ONCE and each image just packages its binary.

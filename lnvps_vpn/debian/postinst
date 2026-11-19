@@ -1,0 +1,22 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ ! -f /etc/lvd/config.yaml ]; then
+        echo "lvd: no /etc/lvd/config.yaml found." >&2
+        echo "     Copy /etc/lvd/config.example.yaml to config.yaml, set api-url and" >&2
+        echo "     token (the token is <router_id>.<secret> from the LNVPS router row)," >&2
+        echo "     then run:" >&2
+        echo "         chmod 600 /etc/lvd/config.yaml" >&2
+        echo "         lvd --config /etc/lvd/config.yaml check" >&2
+        echo "         systemctl enable --now lvd" >&2
+    else
+        # An upgrade of a configured machine restarts into the new binary. Safe
+        # to do unprompted: the daemon holds no state, and the interfaces it
+        # built keep carrying traffic while it is not running.
+        systemctl try-restart lvd.service >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

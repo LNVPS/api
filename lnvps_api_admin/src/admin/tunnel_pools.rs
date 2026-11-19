@@ -82,7 +82,15 @@ pub struct AdminTunnelPoolInfo {
     pub keepalive: Option<u16>,
     pub mtu: u16,
     pub enabled: bool,
-    /// Links already carved out of this pool.
+    /// Addresses already carved out of this pool's block.
+    ///
+    /// What counts as "out of this pool" depends on what the interface is for.
+    /// A marketplace tunnel belongs to one pool and is counted there. A VPN
+    /// device belongs to **none**: it is a peer on every interface of its
+    /// service at once, holding one address that works in all of them, so its
+    /// tunnel row carries no `pool_id`. Counting only rows pointing at this
+    /// pool would report every VPN interface as empty however many customers
+    /// it carries.
     pub links_used: u64,
     /// Links the smaller of the two blocks can supply. A dual-stack pool hands
     /// out one link of each family together, so the v4 block running out ends
@@ -173,7 +181,7 @@ pub struct UpdateTunnelPoolRequest {
 /// The addresses the route server reserves come off the top (see
 /// `reserved_addresses` in the allocator), so this is what an admin can
 /// actually place.
-fn link_capacity(cidr: Option<&str>) -> Option<u64> {
+fn link_capacity(cidr: Option<&str>, probes: bool) -> Option<u64> {
     let net: IpNetwork = cidr?.parse().ok()?;
     let node_prefix = if net.is_ipv4() {
         NODE_PREFIX_V4
@@ -188,6 +196,9 @@ fn link_capacity(cidr: Option<&str>) -> Option<u64> {
     // The route server holds the whole block on-link, so the block's own
     // network address, the route server's address after it, and — on IPv4 —
     // the broadcast address are not the pool's to hand out.
+    if net.is_ipv4() && probes {
+        return Some((total / 2).saturating_sub(3));
+    }
     let reserved = if net.is_ipv4() { 3 } else { 2 };
     Some(total.saturating_sub(reserved))
 }
@@ -198,13 +209,19 @@ async fn pool_info(
 ) -> Result<AdminTunnelPoolInfo, ApiError> {
     let router = db.get_router(pool.router_id).await?;
     let region = db.get_host_region(pool.region_id).await?;
+    // No VPN special case: a device has one peer per interface, so a pool's own
+    // rows are the answer for every kind of tunnel. Asking the *service* -- as
+    // this did while a device was a single row -- counts that device once per
+    // region, so a three-region service reported 3 against every interface for
+    // one customer.
     let links_used = db.list_tunnels_in_pool(pool.id).await?.len() as u64;
 
     // The binding constraint, not the roomier block: a dual-stack pool hands
     // out both families together.
+    let probes = db.get_vpn_service_for_pool(pool.id).await?.is_none();
     let links_total = [
-        link_capacity(pool.cidr4.as_deref()),
-        link_capacity(pool.cidr6.as_deref()),
+        link_capacity(pool.cidr4.as_deref(), probes),
+        link_capacity(pool.cidr6.as_deref(), probes),
     ]
     .into_iter()
     .flatten()
@@ -286,6 +303,15 @@ async fn admin_create_tunnel_pool(
     ApiData::ok(pool_info(&this.db, pool).await?)
 }
 
+fn tunnel_mtu(mtu: u16) -> Result<u16, ApiError> {
+    if mtu < 1280 {
+        return Err(ApiError::bad_request(format!(
+            "mtu {mtu} is below 1280, where Linux turns IPv6 off on the interface"
+        )));
+    }
+    Ok(mtu)
+}
+
 pub(crate) async fn create_tunnel_pool(
     db: &std::sync::Arc<dyn LNVpsDb>,
     req: &CreateTunnelPoolRequest,
@@ -307,6 +333,8 @@ pub(crate) async fn create_tunnel_pool(
 
     let id = db
         .insert_tunnel_pool(&TunnelPool {
+            // Set by the database, and never by a caller.
+            generation: 0,
             id: 0,
             router_id: req.router_id,
             region_id: req.region_id,
@@ -318,7 +346,7 @@ pub(crate) async fn create_tunnel_pool(
             cidr4,
             cidr6,
             keepalive: req.keepalive,
-            mtu: req.mtu.unwrap_or(1420),
+            mtu: tunnel_mtu(req.mtu.unwrap_or(1420))?,
             enabled: req.enabled.unwrap_or(true),
             created: Utc::now(),
         })
@@ -425,7 +453,7 @@ pub(crate) async fn update_tunnel_pool(
         pool.keepalive = keepalive;
     }
     if let Some(mtu) = req.mtu {
-        pool.mtu = mtu;
+        pool.mtu = tunnel_mtu(mtu)?;
     }
     if let Some(enabled) = req.enabled {
         pool.enabled = enabled;
@@ -528,7 +556,7 @@ fn parse_block(
     // Judged by what the block can actually place, not by its prefix: the
     // route server's own address and the block's reserved ones come out of it,
     // so a /31 that looks like it holds two nodes holds none.
-    if link_capacity(Some(value)).unwrap_or(0) == 0 {
+    if link_capacity(Some(value), false).unwrap_or(0) == 0 {
         return Err(ApiError::bad_request(format!(
             "{field} has no room for a node once the route server's own address is reserved"
         )));
@@ -645,10 +673,7 @@ mod tests {
         let info = pool_info(&db, pool).await.unwrap();
         assert_eq!(info.router_name, "rs1");
         assert_eq!(info.links_used, 0);
-        // A /24 places 253 nodes — 256 less its network address, the route
-        // server's own address and its broadcast address. The /64 holds far
-        // more, so the v4 block is what actually limits the pool.
-        assert_eq!(info.links_total, 253);
+        assert_eq!(info.links_total, 125);
     }
 
     /// Capacity has to reflect what can be handed out, not the roomier of the
@@ -668,7 +693,7 @@ mod tests {
         .unwrap();
 
         let info = pool_info(&db, pool).await.unwrap();
-        assert_eq!(info.links_total, 13, "the /28 limits the pool to 13 nodes");
+        assert_eq!(info.links_total, 5, "the /28 limits the pool to 5 nodes");
     }
 
     /// Capacity is what can actually be placed: the block's own reserved
@@ -677,22 +702,31 @@ mod tests {
     #[test]
     fn capacity_counts_what_can_be_placed() {
         // 256 less the network, route server and broadcast addresses.
-        assert_eq!(link_capacity(Some("10.0.0.0/24")), Some(253));
+        assert_eq!(link_capacity(Some("10.0.0.0/24"), false), Some(253));
         // A /30 is the smallest IPv4 block that can place anything at all.
-        assert_eq!(link_capacity(Some("10.0.0.0/30")), Some(1));
-        assert_eq!(link_capacity(Some("10.0.0.0/31")), Some(0));
+        assert_eq!(link_capacity(Some("10.0.0.0/30"), false), Some(1));
+        assert_eq!(link_capacity(Some("10.0.0.0/31"), false), Some(0));
         // IPv6 has no broadcast address, so only two come off.
-        assert_eq!(link_capacity(Some("fd00::/127")), Some(0));
-        assert_eq!(link_capacity(Some("fd00::/126")), Some(2));
+        assert_eq!(link_capacity(Some("fd00::/127"), false), Some(0));
+        assert_eq!(link_capacity(Some("fd00::/126"), false), Some(2));
         // Saturated rather than overflowed: the exact number of addresses in a
         // /48 is not a figure anyone needs, and subtracting the reserved ones
         // from a saturated count is noise at that scale.
-        assert_eq!(link_capacity(Some("fd00::/48")), Some(u64::MAX - 2));
+        assert_eq!(link_capacity(Some("fd00::/48"), false), Some(u64::MAX - 2));
         // Creation refuses these, but an older row or a direct database edit
         // must not panic the listing.
-        assert_eq!(link_capacity(Some("10.0.0.1/32")), Some(0));
-        assert_eq!(link_capacity(Some("not-a-cidr")), None);
-        assert_eq!(link_capacity(None), None);
+        assert_eq!(link_capacity(Some("10.0.0.1/32"), false), Some(0));
+        assert_eq!(link_capacity(Some("not-a-cidr"), false), None);
+        assert_eq!(link_capacity(None, false), None);
+    }
+
+    #[test]
+    fn a_marketplace_pool_keeps_the_top_half_of_its_v4_block_for_probes() {
+        assert_eq!(link_capacity(Some("10.0.0.0/24"), true), Some(125));
+        assert_eq!(link_capacity(Some("10.95.0.0/16"), true), Some(32765));
+        assert_eq!(link_capacity(Some("10.0.0.0/29"), true), Some(1));
+        assert_eq!(link_capacity(Some("10.0.0.0/30"), true), Some(0));
+        assert_eq!(link_capacity(Some("fd00::/126"), true), Some(2));
     }
 
     /// A v6 block in the v4 column would be handed out as an IPv4 link by an
@@ -976,6 +1010,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_pool_mtu_below_the_ipv6_minimum_is_refused() {
+        let (db, router_id) = db().await;
+        let err = create_tunnel_pool(
+            &db,
+            &CreateTunnelPoolRequest {
+                mtu: Some(1240),
+                ..create(router_id)
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.error.contains("1280"), "{}", err.error);
+
+        let pool = create_tunnel_pool(&db, &create(router_id)).await.unwrap();
+        let err = update_tunnel_pool(
+            &db,
+            pool.id,
+            &UpdateTunnelPoolRequest {
+                mtu: Some(1279),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.error.contains("1280"), "{}", err.error);
+        assert_eq!(db.get_tunnel_pool(pool.id).await.unwrap().mtu, 1420);
+    }
+
+    #[tokio::test]
     async fn a_pool_can_be_retuned_but_not_moved_off_its_router() {
         let (db, router_id) = db().await;
         let pool = create_tunnel_pool(&db, &create(router_id)).await.unwrap();
@@ -1160,6 +1223,7 @@ mod tests {
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
             vat: VatClient::new(),
+            chain: None,
         };
         let auth = |resource: AdminResource| AdminAuth {
             user_id: 1,
@@ -1364,6 +1428,7 @@ mod tests {
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
             vat: lnvps_api_common::VatClient::new(),
+            chain: None,
         };
         let admin = AdminAuth {
             user_id: 1,
@@ -1436,5 +1501,105 @@ mod tests {
         .unwrap();
 
         assert!(db.delete_tunnel_pool(pool.id).await.is_err());
+    }
+
+    /// A VPN interface reports the devices it actually carries: its own, once.
+    ///
+    /// Two interfaces on purpose. With one, a count that asks the *service*
+    /// rather than the pool gives the same answer as a correct one, which is
+    /// how the first version of this test passed while the admin page showed
+    /// `3/65533` on every interface of a three-region service carrying one
+    /// customer.
+    #[tokio::test]
+    async fn a_vpn_interface_counts_the_devices_on_its_service() -> anyhow::Result<()> {
+        use lnvps_db::{IntervalType, VpnService};
+
+        let (db, router_id) = db().await;
+
+        let service_id = db
+            .insert_vpn_service(&VpnService {
+                name: "Gold".to_string(),
+                company_id: 1,
+                amount: 400,
+                currency: "EUR".to_string(),
+                interval_amount: 1,
+                interval_type: IntervalType::Month,
+                default_device_limit: 5,
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+
+        // Two regions on one service, sharing one block as the rule requires.
+        let mut pool_ids = Vec::new();
+        for n in 0..2u16 {
+            let pool_id = db
+                .insert_tunnel_pool(&lnvps_db::TunnelPool {
+                    router_id,
+                    region_id: 1,
+                    name: format!("vpn-{n}"),
+                    listen_addr: format!("rs{n}.example"),
+                    listen_port: 51820 + n,
+                    private_key: PRIVATE_KEY.into(),
+                    public_key: lnvps_api_common::wireguard_public_key(PRIVATE_KEY)?,
+                    cidr4: Some("10.21.0.0/16".to_string()),
+                    cidr6: None,
+                    keepalive: Some(25),
+                    mtu: 1420,
+                    enabled: true,
+                    ..Default::default()
+                })
+                .await?;
+            db.link_vpn_service_pool(service_id, pool_id).await?;
+            pool_ids.push(pool_id);
+        }
+
+        for pool_id in &pool_ids {
+            let pool = db.get_tunnel_pool(*pool_id).await?;
+            assert_eq!(pool_info(&db, pool).await.unwrap().links_used, 0);
+        }
+
+        // One device, which the database gives a peer on each interface.
+        let user_id = db.upsert_user(&[1u8; 32]).await?;
+        let plan_id = db
+            .insert_vpn_subscription(&lnvps_db::VpnSubscription {
+                vpn_service_id: service_id,
+                user_id,
+                subscription_line_item_id: 1,
+                ..Default::default()
+            })
+            .await?;
+        let device_id = db
+            .insert_vpn_device_with_peers(
+                &lnvps_db::VpnDevice {
+                    vpn_subscription_id: plan_id,
+                    slot: 0,
+                    name: "laptop".to_string(),
+                    ..Default::default()
+                },
+                &lnvps_db::VpnPeerTemplate {
+                    user_id,
+                    name: "device".to_string(),
+                    peer_pubkey: vec![7u8; 32],
+                    address4: Some("10.21.74.165/32".to_string()),
+                    address6: None,
+                },
+            )
+            .await?;
+        assert_eq!(
+            db.list_vpn_device_tunnels(device_id).await?.len(),
+            2,
+            "one peer per interface"
+        );
+
+        for pool_id in &pool_ids {
+            let pool = db.get_tunnel_pool(*pool_id).await?;
+            assert_eq!(
+                pool_info(&db, pool).await.unwrap().links_used,
+                1,
+                "an interface carries the device once, not once per region"
+            );
+        }
+        Ok(())
     }
 }

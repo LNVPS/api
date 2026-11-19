@@ -3,7 +3,7 @@ use crate::pricing::PricingEngine;
 use crate::ssh_host_key::{ApiVmHostKey, parse_ssh_host_keys};
 use crate::traffic::quota_period;
 use anyhow::{Result, anyhow, bail};
-use chrono::{DateTime, Days, NaiveDate, Utc};
+use chrono::{DateTime, Days, NaiveDate, TimeDelta, Utc};
 use futures::future::join_all;
 use ipnetwork::IpNetwork;
 use lnvps_db::{
@@ -163,8 +163,8 @@ impl ApiVmTemplate {
                 amount: price.total(),
                 currency: price.currency.into(),
                 other_price: vec![], // filled externally
-                interval_amount: 1,
-                interval_type: ApiIntervalType::Month,
+                interval_amount: price.interval_amount,
+                interval_type: price.interval_type.into(),
             },
             region: ApiVmHostRegion {
                 id: region.id,
@@ -268,6 +268,9 @@ pub struct ApiVmStatus {
     pub ip_assignments: Vec<ApiVmIpAssignment>,
     /// Current running state of the VM
     pub status: VmRunningState,
+    /// Why the VM is in a waiting state, when it is
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
     /// Enable automatic renewal (from subscription)
     pub auto_renewal_enabled: bool,
     /// Date the VM will be deleted if not renewed (expiry + dynamic grace period).
@@ -328,6 +331,27 @@ pub struct ApiVmTrafficSummary {
     /// Bytes received so far this period, for display only; never counted
     /// against the allowance
     pub bytes_in: u64,
+    #[serde(default)]
+    pub throttled: bool,
+}
+
+impl ApiVmTrafficSummary {
+    pub fn new(
+        transfer_gb: Option<u32>,
+        period_start: NaiveDate,
+        period_end: NaiveDate,
+        bytes_out: u64,
+        bytes_in: u64,
+    ) -> Self {
+        Self {
+            throttled: transfer_gb.is_some_and(|gb| crate::transfer_quota_exceeded(bytes_out, gb)),
+            transfer_gb,
+            period_start,
+            period_end,
+            bytes_out,
+            bytes_in,
+        }
+    }
 }
 
 /// Grace period (days) for a subscription, tiered by how long the subscription
@@ -353,6 +377,30 @@ pub fn grace_period_days_for_sub(sub: &Subscription, now: DateTime<Utc>, delete_
         14
     } else {
         delete_after
+    }
+}
+
+/// Grace period for hourly subscriptions, regardless of age.
+///
+/// An hourly subscription lapses when the customer's credit runs out. The
+/// age-tiered day windows would leave the service stopped but undeleted (and
+/// costing disk and IPs) for up to `delete_after` days with nothing paid, so
+/// hourly subscriptions get one day to top up instead.
+pub const HOURLY_GRACE_PERIOD: TimeDelta = TimeDelta::hours(24);
+
+/// How long after `expires` a subscription is kept before it is deleted.
+///
+/// Hourly subscriptions use the fixed [`HOURLY_GRACE_PERIOD`]; everything else
+/// uses the age-tiered whole-day window from [`grace_period_days_for_sub`].
+pub fn grace_period_for_sub(
+    sub: &Subscription,
+    now: DateTime<Utc>,
+    delete_after: u16,
+) -> TimeDelta {
+    if sub.interval_type == lnvps_db::IntervalType::Hour {
+        HOURLY_GRACE_PERIOD
+    } else {
+        TimeDelta::days(grace_period_days_for_sub(sub, now, delete_after) as i64)
     }
 }
 
@@ -390,6 +438,20 @@ pub async fn vm_to_status(
         .map(|i| (i.id, i))
         .collect();
 
+    let (status, status_reason) = match db.get_vm_ip_wait(vm.id).await? {
+        Some(w) if !w.released => (
+            VmRunningState {
+                state: crate::VmRunningStates::WaitingForIp,
+                ..Default::default()
+            },
+            Some(
+                "Waiting for an IP address: this region is out of addresses and more have been ordered"
+                    .to_string(),
+            ),
+        ),
+        _ => (state.unwrap_or_default(), None),
+    };
+
     let template = ApiVmTemplate::from_vm(db, &vm).await?;
     let template_transfer_gb = template.transfer_gb;
     // Load subscription for created + expiry + auto_renewal + dynamic deletion date
@@ -403,8 +465,8 @@ pub async fn vm_to_status(
                 // period is dynamic (subscription-age based), so surface the resulting
                 // date rather than a fixed offset.
                 let deleting_on = sub.expires.and_then(|expires| {
-                    let grace = grace_period_days_for_sub(&sub, Utc::now(), delete_after);
-                    expires.checked_add_days(Days::new(grace as u64))
+                    let grace = grace_period_for_sub(&sub, Utc::now(), delete_after);
+                    expires.checked_add_signed(grace)
                 });
                 // Effective prepay window: the company override when set, else the
                 // global default. Surfaced so the client can cap the renewal
@@ -447,7 +509,8 @@ pub async fn vm_to_status(
         image: image.into(),
         template,
         ssh_key,
-        status: state.unwrap_or_default(),
+        status,
+        status_reason,
         ip_assignments: ips
             .into_iter()
             .map(|i| {
@@ -470,13 +533,13 @@ pub async fn vm_to_status(
         }),
         max_prepay_days,
         host_ssh_keys,
-        traffic: ApiVmTrafficSummary {
-            transfer_gb: template_transfer_gb,
+        traffic: ApiVmTrafficSummary::new(
+            template_transfer_gb,
             period_start,
             period_end,
-            bytes_out: traffic_out,
-            bytes_in: traffic_in,
-        },
+            traffic_out,
+            traffic_in,
+        ),
     })
 }
 
@@ -674,17 +737,19 @@ impl From<&VmCustomPricing> for ApiVmTemplateLimits {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ApiIntervalType {
     Day = 0,
     Month = 1,
     Year = 2,
+    Hour = 3,
 }
 
 impl From<lnvps_db::IntervalType> for ApiIntervalType {
     fn from(value: lnvps_db::IntervalType) -> Self {
         match value {
+            lnvps_db::IntervalType::Hour => Self::Hour,
             lnvps_db::IntervalType::Day => Self::Day,
             lnvps_db::IntervalType::Month => Self::Month,
             lnvps_db::IntervalType::Year => Self::Year,
@@ -695,6 +760,7 @@ impl From<lnvps_db::IntervalType> for ApiIntervalType {
 impl From<ApiIntervalType> for lnvps_db::IntervalType {
     fn from(value: ApiIntervalType) -> Self {
         match value {
+            ApiIntervalType::Hour => Self::Hour,
             ApiIntervalType::Day => Self::Day,
             ApiIntervalType::Month => Self::Month,
             ApiIntervalType::Year => Self::Year,
@@ -712,6 +778,17 @@ pub enum ApiCurrency {
     CHF,
     AUD,
     JPY,
+    XMR,
+    LTC,
+    ETH,
+    USDTTRC,
+    MEUR,
+    MUSD,
+    MGBP,
+    MCAD,
+    MCHF,
+    MAUD,
+    MJPY,
 }
 
 impl From<Currency> for ApiCurrency {
@@ -725,6 +802,17 @@ impl From<Currency> for ApiCurrency {
             Currency::CHF => ApiCurrency::CHF,
             Currency::AUD => ApiCurrency::AUD,
             Currency::JPY => ApiCurrency::JPY,
+            Currency::XMR => ApiCurrency::XMR,
+            Currency::LTC => ApiCurrency::LTC,
+            Currency::ETH => ApiCurrency::ETH,
+            Currency::USDTTRC => ApiCurrency::USDTTRC,
+            Currency::MEUR => ApiCurrency::MEUR,
+            Currency::MUSD => ApiCurrency::MUSD,
+            Currency::MGBP => ApiCurrency::MGBP,
+            Currency::MCAD => ApiCurrency::MCAD,
+            Currency::MCHF => ApiCurrency::MCHF,
+            Currency::MAUD => ApiCurrency::MAUD,
+            Currency::MJPY => ApiCurrency::MJPY,
         }
     }
 }
@@ -740,6 +828,17 @@ impl From<ApiCurrency> for Currency {
             ApiCurrency::CHF => Currency::CHF,
             ApiCurrency::AUD => Currency::AUD,
             ApiCurrency::JPY => Currency::JPY,
+            ApiCurrency::XMR => Currency::XMR,
+            ApiCurrency::LTC => Currency::LTC,
+            ApiCurrency::ETH => Currency::ETH,
+            ApiCurrency::USDTTRC => Currency::USDTTRC,
+            ApiCurrency::MEUR => Currency::MEUR,
+            ApiCurrency::MUSD => Currency::MUSD,
+            ApiCurrency::MGBP => Currency::MGBP,
+            ApiCurrency::MCAD => Currency::MCAD,
+            ApiCurrency::MCHF => Currency::MCHF,
+            ApiCurrency::MAUD => Currency::MAUD,
+            ApiCurrency::MJPY => Currency::MJPY,
         }
     }
 }
@@ -852,6 +951,9 @@ pub struct ApiVmOsImage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_arch: Option<String>,
     pub default_username: Option<String>,
+    /// The root disk is encrypted. On first boot the VM asks for a passphrase
+    /// on the serial console, and asks for it again at every boot.
+    pub encrypted: bool,
     /// Popularity of this image expressed as a fraction (0.0â1.0) of all
     /// active VMs currently using it
     pub popularity: f32,
@@ -871,6 +973,7 @@ impl From<lnvps_db::VmOsImage> for ApiVmOsImage {
                 Some(image.cpu_arch.to_string())
             },
             default_username: image.default_username,
+            encrypted: image.encrypted,
             popularity: 0.0,
         }
     }
@@ -941,6 +1044,10 @@ pub struct CustomVmSpec {
     /// IPv6 addresses to assign; defaults to 1.
     #[serde(default = "default_ip_count")]
     pub ip6_count: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_gb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network_mbps: Option<u32>,
 }
 
 fn default_ip_count() -> u16 {
@@ -953,11 +1060,11 @@ impl CustomVmSpec {
     /// An unknown enum spelling is an error rather than a default: a silently
     /// downgraded disk or architecture is worse than a rejected request.
     pub fn to_template(&self) -> Result<VmCustomTemplate> {
-        let mut cpu_features = Vec::with_capacity(self.cpu_feature.len());
-        for f in &self.cpu_feature {
-            cpu_features
-                .push(CpuFeature::from_str(f).map_err(|_| anyhow!("unknown cpu feature {}", f))?);
-        }
+        let cpu_features = self
+            .cpu_feature
+            .iter()
+            .map(|f| CpuFeature::from_str(f).map_err(|_| anyhow!("unknown cpu feature {}", f)))
+            .collect::<Result<Vec<_>>>()?;
         Ok(VmCustomTemplate {
             id: 0,
             cpu: self.cpu,
@@ -981,16 +1088,22 @@ impl CustomVmSpec {
             cpu_features: cpu_features.into(),
             ip4_count: self.ip4_count,
             ip6_count: self.ip6_count,
+            transfer_gb: self.transfer_gb,
+            network_mbps: self.network_mbps,
             ..Default::default()
         })
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UpgradeConfig {
     pub new_cpu: Option<u16>,
     pub new_memory: Option<u64>,
     pub new_disk: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_transfer_gb: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_network_mbps: Option<u32>,
 }
 
 impl UpgradeConfig {
@@ -999,7 +1112,16 @@ impl UpgradeConfig {
             new_cpu,
             new_memory,
             new_disk,
+            ..Default::default()
         }
+    }
+
+    pub fn changes_compute(&self) -> bool {
+        self.new_cpu.is_some() || self.new_memory.is_some() || self.new_disk.is_some()
+    }
+
+    pub fn changes_bandwidth(&self) -> bool {
+        self.new_transfer_gb.is_some() || self.new_network_mbps.is_some()
     }
 }
 
@@ -1027,13 +1149,34 @@ pub struct ApiCustomTemplateParams {
     /// Maximum IPv6 addresses selectable on this plan
     pub max_ip6: u16,
     pub disks: Vec<ApiCustomTemplateDiskParam>,
+    /// Billing period a VM on this plan is charged for, e.g. `1` `hour`. The
+    /// price from `POST /api/v1/vm/custom-template/price` is for one such period.
+    pub interval_amount: u64,
+    pub interval_type: ApiIntervalType,
     /// Outbound transfer included per calendar month, in GB, copied onto every
     /// custom VM built from this plan. Omitted when the plan is unmetered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transfer_gb: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transfer: Option<ApiBandwidthRange>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<ApiBandwidthRange>,
     /// Performance caps applied to every custom VM built from this plan,
     /// whatever specification is chosen. Not selectable.
     pub limits: ApiVmTemplateLimits,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ApiBandwidthRange {
+    pub min: u32,
+    pub max: u32,
+    pub default: u32,
+}
+
+impl ApiBandwidthRange {
+    fn for_plan(default: Option<u32>, min: u32, max: u32) -> Option<Self> {
+        default.map(|default| Self { min, max, default })
+    }
 }
 
 impl ApiCustomTemplateParams {
@@ -1084,7 +1227,19 @@ impl ApiCustomTemplateParams {
                     disk_interface: d.interface.into(),
                 })
                 .collect(),
+            interval_amount: pricing.interval_amount.max(1),
+            interval_type: pricing.interval_type.into(),
             transfer_gb: pricing.transfer_gb,
+            transfer: ApiBandwidthRange::for_plan(
+                pricing.transfer_gb,
+                pricing.min_transfer_gb,
+                pricing.max_transfer_gb,
+            ),
+            network: ApiBandwidthRange::for_plan(
+                pricing.network_mbps,
+                pricing.min_network_mbps,
+                pricing.max_network_mbps,
+            ),
             limits: pricing.into(),
         }
     }
@@ -1125,6 +1280,8 @@ pub enum ApiSubscriptionLineItemResource {
     /// A consumer VPN plan.
     #[serde(rename = "vpn")]
     Vpn { vpn_subscription_id: u64 },
+    #[serde(rename = "vm_addon")]
+    VmAddon { vm_id: u64, kind: String },
 }
 
 impl ApiSubscriptionLineItemResource {
@@ -1266,6 +1423,15 @@ impl ApiSubscriptionLineItemResource {
                 .map(|p| Self::Vpn {
                     vpn_subscription_id: p.id,
                 }),
+            LineItemType::VmAddon => db
+                .get_vm_addon_by_line_item(line_item.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|a| Self::VmAddon {
+                    vm_id: a.vm_id,
+                    kind: a.kind.to_string(),
+                }),
             LineItemType::DnsHosting => None,
         }
     }
@@ -1273,7 +1439,111 @@ impl ApiSubscriptionLineItemResource {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hourly_subscriptions_have_a_fixed_short_grace() {
+        use super::{HOURLY_GRACE_PERIOD, grace_period_for_sub};
+        use chrono::{TimeDelta, Utc};
+        use lnvps_db::{IntervalType, Subscription};
+        let mut sub = Subscription {
+            id: 1,
+            user_id: 1,
+            company_id: 1,
+            name: "s".to_string(),
+            description: None,
+            created: Utc::now() - TimeDelta::days(400),
+            expires: None,
+            is_active: true,
+            is_setup: true,
+            currency: "EUR".to_string(),
+            interval_amount: 1,
+            interval_type: IntervalType::Hour,
+            setup_fee: 0,
+            auto_renewal_enabled: false,
+            external_id: None,
+        };
+        // Age does not lengthen an hourly grace, and delete_after is ignored.
+        assert_eq!(
+            grace_period_for_sub(&sub, Utc::now(), 30),
+            HOURLY_GRACE_PERIOD
+        );
+        assert_eq!(HOURLY_GRACE_PERIOD, TimeDelta::hours(24));
+        // Other intervals keep the age-tiered whole-day window.
+        sub.interval_type = IntervalType::Month;
+        assert_eq!(
+            grace_period_for_sub(&sub, Utc::now(), 30),
+            TimeDelta::days(30)
+        );
+        sub.created = Utc::now();
+        assert_eq!(
+            grace_period_for_sub(&sub, Utc::now(), 30),
+            TimeDelta::days(1)
+        );
+    }
+
+    #[test]
+    fn api_interval_type_hour_round_trips() {
+        use super::ApiIntervalType;
+        use lnvps_db::IntervalType;
+        assert_eq!(
+            ApiIntervalType::from(IntervalType::Hour),
+            ApiIntervalType::Hour
+        );
+        assert_eq!(
+            IntervalType::from(ApiIntervalType::Hour),
+            IntervalType::Hour
+        );
+        assert_eq!(
+            serde_json::to_string(&ApiIntervalType::Hour).unwrap(),
+            "\"hour\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ApiIntervalType>("\"hour\"").unwrap(),
+            ApiIntervalType::Hour
+        );
+        assert_eq!(IntervalType::Hour as u16, 3);
+    }
+
+    #[test]
+    fn api_vm_os_image_reports_encrypted() {
+        let mut image = lnvps_db::VmOsImage {
+            id: 1,
+            distribution: lnvps_db::OsDistribution::NixOS,
+            flavour: "cloudinit".to_string(),
+            version: "24.11".to_string(),
+            enabled: true,
+            release_date: Utc::now(),
+            url: "https://example.com/nixos.qcow2.xz".to_string(),
+            cpu_arch: CpuArch::X86_64,
+            default_username: None,
+            sha2: None,
+            sha2_url: None,
+            encrypted: true,
+        };
+        let api: ApiVmOsImage = image.clone().into();
+        assert!(api.encrypted);
+        assert_eq!(serde_json::to_value(&api).unwrap()["encrypted"], true);
+        image.encrypted = false;
+        assert!(!ApiVmOsImage::from(image).encrypted);
+    }
+
+    #[test]
+    fn api_currency_round_trips_every_currency() {
+        for c in Currency::ALL {
+            let api = ApiCurrency::from(c);
+            assert_eq!(Currency::from(api), c);
+            assert_eq!(serde_json::to_string(&api).unwrap(), format!("\"{}\"", c));
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn test_traffic_summary_reports_throttle() {
+        let day = NaiveDate::from_ymd_opt(2026, 8, 1).unwrap();
+        assert!(ApiVmTrafficSummary::new(Some(1), day, day, 1_000_000_000, 0).throttled);
+        assert!(!ApiVmTrafficSummary::new(Some(1), day, day, 999_999_999, 0).throttled);
+        assert!(!ApiVmTrafficSummary::new(None, day, day, u64::MAX, 0).throttled);
+    }
 
     /// `resolve_many` must issue one query per resource *table*, never per line
     /// item, and must tolerate a line item whose backing row is missing.
@@ -1327,6 +1597,8 @@ mod tests {
                     amount: 100,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 })
                 .await
                 .unwrap();
@@ -1423,6 +1695,8 @@ mod tests {
             cpu_feature: vec![],
             ip4_count: 1,
             ip6_count: 1,
+            transfer_gb: None,
+            network_mbps: None,
         }
     }
 
@@ -1613,6 +1887,107 @@ mod tests {
         assert!(json.contains(r#""cpu_limit":0.5"#));
         let back: ApiVmTemplateLimits = serde_json::from_str(&json).unwrap();
         assert_eq!(back, EXPECTED_LIMITS);
+    }
+
+    #[test]
+    fn test_custom_vm_spec_carries_bandwidth() {
+        let spec: CustomVmSpec = serde_json::from_value(serde_json::json!({
+            "pricing_id": 7, "cpu": 1, "memory": 1, "disk": 1,
+            "disk_type": "ssd", "disk_interface": "pcie",
+            "cpu_mfg": null, "cpu_arch": null,
+            "transfer_gb": 2000, "network_mbps": 500
+        }))
+        .unwrap();
+        let t = spec.to_template().unwrap();
+        assert_eq!(t.transfer_gb, Some(2000));
+        assert_eq!(t.network_mbps, Some(500));
+        assert_eq!(custom_spec().to_template().unwrap().transfer_gb, None);
+    }
+
+    #[test]
+    fn test_upgrade_config_reads_metadata_without_bandwidth() {
+        let cfg: UpgradeConfig =
+            serde_json::from_str(r#"{"new_cpu":4,"new_memory":null,"new_disk":null}"#).unwrap();
+        assert_eq!(cfg.new_cpu, Some(4));
+        assert!(cfg.changes_compute());
+        assert!(!cfg.changes_bandwidth());
+
+        let cfg = UpgradeConfig {
+            new_network_mbps: Some(100),
+            ..Default::default()
+        };
+        assert!(!cfg.changes_compute());
+        assert!(cfg.changes_bandwidth());
+        let json = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(json["new_network_mbps"], 100);
+        assert!(json.get("new_transfer_gb").is_none());
+    }
+
+    #[test]
+    fn test_custom_template_params_report_bandwidth_ranges() {
+        let region = Region {
+            id: 1,
+            name: "r".to_string(),
+            enabled: true,
+            company_id: 1,
+            country_code: None,
+        };
+        let pricing = VmCustomPricing {
+            id: 1,
+            transfer_gb: Some(1000),
+            min_transfer_gb: 500,
+            max_transfer_gb: 5000,
+            network_mbps: None,
+            min_network_mbps: 100,
+            max_network_mbps: 1000,
+            ..Default::default()
+        };
+        let params = ApiCustomTemplateParams::from(&pricing, &vec![], &region);
+        assert_eq!(
+            params.transfer,
+            Some(ApiBandwidthRange {
+                min: 500,
+                max: 5000,
+                default: 1000
+            })
+        );
+        assert_eq!(
+            params.network, None,
+            "an uncapped plan offers no speed choice"
+        );
+    }
+
+    /// The plan listing says how often the plan bills, so a client can label the
+    /// price it gets from the price endpoint. An unset (zero) amount reads as one.
+    #[test]
+    fn test_custom_template_params_report_the_billing_interval() {
+        let region = Region {
+            id: 1,
+            name: "r".to_string(),
+            enabled: true,
+            company_id: 1,
+            country_code: None,
+        };
+        let hourly = VmCustomPricing {
+            id: 1,
+            interval_amount: 1,
+            interval_type: lnvps_db::IntervalType::Hour,
+            ..Default::default()
+        };
+        let json =
+            serde_json::to_value(ApiCustomTemplateParams::from(&hourly, &vec![], &region)).unwrap();
+        assert_eq!(json["interval_amount"], 1);
+        assert_eq!(json["interval_type"], "hour");
+
+        let unset = VmCustomPricing {
+            id: 2,
+            interval_amount: 0,
+            ..Default::default()
+        };
+        let json =
+            serde_json::to_value(ApiCustomTemplateParams::from(&unset, &vec![], &region)).unwrap();
+        assert_eq!(json["interval_amount"], 1);
+        assert_eq!(json["interval_type"], "month");
     }
 }
 

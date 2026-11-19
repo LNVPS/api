@@ -582,6 +582,144 @@ pub fn gre_flood_v4(
     })?
 }
 
+/// Send `count` VLAN-tagged Ethernet frames carrying an IPv4 TCP SYN from
+/// `src` to `dst:dport` out of `ifname` in `ns_path`, via an `AF_PACKET` raw
+/// socket so the tag(s) are inline in the frame data exactly as a trunk port
+/// delivers them. `tags` are the VLAN IDs outermost first: one tag is 802.1Q,
+/// two tags are 802.1ad outer + 802.1Q inner (QinQ). Returns the number sent.
+#[allow(clippy::too_many_arguments)]
+pub fn vlan_syn_flood_v4(
+    ns_path: &str,
+    ifname: &str,
+    dst_mac: [u8; 6],
+    tags: &[u16],
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    dport: u16,
+    count: u32,
+) -> io::Result<u32> {
+    let ifname = ifname.to_string();
+    let tags = tags.to_vec();
+    in_netns(ns_path, move || {
+        let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = Fd(fd);
+        let cname = std::ffi::CString::new(ifname.clone()).unwrap();
+        let ifindex = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+        if ifindex == 0 {
+            return Err(io::Error::other(format!("no such interface {ifname}")));
+        }
+        let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+        sll.sll_family = libc::AF_PACKET as u16;
+        sll.sll_ifindex = ifindex as i32;
+        sll.sll_halen = 6;
+        sll.sll_addr[..6].copy_from_slice(&dst_mac);
+
+        let mut sent = 0u32;
+        for i in 0..count {
+            let sport = 1024u16.wrapping_add((i % 60000) as u16);
+            let mut frame = Vec::with_capacity(14 + 4 * tags.len() + 40);
+            frame.extend_from_slice(&dst_mac);
+            frame.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+            for (n, id) in tags.iter().enumerate() {
+                // Outer tag of a double-tagged frame is 802.1ad (0x88A8).
+                let tpid: u16 = if tags.len() == 2 && n == 0 {
+                    0x88A8
+                } else {
+                    0x8100
+                };
+                frame.extend_from_slice(&tpid.to_be_bytes());
+                frame.extend_from_slice(&(id & 0x0fff).to_be_bytes());
+            }
+            frame.extend_from_slice(&0x0800u16.to_be_bytes());
+            frame.extend_from_slice(&build_syn_v4(
+                src,
+                dst,
+                sport,
+                dport,
+                0x3000_0000u32.wrapping_add(i),
+            ));
+            let n = unsafe {
+                libc::sendto(
+                    fd.0,
+                    frame.as_ptr() as *const libc::c_void,
+                    frame.len(),
+                    0,
+                    &sll as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                )
+            };
+            if n >= 0 {
+                sent += 1;
+            }
+        }
+        Ok(sent)
+    })?
+}
+
+/// Send `count` 802.1Q-tagged ARP requests (who-has `target` tell `sender`)
+/// out of `ifname` — a non-IP tagged frame, as any trunk carries constantly.
+pub fn vlan_arp_v4(
+    ns_path: &str,
+    ifname: &str,
+    dst_mac: [u8; 6],
+    vlan: u16,
+    sender: Ipv4Addr,
+    target: Ipv4Addr,
+    count: u32,
+) -> io::Result<u32> {
+    let ifname = ifname.to_string();
+    in_netns(ns_path, move || {
+        let fd = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = Fd(fd);
+        let cname = std::ffi::CString::new(ifname.clone()).unwrap();
+        let ifindex = unsafe { libc::if_nametoindex(cname.as_ptr()) };
+        if ifindex == 0 {
+            return Err(io::Error::other(format!("no such interface {ifname}")));
+        }
+        let mut sll: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+        sll.sll_family = libc::AF_PACKET as u16;
+        sll.sll_ifindex = ifindex as i32;
+        sll.sll_halen = 6;
+        sll.sll_addr[..6].copy_from_slice(&dst_mac);
+        let src_mac = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
+        let mut frame = Vec::with_capacity(14 + 4 + 28);
+        frame.extend_from_slice(&dst_mac);
+        frame.extend_from_slice(&src_mac);
+        frame.extend_from_slice(&0x8100u16.to_be_bytes());
+        frame.extend_from_slice(&(vlan & 0x0fff).to_be_bytes());
+        frame.extend_from_slice(&0x0806u16.to_be_bytes());
+        // ARP: htype 1, ptype 0x0800, hlen 6, plen 4, op 1 (request).
+        frame.extend_from_slice(&[0, 1, 8, 0, 6, 4, 0, 1]);
+        frame.extend_from_slice(&src_mac);
+        frame.extend_from_slice(&sender.octets());
+        frame.extend_from_slice(&[0u8; 6]);
+        frame.extend_from_slice(&target.octets());
+        let mut sent = 0u32;
+        for _ in 0..count {
+            let n = unsafe {
+                libc::sendto(
+                    fd.0,
+                    frame.as_ptr() as *const libc::c_void,
+                    frame.len(),
+                    0,
+                    &sll as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                )
+            };
+            if n >= 0 {
+                sent += 1;
+            }
+        }
+        Ok(sent)
+    })?
+}
+
 /// Build an outer-IP + GRE + inner-IP/TCP-SYN packet (64 bytes).
 #[allow(clippy::too_many_arguments)]
 fn build_gre_v4(

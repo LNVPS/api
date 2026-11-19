@@ -726,6 +726,10 @@ pub struct VmHost {
     /// hardware rather than LNVPS's. `None` for every LNVPS-owned host.
     #[sqlx(default)]
     pub marketplace_node_id: Option<u64>,
+    /// Host has been decommissioned and is hidden from every listing. The row
+    /// stays so historical VMs still resolve their host.
+    #[sqlx(default)]
+    pub deleted: bool,
 }
 
 #[derive(FromRow, Clone, Debug, Default)]
@@ -915,6 +919,9 @@ pub struct VmOsImage {
     pub sha2: Option<String>,
     /// URL to the SHA-2 checksums file (e.g., SHA512SUMS)
     pub sha2_url: Option<String>,
+    /// The image encrypts its root disk on first boot and asks for the
+    /// passphrase on the serial console at every boot.
+    pub encrypted: bool,
 }
 
 /// Compression extensions recognised on OS image URLs. Files ending with one
@@ -994,6 +1001,17 @@ pub enum RouterKind {
     OvhAdditionalIp = 1,
     /// A Linux machine managed over SSH (BIRD/Pathvector routing, iproute2 tunnels)
     LinuxSsh = 2,
+    /// A machine running `lvd`, the LNVPS VPN daemon, which configures itself.
+    ///
+    /// The only kind LNVPS never dials: a VPN route server lives wherever its
+    /// region is, which is often behind a NAT nothing here can traverse. It
+    /// asks what it should be and applies the answer, authenticating with
+    /// [`Router::token`] -- the same secret that column already means, sent the
+    /// other way.
+    ///
+    /// So the peer mutators on `TunnelRouter` are unavailable for this kind,
+    /// and the desired state is published rather than pushed.
+    Lvd = 3,
     /// Mock router access in tests
     MockRouter = u16::MAX,
 }
@@ -1163,6 +1181,9 @@ pub enum IntervalType {
     #[default]
     Month = 1,
     Year = 2,
+    /// Hourly billing. Stored in the same `SMALLINT` column, so it needs no
+    /// migration. Intended to be paid from account credit.
+    Hour = 3,
 }
 
 /// The kind of resource a cost record is attached to (weak/polymorphic link).
@@ -1382,16 +1403,21 @@ pub struct VmCustomPricing {
     pub expires: Option<DateTime<Utc>>,
     pub region_id: u64,
     pub currency: String,
+    /// Every rate on this model (and on its disk rows) is in `1/rate_scale` of
+    /// the currency's smallest unit. `1` is plain cents/millisats; a larger
+    /// scale lets a short billing interval carry a fraction of a cent. `0` is
+    /// read as `1`.
+    pub rate_scale: u64,
     pub cpu_mfg: CpuMfg,
     pub cpu_arch: CpuArch,
     pub cpu_features: CommaSeparated<CpuFeature>,
-    /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost per CPU core per billing interval, in `1/rate_scale` smallest currency units
     pub cpu_cost: u64,
-    /// Cost per GB ram in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost per GB ram per billing interval, in `1/rate_scale` smallest currency units
     pub memory_cost: u64,
-    /// Cost per IPv4 address in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost per IPv4 address per billing interval, in `1/rate_scale` smallest currency units
     pub ip4_cost: u64,
-    /// Cost per IPv6 address in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost per IPv6 address per billing interval, in `1/rate_scale` smallest currency units
     pub ip6_cost: u64,
     /// Minimum CPU cores allowed
     pub min_cpu: u16,
@@ -1424,6 +1450,16 @@ pub struct VmCustomPricing {
     /// Monthly **outbound** transfer quota in GB granted to VMs built on this
     /// plan (None = unmetered)
     pub transfer_gb: Option<u32>,
+    pub min_transfer_gb: u32,
+    pub max_transfer_gb: u32,
+    pub transfer_cost_per_tb: u64,
+    pub min_network_mbps: u32,
+    pub max_network_mbps: u32,
+    pub network_cost_per_gbps: u64,
+    /// Billing interval of VMs built from this model, e.g. `1` `Month`. Every
+    /// rate on the model is the price for one such interval.
+    pub interval_amount: u64,
+    pub interval_type: IntervalType,
 }
 
 /// Pricing per GB on a disk type (SSD/HDD)
@@ -1433,7 +1469,8 @@ pub struct VmCustomPricingDisk {
     pub pricing_id: u64,
     pub kind: DiskType,
     pub interface: DiskInterface,
-    /// Cost per GB in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost per GB per billing interval, in `1/rate_scale` smallest currency
+    /// units of the parent [`VmCustomPricing`]
     pub cost: u64,
     /// Minimum disk size in bytes for this disk type/interface
     pub min_disk_size: u64,
@@ -1620,6 +1657,8 @@ pub struct Referral {
     /// every fiat balance at the current rate — not on each currency alone.
     #[sqlx(default)]
     pub payout_threshold: Option<u64>,
+    #[sqlx(default)]
+    pub auto_payout_approved: bool,
 }
 
 /// One payout against a referrer's accrued commission.
@@ -1737,12 +1776,16 @@ impl Default for ReferralPayout {
     }
 }
 
-#[derive(FromRow, Clone, Debug)]
+#[derive(FromRow, Clone, Debug, Default)]
 pub struct ReferralCostUsage {
     pub vm_id: u64,
+    #[sqlx(default)]
+    pub user_id: u64,
     pub ref_code: String,
     pub created: DateTime<Utc>,
     pub amount: u64,
+    #[sqlx(default)]
+    pub refunded: u64,
     pub currency: String,
     pub rate: f32,
     pub base_currency: String,
@@ -1754,10 +1797,11 @@ pub struct ReferralCostUsage {
 }
 
 impl ReferralCostUsage {
-    /// Commission earned on this referral: `amount * effective_rate%`, floored,
+    /// Commission earned on this referral: `(amount - refunded) * effective_rate%`, floored,
     /// in the same smallest-currency unit as `amount`.
     pub fn commission(&self) -> u64 {
-        ((self.amount as f64) * (self.effective_rate as f64 / 100.0)).floor() as u64
+        let net = self.amount.saturating_sub(self.refunded);
+        ((net as f64) * (self.effective_rate as f64 / 100.0)).floor() as u64
     }
 }
 
@@ -1859,6 +1903,246 @@ pub struct DiscountRedemptionWithCode {
     pub redemption: DiscountRedemption,
     /// The discount's code. `None` for a code-less (automatic) discount.
     pub discount_code: Option<String>,
+}
+
+/// A user's account credit balance. `balance` equals the sum of the user's
+/// [`AccountCreditEvent`] amounts.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct AccountCredit {
+    pub user_id: u64,
+    /// Minor units of `currency` (msat for BTC).
+    pub balance: u64,
+    pub currency: String,
+    pub auto_apply: bool,
+    pub updated: DateTime<Utc>,
+}
+
+/// One row of the append-only account credit ledger. `amount` is signed:
+/// `topup` and `refund` are positive, `spend` is negative, `admin` is either.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct AccountCreditEvent {
+    pub id: u64,
+    pub user_id: u64,
+    pub kind: String,
+    pub amount: i64,
+    pub currency: String,
+    pub subscription_payment_id: Option<Vec<u8>>,
+    pub note: Option<String>,
+    pub created: DateTime<Utc>,
+}
+
+/// Credit held against an order. Unsettled rows that have not expired are a
+/// reservation against the balance; settling moves the balance.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct AccountCreditDebit {
+    pub id: u64,
+    pub user_id: u64,
+    pub subscription_payment_id: Option<Vec<u8>>,
+    /// Minor units of `currency`, the balance currency.
+    pub amount: u64,
+    pub currency: String,
+    /// The same value in the payment's currency.
+    pub payment_amount: u64,
+    pub settled: bool,
+    pub expires: DateTime<Utc>,
+    pub created: DateTime<Utc>,
+    pub settled_at: Option<DateTime<Utc>>,
+}
+
+impl AccountCreditDebit {
+    pub fn clamp_to(&mut self, available: u64) {
+        if self.amount <= available {
+            return;
+        }
+        self.payment_amount = if self.amount == 0 {
+            0
+        } else {
+            (self.payment_amount as u128 * available as u128 / self.amount as u128) as u64
+        };
+        self.amount = available;
+    }
+}
+
+/// A top-up invoice. A top-up is not a `subscription_payment`: it does not
+/// belong to a subscription, it does not extend anything, and it must never
+/// appear in referral commission or the VM payment history. It lives in its
+/// own table so the Lightning listener can tell the two apart.
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct AccountCreditTopup {
+    pub id: u64,
+    pub user_id: u64,
+    /// Minor units of `currency` (msat for BTC) the customer paid.
+    pub amount: u64,
+    pub currency: String,
+    pub payment_method: PaymentMethod,
+    /// BOLT11 payment hash of a Lightning top-up. Random for on-chain and
+    /// FixedFloat top-ups, which have no invoice.
+    pub invoice_hash: Vec<u8>,
+    /// The BOLT11 invoice (Lightning), the receive address (on-chain) or the
+    /// swap order JSON (FixedFloat).
+    pub external_data: String,
+    /// Outpoint (`{txid}:{vout}`) of the deposit once seen on chain.
+    pub external_id: Option<String>,
+    pub is_paid: bool,
+    pub paid_at: Option<DateTime<Utc>>,
+    pub created: DateTime<Utc>,
+    /// Currency of the balance the top-up was credited to, set when it settles.
+    pub credit_currency: Option<String>,
+    /// Minor units of `credit_currency` credited, set when it settles.
+    pub credit_amount: Option<u64>,
+}
+
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum OnchainAddressOwnerStatus {
+    #[default]
+    Open = 0,
+    Credited = 1,
+}
+
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct OnchainAddressOwner {
+    pub id: u64,
+    pub address: EncryptedString,
+    pub address_hash: Vec<u8>,
+    pub user_id: u64,
+    pub subscription_id: Option<u64>,
+    pub payment_id: Option<Vec<u8>>,
+    pub vm_id: Option<u64>,
+    pub created: DateTime<Utc>,
+    pub expires: Option<DateTime<Utc>>,
+    pub currency: Option<String>,
+    pub amount: Option<u64>,
+    pub status: OnchainAddressOwnerStatus,
+    pub credited_outpoint: Option<String>,
+    pub notified_outpoint: Option<String>,
+}
+
+pub fn onchain_address_hash(address: &str) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(address.as_bytes()).to_vec()
+}
+
+impl SubscriptionPayment {
+    pub fn onchain_receive_address(&self) -> Option<String> {
+        match self.payment_method {
+            PaymentMethod::OnChain => Some(self.external_data.as_str().to_string()),
+            PaymentMethod::FixedFloat => {
+                serde_json::from_str::<serde_json::Value>(self.external_data.as_str())
+                    .ok()?
+                    .get("receive_address")?
+                    .as_str()
+                    .map(str::to_string)
+            }
+            _ => None,
+        }
+        .filter(|a| !a.is_empty())
+    }
+}
+
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct SwapOrderClient {
+    pub id: u64,
+    pub user_id: u64,
+    pub order_id: String,
+    pub payment_id: Vec<u8>,
+    pub coin: String,
+    pub ip: Option<String>,
+    pub user_agent: Option<String>,
+    pub accept_language: Option<String>,
+    pub created: DateTime<Utc>,
+}
+
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum AbuseCaseKind {
+    #[default]
+    Abuse = 0,
+    IllegalContent = 1,
+    CopyrightCa = 2,
+}
+
+#[derive(Type, Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum AbuseActionKind {
+    #[default]
+    Forwarded = 0,
+    Restricted = 1,
+    Suspended = 2,
+    Terminated = 3,
+    Reinstated = 4,
+    NoAction = 5,
+}
+
+impl AbuseActionKind {
+    pub fn disables_service(self) -> bool {
+        matches!(self, Self::Suspended | Self::Terminated)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Forwarded => "forwarded the report to you",
+            Self::Restricted => "restricted part of your service",
+            Self::Suspended => "suspended your service",
+            Self::Terminated => "terminated your service",
+            Self::Reinstated => "restored your service",
+            Self::NoAction => "taken no action",
+        }
+    }
+}
+
+#[derive(Type, Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum AbuseChallengeOutcome {
+    Upheld = 0,
+    Reversed = 1,
+}
+
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct AbuseCase {
+    pub id: u64,
+    pub vm_id: Option<u64>,
+    pub user_id: Option<u64>,
+    pub kind: AbuseCaseKind,
+    pub reported_ip: Option<String>,
+    pub incident_at: Option<DateTime<Utc>>,
+    pub reporter_email: Option<String>,
+    pub summary: String,
+    pub proceedings_started: bool,
+    pub created: DateTime<Utc>,
+    pub closed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct AbuseAction {
+    pub id: u64,
+    pub case_id: u64,
+    pub kind: AbuseActionKind,
+    pub reason: String,
+    pub facts: String,
+    pub legal_basis: Option<String>,
+    pub followed_report: bool,
+    pub notice_withheld: Option<String>,
+    pub notified_at: Option<DateTime<Utc>>,
+    pub admin_user_id: u64,
+    pub created: DateTime<Utc>,
+}
+
+#[derive(FromRow, Clone, Debug)]
+pub struct AbuseChallenge {
+    pub id: u64,
+    pub case_id: u64,
+    pub action_id: u64,
+    pub message: String,
+    pub received_at: DateTime<Utc>,
+    pub outcome: Option<AbuseChallengeOutcome>,
+    pub response: Option<String>,
+    pub decided_at: Option<DateTime<Utc>>,
+    pub decided_by: Option<u64>,
 }
 
 /// How an outbound payout reaches its recipient. Stored as a small integer; new
@@ -2044,9 +2328,13 @@ pub struct Tunnel {
     /// Route server terminating this tunnel. `None` until one is chosen.
     pub router_id: Option<u64>,
     /// The pool this tunnel's inner addresses were carved from, and therefore
-    /// which interface its peer belongs to. `None` for a tunnel allocated
-    /// outside a pool — a hand-configured peering, or a VPN on a router with no
-    /// pool — which is why [`router_id`](Self::router_id) is still here.
+    /// which interface its peer belongs to. `None` only for a tunnel allocated
+    /// outside a pool at all — a hand-configured peering — which is why
+    /// [`router_id`](Self::router_id) is still here.
+    ///
+    /// A VPN device is *not* such a case, despite being reachable in every
+    /// region: it has one row per interface, each naming its own pool. See
+    /// [`VpnDevice`].
     ///
     /// The database enforces `(pool_id, router_id)` against the pool's own
     /// `(id, router_id)`, so the two copies of "which router" cannot disagree.
@@ -2125,6 +2413,14 @@ pub struct TunnelPool {
     /// Whether new allocations may be made from this pool. Disabling stops new
     /// placements without touching what is already carved out of it.
     pub enabled: bool,
+    /// How many times this interface's desired state has changed.
+    ///
+    /// Only meaningful for a pool on a [`RouterKind::Lvd`] router, which
+    /// asks for its configuration rather than being given it: the route server
+    /// sends the generation it last applied and is answered `304` when nothing
+    /// has moved. Bumped where a pushed pool would have been pushed, so there
+    /// is one list of things that change an interface rather than two.
+    pub generation: u64,
     /// When this pool was created
     pub created: DateTime<Utc>,
 }
@@ -2290,17 +2586,20 @@ pub struct VpnSubscription {
 
 /// One registered device: a phone, a laptop.
 ///
-/// The key and addresses are not here: a device is a WireGuard peer, and a peer
-/// is a [`Tunnel`] — the same table as a marketplace node's, terminated by the
-/// same interfaces, planned by the same code and protected by the same unique
-/// indexes. One set of indexes across every peer is what makes it impossible
-/// for a device and a node to be handed the same address.
+/// The key and addresses are not here: a device is a set of WireGuard peers,
+/// and a peer is a [`Tunnel`] -- the same table as a marketplace node's,
+/// terminated by the same interfaces and planned by the same code.
 ///
-/// What is left is only what makes it a device: which plan, which slot, and
-/// what the customer calls it. The tunnel it points at has a NULL `pool_id`,
-/// which is the case [`Tunnel::pool_id`] already describes for a VPN — a device
-/// is a peer on every interface terminating its service at once, so pinning it
-/// to one would be false.
+/// One peer **per interface**, not one per device. A `tunnel` row means a peer
+/// on an interface, which is what its `pool_id`, `router_id` and their
+/// composite foreign key are for. A device carried in three regions is three
+/// rows, all holding the same key and the same addresses, because that identity
+/// working everywhere is the product. Modelling it as a single row left
+/// `pool_id` NULL and made every question a pool can be asked -- what do you
+/// carry, is your block still big enough -- return the wrong answer.
+///
+/// What is left here is only what makes it a device: which plan, which slot,
+/// and what the customer calls it.
 #[derive(FromRow, Clone, Debug, Default)]
 pub struct VpnDevice {
     /// Unique id of this device
@@ -2317,8 +2616,11 @@ pub struct VpnDevice {
     /// The customer's label. Never sent to a route server; [`Tunnel::name`] is
     /// what the route server sees.
     pub name: String,
-    /// The peer this device is
-    pub tunnel_id: u64,
+    /// Its peers are `vpn_device_tunnel` rows, one per interface the service
+    /// terminates, all carrying the same key and the same addresses. There is
+    /// no single `tunnel_id`: a device carried in three regions is three peers,
+    /// because a `tunnel` row means a peer on an interface.
+    ///
     /// When this device was registered
     pub created: DateTime<Utc>,
 }
@@ -2439,6 +2741,8 @@ pub enum PaymentMethod {
     Stripe,
     /// On-chain Bitcoin payments
     OnChain,
+    /// A cryptocurrency (XMR, LTC, ETH, USDTTRC) paid through a third-party swap into our on-chain Bitcoin wallet
+    FixedFloat,
 }
 
 #[derive(Type, Clone, Copy, Debug, Default, PartialEq)]
@@ -2457,6 +2761,7 @@ impl Display for PaymentMethod {
             PaymentMethod::Paypal => write!(f, "PayPal"),
             PaymentMethod::Stripe => write!(f, "Stripe"),
             PaymentMethod::OnChain => write!(f, "OnChain"),
+            PaymentMethod::FixedFloat => write!(f, "FixedFloat"),
         }
     }
 }
@@ -2471,6 +2776,7 @@ impl FromStr for PaymentMethod {
             "paypal" => Ok(PaymentMethod::Paypal),
             "stripe" => Ok(PaymentMethod::Stripe),
             "onchain" => Ok(PaymentMethod::OnChain),
+            "fixedfloat" => Ok(PaymentMethod::FixedFloat),
             _ => bail!("Unknown payment method: {}", s),
         }
     }
@@ -2570,6 +2876,23 @@ pub struct RegionStats {
     pub ipv4_assignments: u64,
     /// Active IPv6 assignments (assignments whose `ip_range` is an IPv6 CIDR)
     pub ipv6_assignments: u64,
+    /// IP ranges configured in the region, enabled or not.
+    pub ip_ranges: u64,
+    /// VM templates sold in the region, enabled or not.
+    pub vm_templates: u64,
+    /// App clusters in the region.
+    pub app_clusters: u64,
+    /// Live (non-deleted) app deployments on those clusters.
+    pub app_deployments: u64,
+    /// Tunnel pools terminating in the region.
+    pub tunnel_pools: u64,
+    /// Distinct VPN services sold in the region, i.e. those with a pool here.
+    pub vpn_services: u64,
+    /// Distinct routers serving the region, counted through the tunnel pools
+    /// that terminate here and the access policies its IP ranges use. A router
+    /// has no region of its own, so this is the only thing "routers in a
+    /// region" can mean.
+    pub routers: u64,
 }
 
 #[derive(Clone, Debug, sqlx::Type)]
@@ -2595,6 +2918,9 @@ pub enum VmHistoryActionType {
     /// migration and for a placement change discovered on the hosts, so the
     /// audit trail shows where a VM has physically lived.
     Migrated = 13,
+    SnapshotCreated = 14,
+    SnapshotRestored = 15,
+    SnapshotDeleted = 16,
 }
 
 impl Display for VmHistoryActionType {
@@ -2614,6 +2940,9 @@ impl Display for VmHistoryActionType {
             VmHistoryActionType::Transferred => write!(f, "transferred"),
             VmHistoryActionType::Refunded => write!(f, "refunded"),
             VmHistoryActionType::Migrated => write!(f, "migrated"),
+            VmHistoryActionType::SnapshotCreated => write!(f, "snapshot_created"),
+            VmHistoryActionType::SnapshotRestored => write!(f, "snapshot_restored"),
+            VmHistoryActionType::SnapshotDeleted => write!(f, "snapshot_deleted"),
         }
     }
 }
@@ -2637,6 +2966,9 @@ impl FromStr for VmHistoryActionType {
             "transferred" => Ok(VmHistoryActionType::Transferred),
             "refunded" => Ok(VmHistoryActionType::Refunded),
             "migrated" => Ok(VmHistoryActionType::Migrated),
+            "snapshot_created" => Ok(VmHistoryActionType::SnapshotCreated),
+            "snapshot_restored" => Ok(VmHistoryActionType::SnapshotRestored),
+            "snapshot_deleted" => Ok(VmHistoryActionType::SnapshotDeleted),
             _ => Err(anyhow!("unknown VM history action type: {}", s)),
         }
     }
@@ -2761,6 +3093,19 @@ pub enum AdminResource {
     /// key that has to stop working now -- so support needs it without also
     /// being able to reprice the service.
     VpnSubscription = 33,
+    /// A customer's account credit balance: reading the balance and ledger, and
+    /// adjusting it (a manual top-up or clawback).
+    ///
+    /// Its own resource rather than part of [`AdminResource::Payments`] because
+    /// adjusting a balance is authority to create or destroy money the customer
+    /// can spend against invoices.
+    AccountCredit = 34,
+    /// Abuse cases: reports against a customer's service, the actions taken and
+    /// the customer's challenges. Its own resource because a decision here
+    /// suspends a customer's service and is sent to them as a legal notice.
+    Abuse = 35,
+    VmAddonPrice = 36,
+    IpOrder = 37,
 }
 
 /// Actions that can be performed on administrative resources
@@ -2814,6 +3159,10 @@ impl Display for AdminResource {
             AdminResource::MarketplaceNode => write!(f, "marketplace_node"),
             AdminResource::MarketplaceOperator => write!(f, "marketplace_operator"),
             AdminResource::SupportAgent => write!(f, "support_agent"),
+            AdminResource::AccountCredit => write!(f, "account_credit"),
+            AdminResource::Abuse => write!(f, "abuse"),
+            AdminResource::VmAddonPrice => write!(f, "vm_addon_price"),
+            AdminResource::IpOrder => write!(f, "ip_order"),
         }
     }
 }
@@ -2859,6 +3208,10 @@ impl FromStr for AdminResource {
             "discount" | "discounts" => Ok(AdminResource::Discount),
             "vpn_service" | "vpn_services" => Ok(AdminResource::VpnService),
             "vpn_subscription" | "vpn_subscriptions" => Ok(AdminResource::VpnSubscription),
+            "account_credit" | "account_credits" => Ok(AdminResource::AccountCredit),
+            "abuse" => Ok(AdminResource::Abuse),
+            "vm_addon_price" | "vm_addon_prices" => Ok(AdminResource::VmAddonPrice),
+            "ip_order" | "ip_orders" => Ok(AdminResource::IpOrder),
             _ => Err(anyhow!("unknown admin resource: {}", s)),
         }
     }
@@ -2903,6 +3256,10 @@ impl TryFrom<u16> for AdminResource {
             31 => Ok(AdminResource::Discount),
             32 => Ok(AdminResource::VpnService),
             33 => Ok(AdminResource::VpnSubscription),
+            34 => Ok(AdminResource::AccountCredit),
+            35 => Ok(AdminResource::Abuse),
+            36 => Ok(AdminResource::VmAddonPrice),
+            37 => Ok(AdminResource::IpOrder),
             _ => Err(anyhow!("unknown admin resource value: {}", value)),
         }
     }
@@ -2946,6 +3303,10 @@ impl AdminResource {
             AdminResource::Discount,
             AdminResource::VpnService,
             AdminResource::VpnSubscription,
+            AdminResource::AccountCredit,
+            AdminResource::Abuse,
+            AdminResource::VmAddonPrice,
+            AdminResource::IpOrder,
         ]
     }
 }
@@ -3030,6 +3391,7 @@ pub enum SubscriptionPaymentType {
     /// branch on [`SubscriptionPaymentType::is_refund`] — see
     /// [`SubscriptionPaymentType::signum`].
     Refund = 3,
+    AddonChange = 4,
 }
 
 impl SubscriptionPaymentType {
@@ -3081,6 +3443,7 @@ impl Display for SubscriptionPaymentType {
             SubscriptionPaymentType::Renewal => write!(f, "Renewal"),
             SubscriptionPaymentType::Upgrade => write!(f, "Upgrade"),
             SubscriptionPaymentType::Refund => write!(f, "Refund"),
+            SubscriptionPaymentType::AddonChange => write!(f, "AddonChange"),
         }
     }
 }
@@ -3189,6 +3552,7 @@ pub enum LineItemType {
     /// carries a `setup_amount` and an `amount` of zero, so the subscription
     /// never renews and never expires. See `subscription_payment_paid`.
     MarketplaceNodeFee = 5,
+    VmAddon = 7,
 }
 
 impl Display for LineItemType {
@@ -3201,6 +3565,7 @@ impl Display for LineItemType {
             LineItemType::App => write!(f, "App"),
             LineItemType::Vpn => write!(f, "VPN"),
             LineItemType::MarketplaceNodeFee => write!(f, "Marketplace Node Fee"),
+            LineItemType::VmAddon => write!(f, "VM Add-on"),
         }
     }
 }
@@ -3227,6 +3592,41 @@ pub struct SubscriptionLineItem {
     /// `ip_range_subscription.subscription_line_item_id`, ...), never by
     /// parsing this column.
     pub configuration: Option<serde_json::Value>,
+    /// When this line item stopped billing on its own (its resource was
+    /// deleted while the subscription carries other products). `None` while
+    /// active. Renewals skip deactivated items.
+    #[serde(default)]
+    pub deactivated_at: Option<DateTime<Utc>>,
+    /// The line item this one is an add-on to (e.g. paid snapshots on a VM's
+    /// line item). An add-on stops billing, and is refunded, together with its
+    /// parent. `None` for a standalone product.
+    #[serde(default)]
+    pub parent_line_item_id: Option<u64>,
+}
+
+impl SubscriptionLineItem {
+    pub fn is_active(&self) -> bool {
+        self.deactivated_at.is_none()
+    }
+
+    /// The ids of `root` and every add-on below it in `items` (add-ons of
+    /// add-ons included), i.e. everything that stops when `root`'s resource is
+    /// deleted. A cycle in `parent_line_item_id` cannot loop: each id is
+    /// visited once.
+    pub fn with_addons(items: &[SubscriptionLineItem], root: u64) -> Vec<u64> {
+        let mut out = vec![root];
+        let mut i = 0;
+        while i < out.len() {
+            let parent = out[i];
+            for li in items {
+                if li.parent_line_item_id == Some(parent) && !out.contains(&li.id) {
+                    out.push(li.id);
+                }
+            }
+            i += 1;
+        }
+        out
+    }
 }
 
 /// Subscription payment
@@ -3329,7 +3729,7 @@ pub struct SubscriptionCohortRow {
 }
 
 /// Subscription payment with company info (for admin views and time-series reporting)
-#[derive(FromRow, Clone, Debug, Serialize, Deserialize)]
+#[derive(FromRow, Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SubscriptionPaymentWithCompany {
     pub id: Vec<u8>,
     pub subscription_id: u64,
@@ -3385,6 +3785,37 @@ pub struct SubscriptionPaymentWithCompany {
     // Region information
     pub region_id: Option<u64>,
     pub region_name: Option<String>,
+    #[sqlx(default)]
+    pub user_country_code: Option<String>,
+    #[sqlx(default)]
+    pub user_geo_country_code: Option<String>,
+    #[sqlx(default)]
+    pub user_billing_tax_id: Option<String>,
+}
+
+#[derive(FromRow, Clone, Debug)]
+pub struct DeletedVm {
+    #[sqlx(flatten)]
+    pub vm: Vm,
+    pub deleted_at: DateTime<Utc>,
+    pub delete_reason: Option<String>,
+}
+
+#[derive(FromRow, Clone, Debug)]
+pub struct PaidSubscriptionPayment {
+    #[sqlx(flatten)]
+    pub payment: SubscriptionPayment,
+    pub subscription_name: String,
+    pub company_base_currency: String,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq)]
+pub struct PaymentTotal {
+    pub currency: String,
+    pub payment_type: SubscriptionPaymentType,
+    pub count: u64,
+    pub amount: u64,
+    pub tax: u64,
 }
 
 /// Internet Registry - Regional Internet Registry
@@ -3439,6 +3870,80 @@ impl InternetRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_onchain_receive_address_per_method() {
+        let payment = |method, data: &str| SubscriptionPayment {
+            id: vec![1; 32],
+            subscription_id: 1,
+            user_id: 1,
+            created: Utc::now(),
+            expires: Utc::now(),
+            amount: 1000,
+            currency: "BTC".to_string(),
+            payment_method: method,
+            payment_type: SubscriptionPaymentType::Purchase,
+            external_data: data.into(),
+            external_id: None,
+            is_paid: false,
+            rate: 1.0,
+            time_value: None,
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+            renewal_source: None,
+        };
+        assert_eq!(
+            payment(PaymentMethod::OnChain, "bc1qours").onchain_receive_address(),
+            Some("bc1qours".to_string())
+        );
+        assert_eq!(
+            payment(
+                PaymentMethod::FixedFloat,
+                r#"{"deposit_address":"ltc1q","receive_address":"bc1qswap"}"#
+            )
+            .onchain_receive_address(),
+            Some("bc1qswap".to_string())
+        );
+        assert_eq!(
+            payment(PaymentMethod::FixedFloat, "not json").onchain_receive_address(),
+            None
+        );
+        assert_eq!(
+            payment(PaymentMethod::OnChain, "").onchain_receive_address(),
+            None
+        );
+        assert_eq!(
+            payment(PaymentMethod::Lightning, "lnbc1").onchain_receive_address(),
+            None
+        );
+        assert_eq!(onchain_address_hash("bc1qours").len(), 32);
+        assert_ne!(onchain_address_hash("a"), onchain_address_hash("b"));
+    }
+
+    /// The backup enums are rendered into API responses and log lines, and
+    /// their numeric values are the stored column, so both are pinned.
+    #[test]
+    fn test_app_backup_enum_rendering() {
+        assert_eq!(AppBackupMethod::Command.to_string(), "command");
+        assert_eq!(AppBackupMethod::Volume.to_string(), "volume");
+        assert_eq!(AppBackupMethod::Exec.to_string(), "exec");
+        assert_eq!(AppBackupState::Pending.to_string(), "pending");
+        assert_eq!(AppBackupState::Running.to_string(), "running");
+        assert_eq!(AppBackupState::Completed.to_string(), "completed");
+        assert_eq!(AppBackupState::Failed.to_string(), "failed");
+        assert_eq!(AppBackupMethod::default(), AppBackupMethod::Command);
+        assert_eq!(AppBackupState::default(), AppBackupState::Pending);
+        assert_eq!(AppBackupMethod::Volume as u8, 1);
+        assert_eq!(AppBackupState::Failed as u8, 3);
+    }
 
     /// A subscription's billing state is what the customer API reports and what
     /// the operator gates on, so the three cases have to be exactly the two
@@ -3546,6 +4051,7 @@ mod tests {
             default_username: None,
             sha2: None,
             sha2_url: None,
+            encrypted: false,
         }
     }
 
@@ -3804,6 +4310,7 @@ mod tests {
             rate: 1.0,
             base_currency: "EUR".to_string(),
             effective_rate: 10.0,
+            ..Default::default()
         };
         // 10% of 10_000 = 1_000
         assert_eq!(u.commission(), 1_000);
@@ -3814,6 +4321,21 @@ mod tests {
         u.amount = 101;
         u.effective_rate = 2.5;
         assert_eq!(u.commission(), 2);
+    }
+
+    #[test]
+    fn test_referral_commission_excludes_refunded_amount() {
+        let mut u = ReferralCostUsage {
+            amount: 10_000,
+            refunded: 4_000,
+            effective_rate: 10.0,
+            ..Default::default()
+        };
+        assert_eq!(u.commission(), 600);
+        u.refunded = 10_000;
+        assert_eq!(u.commission(), 0);
+        u.refunded = 20_000;
+        assert_eq!(u.commission(), 0);
     }
 
     #[test]
@@ -3913,6 +4435,64 @@ mod tests {
             AdminResource::Referral
         );
         assert!(AdminResource::all().contains(&AdminResource::Referral));
+    }
+
+    #[test]
+    fn test_admin_resource_vm_addon_price_roundtrip() {
+        assert_eq!(
+            "vm_addon_price".parse::<AdminResource>().unwrap(),
+            AdminResource::VmAddonPrice
+        );
+        assert_eq!(AdminResource::VmAddonPrice.to_string(), "vm_addon_price");
+        assert_eq!(
+            AdminResource::try_from(36u16).unwrap(),
+            AdminResource::VmAddonPrice
+        );
+        assert!(AdminResource::all().contains(&AdminResource::VmAddonPrice));
+    }
+
+    #[test]
+    fn test_admin_resource_ip_order_roundtrip() {
+        assert_eq!(
+            "ip_order".parse::<AdminResource>().unwrap(),
+            AdminResource::IpOrder
+        );
+        assert_eq!(AdminResource::IpOrder.to_string(), "ip_order");
+        assert_eq!(
+            AdminResource::try_from(37u16).unwrap(),
+            AdminResource::IpOrder
+        );
+        assert!(AdminResource::all().contains(&AdminResource::IpOrder));
+    }
+
+    #[test]
+    fn test_ip_order_state_in_flight() {
+        assert!(IpOrderState::AwaitingApproval.is_in_flight());
+        assert!(IpOrderState::Approved.is_in_flight());
+        assert!(IpOrderState::Ordering.is_in_flight());
+        assert!(IpOrderState::Ordered.is_in_flight());
+        assert!(!IpOrderState::Delivered.is_in_flight());
+        assert!(!IpOrderState::Failed.is_in_flight());
+        assert!(!IpOrderState::Rejected.is_in_flight());
+    }
+
+    #[test]
+    fn test_vm_addon_kind_roundtrip() {
+        assert_eq!(
+            "snapshot".parse::<VmAddonKind>().unwrap(),
+            VmAddonKind::Snapshot
+        );
+        assert_eq!(VmAddonKind::Snapshot.to_string(), "snapshot");
+        assert!("disk".parse::<VmAddonKind>().is_err());
+        assert_eq!(
+            serde_json::to_string(&VmAddonKind::Snapshot).unwrap(),
+            "\"snapshot\""
+        );
+        assert_eq!(LineItemType::VmAddon.to_string(), "VM Add-on");
+        assert_eq!(
+            SubscriptionPaymentType::AddonChange.to_string(),
+            "AddonChange"
+        );
     }
 
     #[test]
@@ -4019,6 +4599,7 @@ mod tests {
             ("paypal", PaymentMethod::Paypal),
             ("stripe", PaymentMethod::Stripe),
             ("onchain", PaymentMethod::OnChain),
+            ("fixedfloat", PaymentMethod::FixedFloat),
         ] {
             assert_eq!(PaymentMethod::from_str(s).unwrap(), m);
         }
@@ -4035,6 +4616,7 @@ mod tests {
             address_type: OnChainAddressType::TaprootPubkey,
             account: Some("deposits".to_string()),
             min_confirmations: 3,
+            unpaid_purge_grace_hours: 24,
         });
         assert_eq!(config.provider_type(), "onchain");
         assert_eq!(config.payment_method(), PaymentMethod::OnChain);
@@ -4067,6 +4649,46 @@ mod tests {
         assert_eq!(oc.min_confirmations, 3);
         pmc.set_provider_config(parsed);
         assert_eq!(pmc.provider_type, "onchain");
+    }
+
+    #[test]
+    fn test_provider_config_fixedfloat() {
+        let json = serde_json::json!({
+            "type": "fixedfloat",
+            "api_key": "k",
+            "api_secret": "s"
+        });
+        let cfg: ProviderConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(cfg.provider_type(), "fixedfloat");
+        assert_eq!(cfg.payment_method(), PaymentMethod::FixedFloat);
+        let ff = cfg.as_fixedfloat().unwrap();
+        assert_eq!((ff.api_key.as_str(), ff.api_secret.as_str()), ("k", "s"));
+        assert!(ff.url.is_none() && ff.refcode.is_none() && ff.afftax.is_none());
+        assert!(cfg.as_onchain().is_none());
+        assert!(
+            ProviderConfig::OnChain(OnChainProviderConfig {
+                url: String::new(),
+                cert_path: "".into(),
+                macaroon_path: "".into(),
+                address_type: OnChainAddressType::default(),
+                account: None,
+                min_confirmations: 1,
+                unpaid_purge_grace_hours: 24,
+            })
+            .as_fixedfloat()
+            .is_none()
+        );
+        let mut pmc = PaymentMethodConfig::new_with_config(
+            1,
+            PaymentMethod::FixedFloat,
+            "xmr".to_string(),
+            true,
+            cfg,
+        );
+        assert_eq!(pmc.provider_type, "fixedfloat");
+        let parsed = pmc.get_provider_config().unwrap();
+        pmc.set_provider_config(parsed);
+        assert_eq!(pmc.provider_type, "fixedfloat");
     }
 
     #[test]
@@ -4265,6 +4887,12 @@ pub struct OnChainProviderConfig {
     /// Confirmations required before a deposit is settled
     #[serde(default = "default_min_confirmations")]
     pub min_confirmations: u32,
+    #[serde(default = "default_unpaid_purge_grace_hours")]
+    pub unpaid_purge_grace_hours: u32,
+}
+
+fn default_unpaid_purge_grace_hours() -> u32 {
+    24
 }
 
 fn default_min_confirmations() -> u32 {
@@ -4280,6 +4908,24 @@ pub struct PaypalProviderConfig {
     pub client_secret: String,
     /// Mode: "sandbox" or "live"
     pub mode: String,
+}
+
+/// FixedFloat swap provider configuration (any supported coin to BTC, settling to the on-chain wallet)
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FixedFloatProviderConfig {
+    /// API key
+    pub api_key: String,
+    /// API secret used to sign requests
+    pub api_secret: String,
+    /// Base URL override, defaults to the public FixedFloat API
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Affiliate code credited for orders
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refcode: Option<String>,
+    /// Affiliate commission as a percentage of the swap, added to the customer's rate
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub afftax: Option<f32>,
 }
 
 /// Typed provider configuration enum
@@ -4298,6 +4944,9 @@ pub enum ProviderConfig {
     /// On-chain Bitcoin payment configuration (LND wallet backend)
     #[serde(rename = "onchain")]
     OnChain(OnChainProviderConfig),
+    /// Cryptocurrency payments swapped to Bitcoin through FixedFloat
+    #[serde(rename = "fixedfloat")]
+    FixedFloat(FixedFloatProviderConfig),
 }
 
 impl ProviderConfig {
@@ -4309,6 +4958,7 @@ impl ProviderConfig {
             ProviderConfig::Stripe(_) => "stripe",
             ProviderConfig::Paypal(_) => "paypal",
             ProviderConfig::OnChain(_) => "onchain",
+            ProviderConfig::FixedFloat(_) => "fixedfloat",
         }
     }
 
@@ -4320,6 +4970,7 @@ impl ProviderConfig {
             ProviderConfig::Stripe(_) => PaymentMethod::Stripe,
             ProviderConfig::Paypal(_) => PaymentMethod::Paypal,
             ProviderConfig::OnChain(_) => PaymentMethod::OnChain,
+            ProviderConfig::FixedFloat(_) => PaymentMethod::FixedFloat,
         }
     }
 
@@ -4359,6 +5010,14 @@ impl ProviderConfig {
     pub fn as_onchain(&self) -> Option<&OnChainProviderConfig> {
         match self {
             ProviderConfig::OnChain(cfg) => Some(cfg),
+            _ => None,
+        }
+    }
+
+    /// Get FixedFloat config if this is a FixedFloat provider
+    pub fn as_fixedfloat(&self) -> Option<&FixedFloatProviderConfig> {
+        match self {
+            ProviderConfig::FixedFloat(cfg) => Some(cfg),
             _ => None,
         }
     }
@@ -4509,6 +5168,11 @@ pub struct App {
     /// English-only caveat as [`App::seo_title`].
     #[sqlx(default)]
     pub seo_description: Option<String>,
+    /// JSON object of language code to translated [`App::category`], e.g.
+    /// `{"de":"Nostr-Relay"}`. Null when the app has none, in which case the
+    /// built-in table for seeded categories applies.
+    #[sqlx(default)]
+    pub category_translations: Option<String>,
     /// Docker-compose-style YAML defining the app (image, ports, env, volumes).
     pub compose: String,
     /// Recurring price in the smallest currency unit (cents / millisats).
@@ -4589,6 +5253,13 @@ pub struct AppCluster {
     /// Static total persistent-storage capacity (bytes).
     #[sqlx(default)]
     pub capacity_storage_bytes: u64,
+    /// DNS server that publishes SRV records for this cluster's L4 deployments.
+    /// `None` publishes nothing.
+    #[sqlx(default)]
+    pub dns_server_id: Option<u64>,
+    /// Zone on `dns_server_id` that holds `ingress_domain`.
+    #[sqlx(default)]
+    pub dns_zone_id: Option<String>,
     pub created: DateTime<Utc>,
 }
 
@@ -4641,6 +5312,93 @@ impl Display for AppDeploymentStatus {
             AppDeploymentStatus::Deleting => write!(f, "deleting"),
         }
     }
+}
+
+/// How an artifact was captured, mirroring the compose `backup:` method.
+#[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum AppBackupMethod {
+    /// App-native logical dump, captured from the command's stdout.
+    #[default]
+    Command = 0,
+    /// Raw tar of a persistent volume.
+    Volume = 1,
+    Exec = 2,
+}
+
+impl Display for AppBackupMethod {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppBackupMethod::Command => write!(f, "command"),
+            AppBackupMethod::Volume => write!(f, "volume"),
+            AppBackupMethod::Exec => write!(f, "exec"),
+        }
+    }
+}
+
+/// Lifecycle of one backup artifact.
+///
+/// `Completed` is the only state in which an object exists to download; a
+/// `Failed` row is kept so the customer can see that a scheduled run did not
+/// produce the backup they are counting on.
+#[derive(Clone, Copy, Debug, sqlx::Type, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[repr(u8)]
+#[serde(rename_all = "snake_case")]
+pub enum AppBackupState {
+    /// Recorded, waiting for the operator to create the Job.
+    #[default]
+    Pending = 0,
+    /// The Job exists and is capturing or uploading.
+    Running = 1,
+    /// Uploaded; downloadable.
+    Completed = 2,
+    /// The capture or the upload failed; see `message`.
+    Failed = 3,
+}
+
+impl Display for AppBackupState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppBackupState::Pending => write!(f, "pending"),
+            AppBackupState::Running => write!(f, "running"),
+            AppBackupState::Completed => write!(f, "completed"),
+            AppBackupState::Failed => write!(f, "failed"),
+        }
+    }
+}
+
+/// One captured artifact from one compose service.
+///
+/// A backup *run* covers the whole deployment, but each service that declares
+/// a `backup:` method produces its own artifact from its own Job, so the run is
+/// represented as the set of rows sharing a `run_id` rather than as a row of
+/// its own.
+#[derive(FromRow, Clone, Debug, PartialEq, Eq)]
+pub struct AppDeploymentBackup {
+    pub id: u64,
+    pub deployment_id: u64,
+    /// Groups the artifacts captured by the same run.
+    pub run_id: String,
+    /// Compose service the artifact came from.
+    pub service: String,
+    pub method: AppBackupMethod,
+    /// Download filename.
+    pub artifact: String,
+    /// Object storage key. Server-derived: the customer addresses a backup by
+    /// `id` and never supplies any part of a path.
+    pub object_key: Option<String>,
+    /// Uploaded size, once the object has been observed.
+    pub size_bytes: Option<u64>,
+    pub state: AppBackupState,
+    /// Failure detail, when there is one.
+    pub message: Option<String>,
+    /// Started by the app's schedule rather than by the customer.
+    pub scheduled: bool,
+    pub created: DateTime<Utc>,
+    pub started: Option<DateTime<Utc>>,
+    pub completed: Option<DateTime<Utc>>,
+    pub deleted: bool,
 }
 
 /// One compose service's last observed CPU and memory use.
@@ -4738,6 +5496,12 @@ pub struct AppDeployment {
     pub namespace: String,
     /// Public ingress hostname once assigned (e.g. `name.apps.lnvps.tld`).
     pub hostname: Option<String>,
+    /// Public L4 port the operator allocated for an app that declares
+    /// `expose: tcp|udp`. Players connect to `hostname:public_port`. Unique per
+    /// cluster, and cleared when the deployment is deleted so the port is free
+    /// to reuse.
+    #[sqlx(default)]
+    pub public_port: Option<u16>,
     /// Optional customer-owned domain (CNAME'd to `hostname` by the customer).
     /// When set, the operator adds it to the Ingress and cert-manager issues a
     /// TLS cert for it; the default `hostname` keeps working alongside it.
@@ -5207,4 +5971,292 @@ mod bulk_message_tests {
         assert!(!some.is_empty());
         assert!(!some.is_explicitly_empty());
     }
+}
+
+/// What every peer of one device is made of.
+///
+/// A device's rows differ only in which interface they sit on: the key and the
+/// addresses are the same in all of them, because a device working everywhere
+/// on one identity is the product. Passing them once, rather than building each
+/// `Tunnel` at the call site, is what stops the copies drifting apart.
+#[derive(Clone, Debug, Default)]
+pub struct VpnPeerTemplate {
+    /// The account this allocation belongs to.
+    pub user_id: u64,
+    /// The interface name a route server sees, not the customer's label.
+    pub name: String,
+    /// The public half the client generated. LNVPS never holds the other.
+    pub peer_pubkey: Vec<u8>,
+    /// The one address, valid on every interface the service terminates.
+    pub address4: Option<String>,
+    pub address6: Option<String>,
+}
+
+#[cfg(test)]
+mod line_item_addon_tests {
+    use super::*;
+
+    fn li(id: u64, parent: Option<u64>) -> SubscriptionLineItem {
+        SubscriptionLineItem {
+            id,
+            subscription_id: 1,
+            subscription_type: LineItemType::Vps,
+            name: String::new(),
+            description: None,
+            amount: 0,
+            setup_amount: 0,
+            configuration: None,
+            deactivated_at: None,
+            parent_line_item_id: parent,
+        }
+    }
+
+    /// Add-ons of add-ons are found, independent lines are not, and a parent
+    /// cycle terminates.
+    #[test]
+    fn with_addons_walks_the_tree_once() {
+        let items = vec![
+            li(1, None),
+            li(2, Some(1)),
+            li(3, Some(2)),
+            li(4, None),
+            li(5, Some(4)),
+        ];
+        let mut got = SubscriptionLineItem::with_addons(&items, 1);
+        got.sort();
+        assert_eq!(got, vec![1, 2, 3]);
+        assert_eq!(SubscriptionLineItem::with_addons(&items, 4), vec![4, 5]);
+
+        let cycle = vec![li(1, Some(2)), li(2, Some(1))];
+        let mut got = SubscriptionLineItem::with_addons(&cycle, 1);
+        got.sort();
+        assert_eq!(got, vec![1, 2]);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum VmAddonKind {
+    Snapshot = 0,
+}
+
+impl Display for VmAddonKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VmAddonKind::Snapshot => write!(f, "snapshot"),
+        }
+    }
+}
+
+impl FromStr for VmAddonKind {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "snapshot" => Ok(VmAddonKind::Snapshot),
+            _ => Err(anyhow!("unknown VM add-on kind: {s}")),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize, Default)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum IpProviderKind {
+    #[default]
+    Ovh = 0,
+    Mock = u16::MAX,
+}
+
+impl Display for IpProviderKind {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IpProviderKind::Ovh => write!(f, "ovh"),
+            IpProviderKind::Mock => write!(f, "mock"),
+        }
+    }
+}
+
+#[derive(FromRow, Clone, Debug)]
+pub struct IpProvider {
+    pub id: u64,
+    pub name: String,
+    pub kind: IpProviderKind,
+    pub enabled: bool,
+    pub url: String,
+    pub token: EncryptedString,
+    pub subsidiary: String,
+    pub rir: String,
+    pub gateway: String,
+    pub access_policy_id: Option<u64>,
+    pub approval_required: bool,
+    pub monthly_spend_cap: u64,
+    pub currency: String,
+    pub enable_ranges_on_delivery: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize, Default)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum IpWhenNoIp {
+    #[default]
+    Reject = 0,
+    OrderAndWait = 1,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq, Default)]
+pub struct IpProviderRegion {
+    pub id: u64,
+    pub provider_id: u64,
+    pub region_id: u64,
+    pub country: Option<String>,
+    pub destination: Option<String>,
+    pub prefix_len: u16,
+    pub quantity: u32,
+    pub auto_threshold: Option<u64>,
+    pub enabled: bool,
+    pub when_no_ip: IpWhenNoIp,
+    pub sell_without_capacity: bool,
+    pub wait_refund_hours: u32,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq)]
+pub struct VmIpWait {
+    pub id: u64,
+    pub vm_id: u64,
+    pub region_id: u64,
+    pub ip4_needed: u16,
+    pub ip_order_id: Option<u64>,
+    pub released: bool,
+    pub created: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize, Default)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum IpOrderState {
+    #[default]
+    AwaitingApproval = 0,
+    Approved = 1,
+    Ordering = 2,
+    Ordered = 3,
+    Delivered = 4,
+    Failed = 5,
+    Rejected = 6,
+}
+
+impl IpOrderState {
+    pub fn is_in_flight(&self) -> bool {
+        matches!(
+            self,
+            IpOrderState::AwaitingApproval
+                | IpOrderState::Approved
+                | IpOrderState::Ordering
+                | IpOrderState::Ordered
+        )
+    }
+
+    pub fn is_spent(&self) -> bool {
+        matches!(
+            self,
+            IpOrderState::Ordering | IpOrderState::Ordered | IpOrderState::Delivered
+        )
+    }
+}
+
+impl Display for IpOrderState {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IpOrderState::AwaitingApproval => write!(f, "awaiting_approval"),
+            IpOrderState::Approved => write!(f, "approved"),
+            IpOrderState::Ordering => write!(f, "ordering"),
+            IpOrderState::Ordered => write!(f, "ordered"),
+            IpOrderState::Delivered => write!(f, "delivered"),
+            IpOrderState::Failed => write!(f, "failed"),
+            IpOrderState::Rejected => write!(f, "rejected"),
+        }
+    }
+}
+
+impl FromStr for IpOrderState {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "awaiting_approval" => Ok(IpOrderState::AwaitingApproval),
+            "approved" => Ok(IpOrderState::Approved),
+            "ordering" => Ok(IpOrderState::Ordering),
+            "ordered" => Ok(IpOrderState::Ordered),
+            "delivered" => Ok(IpOrderState::Delivered),
+            "failed" => Ok(IpOrderState::Failed),
+            "rejected" => Ok(IpOrderState::Rejected),
+            _ => Err(anyhow!("unknown ip order state: {}", s)),
+        }
+    }
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq, Default)]
+pub struct IpOrder {
+    pub id: u64,
+    pub provider: String,
+    pub region_id: u64,
+    pub idempotency_key: Option<String>,
+    pub country: Option<String>,
+    pub destination: Option<String>,
+    pub prefix_len: u16,
+    pub quantity: u32,
+    pub state: IpOrderState,
+    pub provider_order_id: Option<String>,
+    pub cost: u64,
+    pub currency: String,
+    pub auto: bool,
+    pub requested_by: Option<u64>,
+    pub approved_by: Option<u64>,
+    pub approved_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+    pub created: DateTime<Utc>,
+    pub ordered_at: Option<DateTime<Utc>>,
+    pub delivered_at: Option<DateTime<Utc>>,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq)]
+pub struct IpOrderRange {
+    pub id: u64,
+    pub ip_order_id: u64,
+    pub ip_range_id: u64,
+    pub cidr: String,
+    pub released_at: Option<DateTime<Utc>>,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq)]
+pub struct IpOrderAudit {
+    pub id: u64,
+    pub ip_order_id: u64,
+    pub event: String,
+    pub detail: Option<String>,
+    pub actor_user_id: Option<u64>,
+    pub created: DateTime<Utc>,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq)]
+pub struct VmAddonPrice {
+    pub id: u64,
+    pub region_id: u64,
+    pub kind: VmAddonKind,
+    pub currency: String,
+    pub monthly_amount: u64,
+    pub max_quantity: u32,
+    pub enabled: bool,
+    pub created: DateTime<Utc>,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq)]
+pub struct VmAddon {
+    pub id: u64,
+    pub vm_id: u64,
+    pub kind: VmAddonKind,
+    pub quantity: u32,
+    pub subscription_line_item_id: u64,
+    pub created: DateTime<Utc>,
 }

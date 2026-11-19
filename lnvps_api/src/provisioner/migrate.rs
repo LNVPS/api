@@ -299,7 +299,7 @@ impl VmProvisioner {
             &capacity,
         )?;
 
-        let source_client = get_host_client(&source_host, self.config())?;
+        let source_client = get_host_client(self.db(), &source_host, self.config()).await?;
         let was_running = matches!(
             source_client.get_vm_state(&vm).await.map(|s| s.state),
             Ok(VmRunningStates::Running)
@@ -339,7 +339,7 @@ impl VmProvisioner {
 
         // Start it again where it now lives; an online migration never stopped.
         if was_running && !live {
-            let target_client = get_host_client(&target_host, self.config())?;
+            let target_client = get_host_client(self.db(), &target_host, self.config()).await?;
             if let Err(e) = target_client.start_vm(&vm).await {
                 warn!(
                     "VM {} migrated to host {} but failed to start: {}",
@@ -389,7 +389,7 @@ impl VmProvisioner {
         let mut observed: HashMap<u64, Vec<HostVmSpec>> = HashMap::new();
         let mut unreachable = 0;
         for host in &hosts {
-            let client = match get_host_client(host, self.config()) {
+            let client = match get_host_client(self.db(), host, self.config()).await {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("Skipping host {} in placement check: {}", host.id, e);
@@ -664,6 +664,12 @@ mod tests {
     use super::*;
     use lnvps_api_common::{DiskCapacity, GB, LoadFactors};
     use lnvps_db::{CpuArch, DiskType, VmHostKind};
+
+    static DUMMY_HOST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+        DUMMY_HOST_LOCK.lock().await
+    }
 
     fn host(id: u64, region: u64, enabled: bool) -> VmHost {
         VmHost {
@@ -1062,6 +1068,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_migrate_vm_updates_placement_after_the_host_agrees() {
+        let _serial = serial().await;
         let db = Arc::new(MockDb::default());
         add_second_host(&db).await;
         let vm_id = add_vm(&db).await;
@@ -1099,6 +1106,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_migrate_vm_rejects_unknown_or_unfit_target() {
+        let _serial = serial().await;
         let db = Arc::new(MockDb::default());
         let vm_id = add_vm(&db).await;
         let provisioner = VmProvisioner::new(mock_settings(), db.clone());
@@ -1117,6 +1125,7 @@ mod tests {
     /// the hypervisor, leaving `vm.host_id` pointing at the host it left.
     #[tokio::test]
     async fn test_reconcile_moves_database_to_match_the_hosts() {
+        let _serial = serial().await;
         let db = Arc::new(MockDb::default());
         add_second_host(&db).await;
         let vm_id = add_vm(&db).await;
@@ -1151,6 +1160,7 @@ mod tests {
     /// when every host answered and none of them had it.
     #[tokio::test]
     async fn test_locate_vm_reconciles_instead_of_reporting_it_missing() {
+        let _serial = serial().await;
         let db = Arc::new(MockDb::default());
         add_second_host(&db).await;
         let vm_id = add_vm(&db).await;
@@ -1195,6 +1205,7 @@ mod tests {
     /// that pool, and keeps its price, which comes from its template.
     #[tokio::test]
     async fn test_reconcile_maps_the_reported_pool_regardless_of_its_class() {
+        let _serial = serial().await;
         let db = Arc::new(MockDb::default());
         add_second_host(&db).await;
         let vm_id = add_vm(&db).await;
@@ -1230,6 +1241,7 @@ mod tests {
     /// reinstall's import at a name that may not exist on the node.
     #[tokio::test]
     async fn test_reconcile_never_guesses_an_unrecognised_pool() {
+        let _serial = serial().await;
         let db = Arc::new(MockDb::default());
         add_second_host(&db).await;
         let vm_id = add_vm(&db).await;
@@ -1259,6 +1271,7 @@ mod tests {
     /// the space to a pool that no longer held the disk.
     #[tokio::test]
     async fn test_reconcile_follows_a_disk_moved_between_pools_on_one_host() {
+        let _serial = serial().await;
         let db = Arc::new(MockDb::default());
         // A second pool on the same host, which is where the disk was moved to.
         db.host_disks.lock().await.insert(
@@ -1317,6 +1330,7 @@ mod tests {
     /// every pass forever.
     #[tokio::test]
     async fn test_reconcile_ignores_a_disk_move_to_an_unrecorded_pool() {
+        let _serial = serial().await;
         let db = Arc::new(MockDb::default());
         let vm_id = add_vm(&db).await;
 
@@ -1342,6 +1356,7 @@ mod tests {
     /// match, and every "has this been provisioned?" check answers no.
     #[tokio::test]
     async fn test_reconcile_restores_a_wiped_mac_from_the_host() {
+        let _serial = serial().await;
         let db = Arc::new(MockDb::default());
         let vm_id = add_vm(&db).await;
 
@@ -1378,6 +1393,7 @@ mod tests {
     /// capacity keeps being charged to the pool that no longer holds the data.
     #[tokio::test]
     async fn test_reconcile_follows_a_disk_moved_onto_a_disabled_pool() {
+        let _serial = serial().await;
         let db = Arc::new(MockDb::default());
         db.host_disks.lock().await.insert(
             3,
@@ -1414,6 +1430,7 @@ mod tests {
     /// leaves `host_id` stale, which every lifecycle operation is aimed at.
     #[tokio::test]
     async fn test_reconcile_observes_disabled_hosts_and_disabled_regions() {
+        let _serial = serial().await;
         let db = Arc::new(MockDb::default());
         add_second_host(&db).await;
         db.hosts.lock().await.get_mut(&2).expect("host 2").enabled = false;

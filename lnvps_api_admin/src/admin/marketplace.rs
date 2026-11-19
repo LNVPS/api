@@ -733,6 +733,7 @@ mod tests {
             vm_state_cache: VmStateCache::new(),
             exchange: Arc::new(MockExchangeRate::default()),
             vat: VatClient::new(),
+            chain: None,
         }
     }
 
@@ -830,6 +831,8 @@ mod tests {
                     amount: 0,
                     setup_amount: 5000,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await

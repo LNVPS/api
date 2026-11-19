@@ -330,6 +330,79 @@ async fn full_vm_lifecycle_on_real_qemu() -> Result<()> {
 
 #[tokio::test]
 #[ignore]
+async fn snapshots_survive_a_full_cycle_on_real_qemu() -> Result<()> {
+    let host = host()?;
+    let info = vm_info(next_vm_id());
+    seed_os_image(&host, &info).await?;
+    cleanup(&host, &info).await;
+    host.create_vm(&info)
+        .await
+        .map_err(|e| anyhow!("{:?}", e))?;
+    let err = |e| anyhow!("{:?}", e);
+
+    assert!(host.list_snapshots(&info.vm).await.map_err(err)?.is_empty());
+
+    host.create_snapshot(&info.vm, "first", Some("before <the> change & more"))
+        .await
+        .map_err(err)?;
+    assert_eq!(
+        host.get_vm_state(&info.vm).await.map_err(err)?.state,
+        VmRunningStates::Running,
+        "a running VM must be running again after the snapshot"
+    );
+    host.create_snapshot(&info.vm, "second", None)
+        .await
+        .map_err(err)?;
+
+    let listed = host.list_snapshots(&info.vm).await.map_err(err)?;
+    assert_eq!(
+        listed.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+        ["first", "second"]
+    );
+    assert_eq!(
+        listed[0].description.as_deref(),
+        Some("before <the> change & more")
+    );
+    assert!(listed[0].created.is_some());
+
+    assert!(
+        host.create_snapshot(&info.vm, "first", None).await.is_err(),
+        "a name cannot be reused"
+    );
+
+    host.rollback_snapshot(&info.vm, "first")
+        .await
+        .map_err(err)?;
+    assert_eq!(
+        host.get_vm_state(&info.vm).await.map_err(err)?.state,
+        VmRunningStates::Stopped
+    );
+    assert!(
+        host.rollback_snapshot(&info.vm, "nope").await.is_err(),
+        "rolling back to nothing must fail"
+    );
+
+    host.configure_vm(&info).await.map_err(err)?;
+    host.start_vm(&info.vm).await.map_err(err)?;
+    assert_eq!(
+        host.get_vm_state(&info.vm).await.map_err(err)?.state,
+        VmRunningStates::Running,
+        "a restored VM must boot with the configuration reapplied"
+    );
+    assert_eq!(host.list_snapshots(&info.vm).await.map_err(err)?.len(), 2);
+
+    host.delete_snapshot(&info.vm, "first").await.map_err(err)?;
+    host.delete_snapshot(&info.vm, "first").await.map_err(err)?;
+    let listed = host.list_snapshots(&info.vm).await.map_err(err)?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "second");
+
+    host.delete_vm(&info.vm).await.map_err(err)?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
 async fn disk_is_cloned_at_the_requested_size() -> Result<()> {
     let host = host()?;
     let mut info = vm_info(next_vm_id());
@@ -846,6 +919,43 @@ async fn configure_vm_updates_running_domain() -> Result<()> {
             .map_err(|e| anyhow!("{:?}", e))?
             .state,
         VmRunningStates::Running
+    );
+
+    cleanup(&host, &info).await;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore]
+async fn configure_vm_throttles_the_running_interface() -> Result<()> {
+    let host = host()?;
+    let mut info = vm_info(next_vm_id());
+    seed_os_image(&host, &info).await?;
+    cleanup(&host, &info).await;
+
+    host.create_vm(&info)
+        .await
+        .map_err(|e| anyhow!("{:?}", e))?;
+    assert!(!live_xml(&host, info.vm.id).await?.contains("<bandwidth>"));
+
+    info.transfer_throttled = true;
+    host.configure_vm(&info)
+        .await
+        .map_err(|e| anyhow!("{:?}", e))?;
+    let xml = live_xml(&host, info.vm.id).await?;
+    assert!(
+        xml.contains("<inbound average='1250'/>") && xml.contains("<outbound average='1250'/>"),
+        "running interface not throttled:\n{xml}"
+    );
+
+    info.transfer_throttled = false;
+    host.configure_vm(&info)
+        .await
+        .map_err(|e| anyhow!("{:?}", e))?;
+    let xml = live_xml(&host, info.vm.id).await?;
+    assert!(
+        !xml.contains("<bandwidth>"),
+        "running interface still throttled:\n{xml}"
     );
 
     cleanup(&host, &info).await;

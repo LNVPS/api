@@ -31,8 +31,9 @@ use anyhow::{Context, Result, bail};
 use lnvps_api_common::host::config::ProvisionerConfig;
 use lnvps_api_common::host::{FullVmInfo, get_host_client};
 use lnvps_db::{
-    DiskInterface, DiskType, IpRange, LNVpsDb, MarketplaceNode, MarketplaceNodeHealth, UserSshKey,
-    Vm, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate,
+    CpuArch, DiskInterface, DiskType, IpRange, LNVpsDb, MarketplaceNode, MarketplaceNodeHealth,
+    OsDistribution, TunnelPool, UserSshKey, Vm, VmHost, VmHostDisk, VmIpAssignment, VmOsImage,
+    VmTemplate,
 };
 
 use super::{probe_address, probe_mac};
@@ -72,12 +73,19 @@ impl ProbeResult {
         self.failure.is_none()
     }
 
+    /// The failure text as stored: cut to what its column holds.
+    fn failure_text(&self) -> Option<String> {
+        self.failure
+            .as_deref()
+            .map(|f| truncate(f, MAX_FAILURE_LEN))
+    }
+
     /// The row this becomes, with the shape it was measured at.
     pub fn into_health(self, node_id: u64, spec: &ProbeSpec) -> MarketplaceNodeHealth {
         MarketplaceNodeHealth {
             node_id,
             passed: self.passed(),
-            failure: self.failure,
+            failure: self.failure_text(),
             provision_ms: self.provision_ms,
             memory_mb: self.memory_mb,
             disk_write_mb: self.disk_write_mb,
@@ -85,10 +93,35 @@ impl ProbeResult {
             cpu: spec.template.cpu,
             memory_bytes: spec.template.memory,
             disk_bytes: spec.template.disk_size,
-            image: spec.image.url.clone(),
+            image: truncate(&spec.image.url, MAX_IMAGE_LEN),
             ..Default::default()
         }
     }
+}
+
+/// The longest failure text stored. The column is `TEXT` (65535 bytes) and a
+/// node or guest controls this string: over the cap a strict-mode MySQL rejects
+/// the whole row, so the probe that failed is the one whose result is lost.
+const MAX_FAILURE_LEN: usize = 1024;
+
+/// The longest image URL stored (`image VARCHAR(255)`).
+const MAX_IMAGE_LEN: usize = 255;
+
+/// Cut node- or guest-controlled text to what its column can hold.
+///
+/// A rejected row is not a cosmetic loss: a node with no health row has no
+/// cooldown, so it is re-probed on the next sweep and builds another VM each
+/// time.
+fn truncate(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+    // Cut on a char boundary, or the string stops being UTF-8.
+    let mut end = max;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_string()
 }
 
 /// Everything needed to build one probe VM, held in memory only.
@@ -113,6 +146,11 @@ pub struct ProbeSpec {
     /// after it. A long-lived key that opened a shell on every operator's
     /// hardware would be the most valuable secret LNVPS holds.
     pub ssh_public_key: String,
+    /// The storage pool the probe's disk is built in: the node's own registered
+    /// pool name, not a constant. A node whose disk is registered under another
+    /// name would otherwise fail the probe, or measure a pool no customer is
+    /// placed on.
+    pub disk_name: String,
 }
 
 impl ProbeSpec {
@@ -136,17 +174,14 @@ impl ProbeSpec {
             .get_tunnel(node)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Node {} has no tunnel", node.id))?;
-        let address = probe_address(&tunnel.tunnel)
-            .ok_or_else(|| anyhow::anyhow!("Node {} has no IPv6 address to probe on", node.id))?;
-        // The node's own probe gateway, which it answers for on the bridge —
-        // not the route server's address, which the node also holds and would
-        // therefore swallow every reply to.
-        let gateway = super::probe_gateway(&tunnel.tunnel)
-            .and_then(|g| g.split('/').next().map(str::to_string))
-            .ok_or_else(|| anyhow::anyhow!("Node {} has no IPv6 gateway", node.id))?;
-        // Its own address as the range, so the guest's prefix covers nothing
-        // but itself.
-        let range_cidr = address.clone();
+        let address = probe_address(&tunnel.tunnel, &tunnel.pool)
+            .ok_or_else(|| anyhow::anyhow!("Node {} has no IPv4 address to probe on", node.id))?;
+        let range = super::probe_range(&tunnel.pool)
+            .ok_or_else(|| anyhow::anyhow!("Node {}'s pool is too small to probe", node.id))?;
+        let gateway = super::probe_gateway(&tunnel.pool)
+            .ok_or_else(|| anyhow::anyhow!("Node {}'s pool is too small to probe", node.id))?
+            .to_string();
+        let range_cidr = range.to_string();
 
         let mut templates: Vec<VmTemplate> = db
             .list_vm_templates()
@@ -161,14 +196,40 @@ impl ProbeSpec {
         let Some(template) = templates.into_iter().next() else {
             bail!("Region {} has no template to probe with", host.region_id);
         };
+        let template = VmTemplate {
+            disk_iops_read: None,
+            disk_iops_write: None,
+            disk_mbps_read: None,
+            disk_mbps_write: None,
+            network_mbps: None,
+            cpu_limit: None,
+            ..template
+        };
 
+        let wanted_arch = match template.cpu_arch {
+            CpuArch::Unknown => host.cpu_arch,
+            arch => arch,
+        };
         let image = db
             .list_os_image()
             .await?
             .into_iter()
-            .filter(|i| i.enabled && i.cpu_arch == template.cpu_arch)
-            .max_by_key(|i| i.release_date)
-            .ok_or_else(|| anyhow::anyhow!("No enabled OS image to probe with"))?;
+            .filter(|i| i.enabled && (wanted_arch == CpuArch::Unknown || i.cpu_arch == wanted_arch))
+            .max_by_key(|i| (i.distribution == OsDistribution::Alpine, i.release_date))
+            .ok_or_else(|| {
+                anyhow::anyhow!("No enabled OS image to probe with for {wanted_arch}")
+            })?;
+
+        // The pool the node's own libvirt was configured with. Hardcoding a name
+        // here would make the probe either fail or measure a disk customers are
+        // never placed on.
+        let disk_name = db
+            .list_host_disks(host.id)
+            .await?
+            .into_iter()
+            .next()
+            .map(|d| d.name)
+            .unwrap_or_else(|| "default".to_string());
 
         Ok(Self {
             node_id: node.id,
@@ -179,6 +240,7 @@ impl ProbeSpec {
             gateway,
             range_cidr,
             ssh_public_key,
+            disk_name,
         })
     }
 
@@ -211,7 +273,7 @@ impl ProbeSpec {
                 host_id: self.host.id,
                 // The pool the node's libvirt was configured with. A probe that
                 // wrote somewhere else would measure a disk no customer gets.
-                name: "default".to_string(),
+                name: self.disk_name.clone(),
                 size: self.template.disk_size,
                 kind: DiskType::SSD,
                 interface: DiskInterface::PCIe,
@@ -249,6 +311,7 @@ impl ProbeSpec {
             // probe that installed extra rules would be measuring a machine
             // configured unlike the one customers get.
             firewall_rules: vec![],
+            transfer_throttled: false,
         }
     }
 }
@@ -334,7 +397,7 @@ where
     Fut: std::future::Future<Output = Result<ProbeResult>>,
 {
     let _ = db;
-    let client = match get_host_client(&spec.host, cfg) {
+    let client = match get_host_client(db, &spec.host, cfg).await {
         Ok(c) => c,
         Err(e) => return ProbeResult::failed(format!("cannot reach the node: {e}")),
     };
@@ -386,7 +449,7 @@ where
 }
 
 impl ProbeResult {
-    pub(super) fn failed(why: String) -> Self {
+    pub fn failed(why: String) -> Self {
         Self {
             failure: Some(why),
             ..Default::default()
@@ -415,6 +478,26 @@ pub async fn record(
 /// Written down anyway, because the alternative was writing nothing, and a node
 /// with no rows is indistinguishable from a node nobody probed. It is also what
 /// starts the cooldown that stops this node monopolising every sweep.
+pub fn underlay_shortfall(pool: &TunnelPool, measured: Option<u32>) -> Option<String> {
+    let overhead = match pool.listen_addr.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => 60,
+        _ => 80,
+    };
+    let needed = u32::from(pool.mtu) + overhead;
+    match measured {
+        None => Some(format!(
+            "the node could not measure its path to {}; a {}-byte tunnel needs {needed} bytes \
+             unfragmented",
+            pool.listen_addr, pool.mtu
+        )),
+        Some(mtu) if mtu < needed => Some(format!(
+            "the node's path to {} carries {mtu} bytes; a {}-byte tunnel needs {needed}",
+            pool.listen_addr, pool.mtu
+        )),
+        Some(_) => None,
+    }
+}
+
 pub async fn record_unspecified(
     db: &Arc<dyn LNVpsDb>,
     node_id: u64,
@@ -423,7 +506,7 @@ pub async fn record_unspecified(
     db.insert_marketplace_node_health(&MarketplaceNodeHealth {
         node_id,
         passed: result.passed(),
-        failure: result.failure,
+        failure: result.failure_text(),
         ..Default::default()
     })
     .await

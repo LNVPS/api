@@ -41,23 +41,51 @@ pub trait WorkCommander: Send + Sync {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum SnapshotAction {
+    Create {
+        name: String,
+        description: Option<String>,
+    },
+    Restore {
+        name: String,
+    },
+    Delete {
+        name: String,
+    },
+}
+
+impl SnapshotAction {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Create { name, .. } | Self::Restore { name } | Self::Delete { name } => name,
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum WorkJob {
     /// Sync resources from hosts to database
     PatchHosts,
     /// Sync resources (cpu/memory/disks) from a single host to the database
-    PatchHost { host_id: u64 },
+    PatchHost {
+        host_id: u64,
+    },
     /// Check all running VMS
     CheckVms,
     /// Check the VM status matches database state
     ///
     /// This job starts a vm if stopped and also creates the vm if it doesn't exist yet
-    CheckVm { vm_id: u64 },
+    CheckVm {
+        vm_id: u64,
+    },
     /// Unconditionally provision and spawn a VM onto the host.
     ///
     /// Used after a first (Purchase) payment is confirmed so the VM is created
     /// immediately without relying on `get_vm_state` to detect its absence.
-    SpawnVm { vm_id: u64 },
+    SpawnVm {
+        vm_id: u64,
+    },
     /// Send a notification to the users chosen contact preferences
     SendNotification {
         user_id: u64,
@@ -90,6 +118,11 @@ pub enum WorkJob {
         /// purged regardless of this flag.
         #[serde(default)]
         purge: bool,
+        /// The VM's owner asked for this (`DELETE /api/v1/vm/{id}`), not an
+        /// admin. Changes who the history and notifications credit, and for an
+        /// hourly subscription returns the unused time to account credit.
+        #[serde(default)]
+        by_owner: bool,
     },
     /// Start a VM
     StartVm {
@@ -104,14 +137,19 @@ pub enum WorkJob {
     /// Check all nostr domains DNS records - enable disabled domains with DNS records, disable active domains without DNS records
     CheckNostrDomains,
     /// Process VM upgrade after payment confirmation
-    ProcessVmUpgrade { vm_id: u64, config: UpgradeConfig },
+    ProcessVmUpgrade {
+        vm_id: u64,
+        config: UpgradeConfig,
+    },
     /// Re-configure a VM using current database configuration
     ConfigureVm {
         vm_id: u64,
         admin_user_id: Option<u64>,
     },
     /// Re-apply the firewall ruleset for a VM (after firewall rule changes)
-    ApplyVmFirewall { vm_id: u64 },
+    ApplyVmFirewall {
+        vm_id: u64,
+    },
     /// Assign an IP to a VM using the provisioner (handles all additional steps)
     AssignVmIp {
         vm_id: u64,
@@ -188,6 +226,12 @@ pub enum WorkJob {
         /// Temporary channel id the worker replies on (via job feedback).
         reply_channel: String,
     },
+    VmSnapshot {
+        vm_id: u64,
+        user_id: Option<u64>,
+        action: SnapshotAction,
+        reply_channel: String,
+    },
     /// Create a VM for a specific user (admin action)
     CreateVm {
         user_id: u64,
@@ -197,6 +241,8 @@ pub enum WorkJob {
         ref_code: Option<String>,
         admin_user_id: u64,
         reason: Option<String>,
+        #[serde(default)]
+        host_id: Option<u64>,
     },
     /// Create a VM from a custom spec for a specific user (admin action).
     CreateCustomVm {
@@ -209,14 +255,34 @@ pub enum WorkJob {
         reason: Option<String>,
     },
     /// Send an email verification link to the user
-    SendEmailVerification { user_id: u64, verify_url: String },
+    SendEmailVerification {
+        user_id: u64,
+        verify_url: String,
+    },
     /// Download OS images to all hosts, verifying checksums and re-downloading if stale.
     /// If `image_id` is Some, only that image is processed; otherwise all images are checked.
-    DownloadOsImages { image_id: Option<u64> },
+    DownloadOsImages {
+        image_id: Option<u64>,
+    },
+    RefreshOsImageChecksums,
     /// Check all active subscriptions for expiry, auto-renewal, and deactivation.
     CheckSubscriptions,
     /// Process automated referral commission payouts (BTC, over Lightning).
     ProcessReferralPayouts,
+    /// Delete swap order client records and closed abuse cases past their retention period.
+    PurgeExpiredRecords,
+    /// Send a customer a notice about an abuse decision, by email and their contact preferences.
+    SendAbuseReporterEmail {
+        to: String,
+        subject: String,
+        message: String,
+    },
+    SendAbuseNotice {
+        user_id: u64,
+        subject: String,
+        message: String,
+        action_id: Option<u64>,
+    },
     /// Poll routers to refresh cached tunnel/BGP session/route state and record
     /// per-tunnel traffic samples.
     SyncRouterState,
@@ -237,9 +303,14 @@ pub enum WorkJob {
     },
     /// Install or replace the static default route on a router (admin action).
     /// The address family is inferred from `next_hop`.
-    SetRouterDefaultRoute { router_id: u64, next_hop: String },
+    SetRouterDefaultRoute {
+        router_id: u64,
+        next_hop: String,
+    },
     /// Remove the static default route(s) from a router (admin action).
-    ClearRouterDefaultRoute { router_id: u64 },
+    ClearRouterDefaultRoute {
+        router_id: u64,
+    },
     /// Enable or disable a tunnel on a router (admin action).
     ToggleTunnel {
         router_id: u64,
@@ -254,13 +325,18 @@ pub enum WorkJob {
     ///
     /// LNVPS owns the interface's key material, so this is a push, not a
     /// reconcile against whatever happens to be configured.
-    SyncTunnelPool { pool_id: u64 },
+    SyncTunnelPool {
+        pool_id: u64,
+    },
     /// Remove a tunnel interface from a router.
     ///
     /// Carries the router and interface rather than a pool id because it runs
     /// *after* the pool row is gone — the alternative is deleting the row and
     /// leaving a configured interface behind with no record that it exists.
-    RemoveTunnelInterface { router_id: u64, interface: String },
+    RemoveTunnelInterface {
+        router_id: u64,
+        interface: String,
+    },
     /// Reconcile the peers, addresses and routes on a tunnel pool's interface
     /// against the tunnels allocated from it.
     ///
@@ -268,18 +344,33 @@ pub enum WorkJob {
     /// re-applies the interface itself, which on Linux means recreating it and
     /// dropping every peer. This one touches only what has actually drifted,
     /// which is what makes it safe to run on a schedule.
-    ReconcileTunnelPeers { pool_id: u64 },
+    ReconcileTunnelPeers {
+        pool_id: u64,
+    },
     /// Push one node's peer onto its route server.
     ///
     /// The fast path for "this node just got an address": a full reconcile of
     /// the pool would work, but a node waiting on its first guest should not
     /// wait for every other node on the route server to be checked first.
-    SyncNodeTunnel { tunnel_id: u64 },
+    SyncNodeTunnel {
+        tunnel_id: u64,
+    },
     /// Re-apply forward + reverse DNS records for every IP assignment in a range.
     ///
     /// Used after changing a range's DNS server configuration (e.g. switching
     /// reverse DNS to OVH) to reconcile existing assignments to the current config.
     PatchIpRangeDns {
+        ip_range_id: u64,
+        admin_user_id: Option<u64>,
+    },
+    /// Advance one on-demand IP order: review, place, or poll it, depending on its state.
+    ProcessIpOrder {
+        order_id: u64,
+    },
+    /// Poll in-flight IP orders and run the automatic top-up check.
+    CheckIpOrders,
+    /// Terminate a bought IP range with its provider. Refused while it has allocated IPs.
+    ReleaseIpRange {
         ip_range_id: u64,
         admin_user_id: Option<u64>,
     },
@@ -290,7 +381,9 @@ pub enum WorkJob {
     /// the payment path, and consumed by the operator serving that cluster. The
     /// periodic reconcile stays as the backstop: a dropped trigger must be a
     /// delay, not a deployment that never happens.
-    ReconcileAppDeployment { deployment_id: u64 },
+    ReconcileAppDeployment {
+        deployment_id: u64,
+    },
     /// Run the on-payment handling for a subscription payment that has already
     /// been marked paid.
     ///
@@ -324,12 +417,14 @@ impl WorkJob {
             Self::CheckVm { .. } => true,
             Self::CheckVms => true,
             Self::CheckSubscriptions => true,
+            Self::PurgeExpiredRecords => true,
             // A discovery request is a one-shot read tied to a waiting admin
             // request; never retry it if it fails.
             Self::ListUnmanagedVms { .. } => true,
             // A reinstall is a one-shot action tied to a waiting user request;
             // don't let the worker silently retry it later.
             Self::ReinstallVm { .. } => true,
+            Self::VmSnapshot { .. } => true,
             // The periodic reconcile is the backstop, so a failed trigger costs
             // at most one interval — not worth retrying and blocking the stream.
             Self::ReconcileAppDeployment { .. } => true,
@@ -374,6 +469,7 @@ impl fmt::Display for WorkJob {
             WorkJob::ProcessVmRefund { .. } => write!(f, "ProcessVmRefund"),
             WorkJob::ListUnmanagedVms { .. } => write!(f, "ListUnmanagedVms"),
             WorkJob::ReinstallVm { .. } => write!(f, "ReinstallVm"),
+            WorkJob::VmSnapshot { .. } => write!(f, "VmSnapshot"),
             WorkJob::ImportVm { .. } => write!(f, "ImportVm"),
             WorkJob::MigrateVm { .. } => write!(f, "MigrateVm"),
             WorkJob::ReconcileVmHosts => write!(f, "ReconcileVmHosts"),
@@ -381,8 +477,12 @@ impl fmt::Display for WorkJob {
             WorkJob::CreateCustomVm { .. } => write!(f, "CreateCustomVm"),
             WorkJob::SendEmailVerification { .. } => write!(f, "SendEmailVerification"),
             WorkJob::DownloadOsImages { .. } => write!(f, "DownloadOsImages"),
+            WorkJob::RefreshOsImageChecksums => write!(f, "RefreshOsImageChecksums"),
             WorkJob::CheckSubscriptions => write!(f, "CheckSubscriptions"),
             WorkJob::ProcessReferralPayouts => write!(f, "ProcessReferralPayouts"),
+            WorkJob::PurgeExpiredRecords => write!(f, "PurgeExpiredRecords"),
+            WorkJob::SendAbuseNotice { .. } => write!(f, "SendAbuseNotice"),
+            WorkJob::SendAbuseReporterEmail { .. } => write!(f, "SendAbuseReporterEmail"),
             WorkJob::SpawnVm { .. } => write!(f, "SpawnVm"),
             WorkJob::SyncRouterState => write!(f, "SyncRouterState"),
             WorkJob::ProbeMarketplaceNode => write!(f, "ProbeMarketplaceNode"),
@@ -395,6 +495,9 @@ impl fmt::Display for WorkJob {
             WorkJob::ReconcileTunnelPeers { .. } => write!(f, "ReconcileTunnelPeers"),
             WorkJob::SyncNodeTunnel { .. } => write!(f, "SyncNodeTunnel"),
             WorkJob::PatchIpRangeDns { .. } => write!(f, "PatchIpRangeDns"),
+            WorkJob::ProcessIpOrder { .. } => write!(f, "ProcessIpOrder"),
+            WorkJob::CheckIpOrders => write!(f, "CheckIpOrders"),
+            WorkJob::ReleaseIpRange { .. } => write!(f, "ReleaseIpRange"),
         }
     }
 }
@@ -402,6 +505,15 @@ impl fmt::Display for WorkJob {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_create_vm_job_queued_before_host_pinning_still_parses() {
+        let json = r#"{"CreateVm":{"user_id":1,"template_id":2,"image_id":3,"ssh_key_id":4,"ref_code":null,"admin_user_id":1,"reason":null}}"#;
+        match serde_json::from_str::<WorkJob>(json).unwrap() {
+            WorkJob::CreateVm { host_id, .. } => assert_eq!(host_id, None),
+            other => panic!("unexpected job: {other}"),
+        }
+    }
 
     #[test]
     fn test_patch_host_job_display_and_roundtrip() {
@@ -465,5 +577,35 @@ mod tests {
             WorkJob::SyncNodeTunnel { tunnel_id: 5 }.to_string(),
             "SyncNodeTunnel"
         );
+    }
+}
+
+#[cfg(test)]
+mod snapshot_action_tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_action_name() {
+        for (action, name) in [
+            (
+                SnapshotAction::Create {
+                    name: "c1".into(),
+                    description: None,
+                },
+                "c1",
+            ),
+            (SnapshotAction::Restore { name: "r1".into() }, "r1"),
+            (SnapshotAction::Delete { name: "d1".into() }, "d1"),
+        ] {
+            assert_eq!(action.name(), name);
+        }
+        let job = WorkJob::VmSnapshot {
+            vm_id: 1,
+            user_id: None,
+            action: SnapshotAction::Delete { name: "d1".into() },
+            reply_channel: "x".into(),
+        };
+        assert!(job.can_skip());
+        assert_eq!(job.to_string(), "VmSnapshot");
     }
 }

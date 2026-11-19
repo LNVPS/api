@@ -9,6 +9,7 @@ pub mod config;
 pub mod detect;
 pub mod gc;
 pub mod geoip;
+pub mod netdev;
 pub mod publish;
 pub mod runtime;
 pub mod upgrade;

@@ -32,36 +32,36 @@ use crate::host::cloud_init;
 use crate::host::config::LibVirtConfig;
 use crate::host::{
     FullVmInfo, HostVmSpec, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient,
-    VmHostDiskInfo, VmHostInfo,
+    VmHostDiskInfo, VmHostInfo, VmSnapshot,
 };
 use crate::retry::{OpError, OpResult};
 use crate::{KB, VmRunningState};
 use anyhow::{Context, Result, anyhow};
 use conn::LibVirtConn;
-use error::{is_not_found, map_virt_error};
+use error::{is_not_found, is_snapshot_not_found, map_virt_error};
 use lnvps_db::{Vm, VmOsImage};
 use log::{debug, info, warn};
 use rand::random;
-use stats::CpuSampler;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use virt::connect::Connect;
 use virt::domain::Domain;
 use virt::sys::{
-    VIR_CONNECT_LIST_STORAGE_POOLS_ACTIVE, VIR_DOMAIN_BLOCK_RESIZE_BYTES, VIR_DOMAIN_MEM_CONFIG,
-    VIR_DOMAIN_MEM_LIVE, VIR_DOMAIN_UNDEFINE_CHECKPOINTS_METADATA, VIR_DOMAIN_UNDEFINE_NVRAM,
-    VIR_DOMAIN_UNDEFINE_SNAPSHOTS_METADATA, VIR_DOMAIN_VCPU_CONFIG, VIR_DOMAIN_VCPU_LIVE,
+    VIR_CONNECT_LIST_STORAGE_POOLS_ACTIVE, VIR_DOMAIN_AFFECT_LIVE, VIR_DOMAIN_BLOCK_RESIZE_BYTES,
+    VIR_DOMAIN_MEM_CONFIG, VIR_DOMAIN_MEM_LIVE, VIR_DOMAIN_UNDEFINE_CHECKPOINTS_METADATA,
+    VIR_DOMAIN_UNDEFINE_NVRAM, VIR_DOMAIN_UNDEFINE_SNAPSHOTS_METADATA, VIR_DOMAIN_VCPU_CONFIG,
+    VIR_DOMAIN_VCPU_LIVE,
 };
 use xml::{
     PRIMARY_DISK_TARGET, VolumeFormat, build_domain, domain_name, os_image_volume,
-    parse_live_devices, primary_disk_volume, seed_volume, vm_id_from_domain_name,
+    parse_live_devices, parse_snapshot, primary_disk_volume, seed_volume, snapshot_xml,
+    vm_id_from_domain_name,
 };
 
 #[derive(Debug)]
 pub struct LibVirtHost {
     conn: LibVirtConn,
     cfg: LibVirtConfig,
-    cpu: CpuSampler,
 }
 
 impl LibVirtHost {
@@ -69,7 +69,6 @@ impl LibVirtHost {
         Ok(Self {
             conn: LibVirtConn::open(url)?,
             cfg,
-            cpu: CpuSampler::default(),
         })
     }
 
@@ -339,9 +338,122 @@ impl VmHostClient for LibVirtHost {
             .await
     }
 
+    async fn list_snapshots(&self, vm: &Vm) -> OpResult<Vec<VmSnapshot>> {
+        let vm_id = vm.id;
+        self.conn
+            .run(move |c| {
+                let domain = LibVirtHost::require_domain(c, vm_id)?;
+                let snapshots = domain
+                    .list_all_snapshots(0)
+                    .map_err(|e| map_virt_error("list_snapshots", e))?;
+                let mut out = Vec::with_capacity(snapshots.len());
+                for snapshot in snapshots {
+                    let xml = snapshot
+                        .xml_desc(0)
+                        .map_err(|e| map_virt_error("snapshot_xml_desc", e))?;
+                    out.push(parse_snapshot(&xml).map_err(OpError::Fatal)?);
+                }
+                out.sort_by_key(|s| s.created);
+                Ok(out)
+            })
+            .await
+    }
+
+    async fn create_snapshot(
+        &self,
+        vm: &Vm,
+        name: &str,
+        description: Option<&str>,
+    ) -> OpResult<()> {
+        let vm_id = vm.id;
+        let xml = snapshot_xml(name, description);
+        let was_running = self.is_active(vm_id).await?;
+        if was_running {
+            VmHostClient::stop_vm(self, vm).await?;
+        }
+        let created = self
+            .conn
+            .run(move |c| {
+                let domain = LibVirtHost::require_domain(c, vm_id)?;
+                domain
+                    .create_snapshot_xml(&xml, 0)
+                    .map_err(|e| map_virt_error("create_snapshot", e))?;
+                Ok(())
+            })
+            .await;
+        if was_running && let Err(e) = VmHostClient::start_vm(self, vm).await {
+            warn!("VM {} did not restart after snapshotting: {:?}", vm_id, e);
+            created?;
+            return Err(e);
+        }
+        created
+    }
+
+    async fn rollback_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+        let vm_id = vm.id;
+        let name = name.to_string();
+        if self.is_active(vm_id).await? {
+            VmHostClient::stop_vm(self, vm).await?;
+        }
+        self.conn
+            .run(move |c| {
+                let domain = LibVirtHost::require_domain(c, vm_id)?;
+                let snapshot = Domain::lookup_snapshot_by_name(&domain, &name, 0)
+                    .map_err(|e| map_virt_error("lookup_snapshot", e))?;
+                snapshot
+                    .revert(0)
+                    .map_err(|e| map_virt_error("revert_snapshot", e))?;
+                if domain.is_active().unwrap_or(false) {
+                    domain
+                        .destroy()
+                        .map_err(|e| map_virt_error("destroy_domain", e))?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    async fn delete_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+        let vm_id = vm.id;
+        let name = name.to_string();
+        self.conn
+            .run(move |c| {
+                let Some(domain) = LibVirtHost::lookup_domain(c, vm_id)? else {
+                    return Ok(());
+                };
+                let snapshot = match Domain::lookup_snapshot_by_name(&domain, &name, 0) {
+                    Ok(s) => s,
+                    Err(e) if is_snapshot_not_found(&e) => return Ok(()),
+                    Err(e) => return Err(map_virt_error("lookup_snapshot", e)),
+                };
+                snapshot
+                    .delete(0)
+                    .map_err(|e| map_virt_error("delete_snapshot", e))
+            })
+            .await
+    }
+
     async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()> {
         self.ensure_image_volume(image).await?;
         Ok(())
+    }
+
+    fn os_image_volume_name(&self, image: &VmOsImage) -> Option<String> {
+        Some(os_image_volume(
+            image.id,
+            VolumeFormat::from_url(&image.url),
+        ))
+    }
+
+    async fn refresh_image_pool(&self) -> OpResult<()> {
+        let pool_name = self.image_pool();
+        self.conn
+            .run(move |c| {
+                let pool = storage::find_pool(c, &pool_name)?;
+                pool.refresh(0)
+                    .map_err(|e| map_virt_error("refresh_storage_pool", e))
+            })
+            .await
     }
 
     async fn generate_mac(&self, _vm: &Vm) -> OpResult<String> {
@@ -578,7 +690,7 @@ impl VmHostClient for LibVirtHost {
         // domain was defined.
         self.delete_primary_disk(vm_id).await?;
         self.delete_volume_everywhere(seed_volume(vm_id)).await?;
-        self.cpu.forget(vm_id);
+        stats::CPU.forget(vm_id);
         info!("deleted domain {}", domain_name(vm_id));
         Ok(())
     }
@@ -658,47 +770,14 @@ impl VmHostClient for LibVirtHost {
 
     async fn get_vm_state(&self, vm: &Vm) -> OpResult<VmRunningState> {
         let vm_id = vm.id;
-        let sampler = &self.cpu;
-        let domain_state = self
+        let sample = self
             .conn
             .run(move |c| {
                 let domain = LibVirtHost::require_domain(c, vm_id)?;
-                let info = domain
-                    .info()
-                    .map_err(|e| map_virt_error("domain_info", e))?;
-                let xml = domain.xml_desc(0).ok();
-                let counters = xml
-                    .as_deref()
-                    .and_then(|x| parse_live_devices(x).ok())
-                    .map(|devices| {
-                        let mut net = (0u64, 0u64);
-                        let mut disk = (0u64, 0u64);
-                        for iface in &devices.interface_targets {
-                            if let Ok(s) = domain.interface_stats(iface) {
-                                net.0 += s.rx_bytes.max(0) as u64;
-                                net.1 += s.tx_bytes.max(0) as u64;
-                            }
-                        }
-                        for dev in &devices.disk_targets {
-                            if let Ok(s) = domain.block_stats(dev) {
-                                disk.0 += s.rd_bytes.max(0) as u64;
-                                disk.1 += s.wr_bytes.max(0) as u64;
-                            }
-                        }
-                        (net, disk)
-                    })
-                    .unwrap_or_default();
-                Ok((info, counters))
+                sample_domain(&domain)
             })
             .await?;
-
-        let (info, ((net_in, net_out), (disk_read, disk_write))) = domain_state;
-        let mut state = stats::state_from_info(&info, vm_id, sampler);
-        state.net_in = net_in;
-        state.net_out = net_out;
-        state.disk_read = disk_read;
-        state.disk_write = disk_write;
-        Ok(state)
+        Ok(sample.into_state(vm_id))
     }
 
     async fn get_all_vm_states(&self) -> OpResult<Vec<(u64, VmRunningState)>> {
@@ -716,8 +795,10 @@ impl VmHostClient for LibVirtHost {
                     let Some(vm_id) = vm_id_from_domain_name(&name) else {
                         continue;
                     };
-                    let Ok(info) = domain.info() else { continue };
-                    out.push((vm_id, info));
+                    let Ok(sample) = sample_domain(&domain) else {
+                        continue;
+                    };
+                    out.push((vm_id, sample));
                 }
                 Ok(out)
             })
@@ -725,7 +806,7 @@ impl VmHostClient for LibVirtHost {
 
         Ok(raw
             .into_iter()
-            .map(|(vm_id, info)| (vm_id, stats::state_from_info(&info, vm_id, &self.cpu)))
+            .map(|(vm_id, sample)| (vm_id, sample.into_state(vm_id)))
             .collect())
     }
 
@@ -736,7 +817,7 @@ impl VmHostClient for LibVirtHost {
         let disk_path = self.primary_disk_path(cfg).await?;
         // Regenerate the seed so key/IP changes reach the guest on next boot.
         let seed_path = self.write_seed(cfg).await?;
-        let domain_xml = build_domain(
+        let domain = build_domain(
             cfg,
             &self.cfg.qemu,
             self.cfg.secure_boot,
@@ -744,9 +825,9 @@ impl VmHostClient for LibVirtHost {
             Some(&seed_path),
             self.cfg.vlan_aware_bridge,
         )
-        .map_err(OpError::Fatal)?
-        .to_xml()
         .map_err(OpError::Fatal)?;
+        let domain_xml = domain.to_xml().map_err(OpError::Fatal)?;
+        let interface_xml = domain.interface_xml().map_err(OpError::Fatal)?;
 
         let vm_id = cfg.vm.id;
         let resources = cfg.resources().map_err(OpError::Fatal)?;
@@ -793,6 +874,11 @@ impl VmHostClient for LibVirtHost {
                         e.message()
                     );
                 }
+                if let Some(xml) = &interface_xml {
+                    domain
+                        .update_device_flags(xml, VIR_DOMAIN_AFFECT_LIVE)
+                        .map_err(|e| map_virt_error("update_interface", e))?;
+                }
                 Ok(())
             })
             .await
@@ -836,14 +922,65 @@ impl VmHostClient for LibVirtHost {
     ) -> OpResult<Vec<TimeSeriesData>> {
         // Unlike Proxmox, libvirt keeps no RRD history — historical series need
         // an external store (Prometheus) rather than a host query.
-        Err(OpError::Fatal(anyhow!(
-            "libvirt does not store historical resource usage"
-        )))
+        Ok(Vec::new())
     }
 
     async fn connect_terminal(&self, vm: &Vm) -> OpResult<TerminalStream> {
         console::connect(self.conn.handle()?, vm.id)
     }
+}
+
+struct DomainSample {
+    info: virt::domain::DomainInfo,
+    net: (u64, u64),
+    disk: (u64, u64),
+    memory: Vec<(u32, u64)>,
+}
+
+impl DomainSample {
+    fn into_state(self, vm_id: u64) -> VmRunningState {
+        let mut state = stats::state_from_info(&self.info, vm_id, &stats::CPU);
+        state.mem_usage = stats::memory_usage(&self.info, &self.memory);
+        state.net_in = self.net.0;
+        state.net_out = self.net.1;
+        state.disk_read = self.disk.0;
+        state.disk_write = self.disk.1;
+        state
+    }
+}
+
+fn sample_domain(domain: &virt::domain::Domain) -> OpResult<DomainSample> {
+    let info = domain
+        .info()
+        .map_err(|e| map_virt_error("domain_info", e))?;
+    let mut sample = DomainSample {
+        info,
+        net: (0, 0),
+        disk: (0, 0),
+        memory: domain
+            .memory_stats(0)
+            .map(|m| m.into_iter().map(|s| (s.tag, s.val)).collect())
+            .unwrap_or_default(),
+    };
+    let devices = domain
+        .xml_desc(0)
+        .ok()
+        .and_then(|x| parse_live_devices(&x).ok());
+    if let Some(devices) = devices {
+        for iface in &devices.interface_targets {
+            if let Ok(s) = domain.interface_stats(iface) {
+                sample.net.0 += s.rx_bytes.max(0) as u64;
+                sample.net.1 += s.tx_bytes.max(0) as u64;
+            }
+        }
+        for dev in &devices.disk_targets {
+            if let Ok(s) = domain.block_stats(dev) {
+                sample.disk.0 += s.rd_bytes.max(0) as u64;
+                sample.disk.1 += s.wr_bytes.max(0) as u64;
+            }
+        }
+    }
+    Ok(sample)
 }
 
 #[cfg(test)]
@@ -992,11 +1129,13 @@ mod tests {
         let host = host()?;
         let vm = vm_info().vm;
 
-        // Previously `todo!()` — a panic reachable from an HTTP handler.
-        assert!(matches!(
-            host.get_time_series_data(&vm, TimeSeries::Hourly).await,
-            Err(OpError::Fatal(_))
-        ));
+        // Previously `todo!()` — a panic reachable from an HTTP handler, then a
+        // fatal error the customer saw as a 500 on every graph.
+        assert!(
+            host.get_time_series_data(&vm, TimeSeries::Hourly)
+                .await?
+                .is_empty()
+        );
         assert!(matches!(
             host.connect_terminal(&vm).await,
             Err(OpError::Fatal(_))

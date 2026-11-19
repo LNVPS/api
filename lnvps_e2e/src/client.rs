@@ -60,6 +60,15 @@ impl TestClient {
         Ok(resp)
     }
 
+    pub async fn get_with_language(&self, path: &str, language: &str) -> anyhow::Result<Response> {
+        Ok(self
+            .http
+            .get(self.url(path))
+            .header("Accept-Language", language)
+            .send()
+            .await?)
+    }
+
     /// Make an unauthenticated POST request with JSON body.
     pub async fn post(&self, path: &str, body: &impl serde::Serialize) -> anyhow::Result<Response> {
         let url = self.url(path);
@@ -82,6 +91,20 @@ impl TestClient {
             .send()
             .await?;
         Ok(resp)
+    }
+
+    /// GET with a plain bearer token.
+    ///
+    /// For callers that are not users: a route server presents a static
+    /// `<router_id>.<secret>` rather than signing a NIP-98 event, because it is
+    /// a machine LNVPS provisioned rather than an account.
+    pub async fn get_with_bearer(&self, path: &str, token: &str) -> anyhow::Result<Response> {
+        Ok(self
+            .http
+            .get(self.url(path))
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await?)
     }
 
     /// Make an authenticated POST request with JSON body.

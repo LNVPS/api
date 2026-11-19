@@ -10,7 +10,7 @@ use futures::future::join_all;
 use isocountry::CountryCode;
 use lnurl::pay::PayResponse;
 use lnurl::{LnUrlResponse, Tag};
-use log::{error, info};
+use log::{error, info, warn};
 use nostr_sdk::{ToBech32, Url};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use serde::Serialize;
@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use lnvps_api_common::{
     ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate,
-    ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, TraderDetails, UpgradeConfig,
-    UserRateLimiter, VatClient, WorkJob,
+    ClientInfo, ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, SnapshotAction,
+    TraderDetails, UpgradeConfig, UserRateLimiter, VatClient, WorkJob, apply_custom_pricing_limits,
 };
 use lnvps_db::{
     CpuArch, LNVpsDb, PaymentMethod, Region, Vm, VmCustomPricing, VmCustomPricingDisk,
@@ -36,16 +36,19 @@ use crate::api::model::{
     ApiCompany, ApiCustomTemplateParams, ApiCustomVmOrder, ApiCustomVmPrice, ApiCustomVmRequest,
     ApiExchangeRates, ApiInvoiceItem, ApiPaymentInfo, ApiPaymentMethod, ApiRenewalQuote,
     ApiTemplatesResponse, ApiVmFirewallPolicy, ApiVmFirewallRule, ApiVmHistory, ApiVmPayment,
-    ApiVmStatus, ApiVmTraffic, ApiVmTrafficDay, ApiVmTrafficSummary, ApiVmUpgradeQuote,
-    ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule, CreateVmRequest,
-    PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule, PaymentMethodResponse,
-    VMPatchRequest, VmTrafficQuery, quota_period, resolve_traffic_range, validate_firewall_cidr,
-    validate_firewall_ports, vm_to_status,
+    ApiVmSnapshot, ApiVmStatus, ApiVmTraffic, ApiVmTrafficDay, ApiVmTrafficSummary,
+    ApiVmUpgradeQuote, ApiVmUpgradeRequest, CreateSshKey, CreateVmFirewallRule, CreateVmRequest,
+    CreateVmSnapshotRequest, PatchPaymentMethodRequest, PatchVmFirewallPolicy, PatchVmFirewallRule,
+    PaymentMethodResponse, VMPatchRequest, VmTrafficQuery, quota_period, resolve_traffic_range,
+    validate_firewall_cidr, validate_firewall_ports, vm_to_status,
 };
 use crate::api::{
     AmountQuery, AuthQuery, PaymentMethodQuery, RouterState, TicketRequest, TicketResponse,
 };
-use crate::host::{FullVmInfo, TimeSeries, TimeSeriesData, get_host_client};
+use crate::host::{
+    FullVmInfo, TimeSeries, TimeSeriesData, check_new_snapshot, get_host_client,
+    validate_snapshot_name,
+};
 use crate::provisioner::{HostCapacityService, PricingEngine};
 
 /// Attach the live-chat support agent websocket.
@@ -122,7 +125,10 @@ pub fn routes() -> Router<RouterState> {
                 get(v1_notification_channels),
             )
             .route("/api/v1/vm", get(v1_list_vms))
-            .route("/api/v1/vm/{id}", get(v1_get_vm).patch(v1_patch_vm))
+            .route(
+                "/api/v1/vm/{id}",
+                get(v1_get_vm).patch(v1_patch_vm).delete(v1_delete_vm),
+            )
             .route("/api/v1/image", get(v1_list_vm_images))
             .route("/api/v1/vm/templates", get(v1_list_vm_templates))
             .route("/api/v1/exchange-rate", get(v1_exchange_rate))
@@ -148,6 +154,18 @@ pub fn routes() -> Router<RouterState> {
             .route("/api/v1/vm/{id}/stop", patch(v1_stop_vm))
             .route("/api/v1/vm/{id}/restart", patch(v1_restart_vm))
             .route("/api/v1/vm/{id}/re-install", patch(v1_reinstall_vm))
+            .route(
+                "/api/v1/vm/{id}/snapshots",
+                get(v1_list_vm_snapshots).post(v1_create_vm_snapshot),
+            )
+            .route(
+                "/api/v1/vm/{id}/snapshots/{name}",
+                delete(v1_delete_vm_snapshot),
+            )
+            .route(
+                "/api/v1/vm/{id}/snapshots/{name}/restore",
+                patch(v1_restore_vm_snapshot),
+            )
             .route("/api/v1/vm/{id}/time-series", get(v1_time_series))
             .route(
                 "/api/v1/vm/{id}/console",
@@ -170,6 +188,10 @@ pub fn routes() -> Router<RouterState> {
             .route("/api/v1/vm/{id}/payments", get(v1_payment_history))
             .route("/api/v1/vm/{id}/history", get(v1_get_vm_history))
             .route("/api/v1/vm/{id}/traffic", get(v1_get_vm_traffic))
+            .route(
+                "/api/v1/vm/{id}/upgrade/options",
+                get(v1_vm_upgrade_options),
+            )
             .route("/api/v1/vm/{id}/upgrade/quote", post(v1_vm_upgrade_quote))
             .route("/api/v1/vm/{id}/upgrade", post(v1_vm_upgrade))
             .route(
@@ -1085,7 +1107,7 @@ async fn v1_patch_vm(
     if host_config {
         let info = FullVmInfo::load(vm.id, this.db.clone()).await?;
         let host = this.db.get_host(vm.host_id).await?;
-        let client = get_host_client(&host, &this.settings.provisioner)?;
+        let client = get_host_client(&this.db, &host, &this.settings.provisioner).await?;
         client.configure_vm(&info).await?;
 
         // Log VM configuration change
@@ -1272,16 +1294,17 @@ async fn v1_custom_template_calc(
     Json(req): Json<ApiCustomVmRequest>,
 ) -> ApiResult<ApiCustomVmPrice> {
     // create a fake template from the request to generate the price
-    let template: VmCustomTemplate = req.into();
+    let mut template: VmCustomTemplate = req.into();
+    let pricing = this.db.get_custom_pricing(template.pricing_id).await?;
+    apply_custom_pricing_limits(&mut template, &pricing);
 
     // Reject out-of-range specs so the order form surfaces the error early.
     PricingEngine::validate_custom_vm_spec(&this.db, &template).await?;
 
     let price = PricingEngine::get_custom_vm_cost_amount(&this.db, &template).await?;
-    let amount = CurrencyAmount::from_u64(price.currency, price.total());
     // Include conversions to the other supported currencies, like the template
     // listing's `other_price`.
-    ApiData::ok(ApiCustomVmPrice::from_amount(amount, &this.rates).await?)
+    ApiData::ok(ApiCustomVmPrice::from_price(&price, &this.rates).await?)
 }
 
 /// Create a new VM order
@@ -1462,6 +1485,18 @@ async fn v1_create_vm_order(
         )
         .await?;
 
+    if let Err(e) = ensure_hourly_order_funded(&this, &rsp).await {
+        // Nothing was paid and nothing provisioned on a host yet; remove the
+        // order outright rather than leave it for the never-paid sweep.
+        if let Err(pe) = this.db.hard_delete_vm(rsp.id).await {
+            warn!(
+                "Failed to purge unfunded hourly order VM {}: {}",
+                rsp.id, pe
+            );
+        }
+        return Err(e);
+    }
+
     // Log VM creation
     this.history
         .log_vm_created(&rsp, Some(uid), None)
@@ -1482,6 +1517,35 @@ async fn v1_create_vm_order(
     )
 }
 
+/// Refuse an order on an hourly plan the customer's credit cannot pay for.
+///
+/// Hourly subscriptions are paid from account credit only (see
+/// `ensure_credit_funded_if_hourly`), so an order credit cannot cover would
+/// only fail at payment. Checking here, with the same quote the payment will
+/// use, refuses it before the customer is handed a VM they cannot start.
+async fn ensure_hourly_order_funded(this: &RouterState, vm: &Vm) -> Result<(), ApiError> {
+    let sub = this
+        .db
+        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+        .await?;
+    if sub.interval_type != lnvps_db::IntervalType::Hour {
+        return Ok(());
+    }
+    if this
+        .sub_handler
+        .credit_covers_renewal(sub.id)
+        .await
+        .unwrap_or(false)
+    {
+        Ok(())
+    } else {
+        Err(ApiError::new(
+            "Hourly plans are paid from account credit. Top up your credit and turn on \
+             'apply credit automatically' so it covers at least the first hour.",
+        ))
+    }
+}
+
 /// Renew(Extend) a VM
 ///
 /// **Deprecated** — VM billing is a subscription like any other. Use
@@ -1494,6 +1558,7 @@ async fn v1_create_vm_order(
 /// a future release.
 async fn v1_renew_vm(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Query(q): Query<PaymentMethodQuery>,
@@ -1516,10 +1581,21 @@ async fn v1_renew_vm(
             q.code.clone(),
         )
         .await?;
+    crate::api::record_swap_client(
+        &this,
+        uid,
+        payment.payment_method,
+        &payment.id,
+        payment.external_data.as_str(),
+        &client,
+    )
+    .await;
 
     let discount = crate::api::discount_line(&this.db, &payment.id).await;
+    let credit = crate::api::credit_line(&this.db, &payment).await;
     let mut out = ApiVmPayment::from_subscription_payment(payment, id)?;
     out.discount = discount;
+    out.credit = credit;
     ApiData::ok(out)
 }
 
@@ -1597,6 +1673,32 @@ async fn v1_renew_vm_lnurlp(
         }
         .into());
     }
+    let invoice_err = |_| {
+        Json(lnurl::Response::Error {
+            reason: "Error generating invoice".to_string(),
+        })
+    };
+
+    // An hourly VM renews itself from account credit every hour, so a payment
+    // to its LNURL tops the owner's credit up instead of buying time directly
+    // (which the credit-only rule would refuse).
+    let hourly = this
+        .db
+        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+        .await
+        .is_ok_and(|s| s.interval_type == lnvps_db::IntervalType::Hour);
+    if hourly {
+        let pr = crate::api::credit::new_lightning_topup(
+            &this,
+            vm.user_id,
+            q.amount,
+            format!("LNVPS credit top-up for VM {}", id),
+        )
+        .await
+        .map_err(invoice_err)?;
+        return Ok(Json(LnUrlPayCallbackResponse::new(pr)));
+    }
+
     let rsp = this
         .sub_handler
         .renew_amount(
@@ -1605,11 +1707,7 @@ async fn v1_renew_vm_lnurlp(
             PaymentMethod::Lightning,
         )
         .await
-        .map_err(|_| {
-            Json(lnurl::Response::Error {
-                reason: "Error generating invoice".to_string(),
-            })
-        })?;
+        .map_err(invoice_err)?;
 
     // external_data is pr for lightning payment method
     Ok(Json(LnUrlPayCallbackResponse::new(
@@ -1653,7 +1751,7 @@ async fn v1_start_vm(
 ) -> ApiResult<()> {
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
     let host = this.db.get_host(vm.host_id).await?;
-    let client = get_host_client(&host, &this.settings.provisioner)?;
+    let client = get_host_client(&this.db, &host, &this.settings.provisioner).await?;
     client.start_vm(&vm).await?;
 
     // Log VM start
@@ -1673,7 +1771,7 @@ async fn v1_stop_vm(
 ) -> ApiResult<()> {
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
     let host = this.db.get_host(vm.host_id).await?;
-    let client = get_host_client(&host, &this.settings.provisioner)?;
+    let client = get_host_client(&this.db, &host, &this.settings.provisioner).await?;
     client.stop_vm(&vm).await?;
 
     // Log VM stop
@@ -1685,6 +1783,56 @@ async fn v1_stop_vm(
     ApiData::ok(())
 }
 
+/// Refuse an owner's deletion of a VM that has an open abuse case against it.
+///
+/// Deleting would destroy the evidence and the means of acting on the report
+/// (suspending, preserving, answering the reporter) before it is resolved.
+async fn ensure_vm_deletable_by_owner(db: &Arc<dyn LNVpsDb>, vm_id: u64) -> Result<(), ApiError> {
+    let (open_cases, _) = db
+        .list_abuse_cases(1, 0, None, Some(vm_id), Some(true))
+        .await?;
+    if open_cases.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::conflict(
+            "This VM is the subject of an open abuse case and cannot be deleted",
+        ))
+    }
+}
+
+/// Delete a VM the caller no longer needs.
+///
+/// Stops billing: the subscription is deactivated and auto-renewal turned off
+/// when the worker runs the deletion. For an hourly VM the time already paid
+/// for but unused is returned to the caller's account credit. Queued rather
+/// than done inline, because deleting touches the host, the network and the
+/// database, and the worker is the one path that does all of it.
+///
+/// A VM the owner cannot delete yet is refused rather than queued: one already
+/// deleted (404), or one that is the subject of an open abuse case, which must
+/// stay available until it is resolved.
+async fn v1_delete_vm(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<()> {
+    let (_uid, _vm) = get_user_vm(&auth, &this, id).await?;
+
+    ensure_vm_deletable_by_owner(&this.db, id).await?;
+
+    this.work_sender
+        .send(WorkJob::DeleteVm {
+            vm_id: id,
+            reason: Some("Deleted by its owner".to_string()),
+            admin_user_id: None,
+            purge: false,
+            by_owner: true,
+        })
+        .await?;
+    info!("VM {} deletion requested by its owner", id);
+    ApiData::ok(())
+}
+
 /// Restart a VM
 async fn v1_restart_vm(
     auth: Nip98Auth,
@@ -1693,7 +1841,7 @@ async fn v1_restart_vm(
 ) -> ApiResult<()> {
     let (uid, vm) = get_user_vm(&auth, &this, id).await?;
     let host = this.db.get_host(vm.host_id).await?;
-    let client = get_host_client(&host, &this.settings.provisioner)?;
+    let client = get_host_client(&this.db, &host, &this.settings.provisioner).await?;
     // Hard reset (restart) the VM — previously this only issued a stop, leaving
     // the VM powered off.
     client.reset_vm(&vm).await?;
@@ -1825,6 +1973,153 @@ async fn v1_reinstall_vm(
     }
 }
 
+async fn ensure_vm_active(this: &RouterState, vm: &Vm, what: &str) -> Result<(), ApiError> {
+    let subscription = this
+        .db
+        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+        .await?;
+    if is_vm_expired(subscription.expires, Utc::now()) {
+        return Err(ApiError::payment_required(format!(
+            "Cannot {what} an expired VM, please renew it first"
+        )));
+    }
+    Ok(())
+}
+
+async fn v1_list_vm_snapshots(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<Vec<ApiVmSnapshot>> {
+    let (_, vm) = get_user_vm(&auth, &this, id).await?;
+    let snapshots = this
+        .sub_handler
+        .vm_provisioner()
+        .list_snapshots(vm.id)
+        .await?;
+    ApiData::ok(snapshots.into_iter().map(Into::into).collect())
+}
+
+async fn run_vm_snapshot(
+    this: &RouterState,
+    vm: &Vm,
+    uid: u64,
+    action: SnapshotAction,
+) -> Result<(), ApiError> {
+    let Some(feedback) = this.feedback.clone() else {
+        let result = this
+            .sub_handler
+            .vm_provisioner()
+            .run_snapshot_action(vm.id, Some(uid), &action, &this.history)
+            .await;
+        if !matches!(action, SnapshotAction::Delete { .. }) {
+            this.work_sender
+                .send(WorkJob::CheckVm { vm_id: vm.id })
+                .await?;
+        }
+        return Ok(result?);
+    };
+
+    let reply_channel = format!("snapshot-{}-{:032x}", vm.id, rand::random::<u128>());
+    let mut stream = feedback
+        .subscribe(&JobFeedback::channel_name(&reply_channel))
+        .await
+        .map_err(|e| ApiError::new(format!("Failed to subscribe to reply channel: {e}")))?;
+    this.work_sender
+        .send(WorkJob::VmSnapshot {
+            vm_id: vm.id,
+            user_id: Some(uid),
+            action,
+            reply_channel,
+        })
+        .await?;
+
+    match tokio::time::timeout(Duration::from_secs(180), stream.next()).await {
+        Ok(Some(Ok(fb))) => match (fb.snapshot_rejection(), fb.status) {
+            (Some(rejection), _) => Err(ApiError::from(lnvps_api_common::retry::OpError::from(
+                rejection,
+            ))),
+            (None, JobFeedbackStatus::Failed { error }) => {
+                Err(ApiError::new(format!("Snapshot failed: {error}")))
+            }
+            _ => Ok(()),
+        },
+        Ok(Some(Err(e))) => Err(ApiError::new(format!("Snapshot reply error: {e}"))),
+        Ok(None) => Err(ApiError::new("Snapshot reply channel closed")),
+        Err(_) => {
+            info!(
+                "Snapshot of VM {} still in progress after 180s; returning to client",
+                vm.id
+            );
+            Ok(())
+        }
+    }
+}
+
+async fn v1_create_vm_snapshot(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Json(req): Json<CreateVmSnapshotRequest>,
+) -> ApiResult<ApiVmSnapshot> {
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    ensure_vm_active(&this, &vm, "snapshot").await?;
+    let description = req.description.filter(|d| !d.is_empty());
+    let slots = this
+        .sub_handler
+        .vm_provisioner()
+        .snapshot_slots(vm.id)
+        .await?;
+    check_new_snapshot(&[], slots, &req.name, description.as_deref())
+        .map_err(lnvps_api_common::retry::OpError::from)?;
+    run_vm_snapshot(
+        &this,
+        &vm,
+        uid,
+        SnapshotAction::Create {
+            name: req.name.clone(),
+            description: description.clone(),
+        },
+    )
+    .await?;
+    let created = this
+        .sub_handler
+        .vm_provisioner()
+        .list_snapshots(vm.id)
+        .await?
+        .into_iter()
+        .find(|s| s.name == req.name)
+        .unwrap_or(lnvps_api_common::host::VmSnapshot {
+            name: req.name,
+            description,
+            created: None,
+        });
+    ApiData::ok(created.into())
+}
+
+async fn v1_restore_vm_snapshot(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path((id, name)): Path<(u64, String)>,
+) -> ApiResult<()> {
+    validate_snapshot_name(&name).map_err(lnvps_api_common::retry::OpError::from)?;
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    ensure_vm_active(&this, &vm, "restore").await?;
+    run_vm_snapshot(&this, &vm, uid, SnapshotAction::Restore { name }).await?;
+    ApiData::ok(())
+}
+
+async fn v1_delete_vm_snapshot(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path((id, name)): Path<(u64, String)>,
+) -> ApiResult<()> {
+    validate_snapshot_name(&name).map_err(lnvps_api_common::retry::OpError::from)?;
+    let (uid, vm) = get_user_vm(&auth, &this, id).await?;
+    run_vm_snapshot(&this, &vm, uid, SnapshotAction::Delete { name }).await?;
+    ApiData::ok(())
+}
+
 async fn v1_time_series(
     auth: Nip98Auth,
     State(this): State<RouterState>,
@@ -1832,7 +2127,7 @@ async fn v1_time_series(
 ) -> ApiResult<Vec<TimeSeriesData>> {
     let (_, vm) = get_user_vm(&auth, &this, id).await?;
     let host = this.db.get_host(vm.host_id).await?;
-    let client = get_host_client(&host, &this.settings.provisioner)?;
+    let client = get_host_client(&this.db, &host, &this.settings.provisioner).await?;
     ApiData::ok(client.get_time_series_data(&vm, TimeSeries::Hourly).await?)
 }
 
@@ -1859,7 +2154,8 @@ async fn v1_terminal_proxy(
         .get_host(vm.host_id)
         .await
         .map_err(|_| "VM host not found")?;
-    let client = get_host_client(&host, &this.settings.provisioner)
+    let client = get_host_client(&this.db, &host, &this.settings.provisioner)
+        .await
         .map_err(|_| "Failed to get host client")?;
 
     let mut terminal = client.connect_terminal(&vm).await.map_err(|e| {
@@ -1985,6 +2281,12 @@ fn default_currencies_for_method(method: PaymentMethod) -> Vec<ApiCurrency> {
     match method {
         PaymentMethod::Lightning => vec![ApiCurrency::BTC],
         PaymentMethod::OnChain => vec![ApiCurrency::BTC],
+        PaymentMethod::FixedFloat => vec![
+            ApiCurrency::XMR,
+            ApiCurrency::LTC,
+            ApiCurrency::ETH,
+            ApiCurrency::USDTTRC,
+        ],
         PaymentMethod::Revolut => vec![ApiCurrency::EUR, ApiCurrency::USD],
         PaymentMethod::Paypal => vec![ApiCurrency::EUR, ApiCurrency::USD],
         PaymentMethod::Stripe => vec![ApiCurrency::EUR, ApiCurrency::USD],
@@ -2094,6 +2396,7 @@ struct InvoiceLine {
 /// their own `time_value` (everything that is not a VPS).
 fn interval_label(amount: u64, interval: lnvps_db::IntervalType) -> String {
     let unit = match interval {
+        lnvps_db::IntervalType::Hour => "hour",
         lnvps_db::IntervalType::Day => "day",
         lnvps_db::IntervalType::Month => "month",
         lnvps_db::IntervalType::Year => "year",
@@ -2254,6 +2557,10 @@ async fn v1_get_payment_invoice(
         memory_upgrade: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         disk_upgrade: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        transfer_upgrade: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        network_upgrade: Option<u32>,
     }
 
     // The selling company comes from the subscription, which is also what the
@@ -2277,6 +2584,8 @@ async fn v1_get_payment_invoice(
                 cpu_upgrade: c.new_cpu,
                 memory_upgrade: c.new_memory.map(|m| m / crate::GB),
                 disk_upgrade: c.new_disk.map(|m| m / crate::GB),
+                transfer_upgrade: c.new_transfer_gb,
+                network_upgrade: c.new_network_mbps,
             })
     } else {
         None
@@ -2435,6 +2744,27 @@ async fn v1_get_vm_history(
     )
 }
 
+async fn v1_vm_upgrade_options(
+    auth: Nip98Auth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+) -> ApiResult<ApiCustomTemplateParams> {
+    let pubkey = auth.pubkey();
+    let uid = this.db.upsert_user(&pubkey).await?;
+    let vm = this.db.get_vm(id).await?;
+    if vm.user_id != uid {
+        return Err(ApiError::forbidden("VM does not belong to you"));
+    }
+    let pricing = this
+        .sub_handler
+        .pricing_engine()
+        .upgrade_pricing(id)
+        .await?;
+    let disks = this.db.list_custom_pricing_disk(pricing.id).await?;
+    let region = this.db.get_host_region(pricing.region_id).await?;
+    ApiData::ok(ApiCustomTemplateParams::from(&pricing, &disks, &region))
+}
+
 /// Get a quote for upgrading a VM
 async fn v1_vm_upgrade_quote(
     auth: Nip98Auth,
@@ -2450,43 +2780,50 @@ async fn v1_vm_upgrade_quote(
         return Err(ApiError::forbidden("VM does not belong to you"));
     }
 
-    // Create UpgradeConfig from request
-    let cfg = UpgradeConfig {
-        new_cpu: req.cpu,
-        new_memory: req.memory,
-        new_disk: req.disk,
-    };
+    let cfg: UpgradeConfig = req.into();
 
-    // Calculate the upgrade cost and new renewal cost
-    match this
+    let method = q
+        .method
+        .and_then(|m| PaymentMethod::from_str(&m).ok())
+        .unwrap_or(PaymentMethod::Lightning);
+    let quote = match this
         .sub_handler
         .pricing_engine()
-        .calculate_vm_upgrade_cost(
-            id,
-            &cfg,
-            q.method
-                .and_then(|m| PaymentMethod::from_str(&m).ok())
-                .unwrap_or(PaymentMethod::Lightning),
-        )
+        .calculate_vm_upgrade_cost(id, &cfg, method)
         .await
     {
-        Ok(quote) => {
-            let currency = quote.upgrade.amount.currency();
-            ApiData::ok(ApiVmUpgradeQuote {
-                cost_difference: quote.upgrade.amount.into(),
-                new_renewal_cost: quote.renewal.amount.into(),
-                discount: quote.discount.amount.into(),
-                tax: CurrencyAmount::from_u64(currency, quote.tax.amount).into(),
-                processing_fee: CurrencyAmount::from_u64(currency, quote.processing_fee).into(),
-            })
-        }
-        Err(e) => ApiData::err(e.to_string().as_str()),
-    }
+        Ok(quote) => quote,
+        Err(e) => return ApiData::err(e.to_string().as_str()),
+    };
+    let currency = quote.upgrade.amount.currency();
+    let (processing_fee, credit) = this
+        .sub_handler
+        .quote_vm_upgrade_credit(
+            id,
+            method,
+            quote.upgrade.amount.value(),
+            quote.tax.amount,
+            quote.processing_fee,
+            currency,
+        )
+        .await?;
+    ApiData::ok(ApiVmUpgradeQuote {
+        cost_difference: quote.upgrade.amount.into(),
+        new_renewal_cost: quote.renewal.amount.into(),
+        discount: quote.discount.amount.into(),
+        tax: CurrencyAmount::from_u64(currency, quote.tax.amount).into(),
+        processing_fee: CurrencyAmount::from_u64(currency, processing_fee).into(),
+        credit: credit.map(|c| crate::api::model::ApiCredit {
+            amount: c.amount,
+            currency: c.currency.to_string(),
+        }),
+    })
 }
 
 /// Upgrade a VM (requires payment first)
 async fn v1_vm_upgrade(
     auth: Nip98Auth,
+    client: ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Query(q): Query<PaymentMethodQuery>,
@@ -2499,12 +2836,7 @@ async fn v1_vm_upgrade(
         return Err(ApiError::forbidden("VM does not belong to you"));
     }
 
-    // Create UpgradeConfig from request
-    let cfg = UpgradeConfig {
-        new_cpu: req.cpu,
-        new_memory: req.memory,
-        new_disk: req.disk,
-    };
+    let cfg: UpgradeConfig = req.into();
 
     // Same payment resolution as renewals/purchases: interactive, saved NWC
     // wallet, or saved Revolut card — collected on the spot for saved methods.
@@ -2513,9 +2845,21 @@ async fn v1_vm_upgrade(
         .sub_handler
         .create_vm_upgrade_payment(id, &cfg, method, mode)
         .await?;
+    crate::api::record_swap_client(
+        &this,
+        uid,
+        payment.payment_method,
+        &payment.id,
+        payment.external_data.as_str(),
+        &client,
+    )
+    .await;
 
     // Note: The actual upgrade happens after payment is confirmed
-    ApiData::ok(ApiVmPayment::from_subscription_payment(payment, id)?)
+    let credit = crate::api::credit_line(&this.db, &payment).await;
+    let mut out = ApiVmPayment::from_subscription_payment(payment, id)?;
+    out.credit = credit;
+    ApiData::ok(out)
 }
 
 /// Resolve the monthly outbound transfer quota for a VM from its (custom)
@@ -2555,13 +2899,13 @@ async fn v1_get_vm_traffic(
         .await?;
 
     ApiData::ok(ApiVmTraffic {
-        summary: ApiVmTrafficSummary {
-            transfer_gb: vm_transfer_quota_gb(&this, &vm).await?,
-            period_start: quota_start,
-            period_end: quota_end,
-            bytes_out: quota_bytes_out,
-            bytes_in: quota_bytes_in,
-        },
+        summary: ApiVmTrafficSummary::new(
+            vm_transfer_quota_gb(&this, &vm).await?,
+            quota_start,
+            quota_end,
+            quota_bytes_out,
+            quota_bytes_in,
+        ),
         days: days
             .into_iter()
             .map(|d| ApiVmTrafficDay {
@@ -2807,6 +3151,160 @@ fn is_vm_expired(expires: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use lnvps_db::LNVpsDbBase;
+
+    async fn mock_router_state(db: Arc<lnvps_api_common::MockDb>) -> RouterState {
+        use crate::mocks::{MockNode, MockOnChainProvider};
+        use lnvps_api_common::{ChannelWorkCommander, ExchangeRateService, MockExchangeRate};
+        let rates = Arc::new(MockExchangeRate::new());
+        rates
+            .set_rate(
+                lnvps_api_common::Ticker::btc_rate("EUR").unwrap(),
+                100_000.0,
+            )
+            .await;
+        let commander: Arc<dyn lnvps_api_common::WorkCommander> =
+            Arc::new(ChannelWorkCommander::new());
+        let sub_handler = crate::subscription::SubscriptionHandler::new(
+            crate::settings::mock_settings(),
+            db.clone(),
+            Arc::new(MockNode::default()),
+            Arc::new(MockOnChainProvider::default()),
+            None,
+            rates.clone(),
+            VatClient::new(),
+            commander.clone(),
+            lnvps_api_common::VmStateCache::new(),
+        )
+        .unwrap();
+        RouterState {
+            db: db.clone(),
+            state: lnvps_api_common::VmStateCache::new(),
+            sub_handler,
+            history: lnvps_api_common::VmHistoryLogger::new(db),
+            settings: crate::settings::mock_settings(),
+            rates,
+            work_sender: commander,
+            feedback: None,
+            geoip: None,
+        }
+    }
+
+    /// An order on an hourly plan is refused unless opted-in credit covers the
+    /// first hour; a monthly order is never held up by credit.
+    #[tokio::test]
+    async fn an_hourly_order_needs_credit_up_front() {
+        use lnvps_api_common::MockDb;
+        let db = Arc::new(MockDb::default());
+        let state = mock_router_state(db.clone()).await;
+        let uid = db.upsert_user(&[9u8; 32]).await.unwrap();
+        let key = db
+            .insert_user_ssh_key(&lnvps_db::UserSshKey {
+                id: 0,
+                name: "k".to_string(),
+                user_id: uid,
+                created: Default::default(),
+                key_data: "ssh-rsa AAA==".into(),
+            })
+            .await
+            .unwrap();
+        let vm = state
+            .sub_handler
+            .vm_provisioner()
+            .provision(uid, 1, 1, key, None)
+            .await
+            .unwrap();
+        assert!(
+            ensure_hourly_order_funded(&state, &vm).await.is_ok(),
+            "monthly"
+        );
+
+        let sub = db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await
+            .unwrap();
+        db.subscriptions
+            .lock()
+            .await
+            .get_mut(&sub.id)
+            .unwrap()
+            .interval_type = lnvps_db::IntervalType::Hour;
+        let err = ensure_hourly_order_funded(&state, &vm).await.unwrap_err();
+        assert!(err.error.contains("account credit"), "{}", err.error);
+
+        db.adjust_account_credit(uid, "BTC", 10_000_000_000, "topup", None)
+            .await
+            .unwrap();
+        assert!(
+            ensure_hourly_order_funded(&state, &vm).await.is_err(),
+            "credit must be opted in"
+        );
+        db.set_account_credit_auto_apply(uid, true).await.unwrap();
+        assert!(ensure_hourly_order_funded(&state, &vm).await.is_ok());
+    }
+
+    /// The LNURL top-up helper books a Lightning top-up for the VM owner, so a
+    /// payment to an hourly VM's LNURL lands in their credit once settled.
+    #[tokio::test]
+    async fn an_lnurl_topup_is_booked_for_the_owner() {
+        use lnvps_api_common::MockDb;
+        let db = Arc::new(MockDb::default());
+        let state = mock_router_state(db.clone()).await;
+        let uid = db.upsert_user(&[8u8; 32]).await.unwrap();
+
+        let pr = crate::api::credit::new_lightning_topup(&state, uid, 21_500, "t".to_string())
+            .await
+            .unwrap();
+        assert!(!pr.is_empty());
+        let (topups, _) = db.list_account_credit_topups(uid, 10, 0).await.unwrap();
+        assert_eq!(topups.len(), 1);
+        assert_eq!(topups[0].amount, 22_000, "rounded up to whole sats");
+        assert!(!topups[0].is_paid);
+
+        assert!(
+            crate::api::credit::new_lightning_topup(&state, uid, 0, "t".to_string())
+                .await
+                .is_err(),
+            "nothing to top up"
+        );
+    }
+
+    /// An owner cannot delete a VM while an abuse case against it is open, but
+    /// can once it is closed, and a case on another VM is irrelevant.
+    #[tokio::test]
+    async fn owner_delete_is_refused_during_an_open_abuse_case() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::AbuseCase;
+        let mock = Arc::new(MockDb::default());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+
+        assert!(ensure_vm_deletable_by_owner(&db, 7).await.is_ok());
+
+        let case_id = db
+            .insert_abuse_case(&AbuseCase {
+                vm_id: Some(7),
+                summary: "spam".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.insert_abuse_case(&AbuseCase {
+            vm_id: Some(8),
+            summary: "other".to_string(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let err = ensure_vm_deletable_by_owner(&db, 7).await.unwrap_err();
+        assert!(err.error.contains("open abuse case"), "{}", err.error);
+        assert_eq!(err.code, axum::http::StatusCode::CONFLICT);
+        assert!(ensure_vm_deletable_by_owner(&db, 9).await.is_ok());
+
+        db.close_abuse_case(case_id).await.unwrap();
+        assert!(ensure_vm_deletable_by_owner(&db, 7).await.is_ok());
+    }
     use chrono::Utc;
     use lnvps_db::PaymentMethodConfig;
 
@@ -3070,6 +3568,18 @@ mod tests {
                 | ApiPaymentMethod::OnChain => {
                     assert_eq!(info.currencies, vec![ApiCurrency::BTC]);
                 }
+                ApiPaymentMethod::FixedFloat => {
+                    assert_eq!(
+                        info.currencies,
+                        vec![
+                            ApiCurrency::XMR,
+                            ApiCurrency::LTC,
+                            ApiCurrency::ETH,
+                            ApiCurrency::USDTTRC
+                        ]
+                    );
+                }
+                ApiPaymentMethod::Credit => unreachable!("credit is not a configurable method"),
                 ApiPaymentMethod::Revolut | ApiPaymentMethod::Paypal | ApiPaymentMethod::Stripe => {
                     assert_eq!(info.currencies, vec![ApiCurrency::EUR, ApiCurrency::USD]);
                 }
@@ -3238,6 +3748,8 @@ mod tests {
             amount: 1000,
             setup_amount: 0,
             configuration: None,
+            deactivated_at: None,
+            parent_line_item_id: None,
         };
         mock.subscription_line_items
             .lock()
@@ -3368,6 +3880,8 @@ mod tests {
         use lnvps_db::IntervalType;
         assert_eq!(interval_label(1, IntervalType::Month), "1 month");
         assert_eq!(interval_label(3, IntervalType::Month), "3 months");
+        assert_eq!(interval_label(1, IntervalType::Hour), "1 hour");
+        assert_eq!(interval_label(6, IntervalType::Hour), "6 hours");
         assert_eq!(interval_label(1, IntervalType::Day), "1 day");
         assert_eq!(interval_label(14, IntervalType::Day), "14 days");
         assert_eq!(interval_label(1, IntervalType::Year), "1 year");

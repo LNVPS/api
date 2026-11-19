@@ -212,6 +212,16 @@ pub trait TunnelRouter: Send + Sync {
         let _ = (interface, prefixes);
         op_fatal!("This router backend cannot manage tunnel routes")
     }
+
+    async fn sync_tunnel_mtu(&self, interface: &str, mtu: u16) -> OpResult<()> {
+        let _ = (interface, mtu);
+        op_fatal!("This router backend cannot set a tunnel interface's MTU")
+    }
+
+    async fn sync_peer_isolation(&self, blocks: &[String]) -> OpResult<()> {
+        let _ = blocks;
+        op_fatal!("This router backend cannot isolate tunnel peers from each other")
+    }
 }
 
 /// The kind of a tunnel interface
@@ -437,6 +447,14 @@ pub async fn get_router(db: &Arc<dyn LNVpsDb>, router_id: u64) -> OpResult<Arc<d
         #[cfg(not(feature = "linux-ssh"))]
         RouterKind::LinuxSsh => Err(lnvps_api_common::retry::OpError::Fatal(anyhow::anyhow!(
             "LinuxSsh router support is not enabled in this build"
+        ))),
+        // Never dialled: an `lvd` route server is often behind a NAT nothing
+        // here can traverse, which is the whole reason it asks rather than
+        // being told. Its desired state is published at
+        // `/api/v1/routeserver/dataplane` and it applies that itself.
+        RouterKind::Lvd => Err(lnvps_api_common::retry::OpError::Fatal(anyhow::anyhow!(
+            "Router {} runs lvd and configures itself, so LNVPS does not connect to it",
+            cfg.name
         ))),
         RouterKind::MockRouter => {
             #[cfg(test)]

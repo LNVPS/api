@@ -1,18 +1,23 @@
 use crate::{
-    AccessPolicy, AgentConversation, AgentConversationFilter, AgentConversationOverview,
-    AgentMessage, App, AppCluster, AppDeployment, AppDeploymentFilter, AppDeploymentServiceUsage,
+    AbuseAction, AbuseCase, AbuseChallenge, AbuseChallengeOutcome, AccessPolicy, AccountCredit,
+    AccountCreditDebit, AccountCreditEvent, AccountCreditTopup, AgentConversation,
+    AgentConversationFilter, AgentConversationOverview, AgentMessage, App, AppBackupState,
+    AppCluster, AppDeployment, AppDeploymentBackup, AppDeploymentFilter, AppDeploymentServiceUsage,
     AppDeploymentVolumeUsage, AppTag, AsnSubscription, AsnSubscriptionStatus, AvailableIpSpace,
     BulkMessageTarget, Company, DbError, DbResult, Discount, DiscountRedemption,
-    DiscountRedemptionWithCode, DnsServer, EncryptedString, IntervalType, IpRange,
-    IpRangeSubscription, IpSpacePricing, LNVpsDbBase, MarketplaceNode, MarketplaceNodeHealth,
-    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, PaymentMethod,
-    PaymentMethodConfig, PaymentType, Referral, ReferralCostUsage, ReferralPayout, Region,
-    RegionStats, Router, RouterBgpRoute, RouterBgpSession, RouterTunnel, RouterTunnelTraffic,
-    Subscription, SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany,
-    Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmCostPlan,
-    VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate, VmFirewallPolicy, VmFirewallRule,
-    VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmOsImage, VmTemplate, VmTrafficDaily,
-    VmTrafficSample, VmTrafficTotal, VpnDevice, VpnService, VpnSubscription, WebauthnCredential,
+    DiscountRedemptionWithCode, DnsServer, EncryptedString, IntervalType, IpOrder, IpOrderAudit,
+    IpOrderRange, IpOrderState, IpProvider, IpProviderRegion, IpRange, IpRangeSubscription,
+    IpSpacePricing, LNVpsDbBase, LineItemType, MarketplaceNode, MarketplaceNodeHealth,
+    MarketplaceNodeStatus, MarketplaceOperator, NewAgentMessage, OnchainAddressOwner,
+    OnchainAddressOwnerStatus, PaymentMethod, PaymentMethodConfig, PaymentType, Referral,
+    ReferralCostUsage, ReferralPayout, Region, RegionStats, Router, RouterBgpRoute,
+    RouterBgpSession, RouterTunnel, RouterTunnelKind, RouterTunnelTraffic, Subscription,
+    SubscriptionLineItem, SubscriptionPayment, SubscriptionPaymentWithCompany, SwapOrderClient,
+    Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind,
+    VmAddonPrice, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
+    VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmIpAssignment, VmIpWait,
+    VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice,
+    VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
 };
 #[cfg(feature = "admin")]
 use crate::{AdminDb, AdminRole, AdminRoleAssignment, AdminVmHost};
@@ -40,9 +45,183 @@ const AGENT_CONVERSATION_OVERVIEW_SELECT: &str = r#"select c.*,
           group by conversation_id
      ) m on m.conversation_id = c.id"#;
 
+const REFERRAL_USAGE_SELECT: &str = r#"SELECT v.id as vm_id,
+           v.user_id,
+           v.ref_code,
+           sp.created,
+           sp.amount,
+           CAST(COALESCE((
+               SELECT SUM(rf.amount) FROM subscription_payment rf
+                WHERE rf.refunded_payment_id = sp.payment_id
+                  AND rf.payment_type = 3
+                  AND rf.is_paid = 1
+           ), 0) AS UNSIGNED) AS refunded,
+           sp.currency,
+           sp.rate,
+           c.base_currency,
+           COALESCE(r.referral_rate, c.referral_rate) AS effective_rate"#;
+
+const REFERRAL_USAGE_FROM: &str = r#"FROM vm v
+     JOIN (
+         SELECT v2.id as vm_id, sp2.id as payment_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
+                ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) AS rn
+         FROM subscription_payment sp2
+         JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
+             AND sli2.subscription_type = 3
+         JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
+         WHERE sp2.is_paid = 1
+           AND sp2.payment_type <> 3
+     ) sp ON v.id = sp.vm_id AND sp.rn = 1
+     JOIN vm_host vh ON v.host_id = vh.id
+     JOIN region vhr ON vh.region_id = vhr.id
+     JOIN company c ON vhr.company_id = c.id
+     LEFT JOIN referral r ON r.code = v.ref_code
+     WHERE (r.user_id IS NULL OR r.user_id <> v.user_id)"#;
+
 #[derive(Clone)]
 pub struct LNVpsDbMysql {
     db: MySqlPool,
+}
+
+async fn lock_account_credit(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    user_id: u64,
+    currency: &str,
+) -> Result<u64> {
+    let existing: Option<u64> = sqlx::query_scalar(
+        "SELECT balance FROM account_credit WHERE user_id = ? AND currency = ? FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(currency)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(balance) = existing {
+        return Ok(balance);
+    }
+    sqlx::query(
+        "INSERT INTO account_credit (user_id, balance, currency, auto_apply) \
+         SELECT ?, 0, ?, COALESCE(MAX(auto_apply), 0) FROM account_credit WHERE user_id = ? \
+         ON DUPLICATE KEY UPDATE user_id = user_id",
+    )
+    .bind(user_id)
+    .bind(currency)
+    .bind(user_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(sqlx::query_scalar(
+        "SELECT balance FROM account_credit WHERE user_id = ? AND currency = ? FOR UPDATE",
+    )
+    .bind(user_id)
+    .bind(currency)
+    .fetch_one(&mut **tx)
+    .await?)
+}
+
+async fn insert_subscription_payment_with<'e, E: sqlx::MySqlExecutor<'e>>(
+    ex: E,
+    payment: &SubscriptionPayment,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, tax, processing_fee, time_value, metadata, paid_at, tax_rate, tax_country_code, tax_treatment, tax_evidence, tax_breakdown, refunded_payment_id, renewal_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(&payment.id)
+    .bind(payment.subscription_id)
+    .bind(payment.user_id)
+    .bind(payment.created)
+    .bind(payment.expires)
+    .bind(payment.amount)
+    .bind(&payment.currency)
+    .bind(payment.payment_method)
+    .bind(payment.payment_type)
+    .bind(&payment.external_data)
+    .bind(&payment.external_id)
+    .bind(payment.is_paid)
+    .bind(payment.rate)
+    .bind(payment.tax)
+    .bind(payment.processing_fee)
+    .bind(payment.time_value)
+    .bind(&payment.metadata)
+    .bind(payment.paid_at)
+    .bind(payment.tax_rate)
+    .bind(&payment.tax_country_code)
+    .bind(&payment.tax_treatment)
+    .bind(&payment.tax_evidence)
+    .bind(&payment.tax_breakdown)
+    .bind(&payment.refunded_payment_id)
+    .bind(payment.renewal_source)
+    .execute(ex)
+    .await?;
+
+    Ok(())
+}
+
+async fn record_onchain_address_owners(
+    tx: &mut sqlx::Transaction<'_, sqlx::MySql>,
+    subscription_id: u64,
+    vm_id: Option<u64>,
+) -> Result<()> {
+    let payments: Vec<SubscriptionPayment> = sqlx::query_as(
+        "SELECT * FROM subscription_payment WHERE subscription_id = ? AND payment_method IN (?, ?)",
+    )
+    .bind(subscription_id)
+    .bind(PaymentMethod::OnChain as u16)
+    .bind(PaymentMethod::FixedFloat as u16)
+    .fetch_all(&mut **tx)
+    .await?;
+    let (unpaid, paid): (Vec<_>, Vec<_>) = payments.into_iter().partition(|p| !p.is_paid);
+    for p in unpaid.iter().chain(paid.iter()) {
+        let Some(address) = p.onchain_receive_address() else {
+            continue;
+        };
+        let covered: Option<u64> = sqlx::query_scalar(
+            "SELECT payment_amount FROM account_credit_debit WHERE subscription_payment_id = ?",
+        )
+        .bind(&p.id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO onchain_address_owner \
+             (address, address_hash, user_id, subscription_id, payment_id, vm_id, expires, currency, amount) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON DUPLICATE KEY UPDATE id = id",
+        )
+        .bind(EncryptedString::new(address.clone()))
+        .bind(crate::onchain_address_hash(&address))
+        .bind(p.user_id)
+        .bind(p.subscription_id)
+        .bind(&p.id)
+        .bind(vm_id)
+        .bind(p.expires)
+        .bind(&p.currency)
+        .bind(
+            (!p.is_paid)
+                .then(|| {
+                    (p.amount + p.tax + p.processing_fee)
+                        .saturating_sub(covered.unwrap_or(0))
+                        .div_ceil(1000)
+                        * 1000
+                }),
+        )
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+async fn account_credit_reserved<'e, E: sqlx::MySqlExecutor<'e>>(
+    ex: E,
+    user_id: u64,
+    currency: &str,
+    exclude: Option<u64>,
+) -> Result<u64> {
+    Ok(sqlx::query_scalar(
+        "SELECT CAST(COALESCE(SUM(amount), 0) AS UNSIGNED) FROM account_credit_debit \
+         WHERE user_id = ? AND currency = ? AND settled = 0 AND expires > NOW() AND id <> ?",
+    )
+    .bind(user_id)
+    .bind(currency)
+    .bind(exclude.unwrap_or(0))
+    .fetch_one(ex)
+    .await?)
 }
 
 impl LNVpsDbMysql {
@@ -59,6 +238,34 @@ impl LNVpsDbMysql {
 
     pub fn pool(&self) -> &MySqlPool {
         &self.db
+    }
+
+    #[cfg(feature = "admin")]
+    async fn fetch_recent<T>(
+        &self,
+        select: &str,
+        from_where: &str,
+        order_by: &str,
+        binds: &[DateTime<Utc>],
+        limit: u64,
+    ) -> DbResult<(Vec<T>, u64)>
+    where
+        T: for<'r> sqlx::FromRow<'r, sqlx::mysql::MySqlRow> + Send + Unpin,
+    {
+        let count_sql = format!("SELECT COUNT(*) {from_where}");
+        let mut count = sqlx::query_scalar::<_, i64>(&count_sql);
+        for b in binds {
+            count = count.bind(*b);
+        }
+        let total = count.fetch_one(&self.db).await?;
+
+        let data_sql = format!("SELECT {select} {from_where} ORDER BY {order_by} LIMIT ?");
+        let mut data = sqlx::query_as::<_, T>(&data_sql);
+        for b in binds {
+            data = data.bind(*b);
+        }
+        let rows = data.bind(limit).fetch_all(&self.db).await?;
+        Ok((rows, total as u64))
     }
 }
 
@@ -182,12 +389,37 @@ impl<'a> FilteredQuery<'a> {
     }
 }
 
+pub const MIGRATION_LOCK_NAME: &str = "lnvps_migrate";
+
+async fn migrate_locked(pool: &MySqlPool, migrator: &sqlx::migrate::Migrator) -> DbResult<()> {
+    let mut conn = pool.acquire().await?;
+    conn.close_on_drop();
+    let locked: Option<i64> = sqlx::query_scalar("select get_lock(?, 600)")
+        .bind(MIGRATION_LOCK_NAME)
+        .fetch_one(&mut *conn)
+        .await?;
+    if locked != Some(1) {
+        return Err(anyhow!("timed out waiting for the migration lock").into());
+    }
+    let result = migrator.run_direct(&mut *conn).await;
+    let _ = sqlx::query("select release_lock(?)")
+        .bind(MIGRATION_LOCK_NAME)
+        .execute(&mut *conn)
+        .await;
+    result?;
+    Ok(())
+}
+
+impl LNVpsDbMysql {
+    pub async fn migrate_with(&self, migrator: &sqlx::migrate::Migrator) -> DbResult<()> {
+        migrate_locked(&self.db, migrator).await
+    }
+}
+
 #[async_trait]
 impl LNVpsDbBase for LNVpsDbMysql {
     async fn migrate(&self) -> DbResult<()> {
-        let migrator = sqlx::migrate!();
-        migrator.run(&self.db).await?;
-        Ok(())
+        migrate_locked(&self.db, &sqlx::migrate!()).await
     }
 
     async fn upsert_user(&self, pubkey: &[u8; 32]) -> DbResult<u64> {
@@ -485,6 +717,204 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn insert_swap_order_client(&self, record: &SwapOrderClient) -> DbResult<u64> {
+        let res = sqlx::query(
+            "insert into swap_order_client (user_id, order_id, payment_id, coin, ip, user_agent, accept_language) values (?, ?, ?, ?, ?, ?, ?) returning id",
+        )
+        .bind(record.user_id)
+        .bind(&record.order_id)
+        .bind(&record.payment_id)
+        .bind(&record.coin)
+        .bind(&record.ip)
+        .bind(&record.user_agent)
+        .bind(&record.accept_language)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn purge_swap_order_clients(&self, days: u32) -> DbResult<u64> {
+        let res =
+            sqlx::query("delete from swap_order_client where created < NOW() - INTERVAL ? DAY")
+                .bind(days)
+                .execute(&self.db)
+                .await?;
+        Ok(res.rows_affected())
+    }
+
+    async fn purge_user_geo_ips(&self, days: u32) -> DbResult<u64> {
+        let res = sqlx::query(
+            "update users set geo_ip = null where geo_ip is not null and geo_updated < NOW() - INTERVAL ? DAY",
+        )
+        .bind(days)
+        .execute(&self.db)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
+    async fn insert_abuse_case(&self, case: &AbuseCase) -> DbResult<u64> {
+        let res = sqlx::query(
+            "insert into abuse_case (vm_id, user_id, kind, reported_ip, incident_at, reporter_email, summary, proceedings_started) values (?, ?, ?, ?, ?, ?, ?, ?) returning id",
+        )
+        .bind(case.vm_id)
+        .bind(case.user_id)
+        .bind(case.kind)
+        .bind(&case.reported_ip)
+        .bind(case.incident_at)
+        .bind(&case.reporter_email)
+        .bind(&case.summary)
+        .bind(case.proceedings_started)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn get_abuse_case(&self, id: u64) -> DbResult<AbuseCase> {
+        Ok(sqlx::query_as("select * from abuse_case where id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn list_abuse_cases(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        vm_id: Option<u64>,
+        open: Option<bool>,
+    ) -> DbResult<(Vec<AbuseCase>, u64)> {
+        let filter = "from abuse_case where (? is null or user_id = ?) and (? is null or vm_id = ?) and (? is null or (closed_at is null) = ?)";
+        let rows = sqlx::query_as(&format!(
+            "select * {filter} order by created desc, id desc limit ? offset ?"
+        ))
+        .bind(user_id)
+        .bind(user_id)
+        .bind(vm_id)
+        .bind(vm_id)
+        .bind(open)
+        .bind(open)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 = sqlx::query_scalar(&format!("select count(*) {filter}"))
+            .bind(user_id)
+            .bind(user_id)
+            .bind(vm_id)
+            .bind(vm_id)
+            .bind(open)
+            .bind(open)
+            .fetch_one(&self.db)
+            .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn close_abuse_case(&self, id: u64) -> DbResult<()> {
+        sqlx::query("update abuse_case set closed_at = NOW() where id = ? and closed_at is null")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_abuse_action(&self, action: &AbuseAction) -> DbResult<u64> {
+        let res = sqlx::query(
+            "insert into abuse_action (case_id, kind, reason, facts, legal_basis, followed_report, notice_withheld, admin_user_id) values (?, ?, ?, ?, ?, ?, ?, ?) returning id",
+        )
+        .bind(action.case_id)
+        .bind(action.kind)
+        .bind(&action.reason)
+        .bind(&action.facts)
+        .bind(&action.legal_basis)
+        .bind(action.followed_report)
+        .bind(&action.notice_withheld)
+        .bind(action.admin_user_id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn get_abuse_action(&self, id: u64) -> DbResult<AbuseAction> {
+        Ok(sqlx::query_as("select * from abuse_action where id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn list_abuse_actions(&self, case_id: u64) -> DbResult<Vec<AbuseAction>> {
+        Ok(
+            sqlx::query_as("select * from abuse_action where case_id = ? order by id")
+                .bind(case_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn set_abuse_action_notified(&self, id: u64) -> DbResult<()> {
+        sqlx::query("update abuse_action set notified_at = NOW() where id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_abuse_challenge(&self, challenge: &AbuseChallenge) -> DbResult<u64> {
+        let res = sqlx::query(
+            "insert into abuse_challenge (case_id, action_id, message) values (?, ?, ?) returning id",
+        )
+        .bind(challenge.case_id)
+        .bind(challenge.action_id)
+        .bind(&challenge.message)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn get_abuse_challenge(&self, id: u64) -> DbResult<AbuseChallenge> {
+        Ok(sqlx::query_as("select * from abuse_challenge where id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn list_abuse_challenges(&self, case_id: u64) -> DbResult<Vec<AbuseChallenge>> {
+        Ok(
+            sqlx::query_as("select * from abuse_challenge where case_id = ? order by id")
+                .bind(case_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn decide_abuse_challenge(
+        &self,
+        id: u64,
+        outcome: AbuseChallengeOutcome,
+        response: &str,
+        decided_by: u64,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "update abuse_challenge set outcome = ?, response = ?, decided_by = ?, decided_at = NOW() where id = ?",
+        )
+        .bind(outcome)
+        .bind(response)
+        .bind(decided_by)
+        .bind(id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn purge_abuse_cases(&self) -> DbResult<u64> {
+        let res = sqlx::query(
+            "delete from abuse_case where closed_at is not null and (case when kind = 2 then created else closed_at end) < NOW() - INTERVAL (case when kind = 2 and proceedings_started = 0 then 183 else 365 end) DAY",
+        )
+        .execute(&self.db)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     async fn list_users(&self) -> DbResult<Vec<User>> {
         Ok(sqlx::query_as("select * from users")
             .fetch_all(&self.db)
@@ -710,7 +1140,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn list_hosts(&self) -> DbResult<Vec<VmHost>> {
-        Ok(sqlx::query_as("select h.* from vm_host h,region hr where h.enabled = 1 and h.region_id = hr.id and hr.enabled = 1")
+        Ok(sqlx::query_as("select h.* from vm_host h,region hr where h.enabled = 1 and h.deleted = 0 and h.region_id = hr.id and hr.enabled = 1")
             .fetch_all(&self.db)
             .await?)
     }
@@ -724,14 +1154,14 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn list_hosts_paginated(&self, limit: u64, offset: u64) -> DbResult<(Vec<VmHost>, u64)> {
         // Get total count
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vm_host h, region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1"
+            "SELECT COUNT(*) FROM vm_host h, region hr WHERE h.enabled = 1 AND h.deleted = 0 AND h.region_id = hr.id AND hr.enabled = 1"
         )
         .fetch_one(&self.db)
         .await?;
 
         // Get paginated results
         let hosts = sqlx::query_as(
-            "SELECT h.* FROM vm_host h, region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1 ORDER BY h.name LIMIT ? OFFSET ?"
+            "SELECT h.* FROM vm_host h, region hr WHERE h.enabled = 1 AND h.deleted = 0 AND h.region_id = hr.id AND hr.enabled = 1 ORDER BY h.name LIMIT ? OFFSET ?"
         )
         .bind(limit)
         .bind(offset)
@@ -748,7 +1178,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     ) -> DbResult<(Vec<(VmHost, Region)>, u64)> {
         // Get total count
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vm_host h, region hr WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1"
+            "SELECT COUNT(*) FROM vm_host h, region hr WHERE h.enabled = 1 AND h.deleted = 0 AND h.region_id = hr.id AND hr.enabled = 1"
         )
         .fetch_one(&self.db)
         .await?;
@@ -757,7 +1187,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         let rows = sqlx::query(
             "SELECT h.*, hr.id as region_id, hr.name as region_name, hr.enabled as region_enabled, hr.company_id as region_company_id, hr.country_code as region_country_code 
              FROM vm_host h, region hr 
-             WHERE h.enabled = 1 AND h.region_id = hr.id AND hr.enabled = 1 
+             WHERE h.enabled = 1 AND h.deleted = 0 AND h.region_id = hr.id AND hr.enabled = 1 
              ORDER BY h.name LIMIT ? OFFSET ?"
         )
         .bind(limit)
@@ -789,6 +1219,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 ssh_key: row.get("ssh_key"),
                 sunset_date: row.get("sunset_date"),
                 marketplace_node_id: row.get("marketplace_node_id"),
+                deleted: row.get("deleted"),
             };
 
             let region = Region {
@@ -957,7 +1388,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn update_os_image(&self, image: &VmOsImage) -> DbResult<()> {
         sqlx::query(
-            "UPDATE vm_os_image SET distribution=?, flavour=?, version=?, enabled=?, release_date=?, url=?, cpu_arch=?, default_username=?, sha2=?, sha2_url=? WHERE id=?"
+            "UPDATE vm_os_image SET distribution=?, flavour=?, version=?, enabled=?, release_date=?, url=?, cpu_arch=?, default_username=?, sha2=?, sha2_url=?, encrypted=? WHERE id=?"
         )
         .bind(image.distribution as u16)
         .bind(&image.flavour)
@@ -969,6 +1400,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&image.default_username)
         .bind(&image.sha2)
         .bind(&image.sha2_url)
+        .bind(image.encrypted)
         .bind(image.id)
         .execute(&self.db)
         .await?;
@@ -995,6 +1427,498 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_all(&self.db)
                 .await?,
         )
+    }
+
+    async fn list_ip_providers(&self) -> DbResult<Vec<IpProvider>> {
+        Ok(sqlx::query_as("select * from ip_provider order by name")
+            .fetch_all(&self.db)
+            .await?)
+    }
+
+    async fn get_ip_provider(&self, id: u64) -> DbResult<IpProvider> {
+        Ok(sqlx::query_as("select * from ip_provider where id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn get_ip_provider_by_name(&self, name: &str) -> DbResult<Option<IpProvider>> {
+        Ok(sqlx::query_as("select * from ip_provider where name = ?")
+            .bind(name)
+            .fetch_optional(&self.db)
+            .await?)
+    }
+
+    async fn insert_ip_provider(&self, p: &IpProvider) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO ip_provider (name, kind, enabled, url, token, subsidiary, rir, gateway, \
+             access_policy_id, approval_required, monthly_spend_cap, currency, enable_ranges_on_delivery) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&p.name)
+        .bind(p.kind)
+        .bind(p.enabled)
+        .bind(&p.url)
+        .bind(&p.token)
+        .bind(&p.subsidiary)
+        .bind(&p.rir)
+        .bind(&p.gateway)
+        .bind(p.access_policy_id)
+        .bind(p.approval_required)
+        .bind(p.monthly_spend_cap)
+        .bind(&p.currency)
+        .bind(p.enable_ranges_on_delivery)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn update_ip_provider(&self, p: &IpProvider) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE ip_provider SET name = ?, kind = ?, enabled = ?, url = ?, token = ?, subsidiary = ?, \
+             rir = ?, gateway = ?, access_policy_id = ?, approval_required = ?, monthly_spend_cap = ?, \
+             currency = ?, enable_ranges_on_delivery = ? WHERE id = ?",
+        )
+        .bind(&p.name)
+        .bind(p.kind)
+        .bind(p.enabled)
+        .bind(&p.url)
+        .bind(&p.token)
+        .bind(&p.subsidiary)
+        .bind(&p.rir)
+        .bind(&p.gateway)
+        .bind(p.access_policy_id)
+        .bind(p.approval_required)
+        .bind(p.monthly_spend_cap)
+        .bind(&p.currency)
+        .bind(p.enable_ranges_on_delivery)
+        .bind(p.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_ip_provider(&self, id: u64) -> DbResult<()> {
+        let p = self.get_ip_provider(id).await?;
+        let orders: i64 = sqlx::query_scalar("select count(*) from ip_order where provider = ?")
+            .bind(&p.name)
+            .fetch_one(&self.db)
+            .await?;
+        if orders > 0 {
+            return Err(DbError::Source(
+                anyhow!("Cannot delete IP provider: {} orders reference it", orders)
+                    .into_boxed_dyn_error(),
+            ));
+        }
+        sqlx::query("delete from ip_provider where id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_ip_provider_regions(
+        &self,
+        provider_id: Option<u64>,
+        region_id: Option<u64>,
+    ) -> DbResult<Vec<IpProviderRegion>> {
+        Ok(sqlx::query_as(
+            "select * from ip_provider_region where (? is null or provider_id = ?) \
+             and (? is null or region_id = ?) order by id",
+        )
+        .bind(provider_id)
+        .bind(provider_id)
+        .bind(region_id)
+        .bind(region_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn get_ip_provider_region(&self, id: u64) -> DbResult<IpProviderRegion> {
+        Ok(
+            sqlx::query_as("select * from ip_provider_region where id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn insert_ip_provider_region(&self, r: &IpProviderRegion) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO ip_provider_region (provider_id, region_id, country, destination, prefix_len, \
+             quantity, auto_threshold, enabled, when_no_ip, sell_without_capacity, wait_refund_hours) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(r.provider_id)
+        .bind(r.region_id)
+        .bind(&r.country)
+        .bind(&r.destination)
+        .bind(r.prefix_len)
+        .bind(r.quantity)
+        .bind(r.auto_threshold)
+        .bind(r.enabled)
+        .bind(r.when_no_ip)
+        .bind(r.sell_without_capacity)
+        .bind(r.wait_refund_hours)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn update_ip_provider_region(&self, r: &IpProviderRegion) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE ip_provider_region SET country = ?, destination = ?, prefix_len = ?, quantity = ?, \
+             auto_threshold = ?, enabled = ?, when_no_ip = ?, sell_without_capacity = ?, \
+             wait_refund_hours = ? WHERE id = ?",
+        )
+        .bind(&r.country)
+        .bind(&r.destination)
+        .bind(r.prefix_len)
+        .bind(r.quantity)
+        .bind(r.auto_threshold)
+        .bind(r.enabled)
+        .bind(r.when_no_ip)
+        .bind(r.sell_without_capacity)
+        .bind(r.wait_refund_hours)
+        .bind(r.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_ip_provider_region(&self, id: u64) -> DbResult<()> {
+        sqlx::query("delete from ip_provider_region where id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_vm_ip_wait(&self, vm_id: u64) -> DbResult<Option<VmIpWait>> {
+        Ok(sqlx::query_as("select * from vm_ip_wait where vm_id = ?")
+            .bind(vm_id)
+            .fetch_optional(&self.db)
+            .await?)
+    }
+
+    async fn insert_vm_ip_wait(&self, w: &VmIpWait) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO vm_ip_wait (vm_id, region_id, ip4_needed, ip_order_id, released) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(w.vm_id)
+        .bind(w.region_id)
+        .bind(w.ip4_needed)
+        .bind(w.ip_order_id)
+        .bind(w.released)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn list_vm_ip_waits(&self, region_id: Option<u64>) -> DbResult<Vec<VmIpWait>> {
+        Ok(sqlx::query_as(
+            "select * from vm_ip_wait where (? is null or region_id = ?) order by created, id",
+        )
+        .bind(region_id)
+        .bind(region_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn set_vm_ip_wait_order(&self, vm_id: u64, ip_order_id: Option<u64>) -> DbResult<()> {
+        sqlx::query("update vm_ip_wait set ip_order_id = ? where vm_id = ?")
+            .bind(ip_order_id)
+            .bind(vm_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_vm_ip_wait_released(&self, vm_id: u64, released: bool) -> DbResult<()> {
+        sqlx::query("update vm_ip_wait set released = ? where vm_id = ?")
+            .bind(released)
+            .bind(vm_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_vm_ip_wait(&self, vm_id: u64) -> DbResult<()> {
+        sqlx::query("delete from vm_ip_wait where vm_id = ?")
+            .bind(vm_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_ip_order(&self, order: &IpOrder) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO ip_order (provider, region_id, idempotency_key, country, destination, \
+             prefix_len, quantity, state, provider_order_id, cost, currency, auto, requested_by, \
+             approved_by, approved_at, error, ordered_at, delivered_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&order.provider)
+        .bind(order.region_id)
+        .bind(&order.idempotency_key)
+        .bind(&order.country)
+        .bind(&order.destination)
+        .bind(order.prefix_len)
+        .bind(order.quantity)
+        .bind(order.state)
+        .bind(&order.provider_order_id)
+        .bind(order.cost)
+        .bind(&order.currency)
+        .bind(order.auto)
+        .bind(order.requested_by)
+        .bind(order.approved_by)
+        .bind(order.approved_at)
+        .bind(&order.error)
+        .bind(order.ordered_at)
+        .bind(order.delivered_at)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn get_ip_order(&self, id: u64) -> DbResult<IpOrder> {
+        Ok(sqlx::query_as("select * from ip_order where id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn get_ip_order_by_key(&self, key: &str) -> DbResult<Option<IpOrder>> {
+        Ok(
+            sqlx::query_as("select * from ip_order where idempotency_key = ?")
+                .bind(key)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn update_ip_order(&self, order: &IpOrder) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE ip_order SET state = ?, quantity = ?, provider_order_id = ?, cost = ?, currency = ?, \
+             approved_by = ?, approved_at = ?, error = ?, ordered_at = ?, delivered_at = ? \
+             WHERE id = ?",
+        )
+        .bind(order.state)
+        .bind(order.quantity)
+        .bind(&order.provider_order_id)
+        .bind(order.cost)
+        .bind(&order.currency)
+        .bind(order.approved_by)
+        .bind(order.approved_at)
+        .bind(&order.error)
+        .bind(order.ordered_at)
+        .bind(order.delivered_at)
+        .bind(order.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn grow_ip_order_quantity(&self, id: u64, quantity: u32) -> DbResult<bool> {
+        let res = sqlx::query(
+            "UPDATE ip_order SET quantity = ? WHERE id = ? AND state = ? AND quantity < ?",
+        )
+        .bind(quantity)
+        .bind(id)
+        .bind(IpOrderState::AwaitingApproval)
+        .bind(quantity)
+        .execute(&self.db)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn transition_ip_order(
+        &self,
+        id: u64,
+        from: IpOrderState,
+        to: IpOrderState,
+    ) -> DbResult<bool> {
+        let res = sqlx::query("UPDATE ip_order SET state = ? WHERE id = ? AND state = ?")
+            .bind(to)
+            .bind(id)
+            .bind(from)
+            .execute(&self.db)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    async fn list_ip_orders(
+        &self,
+        state: Option<IpOrderState>,
+        region_id: Option<u64>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpOrder>, u64)> {
+        let rows = sqlx::query_as(
+            "select * from ip_order where (? is null or state = ?) and (? is null or region_id = ?) \
+             order by id desc limit ? offset ?",
+        )
+        .bind(state)
+        .bind(state)
+        .bind(region_id)
+        .bind(region_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 = sqlx::query_scalar(
+            "select count(*) from ip_order where (? is null or state = ?) and (? is null or region_id = ?)",
+        )
+        .bind(state)
+        .bind(state)
+        .bind(region_id)
+        .bind(region_id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn sum_ip_order_cost_since(&self, since: DateTime<Utc>, currency: &str) -> DbResult<u64> {
+        let sum: i64 = sqlx::query_scalar(
+            "select cast(coalesce(sum(cost), 0) as signed) from ip_order \
+             where state in (2, 3, 4) and currency = ? and coalesce(ordered_at, created) >= ?",
+        )
+        .bind(currency)
+        .bind(since)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(sum as u64)
+    }
+
+    async fn insert_ip_order_audit(
+        &self,
+        ip_order_id: u64,
+        event: &str,
+        detail: Option<&str>,
+        actor_user_id: Option<u64>,
+    ) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO ip_order_audit (ip_order_id, event, detail, actor_user_id) VALUES (?, ?, ?, ?)",
+        )
+        .bind(ip_order_id)
+        .bind(event)
+        .bind(detail)
+        .bind(actor_user_id)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn list_ip_order_audit(&self, ip_order_id: u64) -> DbResult<Vec<IpOrderAudit>> {
+        Ok(
+            sqlx::query_as("select * from ip_order_audit where ip_order_id = ? order by id")
+                .bind(ip_order_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn insert_ip_order_range(
+        &self,
+        ip_order_id: u64,
+        ip_range_id: u64,
+        cidr: &str,
+    ) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO ip_order_range (ip_order_id, ip_range_id, cidr) VALUES (?, ?, ?)",
+        )
+        .bind(ip_order_id)
+        .bind(ip_range_id)
+        .bind(cidr)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn list_ip_order_ranges_for_order(
+        &self,
+        ip_order_id: u64,
+    ) -> DbResult<Vec<IpOrderRange>> {
+        Ok(
+            sqlx::query_as("select * from ip_order_range where ip_order_id = ? order by id")
+                .bind(ip_order_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn list_ip_order_ranges(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpOrderRange>, u64)> {
+        let rows = sqlx::query_as("select * from ip_order_range order by id desc limit ? offset ?")
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await?;
+        let total: i64 = sqlx::query_scalar("select count(*) from ip_order_range")
+            .fetch_one(&self.db)
+            .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn get_ip_order_range_by_range(
+        &self,
+        ip_range_id: u64,
+    ) -> DbResult<Option<IpOrderRange>> {
+        Ok(
+            sqlx::query_as("select * from ip_order_range where ip_range_id = ?")
+                .bind(ip_range_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn mark_ip_order_range_released(&self, id: u64) -> DbResult<()> {
+        sqlx::query("update ip_order_range set released_at = current_timestamp where id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn insert_ip_range(&self, range: &IpRange) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO ip_range (cidr, gateway, enabled, region_id, reverse_zone_id, access_policy_id, \
+             allocation_mode, use_full_range, forward_dns_server_id, reverse_dns_server_id, forward_zone_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&range.cidr)
+        .bind(&range.gateway)
+        .bind(range.enabled)
+        .bind(range.region_id)
+        .bind(&range.reverse_zone_id)
+        .bind(range.access_policy_id)
+        .bind(range.allocation_mode as u16)
+        .bind(range.use_full_range)
+        .bind(range.forward_dns_server_id)
+        .bind(range.reverse_dns_server_id)
+        .bind(&range.forward_zone_id)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn get_ip_range_by_cidr(&self, cidr: &str) -> DbResult<Option<IpRange>> {
+        Ok(sqlx::query_as("select * from ip_range where cidr = ?")
+            .bind(cidr)
+            .fetch_optional(&self.db)
+            .await?)
+    }
+
+    async fn set_ip_range_enabled(&self, id: u64, enabled: bool) -> DbResult<()> {
+        sqlx::query("update ip_range set enabled = ? where id = ?")
+            .bind(enabled)
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
     }
 
     async fn get_cost_plan(&self, id: u64) -> DbResult<VmCostPlan> {
@@ -1440,6 +2364,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         // CASCADE so it must be cleared first; subscription_line_item does
         // cascade, so deleting the subscription removes the line items.
         if let Some(subscription_id) = subscription_id {
+            record_onchain_address_owners(&mut tx, subscription_id, Some(vm_id)).await?;
             sqlx::query("delete from subscription_payment where subscription_id = ?")
                 .bind(subscription_id)
                 .execute(&mut *tx)
@@ -2905,6 +3830,19 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_never_paid_subscriptions(
+        &self,
+        older_than_seconds: u64,
+    ) -> DbResult<Vec<Subscription>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM subscription WHERE is_setup = 0 \
+             AND created < DATE_SUB(NOW(), INTERVAL ? SECOND)",
+        )
+        .bind(older_than_seconds)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
     async fn deactivate_subscription(&self, id: u64) -> DbResult<()> {
         let mut tx = self.db.begin().await?;
         sqlx::query("UPDATE subscription SET is_active = 0 WHERE id = ?")
@@ -3000,7 +3938,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             line_item.subscription_id = subscription_id;
 
             let li_res = sqlx::query(
-                "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration) VALUES (?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration, parent_line_item_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(line_item.subscription_id)
             .bind(line_item.subscription_type)
@@ -3009,6 +3947,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .bind(line_item.amount)
             .bind(line_item.setup_amount)
             .bind(&line_item.configuration)
+            .bind(line_item.parent_line_item_id)
             .execute(&mut *tx)
             .await?;
 
@@ -3079,6 +4018,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
         // subscription_payment has no ON DELETE CASCADE so it must be cleared
         // first; subscription_line_item does cascade from subscription.
+        record_onchain_address_owners(&mut tx, id, None).await?;
         sqlx::query("delete from subscription_payment where subscription_id = ?")
             .bind(id)
             .execute(&mut *tx)
@@ -3211,7 +4151,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         line_item: &SubscriptionLineItem,
     ) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration) VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, description, amount, setup_amount, configuration, parent_line_item_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(line_item.subscription_id)
         .bind(line_item.subscription_type)
@@ -3220,6 +4160,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(line_item.amount)
         .bind(line_item.setup_amount)
         .bind(&line_item.configuration)
+        .bind(line_item.parent_line_item_id)
         .execute(&self.db)
         .await?;
 
@@ -3231,7 +4172,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         line_item: &SubscriptionLineItem,
     ) -> DbResult<()> {
         sqlx::query(
-            "UPDATE subscription_line_item SET subscription_id = ?, subscription_type = ?, name = ?, description = ?, amount = ?, setup_amount = ?, configuration = ? WHERE id = ?"
+            "UPDATE subscription_line_item SET subscription_id = ?, subscription_type = ?, name = ?, description = ?, amount = ?, setup_amount = ?, configuration = ?, deactivated_at = ?, parent_line_item_id = ? WHERE id = ?"
         )
         .bind(line_item.subscription_id)
         .bind(line_item.subscription_type)
@@ -3240,6 +4181,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(line_item.amount)
         .bind(line_item.setup_amount)
         .bind(&line_item.configuration)
+        .bind(line_item.deactivated_at)
+        .bind(line_item.parent_line_item_id)
         .bind(line_item.id)
         .execute(&self.db)
         .await?;
@@ -3377,37 +4320,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()> {
-        sqlx::query(
-            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, amount, currency, payment_method, payment_type, external_data, external_id, is_paid, rate, tax, processing_fee, time_value, metadata, paid_at, tax_rate, tax_country_code, tax_treatment, tax_evidence, tax_breakdown, refunded_payment_id, renewal_source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(&payment.id)
-        .bind(payment.subscription_id)
-        .bind(payment.user_id)
-        .bind(payment.created)
-        .bind(payment.expires)
-        .bind(payment.amount)
-        .bind(&payment.currency)
-        .bind(payment.payment_method)
-        .bind(payment.payment_type)
-        .bind(&payment.external_data)
-        .bind(&payment.external_id)
-        .bind(payment.is_paid)
-        .bind(payment.rate)
-        .bind(payment.tax)
-        .bind(payment.processing_fee)
-        .bind(payment.time_value)
-        .bind(&payment.metadata)
-        .bind(payment.paid_at)
-        .bind(payment.tax_rate)
-        .bind(&payment.tax_country_code)
-        .bind(&payment.tax_treatment)
-        .bind(&payment.tax_evidence)
-        .bind(&payment.tax_breakdown)
-        .bind(&payment.refunded_payment_id)
-        .bind(payment.renewal_source)
-        .execute(&self.db)
-        .await?;
-
+        insert_subscription_payment_with(&self.db, payment).await?;
         Ok(())
     }
 
@@ -3517,6 +4430,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
                 .fetch_one(tx.as_mut())
                 .await?;
             let interval_sql = match sub.interval_type {
+                IntervalType::Hour => "HOUR",
                 IntervalType::Day => "DAY",
                 IntervalType::Month => "MONTH",
                 IntervalType::Year => "YEAR",
@@ -4276,7 +5190,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn insert_referral(&self, referral: &Referral) -> DbResult<u64> {
         let res = sqlx::query(
-            "INSERT INTO referral (user_id, code, address, mode, referral_rate, payout_threshold) VALUES (?, ?, ?, ?, ?, ?) returning id",
+            "INSERT INTO referral (user_id, code, address, mode, referral_rate, payout_threshold, auto_payout_approved) VALUES (?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(referral.user_id)
         .bind(&referral.code)
@@ -4284,6 +5198,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(referral.mode)
         .bind(referral.referral_rate)
         .bind(referral.payout_threshold)
+        .bind(referral.auto_payout_approved)
         .fetch_one(&self.db)
         .await?;
         Ok(res.try_get(0)?)
@@ -4399,30 +5314,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn list_referral_usage(&self, code: &str) -> DbResult<Vec<ReferralCostUsage>> {
         Ok(sqlx::query_as(
-            "SELECT v.id as vm_id,
-                    v.ref_code,
-                    sp.created,
-                    sp.amount,
-                    sp.currency,
-                    sp.rate,
-                    c.base_currency,
-                    COALESCE(r.referral_rate, c.referral_rate) AS effective_rate
-             FROM vm v
-             JOIN (
-                 SELECT v2.id as vm_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
-                        ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) AS rn
-                 FROM subscription_payment sp2
-                 JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
-                     AND sli2.subscription_type = 3
-                 JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
-                 WHERE sp2.is_paid = 1
-             ) sp ON v.id = sp.vm_id AND sp.rn = 1
-             JOIN vm_host vh ON v.host_id = vh.id
-             JOIN region vhr ON vh.region_id = vhr.id
-             JOIN company c ON vhr.company_id = c.id
-             LEFT JOIN referral r ON r.code = v.ref_code
-             WHERE v.ref_code = ?
-             ORDER BY sp.created DESC",
+&format!("{REFERRAL_USAGE_SELECT} {REFERRAL_USAGE_FROM} AND v.ref_code = ? ORDER BY sp.created DESC"),
         )
         .bind(code)
         .fetch_all(&self.db)
@@ -4436,31 +5328,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
         offset: u64,
     ) -> DbResult<(Vec<ReferralCostUsage>, u64)> {
         let rows = sqlx::query_as(
-            "SELECT v.id as vm_id,
-                    v.ref_code,
-                    sp.created,
-                    sp.amount,
-                    sp.currency,
-                    sp.rate,
-                    c.base_currency,
-                    COALESCE(r.referral_rate, c.referral_rate) AS effective_rate
-             FROM vm v
-             JOIN (
-                 SELECT v2.id as vm_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
-                        ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) AS rn
-                 FROM subscription_payment sp2
-                 JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
-                     AND sli2.subscription_type = 3
-                 JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
-                 WHERE sp2.is_paid = 1
-             ) sp ON v.id = sp.vm_id AND sp.rn = 1
-             JOIN vm_host vh ON v.host_id = vh.id
-             JOIN region vhr ON vh.region_id = vhr.id
-             JOIN company c ON vhr.company_id = c.id
-             LEFT JOIN referral r ON r.code = v.ref_code
-             WHERE v.ref_code = ?
-             ORDER BY sp.created DESC
-             LIMIT ? OFFSET ?",
+&format!(
+            "{REFERRAL_USAGE_SELECT} {REFERRAL_USAGE_FROM} AND v.ref_code = ? ORDER BY sp.created DESC LIMIT ? OFFSET ?"
+        ),
         )
         .bind(code)
         .bind(limit)
@@ -4469,23 +5339,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?;
 
         // Total row count mirrors the same joins/filters as the page query.
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*)
-             FROM vm v
-             JOIN (
-                 SELECT v2.id as vm_id,
-                        ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) AS rn
-                 FROM subscription_payment sp2
-                 JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
-                     AND sli2.subscription_type = 3
-                 JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
-                 WHERE sp2.is_paid = 1
-             ) sp ON v.id = sp.vm_id AND sp.rn = 1
-             JOIN vm_host vh ON v.host_id = vh.id
-             JOIN region vhr ON vh.region_id = vhr.id
-             JOIN company c ON vhr.company_id = c.id
-             WHERE v.ref_code = ?",
-        )
+        let total: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) {REFERRAL_USAGE_FROM} AND v.ref_code = ?"
+        ))
         .bind(code)
         .fetch_one(&self.db)
         .await?;
@@ -4496,7 +5352,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn count_failed_referrals(&self, code: &str) -> DbResult<u64> {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM vm v
+             LEFT JOIN referral r ON r.code = v.ref_code
              WHERE v.ref_code = ?
+               AND (r.user_id IS NULL OR r.user_id <> v.user_id)
                AND NOT EXISTS (
                    SELECT 1
                    FROM subscription_payment sp
@@ -4731,6 +5589,626 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    // ========================================================================
+    // Account credit
+    // ========================================================================
+
+    async fn get_account_credit(&self, user_id: u64, currency: &str) -> DbResult<AccountCredit> {
+        let row: Option<AccountCredit> = sqlx::query_as(
+            "SELECT user_id, balance, currency, auto_apply, updated \
+             FROM account_credit WHERE user_id = ? AND currency = ?",
+        )
+        .bind(user_id)
+        .bind(currency)
+        .fetch_optional(&self.db)
+        .await?;
+        if let Some(row) = row {
+            return Ok(row);
+        }
+        let auto_apply: Option<bool> =
+            sqlx::query_scalar("SELECT MAX(auto_apply) FROM account_credit WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_one(&self.db)
+                .await?;
+        Ok(AccountCredit {
+            user_id,
+            balance: 0,
+            currency: currency.to_string(),
+            auto_apply: auto_apply.unwrap_or(false),
+            updated: Utc::now(),
+        })
+    }
+
+    async fn list_account_credits(&self, user_id: u64) -> DbResult<Vec<AccountCredit>> {
+        Ok(sqlx::query_as(
+            "SELECT user_id, balance, currency, auto_apply, updated \
+             FROM account_credit WHERE user_id = ? ORDER BY currency",
+        )
+        .bind(user_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn set_account_credit_auto_apply(&self, user_id: u64, auto_apply: bool) -> DbResult<()> {
+        let updated = sqlx::query(
+            "UPDATE account_credit SET auto_apply = ?, updated = NOW() WHERE user_id = ?",
+        )
+        .bind(auto_apply)
+        .bind(user_id)
+        .execute(&self.db)
+        .await?;
+        if updated.rows_affected() == 0 {
+            sqlx::query(
+                "INSERT INTO account_credit (user_id, balance, currency, auto_apply) \
+                 VALUES (?, 0, 'BTC', ?) \
+                 ON DUPLICATE KEY UPDATE auto_apply = VALUES(auto_apply), updated = NOW()",
+            )
+            .bind(user_id)
+            .bind(auto_apply)
+            .execute(&self.db)
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn get_account_credit_reserved(&self, user_id: u64, currency: &str) -> DbResult<u64> {
+        Ok(account_credit_reserved(&self.db, user_id, currency, None).await?)
+    }
+
+    async fn insert_refund_to_credit(
+        &self,
+        refund: &SubscriptionPayment,
+        credits: &[(String, u64)],
+        note: Option<&str>,
+    ) -> DbResult<bool> {
+        let mut tx = self.db.begin().await?;
+        let mut balances = Vec::new();
+        let mut sorted: Vec<&(String, u64)> = credits.iter().filter(|(_, c)| *c > 0).collect();
+        sorted.sort();
+        for (currency, credit) in sorted {
+            let balance = lock_account_credit(&mut tx, refund.user_id, currency).await?;
+            balances.push((currency, *credit, balance));
+        }
+        let exists: Option<Vec<u8>> =
+            sqlx::query_scalar("SELECT id FROM subscription_payment WHERE id = ?")
+                .bind(&refund.id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if exists.is_some() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        insert_subscription_payment_with(&mut *tx, refund).await?;
+        for (currency, credit, balance) in balances {
+            let new_balance = balance.checked_add(credit).ok_or_else(|| {
+                anyhow!(
+                    "account credit balance overflow for user {}",
+                    refund.user_id
+                )
+            })?;
+            sqlx::query(
+                "UPDATE account_credit SET balance = ?, updated = NOW() \
+                 WHERE user_id = ? AND currency = ?",
+            )
+            .bind(new_balance)
+            .bind(refund.user_id)
+            .bind(currency)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO account_credit_event \
+                 (user_id, kind, amount, currency, subscription_payment_id, note) \
+                 VALUES (?, 'refund', ?, ?, ?, ?)",
+            )
+            .bind(refund.user_id)
+            .bind(i64::try_from(credit).map_err(|_| anyhow!("refund credit too large"))?)
+            .bind(currency)
+            .bind(&refund.id)
+            .bind(note)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    async fn adjust_account_credit(
+        &self,
+        user_id: u64,
+        currency: &str,
+        delta: i64,
+        kind: &str,
+        note: Option<&str>,
+    ) -> DbResult<AccountCredit> {
+        if delta == 0 {
+            return self.get_account_credit(user_id, currency).await;
+        }
+        let mut tx = self.db.begin().await?;
+        let balance = lock_account_credit(&mut tx, user_id, currency).await?;
+        let new_balance = if delta > 0 {
+            balance
+                .checked_add(delta.unsigned_abs())
+                .ok_or_else(|| anyhow!("account credit balance overflow for user {user_id}"))?
+        } else {
+            let reserved = account_credit_reserved(&mut *tx, user_id, currency, None).await?;
+            let available = balance.saturating_sub(reserved);
+            if delta.unsigned_abs() > available {
+                tx.rollback().await?;
+                return Err(anyhow!(
+                    "account credit for user {user_id} has {available} unreserved, cannot remove {}",
+                    delta.unsigned_abs()
+                )
+                .into());
+            }
+            balance - delta.unsigned_abs()
+        };
+        sqlx::query(
+            "UPDATE account_credit SET balance = ?, updated = NOW() \
+             WHERE user_id = ? AND currency = ?",
+        )
+        .bind(new_balance)
+        .bind(user_id)
+        .bind(currency)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO account_credit_event (user_id, kind, amount, currency, note) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(kind)
+        .bind(delta)
+        .bind(currency)
+        .bind(note)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        self.get_account_credit(user_id, currency).await
+    }
+
+    async fn list_account_credit_events_in_currency(
+        &self,
+        user_id: u64,
+        currency: &str,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AccountCreditEvent>, u64)> {
+        let rows = sqlx::query_as(
+            "SELECT * FROM account_credit_event WHERE user_id = ? AND currency = ? \
+             ORDER BY created DESC, id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(user_id)
+        .bind(currency)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM account_credit_event WHERE user_id = ? AND currency = ?",
+        )
+        .bind(user_id)
+        .bind(currency)
+        .fetch_one(&self.db)
+        .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn list_account_credit_events(
+        &self,
+        user_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AccountCreditEvent>, u64)> {
+        let rows = sqlx::query_as(
+            "SELECT * FROM account_credit_event WHERE user_id = ? \
+             ORDER BY created DESC, id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM account_credit_event WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_one(&self.db)
+                .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn reserve_account_credit(&self, debit: &AccountCreditDebit) -> DbResult<Option<u64>> {
+        let mut tx = self.db.begin().await?;
+        let balance = lock_account_credit(&mut tx, debit.user_id, &debit.currency).await?;
+        let reserved =
+            account_credit_reserved(&mut *tx, debit.user_id, &debit.currency, None).await?;
+        if balance.saturating_sub(reserved) < debit.amount {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let res = sqlx::query(
+            "INSERT INTO account_credit_debit \
+             (user_id, amount, currency, payment_amount, settled, expires) \
+             VALUES (?, ?, ?, ?, 0, ?) RETURNING id",
+        )
+        .bind(debit.user_id)
+        .bind(debit.amount)
+        .bind(&debit.currency)
+        .bind(debit.payment_amount)
+        .bind(debit.expires)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(res.try_get(0)?))
+    }
+
+    async fn attach_account_credit_debit(
+        &self,
+        id: u64,
+        subscription_payment_id: &Vec<u8>,
+        expires: DateTime<Utc>,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE account_credit_debit SET subscription_payment_id = ?, expires = ? \
+             WHERE id = ? AND settled = 0",
+        )
+        .bind(subscription_payment_id)
+        .bind(expires)
+        .bind(id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn release_account_credit_debit(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM account_credit_debit WHERE id = ? AND settled = 0")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_account_credit_debit_by_payment(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<AccountCreditDebit>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM account_credit_debit WHERE subscription_payment_id = ?")
+                .bind(subscription_payment_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn settle_account_credit_debit(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<AccountCreditDebit>> {
+        let owner: Option<(u64, String)> = sqlx::query_as(
+            "SELECT user_id, currency FROM account_credit_debit \
+             WHERE subscription_payment_id = ? AND settled = 0",
+        )
+        .bind(subscription_payment_id)
+        .fetch_optional(&self.db)
+        .await?;
+        let Some((user_id, currency)) = owner else {
+            return Ok(None);
+        };
+        let mut tx = self.db.begin().await?;
+        let balance = lock_account_credit(&mut tx, user_id, &currency).await?;
+        let debit: Option<AccountCreditDebit> = sqlx::query_as(
+            "SELECT * FROM account_credit_debit \
+             WHERE subscription_payment_id = ? AND settled = 0 FOR UPDATE",
+        )
+        .bind(subscription_payment_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(mut debit) = debit else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let available = if debit.expires > Utc::now() {
+            balance
+        } else {
+            let others =
+                account_credit_reserved(&mut *tx, debit.user_id, &debit.currency, Some(debit.id))
+                    .await?;
+            balance.saturating_sub(others)
+        };
+        debit.clamp_to(available);
+
+        sqlx::query(
+            "UPDATE account_credit_debit \
+             SET settled = 1, settled_at = NOW(), amount = ?, payment_amount = ? WHERE id = ?",
+        )
+        .bind(debit.amount)
+        .bind(debit.payment_amount)
+        .bind(debit.id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE account_credit SET balance = ?, updated = NOW() \
+             WHERE user_id = ? AND currency = ?",
+        )
+        .bind(balance - debit.amount)
+        .bind(debit.user_id)
+        .bind(&debit.currency)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO account_credit_event \
+             (user_id, kind, amount, currency, subscription_payment_id) \
+             VALUES (?, 'spend', ?, ?, ?)",
+        )
+        .bind(debit.user_id)
+        .bind(-i64::try_from(debit.amount).map_err(|e| anyhow!(e))?)
+        .bind(&debit.currency)
+        .bind(&debit.subscription_payment_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        debit.settled = true;
+        debit.settled_at = Some(Utc::now());
+        Ok(Some(debit))
+    }
+
+    async fn insert_account_credit_topup(&self, topup: &AccountCreditTopup) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO account_credit_topup \
+             (user_id, amount, currency, payment_method, invoice_hash, external_data, \
+              external_id, is_paid) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0) RETURNING id",
+        )
+        .bind(topup.user_id)
+        .bind(topup.amount)
+        .bind(&topup.currency)
+        .bind(topup.payment_method)
+        .bind(&topup.invoice_hash)
+        .bind(&topup.external_data)
+        .bind(&topup.external_id)
+        .fetch_one(&self.db)
+        .await?;
+        Ok(res.try_get(0)?)
+    }
+
+    async fn get_account_credit_topup_by_hash(
+        &self,
+        invoice_hash: &Vec<u8>,
+    ) -> DbResult<Option<AccountCreditTopup>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM account_credit_topup WHERE invoice_hash = ?")
+                .bind(invoice_hash)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_account_credit_topup_by_ext_id(
+        &self,
+        external_id: &str,
+    ) -> DbResult<Option<AccountCreditTopup>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM account_credit_topup WHERE external_id = ?")
+                .bind(external_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn list_account_credit_topups_by_method(
+        &self,
+        method: PaymentMethod,
+    ) -> DbResult<Vec<AccountCreditTopup>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM account_credit_topup WHERE payment_method = ?")
+                .bind(method)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn set_account_credit_topup_deposit(
+        &self,
+        id: u64,
+        external_id: &str,
+        amount: u64,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE account_credit_topup SET external_id = ?, amount = ? \
+             WHERE id = ? AND is_paid = 0",
+        )
+        .bind(external_id)
+        .bind(amount)
+        .bind(id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_account_credit_topup(&self, id: u64) -> DbResult<Option<AccountCreditTopup>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM account_credit_topup WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn settle_account_credit_topup_noted(
+        &self,
+        id: u64,
+        credit_currency: &str,
+        credit_amount: u64,
+        note: Option<&str>,
+    ) -> DbResult<Option<AccountCreditTopup>> {
+        let owner: Option<u64> = sqlx::query_scalar(
+            "SELECT user_id FROM account_credit_topup WHERE id = ? AND is_paid = 0",
+        )
+        .bind(id)
+        .fetch_optional(&self.db)
+        .await?;
+        let Some(user_id) = owner else {
+            return Ok(None);
+        };
+        let mut tx = self.db.begin().await?;
+        let balance = lock_account_credit(&mut tx, user_id, credit_currency).await?;
+        let paid = sqlx::query(
+            "UPDATE account_credit_topup SET is_paid = 1, paid_at = NOW(), \
+             credit_currency = ?, credit_amount = ? WHERE id = ? AND is_paid = 0",
+        )
+        .bind(credit_currency)
+        .bind(credit_amount)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if paid.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let topup: AccountCreditTopup =
+            sqlx::query_as("SELECT * FROM account_credit_topup WHERE id = ?")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        sqlx::query(
+            "UPDATE account_credit SET balance = ?, updated = NOW() \
+             WHERE user_id = ? AND currency = ?",
+        )
+        .bind(balance + credit_amount)
+        .bind(topup.user_id)
+        .bind(credit_currency)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO account_credit_event (user_id, kind, amount, currency, note) \
+             VALUES (?, 'topup', ?, ?, ?)",
+        )
+        .bind(topup.user_id)
+        .bind(i64::try_from(credit_amount).map_err(|e| anyhow!(e))?)
+        .bind(credit_currency)
+        .bind(note)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(topup))
+    }
+
+    async fn list_account_credit_topups(
+        &self,
+        user_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AccountCreditTopup>, u64)> {
+        let rows = sqlx::query_as(
+            "SELECT * FROM account_credit_topup WHERE user_id = ? \
+             ORDER BY created DESC, id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM account_credit_topup WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_one(&self.db)
+                .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn get_onchain_address_owner(
+        &self,
+        address: &str,
+    ) -> DbResult<Option<OnchainAddressOwner>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM onchain_address_owner WHERE address_hash = ?")
+                .bind(crate::onchain_address_hash(address))
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn mark_onchain_address_owner_notified(&self, id: u64, outpoint: &str) -> DbResult<bool> {
+        let r = sqlx::query(
+            "UPDATE onchain_address_owner SET notified_outpoint = ? \
+             WHERE id = ? AND (notified_outpoint IS NULL OR notified_outpoint = credited_outpoint) \
+             AND (credited_outpoint IS NULL OR credited_outpoint <> ?)",
+        )
+        .bind(outpoint)
+        .bind(id)
+        .bind(outpoint)
+        .execute(&self.db)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    async fn credit_onchain_address_owner(
+        &self,
+        id: u64,
+        outpoint: &str,
+        amount_msat: u64,
+        note: &str,
+    ) -> DbResult<Option<u64>> {
+        let mut tx = self.db.begin().await?;
+        let user_id: Option<u64> =
+            sqlx::query_scalar("SELECT user_id FROM onchain_address_owner WHERE id = ? FOR UPDATE")
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(user_id) = user_id else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let inserted = sqlx::query(
+            "INSERT IGNORE INTO account_credit_topup \
+             (user_id, amount, currency, payment_method, invoice_hash, external_data, external_id, \
+              is_paid, paid_at, credit_currency, credit_amount) \
+             VALUES (?, ?, 'BTC', ?, ?, '', ?, 1, NOW(), 'BTC', ?)",
+        )
+        .bind(user_id)
+        .bind(amount_msat)
+        .bind(PaymentMethod::OnChain)
+        .bind(crate::onchain_address_hash(&format!("late:{outpoint}")))
+        .bind(outpoint)
+        .bind(amount_msat)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        let balance = lock_account_credit(&mut tx, user_id, "BTC").await?;
+        let new_balance = balance + amount_msat;
+        sqlx::query(
+            "UPDATE account_credit SET balance = ?, updated = NOW() \
+             WHERE user_id = ? AND currency = 'BTC'",
+        )
+        .bind(new_balance)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO account_credit_event (user_id, kind, amount, currency, note) \
+             VALUES (?, 'topup', ?, 'BTC', ?)",
+        )
+        .bind(user_id)
+        .bind(i64::try_from(amount_msat).map_err(|e| anyhow!(e))?)
+        .bind(note)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE onchain_address_owner SET status = ?, credited_outpoint = ?, \
+             notified_outpoint = ? WHERE id = ?",
+        )
+        .bind(OnchainAddressOwnerStatus::Credited)
+        .bind(outpoint)
+        .bind(outpoint)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(new_balance))
+    }
+
     // ----- Marketplace (operator-run compute nodes) -----
 
     async fn get_marketplace_operator(&self, id: u64) -> DbResult<MarketplaceOperator> {
@@ -4910,12 +6388,12 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn get_marketplace_node_host(&self, node_id: u64) -> DbResult<Option<VmHost>> {
-        Ok(
-            sqlx::query_as::<_, VmHost>("SELECT * FROM vm_host WHERE marketplace_node_id = ?")
-                .bind(node_id)
-                .fetch_optional(&self.db)
-                .await?,
+        Ok(sqlx::query_as::<_, VmHost>(
+            "SELECT * FROM vm_host WHERE marketplace_node_id = ? AND deleted = 0",
         )
+        .bind(node_id)
+        .fetch_optional(&self.db)
+        .await?)
     }
 
     async fn get_marketplace_node_by_tunnel(
@@ -5226,6 +6704,23 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(res.try_get(0)?)
     }
 
+    async fn bump_tunnel_pool_generation(&self, id: u64) -> DbResult<u64> {
+        // Incremented in the database rather than read, added and written back,
+        // so two changes landing together cannot settle on the same number and
+        // leave a route server believing it is current.
+        sqlx::query("UPDATE tunnel_pool SET generation = generation + 1 WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(
+            sqlx::query_as::<_, (u64,)>("SELECT generation FROM tunnel_pool WHERE id = ?")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?
+                .0,
+        )
+    }
+
     async fn update_tunnel_pool(&self, pool: &TunnelPool) -> DbResult<()> {
         // The same invariant from the other side: a pool already terminating a
         // service cannot have its block edited away from its siblings'.
@@ -5281,6 +6776,178 @@ impl LNVpsDbBase for LNVpsDbMysql {
             .execute(&self.db)
             .await?;
         Ok(())
+    }
+
+    // ----- VM add-ons -----
+
+    async fn list_vm_addon_prices(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmAddonPrice>, u64)> {
+        let rows = sqlx::query_as("SELECT * FROM vm_addon_price ORDER BY id DESC LIMIT ? OFFSET ?")
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.db)
+            .await?;
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vm_addon_price")
+            .fetch_one(&self.db)
+            .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn get_vm_addon_price(&self, id: u64) -> DbResult<VmAddonPrice> {
+        Ok(sqlx::query_as("SELECT * FROM vm_addon_price WHERE id = ?")
+            .bind(id)
+            .fetch_one(&self.db)
+            .await?)
+    }
+
+    async fn get_vm_addon_price_for_region(
+        &self,
+        region_id: u64,
+        kind: VmAddonKind,
+    ) -> DbResult<Option<VmAddonPrice>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM vm_addon_price WHERE region_id = ? AND kind = ?")
+                .bind(region_id)
+                .bind(kind)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn insert_vm_addon_price(&self, price: &VmAddonPrice) -> DbResult<u64> {
+        let res = sqlx::query(
+            "INSERT INTO vm_addon_price (region_id, kind, currency, monthly_amount, max_quantity, enabled) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(price.region_id)
+        .bind(price.kind)
+        .bind(&price.currency)
+        .bind(price.monthly_amount)
+        .bind(price.max_quantity)
+        .bind(price.enabled)
+        .execute(&self.db)
+        .await?;
+        Ok(res.last_insert_id())
+    }
+
+    async fn update_vm_addon_price(&self, price: &VmAddonPrice) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE vm_addon_price SET currency = ?, monthly_amount = ?, max_quantity = ?, enabled = ? \
+             WHERE id = ?",
+        )
+        .bind(&price.currency)
+        .bind(price.monthly_amount)
+        .bind(price.max_quantity)
+        .bind(price.enabled)
+        .bind(price.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_vm_addon_price(&self, id: u64) -> DbResult<()> {
+        sqlx::query("DELETE FROM vm_addon_price WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_vm_addons(&self, vm_id: u64) -> DbResult<Vec<VmAddon>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM vm_addon WHERE vm_id = ? ORDER BY kind")
+                .bind(vm_id)
+                .fetch_all(&self.db)
+                .await?,
+        )
+    }
+
+    async fn get_vm_addon_by_line_item(&self, line_item_id: u64) -> DbResult<Option<VmAddon>> {
+        Ok(
+            sqlx::query_as("SELECT * FROM vm_addon WHERE subscription_line_item_id = ?")
+                .bind(line_item_id)
+                .fetch_optional(&self.db)
+                .await?,
+        )
+    }
+
+    async fn set_vm_addon(
+        &self,
+        vm_id: u64,
+        kind: VmAddonKind,
+        quantity: u32,
+        amount: u64,
+        name: &str,
+    ) -> DbResult<VmAddon> {
+        let mut tx = self.db.begin().await?;
+        let (parent_id, subscription_id): (u64, u64) = sqlx::query_as(
+            "SELECT li.id, li.subscription_id FROM vm v \
+             JOIN subscription_line_item li ON li.id = v.subscription_line_item_id \
+             WHERE v.id = ? FOR UPDATE",
+        )
+        .bind(vm_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let existing: Option<VmAddon> =
+            sqlx::query_as("SELECT * FROM vm_addon WHERE vm_id = ? AND kind = ? FOR UPDATE")
+                .bind(vm_id)
+                .bind(kind)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let deactivated_at = (quantity == 0).then(Utc::now);
+        let line_item_id = match &existing {
+            Some(a) => {
+                sqlx::query(
+                    "UPDATE subscription_line_item SET name = ?, amount = ?, deactivated_at = ? WHERE id = ?",
+                )
+                .bind(name)
+                .bind(amount)
+                .bind(deactivated_at)
+                .bind(a.subscription_line_item_id)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query("UPDATE vm_addon SET quantity = ? WHERE id = ?")
+                    .bind(quantity)
+                    .bind(a.id)
+                    .execute(&mut *tx)
+                    .await?;
+                a.subscription_line_item_id
+            }
+            None => {
+                let li = sqlx::query(
+                    "INSERT INTO subscription_line_item (subscription_id, subscription_type, name, amount, setup_amount, deactivated_at, parent_line_item_id) \
+                     VALUES (?, ?, ?, ?, 0, ?, ?)",
+                )
+                .bind(subscription_id)
+                .bind(LineItemType::VmAddon)
+                .bind(name)
+                .bind(amount)
+                .bind(deactivated_at)
+                .bind(parent_id)
+                .execute(&mut *tx)
+                .await?
+                .last_insert_id();
+                sqlx::query(
+                    "INSERT INTO vm_addon (vm_id, kind, quantity, subscription_line_item_id) VALUES (?, ?, ?, ?)",
+                )
+                .bind(vm_id)
+                .bind(kind)
+                .bind(quantity)
+                .bind(li)
+                .execute(&mut *tx)
+                .await?;
+                li
+            }
+        };
+        let addon = sqlx::query_as("SELECT * FROM vm_addon WHERE subscription_line_item_id = ?")
+            .bind(line_item_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(addon)
     }
 
     // ----- VPN -----
@@ -5402,22 +7069,101 @@ impl LNVpsDbBase for LNVpsDbMysql {
                  must share one block so a device keeps one address in every region"
             )));
         }
+        // Linking an interface and giving it the service's devices is one
+        // operation. A link without the peers is a region a customer can select
+        // and cannot reach, with nothing to indicate why.
+        let mut tx = self.db.begin().await?;
         sqlx::query(
             "INSERT INTO vpn_service_pool (vpn_service_id, tunnel_pool_id) VALUES (?, ?) \
              ON DUPLICATE KEY UPDATE vpn_service_id = VALUES(vpn_service_id)",
         )
         .bind(vpn_service_id)
         .bind(tunnel_pool_id)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await?;
+
+        let router_id: (u64,) = sqlx::query_as("SELECT router_id FROM tunnel_pool WHERE id = ?")
+            .bind(tunnel_pool_id)
+            .fetch_one(&mut *tx)
+            .await?;
+
+        // Every existing device gains a peer here, copied from one it already
+        // has: same key, same addresses, because that identity working in every
+        // region is the product. `LIMIT 1` per device because its rows are
+        // identical by construction.
+        let devices: Vec<(u64, Vec<u8>, Option<String>, Option<String>, String)> = sqlx::query_as(
+            "SELECT d.id, t.peer_pubkey, t.address4, t.address6, t.name FROM vpn_device d \
+                 JOIN vpn_subscription vs ON vs.id = d.vpn_subscription_id \
+                 JOIN vpn_device_tunnel dt ON dt.vpn_device_id = d.id \
+                 JOIN tunnel t ON t.id = dt.tunnel_id \
+                 WHERE vs.vpn_service_id = ? \
+                 GROUP BY d.id",
+        )
+        .bind(vpn_service_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        for (device_id, peer_pubkey, address4, address6, name) in devices {
+            let tunnel_id: u64 = sqlx::query(
+                "INSERT INTO tunnel (kind, user_id, router_id, pool_id, name, peer_pubkey, \
+                 address4, address6, enabled) \
+                 SELECT ?, vs.user_id, ?, ?, ?, ?, ?, ?, 1 FROM vpn_device d \
+                 JOIN vpn_subscription vs ON vs.id = d.vpn_subscription_id WHERE d.id = ?",
+            )
+            .bind(RouterTunnelKind::Wireguard)
+            .bind(router_id.0)
+            .bind(tunnel_pool_id)
+            .bind(&name)
+            .bind(&peer_pubkey)
+            .bind(&address4)
+            .bind(&address6)
+            .bind(device_id)
+            .execute(&mut *tx)
+            .await?
+            .last_insert_id();
+
+            sqlx::query("INSERT INTO vpn_device_tunnel (vpn_device_id, tunnel_id) VALUES (?, ?)")
+                .bind(device_id)
+                .bind(tunnel_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
         Ok(())
     }
 
     async fn unlink_vpn_service_pool(&self, tunnel_pool_id: u64) -> DbResult<()> {
+        // Withdrawing a region takes its peers with it. Leaving them would mean
+        // rows still claiming an interface that no longer terminates the
+        // service, which the planner would then configure -- an unlinked region
+        // that keeps working.
+        //
+        // The devices keep every other region and their addresses: what is
+        // withdrawn is one interface, not the customer's identity.
+        let mut tx = self.db.begin().await?;
+        let tunnel_ids: Vec<(u64,)> = sqlx::query_as(
+            "SELECT dt.tunnel_id FROM vpn_device_tunnel dt \
+             JOIN tunnel t ON t.id = dt.tunnel_id WHERE t.pool_id = ?",
+        )
+        .bind(tunnel_pool_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for (tunnel_id,) in tunnel_ids {
+            sqlx::query("DELETE FROM vpn_device_tunnel WHERE tunnel_id = ?")
+                .bind(tunnel_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM tunnel WHERE id = ?")
+                .bind(tunnel_id)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query("DELETE FROM vpn_service_pool WHERE tunnel_pool_id = ?")
             .bind(tunnel_pool_id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -5503,7 +7249,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn get_vpn_device_by_pubkey(&self, peer_pubkey: &[u8]) -> DbResult<Option<VpnDevice>> {
         Ok(sqlx::query_as(
             "SELECT d.* FROM vpn_device d \
-             JOIN tunnel t ON t.id = d.tunnel_id WHERE t.peer_pubkey = ?",
+             JOIN vpn_device_tunnel dt ON dt.vpn_device_id = d.id \
+             JOIN tunnel t ON t.id = dt.tunnel_id WHERE t.peer_pubkey = ? LIMIT 1",
         )
         .bind(peer_pubkey)
         .fetch_optional(&self.db)
@@ -5522,7 +7269,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn list_vpn_tunnels_in_service(&self, vpn_service_id: u64) -> DbResult<Vec<Tunnel>> {
         Ok(sqlx::query_as(
             "SELECT t.* FROM tunnel t \
-             JOIN vpn_device d ON d.tunnel_id = t.id \
+             JOIN vpn_device_tunnel dt ON dt.tunnel_id = t.id \
+             JOIN vpn_device d ON d.id = dt.vpn_device_id \
              JOIN vpn_subscription vs ON vs.id = d.vpn_subscription_id \
              WHERE vs.vpn_service_id = ? ORDER BY t.id",
         )
@@ -5531,22 +7279,35 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
-    async fn list_active_vpn_tunnels(&self, vpn_service_id: u64) -> DbResult<Vec<Tunnel>> {
-        // The billing join is what applies suspension: an unpaid, deactivated or
-        // expired plan simply stops matching, so its peers leave the next
-        // reconcile's set without any code path having had to disable them.
+    async fn list_vpn_device_tunnels(&self, vpn_device_id: u64) -> DbResult<Vec<Tunnel>> {
         Ok(sqlx::query_as(
             "SELECT t.* FROM tunnel t \
-             JOIN vpn_device d ON d.tunnel_id = t.id \
+             JOIN vpn_device_tunnel dt ON dt.tunnel_id = t.id \
+             WHERE dt.vpn_device_id = ? ORDER BY t.id",
+        )
+        .bind(vpn_device_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_active_vpn_tunnels_in_pool(&self, tunnel_pool_id: u64) -> DbResult<Vec<Tunnel>> {
+        // `t.pool_id` selects this interface's own rows; the billing join is
+        // what applies suspension. An unpaid, deactivated or expired plan simply
+        // stops matching, so its peers leave the next reconcile's set without
+        // any code path having had to disable them.
+        Ok(sqlx::query_as(
+            "SELECT t.* FROM tunnel t \
+             JOIN vpn_device_tunnel dt ON dt.tunnel_id = t.id \
+             JOIN vpn_device d ON d.id = dt.vpn_device_id \
              JOIN vpn_subscription vs ON vs.id = d.vpn_subscription_id \
              JOIN subscription_line_item sli ON sli.id = vs.subscription_line_item_id \
              JOIN subscription s ON s.id = sli.subscription_id \
-             WHERE vs.vpn_service_id = ? AND t.enabled = 1 \
+             WHERE t.pool_id = ? AND t.enabled = 1 \
              AND s.is_active = 1 AND s.is_setup = 1 \
              AND (s.expires IS NULL OR s.expires > NOW()) \
              ORDER BY t.id",
         )
-        .bind(vpn_service_id)
+        .bind(tunnel_pool_id)
         .fetch_all(&self.db)
         .await?)
     }
@@ -5586,18 +7347,63 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn insert_vpn_device(&self, device: &VpnDevice) -> DbResult<u64> {
-        let res = sqlx::query(
-            "INSERT INTO vpn_device (vpn_subscription_id, slot, name, tunnel_id) \
-             VALUES (?, ?, ?, ?) returning id",
+    async fn insert_vpn_device_with_peers(
+        &self,
+        device: &VpnDevice,
+        peer: &VpnPeerTemplate,
+    ) -> DbResult<u64> {
+        let mut tx = self.db.begin().await?;
+
+        let device_id: u64 = sqlx::query(
+            "INSERT INTO vpn_device (vpn_subscription_id, slot, name) VALUES (?, ?, ?)",
         )
         .bind(device.vpn_subscription_id)
         .bind(device.slot)
         .bind(&device.name)
-        .bind(device.tunnel_id)
-        .fetch_one(&self.db)
+        .execute(&mut *tx)
+        .await?
+        .last_insert_id();
+
+        // Every interface the plan's service terminates gets a peer, all
+        // carrying the same key and addresses. Read inside the transaction so a
+        // region linked concurrently is either in this device's set or not,
+        // rather than half of it.
+        let pools: Vec<(u64, u64)> = sqlx::query_as(
+            "SELECT tp.id, tp.router_id FROM tunnel_pool tp \
+             JOIN vpn_service_pool vsp ON vsp.tunnel_pool_id = tp.id \
+             JOIN vpn_subscription vs ON vs.vpn_service_id = vsp.vpn_service_id \
+             WHERE vs.id = ? ORDER BY tp.id",
+        )
+        .bind(device.vpn_subscription_id)
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(res.try_get(0)?)
+
+        for (pool_id, router_id) in pools {
+            let tunnel_id: u64 = sqlx::query(
+                "INSERT INTO tunnel (kind, user_id, router_id, pool_id, name, peer_pubkey, \
+                 address4, address6, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)",
+            )
+            .bind(RouterTunnelKind::Wireguard)
+            .bind(peer.user_id)
+            .bind(router_id)
+            .bind(pool_id)
+            .bind(&peer.name)
+            .bind(&peer.peer_pubkey)
+            .bind(&peer.address4)
+            .bind(&peer.address6)
+            .execute(&mut *tx)
+            .await?
+            .last_insert_id();
+
+            sqlx::query("INSERT INTO vpn_device_tunnel (vpn_device_id, tunnel_id) VALUES (?, ?)")
+                .bind(device_id)
+                .bind(tunnel_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
+        Ok(device_id)
     }
 
     async fn update_vpn_device(&self, device: &VpnDevice) -> DbResult<()> {
@@ -5609,27 +7415,60 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
-    async fn delete_vpn_device(&self, id: u64) -> DbResult<()> {
-        // The tunnel goes with the device. Only this row knows which tunnel
-        // belongs to the customer -- every query reaches one through the other
-        // -- so deleting the link alone leaves a tunnel that no query can see,
-        // holding a public key, forever.
-        //
-        // A transaction because a foreign key cannot express ownership in this
-        // direction, and the two deletes must be ordered: `vpn_device.tunnel_id`
-        // is RESTRICT, so the link goes first. `tunnel_route` cascades off
-        // `tunnel` and needs no help.
+    async fn delete_vpn_subscription(&self, id: u64) -> DbResult<()> {
+        // Ordered by the FKs, which are RESTRICT in both directions: the
+        // devices hold the plan, and each device holds the tunnel that is the
+        // only record of the customer's key. Read the tunnel ids first, drop
+        // the devices, then the tunnels, then the plan. `vpn_device_tunnel`
+        // cascades off `vpn_device` and `tunnel_route` off `tunnel`.
         let mut tx = self.db.begin().await?;
-        let tunnel_id: Option<(u64,)> =
-            sqlx::query_as("SELECT tunnel_id FROM vpn_device WHERE id = ?")
+        let tunnel_ids: Vec<(u64,)> = sqlx::query_as(
+            "SELECT dt.tunnel_id FROM vpn_device_tunnel dt \
+             JOIN vpn_device d ON d.id = dt.vpn_device_id \
+             WHERE d.vpn_subscription_id = ?",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM vpn_device WHERE vpn_subscription_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        for (tunnel_id,) in tunnel_ids {
+            sqlx::query("DELETE FROM tunnel WHERE id = ?")
+                .bind(tunnel_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        sqlx::query("DELETE FROM vpn_subscription WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn delete_vpn_device(&self, id: u64) -> DbResult<()> {
+        // The peers go with the device. Only these rows know which tunnels
+        // belong to the customer -- every query reaches one through the other --
+        // so deleting the device alone would leave tunnels no query can see,
+        // still holding a public key and still configured on a route server.
+        //
+        // Ordered: the link rows cascade off `vpn_device`, but
+        // `vpn_device_tunnel.tunnel_id` is RESTRICT, so the tunnel ids have to
+        // be read before the device goes and deleted after. `tunnel_route`
+        // cascades off `tunnel` and needs no help.
+        let mut tx = self.db.begin().await?;
+        let tunnel_ids: Vec<(u64,)> =
+            sqlx::query_as("SELECT tunnel_id FROM vpn_device_tunnel WHERE vpn_device_id = ?")
                 .bind(id)
-                .fetch_optional(&mut *tx)
+                .fetch_all(&mut *tx)
                 .await?;
         sqlx::query("DELETE FROM vpn_device WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)
             .await?;
-        if let Some((tunnel_id,)) = tunnel_id {
+        for (tunnel_id,) in tunnel_ids {
             sqlx::query("DELETE FROM tunnel WHERE id = ?")
                 .bind(tunnel_id)
                 .execute(&mut *tx)
@@ -5684,10 +7523,10 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn insert_app(&self, app: &App) -> DbResult<u64> {
         let res = sqlx::query(
             "INSERT INTO app (name, display_name, description, icon, repo_url, category, \
-             seo_title, seo_description, compose, amount, \
+             seo_title, seo_description, category_translations, compose, amount, \
              currency, interval_amount, interval_type, setup_amount, enabled, cpu_milli, \
              memory_bytes, storage_bytes) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(&app.name)
         .bind(&app.display_name)
@@ -5697,6 +7536,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&app.category)
         .bind(&app.seo_title)
         .bind(&app.seo_description)
+        .bind(&app.category_translations)
         .bind(&app.compose)
         .bind(app.amount)
         .bind(&app.currency)
@@ -5715,7 +7555,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn update_app(&self, app: &App) -> DbResult<()> {
         sqlx::query(
             "UPDATE app SET name = ?, display_name = ?, description = ?, icon = ?, repo_url = ?, \
-             category = ?, seo_title = ?, seo_description = ?, \
+             category = ?, seo_title = ?, seo_description = ?, category_translations = ?, \
              compose = ?, amount = ?, currency = ?, interval_amount = ?, interval_type = ?, \
              setup_amount = ?, enabled = ?, cpu_milli = ?, memory_bytes = ?, storage_bytes = ? \
              WHERE id = ?",
@@ -5728,6 +7568,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(&app.category)
         .bind(&app.seo_title)
         .bind(&app.seo_description)
+        .bind(&app.category_translations)
         .bind(&app.compose)
         .bind(app.amount)
         .bind(&app.currency)
@@ -5948,8 +7789,9 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn insert_app_cluster(&self, cluster: &AppCluster) -> DbResult<u64> {
         let res = sqlx::query(
             "INSERT INTO app_cluster (name, region_id, ingress_domain, enabled, \
-             capacity_cpu_milli, capacity_memory_bytes, capacity_storage_bytes) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) returning id",
+             capacity_cpu_milli, capacity_memory_bytes, capacity_storage_bytes, \
+             dns_server_id, dns_zone_id) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) returning id",
         )
         .bind(&cluster.name)
         .bind(cluster.region_id)
@@ -5958,6 +7800,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(cluster.capacity_cpu_milli)
         .bind(cluster.capacity_memory_bytes)
         .bind(cluster.capacity_storage_bytes)
+        .bind(cluster.dns_server_id)
+        .bind(&cluster.dns_zone_id)
         .fetch_one(&self.db)
         .await?;
         Ok(res.try_get(0)?)
@@ -5966,7 +7810,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
     async fn update_app_cluster(&self, cluster: &AppCluster) -> DbResult<()> {
         sqlx::query(
             "UPDATE app_cluster SET name = ?, region_id = ?, ingress_domain = ?, enabled = ?, \
-             capacity_cpu_milli = ?, capacity_memory_bytes = ?, capacity_storage_bytes = ? \
+             capacity_cpu_milli = ?, capacity_memory_bytes = ?, capacity_storage_bytes = ?, \
+             dns_server_id = ?, dns_zone_id = ? \
              WHERE id = ?",
         )
         .bind(&cluster.name)
@@ -5976,6 +7821,8 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .bind(cluster.capacity_cpu_milli)
         .bind(cluster.capacity_memory_bytes)
         .bind(cluster.capacity_storage_bytes)
+        .bind(cluster.dns_server_id)
+        .bind(&cluster.dns_zone_id)
         .bind(cluster.id)
         .execute(&self.db)
         .await?;
@@ -6103,6 +7950,18 @@ impl LNVpsDbBase for LNVpsDbMysql {
         .await?)
     }
 
+    async fn find_app_deployment_by_custom_domain(
+        &self,
+        domain: &str,
+    ) -> DbResult<Option<AppDeployment>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM app_deployment WHERE custom_domain = ? AND deleted = 0 LIMIT 1",
+        )
+        .bind(domain)
+        .fetch_optional(&self.db)
+        .await?)
+    }
+
     async fn insert_app_deployment(&self, deployment: &AppDeployment) -> DbResult<u64> {
         let res = sqlx::query(
             "INSERT INTO app_deployment (user_id, app_id, cluster_id, resource_multiplier, subscription_line_item_id, \
@@ -6152,6 +8011,15 @@ impl LNVpsDbBase for LNVpsDbMysql {
 
     async fn set_app_deployment_custom_domain_verified(&self, id: u64) -> DbResult<()> {
         sqlx::query("UPDATE app_deployment SET custom_domain_verified = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_app_deployment_public_port(&self, id: u64, port: Option<u16>) -> DbResult<()> {
+        sqlx::query("UPDATE app_deployment SET public_port = ? WHERE id = ?")
+            .bind(port)
             .bind(id)
             .execute(&self.db)
             .await?;
@@ -6257,8 +8125,135 @@ impl LNVpsDbBase for LNVpsDbMysql {
         ))
     }
 
+    async fn list_app_deployment_backups(
+        &self,
+        deployment_id: u64,
+    ) -> DbResult<Vec<AppDeploymentBackup>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM app_deployment_backup WHERE deployment_id = ? AND deleted = 0 \
+             ORDER BY created DESC, id DESC",
+        )
+        .bind(deployment_id)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn list_app_deployment_backups_paginated(
+        &self,
+        deployment_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AppDeploymentBackup>, u64)> {
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM app_deployment_backup WHERE deployment_id = ? AND deleted = 0",
+        )
+        .bind(deployment_id)
+        .fetch_one(&self.db)
+        .await?;
+        let rows = sqlx::query_as(
+            "SELECT * FROM app_deployment_backup WHERE deployment_id = ? AND deleted = 0 \
+             ORDER BY created DESC, id DESC LIMIT ? OFFSET ?",
+        )
+        .bind(deployment_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        Ok((rows, total as u64))
+    }
+
+    async fn get_app_deployment_backup(&self, id: u64) -> DbResult<AppDeploymentBackup> {
+        Ok(
+            sqlx::query_as("SELECT * FROM app_deployment_backup WHERE id = ? AND deleted = 0")
+                .bind(id)
+                .fetch_one(&self.db)
+                .await?,
+        )
+    }
+
+    async fn insert_app_deployment_backup(&self, backup: &AppDeploymentBackup) -> DbResult<u64> {
+        Ok(sqlx::query(
+            "INSERT INTO app_deployment_backup (deployment_id, run_id, service, method, artifact, \
+             object_key, size_bytes, state, message, scheduled, started, completed) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(backup.deployment_id)
+        .bind(&backup.run_id)
+        .bind(&backup.service)
+        .bind(backup.method)
+        .bind(&backup.artifact)
+        .bind(&backup.object_key)
+        .bind(backup.size_bytes)
+        .bind(backup.state)
+        .bind(&backup.message)
+        .bind(backup.scheduled)
+        .bind(backup.started)
+        .bind(backup.completed)
+        .execute(&self.db)
+        .await?
+        .last_insert_id())
+    }
+
+    async fn update_app_deployment_backup(&self, backup: &AppDeploymentBackup) -> DbResult<()> {
+        sqlx::query(
+            "UPDATE app_deployment_backup SET object_key = ?, size_bytes = ?, state = ?, \
+             message = ?, started = ?, completed = ? WHERE id = ?",
+        )
+        .bind(&backup.object_key)
+        .bind(backup.size_bytes)
+        .bind(backup.state)
+        .bind(&backup.message)
+        .bind(backup.started)
+        .bind(backup.completed)
+        .bind(backup.id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_active_app_deployment_backups(
+        &self,
+        cluster_id: u64,
+    ) -> DbResult<Vec<AppDeploymentBackup>> {
+        Ok(sqlx::query_as(
+            "SELECT b.* FROM app_deployment_backup b \
+             JOIN app_deployment d ON d.id = b.deployment_id \
+             WHERE d.cluster_id = ? AND b.deleted = 0 AND b.state IN (?, ?) \
+             ORDER BY b.id",
+        )
+        .bind(cluster_id)
+        .bind(AppBackupState::Pending)
+        .bind(AppBackupState::Running)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn last_scheduled_app_deployment_backup(
+        &self,
+        deployment_id: u64,
+    ) -> DbResult<Option<DateTime<Utc>>> {
+        // Deleted rows count: retention prunes old runs, and forgetting that a
+        // run happened because its artifact was pruned would restart the
+        // schedule from zero on every sweep.
+        Ok(sqlx::query_scalar(
+            "SELECT MAX(created) FROM app_deployment_backup \
+             WHERE deployment_id = ? AND scheduled = 1",
+        )
+        .bind(deployment_id)
+        .fetch_one(&self.db)
+        .await?)
+    }
+
+    async fn delete_app_deployment_backup(&self, id: u64) -> DbResult<()> {
+        sqlx::query("UPDATE app_deployment_backup SET deleted = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
     async fn delete_app_deployment(&self, id: u64) -> DbResult<()> {
-        sqlx::query("UPDATE app_deployment SET deleted = 1 WHERE id = ?")
+        sqlx::query("UPDATE app_deployment SET deleted = 1, public_port = NULL WHERE id = ?")
             .bind(id)
             .execute(&self.db)
             .await?;
@@ -6307,6 +8302,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
             // cleared first; subscription_line_item does cascade from
             // subscription.
             if still_billed == 0 {
+                record_onchain_address_owners(&mut tx, subscription_id, None).await?;
                 sqlx::query("delete from subscription_payment where subscription_id = ?")
                     .bind(subscription_id)
                     .execute(&mut *tx)
@@ -7074,7 +9070,7 @@ impl AdminDb for LNVpsDbMysql {
     async fn admin_delete_region(&self, region_id: u64) -> DbResult<()> {
         // First check if any hosts are assigned to this region
         let host_count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM vm_host WHERE region_id = ?")
+            sqlx::query_scalar("SELECT COUNT(*) FROM vm_host WHERE region_id = ? AND deleted = 0")
                 .bind(region_id)
                 .fetch_one(&self.db)
                 .await?;
@@ -7097,12 +9093,73 @@ impl AdminDb for LNVpsDbMysql {
     }
 
     async fn admin_count_region_hosts(&self, region_id: u64) -> DbResult<u64> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vm_host WHERE region_id = ?")
-            .bind(region_id)
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vm_host WHERE region_id = ? AND deleted = 0")
+                .bind(region_id)
+                .fetch_one(&self.db)
+                .await?;
+
+        Ok(count as u64)
+    }
+
+    /// Delete a host: removed outright when no VM ever ran on it, otherwise
+    /// flagged `deleted` so historical VMs keep resolving their host.
+    async fn admin_delete_host(&self, host_id: u64) -> DbResult<()> {
+        // The host must exist, so deleting an unknown id is an error rather
+        // than a silent no-op.
+        let host = self.get_host(host_id).await?;
+        if host.deleted {
+            return Err(DbError::Source(
+                anyhow!("Host is already deleted").into_boxed_dyn_error(),
+            ));
+        }
+
+        let active_vms: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM vm WHERE host_id = ? AND deleted = false")
+                .bind(host_id)
+                .fetch_one(&self.db)
+                .await?;
+
+        if active_vms > 0 {
+            return Err(DbError::Source(
+                anyhow!("Cannot delete host with {} active VMs", active_vms).into_boxed_dyn_error(),
+            ));
+        }
+
+        // Soft-deleted VMs still hold foreign keys into vm_host and
+        // vm_host_disk, and those rows are billing history that must be kept,
+        // so a host that ever ran a VM can only be flagged as deleted. A host
+        // with no history at all (added by mistake, or never used) is removed
+        // outright so the table does not accumulate junk.
+        let historic_vms: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM vm WHERE host_id = ?")
+            .bind(host_id)
             .fetch_one(&self.db)
             .await?;
 
-        Ok(count as u64)
+        if historic_vms > 0 {
+            sqlx::query("UPDATE vm_host SET deleted = 1, enabled = 0 WHERE id = ?")
+                .bind(host_id)
+                .execute(&self.db)
+                .await?;
+
+            return Ok(());
+        }
+
+        let mut tx = self.db.begin().await?;
+
+        sqlx::query("DELETE FROM vm_host_disk WHERE host_id = ?")
+            .bind(host_id)
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query("DELETE FROM vm_host WHERE id = ?")
+            .bind(host_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(())
     }
 
     async fn admin_get_region_stats(&self, region_id: u64) -> DbResult<RegionStats> {
@@ -7113,15 +9170,31 @@ impl AdminDb for LNVpsDbMysql {
         // with identical cpu/memory were counted once. Compute host totals and
         // VM/IP counts in separate subqueries to avoid both the value-dedup bug
         // and row multiplication from the joins.
-        let row: (i64, i64, Option<u64>, Option<u64>, i64, i64, i64) = sqlx::query_as(
+        #[allow(clippy::type_complexity)]
+        let row: (
+            i64,
+            i64,
+            Option<u64>,
+            Option<u64>,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(
             r#"
             SELECT
-                (SELECT COUNT(*) FROM vm_host WHERE region_id = ?) as host_count,
+                (SELECT COUNT(*) FROM vm_host WHERE region_id = ? AND deleted = 0) as host_count,
                 (SELECT COUNT(*) FROM vm v
                     JOIN vm_host h ON v.host_id = h.id
                     WHERE h.region_id = ? AND v.deleted = 0) as total_vms,
-                CAST((SELECT COALESCE(SUM(cpu), 0) FROM vm_host WHERE region_id = ?) AS UNSIGNED) as total_cpu_cores,
-                CAST((SELECT COALESCE(SUM(memory), 0) FROM vm_host WHERE region_id = ?) AS UNSIGNED) as total_memory_bytes,
+                CAST((SELECT COALESCE(SUM(cpu), 0) FROM vm_host WHERE region_id = ? AND deleted = 0) AS UNSIGNED) as total_cpu_cores,
+                CAST((SELECT COALESCE(SUM(memory), 0) FROM vm_host WHERE region_id = ? AND deleted = 0) AS UNSIGNED) as total_memory_bytes,
                 (SELECT COUNT(*) FROM vm_ip_assignment ip
                     JOIN vm v ON ip.vm_id = v.id
                     JOIN vm_host h ON v.host_id = h.id
@@ -7138,9 +9211,40 @@ impl AdminDb for LNVpsDbMysql {
                     JOIN vm_host h ON v.host_id = h.id
                     JOIN ip_range r ON ip.ip_range_id = r.id
                     WHERE h.region_id = ? AND v.deleted = 0 AND ip.deleted = 0
-                      AND r.cidr LIKE '%:%') as ipv6_assignments
+                      AND r.cidr LIKE '%:%') as ipv6_assignments,
+                (SELECT COUNT(*) FROM ip_range WHERE region_id = ?) as ip_ranges,
+                (SELECT COUNT(*) FROM vm_template WHERE region_id = ?) as vm_templates,
+                (SELECT COUNT(*) FROM app_cluster WHERE region_id = ?) as app_clusters,
+                (SELECT COUNT(*) FROM app_deployment d
+                    JOIN app_cluster c ON d.cluster_id = c.id
+                    WHERE c.region_id = ? AND d.deleted = 0) as app_deployments,
+                (SELECT COUNT(*) FROM tunnel_pool WHERE region_id = ?) as tunnel_pools,
+                -- Distinct, because one service may terminate on several
+                -- interfaces in the same region.
+                (SELECT COUNT(DISTINCT p.vpn_service_id) FROM vpn_service_pool p
+                    JOIN tunnel_pool t ON p.tunnel_pool_id = t.id
+                    WHERE t.region_id = ?) as vpn_services,
+                -- A router carries no region of its own, so it belongs to a
+                -- region through the tunnel pools terminating there and the
+                -- access policies its IP ranges use. UNION de-duplicates a
+                -- router reached both ways.
+                (SELECT COUNT(*) FROM (
+                    SELECT router_id FROM tunnel_pool WHERE region_id = ?
+                    UNION
+                    SELECT a.router_id FROM ip_range r
+                        JOIN access_policy a ON r.access_policy_id = a.id
+                        WHERE r.region_id = ? AND a.router_id IS NOT NULL
+                ) routers) as routers
             "#,
         )
+        .bind(region_id)
+        .bind(region_id)
+        .bind(region_id)
+        .bind(region_id)
+        .bind(region_id)
+        .bind(region_id)
+        .bind(region_id)
+        .bind(region_id)
         .bind(region_id)
         .bind(region_id)
         .bind(region_id)
@@ -7159,6 +9263,13 @@ impl AdminDb for LNVpsDbMysql {
             total_ip_assignments: row.4 as u64,
             ipv4_assignments: row.5 as u64,
             ipv6_assignments: row.6 as u64,
+            ip_ranges: row.7 as u64,
+            vm_templates: row.8 as u64,
+            app_clusters: row.9 as u64,
+            app_deployments: row.10 as u64,
+            tunnel_pools: row.11 as u64,
+            vpn_services: row.12 as u64,
+            routers: row.13 as u64,
         })
     }
 
@@ -7226,8 +9337,8 @@ impl AdminDb for LNVpsDbMysql {
     async fn admin_create_vm_os_image(&self, image: &VmOsImage) -> DbResult<u64> {
         let result = sqlx::query(
             r#"
-            INSERT INTO vm_os_image (distribution, flavour, version, enabled, release_date, url, cpu_arch, default_username)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO vm_os_image (distribution, flavour, version, enabled, release_date, url, cpu_arch, default_username, encrypted)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#
         )
         .bind(image.distribution as u16)
@@ -7238,6 +9349,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&image.url)
         .bind(image.cpu_arch as u16)
         .bind(&image.default_username)
+        .bind(image.encrypted)
         .execute(&self.db)
         .await?;
 
@@ -7248,7 +9360,7 @@ impl AdminDb for LNVpsDbMysql {
         sqlx::query(
             r#"
             UPDATE vm_os_image 
-            SET distribution = ?, flavour = ?, version = ?, enabled = ?, release_date = ?, url = ?, cpu_arch = ?, default_username = ?, sha2 = ?, sha2_url = ?
+            SET distribution = ?, flavour = ?, version = ?, enabled = ?, release_date = ?, url = ?, cpu_arch = ?, default_username = ?, sha2 = ?, sha2_url = ?, encrypted = ?
             WHERE id = ?
             "#
         )
@@ -7262,6 +9374,7 @@ impl AdminDb for LNVpsDbMysql {
         .bind(&image.default_username)
         .bind(&image.sha2)
         .bind(&image.sha2_url)
+        .bind(image.encrypted)
         .bind(image.id)
         .execute(&self.db)
         .await?;
@@ -7377,7 +9490,7 @@ impl AdminDb for LNVpsDbMysql {
     ) -> DbResult<(Vec<AdminVmHost>, u64)> {
         // Get total count (including disabled hosts)
         let total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM vm_host h JOIN region hr ON h.region_id = hr.id",
+            "SELECT COUNT(*) FROM vm_host h JOIN region hr ON h.region_id = hr.id WHERE h.deleted = 0",
         )
         .fetch_one(&self.db)
         .await?;
@@ -7399,6 +9512,7 @@ impl AdminDb for LNVpsDbMysql {
                  WHERE deleted = 0 
                  GROUP BY host_id
              ) vm_counts ON h.id = vm_counts.host_id
+             WHERE h.deleted = 0
              ORDER BY h.name 
              LIMIT ? OFFSET ?",
         )
@@ -7423,8 +9537,8 @@ impl AdminDb for LNVpsDbMysql {
 
     async fn insert_custom_pricing(&self, pricing: &VmCustomPricing) -> DbResult<u64> {
         let query = r#"
-             INSERT INTO vm_custom_pricing (name, enabled, created, expires, region_id, currency, cpu_mfg, cpu_arch, cpu_features, cpu_cost, memory_cost, ip4_cost, ip6_cost, min_cpu, max_cpu, min_memory, max_memory, min_ip4, max_ip4, min_ip6, max_ip6, disk_iops_read, disk_iops_write, disk_mbps_read, disk_mbps_write, network_mbps, cpu_limit, transfer_gb)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             INSERT INTO vm_custom_pricing (name, enabled, created, expires, region_id, currency, rate_scale, cpu_mfg, cpu_arch, cpu_features, cpu_cost, memory_cost, ip4_cost, ip6_cost, min_cpu, max_cpu, min_memory, max_memory, min_ip4, max_ip4, min_ip6, max_ip6, disk_iops_read, disk_iops_write, disk_mbps_read, disk_mbps_write, network_mbps, cpu_limit, transfer_gb, min_transfer_gb, max_transfer_gb, transfer_cost_per_tb, min_network_mbps, max_network_mbps, network_cost_per_gbps, interval_amount, interval_type)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          "#;
 
         let result = sqlx::query(query)
@@ -7434,6 +9548,7 @@ impl AdminDb for LNVpsDbMysql {
             .bind(pricing.expires)
             .bind(pricing.region_id)
             .bind(&pricing.currency)
+            .bind(pricing.rate_scale)
             .bind(&pricing.cpu_mfg)
             .bind(&pricing.cpu_arch)
             .bind(&pricing.cpu_features)
@@ -7456,6 +9571,14 @@ impl AdminDb for LNVpsDbMysql {
             .bind(pricing.network_mbps)
             .bind(pricing.cpu_limit)
             .bind(pricing.transfer_gb)
+            .bind(pricing.min_transfer_gb)
+            .bind(pricing.max_transfer_gb)
+            .bind(pricing.transfer_cost_per_tb)
+            .bind(pricing.min_network_mbps)
+            .bind(pricing.max_network_mbps)
+            .bind(pricing.network_cost_per_gbps)
+            .bind(pricing.interval_amount)
+            .bind(pricing.interval_type)
             .execute(&self.db)
             .await?;
 
@@ -7465,12 +9588,15 @@ impl AdminDb for LNVpsDbMysql {
     async fn update_custom_pricing(&self, pricing: &VmCustomPricing) -> DbResult<()> {
         let query = r#"
              UPDATE vm_custom_pricing 
-             SET name = ?, enabled = ?, expires = ?, region_id = ?, currency = ?, 
+             SET name = ?, enabled = ?, expires = ?, region_id = ?, currency = ?, rate_scale = ?,
                  cpu_mfg = ?, cpu_arch = ?, cpu_features = ?, cpu_cost = ?, memory_cost = ?, ip4_cost = ?, ip6_cost = ?, 
                  min_cpu = ?, max_cpu = ?, min_memory = ?, max_memory = ?,
                  min_ip4 = ?, max_ip4 = ?, min_ip6 = ?, max_ip6 = ?,
                  disk_iops_read = ?, disk_iops_write = ?, disk_mbps_read = ?, disk_mbps_write = ?,
-                 network_mbps = ?, cpu_limit = ?, transfer_gb = ?
+                 network_mbps = ?, cpu_limit = ?, transfer_gb = ?,
+                 min_transfer_gb = ?, max_transfer_gb = ?, transfer_cost_per_tb = ?,
+                 min_network_mbps = ?, max_network_mbps = ?, network_cost_per_gbps = ?,
+                 interval_amount = ?, interval_type = ?
              WHERE id = ?
          "#;
 
@@ -7480,6 +9606,7 @@ impl AdminDb for LNVpsDbMysql {
             .bind(pricing.expires)
             .bind(pricing.region_id)
             .bind(&pricing.currency)
+            .bind(pricing.rate_scale)
             .bind(&pricing.cpu_mfg)
             .bind(&pricing.cpu_arch)
             .bind(&pricing.cpu_features)
@@ -7502,6 +9629,14 @@ impl AdminDb for LNVpsDbMysql {
             .bind(pricing.network_mbps)
             .bind(pricing.cpu_limit)
             .bind(pricing.transfer_gb)
+            .bind(pricing.min_transfer_gb)
+            .bind(pricing.max_transfer_gb)
+            .bind(pricing.transfer_cost_per_tb)
+            .bind(pricing.min_network_mbps)
+            .bind(pricing.max_network_mbps)
+            .bind(pricing.network_cost_per_gbps)
+            .bind(pricing.interval_amount)
+            .bind(pricing.interval_type)
             .bind(pricing.id)
             .execute(&self.db)
             .await?;
@@ -7834,9 +9969,13 @@ impl AdminDb for LNVpsDbMysql {
              c.id as company_id, c.name as company_name, c.base_currency as company_base_currency,
              v.id as vm_id,
              vh.id as host_id, vh.name as host_name,
-             vhr.id as region_id, vhr.name as region_name
+             vhr.id as region_id, vhr.name as region_name,
+             u.country_code as user_country_code,
+             u.geo_country_code as user_geo_country_code,
+             u.billing_tax_id as user_billing_tax_id
              FROM subscription_payment sp
              JOIN subscription s ON sp.subscription_id = s.id
+             LEFT JOIN users u ON u.id = sp.user_id
              LEFT JOIN subscription_line_item sli ON sli.subscription_id = s.id
                  AND sli.subscription_type = 3
              LEFT JOIN vm v ON v.subscription_line_item_id = sli.id
@@ -7873,32 +10012,13 @@ impl AdminDb for LNVpsDbMysql {
         company_id: u64,
         ref_code: Option<&str>,
     ) -> DbResult<Vec<ReferralCostUsage>> {
-        let mut query = "SELECT v.id as vm_id,
-                                v.ref_code,
-                                sp.created,
-                                sp.amount,
-                                sp.currency,
-                                sp.rate,
-                                c.base_currency,
-                                COALESCE(r.referral_rate, c.referral_rate) AS effective_rate
-                         FROM vm v
-                         JOIN (
-                             SELECT v2.id as vm_id, sp2.currency, sp2.amount, sp2.created, sp2.rate,
-                                    ROW_NUMBER() OVER (PARTITION BY v2.id ORDER BY sp2.created ASC) as rn
-                             FROM subscription_payment sp2
-                             JOIN subscription_line_item sli2 ON sli2.subscription_id = sp2.subscription_id
-                                 AND sli2.subscription_type = 3
-                             JOIN vm v2 ON v2.subscription_line_item_id = sli2.id
-                             WHERE sp2.is_paid = 1
-                         ) sp ON v.id = sp.vm_id AND sp.rn = 1
-                         JOIN vm_host vh ON v.host_id = vh.id
-                         JOIN region vhr ON vh.region_id = vhr.id
-                         JOIN company c ON vhr.company_id = c.id
-                         LEFT JOIN referral r ON r.code = v.ref_code
-                         WHERE v.ref_code IS NOT NULL
-                           AND sp.created >= ?
-                           AND sp.created <= ?
-                           AND c.id = ?".to_string();
+        let mut query = format!(
+            "{REFERRAL_USAGE_SELECT} {REFERRAL_USAGE_FROM}
+               AND v.ref_code IS NOT NULL
+               AND sp.created >= ?
+               AND sp.created <= ?
+               AND c.id = ?"
+        );
 
         if ref_code.is_some() {
             query.push_str(" AND v.ref_code = ?");
@@ -7968,6 +10088,28 @@ impl AdminDb for LNVpsDbMysql {
             .bind(referral_id)
             .fetch_one(&self.db)
             .await?)
+    }
+
+    async fn admin_set_referral_auto_payout(
+        &self,
+        referral_id: u64,
+        approved: bool,
+    ) -> DbResult<()> {
+        sqlx::query("UPDATE referral SET auto_payout_approved = ? WHERE id = ?")
+            .bind(approved)
+            .bind(referral_id)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn admin_remove_referred_vm(&self, code: &str, vm_id: u64) -> DbResult<bool> {
+        let res = sqlx::query("UPDATE vm SET ref_code = NULL WHERE id = ? AND ref_code = ?")
+            .bind(vm_id)
+            .bind(code)
+            .execute(&self.db)
+            .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     async fn admin_list_ip_ranges(
@@ -8430,6 +10572,35 @@ impl AdminDb for LNVpsDbMysql {
             .await?)
     }
 
+    async fn admin_list_swap_order_clients(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        order_id: Option<&str>,
+    ) -> DbResult<(Vec<SwapOrderClient>, u64)> {
+        let filter = "from swap_order_client where (? is null or user_id = ?) and (? is null or order_id = ?)";
+        let rows = sqlx::query_as(&format!(
+            "select * {filter} order by created desc, id desc limit ? offset ?"
+        ))
+        .bind(user_id)
+        .bind(user_id)
+        .bind(order_id)
+        .bind(order_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.db)
+        .await?;
+        let total: i64 = sqlx::query_scalar(&format!("select count(*) {filter}"))
+            .bind(user_id)
+            .bind(user_id)
+            .bind(order_id)
+            .bind(order_id)
+            .fetch_one(&self.db)
+            .await?;
+        Ok((rows, total as u64))
+    }
+
     async fn admin_list_vm_ip_assignments(
         &self,
         limit: u64,
@@ -8748,6 +10919,168 @@ impl AdminDb for LNVpsDbMysql {
         .bind(end)
         .bind(start)
         .bind(end)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn admin_list_vms_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<Vm>, u64)> {
+        self.fetch_recent(
+            "v.*",
+            "FROM vm v \
+             JOIN subscription_line_item sli ON sli.id = v.subscription_line_item_id \
+             JOIN subscription s ON s.id = sli.subscription_id \
+             WHERE s.is_setup = 1 AND s.created >= ?",
+            "s.created DESC, v.id DESC",
+            &[since],
+            limit,
+        )
+        .await
+    }
+
+    async fn admin_list_vms_deleted_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::DeletedVm>, u64)> {
+        self.fetch_recent(
+            "v.*, d.deleted_at, \
+             (SELECT h.description FROM vm_history h \
+              WHERE h.vm_id = v.id AND h.action_type = 4 \
+              ORDER BY h.timestamp DESC, h.id DESC LIMIT 1) AS delete_reason",
+            "FROM vm v \
+             JOIN (SELECT vm_id, MAX(timestamp) AS deleted_at FROM vm_history \
+                   WHERE action_type = 4 AND timestamp >= ? GROUP BY vm_id) d ON d.vm_id = v.id \
+             JOIN subscription_line_item sli ON sli.id = v.subscription_line_item_id \
+             JOIN subscription s ON s.id = sli.subscription_id \
+             WHERE v.deleted = 1 AND s.is_setup = 1",
+            "d.deleted_at DESC, v.id DESC",
+            &[since],
+            limit,
+        )
+        .await
+    }
+
+    async fn admin_list_vms_expiring_between(
+        &self,
+        from: DateTime<Utc>,
+        until: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<Vm>, u64)> {
+        self.fetch_recent(
+            "v.*",
+            "FROM vm v \
+             JOIN subscription_line_item sli ON sli.id = v.subscription_line_item_id \
+             JOIN subscription s ON s.id = sli.subscription_id \
+             WHERE v.deleted = 0 AND s.is_setup = 1 AND s.expires >= ? AND s.expires < ?",
+            "s.expires ASC, v.id ASC",
+            &[from, until],
+            limit,
+        )
+        .await
+    }
+
+    async fn admin_list_users_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<User>, u64)> {
+        self.fetch_recent(
+            "*",
+            "FROM users WHERE created >= ?",
+            "created DESC, id DESC",
+            &[since],
+            limit,
+        )
+        .await
+    }
+
+    async fn admin_list_vpn_subscriptions_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<VpnSubscription>, u64)> {
+        self.fetch_recent(
+            "p.*",
+            "FROM vpn_subscription p \
+             JOIN subscription_line_item sli ON sli.id = p.subscription_line_item_id \
+             JOIN subscription s ON s.id = sli.subscription_id \
+             WHERE s.is_setup = 1 AND p.created >= ?",
+            "p.created DESC, p.id DESC",
+            &[since],
+            limit,
+        )
+        .await
+    }
+
+    async fn admin_list_app_deployments_created_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<AppDeployment>, u64)> {
+        self.fetch_recent(
+            "d.*",
+            "FROM app_deployment d \
+             JOIN subscription_line_item sli ON sli.id = d.subscription_line_item_id \
+             JOIN subscription s ON s.id = sli.subscription_id \
+             WHERE s.is_setup = 1 AND d.created >= ?",
+            "d.created DESC, d.id DESC",
+            &[since],
+            limit,
+        )
+        .await
+    }
+
+    async fn admin_list_payments_paid_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u64,
+    ) -> DbResult<(Vec<crate::PaidSubscriptionPayment>, u64)> {
+        self.fetch_recent(
+            "sp.*, s.name AS subscription_name, c.base_currency AS company_base_currency",
+            "FROM subscription_payment sp \
+             JOIN subscription s ON s.id = sp.subscription_id \
+             JOIN company c ON c.id = s.company_id \
+             WHERE sp.is_paid = 1 AND sp.paid_at >= ?",
+            "sp.paid_at DESC, sp.created DESC",
+            &[since],
+            limit,
+        )
+        .await
+    }
+
+    async fn admin_list_refunds_paid_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> DbResult<Vec<crate::SubscriptionPayment>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM subscription_payment \
+             WHERE is_paid = 1 AND payment_type = 3 AND paid_at >= ? \
+             ORDER BY paid_at DESC, created DESC",
+        )
+        .bind(since)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
+    async fn admin_sum_payments_paid_since(
+        &self,
+        since: DateTime<Utc>,
+    ) -> DbResult<Vec<crate::PaymentTotal>> {
+        Ok(sqlx::query_as(
+            "SELECT currency, payment_type, \
+             CAST(COUNT(*) AS UNSIGNED) AS count, \
+             CAST(SUM(amount) AS UNSIGNED) AS amount, \
+             CAST(SUM(tax) AS UNSIGNED) AS tax \
+             FROM subscription_payment \
+             WHERE is_paid = 1 AND paid_at >= ? \
+             GROUP BY currency, payment_type \
+             ORDER BY currency, payment_type",
+        )
+        .bind(since)
         .fetch_all(&self.db)
         .await?)
     }

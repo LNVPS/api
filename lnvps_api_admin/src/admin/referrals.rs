@@ -2,8 +2,8 @@ use crate::admin::RouterState;
 use crate::admin::auth::AdminAuth;
 use crate::admin::model::{
     AdminCreateReferralPayoutRequest, AdminReferralBalance, AdminReferralDetail,
-    AdminReferralEarning, AdminReferralInfo, AdminReferralPayoutInfo,
-    AdminUpdateReferralPayoutRequest, AdminUpdateReferralRequest,
+    AdminReferralEarning, AdminReferralInfo, AdminReferralListItem, AdminReferralPayoutInfo,
+    AdminReferralUsageInfo, AdminUpdateReferralPayoutRequest, AdminUpdateReferralRequest,
 };
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
@@ -12,7 +12,7 @@ use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, ExchangeRateService,
     Ticker, TickerRate, deserialize_from_str_optional,
 };
-use lnvps_db::{AdminAction, AdminResource, Referral, ReferralPayout};
+use lnvps_db::{AdminAction, AdminResource, Referral, ReferralCostUsage, ReferralPayout};
 use payments_rs::currency::{Currency, CurrencyAmount};
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -31,6 +31,14 @@ pub fn router() -> Router<RouterState> {
         .route(
             "/api/admin/v1/referrals/{id}/payouts/{payout_id}",
             axum::routing::patch(admin_update_referral_payout),
+        )
+        .route(
+            "/api/admin/v1/referrals/{id}/usage",
+            get(admin_list_referral_usage),
+        )
+        .route(
+            "/api/admin/v1/referrals/{id}/usage/{vm_id}",
+            axum::routing::delete(admin_remove_referred_vm),
         )
 }
 
@@ -57,6 +65,7 @@ async fn build_info(this: &RouterState, r: Referral) -> Result<AdminReferralInfo
         mode: r.mode.to_string(),
         referral_rate: r.referral_rate,
         payout_threshold: r.payout_threshold,
+        auto_payout_approved: r.auto_payout_approved,
         created: r.created,
     })
 }
@@ -66,7 +75,7 @@ async fn admin_list_referrals(
     auth: AdminAuth,
     State(this): State<RouterState>,
     Query(params): Query<ListReferralsQuery>,
-) -> ApiPaginatedResult<AdminReferralInfo> {
+) -> ApiPaginatedResult<AdminReferralListItem> {
     auth.require_permission(AdminResource::Referral, AdminAction::View)?;
 
     let limit = params.limit.unwrap_or(50).min(100);
@@ -77,9 +86,49 @@ async fn admin_list_referrals(
 
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
-        out.push(build_info(&this, r).await?);
+        let (usage, payouts) = tokio::try_join!(
+            this.db.list_referral_usage(&r.code),
+            this.db.list_referral_payouts(r.id),
+        )?;
+        let earned = earned_by_currency(&usage);
+        let balances = outstanding_balances(&earned, &payouts, this.exchange.as_ref()).await;
+        out.push(AdminReferralListItem {
+            outstanding_total_msat: total_outstanding_msat(&balances),
+            paid_total_msat: paid_total_msat(&payouts, this.exchange.as_ref()).await,
+            referral: build_info(&this, r).await?,
+        });
     }
     ApiPaginatedData::ok(out, total, limit, offset)
+}
+
+fn earned_by_currency(usage: &[ReferralCostUsage]) -> Vec<AdminReferralEarning> {
+    let mut by_currency: HashMap<String, u64> = HashMap::new();
+    for u in usage {
+        *by_currency.entry(u.currency.to_uppercase()).or_insert(0) += u.commission();
+    }
+    let mut earned: Vec<AdminReferralEarning> = by_currency
+        .into_iter()
+        .map(|(currency, amount)| AdminReferralEarning { currency, amount })
+        .collect();
+    earned.sort_by(|a, b| a.currency.cmp(&b.currency));
+    earned
+}
+
+fn total_outstanding_msat(balances: &[AdminReferralBalance]) -> u64 {
+    balances
+        .iter()
+        .filter_map(|b| b.outstanding_msat)
+        .fold(0u64, |acc, msat| acc.saturating_add(msat))
+}
+
+async fn paid_total_msat(payouts: &[ReferralPayout], exchange: &dyn ExchangeRateService) -> u64 {
+    let mut total = 0u64;
+    for p in payouts.iter().filter(|p| p.is_paid) {
+        if let Some(msat) = outstanding_msat(exchange, &p.sent_currency, p.sent_amount).await {
+            total = total.saturating_add(msat);
+        }
+    }
+    total
 }
 
 /// Get a referral with its earnings and payout history.
@@ -101,24 +150,14 @@ async fn admin_get_referral(
 
     // Aggregate commission earned per currency. Keys are upper-cased so `eur`
     // and `EUR` are one balance rather than two half-netted ones.
-    let mut by_currency: HashMap<String, u64> = HashMap::new();
-    for u in &usage {
-        *by_currency.entry(u.currency.to_uppercase()).or_insert(0) += u.commission();
-    }
-    let mut earned: Vec<AdminReferralEarning> = by_currency
-        .into_iter()
-        .map(|(currency, amount)| AdminReferralEarning { currency, amount })
-        .collect();
-    earned.sort_by(|a, b| a.currency.cmp(&b.currency));
+    let earned = earned_by_currency(&usage);
 
     // What is still owed, and what the whole lot is worth in millisats: that is
     // the figure the payout threshold is judged against, so an admin can see at
     // a glance why a referrer is or is not being paid.
     let balances = outstanding_balances(&earned, &payouts, this.exchange.as_ref()).await;
-    let outstanding_total_msat = balances
-        .iter()
-        .filter_map(|b| b.outstanding_msat)
-        .fold(0u64, |acc, msat| acc.saturating_add(msat));
+    let outstanding_total_msat = total_outstanding_msat(&balances);
+    let paid_total_msat = paid_total_msat(&payouts, this.exchange.as_ref()).await;
 
     let referrals_success = usage.len() as u64;
     let info = build_info(&this, referral).await?;
@@ -128,6 +167,7 @@ async fn admin_get_referral(
         earned,
         balances,
         outstanding_total_msat,
+        paid_total_msat,
         payouts: payouts.into_iter().map(Into::into).collect(),
         referrals_success,
         referrals_failed,
@@ -231,8 +271,52 @@ async fn admin_update_referral(
     }
 
     this.db.update_referral(&referral).await?;
+    if let Some(approved) = req.auto_payout_approved {
+        this.db.admin_set_referral_auto_payout(id, approved).await?;
+    }
     let updated = this.db.admin_get_referral(id).await?;
     ApiData::ok(build_info(&this, updated).await?)
+}
+
+async fn admin_list_referral_usage(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path(id): Path<u64>,
+    Query(params): Query<ListReferralsQuery>,
+) -> ApiPaginatedResult<AdminReferralUsageInfo> {
+    auth.require_permission(AdminResource::Referral, AdminAction::View)?;
+
+    let referral = this.db.admin_get_referral(id).await?;
+    let limit = params.limit.unwrap_or(50).min(100);
+    let offset = params.offset.unwrap_or(0);
+    let (rows, total) = this
+        .db
+        .list_referral_usage_paginated(&referral.code, limit, offset)
+        .await?;
+    ApiPaginatedData::ok(
+        rows.into_iter().map(Into::into).collect(),
+        total,
+        limit,
+        offset,
+    )
+}
+
+async fn admin_remove_referred_vm(
+    auth: AdminAuth,
+    State(this): State<RouterState>,
+    Path((id, vm_id)): Path<(u64, u64)>,
+) -> ApiResult<()> {
+    auth.require_permission(AdminResource::Referral, AdminAction::Delete)?;
+
+    let referral = this.db.admin_get_referral(id).await?;
+    if !this
+        .db
+        .admin_remove_referred_vm(&referral.code, vm_id)
+        .await?
+    {
+        return Err(ApiError::not_found("VM was not referred by this referral"));
+    }
+    ApiData::ok(())
 }
 
 /// List a referral's payout records.
@@ -472,6 +556,47 @@ async fn admin_update_referral_payout(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn test_paid_total_counts_only_paid_payouts_in_msat() {
+        let exchange = lnvps_api_common::MockExchangeRate::default();
+        exchange
+            .set_rate(Ticker::btc_rate("EUR").unwrap(), 100_000.0)
+            .await;
+        let paid = |sent_amount: u64, sent_currency: &str, is_paid: bool| ReferralPayout {
+            sent_amount,
+            sent_currency: sent_currency.to_string(),
+            is_paid,
+            ..Default::default()
+        };
+        let payouts = vec![
+            paid(5_000_000, "BTC", true),
+            paid(1_000, "EUR", true),
+            paid(9_000_000, "BTC", false),
+            paid(7, "XAU", true),
+        ];
+        assert_eq!(paid_total_msat(&payouts, &exchange).await, 15_000_000);
+    }
+
+    #[test]
+    fn test_earned_by_currency_merges_case_and_sorts() {
+        let usage = |currency: &str, amount: u64| ReferralCostUsage {
+            amount,
+            currency: currency.to_string(),
+            effective_rate: 10.0,
+            ..Default::default()
+        };
+        let earned = earned_by_currency(&[
+            usage("eur", 1_000),
+            usage("BTC", 50_000),
+            usage("EUR", 2_000),
+        ]);
+        let got: Vec<(&str, u64)> = earned
+            .iter()
+            .map(|e| (e.currency.as_str(), e.amount))
+            .collect();
+        assert_eq!(got, vec![("BTC", 5_000), ("EUR", 300)]);
+    }
+
     /// Outstanding is earned net of what is paid **and** reserved (amount plus
     /// the fee the referrer bears), per settled currency, and the millisat
     /// value is the total the payout threshold is compared against.
@@ -543,8 +668,7 @@ mod tests {
         );
 
         // The detail endpoint sums exactly the balances that could be valued.
-        let total: u64 = balances.iter().filter_map(|b| b.outstanding_msat).sum();
-        assert_eq!(total, 24_999_000);
+        assert_eq!(total_outstanding_msat(&balances), 24_999_000);
     }
 
     /// A missing or nonsensical rate leaves the balance unvalued rather than

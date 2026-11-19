@@ -245,27 +245,35 @@ fn a_node_with_no_guests_still_loads() {
     assert!(set_elements(&objects, "assigned4").is_empty());
 }
 
-/// Anti-spoof is checked before conntrack. An address that has gone back in the
-/// pool may already be someone else's, and a flow opened while it was still
-/// this guest's must not outlive the assignment.
+/// Anti-spoof is checked before conntrack, on every chain that has both. An
+/// address that has gone back in the pool may already be someone else's, and a
+/// flow opened while it was still this guest's must not outlive the assignment.
+///
+/// `input` needs it for a second reason: conntrack matches the flow, not the
+/// interface, so a guest spoofing the route server's address would otherwise
+/// reach a live control-API or libvirt session through the conntrack accept
+/// without ever being checked.
 #[test]
 fn spoofing_is_checked_before_established_connections() {
     let objects = ruleset(&Policy::default()).objects.to_vec();
-    let forward = chain_rules(&objects, NfFamily::INet, "forward");
 
-    let jump = forward
-        .iter()
-        .position(|r| r.expr.iter().any(|s| matches!(s, Statement::Jump(_))))
-        .expect("guest traffic is checked");
-    let conntrack = forward
-        .iter()
-        .position(|r| {
-            serde_json::to_string(&r.expr)
-                .unwrap()
-                .contains("established")
-        })
-        .expect("established connections are accepted");
-    assert!(jump < conntrack, "{forward:#?}");
+    for chain in ["forward", "input"] {
+        let rules = chain_rules(&objects, NfFamily::INet, chain);
+
+        let jump = rules
+            .iter()
+            .position(|r| r.expr.iter().any(|s| matches!(s, Statement::Jump(_))))
+            .unwrap_or_else(|| panic!("{chain}: guest traffic is checked"));
+        let conntrack = rules
+            .iter()
+            .position(|r| {
+                serde_json::to_string(&r.expr)
+                    .unwrap()
+                    .contains("established")
+            })
+            .unwrap_or_else(|| panic!("{chain}: established connections are accepted"));
+        assert!(jump < conntrack, "{chain}: {rules:#?}");
+    }
 }
 
 /// Layer 2 is a different path through the kernel: a frame from one guest to

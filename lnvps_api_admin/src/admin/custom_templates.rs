@@ -37,10 +37,11 @@ impl AdminCustomTemplateInfo {
         let region = db.get_host_region(pricing.region_id).await.ok();
         // Pricing must not be fatal here: a grandfathered spec that no current
         // plan can quote still has to be viewable, and editable back into range.
-        let price = PricingEngine::get_custom_vm_cost_amount(db, template)
+        let priced = PricingEngine::get_custom_vm_cost_amount(db, template)
             .await
-            .map(|p| p.total())
-            .unwrap_or(0);
+            .ok();
+        let price = priced.as_ref().map(|p| p.total()).unwrap_or(0);
+        let price_raw = priced.as_ref().map(|p| p.total_raw()).unwrap_or(0);
         let vm_ids = db
             .list_vms_by_custom_template(template.id)
             .await?
@@ -61,6 +62,10 @@ impl AdminCustomTemplateInfo {
             region_name: region.map(|r| r.name),
             currency: pricing.currency,
             price,
+            price_raw,
+            rate_scale: pricing.rate_scale.max(1),
+            interval_amount: pricing.interval_amount.max(1),
+            interval_type: pricing.interval_type.into(),
             ip4_count: template.ip4_count,
             ip6_count: template.ip6_count,
             cpu_mfg: match template.cpu_mfg {
@@ -123,7 +128,7 @@ async fn admin_update_custom_template(
 
     // Validate against the (possibly new) plan's limits before writing, so an
     // out-of-range spec is a 400 rather than a VM the pricing engine cannot quote.
-    PricingEngine::validate_custom_vm_spec(&this.db, &new)
+    PricingEngine::validate_custom_vm_resources(&this.db, &new)
         .await
         .map_err(|e| ApiError::bad_request(format!("Invalid custom template: {e}")))?;
     let renewal_amount = PricingEngine::get_custom_vm_cost_amount(&this.db, &new)

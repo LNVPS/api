@@ -37,6 +37,8 @@ enum Command {
         #[command(subcommand)]
         action: DataplaneAction,
     },
+    /// Measure the largest packet the path to a host carries unfragmented.
+    Underlay { target: std::net::IpAddr },
     /// Print the node's TLS fingerprint, the value LNVPS pins at registration.
     Fingerprint {
         /// State directory holding the identity (defaults to the configured one).
@@ -90,6 +92,10 @@ async fn main() -> Result<()> {
             }
         }
         Command::Dataplane { action } => dataplane(&cli.config, action).await?,
+        Command::Underlay { target } => match lnvps_node::underlay::path_mtu(target).await {
+            Some(mtu) => println!("{mtu}"),
+            None => anyhow::bail!("{target} did not answer an ICMP echo"),
+        },
         Command::Fingerprint { state_dir } => {
             let state_dir = match state_dir {
                 Some(dir) => dir,
@@ -195,9 +201,7 @@ async fn run(config_path: &Path) -> Result<()> {
     // against the interface itself — inside the data plane namespace, which is
     // the only place that interface exists.
     let interface = control.tunnel_interface.clone();
-    let addrs = kernel
-        .namespace()
-        .enter(move || config::interface_addresses(&interface))?;
+    let addrs = kernel.here(move || config::interface_addresses(&interface))?;
     config::validate_listen_address(control.listen, &addrs)?;
 
     let tls = tls::load_or_generate(&config.state_dir, Some(control.listen))?;
@@ -233,13 +237,25 @@ async fn run(config_path: &Path) -> Result<()> {
     // Bound inside the namespace, because that is where the tunnel address
     // lives. The socket keeps that namespace while the rest of the daemon stays
     // in the machine's own, which is what lets it go on reaching LNVPS.
-    let listener = kernel.namespace().enter(move || {
+    let listener = kernel.here(move || {
         std::net::TcpListener::bind(addr)
             .with_context(|| format!("Cannot bind the control API to {addr}"))
     })?;
 
+    // The pool the daemon built for LNVPS's libvirtd: where a fetched OS image
+    // lands, so LNVPS can ask for one instead of pushing it down the tunnel.
+    let pool_dir = lnvps_node::libvirt::Paths::new(&config.state_dir).pool_dir();
+    // Gigabytes of interrupted downloads, on hardware LNVPS does not own. A
+    // restart is the only chance to clear the ones whose request died with the
+    // process it was being served by.
+    match lnvps_node::images::sweep_partials(&pool_dir).await {
+        Ok(0) => {}
+        Ok(n) => log::info!("Cleared {n} interrupted image download(s)"),
+        Err(e) => log::warn!("Could not clear interrupted image downloads: {e}"),
+    }
+
     control::serve_on(
-        Arc::new(ControlState::new(control_pubkey, addr, kernel, fw)),
+        Arc::new(ControlState::new(control_pubkey, addr, kernel, fw).with_pool_dir(pool_dir)),
         listener,
         tls,
     )

@@ -201,6 +201,10 @@ pub fn build_domain(
             kind: Some("serial".to_string()),
         }),
     }));
+    devices.push(DomainDevice::MemBalloon(MemBalloon {
+        model: "virtio".to_string(),
+        stats: Some(MemBalloonStats { period: 10 }),
+    }));
 
     Ok(DomainXML {
         kind: if qemu.kvm {
@@ -396,6 +400,19 @@ pub struct DomainXML {
 impl DomainXML {
     pub fn to_xml(&self) -> Result<String> {
         Ok(quick_xml::se::to_string(self)?)
+    }
+
+    pub fn interface_xml(&self) -> Result<Option<String>> {
+        let Some(iface) = self.devices.contents.iter().find_map(|d| match d {
+            DomainDevice::Interface(i) => Some(i),
+            _ => None,
+        }) else {
+            return Ok(None);
+        };
+        Ok(Some(quick_xml::se::to_string_with_root(
+            "interface",
+            iface,
+        )?))
     }
 }
 
@@ -731,8 +748,26 @@ pub enum DomainDevice {
     Serial(SerialDevice),
     #[serde(rename = "console")]
     Console(ConsoleDevice),
+    #[serde(rename = "memballoon")]
+    MemBalloon(MemBalloon),
     #[serde(other)]
     Other,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[serde(rename = "memballoon")]
+pub struct MemBalloon {
+    #[serde(rename = "@model")]
+    pub model: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<MemBalloonStats>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, Clone)]
+#[serde(rename = "stats")]
+pub struct MemBalloonStats {
+    #[serde(rename = "@period")]
+    pub period: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default, Clone)]
@@ -1101,6 +1136,72 @@ pub fn parse_live_devices(xml: &str) -> Result<LiveDomainDevices> {
     Ok(out)
 }
 
+pub fn snapshot_xml(name: &str, description: Option<&str>) -> String {
+    use quick_xml::escape::escape;
+    let description = description
+        .map(|d| format!("<description>{}</description>", escape(d)))
+        .unwrap_or_default();
+    format!(
+        "<domainsnapshot><name>{}</name>{}</domainsnapshot>",
+        escape(name),
+        description
+    )
+}
+
+pub fn parse_snapshot(xml: &str) -> Result<crate::host::VmSnapshot> {
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+
+    let mut reader = Reader::from_str(xml);
+    let mut field: Option<String> = None;
+    let mut text = String::new();
+    let mut name = None;
+    let mut description = None;
+    let mut created = None;
+    loop {
+        match reader.read_event()? {
+            Event::Eof => break,
+            Event::Start(e) => {
+                field = Some(String::from_utf8_lossy(e.name().as_ref()).to_string());
+                text.clear();
+            }
+            Event::Text(t) => text.push_str(&t.decode()?),
+            Event::GeneralRef(r) => {
+                let entity = r.decode()?;
+                match entity.as_ref() {
+                    "amp" => text.push('&'),
+                    "lt" => text.push('<'),
+                    "gt" => text.push('>'),
+                    "quot" => text.push('"'),
+                    "apos" => text.push('\''),
+                    _ => {}
+                }
+            }
+            Event::End(_) => {
+                match field.take().as_deref() {
+                    Some("name") if name.is_none() => name = Some(text.clone()),
+                    Some("description") => description = Some(text.clone()),
+                    Some("creationTime") => {
+                        created = text
+                            .trim()
+                            .parse::<i64>()
+                            .ok()
+                            .and_then(|t| chrono::DateTime::from_timestamp(t, 0))
+                    }
+                    _ => {}
+                }
+                text.clear();
+            }
+            _ => {}
+        }
+    }
+    Ok(crate::host::VmSnapshot {
+        name: name.ok_or_else(|| anyhow::anyhow!("snapshot XML has no name"))?,
+        description: description.filter(|d| !d.is_empty()),
+        created,
+    })
+}
+
 fn attr(e: &quick_xml::events::BytesStart, key: &str) -> Result<Option<String>> {
     for a in e.attributes() {
         let a = a?;
@@ -1197,6 +1298,27 @@ mod tests {
         assert_eq!(tune.read_iops_sec, Some(1000));
         assert_eq!(tune.write_bytes_sec, Some(100_000_000));
         assert_eq!(tune.write_iops_sec, None);
+    }
+
+    #[test]
+    fn throttled_vm_interface_carries_the_throttle_rate() -> Result<()> {
+        let mut cfg = mock_full_vm();
+        cfg.transfer_throttled = true;
+        let domain = build_domain(&cfg, &qemu_cfg(), false, "/disk", None, true)?;
+        let xml = domain.interface_xml()?.expect("interface");
+        assert!(xml.starts_with("<interface type=\"bridge\">"), "got {xml}");
+        assert!(
+            xml.contains("<mac address=\"ff:ff:ff:ff:ff:fe\"/>"),
+            "got {xml}"
+        );
+        assert!(xml.contains("<inbound average=\"1250\"/>"), "got {xml}");
+        assert!(xml.contains("<outbound average=\"1250\"/>"), "got {xml}");
+
+        cfg.transfer_throttled = false;
+        let domain = build_domain(&cfg, &qemu_cfg(), false, "/disk", None, true)?;
+        let xml = domain.interface_xml()?.expect("interface");
+        assert!(!xml.contains("bandwidth"), "got {xml}");
+        Ok(())
     }
 
     #[test]
@@ -1339,6 +1461,10 @@ mod tests {
         assert!(!xml.contains("default-pool:vm-1-disk0"), "got {xml}");
         assert!(xml.contains(r#"<memory unit="bytes">"#), "got {xml}");
         assert!(xml.contains("<serial"), "serial console missing: {xml}");
+        assert!(
+            xml.contains(r#"<memballoon model="virtio"><stats period="10"/></memballoon>"#),
+            "got {xml}"
+        );
         assert!(xml.contains(r#"<model type="virtio"/>"#), "got {xml}");
         // The runtime domain id is assigned by libvirt; sending one is invalid.
         assert!(!xml.contains("<domain type=\"kvm\" id="), "got {xml}");
@@ -1387,6 +1513,38 @@ mod tests {
     fn parse_live_devices_handles_no_devices() -> Result<()> {
         let devices = parse_live_devices("<domain type='kvm'><name>x</name></domain>")?;
         assert_eq!(devices, LiveDomainDevices::default());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_xml_escapes_free_text() {
+        let xml = snapshot_xml("pre-upgrade", Some("a <b> & c"));
+        assert_eq!(
+            xml,
+            "<domainsnapshot><name>pre-upgrade</name>\
+             <description>a &lt;b&gt; &amp; c</description></domainsnapshot>"
+        );
+        assert_eq!(
+            snapshot_xml("x", None),
+            "<domainsnapshot><name>x</name></domainsnapshot>"
+        );
+    }
+
+    #[test]
+    fn snapshot_is_parsed_from_libvirt_xml() -> Result<()> {
+        let xml = "<domainsnapshot><name>s1</name><description>hello &amp; bye</description>\
+                   <state>shutoff</state><creationTime>1700000000</creationTime>\
+                   <domain><name>VM1</name></domain></domainsnapshot>";
+        let s = parse_snapshot(xml)?;
+        assert_eq!(s.name, "s1");
+        assert_eq!(s.description.as_deref(), Some("hello & bye"));
+        assert_eq!(s.created.map(|c| c.timestamp()), Some(1_700_000_000));
+
+        let bare = parse_snapshot("<domainsnapshot><name>s2</name></domainsnapshot>")?;
+        assert_eq!(bare.description, None);
+        assert_eq!(bare.created, None);
+
+        assert!(parse_snapshot("<domainsnapshot></domainsnapshot>").is_err());
         Ok(())
     }
 }

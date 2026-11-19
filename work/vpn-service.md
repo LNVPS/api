@@ -301,31 +301,140 @@ Notes:
   failing immediately after a successful insert.
 
 ### Increment 5 — agent router backend
-- [ ] `RouterKind::LnvpsAgent` + `router/agent.rs` implementing the read half of `TunnelRouter`
+- [ ] `RouterKind::Lvd` + `router/agent.rs` implementing the read half of `TunnelRouter`
 - [ ] Split `reconcile_tunnel_peers` into drift detection and push; gate push on backend
 - [ ] Digest-based drift comparison; summarised peer view
 - [ ] Unit tests
 
 ### Increment 6 — route-server-facing API
-- [ ] `/api/v1/routeserver/dataplane` (versioned/ETagged) and `/counters`, per-router token auth
-- [ ] Generation counter on `tunnel_pool`; poke-on-change
-- [ ] Unit tests
+- [x] `RouterKind::Lvd = 3`: the one kind LNVPS never dials.
+- [x] `GET /api/v1/routeserver/dataplane`, authenticated by a static `<router_id>.<secret>`
+      bearer compared against `router.token`. No JWT: unlike a marketplace node there is
+      nothing to mint, since a route server is provisioned by hand.
+- [x] `tunnel_pool.generation`, bumped in `sync_pool`/`reconcile_peers` where a pushed pool
+      would have been pushed, so there is one list of things that change an interface.
+- [x] **Long-poll instead of poke-on-change.** An `lvd` instance runs wherever its region is,
+      which means behind a NAT nothing here can traverse; dialling out to it would work
+      everywhere it was tested and fail on the one machine nobody thought about, and that
+      failure surfaces as a revoked device that keeps working. `?generation=N&wait=25` holds
+      the request until the generation moves, so a change lands in one round trip over a
+      connection the route server opened. A held request wakes on Redis pub/sub, over the
+      existing `WorkFeedback`, on one channel per interface it terminates. The message is
+      only a hint: the database is re-read regardless, because pub/sub is fire-and-forget
+      and a message published while an instance was reconnecting is simply gone. A 5s
+      re-read bounds that loss, and is the whole mechanism when no Redis is configured.
+- [x] 5 unit tests, including one asserting the serialised document carries no identity.
+- [ ] `POST /api/v1/routeserver/counters`
 
-### Increment 7 — extract the netlink layer
-- [ ] Lift `lnvps_node/src/net.rs` (`NetOps` trait and impl) into a shared crate
-- [ ] Repoint `lnvps_node` at it, no behaviour change
+### Increment 7 — extract the netlink layer  ✅ DONE
+- [x] `lnvps_netlink`: `NetOps`, `WgSettings`/`WgObserved`, the netlink `Kernel`,
+      `UnavailableKernel`, `netns` and the `/proc/sys` helpers
+- [x] `lnvps_node` repointed, re-exporting from `net::` and `lnvps_node::netns` so no call
+      site moved and the e2e harness is untouched. No behaviour change.
 
-### Increment 8 — `lnvps_vpn` daemon
-- [ ] New crate: pull loop, batch peer apply (`wg syncconf` equivalent over netlink),
-      600s endpoint scrub, inbound control listener for immediate re-pull
-- [ ] Config, packaging, `config.example.yaml`
-- [ ] Unit tests
+Notes:
 
-### Increment 9 — end-to-end
-- [ ] Extend the netns harness: one device reaching two pools with the same inner address
-- [ ] Script entry alongside `scripts/tunnel-e2e.sh`
-- [ ] **Cover the `/api/v1/vpn/*` endpoints** — they have no unit-test coverage by design
-      (see increment 4), so without this they ship untested
+- `Kernel` is still namespace-bound, which is right for a node and wrong for a route server.
+  A host-namespace constructor is additive and belongs with the daemon that needs it.
+- The desired-document types, `apply`, `observe` and `DataPlaneState` stayed behind: bridges,
+  guests and libvirt are a marketplace node's vocabulary, not a data plane's.
+
+### Increment 8 — `lnvps_vpn` daemon  ✅ DONE (bar packaging)
+- [x] New crate `lnvps_vpn`, binary `lvd`. Root workspace member, released on the API's tag.
+- [x] `client.rs`: the long-polling fetch. Its own copy of the document types rather than a
+      shared crate, because a route server must not compile the database and the payment
+      stack to parse four structs, and because a daemon that tolerates fields it does not
+      know can be upgraded in either order.
+- [x] `apply.rs`: convergent, and **peer-at-a-time**. The kernel's only way to state a
+      device's configuration replaces its peer set with it, so a whole-interface apply would
+      reset every established session — one customer registering a phone becoming a stampede
+      of renegotiation across thousands of peers. The interface is re-keyed only when the key
+      or port is actually wrong.
+- [x] `scrub.rs`: the 600s endpoint scrub, and the reason it exists spelled out where the
+      code is.
+- [x] `Kernel::host()` in `lnvps_netlink`, plus `set_wireguard_peer` /
+      `configure_wireguard_interface`, and `WgObserved` carrying port, key, per-peer allowed
+      IPs, endpoint and byte counters.
+- [x] `config.example.yaml`, with a test asserting this build accepts it.
+- [x] **Packaging**: `cargo deb` metadata, a systemd unit, maintainer scripts, and
+      `.github/workflows/lvd-deb.yml` building `lnvps-lvd_<version>_amd64.deb` on its own
+      `lvd-v*` tag. Built, installed, started, upgraded and purged on a real machine.
+      `lnvps_vpn` carries an explicit `version` rather than inheriting the workspace's, so a
+      route server's upgrade cadence is its own: publishing a package on every API release
+      would leave an operator unable to tell from the version whether an upgrade mattered.
+- [x] 26 unit tests. `client.rs`, `config.rs` and `scrub.rs` at 100% function coverage.
+
+**No self-upgrade**, unlike `lnvps_fw`. That exists because firewall daemons run on many hosts,
+some of which LNVPS does not administer. Route servers are few and ours, and a daemon that can
+replace its own binary on a machine terminating customer traffic is a bigger thing to own than
+`apt upgrade` on a box we already have access to.
+
+**No inbound control listener.** The original sketch had one for immediate re-pull. It is not
+needed and it is not wanted: long-poll already delivers a change in one round trip, and an
+inbound listener would need a port, a certificate for LNVPS to pin, and reachability that a
+route server behind somebody else's NAT does not have. Outbound-only means the daemon has no
+listening socket at all.
+
+Notes:
+
+- **An interface the document does not mention is left alone.** A route server is not
+  necessarily only a route server, and tearing down what LNVPS has not heard of would let a
+  bug here take out the operator's own networking.
+- **`main.rs` is uncovered** by unit tests, as `lnvps_node`'s is; the netns harness runs it as
+  a real process instead.
+- Installing the package surfaced a fault nothing else would have: `env_logger` defaults to
+  errors only, so the unit ran green and silent while failing every fetch. Every way this
+  daemon fails in the field is logged at `warn` or `info`. The unit sets `RUST_LOG=info`.
+- The unit runs as root but with `CapabilityBoundingSet=CAP_NET_ADMIN` and `ProtectSystem=strict`.
+  Verified under `systemd-run` with the same properties that creating a WireGuard interface,
+  addressing it and routing through it all still work.
+- No `StateDirectory`: the daemon holds nothing across restarts, so a rebuilt route server needs
+  only its config file.
+- Still open from increment 6: `POST /api/v1/routeserver/counters`. The counters are read
+  from the kernel now (`WgPeerState::rx_bytes`/`tx_bytes`); nothing reports them yet.
+
+### Increment 9 — end-to-end  ✅ DONE
+- [x] `lnvps_e2e/tests/vpn_lvd.rs`: **LNVPS and `lvd` together**, on real namespaces, carrying
+      real packets. Nothing is hand-written: the service and its two interfaces are created
+      through the admin API, the plan is paid over Lightning, the device is registered through
+      the user API with a keypair generated in the test, and two `lvd` processes are started
+      with nothing but an API address and a token. They discover the rest themselves.
+- [x] `scripts/vpn-e2e.sh`, plus `--setup-only` on `run-e2e.sh`. This harness needs a running
+      stack *and* root, which no existing script gave it at once.
+- [x] `lnvps_e2e/src/vpn.rs`: the HTTP surface, run against a live stack (11 tests).
+
+**The first attempt was wrong and was thrown away.** `vpn_netns.rs` hand-wrote the document,
+called `apply()` as a function and pinged. That proves "given a correct document, WireGuard
+works", and WireGuard working is not ours to test. Worse, the document being correct was
+*assumed*: the multi-region property it claimed to prove was written into the fixture by hand.
+The seam that actually carries risk is the one it skipped — the document is defined twice, by
+the API that publishes it and the daemon that parses it, with JSON in between and nothing
+forcing them to agree.
+
+What the real harness asserts:
+
+- every region's config carries the **same** device address, checked against what the
+  allocator did rather than against a fixture, and the configs differ only in their endpoint;
+- both `lvd` instances install the customer's key unprompted, having been told only where
+  LNVPS is;
+- the device reaches **both** regions on the one address it holds, by switching peers the way
+  a client switches region;
+- revoking through the admin API removes the key from **every** region within a round trip,
+  and the device then cannot reach the route server;
+- the rendered `wg-quick` file carries the placeholder, because LNVPS never had the key.
+
+It also subsumes the connected-route regression: with that bug, `apply` fails and no peer is
+ever installed, so the harness fails at the first assertion.
+
+Notes:
+
+- The two `lvd` processes are real processes with real config files, started under
+  `ip netns exec`. Nothing dials them, which is what makes this arrangement possible at all.
+- Lost with `vpn_netns.rs`: the only test of `sync_routes` add-and-remove against a real
+  kernel. A VPN interface asks for no routes, so that path is now covered by unit tests
+  against the fake kernel and by the marketplace harness, not on real netlink.
+- `scripts/run-e2e.sh` writes its generated configs to fixed `/tmp` paths, so two runs on one
+  machine overwrite each other's. Not fixed here; it cost an hour to diagnose.
 
 ### Increment 10 — admin API  ✅ DONE
 - [x] `AdminResource::VpnService = 32` and `VpnSubscription = 33`, granted to `super_admin` by

@@ -15,7 +15,7 @@ This document provides comprehensive API specifications for generating TypeScrip
 **DiskType**: `"hdd"`, `"ssd"`
 **DiskInterface**: `"sata"`, `"scsi"`, `"pcie"`
 **VmState**: `"unknown"`, `"running"`, `"stopped"`, `"creating"`
-**CostPlanIntervalType**: `"day"`, `"month"`, `"year"`
+**CostPlanIntervalType**: `"hour"`, `"day"`, `"month"`, `"year"`
 **OsDistribution**: `"ubuntu"`, `"debian"`, `"centos"`, `"fedora"`, `"freebsd"`, `"opensuse"`, `"archlinux"`,
 `"redhatenterprise"`, `"almalinux"`, `"rockylinux"`, `"alpine"`, `"nixos"`, `"openbsd"`, `"netbsd"`, `"gentoo"`,
 `"voidlinux"`
@@ -69,6 +69,12 @@ they once were — check them if previously-working requests start failing.
 - **`created_at` must be within 60 seconds** of server time (previously 600).
   A client with a badly-skewed clock will be rejected.
 - **The `method` tag must match the request method.**
+- **The `u` tag's path must match the request path.** The host inside the `u`
+  tag is **not** compared: this API answers on several hostnames (clearnet,
+  Tor, UAT) and no single configured value covers them. In practice clients
+  sign the URL they are calling; if you deliberately sign an event for a
+  different host with a colliding path, it will be accepted here within the
+  60-second window.
 - **The `payload` tag is optional, but verified when present.** If you include
   it, it must be the lowercase hex SHA-256 of the exact request body. Omitting
   it is still accepted; including it binds the body to the signature and is
@@ -384,7 +390,7 @@ interface VmCostPlan {
   /** @deprecated (#230) Use GET /api/v1/exchange-rate instead. Still populated for now. */
   other_price: Price[]; // Alternative currency prices
   interval_amount: number;
-  interval_type: 'day' | 'month' | 'year';
+  interval_type: 'hour' | 'day' | 'month' | 'year';
 }
 
 interface Price {
@@ -394,7 +400,9 @@ interface Price {
 
 interface CustomVmPrice {
   currency: 'BTC' | 'EUR' | 'USD';
-  amount: number; // Base price in smallest currency units
+  amount: number; // Price of ONE billing period, in smallest currency units
+  interval_amount: number; // The billing period `amount` is for, e.g. 1 `hour`
+  interval_type: 'hour' | 'day' | 'month' | 'year';
   /** @deprecated (#230) Use GET /api/v1/exchange-rate instead. Still populated for now. */
   other_price: Price[]; // The same price converted to other supported currencies
 }
@@ -417,6 +425,10 @@ interface CustomVmRequest {
   disk: number; // Disk size in bytes
   disk_type: 'hdd' | 'ssd';
   disk_interface: 'sata' | 'scsi' | 'pcie';
+  ip4_count?: number; // Defaults to 1
+  ip6_count?: number; // Defaults to 1
+  transfer_gb?: number; // Monthly outbound transfer in GB; defaults to transfer.default, ignored on an unmetered plan
+  network_mbps?: number; // Network speed in Mbit/s; defaults to network.default, ignored on an uncapped plan
 }
 
 interface CustomVmOrder extends CustomVmRequest {
@@ -437,6 +449,17 @@ interface CustomTemplateParams {
   min_memory: number; // In bytes
   max_memory: number; // In bytes
   disks: CustomTemplateDiskParam[];
+  interval_amount: number; // How often a VM on this plan bills, e.g. 1 `hour`; the price endpoint's `amount` is for one such period
+  interval_type: 'hour' | 'day' | 'month' | 'year';
+  transfer_gb?: number; // Default monthly transfer in GB; omitted when unmetered
+  transfer?: BandwidthRange; // Selectable monthly transfer in GB; omitted when unmetered
+  network?: BandwidthRange; // Selectable network speed in Mbit/s; omitted when uncapped
+}
+
+interface BandwidthRange {
+  min: number;
+  max: number;
+  default: number;
 }
 
 interface CustomTemplateDiskParam {
@@ -458,6 +481,7 @@ interface VmOsImage {
   release_date: string; // ISO 8601 datetime
   cpu_arch?: string; // CPU architecture (e.g. "x86_64", "arm64"; omitted if unspecified)
   default_username?: string;
+  encrypted: boolean; // root disk is encrypted; the VM asks for a passphrase on the serial console at first boot and at every boot
   popularity: number; // fraction (0.0–1.0) of active VMs using this image
 }
 
@@ -514,6 +538,7 @@ interface Discount {
 type PaymentData = 
   | { lightning: string } // Lightning Network invoice
   | { onchain: { address: string; outpoint?: string } } // On-chain Bitcoin receive address (BTC only). `outpoint` ("{txid}:{vout}") is set as soon as a deposit is seen in the mempool (0-conf), before it confirms, so the UI can show "received, waiting for confirmation"; absent until a deposit is detected. Confirmed once is_paid is true
+  | { fixedfloat: { coin: string; address: string; amount: string; outpoint?: string } } // A cryptocurrency swapped to Bitcoin. Send exactly `amount` of `coin` (XMR, LTC, ETH or USDTTRC) to `address` before `expires`. A third-party exchange converts it and pays our Bitcoin wallet; `outpoint` ("{txid}:{vout}") appears when that Bitcoin is seen in the mempool. The credited time is priced from the Bitcoin actually received, so a short or late deposit buys proportionally less time. Confirmed once is_paid is true
   | { revolut: { token: string } } // Revolut payment token
   | { stripe: { session_id: string } }; // Stripe checkout session
 
@@ -522,9 +547,9 @@ interface PaymentType {
 }
 
 interface PaymentMethod {
-  name: 'lightning' | 'onchain' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
+  name: 'lightning' | 'onchain' | 'fixedfloat' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
   metadata: Record<string, string>;
-  currencies: ('BTC' | 'EUR' | 'USD')[];
+  currencies: ('BTC' | 'EUR' | 'USD' | 'GBP' | 'CAD' | 'CHF' | 'AUD' | 'JPY' | 'XMR' | 'LTC' | 'ETH' | 'USDTTRC')[]; // For `fixedfloat` these are the coins the customer can pay with, never billing currencies
   processing_fee_rate?: number; // Percentage rate (e.g., 1.0 for 1%)
   processing_fee_base?: number; // Base amount in smallest currency units (cents for fiat, millisats for BTC)
   processing_fee_currency?: string; // Currency for the base fee (e.g., "EUR")
@@ -572,7 +597,7 @@ interface SubscriptionPayment {
   created: string; // ISO 8601 datetime
   expires: string; // ISO 8601 datetime
   amount: Price; // Total payment amount
-  payment_method: 'lightning' | 'onchain' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
+  payment_method: 'lightning' | 'onchain' | 'fixedfloat' | 'revolut' | 'paypal' | 'stripe' | 'nwc' | 'lnurl';
   payment_type: 'Purchase' | 'Renewal' | 'Upgrade';
   is_paid: boolean;
   paid_at?: string; // ISO 8601 datetime when payment was completed (only present when is_paid is true)
@@ -622,6 +647,8 @@ interface VmUpgradeRequest {
   cpu?: number; // New CPU core count (must be >= current)
   memory?: number; // New memory in bytes (must be >= current)
   disk?: number; // New disk size in bytes (must be >= current)
+  transfer_gb?: number; // New monthly transfer in GB (must be >= current, VM must be metered)
+  network_mbps?: number; // New network speed in Mbit/s (must be >= current, VM must be capped)
 }
 
 interface VmUpgradeQuote {
@@ -776,6 +803,108 @@ and React example. `{provider}` is one of the enabled tags (`google`, `github`,
 - **Notes**: Removes the stored number, clears verification state and sets `contact_whatsapp` to `false`.
 - **Response**: `null`
 
+### Account Credit
+
+A balance you top up and spend against purchases, renewals and upgrades, in the
+same flow as a saved wallet. The balance is held in msat and converted into
+the payment currency of whatever you buy at the current rate.
+
+#### Get Credit Balance
+- **GET** `/api/v1/account/credit`
+- **Auth**: Required
+- **Response**:
+```json
+{
+  "data": {
+    "balance": 5000000,
+    "currency": "BTC",
+    "auto_apply": true
+  }
+}
+```
+- `balance`: your available credit, in msat. Never negative.
+- `auto_apply`: when true, every quote automatically spends as much credit as
+  the bill allows; when false the balance waits for you to opt in.
+
+#### Toggle Auto-Apply
+- **PATCH** `/api/v1/account/credit`
+- **Auth**: Required
+- **Body**: `{ "auto_apply": bool }`
+- **Response**: the balance object above, reflecting the new flag.
+
+#### Top Up
+- **POST** `/api/v1/account/credit/topup`
+- **Auth**: Required
+- **Body**: `{ "amount": 10000000, "method": "lightning", "coin": "XMR" }`
+  (`amount` in msat, rounded up to a whole sat, minimum 1000). `method` is
+  `lightning` (default), `onchain` or `fixedfloat`; `coin` is required for
+  `fixedfloat` and is one of that method's `currencies`.
+- **Notes**: `lightning` issues an invoice. `onchain` issues a Bitcoin receive
+  address and `fixedfloat` a swap deposit address, both in `data` in the same
+  shape as a payment's `data`. On-chain and swap top-ups credit whatever
+  actually arrives, at any amount, once the deposit confirms; `amount` is only
+  the quote and the address stays valid for later deposits. A top-up is not tied
+  to any subscription and never appears on a VM's payment history.
+- **Response**:
+```json
+{
+  "data": {
+    "pr": "lnbc...",
+    "payment_hash": "...",
+    "method": "lightning",
+    "data": { "lightning": "lnbc..." },
+    "amount": 10000000,
+    "currency": "BTC",
+    "is_paid": false,
+    "expires": "2026-10-15T12:10:00Z"
+  }
+}
+```
+`pr` is present only for `lightning`. `data` is `{ "onchain": { "address",
+"outpoint" } }` or `{ "fixedfloat": { "coin", "address", "amount", "outpoint" } }`
+for the other methods; `outpoint` appears once the deposit is seen in the mempool.
+
+#### Top-Up Status
+- **GET** `/api/v1/account/credit/topup/{payment_hash}`
+- **Auth**: Required
+- **Response**: the top-up object above with the current `is_paid` and, for
+  on-chain and swap top-ups, the received `amount` once a deposit is seen.
+
+#### Credit Ledger
+- **GET** `/api/v1/account/credit/events?limit=50&offset=0`
+- **Auth**: Required
+- **Notes**: Every movement of your balance, newest first. `kind` is one of
+  `topup`, `spend`, `refund`, `admin`; `amount` is the signed change to the
+  balance (`spend` is negative). `subscription_payment_id` is set on `spend`
+  rows to the payment the credit went to.
+- **Response**: standard paginated wrapper of
+  `{ kind, amount, currency, subscription_payment_id, note, created }` rows.
+
+#### How credit is spent
+
+When `auto_apply` is on and you hold a balance, quotes for renewals, purchases
+and upgrades show a `credit` line (renewal quotes) or a `credit` object on the
+payment response:
+
+```json
+{ "amount": 500000, "currency": "BTC" }
+```
+
+That is the part of the bill your balance covers, in the bill's currency. The
+invoice you are asked to pay covers the remainder, and the processing fee is
+charged only on that remainder. A bill fully covered by credit needs no payment
+at all: it settles the moment it is ordered and its payment `data` is
+`"credit"`. If the remainder would fall below the payment method's minimum,
+less credit is used so the remainder meets it.
+
+Credit applied to an unpaid order is held until the order expires, so the same
+credit is never offered to two orders at once. If an order is paid after it
+expired and the credit has since gone elsewhere, only what is left is spent and
+the rest of the bill buys less time (on-chain) or is absorbed. Auto-renewal
+uses credit when it covers the whole renewal, otherwise your saved wallet or
+card pays the remainder. A refund of a VM paid partly with credit returns the
+credit share to your balance and the cash share to your invoice.
+
 ### Automatic Renewal with Nostr Wallet Connect
 
 The LNVPS platform supports automatic VM renewal using Nostr Wallet Connect (NWC). This feature allows users to set up their Lightning wallets to automatically pay for VM renewals before expiration.
@@ -921,14 +1050,17 @@ network transfer for the current UTC calendar month:
   "period_start": "2026-08-01",
   "period_end": "2026-08-31",
   "bytes_out": 41231000000,
-  "bytes_in": 8800000000
+  "bytes_in": 8800000000,
+  "throttled": false
 }
 ```
 
 `transfer_gb` is the plan's **outbound** allowance per month and is omitted when
 the plan is unmetered; `bytes_out` is the figure it bounds. Inbound transfer is
-reported but never counted against the allowance. Exceeding it currently has no
-automatic effect — no throttle, no suspension, no overage billing.
+reported but never counted against the allowance. Once `bytes_out` reaches the
+allowance the VM's network is limited to 10 Mbit/s in each direction until the
+allowance resets on the 1st, and `throttled` is true. The limit is applied
+within about an hour of crossing it.
 
 Use `GET /api/v1/vm/{id}/traffic` only when a day-by-day breakdown or a
 historical range is needed; a usage bar can be rendered from this object alone.
@@ -952,6 +1084,12 @@ historical range is needed; a usage bar can be rendered from this object alone.
 - **Body**: `CustomVmOrder`
 - **Response**: `VmStatus`
 
+#### Get VM Upgrade Options
+- **GET** `/api/v1/vm/{id}/upgrade/options`
+- **Auth**: Required
+- **Response**: `CustomTemplateParams`
+- **Description**: The custom pricing plan an upgrade of this VM is priced and limited by: the VM's own plan for a custom VM (returned even when the plan no longer takes new orders), or the region's matching plan for a VM on a standard template. Its `max_*` fields, `disks`, `transfer` and `network` bound what the upgrade request may ask for; the minimum for each is what the VM already has.
+
 #### Get VM Upgrade Quote
 - **POST** `/api/v1/vm/{id}/upgrade/quote?method={payment_method}`
 - **Auth**: Required
@@ -959,7 +1097,7 @@ historical range is needed; a usage bar can be rendered from this object alone.
   - `method`: Optional payment method ('lightning' | 'revolut' | 'paypal'). Defaults to 'lightning'
 - **Body**: `VmUpgradeRequest`
 - **Response**: `VmUpgradeQuote`
-- **Description**: Calculate the pro-rated upgrade cost for remaining VM time and the new monthly renewal cost after upgrade. Available for both standard template VMs and custom template VMs. Like the upgrade endpoint itself, the request must strictly increase at least one resource (no downgrades). Cost is calculated in the currency appropriate for the selected payment method. The response includes the upgrade cost (cost_difference), new renewal cost, and the discount amount representing the value of remaining time at the old pricing rate.
+- **Description**: Calculate the pro-rated upgrade cost for remaining VM time and the new renewal cost after upgrade (one billing period of the plan the VM ends up on). Available for both standard template VMs and custom template VMs. Like the upgrade endpoint itself, the request must strictly increase at least one resource (no downgrades). Cost is calculated in the currency appropriate for the selected payment method. The response includes the upgrade cost (cost_difference), new renewal cost, and the discount amount representing the value of remaining time at the old pricing rate. When account credit is auto-applied the response also carries `credit` (`{ amount, currency }`), and `processing_fee` is the fee on the remainder.
 
 #### Create VM Upgrade Payment
 - **POST** `/api/v1/vm/{id}/upgrade?method={payment_method}`
@@ -969,7 +1107,7 @@ historical range is needed; a usage bar can be rendered from this object alone.
   - `payment_method_id`: Optional; for `method=saved`, the specific saved card to charge (omit to use the default saved card)
 - **Body**: `VmUpgradeRequest`
 - **Response**: `VmPayment`
-- **Description**: Create a payment for upgrading VM specifications. An upgrade must keep every resource at or above its current level and strictly increase at least one of CPU, memory or disk — requests that shrink a resource (or change nothing) are rejected; downgrades require a reinstall onto a smaller template. The upgrade is applied after payment confirmation. Payment method determines the currency and payment provider used. Saved methods are collected on the spot the same way as renewals: `method=nwc` pays via the user's saved Nostr Wallet Connect wallet, and `method=saved` charges a saved Revolut card off-session (merchant-initiated). For these off-session methods the request briefly waits for settlement — the returned `VmPayment` is already `is_paid: true` if it settled within ~10s, otherwise it is returned pending and settles asynchronously. **Important: Running VMs will be automatically stopped and restarted during the upgrade process to apply hardware changes.**
+- **Description**: Create a payment for upgrading VM specifications. An upgrade must keep every resource at or above its current level and strictly increase at least one of CPU, memory, disk, monthly transfer or network speed — requests that shrink a resource (or change nothing) are rejected; downgrades require a reinstall onto a smaller template. The upgrade is applied after payment confirmation. Payment method determines the currency and payment provider used. Saved methods are collected on the spot the same way as renewals: `method=nwc` pays via the user's saved Nostr Wallet Connect wallet, and `method=saved` charges a saved Revolut card off-session (merchant-initiated). For these off-session methods the request briefly waits for settlement — the returned `VmPayment` is already `is_paid: true` if it settled within ~10s, otherwise it is returned pending and settles asynchronously. **Important: Running VMs will be automatically stopped and restarted during the upgrade process to apply CPU, memory or disk changes.** An upgrade of only `transfer_gb` or `network_mbps` is applied without a restart. Bandwidth can only be raised on a VM that already has an allowance or speed cap; an unmetered or uncapped VM stays that way.
 
 ### VM Operations
 
@@ -988,12 +1126,57 @@ historical range is needed; a usage bar can be rendered from this object alone.
 - **Auth**: Required
 - **Response**: `null`
 
+#### Delete VM
+- **DELETE** `/api/v1/vm/{id}`
+- **Auth**: Required
+- **Response**: `null`. The deletion is queued, not immediate.
+- **Description**: Deletes a VM you no longer need and stops its billing. If the VM's subscription bills nothing else, the subscription is deactivated and auto-renewal turned off; if it also bills other products (an IP range, an app), only the VM's line item and its add-ons (such as paid snapshots) stop, and the rest keep billing. A subscription whose line items all belong to the VM ends with it. The time you paid for but did not use is returned to your account credit, whatever the billing interval, as a `refund` event:
+  - each payment gives back the share of what it charged (tax included) that the unused time represents, and on a shared subscription only the VM line item's share of it;
+  - what account credit paid comes back as exactly the credit it took;
+  - what was paid in cash (Lightning, card, on-chain, swap) comes back as credit at the current exchange rate. It is not paid out to the original method.
+- **Errors**: `403 Forbidden` if the VM is not yours; `404 Not Found` if it does not exist or is already deleted; `409 Conflict` if the VM is the subject of an open abuse case.
+
 #### Reinstall VM
 - **PATCH** `/api/v1/vm/{id}/re-install`
 - **Auth**: Required
 - **Body** (optional): `{ "image_id": number }` — switch the VM to a different OS image as part of the re-install. When omitted, the VM is reinstalled with its current image.
 - **Response**: `null`
 - **Errors**: `402 Payment Required` if the VM is expired (renew it first); `403 Forbidden` if the VM is not yours or the chosen image is not available; `404 Not Found` if the VM or image does not exist.
+
+#### VM Snapshots
+
+A snapshot keeps a VM's disk as it is now so it can be returned to later. A VM holds as many snapshots as it has snapshot slots, bought as a [VM add-on](#vm-add-ons); a VM with no slots cannot take one. All four endpoints require auth, and snapshots cannot be created or restored on an expired VM (`402 Payment Required`).
+
+Snapshots are deleted when the VM is re-installed or its disk is resized.
+
+- **GET** `/api/v1/vm/{id}/snapshots`: list snapshots, oldest first.
+  - **Response**: `[{ "name": string, "description": string | null, "created": string | null }]`
+- **POST** `/api/v1/vm/{id}/snapshots`: take a snapshot.
+  - **Body**: `{ "name": string, "description"?: string }`. `name` starts with a letter and uses letters, digits, `_` and `-`, 2 to 40 characters. `description` is one line of up to 200 characters.
+  - **Response**: the created snapshot.
+  - **Errors**: `400 Bad Request` for an invalid name or description; `409 Conflict` if the name is taken, the VM has no snapshot slots, or every slot is in use.
+  - A running VM keeps running on Proxmox. On libvirt hosts (including marketplace nodes) it is shut down for the copy and started again, so expect a short outage.
+- **PATCH** `/api/v1/vm/{id}/snapshots/{name}/restore`: return the VM to a snapshot. Everything written to the disk since is lost. The VM is started again afterwards. Only the newest snapshot can be restored: to go back further, delete the newer ones first.
+  - **Response**: `null`
+  - **Errors**: `404 Not Found` if the snapshot does not exist; `409 Conflict` if newer snapshots exist (the message names them).
+- **DELETE** `/api/v1/vm/{id}/snapshots/{name}`: delete a snapshot. Deleting one that does not exist succeeds.
+
+Create, restore and delete wait up to 180 seconds for the host. If the operation is still running after that, the call returns success and the VM's state catches up shortly after.
+  - **Response**: `null`
+
+#### VM Add-ons
+
+Paid extras billed on the VM's subscription as their own line items, renewed with the VM and stopped with it. The only kind is `snapshot`: each one is a snapshot slot. Prices are set per region at a monthly rate and scaled to the VM's billing interval; a VM in a region with no price cannot buy them.
+
+- **GET** `/api/v1/vm/{id}/addons`: the add-ons on sale for this VM.
+  - **Response**: `[{ "kind": "snapshot", "quantity": number, "max_quantity": number, "monthly_price": ApiPrice, "interval_price": ApiPrice }]`. `quantity` is what the VM holds now; `interval_price` is one unit for one of the VM's billing intervals, in the subscription's currency.
+- **POST** `/api/v1/vm/{id}/addons/quote?method=`: price a change without making it.
+  - **Body**: `{ "kind": "snapshot", "quantity": number }`
+  - **Response**: `{ "kind", "current", "quantity", "interval_price", "due_now", "tax", "processing_fee", "credit"? }`. `interval_price` is what the add-on costs each interval after the change; `due_now` (in the payment method's currency) covers the extra units for the rest of the paid period.
+- **PUT** `/api/v1/vm/{id}/addons?method=`: change the quantity. Takes the same `method`, `payment_method_id` and `coin` parameters as a renewal.
+  - **Body**: `{ "kind": "snapshot", "quantity": number }`
+  - **Response**: `{ "applied": bool, "payment"?: ApiVmPayment }`. Lowering the quantity is applied at once with no refund; when slots go below the snapshots held, the oldest snapshots are deleted to fit. Raising it returns a `payment` (payment type `AddonChange`) and takes effect when it is paid; `applied` is true when credit or a saved method settled it already.
+  - **Errors**: `400 Bad Request` if the add-on is not sold in the VM's region or the quantity is above `max_quantity`.
 
 #### VM Serial Console (WebSocket)
 - **WebSocket** `/api/v1/vm/{id}/console`
@@ -1169,10 +1352,17 @@ These are properties of the offer, not of a host. A host's own capacity is never
 reported to customers: two hosts backing the same plan must be indistinguishable
 to the buyer.
 
-`CustomTemplateParams` also carries `transfer_gb`, the allowance copied onto
-every custom VM built from that plan. Its `limits` never includes
-`firewall_rule_limit` — a pricing plan holds none, so such a VM uses the server
-default.
+`CustomTemplateParams` also carries `transfer_gb`, the plan's default monthly
+allowance. Its `limits` never includes `firewall_rule_limit`: a pricing plan
+holds none, so such a VM uses the server default.
+
+Monthly transfer and network speed are selectable on a custom VM. `transfer` and
+`network` give the range a plan sells and the value used when the order leaves
+it out. Both are billed on the whole amount chosen, so use
+`POST /api/v1/vm/custom-template/price` for the price. A plan without `transfer`
+is unmetered and one without `network` is uncapped; neither can be bought on it.
+The chosen values appear on the VM as `template.transfer_gb` and
+`template.limits.network_mbps`.
 
 #### List OS Images
 - **GET** `/api/v1/image`
@@ -1185,7 +1375,7 @@ default.
 - **POST** `/api/v1/vm/custom-template/price`
 - **Auth**: None
 - **Body**: `CustomVmRequest`
-- **Response**: `CustomVmPrice` (base `{ currency, amount }` plus the deprecated `other_price[]`; prefer `GET /api/v1/exchange-rate` for conversions)
+- **Response**: `CustomVmPrice` (`{ currency, amount, interval_amount, interval_type }` plus the deprecated `other_price[]`; prefer `GET /api/v1/exchange-rate` for conversions). `amount` is the price of one billing period, the plan's `interval_*`. A plan that bills hourly is priced per hour, a fraction of a cent in fiat, so its `amount` comes back in BTC millisats (`currency: "BTC"`) rather than a rounded fiat cent; an hourly VM is paid from account credit.
 
 #### Exchange Rates
 - **GET** `/api/v1/exchange-rate`
@@ -1213,7 +1403,8 @@ interface ExchangeRates {
 - **GET** `/api/v1/vm/{id}/renew?method={payment_method}&intervals={count}`
 - **Auth**: Required
 - **Query Params**: 
-  - `method`: Optional payment method ('lightning' | 'onchain' | 'revolut' | 'paypal' | 'nwc')
+  - `method`: Optional payment method ('lightning' | 'onchain' | 'fixedfloat' | 'revolut' | 'paypal' | 'nwc')
+  - `coin`: Required when `method=fixedfloat`: one of the `currencies` the `fixedfloat` payment method lists (`XMR`, `LTC`, `ETH`, `USDTTRC`, case-insensitive). The payment is priced in BTC and the response `data` is `{ fixedfloat: { coin, address, amount } }`. A coin that is missing, not a coin, or not listed for the company is rejected
   - `intervals`: Optional number of billing intervals to renew (default: 1). For example, if the VM has a monthly billing cycle, `intervals=3` would generate a payment for 3 months.
   - `code`: Optional discount code. A code that cannot be used (unknown, expired, exhausted, or not applicable to this order) **fails the request** rather than quietly invoicing full price, so the customer is told it did not work. The returned `amount` and `tax` are already net of any discount, and `discount` describes what was taken off.
 - **Response**: `VmPayment`
@@ -1488,6 +1679,7 @@ interface Referral {
   mode: "lightning_address" | "nwc" | "account_credit" | "on_chain"; // Payout method
   referral_rate: number | null;    // Per-referrer commission override (whole %), admin-controlled; null = no override, use company default. NOT the rate you earn by itself.
   effective_referral_rate: number; // The commission rate that currently applies to you (whole %): the override if set, else the default company's rate. Use this for display.
+  auto_payout_approved: boolean;   // Whether an admin has approved automated payouts. Until then commission accrues and is paid manually.
   created: string;                 // ISO 8601 datetime
 }
 
@@ -1515,7 +1707,8 @@ interface ReferralUsage {
   amount: number;        // The referred VM's first payment amount (smallest currency unit)
   currency: string;      // Currency of the payment / commission
   effective_rate: number;// Rate actually applied to THIS referred VM (whole %); resolved against the VM's own company
-  commission: number;    // Commission earned from this VM = amount * effective_rate% (smallest currency unit)
+  commission: number;    // Commission earned from this VM = (amount - refunded) * effective_rate% (smallest currency unit)
+  payable_after: string | null; // ISO 8601 datetime the commission becomes eligible for automated payout; null when automated payouts are off
 }
 
 interface ReferralState extends Referral {
@@ -1573,6 +1766,42 @@ interface PatchAppDeploymentRequest {
 - **Auth**: Required
 - **Response**: `true` — stops billing (deactivates the subscription) and tears the deployment down (namespace + volumes removed).
 - **Error**: `404` if not found or not owned by you
+
+#### Deployment Backups
+Apps whose compose declares a `backup:` method can be backed up. A run captures every such service at once, one artifact per service, into LNVPS object storage. Apps with a `backup:` schedule are also backed up automatically; every run counts towards the app's retention (7 runs when it declares no schedule), and older runs are deleted with their files.
+
+- **GET** `/api/v1/app-deployments/{id}/backups?limit=&offset=`
+  - **Auth**: Required
+  - **Response**: paginated `AppBackup[]`, newest first (`limit` defaults to 50, max 100). Artifacts of one run share a `run_id`.
+- **POST** `/api/v1/app-deployments/{id}/backups`
+  - **Auth**: Required
+  - **Response**: `AppBackup[]`, the new run's artifacts in `pending` state. The operator picks them up within a minute.
+  - **Errors**: `400` when backups are not available, the deployment is not `running`, the app declares no backup method, or a manual run started less than 60 minutes ago; `409` while a run is still pending or running; `404` if not found or not owned by you.
+- **GET** `/api/v1/app-deployments/{id}/backups/{backup_id}/download`
+  - **Auth**: Required
+  - **Response**: `{ url: string, filename: string, expires: string }`. `url` is a presigned download link valid for 60 minutes; open it directly, it needs no `Authorization` header. The response names the file `filename`.
+  - **Errors**: `400` when the backup is not `completed`; `404` if the backup does not belong to this deployment or the deployment is not yours.
+- **DELETE** `/api/v1/app-deployments/{id}/backups/{backup_id}`
+  - **Auth**: Required
+  - **Response**: `null`. Deletes the stored file, then the record.
+  - **Errors**: `409` while the backup is pending or running; `404` as above.
+
+```typescript
+interface AppBackup {
+  id: number;
+  run_id: string;                // groups the artifacts captured by one run
+  service: string;               // compose service the artifact came from
+  method: "command" | "volume" | "exec";  // dump in its own pod, tar of a volume, or the app's export run in its container
+  artifact: string;              // download filename, e.g. "route96.sql.gz"
+  state: "pending" | "running" | "completed" | "failed";
+  size_bytes?: number;           // once uploaded
+  message?: string;              // failure detail
+  scheduled: boolean;            // started by the app's schedule rather than by you
+  created: string;
+  started?: string;
+  completed?: string;
+}
+```
 
 The catalog + read endpoints below are unauthenticated-safe views of what you can deploy and what you're running.
 
@@ -1644,7 +1873,7 @@ interface App {
   amount: number;            // recurring price in smallest currency units (cents / millisats)
   currency: string;
   interval_amount: number;
-  interval_type: "day" | "month" | "year";
+  interval_type: "hour" | "day" | "month" | "year";
   setup_amount: number;      // one-off setup fee in smallest currency units (0 = none)
   // Resource footprint computed from the compose (issue #231):
   cpu_milli: number;         // total requested CPU in millicores
@@ -1941,7 +2170,7 @@ function isApiSuccess<T>(response: ApiResult<T>): response is ApiResponse<T> {
 12. **Pro-rated Billing**: Upgrade costs are calculated based on the remaining time until VM expiration. The cost represents the difference between current and new specifications, pro-rated for the remaining billing period. The system calculates: (new_rate_per_second * seconds_remaining) - (old_rate_per_second * seconds_remaining). The discount field shows the value of remaining time at the old rate. The system respects the actual billing interval of the cost plan (daily, monthly, yearly) rather than assuming monthly billing.
 13. **Billing Interval Handling**: 
     - Standard template VMs: Use their cost plan's actual interval (interval_type and interval_amount)
-    - Custom template VMs: Always use monthly billing for pro-rating calculations
+    - Custom template VMs: Use the custom pricing plan's interval (`interval_*` on the plan, monthly unless the plan says otherwise)
     - Examples: A cost plan with interval_type="day" and interval_amount=7 bills every 7 days
 14. **Upgrade Payment Flow**: 
     - First, get a quote using `/api/v1/vm/{id}/upgrade/quote`
@@ -1974,7 +2203,7 @@ const quoteResponse = await fetch(`/api/v1/vm/123/upgrade/quote?method=${payment
 
 const quote: ApiResponse<VmUpgradeQuote> = await quoteResponse.json();
 console.log(`Upgrade cost: ${quote.data.cost_difference.amount} ${quote.data.cost_difference.currency}`);
-console.log(`New monthly cost: ${quote.data.new_renewal_cost.amount} ${quote.data.new_renewal_cost.currency}`);
+console.log(`New renewal cost: ${quote.data.new_renewal_cost.amount} ${quote.data.new_renewal_cost.currency}`);
 console.log(`Discount applied: ${quote.data.discount.amount} ${quote.data.discount.currency}`);
 
 // Step 2: Create upgrade payment if user accepts the quote (using same payment method)

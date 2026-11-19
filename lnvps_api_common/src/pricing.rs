@@ -3,12 +3,12 @@ use crate::{
     UpgradeConfig, VatClient, saturating_add_seconds,
 };
 use anyhow::{Result, anyhow, bail, ensure};
-use chrono::{DateTime, Days, Months, Utc};
+use chrono::{DateTime, Days, Months, TimeDelta, Utc};
 use isocountry::CountryCode;
 use lnvps_db::{
     CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, IntervalType, LNVpsDb, PaymentMethod,
-    SubscriptionPayment, SubscriptionPaymentType, Vm, VmCostPlan, VmCustomPricing,
-    VmCustomTemplate,
+    SubscriptionPayment, SubscriptionPaymentType, Vm, VmAddonKind, VmAddonPrice, VmCostPlan,
+    VmCustomPricing, VmCustomTemplate,
 };
 use payments_rs::currency::{Currency, CurrencyAmount};
 #[cfg(test)]
@@ -28,6 +28,111 @@ pub fn round_msat_to_sat(msat: u64) -> u64 {
 fn round_to_sat(amount: CurrencyAmount) -> CurrencyAmount {
     debug_assert_eq!(amount.currency(), Currency::BTC);
     CurrencyAmount::from_u64(Currency::BTC, round_msat_to_sat(amount.value()))
+}
+
+/// Pick the custom pricing model a standard VM converts to on upgrade.
+///
+/// Both the upgrade quote and the conversion that runs once it is paid call
+/// this, so the customer is charged for the model they are then moved onto.
+///
+/// Among the enabled models in the region that can price the VM's hardware, one
+/// that bills on the VM's current interval is preferred. A VM that is not billed
+/// hourly is never moved onto an hourly model, because hourly billing is paid
+/// from account credit only and the customer did not choose it. If the only
+/// compatible models are hourly the upgrade is refused rather than switching
+/// how the customer pays.
+#[allow(clippy::too_many_arguments)]
+pub async fn select_custom_pricing(
+    db: &Arc<dyn LNVpsDb>,
+    region_id: u64,
+    disk_type: DiskType,
+    disk_interface: DiskInterface,
+    cpu_mfg: CpuMfg,
+    cpu_arch: CpuArch,
+    cpu_features: &[CpuFeature],
+    current_interval: Option<(IntervalType, u64)>,
+) -> Result<VmCustomPricing> {
+    let vm_is_hourly = matches!(current_interval, Some((IntervalType::Hour, _)));
+    let mut best: Option<(bool, VmCustomPricing)> = None;
+
+    for pricing in db.list_custom_pricing(region_id).await? {
+        if !pricing.enabled {
+            continue;
+        }
+        // Hourly billing is credit-only; never move a VM onto it implicitly.
+        if pricing.interval_type == IntervalType::Hour && !vm_is_hourly {
+            continue;
+        }
+
+        // Check CPU manufacturer match (Unknown means any)
+        if cpu_mfg != CpuMfg::Unknown
+            && pricing.cpu_mfg != CpuMfg::Unknown
+            && pricing.cpu_mfg != cpu_mfg
+        {
+            continue;
+        }
+
+        // Check CPU architecture match (Unknown means any)
+        if cpu_arch != CpuArch::Unknown
+            && pricing.cpu_arch != CpuArch::Unknown
+            && pricing.cpu_arch != cpu_arch
+        {
+            continue;
+        }
+
+        // Check that pricing supports all required CPU features (empty list means any)
+        if !cpu_features.is_empty()
+            && !pricing.cpu_features.is_empty()
+            && !cpu_features
+                .iter()
+                .all(|f| pricing.cpu_features.contains(f))
+        {
+            continue;
+        }
+
+        // Check if this pricing supports the required disk type and interface
+        let disk_configs = db.list_custom_pricing_disk(pricing.id).await?;
+        if !disk_configs
+            .iter()
+            .any(|disk| disk.kind == disk_type && disk.interface == disk_interface)
+        {
+            continue;
+        }
+
+        let same_interval = current_interval.is_some_and(|(t, a)| {
+            t == pricing.interval_type && a == pricing.interval_amount.max(1)
+        });
+        match &best {
+            // The first compatible model wins unless a later one matches the
+            // VM's interval and the current best does not.
+            Some((best_same, _)) if *best_same || !same_interval => {}
+            _ => best = Some((same_interval, pricing)),
+        }
+    }
+
+    best.map(|(_, p)| p).ok_or_else(|| {
+        anyhow!(
+            "No custom pricing available for this region that supports disk type {:?} with interface {:?}",
+            disk_type,
+            disk_interface
+        )
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct VmAddonQuote {
+    pub current: u32,
+    pub quantity: u32,
+    pub interval_amount: CurrencyAmount,
+    pub charge: ConvertedCurrencyAmount,
+    pub tax: TaxDetermination,
+    pub processing_fee: u64,
+}
+
+impl VmAddonQuote {
+    pub fn is_free(&self) -> bool {
+        self.charge.amount.value() == 0
+    }
 }
 
 /// Result of calculating upgrade costs including both immediate upgrade cost and new renewal cost
@@ -51,24 +156,18 @@ pub struct UpgradeCostQuote {
 pub struct RemainingTimeInfo {
     /// Seconds remaining until VM expires
     pub seconds_remaining: i64,
-    /// Current renewal cost for full period
+    /// Current renewal cost for full period, in `1/scale` smallest currency units
     pub renewal_cost: CurrencyAmount,
+    /// Divisor taking `renewal_cost`, `cost_per_second` and `prorated_cost` to
+    /// the currency's smallest unit (1 except for fine-grained custom pricing)
+    pub scale: u64,
     /// Duration of renewal period in seconds
     pub renewal_period_seconds: i64,
-    /// Cost per second at current rate
+    /// Cost per second at current rate, in `1/scale` smallest currency units
     pub cost_per_second: f64,
-    /// Pro-rated cost for remaining time
+    /// Pro-rated cost for remaining time, in `1/scale` smallest currency units
     pub prorated_cost: CurrencyAmount,
 }
-
-/// Billing period a custom VM price buys. Custom builds have no cost plan row,
-/// so the interval is fixed here and is what both the renewal and the quoted
-/// price report.
-pub const CUSTOM_VM_INTERVAL_AMOUNT: u64 = 1;
-pub const CUSTOM_VM_INTERVAL_TYPE: IntervalType = IntervalType::Month;
-// The renewal below advances by months, so a change of unit here has to be made
-// there too.
-const _: () = assert!(matches!(CUSTOM_VM_INTERVAL_TYPE, IntervalType::Month));
 
 /// ISO 3166-1 alpha-3 codes treated as inside the EU VAT area (27 member states).
 const EU_VAT_COUNTRIES: [&str; 27] = [
@@ -102,8 +201,73 @@ pub fn vat_number_country_alpha3(vat: &str) -> Option<String> {
         .map(|c| c.alpha3().to_string())
 }
 
+pub fn seller_country(company: &lnvps_db::Company) -> Option<String> {
+    company
+        .tax_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(vat_number_country_alpha3)
+        .or_else(|| company.country_code.as_ref().map(|cc| cc.to_uppercase()))
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlaceOfSupply {
+    pub country_code: Option<String>,
+    pub treatment: TaxTreatment,
+    pub vat_number: Option<String>,
+}
+
+pub fn place_of_supply(
+    declared_country: Option<&str>,
+    geo_country: Option<&str>,
+    vat_number: Option<&str>,
+    seller_cc: Option<&str>,
+) -> PlaceOfSupply {
+    let supply =
+        |country_code: Option<String>, treatment, vat_number: Option<&str>| PlaceOfSupply {
+            country_code,
+            treatment,
+            vat_number: vat_number.map(str::to_string),
+        };
+
+    if !seller_cc.map(is_eu_vat_country).unwrap_or(false) {
+        return supply(None, TaxTreatment::OutOfScope, None);
+    }
+
+    if let Some(vat) = vat_number.map(str::trim).filter(|s| !s.is_empty())
+        && let Some(vat_cc) = vat_number_country_alpha3(vat)
+    {
+        let treatment = if seller_cc == Some(vat_cc.as_str()) {
+            TaxTreatment::Domestic
+        } else if is_eu_vat_country(&vat_cc) {
+            TaxTreatment::ReverseCharge
+        } else {
+            TaxTreatment::OutOfScope
+        };
+        return supply(Some(vat_cc), treatment, Some(vat));
+    }
+
+    match declared_country.or(geo_country).map(str::to_uppercase) {
+        Some(cc) if is_eu_vat_country(&cc) => {
+            let treatment = if seller_cc == Some(cc.as_str()) {
+                TaxTreatment::Domestic
+            } else {
+                TaxTreatment::OssB2c
+            };
+            supply(Some(cc), treatment, None)
+        }
+        Some(cc) => supply(Some(cc), TaxTreatment::OutOfScope, None),
+        None => supply(
+            seller_cc.map(str::to_string),
+            TaxTreatment::UndeterminedDefault,
+            None,
+        ),
+    }
+}
+
 /// Which rate branch was selected for a payment. Recorded on the payment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaxTreatment {
     /// Customer country equals the seller country: seller-country rate applied.
@@ -128,6 +292,23 @@ impl TaxTreatment {
             TaxTreatment::OutOfScope => "out_of_scope",
             TaxTreatment::UndeterminedDefault => "undetermined_default",
         }
+    }
+}
+
+impl FromStr for TaxTreatment {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        [
+            TaxTreatment::Domestic,
+            TaxTreatment::OssB2c,
+            TaxTreatment::ReverseCharge,
+            TaxTreatment::OutOfScope,
+            TaxTreatment::UndeterminedDefault,
+        ]
+        .into_iter()
+        .find(|t| t.as_str() == s)
+        .ok_or_else(|| anyhow!("Unknown tax treatment: {s}"))
     }
 }
 
@@ -311,6 +492,7 @@ impl PricingEngine {
     /// Convert cost plan interval to seconds
     fn cost_plan_interval_to_seconds(interval_type: IntervalType, interval_amount: u64) -> i64 {
         let base_seconds = match interval_type {
+            IntervalType::Hour => 60 * 60,            // 3,600 seconds per hour
             IntervalType::Day => 24 * 60 * 60,        // 86,400 seconds per day
             IntervalType::Month => 30 * 24 * 60 * 60, // 2,592,000 seconds per month (30 days)
             IntervalType::Year => 365 * 24 * 60 * 60, // 31,536,000 seconds per year (365 days)
@@ -487,43 +669,49 @@ impl PricingEngine {
         method: PaymentMethod,
         gross: CurrencyAmount,
     ) -> Result<()> {
+        let min = self
+            .min_amount_in(company_id, method, gross.currency())
+            .await?;
+        ensure!(
+            gross.value() >= min,
+            "Amount is below the minimum for this payment method ({} {})",
+            CurrencyAmount::from_u64(gross.currency(), min).value_f32(),
+            gross.currency()
+        );
+        Ok(())
+    }
+
+    /// The method's configured minimum processable amount in `currency`, or 0.
+    pub async fn min_amount_in(
+        &self,
+        company_id: u64,
+        method: PaymentMethod,
+        currency: Currency,
+    ) -> Result<u64> {
         if method == PaymentMethod::Lightning {
-            return Ok(());
+            return Ok(0);
         }
-        let config = match self
+        let Ok(config) = self
             .db
             .get_payment_method_config_for_company(company_id, method)
             .await
-        {
-            Ok(c) => c,
-            // No config -> nothing to enforce (fee calc logs this case already)
-            Err(_) => return Ok(()),
+        else {
+            return Ok(0);
         };
         let (Some(min_raw), Some(min_currency_str)) =
             (config.min_amount, config.min_amount_currency.as_deref())
         else {
-            return Ok(());
+            return Ok(0);
         };
         if min_raw == 0 {
-            return Ok(());
+            return Ok(0);
         }
         let min_currency = Currency::from_str(min_currency_str)
             .map_err(|_| anyhow!("Invalid min_amount_currency '{}'", min_currency_str))?;
-        // Convert the configured minimum into the gross currency (resolving a
-        // cross-rate path if there is no direct pair).
-        let min_in_gross = self
-            .convert_currency(
-                CurrencyAmount::from_u64(min_currency, min_raw),
-                gross.currency(),
-            )
-            .await?;
-        ensure!(
-            gross.value() >= min_in_gross.value(),
-            "Amount is below the minimum for this payment method ({} {})",
-            min_in_gross.value_f32(),
-            gross.currency()
-        );
-        Ok(())
+        Ok(self
+            .convert_currency(CurrencyAmount::from_u64(min_currency, min_raw), currency)
+            .await?
+            .value())
     }
 
     /// Turn an amount **actually paid** into VM extension time.
@@ -542,11 +730,12 @@ impl PricingEngine {
         let vm = self.db.get_vm(vm_id).await?;
         let company_id = self.db.get_vm_company_id(vm_id).await?;
 
-        let cost = if vm.template_id.is_some() {
+        let mut cost = if vm.template_id.is_some() {
             self.get_template_vm_cost(&vm, method, company_id).await?
         } else {
             self.get_custom_vm_cost(&vm, method, company_id).await?
         };
+        cost.amount += self.vm_addons_interval_cost(&vm, method).await?;
 
         ensure!(cost.currency == input.currency(), "Invalid currency");
 
@@ -614,8 +803,16 @@ impl PricingEngine {
         let line_items = self
             .db
             .list_subscription_line_items(subscription_id)
-            .await?;
-        ensure!(!line_items.is_empty(), "Subscription has no line items");
+            .await?
+            .into_iter()
+            // A deactivated item's resource is gone: it is not billed,
+            // renewed or handed lifecycle events.
+            .filter(|li| li.is_active())
+            .collect::<Vec<_>>();
+        ensure!(
+            !line_items.is_empty(),
+            "Subscription has no active line items"
+        );
 
         let subscription_currency = Currency::from_str(&subscription.currency)
             .map_err(|_| anyhow!("Invalid subscription currency"))?;
@@ -827,7 +1024,8 @@ impl PricingEngine {
         // whose specs predate the current plan limits — so renewals and the startup
         // subscription backfill don't break for out-of-range legacy VMs.
 
-        // All costs are in smallest currency units (cents/millisats). Round GB
+        // All costs are in `1/rate_scale` smallest currency units (cents or
+        // millisats at scale 1), for one billing interval of the model. Round GB
         // counts UP so sub-GB fractions are billed rather than truncated to 0.
         let disk_size_gb = template.disk_size.div_ceil(crate::GB);
         let memory_gb = template.memory.div_ceil(crate::GB);
@@ -837,6 +1035,8 @@ impl PricingEngine {
         let memory_cost = pricing.memory_cost * memory_gb;
         let ip4_cost = pricing.ip4_cost * v4s;
         let ip6_cost = pricing.ip6_cost * v6s;
+        let transfer_cost = cost_per_thousand(template.transfer_gb, pricing.transfer_cost_per_tb);
+        let network_cost = cost_per_thousand(template.network_mbps, pricing.network_cost_per_gbps);
 
         let currency: Currency = if let Ok(p) = pricing.currency.parse() {
             p
@@ -845,11 +1045,16 @@ impl PricingEngine {
         };
         Ok(PricingData {
             currency,
+            scale: pricing.rate_scale.max(1),
+            interval_type: pricing.interval_type,
+            interval_amount: pricing.interval_amount.max(1),
             cpu_cost,
             memory_cost,
             ip6_cost,
             ip4_cost,
             disk_cost,
+            transfer_cost,
+            network_cost,
         })
     }
 
@@ -865,6 +1070,28 @@ impl PricingEngine {
         db: &Arc<dyn LNVpsDb>,
         template: &VmCustomTemplate,
     ) -> Result<()> {
+        let pricing = Self::validate_custom_vm_resources(db, template).await?;
+        ensure_bandwidth_in_range(
+            "Monthly transfer",
+            template.transfer_gb,
+            pricing.transfer_gb,
+            pricing.min_transfer_gb,
+            pricing.max_transfer_gb,
+        )?;
+        ensure_bandwidth_in_range(
+            "Network speed",
+            template.network_mbps,
+            pricing.network_mbps,
+            pricing.min_network_mbps,
+            pricing.max_network_mbps,
+        )?;
+        Ok(())
+    }
+
+    pub async fn validate_custom_vm_resources(
+        db: &Arc<dyn LNVpsDb>,
+        template: &VmCustomTemplate,
+    ) -> Result<VmCustomPricing> {
         let pricing = db.get_custom_pricing(template.pricing_id).await?;
         let pricing_disk = db.list_custom_pricing_disk(pricing.id).await?;
         let disk_pricing = pricing_disk
@@ -914,7 +1141,7 @@ impl PricingEngine {
                 pricing.max_ip6
             );
         }
-        Ok(())
+        Ok(pricing)
     }
 
     /// Get the renewal cost of a custom VM
@@ -933,17 +1160,25 @@ impl PricingEngine {
         let template = self.db.get_custom_vm_template(template_id).await?;
         let price = Self::get_custom_vm_cost_amount(&self.db, &template).await?;
 
+        // A custom price is for one billing interval of its pricing model, so
+        // that interval (not a fixed month) is the time one payment buys.
+        let subscription = self
+            .db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await?;
         // clamp base to now for expired VMs
-        let base = self
-            .vm_subscription_expires(vm)
-            .await
+        let base = subscription
+            .expires
             .unwrap_or_else(Utc::now)
             .max(Utc::now());
         let time_value =
-            (base.add(Months::new(CUSTOM_VM_INTERVAL_AMOUNT as u32)) - base).num_seconds() as u64;
+            Self::interval_seconds_from(base, price.interval_type, price.interval_amount);
+        // Convert the raw (sub-cent) price once, so an hourly share keeps its
+        // fraction until it is rounded to a whole satoshi.
         let converted_amount = self
-            .get_amount_and_rate(
-                CurrencyAmount::from_u64(price.currency, price.total()),
+            .get_amount_and_rate_scaled(
+                CurrencyAmount::from_u64(price.currency, price.total_raw()),
+                price.scale,
                 method,
             )
             .await?;
@@ -1000,14 +1235,12 @@ impl PricingEngine {
         // (`company.tax_id`) when present — that number is our VIES registration
         // and identifies the country we are registered in — and otherwise from
         // the company's configured country.
-        let seller_cc = self.db.get_company(company_id).await.ok().and_then(|c| {
-            c.tax_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .and_then(vat_number_country_alpha3)
-                .or_else(|| c.country_code.map(|cc| cc.to_uppercase()))
-        });
+        let seller_cc = self
+            .db
+            .get_company(company_id)
+            .await
+            .ok()
+            .and_then(|c| seller_country(&c));
 
         // Record the raw country signals observed now, even when only one of
         // them drives the decision.
@@ -1029,69 +1262,21 @@ impl PricingEngine {
         amount: u64,
         seller_cc: Option<String>,
     ) -> TaxDetermination {
-        // Only sellers in the EU VAT area select a rate here.
-        if !seller_cc.as_deref().map(is_eu_vat_country).unwrap_or(false) {
-            return TaxDetermination::zero(None, TaxTreatment::OutOfScope, None);
-        }
-
-        // 1. Customer supplied a VAT number (validated when it was saved).
-        if let Some(vat) = user
-            .billing_tax_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            && let Some(vat_cc) = vat_number_country_alpha3(vat)
-        {
-            if seller_cc.as_deref() == Some(vat_cc.as_str()) {
-                let rate = self.rate_for_country(&vat_cc);
-                return TaxDetermination::taxed(
-                    amount,
-                    rate,
-                    Some(vat_cc),
-                    TaxTreatment::Domestic,
-                    Some(vat.to_string()),
-                );
-            }
-            let treatment = if is_eu_vat_country(&vat_cc) {
-                TaxTreatment::ReverseCharge
-            } else {
-                TaxTreatment::OutOfScope
-            };
-            return TaxDetermination::zero(Some(vat_cc), treatment, Some(vat.to_string()));
-        }
-
-        // 2. No VAT number: pick the customer country from available signals.
-        let customer_cc = user
-            .country_code
-            .clone()
-            .or_else(|| user.geo_country_code.clone())
-            .map(|c| c.to_uppercase());
-        match customer_cc {
-            Some(cc) if is_eu_vat_country(&cc) => {
+        let supply = place_of_supply(
+            user.country_code.as_deref(),
+            user.geo_country_code.as_deref(),
+            user.billing_tax_id.as_deref(),
+            seller_cc.as_deref(),
+        );
+        match (supply.treatment, supply.country_code) {
+            (
+                TaxTreatment::Domestic | TaxTreatment::OssB2c | TaxTreatment::UndeterminedDefault,
+                Some(cc),
+            ) => {
                 let rate = self.rate_for_country(&cc);
-                let treatment = if seller_cc.as_deref() == Some(cc.as_str()) {
-                    TaxTreatment::Domestic
-                } else {
-                    TaxTreatment::OssB2c
-                };
-                TaxDetermination::taxed(amount, rate, Some(cc), treatment, None)
+                TaxDetermination::taxed(amount, rate, Some(cc), supply.treatment, supply.vat_number)
             }
-            Some(cc) => TaxDetermination::zero(Some(cc), TaxTreatment::OutOfScope, None),
-            // 3. No customer country available: fall back to the seller country
-            //    (guaranteed in the EU list by the gate above).
-            None => match seller_cc {
-                Some(scc) => {
-                    let rate = self.rate_for_country(&scc);
-                    TaxDetermination::taxed(
-                        amount,
-                        rate,
-                        Some(scc),
-                        TaxTreatment::UndeterminedDefault,
-                        None,
-                    )
-                }
-                None => TaxDetermination::zero(None, TaxTreatment::OutOfScope, None),
-            },
+            (treatment, cc) => TaxDetermination::zero(cc, treatment, supply.vat_number),
         }
     }
 
@@ -1101,6 +1286,7 @@ impl PricingEngine {
         base_currency: Currency,
         target_currency: Currency,
     ) -> Result<TickerRate> {
+        let (base_currency, target_currency) = (base_currency.base(), target_currency.base());
         if base_currency == target_currency {
             return Ok(TickerRate::passthrough(base_currency));
         }
@@ -1143,19 +1329,22 @@ impl PricingEngine {
         if source.currency() == target {
             return Ok(source);
         }
+        if source.currency().base() == target.base() {
+            return TickerRate::passthrough(target).convert_into(source, 1, target);
+        }
         if let Some(rate) = self.find_rate(source.currency(), target).await {
-            return rate.convert(source);
+            return rate.convert_into(source, 1, target);
         }
         for mid in [Currency::BTC, Currency::EUR] {
-            if mid == source.currency() || mid == target {
+            if mid == source.currency().base() || mid == target.base() {
                 continue;
             }
             if let (Some(first), Some(second)) = (
                 self.find_rate(source.currency(), mid).await,
                 self.find_rate(mid, target).await,
             ) {
-                let intermediate = first.convert(source)?;
-                return second.convert(intermediate);
+                let intermediate = first.convert_into(source, 1, mid)?;
+                return second.convert_into(intermediate, 1, target);
             }
         }
         bail!(
@@ -1166,6 +1355,22 @@ impl PricingEngine {
     }
 
     pub fn next_template_expire(base_expiry: DateTime<Utc>, cost_plan: &VmCostPlan) -> u64 {
+        Self::interval_seconds_from(
+            base_expiry,
+            cost_plan.interval_type,
+            cost_plan.interval_amount,
+        )
+    }
+
+    /// Seconds one `interval_amount` `interval_type` period adds to an expiry,
+    /// counted from `base_expiry` (clamped to now so expired VMs get a sensible
+    /// value). Months and years are calendar time, so the result depends on the
+    /// base.
+    pub fn interval_seconds_from(
+        base_expiry: DateTime<Utc>,
+        interval_type: IntervalType,
+        interval_amount: u64,
+    ) -> u64 {
         // Clamp the base to now so expired VMs get a sensible time_value
         let base = base_expiry.max(Utc::now());
         // `Days`/`Months` addition panics on overflow, and the `as u32` casts
@@ -1173,13 +1378,16 @@ impl PricingEngine {
         // must not be able to abort the process, so every step is checked and
         // falls back to leaving the expiry untouched (yielding a zero interval,
         // which the callers already treat as "nothing to bill").
-        let next_expire = match cost_plan.interval_type {
-            IntervalType::Day => base.checked_add_days(Days::new(cost_plan.interval_amount)),
-            IntervalType::Month => u32::try_from(cost_plan.interval_amount)
+        let next_expire = match interval_type {
+            IntervalType::Hour => i64::try_from(interval_amount)
+                .ok()
+                .and_then(TimeDelta::try_hours)
+                .and_then(|d| base.checked_add_signed(d)),
+            IntervalType::Day => base.checked_add_days(Days::new(interval_amount)),
+            IntervalType::Month => u32::try_from(interval_amount)
                 .ok()
                 .and_then(|m| base.checked_add_months(Months::new(m))),
-            IntervalType::Year => cost_plan
-                .interval_amount
+            IntervalType::Year => interval_amount
                 .checked_mul(12)
                 .and_then(|m| u32::try_from(m).ok())
                 .and_then(|m| base.checked_add_months(Months::new(m))),
@@ -1238,6 +1446,8 @@ impl PricingEngine {
         })
     }
 
+    /// The custom pricing model a standard VM converts to when it is upgraded.
+    /// See [`select_custom_pricing`] for how the choice is made.
     async fn find_custom_pricing(
         &self,
         region_id: u64,
@@ -1246,59 +1456,51 @@ impl PricingEngine {
         cpu_mfg: CpuMfg,
         cpu_arch: CpuArch,
         cpu_features: &[CpuFeature],
+        current_interval: Option<(IntervalType, u64)>,
     ) -> Result<VmCustomPricing> {
-        // Get custom pricing for the region
-        let custom_pricings = self.db.list_custom_pricing(region_id).await?;
-        let mut compatible_pricing = None;
+        select_custom_pricing(
+            &self.db,
+            region_id,
+            disk_type,
+            disk_interface,
+            cpu_mfg,
+            cpu_arch,
+            cpu_features,
+            current_interval,
+        )
+        .await
+    }
 
-        for pricing in custom_pricings {
-            if !pricing.enabled {
-                continue;
-            }
+    /// The billing interval a VM is on now, from its subscription.
+    async fn vm_billing_interval(&self, vm: &Vm) -> Option<(IntervalType, u64)> {
+        let sub = self
+            .db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await
+            .ok()?;
+        Some((sub.interval_type, sub.interval_amount.max(1)))
+    }
 
-            // Check CPU manufacturer match (Unknown means any)
-            if cpu_mfg != CpuMfg::Unknown && pricing.cpu_mfg != CpuMfg::Unknown {
-                if pricing.cpu_mfg != cpu_mfg {
-                    continue;
-                }
-            }
-
-            // Check CPU architecture match (Unknown means any)
-            if cpu_arch != CpuArch::Unknown && pricing.cpu_arch != CpuArch::Unknown {
-                if pricing.cpu_arch != cpu_arch {
-                    continue;
-                }
-            }
-
-            // Check that pricing supports all required CPU features (empty list means any)
-            if !cpu_features.is_empty() && !pricing.cpu_features.is_empty() {
-                let has_all_features = cpu_features
-                    .iter()
-                    .all(|f| pricing.cpu_features.contains(f));
-                if !has_all_features {
-                    continue;
-                }
-            }
-
-            // Check if this pricing supports the required disk type and interface
-            let disk_configs = self.db.list_custom_pricing_disk(pricing.id).await?;
-            let has_compatible_disk = disk_configs
-                .iter()
-                .any(|disk| disk.kind == disk_type && disk.interface == disk_interface);
-
-            if has_compatible_disk {
-                compatible_pricing = Some(pricing);
-                break;
-            }
+    pub async fn upgrade_pricing(&self, vm_id: u64) -> Result<VmCustomPricing> {
+        let vm = self.db.get_vm(vm_id).await?;
+        if let Some(template_id) = vm.template_id {
+            let template = self.db.get_vm_template(template_id).await?;
+            self.find_custom_pricing(
+                template.region_id,
+                template.disk_type,
+                template.disk_interface,
+                template.cpu_mfg,
+                template.cpu_arch,
+                &template.cpu_features,
+                self.vm_billing_interval(&vm).await,
+            )
+            .await
+        } else if let Some(custom_template_id) = vm.custom_template_id {
+            let template = self.db.get_custom_vm_template(custom_template_id).await?;
+            Ok(self.db.get_custom_pricing(template.pricing_id).await?)
+        } else {
+            bail!("VM must have either a standard template or custom template to upgrade");
         }
-
-        let custom_pricing = compatible_pricing
-            .ok_or_else(|| anyhow::anyhow!(
-                "No custom pricing available for this region that supports disk type {:?} with interface {:?}",
-                disk_type,
-                disk_interface
-            ))?;
-        Ok(custom_pricing)
     }
 
     /// Create a new custom template object from an existing VM for upgrade
@@ -1322,6 +1524,8 @@ impl PricingEngine {
             cpu_features,
             ip4_count,
             ip6_count,
+            transfer_gb,
+            network_mbps,
         ) = if let Some(template_id) = vm.template_id {
             let template = self.db.get_vm_template(template_id).await?;
             (
@@ -1332,6 +1536,7 @@ impl PricingEngine {
                     template.cpu_mfg.clone(),
                     template.cpu_arch.clone(),
                     &template.cpu_features,
+                    self.vm_billing_interval(&vm).await,
                 )
                 .await?,
                 template.cpu,
@@ -1344,6 +1549,8 @@ impl PricingEngine {
                 template.cpu_features,
                 template.ip4_count,
                 template.ip6_count,
+                template.transfer_gb,
+                template.network_mbps,
             )
         } else if let Some(custom_template_id) = vm.custom_template_id {
             let custom_template = self.db.get_custom_vm_template(custom_template_id).await?;
@@ -1361,6 +1568,8 @@ impl PricingEngine {
                 custom_template.cpu_features,
                 custom_template.ip4_count,
                 custom_template.ip6_count,
+                custom_template.transfer_gb,
+                custom_template.network_mbps,
             )
         } else {
             bail!("VM must have either a standard template or custom template to upgrade");
@@ -1376,12 +1585,18 @@ impl PricingEngine {
             cfg.new_memory.unwrap_or(memory),
             cfg.new_disk.unwrap_or(disk),
         );
+        let (new_transfer_gb, new_network_mbps) =
+            upgrade_bandwidth(cfg, &pricing, transfer_gb, network_mbps)?;
         ensure!(
             new_cpu >= cpu && new_memory >= memory && new_disk >= disk,
             "An upgrade cannot reduce the VM's resources"
         );
         ensure!(
-            new_cpu > cpu || new_memory > memory || new_disk > disk,
+            new_cpu > cpu
+                || new_memory > memory
+                || new_disk > disk
+                || new_transfer_gb != transfer_gb
+                || new_network_mbps != network_mbps,
             "An upgrade must increase at least one resource"
         );
 
@@ -1405,10 +1620,10 @@ impl PricingEngine {
             disk_iops_write: pricing.disk_iops_write,
             disk_mbps_read: pricing.disk_mbps_read,
             disk_mbps_write: pricing.disk_mbps_write,
-            network_mbps: pricing.network_mbps,
+            network_mbps: new_network_mbps,
             cpu_limit: pricing.cpu_limit,
             firewall_rule_limit: None,
-            transfer_gb: pricing.transfer_gb,
+            transfer_gb: new_transfer_gb,
         };
         Ok(new_custom_template)
     }
@@ -1438,7 +1653,7 @@ impl PricingEngine {
         );
 
         // Get current VM pricing information
-        let (current_cost, current_time_value) = if let Some(tid) = vm.template_id {
+        let (current_cost, current_time_value, scale) = if let Some(tid) = vm.template_id {
             let template = self.db.get_vm_template(tid).await?;
             let cost_plan = self.db.get_cost_plan(template.cost_plan_id).await?;
             let time_value = Self::cost_plan_interval_to_seconds(
@@ -1454,17 +1669,17 @@ impl PricingEngine {
                     cost_plan.amount,
                 ),
                 time_value,
+                1u64,
             )
         } else if let Some(cid) = vm.custom_template_id {
             let template = self.db.get_custom_vm_template(cid).await?;
             let price = Self::get_custom_vm_cost_amount(&self.db, &template).await?;
-            let time_value = Self::cost_plan_interval_to_seconds(
-                CUSTOM_VM_INTERVAL_TYPE,
-                CUSTOM_VM_INTERVAL_AMOUNT,
-            );
+            let time_value =
+                Self::cost_plan_interval_to_seconds(price.interval_type, price.interval_amount);
             (
-                CurrencyAmount::from_u64(price.currency, price.total()),
+                CurrencyAmount::from_u64(price.currency, price.total_raw()),
                 time_value,
+                price.scale,
             )
         } else {
             bail!("VM must have either a standard template or custom template");
@@ -1479,6 +1694,7 @@ impl PricingEngine {
         Ok(RemainingTimeInfo {
             seconds_remaining,
             renewal_cost: current_cost,
+            scale,
             renewal_period_seconds: current_time_value,
             cost_per_second,
             prorated_cost,
@@ -1497,8 +1713,153 @@ impl PricingEngine {
             .await?;
 
         // Convert to the requested payment method currency
-        self.get_amount_and_rate(remaining_info.prorated_cost, method)
+        self.get_amount_and_rate_scaled(remaining_info.prorated_cost, remaining_info.scale, method)
             .await
+    }
+
+    async fn vm_addons_interval_cost(&self, vm: &Vm, method: PaymentMethod) -> Result<u64> {
+        let subscription = self
+            .db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await?;
+        let total: u64 = self
+            .db
+            .list_subscription_line_items(subscription.id)
+            .await?
+            .iter()
+            .filter(|li| li.is_active() && li.subscription_type == lnvps_db::LineItemType::VmAddon)
+            .map(|li| li.amount)
+            .sum();
+        if total == 0 {
+            return Ok(0);
+        }
+        let currency = Currency::from_str(&subscription.currency)
+            .map_err(|_| anyhow!("Invalid subscription currency"))?;
+        Ok(self
+            .get_amount_and_rate(CurrencyAmount::from_u64(currency, total), method)
+            .await?
+            .amount
+            .value())
+    }
+
+    pub async fn vm_addon_price(&self, vm_id: u64, kind: VmAddonKind) -> Result<VmAddonPrice> {
+        let vm = self.db.get_vm(vm_id).await?;
+        let host = self.db.get_host(vm.host_id).await?;
+        self.db
+            .get_vm_addon_price_for_region(host.region_id, kind)
+            .await?
+            .filter(|p| p.enabled)
+            .ok_or_else(|| anyhow!("{kind} add-ons are not sold in this region"))
+    }
+
+    pub async fn vm_addon_interval_amount(
+        &self,
+        price: &VmAddonPrice,
+        quantity: u32,
+        subscription: &lnvps_db::Subscription,
+    ) -> Result<u64> {
+        let from = Currency::from_str(&price.currency)
+            .map_err(|_| anyhow!("Invalid add-on currency {}", price.currency))?;
+        let to = Currency::from_str(&subscription.currency)
+            .map_err(|_| anyhow!("Invalid subscription currency"))?;
+        let monthly = price
+            .monthly_amount
+            .checked_mul(quantity as u64)
+            .ok_or_else(|| anyhow!("Add-on price overflow"))?;
+        if monthly == 0 {
+            return Ok(0);
+        }
+        let monthly = self
+            .convert_currency(CurrencyAmount::from_u64(from, monthly), to)
+            .await?
+            .value() as u128;
+        let month = Self::cost_plan_interval_to_seconds(IntervalType::Month, 1) as u128;
+        let interval = Self::cost_plan_interval_to_seconds(
+            subscription.interval_type,
+            subscription.interval_amount.max(1),
+        ) as u128;
+        let in_interval = (monthly * interval).div_ceil(month).max(1);
+        u64::try_from(in_interval).map_err(|_| anyhow!("Add-on price overflow"))
+    }
+
+    pub async fn calculate_vm_addon_cost(
+        &self,
+        vm_id: u64,
+        kind: VmAddonKind,
+        quantity: u32,
+        method: PaymentMethod,
+    ) -> Result<VmAddonQuote> {
+        let price = self.vm_addon_price(vm_id, kind).await?;
+        ensure!(
+            quantity <= price.max_quantity,
+            "At most {} {kind} add-ons can be bought",
+            price.max_quantity
+        );
+        let vm = self.db.get_vm(vm_id).await?;
+        ensure!(!vm.deleted, "Can't change add-ons on a deleted VM");
+        let subscription = self
+            .db
+            .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+            .await?;
+        let current = self
+            .db
+            .list_vm_addons(vm_id)
+            .await?
+            .into_iter()
+            .find(|a| a.kind == kind)
+            .map(|a| a.quantity)
+            .unwrap_or(0);
+        let new_amount = self
+            .vm_addon_interval_amount(&price, quantity, &subscription)
+            .await?;
+        let old_amount = self
+            .vm_addon_interval_amount(&price, current, &subscription)
+            .await?;
+        let currency = Currency::from_str(&subscription.currency)
+            .map_err(|_| anyhow!("Invalid subscription currency"))?;
+
+        let now = Utc::now();
+        let remaining = subscription
+            .expires
+            .filter(|e| *e > now)
+            .map(|e| (e - now).num_seconds().max(0) as u128)
+            .unwrap_or(0);
+        let interval = Self::cost_plan_interval_to_seconds(
+            subscription.interval_type,
+            subscription.interval_amount.max(1),
+        ) as u128;
+        let delta = new_amount.saturating_sub(old_amount) as u128;
+        let due = if subscription.is_setup && interval > 0 {
+            (delta * remaining).div_ceil(interval) as u64
+        } else {
+            0
+        };
+        let charge = self
+            .get_amount_and_rate(CurrencyAmount::from_u64(currency, due), method)
+            .await?;
+        let company_id = subscription.company_id;
+        let tax = self
+            .determine_tax(vm.user_id, charge.amount.value(), company_id)
+            .await?;
+        let processing_fee = if charge.amount.value() > 0 {
+            self.calculate_processing_fee(
+                company_id,
+                method,
+                charge.amount.currency(),
+                charge.amount.value() + tax.amount,
+            )
+            .await
+        } else {
+            0
+        };
+        Ok(VmAddonQuote {
+            current,
+            quantity,
+            interval_amount: CurrencyAmount::from_u64(currency, new_amount),
+            charge,
+            tax,
+            processing_fee,
+        })
     }
 
     /// Calculate the prorated cost of resizing a managed app deployment to
@@ -1617,30 +1978,36 @@ impl PricingEngine {
         // min/max limits (unlike plain renewals of existing specs).
         Self::validate_custom_vm_spec(&self.db, &new_custom_template).await?;
 
-        // Get the cost of renewal
+        // Get the cost of renewal: one billing interval of the new pricing
+        // model, kept in its fine `1/scale` unit until it is converted.
         let new_price = Self::get_custom_vm_cost_amount(&self.db, &new_custom_template).await?;
-        let new_price = CurrencyAmount::from_u64(new_price.currency, new_price.total());
+        let new_raw = CurrencyAmount::from_u64(new_price.currency, new_price.total_raw());
 
-        // Get the time value for the custom template
-        let custom_plan_seconds =
-            Self::cost_plan_interval_to_seconds(CUSTOM_VM_INTERVAL_TYPE, CUSTOM_VM_INTERVAL_AMOUNT);
-        let new_cost_per_second = new_price.value() as f64 / custom_plan_seconds as f64;
+        let interval_seconds =
+            Self::cost_plan_interval_to_seconds(new_price.interval_type, new_price.interval_amount);
+        let new_cost_per_second = new_raw.value() as f64 / interval_seconds as f64;
 
         // calculate the cost based on the time until the vm expires
         let new_cost_until_expire = CurrencyAmount::from_u64(
-            new_price.currency(),
+            new_raw.currency(),
             (new_cost_per_second * remaining_info.seconds_remaining as f64) as u64,
         );
 
         // create a discount off the new price for the time remaining at the old rate
         let discount_currency = remaining_info.prorated_cost;
 
-        // convert prices to match payment method
+        // convert prices to match payment method; the old and new prices can be
+        // at different scales (a standard plan is whole cents), so each is
+        // converted with its own
         let new_cost_until_expire = self
-            .get_amount_and_rate(new_cost_until_expire, method)
+            .get_amount_and_rate_scaled(new_cost_until_expire, new_price.scale, method)
             .await?;
-        let discount_currency = self.get_amount_and_rate(discount_currency, method).await?;
-        let new_renewal_currency = self.get_amount_and_rate(new_price, method).await?;
+        let discount_currency = self
+            .get_amount_and_rate_scaled(discount_currency, remaining_info.scale, method)
+            .await?;
+        let new_renewal_currency = self
+            .get_amount_and_rate_scaled(new_raw, new_price.scale, method)
+            .await?;
 
         let upgrade = new_cost_until_expire.sub(discount_currency)?;
 
@@ -1673,26 +2040,47 @@ impl PricingEngine {
         list_price: CurrencyAmount,
         method: PaymentMethod,
     ) -> Result<ConvertedCurrencyAmount> {
+        self.get_amount_and_rate_scaled(list_price, 1, method).await
+    }
+
+    /// [`Self::get_amount_and_rate`] for a `list_price` held in `1/scale` of its
+    /// smallest unit (custom pricing, see [`PricingData::total_raw`]). The fraction is
+    /// carried through the currency conversion and only rounded at the end, so
+    /// an hourly price of a fraction of a cent is not lost.
+    pub async fn get_amount_and_rate_scaled(
+        &self,
+        list_price: CurrencyAmount,
+        scale: u64,
+        method: PaymentMethod,
+    ) -> Result<ConvertedCurrencyAmount> {
+        let scale = scale.max(1);
         Ok(match (list_price.currency(), method) {
-            (c, PaymentMethod::Lightning | PaymentMethod::OnChain) if c != Currency::BTC => {
+            (c, PaymentMethod::Lightning | PaymentMethod::OnChain | PaymentMethod::FixedFloat)
+                if c != Currency::BTC =>
+            {
                 // convert to BTC if price is not already in bitcoin
                 let ticker = self.get_ticker(Currency::BTC, c).await?;
-                let mut converted = ticker.convert_with_rate(list_price)?;
+                let mut converted = ticker.convert_scaled_with_rate(list_price, scale)?;
                 // Round to nearest satoshi for wallet compatibility
                 converted.amount = round_to_sat(converted.amount);
                 converted
             }
-            (c, PaymentMethod::Lightning | PaymentMethod::OnChain) if c == Currency::BTC => {
-                // pass-through price as BTC, rounded to nearest satoshi
+            (c, PaymentMethod::Lightning | PaymentMethod::OnChain | PaymentMethod::FixedFloat)
+                if c == Currency::BTC =>
+            {
+                // pass-through price as BTC, rounded up to the satoshi
                 ConvertedCurrencyAmount {
-                    amount: round_to_sat(list_price),
+                    amount: round_to_sat(CurrencyAmount::from_u64(
+                        Currency::BTC,
+                        list_price.value().div_ceil(scale),
+                    )),
                     rate: TickerRate::passthrough(Currency::BTC),
                 }
             }
             (c, PaymentMethod::Revolut) if c != Currency::BTC => {
                 // convert to base_currency if price is not already in bitcoin
                 let ticker = self.get_ticker(list_price.currency(), c).await?;
-                ticker.convert_with_rate(list_price)?
+                ticker.convert_scaled_with_rate(list_price, scale)?
             }
             // default
             (c, m) => bail!("Cant get price from {} to {}", c, m),
@@ -1735,30 +2123,168 @@ impl NewPaymentInfo {
     }
 }
 
+/// What a custom VM costs for one billing interval of its pricing model.
+///
+/// The components are in `1/scale` of the currency's smallest unit (see
+/// [`VmCustomPricing::rate_scale`]): an hourly price is a fraction of a cent, so
+/// converting or rounding each rate to whole cents would lose it. Use
+/// [`PricingData::total`] for plain minor units (rounded up), and
+/// [`PricingEngine::get_amount_and_rate_scaled`] with [`PricingData::total_raw`]
+/// to convert into a payment currency without that loss.
 #[derive(Clone, Debug)]
 pub struct PricingData {
     pub currency: Currency,
-    /// Cost per CPU core in smallest currency units (cents for fiat, millisats for BTC)
+    /// Divisor taking the cost fields to the currency's smallest unit; never 0
+    pub scale: u64,
+    /// The billing interval this price is for (the pricing model's)
+    pub interval_type: IntervalType,
+    pub interval_amount: u64,
+    /// Cost of the CPU cores, in `1/scale` smallest currency units
     pub cpu_cost: u64,
-    /// Cost per GB RAM in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost of the RAM, in `1/scale` smallest currency units
     pub memory_cost: u64,
-    /// Cost per IPv4 address in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost of the IPv4 addresses, in `1/scale` smallest currency units
     pub ip4_cost: u64,
-    /// Cost per IPv6 address in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost of the IPv6 addresses, in `1/scale` smallest currency units
     pub ip6_cost: u64,
-    /// Cost per GB disk in smallest currency units (cents for fiat, millisats for BTC)
+    /// Cost of the disk, in `1/scale` smallest currency units
     pub disk_cost: u64,
+    pub transfer_cost: u64,
+    pub network_cost: u64,
 }
 
 impl PricingData {
-    pub fn total(&self) -> u64 {
-        self.cpu_cost + self.memory_cost + self.ip4_cost + self.ip6_cost + self.disk_cost
+    /// The whole price in `1/scale` smallest currency units.
+    pub fn total_raw(&self) -> u64 {
+        self.cpu_cost
+            + self.memory_cost
+            + self.ip4_cost
+            + self.ip6_cost
+            + self.disk_cost
+            + self.transfer_cost
+            + self.network_cost
     }
+
+    /// The whole price in the currency's smallest unit, rounded up so a
+    /// fractional cent is never given away. Identical to [`Self::total_raw`] at
+    /// scale 1.
+    pub fn total(&self) -> u64 {
+        self.total_raw().div_ceil(self.scale.max(1))
+    }
+
+    /// One component, in the currency's smallest unit rounded up.
+    pub fn minor(&self, raw: u64) -> u64 {
+        raw.div_ceil(self.scale.max(1))
+    }
+}
+
+fn cost_per_thousand(amount: Option<u32>, cost_per_thousand: u64) -> u64 {
+    amount.map_or(0, |a| (a as u64 * cost_per_thousand).div_ceil(1000))
+}
+
+fn resolve_bandwidth(requested: Option<u32>, plan_default: Option<u32>) -> Option<u32> {
+    plan_default.and(requested.or(plan_default))
+}
+
+fn bandwidth_at_least(new: Option<u32>, current: Option<u32>) -> bool {
+    match (new, current) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(n), Some(c)) => n >= c,
+    }
+}
+
+fn ensure_bandwidth_in_range(
+    what: &str,
+    value: Option<u32>,
+    plan_default: Option<u32>,
+    min: u32,
+    max: u32,
+) -> Result<()> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    ensure!(
+        plan_default.is_some(),
+        "{what} is not selectable on this plan"
+    );
+    ensure!(
+        (min..=max).contains(&value),
+        "{what} {value} out of range ({min}-{max})"
+    );
+    Ok(())
+}
+
+pub fn upgrade_bandwidth(
+    cfg: &UpgradeConfig,
+    pricing: &VmCustomPricing,
+    transfer_gb: Option<u32>,
+    network_mbps: Option<u32>,
+) -> Result<(Option<u32>, Option<u32>)> {
+    ensure!(
+        cfg.new_transfer_gb.is_none() || pricing.transfer_gb.is_some(),
+        "Monthly transfer is not selectable on this plan"
+    );
+    ensure!(
+        cfg.new_network_mbps.is_none() || pricing.network_mbps.is_some(),
+        "Network speed is not selectable on this plan"
+    );
+    let new_transfer_gb = cfg.new_transfer_gb.or(pricing.transfer_gb.and(transfer_gb));
+    let new_network_mbps = cfg
+        .new_network_mbps
+        .or(pricing.network_mbps.and(network_mbps));
+    ensure!(
+        bandwidth_at_least(new_transfer_gb, transfer_gb)
+            && bandwidth_at_least(new_network_mbps, network_mbps),
+        "An upgrade cannot reduce the VM's bandwidth"
+    );
+    Ok((new_transfer_gb, new_network_mbps))
+}
+
+pub fn apply_custom_pricing_limits(template: &mut VmCustomTemplate, pricing: &VmCustomPricing) {
+    template.disk_iops_read = pricing.disk_iops_read;
+    template.disk_iops_write = pricing.disk_iops_write;
+    template.disk_mbps_read = pricing.disk_mbps_read;
+    template.disk_mbps_write = pricing.disk_mbps_write;
+    template.cpu_limit = pricing.cpu_limit;
+    template.network_mbps = resolve_bandwidth(template.network_mbps, pricing.network_mbps);
+    template.transfer_gb = resolve_bandwidth(template.transfer_gb, pricing.transfer_gb);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hourly_interval_seconds_and_expiry() {
+        assert_eq!(
+            PricingEngine::cost_plan_interval_to_seconds(IntervalType::Hour, 1),
+            3_600
+        );
+        assert_eq!(
+            PricingEngine::cost_plan_interval_to_seconds(IntervalType::Hour, 6),
+            21_600
+        );
+        let plan = VmCostPlan {
+            id: 1,
+            name: "hourly".to_string(),
+            created: Utc::now(),
+            amount: 1,
+            currency: "EUR".to_string(),
+            interval_type: IntervalType::Hour,
+            interval_amount: 2,
+        };
+        assert_eq!(
+            PricingEngine::next_template_expire(Utc::now(), &plan),
+            7_200
+        );
+        // An absurd amount must not panic; it yields a zero interval.
+        let plan = VmCostPlan {
+            interval_amount: u64::MAX,
+            ..plan
+        };
+        assert_eq!(PricingEngine::next_template_expire(Utc::now(), &plan), 0);
+    }
     use crate::{MockDb, MockExchangeRate};
     use lnvps_db::{
         CpuMfg, DiskType, LNVpsDbBase, PaymentMethodConfig, User, VmCustomPricing,
@@ -2018,6 +2544,96 @@ mod tests {
         Ok(())
     }
 
+    fn priced(scale: u64, cpu: u64) -> PricingData {
+        PricingData {
+            currency: Currency::EUR,
+            scale,
+            interval_type: IntervalType::Hour,
+            interval_amount: 1,
+            cpu_cost: cpu,
+            memory_cost: 0,
+            ip4_cost: 0,
+            ip6_cost: 0,
+            disk_cost: 0,
+            transfer_cost: 0,
+            network_cost: 0,
+        }
+    }
+
+    /// At scale 1 a price is plain minor units, exactly as before; at a finer
+    /// scale the total rounds UP to a whole cent so a fraction is never given away.
+    #[test]
+    fn pricing_data_total_rounds_up_to_minor_units() {
+        assert_eq!(1_230, priced(1, 1_230).total());
+        assert_eq!(1_230, priced(1, 1_230).total_raw());
+        // 1.5 cents (15_000 at 1/10_000 of a cent) rounds up to 2.
+        assert_eq!(2, priced(10_000, 15_000).total());
+        assert_eq!(1, priced(10_000, 1).total());
+        assert_eq!(0, priced(10_000, 0).total());
+        // A scale of 0 (an unset column) behaves as 1, never divides by zero.
+        assert_eq!(7, priced(0, 7).total());
+    }
+
+    /// An hourly custom pricing model prices a VM per hour at a sub-cent scale:
+    /// a renewal charges that hour's price, converted without losing the
+    /// fraction of a cent, and extends the VM by one hour.
+    #[tokio::test]
+    async fn hourly_custom_vm_renewal_charges_one_hours_price() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+        setup_upgrade_test_data(&db).await?;
+        add_custom_pricing(&db).await;
+        {
+            // Hourly, rates in 1/10_000 of a cent: 0.5 cent per CPU-hour.
+            let mut p = db.custom_pricing.lock().await;
+            let pricing = p.get_mut(&1).unwrap();
+            pricing.interval_type = IntervalType::Hour;
+            pricing.interval_amount = 1;
+            pricing.rate_scale = 10_000;
+            pricing.cpu_cost = 5_000;
+            pricing.memory_cost = 0;
+            pricing.ip4_cost = 0;
+            pricing.ip6_cost = 0;
+            for d in db.custom_pricing_disk.lock().await.values_mut() {
+                d.cost = 0;
+            }
+        }
+        db.vms.lock().await.insert(
+            1,
+            Vm {
+                id: 1,
+                user_id: 1,
+                template_id: None,
+                custom_template_id: Some(1),
+                deleted: false,
+                ..MockDb::mock_vm()
+            },
+        );
+        let template = db.get_custom_vm_template(1).await?;
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let cpus = template.cpu as u64;
+        let pe = PricingEngine::new(db.clone(), rates, VatClient::new());
+
+        let price = PricingEngine::get_custom_vm_cost_amount(&db, &template).await?;
+        assert_eq!(10_000, price.scale);
+        assert_eq!(5_000 * cpus, price.total_raw());
+        // The whole-cent total is rounded UP, never the 0 a plain-cents rate would be.
+        assert_eq!((5_000 * cpus).div_ceil(10_000), price.total());
+
+        let hourly = match pe.get_vm_cost(1, PaymentMethod::Lightning).await? {
+            CostResult::New(p) => p,
+            _ => bail!("expected a new payment"),
+        };
+        assert_eq!(3_600, hourly.time_value);
+        // EUR -> msat at MOCK_RATE, from the unrounded value, then whole sats.
+        let expected_msat = (price.total_raw() as f64 / 10_000.0 / 100.0 / MOCK_RATE as f64
+            * 1.0e11)
+            .round() as u64;
+        assert_eq!(round_msat_to_sat(expected_msat), hourly.amount);
+        Ok(())
+    }
+
     /// Address counts come from the ordered spec and multiply the per-address
     /// price, so an order for extra addresses costs more.
     #[tokio::test]
@@ -2190,6 +2806,8 @@ mod tests {
                     amount: 1000, // €10.00 / month
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await?;
@@ -2270,6 +2888,8 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await?;
@@ -2598,6 +3218,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
 
         let quote = pe
@@ -2670,6 +3291,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         // Revolut so a processing fee applies (Lightning has none).
         let quote = pe
@@ -2738,6 +3360,7 @@ mod tests {
             new_cpu: Some(2),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
 
         // Should fail for expired VM
@@ -2787,6 +3410,7 @@ mod tests {
             new_cpu: Some(1),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         assert!(
             pe.calculate_vm_upgrade_cost(1, &cpu_down, PaymentMethod::Lightning)
@@ -2799,6 +3423,7 @@ mod tests {
             new_cpu: None,
             new_memory: Some(crate::GB),
             new_disk: None,
+            ..Default::default()
         };
         assert!(
             pe.calculate_vm_upgrade_cost(1, &mem_down, PaymentMethod::Lightning)
@@ -2811,6 +3436,7 @@ mod tests {
             new_cpu: None,
             new_memory: None,
             new_disk: Some(32 * crate::GB),
+            ..Default::default()
         };
         assert!(
             pe.calculate_vm_upgrade_cost(1, &disk_down, PaymentMethod::Lightning)
@@ -2823,6 +3449,7 @@ mod tests {
             new_cpu: Some(2),
             new_memory: Some(2 * crate::GB),
             new_disk: Some(64 * crate::GB),
+            ..Default::default()
         };
         assert!(
             pe.calculate_vm_upgrade_cost(1, &same, PaymentMethod::Lightning)
@@ -2835,6 +3462,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         assert!(
             pe.calculate_vm_upgrade_cost(1, &up, PaymentMethod::Lightning)
@@ -2842,6 +3470,170 @@ mod tests {
                 .is_ok()
         );
 
+        Ok(())
+    }
+
+    /// Add a second enabled pricing model for region 1 that is hourly, at a finer
+    /// rate scale, with the same disk the first one has.
+    async fn add_hourly_pricing(db: &MockDb) {
+        let mut base = db.custom_pricing.lock().await.get(&1).unwrap().clone();
+        base.id = 2;
+        base.name = "Hourly".to_string();
+        base.interval_type = IntervalType::Hour;
+        base.interval_amount = 1;
+        base.rate_scale = 10_000;
+        // 2.00 EUR/CPU/month and 1.00 EUR/GB/month, per hour at 1/10_000 cent
+        base.cpu_cost = 2_778;
+        base.memory_cost = 1_389;
+        db.custom_pricing.lock().await.insert(2, base);
+        db.custom_pricing_disk.lock().await.insert(
+            2,
+            VmCustomPricingDisk {
+                id: 2,
+                pricing_id: 2,
+                kind: DiskType::SSD,
+                interface: DiskInterface::PCIe,
+                cost: 694, // 0.50 EUR/GB/month per hour
+                min_disk_size: 5 * crate::GB,
+                max_disk_size: 1 * crate::TB,
+            },
+        );
+    }
+
+    /// A VM that is not billed hourly is never moved onto an hourly model by an
+    /// upgrade: hourly billing is credit-only and the customer did not choose it.
+    /// Nothing else compatible means the upgrade is refused, not redirected.
+    #[tokio::test]
+    async fn upgrade_never_moves_a_monthly_vm_onto_an_hourly_model() -> Result<()> {
+        let db = MockDb::default();
+        setup_upgrade_test_data(&db).await?;
+        add_hourly_pricing(&db).await;
+        let db = Arc::new(db);
+        let monthly = Some((IntervalType::Month, 1));
+        let dyn_db: Arc<dyn LNVpsDb> = db.clone();
+        let picked = select_custom_pricing(
+            &dyn_db,
+            1,
+            DiskType::SSD,
+            DiskInterface::PCIe,
+            CpuMfg::Unknown,
+            CpuArch::Unknown,
+            &[],
+            monthly,
+        )
+        .await?;
+        assert_eq!(1, picked.id, "monthly VM stays on the monthly model");
+
+        // With the monthly model disabled, the hourly one is not a fallback.
+        db.custom_pricing.lock().await.get_mut(&1).unwrap().enabled = false;
+        assert!(
+            select_custom_pricing(
+                &dyn_db,
+                1,
+                DiskType::SSD,
+                DiskInterface::PCIe,
+                CpuMfg::Unknown,
+                CpuArch::Unknown,
+                &[],
+                monthly,
+            )
+            .await
+            .is_err()
+        );
+        // An hourly VM may use the hourly model.
+        let hourly = select_custom_pricing(
+            &dyn_db,
+            1,
+            DiskType::SSD,
+            DiskInterface::PCIe,
+            CpuMfg::Unknown,
+            CpuArch::Unknown,
+            &[],
+            Some((IntervalType::Hour, 1)),
+        )
+        .await?;
+        assert_eq!(2, hourly.id);
+        Ok(())
+    }
+
+    /// Upgrading a VM that is already on an hourly custom model quotes against
+    /// that hourly rate: the renewal is one hour, the upgrade is the extra
+    /// hourly cost over the time left, and nothing is read as whole cents.
+    #[tokio::test]
+    async fn upgrade_quote_on_an_hourly_custom_vm_uses_the_hourly_rate() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+        setup_upgrade_test_data(&db).await?;
+        add_hourly_pricing(&db).await;
+        // 6 hours of paid time left on an hourly subscription.
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let s = subs.get_mut(&1).unwrap();
+            s.expires = Some(Utc::now() + chrono::Duration::hours(6));
+            s.is_setup = true;
+            s.interval_type = IntervalType::Hour;
+            s.interval_amount = 1;
+        }
+        db.custom_template.lock().await.insert(
+            1,
+            VmCustomTemplate {
+                id: 1,
+                cpu: 2,
+                memory: 2 * crate::GB,
+                disk_size: 20 * crate::GB,
+                disk_type: DiskType::SSD,
+                disk_interface: DiskInterface::PCIe,
+                pricing_id: 2,
+                ip4_count: 1,
+                ip6_count: 1,
+                ..Default::default()
+            },
+        );
+        db.vms.lock().await.insert(
+            1,
+            Vm {
+                id: 1,
+                user_id: 1,
+                template_id: None,
+                custom_template_id: Some(1),
+                deleted: false,
+                ..MockDb::mock_vm()
+            },
+        );
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let pe = PricingEngine::new(db.clone(), rates, VatClient::new());
+
+        let cfg = UpgradeConfig {
+            new_cpu: Some(4),
+            ..Default::default()
+        };
+        let quote = pe
+            .calculate_vm_upgrade_cost(1, &cfg, PaymentMethod::Lightning)
+            .await?;
+
+        // One more core costs 2.00 EUR a month, so an hour is ~0.28 cent: the
+        // renewal for 4 CPU + 2 GB + 20 GB is one hour of that.
+        let hourly_raw = 4 * 2_778 + 2 * 1_389 + 20 * 694;
+        let eur_to_msat = |raw: u64| (raw as f64 / 10_000.0 / 100.0 / MOCK_RATE as f64 * 1.0e11);
+        assert_eq!(
+            round_msat_to_sat(eur_to_msat(hourly_raw).round() as u64),
+            quote.renewal.amount.value(),
+            "the renewal is one hour at the hourly rate"
+        );
+        // Upgrade = extra core for ~6 hours, never zero, and nowhere near a
+        // monthly price (a plain-cents read of 2_778 would be 27 EUR).
+        let upgrade = quote.upgrade.amount.value();
+        assert!(upgrade > 0, "upgrade must cost something");
+        assert!(
+            upgrade < quote.renewal.amount.value() * 6,
+            "6 hours of one extra core is less than 6 hours of the whole VM"
+        );
+        assert_eq!(
+            Currency::BTC,
+            quote.upgrade.amount.currency(),
+            "paid in sats"
+        );
         Ok(())
     }
 
@@ -2884,6 +3676,7 @@ mod tests {
             new_cpu: Some(2),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
 
         // Should fail for deleted VM
@@ -2935,6 +3728,7 @@ mod tests {
             new_cpu: Some(4), // Upgrade from 2 to 4 CPUs
             new_memory: Some(4 * crate::GB),
             new_disk: Some(120 * crate::GB),
+            ..Default::default()
         };
 
         let quote = pe
@@ -2997,6 +3791,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None, // Keep 2GB
             new_disk: None,   // Keep 64GB
+            ..Default::default()
         };
 
         // Get the old VM cost per second
@@ -3168,6 +3963,7 @@ mod tests {
             new_cpu: Some(8),                 // Upgrade from 2 to 8 CPUs (4x increase)
             new_memory: Some(16 * crate::GB), // Upgrade from 2GB to 16GB (8x increase)
             new_disk: Some(500 * crate::GB),  // Upgrade from 64GB to 500GB disk
+            ..Default::default()
         };
 
         let quote = pe
@@ -3565,6 +4361,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = pe.create_upgrade_template(vm_id, &cfg).await;
         assert!(result.is_ok(), "Should find pricing with Unknown cpu_mfg");
@@ -3588,6 +4385,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = pe.create_upgrade_template(vm_id, &cfg).await;
         assert!(
@@ -3615,6 +4413,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = pe.create_upgrade_template(vm_id, &cfg).await;
         assert!(
@@ -3643,6 +4442,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = pe.create_upgrade_template(vm_id, &cfg).await;
         assert!(result.is_ok(), "Should find second pricing");
@@ -3667,6 +4467,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = pe.create_upgrade_template(vm_id, &cfg).await;
         assert!(
@@ -3706,6 +4507,7 @@ mod tests {
             new_cpu: Some(4),
             new_memory: None,
             new_disk: None,
+            ..Default::default()
         };
         let result = pe.create_upgrade_template(vm_id, &cfg).await;
         assert!(
@@ -4454,6 +5256,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_milli_price_converts_at_its_base_rate() -> Result<()> {
+        let pe = make_pe(Arc::new(MockDb::default())).await;
+        let hour = CurrencyAmount::from_u64(Currency::MEUR, 137);
+
+        let btc = pe
+            .get_amount_and_rate(hour, PaymentMethod::Lightning)
+            .await?;
+        assert_eq!(btc.amount, CurrencyAmount::millisats(2_000));
+
+        let card = pe.get_amount_and_rate(hour, PaymentMethod::Revolut).await?;
+        assert_eq!(card.amount, CurrencyAmount::from_u64(Currency::EUR, 1));
+        let month = CurrencyAmount::from_u64(Currency::MEUR, 4_990_000);
+        let card = pe
+            .get_amount_and_rate(month, PaymentMethod::Revolut)
+            .await?;
+        assert_eq!(card.amount, CurrencyAmount::from_u64(Currency::EUR, 4_990));
+
+        assert_eq!(
+            pe.convert_currency(hour, Currency::EUR).await?,
+            CurrencyAmount::from_u64(Currency::EUR, 1)
+        );
+        assert_eq!(
+            pe.convert_currency(CurrencyAmount::millisats(14_000), Currency::MEUR)
+                .await?,
+            CurrencyAmount::from_u64(Currency::MEUR, 1_400)
+        );
+        assert_eq!(
+            pe.convert_currency(CurrencyAmount::from_u64(Currency::EUR, 3), Currency::MEUR)
+                .await?,
+            CurrencyAmount::from_u64(Currency::MEUR, 3_000)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn min_amount_converts_across_currencies() -> Result<()> {
         // Minimum configured in EUR, charge in BTC. 1 BTC = 100,000 EUR (MOCK_RATE).
         let db = MockDb::default();
@@ -4503,6 +5340,7 @@ mod tests {
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
+                    category_translations: None,
                     compose: String::new(),
                     // EUR 10.00/month at the base size.
                     amount: 1000,
@@ -4531,6 +5369,8 @@ mod tests {
                     amount: 1000 * multiplier as u64,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 },
             );
             let mut subs = db.subscriptions.lock().await;
@@ -4556,6 +5396,7 @@ mod tests {
                     hostname: None,
                     custom_domain: None,
                     custom_domain_verified: false,
+                    public_port: None,
                     config: None,
                     desired_state: AppDeploymentDesiredState::Running,
                     status: AppDeploymentStatus::Running,
@@ -4638,6 +5479,283 @@ mod tests {
                 .await
                 .is_err()
         );
+        Ok(())
+    }
+
+    async fn add_bandwidth_pricing(db: &MockDb) {
+        add_custom_pricing(db).await;
+        let mut p = db.custom_pricing.lock().await;
+        let pricing = p.get_mut(&1).unwrap();
+        pricing.transfer_gb = Some(1000);
+        pricing.min_transfer_gb = 500;
+        pricing.max_transfer_gb = 10_000;
+        pricing.transfer_cost_per_tb = 100;
+        pricing.network_mbps = Some(1000);
+        pricing.min_network_mbps = 100;
+        pricing.max_network_mbps = 10_000;
+        pricing.network_cost_per_gbps = 200;
+    }
+
+    async fn set_custom_template_bandwidth(
+        db: &MockDb,
+        transfer_gb: Option<u32>,
+        network_mbps: Option<u32>,
+    ) {
+        let mut t = db.custom_template.lock().await;
+        let template = t.get_mut(&1).unwrap();
+        template.transfer_gb = transfer_gb;
+        template.network_mbps = network_mbps;
+    }
+
+    #[tokio::test]
+    async fn custom_pricing_bills_bandwidth() -> Result<()> {
+        let db = MockDb::default();
+        add_bandwidth_pricing(&db).await;
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+
+        let mut template = db.get_custom_vm_template(1).await?;
+        let unmetered = PricingEngine::get_custom_vm_cost_amount(&db, &template).await?;
+        assert_eq!(0, unmetered.transfer_cost);
+        assert_eq!(0, unmetered.network_cost);
+        assert_eq!(855, unmetered.total());
+
+        template.transfer_gb = Some(2500);
+        template.network_mbps = Some(1001);
+        let price = PricingEngine::get_custom_vm_cost_amount(&db, &template).await?;
+        assert_eq!(250, price.transfer_cost);
+        assert_eq!(201, price.network_cost, "a part unit rounds up");
+        assert_eq!(855 + 250 + 201, price.total());
+        Ok(())
+    }
+
+    #[test]
+    fn apply_custom_pricing_limits_settles_bandwidth() {
+        let pricing = VmCustomPricing {
+            transfer_gb: Some(1000),
+            network_mbps: None,
+            disk_iops_read: Some(5),
+            cpu_limit: Some(0.5),
+            ..Default::default()
+        };
+        let mut template = VmCustomTemplate::default();
+        apply_custom_pricing_limits(&mut template, &pricing);
+        assert_eq!(
+            template.transfer_gb,
+            Some(1000),
+            "plan default when none asked"
+        );
+        assert_eq!(template.network_mbps, None);
+        assert_eq!(template.disk_iops_read, Some(5));
+        assert_eq!(template.cpu_limit, Some(0.5));
+
+        let mut template = VmCustomTemplate {
+            transfer_gb: Some(4000),
+            network_mbps: Some(500),
+            ..Default::default()
+        };
+        apply_custom_pricing_limits(&mut template, &pricing);
+        assert_eq!(template.transfer_gb, Some(4000));
+        assert_eq!(
+            template.network_mbps, None,
+            "an uncapped plan stays uncapped"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_custom_vm_spec_checks_bandwidth() -> Result<()> {
+        let mock = MockDb::default();
+        add_bandwidth_pricing(&mock).await;
+        let custom_pricing = mock.custom_pricing.clone();
+        let db: Arc<dyn LNVpsDb> = Arc::new(mock);
+
+        let base = db.get_custom_vm_template(1).await?;
+        PricingEngine::validate_custom_vm_spec(&db, &base).await?;
+        for (transfer_gb, network_mbps, ok) in [
+            (Some(500), Some(100), true),
+            (Some(10_000), Some(10_000), true),
+            (Some(499), None, false),
+            (Some(10_001), None, false),
+            (None, Some(99), false),
+            (None, Some(10_001), false),
+        ] {
+            let t = VmCustomTemplate {
+                transfer_gb,
+                network_mbps,
+                ..base.clone()
+            };
+            assert_eq!(
+                PricingEngine::validate_custom_vm_spec(&db, &t)
+                    .await
+                    .is_ok(),
+                ok,
+                "transfer {transfer_gb:?} network {network_mbps:?}"
+            );
+            PricingEngine::validate_custom_vm_resources(&db, &t).await?;
+        }
+
+        custom_pricing.lock().await.get_mut(&1).unwrap().transfer_gb = None;
+        let t = VmCustomTemplate {
+            transfer_gb: Some(1000),
+            ..base
+        };
+        let err = PricingEngine::validate_custom_vm_spec(&db, &t)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not selectable"));
+        Ok(())
+    }
+
+    #[test]
+    fn upgrade_bandwidth_only_grows() {
+        let pricing = VmCustomPricing {
+            transfer_gb: Some(1000),
+            network_mbps: Some(1000),
+            ..Default::default()
+        };
+        let cfg = |t: Option<u32>, n: Option<u32>| UpgradeConfig {
+            new_transfer_gb: t,
+            new_network_mbps: n,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            upgrade_bandwidth(&cfg(None, None), &pricing, Some(1000), Some(500)).unwrap(),
+            (Some(1000), Some(500)),
+            "unchanged values carry over"
+        );
+        assert_eq!(
+            upgrade_bandwidth(
+                &cfg(Some(2000), Some(2000)),
+                &pricing,
+                Some(1000),
+                Some(500)
+            )
+            .unwrap(),
+            (Some(2000), Some(2000))
+        );
+        assert!(upgrade_bandwidth(&cfg(Some(999), None), &pricing, Some(1000), None).is_err());
+        assert!(
+            upgrade_bandwidth(&cfg(Some(5000), None), &pricing, None, None).is_err(),
+            "an unmetered VM cannot be given a quota"
+        );
+        assert_eq!(
+            upgrade_bandwidth(&cfg(None, None), &pricing, None, None).unwrap(),
+            (None, None),
+            "unmetered stays unmetered"
+        );
+
+        let unmetered = VmCustomPricing::default();
+        assert!(upgrade_bandwidth(&cfg(Some(5000), None), &unmetered, Some(1000), None).is_err());
+        assert!(upgrade_bandwidth(&cfg(None, Some(5000)), &unmetered, None, Some(1000)).is_err());
+        assert_eq!(
+            upgrade_bandwidth(&cfg(None, None), &unmetered, Some(1000), Some(100)).unwrap(),
+            (None, None),
+            "moving onto an unmetered plan lifts the quota"
+        );
+    }
+
+    async fn setup_custom_vm_with_bandwidth(db: &MockDb) -> Result<()> {
+        setup_upgrade_test_data(db).await?;
+        add_bandwidth_pricing(db).await;
+        set_custom_template_bandwidth(db, Some(1000), Some(1000)).await;
+        {
+            let mut subs = db.subscriptions.lock().await;
+            if let Some(s) = subs.get_mut(&1) {
+                s.expires = Some(Utc::now() + chrono::Duration::days(15));
+                s.is_setup = true;
+            }
+        }
+        db.vms.lock().await.insert(
+            1,
+            Vm {
+                id: 1,
+                user_id: 1,
+                template_id: None,
+                custom_template_id: Some(1),
+                deleted: false,
+                ..MockDb::mock_vm()
+            },
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_only_upgrade_is_charged() -> Result<()> {
+        let db = MockDb::default();
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, MOCK_RATE).await;
+        setup_custom_vm_with_bandwidth(&db).await?;
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let pe = PricingEngine::new(db.clone(), rates, VatClient::new());
+
+        let cfg = UpgradeConfig {
+            new_transfer_gb: Some(5000),
+            new_network_mbps: Some(2000),
+            ..Default::default()
+        };
+        let template = pe.create_upgrade_template(1, &cfg).await?;
+        assert_eq!(template.transfer_gb, Some(5000));
+        assert_eq!(template.network_mbps, Some(2000));
+        assert_eq!(template.cpu, 2);
+
+        let quote = pe
+            .calculate_vm_upgrade_cost(1, &cfg, PaymentMethod::Revolut)
+            .await?;
+        assert_eq!(quote.renewal.amount.value(), 855 + 500 + 400);
+        assert!(quote.upgrade.amount.value() > 0);
+
+        let shrink = UpgradeConfig {
+            new_transfer_gb: Some(600),
+            ..Default::default()
+        };
+        assert!(pe.create_upgrade_template(1, &shrink).await.is_err());
+
+        let out_of_range = UpgradeConfig {
+            new_transfer_gb: Some(20_000),
+            ..Default::default()
+        };
+        assert!(
+            pe.calculate_vm_upgrade_cost(1, &out_of_range, PaymentMethod::Revolut)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upgrade_pricing_is_the_plan_the_vm_is_on() -> Result<()> {
+        let rates = Arc::new(MockExchangeRate::new());
+        let db = MockDb::default();
+        setup_custom_vm_with_bandwidth(&db).await?;
+        db.custom_pricing.lock().await.get_mut(&1).unwrap().enabled = false;
+        {
+            let mut templates = db.templates.lock().await;
+            let t = templates.get_mut(&1).unwrap();
+            t.disk_type = DiskType::SSD;
+            t.disk_interface = Default::default();
+        }
+        let custom_pricing = db.custom_pricing.clone();
+        let vms = db.vms.clone();
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let pe = PricingEngine::new(db.clone(), rates, VatClient::new());
+
+        assert_eq!(
+            pe.upgrade_pricing(1).await?.id,
+            1,
+            "a custom VM upgrades on its own plan, even a retired one"
+        );
+
+        custom_pricing.lock().await.get_mut(&1).unwrap().enabled = true;
+        {
+            let mut vms = vms.lock().await;
+            let vm = vms.get_mut(&1).unwrap();
+            vm.custom_template_id = None;
+            vm.template_id = Some(1);
+        }
+        assert_eq!(pe.upgrade_pricing(1).await?.id, 1);
+
+        vms.lock().await.get_mut(&1).unwrap().template_id = None;
+        assert!(pe.upgrade_pricing(1).await.is_err());
         Ok(())
     }
 }

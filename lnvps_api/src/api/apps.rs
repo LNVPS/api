@@ -3,8 +3,10 @@
 //! Browse the app catalog and view your own deployments. Ordering, lifecycle
 //! control and the operator reconcile land in later increments.
 
+use crate::api::app_category::localize_category;
 use crate::api::model::{ApiPrice, ApiSubscriptionPayment};
 use crate::api::{PaymentMethodQuery, RouterState};
+use crate::settings::Settings;
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
@@ -12,7 +14,7 @@ use chrono::{DateTime, Utc};
 use lnvps_api_common::k8s_names::{deployment_namespace, pending_deployment_namespace};
 use lnvps_api_common::{
     ApiData, ApiError, ApiIntervalType, ApiResult, AppCapacity, AppClusterCapacityService,
-    AppDeploymentUsage, Nip98Auth,
+    AppDeploymentUsage, ClientInfo, Nip98Auth,
 };
 use lnvps_db::{
     App, AppDeployment, AppDeploymentDesiredState, AppDeploymentStatus, AppTag, EncryptedString,
@@ -76,6 +78,7 @@ pub struct ApiApp {
     /// "hosting", no "managed" and no trailing punctuation — the client's
     /// template supplies those, e.g. `{display_name} Hosting — Managed
     /// {category}`. Also suitable for `Product.category` in structured data.
+    /// Translated per `Accept-Language` when a translation exists, else English.
     pub category: String,
     /// Per-app override for the page `<title>`. Null for almost every app —
     /// clients should template from `display_name` + `category` and only use
@@ -201,7 +204,7 @@ impl ApiApp {
     /// that fetch inside a per-item conversion is precisely where an N+1 comes
     /// from. Callers load the whole result set's assignments in one query and
     /// hand in the slice.
-    pub fn from_app(a: App, tags: Vec<ApiAppTag>) -> Self {
+    pub fn from_app(a: App, tags: Vec<ApiAppTag>, accept_language: Option<&str>) -> Self {
         // Per-service and per-volume breakdowns from the (already-validated)
         // compose; best-effort, so a row that somehow fails to parse still
         // renders with its stored totals rather than failing the listing.
@@ -237,7 +240,11 @@ impl ApiApp {
             description: a.description,
             icon: a.icon,
             repo_url: a.repo_url,
-            category: a.category,
+            category: localize_category(
+                &a.category,
+                a.category_translations.as_deref(),
+                accept_language,
+            ),
             seo_title: a.seo_title,
             seo_description: a.seo_description,
             compose: a.compose,
@@ -271,6 +278,61 @@ pub struct ApiAppRegion {
     pub ingress_domain: String,
 }
 
+/// An SRV record that sends a client to a deployment's allocated port.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct ApiAppSrv {
+    /// Record name, e.g. `_minecraft._tcp.mine.games.example`.
+    pub name: String,
+    pub target: String,
+    pub port: u16,
+}
+
+/// Connect address and SRV record for an L4 deployment.
+fn connect_info(
+    compose: &str,
+    hostname: Option<&str>,
+    public_port: Option<u16>,
+) -> (Option<String>, Option<ApiAppSrv>) {
+    let (Some(host), Some(port)) = (hostname, public_port) else {
+        return (None, None);
+    };
+    let l4 = lnvps_compose::Compose::parse(compose).ok();
+    let l4 = l4.as_ref().and_then(|c| c.l4_port());
+    let default_port = l4.as_ref().map(|l| l.port.container);
+    if default_port == Some(port) {
+        return (Some(host.to_string()), None);
+    }
+    let srv = l4.as_ref().and_then(|l| {
+        l.srv_name(host).map(|name| ApiAppSrv {
+            name,
+            target: host.to_string(),
+            port,
+        })
+    });
+    if srv.is_some() {
+        (Some(host.to_string()), srv)
+    } else {
+        (Some(format!("{host}:{port}")), None)
+    }
+}
+
+#[derive(Serialize)]
+pub struct ApiCustomDomainChallenge {
+    pub name: String,
+    pub value: String,
+}
+
+fn custom_domain_challenge(d: &AppDeployment) -> Option<ApiCustomDomainChallenge> {
+    let domain = d
+        .custom_domain
+        .as_deref()
+        .filter(|_| !d.custom_domain_verified)?;
+    Some(ApiCustomDomainChallenge {
+        name: lnvps_api_common::custom_domain_challenge_name(domain),
+        value: lnvps_api_common::custom_domain_challenge_token(d.id, domain),
+    })
+}
+
 /// A customer's app deployment.
 #[derive(Serialize)]
 pub struct ApiAppDeployment {
@@ -282,6 +344,16 @@ pub struct ApiAppDeployment {
     /// Public endpoint hostname once assigned (`None` until reconciled or for
     /// apps with no ingress port).
     pub hostname: Option<String>,
+    /// Public L4 port allocated for an app that declares `expose: tcp|udp`
+    /// (game servers). `None` for HTTP-only apps and until allocated.
+    pub public_port: Option<u16>,
+    /// What a player types to connect: `hostname:public_port`, or just
+    /// `hostname` when the port is the app's own default and clients find it
+    /// without help. `None` until both are known.
+    pub connect_address: Option<String>,
+    /// SRV record that points clients at `public_port` when it differs from the
+    /// app's default port. `None` when not needed or the app names no service.
+    pub srv: Option<ApiAppSrv>,
     /// Customer-owned domain (CNAME'd to `hostname`). When set, the operator
     /// serves it too and cert-manager issues a TLS cert for it (HTTP-01 once
     /// DNS resolves). `None` when unset.
@@ -293,6 +365,10 @@ pub struct ApiAppDeployment {
     /// requested. Point a CNAME at `hostname` and the next reconcile releases
     /// it. Always `false` when `custom_domain` is `None`.
     pub custom_domain_verified: bool,
+    /// TXT record that proves ownership of `custom_domain`. The domain is
+    /// held until `name` carries `value`; a CNAME alone never releases it.
+    /// `None` when `custom_domain` is `None` or already verified.
+    pub custom_domain_challenge: Option<ApiCustomDomainChallenge>,
     /// Desired run state: `running` or `stopped`.
     pub desired_state: String,
     /// Observed status: `pending`, `running`, `stopped`, `error`, `deleting`.
@@ -408,12 +484,18 @@ async fn deployment_to_api_with_breakdown(
     let app = db.get_app(d.app_id).await?;
     let m = multiplier as u64;
     let usage = AppDeploymentUsage::from_parts(&d, usage_services, usage_volumes);
+    let (connect_address, srv) = connect_info(&app.compose, d.hostname.as_deref(), d.public_port);
+    let custom_domain_challenge = custom_domain_challenge(&d);
     Ok(ApiAppDeployment {
         id: d.id,
         app_id: d.app_id,
         name: d.name,
         hostname: d.hostname,
+        public_port: d.public_port,
+        connect_address,
+        srv,
         custom_domain_verified: d.custom_domain.is_some() && d.custom_domain_verified,
+        custom_domain_challenge,
         custom_domain: d.custom_domain,
         desired_state: d.desired_state.to_string(),
         status: d.status.to_string(),
@@ -481,6 +563,7 @@ async fn tags_by_app(
 /// UI, and a stale chip should degrade to "no results", not to an error page.
 async fn v1_list_apps(
     State(this): State<RouterState>,
+    client: ClientInfo,
     Query(params): Query<Vec<(String, String)>>,
 ) -> ApiResult<Vec<ApiApp>> {
     let apps = this.db.list_apps(true).await?;
@@ -490,6 +573,7 @@ async fn v1_list_apps(
     // unpaginated and already loads every enabled app plus every assignment,
     // so the rows are in hand and a second query shape would buy nothing.
     let wanted = tag_filter(&params);
+    let lang = client.accept_language.as_deref();
     ApiData::ok(
         apps.into_iter()
             .filter_map(|a| {
@@ -497,14 +581,18 @@ async fn v1_list_apps(
                 let matches = wanted
                     .iter()
                     .all(|slug| app_tags.iter().any(|t| &t.slug == slug));
-                matches.then(|| ApiApp::from_app(a, app_tags))
+                matches.then(|| ApiApp::from_app(a, app_tags, lang))
             })
             .collect(),
     )
 }
 
 /// Get a single enabled catalog app. Public (no auth), like the list.
-async fn v1_get_app(State(this): State<RouterState>, Path(id): Path<u64>) -> ApiResult<ApiApp> {
+async fn v1_get_app(
+    State(this): State<RouterState>,
+    client: ClientInfo,
+    Path(id): Path<u64>,
+) -> ApiResult<ApiApp> {
     let app = this.db.get_app(id).await?;
     if !app.enabled {
         return Err(ApiError::not_found("App not found"));
@@ -516,7 +604,11 @@ async fn v1_get_app(State(this): State<RouterState>, Path(id): Path<u64>) -> Api
         .into_iter()
         .map(|(_, t)| t.into())
         .collect();
-    ApiData::ok(ApiApp::from_app(app, tags))
+    ApiData::ok(ApiApp::from_app(
+        app,
+        tags,
+        client.accept_language.as_deref(),
+    ))
 }
 
 /// List the tag vocabulary with per-tag counts of enabled apps.
@@ -719,6 +811,8 @@ async fn v1_create_app_deployment(
         amount: app.amount,
         setup_amount: app.setup_amount,
         configuration: None,
+        deactivated_at: None,
+        parent_line_item_id: None,
     };
     let (_sub_id, line_item_ids) = this
         .db
@@ -742,6 +836,7 @@ async fn v1_create_app_deployment(
         hostname: None,
         custom_domain: None,
         custom_domain_verified: false,
+        public_port: None,
         config: Some(EncryptedString::new(config_json)),
         desired_state: AppDeploymentDesiredState::Running,
         status: AppDeploymentStatus::Pending,
@@ -821,11 +916,23 @@ pub struct PatchAppDeploymentRequest {
     pub custom_domain: Option<Option<String>>,
 }
 
-/// Validate a customer-supplied custom domain: lowercase DNS hostname, one or
-/// more labels, no scheme/port/path. Returns the normalized (trimmed, lowercase)
-/// domain.
-fn validate_custom_domain(d: &str) -> Result<String, ApiError> {
-    lnvps_compose::validate_custom_domain(d).map_err(|e| ApiError::new(e.to_string()))
+/// Validate a customer-supplied custom domain: a public DNS hostname that is
+/// not one of the operator's own. Returns the normalised form to store.
+///
+/// The reserved check matters more here than the syntax one: a custom domain
+/// is held until the operator sees it resolve to us, and the operator's own
+/// hostnames already do.
+fn validate_custom_domain(settings: &Settings, d: &str) -> Result<String, ApiError> {
+    let d = lnvps_api_common::dns_name::validate_public_domain(d)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    for suffix in crate::api::nostr_domain::reserved_domains(settings) {
+        if lnvps_api_common::dns_name::is_under(&d, &suffix) {
+            return Err(ApiError::bad_request(format!(
+                "'{d}' is not available: '{suffix}' is reserved"
+            )));
+        }
+    }
+    Ok(d)
 }
 
 /// Update a deployment's name and/or config. The operator re-applies the change
@@ -875,18 +982,37 @@ async fn v1_patch_app_deployment(
     // a new domain is held until the operator sees it resolve to us, so the
     // flag only survives a no-op edit that resubmits the same domain.
     if let Some(cd) = &req.custom_domain {
-        let new_domain = match cd {
-            Some(d) if !d.trim().is_empty() => Some(validate_custom_domain(d)?),
-            _ => None,
-        };
-        if new_domain != deployment.custom_domain {
-            deployment.custom_domain_verified = false;
-        }
-        deployment.custom_domain = new_domain;
+        apply_custom_domain(
+            this.db.as_ref(),
+            &this.settings,
+            &mut deployment,
+            cd.as_deref(),
+        )
+        .await?;
     }
 
     this.db.update_app_deployment(&deployment).await?;
     ApiData::ok(deployment_to_api(this.db.as_ref(), deployment).await?)
+}
+
+async fn apply_custom_domain(
+    db: &dyn lnvps_db::LNVpsDb,
+    settings: &Settings,
+    deployment: &mut AppDeployment,
+    requested: Option<&str>,
+) -> Result<(), ApiError> {
+    let new_domain = match requested {
+        Some(d) if !d.trim().is_empty() => Some(validate_custom_domain(settings, d)?),
+        _ => None,
+    };
+    if new_domain != deployment.custom_domain {
+        if let Some(domain) = &new_domain {
+            lnvps_api_common::ensure_custom_domain_free(db, domain, deployment.id).await?;
+        }
+        deployment.custom_domain_verified = false;
+    }
+    deployment.custom_domain = new_domain;
+    Ok(())
 }
 
 async fn set_desired_state(
@@ -1039,6 +1165,7 @@ async fn v1_app_deployment_upgrade_quote(
 /// upgrade leaves it untouched.
 async fn v1_app_deployment_upgrade(
     auth: Nip98Auth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Query(q): Query<PaymentMethodQuery>,
@@ -1055,6 +1182,15 @@ async fn v1_app_deployment_upgrade(
         .sub_handler
         .create_app_upgrade_payment(id, req.resource_multiplier, method, mode)
         .await?;
+    crate::api::record_swap_client(
+        &this,
+        uid,
+        payment.payment_method,
+        &payment.id,
+        payment.external_data.as_str(),
+        &client,
+    )
+    .await;
 
     ApiData::ok(ApiSubscriptionPayment::from(payment))
 }
@@ -1137,34 +1273,45 @@ mod tests {
 
     #[test]
     fn test_validate_custom_domain() {
+        let mut settings = crate::settings::mock_settings();
+        settings.public_url = "https://api.lnvps.net".to_string();
+        let s = &settings;
+
         // Valid hostnames normalize (trim, lowercase, strip trailing dot).
         assert_eq!(
-            validate_custom_domain("blog.example.com").ok().as_deref(),
-            Some("blog.example.com")
-        );
-        assert_eq!(
-            validate_custom_domain(" Blog.Example.COM. ")
+            validate_custom_domain(s, "blog.myrelay.com")
                 .ok()
                 .as_deref(),
-            Some("blog.example.com")
+            Some("blog.myrelay.com")
         );
         assert_eq!(
-            validate_custom_domain("a-b.co.uk").ok().as_deref(),
+            validate_custom_domain(s, " Blog.MyRelay.COM. ")
+                .ok()
+                .as_deref(),
+            Some("blog.myrelay.com")
+        );
+        assert_eq!(
+            validate_custom_domain(s, "a-b.co.uk").ok().as_deref(),
             Some("a-b.co.uk")
         );
 
         // Invalid: no dot (bare label/TLD), bad chars, scheme/port/path, empties.
-        assert!(validate_custom_domain("").is_err());
-        assert!(validate_custom_domain("localhost").is_err());
-        assert!(validate_custom_domain("example").is_err());
-        assert!(validate_custom_domain("https://blog.example.com").is_err());
-        assert!(validate_custom_domain("blog.example.com:8443").is_err());
-        assert!(validate_custom_domain("blog.example.com/path").is_err());
-        assert!(validate_custom_domain("-bad.example.com").is_err());
-        assert!(validate_custom_domain("bad-.example.com").is_err());
-        assert!(validate_custom_domain("bl og.example.com").is_err());
-        assert!(validate_custom_domain("a..com").is_err());
-        assert!(validate_custom_domain(&format!("{}.com", "a".repeat(64))).is_err());
+        assert!(validate_custom_domain(s, "").is_err());
+        assert!(validate_custom_domain(s, "localhost").is_err());
+        assert!(validate_custom_domain(s, "myrelay").is_err());
+        assert!(validate_custom_domain(s, "https://blog.myrelay.com").is_err());
+        assert!(validate_custom_domain(s, "blog.myrelay.com:8443").is_err());
+        assert!(validate_custom_domain(s, "blog.myrelay.com/path").is_err());
+        assert!(validate_custom_domain(s, "-bad.myrelay.com").is_err());
+        assert!(validate_custom_domain(s, "bad-.myrelay.com").is_err());
+        assert!(validate_custom_domain(s, "bl og.myrelay.com").is_err());
+        assert!(validate_custom_domain(s, "a..com").is_err());
+        assert!(validate_custom_domain(s, &format!("{}.com", "a".repeat(64))).is_err());
+
+        // The operator's own hostnames: a custom domain is held until it
+        // resolves to us, and these already do.
+        assert!(validate_custom_domain(s, "api.lnvps.net").is_err());
+        assert!(validate_custom_domain(s, "anything.lnvps.net").is_err());
     }
 
     #[test]
@@ -1198,6 +1345,73 @@ mod tests {
 
     /// The unique-name lookup is scoped to (cluster, name) and ignores
     /// soft-deleted rows, so a freed name is reusable but a live one isn't.
+    fn deployment(name: &str, domain: Option<&str>) -> AppDeployment {
+        AppDeployment {
+            id: 0,
+            user_id: 1,
+            app_id: 1,
+            cluster_id: 1,
+            resource_multiplier: 1,
+            subscription_line_item_id: 0,
+            name: name.to_string(),
+            namespace: format!("ns-{name}"),
+            hostname: None,
+            custom_domain: domain.map(str::to_string),
+            custom_domain_verified: false,
+            public_port: None,
+            config: None,
+            desired_state: AppDeploymentDesiredState::Running,
+            status: AppDeploymentStatus::Pending,
+            status_message: None,
+            usage_cpu_milli: None,
+            usage_memory_bytes: None,
+            usage_storage_bytes: None,
+            usage_collected: None,
+            created: Utc::now(),
+            deleted: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn second_deployment_cannot_claim_a_taken_custom_domain() {
+        use lnvps_api_common::MockDb;
+        use lnvps_db::LNVpsDbBase;
+
+        let db = MockDb::default();
+        let settings = crate::settings::mock_settings();
+        let first = db
+            .insert_app_deployment(&deployment("a", Some("blog.myrelay.org")))
+            .await
+            .unwrap();
+        let second_id = db
+            .insert_app_deployment(&deployment("b", None))
+            .await
+            .unwrap();
+        let mut second = db.get_app_deployment(second_id).await.unwrap();
+
+        let err = apply_custom_domain(&db, &settings, &mut second, Some("Blog.MyRelay.org"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, axum::http::StatusCode::CONFLICT, "{}", err.error);
+        assert!(err.error.contains("already in use"), "{}", err.error);
+        assert_eq!(second.custom_domain, None);
+
+        apply_custom_domain(&db, &settings, &mut second, Some("other.myrelay.org"))
+            .await
+            .unwrap();
+        assert_eq!(second.custom_domain.as_deref(), Some("other.myrelay.org"));
+
+        let mut owner = db.get_app_deployment(first).await.unwrap();
+        apply_custom_domain(&db, &settings, &mut owner, Some("blog.myrelay.org"))
+            .await
+            .unwrap();
+
+        db.delete_app_deployment(first).await.unwrap();
+        apply_custom_domain(&db, &settings, &mut second, Some("blog.myrelay.org"))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn find_app_deployment_by_cluster_name_scopes_correctly() {
         use lnvps_api_common::MockDb;
@@ -1216,6 +1430,7 @@ mod tests {
             hostname: None,
             custom_domain: None,
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Pending,
@@ -1294,6 +1509,7 @@ mod tests {
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
+                    category_translations: None,
                     compose: "services:\n  a:\n    image: x\n".to_string(),
                     amount: 1000,
                     currency: "USD".to_string(),
@@ -1325,6 +1541,8 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 },
             );
             let mut subs = db.subscriptions.lock().await;
@@ -1362,6 +1580,7 @@ mod tests {
             hostname: None,
             custom_domain: None,
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status,
@@ -1432,6 +1651,7 @@ mod tests {
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
+                    category_translations: None,
                     compose: "services:\n  a:\n    image: x\n".to_string(),
                     amount: 1000,
                     currency: "USD".to_string(),
@@ -1460,6 +1680,7 @@ mod tests {
             hostname: None,
             custom_domain: None,
             custom_domain_verified: false,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Running,
@@ -1545,6 +1766,7 @@ mod tests {
                     category: "Nostr relay".to_string(),
                     seo_title: None,
                     seo_description: None,
+                    category_translations: None,
                     compose: "services:\n  a:\n    image: x\n".to_string(),
                     amount: 1000,
                     currency: "USD".to_string(),
@@ -1572,6 +1794,7 @@ mod tests {
             hostname: Some("d.apps.example.com".to_string()),
             custom_domain: Some("blog.example.com".to_string()),
             custom_domain_verified: true,
+            public_port: None,
             config: None,
             desired_state: AppDeploymentDesiredState::Running,
             status: AppDeploymentStatus::Running,
@@ -1587,9 +1810,59 @@ mod tests {
         let api = ok(deployment_to_api(&db, d.clone()).await);
         assert_eq!(api.custom_domain.as_deref(), Some("blog.example.com"));
         assert!(api.custom_domain_verified);
+        assert!(api.custom_domain_challenge.is_none());
+
+        d.custom_domain_verified = false;
+        let api = ok(deployment_to_api(&db, d.clone()).await);
+        let challenge = api.custom_domain_challenge.expect("challenge while held");
+        assert_eq!(challenge.name, "_lnvps-challenge.blog.example.com");
+        assert_eq!(
+            challenge.value,
+            lnvps_api_common::custom_domain_challenge_token(d.id, "blog.example.com")
+        );
 
         d.custom_domain = None;
         let api = ok(deployment_to_api(&db, d).await);
         assert!(!api.custom_domain_verified);
+        assert!(api.custom_domain_challenge.is_none());
+    }
+
+    const MC: &str = "services:\n  s:\n    image: x\n    ports:\n      - { name: g, container: 25565, protocol: tcp, expose: tcp, srv: minecraft }\n";
+    const NO_SRV: &str = "services:\n  s:\n    image: x\n    ports:\n      - { name: g, container: 7777, protocol: tcp, expose: tcp }\n";
+
+    #[test]
+    fn connect_address_is_unknown_until_host_and_port_exist() {
+        assert_eq!(connect_info(MC, None, Some(25570)), (None, None));
+        assert_eq!(connect_info(MC, Some("a.games.io"), None), (None, None));
+    }
+
+    #[test]
+    fn default_port_connects_on_the_bare_hostname() {
+        assert_eq!(
+            connect_info(MC, Some("a.games.io"), Some(25565)),
+            (Some("a.games.io".to_string()), None)
+        );
+    }
+
+    #[test]
+    fn non_default_port_with_srv_label_reports_the_srv_record() {
+        let (addr, srv) = connect_info(MC, Some("a.games.io"), Some(25570));
+        assert_eq!(addr.as_deref(), Some("a.games.io"));
+        assert_eq!(
+            srv,
+            Some(ApiAppSrv {
+                name: "_minecraft._tcp.a.games.io".to_string(),
+                target: "a.games.io".to_string(),
+                port: 25570,
+            })
+        );
+    }
+
+    #[test]
+    fn non_default_port_without_srv_label_needs_host_and_port() {
+        assert_eq!(
+            connect_info(NO_SRV, Some("a.games.io"), Some(25570)),
+            (Some("a.games.io:25570".to_string()), None)
+        );
     }
 }

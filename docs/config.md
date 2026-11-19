@@ -211,7 +211,13 @@ whatsapp:
 referral:
   min-payout-sats: 1000        # minimum accrued BTC commission before an auto-payout
   min-fiat-payout-sats: 1000   # same for fiat-settled commission, valued at the quote; omit to disable
+  commission-hold-days: 30     # days a referred VM's first payment must age before its commission is paid
 ```
+
+A referred VM's commission is only paid once its first payment is
+`commission-hold-days` old, which leaves time to refund an order placed through
+a sock-puppet account. Refunds against that payment reduce the commission, and a
+VM ordered with the buyer's own referral code earns nothing.
 
 Fiat-settled commission is paid by converting the balance to sats at the rate
 quoted when the payout is sent. The payout record keeps both sides — `amount`
@@ -225,6 +231,26 @@ transaction is broadcast, and each row's share of the network fee is converted
 back at that same quote. The floor applied to those rows is the higher of
 `min-fiat-payout-sats` and `min-onchain-payout-sats`, because an on-chain payout
 must also clear the mempool fee it pays.
+
+### Chain explorer (optional)
+
+```yaml
+# Defaults to mempool.space; set `none` to switch the check off.
+chain-explorer:
+  mempool:
+    url: "https://mempool.space"
+```
+
+Used only to tell a live on-chain deposit from a replaced one. An hourly sweep
+takes every unpaid deposit whose quote has expired and asks whether its
+transaction is still known to the network, and whether the coins it spends have
+since been taken by a different, confirmed transaction. Either answer means the
+customer replaced (RBF'd) the payment away and it can never confirm, so its
+outpoint is dropped and the unpaid VM is deleted by the usual sweep instead of
+being held forever.
+
+With `none`, or a self-hosted esplora that is unreachable, deposits still settle
+normally; a replaced one just keeps blocking deletion of the VM it was for.
 
 ### DNS — Cloudflare (optional)
 
@@ -317,6 +343,22 @@ no rates are known and VAT falls back to 0%.
 # Enables NIP-05 routing under this hostname
 nostr-address-host: "nostr.example.com"
 ```
+
+### Reserved domains (optional)
+
+```yaml
+# Domains customers may not register, each covering everything below it
+reserved-domains:
+  - "lnvps.com"
+  - "lnvps.cloud"
+```
+
+A customer-registered NIP-05 domain or app custom domain becomes an Ingress
+rule claiming that hostname in the operator's cluster, so the operator's own
+hostnames have to be refused. The hosts in `public-url` and
+`nostr-address-host` are reserved automatically, along with their parent domain
+(`api.lnvps.net` reserves all of `lnvps.net`). List here anything the operator
+serves that those two do not cover.
 
 ### Captcha (optional)
 

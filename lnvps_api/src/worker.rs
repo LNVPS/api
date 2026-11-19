@@ -1,3 +1,4 @@
+use crate::chain::{ChainExplorer, OutPoint};
 use crate::host::{FullVmInfo, VmHostClient, get_host_client};
 use crate::notifications::{Notification, NotificationChannel, build_channels, send_email};
 use crate::provisioner::{VmLocation, VmProvisioner};
@@ -10,15 +11,18 @@ use hickory_resolver::TokioResolver;
 use lnvps_api_common::{
     BlackholeWorkFeedback, ChannelWorkCommander, InMemoryKeyValueStore, JobFeedback, KeyValueStore,
     NetworkProvisioner, RedisConfig, RedisKeyValueStore, RedisWorkCommander, RedisWorkFeedback,
-    SCANNED_KEY_FAMILIES, TrafficRecorder, UpgradeConfig, VmHistoryLogger, VmRunningState,
-    VmRunningStates, VmStateCache, WorkCommander, WorkFeedback, WorkJob, WorkJobMessage,
-    capture_is_complete, merge_ssh_host_keys, op_fatal, parse_ssh_host_keys, quota_period,
+    SCANNED_KEY_FAMILIES, SnapshotAction, TrafficRecorder, UpgradeConfig, VmHistoryLogger,
+    VmRunningState, VmRunningStates, VmStateCache, WorkCommander, WorkFeedback, WorkJob,
+    WorkJobMessage, capture_is_complete, merge_ssh_host_keys, op_fatal, parse_ssh_host_keys,
+    quota_period,
     retry::{OpError, Pipeline, RetryPolicy},
+    upgrade_bandwidth,
 };
 use lnvps_db::{
-    BulkMessageTarget, CpuArch, CpuFeature, CpuMfg, IntervalType, LNVpsDb, LineItemType,
-    PaymentMethod, RouterTunnelTraffic, Subscription, SubscriptionLineItem, SubscriptionPayment,
-    Vm, VmHistoryActionType, VmHost, VmHostKind, VmIpAssignment, VmOsImage,
+    BulkMessageTarget, CpuArch, CpuFeature, CpuMfg, DiskInterface, DiskType, IntervalType, LNVpsDb,
+    LineItemType, PaymentMethod, RouterTunnelTraffic, Subscription, SubscriptionLineItem,
+    SubscriptionPayment, Vm, VmHistoryActionType, VmHost, VmHostDisk, VmHostKind, VmIpAssignment,
+    VmOsImage,
 };
 use log::{debug, error, info, warn};
 use nostr_sdk::Client;
@@ -33,6 +37,8 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 /// Name of the host-info binary for x86_64 (expected in same directory as current executable)
+pub const CLIENT_RECORD_RETENTION_DAYS: u32 = 395;
+
 const HOST_INFO_BINARY_NAME_X86_64: &str = "lnvps-host-info";
 /// Name of the host-info binary for arm64 (expected in same directory as current executable)
 const HOST_INFO_BINARY_NAME_ARM64: &str = "lnvps-host-info-arm64";
@@ -57,21 +63,80 @@ fn get_host_info_path_for_arch(arch: CpuArch) -> Option<std::path::PathBuf> {
     Some(exe_dir.join(binary_name))
 }
 
-/// Whether an unpaid payment should still block deletion of a never-paid VM.
+/// Whether an unpaid payment should still block deletion of a never-paid
+/// resource, or of the subscription that would bill it.
 ///
 /// A payment blocks deletion while its invoice is unexpired, but also — for
 /// on-chain payments — once a deposit has been detected in the mempool
 /// (`external_id` holds the deposit outpoint `{txid}:{vout}`): confirmation
-/// can land well after the 1h quote expiry, and purging the VM in that window
+/// can land well after the 1h quote expiry, and purging in that window
 /// would lose the customer's payment (issue #194).
-pub(crate) fn payment_blocks_unpaid_vm_deletion(
+pub(crate) fn payment_blocks_unpaid_deletion(
     p: &SubscriptionPayment,
     now: DateTime<Utc>,
+    onchain_grace: TimeDelta,
 ) -> bool {
     !p.is_paid
         && (p.expires > now
-            || (p.payment_method == PaymentMethod::OnChain && p.external_id.is_some()))
+            || (matches!(
+                p.payment_method,
+                PaymentMethod::OnChain | PaymentMethod::FixedFloat
+            ) && (p.external_id.is_some() || p.expires + onchain_grace > now)))
 }
+
+pub(crate) async fn onchain_unpaid_purge_grace(db: &dyn LNVpsDb) -> TimeDelta {
+    let hours = db
+        .list_payment_method_configs()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|c| c.get_provider_config())
+        .filter_map(|c| c.as_onchain().map(|o| o.unpaid_purge_grace_hours))
+        .max()
+        .unwrap_or(24);
+    TimeDelta::hours(hours as i64)
+}
+
+/// Why a detected deposit can no longer confirm.
+#[derive(Debug, PartialEq, Eq)]
+enum DepositDead {
+    /// No longer known to the network: replaced and evicted everywhere.
+    Evicted,
+    /// The coins it spends were taken by this other, confirmed transaction.
+    Replaced(String),
+}
+
+/// Whether a detected deposit transaction can still confirm.
+///
+/// Two ways to be sure it cannot. It is gone from the network, which is what a
+/// replaced transaction looks like from outside; or one of the coins it spends
+/// has since been spent by a *different* transaction that has confirmed. The
+/// confirmation requirement matters: a conflicting spend sitting in the mempool
+/// can itself be replaced, and clearing on that would race the customer's
+/// wallet.
+async fn deposit_dead(explorer: &dyn ChainExplorer, txid: &str) -> Result<Option<DepositDead>> {
+    let Some(inputs) = explorer.tx_inputs(txid).await? else {
+        return Ok(Some(DepositDead::Evicted));
+    };
+    for input in &inputs {
+        let spend = explorer.outspend(input).await?;
+        match spend.spent_by {
+            Some(by) if by != txid && spend.confirmed => {
+                return Ok(Some(DepositDead::Replaced(by)));
+            }
+            _ => {}
+        }
+    }
+    Ok(None)
+}
+
+/// How long a never-paid subscription is kept before it is purged.
+///
+/// Generous on purpose. A lightning invoice has expired many times over by
+/// then, but a bank transfer or a late on-chain send has not, and the cost of
+/// waiting is a dead row while the cost of being early is deleting an order the
+/// customer is still paying for.
+const NEVER_PAID_SUBSCRIPTION_TTL: TimeDelta = TimeDelta::hours(24);
 
 /// How long to wait before scanning a VM's host keys again while the capture is
 /// still missing keys.
@@ -153,6 +218,8 @@ pub struct Worker {
     http_client: reqwest::Client,
     referral_payouts: crate::referral::ReferralPayoutHandler,
     refunds: crate::refund::VmRefundHandler,
+    chain_explorer: Option<Arc<dyn crate::chain::ChainExplorer>>,
+    ip_orders: Arc<lnvps_api_common::ip_provider::IpOrderService>,
 }
 
 #[derive(Clone)]
@@ -178,8 +245,15 @@ pub struct WorkerSettings {
     /// Minimum fiat-settled referral commission (satoshis at the quote) before
     /// an automated converted payout is attempted. `None` disables them.
     pub referral_min_fiat_payout_sats: Option<u64>,
+    pub referral_commission_hold_days: u64,
     /// Source of the on-chain fee-rate estimate for the cap above.
     pub referral_fee_estimator: crate::settings::FeeEstimatorConfig,
+    /// Source of chain lookups used to spot replaced deposits.
+    pub chain_explorer: crate::settings::ChainExplorerConfig,
+    /// LNVPS's control identity, for calling marketplace nodes. `None` in a
+    /// deployment with no nostr key: such a worker patches its own hosts and
+    /// leaves nodes' hardware as last reported.
+    pub node_control: Option<lnvps_api_common::node_control::NodeControl>,
 }
 
 impl From<&Settings> for WorkerSettings {
@@ -206,14 +280,53 @@ impl From<&Settings> for WorkerSettings {
                 .referral
                 .as_ref()
                 .and_then(|r| r.min_fiat_payout_sats),
+            referral_commission_hold_days: val
+                .referral
+                .as_ref()
+                .map(|r| r.commission_hold_days)
+                .unwrap_or(30),
             referral_fee_estimator: val
                 .referral
                 .as_ref()
                 .map(|r| r.fee_estimator.clone())
                 .unwrap_or_default(),
+            chain_explorer: val.chain_explorer.clone(),
+            node_control: val.nostr.as_ref().and_then(|n| {
+                match lnvps_api_common::node_control::NodeControl::new(&n.nsec) {
+                    Ok(c) => Some(c),
+                    Err(e) => {
+                        error!("The marketplace control key is unusable: {e}");
+                        None
+                    }
+                }
+            }),
         }
     }
 }
+
+/// Whether LNVPS polls this router to refresh its cached state.
+///
+/// Not every enabled router is one LNVPS connects to. An `lvd` route server
+/// fetches its own configuration and is often behind a NAT nothing here can
+/// traverse, so building a client for it is a fatal error *by design*. Polling
+/// one anyway logged that error every minute, forever, about a machine that was
+/// working perfectly -- and a log that cries wolf once a minute is the first
+/// thing blamed when something real breaks.
+///
+/// There is nothing to refresh either: the tunnel, BGP session and route state
+/// the sampler caches is all read *from* the router, and this kind is never
+/// asked.
+///
+/// A predicate rather than an inline filter because the sampler swallows and
+/// logs its errors, so a test driving the loop cannot tell a skipped router
+/// from a failed one. This can be asserted directly.
+pub fn is_pollable(router: &lnvps_db::Router) -> bool {
+    router.enabled && !matches!(router.kind, lnvps_db::RouterKind::Lvd)
+}
+
+pub const NODE_QUIET_AFTER: chrono::Duration = chrono::Duration::minutes(10);
+const NODE_QUIET_SWEEP: chrono::Duration = chrono::Duration::minutes(5);
+pub const PROBE_FAILURES_TO_CORDON: u64 = 3;
 
 impl Worker {
     const CHECK_VMS_SECONDS: u64 = 30;
@@ -251,7 +364,10 @@ impl Worker {
             subscription_handler.pricing_engine().rates(),
             settings.referral_min_fiat_payout_sats,
             kv.clone(),
-        );
+        )
+        .with_commission_hold(chrono::Duration::days(
+            settings.referral_commission_hold_days as i64,
+        ));
 
         let refunds = crate::refund::VmRefundHandler::new(
             db.clone(),
@@ -269,8 +385,16 @@ impl Worker {
             .build()?;
 
         let notification_channels = build_channels(&settings, nostr.as_ref(), &http_client);
+        let chain_explorer = crate::chain::build_chain_explorer(&settings.chain_explorer);
+
+        let ip_orders = Arc::new(lnvps_api_common::ip_provider::IpOrderService::new(
+            db.clone(),
+            work_commander.clone(),
+        ));
 
         Ok(Self {
+            chain_explorer,
+            ip_orders,
             db,
             subscription_handler,
             vm_state_cache,
@@ -359,21 +483,33 @@ impl Worker {
         let lead = expiry_lead_window(sub);
         let lead_descr = format_lead_window(lead);
 
-        let line_items = self.db.list_subscription_line_items(sub.id).await?;
+        let line_items: Vec<_> = self
+            .db
+            .list_subscription_line_items(sub.id)
+            .await?
+            .into_iter()
+            .filter(|li| li.is_active())
+            .collect();
         let sub_notification_subject = self.sub_notification_subject(sub, &line_items).await;
         let sub_notification_descr = Self::sub_notification_message(sub, &line_items);
 
         // --- Expiring soon ---
-        // Only subscriptions that have NOT yet expired can be "expiring soon".
-        // The `expires > now` guard is important: without it, an already-expired
-        // subscription would wrongly match this branch whenever `last_check` is
-        // stale (e.g. a freshly-started worker whose last check defaults to the
-        // unix epoch), starving the expired/grace branches below.
+        // Users are warned at each reminder milestone that fits inside the
+        // billing interval (7 days, 3 days, 1 day out for a monthly VM), so
+        // there is time to act before the VM stops. Only subscriptions that have
+        // NOT yet expired can be "expiring soon"; `due_reminder` enforces that,
+        // which matters when `last_check` is stale (e.g. a freshly-started worker
+        // whose last check defaults to the unix epoch) and would otherwise starve
+        // the expired/grace branches below.
         let now = Utc::now();
-        let expiry_window = now.add(lead);
-        if expires > now && expires < expiry_window && expires > last_check.add(lead) {
-            // Attempt auto-renewal using the user's default saved payment method
-            // (NWC Lightning wallet or Revolut card), dispatched by provider.
+        if let Some(due) = due_reminder(sub, now, last_check) {
+            // The final reminder is the one that also drives auto-renewal; the
+            // earlier ones are notice only.
+            let is_final_reminder = due <= lead;
+
+            // Attempt auto-renewal using the user's account credit or default
+            // saved payment method (NWC Lightning wallet or Revolut card),
+            // dispatched by provider.
             let mut auto_renewed = false;
 
             if sub.auto_renewal_enabled {
@@ -383,14 +519,39 @@ impl Worker {
                     .await
                     .map(|m| m.iter().any(|pm| pm.enabled))
                     .unwrap_or(false);
-                if has_method {
+                // A credit balance the user opted into is also a renewable
+                // method, so it counts even when no saved method exists.
+                let has_credit = self
+                    .subscription_handler
+                    .credit_covers_renewal(sub.id)
+                    .await
+                    .unwrap_or(false);
+                if (has_method || has_credit) && !is_final_reminder {
+                    // It will renew itself before it expires; an "expiring soon"
+                    // warning a week out would just be wrong.
+                    return Ok(());
+                }
+                if has_method || has_credit {
                     info!("Attempting auto-renewal for subscription {}", sub.id);
                     match self.subscription_handler.auto_renew(sub.id).await {
-                        Ok(_) => {
+                        Ok(payment) => {
                             info!("Successfully auto-renewed subscription {}", sub.id);
+                            // An hourly subscription renews every hour; a notice
+                            // each time would be 24 messages a day. It is only
+                            // worth telling the customer when renewal fails.
+                            if sub.interval_type == IntervalType::Hour {
+                                return Ok(());
+                            }
+                            let paid_with = if payment.external_data.as_str()
+                                == crate::subscription::CREDIT_FUNDED_MARKER
+                            {
+                                "your account credit"
+                            } else {
+                                "your saved payment method"
+                            };
                             self.queue_notification(
                                 sub.user_id,
-                                format!("Your subscription is being automatically renewed using your saved payment method.\n{}", sub_notification_descr),
+                                format!("Your subscription is being automatically renewed using {}.\n{}", paid_with, sub_notification_descr),
                                 Some(format!("[{}] Auto-Renewed", sub_notification_subject)),
                             ).await;
                             auto_renewed = true;
@@ -415,17 +576,25 @@ impl Worker {
             // Send a plain expiry warning whenever auto-renewal was not attempted
             // (auto_renewal off, or no saved payment method).
             if !auto_renewed {
+                let grace = self.grace_period(sub);
                 self.queue_notification(
                     sub.user_id,
                     format!(
-                        "Your subscription will expire soon. Please renew manually in the next {}.\n{}",
-                        lead_descr, sub_notification_descr
+                        "Your subscription expires in {} ({}).\nPlease renew before then to avoid interruption.\n{}\n{}",
+                        format_lead_window(due),
+                        format_timestamp(expires),
+                        deletion_warning(expires, grace),
+                        sub_notification_descr
                     ),
-                    Some(format!("[{}] Expiring Soon", sub_notification_subject)),
+                    Some(format!(
+                        "[{}] Expires in {}",
+                        sub_notification_subject,
+                        format_lead_window(due)
+                    )),
                 )
                 .await;
             }
-        } else if expires.add(Days::new(self.grace_period_days(sub) as u64)) < Utc::now() {
+        } else if expires.add(self.grace_period(sub)) < Utc::now() {
             // mark subscription as not-active
             let mut sub = sub.clone();
             sub.is_active = false;
@@ -467,10 +636,15 @@ impl Worker {
             let already_handled = self
                 .subscription_expiry_already_handled(sub, &line_items, last_check)
                 .await;
+            let grace = self.grace_period(sub);
             if !already_handled {
                 self.queue_notification(
                     sub.user_id,
-                    format!("Your subscription has expired.\n{}", sub_notification_descr),
+                    format!(
+                        "Your subscription has expired.\n{}\n{}",
+                        deletion_warning(expires, grace),
+                        sub_notification_descr
+                    ),
                     Some(format!("[{}] Expired", sub_notification_subject)),
                 )
                 .await;
@@ -484,6 +658,26 @@ impl Worker {
                         Err(e) => warn!("Failed to build handler for line item {}: {}", li.id, e),
                     }
                 }
+            } else if let Some(days_expired) = post_expiry_reminder_due(expires, now, last_check) {
+                // Daily countdown for the whole grace period, so a user who
+                // missed the expiry notice still has a running clock in front of
+                // them until the data is gone.
+                let days_left = days_until_deletion(expires, grace, now);
+                self.queue_notification(
+                    sub.user_id,
+                    format!(
+                        "Your subscription expired {} ago and your services are suspended.\n{}\nRenew now to restore them.\n{}",
+                        format_days(days_expired),
+                        deletion_warning(expires, grace),
+                        sub_notification_descr
+                    ),
+                    Some(format!(
+                        "[{}] Deletion in {}",
+                        sub_notification_subject,
+                        format_days(days_left)
+                    )),
+                )
+                .await;
             }
         }
 
@@ -491,10 +685,97 @@ impl Worker {
     }
 }
 
+/// Pre-expiry reminder offsets, longest first.
+///
+/// A single warning one day out was not enough notice: users on holiday or with
+/// a slow payment method lost VMs they intended to keep. Each milestone that
+/// fits inside the billing interval produces one notification.
+const REMINDER_MILESTONES: [TimeDelta; 3] =
+    [TimeDelta::days(7), TimeDelta::days(3), TimeDelta::days(1)];
+
+/// Reminder offsets applicable to `sub`, nearest-to-expiry first.
+///
+/// Milestones longer than half the billing interval are dropped (a 3-day
+/// subscription should not be warned 7 days out, it did not exist yet), and the
+/// auto-renewal lead window is always included as the final reminder.
+fn reminder_milestones(sub: &Subscription) -> Vec<TimeDelta> {
+    let lead = expiry_lead_window(sub);
+    let half = subscription_interval(sub) / 2;
+    let mut out: Vec<TimeDelta> = REMINDER_MILESTONES
+        .into_iter()
+        .filter(|m| *m <= half && *m > lead)
+        .collect();
+    out.push(lead);
+    out.sort();
+    out
+}
+
+/// The reminder milestone crossed in `(last_check, now]`, if any.
+///
+/// Returns the nearest-to-expiry crossed milestone so that a worker resuming
+/// after downtime sends one accurate reminder rather than a burst of stale ones.
+fn due_reminder(
+    sub: &Subscription,
+    now: DateTime<Utc>,
+    last_check: DateTime<Utc>,
+) -> Option<TimeDelta> {
+    let expires = sub.expires?;
+    if expires <= now {
+        return None;
+    }
+    reminder_milestones(sub).into_iter().find(|m| {
+        let at = expires - *m;
+        at <= now && at > last_check
+    })
+}
+
+/// Whole days since expiry when a daily post-expiry reminder is due this tick,
+/// i.e. when a day boundary after `expires` was crossed in `(last_check, now]`.
+fn post_expiry_reminder_due(
+    expires: DateTime<Utc>,
+    now: DateTime<Utc>,
+    last_check: DateTime<Utc>,
+) -> Option<i64> {
+    let days = (now - expires).num_days();
+    if days < 1 {
+        return None;
+    }
+    if last_check < expires + TimeDelta::days(days) {
+        Some(days)
+    } else {
+        None
+    }
+}
+
+/// Whole days left before deletion, rounded up so any remaining time reads as at
+/// least one day, floored at zero. The exact deletion timestamp is in the
+/// message body, so the rounding is only for the headline.
+fn days_until_deletion(expires: DateTime<Utc>, grace: TimeDelta, now: DateTime<Utc>) -> i64 {
+    const DAY: i64 = 24 * 60 * 60;
+    let secs = (expires + grace - now).num_seconds();
+    if secs <= 0 { 0 } else { (secs + DAY - 1) / DAY }
+}
+
+/// One-line warning naming the date the services are deleted.
+fn deletion_warning(expires: DateTime<Utc>, grace: TimeDelta) -> String {
+    format!(
+        "If it is not renewed, your services and all their data are permanently deleted on {}.",
+        format_timestamp(expires + grace)
+    )
+}
+
+fn format_timestamp(t: DateTime<Utc>) -> String {
+    t.format("%Y-%m-%d %H:%M UTC").to_string()
+}
+
+fn format_days(days: i64) -> String {
+    format!("{} day{}", days, if days == 1 { "" } else { "s" })
+}
+
 /// Grace period (days) for a subscription, tiered by subscription age. Lives in
 /// `lnvps_api_common` so the API layer can surface the resulting deletion date;
 /// re-exported here for the worker/subscription callers.
-pub use lnvps_api_common::grace_period_days_for_sub;
+pub use lnvps_api_common::{grace_period_days_for_sub, grace_period_for_sub};
 
 /// Approximate duration of one billing interval for a subscription.
 ///
@@ -503,6 +784,7 @@ pub use lnvps_api_common::grace_period_days_for_sub;
 fn subscription_interval(sub: &Subscription) -> TimeDelta {
     let amount = sub.interval_amount.max(1) as i64;
     match sub.interval_type {
+        IntervalType::Hour => TimeDelta::hours(amount),
         IntervalType::Day => TimeDelta::days(amount),
         IntervalType::Month => TimeDelta::days(30 * amount),
         IntervalType::Year => TimeDelta::days(365 * amount),
@@ -543,6 +825,7 @@ impl Worker {
     /// the worker from carrying a service it uses in four places.
     fn tunnels(&self) -> crate::provisioner::wg::TunnelProvisioner {
         crate::provisioner::wg::TunnelProvisioner::new(self.db.clone())
+            .with_feedback(self.feedback.clone())
     }
 
     /// Grace period (in days) for a subscription, tiered by subscription age.
@@ -556,8 +839,8 @@ impl Worker {
     /// | ≤ 28       | 7             |
     /// | ≤ 180      | 14            |
     /// | > 180      | delete_after  |
-    fn grace_period_days(&self, sub: &Subscription) -> u16 {
-        grace_period_days_for_sub(sub, Utc::now(), self.settings.delete_after)
+    fn grace_period(&self, sub: &Subscription) -> TimeDelta {
+        grace_period_for_sub(sub, Utc::now(), self.settings.delete_after)
     }
 
     /// Whether the one-shot "expired" handling for `sub` has already run.
@@ -625,6 +908,13 @@ impl Worker {
         line_items: &Vec<SubscriptionLineItem>,
     ) -> String {
         let interval_str = match sub.interval_type {
+            IntervalType::Hour => {
+                if sub.interval_amount == 1 {
+                    "per hour".to_string()
+                } else {
+                    format!("every {} hours", sub.interval_amount)
+                }
+            }
             IntervalType::Day => {
                 if sub.interval_amount == 1 {
                     "per day".to_string()
@@ -694,11 +984,52 @@ impl Worker {
     /// and a sweep that probed the whole fleet at once would arrive as a
     /// thundering herd on the operators least able to absorb it.
     #[cfg(feature = "linux-ssh")]
+    pub async fn alert_quiet_marketplace_nodes(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<u64>> {
+        let mut alerted = Vec::new();
+        for node in self
+            .db
+            .list_all_marketplace_nodes(Some(lnvps_db::MarketplaceNodeStatus::Approved))
+            .await?
+        {
+            let Some(seen) = node.last_seen else {
+                continue;
+            };
+            let quiet = now - seen;
+            if quiet > NODE_QUIET_AFTER && quiet <= NODE_QUIET_AFTER + NODE_QUIET_SWEEP {
+                self.queue_admin_notification(
+                    format!(
+                        "Marketplace node {} ({}) has not called LNVPS since {seen}",
+                        node.id, node.name
+                    ),
+                    Some("Marketplace node quiet".to_string()),
+                )
+                .await;
+                alerted.push(node.id);
+            }
+        }
+        Ok(alerted)
+    }
+
     pub async fn probe_marketplace_node(&self) -> Result<()> {
         let due = crate::provisioner::probe_candidates(&self.db, chrono::Utc::now()).await?;
         let Some(node) = due.into_iter().next() else {
             return Ok(());
         };
+        let proven_before = self.has_passed_a_probe(node.id).await?;
+        if let Some(failure) = self.underlay_failure(&node).await? {
+            warn!("Marketplace node {} failed its probe: {}", node.id, failure);
+            crate::provisioner::record_unspecified(
+                &self.db,
+                node.id,
+                crate::provisioner::ProbeResult::failed(failure),
+            )
+            .await?;
+            self.cordon_if_failing(node.id).await?;
+            return Ok(());
+        }
 
         // A probe that could not be run at all must not abort the sweep: this
         // runs from `handle_job`, whose error stops the rest of the batch, so
@@ -715,6 +1046,16 @@ impl Worker {
                     return Ok(());
                 }
             };
+        self.admit_after_probe(node.id, proven_before, &result)
+            .await
+    }
+
+    async fn admit_after_probe(
+        &self,
+        node_id: u64,
+        proven_before: bool,
+        result: &crate::provisioner::ProbeResult,
+    ) -> Result<()> {
         if !result.passed() {
             // Recorded, not acted on. One bad probe is a bad afternoon — a
             // backup job, a noisy neighbour — and taking a node out of service
@@ -722,20 +1063,24 @@ impl Worker {
             // Suspension on a trend is increment 12's job.
             warn!(
                 "Marketplace node {} failed its probe: {}",
-                node.id,
+                node_id,
                 result.failure.as_deref().unwrap_or("unknown")
             );
+            self.cordon_if_failing(node_id).await?;
             return Ok(());
         }
 
         // The gate: a host is only enabled once a VM has actually run on it.
-        let Some(host) = self.db.get_marketplace_node_host(node.id).await? else {
+        if proven_before {
+            return Ok(());
+        }
+        let Some(host) = self.db.get_marketplace_node_host(node_id).await? else {
             return Ok(());
         };
         if !host.enabled {
             info!(
                 "Marketplace node {} carried a probe VM in {}ms; enabling host {}",
-                node.id,
+                node_id,
                 result.provision_ms.unwrap_or_default(),
                 host.id
             );
@@ -749,6 +1094,82 @@ impl Worker {
         Ok(())
     }
 
+    async fn underlay_failure(&self, node: &lnvps_db::MarketplaceNode) -> Result<Option<String>> {
+        let Some(control) = self.settings.node_control.as_ref() else {
+            return Ok(None);
+        };
+        let Some(tunnel) = crate::provisioner::MarketplaceTunnels::new(self.db.clone())
+            .get_tunnel(node)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Some(host) = self.db.get_marketplace_node_host(node.id).await? else {
+            return Ok(None);
+        };
+        Ok(match control.status(node, &host).await {
+            Ok(status) => crate::provisioner::underlay_shortfall(&tunnel.pool, status.underlay_mtu),
+            Err(e) => Some(format!("could not read the node's status: {e:#}")),
+        })
+    }
+
+    async fn cordon_if_failing(&self, node_id: u64) -> Result<bool> {
+        let (recent, _) = self
+            .db
+            .list_marketplace_node_health(node_id, PROBE_FAILURES_TO_CORDON, 0)
+            .await?;
+        if recent.len() < PROBE_FAILURES_TO_CORDON as usize || recent.iter().any(|h| h.passed) {
+            return Ok(false);
+        }
+        let Some(host) = self.db.get_marketplace_node_host(node_id).await? else {
+            return Ok(false);
+        };
+        if !host.enabled {
+            return Ok(false);
+        }
+        warn!(
+            "Marketplace node {node_id} failed {PROBE_FAILURES_TO_CORDON} probes in a row; \
+             disabling host {}",
+            host.id
+        );
+        let host_id = host.id;
+        self.db
+            .update_host(&VmHost {
+                enabled: false,
+                ..host
+            })
+            .await?;
+        self.queue_admin_notification(
+            format!(
+                "Marketplace node {node_id} failed its last {PROBE_FAILURES_TO_CORDON} probes; \
+                 host {host_id} is disabled until an admin re-enables it. Latest: {}",
+                recent[0].failure.as_deref().unwrap_or("unknown")
+            ),
+            Some("Marketplace node cordoned".to_string()),
+        )
+        .await;
+        Ok(true)
+    }
+
+    async fn has_passed_a_probe(&self, node_id: u64) -> Result<bool> {
+        const PAGE: u64 = 500;
+        let mut offset = 0;
+        loop {
+            let (rows, total) = self
+                .db
+                .list_marketplace_node_health(node_id, PAGE, offset)
+                .await?;
+            if rows.iter().any(|h| h.passed) {
+                return Ok(true);
+            }
+            offset += rows.len() as u64;
+            if rows.is_empty() || offset >= total as u64 {
+                return Ok(false);
+            }
+        }
+    }
+
+    // (see `is_pollable` below for which routers this skips)
     /// Poll every enabled router to refresh cached tunnel/BGP session/route state
     /// and record per-tunnel traffic samples.
     ///
@@ -757,7 +1178,7 @@ impl Worker {
     /// for BGP). All route/tunnel queries used here are bounded and full-table safe.
     pub async fn sync_router_state(&self) -> Result<()> {
         let routers = self.db.list_routers().await?;
-        for router in routers.iter().filter(|r| r.enabled) {
+        for router in routers.iter().filter(|r| is_pollable(r)) {
             if let Err(e) = self.sync_one_router(router.id).await {
                 error!("Failed to sync router {}: {}", router.id, e);
             }
@@ -1041,7 +1462,133 @@ impl Worker {
             }
         }
 
+        if let Err(e) = self.check_never_paid_subscriptions().await {
+            error!("Failed to sweep never-paid subscriptions: {}", e);
+        }
+
         self.set_last_check_subscriptions(Utc::now()).await?;
+        Ok(())
+    }
+
+    /// Purge subscriptions whose first payment never arrived.
+    ///
+    /// Nothing else revisits these. `handle_subscription_state` reads
+    /// `list_lifecycle_subscriptions`, which is active-with-an-expiry, and an
+    /// abandoned checkout is neither, so without this an order that was never
+    /// paid for lives in the database for good. For a VPN plan that is worse
+    /// than clutter: `create_vpn_plan` returns an existing plan whenever its
+    /// state is not `Expired`, and `Unpaid` is not `Expired`, so the customer
+    /// stays pinned to a subscription at the price it was created at with no
+    /// way to get a current one.
+    ///
+    /// VMs are deliberately not touched here. `check_vms` already purges
+    /// never-paid ones on its own (shorter) clock, and it has to — it has a
+    /// hypervisor to talk to, which this does not.
+    pub async fn check_never_paid_subscriptions(&self) -> Result<()> {
+        let now = Utc::now();
+        let subs = self
+            .db
+            .list_never_paid_subscriptions(NEVER_PAID_SUBSCRIPTION_TTL.num_seconds() as u64)
+            .await?;
+        for sub in &subs {
+            if let Err(e) = self.purge_never_paid_subscription(sub, now).await {
+                error!("Failed to purge never-paid subscription {}: {}", sub.id, e);
+                self.queue_admin_notification(
+                    format!("Failed to purge never-paid subscription {}:\n{}", sub.id, e),
+                    Some(format!("Subscription {} Purge Failed", sub.id)),
+                )
+                .await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Release one never-paid subscription's product rows, then the subscription.
+    ///
+    /// Never paid means never provisioned, for every product: the operator's
+    /// gate gives a `BillingState::Unpaid` deployment no cluster objects at
+    /// all, and the VPN planner's peer set is joined through `is_setup`. So
+    /// there is nothing running to tear down here, only rows to remove.
+    async fn purge_never_paid_subscription(
+        &self,
+        sub: &Subscription,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        // Re-read: a payment may have settled between the listing snapshot and
+        // now, and purging then would delete a subscription the customer has
+        // just paid for.
+        let current = self.db.get_subscription(sub.id).await?;
+        if current.is_setup {
+            info!(
+                "Subscription {} was paid since last check, keeping it",
+                sub.id
+            );
+            return Ok(());
+        }
+
+        let payments = self.db.list_subscription_payments(sub.id).await?;
+        let grace = onchain_unpaid_purge_grace(self.db.as_ref()).await;
+        if payments
+            .iter()
+            .any(|p| payment_blocks_unpaid_deletion(p, now, grace))
+        {
+            info!(
+                "Subscription {} has pending or detected unpaid payments, keeping it",
+                sub.id
+            );
+            return Ok(());
+        }
+
+        let line_items: Vec<_> = self
+            .db
+            .list_subscription_line_items(sub.id)
+            .await?
+            .into_iter()
+            .filter(|li| li.is_active())
+            .collect();
+        if line_items
+            .iter()
+            .any(|li| li.subscription_type == LineItemType::Vps)
+        {
+            return Ok(());
+        }
+
+        // Whether the subscription row itself still needs removing at the end.
+        // `hard_delete_app_deployment` takes it with the deployment when it
+        // bills nothing else, so a second delete would be pointless.
+        let mut purged_with_product = false;
+        for li in &line_items {
+            match li.subscription_type {
+                LineItemType::Vpn => {
+                    if let Some(plan) = self.db.get_vpn_subscription_by_line_item(li.id).await? {
+                        info!("Purging never-paid VPN plan {}", plan.id);
+                        self.db.delete_vpn_subscription(plan.id).await?;
+                    }
+                }
+                LineItemType::App => {
+                    let deployment = self.db.get_app_deployment_by_line_item(li.id).await?;
+                    info!("Purging never-paid app deployment {}", deployment.id);
+                    self.db.hard_delete_app_deployment(deployment.id).await?;
+                    purged_with_product = true;
+                }
+                LineItemType::MarketplaceNodeFee => {
+                    // The node itself is not the customer's order here, the fee
+                    // is: unlisting it would destroy an operator's registration
+                    // over an unpaid listing fee. Only the billing link goes.
+                    let mut node = self.db.get_marketplace_node_by_line_item(li.id).await?;
+                    node.subscription_line_item_id = None;
+                    self.db.update_marketplace_node(&node).await?;
+                }
+                // IP range and ASN subscriptions cascade off the line item, and
+                // DNS hosting has no product row at all.
+                _ => {}
+            }
+        }
+
+        if !purged_with_product {
+            self.db.hard_delete_subscription(sub.id).await?;
+        }
+        info!("Purged never-paid subscription {}", sub.id);
         Ok(())
     }
 
@@ -1103,7 +1650,8 @@ impl Worker {
                 );
                 let moved = self.db.get_vm(vm.id).await?;
                 let host = self.db.get_host(moved.host_id).await?;
-                let client = get_host_client(&host, &self.settings.provisioner_config)?;
+                let client =
+                    get_host_client(&self.db, &host, &self.settings.provisioner_config).await?;
                 match client.get_vm_state(&moved).await {
                     Ok(s) => self.vm_state_cache.set_state(moved.id, s).await?,
                     Err(e) => warn!(
@@ -1157,7 +1705,7 @@ impl Worker {
     /// are omitted.
     async fn list_unmanaged_vms(&self, host_id: u64) -> Result<Vec<lnvps_api_common::HostVmSpec>> {
         let host = self.db.get_host(host_id).await?;
-        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.settings.provisioner_config).await?;
         let all = client.list_host_vms().await?;
 
         let mut unmanaged = Vec::new();
@@ -1166,6 +1714,13 @@ impl Worker {
                 // Outside the managed id range, not importable
                 continue;
             };
+            // A probe is LNVPS's own VM on the operator's machine, not something
+            // to offer for import. Its domain name parses to an id past any
+            // AUTO_INCREMENT column, which is what keeps the two apart — but
+            // parsing is not enough of a guard on its own.
+            if crate::provisioner::is_probe(mapped) {
+                continue;
+            }
             match self.db.get_vm(mapped).await {
                 Ok(vm) if !vm.deleted => continue, // already tracked
                 _ => unmanaged.push(spec),
@@ -1179,7 +1734,7 @@ impl Worker {
     async fn check_vm(&self, vm: &Vm) -> Result<()> {
         debug!("Checking VM: {}", vm.id);
         let host = self.db.get_host(vm.host_id).await?;
-        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.settings.provisioner_config).await?;
         self.handle_vm_state(
             client
                 .get_vm_state(vm)
@@ -1370,7 +1925,7 @@ impl Worker {
     async fn check_vms_on_host(&self, host_id: u64, vms: &[&Vm]) -> Result<()> {
         debug!("Checking {} VMs on host {}", vms.len(), host_id);
         let host = self.db.get_host(host_id).await?;
-        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.settings.provisioner_config).await?;
 
         let states = client.get_all_vm_states().await?;
         let state_map: HashMap<u64, VmRunningState> = states.into_iter().collect();
@@ -1400,9 +1955,19 @@ impl Worker {
 
     /// Spawn a VM and send notifications
     async fn spawn_vm_internal(&self, vm: &Vm) -> Result<()> {
+        if !self.ip_orders.gate_vm(vm).await? {
+            info!(
+                "VM {} is waiting for an IP address, not spawning yet",
+                vm.id
+            );
+            return Ok(());
+        }
         let provisioner = self.subscription_handler.vm_provisioner();
         let pipeline = provisioner.spawn_vm_pipeline(vm.id).await?;
         pipeline.execute().await?;
+        if let Err(e) = self.db.delete_vm_ip_wait(vm.id).await {
+            warn!("Failed to clear the IP wait of VM {}: {}", vm.id, e);
+        }
 
         // Log VM created
         if let Err(e) = self
@@ -1497,6 +2062,12 @@ impl Worker {
             return Ok(());
         }
 
+        // Runs before the deletion pass below so a deposit found to be replaced
+        // stops blocking its VM on this same sweep. Gates itself internally.
+        if let Err(e) = self.check_conflicted_deposits().await {
+            error!("Failed to check for replaced deposits: {}", e);
+        }
+
         // check VM status from db vm list
         let db_vms = self.db.list_vms().await?;
         let provisioner = self.subscription_handler.vm_provisioner();
@@ -1529,6 +2100,7 @@ impl Worker {
             }
         }
 
+        let grace = onchain_unpaid_purge_grace(self.db.as_ref()).await;
         // Process deletions first
         for vm in vms_to_delete {
             // Re-read the subscription to guard against a race condition where a
@@ -1568,7 +2140,10 @@ impl Worker {
                 .db
                 .list_vm_subscription_payments(vm.id)
                 .await
-                .map(|ps| ps.iter().any(|p| payment_blocks_unpaid_vm_deletion(p, now)))
+                .map(|ps| {
+                    ps.iter()
+                        .any(|p| payment_blocks_unpaid_deletion(p, now, grace))
+                })
                 .unwrap_or(false)
             {
                 info!(
@@ -1621,6 +2196,13 @@ impl Worker {
     /// slowly, and the check costs an aggregate query per metered VM.
     const CHECK_TRANSFER_SECONDS: i64 = 3600;
 
+    /// How often unconfirmed deposits are checked for replacement.
+    ///
+    /// Costs an explorer lookup per input of every unconfirmed deposit, and a
+    /// replaced transaction stays replaced, so there is nothing to be gained
+    /// from asking more often.
+    const CHECK_DEPOSITS_SECONDS: i64 = 3600;
+
     /// Key marking a warning as already sent, scoped to the VM, the quota month
     /// and the threshold.
     ///
@@ -1632,11 +2214,7 @@ impl Worker {
     }
 
     /// Warn customers whose VMs are at or past their monthly transfer
-    /// allowance.
-    ///
-    /// Warning only — nothing here throttles, suspends or bills. The figures
-    /// come from hypervisor interface counters and include traffic that is not
-    /// billable internet egress, so they are not yet a basis for enforcement.
+    /// allowance, and throttle or restore their NIC as they cross it.
     async fn check_transfer_quotas(&self) -> Result<()> {
         let last_check = self.get_last_check_transfer().await?;
         if Utc::now().signed_duration_since(last_check).num_seconds() < Self::CHECK_TRANSFER_SECONDS
@@ -1670,16 +2248,27 @@ impl Worker {
                 },
                 _ => None,
             };
-            // Unmetered: there is no allowance to be near.
-            let Some(quota_gb) = quota_gb.filter(|g| *g > 0) else {
-                continue;
+            let over = match quota_gb.filter(|g| *g > 0) {
+                Some(quota_gb) => {
+                    match self
+                        .check_vm_transfer_quota(&vm, quota_gb, period_start, period_end)
+                        .await
+                    {
+                        Ok(over) => over,
+                        Err(e) => {
+                            warn!("Failed to check transfer quota for VM {}: {}", vm.id, e);
+                            continue;
+                        }
+                    }
+                }
+                None => false,
             };
 
             if let Err(e) = self
-                .check_vm_transfer_quota(&vm, quota_gb, period_start, period_end)
+                .sync_transfer_throttle(&vm, quota_gb, over, period_start)
                 .await
             {
-                warn!("Failed to check transfer quota for VM {}: {}", vm.id, e);
+                warn!("Failed to sync transfer throttle for VM {}: {}", vm.id, e);
             }
         }
 
@@ -1687,19 +2276,83 @@ impl Worker {
         Ok(())
     }
 
+    fn transfer_throttle_key(vm_id: u64) -> String {
+        format!("vm-transfer-throttled:{vm_id}")
+    }
+
+    /// Make sure the VM's NIC matches whether it is over its allowance.
+    ///
+    /// The key records what was last *applied* to the host, and only
+    /// [`Self::configure_vm`] writes it, once the host has accepted the config.
+    /// While the two disagree a reconfigure is queued on every pass, so a
+    /// reconfigure that fails (and is dead-lettered) is retried an hour later
+    /// instead of the VM being left at full speed with the throttle believed
+    /// to be in place.
+    async fn sync_transfer_throttle(
+        &self,
+        vm: &Vm,
+        quota_gb: Option<u32>,
+        over: bool,
+        period_start: NaiveDate,
+    ) -> Result<()> {
+        let key = Self::transfer_throttle_key(vm.id);
+        let applied = match self.kv.get(&key).await? {
+            Some(v) => v.first() == Some(&1),
+            None => {
+                let previous_period = period_start.pred_opt().unwrap_or(period_start);
+                lnvps_api_common::vm_over_transfer_quota(&self.db, vm.id, quota_gb, previous_period)
+                    .await?
+            }
+        };
+        if applied != over {
+            info!(
+                "{} network for VM {} (transfer allowance {})",
+                if over { "Throttling" } else { "Restoring" },
+                vm.id,
+                if over { "exceeded" } else { "reset" }
+            );
+            self.work_commander
+                .send(WorkJob::ConfigureVm {
+                    vm_id: vm.id,
+                    admin_user_id: None,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Record the transfer throttle state a successful reconfigure put on the
+    /// host, so [`Self::sync_transfer_throttle`] stops re-queuing it.
+    async fn record_applied_transfer_throttle(&self, info: &FullVmInfo) {
+        if let Err(e) = self
+            .kv
+            .store(
+                &Self::transfer_throttle_key(info.vm.id),
+                &[info.transfer_throttled as u8],
+            )
+            .await
+        {
+            warn!(
+                "VM {} was reconfigured but its transfer throttle state was not recorded: {}",
+                info.vm.id, e
+            );
+        }
+    }
+
     /// Warn about one VM if it has crossed a threshold it has not been warned
-    /// about this month.
+    /// about this month. Returns whether it is over its allowance.
     async fn check_vm_transfer_quota(
         &self,
         vm: &Vm,
         quota_gb: u32,
         period_start: NaiveDate,
         period_end: NaiveDate,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let (_, bytes_out) = self
             .db
             .get_vm_traffic_total(vm.id, period_start, period_end)
             .await?;
+        let over = lnvps_api_common::transfer_quota_exceeded(bytes_out, quota_gb);
 
         let quota_bytes = quota_gb as u64 * 1_000_000_000;
         let used_pct = (bytes_out as f64 / quota_bytes as f64 * 100.0) as u64;
@@ -1708,36 +2361,39 @@ impl Worker {
             .into_iter()
             .find(|t| used_pct >= *t as u64)
         else {
-            return Ok(());
+            return Ok(over);
         };
 
         let key = Self::transfer_warned_key(vm.id, period_start, threshold);
         if self.kv.get(&key).await?.is_some() {
-            return Ok(());
+            return Ok(over);
         }
 
         let used_gb = bytes_out as f64 / 1_000_000_000.0;
+        let resets = period_end.succ_opt().unwrap_or(period_end);
         let message = if threshold >= 100 {
             format!(
                 "VM {} has used {:.1} GB of its {} GB monthly outbound transfer allowance ({}%).\n\n\
-                 Your VM has not been throttled, suspended or charged for the excess — this is a \
-                 notification only. The allowance resets on {}.",
+                 Its network is now limited to {} Mbit/s. Full speed returns when the allowance \
+                 resets on {}.",
                 vm.id,
                 used_gb,
                 quota_gb,
                 used_pct,
-                period_end.succ_opt().unwrap_or(period_end)
+                lnvps_api_common::TRANSFER_THROTTLE_MBPS,
+                resets
             )
         } else {
             format!(
                 "VM {} has used {:.1} GB of its {} GB monthly outbound transfer allowance ({}%).\n\n\
-                 The allowance resets on {}. Nothing changes if you exceed it — this is an early \
-                 notice, not a warning of any action.",
+                 Once it reaches 100% its network is limited to {} Mbit/s until the allowance \
+                 resets on {}.",
                 vm.id,
                 used_gb,
                 quota_gb,
                 used_pct,
-                period_end.succ_opt().unwrap_or(period_end)
+                lnvps_api_common::TRANSFER_THROTTLE_MBPS,
+                resets
             )
         };
 
@@ -1754,7 +2410,7 @@ impl Worker {
         // Marked only after the notification is queued, so a failure to queue
         // is retried on the next pass rather than silently suppressed.
         self.kv.store(&key, &[1u8]).await?;
-        Ok(())
+        Ok(over)
     }
 
     pub async fn get_last_check_transfer(&self) -> Result<DateTime<Utc>> {
@@ -1774,6 +2430,90 @@ impl Worker {
         self.kv
             .store("worker-last-check-transfer", &t.to_le_bytes())
             .await?;
+        Ok(())
+    }
+
+    pub async fn get_last_check_deposits(&self) -> Result<DateTime<Utc>> {
+        let Some(v) = self.kv.get("worker-last-check-deposits").await? else {
+            return Ok(DateTime::UNIX_EPOCH);
+        };
+        let timestamp = if v.len() == 8 {
+            u64::from_le_bytes(v.as_slice().try_into()?)
+        } else {
+            0
+        };
+        Ok(DateTime::from_timestamp(timestamp as _, 0).unwrap_or(DateTime::UNIX_EPOCH))
+    }
+
+    pub async fn set_last_check_deposits(&self, ts: DateTime<Utc>) -> Result<()> {
+        let t = ts.timestamp() as u64;
+        self.kv
+            .store("worker-last-check-deposits", &t.to_le_bytes())
+            .await?;
+        Ok(())
+    }
+
+    /// Forget the deposit outpoint on unpaid on-chain payments whose deposit
+    /// transaction can no longer confirm.
+    ///
+    /// A detected deposit blocks deletion of the resource it was meant to pay
+    /// for, because confirmation can land long after the quote expires
+    /// (issue #194). When the customer's wallet replaces that transaction with
+    /// one that does not pay us, nothing ever arrives for the watched address
+    /// and the block would last forever. Clearing `external_id` puts the
+    /// payment back to plain unpaid, and the ordinary never-paid sweep then
+    /// deletes the VM or subscription as it would have all along.
+    ///
+    /// Only quotes that have already expired are examined: inside the quote
+    /// window, a transaction the explorer has not heard of is far more likely
+    /// to have just been broadcast than to be dead.
+    ///
+    /// Nothing is settled or refunded here: if the deposit somehow does confirm
+    /// later, it is still matched by receive address and credited.
+    async fn check_conflicted_deposits(&self) -> Result<()> {
+        let Some(explorer) = self.chain_explorer.clone() else {
+            return Ok(());
+        };
+        let last_check = self.get_last_check_deposits().await?;
+        let now = Utc::now();
+        if now.signed_duration_since(last_check).num_seconds() < Self::CHECK_DEPOSITS_SECONDS {
+            return Ok(());
+        }
+
+        let payments = self
+            .db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        for mut payment in payments
+            .into_iter()
+            .filter(|p| !p.is_paid && p.external_id.is_some() && p.expires < now)
+        {
+            let Some(deposit) = payment.external_id.as_deref().and_then(OutPoint::parse) else {
+                continue;
+            };
+            match deposit_dead(explorer.as_ref(), &deposit.txid).await {
+                Ok(Some(reason)) => {
+                    info!(
+                        "Deposit {} for payment {} cannot confirm ({:?}), clearing it",
+                        deposit,
+                        hex::encode(&payment.id),
+                        reason
+                    );
+                    payment.external_id = None;
+                    if let Err(e) = self.db.update_subscription_payment(&payment).await {
+                        error!(
+                            "Failed to clear dead deposit on payment {}: {}",
+                            hex::encode(&payment.id),
+                            e
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => warn!("Failed to check deposit {}: {}", deposit, e),
+            }
+        }
+
+        self.set_last_check_deposits(Utc::now()).await?;
         Ok(())
     }
 
@@ -1836,6 +2576,55 @@ impl Worker {
             Some(&html_message),
         )
         .await
+    }
+
+    async fn send_abuse_notice(
+        &self,
+        user_id: u64,
+        subject: &str,
+        message: &str,
+        action_id: Option<u64>,
+    ) -> Result<(), OpError<anyhow::Error>> {
+        let user = self
+            .db
+            .get_user(user_id)
+            .await
+            .map_err(|e| OpError::Transient(anyhow::Error::from(e)))?;
+        let mut delivered = false;
+        if !user.email.is_empty()
+            && let Some(smtp) = self.settings.smtp.as_ref()
+        {
+            send_email(smtp, user.email.as_str(), subject, message, None).await?;
+            delivered = true;
+        }
+        let notification = Notification::new(Some(subject.to_string()), message.to_string());
+        for channel in &self.notification_channels {
+            if channel.name() == "email" || !channel.wants(&user) {
+                continue;
+            }
+            match channel.send(&user, &notification).await {
+                Ok(()) => delivered = true,
+                Err(OpError::Fatal(e)) => warn!(
+                    "Permanent {} abuse notice error for user {}: {}",
+                    channel.name(),
+                    user_id,
+                    e
+                ),
+                Err(OpError::Transient(e)) => return Err(OpError::Transient(e)),
+            }
+        }
+        if delivered && let Some(id) = action_id {
+            self.db
+                .set_abuse_action_notified(id)
+                .await
+                .map_err(|e| OpError::Transient(anyhow::Error::from(e)))?;
+        } else if !delivered {
+            warn!(
+                "Abuse notice for user {} had no way to be delivered",
+                user_id
+            );
+        }
+        Ok(())
     }
 
     async fn queue_notification(&self, user_id: u64, message: String, title: Option<String>) {
@@ -1972,7 +2761,8 @@ impl Worker {
         if host.kind == VmHostKind::Dummy {
             return Ok(());
         }
-        let client = match get_host_client(host, &self.settings.provisioner_config) {
+        let client = match get_host_client(&self.db, host, &self.settings.provisioner_config).await
+        {
             Ok(h) => h,
             Err(e) => bail!("Failed to get host client: {} {}", host.name, e),
         };
@@ -1988,8 +2778,43 @@ impl Worker {
             );
         }
 
+        self.reconcile_host_disks(host, &info.disks).await?;
+
+        // A marketplace node reports its own hardware over the control API. It
+        // has no SSH account to give LNVPS and no reason to — the detection is
+        // the same code, running on the machine that knows the answer.
+        if host.kind == VmHostKind::MarketplaceNode {
+            if let Err(e) = self.read_node_inventory(host).await {
+                warn!("Failed to read inventory from node {}: {:?}", host.name, e);
+            }
+        } else {
+            // Run host-info utility to detect CPU/GPU features (only if binary exists)
+            match get_host_info_path() {
+                Some(p) if p.exists() => {
+                    if let Err(e) = self.run_host_info(host).await {
+                        warn!("Failed to run host-info on {}: {:?}", host.name, e);
+                    }
+                }
+                _ => {
+                    warn!(
+                        "Host-info detection disabled: binary not found (expected at {:?})",
+                        get_host_info_path()
+                    );
+                }
+            }
+        }
+
+        self.patch_host_vms(host, client.as_ref()).await
+    }
+
+    /// Bring `vm_host_disk` in line with the pools the host reports.
+    async fn reconcile_host_disks(
+        &self,
+        host: &VmHost,
+        reported: &[lnvps_api_common::host::VmHostDiskInfo],
+    ) -> Result<()> {
         let mut host_disks = self.db.list_host_disks(host.id).await?;
-        for disk in &info.disks {
+        for disk in reported {
             if let Some(hd) = host_disks.iter_mut().find(|d| d.name == disk.name) {
                 if hd.size != disk.size {
                     hd.size = disk.size;
@@ -1999,27 +2824,46 @@ impl Worker {
                         hd.name, hd.size, hd.kind, hd.interface
                     );
                 }
+            } else if host.kind == VmHostKind::MarketplaceNode {
+                // A marketplace node's pools are the ones its own daemon
+                // created, so every pool it exposes is ours to sell and there
+                // is no admin to map them by hand — a node is enrolled by its
+                // operator, and approval is the gate. On an LNVPS-owned host
+                // the opposite holds: `local` and `backups` are pools nobody
+                // means to sell, so those still only warn.
+                //
+                // Type and interface are not in what libvirt reports about a
+                // pool, and the capacity is the filesystem's. Both are what an
+                // admin edits afterwards; the row exists so the node can be
+                // placed on at all.
+                let mut new_disk = VmHostDisk {
+                    id: 0,
+                    host_id: host.id,
+                    name: disk.name.clone(),
+                    size: disk.size,
+                    kind: DiskType::SSD,
+                    interface: DiskInterface::PCIe,
+                    enabled: true,
+                };
+                new_disk.id = self.db.create_host_disk(&new_disk).await?;
+                info!(
+                    "Imported host disk {} on {}: size={},type={},interface={}",
+                    new_disk.name, host.name, new_disk.size, new_disk.kind, new_disk.interface
+                );
+                host_disks.push(new_disk);
             } else {
                 warn!("Un-mapped host disk {}", disk.name);
             }
         }
+        Ok(())
+    }
 
-        // Run host-info utility to detect CPU/GPU features (only if binary exists)
-        match get_host_info_path() {
-            Some(p) if p.exists() => {
-                if let Err(e) = self.run_host_info(host).await {
-                    warn!("Failed to run host-info on {}: {:?}", host.name, e);
-                }
-            }
-            _ => {
-                warn!(
-                    "Host-info detection disabled: binary not found (expected at {:?})",
-                    get_host_info_path()
-                );
-            }
-        }
-
-        // Patch config + firewall configuration for all VMs on this host
+    /// Re-apply config and firewall to every live VM on a host.
+    async fn patch_host_vms(
+        &self,
+        host: &VmHost,
+        client: &dyn lnvps_api_common::host::VmHostClient,
+    ) -> Result<()> {
         let vms = self.db.list_vms_on_host(host.id).await?;
         for vm in &vms {
             // Sweep up orphaned/unused disks for every live VM. Repeated
@@ -2192,6 +3036,41 @@ impl Worker {
             .filter_map(|f| f.parse().ok())
             .collect();
 
+        self.store_cpu_info(host, cpu_mfg, cpu_arch, cpu_features)
+            .await
+    }
+
+    /// Read a marketplace node's own hardware report, over the tunnel.
+    async fn read_node_inventory(&self, host: &mut VmHost) -> Result<()> {
+        let control = self
+            .settings
+            .node_control
+            .as_ref()
+            .context("No marketplace control key is configured, so nodes cannot be called")?;
+        let node_id = host
+            .marketplace_node_id
+            .context("Host is a marketplace node with no node behind it")?;
+        let node = self.db.get_marketplace_node(node_id).await?;
+        let status = control.status(&node, host).await?;
+
+        let cpu = status.inventory.cpu;
+        let cpu_mfg = CpuMfg::from_str(&cpu.mfg).unwrap_or(CpuMfg::Unknown);
+        let cpu_arch = CpuArch::from_str(&cpu.arch).unwrap_or(CpuArch::Unknown);
+        let cpu_features: Vec<CpuFeature> =
+            cpu.features.iter().filter_map(|f| f.parse().ok()).collect();
+
+        self.store_cpu_info(host, cpu_mfg, cpu_arch, cpu_features)
+            .await
+    }
+
+    /// Write detected CPU facts to the host, if they changed.
+    async fn store_cpu_info(
+        &self,
+        host: &mut VmHost,
+        cpu_mfg: CpuMfg,
+        cpu_arch: CpuArch,
+        cpu_features: Vec<CpuFeature>,
+    ) -> Result<()> {
         let features_changed = host.cpu_mfg != cpu_mfg
             || host.cpu_arch != cpu_arch
             || host.cpu_features.0 != cpu_features;
@@ -2799,6 +3678,26 @@ impl Worker {
             WorkJob::CheckSubscriptions => {
                 self.check_subscriptions().await?;
             }
+            WorkJob::PurgeExpiredRecords => {
+                let removed = self
+                    .db
+                    .purge_swap_order_clients(CLIENT_RECORD_RETENTION_DAYS)
+                    .await?;
+                if removed > 0 {
+                    info!("Purged {} expired swap order client records", removed);
+                }
+                let ips = self
+                    .db
+                    .purge_user_geo_ips(CLIENT_RECORD_RETENTION_DAYS)
+                    .await?;
+                if ips > 0 {
+                    info!("Cleared {} expired user IP addresses", ips);
+                }
+                let cases = self.db.purge_abuse_cases().await?;
+                if cases > 0 {
+                    info!("Purged {} expired abuse cases", cases);
+                }
+            }
             WorkJob::ProcessReferralPayouts => {
                 self.referral_payouts.process_payouts().await?;
             }
@@ -2807,10 +3706,14 @@ impl Worker {
             }
             #[cfg(feature = "linux-ssh")]
             WorkJob::ProbeMarketplaceNode => {
+                self.alert_quiet_marketplace_nodes(chrono::Utc::now())
+                    .await?;
                 self.probe_marketplace_node().await?;
             }
             #[cfg(not(feature = "linux-ssh"))]
             WorkJob::ProbeMarketplaceNode => {
+                self.alert_quiet_marketplace_nodes(chrono::Utc::now())
+                    .await?;
                 // A build without SSH cannot log into a probe VM, and a probe
                 // that only created and destroyed one would report a node
                 // healthy on the strength of nothing.
@@ -2862,11 +3765,28 @@ impl Worker {
                 reason,
                 admin_user_id,
                 purge,
+                by_owner,
             } => {
                 let vm = self.db.get_vm(*vm_id).await?;
                 if vm.deleted {
                     return Ok(None);
                 }
+
+                // Read the paid-through time before deleting: deletion stops
+                // billing, and an hourly VM's unused time is returned to its
+                // owner's credit afterwards.
+                let unused_refund_basis = if *by_owner {
+                    match self
+                        .db
+                        .get_subscription_by_line_item_id(vm.subscription_line_item_id)
+                        .await
+                    {
+                        Ok(s) => s.expires.map(|e| (e, Utc::now())),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
 
                 // A VM that has never had its first (purchase) payment confirmed
                 // carries no customer data, so purge it entirely. Super-admins
@@ -2889,20 +3809,84 @@ impl Worker {
                 // Only record deletion history for soft-deleted VMs.
                 if !hard_delete {
                     // Log VM deletion
-                    let metadata = if let Some(admin_id) = admin_user_id {
-                        Some(serde_json::json!({
-                            "admin_user_id": admin_id,
-                            "admin_action": true
-                        }))
+                    let (metadata, initiated_by) = if *by_owner {
+                        (
+                            Some(serde_json::json!({ "admin_action": false })),
+                            Some(vm.user_id),
+                        )
+                    } else if let Some(admin_id) = admin_user_id {
+                        (
+                            Some(serde_json::json!({
+                                "admin_user_id": admin_id,
+                                "admin_action": true
+                            })),
+                            *admin_user_id,
+                        )
                     } else {
-                        Some(serde_json::json!({
-                            "admin_action": true
-                        }))
+                        (
+                            Some(serde_json::json!({
+                                "admin_action": true
+                            })),
+                            None,
+                        )
                     };
 
                     self.vm_history_logger
-                        .log_vm_deleted(*vm_id, *admin_user_id, reason.as_deref(), metadata)
+                        .log_vm_deleted(*vm_id, initiated_by, reason.as_deref(), metadata)
                         .await?;
+                }
+
+                // The VM is gone and billing has stopped, so a refund that
+                // fails is money to hand back by hand, not a reason to retry the
+                // job: a redelivery would find the VM deleted and do nothing.
+                let mut credit_returned = Vec::new();
+                if let Some((expires, at)) = unused_refund_basis {
+                    match self
+                        .refunds
+                        .refund_unused_to_credit(*vm_id, vm.user_id, expires, at)
+                        .await
+                    {
+                        Ok(c) => credit_returned = c,
+                        Err(e) => {
+                            error!(
+                                "VM {} was deleted by its owner but returning its unused time \
+                                 to account credit failed: {}",
+                                vm_id, e
+                            );
+                            self.queue_admin_notification(
+                                format!(
+                                    "VM {} was deleted by user {} but the unused time could not be \
+                                     returned to their account credit: {}",
+                                    vm_id, vm.user_id, e
+                                ),
+                                Some(format!("[VM{}] Credit refund failed", vm_id)),
+                            )
+                            .await;
+                        }
+                    }
+                }
+
+                if *by_owner {
+                    let msg = if !credit_returned.is_empty() {
+                        format!(
+                            "Your VM #{} has been deleted and billing has stopped. The unused \
+                             time ({}) was returned to your account credit.",
+                            vm_id,
+                            crate::refund::describe_credit(&credit_returned)
+                        )
+                    } else {
+                        format!(
+                            "Your VM #{} has been deleted and billing has stopped.",
+                            vm_id
+                        )
+                    };
+                    self.queue_notification(
+                        vm.user_id,
+                        msg,
+                        Some(format!("[VM{}] Deleted", vm_id)),
+                    )
+                    .await;
+                    return Ok(Some(format!("VM {} deleted by its owner", vm_id)));
                 }
 
                 // Send notifications
@@ -3139,6 +4123,40 @@ impl Worker {
                     Err(e) => format!("VM {} reinstall failed: {}", vm_id, e),
                 }));
             }
+            WorkJob::VmSnapshot {
+                vm_id,
+                user_id,
+                action,
+                reply_channel,
+            } => {
+                let result = self
+                    .subscription_handler
+                    .vm_provisioner()
+                    .run_snapshot_action(*vm_id, *user_id, action, &self.vm_history_logger)
+                    .await;
+                if !matches!(action, SnapshotAction::Delete { .. })
+                    && let Err(e) = self
+                        .work_commander
+                        .send(WorkJob::CheckVm { vm_id: *vm_id })
+                        .await
+                {
+                    warn!(
+                        "Failed to queue CheckVm after snapshot of VM {}: {}",
+                        vm_id, e
+                    );
+                }
+                if let Err(e) = self
+                    .feedback
+                    .publish(JobFeedback::snapshot_reply(reply_channel.clone(), &result))
+                    .await
+                {
+                    warn!("Failed to publish VmSnapshot reply for VM {}: {}", vm_id, e);
+                }
+                return Ok(Some(match &result {
+                    Ok(()) => format!("VM {} snapshot {} done", vm_id, action.name()),
+                    Err(e) => format!("VM {} snapshot {} failed: {}", vm_id, action.name(), e),
+                }));
+            }
             WorkJob::ApplyVmFirewall { vm_id } => {
                 self.apply_vm_firewall(*vm_id).await?;
             }
@@ -3211,6 +4229,7 @@ impl Worker {
                         )),
                         admin_user_id: Some(*admin_user_id),
                         purge: false,
+                        by_owner: false,
                     })
                     .await
                 {
@@ -3220,12 +4239,21 @@ impl Worker {
                     );
                 }
 
+                let credit_note = if !outcome.credit_returned.is_empty() {
+                    format!(
+                        " {} paid with account credit were returned to your balance.",
+                        crate::refund::describe_credit(&outcome.credit_returned)
+                    )
+                } else {
+                    String::new()
+                };
                 self.queue_notification(
                     vm.user_id,
                     format!(
-                        "Your VM #{} has been refunded {} sats and will be deleted.",
+                        "Your VM #{} has been refunded {} sats and will be deleted.{}",
                         vm_id,
-                        outcome.amount_msat / 1000
+                        outcome.amount_msat / 1000,
+                        credit_note
                     ),
                     Some(format!("[VM{}] Refunded", vm_id)),
                 )
@@ -3251,16 +4279,18 @@ impl Worker {
                 ref_code,
                 admin_user_id,
                 reason,
+                host_id,
             } => {
                 info!("Admin {} creating VM for user {}", admin_user_id, user_id);
                 let provisioner = self.subscription_handler.vm_provisioner();
                 let vm = provisioner
-                    .provision(
+                    .provision_on_host(
                         *user_id,
                         *template_id,
                         *image_id,
                         *ssh_key_id,
                         ref_code.clone(),
+                        *host_id,
                     )
                     .await?;
 
@@ -3507,8 +4537,53 @@ impl Worker {
                     }
                 }
             }
+            WorkJob::SendAbuseNotice {
+                user_id,
+                subject,
+                message,
+                action_id,
+            } => {
+                if let Err(OpError::Transient(e)) = self
+                    .send_abuse_notice(*user_id, subject, message, *action_id)
+                    .await
+                {
+                    return Err(e);
+                }
+            }
+            WorkJob::SendAbuseReporterEmail {
+                to,
+                subject,
+                message,
+            } => {
+                let Some(smtp) = self.settings.smtp.as_ref() else {
+                    return Ok(None);
+                };
+                match send_email(smtp, to, subject, message, None).await {
+                    Ok(()) => {}
+                    Err(OpError::Fatal(e)) => warn!("Abuse reporter email to {} failed: {}", to, e),
+                    Err(OpError::Transient(e)) => return Err(e),
+                }
+            }
             WorkJob::DownloadOsImages { image_id } => {
                 self.download_os_images(*image_id).await?;
+            }
+            WorkJob::RefreshOsImageChecksums => {
+                self.refresh_os_image_checksums().await?;
+            }
+            WorkJob::ProcessIpOrder { order_id } => {
+                self.ip_orders.process_order(*order_id).await?;
+            }
+            WorkJob::CheckIpOrders => {
+                self.ip_orders.sweep().await?;
+            }
+            WorkJob::ReleaseIpRange {
+                ip_range_id,
+                admin_user_id,
+            } => {
+                self.ip_orders
+                    .release_range(*ip_range_id, *admin_user_id)
+                    .await?;
+                return Ok(Some(format!("Released IP range {}", ip_range_id)));
             }
             WorkJob::PatchIpRangeDns {
                 ip_range_id,
@@ -3561,30 +4636,34 @@ impl Worker {
             self.db.list_os_image().await?
         };
 
-        // Resolve and persist sha2/sha2_url for any image that is missing them
         let mut images = images;
-        for image in &mut images {
-            if image.sha2.is_none() {
-                self.resolve_and_persist_sha2(image).await;
+        self.refresh_checksums(&mut images).await;
+
+        let hosts = self.reconcile_hosts().await?;
+        let mut clients: Vec<(String, Arc<dyn VmHostClient>)> = Vec::new();
+        for host in &hosts {
+            match get_host_client(&self.db, host, &self.settings.provisioner_config).await {
+                Ok(c) => clients.push((host.name.clone(), c)),
+                Err(e) => warn!("Failed to get client for host {}: {}", host.name, e),
             }
         }
 
-        let hosts = self.reconcile_hosts().await?;
-        let clients: Vec<(String, Arc<dyn VmHostClient>)> = hosts
-            .iter()
-            .filter_map(
-                |host| match get_host_client(host, &self.settings.provisioner_config) {
-                    Ok(c) => Some((host.name.clone(), c)),
-                    Err(e) => {
-                        warn!("Failed to get client for host {}: {}", host.name, e);
-                        None
-                    }
-                },
-            )
-            .collect();
-
         download_images_on_hosts(clients, &images).await;
         Ok(())
+    }
+
+    async fn refresh_os_image_checksums(&self) -> Result<()> {
+        let mut images = self.db.list_os_image().await?;
+        self.refresh_checksums(&mut images).await;
+        Ok(())
+    }
+
+    async fn refresh_checksums(&self, images: &mut [VmOsImage]) {
+        for image in images {
+            if image.sha2.is_none() || image.sha2_url.is_some() {
+                self.resolve_and_persist_sha2(image).await;
+            }
+        }
     }
 
     /// Hosts that reconciliation sweeps must visit.
@@ -3636,7 +4715,18 @@ impl Worker {
         };
 
         if let Some((checksum, sums_url)) = resolved {
-            info!("Resolved sha2 for {}: {}", image.url, checksum);
+            if image.sha2.as_deref() == Some(checksum.as_str())
+                && image.sha2_url.as_deref() == Some(sums_url.as_str())
+            {
+                return;
+            }
+            match &image.sha2 {
+                Some(old) => info!(
+                    "Published sha2 for {} moved from {} to {}",
+                    image.url, old, checksum
+                ),
+                None => info!("Resolved sha2 for {}: {}", image.url, checksum),
+            }
             image.sha2 = Some(checksum);
             image.sha2_url = Some(sums_url);
             if let Err(e) = self.db.update_os_image(image).await {
@@ -3694,6 +4784,20 @@ impl Worker {
                         if let Some(new_disk) = ctx.cfg.new_disk {
                             new_template.disk_size = new_disk;
                         }
+                        if ctx.cfg.changes_bandwidth() {
+                            let pricing = ctx.db.get_custom_pricing(old_template.pricing_id).await?;
+                            let (transfer_gb, network_mbps) = match upgrade_bandwidth(
+                                &ctx.cfg,
+                                &pricing,
+                                old_template.transfer_gb,
+                                old_template.network_mbps,
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => op_fatal!(e, anyhow::Error),
+                            };
+                            new_template.transfer_gb = transfer_gb;
+                            new_template.network_mbps = network_mbps;
+                        }
 
                         if old_template.cpu > new_template.cpu {
                             op_fatal!("Cannot downgrade CPU");
@@ -3709,6 +4813,8 @@ impl Worker {
                         if old_template.cpu == new_template.cpu
                             && old_template.memory == new_template.memory
                             && old_template.disk_size == new_template.disk_size
+                            && old_template.transfer_gb == new_template.transfer_gb
+                            && old_template.network_mbps == new_template.network_mbps
                         {
                             info!(
                                 "Custom template {} for VM {} already has the requested specs, skipping template update",
@@ -3732,12 +4838,16 @@ impl Worker {
                             "old_specs": {
                                 "cpu": old_template.cpu,
                                 "memory": old_template.memory,
-                                "disk_size": old_template.disk_size
+                                "disk_size": old_template.disk_size,
+                                "transfer_gb": old_template.transfer_gb,
+                                "network_mbps": old_template.network_mbps
                             },
                             "new_specs": {
                                 "cpu": new_template.cpu,
                                 "memory": new_template.memory,
-                                "disk_size": new_template.disk_size
+                                "disk_size": new_template.disk_size,
+                                "transfer_gb": new_template.transfer_gb,
+                                "network_mbps": new_template.network_mbps
                             }
                         });
 
@@ -3778,7 +4888,9 @@ impl Worker {
                             "changes": {
                                 "cpu": ctx.cfg.new_cpu,
                                 "memory": ctx.cfg.new_memory,
-                                "disk": ctx.cfg.new_disk
+                                "disk": ctx.cfg.new_disk,
+                                "transfer_gb": ctx.cfg.new_transfer_gb,
+                                "network_mbps": ctx.cfg.new_network_mbps
                             },
                             "converted_from_template_id": vm_before.template_id,
                             "new_custom_template_id": vm_after.custom_template_id
@@ -3805,9 +4917,12 @@ impl Worker {
             })
             .step("stop_vm", |ctx| {
                 Box::pin(async move {
+                    if !ctx.cfg.changes_compute() {
+                        return Ok(());
+                    }
                     let vm = ctx.db.get_vm(ctx.vm_id).await?;
                     let host = ctx.db.get_host(vm.host_id).await?;
-                    let client = get_host_client(&host, &ctx.settings.provisioner_config)?;
+                    let client = get_host_client(&ctx.db, &host, &ctx.settings.provisioner_config).await?;
 
                     info!("Stopping VM {} for upgrade", ctx.vm_id);
                     if let Err(e) = client.stop_vm(&vm).await {
@@ -3822,7 +4937,12 @@ impl Worker {
                     if ctx.cfg.new_disk.is_some() {
                         let full_info = FullVmInfo::load(ctx.vm_id, ctx.db.clone()).await?;
                         let host = ctx.db.get_host(full_info.host.id).await?;
-                        let client = get_host_client(&host, &ctx.settings.provisioner_config)?;
+                        let client = get_host_client(&ctx.db, &host, &ctx.settings.provisioner_config).await?;
+
+                        let cleared = lnvps_api_common::host::clear_snapshots(client.as_ref(), &full_info.vm).await?;
+                        if cleared > 0 {
+                            info!("Deleted {} snapshots of VM {} before resizing its disk", cleared, ctx.vm_id);
+                        }
 
                         info!("Resizing disk for VM {}", ctx.vm_id);
                         client.resize_disk(&full_info).await?;
@@ -3832,10 +4952,13 @@ impl Worker {
             })
             .step("configure_cpu_memory", |ctx| {
                 Box::pin(async move {
-                    if ctx.cfg.new_cpu.is_some() || ctx.cfg.new_memory.is_some() {
+                    if ctx.cfg.new_cpu.is_some()
+                        || ctx.cfg.new_memory.is_some()
+                        || ctx.cfg.changes_bandwidth()
+                    {
                         let full_info = FullVmInfo::load(ctx.vm_id, ctx.db.clone()).await?;
                         let host = ctx.db.get_host(full_info.host.id).await?;
-                        let client = get_host_client(&host, &ctx.settings.provisioner_config)?;
+                        let client = get_host_client(&ctx.db, &host, &ctx.settings.provisioner_config).await?;
 
                         info!("Updating CPU/memory configuration for VM {}", ctx.vm_id);
                         client.configure_vm(&full_info).await?;
@@ -3845,9 +4968,12 @@ impl Worker {
             })
             .step("start_vm", |ctx| {
                 Box::pin(async move {
+                    if !ctx.cfg.changes_compute() {
+                        return Ok(());
+                    }
                     let vm = ctx.db.get_vm(ctx.vm_id).await?;
                     let host = ctx.db.get_host(vm.host_id).await?;
-                    let client = get_host_client(&host, &ctx.settings.provisioner_config)?;
+                    let client = get_host_client(&ctx.db, &host, &ctx.settings.provisioner_config).await?;
 
                     info!("Starting VM {} after upgrade", ctx.vm_id);
                     client.start_vm(&vm).await?;
@@ -3894,9 +5020,10 @@ impl Worker {
 
         let full_info = FullVmInfo::load(vm_id, self.db.clone()).await?;
         let host = self.db.get_host(full_info.host.id).await?;
-        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.settings.provisioner_config).await?;
 
         client.configure_vm(&full_info).await?;
+        self.record_applied_transfer_throttle(&full_info).await;
 
         info!(
             "Successfully re-configured VM {} using current database settings",
@@ -3916,7 +5043,7 @@ impl Worker {
 
         let full_info = FullVmInfo::load(vm_id, self.db.clone()).await?;
         let host = self.db.get_host(full_info.host.id).await?;
-        let client = get_host_client(&host, &self.settings.provisioner_config)?;
+        let client = get_host_client(&self.db, &host, &self.settings.provisioner_config).await?;
 
         client.patch_firewall(&full_info).await?;
 
@@ -4249,10 +5376,10 @@ pub(crate) async fn download_images_on_hosts(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mocks::{MockNode, MockOnChainProvider};
+    use crate::mocks::{MockChainExplorer, MockNode, MockOnChainProvider};
     use crate::settings::mock_settings;
     use crate::subscription::SubscriptionHandler;
-    use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate};
+    use lnvps_api_common::{ChannelWorkCommander, ExchangeRateService, MockDb, MockExchangeRate};
     use lnvps_db::{
         LNVpsDbBase, LineItemType, Subscription, SubscriptionLineItem, SubscriptionPayment,
         UserSshKey, Vm,
@@ -4306,6 +5433,30 @@ mod tests {
 
             async fn generate_mac(&self, vm: &Vm) -> OpResult<String> {
                 self.inner.generate_mac(vm).await
+            }
+
+            async fn list_snapshots(
+                &self,
+                vm: &Vm,
+            ) -> OpResult<Vec<lnvps_api_common::host::VmSnapshot>> {
+                self.inner.list_snapshots(vm).await
+            }
+
+            async fn create_snapshot(
+                &self,
+                vm: &Vm,
+                name: &str,
+                description: Option<&str>,
+            ) -> OpResult<()> {
+                self.inner.create_snapshot(vm, name, description).await
+            }
+
+            async fn rollback_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+                self.inner.rollback_snapshot(vm, name).await
+            }
+
+            async fn delete_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+                self.inner.delete_snapshot(vm, name).await
             }
 
             async fn start_vm(&self, vm: &Vm) -> OpResult<()> {
@@ -4404,6 +5555,7 @@ mod tests {
                 default_username: None,
                 sha2: None,
                 sha2_url: None,
+                encrypted: false,
             };
             let images = vec![
                 img(1, "https://example.com/a.qcow2"),
@@ -4426,8 +5578,120 @@ mod tests {
         }
     }
 
+    /// Regression test: a probe is LNVPS's own VM on the operator's machine and
+    /// must not be offered as an importable one. Its domain name parses to an
+    /// id past any `AUTO_INCREMENT` column, so it reaches discovery looking
+    /// exactly like an untracked customer VM.
+    #[tokio::test]
+    async fn test_list_unmanaged_vms_hides_probes() -> Result<()> {
+        use crate::host::dummy_host::DummyVmHost;
+        use lnvps_api_common::HostVmSpec;
+
+        fn spec(id: u64, name: &str) -> HostVmSpec {
+            HostVmSpec {
+                host_vm_id: id as i64,
+                mapped_vm_id: Some(id),
+                name: Some(name.to_string()),
+                cpu: 1,
+                memory: 1_000_000_000,
+                disk_size: 10_000_000_000,
+                disk_storage: None,
+                mac_address: None,
+                running: false,
+            }
+        }
+
+        let db = Arc::new(MockDb::default());
+        db.create_host(&VmHost {
+            kind: VmHostKind::Dummy,
+            region_id: 1,
+            name: "dummy-host".to_string(),
+            ip: "http://localhost".to_string(),
+            enabled: true,
+            ..Default::default()
+        })
+        .await?;
+
+        let probe = crate::provisioner::probe_vm_id(1);
+        DummyVmHost::set_host_vms(vec![spec(probe, "probe"), spec(101, "VM101")]).await;
+
+        let worker = setup_worker(db.clone()).await?;
+        let listed: Vec<u64> = worker
+            .list_unmanaged_vms(1)
+            .await?
+            .iter()
+            .filter_map(|s| s.mapped_vm_id)
+            .collect();
+
+        assert!(!listed.contains(&probe), "a probe must not be importable");
+        assert!(
+            listed.contains(&101),
+            "a real untracked VM must still be listed"
+        );
+
+        DummyVmHost::clear_host_vms().await;
+        Ok(())
+    }
+
     async fn setup_worker(db: Arc<MockDb>) -> Result<Worker> {
         setup_worker_with_delete_after(db, 0).await
+    }
+
+    #[tokio::test]
+    async fn test_vm_snapshot_job_runs_and_reports() -> Result<()> {
+        let _snapshots =
+            lnvps_api_common::host::dummy_host::DummyVmHost::exclusive_snapshots().await;
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        let worker = setup_worker(db.clone()).await?;
+        lnvps_api_common::host::dummy_host::DummyVmHost::clear_all_snapshots().await;
+        db.set_vm_addon(vm_id, lnvps_db::VmAddonKind::Snapshot, 3, 0, "Snapshots")
+            .await?;
+
+        let job = |action| WorkJob::VmSnapshot {
+            vm_id,
+            user_id: None,
+            action,
+            reply_channel: "test".to_string(),
+        };
+        let done = worker
+            .try_job(&job(SnapshotAction::Create {
+                name: "first".to_string(),
+                description: None,
+            }))
+            .await?;
+        assert!(done.unwrap().contains("done"));
+        assert_eq!(
+            worker
+                .subscription_handler
+                .vm_provisioner()
+                .list_snapshots(vm_id)
+                .await?
+                .len(),
+            1
+        );
+
+        let failed = worker
+            .try_job(&job(SnapshotAction::Restore {
+                name: "missing".to_string(),
+            }))
+            .await?;
+        assert!(failed.unwrap().contains("failed"));
+
+        worker
+            .try_job(&job(SnapshotAction::Delete {
+                name: "first".to_string(),
+            }))
+            .await?;
+        assert!(
+            worker
+                .subscription_handler
+                .vm_provisioner()
+                .list_snapshots(vm_id)
+                .await?
+                .is_empty()
+        );
+        Ok(())
     }
 
     /// Regression test: one broken host must not abort the `PatchHosts` sweep.
@@ -4464,6 +5728,201 @@ mod tests {
             .try_job(&WorkJob::PatchHosts)
             .await
             .expect("a single unpatchable host must not fail the whole sweep");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_expired_records_job_drops_only_expired_rows() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        {
+            let mut rows = db.swap_order_clients.lock().await;
+            for (id, order, age) in [(1u64, "OLD", 400i64), (2, "NEW", 30)] {
+                rows.push(lnvps_db::SwapOrderClient {
+                    id,
+                    order_id: order.to_string(),
+                    created: Utc::now() - TimeDelta::days(age),
+                    ..Default::default()
+                });
+            }
+        }
+        let worker = setup_worker(db.clone()).await?;
+        worker.try_job(&WorkJob::PurgeExpiredRecords).await?;
+        let rows = db.swap_order_clients.lock().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].order_id, "NEW");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_job_clears_old_user_ips_and_keeps_the_country() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let old = db.upsert_user(&[4u8; 32]).await?;
+        let fresh = db.upsert_user(&[5u8; 32]).await?;
+        for (id, age) in [(old, 400i64), (fresh, 10)] {
+            let mut u = db.get_user(id).await?;
+            u.geo_ip = Some("203.0.113.5".to_string());
+            u.geo_country_code = Some("IRL".to_string());
+            u.geo_updated = Some(Utc::now() - TimeDelta::days(age));
+            db.update_user(&u).await?;
+        }
+        let worker = setup_worker(db.clone()).await?;
+        worker.try_job(&WorkJob::PurgeExpiredRecords).await?;
+        let old = db.get_user(old).await?;
+        assert!(old.geo_ip.is_none());
+        assert_eq!(old.geo_country_code.as_deref(), Some("IRL"));
+        assert!(db.get_user(fresh).await?.geo_ip.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_job_also_drops_abuse_cases_a_year_after_closing() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        {
+            let mut rows = db.abuse_cases.lock().await;
+            for (id, closed_days) in [(1u64, 400i64), (2, 10)] {
+                rows.push(lnvps_db::AbuseCase {
+                    id,
+                    created: Utc::now() - TimeDelta::days(closed_days + 1),
+                    closed_at: Some(Utc::now() - TimeDelta::days(closed_days)),
+                    ..Default::default()
+                });
+            }
+        }
+        let worker = setup_worker(db.clone()).await?;
+        worker.try_job(&WorkJob::PurgeExpiredRecords).await?;
+        let rows = db.abuse_cases.lock().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_abuse_notice_with_no_way_to_reach_the_customer_does_not_fail_the_job() -> Result<()>
+    {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[3u8; 32]).await?;
+        let case = db
+            .insert_abuse_case(&lnvps_db::AbuseCase::default())
+            .await?;
+        let action_id = db
+            .insert_abuse_action(&lnvps_db::AbuseAction {
+                case_id: case,
+                ..Default::default()
+            })
+            .await?;
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .try_job(&WorkJob::SendAbuseNotice {
+                user_id,
+                subject: "s".to_string(),
+                message: "m".to_string(),
+                action_id: Some(action_id),
+            })
+            .await?;
+        assert!(db.get_abuse_action(action_id).await?.notified_at.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_abuse_reporter_email_without_smtp_is_a_no_op() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let worker = setup_worker(db).await?;
+        worker
+            .try_job(&WorkJob::SendAbuseReporterEmail {
+                to: "r@example.com".to_string(),
+                subject: "s".to_string(),
+                message: "m".to_string(),
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// A marketplace node's pools are created by its own daemon, and nobody at
+    /// LNVPS maps them by hand. Until they were imported, an approved node had
+    /// no `vm_host_disk` row at all, so no VM could be placed on it and the
+    /// only sign was a warning per patch.
+    #[tokio::test]
+    async fn a_marketplace_pool_is_imported_as_a_host_disk() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let host_id = db
+            .create_host(&VmHost {
+                kind: VmHostKind::MarketplaceNode,
+                region_id: 1,
+                name: "node-7".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let host = db.get_host(host_id).await?;
+        let worker = setup_worker(db.clone()).await?;
+
+        let reported = vec![lnvps_api_common::host::VmHostDiskInfo {
+            name: "default".to_string(),
+            size: 1024,
+            used: 0,
+        }];
+        worker.reconcile_host_disks(&host, &reported).await?;
+
+        let disks = db.list_host_disks(host_id).await?;
+        assert_eq!(disks.len(), 1, "the node's pool must become a disk");
+        assert_eq!(disks[0].name, "default");
+        assert_eq!(disks[0].size, 1024);
+        assert!(
+            disks[0].enabled,
+            "approval is the gate, not a second switch"
+        );
+
+        // The capacity is re-read like cpu and memory are, and importing is
+        // idempotent: a second sweep must not add the pool again.
+        worker
+            .reconcile_host_disks(
+                &host,
+                &[lnvps_api_common::host::VmHostDiskInfo {
+                    name: "default".to_string(),
+                    size: 2048,
+                    used: 0,
+                }],
+            )
+            .await?;
+        let disks = db.list_host_disks(host_id).await?;
+        assert_eq!(disks.len(), 1);
+        assert_eq!(disks[0].size, 2048);
+        Ok(())
+    }
+
+    /// An LNVPS-owned host's pools are not all for guests: `local` and
+    /// `backups` on a Proxmox host are Proxmox's own. Importing them would put
+    /// the operator's backup space up for sale.
+    #[tokio::test]
+    async fn a_proxmox_pool_is_not_imported() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let host_id = db
+            .create_host(&VmHost {
+                kind: VmHostKind::Proxmox,
+                region_id: 1,
+                name: "pve".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let host = db.get_host(host_id).await?;
+        let worker = setup_worker(db.clone()).await?;
+
+        worker
+            .reconcile_host_disks(
+                &host,
+                &[lnvps_api_common::host::VmHostDiskInfo {
+                    name: "backups".to_string(),
+                    size: 1024,
+                    used: 0,
+                }],
+            )
+            .await?;
+
+        assert!(
+            db.list_host_disks(host_id).await?.is_empty(),
+            "an unmapped pool on an LNVPS host stays unmapped"
+        );
         Ok(())
     }
 
@@ -4525,6 +5984,198 @@ mod tests {
     /// open it is a VM having actually run there. A gate that opened on a
     /// failure — or on nothing at all — would put customers on hardware nobody
     /// has tested.
+    async fn a_marketplace_host(db: &Arc<dyn LNVpsDb>) -> Result<(u64, u64)> {
+        let user_id = db.upsert_user(&[5u8; 32]).await?;
+        let operator_id = db
+            .insert_marketplace_operator(&lnvps_db::MarketplaceOperator {
+                user_id,
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let node_id = db
+            .insert_marketplace_node(&lnvps_db::MarketplaceNode {
+                operator_id,
+                name: "node".to_string(),
+                status: lnvps_db::MarketplaceNodeStatus::Approved,
+                ..Default::default()
+            })
+            .await?;
+        let host_id = db
+            .create_host(&VmHost {
+                kind: lnvps_db::VmHostKind::MarketplaceNode,
+                region_id: 1,
+                name: "node".to_string(),
+                enabled: false,
+                marketplace_node_id: Some(node_id),
+                ..Default::default()
+            })
+            .await?;
+        Ok((node_id, host_id))
+    }
+
+    #[tokio::test]
+    async fn a_pinned_checksum_follows_the_published_one() -> Result<()> {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let fresh = "d3".repeat(64);
+        Mock::given(path("/SHA512SUMS"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(format!("{fresh}  debian-13-genericcloud-amd64.raw\n")),
+            )
+            .mount(&server)
+            .await;
+
+        let mock = Arc::new(MockDb::empty());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let image = lnvps_db::VmOsImage {
+            id: 6,
+            distribution: lnvps_db::OsDistribution::Debian,
+            flavour: "server".to_string(),
+            version: "13".to_string(),
+            enabled: true,
+            release_date: chrono::Utc::now(),
+            url: format!("{}/debian-13-genericcloud-amd64.raw", server.uri()),
+            cpu_arch: lnvps_db::CpuArch::X86_64,
+            default_username: Some("debian".to_string()),
+            sha2: Some("cb".repeat(64)),
+            sha2_url: Some(format!("{}/SHA512SUMS", server.uri())),
+            encrypted: false,
+        };
+        mock.os_images.lock().await.insert(6, image.clone());
+        let worker = setup_worker(mock.clone()).await?;
+
+        worker.download_os_images(Some(6)).await?;
+        assert_eq!(db.get_os_image(6).await?.sha2, Some(fresh.clone()));
+
+        worker.refresh_os_image_checksums().await?;
+        assert_eq!(db.get_os_image(6).await?.sha2, Some(fresh.clone()));
+
+        let mut stale = db.get_os_image(6).await?;
+        stale.sha2 = Some("cb".repeat(64));
+        mock.os_images.lock().await.insert(6, stale);
+        worker.refresh_os_image_checksums().await?;
+        assert_eq!(db.get_os_image(6).await?.sha2, Some(fresh));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_node_failing_probes_in_a_row_is_cordoned() -> Result<()> {
+        let mock = Arc::new(MockDb::empty());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let (node_id, host_id) = a_marketplace_host(&db).await?;
+        let mut host = db.get_host(host_id).await?;
+        host.enabled = true;
+        db.update_host(&host).await?;
+        let worker = setup_worker(mock.clone()).await?;
+        let failed = || lnvps_db::MarketplaceNodeHealth {
+            node_id,
+            failure: Some("no".to_string()),
+            ..Default::default()
+        };
+
+        db.insert_marketplace_node_health(&lnvps_db::MarketplaceNodeHealth {
+            node_id,
+            passed: true,
+            ..Default::default()
+        })
+        .await?;
+        for _ in 1..PROBE_FAILURES_TO_CORDON {
+            db.insert_marketplace_node_health(&failed()).await?;
+            assert!(!worker.cordon_if_failing(node_id).await?);
+            assert!(db.get_host(host_id).await?.enabled);
+        }
+
+        db.insert_marketplace_node_health(&failed()).await?;
+        assert!(worker.cordon_if_failing(node_id).await?);
+        assert!(!db.get_host(host_id).await?.enabled);
+        assert!(!worker.cordon_if_failing(node_id).await?, "cordoned twice");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_node_gone_quiet_is_reported_once() -> Result<()> {
+        let mock = Arc::new(MockDb::empty());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let (node_id, _) = a_marketplace_host(&db).await?;
+        let worker = setup_worker(mock.clone()).await?;
+        let seen = chrono::Utc::now();
+        db.touch_marketplace_node(node_id, seen).await?;
+
+        for (after, expect) in [
+            (chrono::Duration::minutes(2), false),
+            (NODE_QUIET_AFTER + chrono::Duration::minutes(1), true),
+            (NODE_QUIET_AFTER + chrono::Duration::minutes(7), false),
+        ] {
+            let alerted = worker.alert_quiet_marketplace_nodes(seen + after).await?;
+            assert_eq!(alerted.contains(&node_id), expect, "quiet for {after}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_underlay_is_not_judged_without_a_control_key() -> Result<()> {
+        let mock = Arc::new(MockDb::empty());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let (node_id, _) = a_marketplace_host(&db).await?;
+        let worker = setup_worker(mock.clone()).await?;
+        let node = db.get_marketplace_node(node_id).await?;
+
+        assert_eq!(worker.underlay_failure(&node).await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_first_passing_probe_enables_the_host() -> Result<()> {
+        let mock = Arc::new(MockDb::empty());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let (node_id, host_id) = a_marketplace_host(&db).await?;
+        let worker = setup_worker(mock.clone()).await?;
+
+        assert!(!worker.has_passed_a_probe(node_id).await?);
+        worker
+            .admit_after_probe(node_id, false, &crate::provisioner::ProbeResult::default())
+            .await?;
+
+        assert!(db.get_host(host_id).await?.enabled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_later_passing_probe_leaves_a_disabled_host_alone() -> Result<()> {
+        let mock = Arc::new(MockDb::empty());
+        let db: Arc<dyn LNVpsDb> = mock.clone();
+        let (node_id, host_id) = a_marketplace_host(&db).await?;
+        db.insert_marketplace_node_health(&lnvps_db::MarketplaceNodeHealth {
+            node_id,
+            failure: Some("no".to_string()),
+            ..Default::default()
+        })
+        .await?;
+        db.insert_marketplace_node_health(&lnvps_db::MarketplaceNodeHealth {
+            node_id,
+            passed: true,
+            ..Default::default()
+        })
+        .await?;
+        let worker = setup_worker(mock.clone()).await?;
+
+        let proven = worker.has_passed_a_probe(node_id).await?;
+        worker
+            .admit_after_probe(node_id, proven, &crate::provisioner::ProbeResult::default())
+            .await?;
+
+        assert!(proven);
+        assert!(
+            !db.get_host(host_id).await?.enabled,
+            "a host an admin disabled was re-enabled by a routine probe"
+        );
+        Ok(())
+    }
+
     #[cfg(feature = "linux-ssh")]
     #[tokio::test]
     async fn a_host_is_not_enabled_without_a_passing_probe() -> Result<()> {
@@ -4652,6 +6303,13 @@ mod tests {
         settings.delete_after = delete_after;
         let node = Arc::new(MockNode::default());
         let rates = Arc::new(MockExchangeRate::new());
+        // Renewals priced in EUR against a BTC credit balance need a rate.
+        rates
+            .set_rate(
+                lnvps_api_common::Ticker::btc_rate("EUR").unwrap(),
+                100_000.0,
+            )
+            .await;
         let work_commander = Arc::new(ChannelWorkCommander::new());
         let cache = VmStateCache::new();
         let sub_handler = SubscriptionHandler::new(
@@ -4729,6 +6387,8 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await?;
@@ -4889,6 +6549,145 @@ mod tests {
 
         assert!(worker.kv.get(&warned_key(vm_id, 100)).await?.is_none());
         assert!(worker.kv.get(&warned_key(vm_id, 80)).await?.is_none());
+        Ok(())
+    }
+
+    async fn queued_configure_vm(worker: &Worker, vm_id: u64) -> bool {
+        let mut found = false;
+        while let Ok(Ok(jobs)) =
+            tokio::time::timeout(Duration::from_millis(50), worker.work_commander.recv()).await
+        {
+            found |= jobs
+                .iter()
+                .any(|j| matches!(j.job, WorkJob::ConfigureVm { vm_id: v, .. } if v == vm_id));
+        }
+        found
+    }
+
+    #[tokio::test]
+    async fn test_transfer_quota_exceeded_throttles_once() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        set_template_transfer_gb(&db, Some(100)).await;
+        let worker = setup_worker(db.clone()).await?;
+
+        worker.check_transfer_quotas().await?;
+        assert!(!queued_configure_vm(&worker, vm_id).await);
+        assert!(
+            !FullVmInfo::load(vm_id, db.clone())
+                .await?
+                .transfer_throttled
+        );
+
+        book_traffic(&db, vm_id, 100_000_000_000).await;
+        worker.set_last_check_transfer(DateTime::UNIX_EPOCH).await?;
+        worker.check_transfer_quotas().await?;
+        assert!(queued_configure_vm(&worker, vm_id).await);
+        let info = FullVmInfo::load(vm_id, db.clone()).await?;
+        assert!(info.transfer_throttled);
+        assert_eq!(
+            info.limits().network_mbps,
+            Some(lnvps_api_common::TRANSFER_THROTTLE_MBPS)
+        );
+        worker.configure_vm(vm_id, None).await?;
+
+        worker.set_last_check_transfer(DateTime::UNIX_EPOCH).await?;
+        worker.check_transfer_quotas().await?;
+        assert!(
+            !queued_configure_vm(&worker, vm_id).await,
+            "an already throttled VM is not reconfigured every pass"
+        );
+        Ok(())
+    }
+
+    /// A reconfigure that fails must not be taken as applied. The throttle is
+    /// queued again on the next pass until a reconfigure succeeds, instead of
+    /// the VM staying at full speed with the throttle believed to be in place.
+    #[tokio::test]
+    async fn test_failed_throttle_reconfigure_is_retried() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        set_template_transfer_gb(&db, Some(100)).await;
+        let worker = setup_worker(db.clone()).await?;
+        book_traffic(&db, vm_id, 150_000_000_000).await;
+
+        let broken = db
+            .create_host(&VmHost {
+                kind: VmHostKind::Proxmox,
+                region_id: 1,
+                name: "broken-host".to_string(),
+                ip: "not a url".to_string(),
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let real_host = db.get_vm(vm_id).await?.host_id;
+        db.vms.lock().await.get_mut(&vm_id).unwrap().host_id = broken;
+
+        worker.check_transfer_quotas().await?;
+        assert!(queued_configure_vm(&worker, vm_id).await);
+        assert!(worker.configure_vm(vm_id, None).await.is_err());
+        assert_ne!(
+            worker.kv.get(&Worker::transfer_throttle_key(vm_id)).await?,
+            Some(vec![1]),
+            "a failed reconfigure is not recorded as throttled"
+        );
+
+        worker.set_last_check_transfer(DateTime::UNIX_EPOCH).await?;
+        worker.check_transfer_quotas().await?;
+        assert!(
+            queued_configure_vm(&worker, vm_id).await,
+            "the throttle is queued again after the failure"
+        );
+
+        db.vms.lock().await.get_mut(&vm_id).unwrap().host_id = real_host;
+        worker.configure_vm(vm_id, None).await?;
+        assert_eq!(
+            worker.kv.get(&Worker::transfer_throttle_key(vm_id)).await?,
+            Some(vec![1])
+        );
+        worker.set_last_check_transfer(DateTime::UNIX_EPOCH).await?;
+        worker.check_transfer_quotas().await?;
+        assert!(
+            !queued_configure_vm(&worker, vm_id).await,
+            "once applied, it is not re-queued"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_transfer_throttle_lifts_when_the_period_resets() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        set_template_transfer_gb(&db, Some(100)).await;
+        let (period_start, _) = quota_period(Utc::now().date_naive());
+        db.add_vm_traffic(vm_id, period_start.pred_opt().unwrap(), 0, 200_000_000_000)
+            .await?;
+        let worker = setup_worker(db.clone()).await?;
+
+        worker.check_transfer_quotas().await?;
+        assert!(
+            queued_configure_vm(&worker, vm_id).await,
+            "a VM over last month's allowance is restored even with no stored state"
+        );
+        worker.configure_vm(vm_id, None).await?;
+        assert_eq!(
+            worker.kv.get(&Worker::transfer_throttle_key(vm_id)).await?,
+            Some(vec![0]),
+            "the reconfigure records what it applied"
+        );
+
+        worker
+            .kv
+            .store(&Worker::transfer_throttle_key(vm_id), &[1])
+            .await?;
+        set_template_transfer_gb(&db, None).await;
+        worker.set_last_check_transfer(DateTime::UNIX_EPOCH).await?;
+        worker.check_transfer_quotas().await?;
+        assert!(
+            queued_configure_vm(&worker, vm_id).await,
+            "removing the allowance lifts the throttle"
+        );
         Ok(())
     }
 
@@ -5216,14 +7015,11 @@ mod tests {
         Ok(())
     }
 
-    /// An unpaid VM (older than 1 hour) with an expired on-chain payment and NO detected
-    /// deposit must still be purged — the #194 guard only holds VMs with a mempool sighting.
-    #[tokio::test]
-    async fn test_check_vms_deletes_unpaid_vm_with_expired_undetected_onchain_payment() -> Result<()>
-    {
-        let db = Arc::new(MockDb::default());
-        let old = Utc::now().sub(TimeDelta::hours(2));
-        let (vm_id, subscription_id) = add_vm_with_subscription(&db, old, false).await?;
+    /// Build an unpaid VM whose on-chain deposit was detected in the mempool and
+    /// whose deposit transaction spends `input`.
+    async fn add_vm_with_detected_deposit(db: &Arc<MockDb>, txid: &str) -> Result<u64> {
+        let old = Utc::now().sub(TimeDelta::hours(26));
+        let (vm_id, subscription_id) = add_vm_with_subscription(db, old, false).await?;
         let user_id = db.get_vm(vm_id).await?.user_id;
 
         let mut payment = make_subscription_payment(
@@ -5231,25 +7027,305 @@ mod tests {
             user_id,
             old,
             old.add(TimeDelta::hours(1)),
-            4,
+            9,
         );
-        payment.payment_method = lnvps_db::PaymentMethod::OnChain;
+        payment.payment_method = PaymentMethod::OnChain;
+        payment.external_id = Some(format!("{txid}:0"));
         db.insert_subscription_payment(&payment).await?;
+        Ok(vm_id)
+    }
 
-        let worker = setup_worker(db.clone()).await?;
+    /// A deposit whose coins were spent by another confirmed transaction is
+    /// dead: its outpoint is dropped and the VM it was paying for is purged by
+    /// the same sweep.
+    #[tokio::test]
+    async fn test_check_vms_purges_vm_whose_deposit_was_replaced() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let vm_id = add_vm_with_detected_deposit(&db, "deadtx").await?;
+
+        let explorer = Arc::new(MockChainExplorer::default());
+        explorer.set_inputs("deadtx", &["parent:12"]).await;
+        explorer
+            .set_outspend("parent:12", Some("replacement"), true)
+            .await;
+        let mut worker = setup_worker(db.clone()).await?;
+        worker.chain_explorer = Some(explorer);
         worker.check_vms().await?;
 
-        let vms = db.vms.lock().await;
+        let payment = db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
         assert!(
-            !vms.contains_key(&vm_id),
-            "Unpaid VM with an expired on-chain payment and no detected deposit should be purged"
+            payment.iter().all(|p| p.external_id.is_none()),
+            "a replaced deposit must not keep its outpoint"
+        );
+        assert!(
+            !db.vms.lock().await.contains_key(&vm_id),
+            "VM whose deposit was replaced should be purged"
         );
         Ok(())
     }
 
+    /// A deposit transaction the network has forgotten was replaced by one that
+    /// does not pay us: it can never confirm, so it must stop holding the VM.
+    #[tokio::test]
+    async fn test_check_vms_purges_vm_whose_deposit_was_evicted() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let vm_id = add_vm_with_detected_deposit(&db, "evictedtx").await?;
+
+        let mut worker = setup_worker(db.clone()).await?;
+        worker.chain_explorer = Some(Arc::new(MockChainExplorer::default()));
+        worker.check_vms().await?;
+
+        let payments = db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        assert!(payments.iter().all(|p| p.external_id.is_none()));
+        assert!(!db.vms.lock().await.contains_key(&vm_id));
+        Ok(())
+    }
+
+    /// An unexpired quote is left alone: an explorer that has not seen the
+    /// transaction yet is the normal state right after a broadcast.
+    #[tokio::test]
+    async fn test_check_conflicted_deposits_skips_unexpired_quote() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let old = Utc::now().sub(TimeDelta::hours(2));
+        let (vm_id, subscription_id) = add_vm_with_subscription(&db, old, false).await?;
+        let user_id = db.get_vm(vm_id).await?.user_id;
+        let mut payment = make_subscription_payment(
+            subscription_id,
+            user_id,
+            Utc::now(),
+            Utc::now().add(TimeDelta::minutes(30)),
+            8,
+        );
+        payment.payment_method = PaymentMethod::OnChain;
+        payment.external_id = Some("freshtx:0".to_string());
+        db.insert_subscription_payment(&payment).await?;
+
+        let mut worker = setup_worker(db.clone()).await?;
+        worker.chain_explorer = Some(Arc::new(MockChainExplorer::default()));
+        worker.check_conflicted_deposits().await?;
+
+        let payments = db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        assert!(payments.iter().all(|p| p.external_id.is_some()));
+        Ok(())
+    }
+
+    /// A deposit still sitting unspent in the mempool keeps its outpoint, and
+    /// keeps holding the VM.
+    #[tokio::test]
+    async fn test_check_vms_keeps_vm_whose_deposit_is_live() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let vm_id = add_vm_with_detected_deposit(&db, "livetx").await?;
+
+        let explorer = Arc::new(MockChainExplorer::default());
+        explorer.set_inputs("livetx", &["parent:0"]).await;
+        explorer
+            .set_outspend("parent:0", Some("livetx"), false)
+            .await;
+        let mut worker = setup_worker(db.clone()).await?;
+        worker.chain_explorer = Some(explorer);
+        worker.check_vms().await?;
+
+        let payments = db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        assert!(payments.iter().all(|p| p.external_id.is_some()));
+        assert!(db.vms.lock().await.contains_key(&vm_id));
+        Ok(())
+    }
+
+    /// An explorer that cannot answer must leave the deposit alone: clearing on
+    /// no information would purge a VM whose payment is still on its way.
+    #[tokio::test]
+    async fn test_check_conflicted_deposits_keeps_deposit_when_explorer_fails() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let vm_id = add_vm_with_detected_deposit(&db, "unknowntx").await?;
+
+        let explorer = Arc::new(MockChainExplorer::default());
+        *explorer.fail.lock().await = true;
+        let mut worker = setup_worker(db.clone()).await?;
+        worker.chain_explorer = Some(explorer);
+        worker.check_conflicted_deposits().await?;
+
+        let payments = db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        assert!(payments.iter().all(|p| p.external_id.is_some()));
+        assert!(db.vms.lock().await.contains_key(&vm_id));
+        Ok(())
+    }
+
+    /// Without a configured explorer the sweep is a no-op, and its timestamp is
+    /// never advanced.
+    #[tokio::test]
+    async fn test_check_conflicted_deposits_without_explorer_is_noop() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        add_vm_with_detected_deposit(&db, "deadtx").await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_conflicted_deposits().await?;
+
+        let payments = db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        assert!(payments.iter().all(|p| p.external_id.is_some()));
+        assert_eq!(
+            worker.get_last_check_deposits().await?,
+            DateTime::UNIX_EPOCH
+        );
+        Ok(())
+    }
+
+    /// The sweep is hourly: a second call inside the window does no work.
+    #[tokio::test]
+    async fn test_check_conflicted_deposits_is_rate_limited() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        add_vm_with_detected_deposit(&db, "deadtx").await?;
+
+        let mut worker = setup_worker(db.clone()).await?;
+        worker.chain_explorer = Some(Arc::new(MockChainExplorer::default()));
+        worker.set_last_check_deposits(Utc::now()).await?;
+        worker.check_conflicted_deposits().await?;
+
+        let payments = db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        assert!(
+            payments.iter().all(|p| p.external_id.is_some()),
+            "rate-limited sweep must not have run"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deposit_dead_requires_a_confirmed_conflict() -> Result<()> {
+        let explorer = MockChainExplorer::default();
+        explorer.set_inputs("tx", &["parent:1"]).await;
+
+        // Unspent.
+        assert_eq!(deposit_dead(&explorer, "tx").await?, None);
+
+        // Spent by the deposit transaction itself.
+        explorer.set_outspend("parent:1", Some("tx"), true).await;
+        assert_eq!(deposit_dead(&explorer, "tx").await?, None);
+
+        // Conflicting spend, but unconfirmed: it could itself be replaced.
+        explorer
+            .set_outspend("parent:1", Some("other"), false)
+            .await;
+        assert_eq!(deposit_dead(&explorer, "tx").await?, None);
+
+        // Conflicting spend, confirmed.
+        explorer.set_outspend("parent:1", Some("other"), true).await;
+        assert_eq!(
+            deposit_dead(&explorer, "tx").await?,
+            Some(DepositDead::Replaced("other".to_string()))
+        );
+
+        // Not known to the explorer at all.
+        assert_eq!(
+            deposit_dead(&explorer, "never-seen").await?,
+            Some(DepositDead::Evicted)
+        );
+
+        *explorer.fail.lock().await = true;
+        assert!(deposit_dead(&explorer, "tx").await.is_err());
+        Ok(())
+    }
+
+    async fn add_unpaid_vm_with_onchain_quote(
+        db: &Arc<MockDb>,
+        quote_expired: TimeDelta,
+    ) -> Result<(u64, SubscriptionPayment)> {
+        let expires = Utc::now().sub(quote_expired);
+        let created = expires.sub(TimeDelta::hours(1));
+        let (vm_id, subscription_id) = add_vm_with_subscription(db, created, false).await?;
+        let user_id = db.get_vm(vm_id).await?.user_id;
+        let mut payment = make_subscription_payment(subscription_id, user_id, created, expires, 4);
+        payment.payment_method = lnvps_db::PaymentMethod::OnChain;
+        payment.external_data = "bcrt1qpurged".into();
+        db.insert_subscription_payment(&payment).await?;
+        Ok((vm_id, payment))
+    }
+
+    #[tokio::test]
+    async fn test_check_vms_deletes_unpaid_vm_with_onchain_quote_past_grace() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, payment) = add_unpaid_vm_with_onchain_quote(&db, TimeDelta::hours(25)).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_vms().await?;
+
+        assert!(!db.vms.lock().await.contains_key(&vm_id));
+        let owner = db
+            .get_onchain_address_owner("bcrt1qpurged")
+            .await?
+            .expect("the purge keeps who the address belongs to");
+        assert_eq!(owner.user_id, payment.user_id);
+        assert_eq!(owner.vm_id, Some(vm_id));
+        assert_eq!(owner.subscription_id, Some(payment.subscription_id));
+        assert_eq!(owner.payment_id, Some(payment.id.clone()));
+        assert_eq!(owner.expires, Some(payment.expires));
+        assert_eq!(owner.amount, Some(1000));
+        assert_eq!(owner.status, lnvps_db::OnchainAddressOwnerStatus::Open);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_check_vms_keeps_unpaid_vm_with_onchain_quote_within_grace() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_unpaid_vm_with_onchain_quote(&db, TimeDelta::minutes(10)).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_vms().await?;
+
+        assert!(db.vms.lock().await.contains_key(&vm_id));
+        assert!(
+            db.get_onchain_address_owner("bcrt1qpurged")
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_check_vms_onchain_grace_comes_from_the_onchain_config() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_unpaid_vm_with_onchain_quote(&db, TimeDelta::hours(25)).await?;
+        db.insert_payment_method_config(&lnvps_db::PaymentMethodConfig::new_with_config(
+            1,
+            PaymentMethod::OnChain,
+            "OC".to_string(),
+            true,
+            lnvps_db::ProviderConfig::OnChain(lnvps_db::OnChainProviderConfig {
+                url: "https://x:10009".to_string(),
+                cert_path: "c".into(),
+                macaroon_path: "m".into(),
+                address_type: lnvps_db::OnChainAddressType::WitnessPubkeyHash,
+                account: None,
+                min_confirmations: 1,
+                unpaid_purge_grace_hours: 48,
+            }),
+        ))
+        .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_vms().await?;
+
+        assert!(db.vms.lock().await.contains_key(&vm_id));
+        Ok(())
+    }
+
     #[test]
-    fn test_payment_blocks_unpaid_vm_deletion() {
+    fn test_payment_blocks_unpaid_deletion() {
         let now = Utc::now();
+        let none = TimeDelta::zero();
+        let grace = TimeDelta::hours(24);
         let base = make_subscription_payment(
             1,
             1,
@@ -5258,36 +7334,40 @@ mod tests {
             5,
         );
 
-        // Expired lightning payment: does not block.
-        assert!(!payment_blocks_unpaid_vm_deletion(&base, now));
+        assert!(!payment_blocks_unpaid_deletion(&base, now, grace));
 
-        // Unexpired payment: blocks.
         let mut p = base.clone();
         p.expires = now.add(TimeDelta::minutes(10));
-        assert!(payment_blocks_unpaid_vm_deletion(&p, now));
+        assert!(payment_blocks_unpaid_deletion(&p, now, none));
 
-        // Expired on-chain with detected deposit: blocks (#194).
         let mut p = base.clone();
         p.payment_method = lnvps_db::PaymentMethod::OnChain;
         p.external_id = Some("txid:0".to_string());
-        assert!(payment_blocks_unpaid_vm_deletion(&p, now));
+        assert!(payment_blocks_unpaid_deletion(&p, now, none));
 
-        // Expired on-chain without detected deposit: does not block.
         let mut p = base.clone();
         p.payment_method = lnvps_db::PaymentMethod::OnChain;
-        assert!(!payment_blocks_unpaid_vm_deletion(&p, now));
+        assert!(!payment_blocks_unpaid_deletion(&p, now, none));
+        assert!(payment_blocks_unpaid_deletion(&p, now, grace));
+        assert!(!payment_blocks_unpaid_deletion(
+            &p,
+            now.add(TimeDelta::hours(24)),
+            grace
+        ));
 
-        // Expired lightning with external_id (not on-chain): does not block.
+        let mut p = base.clone();
+        p.payment_method = lnvps_db::PaymentMethod::FixedFloat;
+        assert!(payment_blocks_unpaid_deletion(&p, now, grace));
+
         let mut p = base.clone();
         p.external_id = Some("abc".to_string());
-        assert!(!payment_blocks_unpaid_vm_deletion(&p, now));
+        assert!(!payment_blocks_unpaid_deletion(&p, now, grace));
 
-        // Paid payment never blocks, even with detected deposit.
         let mut p = base.clone();
         p.payment_method = lnvps_db::PaymentMethod::OnChain;
         p.external_id = Some("txid:0".to_string());
         p.is_paid = true;
-        assert!(!payment_blocks_unpaid_vm_deletion(&p, now));
+        assert!(!payment_blocks_unpaid_deletion(&p, now, grace));
     }
 
     /// Drain all currently-queued work jobs without blocking, returning the count of
@@ -5394,10 +7474,375 @@ mod tests {
         sub.interval_amount = 2;
         assert_eq!(expiry_lead_window(&sub), TimeDelta::days(1));
 
+        // Hourly billing: the lead is half the interval (30 minutes), so a
+        // just-renewed hourly subscription is not immediately "expiring soon".
+        sub.interval_type = IntervalType::Hour;
+        sub.interval_amount = 1;
+        assert_eq!(subscription_interval(&sub), TimeDelta::hours(1));
+        assert_eq!(expiry_lead_window(&sub), TimeDelta::minutes(30));
+        sub.interval_amount = 6;
+        assert_eq!(subscription_interval(&sub), TimeDelta::hours(6));
+        assert_eq!(expiry_lead_window(&sub), TimeDelta::hours(3));
+
         // Yearly billing stays at the 1-day max.
         sub.interval_amount = 1;
         sub.interval_type = IntervalType::Year;
         assert_eq!(expiry_lead_window(&sub), TimeDelta::days(1));
+    }
+
+    /// Build a bare monthly subscription for the milestone unit tests.
+    fn make_test_sub() -> Subscription {
+        Subscription {
+            id: 0,
+            user_id: 0,
+            company_id: 1,
+            name: "s".to_string(),
+            description: None,
+            created: Utc::now(),
+            expires: None,
+            is_active: true,
+            is_setup: true,
+            currency: "EUR".to_string(),
+            interval_amount: 1,
+            interval_type: IntervalType::Month,
+            setup_fee: 0,
+            auto_renewal_enabled: false,
+            external_id: None,
+        }
+    }
+
+    #[test]
+    fn test_reminder_milestones_scale_with_interval() {
+        let mut sub = make_test_sub();
+        // Monthly: full 7/3/1 day schedule, nearest-to-expiry first.
+        assert_eq!(
+            reminder_milestones(&sub),
+            vec![TimeDelta::days(1), TimeDelta::days(3), TimeDelta::days(7)]
+        );
+
+        // Weekly: 7 days out is more than half the interval, so it is dropped.
+        sub.interval_type = IntervalType::Day;
+        sub.interval_amount = 7;
+        assert_eq!(
+            reminder_milestones(&sub),
+            vec![TimeDelta::days(1), TimeDelta::days(3)]
+        );
+
+        // Daily: only the (capped) lead window survives.
+        sub.interval_amount = 1;
+        assert_eq!(reminder_milestones(&sub), vec![TimeDelta::hours(12)]);
+
+        // A 4-day interval keeps a single 1-day reminder (the lead window),
+        // never duplicated.
+        sub.interval_amount = 4;
+        assert_eq!(reminder_milestones(&sub), vec![TimeDelta::days(1)]);
+    }
+
+    #[test]
+    fn test_due_reminder_fires_once_per_milestone() {
+        let now = Utc::now();
+        let mut sub = make_test_sub();
+        sub.expires = Some(now.add(TimeDelta::days(7)));
+
+        // The 7-day milestone falls in (last_check, now].
+        assert_eq!(
+            due_reminder(&sub, now, now.sub(TimeDelta::minutes(1))),
+            Some(TimeDelta::days(7))
+        );
+        // Already past on the previous tick: no repeat.
+        assert_eq!(
+            due_reminder(&sub, now, now.add(TimeDelta::minutes(1))),
+            None
+        );
+        // Nothing crossed yet.
+        sub.expires = Some(now.add(TimeDelta::days(9)));
+        assert_eq!(due_reminder(&sub, now, now.sub(TimeDelta::days(1))), None);
+
+        // Worker downtime: 7-day and 3-day milestones both crossed since the
+        // last check, but only the nearest-to-expiry one is sent.
+        sub.expires = Some(now.add(TimeDelta::days(2)));
+        assert_eq!(
+            due_reminder(&sub, now, now.sub(TimeDelta::days(10))),
+            Some(TimeDelta::days(3))
+        );
+
+        // Already expired: handled by the expired/grace branches instead.
+        sub.expires = Some(now.sub(TimeDelta::hours(1)));
+        assert_eq!(due_reminder(&sub, now, now.sub(TimeDelta::days(10))), None);
+
+        // No expiry at all.
+        sub.expires = None;
+        assert_eq!(due_reminder(&sub, now, now.sub(TimeDelta::days(10))), None);
+    }
+
+    #[test]
+    fn test_post_expiry_reminder_due() {
+        let now = Utc::now();
+        let expires = now.sub(TimeDelta::days(3));
+
+        // Day 3 boundary crossed since the last check.
+        assert_eq!(
+            post_expiry_reminder_due(expires, now, now.sub(TimeDelta::hours(2))),
+            Some(3)
+        );
+        // Same day already notified: the day-3 boundary is behind `last_check`.
+        assert_eq!(
+            post_expiry_reminder_due(
+                now.sub(TimeDelta::days(3)).sub(TimeDelta::hours(2)),
+                now,
+                now.sub(TimeDelta::minutes(1))
+            ),
+            None
+        );
+        // Less than a day since expiry: the one-shot "Expired" notice covers it.
+        assert_eq!(
+            post_expiry_reminder_due(now.sub(TimeDelta::hours(5)), now, DateTime::UNIX_EPOCH),
+            None
+        );
+    }
+
+    #[test]
+    fn test_deletion_countdown_helpers() {
+        let now = Utc::now();
+        let expires = now.sub(TimeDelta::days(10));
+        assert_eq!(days_until_deletion(expires, TimeDelta::days(14), now), 4);
+        // Never negative, even past the deletion date.
+        assert_eq!(days_until_deletion(expires, TimeDelta::days(2), now), 0);
+
+        let warning = deletion_warning(expires, TimeDelta::days(14));
+        assert!(warning.contains(&format_timestamp(expires.add(TimeDelta::days(14)))));
+        assert!(warning.contains("permanently deleted"));
+
+        assert_eq!(format_days(1), "1 day");
+        assert_eq!(format_days(0), "0 days");
+        assert_eq!(format_days(4), "4 days");
+        assert_eq!(
+            format_timestamp(DateTime::from_timestamp(1_700_000_000, 0).unwrap()),
+            "2023-11-14 22:13 UTC"
+        );
+    }
+
+    /// A monthly subscription must be warned a week out, not only the day
+    /// before, and the warning must not repeat on the next tick.
+    #[tokio::test]
+    async fn test_seven_day_expiry_reminder() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        // Created 23 days ago on a 30-day interval => expires in ~7 days.
+        let created = Utc::now().sub(TimeDelta::days(23));
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, created, true).await?;
+        let sub = db.get_subscription(subscription_id).await?;
+        let worker = setup_worker_with_delete_after(db.clone(), 30).await?;
+
+        let last_check = Utc::now().sub(TimeDelta::minutes(1));
+        worker.handle_subscription_state(&sub, last_check).await?;
+        assert_eq!(
+            count_notifications(&worker, "Expires in 7 days").await,
+            1,
+            "a 7-day expiry reminder must be sent"
+        );
+
+        // Next tick: the milestone is behind `last_check` now, so it is silent.
+        worker.handle_subscription_state(&sub, Utc::now()).await?;
+        assert_eq!(
+            count_notifications(&worker, "Expires in").await,
+            0,
+            "expiry reminders must not repeat within the same milestone"
+        );
+        Ok(())
+    }
+
+    /// An hourly VM whose owner deletes it stops billing and gets the unused
+    /// part of what credit paid for back as credit.
+    #[tokio::test]
+    async fn an_owner_deleting_an_hourly_vm_returns_unused_time_as_credit() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let created = Utc::now().sub(TimeDelta::hours(4));
+        let (vm_id, sub_id) = add_vm_with_subscription(&db, created, true).await?;
+        let vm = db.get_vm(vm_id).await?;
+        // 4 of the 8 paid hours are left.
+        {
+            let mut subs = db.subscriptions.lock().await;
+            let sub = subs.get_mut(&sub_id).unwrap();
+            sub.interval_type = IntervalType::Hour;
+            sub.auto_renewal_enabled = true;
+            sub.expires = Some(Utc::now().add(TimeDelta::hours(4)));
+        }
+        let mut payment = make_subscription_payment(
+            sub_id,
+            vm.user_id,
+            created,
+            Utc::now().add(TimeDelta::hours(4)),
+            9,
+        );
+        payment.is_paid = true;
+        payment.amount = 8_000;
+        payment.time_value = Some(8 * 3600);
+        db.insert_subscription_payment(&payment).await?;
+        db.account_credit_debits
+            .lock()
+            .await
+            .push(lnvps_db::AccountCreditDebit {
+                user_id: vm.user_id,
+                subscription_payment_id: Some(payment.id.clone()),
+                amount: 8_000,
+                currency: "BTC".to_string(),
+                payment_amount: 8_000,
+                settled: true,
+                ..Default::default()
+            });
+        let worker = setup_worker(db.clone()).await?;
+
+        let out = worker
+            .try_job(&WorkJob::DeleteVm {
+                vm_id,
+                reason: Some("Deleted by its owner".to_string()),
+                admin_user_id: None,
+                purge: false,
+                by_owner: true,
+            })
+            .await?;
+        assert!(out.unwrap().contains("by its owner"));
+
+        assert!(db.get_vm(vm_id).await?.deleted);
+        let sub = db.get_subscription(sub_id).await?;
+        assert!(!sub.is_active && !sub.auto_renewal_enabled, "billing stops");
+        let balance = db.get_account_credit(vm.user_id, "BTC").await?.balance;
+        assert!(
+            (3_990..=4_000).contains(&balance),
+            "about half of 8000 returned, got {balance}"
+        );
+        assert!(count_notifications(&worker, "Deleted").await >= 1);
+        // The history credits the owner, not an administrator.
+        let history = db.list_vm_history_paginated(vm_id, 20, 0).await?;
+        let deleted = history
+            .iter()
+            .find(|h| matches!(h.action_type, lnvps_db::VmHistoryActionType::Deleted))
+            .expect("a deleted entry");
+        assert_eq!(deleted.initiated_by_user, Some(vm.user_id));
+        Ok(())
+    }
+
+    /// An owner deleting a monthly VM gets the unused part of the month back
+    /// as credit too: 25 of 30 days left on 1000 msat of credit.
+    #[tokio::test]
+    async fn an_owner_deleting_a_monthly_vm_returns_unused_time_as_credit() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let created = Utc::now().sub(TimeDelta::days(5));
+        let (vm_id, sub_id) = add_vm_with_subscription(&db, created, true).await?;
+        let vm = db.get_vm(vm_id).await?;
+        let mut payment = make_subscription_payment(
+            sub_id,
+            vm.user_id,
+            created,
+            created.add(TimeDelta::days(30)),
+            9,
+        );
+        payment.is_paid = true;
+        db.insert_subscription_payment(&payment).await?;
+        db.account_credit_debits
+            .lock()
+            .await
+            .push(lnvps_db::AccountCreditDebit {
+                user_id: vm.user_id,
+                subscription_payment_id: Some(payment.id.clone()),
+                amount: 1_000,
+                currency: "BTC".to_string(),
+                payment_amount: 1_000,
+                settled: true,
+                ..Default::default()
+            });
+        let worker = setup_worker(db.clone()).await?;
+
+        worker
+            .try_job(&WorkJob::DeleteVm {
+                vm_id,
+                reason: None,
+                admin_user_id: None,
+                purge: false,
+                by_owner: true,
+            })
+            .await?;
+        assert!(db.get_vm(vm_id).await?.deleted);
+        let balance = db.get_account_credit(vm.user_id, "BTC").await?.balance;
+        assert!(
+            (820..=834).contains(&balance),
+            "about 25/30 of 1000, got {balance}"
+        );
+        Ok(())
+    }
+
+    /// An hourly subscription gets a 24 hour grace period, not the 1-14 day
+    /// age-tiered window, so a lapsed credit balance does not hold resources
+    /// for days. The same expiry under a monthly interval is still in grace.
+    #[tokio::test]
+    async fn test_hourly_subscription_is_cancelled_after_24h_grace() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        // Created 31 days + 6 hours ago: expired 6 hours ago... shift so the
+        // expiry is 30 hours in the past.
+        let created = Utc::now().sub(TimeDelta::days(31)).sub(TimeDelta::hours(6));
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, created, true).await?;
+        let monthly = db.get_subscription(subscription_id).await?;
+        let expires = monthly.expires.unwrap();
+        assert!(expires < Utc::now().sub(TimeDelta::hours(29)));
+        let worker = setup_worker_with_delete_after(db.clone(), 30).await?;
+
+        let mut hourly = monthly.clone();
+        hourly.interval_type = IntervalType::Hour;
+        assert_eq!(worker.grace_period(&hourly), TimeDelta::hours(24));
+        worker
+            .handle_subscription_state(&hourly, expires.sub(TimeDelta::minutes(1)))
+            .await?;
+        assert!(
+            count_notifications(&worker, "Cancelled").await >= 1,
+            "an hourly subscription 30h past expiry is beyond its 24h grace"
+        );
+
+        // The same expiry on a monthly plan is still inside its grace window.
+        let (_v2, sub2) = add_vm_with_subscription(&db, created, true).await?;
+        let monthly2 = db.get_subscription(sub2).await?;
+        worker
+            .handle_subscription_state(&monthly2, expires.sub(TimeDelta::minutes(1)))
+            .await?;
+        assert_eq!(count_notifications(&worker, "Cancelled").await, 0);
+        Ok(())
+    }
+
+    /// Once expired, the user gets a daily reminder counting down to deletion
+    /// for the whole grace period.
+    #[tokio::test]
+    async fn test_daily_deletion_countdown_within_grace() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        // Created 40 days ago => expired ~10 days ago, 14-day grace period.
+        let created = Utc::now().sub(TimeDelta::days(40));
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, created, true).await?;
+        let sub = db.get_subscription(subscription_id).await?;
+        let worker = setup_worker_with_delete_after(db.clone(), 30).await?;
+
+        // First tick fires the one-shot "Expired" handling.
+        let expires = sub.expires.unwrap();
+        worker
+            .handle_subscription_state(&sub, expires.sub(TimeDelta::days(1)))
+            .await?;
+        count_notifications(&worker, "").await;
+
+        // Later tick within the grace period: a countdown reminder.
+        worker
+            .handle_subscription_state(&sub, expires.add(TimeDelta::minutes(1)))
+            .await?;
+        assert_eq!(
+            count_notifications(&worker, "Deletion in 4 days").await,
+            1,
+            "an expired subscription must get a daily deletion countdown"
+        );
+
+        // Same day, already notified: silent.
+        worker.handle_subscription_state(&sub, Utc::now()).await?;
+        assert_eq!(
+            count_notifications(&worker, "Deletion in").await,
+            0,
+            "the countdown must fire at most once per day"
+        );
+        Ok(())
     }
 
     #[test]
@@ -5436,12 +7881,75 @@ mod tests {
             .handle_subscription_state(&sub, Utc::now().sub(TimeDelta::minutes(1)))
             .await?;
 
-        let notes = count_notifications(&worker, "Expiring Soon").await
+        let notes = count_notifications(&worker, "Expires in").await
             + count_notifications(&worker, "Auto-Renewed").await;
         assert_eq!(
             notes, 0,
             "a freshly-renewed 1-day sub must not be 'expiring soon' (double-charge bug)"
         );
+        Ok(())
+    }
+
+    /// An hourly subscription renewed from credit is renewed silently: a notice
+    /// every hour would be 24 a day.
+    #[tokio::test]
+    async fn test_hourly_credit_renewal_sends_no_notice() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        let sub = {
+            let mut subs = db.subscriptions.lock().await;
+            let s = subs.get_mut(&subscription_id).unwrap();
+            s.interval_type = IntervalType::Hour;
+            s.auto_renewal_enabled = true;
+            // Inside the 30 minute lead window.
+            s.expires = Some(Utc::now().add(TimeDelta::minutes(20)));
+            s.clone()
+        };
+        db.adjust_account_credit(sub.user_id, "BTC", 10_000_000_000, "topup", None)
+            .await?;
+        db.set_account_credit_auto_apply(sub.user_id, true).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .handle_subscription_state(&sub, Utc::now().sub(TimeDelta::minutes(15)))
+            .await?;
+
+        let renewed = db.get_subscription(subscription_id).await?;
+        assert!(
+            renewed.expires.unwrap() > sub.expires.unwrap(),
+            "the hour was renewed from credit"
+        );
+        assert_eq!(count_notifications(&worker, "").await, 0, "and silently");
+        Ok(())
+    }
+
+    /// A credit balance too small to renew is not a renewal method: the user
+    /// still gets the early "expires in" reminders.
+    #[tokio::test]
+    async fn test_leftover_credit_does_not_suppress_expiry_reminders() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (_vm_id, subscription_id) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        let sub = {
+            let mut subs = db.subscriptions.lock().await;
+            let s = subs.get_mut(&subscription_id).unwrap();
+            s.auto_renewal_enabled = true;
+            s.expires = Some(
+                Utc::now()
+                    .add(TimeDelta::days(7))
+                    .sub(TimeDelta::minutes(1)),
+            );
+            s.clone()
+        };
+        db.adjust_account_credit(sub.user_id, "BTC", 1_000, "topup", None)
+            .await?;
+        db.set_account_credit_auto_apply(sub.user_id, true).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .handle_subscription_state(&sub, Utc::now().sub(TimeDelta::minutes(5)))
+            .await?;
+
+        assert_eq!(count_notifications(&worker, "Expires in 7 days").await, 1);
         Ok(())
     }
 
@@ -5468,12 +7976,46 @@ mod tests {
             .handle_subscription_state(&sub, Utc::now().sub(TimeDelta::days(1)))
             .await?;
 
-        let notes = count_notifications(&worker, "Expiring Soon").await;
+        let notes = count_notifications(&worker, "Expires in").await;
         assert!(
             notes >= 1,
             "a daily sub within the 12h lead window must warn/auto-renew (got {notes})"
         );
         Ok(())
+    }
+
+    /// A route server that configures itself is not polled.
+    ///
+    /// Asserted on the predicate rather than by driving the sampler: that loop
+    /// logs and swallows its errors, so it returns `Ok` whether a router was
+    /// skipped or dialled and failed. A test around it passes either way, which
+    /// is worse than no test.
+    #[test]
+    fn only_routers_lnvps_dials_are_polled() {
+        use lnvps_db::{Router, RouterKind};
+
+        let router = |kind, enabled| Router {
+            id: 1,
+            name: "r".to_string(),
+            enabled,
+            kind,
+            url: String::new(),
+            token: "".into(),
+        };
+
+        // An lvd route server refuses to be dialled by design, so polling it
+        // reports a fault that does not exist.
+        assert!(!super::is_pollable(&router(RouterKind::Lvd, true)));
+        // Every other kind is asked, when it is enabled.
+        assert!(super::is_pollable(&router(RouterKind::Mikrotik, true)));
+        assert!(super::is_pollable(&router(RouterKind::LinuxSsh, true)));
+        assert!(super::is_pollable(&router(
+            RouterKind::OvhAdditionalIp,
+            true
+        )));
+        // Disabled still means disabled.
+        assert!(!super::is_pollable(&router(RouterKind::Mikrotik, false)));
+        assert!(!super::is_pollable(&router(RouterKind::Lvd, false)));
     }
 
     #[tokio::test]
@@ -5837,7 +8379,11 @@ mod tests {
         // this list is the anti-spoof boundary, not just a routing hint.
         assert_eq!(
             peers[0].allowed_ips,
-            vec!["10.66.0.2/32".to_string(), "203.0.113.5/32".to_string()]
+            vec![
+                "10.66.0.2/32".to_string(),
+                "10.66.0.254/32".to_string(),
+                "203.0.113.5/32".to_string()
+            ]
         );
         // One address for the pool, carrying the block's prefix: every node in
         // it is on-link, so the route server does not carry an address per
@@ -5853,7 +8399,11 @@ mod tests {
         // point-to-point interface does not route the rest of its prefix.
         assert_eq!(
             mr.interface_routes(&interface).await,
-            vec!["10.66.0.0/24".to_string(), "203.0.113.5/32".to_string()]
+            vec![
+                "10.66.0.0/24".to_string(),
+                "10.66.0.254/32".to_string(),
+                "203.0.113.5/32".to_string()
+            ]
         );
         assert_eq!(tunnel.pool_id, Some(pool_id));
 
@@ -5907,7 +8457,11 @@ mod tests {
         assert_eq!(drift.changed, vec![key.clone()]);
         assert_eq!(
             mr.peers(&interface).await[0].allowed_ips,
-            vec!["10.66.0.2/32".to_string(), "203.0.113.5/32".to_string()]
+            vec![
+                "10.66.0.2/32".to_string(),
+                "10.66.0.254/32".to_string(),
+                "203.0.113.5/32".to_string()
+            ]
         );
 
         // LNVPS owns `wgln*` outright, so a key no allocation accounts for is
@@ -5924,6 +8478,100 @@ mod tests {
         let drift = worker.tunnels().reconcile_peers(pool_id).await?;
         assert_eq!(drift.unclaimed, vec!["c3RyYXk=".to_string()]);
         assert_eq!(mr.peers(&interface).await.len(), 1);
+
+        mr.clear().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_carries_the_pool_mtu_to_the_route_server() -> Result<()> {
+        use crate::mocks::MockRouter;
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        setup_node_tunnel(&db, pool_id).await?;
+        let mr = MockRouter::new();
+        mr.clear().await;
+        let worker = setup_worker(db.clone()).await?;
+        worker.tunnels().sync_pool(pool_id).await?;
+        let interface = format!("wgln{pool_id}");
+        assert_eq!(mr.interface_mtu(&interface).await, Some(1420));
+
+        let mut pool = db.get_tunnel_pool(pool_id).await?;
+        pool.mtu = 1280;
+        db.update_tunnel_pool(&pool).await?;
+        worker.tunnels().reconcile_peers(pool_id).await?;
+        assert_eq!(mr.interface_mtu(&interface).await, Some(1280));
+
+        mr.clear().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_isolates_every_node_block_on_the_router() -> Result<()> {
+        use crate::mocks::MockRouter;
+        use lnvps_db::TunnelPool;
+
+        let db = Arc::new(MockDb::empty());
+        let pool_id = setup_pool(&db, 51820).await?;
+        setup_node_tunnel(&db, pool_id).await?;
+        let pool = |router_id: u64, port: u16, cidr4: &str, cidr6: Option<&str>, enabled| {
+            let keys = lnvps_api_common::generate_wireguard_keypair().unwrap();
+            TunnelPool {
+                router_id,
+                region_id: 1,
+                name: format!("pool{port}"),
+                listen_addr: "192.0.2.1".to_string(),
+                listen_port: port,
+                private_key: keys.private_key.into(),
+                public_key: keys.public_key,
+                cidr4: Some(cidr4.to_string()),
+                cidr6: cidr6.map(str::to_string),
+                mtu: 1420,
+                enabled,
+                ..Default::default()
+            }
+        };
+        db.insert_tunnel_pool(&pool(1, 51821, "10.67.0.0/24", Some("fd67::/64"), false))
+            .await?;
+        let vpn_pool = db
+            .insert_tunnel_pool(&pool(1, 51822, "10.68.0.0/24", None, true))
+            .await?;
+        db.vpn_service_pools.lock().await.insert(vpn_pool, 1);
+        db.vpn_services.lock().await.insert(
+            1,
+            lnvps_db::VpnService {
+                id: 1,
+                ..Default::default()
+            },
+        );
+        db.router.lock().await.insert(
+            2,
+            lnvps_db::Router {
+                id: 2,
+                name: "rs2".to_string(),
+                enabled: true,
+                kind: lnvps_db::RouterKind::MockRouter,
+                url: "mock://".to_string(),
+                token: "".into(),
+            },
+        );
+        db.insert_tunnel_pool(&pool(2, 51823, "10.69.0.0/24", None, true))
+            .await?;
+
+        let mr = MockRouter::new();
+        mr.clear().await;
+        let worker = setup_worker(db.clone()).await?;
+        worker.tunnels().sync_pool(pool_id).await?;
+
+        assert_eq!(
+            mr.isolated_blocks().await,
+            Some(vec![
+                "10.66.0.0/24".to_string(),
+                "10.67.0.0/24".to_string(),
+                "fd67::/64".to_string(),
+            ])
+        );
 
         mr.clear().await;
         Ok(())
@@ -6224,6 +8872,481 @@ mod tests {
             .process_bulk_message("Nobody home".to_string(), "text".to_string(), admin, None)
             .await?;
         assert!(summary.contains("matched no recipients"), "{summary}");
+        Ok(())
+    }
+
+    // ----- never-paid subscription sweep -----
+
+    /// A never-paid subscription of the given type, created `age` ago, with a
+    /// single line item. Returns `(subscription_id, line_item_id)`.
+    async fn add_never_paid_subscription(
+        db: &Arc<MockDb>,
+        user_id: u64,
+        kind: LineItemType,
+        age: TimeDelta,
+    ) -> Result<(u64, u64)> {
+        let (sub_id, line_items) = db
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id,
+                    company_id: 1,
+                    name: "abandoned".to_string(),
+                    description: None,
+                    created: Utc::now() - age,
+                    expires: None,
+                    is_active: false,
+                    is_setup: false,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: lnvps_db::IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: true,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: kind,
+                    name: "abandoned".to_string(),
+                    description: None,
+                    amount: 500,
+                    setup_amount: 0,
+                    configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
+                }],
+            )
+            .await?;
+        Ok((sub_id, line_items[0]))
+    }
+
+    /// An order nobody paid for is removed once it is past the TTL. Nothing
+    /// else ever revisits it: `list_lifecycle_subscriptions` is
+    /// active-with-an-expiry, and an abandoned checkout is neither.
+    #[tokio::test]
+    async fn test_never_paid_subscription_is_purged() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[1u8; 32]).await?;
+        let (sub_id, _) =
+            add_never_paid_subscription(&db, user_id, LineItemType::DnsHosting, TimeDelta::days(2))
+                .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_never_paid_subscriptions().await?;
+
+        assert!(
+            db.get_subscription(sub_id).await.is_err(),
+            "a never-paid subscription past the TTL must be purged"
+        );
+        Ok(())
+    }
+
+    /// The TTL is what stops the sweep racing a customer who is still at the
+    /// checkout page.
+    #[tokio::test]
+    async fn test_never_paid_subscription_within_ttl_is_kept() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[2u8; 32]).await?;
+        let (sub_id, _) = add_never_paid_subscription(
+            &db,
+            user_id,
+            LineItemType::DnsHosting,
+            TimeDelta::minutes(5),
+        )
+        .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_never_paid_subscriptions().await?;
+
+        assert!(db.get_subscription(sub_id).await.is_ok());
+        Ok(())
+    }
+
+    /// An unexpired invoice, or an on-chain deposit seen but not confirmed,
+    /// means the money may still be on its way. Purging then would take the
+    /// order out from under a customer who has already paid for it (#194).
+    #[tokio::test]
+    async fn test_never_paid_subscription_with_pending_payment_is_kept() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[3u8; 32]).await?;
+        let (sub_id, _) =
+            add_never_paid_subscription(&db, user_id, LineItemType::DnsHosting, TimeDelta::days(2))
+                .await?;
+        db.insert_subscription_payment(&make_subscription_payment(
+            sub_id,
+            user_id,
+            Utc::now(),
+            Utc::now() + TimeDelta::minutes(30),
+            1,
+        ))
+        .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_never_paid_subscriptions().await?;
+
+        assert!(
+            db.get_subscription(sub_id).await.is_ok(),
+            "a subscription with an unexpired invoice must survive the sweep"
+        );
+        Ok(())
+    }
+
+    /// A VM's subscription belongs to `check_vms`, which purges never-paid VMs
+    /// on its own clock and has a hypervisor to talk to. Deleting the
+    /// subscription here would orphan the VM row.
+    #[tokio::test]
+    async fn test_never_paid_vm_subscription_is_left_to_check_vms() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, sub_id) =
+            add_vm_with_subscription(&db, Utc::now() - TimeDelta::days(2), false).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_never_paid_subscriptions().await?;
+
+        assert!(db.get_subscription(sub_id).await.is_ok());
+        assert!(db.get_vm(vm_id).await.is_ok());
+        Ok(())
+    }
+
+    /// A never-paid VPN plan goes with its subscription, devices and all.
+    ///
+    /// Those devices were never configured on a route server (the peer set is
+    /// joined through `is_setup`), so nothing is being cut off. Leaving the
+    /// plan behind is what pins the customer: `create_vpn_plan` returns an
+    /// existing plan whenever its state is not `Expired`, and `Unpaid` is not
+    /// `Expired`, so they could never get one at current pricing.
+    #[tokio::test]
+    async fn test_never_paid_vpn_plan_is_purged_with_its_devices() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let dyn_db: Arc<dyn LNVpsDb> = db.clone();
+        let user_id = db.upsert_user(&[4u8; 32]).await?;
+        let (sub_id, line_item_id) =
+            add_never_paid_subscription(&db, user_id, LineItemType::Vpn, TimeDelta::days(2))
+                .await?;
+        let service_id = db
+            .insert_vpn_service(&lnvps_db::VpnService {
+                name: "eu".to_string(),
+                company_id: 1,
+                amount: 500,
+                currency: "EUR".to_string(),
+                interval_amount: 1,
+                interval_type: lnvps_db::IntervalType::Month,
+                setup_amount: 0,
+                default_device_limit: 5,
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let plan_id = db
+            .insert_vpn_subscription(&lnvps_db::VpnSubscription {
+                id: 0,
+                vpn_service_id: service_id,
+                user_id,
+                subscription_line_item_id: line_item_id,
+                created: Utc::now() - TimeDelta::days(2),
+            })
+            .await?;
+        // A device is a peer on every interface terminating the service, so
+        // the service needs one before there is anywhere to connect.
+        let router_id = {
+            let mut routers = db.router.lock().await;
+            let id = routers.keys().max().copied().unwrap_or(0) + 1;
+            routers.insert(
+                id,
+                lnvps_db::Router {
+                    id,
+                    name: "rs".to_string(),
+                    enabled: true,
+                    kind: lnvps_db::RouterKind::MockRouter,
+                    url: "mock://rs".to_string(),
+                    token: "t".into(),
+                },
+            );
+            id
+        };
+        let pool_id = db
+            .insert_tunnel_pool(&lnvps_db::TunnelPool {
+                router_id,
+                region_id: 1,
+                name: "vpn".to_string(),
+                listen_addr: "rs.example".to_string(),
+                listen_port: 51820,
+                private_key: lnvps_api_common::generate_wireguard_keypair()?
+                    .private_key
+                    .into(),
+                public_key: vec![0x33; 32],
+                cidr4: Some("10.64.0.0/24".to_string()),
+                mtu: 1420,
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        db.link_vpn_service_pool(service_id, pool_id).await?;
+
+        let plan = db.get_vpn_subscription(plan_id).await?;
+        let device =
+            crate::provisioner::register_vpn_device(&dyn_db, &plan, "phone", &[7u8; 32]).await?;
+        let tunnels = db.list_vpn_device_tunnels(device.id).await?;
+        assert_eq!(tunnels.len(), 1, "precondition: the device is a peer");
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_never_paid_subscriptions().await?;
+
+        assert!(db.get_subscription(sub_id).await.is_err());
+        assert!(
+            db.get_vpn_subscription_for_user(user_id).await?.is_none(),
+            "the plan must go, or the customer stays pinned to it"
+        );
+        assert!(
+            db.list_vpn_devices(plan_id).await?.is_empty(),
+            "a device is only reachable through its plan; leaving it strands a tunnel"
+        );
+        assert!(db.get_tunnel(tunnels[0].id).await.is_err());
+        Ok(())
+    }
+
+    /// The listing fee is the order, not the node. An operator who never paid
+    /// one keeps their registration; only the billing link goes, so they can
+    /// start a fee again at current pricing.
+    #[tokio::test]
+    async fn test_never_paid_marketplace_fee_keeps_the_node() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[5u8; 32]).await?;
+        let (sub_id, line_item_id) = add_never_paid_subscription(
+            &db,
+            user_id,
+            LineItemType::MarketplaceNodeFee,
+            TimeDelta::days(2),
+        )
+        .await?;
+        let operator_id = db
+            .insert_marketplace_operator(&lnvps_db::MarketplaceOperator {
+                user_id,
+                enabled: true,
+                ..Default::default()
+            })
+            .await?;
+        let node_id = db
+            .insert_marketplace_node(&lnvps_db::MarketplaceNode {
+                operator_id,
+                name: "rack 1".to_string(),
+                subscription_line_item_id: Some(line_item_id),
+                ..Default::default()
+            })
+            .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_never_paid_subscriptions().await?;
+
+        assert!(db.get_subscription(sub_id).await.is_err());
+        let node = db.get_marketplace_node(node_id).await?;
+        assert_eq!(
+            node.subscription_line_item_id, None,
+            "the node survives an unpaid listing fee, unlinked"
+        );
+        Ok(())
+    }
+
+    /// A never-paid deployment has no Kubernetes objects at all — the
+    /// operator's gate gives `BillingState::Unpaid` nothing — so the row and
+    /// its billing go together.
+    #[tokio::test]
+    async fn test_never_paid_app_deployment_is_purged() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[6u8; 32]).await?;
+        let (sub_id, line_item_id) =
+            add_never_paid_subscription(&db, user_id, LineItemType::App, TimeDelta::days(2))
+                .await?;
+        let deployment_id = db
+            .insert_app_deployment(&lnvps_db::AppDeployment {
+                id: 0,
+                user_id,
+                app_id: 1,
+                cluster_id: 1,
+                resource_multiplier: 1,
+                subscription_line_item_id: line_item_id,
+                name: "blog".to_string(),
+                namespace: "app-1".to_string(),
+                hostname: None,
+                custom_domain: None,
+                custom_domain_verified: false,
+                public_port: None,
+                config: None,
+                desired_state: lnvps_db::AppDeploymentDesiredState::Running,
+                status: lnvps_db::AppDeploymentStatus::Pending,
+                status_message: None,
+                usage_cpu_milli: None,
+                usage_memory_bytes: None,
+                usage_storage_bytes: None,
+                usage_collected: None,
+                created: Utc::now() - TimeDelta::days(2),
+                deleted: false,
+            })
+            .await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker.check_never_paid_subscriptions().await?;
+
+        assert!(db.get_app_deployment(deployment_id).await.is_err());
+        assert!(db.get_subscription(sub_id).await.is_err());
+        Ok(())
+    }
+
+    /// A payment settling between the listing snapshot and the purge must win.
+    #[tokio::test]
+    async fn test_never_paid_sweep_rereads_before_purging() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let user_id = db.upsert_user(&[7u8; 32]).await?;
+        let (sub_id, _) =
+            add_never_paid_subscription(&db, user_id, LineItemType::DnsHosting, TimeDelta::days(2))
+                .await?;
+        let stale = db.get_subscription(sub_id).await?;
+
+        let mut paid = stale.clone();
+        paid.is_setup = true;
+        paid.is_active = true;
+        db.update_subscription(&paid).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .purge_never_paid_subscription(&stale, Utc::now())
+            .await?;
+
+        assert!(
+            db.get_subscription(sub_id).await.is_ok(),
+            "a subscription paid since the snapshot must not be purged"
+        );
+        Ok(())
+    }
+
+    async fn add_bandwidth_plan(db: &Arc<MockDb>) {
+        db.custom_pricing.lock().await.insert(
+            1,
+            lnvps_db::VmCustomPricing {
+                id: 1,
+                enabled: true,
+                region_id: 1,
+                currency: "EUR".to_string(),
+                cpu_cost: 100,
+                min_cpu: 1,
+                max_cpu: 16,
+                max_memory: u64::MAX,
+                max_ip4: 4,
+                max_ip6: 4,
+                transfer_gb: Some(1000),
+                min_transfer_gb: 500,
+                max_transfer_gb: 10_000,
+                transfer_cost_per_tb: 100,
+                network_mbps: Some(1000),
+                min_network_mbps: 100,
+                max_network_mbps: 10_000,
+                network_cost_per_gbps: 200,
+                ..Default::default()
+            },
+        );
+        db.custom_pricing_disk.lock().await.insert(
+            1,
+            lnvps_db::VmCustomPricingDisk {
+                id: 1,
+                pricing_id: 1,
+                kind: lnvps_db::DiskType::SSD,
+                interface: lnvps_db::DiskInterface::PCIe,
+                cost: 1,
+                min_disk_size: 0,
+                max_disk_size: u64::MAX,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_upgrade_updates_custom_template() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        add_bandwidth_plan(&db).await;
+        let template_id = db
+            .insert_custom_vm_template(&lnvps_db::VmCustomTemplate {
+                cpu: 2,
+                memory: crate::GB,
+                disk_size: 10 * crate::GB,
+                disk_type: lnvps_db::DiskType::SSD,
+                disk_interface: lnvps_db::DiskInterface::PCIe,
+                pricing_id: 1,
+                transfer_gb: Some(1000),
+                network_mbps: Some(1000),
+                ..Default::default()
+            })
+            .await?;
+        let mut vm = db.get_vm(vm_id).await?;
+        vm.template_id = None;
+        vm.custom_template_id = Some(template_id);
+        db.update_vm(&vm).await?;
+
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .process_vm_upgrade(
+                vm_id,
+                &UpgradeConfig {
+                    new_transfer_gb: Some(4000),
+                    new_network_mbps: Some(2000),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let template = db.get_custom_vm_template(template_id).await?;
+        assert_eq!(template.transfer_gb, Some(4000));
+        assert_eq!(template.network_mbps, Some(2000));
+        assert_eq!(template.cpu, 2, "compute is untouched");
+        let line_item = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        assert_eq!(line_item.amount, 200 + 10 + 400 + 400);
+
+        let refused = worker
+            .process_vm_upgrade(
+                vm_id,
+                &UpgradeConfig {
+                    new_transfer_gb: Some(2000),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(refused.is_err(), "bandwidth cannot shrink");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bandwidth_upgrade_converts_standard_template() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        add_bandwidth_plan(&db).await;
+        {
+            let mut templates = db.templates.lock().await;
+            let t = templates.get_mut(&1).expect("mock template");
+            t.disk_type = lnvps_db::DiskType::SSD;
+            t.disk_interface = lnvps_db::DiskInterface::PCIe;
+            t.transfer_gb = Some(500);
+            t.network_mbps = None;
+        }
+
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .process_vm_upgrade(
+                vm_id,
+                &UpgradeConfig {
+                    new_transfer_gb: Some(3000),
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        let vm = db.get_vm(vm_id).await?;
+        let template = db
+            .get_custom_vm_template(vm.custom_template_id.expect("converted"))
+            .await?;
+        assert_eq!(template.transfer_gb, Some(3000));
+        assert_eq!(template.network_mbps, None, "an uncapped VM stays uncapped");
         Ok(())
     }
 }

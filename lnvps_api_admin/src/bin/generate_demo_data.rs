@@ -393,6 +393,7 @@ async fn create_hosts(db: &LNVpsDbMysql, regions: &[Region]) -> Result<Vec<VmHos
             ssh_key: None,
             sunset_date: None,
             marketplace_node_id: None,
+            deleted: false,
         };
 
         let id = db.create_host(&host).await?;
@@ -516,6 +517,7 @@ async fn create_os_images(db: &LNVpsDbMysql) -> Result<Vec<VmOsImage>> {
             default_username: Some("ubuntu".to_string()),
             sha2: None,
             sha2_url: None,
+            encrypted: false,
         };
 
         let id = db.admin_create_vm_os_image(&os_image).await?;
@@ -992,6 +994,7 @@ async fn create_custom_pricing(
             network_mbps: None,
             cpu_limit: None,
             transfer_gb: None,
+            ..Default::default()
         };
 
         let id = db.insert_custom_pricing(&pricing).await?;

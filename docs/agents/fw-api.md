@@ -27,7 +27,7 @@ section to disable the API entirely.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/status` | daemon health: version, uptime, interfaces, counts, events cursor |
+| GET | `/status` | daemon health: version, uptime, interfaces, counts, events cursor, and per-NIC `nics` (role, driver, MTU, link speed, **effective XDP mode**, offloads + what the attach changed, driver XDP counters) |
 | GET | `/rules` | current ruleset (protected prefixes + manual overrides) |
 | PUT | `/rules` | replace the ruleset atomically (idempotent; re-push desired state) |
 | GET | `/mitigations` | currently-active mitigations (auto + manual) with peak rates |
@@ -216,6 +216,14 @@ rejected with `400`.
 with `since=<cursor>` for only new ones. The buffer is bounded
 (`api.events-buffer`); on overflow the oldest are dropped — durable history is
 `lnvps_api`'s responsibility.
+
+Event `kind`s: `start` / `flags` / `stop` are auto-detected mitigations (with
+the rates that tripped them). Rule changes are recorded too, since they take
+effect without any traffic-side signal: `manual_start` / `manual_stop` (an
+override set, re-flagged, or cleared; `cidr` + `flags`), `block_start` /
+`block_stop` (manual source block), `sni_start` / `sni_stop` (`cidr` carries
+the hostname). Each is also logged (`OVERRIDE SET`, `SOURCE BLOCK ADDED`, ...)
+so a throughput complaint can be lined up against the journal.
 
 ## Dashboard
 

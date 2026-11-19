@@ -4,7 +4,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use futures::stream;
 use futures::stream::BoxStream;
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Value};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -68,6 +68,20 @@ impl JobFeedback {
         "worker:feedback".to_string()
     }
 
+    /// The job id under which a tunnel pool's desired state is announced.
+    ///
+    /// A subject rather than one invocation, unlike every other job id here.
+    /// The listeners are route servers waiting to be told their configuration
+    /// moved, and they know which pool they are running, not which sync run
+    /// moved it -- a per-invocation id would be a channel nobody could
+    /// subscribe to before the thing they are waiting for had already happened.
+    ///
+    /// Its own constructor so that the side announcing and the side waiting
+    /// cannot format it differently.
+    pub fn tunnel_pool_job_id(pool_id: u64) -> String {
+        format!("tunnel_pool:{pool_id}")
+    }
+
     /// Create a job feedback with started status
     pub fn create_job_started_feedback(job_id: String, job_type: String) -> Self {
         Self::new(job_id, job_type, JobFeedbackStatus::Started)
@@ -101,6 +115,29 @@ impl JobFeedback {
         Self::new(job_id, job_type, JobFeedbackStatus::Failed { error })
     }
 
+    pub fn snapshot_reply(reply_channel: String, result: &crate::retry::OpResult<()>) -> Self {
+        use crate::host::SnapshotRejection;
+        let job_type = "VmSnapshot".to_string();
+        match result {
+            Ok(()) => Self::create_job_completed_feedback(reply_channel, job_type, None),
+            Err(e) => match e.inner().downcast_ref::<SnapshotRejection>() {
+                Some(r) => Self::create_job_failed_feedback(reply_channel, job_type, r.to_string())
+                    .with_metadata(HashMap::from([(
+                        "rejection".to_string(),
+                        r.kind().to_string(),
+                    )])),
+                None => Self::create_job_failed_feedback(reply_channel, job_type, e.to_string()),
+            },
+        }
+    }
+
+    pub fn snapshot_rejection(&self) -> Option<crate::host::SnapshotRejection> {
+        let JobFeedbackStatus::Failed { error } = &self.status else {
+            return None;
+        };
+        crate::host::SnapshotRejection::from_kind(self.metadata.get("rejection")?, error.clone())
+    }
+
     /// Create a job feedback with cancelled status
     pub fn create_job_cancelled_feedback(
         job_id: String,
@@ -114,7 +151,7 @@ impl JobFeedback {
 #[derive(Clone, Debug)]
 pub struct RedisWorkFeedback {
     redis: redis::Client,
-    conn: MultiplexedConnection,
+    conn: ConnectionManager,
 }
 
 impl RedisWorkFeedback {
@@ -125,7 +162,7 @@ impl RedisWorkFeedback {
 
     pub async fn new_from_client(client: redis::Client) -> Result<Self> {
         // get a reusable connection object
-        let conn = client.get_multiplexed_async_connection().await?;
+        let conn = ConnectionManager::new(client.clone()).await?;
         Ok(Self {
             conn,
             redis: client,
@@ -197,5 +234,35 @@ impl WorkFeedback for BlackholeWorkFeedback {
 
     async fn subscribe(&self, _channel: &str) -> Result<BoxStream<Result<JobFeedback>>> {
         Ok(stream::empty().boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::SnapshotRejection;
+    use crate::retry::OpError;
+
+    #[test]
+    fn snapshot_reply_carries_the_rejection() {
+        let ok = JobFeedback::snapshot_reply("c".into(), &Ok(()));
+        assert!(matches!(ok.status, JobFeedbackStatus::Completed { .. }));
+        assert_eq!(ok.snapshot_rejection(), None);
+
+        let rejected = JobFeedback::snapshot_reply(
+            "c".into(),
+            &Err(SnapshotRejection::Conflict("full".into()).into()),
+        );
+        let json = serde_json::to_string(&rejected).unwrap();
+        let back: JobFeedback = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.snapshot_rejection(),
+            Some(SnapshotRejection::Conflict("full".into()))
+        );
+
+        let failed =
+            JobFeedback::snapshot_reply("c".into(), &Err(OpError::Fatal(anyhow::anyhow!("boom"))));
+        assert!(matches!(failed.status, JobFeedbackStatus::Failed { .. }));
+        assert_eq!(failed.snapshot_rejection(), None);
     }
 }

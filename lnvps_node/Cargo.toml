@@ -1,13 +1,34 @@
 [package]
 name = "lnvps_node"
-version.workspace = true
+version = "0.1.0"
 edition.workspace = true
+license = "MIT"
+description = "LNVPS marketplace node daemon"
 
 [[bin]]
 name = "lnvps-node"
 path = "src/main.rs"
 
+[package.metadata.deb]
+name = "lnvps-node"
+maintainer = "LNVPS <admin@lnvps.net>"
+copyright = "LNVPS"
+section = "net"
+priority = "optional"
+extended-description = """\
+The LNVPS marketplace node daemon. Serves the control API over the tunnel, \
+reports hardware inventory and applies the data plane LNVPS asks for. The \
+control public key is compiled in at build time."""
+depends = "$auto"
+maintainer-scripts = "debian/"
+assets = [
+    ["target/release/lnvps-node", "usr/bin/lnvps-node", "755"],
+    ["systemd/lnvps-node.service", "lib/systemd/system/lnvps-node.service", "644"],
+    ["config.example.yaml", "etc/lnvps-node/config.example.yaml", "644"],
+]
+
 [dependencies]
+lnvps_netlink = { path = "../lnvps_netlink" }
 # Detection is shared with the `lnvps-host-info` binary so an operator's
 # pre-flight check and the daemon's report cannot disagree about the machine.
 # Built without the vendor libraries: a node must start on a host that has
@@ -29,6 +50,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # approach as lnvps_fw's control API.
 rcgen = "0.13"
 base64 = "0.22"
+# Verifying an image the node fetched against the digest LNVPS named.
+sha2 = "0.10"
 clap = { version = "4.5", features = ["derive"] }
 
 # Control API: axum over rustls. HTTPS is not optional — LNVPS pins the
@@ -55,6 +78,7 @@ async-trait.workspace = true
 ipnetwork.workspace = true
 netlink-packet-route = "0.30"
 nix = { version = "0.30", features = ["sched", "mount", "fs"] }
+socket2 = "0.6"
 
 [dev-dependencies]
 tempfile = "3"

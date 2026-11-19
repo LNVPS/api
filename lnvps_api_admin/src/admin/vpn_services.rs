@@ -20,7 +20,7 @@ use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 
 use lnvps_api_common::{
-    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, WorkJob,
+    ApiData, ApiError, ApiIntervalType, ApiPaginatedData, ApiPaginatedResult, ApiResult, WorkJob,
     deserialize_from_str_optional,
 };
 use lnvps_db::{AdminAction, AdminResource, IntervalType, LNVpsDb, VpnService};
@@ -71,7 +71,7 @@ pub struct AdminVpnServiceInfo {
     /// Recurring price, in the currency's smallest unit.
     pub amount: u64,
     pub interval_amount: u64,
-    pub interval_type: IntervalType,
+    pub interval_type: ApiIntervalType,
     /// One-off charge on the first payment, in the same unit as `amount`.
     pub setup_amount: u64,
     /// Resolvers handed to clients, comma-separated as stored.
@@ -113,7 +113,7 @@ pub struct CreateVpnServiceRequest {
     pub amount: u64,
     /// Defaults to 1 with `interval_type` month.
     pub interval_amount: Option<u64>,
-    pub interval_type: Option<IntervalType>,
+    pub interval_type: Option<ApiIntervalType>,
     pub setup_amount: Option<u64>,
     pub dns: Option<String>,
     /// Defaults to 5.
@@ -132,7 +132,7 @@ pub struct UpdateVpnServiceRequest {
     pub currency: Option<String>,
     pub amount: Option<u64>,
     pub interval_amount: Option<u64>,
-    pub interval_type: Option<IntervalType>,
+    pub interval_type: Option<ApiIntervalType>,
     pub setup_amount: Option<u64>,
     #[serde(
         default,
@@ -177,7 +177,7 @@ async fn service_info(
         currency: service.currency,
         amount: service.amount,
         interval_amount: service.interval_amount,
-        interval_type: service.interval_type,
+        interval_type: service.interval_type.into(),
         setup_amount: service.setup_amount,
         dns: service.dns,
         default_device_limit: service.default_device_limit,
@@ -244,7 +244,10 @@ async fn admin_create_vpn_service(
             currency: req.currency.to_uppercase(),
             amount: req.amount,
             interval_amount: req.interval_amount.unwrap_or(1),
-            interval_type: req.interval_type.unwrap_or(IntervalType::Month),
+            interval_type: req
+                .interval_type
+                .map(Into::into)
+                .unwrap_or(IntervalType::Month),
             setup_amount: req.setup_amount.unwrap_or(0),
             dns: req.dns.filter(|d| !d.trim().is_empty()),
             default_device_limit: req.default_device_limit.unwrap_or(DEFAULT_DEVICE_LIMIT),
@@ -284,7 +287,7 @@ async fn admin_update_vpn_service(
         service.interval_amount = interval_amount;
     }
     if let Some(interval_type) = req.interval_type {
-        service.interval_type = interval_type;
+        service.interval_type = interval_type.into();
     }
     if let Some(setup_amount) = req.setup_amount {
         service.setup_amount = setup_amount;

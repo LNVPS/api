@@ -15,6 +15,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow, bail};
+use lnvps_api_common::{JobFeedback, WorkFeedback};
 use lnvps_db::LNVpsDb;
 use log::{info, warn};
 
@@ -84,11 +85,53 @@ impl std::fmt::Display for TunnelPeerDrift {
 /// there.
 pub struct TunnelProvisioner {
     db: Arc<dyn LNVpsDb>,
+    /// Where generation bumps are announced, when there is anywhere to announce
+    /// them. See [`TunnelProvisioner::with_feedback`].
+    feedback: Option<Arc<dyn WorkFeedback>>,
 }
 
 impl TunnelProvisioner {
     pub fn new(db: Arc<dyn LNVpsDb>) -> Self {
-        Self { db }
+        Self { db, feedback: None }
+    }
+
+    /// Announce generation bumps, so a route server holding a request open is
+    /// told at once instead of on its next re-read.
+    ///
+    /// Optional because most callers only plan: a bump happens where a pushed
+    /// pool would have been pushed, which is the worker. A provisioner without
+    /// one still bumps -- the database is what a route server reads -- it just
+    /// does not say so out loud, and the waiter falls back to re-reading.
+    pub fn with_feedback(mut self, feedback: Arc<dyn WorkFeedback>) -> Self {
+        self.feedback = Some(feedback);
+        self
+    }
+
+    /// Record that this interface's desired state moved, and say so.
+    ///
+    /// The database is written first and announced second, in that order: a
+    /// route server woken by the message immediately re-reads, and being woken
+    /// before the new state is readable would send it back to sleep on the old
+    /// generation. A message that never arrives costs one wait cycle, because
+    /// the waiter has a deadline; a message that arrives early would cost the
+    /// full round trip it exists to save.
+    async fn publish_generation(&self, pool_id: u64) -> Result<u64> {
+        let generation = self.db.bump_tunnel_pool_generation(pool_id).await?;
+        if let Some(feedback) = &self.feedback
+            && let Err(e) = feedback
+                .publish(JobFeedback::create_job_completed_feedback(
+                    JobFeedback::tunnel_pool_job_id(pool_id),
+                    "SyncTunnelPool".to_string(),
+                    Some(generation.to_string()),
+                ))
+                .await
+        {
+            // Not an error: the generation is in the database, which is what a
+            // route server actually reads. Losing the announcement delays it by
+            // one wait cycle rather than losing the change.
+            log::warn!("Could not announce tunnel pool {pool_id} generation {generation}: {e}");
+        }
+        Ok(generation)
     }
 
     /// Enable/disable a tunnel on a router and refresh its cached state.
@@ -132,8 +175,32 @@ impl TunnelProvisioner {
     /// interface should be. Without it a pool could only describe an interface
     /// somebody configured by hand, and bringing up a new route server would be
     /// a manual job with a database row bolted on afterwards.
+    /// Whether this route server fetches its own configuration instead of being
+    /// given it.
+    ///
+    /// The one fork between the two backends, and it is here rather than in the
+    /// `TunnelRouter` trait because what differs is not *how* to push but
+    /// whether to push at all. An `lvd` route server is often behind a NAT
+    /// nothing here can traverse, so the desired state is published and the
+    /// machine comes and gets it; recording that it moved is the whole of what
+    /// LNVPS does.
+    async fn publishes_own_state(&self, router_id: u64) -> Result<bool> {
+        Ok(matches!(
+            self.db.get_router(router_id).await?.kind,
+            lnvps_db::RouterKind::Lvd
+        ))
+    }
+
     pub async fn sync_pool(&self, pool_id: u64) -> Result<()> {
         let pool = self.db.get_tunnel_pool(pool_id).await?;
+        if self.publishes_own_state(pool.router_id).await? {
+            let generation = self.publish_generation(pool_id).await?;
+            log::info!(
+                "Tunnel pool {pool_id} is on a self-configuring route server; \
+                 published generation {generation}"
+            );
+            return Ok(());
+        }
         let router = crate::router::get_router(&self.db, pool.router_id)
             .await
             .map_err(|e| anyhow!("failed to load router {}: {}", pool.router_id, e))?;
@@ -260,6 +327,18 @@ impl TunnelProvisioner {
     /// whether anything was wrong rather than only that it ran.
     pub async fn reconcile_peers(&self, pool_id: u64) -> Result<TunnelPeerDrift> {
         let pool = self.db.get_tunnel_pool(pool_id).await?;
+        // Nothing to compare against yet: reading back what an `lvd` route
+        // server actually applied is its own piece of work. Until then this
+        // records that the peer set moved, which is what makes the machine
+        // fetch it.
+        if self.publishes_own_state(pool.router_id).await? {
+            let generation = self.publish_generation(pool_id).await?;
+            log::info!(
+                "Tunnel pool {pool_id} is on a self-configuring route server; \
+                 published generation {generation}"
+            );
+            return Ok(TunnelPeerDrift::default());
+        }
         let router = crate::router::get_router(&self.db, pool.router_id)
             .await
             .map_err(|e| anyhow!("failed to load router {}: {}", pool.router_id, e))?;
@@ -290,9 +369,9 @@ impl TunnelProvisioner {
         // What is behind each node peer is recomputed from the guest
         // assignments before the plan is built, so the planner can read it
         // without knowing that marketplace nodes exist.
-        crate::provisioner::MarketplaceTunnels::new(self.db.clone())
-            .refresh_routes(&pool)
-            .await?;
+        let marketplace = crate::provisioner::MarketplaceTunnels::new(self.db.clone());
+        marketplace.refresh_routes(&pool).await?;
+        marketplace.sync_host_mtus(&pool).await?;
         let plan = self.plan(&pool).await?;
         let mut drift = TunnelPeerDrift::default();
 
@@ -332,6 +411,17 @@ impl TunnelProvisioner {
         tr.sync_tunnel_routes(&interface, &plan.routes)
             .await
             .map_err(|e| anyhow!("failed to configure routes on {interface}: {}", e))?;
+        tr.sync_tunnel_mtu(&interface, pool.mtu)
+            .await
+            .map_err(|e| anyhow!("failed to set the MTU of {interface}: {}", e))?;
+        let blocks = self.node_blocks(pool.router_id).await?;
+        tr.sync_peer_isolation(&blocks).await.map_err(|e| {
+            anyhow!(
+                "failed to isolate tunnel peers on router {}: {}",
+                pool.router_id,
+                e
+            )
+        })?;
 
         if !drift.is_empty() {
             warn!(
@@ -340,6 +430,23 @@ impl TunnelProvisioner {
             );
         }
         Ok(drift)
+    }
+
+    async fn node_blocks(&self, router_id: u64) -> Result<Vec<String>> {
+        let mut blocks = Vec::new();
+        for pool in self
+            .db
+            .list_tunnel_pools(None)
+            .await?
+            .into_iter()
+            .filter(|p| p.router_id == router_id)
+        {
+            if self.db.get_vpn_service_for_pool(pool.id).await?.is_some() {
+                continue;
+            }
+            blocks.extend([pool.cidr4, pool.cidr6].into_iter().flatten());
+        }
+        Ok(blocks)
     }
 
     /// Push one node's peer onto its route server.
@@ -408,18 +515,14 @@ impl TunnelProvisioner {
     pub async fn plan(&self, pool: &TunnelPool) -> Result<InterfacePlan> {
         let mut plan = InterfacePlan::default();
 
-        // Where this interface's peers are addressed from, and which peers they
-        // are. A pool records neither, because it records nothing about what it is
-        // for: an interface terminating a VPN service carries that service's
-        // devices, addressed from the service's block so a device keeps one address
-        // in every region, and any other pool carries the links carved from its own.
-        // The block is the pool's, as it is for every interface. Only which
-        // peers it carries differs: an interface terminating a VPN service
-        // carries that service's devices, which are peers on every one of its
-        // interfaces at once and so belong to no single pool.
-        let tunnels = match self.db.get_vpn_service_for_pool(pool.id).await? {
-            Some(service) => self.db.list_active_vpn_tunnels(service.id).await?,
-            None => self.db.list_tunnels_in_pool(pool.id).await?,
+        // Which peers this interface carries. Both branches now select on
+        // `pool_id`, because a VPN device has a row per interface like anything
+        // else; what a VPN pool needs on top is the billing join, which is
+        // where suspension is applied. A lapsed customer's rows still exist and
+        // still own their addresses, and they simply stop matching.
+        let tunnels = match self.db.get_vpn_service_for_pool(pool.id).await?.is_some() {
+            true => self.db.list_active_vpn_tunnels_in_pool(pool.id).await?,
+            false => self.db.list_tunnels_in_pool(pool.id).await?,
         };
         let (cidr4, cidr6) = (pool.cidr4.clone(), pool.cidr6.clone());
 
@@ -506,7 +609,8 @@ impl TunnelProvisioner {
         &self,
         pool: &TunnelPool,
     ) -> Result<(Option<String>, Option<String>)> {
-        let taken = taken_addresses(&self.db.list_tunnels_in_pool(pool.id).await?);
+        let mut taken = taken_addresses(&self.db.list_tunnels_in_pool(pool.id).await?);
+        taken.extend(crate::provisioner::probe_reserved(pool));
         carve_peer(
             pool.cidr4.as_deref(),
             pool.cidr6.as_deref(),

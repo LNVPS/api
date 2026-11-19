@@ -1,4 +1,3 @@
-use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, AeadCore, KeyInit, OsRng},
@@ -195,9 +194,7 @@ fn load_or_generate_key<P: AsRef<Path>>(
         Ok(*Key::<Aes256Gcm>::from_slice(&key_bytes))
     } else if auto_generate {
         // Generate new key
-        let mut key_bytes = [0u8; 32];
-        let mut rng = OsRng;
-        rng.fill_bytes(&mut key_bytes);
+        let key = Aes256Gcm::generate_key(OsRng);
 
         // Create directory if it doesn't exist
         if let Some(parent) = key_path.parent() {
@@ -205,21 +202,11 @@ fn load_or_generate_key<P: AsRef<Path>>(
                 .map_err(|e| anyhow!("Failed to create key directory: {}", e))?;
         }
 
-        // Write key to file with restrictive permissions
-        fs::write(key_path, key_bytes)
+        write_owner_only(key_path, key.as_slice())
             .map_err(|e| anyhow!("Failed to write encryption key file: {}", e))?;
 
-        // Set file permissions to 600 (owner read/write only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = fs::metadata(key_path)?.permissions();
-            perms.set_mode(0o600);
-            fs::set_permissions(key_path, perms)?;
-        }
-
         log::info!("Generated new encryption key at: {}", key_path.display());
-        Ok(*Key::<Aes256Gcm>::from_slice(&key_bytes))
+        Ok(key)
     } else {
         Err(anyhow!(
             "Encryption key file does not exist and auto-generate is disabled"
@@ -227,15 +214,24 @@ fn load_or_generate_key<P: AsRef<Path>>(
     }
 }
 
+fn write_owner_only(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(contents)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn create_test_context() -> Result<EncryptionContext> {
-        let mut rng = OsRng;
-        let mut new_key: [u8; 32] = [0; 32];
-        rng.fill_bytes(&mut new_key);
-        let key = *Key::<Aes256Gcm>::from_slice(&new_key);
+        let key = Aes256Gcm::generate_key(OsRng);
         let cipher = Aes256Gcm::new(&key);
         let key_id = derive_key_id(&key);
         Ok(EncryptionContext { cipher, key_id })
@@ -358,5 +354,20 @@ mod tests {
         let context = create_test_context().unwrap();
         let err = context.decrypt("ENC1:nokeyid").unwrap_err();
         assert!(err.to_string().contains("Malformed ENC1"));
+    }
+
+    #[test]
+    fn a_generated_key_file_is_owner_only_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys").join("db.key");
+        let generated = load_or_generate_key(&path, true).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), generated.as_slice());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(load_or_generate_key(&path, true).unwrap(), generated);
     }
 }

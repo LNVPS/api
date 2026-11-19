@@ -212,6 +212,58 @@ pub trait LNVpsDbBase: Send + Sync {
     /// preference, and clear the one-time link token for the given user.
     async fn link_telegram_chat(&self, user_id: u64, chat_id: i64) -> DbResult<()>;
 
+    /// Keep who ordered a swap, and from where. Rows outlive the user.
+    async fn insert_swap_order_client(&self, record: &SwapOrderClient) -> DbResult<u64>;
+
+    /// Delete swap order client records older than `days`. Returns the number removed.
+    async fn purge_swap_order_clients(&self, days: u32) -> DbResult<u64>;
+
+    /// Clear the stored IP on users whose last-seen IP is older than `days`,
+    /// keeping the country that was derived from it. Returns the number cleared.
+    async fn purge_user_geo_ips(&self, days: u32) -> DbResult<u64>;
+
+    async fn insert_abuse_case(&self, case: &AbuseCase) -> DbResult<u64>;
+
+    async fn get_abuse_case(&self, id: u64) -> DbResult<AbuseCase>;
+
+    async fn list_abuse_cases(
+        &self,
+        limit: u64,
+        offset: u64,
+        user_id: Option<u64>,
+        vm_id: Option<u64>,
+        open: Option<bool>,
+    ) -> DbResult<(Vec<AbuseCase>, u64)>;
+
+    /// Close a case. Its retention period runs from here. No-op once closed.
+    async fn close_abuse_case(&self, id: u64) -> DbResult<()>;
+
+    async fn insert_abuse_action(&self, action: &AbuseAction) -> DbResult<u64>;
+
+    async fn get_abuse_action(&self, id: u64) -> DbResult<AbuseAction>;
+
+    async fn list_abuse_actions(&self, case_id: u64) -> DbResult<Vec<AbuseAction>>;
+
+    async fn set_abuse_action_notified(&self, id: u64) -> DbResult<()>;
+
+    async fn insert_abuse_challenge(&self, challenge: &AbuseChallenge) -> DbResult<u64>;
+
+    async fn get_abuse_challenge(&self, id: u64) -> DbResult<AbuseChallenge>;
+
+    async fn list_abuse_challenges(&self, case_id: u64) -> DbResult<Vec<AbuseChallenge>>;
+
+    async fn decide_abuse_challenge(
+        &self,
+        id: u64,
+        outcome: AbuseChallengeOutcome,
+        response: &str,
+        decided_by: u64,
+    ) -> DbResult<()>;
+
+    /// Delete closed cases past retention: 12 months after closing, or 6 months
+    /// after receipt for a Canadian copyright notice with no proceedings started.
+    async fn purge_abuse_cases(&self) -> DbResult<u64>;
+
     /// List all users
     async fn list_users(&self) -> DbResult<Vec<User>>;
 
@@ -287,12 +339,16 @@ pub trait LNVpsDbBase: Send + Sync {
     /// List VM's owned by a specific user
     async fn list_hosts(&self) -> DbResult<Vec<VmHost>>;
 
-    /// List every host, including disabled hosts and hosts in disabled regions.
+    /// List every host, including disabled and deleted hosts and hosts in
+    /// disabled regions.
     ///
-    /// `enabled` is a scheduling flag — "place no new VMs here" — not a claim
-    /// that the host has stopped existing. Reconciliation observes physical
-    /// reality and must see every host; only placement/capacity paths should
-    /// use the filtered [LNVpsDbBase::list_hosts].
+    /// `enabled` is a scheduling flag - "place no new VMs here" - not a claim
+    /// that the host has stopped existing, and `deleted` only hides the host
+    /// from listings. Reconciliation observes physical reality and must see
+    /// every host, and bulk VM loads resolve `vm.host_id` through this list, so
+    /// it must never filter: a deleted VM on a deleted host still has to render.
+    /// Only placement/capacity paths should use the filtered
+    /// [LNVpsDbBase::list_hosts].
     async fn list_hosts_all(&self) -> DbResult<Vec<VmHost>>;
 
     /// List hosts with pagination
@@ -939,6 +995,18 @@ pub trait LNVpsDbBase: Send + Sync {
     /// This filters out: inactive subscriptions, subscriptions never paid (expires IS NULL).
     async fn list_lifecycle_subscriptions(&self) -> DbResult<Vec<Subscription>>;
 
+    /// Subscriptions whose purchase payment was never confirmed (`is_setup = 0`)
+    /// and which were created more than `older_than_seconds` ago.
+    ///
+    /// The complement of [`Self::list_lifecycle_subscriptions`], which cannot
+    /// see these: a never-paid subscription has a NULL `expires` and (since the
+    /// customer never paid) `is_active = 0`, so both of that query's filters
+    /// exclude it and nothing would ever revisit an abandoned checkout.
+    async fn list_never_paid_subscriptions(
+        &self,
+        older_than_seconds: u64,
+    ) -> DbResult<Vec<Subscription>>;
+
     /// Deactivate a subscription: set `is_active = false`.
     /// Also sets `ended_at = NOW()` on all linked `ip_range_subscription` rows.
     async fn deactivate_subscription(&self, id: u64) -> DbResult<()>;
@@ -1397,6 +1465,164 @@ pub trait LNVpsDbBase: Send + Sync {
     /// cents would be meaningless.
     async fn sum_discount_redemptions(&self, discount_id: u64) -> DbResult<Vec<(String, u64)>>;
 
+    // ========================================================================
+    // Account credit
+    // ========================================================================
+
+    /// The user's balance in `currency`, or a zero row when they have none.
+    /// `auto_apply` is the user's flag, shared by all their balances.
+    async fn get_account_credit(&self, user_id: u64, currency: &str) -> DbResult<AccountCredit>;
+
+    /// Every balance row the user has, one per currency.
+    async fn list_account_credits(&self, user_id: u64) -> DbResult<Vec<AccountCredit>>;
+
+    /// Set the user's auto-apply flag on all their balances.
+    async fn set_account_credit_auto_apply(&self, user_id: u64, auto_apply: bool) -> DbResult<()>;
+
+    /// Credit held by unsettled, unexpired debits in `currency`.
+    async fn get_account_credit_reserved(&self, user_id: u64, currency: &str) -> DbResult<u64>;
+
+    /// Book a refund row and return `credits` ((currency, minor units), may be
+    /// empty) to the refunded customer's balances, in one transaction. Each
+    /// `refund` ledger event references the refund row. Either both land or
+    /// neither does, so the books never show a refund the customer did not
+    /// receive.
+    ///
+    /// Returns `false` (and changes nothing) when a row with `refund.id`
+    /// already exists, so a retry with the same derived id cannot pay twice.
+    async fn insert_refund_to_credit(
+        &self,
+        refund: &SubscriptionPayment,
+        credits: &[(String, u64)],
+        note: Option<&str>,
+    ) -> DbResult<bool>;
+
+    /// Shift the `currency` balance by a signed `delta` and write a ledger
+    /// event in one transaction. A negative delta may not take the balance
+    /// below what is reserved.
+    async fn adjust_account_credit(
+        &self,
+        user_id: u64,
+        currency: &str,
+        delta: i64,
+        kind: &str,
+        note: Option<&str>,
+    ) -> DbResult<AccountCredit>;
+
+    async fn list_account_credit_events_in_currency(
+        &self,
+        user_id: u64,
+        currency: &str,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AccountCreditEvent>, u64)>;
+
+    async fn list_account_credit_events(
+        &self,
+        user_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AccountCreditEvent>, u64)>;
+
+    /// Hold `debit.amount` of the user's balance until `debit.expires`.
+    /// Returns the debit id, or `None` when the unreserved balance is short.
+    async fn reserve_account_credit(&self, debit: &AccountCreditDebit) -> DbResult<Option<u64>>;
+
+    async fn attach_account_credit_debit(
+        &self,
+        id: u64,
+        subscription_payment_id: &Vec<u8>,
+        expires: DateTime<Utc>,
+    ) -> DbResult<()>;
+
+    /// Drop an unsettled reservation.
+    async fn release_account_credit_debit(&self, id: u64) -> DbResult<()>;
+
+    async fn get_account_credit_debit_by_payment(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<AccountCreditDebit>>;
+
+    /// Spend the debit on a payment. Idempotent: returns `None` when there is
+    /// no unsettled debit. An expired reservation may find its credit promised
+    /// elsewhere, so it is clamped to what is left unreserved, and the returned
+    /// row carries the amounts actually spent.
+    async fn settle_account_credit_debit(
+        &self,
+        subscription_payment_id: &Vec<u8>,
+    ) -> DbResult<Option<AccountCreditDebit>>;
+
+    async fn insert_account_credit_topup(&self, topup: &AccountCreditTopup) -> DbResult<u64>;
+
+    async fn get_account_credit_topup_by_hash(
+        &self,
+        invoice_hash: &Vec<u8>,
+    ) -> DbResult<Option<AccountCreditTopup>>;
+
+    async fn get_account_credit_topup_by_ext_id(
+        &self,
+        external_id: &str,
+    ) -> DbResult<Option<AccountCreditTopup>>;
+
+    async fn list_account_credit_topups_by_method(
+        &self,
+        method: PaymentMethod,
+    ) -> DbResult<Vec<AccountCreditTopup>>;
+
+    /// Record the deposit that pays an unpaid on-chain or FixedFloat top-up:
+    /// its outpoint and the msat actually received, which replaces the amount
+    /// the customer asked for. No-op once the top-up is paid.
+    async fn set_account_credit_topup_deposit(
+        &self,
+        id: u64,
+        external_id: &str,
+        amount: u64,
+    ) -> DbResult<()>;
+
+    async fn get_account_credit_topup(&self, id: u64) -> DbResult<Option<AccountCreditTopup>>;
+
+    /// Mark a top-up paid and credit `credit_amount` to the user's
+    /// `credit_currency` balance. Idempotent.
+    async fn settle_account_credit_topup(
+        &self,
+        id: u64,
+        credit_currency: &str,
+        credit_amount: u64,
+    ) -> DbResult<Option<AccountCreditTopup>> {
+        self.settle_account_credit_topup_noted(id, credit_currency, credit_amount, None)
+            .await
+    }
+
+    async fn settle_account_credit_topup_noted(
+        &self,
+        id: u64,
+        credit_currency: &str,
+        credit_amount: u64,
+        note: Option<&str>,
+    ) -> DbResult<Option<AccountCreditTopup>>;
+
+    async fn list_account_credit_topups(
+        &self,
+        user_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AccountCreditTopup>, u64)>;
+
+    async fn get_onchain_address_owner(
+        &self,
+        address: &str,
+    ) -> DbResult<Option<OnchainAddressOwner>>;
+
+    async fn mark_onchain_address_owner_notified(&self, id: u64, outpoint: &str) -> DbResult<bool>;
+
+    async fn credit_onchain_address_owner(
+        &self,
+        id: u64,
+        outpoint: &str,
+        amount_msat: u64,
+        note: &str,
+    ) -> DbResult<Option<u64>>;
+
     // ----- Marketplace (operator-run compute nodes) -----
 
     /// Get a marketplace operator enrolment by id
@@ -1593,6 +1819,130 @@ pub trait LNVpsDbBase: Send + Sync {
     /// Delete a pool. Fails while any tunnel is still carved out of it.
     async fn delete_tunnel_pool(&self, id: u64) -> DbResult<()>;
 
+    /// Record that this interface's desired state has changed, and return the
+    /// new generation.
+    ///
+    /// Its own method rather than a field on [`Self::update_tunnel_pool`]
+    /// because most of what moves an interface is not an edit to its row: a
+    /// device registered, a plan lapsed, a service linked. A caller changing
+    /// the MTU should not be able to state a generation at all, let alone an
+    /// older one.
+    async fn bump_tunnel_pool_generation(&self, id: u64) -> DbResult<u64>;
+
+    // ----- IP providers -----
+
+    async fn list_ip_providers(&self) -> DbResult<Vec<IpProvider>>;
+    async fn get_ip_provider(&self, id: u64) -> DbResult<IpProvider>;
+    async fn get_ip_provider_by_name(&self, name: &str) -> DbResult<Option<IpProvider>>;
+    async fn insert_ip_provider(&self, provider: &IpProvider) -> DbResult<u64>;
+    async fn update_ip_provider(&self, provider: &IpProvider) -> DbResult<()>;
+    /// Refused while orders reference the provider, so the audit trail keeps its subject.
+    async fn delete_ip_provider(&self, id: u64) -> DbResult<()>;
+    async fn list_ip_provider_regions(
+        &self,
+        provider_id: Option<u64>,
+        region_id: Option<u64>,
+    ) -> DbResult<Vec<IpProviderRegion>>;
+    async fn get_ip_provider_region(&self, id: u64) -> DbResult<IpProviderRegion>;
+    async fn insert_ip_provider_region(&self, rule: &IpProviderRegion) -> DbResult<u64>;
+    async fn update_ip_provider_region(&self, rule: &IpProviderRegion) -> DbResult<()>;
+    async fn delete_ip_provider_region(&self, id: u64) -> DbResult<()>;
+
+    // ----- VMs waiting for an IP -----
+
+    async fn get_vm_ip_wait(&self, vm_id: u64) -> DbResult<Option<VmIpWait>>;
+    async fn insert_vm_ip_wait(&self, wait: &VmIpWait) -> DbResult<u64>;
+    /// Oldest first.
+    async fn list_vm_ip_waits(&self, region_id: Option<u64>) -> DbResult<Vec<VmIpWait>>;
+    async fn set_vm_ip_wait_order(&self, vm_id: u64, ip_order_id: Option<u64>) -> DbResult<()>;
+    async fn set_vm_ip_wait_released(&self, vm_id: u64, released: bool) -> DbResult<()>;
+    async fn delete_vm_ip_wait(&self, vm_id: u64) -> DbResult<()>;
+
+    // ----- On-demand IP orders -----
+
+    async fn insert_ip_order(&self, order: &IpOrder) -> DbResult<u64>;
+    async fn get_ip_order(&self, id: u64) -> DbResult<IpOrder>;
+    async fn get_ip_order_by_key(&self, key: &str) -> DbResult<Option<IpOrder>>;
+    async fn update_ip_order(&self, order: &IpOrder) -> DbResult<()>;
+    /// Raise the quantity of an order that has not been approved yet. Returns
+    /// whether it was raised, which it only is while the order is still
+    /// awaiting approval and the new quantity is larger.
+    async fn grow_ip_order_quantity(&self, id: u64, quantity: u32) -> DbResult<bool>;
+    /// Move an order between states only if it is still in `from`. Returns
+    /// whether this caller made the move, which is what stops two workers
+    /// both buying the same order.
+    async fn transition_ip_order(
+        &self,
+        id: u64,
+        from: IpOrderState,
+        to: IpOrderState,
+    ) -> DbResult<bool>;
+    async fn list_ip_orders(
+        &self,
+        state: Option<IpOrderState>,
+        region_id: Option<u64>,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpOrder>, u64)>;
+    /// Total cost of orders that have committed money (ordering, ordered or
+    /// delivered) at or after `since`, in `currency`.
+    async fn sum_ip_order_cost_since(&self, since: DateTime<Utc>, currency: &str) -> DbResult<u64>;
+    async fn insert_ip_order_audit(
+        &self,
+        ip_order_id: u64,
+        event: &str,
+        detail: Option<&str>,
+        actor_user_id: Option<u64>,
+    ) -> DbResult<u64>;
+    async fn list_ip_order_audit(&self, ip_order_id: u64) -> DbResult<Vec<IpOrderAudit>>;
+    async fn insert_ip_order_range(
+        &self,
+        ip_order_id: u64,
+        ip_range_id: u64,
+        cidr: &str,
+    ) -> DbResult<u64>;
+    async fn list_ip_order_ranges_for_order(&self, ip_order_id: u64)
+    -> DbResult<Vec<IpOrderRange>>;
+    async fn list_ip_order_ranges(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<IpOrderRange>, u64)>;
+    async fn get_ip_order_range_by_range(&self, ip_range_id: u64)
+    -> DbResult<Option<IpOrderRange>>;
+    async fn mark_ip_order_range_released(&self, id: u64) -> DbResult<()>;
+    async fn insert_ip_range(&self, range: &IpRange) -> DbResult<u64>;
+    async fn get_ip_range_by_cidr(&self, cidr: &str) -> DbResult<Option<IpRange>>;
+    async fn set_ip_range_enabled(&self, id: u64, enabled: bool) -> DbResult<()>;
+
+    // ----- VM add-ons -----
+
+    async fn list_vm_addon_prices(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<VmAddonPrice>, u64)>;
+    async fn get_vm_addon_price(&self, id: u64) -> DbResult<VmAddonPrice>;
+    async fn get_vm_addon_price_for_region(
+        &self,
+        region_id: u64,
+        kind: VmAddonKind,
+    ) -> DbResult<Option<VmAddonPrice>>;
+    async fn insert_vm_addon_price(&self, price: &VmAddonPrice) -> DbResult<u64>;
+    async fn update_vm_addon_price(&self, price: &VmAddonPrice) -> DbResult<()>;
+    async fn delete_vm_addon_price(&self, id: u64) -> DbResult<()>;
+
+    async fn list_vm_addons(&self, vm_id: u64) -> DbResult<Vec<VmAddon>>;
+    async fn get_vm_addon_by_line_item(&self, line_item_id: u64) -> DbResult<Option<VmAddon>>;
+    async fn set_vm_addon(
+        &self,
+        vm_id: u64,
+        kind: VmAddonKind,
+        quantity: u32,
+        amount: u64,
+        name: &str,
+    ) -> DbResult<VmAddon>;
+
     // ----- VPN -----
 
     /// Get a VPN service by id
@@ -1678,6 +2028,15 @@ pub trait LNVpsDbBase: Send + Sync {
     /// service would strand every device's address.
     async fn update_vpn_subscription(&self, sub: &VpnSubscription) -> DbResult<()>;
 
+    /// Permanently remove a plan, along with every device on it and each
+    /// device's tunnel.
+    ///
+    /// This is for a plan that was never paid for, which by definition was
+    /// never configured on a route server. A lapsed plan is *kept*, devices and
+    /// all, so that a returning customer only has to pay again — see the module
+    /// docs on `subscription::vpn`.
+    async fn delete_vpn_subscription(&self, id: u64) -> DbResult<()>;
+
     /// Get a device by id
     async fn get_vpn_device(&self, id: u64) -> DbResult<VpnDevice>;
 
@@ -1696,14 +2055,26 @@ pub trait LNVpsDbBase: Send + Sync {
     /// customer's traffic to another the moment the first one paid again.
     async fn list_vpn_tunnels_in_service(&self, vpn_service_id: u64) -> DbResult<Vec<Tunnel>>;
 
-    /// Every peer a pool's interface should carry: enabled, on a plan whose
-    /// subscription is paid and unexpired, on the service this pool terminates.
+    /// Every peer **this interface** should carry: the rows allocated to this
+    /// pool, enabled, on a plan whose subscription is paid and unexpired.
+    ///
+    /// Keyed on the pool rather than the service because a device now has one
+    /// peer per interface, so the pool already selects its own. What it cannot
+    /// select on its own is billing: a lapsed customer's rows still exist and
+    /// still own their addresses, and this is where suspension is applied. That
+    /// is why the planner cannot simply call `list_tunnels_in_pool`.
     ///
     /// One query rather than a walk over plans, because this runs on every
-    /// reconcile of every pool and the peer set is the whole customer base. It
-    /// is also where suspension is applied, which is why no code path has to
-    /// remember to disable a lapsed customer's peers.
-    async fn list_active_vpn_tunnels(&self, vpn_service_id: u64) -> DbResult<Vec<Tunnel>>;
+    /// reconcile of every pool and the peer set is the whole customer base.
+    async fn list_active_vpn_tunnels_in_pool(&self, tunnel_pool_id: u64) -> DbResult<Vec<Tunnel>>;
+
+    /// A device's peers: one per interface its service terminates, all holding
+    /// the same key and the same addresses.
+    ///
+    /// Identical by construction, so a caller that only wants the key or the
+    /// address -- rendering a config, showing a device in an admin list -- can
+    /// take the first and be right.
+    async fn list_vpn_device_tunnels(&self, vpn_device_id: u64) -> DbResult<Vec<Tunnel>>;
 
     /// The prefixes routed behind each of `tunnel_ids`.
     ///
@@ -1719,17 +2090,35 @@ pub trait LNVpsDbBase: Send + Sync {
     /// until somebody noticed, while a recompute is self-correcting.
     async fn replace_tunnel_routes(&self, tunnel_id: u64, prefixes: &[String]) -> DbResult<()>;
 
-    /// Register a device, returning the new id. The caller claims the slot;
-    /// `uk_vpn_device_slot` is what makes the limit unforgeable under
-    /// concurrent registrations.
-    async fn insert_vpn_device(&self, device: &VpnDevice) -> DbResult<u64>;
+    /// Register a device **and its peers**, returning the new id.
+    ///
+    /// One `tunnel` per interface the plan's service terminates, each carrying
+    /// `peer`'s key and addresses, plus the link rows joining them to the
+    /// device. In one transaction, because a device whose peers appeared on
+    /// some interfaces and not others is a customer whose VPN works in some
+    /// regions and not others, with nothing to indicate why.
+    ///
+    /// The caller claims the slot; `uk_vpn_device_slot` is what makes the limit
+    /// unforgeable under concurrent registrations, and
+    /// `uk_tunnel_pool_address4`/`6` do the same for addresses within an
+    /// interface.
+    async fn insert_vpn_device_with_peers(
+        &self,
+        device: &VpnDevice,
+        peer: &VpnPeerTemplate,
+    ) -> DbResult<u64>;
 
-    /// Update a device's label. `vpn_subscription_id`, `slot`, `tunnel_id` and
-    /// `created` are immutable and are not written: the peer behind a device is
-    /// the thing the customer's config points at.
+    /// Update a device's label. `vpn_subscription_id`, `slot` and `created` are
+    /// immutable and are not written: the peers behind a device are what the
+    /// customer's configs point at.
     async fn update_vpn_device(&self, device: &VpnDevice) -> DbResult<()>;
 
-    /// Delete a device, releasing its slot and addresses.
+    /// Delete a device, releasing its slot and every address it held.
+    ///
+    /// Its peers go with it, in one transaction and in foreign-key order. A
+    /// tunnel left behind is a key still configured on a route server after
+    /// LNVPS has forgotten it exists, which is the one failure that matters
+    /// when a device is revoked.
     async fn delete_vpn_device(&self, id: u64) -> DbResult<()>;
 
     // ----- App catalog -----
@@ -1843,6 +2232,10 @@ pub trait LNVpsDbBase: Send + Sync {
         cluster_id: u64,
         name: &str,
     ) -> DbResult<Option<AppDeployment>>;
+    async fn find_app_deployment_by_custom_domain(
+        &self,
+        domain: &str,
+    ) -> DbResult<Option<AppDeployment>>;
     async fn insert_app_deployment(&self, deployment: &AppDeployment) -> DbResult<u64>;
     async fn update_app_deployment(&self, deployment: &AppDeployment) -> DbResult<()>;
     /// Mark a deployment's custom domain as observed resolving to us, which is
@@ -1852,6 +2245,11 @@ pub trait LNVpsDbBase: Send + Sync {
     /// operator holds a row copy read at the top of the pass, and writing the
     /// whole row back would undo an edit the customer made in between.
     async fn set_app_deployment_custom_domain_verified(&self, id: u64) -> DbResult<()>;
+
+    /// Record (or clear) the public L4 port allocated to a deployment. Kept
+    /// apart from [`Self::update_app_deployment`] so a status write-back made
+    /// from a stale copy of the row cannot overwrite an allocation.
+    async fn set_app_deployment_public_port(&self, id: u64, port: Option<u16>) -> DbResult<()>;
     /// Record the usage the cluster last reported for a deployment, stamping
     /// the observation time.
     ///
@@ -1890,6 +2288,43 @@ pub trait LNVpsDbBase: Send + Sync {
         Vec<AppDeploymentServiceUsage>,
         Vec<AppDeploymentVolumeUsage>,
     )>;
+    /// A deployment's backups, newest first, excluding deleted ones.
+    async fn list_app_deployment_backups(
+        &self,
+        deployment_id: u64,
+    ) -> DbResult<Vec<AppDeploymentBackup>>;
+    async fn list_app_deployment_backups_paginated(
+        &self,
+        deployment_id: u64,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<(Vec<AppDeploymentBackup>, u64)>;
+    /// One backup by id. Callers check ownership through its deployment.
+    async fn get_app_deployment_backup(&self, id: u64) -> DbResult<AppDeploymentBackup>;
+    /// Record a backup artifact; returns its id. `id` on the input is ignored.
+    async fn insert_app_deployment_backup(&self, backup: &AppDeploymentBackup) -> DbResult<u64>;
+    /// Write back progress: state, object key, size, message and timestamps.
+    /// Everything else on the row is immutable once recorded.
+    async fn update_app_deployment_backup(&self, backup: &AppDeploymentBackup) -> DbResult<()>;
+    /// Backups still owing work (pending or running) across one cluster's
+    /// deployments — the operator's sweep, which is scoped to its own cluster
+    /// because only that operator can create the Jobs.
+    async fn list_active_app_deployment_backups(
+        &self,
+        cluster_id: u64,
+    ) -> DbResult<Vec<AppDeploymentBackup>>;
+    /// When the last *scheduled* run for a deployment started, so the operator
+    /// can tell whether the next one is due. `None` when the schedule has never
+    /// run. Customer-requested runs are excluded on purpose: an on-demand
+    /// backup must not silently cancel the automatic one.
+    async fn last_scheduled_app_deployment_backup(
+        &self,
+        deployment_id: u64,
+    ) -> DbResult<Option<DateTime<Utc>>>;
+    /// Soft-delete a backup (sets `deleted = 1`). The row outlives the object
+    /// so a pruned backup cannot be listed again while its object is still
+    /// being removed.
+    async fn delete_app_deployment_backup(&self, id: u64) -> DbResult<()>;
     /// Soft-delete a deployment (sets `deleted = 1`); the operator tears down
     /// the Kubernetes resources on its next reconcile.
     async fn delete_app_deployment(&self, id: u64) -> DbResult<()>;

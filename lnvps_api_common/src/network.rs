@@ -157,11 +157,16 @@ impl NetworkProvisioner {
         }
 
         if picked.ip4.len() < ip4_count as usize {
-            bail!(
+            let mut msg = format!(
                 "Only {} of {} IPv4 addresses available in this region",
                 picked.ip4.len(),
                 ip4_count
             );
+            let more = self.out_of_ips_message(region_id).await;
+            if !more.starts_with("No IPs") {
+                msg = format!("{msg}. {more}");
+            }
+            bail!(msg);
         }
         Ok(picked)
     }
@@ -216,9 +221,29 @@ impl NetworkProvisioner {
             }
         }
         if ret.ip4.is_none() && ret.ip6.is_none() {
-            bail!("No IPs available in this region");
+            bail!(self.out_of_ips_message(region_id).await);
         } else {
             Ok(ret)
+        }
+    }
+
+    pub async fn out_of_ips_message(&self, region_id: u64) -> String {
+        let in_flight = self
+            .db
+            .list_ip_orders(None, Some(region_id), 100, 0)
+            .await
+            .map(|(o, _)| o.into_iter().find(|o| o.state.is_in_flight()))
+            .unwrap_or(None);
+        match in_flight {
+            Some(o) if o.state == lnvps_db::IpOrderState::AwaitingApproval => format!(
+                "This region is out of IP addresses. More have been requested (order {}) and are awaiting approval.",
+                o.id
+            ),
+            Some(o) => format!(
+                "This region is out of IP addresses. More are on order (order {}, {}) and will be available once delivered.",
+                o.id, o.state
+            ),
+            None => "No IPs available in this region".to_string(),
         }
     }
 
@@ -970,6 +995,47 @@ mod tests {
         assert_eq!(3, unique.len(), "every picked address must be distinct");
         // The mock region's only IPv6 range is SLAAC, which yields one address.
         assert_eq!(1, picked.ip6.len());
+    }
+
+    #[tokio::test]
+    async fn out_of_ips_error_mentions_an_order_in_flight() {
+        let db = MockDb::default();
+        db.ip_range.lock().await.clear();
+        let db: Arc<dyn LNVpsDb> = Arc::new(db);
+        let mgr = NetworkProvisioner::new(db.clone());
+        assert_eq!(
+            mgr.out_of_ips_message(1).await,
+            "No IPs available in this region"
+        );
+        db.insert_ip_order(&lnvps_db::IpOrder {
+            region_id: 1,
+            state: lnvps_db::IpOrderState::AwaitingApproval,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let msg = mgr.out_of_ips_message(1).await;
+        assert!(msg.contains("awaiting approval"), "{msg}");
+        let id = db
+            .insert_ip_order(&lnvps_db::IpOrder {
+                region_id: 1,
+                state: lnvps_db::IpOrderState::Ordered,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        db.transition_ip_order(
+            1,
+            lnvps_db::IpOrderState::AwaitingApproval,
+            lnvps_db::IpOrderState::Failed,
+        )
+        .await
+        .unwrap();
+        let msg = mgr.out_of_ips_message(1).await;
+        assert!(
+            msg.contains(&format!("order {id}")) && msg.contains("on order"),
+            "{msg}"
+        );
     }
 
     #[tokio::test]

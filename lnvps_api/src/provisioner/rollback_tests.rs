@@ -645,6 +645,154 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn test_delete_vm_keeps_dns_refs_when_dns_delete_fails_then_retries() -> Result<()> {
+        clear_mock_state().await;
+        MockDnsServer::reset().await;
+        let settings = mock_settings();
+        let db = Arc::new(MockDb::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, 69_420.0).await;
+        setup_db_with_static_arp(&db).await?;
+
+        let dns = MockDnsServer::new();
+        let provisioner = VmProvisioner::new(settings, db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        provisioner
+            .spawn_vm_pipeline(vm.id)
+            .await?
+            .execute()
+            .await?;
+
+        let record_count = |dns: &MockDnsServer| {
+            let zones = dns.zones.clone();
+            async move { zones.lock().await.values().map(|z| z.len()).sum::<usize>() }
+        };
+        let before = record_count(&dns).await;
+        assert!(before > 0);
+
+        MockDnsServer::fail_deletes(true).await;
+        let res = provisioner.delete_vm(vm.id, false).await;
+        MockDnsServer::fail_deletes(false).await;
+        assert!(res.is_err(), "failed DNS delete must fail the VM delete");
+        assert_eq!(record_count(&dns).await, before);
+        let ips = db.list_vm_ip_assignments(vm.id).await?;
+        assert!(!ips.is_empty());
+        assert!(
+            ips.iter()
+                .all(|i| i.dns_forward_ref.is_some() && i.dns_reverse_ref.is_some())
+        );
+
+        provisioner.delete_vm(vm.id, false).await?;
+        assert_eq!(record_count(&dns).await, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reused_ip_gets_single_ptr_after_vm_delete() -> Result<()> {
+        clear_mock_state().await;
+        MockDnsServer::reset().await;
+        let settings = mock_settings();
+        let db = Arc::new(MockDb::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, 69_420.0).await;
+        setup_db_with_static_arp(&db).await?;
+
+        let dns = MockDnsServer::new();
+        let provisioner = VmProvisioner::new(settings, db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        provisioner
+            .spawn_vm_pipeline(vm.id)
+            .await?
+            .execute()
+            .await?;
+        let v4 = db
+            .list_vm_ip_assignments(vm.id)
+            .await?
+            .into_iter()
+            .find(|i| i.ip.contains('.'))
+            .expect("v4 ip");
+
+        MockDnsServer::fail_deletes(true).await;
+        let failed = provisioner.delete_vm(vm.id, false).await;
+        MockDnsServer::fail_deletes(false).await;
+        assert!(failed.is_err(), "failed DNS delete must fail the VM delete");
+        provisioner.delete_vm(vm.id, false).await?;
+        {
+            let zones = dns.zones.lock().await;
+            assert_eq!(zones.get("mock-rev-zone-id").map_or(0, |z| z.len()), 0);
+            assert_eq!(zones.get("mock-forward-zone-id").map_or(0, |z| z.len()), 0);
+        }
+
+        let vm2 = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        let mut vm2 = db.get_vm(vm2.id).await?;
+        vm2.mac_address = "02:00:00:00:00:02".to_string();
+        db.update_vm(&vm2).await?;
+        let mut reused = lnvps_db::VmIpAssignment {
+            vm_id: vm2.id,
+            ip_range_id: v4.ip_range_id,
+            ip: v4.ip.clone(),
+            ..Default::default()
+        };
+        provisioner.network.save_ip_assignment(&mut reused).await?;
+
+        let zones = dns.zones.lock().await;
+        let ptrs = zones
+            .get("mock-rev-zone-id")
+            .map(|z| z.values().filter(|e| e.kind == "PTR").count())
+            .unwrap_or(0);
+        assert_eq!(ptrs, 1, "reused IP must have exactly one PTR");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_orphan_dns_records_are_reported() -> Result<()> {
+        use lnvps_api_common::find_orphan_dns_records;
+        clear_mock_state().await;
+        MockDnsServer::reset().await;
+        let settings = mock_settings();
+        let db = Arc::new(MockDb::default());
+        let rates = Arc::new(MockExchangeRate::new());
+        rates.set_rate(Ticker::btc_rate("EUR")?, 69_420.0).await;
+        setup_db_with_static_arp(&db).await?;
+
+        let provisioner = VmProvisioner::new(settings, db.clone());
+        let (user, ssh_key) = add_user(&db).await?;
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        provisioner
+            .spawn_vm_pipeline(vm.id)
+            .await?
+            .execute()
+            .await?;
+
+        let dyn_db: Arc<dyn lnvps_db::LNVpsDb> = db.clone();
+        assert!(find_orphan_dns_records(&dyn_db).await?.is_empty());
+
+        let ips = db.list_vm_ip_assignments(vm.id).await?;
+        let expected: usize = ips
+            .iter()
+            .map(|i| {
+                usize::from(i.dns_forward_ref.is_some()) + usize::from(i.dns_reverse_ref.is_some())
+            })
+            .sum();
+        assert!(expected > 0);
+        db.delete_vm_ip_assignments_by_vm_id(vm.id).await?;
+
+        let orphans = find_orphan_dns_records(&dyn_db).await?;
+        assert_eq!(orphans.len(), expected);
+        Ok(())
+    }
+
     /// Test the delete_vm pipeline executes all cleanup steps
     #[tokio::test]
     async fn test_delete_vm_pipeline_complete_cleanup() -> Result<()> {
@@ -992,6 +1140,268 @@ mod tests {
         // Reinstall should complete without error.
         provisioner.reinstall_vm(vm.id).await?;
 
+        Ok(())
+    }
+
+    async fn spawned_vm(provisioner: &VmProvisioner, db: &Arc<MockDb>) -> Result<lnvps_db::Vm> {
+        let (user, ssh_key) = add_user(db).await?;
+        let vm = provisioner
+            .provision(user.id, 1, 1, ssh_key.id, None)
+            .await?;
+        provisioner
+            .spawn_vm_pipeline(vm.id)
+            .await?
+            .execute()
+            .await?;
+        lnvps_api_common::host::dummy_host::DummyVmHost::clear_all_snapshots().await;
+        db.set_vm_addon(vm.id, lnvps_db::VmAddonKind::Snapshot, 3, 0, "Snapshots")
+            .await?;
+        Ok(vm)
+    }
+
+    #[tokio::test]
+    async fn test_snapshots_need_paid_slots() -> Result<()> {
+        let _snapshots =
+            lnvps_api_common::host::dummy_host::DummyVmHost::exclusive_snapshots().await;
+        use lnvps_api_common::host::SnapshotRejection;
+        clear_mock_state().await;
+        let db = Arc::new(MockDb::default());
+        setup_db_with_static_arp(&db).await?;
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let vm = spawned_vm(&provisioner, &db).await?;
+        db.set_vm_addon(vm.id, lnvps_db::VmAddonKind::Snapshot, 0, 0, "Snapshots")
+            .await?;
+
+        let err = provisioner
+            .create_snapshot(vm.id, "one", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err.inner().downcast_ref::<SnapshotRejection>(),
+            Some(SnapshotRejection::Conflict(m)) if m.contains("Buy")
+        ));
+
+        db.set_vm_addon(vm.id, lnvps_db::VmAddonKind::Snapshot, 1, 0, "Snapshots")
+            .await?;
+        provisioner.create_snapshot(vm.id, "one", None).await?;
+        assert!(
+            provisioner
+                .create_snapshot(vm.id, "two", None)
+                .await
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trim_snapshots_deletes_the_oldest() -> Result<()> {
+        let _snapshots =
+            lnvps_api_common::host::dummy_host::DummyVmHost::exclusive_snapshots().await;
+        clear_mock_state().await;
+        let db = Arc::new(MockDb::default());
+        setup_db_with_static_arp(&db).await?;
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let vm = spawned_vm(&provisioner, &db).await?;
+        for name in ["s1", "s2", "s3"] {
+            provisioner.create_snapshot(vm.id, name, None).await?;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(provisioner.trim_snapshots(vm.id, 1).await?, ["s1", "s2"]);
+        let left: Vec<_> = provisioner
+            .list_snapshots(vm.id)
+            .await?
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(left, ["s3"]);
+        assert!(provisioner.trim_snapshots(vm.id, 1).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_lifecycle() -> Result<()> {
+        let _snapshots =
+            lnvps_api_common::host::dummy_host::DummyVmHost::exclusive_snapshots().await;
+        clear_mock_state().await;
+        let db = Arc::new(MockDb::default());
+        setup_db_with_static_arp(&db).await?;
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let vm = spawned_vm(&provisioner, &db).await?;
+
+        provisioner
+            .create_snapshot(vm.id, "one", Some("first"))
+            .await?;
+        provisioner.create_snapshot(vm.id, "two", None).await?;
+        let listed = provisioner.list_snapshots(vm.id).await?;
+        assert_eq!(
+            listed.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["one", "two"]
+        );
+
+        provisioner.rollback_snapshot(vm.id, "two").await?;
+        assert_eq!(provisioner.list_snapshots(vm.id).await?.len(), 2);
+
+        provisioner.delete_snapshot(vm.id, "one").await?;
+        assert_eq!(provisioner.list_snapshots(vm.id).await?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_limits_and_rejections() -> Result<()> {
+        let _snapshots =
+            lnvps_api_common::host::dummy_host::DummyVmHost::exclusive_snapshots().await;
+        use lnvps_api_common::host::SnapshotRejection;
+        clear_mock_state().await;
+        let db = Arc::new(MockDb::default());
+        setup_db_with_static_arp(&db).await?;
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let vm = spawned_vm(&provisioner, &db).await?;
+
+        let rejection = |e: lnvps_api_common::retry::OpError<anyhow::Error>| {
+            e.inner().downcast_ref::<SnapshotRejection>().cloned()
+        };
+
+        for name in ["s1", "s2", "s3"] {
+            provisioner.create_snapshot(vm.id, name, None).await?;
+        }
+        let full = provisioner
+            .create_snapshot(vm.id, "s4", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            rejection(full),
+            Some(SnapshotRejection::Conflict(_))
+        ));
+
+        let dup = provisioner
+            .create_snapshot(vm.id, "s1", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            rejection(dup),
+            Some(SnapshotRejection::Conflict(_))
+        ));
+
+        let older = provisioner
+            .rollback_snapshot(vm.id, "s1")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            rejection(older),
+            Some(SnapshotRejection::Conflict(_))
+        ));
+        provisioner.rollback_snapshot(vm.id, "s3").await?;
+
+        let bad_path = provisioner
+            .delete_snapshot(vm.id, "../x")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            rejection(bad_path),
+            Some(SnapshotRejection::Invalid(_))
+        ));
+        provisioner.delete_snapshot(vm.id, "s1").await?;
+        let bad = provisioner
+            .create_snapshot(vm.id, "9 bad", None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            rejection(bad),
+            Some(SnapshotRejection::Invalid(_))
+        ));
+
+        let missing = provisioner
+            .rollback_snapshot(vm.id, "nope")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            rejection(missing),
+            Some(SnapshotRejection::NotFound(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_actions_are_logged_only_when_they_succeed() -> Result<()> {
+        let _snapshots =
+            lnvps_api_common::host::dummy_host::DummyVmHost::exclusive_snapshots().await;
+        use lnvps_api_common::{SnapshotAction, VmHistoryLogger};
+        clear_mock_state().await;
+        let db = Arc::new(MockDb::default());
+        setup_db_with_static_arp(&db).await?;
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let vm = spawned_vm(&provisioner, &db).await?;
+        let history = VmHistoryLogger::new(db.clone());
+        let actions = |n: &str| {
+            [
+                SnapshotAction::Create {
+                    name: n.to_string(),
+                    description: Some("d".to_string()),
+                },
+                SnapshotAction::Restore {
+                    name: n.to_string(),
+                },
+                SnapshotAction::Delete {
+                    name: n.to_string(),
+                },
+            ]
+        };
+        for action in actions("one") {
+            provisioner
+                .run_snapshot_action(vm.id, Some(vm.user_id), &action, &history)
+                .await?;
+        }
+        assert!(
+            provisioner
+                .run_snapshot_action(
+                    vm.id,
+                    None,
+                    &SnapshotAction::Restore {
+                        name: "gone".to_string()
+                    },
+                    &history,
+                )
+                .await
+                .is_err()
+        );
+        let logged: Vec<String> = db
+            .list_vm_history(vm.id)
+            .await?
+            .iter()
+            .map(|h| h.action_type.to_string())
+            .filter(|a| a.starts_with("snapshot"))
+            .collect();
+        assert_eq!(logged.len(), 3, "{logged:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_reinstall_discards_snapshots() -> Result<()> {
+        let _snapshots =
+            lnvps_api_common::host::dummy_host::DummyVmHost::exclusive_snapshots().await;
+        clear_mock_state().await;
+        let db = Arc::new(MockDb::default());
+        setup_db_with_static_arp(&db).await?;
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let vm = spawned_vm(&provisioner, &db).await?;
+
+        provisioner.create_snapshot(vm.id, "keep", None).await?;
+        provisioner.reinstall_vm(vm.id).await?;
+        assert!(provisioner.list_snapshots(vm.id).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshots_refused_in_read_only_mode() -> Result<()> {
+        clear_mock_state().await;
+        let mut settings = mock_settings();
+        settings.read_only = true;
+        let db = Arc::new(MockDb::default());
+        setup_db_with_static_arp(&db).await?;
+        let provisioner = VmProvisioner::new(settings, db.clone());
+        assert!(provisioner.create_snapshot(1, "one", None).await.is_err());
+        assert!(provisioner.rollback_snapshot(1, "one").await.is_err());
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 use anyhow::Result;
 use redis::AsyncCommands;
-use redis::aio::MultiplexedConnection;
+use redis::aio::ConnectionManager;
 use serde::Deserialize;
 
 use serde::Serialize;
@@ -18,6 +18,8 @@ pub enum VmRunningStates {
     Stopped,
     /// Payment received; VM is being provisioned on the host for the first time.
     Creating,
+    /// Paid, but the region has no free IP address yet; one is on order.
+    WaitingForIp,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default)]
@@ -92,7 +94,7 @@ impl VmStateCacheBackend for LocalVmStateCache {
 #[derive(Clone)]
 pub struct RedisVmStateCache {
     client: redis::Client,
-    conn: MultiplexedConnection,
+    conn: ConnectionManager,
     ttl: Duration,
 }
 
@@ -100,7 +102,7 @@ impl RedisVmStateCache {
     pub async fn new(config: RedisConfig) -> Result<Self> {
         let client = redis::Client::open(config.url)?;
         Ok(Self {
-            conn: client.get_multiplexed_async_connection().await?,
+            conn: ConnectionManager::new(client.clone()).await?,
             client,
             ttl: Duration::from_secs(config.ttl),
         })

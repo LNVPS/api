@@ -13,6 +13,8 @@ members = [
     "lnvps_e2e",
     "lnvps_agent",
     "lnvps_node",
+    "lnvps_netlink",
+    "lnvps_vpn",
 ]
 # Both are separate workspaces with their own lockfile and are built in their
 # own Docker context: lnvps_fw because the eBPF datapath needs its own
@@ -45,7 +47,7 @@ config = { version = "0.15", features = ["yaml"] }
 hex = "0.4"
 nftables = "0.6"
 ipnetwork = "0.21"
-payments-rs = { version = "0.7.0", default-features = false }
+payments-rs = { version = "0.10.0", default-features = false }
 async-trait = "0.1"
 futures = "0.3"
 reqwest = { version = "0.13", features = ["json", "rustls-no-provider"] }

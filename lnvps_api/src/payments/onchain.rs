@@ -39,11 +39,15 @@
 //!   every payment is re-generated uniformly from current line-item pricing.
 
 use crate::subscription::SubscriptionHandler;
+use crate::swap::SwapData;
 use anyhow::{Result, bail};
 use chrono::Utc;
 use futures::StreamExt;
 use lnvps_api_common::{CostResult, WorkJob};
-use lnvps_db::{LNVpsDb, PaymentMethod, SubscriptionPayment, SubscriptionPaymentType};
+use lnvps_db::{
+    AccountCreditTopup, AccountType, LNVpsDb, OnchainAddressOwner, PaymentMethod,
+    SubscriptionPayment, SubscriptionPaymentType,
+};
 use log::{debug, error, info, warn};
 use payments_rs::currency::CurrencyAmount;
 use payments_rs::onchain::{ChainPaymentUpdate, OnChainProvider};
@@ -67,6 +71,26 @@ fn deposit_key(txid: &str, vout: u32) -> String {
     format!("{}:{}", txid, vout)
 }
 
+fn receive_address(payment: &SubscriptionPayment) -> Option<String> {
+    match payment.payment_method {
+        PaymentMethod::OnChain => Some(payment.external_data.as_str().to_string()),
+        PaymentMethod::FixedFloat => SwapData::parse(payment.external_data.as_str())
+            .ok()
+            .map(|d| d.receive_address),
+        _ => None,
+    }
+}
+
+fn topup_receive_address(topup: &AccountCreditTopup) -> Option<String> {
+    match topup.payment_method {
+        PaymentMethod::OnChain => Some(topup.external_data.clone()),
+        PaymentMethod::FixedFloat => SwapData::parse(&topup.external_data)
+            .ok()
+            .map(|d| d.receive_address),
+        _ => None,
+    }
+}
+
 impl OnChainPaymentHandler {
     pub fn new(
         provider: Arc<dyn OnChainProvider>,
@@ -83,13 +107,338 @@ impl OnChainPaymentHandler {
 
     /// Find the payment a deposit belongs to: the most recent on-chain payment
     /// whose stored receive address matches.
-    async fn payment_for_address(&self, address: &str) -> Result<Option<SubscriptionPayment>> {
+    /// Spend the credit held on `payment` and return what it covered, in msat.
+    async fn claim_credit_msat(&self, payment: &SubscriptionPayment) -> Result<u64> {
+        if let Some(d) = self.db.settle_account_credit_debit(&payment.id).await? {
+            return Ok(d.payment_amount);
+        }
         Ok(self
             .db
-            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .get_account_credit_debit_by_payment(&payment.id)
             .await?
+            .filter(|d| d.settled)
+            .map(|d| d.payment_amount)
+            .unwrap_or(0))
+    }
+
+    async fn topup_for_address(&self, address: &str) -> Result<Option<AccountCreditTopup>> {
+        let mut topups = self
+            .db
+            .list_account_credit_topups_by_method(PaymentMethod::OnChain)
+            .await?;
+        topups.extend(
+            self.db
+                .list_account_credit_topups_by_method(PaymentMethod::FixedFloat)
+                .await?,
+        );
+        Ok(topups
             .into_iter()
-            .filter(|p| p.external_data.as_str() == address)
+            .filter(|t| topup_receive_address(t).as_deref() == Some(address))
+            .max_by_key(|t| t.created))
+    }
+
+    async fn handle_topup_detected(
+        &self,
+        address: &str,
+        key: &str,
+        amount_msat: u64,
+    ) -> Result<bool> {
+        if self
+            .db
+            .get_account_credit_topup_by_ext_id(key)
+            .await?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        let Some(topup) = self.topup_for_address(address).await? else {
+            return Ok(false);
+        };
+        if !topup.is_paid && topup.external_id.is_none() {
+            self.db
+                .set_account_credit_topup_deposit(topup.id, key, amount_msat)
+                .await?;
+        }
+        Ok(true)
+    }
+
+    async fn handle_topup_deposit(
+        &self,
+        address: &str,
+        key: &str,
+        amount_msat: u64,
+    ) -> Result<bool> {
+        let topup = match self.db.get_account_credit_topup_by_ext_id(key).await? {
+            Some(t) => t,
+            None => {
+                let Some(found) = self.topup_for_address(address).await? else {
+                    return Ok(false);
+                };
+                if found.is_paid {
+                    if found.payment_method != PaymentMethod::OnChain {
+                        debug!("Deposit {} to settled swap address, ignoring", key);
+                        return Ok(true);
+                    }
+                    let id = self
+                        .db
+                        .insert_account_credit_topup(&AccountCreditTopup {
+                            invoice_hash: rand::random::<[u8; 32]>().to_vec(),
+                            external_id: Some(key.to_string()),
+                            amount: amount_msat,
+                            ..found
+                        })
+                        .await?;
+                    self.settle_topup(id).await?;
+                    return Ok(true);
+                }
+                found
+            }
+        };
+        if topup.is_paid {
+            debug!("Skipping already processed deposit {}", key);
+            return Ok(true);
+        }
+        self.db
+            .set_account_credit_topup_deposit(topup.id, key, amount_msat)
+            .await?;
+        self.settle_topup(topup.id).await?;
+        Ok(true)
+    }
+
+    /// Credit the balance for a top-up and tell the user about it.
+    ///
+    /// Only the call that actually settles the top-up notifies, so replayed
+    /// stream events never produce a second notification.
+    async fn settle_topup(&self, id: u64) -> Result<()> {
+        match self.sub_handler.settle_credit_topup(id).await? {
+            Some(t) => {
+                info!(
+                    "Credit top-up {} settled on chain: +{} msat to user {}",
+                    t.id, t.amount, t.user_id
+                );
+                self.notify_credited(&t).await;
+            }
+            None => info!("Credit top-up {} already settled", id),
+        }
+        Ok(())
+    }
+
+    /// Queue a notification telling the user an on-chain deposit was credited.
+    async fn notify_credited(&self, topup: &AccountCreditTopup) {
+        let currency = topup.credit_currency.as_deref().unwrap_or(&topup.currency);
+        let value = topup.credit_amount.unwrap_or(topup.amount);
+        let amount = match currency.parse::<payments_rs::currency::Currency>() {
+            _ if currency == "BTC" => {
+                format!("{} sats", value / 1000)
+            }
+            Ok(c) => payments_rs::currency::CurrencyAmount::from_u64(c, value).to_string(),
+            Err(_) => format!("{value} {currency}"),
+        };
+        if let Err(e) = self
+            .sub_handler
+            .work_commander()
+            .send(WorkJob::SendNotification {
+                user_id: topup.user_id,
+                title: Some("On-chain deposit received".to_string()),
+                message: format!(
+                    "Your on-chain deposit of {} has been confirmed and credited to your account balance.",
+                    amount
+                ),
+            })
+            .await
+        {
+            warn!(
+                "Failed to queue deposit notification for top-up {}: {}",
+                topup.id, e
+            );
+        }
+    }
+
+    /// Credit a deposit that has no live payment to settle (the VM it was
+    /// meant for was deleted) to the owner's account balance.
+    ///
+    /// Recorded as a settled top-up keyed by the deposit outpoint, so replays
+    /// of the stream are skipped by the same check as ordinary top-ups. The
+    /// receive address is deliberately not stored: it must not make later
+    /// deposits to the same address look like a top-up address.
+    async fn credit_unclaimed_deposit(
+        &self,
+        user_id: u64,
+        key: &str,
+        amount_msat: u64,
+    ) -> Result<()> {
+        let id = self
+            .db
+            .insert_account_credit_topup(&AccountCreditTopup {
+                user_id,
+                amount: amount_msat,
+                currency: "BTC".to_string(),
+                payment_method: PaymentMethod::OnChain,
+                invoice_hash: rand::random::<[u8; 32]>().to_vec(),
+                external_data: String::new(),
+                external_id: Some(key.to_string()),
+                ..Default::default()
+            })
+            .await?;
+        self.settle_topup(id).await
+    }
+
+    async fn owner_reachable(&self, user_id: u64) -> bool {
+        self.db
+            .get_user(user_id)
+            .await
+            .map(|u| !u.email.is_empty() || u.account_type == AccountType::Nostr)
+            .unwrap_or(false)
+    }
+
+    async fn queue(&self, job: WorkJob) {
+        if let Err(e) = self.sub_handler.work_commander().send(job).await {
+            warn!("Failed to queue late deposit notification: {}", e);
+        }
+    }
+
+    async fn handle_late_detected(
+        &self,
+        owner: &OnchainAddressOwner,
+        txid: &str,
+        key: &str,
+        amount_msat: u64,
+    ) -> Result<()> {
+        if !self
+            .db
+            .mark_onchain_address_owner_notified(owner.id, key)
+            .await?
+        {
+            return Ok(());
+        }
+        info!(
+            "Late deposit {} of {} msat seen for removed order of user {}",
+            key, amount_msat, owner.user_id
+        );
+        if self.owner_reachable(owner.user_id).await {
+            self.queue(WorkJob::SendNotification {
+                user_id: owner.user_id,
+                title: Some("We have seen your on-chain payment".to_string()),
+                message: format!(
+                    "We can see your on-chain payment of {} sats (transaction {}). \
+                     The order it was for has expired and been removed, so once the payment \
+                     confirms we will add it to your account credit. You do not need to do anything.",
+                    amount_msat / 1000,
+                    txid
+                ),
+            })
+            .await;
+        } else {
+            self.queue(WorkJob::SendAdminNotification {
+                title: Some("Late on-chain payment seen, owner unreachable".to_string()),
+                message: format!(
+                    "An unconfirmed deposit of {} sats (outpoint {}) arrived at {}, which belonged \
+                     to a removed order of user {}. The user has no email and no nostr key, so they \
+                     could not be told. It will be credited to their account once it confirms.",
+                    amount_msat / 1000,
+                    key,
+                    owner.address.as_str(),
+                    owner.user_id
+                ),
+            })
+            .await;
+        }
+        Ok(())
+    }
+
+    async fn handle_late_deposit(
+        &self,
+        owner: &OnchainAddressOwner,
+        txid: &str,
+        key: &str,
+        amount_msat: u64,
+    ) -> Result<()> {
+        let note = format!("{key}: late on-chain payment after the order was removed");
+        let Some(balance) = self
+            .db
+            .credit_onchain_address_owner(owner.id, key, amount_msat, &note)
+            .await?
+        else {
+            debug!("Late deposit {} already credited", key);
+            return Ok(());
+        };
+        warn!(
+            "Late deposit {} of {} msat credited to user {} (order removed)",
+            key, amount_msat, owner.user_id
+        );
+        let sats = amount_msat / 1000;
+        let quoted = owner
+            .amount
+            .filter(|_| owner.currency.as_deref() == Some("BTC"))
+            .map(|q| q / 1000);
+        let mismatch = match quoted {
+            Some(q) if sats < q => {
+                format!(" This is less than the {q} sats quoted for the order.")
+            }
+            Some(q) if sats > q => {
+                format!(" This is more than the {q} sats quoted for the order.")
+            }
+            _ => String::new(),
+        };
+        let reachable = self.owner_reachable(owner.user_id).await;
+        if reachable {
+            self.queue(WorkJob::SendNotification {
+                user_id: owner.user_id,
+                title: Some("Your on-chain payment was added to your account credit".to_string()),
+                message: format!(
+                    "Your on-chain payment of {sats} sats (transaction {txid}) has confirmed. \
+                     The order it was for had expired and been removed, so we have added the full \
+                     amount received to your account credit.{mismatch} Your credit balance is now \
+                     {} sats. To use it, order a VM from the dashboard and pay with your account credit.",
+                    balance / 1000
+                ),
+            })
+            .await;
+        }
+        let vm = owner
+            .vm_id
+            .map(|id| format!("[VM{id}] "))
+            .unwrap_or_default();
+        self.queue(WorkJob::SendAdminNotification {
+            title: Some(format!("{vm}Late on-chain payment credited")),
+            message: format!(
+                "A deposit of {sats} sats (outpoint {key}) arrived at {}, which belonged to a \
+                 removed order (user {}, VM {}, subscription {}). It has been credited to the \
+                 user's account balance.{}",
+                owner.address.as_str(),
+                owner.user_id,
+                owner
+                    .vm_id
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none".into()),
+                owner
+                    .subscription_id
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "none".into()),
+                if reachable {
+                    ""
+                } else {
+                    " The user has no email and no nostr key, so they could not be told."
+                }
+            ),
+        })
+        .await;
+        Ok(())
+    }
+
+    async fn payment_for_address(&self, address: &str) -> Result<Option<SubscriptionPayment>> {
+        let mut payments = self
+            .db
+            .list_subscription_payments_by_method(PaymentMethod::OnChain)
+            .await?;
+        payments.extend(
+            self.db
+                .list_subscription_payments_by_method(PaymentMethod::FixedFloat)
+                .await?,
+        );
+        Ok(payments
+            .into_iter()
+            .filter(|p| receive_address(p).as_deref() == Some(address))
             .max_by_key(|p| p.created))
     }
 
@@ -121,7 +470,7 @@ impl OnChainPaymentHandler {
         {
             Ok(vm) => {
                 engine
-                    .get_cost_by_amount(vm.id, gross, PaymentMethod::OnChain)
+                    .get_cost_by_amount(vm.id, gross, payment.payment_method)
                     .await?
             }
             Err(_) => {
@@ -129,7 +478,7 @@ impl OnChainPaymentHandler {
                     .get_subscription_cost_by_amount(
                         payment.subscription_id,
                         gross,
-                        PaymentMethod::OnChain,
+                        payment.payment_method,
                     )
                     .await?
             }
@@ -161,6 +510,12 @@ impl OnChainPaymentHandler {
         amount_msat: u64,
     ) -> Result<()> {
         let key = deposit_key(txid, vout);
+        if self
+            .handle_topup_detected(address, &key, amount_msat)
+            .await?
+        {
+            return Ok(());
+        }
         // Already priced or settled (replayed event)
         if self
             .db
@@ -171,6 +526,10 @@ impl OnChainPaymentHandler {
             return Ok(());
         }
         let Some(mut payment) = self.payment_for_address(address).await? else {
+            if let Some(owner) = self.db.get_onchain_address_owner(address).await? {
+                self.handle_late_detected(&owner, txid, &key, amount_msat)
+                    .await?;
+            }
             return Ok(());
         };
         // Address-reuse deposits are handled at confirmation; only a pending
@@ -187,7 +546,14 @@ impl OnChainPaymentHandler {
         {
             return Ok(());
         }
-        self.regenerate(&mut payment, amount_msat).await?;
+        let credit_msat = self
+            .db
+            .get_account_credit_debit_by_payment(&payment.id)
+            .await?
+            .map(|d| d.payment_amount)
+            .unwrap_or(0);
+        self.regenerate(&mut payment, amount_msat + credit_msat)
+            .await?;
         info!(
             "Deposit {} detected: priced payment {} at rate {} for {} msat ({}s)",
             key,
@@ -203,9 +569,9 @@ impl OnChainPaymentHandler {
 
     /// Notify the admins about a deposit that arrived for a deleted VM.
     ///
-    /// Database-wise the deposit is ignored — nothing is settled or recorded.
-    /// The sender is expected to contact support so it can be resolved out of
-    /// band.
+    /// The deposit is credited to the owner's account balance by the caller
+    /// (see [`Self::credit_unclaimed_deposit`]); this only informs the admins
+    /// so they can follow up if the sender contacts support.
     async fn notify_deleted_vm_deposit(
         &self,
         payment: SubscriptionPayment,
@@ -233,8 +599,8 @@ impl OnChainPaymentHandler {
                 message: format!(
                     "An on-chain deposit of {} sats (outpoint {}) arrived for deleted VM #{} (user {}).\n\
                      Receive address: {}\n\
-                     The deposit has NOT been credited. The sender is expected to \
-                     contact support so it can be resolved out of band.",
+                     The deposit has been credited to the user's account balance.",
+
                     amount_msat / 1000,
                     key,
                     vm_id,
@@ -261,6 +627,12 @@ impl OnChainPaymentHandler {
         // deposit was already handled. An *unpaid* match is the pending
         // payment priced at Detected.
         let key = deposit_key(txid, vout);
+        if self
+            .handle_topup_deposit(address, &key, amount_msat)
+            .await?
+        {
+            return Ok(());
+        }
         let priced = match self.db.get_subscription_payment_by_ext_id(&key).await {
             Ok(p) if p.is_paid => {
                 debug!("Skipping already processed deposit {}", key);
@@ -276,7 +648,12 @@ impl OnChainPaymentHandler {
             None => match self.payment_for_address(address).await? {
                 Some(p) => p,
                 None => {
-                    debug!("Deposit {} to unknown address {}, ignoring", txid, address);
+                    if let Some(owner) = self.db.get_onchain_address_owner(address).await? {
+                        return self
+                            .handle_late_deposit(&owner, txid, &key, amount_msat)
+                            .await;
+                    }
+                    debug!("Deposit {} to unknown address {}, ignoring", key, address);
                     return Ok(());
                 }
             },
@@ -291,6 +668,11 @@ impl OnChainPaymentHandler {
             .await
             && vm.deleted
         {
+            // Credit the owner so the funds are not stranded, then alert the
+            // admins. The credit is keyed by the outpoint, so a replay is
+            // skipped before reaching here.
+            self.credit_unclaimed_deposit(payment.user_id, &key, amount_msat)
+                .await?;
             return self
                 .notify_deleted_vm_deposit(payment, vm.id, address, &key, amount_msat)
                 .await;
@@ -300,9 +682,10 @@ impl OnChainPaymentHandler {
             let mut payment = payment;
             // Price now unless Detected already did (and for the same gross
             // amount — a replaced tx could change the output value).
+            let gross = amount_msat + self.claim_credit_msat(&payment).await?;
             let priced_gross = payment.amount + payment.tax + payment.processing_fee;
-            if !already_priced || priced_gross != amount_msat {
-                self.regenerate(&mut payment, amount_msat).await?;
+            if !already_priced || priced_gross != gross {
+                self.regenerate(&mut payment, gross).await?;
             }
             info!(
                 "Settling on-chain payment {}: {} msat at rate {} ({}s)",
@@ -314,6 +697,12 @@ impl OnChainPaymentHandler {
             payment.external_id = Some(key);
             self.db.update_subscription_payment(&payment).await?;
             self.sub_handler.complete_payment(&payment).await?;
+        } else if payment.payment_method != PaymentMethod::OnChain {
+            debug!(
+                "Deposit {} to settled swap address of payment {}, ignoring",
+                key,
+                hex::encode(&payment.id)
+            );
         } else {
             // Address reuse after settlement: insert a new renewal payment,
             // priced from the received amount (issue #109).
@@ -494,6 +883,8 @@ mod tests {
                     amount: 1000,
                     setup_amount: 0,
                     configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
                 }],
             )
             .await?;
@@ -664,6 +1055,94 @@ mod tests {
         Ok(())
     }
 
+    async fn hold_credit(db: &MockDb, payment: &SubscriptionPayment, msat: u64) {
+        db.adjust_account_credit(payment.user_id, "BTC", msat as i64, "topup", None)
+            .await
+            .unwrap();
+        let id = db
+            .reserve_account_credit(&lnvps_db::AccountCreditDebit {
+                user_id: payment.user_id,
+                amount: msat,
+                currency: "BTC".to_string(),
+                payment_amount: msat,
+                expires: payment.expires,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        db.attach_account_credit_debit(id, &payment.id, payment.expires)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_credit_covered_deposit_prices_the_whole_bill() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        hold_credit(&db, &payment, 400_000).await;
+        let expect = engine_price(&handler, payment.subscription_id, EXPECTED).await?;
+
+        handler
+            .handle_detected(ADDRESS, "tx1", 0, EXPECTED - 400_000)
+            .await?;
+        handler
+            .handle_deposit(ADDRESS, "tx1", 0, EXPECTED - 400_000)
+            .await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(p.is_paid);
+        assert_eq!(p.amount + p.tax + p.processing_fee, EXPECTED);
+        assert_close(p.time_value.unwrap(), expect.time_value);
+        let debit = db
+            .get_account_credit_debit_by_payment(&payment.id)
+            .await?
+            .unwrap();
+        assert!(debit.settled);
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
+            0
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_late_deposit_gets_only_the_credit_left() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        hold_credit(&db, &payment, 400_000).await;
+        db.attach_account_credit_debit(
+            db.get_account_credit_debit_by_payment(&payment.id)
+                .await?
+                .unwrap()
+                .id,
+            &payment.id,
+            Utc::now() - chrono::Duration::seconds(1),
+        )
+        .await?;
+        db.reserve_account_credit(&lnvps_db::AccountCreditDebit {
+            user_id: payment.user_id,
+            amount: 300_000,
+            currency: "BTC".to_string(),
+            payment_amount: 300_000,
+            expires: Utc::now() + chrono::Duration::hours(1),
+            ..Default::default()
+        })
+        .await?
+        .unwrap();
+
+        handler
+            .handle_deposit(ADDRESS, "tx1", 0, EXPECTED - 400_000)
+            .await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(p.is_paid);
+        assert_eq!(p.amount + p.tax + p.processing_fee, EXPECTED - 300_000);
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
+            300_000
+        );
+        Ok(())
+    }
+
     /// Half the deposit buys half the time (engine pricing is linear).
     #[tokio::test]
     async fn test_partial_deposit_buys_less_time() -> Result<()> {
@@ -681,6 +1160,93 @@ mod tests {
         Ok(())
     }
 
+    async fn make_fixedfloat(db: &MockDb, payment: &SubscriptionPayment) -> Result<()> {
+        let mut p = payment.clone();
+        p.payment_method = PaymentMethod::FixedFloat;
+        p.external_data = SwapData {
+            coin: "XMR".to_string(),
+            order_id: "ABC".to_string(),
+            order_token: "tok".to_string(),
+            deposit_address: "4Axmr".to_string(),
+            deposit_amount: "1.5".to_string(),
+            receive_address: ADDRESS.to_string(),
+        }
+        .to_json()?
+        .into();
+        db.update_subscription_payment(&p).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fixedfloat_swap_deposit_settles() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        make_fixedfloat(&db, &payment).await?;
+        let expect = engine_price(&handler, payment.subscription_id, EXPECTED).await?;
+
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(p.is_paid);
+        assert_eq!(p.payment_method, PaymentMethod::FixedFloat);
+        assert_eq!(p.external_id.as_deref(), Some("tx1:0"));
+        assert_close(p.time_value.unwrap(), expect.time_value);
+        assert_eq!(db.subscription_payments.lock().await.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fixedfloat_swap_short_deposit_buys_less_time() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        make_fixedfloat(&db, &payment).await?;
+        let expect_full = engine_price(&handler, payment.subscription_id, EXPECTED).await?;
+
+        handler
+            .handle_deposit(ADDRESS, "tx1", 0, EXPECTED / 2)
+            .await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(p.is_paid);
+        assert_close(p.time_value.unwrap(), expect_full.time_value / 2);
+        assert_eq!(p.amount + p.tax + p.processing_fee, EXPECTED / 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fixedfloat_swap_detected_locks_pricing() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        make_fixedfloat(&db, &payment).await?;
+
+        handler.handle_detected(ADDRESS, "tx1", 0, EXPECTED).await?;
+
+        let p = get_payment(&db, &payment.id).await;
+        assert!(!p.is_paid);
+        assert_eq!(p.external_id.as_deref(), Some("tx1:0"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fixedfloat_swap_second_deposit_to_settled_address_ignored() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        make_fixedfloat(&db, &payment).await?;
+
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+        handler.handle_deposit(ADDRESS, "tx2", 0, EXPECTED).await?;
+
+        assert_eq!(db.subscription_payments.lock().await.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_receive_address() -> Result<()> {
+        let (_db, _provider, _handler, mut p) = setup().await?;
+        assert_eq!(receive_address(&p).as_deref(), Some(ADDRESS));
+        p.payment_method = PaymentMethod::Lightning;
+        assert_eq!(receive_address(&p), None);
+        p.payment_method = PaymentMethod::FixedFloat;
+        assert_eq!(receive_address(&p), None);
+        Ok(())
+    }
+
     /// A replayed deposit must not settle or create anything.
     #[tokio::test]
     async fn test_duplicate_deposit_skipped() -> Result<()> {
@@ -692,10 +1258,12 @@ mod tests {
         Ok(())
     }
 
-    /// Deposits to unknown addresses are ignored.
     #[tokio::test]
     async fn test_unknown_address_ignored() -> Result<()> {
         let (db, _provider, handler, payment) = setup().await?;
+        handler
+            .handle_detected("bcrt1qunknown", "tx1", 0, EXPECTED)
+            .await?;
         handler
             .handle_deposit("bcrt1qunknown", "tx1", 0, EXPECTED)
             .await?;
@@ -703,6 +1271,204 @@ mod tests {
         let p = get_payment(&db, &payment.id).await;
         assert!(!p.is_paid);
         assert_eq!(db.subscription_payments.lock().await.len(), 1);
+        assert!(db.account_credit_events.lock().await.is_empty());
+        assert!(next_jobs(&handler).await.is_empty());
+        Ok(())
+    }
+
+    async fn next_jobs(handler: &OnChainPaymentHandler) -> Vec<WorkJob> {
+        let mut jobs = Vec::new();
+        while let Ok(Ok(batch)) = tokio::time::timeout(
+            Duration::from_millis(50),
+            handler.sub_handler.work_commander().recv(),
+        )
+        .await
+        {
+            jobs.extend(batch.into_iter().map(|m| m.job));
+        }
+        jobs
+    }
+
+    async fn purge_order(db: &MockDb, payment: &SubscriptionPayment) -> Result<u64> {
+        let vm = db.get_vm_by_subscription(payment.subscription_id).await?;
+        db.hard_delete_vm(vm.id).await?;
+        assert!(db.subscription_payments.lock().await.is_empty());
+        Ok(vm.id)
+    }
+
+    fn user_notice(job: &WorkJob) -> Option<(u64, String)> {
+        match job {
+            WorkJob::SendNotification {
+                user_id, message, ..
+            } => Some((*user_id, message.clone())),
+            _ => None,
+        }
+    }
+
+    fn admin_notice(job: &WorkJob) -> Option<String> {
+        match job {
+            WorkJob::SendAdminNotification { title, message } => {
+                Some(format!("{}\n{}", title.as_deref().unwrap_or(""), message))
+            }
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_late_deposit_to_purged_order_credits_owner_once() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        let vm_id = purge_order(&db, &payment).await?;
+
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
+            EXPECTED
+        );
+        let events = db.account_credit_events.lock().await.clone();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "topup");
+        let note = events[0].note.clone().unwrap();
+        assert!(note.contains("tx1:0"), "{note}");
+        assert!(
+            note.contains("late on-chain payment after the order was removed"),
+            "{note}"
+        );
+        let owner = db.get_onchain_address_owner(ADDRESS).await?.unwrap();
+        assert_eq!(owner.status, lnvps_db::OnchainAddressOwnerStatus::Credited);
+        assert_eq!(owner.credited_outpoint.as_deref(), Some("tx1:0"));
+
+        let jobs = next_jobs(&handler).await;
+        assert_eq!(jobs.len(), 2, "{jobs:?}");
+        let (user_id, message) = user_notice(&jobs[0]).expect("owner notice first");
+        assert_eq!(user_id, payment.user_id);
+        assert!(message.contains("1100 sats"), "{message}");
+        assert!(message.contains("tx1"), "{message}");
+        assert!(message.contains("account credit"), "{message}");
+        assert!(message.contains("balance is now 1100 sats"), "{message}");
+        assert!(
+            message.contains("order a VM from the dashboard"),
+            "{message}"
+        );
+        assert!(!message.contains('\u{2014}') && !message.contains('\u{2013}'));
+        let admin = admin_notice(&jobs[1]).expect("admin notice");
+        assert!(admin.contains("tx1:0"), "{admin}");
+        assert!(admin.contains(ADDRESS), "{admin}");
+        assert!(admin.contains(&format!("VM{vm_id}")), "{admin}");
+
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
+            EXPECTED,
+            "a replay credits nothing more"
+        );
+        assert!(next_jobs(&handler).await.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_late_deposit_detected_tells_owner_once_and_credits_nothing() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        purge_order(&db, &payment).await?;
+
+        handler.handle_detected(ADDRESS, "tx1", 0, EXPECTED).await?;
+        handler.handle_detected(ADDRESS, "tx1", 0, EXPECTED).await?;
+        handler.handle_detected(ADDRESS, "tx2", 0, EXPECTED).await?;
+
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
+            0
+        );
+        assert!(db.account_credit_events.lock().await.is_empty());
+        let jobs = next_jobs(&handler).await;
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        let (user_id, message) = user_notice(&jobs[0]).unwrap();
+        assert_eq!(user_id, payment.user_id);
+        assert!(message.contains("1100 sats"), "{message}");
+        assert!(message.contains("tx1"), "{message}");
+        assert!(message.contains("once the payment confirms"), "{message}");
+
+        handler.handle_deposit(ADDRESS, "tx2", 0, EXPECTED).await?;
+        let jobs = next_jobs(&handler).await;
+        assert_eq!(jobs.len(), 2, "{jobs:?}");
+        assert!(user_notice(&jobs[0]).unwrap().1.contains("balance is now"));
+
+        handler.handle_detected(ADDRESS, "tx2", 0, EXPECTED).await?;
+        assert!(next_jobs(&handler).await.is_empty());
+
+        handler.handle_detected(ADDRESS, "tx3", 0, EXPECTED).await?;
+        let jobs = next_jobs(&handler).await;
+        assert_eq!(jobs.len(), 1, "a new deposit after a credit is announced");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_late_deposit_states_an_under_or_over_payment() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        purge_order(&db, &payment).await?;
+
+        handler.handle_deposit(ADDRESS, "tx1", 0, 600_000).await?;
+        let jobs = next_jobs(&handler).await;
+        let message = user_notice(&jobs[0]).unwrap().1;
+        assert!(message.contains("600 sats"), "{message}");
+        assert!(message.contains("less than the 1100 sats"), "{message}");
+
+        handler.handle_deposit(ADDRESS, "tx2", 0, 2_000_000).await?;
+        let jobs = next_jobs(&handler).await;
+        let message = user_notice(&jobs[0]).unwrap().1;
+        assert!(message.contains("more than the 1100 sats"), "{message}");
+        assert!(message.contains("balance is now 2600 sats"), "{message}");
+
+        handler.handle_deposit(ADDRESS, "tx3", 0, EXPECTED).await?;
+        let jobs = next_jobs(&handler).await;
+        let message = user_notice(&jobs[0]).unwrap().1;
+        assert!(!message.contains("than the"), "{message}");
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
+            600_000 + 2_000_000 + EXPECTED
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_late_deposit_owner_without_contact_goes_to_admin() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        purge_order(&db, &payment).await?;
+        db.users
+            .lock()
+            .await
+            .get_mut(&payment.user_id)
+            .unwrap()
+            .account_type = lnvps_db::AccountType::OAuth;
+
+        handler.handle_detected(ADDRESS, "tx1", 0, EXPECTED).await?;
+        let jobs = next_jobs(&handler).await;
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        let admin = admin_notice(&jobs[0]).expect("admin told instead of the owner");
+        assert!(admin.contains("tx1:0"), "{admin}");
+        assert!(admin.contains("no email"), "{admin}");
+
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+        let jobs = next_jobs(&handler).await;
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        let admin = admin_notice(&jobs[0]).expect("admin told instead of the owner");
+        assert!(admin.contains("no email"), "{admin}");
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "BTC").await?.balance,
+            EXPECTED
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_deposit_to_live_order_does_not_use_the_owner_table() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        handler.handle_detected(ADDRESS, "tx1", 0, EXPECTED).await?;
+        handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
+
+        assert!(get_payment(&db, &payment.id).await.is_paid);
+        assert!(db.account_credit_topups.lock().await.is_empty());
+        assert!(db.onchain_address_owners.lock().await.is_empty());
         Ok(())
     }
 
@@ -860,18 +1626,34 @@ mod tests {
         let p = get_payment(&db, &payment.id).await;
         assert_eq!(p.external_id, None);
 
-        // Confirmed: nothing touched in the database, one admin notification
+        // Confirmed: the payment is untouched, the owner is credited and told,
+        // and the admins are alerted
         handler.handle_deposit(ADDRESS, "tx1", 0, EXPECTED).await?;
         let p = get_payment(&db, &payment.id).await;
         assert!(!p.is_paid, "payment must be untouched");
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "EUR").await?.balance,
+            110
+        );
         assert_eq!(p.external_id, None);
         assert_eq!(p.metadata, None);
         assert_eq!(p.time_value, payment.time_value);
         assert_eq!(p.rate, payment.rate);
 
-        let jobs = handler.sub_handler.work_commander().recv().await?;
-        assert_eq!(jobs.len(), 1);
-        match &jobs[0].job {
+        let user_job = handler.sub_handler.work_commander().recv().await?;
+        let admin_job = handler.sub_handler.work_commander().recv().await?;
+        assert_eq!(user_job.len(), 1);
+        assert_eq!(admin_job.len(), 1);
+        match &user_job[0].job {
+            WorkJob::SendNotification {
+                user_id, message, ..
+            } => {
+                assert_eq!(*user_id, payment.user_id);
+                assert!(message.contains("credited"));
+            }
+            other => panic!("expected SendNotification, got {:?}", other),
+        }
+        match &admin_job[0].job {
             WorkJob::SendAdminNotification { title, message } => {
                 assert!(title.as_deref().unwrap_or("").contains("deleted VM"));
                 assert!(message.contains("tx1:0"));
@@ -887,12 +1669,23 @@ mod tests {
             handler.sub_handler.work_commander().recv(),
         )
         .await;
-        assert!(no_job.is_err(), "replay must not re-notify admins");
+        assert!(no_job.is_err(), "replay must not re-notify");
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "EUR").await?.balance,
+            110,
+            "replay must not credit twice"
+        );
 
         // A second distinct deposit to the same address notifies again
         handler.handle_deposit(ADDRESS, "tx2", 0, EXPECTED).await?;
         let jobs = handler.sub_handler.work_commander().recv().await?;
         assert_eq!(jobs.len(), 1);
+        let jobs = handler.sub_handler.work_commander().recv().await?;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "EUR").await?.balance,
+            220
+        );
         Ok(())
     }
 
@@ -1059,6 +1852,137 @@ mod tests {
         assert_eq!(db.subscription_payments.lock().await.len(), 1);
         assert_eq!(first.time_value, again.time_value);
         assert_eq!(first.external_id, again.external_id);
+        Ok(())
+    }
+
+    const TOPUP_ADDRESS: &str = "bcrt1qtopup0";
+
+    async fn add_topup(
+        db: &MockDb,
+        user_id: u64,
+        method: PaymentMethod,
+        data: String,
+    ) -> Result<u64> {
+        db.insert_account_credit_topup(&AccountCreditTopup {
+            user_id,
+            amount: 50_000,
+            currency: "BTC".to_string(),
+            payment_method: method,
+            invoice_hash: vec![5u8; 32],
+            external_data: data,
+            ..Default::default()
+        })
+        .await
+        .map_err(Into::into)
+    }
+
+    #[tokio::test]
+    async fn test_onchain_topup_credits_balance_once() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        add_topup(
+            &db,
+            payment.user_id,
+            PaymentMethod::OnChain,
+            TOPUP_ADDRESS.into(),
+        )
+        .await?;
+
+        handler
+            .handle_detected(TOPUP_ADDRESS, "tx9", 0, 70_000)
+            .await?;
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "EUR").await?.balance,
+            0
+        );
+        handler
+            .handle_deposit(TOPUP_ADDRESS, "tx9", 0, 70_000)
+            .await?;
+        handler
+            .handle_deposit(TOPUP_ADDRESS, "tx9", 0, 70_000)
+            .await?;
+
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "EUR").await?.balance,
+            7
+        );
+        assert!(!get_payment(&db, &payment.id).await.is_paid);
+
+        // Exactly one notification to the user, despite the replayed deposit
+        let jobs = handler.sub_handler.work_commander().recv().await?;
+        assert_eq!(jobs.len(), 1);
+        match &jobs[0].job {
+            WorkJob::SendNotification {
+                user_id, message, ..
+            } => {
+                assert_eq!(*user_id, payment.user_id);
+                assert!(message.contains("EUR 0.07"));
+            }
+            other => panic!("expected SendNotification, got {:?}", other),
+        }
+        let no_job = tokio::time::timeout(
+            Duration::from_millis(50),
+            handler.sub_handler.work_commander().recv(),
+        )
+        .await;
+        assert!(no_job.is_err(), "replay must not re-notify the user");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_onchain_topup_address_reuse_credits_again() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        add_topup(
+            &db,
+            payment.user_id,
+            PaymentMethod::OnChain,
+            TOPUP_ADDRESS.into(),
+        )
+        .await?;
+
+        handler
+            .handle_deposit(TOPUP_ADDRESS, "tx1", 0, 40_000)
+            .await?;
+        handler
+            .handle_deposit(TOPUP_ADDRESS, "tx2", 1, 60_000)
+            .await?;
+
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "EUR").await?.balance,
+            10
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_fixedfloat_topup_credits_balance() -> Result<()> {
+        let (db, _provider, handler, payment) = setup().await?;
+        let swap = SwapData {
+            coin: "XMR".to_string(),
+            order_id: "ABC".to_string(),
+            order_token: "tok".to_string(),
+            deposit_address: "4Axmr".to_string(),
+            deposit_amount: "1.5".to_string(),
+            receive_address: TOPUP_ADDRESS.to_string(),
+        };
+        add_topup(
+            &db,
+            payment.user_id,
+            PaymentMethod::FixedFloat,
+            swap.to_json()?,
+        )
+        .await?;
+
+        handler
+            .handle_deposit(TOPUP_ADDRESS, "tx3", 0, 48_000)
+            .await?;
+        handler
+            .handle_deposit(TOPUP_ADDRESS, "tx4", 0, 9_000)
+            .await?;
+
+        assert_eq!(
+            db.get_account_credit(payment.user_id, "EUR").await?.balance,
+            5
+        );
         Ok(())
     }
 }

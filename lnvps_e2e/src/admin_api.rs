@@ -90,6 +90,7 @@ mod tests {
             "/api/admin/v1/companies",
             "/api/admin/v1/cost_plans",
             "/api/admin/v1/custom_pricing",
+            "/api/admin/v1/vm_addon_prices",
             "/api/admin/v1/ip_ranges",
             "/api/admin/v1/access_policies",
             "/api/admin/v1/routers",
@@ -756,7 +757,8 @@ mod tests {
             "description": "test relay app",
             "repo_url": "https://github.com/example/relay",
             "category": "Nostr relay",
-            "compose": "services:\n  relay:\n    image: example/relay:latest\n    ports:\n      - { name: ws, container: 7777, protocol: http, expose: ingress }\n",
+            "tags": ["nostr"],
+            "compose": "services:\n  relay:\n    image: example/relay:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    ports:\n      - { name: ws, container: 7777, protocol: http, expose: ingress }\n",
             "amount": 1000,
             "currency": "usd",
             "interval_amount": 1,
@@ -792,6 +794,39 @@ mod tests {
             .unwrap();
         assert_ne!(resp.status(), StatusCode::OK, "duplicate app name rejected");
 
+        // An image on a bare tag is rejected: the tag is a mutable pointer, so
+        // admitting one lets the publisher change what every deployment runs.
+        let unpinned = serde_json::json!({
+            "name": "e2e-relay-unpinned",
+            "display_name": "E2E Relay Unpinned",
+            "description": "test relay app",
+            "repo_url": "https://github.com/example/relay",
+            "category": "Nostr relay",
+            "tags": ["nostr"],
+            "compose": "services:\n  relay:\n    image: example/relay:latest\n    ports:\n      - { name: ws, container: 7777, protocol: http, expose: ingress }\n",
+            "amount": 1000,
+            "currency": "usd",
+            "interval_amount": 1,
+            "interval_type": "month",
+            "setup_amount": 0
+        });
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &unpinned)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "unpinned image rejected"
+        );
+        assert!(
+            resp.text()
+                .await
+                .unwrap()
+                .contains("is not pinned to a digest"),
+            "the error names the reason"
+        );
+
         // Invalid slug rejected.
         // `category` is present so the request reaches slug validation: making
         // it required (#239) means omitting it fails deserialization with 422
@@ -800,6 +835,7 @@ mod tests {
             "name": "Bad Name",
             "display_name": "x",
             "category": "Nostr relay",
+            "tags": ["nostr"],
             "compose": "services: {}",
             "amount": 1,
             "currency": "usd",
@@ -936,11 +972,11 @@ mod tests {
 
         let compose = |name: &str, cmd: &str| {
             format!(
-                "services:\n  s3:\n    image: rustfs/rustfs:latest\n    ports:\n      \
+                "services:\n  s3:\n    image: rustfs/rustfs:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    ports:\n      \
                  - {{ name: s3, container: 9000, protocol: http, expose: none }}\n  \
-                 app:\n    image: example/app:latest\n    depends_on: [s3]\n    ports:\n      \
+                 app:\n    image: example/app:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    depends_on: [s3]\n    ports:\n      \
                  - {{ name: http, container: 3000, protocol: http, expose: ingress }}\n    \
-                 init:\n      - name: {name}\n        image: minio/mc:latest\n        \
+                 init:\n      - name: {name}\n        image: minio/mc:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n        \
                  env:\n          MC_HOST_s3: http://k:${{S3_KEY}}@s3:9000\n        \
                  command: [\"sh\", \"-c\", \"{cmd}\"]\n\
                  secrets:\n  - {{ name: S3_KEY, generate: token }}\n"
@@ -952,6 +988,7 @@ mod tests {
                 "name": slug,
                 "display_name": "Init App",
                 "category": "Media server",
+                "tags": ["nostr"],
                 "compose": compose,
                 "amount": 1000,
                 "currency": "usd",
@@ -1029,10 +1066,11 @@ mod tests {
 
         let compose = |scratch: &str| {
             format!(
-                "services:\n  db:\n    image: mariadb:11\n    user: \"999\"\n    \
+                "services:\n  db:\n    image: mariadb:11@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    user: \"999\"\n    \
                  volumes:\n      - {{ name: data, path: /var/lib/mysql, size: 5Gi }}\n    \
+                 backup: {{ volume: data }}\n    \
                  scratch:\n{scratch}  \
-                 app:\n    image: example/app:latest\n    user: \"1000\"\n    \
+                 app:\n    image: example/app:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    user: \"1000\"\n    \
                  depends_on: [db]\n    ports:\n      \
                  - {{ name: http, container: 3000, protocol: http, expose: ingress }}\n"
             )
@@ -1043,6 +1081,7 @@ mod tests {
                 "name": slug,
                 "display_name": "Scratch App",
                 "category": "Media server",
+                "tags": ["nostr"],
                 "compose": compose,
                 "amount": 1000,
                 "currency": "usd",
@@ -1121,7 +1160,7 @@ mod tests {
 
         let compose = |config: &str| {
             format!(
-                "services:\n  web:\n    image: example/web:latest\n    user: \"1000\"\n    \
+                "services:\n  web:\n    image: example/web:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    user: \"1000\"\n    \
                  ports:\n      - {{ name: http, container: 80, protocol: http, expose: ingress }}\n    \
                  env:\n      V: ${{v}}\n\
                  config:\n  - {config}\n"
@@ -1132,6 +1171,7 @@ mod tests {
                 "name": slug,
                 "display_name": "Config Constraints",
                 "category": "Nostr relay",
+                "tags": ["nostr"],
                 "compose": compose,
                 "amount": 1000,
                 "currency": "usd",
@@ -1209,8 +1249,8 @@ mod tests {
 
         let compose = |db_ports: &str| {
             format!(
-                "services:\n  db:\n    image: postgres:17-alpine\n    user: root\n{db_ports}  \
-                 relay:\n    image: example/relay:latest\n    user: \"1000\"\n    \
+                "services:\n  db:\n    image: postgres:17-alpine@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    user: root\n{db_ports}  \
+                 relay:\n    image: example/relay:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    user: \"1000\"\n    \
                  ports:\n      - {{ name: http, container: 3000, protocol: http, expose: ingress }}\n    \
                  env:\n      DATABASE_URL: \"postgres://buzz:pw@db:5432/buzz\"\n"
             )
@@ -1220,6 +1260,7 @@ mod tests {
                 "name": slug,
                 "display_name": "Addressed Peer",
                 "category": "Nostr relay",
+                "tags": ["nostr"],
                 "compose": compose,
                 "amount": 1000,
                 "currency": "usd",
@@ -1278,9 +1319,10 @@ mod tests {
 
         let compose = |user: &str| {
             format!(
-                "services:\n  web:\n    image: example/web:latest\n{user}    \
+                "services:\n  web:\n    image: example/web:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n{user}    \
                  ports:\n      - {{ name: http, container: 80, protocol: http, expose: ingress }}\n    \
-                 volumes:\n      - {{ name: data, path: /data, size: 1Gi }}\n"
+                 volumes:\n      - {{ name: data, path: /data, size: 1Gi }}\n    \
+                 backup: {{ command: [\"true\"] }}\n"
             )
         };
         let body = |compose: String| {
@@ -1288,6 +1330,7 @@ mod tests {
                 "name": slug,
                 "display_name": "Volumes Need A User",
                 "category": "Nostr relay",
+                "tags": ["nostr"],
                 "compose": compose,
                 "amount": 1000,
                 "currency": "usd",
@@ -1323,6 +1366,22 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
+        let no_backup =
+            compose("    user: \"1000\"\n").replace("    backup: { command: [\"true\"] }\n", "");
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "compose": no_backup }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let err = resp.text().await.unwrap();
+        assert!(
+            err.contains("no service declares a `backup:` method"),
+            "{err}"
+        );
+
         let resp = client
             .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
             .await
@@ -1330,19 +1389,19 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// A catalog edit may grow a persistent volume but not shrink, drop or
-    /// rename one (#292). Kubernetes permits PVC expansion only, and the
-    /// operator cannot prune a PVC it stops applying, so each of those puts
-    /// every existing deployment of the app somewhere the API cannot walk back.
+    /// A catalog edit may resize a persistent volume but not drop or rename
+    /// one (#292). The operator cannot prune a PVC it stops applying, so either
+    /// leaves the customer's data in an orphaned claim.
     #[tokio::test]
-    async fn test_admin_app_compose_volume_may_not_shrink() {
+    async fn test_admin_app_compose_volume_may_not_vanish() {
         let client = setup().await;
         let suffix = nostr::Keys::generate().public_key().to_hex()[..8].to_string();
         let slug = format!("e2e-vol-shrink-{suffix}");
 
         let compose = |vol: &str| {
             format!(
-                "services:\n  db:\n    image: example/db:latest\n    user: \"1000\"\n    \
+                "services:\n  db:\n    image: example/db:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    user: \"1000\"\n    \
+                 backup: {{ command: [\"true\"] }}\n    \
                  volumes:\n      - {vol}\n"
             )
         };
@@ -1353,8 +1412,9 @@ mod tests {
                 "/api/admin/v1/apps",
                 &serde_json::json!({
                     "name": slug,
-                    "display_name": "Volumes Only Grow",
+                    "display_name": "Volumes Stay Put",
                     "category": "Nostr relay",
+                    "tags": ["nostr"],
                     "compose": compose("{ name: data, path: /data, size: 5Gi }"),
                     "amount": 1000,
                     "currency": "usd",
@@ -1374,9 +1434,8 @@ mod tests {
             .patch_auth(&path, &patch("{ name: data, path: /data, size: 1Gi }"))
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let err = resp.text().await.unwrap();
-        assert!(err.contains("shrinks from 5Gi to 1Gi"), "{err}");
+        let status = resp.status();
+        assert_eq!(status, StatusCode::OK, "{}", resp.text().await.unwrap());
 
         // Dropping the volume, and renaming it, are refused the same way: the
         // old PVC survives with the customer's data in it either way.
@@ -1384,7 +1443,7 @@ mod tests {
             .patch_auth(
                 &path,
                 &serde_json::json!({
-                    "compose": "services:\n  db:\n    image: example/db:latest\n"
+                    "compose": "services:\n  db:\n    image: example/db:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n"
                 }),
             )
             .await
@@ -1399,19 +1458,11 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-        // Growing is the whole point of allowing the edit at all...
         let resp = client
             .patch_auth(&path, &patch("{ name: data, path: /data, size: 20Gi }"))
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-
-        // ...and the new size is the floor from then on.
-        let resp = client
-            .patch_auth(&path, &patch("{ name: data, path: /data, size: 5Gi }"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let resp = client.delete_auth(&path).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1429,7 +1480,7 @@ mod tests {
 
         let compose = |bytes: &str| {
             format!(
-                "services:\n  relay:\n    image: example/relay:latest\n    env:\n      \
+                "services:\n  relay:\n    image: example/relay:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n    env:\n      \
                  KEY: ${{RELAY_KEY}}\nsecrets:\n  - {{ name: RELAY_KEY, generate: token{bytes} }}\n"
             )
         };
@@ -1438,6 +1489,7 @@ mod tests {
                 "name": slug,
                 "display_name": "Secret Bytes Relay",
                 "category": "Nostr relay",
+                "tags": ["nostr"],
                 "compose": compose,
                 "amount": 1000,
                 "currency": "usd",
@@ -1514,7 +1566,8 @@ mod tests {
             let mut v = serde_json::json!({
                 "name": slug,
                 "display_name": "SEO Relay",
-                "compose": "services:\n  relay:\n    image: example/relay:latest\n",
+                "tags": ["nostr"],
+                "compose": "services:\n  relay:\n    image: example/relay:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n",
                 "amount": 1000,
                 "currency": "usd",
                 "interval_amount": 1,
@@ -1689,6 +1742,70 @@ mod tests {
             .expect("app in public catalog");
         assert_eq!(listed["category"].as_str(), Some("Personal Nostr relay"));
 
+        let category_in = |lang: &'static str| {
+            let public = public.clone();
+            async move {
+                let resp = match lang {
+                    "" => public.get(&format!("/api/v1/apps/{app_id}")).await,
+                    l => {
+                        public
+                            .get_with_language(&format!("/api/v1/apps/{app_id}"), l)
+                            .await
+                    }
+                }
+                .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+                body["data"]["category"].as_str().unwrap().to_string()
+            }
+        };
+        assert_eq!(category_in("").await, "Personal Nostr relay");
+        assert_eq!(category_in("de").await, "Persönliches Nostr-Relay");
+        assert_eq!(category_in("ja,en;q=0.5").await, "個人用Nostrリレー");
+        assert_eq!(category_in("it").await, "Personal Nostr relay");
+
+        let resp = public
+            .get_with_language("/api/v1/apps", "de")
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        let listed = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["id"].as_u64() == Some(app_id))
+            .expect("app in public catalog");
+        assert_eq!(
+            listed["category"].as_str(),
+            Some("Persönliches Nostr-Relay")
+        );
+
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({
+                    "category": "Git server",
+                    "category_translations": { "de": "Git-Server" }
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(body["data"]["category_translations"]["de"], "Git-Server");
+        assert_eq!(category_in("de").await, "Git-Server");
+        assert_eq!(category_in("ja").await, "Git server");
+        assert_eq!(category_in("").await, "Git server");
+
+        let resp = client
+            .patch_auth(
+                &format!("/api/admin/v1/apps/{app_id}"),
+                &serde_json::json!({ "category_translations": { "de-DE": "x" } }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
         // Cleanup.
         let resp = client
             .delete_auth(&format!("/api/admin/v1/apps/{app_id}"))
@@ -1809,7 +1926,8 @@ mod tests {
                 "name": format!("e2e-tags-{suffix}"),
                 "display_name": "E2E Tagged",
                 "category": "Nostr relay",
-                "compose": "services:\n  relay:\n    image: example/relay:latest\n",
+                "tags": ["nostr"],
+                "compose": "services:\n  relay:\n    image: example/relay:latest@sha256:a192355ccfa83f9fd5a0b62ee41eefc5f37e8d4a58187e12941061a7e9a6b6ad\n",
                 "amount": 1000,
                 "currency": "usd",
                 "interval_amount": 1,
@@ -1833,6 +1951,22 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         assert!(resp.text().await.unwrap().contains("no-such-tag"));
+
+        for empty in [Some(serde_json::json!([])), Some(serde_json::json!(["  "]))] {
+            let resp = client
+                .post_auth("/api/admin/v1/apps", &app_body(empty))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(resp.text().await.unwrap().contains("at least one tag"));
+        }
+        let mut untagged = app_body(None);
+        untagged.as_object_mut().unwrap().remove("tags");
+        let resp = client
+            .post_auth("/api/admin/v1/apps", &untagged)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
         let resp = client
             .post_auth(
@@ -1919,16 +2053,23 @@ mod tests {
         let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
         assert_eq!(slugs(&body["data"]), vec![tag_b.clone()]);
 
-        // `[]` clears.
-        let resp = client
-            .patch_auth(
-                &format!("/api/admin/v1/apps/{app_id}"),
-                &serde_json::json!({ "tags": [] }),
-            )
-            .await
-            .unwrap();
-        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
-        assert!(slugs(&body["data"]).is_empty());
+        for empty in [serde_json::json!([]), serde_json::json!(["  "])] {
+            let resp = client
+                .patch_auth(
+                    &format!("/api/admin/v1/apps/{app_id}"),
+                    &serde_json::json!({ "tags": empty }),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(resp.text().await.unwrap().contains("at least one tag"));
+            let resp = client
+                .get_auth(&format!("/api/admin/v1/apps/{app_id}"))
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+            assert_eq!(slugs(&body["data"]), vec![tag_b.clone()]);
+        }
         // Restore both for the public-surface checks below.
         let resp = client
             .patch_auth(
@@ -3082,15 +3223,76 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn test_admin_create_custom_pricing_rejects_default_outside_bandwidth_range() {
+        let client = setup().await;
+        let body = serde_json::json!({
+            "name": "e2e-bad-transfer-range",
+            "enabled": true,
+            "region_id": 1,
+            "currency": "EUR",
+            "cpu_cost": 100,
+            "memory_cost": 50,
+            "ip4_cost": 200,
+            "ip6_cost": 0,
+            "min_cpu": 1,
+            "max_cpu": 4,
+            "min_memory": 1073741824_u64,
+            "max_memory": 8589934592_u64,
+            "transfer_gb": 100,
+            "min_transfer_gb": 500,
+            "max_transfer_gb": 5000,
+            "disk_pricing": []
+        });
+        let resp = client
+            .post_auth("/api/admin/v1/custom_pricing", &body)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
     /// A plan may offer more than one address per family; the guest network
     /// config carries them all on one NIC.
     #[tokio::test]
     async fn test_admin_create_custom_pricing_accepts_multi_ip_range() {
         let client = setup().await;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+        let company = client
+            .post_auth(
+                "/api/admin/v1/companies",
+                &serde_json::json!({
+                    "name": format!("e2e-multi-ip-{ts}"),
+                    "email": format!("e2e-multi-ip-{ts}@test.local"),
+                    "base_currency": "EUR"
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(company.status(), StatusCode::OK);
+        let company: Value = serde_json::from_str(&company.text().await.unwrap()).unwrap();
+        let company_id = company["data"]["id"].as_u64().unwrap();
+        let region = client
+            .post_auth(
+                "/api/admin/v1/regions",
+                &serde_json::json!({
+                    "name": format!("e2e-multi-ip-{ts}"),
+                    "enabled": true,
+                    "company_id": company_id
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(region.status(), StatusCode::OK);
+        let region: Value = serde_json::from_str(&region.text().await.unwrap()).unwrap();
+        let region_id = region["data"]["id"].as_u64().unwrap();
+
         let body = serde_json::json!({
             "name": "e2e-multi-ip",
             "enabled": true,
-            "region_id": 1,
+            "region_id": region_id,
             "currency": "EUR",
             "cpu_cost": 100,
             "memory_cost": 50,
@@ -3109,6 +3311,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let pricing: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(pricing["data"]["max_ip4"], 4);
+
+        let pool = crate::db::connect().await.unwrap();
+        crate::db::hard_delete_custom_pricing(&pool, pricing["data"]["id"].as_u64().unwrap())
+            .await
+            .unwrap();
+        crate::db::hard_delete_region(&pool, region_id)
+            .await
+            .unwrap();
+        crate::db::hard_delete_company(&pool, company_id)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -3408,6 +3623,117 @@ mod tests {
             "Time series report should return 200, 400, or 500, got: {}",
             resp.status()
         );
+    }
+
+    #[tokio::test]
+    async fn test_admin_activity_report() {
+        let client = setup().await;
+        let pool = crate::db::connect().await.unwrap();
+        let uid = crate::db::ensure_user(&pool, &nostr::Keys::generate())
+            .await
+            .unwrap();
+
+        let fresh = crate::db::seed_standalone_vm(&pool, uid, "activity-new", "")
+            .await
+            .unwrap();
+        let expiring = crate::db::seed_standalone_vm(&pool, uid, "activity-exp", "")
+            .await
+            .unwrap();
+        let gone = crate::db::seed_standalone_vm(&pool, uid, "activity-del", "")
+            .await
+            .unwrap();
+        let (_app, _cluster, dep_id) = crate::db::seed_app_deployment(&pool, uid, "activity")
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "UPDATE subscription SET created = DATE_SUB(NOW(), INTERVAL 60 DAY), \
+             expires = DATE_ADD(NOW(), INTERVAL 2 DAY) WHERE id = ?",
+        )
+        .bind(expiring.subscription_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE vm SET deleted = 1 WHERE id = ?")
+            .bind(gone.vm_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO vm_history (vm_id, action_type, description) VALUES (?, 4, 'e2e delete')",
+        )
+        .bind(gone.vm_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let payment_id = crate::db::rand_bytes32().to_vec();
+        sqlx::query(
+            "INSERT INTO subscription_payment (id, subscription_id, user_id, created, expires, \
+             amount, currency, payment_method, payment_type, external_data, is_paid, rate, \
+             tax, processing_fee, paid_at) \
+             VALUES (?, ?, ?, NOW(), DATE_ADD(NOW(), INTERVAL 1 DAY), 4321, 'BTC', 0, 0, '', 1, \
+             1.0, 0, 0, NOW())",
+        )
+        .bind(&payment_id)
+        .bind(fresh.subscription_id)
+        .bind(uid)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let resp = client
+            .get_auth("/api/admin/v1/reports/activity?days=7&expiring_days=7&limit=100")
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let data = &body["data"];
+        let ids = |section: &str| -> Vec<u64> {
+            data[section]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|i| i["id"].as_u64().unwrap())
+                .collect()
+        };
+
+        assert!(ids("new_vms").contains(&fresh.vm_id));
+        assert!(!ids("new_vms").contains(&expiring.vm_id));
+        assert!(ids("expiring_vms").contains(&expiring.vm_id));
+        assert!(!ids("expiring_vms").contains(&gone.vm_id));
+        assert!(ids("new_app_deployments").contains(&dep_id));
+        assert!(ids("new_users").contains(&uid));
+
+        let deleted = data["deleted_vms"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"].as_u64() == Some(gone.vm_id))
+            .expect("deleted VM listed");
+        assert_eq!(deleted["delete_reason"], "e2e delete");
+
+        let payment = data["payments"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == hex::encode(&payment_id))
+            .expect("paid payment listed");
+        assert_eq!(payment["amount"], 4321);
+        assert_eq!(payment["subscription_name"], "activity-new-sub");
+        assert!(
+            data["payment_totals"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["currency"] == "BTC" && t["amount"].as_u64() >= Some(4321))
+        );
+
+        for seeded in [&fresh, &expiring, &gone] {
+            crate::db::hard_delete_seeded_vm(&pool, seeded)
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]
@@ -3912,8 +4238,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "complete payment");
         let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
-        let amount = body["data"]["amount"].as_u64().unwrap();
         let tax = body["data"]["tax"].as_u64().unwrap();
+        let amount = body["data"]["amount"].as_u64().unwrap() + tax;
         assert!(amount > 1, "need a payment big enough to halve");
 
         // Nothing refunded yet: the whole payment is refundable.
@@ -3947,7 +4273,10 @@ mod tests {
             payment_id,
             "refund links to the payment it reverses"
         );
-        assert_eq!(refund["amount"].as_u64().unwrap(), half);
+        assert_eq!(
+            refund["amount"].as_u64().unwrap() + refund["tax"].as_u64().unwrap(),
+            half
+        );
         assert!(refund["is_paid"].as_bool().unwrap());
         // Tax is a slice of the tax actually charged, never more than it.
         assert!(refund["tax"].as_u64().unwrap() <= tax);
@@ -3977,7 +4306,10 @@ mod tests {
         let resp = admin.post_auth(&refunds_url, &rest).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "refund the remainder");
         let body: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
-        assert_eq!(body["data"]["amount"].as_u64().unwrap(), amount - half);
+        assert_eq!(
+            body["data"]["amount"].as_u64().unwrap() + body["data"]["tax"].as_u64().unwrap(),
+            amount - half
+        );
 
         let resp = admin
             .post_auth(&refunds_url, &serde_json::json!({ "refunded_at": at + 3 }))

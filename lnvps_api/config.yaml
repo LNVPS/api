@@ -27,6 +27,9 @@ referral:
   # quote the transaction is built at; for them the floor applied is the higher
   # of this and min-onchain-payout-sats.
   min-fiat-payout-sats: null
+  # Days a referred VM's first payment must age before its commission is paid
+  # out. Defaults to 30.
+  commission-hold-days: 30
   # Maximum next-block fee rate (sat/vByte) tolerated for on-chain payouts. The
   # current rate is obtained from fee-estimator before each batch; if it exceeds
   # this cap the batch is deferred until fees drop. Defaults to 50.

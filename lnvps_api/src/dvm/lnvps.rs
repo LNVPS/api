@@ -4,10 +4,11 @@ use crate::subscription::SubscriptionHandler;
 use anyhow::Context;
 use lnvps_api_common::VmStateCache;
 use lnvps_db::{
-    DiskInterface, DiskType, OsDistribution, PaymentMethod, UserSshKey, VmCustomTemplate,
+    DiskInterface, DiskType, OsDistribution, PaymentMethod, SubscriptionPayment, UserSshKey,
+    VmCustomTemplate,
 };
 use nostr_sdk::prelude::DataVendingMachineStatus;
-use nostr_sdk::{Client, Tag};
+use nostr_sdk::{Client, EventBuilder, Tag};
 use ssh_key::PublicKey;
 use std::future::Future;
 use std::pin::Pin;
@@ -75,24 +76,25 @@ impl DVMHandler for LnvpsDvm {
             };
             let mut pricing = db.list_custom_pricing(host_region.id).await?;
 
-            // Filter to only enabled pricing
-            pricing.retain(|p| p.enabled);
+            // Filter to only enabled pricing. Hourly models are paid from account
+            // credit only, which a DVM order paid by Lightning invoice can't use,
+            // so they are never picked here.
+            pricing.retain(|p| p.enabled && p.interval_type != lnvps_db::IntervalType::Hour);
 
             // we expect only 1 pricing per region
             let pricing = pricing
                 .first()
                 .context("no custom pricing found in region")?;
 
-            let template = VmCustomTemplate {
-                id: 0,
-                cpu: cpu.parse()?,
-                memory: crate::MB * memory.parse::<u64>()?,
-                disk_size: crate::GB * disk.parse::<u64>()?,
-                disk_type: DiskType::from_str(disk_type)?,
-                disk_interface: DiskInterface::from_str(disk_interface)?,
-                pricing_id: pricing.id,
-                ..Default::default()
-            };
+            let template = build_template(
+                &request.params,
+                cpu,
+                memory,
+                disk,
+                disk_type,
+                disk_interface,
+                pricing.id,
+            )?;
             let uid = db.upsert_user(request.event.pubkey.as_bytes()).await?;
 
             let pk: PublicKey = ssh_key.parse()?;
@@ -141,23 +143,67 @@ impl DVMHandler for LnvpsDvm {
             let invoice = sub_handler
                 .renew_subscription(line_item.subscription_id, PaymentMethod::Lightning, 1)
                 .await?;
-
-            let mut payment = build_status_for_job(
-                &request,
-                DataVendingMachineStatus::PaymentRequired,
-                None,
-                None,
-            );
-            payment = payment.tag(Tag::parse([
-                "amount",
-                invoice.amount.to_string().as_str(),
-                invoice.external_data.as_str(),
-            ])?);
-            client.send_event_builder(payment).await?;
+            client
+                .send_event_builder(payment_feedback(&request, &invoice)?)
+                .await?;
 
             Ok(())
         })
     }
+}
+
+fn build_template(
+    params: &std::collections::HashMap<String, String>,
+    cpu: &str,
+    memory: &str,
+    disk: &str,
+    disk_type: &str,
+    disk_interface: &str,
+    pricing_id: u64,
+) -> anyhow::Result<VmCustomTemplate> {
+    let ip_count = |name: &str| -> anyhow::Result<u16> {
+        Ok(match params.get(name) {
+            Some(v) => v.parse()?,
+            None => 1,
+        })
+    };
+    Ok(VmCustomTemplate {
+        id: 0,
+        cpu: cpu.parse()?,
+        memory: crate::MB * memory.parse::<u64>()?,
+        disk_size: crate::GB * disk.parse::<u64>()?,
+        disk_type: DiskType::from_str(disk_type)?,
+        disk_interface: DiskInterface::from_str(disk_interface)?,
+        pricing_id,
+        ip4_count: ip_count("ip4_count")?,
+        ip6_count: ip_count("ip6_count")?,
+        ..Default::default()
+    })
+}
+
+fn payment_feedback(
+    request: &DVMJobRequest,
+    invoice: &SubscriptionPayment,
+) -> anyhow::Result<EventBuilder> {
+    if invoice.is_paid {
+        return Ok(build_status_for_job(
+            request,
+            DataVendingMachineStatus::Success,
+            None,
+            None,
+        ));
+    }
+    Ok(build_status_for_job(
+        request,
+        DataVendingMachineStatus::PaymentRequired,
+        None,
+        None,
+    )
+    .tag(Tag::parse([
+        "amount",
+        invoice.amount.to_string().as_str(),
+        invoice.external_data.as_str(),
+    ])?))
 }
 
 #[cfg(test)]
@@ -172,6 +218,89 @@ mod tests {
     use lnvps_db::{VmCustomPricing, VmCustomPricingDisk};
     use nostr_sdk::{EventBuilder, Keys, Kind};
     use std::sync::Arc;
+
+    async fn job_request(keys: &Keys) -> DVMJobRequest {
+        let ev = EventBuilder::new(Kind::from_u16(5999), "")
+            .sign(keys)
+            .await
+            .unwrap();
+        parse_job_request(&ev).unwrap()
+    }
+
+    fn renewal(is_paid: bool, external_data: &str) -> SubscriptionPayment {
+        SubscriptionPayment {
+            id: vec![1u8; 32],
+            subscription_id: 1,
+            user_id: 1,
+            created: chrono::Utc::now(),
+            expires: chrono::Utc::now(),
+            amount: 21_000,
+            currency: "BTC".to_string(),
+            payment_method: PaymentMethod::Lightning,
+            payment_type: lnvps_db::SubscriptionPaymentType::Purchase,
+            external_data: external_data.to_string().into(),
+            external_id: None,
+            is_paid,
+            rate: 1.0,
+            time_value: None,
+            metadata: None,
+            tax: 0,
+            processing_fee: 0,
+            paid_at: None,
+            tax_rate: None,
+            tax_country_code: None,
+            tax_treatment: None,
+            tax_evidence: None,
+            tax_breakdown: None,
+            refunded_payment_id: None,
+            renewal_source: None,
+        }
+    }
+
+    fn tag_values(ev: &nostr_sdk::Event, name: &str) -> Vec<String> {
+        ev.tags
+            .iter()
+            .find(|t| t.as_slice().first().map(String::as_str) == Some(name))
+            .map(|t| t.as_slice()[1..].to_vec())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn dvm_template_defaults_ip_counts_to_one() {
+        let mut params = std::collections::HashMap::new();
+        let t = build_template(&params, "1", "1024", "10", "ssd", "pcie", 1).unwrap();
+        assert_eq!((t.ip4_count, t.ip6_count), (1, 1));
+        params.insert("ip4_count".to_string(), "0".to_string());
+        params.insert("ip6_count".to_string(), "2".to_string());
+        let t = build_template(&params, "1", "1024", "10", "ssd", "pcie", 1).unwrap();
+        assert_eq!((t.ip4_count, t.ip6_count), (0, 2));
+    }
+
+    #[tokio::test]
+    async fn a_credit_funded_job_reports_success() {
+        let keys = Keys::generate();
+        let req = job_request(&keys).await;
+        let ev = payment_feedback(&req, &renewal(true, "credit"))
+            .unwrap()
+            .sign(&keys)
+            .await
+            .unwrap();
+        assert_eq!(tag_values(&ev, "status")[0], "success");
+        assert!(tag_values(&ev, "amount").is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unpaid_job_asks_for_payment() {
+        let keys = Keys::generate();
+        let req = job_request(&keys).await;
+        let ev = payment_feedback(&req, &renewal(false, "lnbc1"))
+            .unwrap()
+            .sign(&keys)
+            .await
+            .unwrap();
+        assert_eq!(tag_values(&ev, "status")[0], "payment-required");
+        assert_eq!(tag_values(&ev, "amount"), vec!["21000", "lnbc1"]);
+    }
 
     #[tokio::test]
     #[ignore]
