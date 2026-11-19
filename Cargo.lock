@@ -3551,6 +3551,7 @@ dependencies = [
  "nostr 0.44.7",
  "nostr-sdk",
  "payments-rs",
+ "regex",
  "reqwest 0.13.4",
  "rustls",
  "serde",

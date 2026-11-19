@@ -654,6 +654,16 @@ pub struct AgentConfig {
     /// source, since a client can always reconnect.
     #[serde(default = "default_agent_anonymous_messages_per_hour")]
     pub anonymous_messages_per_hour: u32,
+
+    /// Where `escalate_to_support` sends a logged-in customer's chat. Needs
+    /// the top-level `smtp` section; without it the tool reports it is off.
+    #[serde(default = "default_agent_support_email")]
+    pub support_email: String,
+}
+
+#[cfg(feature = "agent")]
+pub fn default_agent_support_email() -> String {
+    lnvps_agent::escalation::DEFAULT_SUPPORT_EMAIL.to_string()
 }
 
 /// Default cap on a single chat message (characters).

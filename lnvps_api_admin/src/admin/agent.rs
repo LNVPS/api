@@ -75,6 +75,13 @@ pub struct AdminAgentConversationInfo {
     pub message_count: u64,
     /// When the newest message landed; `null` for a thread with no messages.
     pub last_message_at: Option<DateTime<Utc>>,
+    /// When the agent last emailed this thread to support; `null` if never.
+    pub escalated_at: Option<DateTime<Utc>>,
+    pub escalation_count: u64,
+    /// Reason given in the latest escalation email.
+    pub escalation_reason: Option<String>,
+    /// Comma separated VM ids named in the latest escalation.
+    pub escalation_vm_ids: Option<String>,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
 }
@@ -99,6 +106,10 @@ impl From<AgentConversationOverview> for AdminAgentConversationInfo {
             compacted_upto: c.compacted_upto,
             message_count: c.message_count,
             last_message_at: c.last_message_at,
+            escalated_at: c.escalated_at,
+            escalation_count: c.escalation_count,
+            escalation_reason: c.escalation_reason,
+            escalation_vm_ids: c.escalation_vm_ids,
             created: c.created,
             updated: c.updated,
         }

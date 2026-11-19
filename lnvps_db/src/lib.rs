@@ -954,6 +954,15 @@ pub trait LNVpsDbBase: Send + Sync {
         compacted_upto: u64,
     ) -> DbResult<()>;
 
+    /// Record that the agent emailed a conversation to support: stamps the
+    /// time, bumps the counter and keeps the latest reason and VM ids.
+    async fn record_agent_escalation(
+        &self,
+        conversation_id: u64,
+        reason: &str,
+        vm_ids: &str,
+    ) -> DbResult<()>;
+
     /// Execute a raw SQL query that doesn't return data
     async fn execute_query(&self, query: &str) -> DbResult<u64>;
 

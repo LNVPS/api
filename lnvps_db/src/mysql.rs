@@ -3801,6 +3801,28 @@ impl LNVpsDbBase for LNVpsDbMysql {
         Ok(())
     }
 
+    async fn record_agent_escalation(
+        &self,
+        conversation_id: u64,
+        reason: &str,
+        vm_ids: &str,
+    ) -> DbResult<()> {
+        sqlx::query(
+            r#"update agent_conversation
+                  set escalated_at=current_timestamp,
+                      escalation_count=escalation_count+1,
+                      escalation_reason=?,
+                      escalation_vm_ids=?
+                where id=?"#,
+        )
+        .bind(reason)
+        .bind(vm_ids)
+        .bind(conversation_id)
+        .execute(&self.db)
+        .await?;
+        Ok(())
+    }
+
     async fn execute_query(&self, query: &str) -> DbResult<u64> {
         let result = sqlx::query(query).execute(&self.db).await?;
         Ok(result.rows_affected())

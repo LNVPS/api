@@ -5659,6 +5659,14 @@ pub struct AgentConversation {
     pub compacted_upto: u64,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
+    /// When the agent last emailed this thread to support.
+    pub escalated_at: Option<DateTime<Utc>>,
+    /// How many times the thread has been escalated.
+    pub escalation_count: u64,
+    /// The reason given in the latest escalation.
+    pub escalation_reason: Option<String>,
+    /// Comma separated VM ids named in the latest escalation.
+    pub escalation_vm_ids: Option<String>,
 }
 
 /// A single message in a support-agent conversation.
@@ -5705,6 +5713,10 @@ pub struct AgentConversationOverview {
     /// When the newest message landed. `None` for a thread whose row exists but
     /// which has never carried a message.
     pub last_message_at: Option<DateTime<Utc>>,
+    pub escalated_at: Option<DateTime<Utc>>,
+    pub escalation_count: u64,
+    pub escalation_reason: Option<String>,
+    pub escalation_vm_ids: Option<String>,
 }
 
 /// Which conversations to return from [`crate::LNVpsDb::list_agent_conversations`].

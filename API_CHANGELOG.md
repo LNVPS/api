@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Per-account rate limits** on VM orders (20/h), renew and upgrade payments (60/h) and admin refunds (10/h), shared through Redis when configured. Exceeding returns 429.
 - **Step-up**: `POST /api/v1/webauthn/step-up/start` and `/finish` return a 5 minute token for the `X-Step-Up` header. With admin config `require-step-up: true`, refunds, VM purge, credit adjustment and role changes need it.
 - **Audit**: login, passkey add, token create and revoke, email change, firewall changes, reinstall, and all VM history and IP order events are now in the audit log. `audit_log.ip` is truncated to /24 or /48 after 90 days (migration `20261201000000_audit_log_ip_truncate.sql`).
+- **Support agent handoff**: in live chat a logged-in customer's chat can be emailed to support by the agent (`escalate_to_support`, sent from the `smtp` settings to the new agent setting `support-email`, default `support@lnvps.net`). Reply-To is the account email, and the Message-ID `<support-<conversation id>@domain>` threads repeat escalations. At most one per conversation per 24 h unless a new VM is named. `GET /api/admin/v1/agent/conversations` adds `escalated_at`, `escalation_count`, `escalation_reason`, `escalation_vm_ids`. Needs migration `20261119163956_agent_escalation.sql`.
+- **Support agent**: a VM that does not answer on the edge router's network now returns `no_reply_from_vm` instead of a "looking glass unavailable" error.
 - **Abuse alert**: a new account ordering a large template with a throwaway email domain notifies admins.
 
 ### Changed

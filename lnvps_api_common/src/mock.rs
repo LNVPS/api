@@ -2804,6 +2804,10 @@ impl LNVpsDbBase for MockDb {
             compacted_upto: 0,
             created: now,
             updated: now,
+            escalated_at: None,
+            escalation_count: 0,
+            escalation_reason: None,
+            escalation_vm_ids: None,
         };
         conversations.insert(id, conversation.clone());
         Ok(conversation)
@@ -2838,6 +2842,10 @@ impl LNVpsDbBase for MockDb {
             updated: conversation.updated,
             message_count: own.len() as u64,
             last_message_at: own.iter().map(|m| m.created).max(),
+            escalated_at: conversation.escalated_at,
+            escalation_count: conversation.escalation_count,
+            escalation_reason: conversation.escalation_reason,
+            escalation_vm_ids: conversation.escalation_vm_ids,
         })
     }
 
@@ -2877,6 +2885,10 @@ impl LNVpsDbBase for MockDb {
                     updated: c.updated,
                     message_count: own.len() as u64,
                     last_message_at: own.iter().map(|m| m.created).max(),
+                    escalated_at: c.escalated_at,
+                    escalation_count: c.escalation_count,
+                    escalation_reason: c.escalation_reason.clone(),
+                    escalation_vm_ids: c.escalation_vm_ids.clone(),
                 }
             })
             .collect();
@@ -2892,6 +2904,23 @@ impl LNVpsDbBase for MockDb {
                 .collect(),
             total,
         ))
+    }
+
+    async fn record_agent_escalation(
+        &self,
+        conversation_id: u64,
+        reason: &str,
+        vm_ids: &str,
+    ) -> DbResult<()> {
+        let mut conversations = self.agent_conversations.lock().await;
+        let conversation = conversations.get_mut(&conversation_id).ok_or_else(|| {
+            DbError::from(anyhow!("agent conversation {} not found", conversation_id))
+        })?;
+        conversation.escalated_at = Some(chrono::Utc::now());
+        conversation.escalation_count += 1;
+        conversation.escalation_reason = Some(reason.to_string());
+        conversation.escalation_vm_ids = Some(vm_ids.to_string());
+        Ok(())
     }
 
     async fn count_agent_messages(&self, conversation_id: u64) -> DbResult<u64> {

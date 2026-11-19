@@ -26,6 +26,7 @@ pub mod billing;
 pub mod catalogue;
 pub mod diagnostics;
 pub mod errors;
+pub mod escalation;
 pub mod guard;
 pub mod partners;
 pub mod vms;
@@ -175,6 +176,7 @@ pub fn public_tools() -> Vec<FunctionObject> {
 pub fn live_chat_tools() -> Vec<FunctionObject> {
     let mut tools = customer_read_tools();
     tools.extend(power_tools());
+    tools.push(escalation::escalate_to_support());
     tools.extend(diagnostic_tools());
     tools.extend(catalogue_tools());
     tools
@@ -249,6 +251,16 @@ mod tests {
                 "{forbidden} must not be public"
             );
         }
+    }
+
+    /// The handoff trusts the session's authenticated user, so only live chat
+    /// carries it: email identifies the sender by a forgeable From header and
+    /// Nostr threads are public.
+    #[test]
+    fn escalation_is_offered_only_in_authenticated_live_chat() {
+        assert!(names(&live_chat_tools()).contains(&"escalate_to_support"));
+        assert!(!names(&support_tools()).contains(&"escalate_to_support"));
+        assert!(!names(&public_tools()).contains(&"escalate_to_support"));
     }
 
     #[test]
