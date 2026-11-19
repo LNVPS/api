@@ -25,6 +25,7 @@ pub mod apps;
 pub mod billing;
 pub mod catalogue;
 pub mod diagnostics;
+pub mod errors;
 pub mod guard;
 pub mod partners;
 pub mod vms;

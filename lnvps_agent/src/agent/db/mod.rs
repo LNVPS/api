@@ -398,9 +398,10 @@ impl ToolExecutor for DbToolExecutor {
             "scan_vm_ports" => {
                 let vm = self.owned_vm(&args).await?;
                 let ips = self.vm_ips(&vm).await;
-                let ports = args.get("ports").and_then(|v| v.as_array()).map(|a| {
-                    a.iter().filter_map(|v| v.as_u64()).collect::<Vec<_>>()
-                });
+                let ports = args
+                    .get("ports")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64()).collect::<Vec<_>>());
                 let range = match (
                     args.get("range_start").and_then(|v| v.as_u64()),
                     args.get("range_end").and_then(|v| v.as_u64()),

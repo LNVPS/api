@@ -204,7 +204,10 @@ async fn scan_vm_ports_finds_sshd_moved_off_port_22() {
 async fn scan_vm_ports_rejects_an_oversized_range() {
     let stack = stack(1, "127.0.0.1").await;
     let err = executor(&stack, 1)
-        .execute("scan_vm_ports", r#"{"vm_id":7,"range_start":1,"range_end":5000}"#)
+        .execute(
+            "scan_vm_ports",
+            r#"{"vm_id":7,"range_start":1,"range_end":5000}"#,
+        )
         .await
         .expect_err("too many ports");
     assert!(err.to_string().contains("at most"));

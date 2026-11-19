@@ -41,12 +41,27 @@ impl DbToolExecutor {
     /// SSH keys by name only. The key material is stored encrypted and is not
     /// needed to answer "which key is on my VM", which is what is asked.
     pub(super) async fn ssh_keys(&self) -> Result<Value> {
+        let user_id = self.require_user()?;
+        let vms = self.db.list_user_vms(user_id).await.unwrap_or_default();
         Ok(Value::Array(
             self.db
-                .list_user_ssh_key(self.require_user()?)
+                .list_user_ssh_key(user_id)
                 .await?
                 .into_iter()
-                .map(|k| json!({ "id": k.id, "name": k.name, "created": k.created }))
+                .map(|k| {
+                    let in_use_by_vms: Vec<u64> = vms
+                        .iter()
+                        .filter(|vm| !vm.deleted && vm.ssh_key_id == Some(k.id))
+                        .map(|vm| vm.id)
+                        .collect();
+                    json!({
+                        "id": k.id,
+                        "name": k.name,
+                        "created": k.created,
+                        "in_use_by_vms": in_use_by_vms,
+                        "deletable": in_use_by_vms.is_empty(),
+                    })
+                })
                 .collect(),
         ))
     }
@@ -151,6 +166,36 @@ mod tests {
         for leaked in ["SECRET-KEY-BLOB", "key_data"] {
             assert!(!out.contains(leaked), "leaked {leaked}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_key_installed_on_a_vm_is_reported_as_not_deletable() {
+        let db = Arc::new(MockDb::default());
+        db.user_ssh_keys.lock().await.insert(
+            1,
+            lnvps_db::UserSshKey {
+                id: 1,
+                name: "laptop".to_string(),
+                user_id: 1,
+                created: chrono::Utc::now(),
+                key_data: "ssh-ed25519 K".to_string().into(),
+            },
+        );
+        db.vms.lock().await.insert(
+            7,
+            lnvps_db::Vm {
+                id: 7,
+                user_id: 1,
+                ssh_key_id: Some(1),
+                ..MockDb::mock_vm()
+            },
+        );
+        let dyn_db: Arc<dyn LNVpsDb> = db.clone();
+        let exec = DbToolExecutor::new(dyn_db, 1);
+        let out = exec.execute("list_my_ssh_keys", "{}").await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed[0]["in_use_by_vms"], serde_json::json!([7]));
+        assert_eq!(parsed[0]["deletable"], false);
     }
 
     /// Enough to answer "why did my renewal fail" — and no more: the stored

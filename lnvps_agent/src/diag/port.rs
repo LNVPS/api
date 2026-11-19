@@ -180,8 +180,13 @@ mod tests {
     #[test]
     fn every_outcome_carries_an_interpretation() {
         assert!(meaning_of(true, "open").contains("accepted"));
-        assert!(meaning_of(false, "refused (host reachable, nothing listening)").contains("nothing listens"));
-        assert!(meaning_of(false, "timeout after 5s (filtered or host down)").contains("scan_vm_ports"));
+        assert!(
+            meaning_of(false, "refused (host reachable, nothing listening)")
+                .contains("nothing listens")
+        );
+        assert!(
+            meaning_of(false, "timeout after 5s (filtered or host down)").contains("scan_vm_ports")
+        );
         assert!(meaning_of(false, "No route to host (os error 113)").contains("scan_vm_ports"));
     }
 

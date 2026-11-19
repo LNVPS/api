@@ -131,10 +131,7 @@ pub fn select_target(ips: &[String], prefer_v6: bool) -> Result<IpAddr> {
     Ok(*wanted.expect("non-empty"))
 }
 
-pub fn resolve_scan_ports(
-    ports: Option<Vec<u64>>,
-    range: Option<(u64, u64)>,
-) -> Result<Vec<u16>> {
+pub fn resolve_scan_ports(ports: Option<Vec<u64>>, range: Option<(u64, u64)>) -> Result<Vec<u16>> {
     let valid = |p: u64| u16::try_from(p).ok().filter(|p| *p > 0);
     let mut out: Vec<u16> = Vec::new();
     if let Some((start, end)) = range {

@@ -448,7 +448,10 @@ impl SupportAgent {
 
                     let result = match executor.execute(&name, &args).await {
                         Ok(content) => content,
-                        Err(e) => format!("Error: {}", e),
+                        Err(e) => format!(
+                            "Error: {}",
+                            crate::tools::errors::customer_safe(&e.to_string())
+                        ),
                     };
                     log::info!("Tool {} result: {}", name, truncate_chars(&result, 200));
 
@@ -604,7 +607,10 @@ impl SupportAgent {
 
                         let result = match executor.execute(&name, &args).await {
                             Ok(content) => content,
-                            Err(e) => format!("Error: {}", e),
+                            Err(e) => format!(
+                                "Error: {}",
+                                crate::tools::errors::customer_safe(&e.to_string())
+                            ),
                         };
                         log::info!("Tool {} result: {}", name, truncate_chars(&result, 200));
                         if emit_tool_activity {
