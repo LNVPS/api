@@ -381,7 +381,10 @@ mod tests {
                 .execute(tool, r#"{"vm_id":5}"#)
                 .await
                 .expect_err("disabled VM must be refused");
-            assert!(err.to_string().contains("disabled by LNVPS staff"), "{tool}");
+            assert!(
+                err.to_string().contains("disabled by LNVPS staff"),
+                "{tool}"
+            );
         }
     }
 
@@ -410,7 +413,10 @@ mod tests {
                 ..Default::default()
             },
         );
-        let out = exec.execute("get_vm_details", r#"{"vm_id":5}"#).await.unwrap();
+        let out = exec
+            .execute("get_vm_details", r#"{"vm_id":5}"#)
+            .await
+            .unwrap();
         let parsed: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["installed_key"]["name"], "laptop");
         assert!(parsed["default_login_user"].is_string() || parsed["default_login_user"].is_null());

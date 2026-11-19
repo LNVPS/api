@@ -173,7 +173,7 @@ fn parse_mtr(text: &str, target: IpAddr, server: &str) -> Result<Traceroute> {
         from: server.to_string(),
         reached: final_hop.map(Hop::responded).unwrap_or(false),
         loss_percent: final_hop.map(|h| h.loss_percent),
-        rtt_ms: final_hop.and_then(|h| h.rtt_ms),
+        rtt_ms: final_hop.filter(|h| h.responded()).and_then(|h| h.rtt_ms),
         hops,
     })
 }

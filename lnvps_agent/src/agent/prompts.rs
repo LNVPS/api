@@ -302,7 +302,10 @@ mod tests {
     fn payment_methods_come_from_the_tool_not_the_prompt() {
         let msg = user_system_message(&serde_json::json!({"id": 1}));
         assert!(msg.contains("list_payment_methods"));
-        for hard_coded in ["Revolut, Stripe, PayPal", "Lightning Network (Bitcoin) or fiat"] {
+        for hard_coded in [
+            "Revolut, Stripe, PayPal",
+            "Lightning Network (Bitcoin) or fiat",
+        ] {
             assert!(!msg.contains(hard_coded), "{hard_coded}");
         }
         assert!(general_system_message().contains("list_payment_methods"));

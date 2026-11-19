@@ -1279,7 +1279,10 @@ mod tests {
     #[test]
     fn a_single_oversized_line_still_respects_the_limit() {
         let one_line = "word ".repeat(500);
-        assert_eq!(cap_summary(&one_line).split_whitespace().count(), SUMMARY_WORD_LIMIT);
+        assert_eq!(
+            cap_summary(&one_line).split_whitespace().count(),
+            SUMMARY_WORD_LIMIT
+        );
     }
 
     #[test]

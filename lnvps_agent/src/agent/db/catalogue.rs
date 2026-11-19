@@ -486,28 +486,32 @@ mod tests {
     #[tokio::test]
     pub(super) async fn payment_methods_list_only_enabled_configs_from_the_database() {
         let (db, exec) = executor(1).await;
-        let config = |id: u64, method, enabled: bool, currencies: &str| lnvps_db::PaymentMethodConfig {
-            id,
-            company_id: 1,
-            payment_method: method,
-            name: format!("m{id}"),
-            enabled,
-            provider_type: "x".to_string(),
-            config: None,
-            processing_fee_rate: Some(1.0),
-            processing_fee_base: None,
-            processing_fee_currency: None,
-            min_amount: None,
-            min_amount_currency: None,
-            supported_currencies: lnvps_db::CommaSeparated::new(
-                currencies.split(',').map(|c| c.to_string()).collect(),
-            ),
-            created: chrono::Utc::now(),
-            modified: chrono::Utc::now(),
-        };
+        let config =
+            |id: u64, method, enabled: bool, currencies: &str| lnvps_db::PaymentMethodConfig {
+                id,
+                company_id: 1,
+                payment_method: method,
+                name: format!("m{id}"),
+                enabled,
+                provider_type: "x".to_string(),
+                config: None,
+                processing_fee_rate: Some(1.0),
+                processing_fee_base: None,
+                processing_fee_currency: None,
+                min_amount: None,
+                min_amount_currency: None,
+                supported_currencies: lnvps_db::CommaSeparated::new(
+                    currencies.split(',').map(|c| c.to_string()).collect(),
+                ),
+                created: chrono::Utc::now(),
+                modified: chrono::Utc::now(),
+            };
         {
             let mut configs = db.payment_method_configs.lock().await;
-            configs.insert(1, config(1, lnvps_db::PaymentMethod::Lightning, true, "BTC"));
+            configs.insert(
+                1,
+                config(1, lnvps_db::PaymentMethod::Lightning, true, "BTC"),
+            );
             configs.insert(2, config(2, lnvps_db::PaymentMethod::Revolut, false, "EUR"));
         }
         let out = exec.execute("list_payment_methods", "{}").await.unwrap();
