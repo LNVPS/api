@@ -163,9 +163,18 @@ impl VmProvisioner {
         image_id: u64,
         ssh_key_id: u64,
         ref_code: Option<String>,
+        user_data: Option<String>,
     ) -> Result<Vm> {
-        self.provision_on_host(user_id, template_id, image_id, ssh_key_id, ref_code, None)
-            .await
+        self.provision_on_host(
+            user_id,
+            template_id,
+            image_id,
+            ssh_key_id,
+            ref_code,
+            None,
+            user_data,
+        )
+        .await
     }
 
     async fn foreign_ref_code(&self, user_id: u64, ref_code: Option<String>) -> Option<String> {
@@ -176,6 +185,7 @@ impl VmProvisioner {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn provision_on_host(
         &self,
         user_id: u64,
@@ -184,6 +194,7 @@ impl VmProvisioner {
         ssh_key_id: u64,
         ref_code: Option<String>,
         host_id: Option<u64>,
+        user_data: Option<String>,
     ) -> Result<Vm> {
         let user = self.db.get_user(user_id).await?;
         let template = self.db.get_vm_template(template_id).await?;
@@ -211,6 +222,14 @@ impl VmProvisioner {
         let host = cap
             .get_host_for_template_ip_aware(template.region_id, &template, host_id)
             .await?;
+
+        if user_data.is_some() {
+            let client = self.host_client(&host.host).await?;
+            ensure!(
+                client.supports_user_data().await?,
+                "This region's host cannot deliver user_data"
+            );
+        }
 
         let pick_disk = if let Some(hd) = host.disks.first() {
             hd
@@ -272,6 +291,7 @@ impl VmProvisioner {
             disk_id: pick_disk.disk.id,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             ssh_host_keys: None,
+            user_data: user_data.map(Into::into),
             deleted: false,
             ref_code: self.foreign_ref_code(user.id, ref_code).await,
             disabled: false,
@@ -310,6 +330,7 @@ impl VmProvisioner {
         image_id: u64,
         ssh_key_id: u64,
         ref_code: Option<String>,
+        user_data: Option<String>,
     ) -> Result<Vm> {
         let user = self.db.get_user(user_id).await?;
         let pricing = self.db.get_custom_pricing(template.pricing_id).await?;
@@ -342,6 +363,14 @@ impl VmProvisioner {
         let host = cap
             .get_host_for_template_ip_aware(pricing.region_id, &template, None)
             .await?;
+
+        if user_data.is_some() {
+            let client = self.host_client(&host.host).await?;
+            ensure!(
+                client.supports_user_data().await?,
+                "This region's host cannot deliver user_data"
+            );
+        }
 
         let pick_disk = if let Some(hd) = host.disks.first() {
             hd
@@ -407,6 +436,7 @@ impl VmProvisioner {
             disk_id: pick_disk.disk.id,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             ssh_host_keys: None,
+            user_data: user_data.map(Into::into),
             deleted: false,
             ref_code: self.foreign_ref_code(user.id, ref_code).await,
             disabled: false,
@@ -604,6 +634,7 @@ impl VmProvisioner {
                 .clone()
                 .unwrap_or_else(|| "ff:ff:ff:ff:ff:ff".to_string()),
             ssh_host_keys: None,
+            user_data: None,
             deleted: false,
             ref_code: None,
             disabled: false,
@@ -1448,6 +1479,201 @@ impl SpawnVmContext {
 mod tests {
     use super::*;
 
+    use lnvps_api_common::VmRunningState;
+    use lnvps_api_common::host::{TerminalStream, TimeSeries, TimeSeriesData, VmHostInfo};
+    use lnvps_db::VmOsImage;
+
+    struct UserDataHost(u8);
+
+    #[async_trait::async_trait]
+    impl VmHostClient for UserDataHost {
+        async fn supports_user_data(&self) -> OpResult<bool> {
+            match self.0 {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(lnvps_api_common::retry::OpError::Fatal(anyhow!(
+                    "capability lookup failed"
+                ))),
+            }
+        }
+        async fn get_info(&self) -> OpResult<VmHostInfo> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .get_info()
+                .await
+        }
+        async fn list_snapshots(&self, vm: &Vm) -> OpResult<Vec<VmSnapshot>> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .list_snapshots(vm)
+                .await
+        }
+        async fn create_snapshot(
+            &self,
+            vm: &Vm,
+            name: &str,
+            description: Option<&str>,
+        ) -> OpResult<()> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .create_snapshot(vm, name, description)
+                .await
+        }
+        async fn rollback_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .rollback_snapshot(vm, name)
+                .await
+        }
+        async fn delete_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .delete_snapshot(vm, name)
+                .await
+        }
+        async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .download_os_image(image)
+                .await
+        }
+        async fn generate_mac(&self, vm: &Vm) -> OpResult<String> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .generate_mac(vm)
+                .await
+        }
+        async fn start_vm(&self, vm: &Vm) -> OpResult<()> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .start_vm(vm)
+                .await
+        }
+        async fn stop_vm(&self, vm: &Vm) -> OpResult<()> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .stop_vm(vm)
+                .await
+        }
+        async fn reset_vm(&self, vm: &Vm) -> OpResult<()> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .reset_vm(vm)
+                .await
+        }
+        async fn create_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .create_vm(cfg)
+                .await
+        }
+        async fn delete_vm(&self, vm: &Vm) -> OpResult<()> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .delete_vm(vm)
+                .await
+        }
+        async fn unlink_primary_disk(&self, vm: &Vm) -> OpResult<()> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .unlink_primary_disk(vm)
+                .await
+        }
+        async fn import_template_disk(&self, cfg: &FullVmInfo) -> OpResult<()> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .import_template_disk(cfg)
+                .await
+        }
+        async fn resize_disk(&self, cfg: &FullVmInfo) -> OpResult<()> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .resize_disk(cfg)
+                .await
+        }
+        async fn get_vm_state(&self, vm: &Vm) -> OpResult<VmRunningState> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .get_vm_state(vm)
+                .await
+        }
+        async fn get_all_vm_states(&self) -> OpResult<Vec<(u64, VmRunningState)>> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .get_all_vm_states()
+                .await
+        }
+        async fn configure_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .configure_vm(cfg)
+                .await
+        }
+        async fn patch_firewall(&self, cfg: &FullVmInfo) -> OpResult<()> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .patch_firewall(cfg)
+                .await
+        }
+        async fn get_time_series_data(
+            &self,
+            vm: &Vm,
+            series: TimeSeries,
+        ) -> OpResult<Vec<TimeSeriesData>> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .get_time_series_data(vm, series)
+                .await
+        }
+        async fn connect_terminal(&self, vm: &Vm) -> OpResult<TerminalStream> {
+            lnvps_api_common::host::dummy_host::DummyVmHost::new()
+                .connect_terminal(vm)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn user_data_is_checked_before_order_writes_and_stored_for_both_orders() -> Result<()> {
+        for custom in [false, true] {
+            for capability in [0, 1, 2] {
+                let db = Arc::new(MockDb::default());
+                let (user, key) = add_user(&db).await?;
+                let prov = make_provisioner(db.clone())
+                    .with_host_clients(move |_| Arc::new(UserDataHost(capability)));
+                let before_vms = db.vms.lock().await.len();
+                let before_subs = db.subscriptions.lock().await.len();
+                let before_payments = db.subscription_payments.lock().await.len();
+                let script = "#!/bin/sh\necho stored-script";
+                let result = if custom {
+                    let pricing_id =
+                        insert_custom_pricing(&db, DiskType::SSD, DiskInterface::PCIe).await?;
+                    prov.provision_custom(
+                        user.id,
+                        VmCustomTemplate {
+                            cpu: 2,
+                            memory: 4 * GB,
+                            disk_size: 50 * GB,
+                            disk_type: DiskType::SSD,
+                            disk_interface: DiskInterface::PCIe,
+                            pricing_id,
+                            ..Default::default()
+                        },
+                        1,
+                        key.id,
+                        None,
+                        Some(script.into()),
+                    )
+                    .await
+                } else {
+                    prov.provision_on_host(user.id, 1, 1, key.id, None, None, Some(script.into()))
+                        .await
+                };
+                if capability == 1 {
+                    let vm = result?;
+                    assert_eq!(vm.user_data.as_ref().unwrap().as_str(), script);
+                    assert_eq!(
+                        db.get_vm(vm.id).await?.user_data.as_ref().unwrap().as_str(),
+                        script
+                    );
+                } else {
+                    let message = result.unwrap_err().to_string();
+                    assert!(
+                        message.contains(if capability == 0 {
+                            "cannot deliver user_data"
+                        } else {
+                            "capability lookup failed"
+                        }),
+                        "{message}"
+                    );
+                    assert_eq!(db.vms.lock().await.len(), before_vms);
+                    assert_eq!(db.subscriptions.lock().await.len(), before_subs);
+                    assert_eq!(db.subscription_payments.lock().await.len(), before_payments);
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn image_arch_compat_matching_and_any() {
         // Exact match
@@ -1567,7 +1793,14 @@ mod tests {
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, Some("mock-ref".to_string()))
+            .provision(
+                user.id,
+                1,
+                1,
+                ssh_key.id,
+                Some("mock-ref".to_string()),
+                None,
+            )
             .await?;
         println!("{:?}", vm);
 
@@ -1723,7 +1956,7 @@ mod tests {
 
         let (user, ssh_key) = add_user(&db).await?;
 
-        let prov = prov.provision(user.id, id, 1, ssh_key.id, None).await;
+        let prov = prov.provision(user.id, id, 1, ssh_key.id, None, None).await;
         assert!(prov.is_err());
         if let Err(e) = prov {
             println!("{}", e);
@@ -1758,7 +1991,7 @@ mod tests {
         let (_user_b, key_b) = add_user(&db).await?;
 
         // user_a tries to order a VM using user_b's SSH key
-        let res = prov.provision(user_a.id, id, 1, key_b.id, None).await;
+        let res = prov.provision(user_a.id, id, 1, key_b.id, None, None).await;
         assert!(res.is_err());
         let msg = res.unwrap_err().to_string().to_lowercase();
         assert!(
@@ -2263,7 +2496,7 @@ mod tests {
 
         let prov = make_provisioner(db);
         let result = prov
-            .provision_custom(user.id, template, 1, ssh_key.id, None)
+            .provision_custom(user.id, template, 1, ssh_key.id, None, None)
             .await;
 
         assert!(
@@ -2360,7 +2593,7 @@ mod tests {
         }
         let (user, ssh_key) = add_user(&db).await?;
         let result = make_provisioner(db)
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await;
         assert!(result.is_err(), "should fail with disabled template");
         assert!(
@@ -2384,7 +2617,7 @@ mod tests {
         }
         let (user, ssh_key) = add_user(&db).await?;
         let result = make_provisioner(db)
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await;
         assert!(result.is_err(), "should fail with expired template");
         assert!(
@@ -2489,7 +2722,7 @@ mod tests {
             ..Default::default()
         };
         let result = make_provisioner(db)
-            .provision_custom(user.id, template, 1, ssh_key.id, None)
+            .provision_custom(user.id, template, 1, ssh_key.id, None, None)
             .await;
         assert!(result.is_err(), "should fail with expired custom pricing");
         assert!(
@@ -2579,7 +2812,9 @@ mod tests {
         let prov = make_provisioner(db.clone());
         let (user, ssh_key) = add_user(&db).await?;
 
-        let vm = prov.provision(user.id, 1, 1, ssh_key.id, None).await?;
+        let vm = prov
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
+            .await?;
 
         assert!(
             vm.subscription_line_item_id > 0,
@@ -2627,7 +2862,7 @@ mod tests {
         };
 
         let vm = prov
-            .provision_custom(user.id, template, 1, ssh_key.id, None)
+            .provision_custom(user.id, template, 1, ssh_key.id, None, None)
             .await?;
 
         assert!(vm.subscription_line_item_id > 0);
@@ -2678,7 +2913,7 @@ mod tests {
         };
 
         let monthly_vm = prov
-            .provision_custom(user.id, template.clone(), 1, ssh_key.id, None)
+            .provision_custom(user.id, template.clone(), 1, ssh_key.id, None, None)
             .await?;
         let monthly_item = db
             .get_subscription_line_item(monthly_vm.subscription_line_item_id)
@@ -2706,7 +2941,7 @@ mod tests {
             d.cost = (d.cost * 10_000).div_ceil(720);
         }
         let hourly_vm = prov
-            .provision_custom(user.id, template, 1, ssh_key.id, None)
+            .provision_custom(user.id, template, 1, ssh_key.id, None, None)
             .await?;
         let hourly_item = db
             .get_subscription_line_item(hourly_vm.subscription_line_item_id)
@@ -2753,7 +2988,7 @@ mod tests {
             ..Default::default()
         };
         let vm = prov
-            .provision_custom(user.id, template, 1, ssh_key.id, None)
+            .provision_custom(user.id, template, 1, ssh_key.id, None, None)
             .await?;
         let item = db
             .get_subscription_line_item(vm.subscription_line_item_id)
@@ -2793,7 +3028,7 @@ mod tests {
         };
 
         let vm = prov
-            .provision_custom(user.id, spec(Some(4000)), 1, ssh_key.id, None)
+            .provision_custom(user.id, spec(Some(4000)), 1, ssh_key.id, None, None)
             .await?;
         let template = db
             .get_custom_vm_template(vm.custom_template_id.unwrap())
@@ -2806,7 +3041,7 @@ mod tests {
         assert_eq!(line_item.amount, 200 + 200 + 250 + 400);
 
         assert!(
-            prov.provision_custom(user.id, spec(Some(9000)), 1, ssh_key.id, None)
+            prov.provision_custom(user.id, spec(Some(9000)), 1, ssh_key.id, None, None)
                 .await
                 .is_err(),
             "transfer above the plan maximum is refused"
@@ -3180,7 +3415,7 @@ mod tests {
         let (user, ssh_key) = add_user(&db).await?;
 
         let vm = prov
-            .provision(user.id, 1, 1, ssh_key.id, Some("TEST123".to_string()))
+            .provision(user.id, 1, 1, ssh_key.id, Some("TEST123".to_string()), None)
             .await?;
 
         assert_eq!(vm.ref_code, Some("TEST123".to_string()));
@@ -3200,7 +3435,7 @@ mod tests {
         .await?;
 
         let vm = prov
-            .provision(user.id, 1, 1, ssh_key.id, Some("SELF1".to_string()))
+            .provision(user.id, 1, 1, ssh_key.id, Some("SELF1".to_string()), None)
             .await?;
 
         assert_eq!(vm.ref_code, None);
@@ -3220,7 +3455,7 @@ mod tests {
         let (user, ssh_key) = add_user(&db).await?;
 
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         let li = db
             .get_subscription_line_item(vm.subscription_line_item_id)
@@ -3263,7 +3498,7 @@ mod tests {
         let (user, ssh_key) = add_user(&db).await?;
 
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         let li = db
             .get_subscription_line_item(vm.subscription_line_item_id)
@@ -3324,7 +3559,7 @@ mod tests {
         let provisioner = sub_handler.vm_provisioner();
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         let li = db
             .get_subscription_line_item(vm.subscription_line_item_id)
@@ -3375,7 +3610,7 @@ mod tests {
 
         // Provision a VM (subscription starts inactive, expires=None)
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
 
         let li = db
@@ -3443,7 +3678,7 @@ mod tests {
         let (user, ssh_key) = add_user(&db).await?;
 
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         let li = db
             .get_subscription_line_item(vm.subscription_line_item_id)
@@ -3502,7 +3737,7 @@ mod tests {
         let (user, ssh_key) = add_user(&db).await?;
 
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         let vm_id = vm.id;
 
@@ -3543,7 +3778,7 @@ mod tests {
         let (user, ssh_key) = add_user(&db).await?;
 
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         let vm_id = vm.id;
 
@@ -3592,7 +3827,7 @@ mod tests {
         let (user, ssh_key) = add_user(&db).await?;
 
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         let vm_id = vm.id;
         let li = db
@@ -3648,7 +3883,7 @@ mod tests {
         let (user, ssh_key) = add_user(&db).await?;
 
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         let vm_id = vm.id;
         let li = db
@@ -3699,7 +3934,7 @@ mod tests {
         let (user, ssh_key) = add_user(&db).await?;
 
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         let li = db
             .get_subscription_line_item(vm.subscription_line_item_id)
@@ -3763,7 +3998,7 @@ mod tests {
         let (user, ssh_key) = add_user(&db).await?;
 
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         let li = db
             .get_subscription_line_item(vm.subscription_line_item_id)
@@ -3815,7 +4050,7 @@ mod tests {
         let (user, ssh_key) = add_user(&db).await?;
 
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         let li = db
             .get_subscription_line_item(vm.subscription_line_item_id)

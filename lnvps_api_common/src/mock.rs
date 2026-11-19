@@ -380,6 +380,7 @@ impl MockDb {
             disk_id: 1,
             mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
             ssh_host_keys: None,
+            user_data: None,
             deleted: false,
             ref_code: None,
             disabled: false,
@@ -2012,6 +2013,7 @@ impl LNVpsDbBase for MockDb {
         if let Some(vm) = vms.get_mut(&vm_id) {
             vm.deleted = true;
             vm.ssh_key_id = None;
+            vm.user_data = vm.user_data.as_ref().map(|_| "".into());
         }
         Ok(())
     }
@@ -8448,6 +8450,7 @@ impl lnvps_db::AdminDb for MockDb {
         let vm = vms.get_mut(&vm_id).ok_or(anyhow!("no vm"))?;
         vm.user_id = new_user_id;
         vm.ssh_key_id = None;
+        vm.user_data = None;
         Ok(())
     }
 
@@ -9791,6 +9794,7 @@ mod tests {
                     id: 1,
                     user_id: 1,
                     ssh_key_id: Some(5),
+                    user_data: Some("#!/bin/sh\necho old-owner".into()),
                     ..MockDb::mock_vm()
                 },
             );
@@ -9800,6 +9804,7 @@ mod tests {
         let vm = db.get_vm(1).await.unwrap();
         assert_eq!(vm.user_id, 42);
         assert_eq!(vm.ssh_key_id, None);
+        assert!(vm.user_data.is_none());
     }
 
     /// list_all_referrals + delete_referral base-trait methods.
@@ -10549,6 +10554,62 @@ mod tests {
     /// Regression: vm_to_status must return an error (not panic) when a VM's IP
     /// assignment references an IP range that cannot be loaded. Previously the
     /// failed range lookup was silently dropped and then `.expect()` panicked.
+    #[tokio::test]
+    async fn user_data_round_trips_but_is_not_in_status_and_is_cleared_on_delete() {
+        use lnvps_db::LNVpsDb;
+        let db = std::sync::Arc::new(MockDb::default());
+        let mut vm = MockDb::mock_vm();
+        vm.user_id = db.upsert_user(&[42; 32]).await.unwrap();
+        vm.ssh_key_id = None;
+        vm.user_data = Some("#!/bin/sh\necho private-script-marker".into());
+        vm.id = db.insert_vm(&vm).await.unwrap();
+        let stored = db.get_vm(vm.id).await.unwrap();
+        assert_eq!(
+            stored.user_data.as_ref().unwrap().as_str(),
+            vm.user_data.as_ref().unwrap().as_str()
+        );
+        assert!(!format!("{stored:?}").contains("private-script-marker"));
+        let erased: std::sync::Arc<dyn LNVpsDb> = db.clone();
+        let status = crate::model::vm_to_status(&erased, stored, None, None, 0, 365)
+            .await
+            .unwrap();
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(!json.contains("private-script-marker"));
+        assert!(!json.contains("user_data"));
+        vm.id += 1;
+        db.insert_vm_with_id(&vm).await.unwrap();
+        assert_eq!(
+            db.get_vm(vm.id)
+                .await
+                .unwrap()
+                .user_data
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            vm.user_data.as_ref().unwrap().as_str()
+        );
+        db.delete_vm(vm.id).await.unwrap();
+        let deleted = db.vms.lock().await.get(&vm.id).unwrap().clone();
+        assert!(deleted.deleted);
+        assert_eq!(deleted.user_data.as_ref().unwrap().as_str(), "");
+        assert!(deleted.ssh_key_id.is_none());
+
+        let payment = make_payment(1, Some(86400));
+        db.insert_subscription_payment(&payment).await.unwrap();
+        db.subscription_payment_paid(&payment).await.unwrap();
+        let revived = db.get_vm(vm.id).await.unwrap();
+        assert!(!revived.deleted);
+        assert_eq!(revived.user_data.as_ref().unwrap().as_str(), "");
+
+        vm.id += 1;
+        vm.user_data = None;
+        db.insert_vm_with_id(&vm).await.unwrap();
+        db.delete_vm(vm.id).await.unwrap();
+        let deleted = db.vms.lock().await.get(&vm.id).unwrap().clone();
+        assert!(deleted.deleted);
+        assert!(deleted.user_data.is_none());
+    }
+
     #[tokio::test]
     async fn test_vm_to_status_missing_ip_range_errors_not_panics() {
         use crate::model::vm_to_status;

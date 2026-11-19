@@ -11,6 +11,7 @@ pub const ENCRYPTED_COLUMNS: &[(&str, &str, &str)] = &[
     ("users", "id", "billing_postcode"),
     ("users", "id", "billing_tax_id"),
     ("user_ssh_key", "id", "key_data"),
+    ("vm", "id", "user_data"),
     ("user_payment_method", "id", "external_id"),
     ("user_payment_method", "id", "external_customer_id"),
     ("vm_host", "id", "api_token"),
@@ -60,6 +61,18 @@ mod tests {
     fn ctx(byte: u8, previous: &[u8]) -> EncryptionContext {
         let previous: Vec<[u8; 32]> = previous.iter().map(|b| [*b; 32]).collect();
         EncryptionContext::from_raw_keys([byte; 32], &previous)
+    }
+
+    #[test]
+    fn user_data_is_rotated_with_other_secrets() {
+        assert!(ENCRYPTED_COLUMNS.contains(&("vm", "id", "user_data")));
+        let old = ctx(1, &[]);
+        let new = ctx(2, &[1]);
+        let script = "#!/bin/sh\necho private";
+        let stored = old.encrypt(script).unwrap();
+        assert!(!stored.contains(script));
+        let moved = reencrypt(&new, &stored).unwrap().unwrap();
+        assert_eq!(new.decrypt(&moved).unwrap(), script);
     }
 
     #[test]

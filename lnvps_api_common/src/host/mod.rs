@@ -334,6 +334,11 @@ pub fn extract_host_from_url(input: &str) -> String {
 /// Generic type for creating VM's
 #[async_trait]
 pub trait VmHostClient: Send + Sync {
+    /// Whether this host can deliver a first-boot script to cloud-init.
+    async fn supports_user_data(&self) -> OpResult<bool> {
+        Ok(false)
+    }
+
     async fn get_info(&self) -> OpResult<VmHostInfo>;
 
     /// List all VMs present on the host, described in host-native terms.
@@ -948,6 +953,7 @@ mod tests {
                 disk_id: 1,
                 mac_address: "ff:ff:ff:ff:ff:fe".to_string(),
                 ssh_host_keys: None,
+                user_data: None,
                 deleted: false,
                 ref_code: None,
                 disabled: false,

@@ -435,6 +435,7 @@ interface CustomVmOrder extends CustomVmRequest {
   image_id: number;
   ssh_key_id: number;
   ref_code?: string;
+  user_data?: string; // Optional first-boot script; see VM order scripts below
 }
 
 interface CustomTemplateParams {
@@ -637,8 +638,28 @@ interface CreateVmRequest {
   image_id: number;
   ssh_key_id: number;
   ref_code?: string;
+  user_data?: string;
 }
 ```
+
+#### VM order scripts
+
+Both standard and custom VM orders accept optional `user_data`: a script of at most
+16384 bytes (16 KiB), starting with `#!` and containing no NUL bytes. Empty strings,
+cloud-config, includes and MIME documents are not accepted. Omit the field for the
+usual image setup.
+
+Cloud-init runs the script once as root in its final `scripts-user` stage, after
+installing the SSH key and setting up host keys. A reinstall runs it again, and on
+Proxmox hosts a reconfiguration (such as an address or SSH key change) also runs it
+again. Scripts must be safe to run more than once.
+
+The script is stored encrypted, is never returned by any API response, and is
+cleared when the VM is deleted. A VM revived after deletion cannot be built with
+that script. An order with a script is refused if the region's
+chosen host cannot deliver it. Proxmox operators must configure LNVPS's SSH access
+and a storage with the `snippets` content type. Libvirt hosts support scripts
+through their NoCloud seed.
 
 ### VM Upgrades
 

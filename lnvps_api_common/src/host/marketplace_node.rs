@@ -100,6 +100,10 @@ async fn expected_digest(image: &VmOsImage) -> Option<String> {
 
 #[async_trait]
 impl VmHostClient for MarketplaceNodeHost {
+    async fn supports_user_data(&self) -> OpResult<bool> {
+        self.inner.supports_user_data().await
+    }
+
     /// Ask the node to fetch the image, and make its pool show the result.
     ///
     /// An image with no published checksum falls back to uploading: the node is
@@ -263,6 +267,49 @@ impl VmHostClient for MarketplaceNodeHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn user_data_capability_is_forwarded() -> anyhow::Result<()> {
+        let inner = Arc::new(crate::host::dummy_host::DummyVmHost::new());
+        let host = MarketplaceNodeHost::new(
+            inner,
+            NodeControl::new(&"01".repeat(32))?,
+            MarketplaceNode::default(),
+            VmHost::default(),
+        );
+        assert!(!host.supports_user_data().await?);
+        #[cfg(feature = "libvirt")]
+        {
+            let inner = Arc::new(crate::host::libvirt::LibVirtHost::new(
+                "test:///default",
+                crate::host::config::LibVirtConfig {
+                    qemu: crate::host::config::QemuConfig {
+                        machine: "q35".into(),
+                        os_type: "l26".into(),
+                        bridge: "vmbr0".into(),
+                        cpu: "kvm64".into(),
+                        kvm: true,
+                        arch: "x86_64".into(),
+                        balloon_min_pct: None,
+                        firewall_config: None,
+                    },
+                    image_pool: None,
+                    image_cache_dir: None,
+                    secure_boot: false,
+                    vlan_aware_bridge: false,
+                    shutdown_timeout_secs: None,
+                },
+            )?);
+            let host = MarketplaceNodeHost::new(
+                inner,
+                NodeControl::new(&"01".repeat(32))?,
+                MarketplaceNode::default(),
+                VmHost::default(),
+            );
+            assert!(host.supports_user_data().await?);
+        }
+        Ok(())
+    }
 
     fn image(sha2: Option<&str>) -> VmOsImage {
         VmOsImage {

@@ -377,6 +377,9 @@ impl VmHostClient for DummyVmHost {
     /// transition it to `Stopped` after a real async delay of 10–60 seconds,
     /// simulating provisioning time on a real hypervisor.
     async fn create_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
+        if cfg.vm.user_data.is_some() {
+            op_fatal!("Dummy hosts cannot deliver user_data");
+        }
         let vm_id = cfg.vm.id;
 
         // when using dummy host in real dev env, add a small delete in create_vm
@@ -642,6 +645,19 @@ impl VmHostClient for DummyVmHost {
 
 #[cfg(test)]
 mod snapshot_tests {
+    #[tokio::test]
+    async fn user_data_is_rejected_instead_of_dropped() {
+        use super::*;
+        let host = DummyVmHost::new();
+        assert!(!host.supports_user_data().await.unwrap());
+        let mut info = crate::host::tests::mock_full_vm();
+        info.vm.user_data = Some("#!/bin/sh\necho test".into());
+        assert!(matches!(
+            host.create_vm(&info).await,
+            Err(crate::retry::OpError::Fatal(_))
+        ));
+    }
+
     use super::*;
     use crate::host::tests::mock_full_vm;
 
