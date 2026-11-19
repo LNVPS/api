@@ -7,6 +7,8 @@ services:
       - { name: ws, container: 7777, protocol: http, expose: ingress }
     env:
       STREAMS: "${stream_from_relays}"
+      ALLOWED_KINDS: "${filter_validation_allowed_kinds}"
+      VIEW_POLICY: "${write_policy_plugin}"
     files:
       - path: /etc/strfry.conf
         content: |
@@ -25,7 +27,7 @@ services:
               port = 7777
               realIpHeader = "${real_ip_header}"
               writePolicy {
-                  plugin = "${write_policy_plugin}"
+                  plugin = "python3 /etc/strfry-view-policy.py"
               }
               auth {
                   enabled = ${auth_enabled}
@@ -69,7 +71,7 @@ services:
                   maxFiltersPerReq = ${filter_validation_max_filters_per_req}
                   minFiltersPerReq = ${filter_validation_min_filters_per_req}
                   maxKindsPerFilter = ${filter_validation_max_kinds_per_filter}
-                  allowedKinds = "${filter_validation_allowed_kinds}"
+                  allowedKinds = ""
                   requireAuthorOrTag = ${filter_validation_require_author_or_tag}
               }
           }
@@ -88,6 +90,10 @@ services:
           PER_IP_MAX = 30
           MAX_SKEW = 15 * 60
           MAX_TRACKED = 200000
+          VIEW_POLICY_ON = bool(os.environ.get("VIEW_POLICY", "").strip())
+          ALLOWED_KINDS = {
+              int(k) for k in os.environ.get("ALLOWED_KINDS", "").split(",") if k.strip().isdigit()
+          }
 
           seen_targets = {}
           ip_windows = {}
@@ -142,7 +148,9 @@ services:
 
           def judge(msg, now=None):
               event = msg["event"]
-              if event["kind"] != VIEW_KIND:
+              if ALLOWED_KINDS and event["kind"] not in ALLOWED_KINDS:
+                  return {"action": "reject", "msg": "blocked: kind %d not accepted here" % event["kind"]}
+              if event["kind"] != VIEW_KIND or not VIEW_POLICY_ON:
                   return {"action": "accept"}
               now = int(time.time()) if now is None else now
               if abs(event["created_at"] - now) > MAX_SKEW:
@@ -204,7 +212,7 @@ config:
   - { name: filter_validation_max_filters_per_req, label: "Max filters per REQ (when restricted)", type: int, default: "3", pattern: "[1-9][0-9]*", group: "Access" }
   - { name: filter_validation_min_filters_per_req, label: "Min filters per REQ (when restricted)", type: int, default: "1", pattern: "[0-9]+", group: "Access" }
   - { name: filter_validation_max_kinds_per_filter, label: "Max kinds per filter (when restricted)", type: int, default: "3", pattern: "[1-9][0-9]*", group: "Access" }
-  - { name: filter_validation_allowed_kinds, label: "Allowed kinds (comma-separated, blank for all)", type: string, default: "", pattern: "([0-9]+(, *[0-9]+)*)?", group: "Access" }
+  - { name: filter_validation_allowed_kinds, label: "Allowed kinds to publish (comma-separated, blank for all)", type: string, default: "", pattern: "([0-9]+(, *[0-9]+)*)?", group: "Access" }
   - { name: filter_validation_require_author_or_tag, label: "Require an author or tag in filters", type: bool, default: "false", group: "Access" }
   - { name: max_event_size, label: "Max event size (bytes)", type: int, default: "65536", pattern: "[1-9][0-9]*", group: "Event limits" }
   - { name: reject_events_newer_than_seconds, label: "Reject events newer than (seconds ahead)", type: int, default: "900", pattern: "[0-9]+", group: "Event limits" }
