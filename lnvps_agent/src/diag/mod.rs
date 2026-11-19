@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 pub use lg::{Hop, LookingGlass, Traceroute};
 pub use policy::PolicyDocs;
-pub use port::{PortCheck, check_port};
+pub use port::{COMMON_PORTS, MAX_SCAN_PORTS, PortCheck, PortScan, check_port, scan_ports};
 
 /// Diagnostics shared by every tool executor.
 ///
@@ -95,6 +95,17 @@ impl Diagnostics {
         Ok(port::check_port(select_target(ips, prefer_v6)?, port).await)
     }
 
+    pub async fn scan_ports(
+        &self,
+        ips: &[String],
+        prefer_v6: bool,
+        ports: Option<Vec<u64>>,
+        range: Option<(u64, u64)>,
+    ) -> Result<PortScan> {
+        let ports = resolve_scan_ports(ports, range)?;
+        Ok(port::scan_ports(select_target(ips, prefer_v6)?, &ports).await)
+    }
+
     /// The published Terms of Service / Acceptable Use text.
     pub async fn terms_of_service(&self) -> Result<Arc<str>> {
         self.policy.terms_of_service().await
@@ -118,6 +129,41 @@ pub fn select_target(ips: &[String], prefer_v6: bool) -> Result<IpAddr> {
         .find(|ip| ip.is_ipv6() == prefer_v6)
         .or_else(|| parsed.first());
     Ok(*wanted.expect("non-empty"))
+}
+
+pub fn resolve_scan_ports(
+    ports: Option<Vec<u64>>,
+    range: Option<(u64, u64)>,
+) -> Result<Vec<u16>> {
+    let valid = |p: u64| u16::try_from(p).ok().filter(|p| *p > 0);
+    let mut out: Vec<u16> = Vec::new();
+    if let Some((start, end)) = range {
+        let (Some(start), Some(end)) = (valid(start), valid(end)) else {
+            bail!("ports must be between 1 and 65535");
+        };
+        if end < start {
+            bail!("the end of the range is below its start");
+        }
+        if (end - start) as usize + 1 > MAX_SCAN_PORTS {
+            bail!("a scan covers at most {MAX_SCAN_PORTS} ports");
+        }
+        out.extend(start..=end);
+    }
+    for p in ports.unwrap_or_default() {
+        let Some(p) = valid(p) else {
+            bail!("ports must be between 1 and 65535");
+        };
+        out.push(p);
+    }
+    if out.is_empty() {
+        out.extend_from_slice(COMMON_PORTS);
+    }
+    out.sort_unstable();
+    out.dedup();
+    if out.len() > MAX_SCAN_PORTS {
+        bail!("a scan covers at most {MAX_SCAN_PORTS} ports");
+    }
+    Ok(out)
 }
 
 /// Reduce a traceroute to a reachability answer, naming the last hop that
@@ -199,6 +245,27 @@ mod tests {
         let ips = vec!["127.0.0.1".to_string()];
         assert!(diag.check_port(&ips, false, 0).await.is_err());
         assert!(diag.check_port(&ips, false, 70_000).await.is_err());
+    }
+
+    #[test]
+    fn scan_defaults_to_the_common_ports_including_alternative_ssh() {
+        let ports = resolve_scan_ports(None, None).unwrap();
+        assert!(ports.contains(&22) && ports.contains(&2222) && ports.contains(&19009));
+    }
+
+    #[test]
+    fn scan_accepts_a_range_plus_extra_ports_and_dedups() {
+        let ports = resolve_scan_ports(Some(vec![20, 22]), Some((20, 22))).unwrap();
+        assert_eq!(ports, vec![20, 21, 22]);
+    }
+
+    #[test]
+    fn scan_rejects_bad_or_oversized_input() {
+        assert!(resolve_scan_ports(Some(vec![0]), None).is_err());
+        assert!(resolve_scan_ports(Some(vec![70_000]), None).is_err());
+        assert!(resolve_scan_ports(None, Some((10, 5))).is_err());
+        assert!(resolve_scan_ports(None, Some((1, 2000))).is_err());
+        assert!(resolve_scan_ports(None, Some((1, 1024))).is_ok());
     }
 
     fn trace(reached: bool) -> Traceroute {

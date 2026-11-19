@@ -124,6 +124,7 @@ fn diagnostic_tools() -> Vec<FunctionObject> {
         diagnostics::ping_vm(),
         diagnostics::traceroute_vm(),
         diagnostics::check_vm_port(),
+        diagnostics::scan_vm_ports(),
     ]
 }
 
@@ -239,7 +240,7 @@ mod tests {
     fn public_tools_exclude_vm_probes() {
         let tools = public_tools();
         let names = names(&tools);
-        for forbidden in ["ping_vm", "traceroute_vm", "check_vm_port"] {
+        for forbidden in ["ping_vm", "traceroute_vm", "check_vm_port", "scan_vm_ports"] {
             assert!(
                 !names.contains(&forbidden),
                 "{forbidden} must not be public"
@@ -251,7 +252,7 @@ mod tests {
     fn customer_sets_include_diagnostics() {
         for set in [support_tools(), live_chat_tools()] {
             let names = names(&set);
-            for expected in ["ping_vm", "traceroute_vm", "check_vm_port"] {
+            for expected in ["ping_vm", "traceroute_vm", "check_vm_port", "scan_vm_ports"] {
                 assert!(names.contains(&expected), "missing {expected}");
             }
         }

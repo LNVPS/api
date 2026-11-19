@@ -61,6 +61,31 @@ pub fn check_vm_port() -> FunctionObject {
     )
 }
 
+pub fn scan_vm_ports() -> FunctionObject {
+    tool(
+        "scan_vm_ports",
+        "Find which TCP ports on a VM owned by the current user accept connections. Scans a list of common ports (including alternative SSH ports) by default, or the ports and range you give (at most 1024 ports). Use it when a service is unreachable on the expected port, for example SSH on 22 times out but the customer may have moved sshd, or to check which ports are open before telling a customer the VM is down.",
+        json!({
+            "type": "object",
+            "properties": {
+                "vm_id": { "type": "integer", "description": "The numeric VM ID to probe" },
+                "ports": {
+                    "type": "array",
+                    "items": { "type": "integer" },
+                    "description": "Specific ports to include in the scan"
+                },
+                "range_start": { "type": "integer", "description": "First port of an optional range" },
+                "range_end": { "type": "integer", "description": "Last port of an optional range" },
+                "ipv6": {
+                    "type": "boolean",
+                    "description": "Probe the VM's IPv6 address instead of its IPv4 address. Defaults to false."
+                }
+            },
+            "required": ["vm_id"]
+        }),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -79,7 +104,7 @@ mod tests {
     /// A probe that took a hostname would turn support chat into a scanner.
     #[test]
     fn probes_only_accept_a_vm_id() {
-        for spec in [ping_vm(), traceroute_vm(), check_vm_port()] {
+        for spec in [ping_vm(), traceroute_vm(), check_vm_port(), scan_vm_ports()] {
             let name = spec.name.clone();
             let params = spec.parameters.expect("parameters");
             let properties = params["properties"].as_object().unwrap();

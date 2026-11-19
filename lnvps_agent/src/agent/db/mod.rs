@@ -395,6 +395,26 @@ impl ToolExecutor for DbToolExecutor {
                 )?)
             }
 
+            "scan_vm_ports" => {
+                let vm = self.owned_vm(&args).await?;
+                let ips = self.vm_ips(&vm).await;
+                let ports = args.get("ports").and_then(|v| v.as_array()).map(|a| {
+                    a.iter().filter_map(|v| v.as_u64()).collect::<Vec<_>>()
+                });
+                let range = match (
+                    args.get("range_start").and_then(|v| v.as_u64()),
+                    args.get("range_end").and_then(|v| v.as_u64()),
+                ) {
+                    (Some(s), Some(e)) => Some((s, e)),
+                    _ => None,
+                };
+                pretty(&serde_json::to_value(
+                    self.diag
+                        .scan_ports(&ips, wants_ipv6(&args), ports, range)
+                        .await?,
+                )?)
+            }
+
             // Not offered in any tool set: granting paid time, moving money
             // and destroying data are subscription-lifecycle operations that
             // live in the API. Reaching this arm means the model invented the

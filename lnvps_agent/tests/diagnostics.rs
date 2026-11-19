@@ -103,7 +103,7 @@ async fn traceroute_vm_returns_the_full_path() {
 async fn probes_refuse_another_users_vm() {
     let stack = stack(99, "185.18.221.87").await;
     let exec = executor(&stack, 1);
-    for tool in ["ping_vm", "traceroute_vm"] {
+    for tool in ["ping_vm", "traceroute_vm", "scan_vm_ports"] {
         let err = exec
             .execute(tool, r#"{"vm_id":7}"#)
             .await
@@ -177,4 +177,35 @@ async fn public_executor_refuses_probes() {
             "{tool} must be unavailable anonymously"
         );
     }
+}
+
+#[tokio::test]
+async fn scan_vm_ports_finds_sshd_moved_off_port_22() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let moved = listener.local_addr().unwrap().port();
+    let unused = {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let stack = stack(1, "127.0.0.1").await;
+    let out = executor(&stack, 1)
+        .execute(
+            "scan_vm_ports",
+            &format!(r#"{{"vm_id":7,"ports":[{unused},{moved}]}}"#),
+        )
+        .await
+        .expect("scan");
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(parsed["open_ports"], serde_json::json!([moved]));
+    assert!(out.contains("not the public internet"));
+}
+
+#[tokio::test]
+async fn scan_vm_ports_rejects_an_oversized_range() {
+    let stack = stack(1, "127.0.0.1").await;
+    let err = executor(&stack, 1)
+        .execute("scan_vm_ports", r#"{"vm_id":7,"range_start":1,"range_end":5000}"#)
+        .await
+        .expect_err("too many ports");
+    assert!(err.to_string().contains("at most"));
 }
