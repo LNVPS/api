@@ -99,19 +99,19 @@ pub struct User {
     /// Users country
     pub country_code: Option<String>,
     /// Name to show on invoices
-    pub billing_name: Option<String>,
+    pub billing_name: Option<EncryptedString>,
     /// Billing address line 1
-    pub billing_address_1: Option<String>,
+    pub billing_address_1: Option<EncryptedString>,
     /// Billing address line 2
-    pub billing_address_2: Option<String>,
+    pub billing_address_2: Option<EncryptedString>,
     /// Billing city
-    pub billing_city: Option<String>,
+    pub billing_city: Option<EncryptedString>,
     /// Billing state/county
-    pub billing_state: Option<String>,
+    pub billing_state: Option<EncryptedString>,
     /// Billing postcode/zip
-    pub billing_postcode: Option<String>,
+    pub billing_postcode: Option<EncryptedString>,
     /// Billing tax id
-    pub billing_tax_id: Option<String>,
+    pub billing_tax_id: Option<EncryptedString>,
     /// Country (ISO 3166-1 alpha-3) resolved from the client's IP address.
     ///
     /// This is an *independent* place-of-supply evidence signal for EU VAT,
@@ -273,6 +273,19 @@ pub struct UserSshKey {
     pub user_id: u64,
     pub created: DateTime<Utc>,
     pub key_data: EncryptedString,
+}
+
+#[derive(FromRow, Clone, Debug, Default)]
+pub struct ApiToken {
+    pub id: u64,
+    pub user_id: u64,
+    pub name: String,
+    pub token_hash: String,
+    pub scope: String,
+    pub created: DateTime<Utc>,
+    pub expires: DateTime<Utc>,
+    pub last_used: Option<DateTime<Utc>>,
+    pub last_ip: Option<String>,
 }
 
 /// A registered WebAuthn / passkey credential belonging to a
@@ -2921,6 +2934,7 @@ pub enum VmHistoryActionType {
     SnapshotCreated = 14,
     SnapshotRestored = 15,
     SnapshotDeleted = 16,
+    MigrationProgress = 17,
 }
 
 impl Display for VmHistoryActionType {
@@ -2943,6 +2957,7 @@ impl Display for VmHistoryActionType {
             VmHistoryActionType::SnapshotCreated => write!(f, "snapshot_created"),
             VmHistoryActionType::SnapshotRestored => write!(f, "snapshot_restored"),
             VmHistoryActionType::SnapshotDeleted => write!(f, "snapshot_deleted"),
+            VmHistoryActionType::MigrationProgress => write!(f, "migration_progress"),
         }
     }
 }
@@ -2969,6 +2984,7 @@ impl FromStr for VmHistoryActionType {
             "snapshot_created" => Ok(VmHistoryActionType::SnapshotCreated),
             "snapshot_restored" => Ok(VmHistoryActionType::SnapshotRestored),
             "snapshot_deleted" => Ok(VmHistoryActionType::SnapshotDeleted),
+            "migration_progress" => Ok(VmHistoryActionType::MigrationProgress),
             _ => Err(anyhow!("unknown VM history action type: {}", s)),
         }
     }
@@ -5643,6 +5659,14 @@ pub struct AgentConversation {
     pub compacted_upto: u64,
     pub created: DateTime<Utc>,
     pub updated: DateTime<Utc>,
+    /// When the agent last emailed this thread to support.
+    pub escalated_at: Option<DateTime<Utc>>,
+    /// How many times the thread has been escalated.
+    pub escalation_count: u64,
+    /// The reason given in the latest escalation.
+    pub escalation_reason: Option<String>,
+    /// Comma separated VM ids named in the latest escalation.
+    pub escalation_vm_ids: Option<String>,
 }
 
 /// A single message in a support-agent conversation.
@@ -5689,6 +5713,10 @@ pub struct AgentConversationOverview {
     /// When the newest message landed. `None` for a thread whose row exists but
     /// which has never carried a message.
     pub last_message_at: Option<DateTime<Utc>>,
+    pub escalated_at: Option<DateTime<Utc>>,
+    pub escalation_count: u64,
+    pub escalation_reason: Option<String>,
+    pub escalation_vm_ids: Option<String>,
 }
 
 /// Which conversations to return from [`crate::LNVpsDb::list_agent_conversations`].
@@ -6130,6 +6158,41 @@ pub struct VmIpWait {
     pub ip_order_id: Option<u64>,
     pub released: bool,
     pub created: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize, Default)]
+#[repr(u16)]
+#[serde(rename_all = "snake_case")]
+pub enum VmMigrationState {
+    #[default]
+    InProgress = 0,
+    Completed = 1,
+    RolledBack = 2,
+    Failed = 3,
+}
+
+#[derive(FromRow, Clone, Debug, PartialEq, Default)]
+pub struct VmMigration {
+    pub id: u64,
+    pub vm_id: u64,
+    pub source_host_id: u64,
+    pub source_disk_id: u64,
+    pub target_host_id: u64,
+    pub target_disk_id: u64,
+    pub state: VmMigrationState,
+    pub phase: String,
+    pub options: String,
+    pub old_ips: Option<String>,
+    pub source_retained: bool,
+    pub needs_attention: bool,
+    pub source_was_running: bool,
+    pub flipped: bool,
+    pub bytes_copied: u64,
+    pub checksum: Option<String>,
+    pub error: Option<String>,
+    pub initiated_by: Option<u64>,
+    pub created: DateTime<Utc>,
+    pub finished: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, sqlx::Type, Serialize, Deserialize, Default)]

@@ -4,7 +4,7 @@
   inputs = {
     # Pin to a release channel so image builds are reproducible. Bump this in
     # lockstep with the `version` you register in the OS image record.
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
     nixos-generators = {
       url = "github:nix-community/nixos-generators";

@@ -6,8 +6,8 @@ use crate::host::proxmox_config::{
     SshKeys, opt_prop_string,
 };
 use crate::host::{
-    FullVmInfo, MigrateVmRequest, TerminalStream, TimeSeries, TimeSeriesData, VmHostClient,
-    VmHostDiskInfo, VmHostInfo, VmSnapshot,
+    DiskFormat, DiskStream, FullVmInfo, ImportedDisk, MigrateVmRequest, TerminalStream, TimeSeries,
+    TimeSeriesData, VmHostClient, VmHostDiskInfo, VmHostInfo, VmSnapshot,
 };
 use crate::retry::{OpError, OpResult, Pipeline, RetryPolicy};
 use crate::ssh_client::SshClient;
@@ -37,9 +37,66 @@ const ISO_DIR: &str = "/var/lib/vz/template/iso";
 
 pub type SshExecFn = Arc<dyn Fn(&str) -> Result<(i32, String)> + Send + Sync>;
 
+pub type SshStreamFn = Arc<
+    dyn Fn(&str, DiskStream) -> futures::future::BoxFuture<'static, Result<(i32, String)>>
+        + Send
+        + Sync,
+>;
+
+fn migration_staging_path(vm_id: u64, format: DiskFormat) -> String {
+    format!("{ISO_DIR}/lnvps-migrate-vm{vm_id}.{}", format.extension())
+}
+
+fn receive_disk_command(staging: &str) -> String {
+    format!("set -o pipefail; tee '{staging}' | sha256sum | cut -d' ' -f1; stat -c %s '{staging}'")
+}
+
+fn parse_received_disk(out: &str) -> Result<ImportedDisk> {
+    let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+    let sha256 = lines
+        .next()
+        .filter(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| anyhow::anyhow!("no sha256 in receiver output: {out}"))?
+        .to_lowercase();
+    let bytes = lines
+        .next()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| anyhow::anyhow!("no size in receiver output: {out}"))?;
+    Ok(ImportedDisk { bytes, sha256 })
+}
+
+fn staged_import_command(req: &FullVmInfo, staging: &str) -> String {
+    let limits = req.limits();
+    let mut args = vec![
+        format!("{}:0", req.disk.name),
+        format!("import-from={staging}"),
+    ];
+    if matches!(req.disk.kind, DiskType::SSD) {
+        args.push("discard=on".to_string());
+        args.push("ssd=1".to_string());
+    }
+    args.push("iothread=1".to_string());
+    for (k, v) in [
+        ("mbps_rd", limits.disk_mbps_read),
+        ("mbps_wr", limits.disk_mbps_write),
+        ("iops_rd", limits.disk_iops_read),
+        ("iops_wr", limits.disk_iops_write),
+    ] {
+        if let Some(v) = v {
+            args.push(format!("{k}={v}"));
+        }
+    }
+    format!(
+        "/usr/sbin/qm set {} --scsi0 {}",
+        ProxmoxVmId::from(req.vm.id),
+        args.join(",")
+    )
+}
+
 #[derive(Clone)]
 pub struct ProxmoxClient {
     ssh_exec: Option<SshExecFn>,
+    ssh_stream_exec: Option<SshStreamFn>,
     api: JsonApi,
     config: QemuConfig,
     ssh: Option<SshConfig>,
@@ -80,6 +137,7 @@ impl ProxmoxClient {
     ) -> Self {
         Self {
             ssh_exec: None,
+            ssh_stream_exec: None,
             api: JsonApi::token(base.as_str(), &format!("PVEAPIToken={}", token), true).unwrap(),
             config,
             ssh,
@@ -93,6 +151,11 @@ impl ProxmoxClient {
 
     pub fn with_ssh_exec(mut self, exec: SshExecFn) -> Self {
         self.ssh_exec = Some(exec);
+        self
+    }
+
+    pub fn with_ssh_stream_exec(mut self, exec: SshStreamFn) -> Self {
+        self.ssh_stream_exec = Some(exec);
         self
     }
 
@@ -1668,6 +1731,37 @@ impl ProxmoxClient {
         Ok(())
     }
 
+    async fn import_staged_disk(&self, req: &FullVmInfo, staging: &str) -> OpResult<()> {
+        let cmd = staged_import_command(req, staging);
+        let (code, out) = self.ssh_run(cmd).await.map_err(OpError::Transient)?;
+        if code != 0 {
+            op_fatal!("importing the migrated disk failed (exit {code}): {out}");
+        }
+        Ok(())
+    }
+
+    async fn ssh_stream(&self, command: &str, disk: DiskStream) -> Result<(i32, String)> {
+        if let Some(exec) = &self.ssh_stream_exec {
+            return exec(command, disk).await;
+        }
+        let ssh_cfg = self
+            .ssh
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("SSH not configured"))?;
+        let host = crate::host::extract_host_from_url(&self.api.base().to_string());
+        let mut client = SshClient::new();
+        client
+            .connect((host, 22), &ssh_cfg.user, &ssh_cfg.key)
+            .await?;
+        let timeout = Duration::from_secs(
+            crate::MIGRATION_BASE_TIMEOUT_SECS
+                + disk.size.div_ceil(crate::GB) * crate::DEFAULT_MIGRATION_SECS_PER_GB * 4,
+        );
+        client
+            .execute_with_stdin(command, disk.reader, timeout)
+            .await
+    }
+
     /// Destroy a VM by ID (stop first, then delete via SSH)
     async fn destroy_vm(&self, vm_id: ProxmoxVmId) -> OpResult<()> {
         // Check if VM exists first. Only a definitive 404 (Ok(None)) means the VM
@@ -2127,6 +2221,90 @@ impl VmHostClient for ProxmoxClient {
 
     async fn start_vm(&self, vm: &Vm) -> OpResult<()> {
         let task = self.start_vm(&self.node, vm.id.into()).await?;
+        self.wait_for_task(&task).await?;
+        Ok(())
+    }
+
+    async fn create_vm_from_disk(
+        &self,
+        req: &FullVmInfo,
+        disk: DiskStream,
+    ) -> OpResult<ImportedDisk> {
+        self.ensure_ssh_node().await?;
+        let vm_id: ProxmoxVmId = req.vm.id.into();
+        if self.get_vm_status_opt(&self.node, vm_id).await?.is_some() {
+            op_fatal!(
+                "VM {} already exists on {}, refusing to import over it",
+                vm_id,
+                self.node
+            );
+        }
+        let vendor_snippet = self.ensure_vendor_snippet().await?;
+        let network_snippet = self.ensure_network_snippet(req).await?;
+        let config = self
+            .make_config(req, vendor_snippet.as_deref(), network_snippet.as_deref())
+            .map_err(OpError::Fatal)?;
+        let task = self
+            .create_vm(CreateVm {
+                node: self.node.clone(),
+                vm_id,
+                config,
+            })
+            .await?;
+        self.wait_for_task(&task).await?;
+
+        let staging = migration_staging_path(req.vm.id, disk.format);
+        let (code, free) = self
+            .ssh_run(format!("df --output=avail -B1 '{ISO_DIR}' | tail -n1"))
+            .await
+            .map_err(OpError::Transient)?;
+        let free: u64 = free.trim().parse().unwrap_or(0);
+        if code != 0 || free < disk.size {
+            let _ = self.destroy_vm(vm_id).await;
+            op_fatal!(
+                "{ISO_DIR} on {} has {free} bytes free, the disk needs {}",
+                self.node,
+                disk.size
+            );
+        }
+        let result = async {
+            let (code, out) = self
+                .ssh_stream(&receive_disk_command(&staging), disk)
+                .await
+                .map_err(OpError::Transient)?;
+            if code != 0 {
+                op_fatal!("receiving the disk failed (exit {code}): {out}");
+            }
+            let imported = parse_received_disk(&out).map_err(OpError::Fatal)?;
+            self.import_staged_disk(req, &staging).await?;
+            self.resize_main_disk(req).await?;
+            Ok(imported)
+        }
+        .await;
+        if let Err(e) = self.ssh_run(format!("rm -f '{staging}'")).await {
+            warn!("Failed to remove staged disk {staging}: {e}");
+        }
+        if result.is_err()
+            && let Err(e) = self.destroy_vm(vm_id).await
+        {
+            warn!("Failed to remove half-imported VM {vm_id}: {e}");
+        }
+        result
+    }
+
+    async fn retire_vm(&self, vm: &Vm) -> OpResult<()> {
+        VmHostClient::stop_vm(self, vm).await?;
+        let task = self
+            .configure_vm(ConfigureVm {
+                node: self.node.clone(),
+                vm_id: vm.id.into(),
+                config: VmConfig {
+                    on_boot: Some(false),
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .await?;
         self.wait_for_task(&task).await?;
         Ok(())
     }
@@ -4017,6 +4195,210 @@ mod tests {
     /// The snippet storage lookup must survive exactly one round-trip per
     /// client, no matter how many VMs the sweep walks — `write_snippet` used to
     /// re-issue it on every call.
+    #[test]
+    fn migrated_disk_receiver_writes_and_hashes_exactly_what_it_was_sent() -> Result<()> {
+        use sha2::Digest;
+        use std::io::Write;
+        let dir = tempfile::TempDir::new()?;
+        let staging = dir.path().join("vm7.raw").display().to_string();
+        let bytes: Vec<u8> = (0..2_500_000u32).map(|i| (i % 241) as u8).collect();
+
+        let mut child = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(receive_disk_command(&staging))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().unwrap();
+        let payload = bytes.clone();
+        let writer = std::thread::spawn(move || stdin.write_all(&payload));
+        let out = child.wait_with_output()?;
+        writer.join().unwrap()?;
+        assert!(out.status.success());
+
+        let got = parse_received_disk(&String::from_utf8_lossy(&out.stdout))?;
+        assert_eq!(got.bytes, bytes.len() as u64);
+        assert_eq!(got.sha256, hex::encode(sha2::Sha256::digest(&bytes)));
+        assert_eq!(std::fs::read(&staging)?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn migrated_disk_receiver_output_must_carry_a_hash_and_a_size() {
+        let sha = "a".repeat(64);
+        assert_eq!(
+            parse_received_disk(&format!("{sha}\n123\n")).unwrap(),
+            ImportedDisk {
+                bytes: 123,
+                sha256: sha.clone()
+            }
+        );
+        assert!(parse_received_disk("").is_err());
+        assert!(parse_received_disk(&format!("{sha}\n")).is_err());
+        assert!(parse_received_disk("tee: write error\n12\n").is_err());
+    }
+
+    #[test]
+    fn migrated_disk_is_imported_with_the_spawn_disk_options() {
+        let mut info = crate::host::tests::mock_full_vm();
+        info.vm.id = 7;
+        info.disk.name = "local-zfs".to_string();
+        info.disk.kind = DiskType::SSD;
+        if let Some(t) = info.template.as_mut() {
+            t.disk_iops_read = Some(500);
+        }
+        let cmd = staged_import_command(&info, "/var/lib/vz/template/iso/x.raw");
+        assert!(
+            cmd.starts_with("/usr/sbin/qm set 107 --scsi0 local-zfs:0,import-from=/var/lib/vz/template/iso/x.raw"),
+            "{cmd}"
+        );
+        for opt in ["discard=on", "ssd=1", "iothread=1", "iops_rd=500"] {
+            assert!(cmd.contains(opt), "{cmd}");
+        }
+        assert_eq!(
+            migration_staging_path(7, DiskFormat::QCow2),
+            "/var/lib/vz/template/iso/lnvps-migrate-vm7.qcow2"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_migrated_disk_becomes_a_new_vm_with_the_streamed_bytes() -> Result<()> {
+        use std::sync::atomic::{AtomicBool, Ordering as AO};
+        let server = MockServer::start().await;
+        let created = Arc::new(AtomicBool::new(false));
+        let flag = created.clone();
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/qemu/107/status/current$"))
+            .respond_with(move |_: &wiremock::Request| {
+                if flag.load(AO::SeqCst) {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "data": {"status": "stopped", "vmid": 107}
+                    }))
+                } else {
+                    ResponseTemplate::new(404)
+                }
+            })
+            .mount(&server)
+            .await;
+        let flag = created.clone();
+        Mock::given(method("POST"))
+            .and(path_regex(r".*/nodes/pve/qemu$"))
+            .respond_with(move |_: &wiremock::Request| {
+                flag.store(true, AO::SeqCst);
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": "UPID:create"}))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path_regex(r".*/qemu/107/resize$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"data": "UPID:resize"})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/tasks/.*/status$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {"id": "x", "node": "pve", "pid": 1, "pstart": 1, "starttime": 1, "upid": "x",
+                          "status": "stopped", "type": "x", "user": "root@pam", "exitstatus": "OK"}
+            })))
+            .mount(&server)
+            .await;
+
+        let ran = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = ran.clone();
+        let streamed = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = streamed.clone();
+        let q_cfg = QemuConfig {
+            machine: "q35".to_string(),
+            os_type: "l26".to_string(),
+            bridge: "vmbr0".to_string(),
+            cpu: "kvm64".to_string(),
+            kvm: true,
+            arch: "x86_64".to_string(),
+            balloon_min_pct: None,
+            firewall_config: None,
+        };
+        let client = ProxmoxClient::new(server.uri().parse()?, "pve", "", None, q_cfg, None)
+            .with_ssh_exec(Arc::new(move |cmd: &str| {
+                log.lock().unwrap().push(cmd.to_string());
+                if cmd.starts_with("df ") {
+                    Ok((0, "999999999999\n".to_string()))
+                } else {
+                    Ok((0, String::new()))
+                }
+            }))
+            .with_ssh_stream_exec(Arc::new(move |cmd: &str, mut disk: DiskStream| {
+                let cmd = cmd.to_string();
+                let sink = sink.clone();
+                Box::pin(async move {
+                    use sha2::Digest;
+                    use tokio::io::AsyncReadExt;
+                    assert!(cmd.contains("tee '/var/lib/vz/template/iso/lnvps-migrate-vm7.raw'"));
+                    let mut got = Vec::new();
+                    disk.reader.read_to_end(&mut got).await?;
+                    let out = format!(
+                        "{}\n{}\n",
+                        hex::encode(sha2::Sha256::digest(&got)),
+                        got.len()
+                    );
+                    *sink.lock().unwrap() = got;
+                    Ok((0, out))
+                })
+            }));
+
+        let mut info = crate::host::tests::mock_full_vm();
+        info.vm.id = 7;
+        info.ips.truncate(1);
+        info.ranges.truncate(1);
+        let bytes: Vec<u8> = (0..123_457u32).map(|i| (i % 199) as u8).collect();
+        let imported = client
+            .create_vm_from_disk(
+                &info,
+                DiskStream {
+                    size: bytes.len() as u64,
+                    format: DiskFormat::Raw,
+                    reader: Box::pin(std::io::Cursor::new(bytes.clone())),
+                },
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+        assert_eq!(*streamed.lock().unwrap(), bytes);
+        assert_eq!(imported.bytes, bytes.len() as u64);
+        let ran = ran.lock().unwrap().clone();
+        assert!(
+            ran.iter()
+                .any(|c| c.starts_with("/usr/sbin/qm set 107 --scsi0")
+                    && c.contains("import-from=/var/lib/vz/template/iso/lnvps-migrate-vm7.raw")),
+            "{ran:?}"
+        );
+        assert_eq!(
+            ran.last().map(String::as_str),
+            Some("rm -f '/var/lib/vz/template/iso/lnvps-migrate-vm7.raw'"),
+            "the staged copy is removed"
+        );
+
+        assert!(
+            client
+                .create_vm_from_disk(
+                    &info,
+                    DiskStream {
+                        size: 1,
+                        format: DiskFormat::Raw,
+                        reader: Box::pin(std::io::Cursor::new(vec![0u8])),
+                    },
+                )
+                .await
+                .is_err(),
+            "an existing vmid is never imported over"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_snippet_storage_lookup_is_memoised() -> Result<()> {
         let server = MockServer::start().await;

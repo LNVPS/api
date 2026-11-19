@@ -57,6 +57,14 @@ impl From<EncryptedString> for String {
     }
 }
 
+impl std::ops::Deref for EncryptedString {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.plaintext
+    }
+}
+
 impl AsRef<str> for EncryptedString {
     fn as_ref(&self) -> &str {
         &self.plaintext

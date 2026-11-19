@@ -31,22 +31,24 @@ The working tree initially had a staged, unfinished merge of upstream
 `docs/managed-app-examples.md` and `scripts/app-catalog-test.sh`. No unmerged index
 entries or conflict markers remain in those files. Against the merge's upstream
 parent, staged changes are limited to the AppWeaver catalog, docs and fixture.
-Do not abort/reset the merge or discard its staged work. New release-pin edits
-are initially unstaged so the pre-existing index remains intact.
+The staged work and release-pin updates were preserved in merge commit
+`d1289b99` (`Merge upstream/master and pin AppWeaver 14.27.4`). Its parents are
+the PR head and upstream merge target above.
 
-Upstream master was `2ebee382b5e9edc364ab6ac5c684ceb3e8caa89e` when inspected,
-42 commits beyond the merge target. Recheck before integration. A newer upstream
-merge cannot begin until this merge is concluded; committing/pushing requires an
-explicit user request. Existing staged whitespace issues in `lnvps_db/src/mysql.rs`
-are outside this catalog change.
+Fetched upstream master at `2ebee382b5e9edc364ab6ac5c684ceb3e8caa89e`, 42 commits
+beyond the original merge target, and merged with `--no-commit --no-ff`. The merge
+is conflict-free and staged, awaiting commit authorization. The existing progress
+update in this work file was preserved. Against that upstream commit, the candidate
+PR diff is limited to four files: catalog, AppWeaver docs, fixture and this plan.
 
 ## Checklist
 
 - [x] Verify 14.27.4 digest, platform, embedded SHA, CI revision and image entrypoint.
 - [x] Review latest PR feedback and existing staged conflict resolutions.
 - [x] Update catalog pin and matching docs; validate declarations and rendering.
-- [ ] Conclude the current merge, preserving all staged work, when authorized to commit.
-- [ ] Integrate current upstream master and review the resulting AppWeaver-only PR diff.
+- [x] Conclude the current merge, preserving all staged work (commit `d1289b99`).
+- [x] Fetch/prepare the current upstream merge and review its AppWeaver-only candidate diff.
+- [ ] Commit the prepared upstream merge when authorized.
 - [ ] Verify disposable-container first boot, restart, owner authentication and health.
 - [ ] Verify quiesced backup/restore preserves keys, SQLite sidecars, installed apps,
       FIPS identity/pairings/relay settings and HOME/XDG credentials.
@@ -72,4 +74,10 @@ shared operator behavior. No VPS/runtime success is implied by static validation
   whole-merge whitespace check reports four unrelated trailing-whitespace lines
   in `lnvps_db/src/mysql.rs`; those were left intact.
 - No tests, application startup, VPS deployment or authenticated browser checks
-  were run. Commits, push and PR edits remain pending explicit requests.
+  were run. The original merge was committed with user authorization; the latest
+  upstream merge commit, push and PR edits remain pending explicit requests.
+- After merging upstream `2ebee382`, repeated catalog validation, rendering and
+  Docker Compose configuration validation: all passed. `bash -n` passed for
+  `scripts/app-catalog-test.sh`. Both the current staged merge and its candidate
+  AppWeaver-only diff against upstream pass `git diff --check`; no unmerged index
+  entries remain. These are static checks, not application/runtime verification.

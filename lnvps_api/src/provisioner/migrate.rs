@@ -10,7 +10,7 @@
 //! is aimed at the host in that column, so a stale value silently points all of
 //! them at a node that no longer has the VM.
 
-use crate::host::{MigrateVmRequest, VmResources, get_host_client};
+use crate::host::{MigrateVmRequest, VmResources};
 use crate::provisioner::{UNASSIGNED_MAC, VmProvisioner};
 use anyhow::{Result, anyhow, bail};
 use lnvps_api_common::{
@@ -20,6 +20,9 @@ use lnvps_db::{Vm, VmHost, VmHostDisk};
 use log::{info, warn};
 use serde_json::json;
 use std::collections::HashMap;
+
+mod adopt;
+pub use adopt::*;
 
 /// Where a migration should put the VM on the destination host.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +262,39 @@ pub fn plan_host_drift(
     (drift, ambiguous)
 }
 
+pub struct MigrationFence {
+    pub in_flight: std::collections::HashSet<u64>,
+    pub retained: std::collections::HashSet<(u64, u64)>,
+}
+
+impl MigrationFence {
+    pub fn hide_retained(&self, observed: &mut HashMap<u64, Vec<HostVmSpec>>) {
+        for (host_id, specs) in observed.iter_mut() {
+            specs.retain(|s| {
+                s.mapped_vm_id
+                    .is_none_or(|vm| !self.retained.contains(&(*host_id, vm)))
+            });
+        }
+    }
+}
+
+impl VmProvisioner {
+    pub async fn migration_fence(&self) -> Result<MigrationFence> {
+        let mut fence = MigrationFence {
+            in_flight: Default::default(),
+            retained: Default::default(),
+        };
+        for m in self.get_db().list_open_vm_migrations().await? {
+            if m.state == lnvps_db::VmMigrationState::InProgress {
+                fence.in_flight.insert(m.vm_id);
+            } else if m.flipped && m.source_retained {
+                fence.retained.insert((m.source_host_id, m.vm_id));
+            }
+        }
+        Ok(fence)
+    }
+}
+
 impl VmProvisioner {
     /// Migrate a VM to another host.
     ///
@@ -299,7 +335,7 @@ impl VmProvisioner {
             &capacity,
         )?;
 
-        let source_client = get_host_client(self.db(), &source_host, self.config()).await?;
+        let source_client = self.host_client(&source_host).await?;
         let was_running = matches!(
             source_client.get_vm_state(&vm).await.map(|s| s.state),
             Ok(VmRunningStates::Running)
@@ -339,7 +375,7 @@ impl VmProvisioner {
 
         // Start it again where it now lives; an online migration never stopped.
         if was_running && !live {
-            let target_client = get_host_client(self.db(), &target_host, self.config()).await?;
+            let target_client = self.host_client(&target_host).await?;
             if let Err(e) = target_client.start_vm(&vm).await {
                 warn!(
                     "VM {} migrated to host {} but failed to start: {}",
@@ -389,7 +425,7 @@ impl VmProvisioner {
         let mut observed: HashMap<u64, Vec<HostVmSpec>> = HashMap::new();
         let mut unreachable = 0;
         for host in &hosts {
-            let client = match get_host_client(self.db(), host, self.config()).await {
+            let client = match self.host_client(host).await {
                 Ok(c) => c,
                 Err(e) => {
                     warn!("Skipping host {} in placement check: {}", host.id, e);
@@ -423,7 +459,12 @@ impl VmProvisioner {
     /// customer with two copies of their machine (or, when the ids collide as
     /// they do on Proxmox, a failed spawn whose rollback damages the live VM).
     pub async fn locate_vm(&self, vm: &Vm) -> Result<VmLocation> {
-        let (observed, unreachable) = self.observe_hosts().await?;
+        let (mut observed, unreachable) = self.observe_hosts().await?;
+        let fence = self.migration_fence().await?;
+        if fence.in_flight.contains(&vm.id) {
+            return Ok(VmLocation::Unknown);
+        }
+        fence.hide_retained(&mut observed);
 
         let mut found: Vec<(u64, Option<String>)> = observed
             .iter()
@@ -467,7 +508,9 @@ impl VmProvisioner {
     /// subsequent lifecycle operation for that VM until someone notices.
     pub async fn reconcile_vm_hosts(&self) -> Result<Vec<VmHostDrift>> {
         let db = self.get_db();
-        let (observed, _) = self.observe_hosts().await?;
+        let (mut observed, _) = self.observe_hosts().await?;
+        let fence = self.migration_fence().await?;
+        fence.hide_retained(&mut observed);
 
         self.heal_unassigned_macs(&observed).await;
 
@@ -486,7 +529,7 @@ impl VmProvisioner {
             .list_vms()
             .await?
             .into_iter()
-            .filter(|v| !v.deleted)
+            .filter(|v| !v.deleted && !fence.in_flight.contains(&v.id))
             .map(|v| {
                 (
                     v.id,
@@ -1423,6 +1466,64 @@ mod tests {
         DummyVmHost::set_host_vms_for(1, vec![spec(vm_id, "mock-disk")]).await;
         provisioner.reconcile_vm_hosts().await.expect("reconcile");
         assert_eq!(db.get_vm(vm_id).await.expect("vm").disk_id, 1);
+        DummyVmHost::clear_host_vms().await;
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_ignores_vms_mid_migration_and_retained_source_copies() {
+        let _serial = serial().await;
+        let db = Arc::new(MockDb::default());
+        add_second_host(&db).await;
+        let moving = add_vm(&db).await;
+        let moved = add_vm(&db).await;
+        db.update_vm_host(moved, 2, 2).await.unwrap();
+
+        db.insert_vm_migration(&lnvps_db::VmMigration {
+            vm_id: moving,
+            source_host_id: 1,
+            target_host_id: 2,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        db.insert_vm_migration(&lnvps_db::VmMigration {
+            vm_id: moved,
+            source_host_id: 1,
+            target_host_id: 2,
+            state: lnvps_db::VmMigrationState::Completed,
+            flipped: true,
+            source_retained: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        DummyVmHost::clear_host_vms().await;
+        DummyVmHost::set_host_vms_for(1, vec![spec(moved, "mock-disk")]).await;
+        DummyVmHost::set_host_vms_for(
+            2,
+            vec![spec(moving, "mock-disk-2"), spec(moved, "mock-disk-2")],
+        )
+        .await;
+
+        let provisioner = VmProvisioner::new(mock_settings(), db.clone());
+        let drifts = provisioner.reconcile_vm_hosts().await.expect("reconcile");
+        assert!(drifts.is_empty(), "{drifts:?}");
+        assert_eq!(db.get_vm(moving).await.unwrap().host_id, 1);
+        assert_eq!(db.get_vm(moved).await.unwrap().host_id, 2);
+
+        let vm = db.get_vm(moved).await.unwrap();
+        assert_eq!(
+            provisioner.locate_vm(&vm).await.expect("locate"),
+            VmLocation::Host(2),
+            "the stopped source copy is not a second live VM"
+        );
+        let vm = db.get_vm(moving).await.unwrap();
+        assert_eq!(
+            provisioner.locate_vm(&vm).await.expect("locate"),
+            VmLocation::Unknown,
+            "a VM mid-migration is never rebuilt or re-pointed"
+        );
         DummyVmHost::clear_host_vms().await;
     }
 

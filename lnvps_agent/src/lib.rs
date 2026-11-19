@@ -2,6 +2,7 @@ pub mod agent;
 pub mod channel;
 pub mod conversation;
 pub mod diag;
+pub mod escalation;
 pub mod identity;
 pub mod resolve;
 pub mod session;

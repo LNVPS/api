@@ -244,6 +244,44 @@ impl VolumeXML {
     }
 }
 
+pub fn download_volume(
+    conn: &Connect,
+    vol: &StorageVol,
+    size: u64,
+    tx: &tokio::sync::mpsc::Sender<std::io::Result<Vec<u8>>>,
+) -> OpResult<()> {
+    let stream = Stream::new(conn, 0).map_err(|e| map_virt_error("new_stream", e))?;
+    vol.download(&stream, 0, size, 0)
+        .map_err(|e| map_virt_error("download_storage_vol", e))?;
+    let mut sent = 0u64;
+    loop {
+        let mut buf = vec![0u8; UPLOAD_CHUNK];
+        let n = stream
+            .recv(&mut buf)
+            .map_err(|e| map_virt_error("stream_recv", e))?;
+        if n <= 0 {
+            break;
+        }
+        buf.truncate(n as usize);
+        sent += n as u64;
+        if tx.blocking_send(Ok(buf)).is_err() {
+            let _ = stream.abort();
+            return Err(OpError::Fatal(anyhow!(
+                "disk export receiver went away after {sent} bytes"
+            )));
+        }
+    }
+    stream
+        .finish()
+        .map_err(|e| map_virt_error("stream_finish", e))?;
+    if sent != size {
+        return Err(OpError::Fatal(anyhow!(
+            "volume download ended after {sent} of {size} bytes"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

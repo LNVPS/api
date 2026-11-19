@@ -11,6 +11,7 @@ mod access_policies;
 mod activity;
 mod agent;
 mod apps;
+mod audit_log;
 mod auth;
 mod bulk_message;
 pub mod chain;
@@ -18,6 +19,7 @@ mod companies;
 mod cost_plans;
 mod costs;
 mod credit;
+mod credit_rebook;
 mod custom_pricing;
 mod custom_templates;
 mod discounts;
@@ -40,6 +42,8 @@ mod roles;
 mod routers;
 mod subscriptions;
 mod swap_orders;
+#[cfg(test)]
+mod test_support;
 mod tunnel_pools;
 mod user_payment_methods;
 mod users;
@@ -85,6 +89,7 @@ pub fn admin_router(
         .merge(activity::router())
         .merge(users::router())
         .merge(agent::router())
+        .merge(audit_log::router())
         .merge(passkeys::router())
         .merge(bulk_message::router())
         .merge(vms::router())
@@ -96,6 +101,7 @@ pub fn admin_router(
         .merge(companies::router())
         .merge(abuse::router())
         .merge(credit::router())
+        .merge(credit_rebook::router())
         .merge(swap_orders::router())
         .merge(cost_plans::router())
         .merge(costs::router())

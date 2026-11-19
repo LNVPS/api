@@ -557,13 +557,13 @@ impl From<lnvps_db::User> for AdminUserInfo {
             contact_nip17: user.contact_nip17,
             contact_email: user.contact_email,
             country_code: user.country_code,
-            billing_name: user.billing_name,
-            billing_address_1: user.billing_address_1,
-            billing_address_2: user.billing_address_2,
-            billing_city: user.billing_city,
-            billing_state: user.billing_state,
-            billing_postcode: user.billing_postcode,
-            billing_tax_id: user.billing_tax_id,
+            billing_name: user.billing_name.map(|v| v.as_str().to_string()),
+            billing_address_1: user.billing_address_1.map(|v| v.as_str().to_string()),
+            billing_address_2: user.billing_address_2.map(|v| v.as_str().to_string()),
+            billing_city: user.billing_city.map(|v| v.as_str().to_string()),
+            billing_state: user.billing_state.map(|v| v.as_str().to_string()),
+            billing_postcode: user.billing_postcode.map(|v| v.as_str().to_string()),
+            billing_tax_id: user.billing_tax_id.map(|v| v.as_str().to_string()),
             geo_country_code: user.geo_country_code,
             geo_ip: user.geo_ip,
             geo_updated: user.geo_updated,
@@ -595,13 +595,25 @@ impl From<lnvps_db::AdminUserInfo> for AdminUserInfo {
             contact_nip17: user.user_info.contact_nip17,
             contact_email: user.user_info.contact_email,
             country_code: user.user_info.country_code,
-            billing_name: user.user_info.billing_name,
-            billing_address_1: user.user_info.billing_address_1,
-            billing_address_2: user.user_info.billing_address_2,
-            billing_city: user.user_info.billing_city,
-            billing_state: user.user_info.billing_state,
-            billing_postcode: user.user_info.billing_postcode,
-            billing_tax_id: user.user_info.billing_tax_id,
+            billing_name: user.user_info.billing_name.map(|v| v.as_str().to_string()),
+            billing_address_1: user
+                .user_info
+                .billing_address_1
+                .map(|v| v.as_str().to_string()),
+            billing_address_2: user
+                .user_info
+                .billing_address_2
+                .map(|v| v.as_str().to_string()),
+            billing_city: user.user_info.billing_city.map(|v| v.as_str().to_string()),
+            billing_state: user.user_info.billing_state.map(|v| v.as_str().to_string()),
+            billing_postcode: user
+                .user_info
+                .billing_postcode
+                .map(|v| v.as_str().to_string()),
+            billing_tax_id: user
+                .user_info
+                .billing_tax_id
+                .map(|v| v.as_str().to_string()),
             geo_country_code: user.user_info.geo_country_code,
             geo_ip: user.user_info.geo_ip,
             geo_updated: user.user_info.geo_updated,
@@ -3411,6 +3423,7 @@ pub enum AdminVmHistoryActionType {
     SnapshotCreated,
     SnapshotRestored,
     SnapshotDeleted,
+    MigrationProgress,
 }
 
 impl From<VmHistoryActionType> for AdminVmHistoryActionType {
@@ -3435,6 +3448,7 @@ impl From<VmHistoryActionType> for AdminVmHistoryActionType {
             VmHistoryActionType::SnapshotCreated => AdminVmHistoryActionType::SnapshotCreated,
             VmHistoryActionType::SnapshotRestored => AdminVmHistoryActionType::SnapshotRestored,
             VmHistoryActionType::SnapshotDeleted => AdminVmHistoryActionType::SnapshotDeleted,
+            VmHistoryActionType::MigrationProgress => AdminVmHistoryActionType::MigrationProgress,
         }
     }
 }

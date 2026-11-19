@@ -142,6 +142,8 @@ const NEVER_PAID_SUBSCRIPTION_TTL: TimeDelta = TimeDelta::hours(24);
 /// still missing keys.
 const HOST_KEY_SCAN_RETRY_SECS: u64 = 3600;
 
+const HOST_KEY_NEW_VM_WINDOW: TimeDelta = TimeDelta::minutes(30);
+
 /// Key holding when a VM's host keys were last scanned.
 fn host_key_attempt_key(vm_id: u64) -> String {
     format!("worker-host-keys-attempt-{vm_id}")
@@ -1799,7 +1801,9 @@ impl Worker {
         // check for the life of the VM. One attempt per hour still captures
         // the keys within an hour of the guest becoming reachable.
         let attempt_key = host_key_attempt_key(vm.id);
-        if let Ok(Some(v)) = self.kv.get(&attempt_key).await
+        let fresh = captured.is_empty() && self.vm_booted_recently(vm.id).await;
+        if !fresh
+            && let Ok(Some(v)) = self.kv.get(&attempt_key).await
             && v.len() == 8
         {
             let last = u64::from_le_bytes(v.as_slice().try_into().unwrap_or_default());
@@ -1846,6 +1850,24 @@ impl Worker {
         if let Err(e) = self.db.set_vm_ssh_host_keys(vm.id, Some(&merged)).await {
             warn!("[host-keys] vm {}: failed to store keys: {}", vm.id, e);
         }
+    }
+
+    async fn vm_booted_recently(&self, vm_id: u64) -> bool {
+        let cutoff = Utc::now() - HOST_KEY_NEW_VM_WINDOW;
+        self.db
+            .list_vm_history(vm_id)
+            .await
+            .map(|history| {
+                history.iter().any(|h| {
+                    matches!(
+                        h.action_type,
+                        VmHistoryActionType::Created
+                            | VmHistoryActionType::Started
+                            | VmHistoryActionType::Reinstalled
+                    ) && h.timestamp >= cutoff
+                })
+            })
+            .unwrap_or(false)
     }
 
     /// The address to scan a VM's host keys on: its first assigned IP, v4
@@ -2754,6 +2776,97 @@ impl Worker {
             .await
         {
             warn!("Failed to send admin notification: {}", e);
+        }
+    }
+
+    async fn after_cross_host_migration(
+        &self,
+        source_host_id: u64,
+        outcome: &crate::provisioner::MigrationOutcome,
+    ) {
+        let vm = &outcome.vm;
+        for host_id in [source_host_id, vm.host_id] {
+            let Ok(host) = self.db.get_host(host_id).await else {
+                continue;
+            };
+            let Some(node_id) = host.marketplace_node_id else {
+                continue;
+            };
+            let pool = async {
+                let node = self.db.get_marketplace_node(node_id).await?;
+                let tunnel = self
+                    .db
+                    .get_tunnel(node.tunnel_id.context("node has no tunnel")?)
+                    .await?;
+                tunnel.pool_id.context("tunnel has no pool")
+            }
+            .await;
+            match pool {
+                Ok(pool_id) => {
+                    if let Err(e) = self
+                        .work_commander
+                        .send(WorkJob::SyncTunnelPool { pool_id })
+                        .await
+                    {
+                        warn!("Failed to queue tunnel route refresh for pool {pool_id}: {e}");
+                    }
+                }
+                Err(e) => warn!("No tunnel routes to refresh for node {node_id}: {e:#}"),
+            }
+        }
+
+        if !outcome.reassigned.is_empty() {
+            let lines = outcome
+                .reassigned
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{} is now {}",
+                        r.old_ip,
+                        r.new_ip.as_deref().unwrap_or("removed")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.queue_notification(
+                vm.user_id,
+                format!(
+                    "Your VM #{} has been moved to a new location and its IP addresses changed:\n\n{}\n\n\
+                     Update any DNS records or firewall rules that point at the old addresses.",
+                    vm.id, lines
+                ),
+                Some(format!("[VM{}] IP addresses changed", vm.id)),
+            )
+            .await;
+        }
+
+        let mut notes = Vec::new();
+        if let Some(p) = &outcome.needs_attention {
+            notes.push(format!("Needs attention: {p}"));
+        }
+        if outcome.source_retained {
+            notes.push(format!(
+                "The stopped copy on host {source_host_id} is kept and must be deleted by hand once the VM is confirmed healthy"
+            ));
+        }
+        if let Ok(src) = self.db.get_host(source_host_id).await
+            && src.marketplace_node_id.is_some()
+        {
+            notes.push(format!(
+                "Host {source_host_id} is a marketplace node: its operator no longer earns a share of this VM"
+            ));
+        }
+        if outcome.migration_id.is_some() && !notes.is_empty() {
+            self.queue_admin_notification(
+                format!(
+                    "VM {} moved to host {}.\n\n{}",
+                    vm.id,
+                    vm.host_id,
+                    notes.join("\n")
+                ),
+                Some(format!("VM {} Migration", vm.id)),
+            )
+            .await;
         }
     }
 
@@ -3693,6 +3806,13 @@ impl Worker {
                 if ips > 0 {
                     info!("Cleared {} expired user IP addresses", ips);
                 }
+                let audit_ips = self
+                    .db
+                    .truncate_audit_ips(lnvps_db::audit::IP_RETENTION_DAYS)
+                    .await?;
+                if audit_ips > 0 {
+                    info!("Truncated {} audit log IP addresses", audit_ips);
+                }
                 let cases = self.db.purge_abuse_cases().await?;
                 if cases > 0 {
                     info!("Purged {} expired abuse cases", cases);
@@ -4439,6 +4559,7 @@ impl Worker {
                 live,
                 admin_user_id,
                 reason,
+                options,
             } => {
                 info!(
                     "Migrating VM {} to host {} ({})",
@@ -4447,11 +4568,13 @@ impl Worker {
                     if *live { "online" } else { "offline" }
                 );
                 let provisioner = self.subscription_handler.vm_provisioner();
+                let source_host_id = self.db.get_vm(*vm_id).await?.host_id;
                 match provisioner
-                    .migrate_vm(*vm_id, *target_host_id, *live, *admin_user_id)
+                    .migrate_vm_with(*vm_id, *target_host_id, *live, options, *admin_user_id)
                     .await
                 {
-                    Ok(vm) => {
+                    Ok(outcome) => {
+                        let vm = outcome.vm.clone();
                         // The destination enforces its own firewall/ipset state,
                         // so re-apply the ruleset rather than assuming it came
                         // across with the VM.
@@ -4462,10 +4585,17 @@ impl Worker {
                         {
                             warn!("Failed to queue firewall re-apply for VM {}: {}", vm.id, e);
                         }
+                        self.after_cross_host_migration(source_host_id, &outcome)
+                            .await;
                         return Ok(Some(format!(
-                            "VM {} migrated to host {}{}",
+                            "VM {} migrated to host {}{}{}",
                             vm.id,
                             target_host_id,
+                            outcome
+                                .needs_attention
+                                .as_ref()
+                                .map(|p| format!(", needs attention: {p}"))
+                                .unwrap_or_default(),
                             reason
                                 .as_ref()
                                 .map(|r| format!(" ({})", r))
@@ -5775,6 +5905,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn purge_job_truncates_old_audit_ips_and_keeps_the_chain_valid() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        {
+            let mut log = db.audit_log.lock().await;
+            for (i, (ip, age)) in [("203.0.113.77", 120i64), ("198.51.100.9", 5)]
+                .into_iter()
+                .enumerate()
+            {
+                let prev = log
+                    .last()
+                    .map(|e| e.hash.clone())
+                    .unwrap_or_else(|| lnvps_db::audit::GENESIS_HASH.to_string());
+                let mut entry = lnvps_db::NewAuditEntry::new("user", Some(1), "auth.login");
+                entry.ip = Some(ip.to_string());
+                log.push(lnvps_db::AuditEntry::seal(
+                    i as u64 + 1,
+                    (Utc::now() - TimeDelta::days(age)).timestamp(),
+                    &prev,
+                    entry,
+                ));
+            }
+        }
+        let worker = setup_worker(db.clone()).await?;
+        worker.try_job(&WorkJob::PurgeExpiredRecords).await?;
+        let rows = db.audit_range(0, 10).await?;
+        assert_eq!(rows[0].ip.as_deref(), Some("203.0.113.0"));
+        assert_eq!(rows[1].ip.as_deref(), Some("198.51.100.9"));
+        assert!(lnvps_db::audit::verify_chain(&rows, None).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn purge_job_also_drops_abuse_cases_a_year_after_closing() -> Result<()> {
         let db = Arc::new(MockDb::default());
         {
@@ -6807,6 +6969,95 @@ mod tests {
         Ok(())
     }
 
+    async fn host_key_retry_stamp_after_pass(
+        age_of_vm: Option<TimeDelta>,
+        action: VmHistoryActionType,
+    ) -> Result<(u64, u64)> {
+        let db = Arc::new(MockDb::default());
+        db.hosts
+            .lock()
+            .await
+            .get_mut(&1)
+            .expect("mock host")
+            .ssh_key = Some(lnvps_db::EncryptedString::from("not-a-usable-key"));
+        let (vm_id, _) = add_vm_with_subscription(&db, Utc::now(), true).await?;
+        db.insert_vm_ip_assignment(&VmIpAssignment {
+            vm_id,
+            ip_range_id: 1,
+            ip: "10.0.0.5".to_string(),
+            ..Default::default()
+        })
+        .await?;
+        if let Some(age) = age_of_vm {
+            db.insert_vm_history(&lnvps_db::VmHistory {
+                id: 0,
+                vm_id,
+                action_type: action,
+                timestamp: Utc::now() - age,
+                initiated_by_user: None,
+                previous_state: None,
+                new_state: None,
+                metadata: None,
+                description: None,
+            })
+            .await?;
+        }
+        let worker = setup_worker(db.clone()).await?;
+        worker
+            .vm_state_cache
+            .set_state(
+                vm_id,
+                VmRunningState {
+                    state: VmRunningStates::Running,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let earlier = (Utc::now().timestamp() - 60) as u64;
+        worker
+            .kv
+            .store(&host_key_attempt_key(vm_id), &earlier.to_le_bytes())
+            .await?;
+
+        let vm = db.get_vm(vm_id).await?;
+        let host = db.get_host(vm.host_id).await?;
+        worker
+            .capture_vm_ssh_host_keys(&vm, &host, &mut HostSshSession::default())
+            .await;
+
+        let stamp = worker.kv.get(&host_key_attempt_key(vm_id)).await?.unwrap();
+        Ok((earlier, u64::from_le_bytes(stamp.as_slice().try_into()?)))
+    }
+
+    #[tokio::test]
+    async fn test_new_vm_without_host_keys_is_rescanned_every_pass() -> Result<()> {
+        for action in [
+            VmHistoryActionType::Created,
+            VmHistoryActionType::Reinstalled,
+        ] {
+            let (earlier, stamp) =
+                host_key_retry_stamp_after_pass(Some(TimeDelta::minutes(2)), action).await?;
+            assert!(
+                stamp > earlier,
+                "a VM that booted minutes ago must be rescanned despite a scan a minute ago"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_old_vm_without_host_keys_backs_off_hourly() -> Result<()> {
+        for age in [None, Some(TimeDelta::hours(2))] {
+            let (earlier, stamp) =
+                host_key_retry_stamp_after_pass(age, VmHistoryActionType::Created).await?;
+            assert_eq!(
+                stamp, earlier,
+                "an old VM must wait out the hourly back-off"
+            );
+        }
+        Ok(())
+    }
+
     /// Regression: unassigning an IP from a deleted VM must not queue a `ConfigureVm` job.
     ///
     /// A deleted VM no longer exists on the host, so reconfiguring it always
@@ -7401,6 +7652,53 @@ mod tests {
     /// detected — not on every CheckSubscriptions cycle. Previously the expired branch had
     /// no edge-trigger guard and re-ran every ~30s, re-stopping the VM and spamming
     /// notifications in an endless loop.
+    #[tokio::test]
+    async fn reassigned_addresses_are_told_to_the_owner_and_admins() -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let created = Utc::now();
+        let (vm_id, _) = add_vm_with_subscription(&db, created, true).await?;
+        let worker = setup_worker_with_delete_after(db.clone(), 30).await?;
+        let vm = db.get_vm(vm_id).await?;
+        let outcome = crate::provisioner::MigrationOutcome {
+            vm: vm.clone(),
+            migration_id: Some(1),
+            method: lnvps_api_common::MigrationMethod::CopyAndAdopt,
+            reassigned: vec![crate::provisioner::ReassignedIp {
+                old_ip: "10.0.0.5".to_string(),
+                new_ip: Some("10.9.0.5".to_string()),
+            }],
+            source_retained: true,
+            needs_attention: None,
+        };
+        worker
+            .after_cross_host_migration(vm.host_id, &outcome)
+            .await;
+
+        let mut user_msgs = Vec::new();
+        let mut admin_msgs = Vec::new();
+        while let Ok(Ok(jobs)) = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            worker.work_commander.recv(),
+        )
+        .await
+        {
+            for j in jobs {
+                match j.job {
+                    WorkJob::SendNotification {
+                        user_id, message, ..
+                    } => user_msgs.push((user_id, message)),
+                    WorkJob::SendAdminNotification { message, .. } => admin_msgs.push(message),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(user_msgs.len(), 1);
+        assert_eq!(user_msgs[0].0, vm.user_id);
+        assert!(user_msgs[0].1.contains("10.0.0.5 is now 10.9.0.5"));
+        assert!(admin_msgs.iter().any(|m| m.contains("deleted by hand")));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_expired_subscription_notifies_once_within_grace_period() -> Result<()> {
         let db = Arc::new(MockDb::default());
@@ -8804,7 +9102,7 @@ mod tests {
             let mut users = db.users.lock().await;
             let u = users.get_mut(&reachable).unwrap();
             u.contact_nip17 = true;
-            u.billing_name = Some("Nostr Owner".to_string());
+            u.billing_name = Some("Nostr Owner".into());
             users.get_mut(&other_host_owner).unwrap().contact_nip17 = true;
         }
         {

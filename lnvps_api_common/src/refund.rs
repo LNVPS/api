@@ -13,7 +13,39 @@
 use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use lnvps_db::{SubscriptionPayment, SubscriptionPaymentType};
+use payments_rs::currency::{Currency, CurrencyAmount};
 use sha2::{Digest, Sha256};
+use std::str::FromStr;
+
+pub fn value_in_billing_currency(
+    amount: u64,
+    payment_currency: &str,
+    billing_currency: &str,
+    rate: f32,
+) -> Option<u64> {
+    if payment_currency == billing_currency {
+        return Some(amount);
+    }
+    let from = Currency::from_str(payment_currency).ok()?;
+    let to = Currency::from_str(billing_currency).ok()?;
+    if from.base() == to.base() {
+        return Some(amount);
+    }
+    if !(rate.is_finite() && rate > 0.0) {
+        return None;
+    }
+    let fiat = match (from, to) {
+        (Currency::BTC, c) | (c, Currency::BTC) if c != Currency::BTC => c,
+        _ => return None,
+    };
+    crate::TickerRate {
+        ticker: crate::Ticker(Currency::BTC, fiat),
+        rate,
+    }
+    .convert_into(CurrencyAmount::from_u64(from, amount), 1, to)
+    .ok()
+    .map(|c| c.value())
+}
 
 /// Derive the id of a refund row from what it records.
 ///

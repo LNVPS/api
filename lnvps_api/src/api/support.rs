@@ -50,6 +50,25 @@ use lnvps_db::{AdminAction, AdminResource, LNVpsDb};
 use crate::api::RouterState;
 use crate::settings::AgentConfig;
 
+fn support_escalation(
+    settings: &crate::settings::Settings,
+    config: &AgentConfig,
+) -> Option<lnvps_agent::escalation::Escalation> {
+    let smtp = settings.smtp.as_ref()?;
+    let from = smtp.from.clone().unwrap_or_else(|| smtp.username.clone());
+    let sink = lnvps_agent::escalation::SmtpMailSink::new(
+        smtp.server.clone(),
+        smtp.username.clone(),
+        smtp.password.clone(),
+        from.clone(),
+    );
+    Some(lnvps_agent::escalation::Escalation::new(
+        Arc::new(sink),
+        config.support_email.clone(),
+        &from,
+    ))
+}
+
 /// Whether `user_id` may see the agent's internal tool activity.
 ///
 /// Gated on `users:view` — the same permission the admin API requires to look
@@ -376,11 +395,13 @@ pub(crate) async fn v1_support_chat(
             }
         };
 
-        let executor: Arc<dyn ToolExecutor> = Arc::new(
-            DbToolExecutor::new(this.db.clone(), uid)
-                .with_power_actions(this.settings.provisioner.clone(), this.work_sender.clone())
-                .with_exchange_rates(this.rates.clone()),
-        );
+        let mut customer_executor = DbToolExecutor::new(this.db.clone(), uid)
+            .with_power_actions(this.settings.provisioner.clone(), this.work_sender.clone())
+            .with_exchange_rates(this.rates.clone());
+        if let Some(escalation) = support_escalation(&this.settings, &config) {
+            customer_executor = customer_executor.with_escalation(escalation);
+        }
+        let executor: Arc<dyn ToolExecutor> = Arc::new(customer_executor);
         (
             SenderIdentity::Pubkey(hex::encode(pubkey)),
             // A NIP-98 signature proves control of the key, and `upsert_user`
@@ -706,6 +727,7 @@ mod tests {
                 crate::settings::default_agent_anonymous_connections_per_hour(),
             anonymous_messages_per_hour: crate::settings::default_agent_anonymous_messages_per_hour(
             ),
+            support_email: crate::settings::default_agent_support_email(),
         };
 
         // No agent: 404, so "non-404 means chat exists" stays true.

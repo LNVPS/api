@@ -33,6 +33,7 @@ fn analytics_viewer() -> AdminAuth {
         .into_iter()
         .collect(),
         nip98_auth: None,
+        step_up: false,
     }
 }
 

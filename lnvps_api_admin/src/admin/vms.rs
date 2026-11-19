@@ -13,13 +13,14 @@ use chrono::{DateTime, Days, Utc};
 use lightning_invoice::Bolt11Invoice;
 use lnvps_api_common::{
     ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, ApiVmTrafficSummary,
-    PageQuery, PricingEngine, RefundEvidence, UpgradeConfig, VatClient, VmHistoryLogger,
-    VmRunningState, VmStateCache, WorkJob, build_refund_row, gross_charged, quota_period,
-    refundable_remaining, refunded_gross, resolve_traffic_range,
+    IpPolicy, MigrationOptions, MigrationPlan, PageQuery, PricingEngine, RefundEvidence,
+    UpgradeConfig, VatClient, VmHistoryLogger, VmRunningState, VmStateCache, WorkJob,
+    build_refund_row, gross_charged, load_migration_plan, quota_period, refundable_remaining,
+    refunded_gross, resolve_traffic_range,
 };
 use lnvps_db::{AdminAction, AdminResource, SubscriptionPaymentType};
 use log::{error, info};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 pub fn router() -> Router<RouterState> {
@@ -464,6 +465,7 @@ struct AdminTransferVmRequest {
 /// Transfer a VM to another user account
 async fn admin_transfer_vm(
     auth: AdminAuth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Json(req): Json<AdminTransferVmRequest>,
@@ -477,6 +479,17 @@ async fn admin_transfer_vm(
     if vm.deleted {
         return Err(ApiError::conflict("Cannot transfer a deleted VM"));
     }
+
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("admin", Some(auth.user_id), "admin.vm.transfer")
+                .auth("nip98", None)
+                .target("vm", id),
+            &client,
+        ),
+    )
+    .await?;
 
     let old_user_id = vm.user_id;
 
@@ -520,6 +533,34 @@ struct AdminMigrateVmRequest {
     #[serde(default)]
     live: bool,
     reason: Option<String>,
+    #[serde(default)]
+    ip_policy: IpPolicy,
+    #[serde(default)]
+    keep_source: Option<bool>,
+    #[serde(default)]
+    target_disk_id: Option<u64>,
+    #[serde(default)]
+    timeout_secs_per_gb: Option<u64>,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+impl AdminMigrateVmRequest {
+    fn options(&self) -> MigrationOptions {
+        MigrationOptions {
+            ip_policy: self.ip_policy,
+            keep_source: self.keep_source.unwrap_or(true),
+            target_disk_id: self.target_disk_id,
+            timeout_secs_per_gb: self.timeout_secs_per_gb,
+        }
+    }
+}
+
+#[derive(Serialize, Debug)]
+#[serde(untagged)]
+enum AdminMigrateVmResponse {
+    Queued { job_id: String, plan: MigrationPlan },
+    DryRun { dry_run: bool, plan: MigrationPlan },
 }
 
 /// Migrate a VM to another host (issue #66)
@@ -533,7 +574,7 @@ async fn admin_migrate_vm(
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     Json(req): Json<AdminMigrateVmRequest>,
-) -> ApiResult<JobResponse> {
+) -> ApiResult<AdminMigrateVmResponse> {
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
 
     let vm = this.db.get_vm(id).await?;
@@ -547,8 +588,23 @@ async fn admin_migrate_vm(
     // Fail an unknown/disabled host here rather than in a background job the
     // caller has to go looking for.
     let target = this.db.get_host(req.target_host_id).await?;
-    if !target.enabled {
+    if !target.enabled && !req.dry_run {
         return Err(ApiError::conflict("Target host is disabled"));
+    }
+
+    let options = req.options();
+    let plan = load_migration_plan(&this.db, id, req.target_host_id, &options).await?;
+    if req.dry_run {
+        return ApiData::ok(AdminMigrateVmResponse::DryRun {
+            dry_run: true,
+            plan,
+        });
+    }
+    if !plan.allowed() {
+        return Err(ApiError::conflict(format!(
+            "Migration refused: {}",
+            plan.refusals.join("; ")
+        )));
     }
 
     let job = WorkJob::MigrateVm {
@@ -557,6 +613,7 @@ async fn admin_migrate_vm(
         live: req.live,
         admin_user_id: Some(auth.user_id),
         reason: req.reason,
+        options,
     };
 
     match this.work_commander.send(job).await {
@@ -565,7 +622,10 @@ async fn admin_migrate_vm(
                 "Admin {} queued migration of VM {} to host {} (stream {})",
                 auth.user_id, id, req.target_host_id, stream_id
             );
-            ApiData::ok(JobResponse { job_id: stream_id })
+            ApiData::ok(AdminMigrateVmResponse::Queued {
+                job_id: stream_id,
+                plan,
+            })
         }
         Err(e) => {
             error!("Failed to queue VM migration job: {}", e);
@@ -670,6 +730,7 @@ struct AdminProcessRefundRequest {
 /// Delete a VM
 async fn admin_delete_vm(
     auth: AdminAuth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path(id): Path<u64>,
     req: Json<AdminDeleteVmRequest>,
@@ -681,6 +742,9 @@ async fn admin_delete_vm(
     // is restricted to super-admins. Never-paid VMs are purged automatically by
     // the worker regardless of this flag. Authorize before looking up the VM.
     let purge = req.purge.unwrap_or(false);
+    if purge {
+        auth.require_step_up()?;
+    }
     if purge && !auth.is_super_admin(&this.db).await? {
         return Err(ApiError::forbidden(
             "Only super admins can permanently purge a VM",
@@ -695,6 +759,26 @@ async fn admin_delete_vm(
     if vm.deleted && !purge {
         return Err(ApiError::conflict("VM is already deleted"));
     }
+
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new(
+                "admin",
+                Some(auth.user_id),
+                if purge {
+                    "admin.vm.purge"
+                } else {
+                    "admin.vm.delete"
+                },
+            )
+            .auth("nip98", None)
+            .target("vm", id)
+            .change(None, req.reason.clone()),
+            &client,
+        ),
+    )
+    .await?;
 
     // Send delete job via Redis stream for distributed processing
     let delete_job = WorkJob::DeleteVm {
@@ -1176,6 +1260,7 @@ async fn admin_calculate_vm_refund(
 /// would report success for something nothing here can do.
 async fn admin_process_vm_refund(
     auth: AdminAuth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path(vm_id): Path<u64>,
     Json(req): Json<AdminProcessRefundRequest>,
@@ -1184,6 +1269,8 @@ async fn admin_process_vm_refund(
     // VM permission alone would let whoever can delete a VM send funds out.
     auth.require_permission(AdminResource::VirtualMachines, AdminAction::Update)?;
     auth.require_permission(AdminResource::Payments, AdminAction::Update)?;
+    auth.require_step_up()?;
+    lnvps_api_common::enforce_account_limit(lnvps_api_common::AccountAction::Refund, auth.user_id).await?;
 
     // Verify VM exists
     let _vm = this.db.get_vm(vm_id).await?;
@@ -1242,6 +1329,25 @@ async fn admin_process_vm_refund(
     if parsed.is_expired() {
         return Err(ApiError::bad_request("Lightning invoice has expired"));
     }
+
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("admin", Some(auth.user_id), "admin.refund")
+                .auth("nip98", None)
+                .target("vm", vm_id)
+                .change(
+                    None,
+                    Some(format!(
+                        "lightning refund {} msat from {:?}",
+                        parsed.amount_milli_satoshis().unwrap_or_default(),
+                        req.refund_from_date
+                    )),
+                ),
+            &client,
+        ),
+    )
+    .await?;
 
     let refund_job = WorkJob::ProcessVmRefund {
         vm_id,
@@ -1302,12 +1408,15 @@ struct AdminRecordRefundRequest {
 /// `GET /refund` computes, from the cost plan) would misstate the return.
 async fn admin_record_payment_refund(
     auth: AdminAuth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path((vm_id, payment_id)): Path<(u64, String)>,
     Json(req): Json<AdminRecordRefundRequest>,
 ) -> ApiResult<AdminVmPaymentInfo> {
     // Money leaving the business is a payments write, like completing one.
     auth.require_permission(AdminResource::Payments, AdminAction::Update)?;
+    auth.require_step_up()?;
+    lnvps_api_common::enforce_account_limit(lnvps_api_common::AccountAction::Refund, auth.user_id).await?;
 
     let vm = this.db.get_vm(vm_id).await?;
     let payment = load_vm_payment(&this, &vm, &payment_id).await?;
@@ -1378,6 +1487,20 @@ async fn admin_record_payment_refund(
         ));
     }
 
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("admin", Some(auth.user_id), "admin.refund")
+                .auth("nip98", None)
+                .target("payment", payment_id.as_str())
+                .change(
+                    None,
+                    Some(format!("{} {} recorded", amount, refund.currency)),
+                ),
+            &client,
+        ),
+    )
+    .await?;
     this.db.insert_subscription_payment(&refund).await?;
 
     info!(
@@ -1874,8 +1997,148 @@ mod tests {
         assert_eq!(sub.user_pubkey, hex::encode([2u8; 32]));
     }
 
-    /// The endpoint itself: permission gate, id cap, de-duplication, and
-    /// unknown ids skipped rather than failing the batch.
+    async fn migrate_fixture() -> (
+        RouterState,
+        std::sync::Arc<lnvps_api_common::ChannelWorkCommander>,
+        u64,
+    ) {
+        use lnvps_api_common::{ChannelWorkCommander, MockDb, MockExchangeRate, VatClient};
+        use lnvps_db::{LNVpsDbBase, VmHost, VmHostDisk, VmHostKind};
+        use std::sync::Arc;
+
+        crate::verbose_errors_for_tests();
+        let db = MockDb::default();
+        db.hosts.lock().await.insert(
+            2,
+            VmHost {
+                id: 2,
+                kind: VmHostKind::Dummy,
+                region_id: 1,
+                name: "mock-host-2".to_string(),
+                cpu: 64,
+                cpu_arch: lnvps_db::CpuArch::X86_64,
+                memory: 512 * lnvps_api_common::GB,
+                enabled: true,
+                load_cpu: 1.0,
+                load_memory: 1.0,
+                load_disk: 1.0,
+                ..Default::default()
+            },
+        );
+        db.host_disks.lock().await.insert(
+            2,
+            VmHostDisk {
+                id: 2,
+                host_id: 2,
+                name: "mock-disk-2".to_string(),
+                size: 10_000 * lnvps_api_common::GB,
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let user_id = db.upsert_user(&[4u8; 32]).await.unwrap();
+        let mut vm = MockDb::mock_vm();
+        vm.user_id = user_id;
+        vm.ssh_key_id = None;
+        let vm_id = db.insert_vm(&vm).await.unwrap();
+        let commander = Arc::new(ChannelWorkCommander::new());
+        let db: Arc<dyn lnvps_db::LNVpsDb> = Arc::new(db);
+        (
+            RouterState {
+                node_control: None,
+                db,
+                work_commander: commander.clone(),
+                feedback: None,
+                vm_state_cache: VmStateCache::new(),
+                exchange: Arc::new(MockExchangeRate::default()),
+                vat: VatClient::new(),
+                chain: None,
+            },
+            commander,
+            vm_id,
+        )
+    }
+
+    fn vm_admin() -> AdminAuth {
+        AdminAuth {
+            user_id: 1,
+            pubkey: vec![1u8; 32],
+            permissions: [crate::admin::model::Permission {
+                resource: AdminResource::VirtualMachines,
+                action: AdminAction::Update,
+            }]
+            .into_iter()
+            .collect(),
+            nip98_auth: None,
+            step_up: false,
+        }
+    }
+
+    async fn queued(commander: &lnvps_api_common::ChannelWorkCommander) -> Vec<WorkJob> {
+        use lnvps_api_common::WorkCommander;
+        match tokio::time::timeout(std::time::Duration::from_millis(50), commander.recv()).await {
+            Ok(Ok(jobs)) => jobs.into_iter().map(|j| j.job).collect(),
+            _ => vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn migrate_dry_run_returns_the_plan_and_queues_nothing() {
+        let (this, commander, vm_id) = migrate_fixture().await;
+        let req: AdminMigrateVmRequest =
+            serde_json::from_str(r#"{"target_host_id":2,"dry_run":true}"#).unwrap();
+        let out = admin_migrate_vm(vm_admin(), State(this.clone()), Path(vm_id), Json(req))
+            .await
+            .unwrap();
+        let body = serde_json::to_value(&out.0.data).unwrap();
+        assert_eq!(body["dry_run"], true);
+        assert_eq!(body["plan"]["method"], "hypervisor");
+        assert_eq!(body["plan"]["target_disk_id"], 2);
+        assert!(body["plan"]["refusals"].as_array().unwrap().is_empty());
+        assert!(body.get("job_id").is_none());
+        assert!(queued(&commander).await.is_empty());
+        assert_eq!(this.db.get_vm(vm_id).await.unwrap().host_id, 1);
+    }
+
+    #[tokio::test]
+    async fn migrate_old_request_shape_still_queues_a_job() {
+        let (this, commander, vm_id) = migrate_fixture().await;
+        let req: AdminMigrateVmRequest =
+            serde_json::from_str(r#"{"target_host_id":2,"live":true,"reason":"drain"}"#).unwrap();
+        let out = admin_migrate_vm(vm_admin(), State(this), Path(vm_id), Json(req))
+            .await
+            .unwrap();
+        let body = serde_json::to_value(&out.0.data).unwrap();
+        assert!(body["job_id"].is_string());
+        let jobs = queued(&commander).await;
+        let [
+            WorkJob::MigrateVm {
+                target_host_id: 2,
+                live: true,
+                options,
+                ..
+            },
+        ] = jobs.as_slice()
+        else {
+            panic!("{jobs:?}");
+        };
+        assert_eq!(*options, MigrationOptions::default());
+    }
+
+    #[tokio::test]
+    async fn migrate_refusals_are_returned_before_queueing() {
+        let (this, commander, vm_id) = migrate_fixture().await;
+        let req: AdminMigrateVmRequest = serde_json::from_str(
+            r#"{"target_host_id":2,"ip_policy":"reassign","keep_source":false,"target_disk_id":99}"#,
+        )
+        .unwrap();
+        let err = admin_migrate_vm(vm_admin(), State(this), Path(vm_id), Json(req))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.error.contains("disk 99"), "{}", err.error);
+        assert!(queued(&commander).await.is_empty());
+    }
     #[tokio::test]
     async fn admin_bulk_vm_status_endpoint() {
         use crate::admin::model::Permission;
@@ -1910,6 +2173,7 @@ mod tests {
             pubkey: vec![1u8; 32],
             permissions: permissions.into_iter().collect(),
             nip98_auth: None,
+            step_up: false,
         };
         let viewer = || {
             auth(vec![Permission {
@@ -2130,6 +2394,7 @@ mod tests {
             .into_iter()
             .collect(),
             nip98_auth: None,
+            step_up: false,
         };
 
         // Happy path: normalised and saved
@@ -2228,6 +2493,7 @@ mod tests {
                     pubkey: vec![1u8; 32],
                     permissions: Default::default(),
                     nip98_auth: None,
+                    step_up: false,
                 },
                 State(this.clone()),
                 Path(vm_id),
@@ -2423,6 +2689,7 @@ mod tests {
             .into_iter()
             .collect(),
             nip98_auth: None,
+            step_up: false,
         };
         let request = |host_id| AdminCreateVmRequest {
             user_id,
@@ -2460,5 +2727,332 @@ mod tests {
             )),
             "the pinned disabled host was not passed to the job"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::admin::test_support::{Fixture, admin, fixture};
+    use lnvps_api_common::{ClientInfo, MOCK_SUPER_ADMIN_USER};
+    use lnvps_db::{
+        IntervalType, LNVpsDbBase, LineItemType, PaymentMethod, Subscription, SubscriptionLineItem,
+        SubscriptionPayment,
+    };
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn invoice(msat: u64) -> String {
+        use lightning_invoice::{Currency, InvoiceBuilder, PaymentSecret};
+        let secret = [7u8; 32];
+        InvoiceBuilder::new(Currency::Regtest)
+            .description("refund".to_string())
+            .payment_hash(
+                <bitcoin::hashes::sha256::Hash as bitcoin::hashes::Hash>::from_slice(&secret)
+                    .unwrap(),
+            )
+            .payment_secret(PaymentSecret(secret))
+            .duration_since_epoch(SystemTime::now().duration_since(UNIX_EPOCH).unwrap())
+            .expiry_time(Duration::from_secs(3600))
+            .min_final_cltv_expiry_delta(144)
+            .amount_milli_satoshis(msat)
+            .build_signed(|s| {
+                let sk = bitcoin::secp256k1::SecretKey::from_slice(&[0xcd; 32]).unwrap();
+                bitcoin::secp256k1::Secp256k1::signing_only().sign_ecdsa_recoverable(s, &sk)
+            })
+            .unwrap()
+            .to_string()
+    }
+
+    async fn paid_payment(f: &Fixture) -> Vec<u8> {
+        let vm = f.mock.get_vm(f.vm_id).await.unwrap();
+        let (sub_id, _) = f
+            .mock
+            .insert_subscription_with_line_items(
+                &Subscription {
+                    id: 0,
+                    user_id: f.owner_id,
+                    company_id: 1,
+                    name: "vm".to_string(),
+                    description: None,
+                    created: Utc::now(),
+                    expires: Some(Utc::now()),
+                    is_active: true,
+                    is_setup: true,
+                    currency: "EUR".to_string(),
+                    interval_amount: 1,
+                    interval_type: IntervalType::Month,
+                    setup_fee: 0,
+                    auto_renewal_enabled: false,
+                    external_id: None,
+                },
+                vec![SubscriptionLineItem {
+                    id: 0,
+                    subscription_id: 0,
+                    subscription_type: LineItemType::Vps,
+                    name: "vm".to_string(),
+                    description: None,
+                    amount: 100,
+                    setup_amount: 0,
+                    configuration: None,
+                    deactivated_at: None,
+                    parent_line_item_id: None,
+                }],
+            )
+            .await
+            .unwrap();
+        let line = f
+            .mock
+            .subscription_line_items
+            .lock()
+            .await
+            .values()
+            .find(|l| l.subscription_id == sub_id)
+            .unwrap()
+            .id;
+        f.mock
+            .vms
+            .lock()
+            .await
+            .get_mut(&vm.id)
+            .unwrap()
+            .subscription_line_item_id = line;
+        let id = vec![9u8; 32];
+        f.mock
+            .insert_subscription_payment(&SubscriptionPayment {
+                id: id.clone(),
+                subscription_id: sub_id,
+                user_id: f.owner_id,
+                created: Utc::now(),
+                expires: Utc::now(),
+                amount: 12_500_000,
+                currency: "BTC".to_string(),
+                payment_method: PaymentMethod::Lightning,
+                payment_type: SubscriptionPaymentType::Renewal,
+                external_data: "".into(),
+                external_id: None,
+                is_paid: true,
+                rate: 80_000.0,
+                time_value: Some(2_592_000),
+                metadata: None,
+                tax: 0,
+                processing_fee: 0,
+                paid_at: Some(Utc::now()),
+                tax_rate: None,
+                tax_country_code: None,
+                tax_treatment: None,
+                tax_evidence: None,
+                tax_breakdown: None,
+                refunded_payment_id: None,
+                renewal_source: None,
+            })
+            .await
+            .unwrap();
+        id
+    }
+
+    fn delete_request(purge: bool) -> Json<AdminDeleteVmRequest> {
+        Json(AdminDeleteVmRequest {
+            reason: Some("abuse".into()),
+            purge: Some(purge),
+        })
+    }
+
+    fn deleter() -> AdminAuth {
+        admin(
+            MOCK_SUPER_ADMIN_USER,
+            &[(AdminResource::VirtualMachines, AdminAction::Delete)],
+        )
+    }
+
+    #[tokio::test]
+    async fn a_vm_delete_is_audited_and_queued() {
+        let f = fixture().await;
+        admin_delete_vm(
+            deleter(),
+            ClientInfo::default(),
+            State(f.state.clone()),
+            Path(f.vm_id),
+            delete_request(false),
+        )
+        .await
+        .unwrap();
+        assert_eq!(f.audit_actions().await, vec!["admin.vm.delete"]);
+        assert_eq!(f.queued_jobs().await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_vm_purge_is_audited_as_a_purge() {
+        let f = fixture().await;
+        admin_delete_vm(
+            deleter(),
+            ClientInfo::default(),
+            State(f.state.clone()),
+            Path(f.vm_id),
+            delete_request(true),
+        )
+        .await
+        .unwrap();
+        assert_eq!(f.audit_actions().await, vec!["admin.vm.purge"]);
+        assert_eq!(f.queued_jobs().await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_write_blocks_a_purge() {
+        let f = fixture().await;
+        f.break_audit_log();
+        let res = admin_delete_vm(
+            deleter(),
+            ClientInfo::default(),
+            State(f.state.clone()),
+            Path(f.vm_id),
+            delete_request(true),
+        )
+        .await;
+        assert!(res.is_err());
+        assert_eq!(f.queued_jobs().await, 0);
+    }
+
+    fn transfer_request(to: u64) -> Json<AdminTransferVmRequest> {
+        Json(AdminTransferVmRequest {
+            user_id: to,
+            reason: None,
+        })
+    }
+
+    fn mover() -> AdminAuth {
+        admin(9, &[(AdminResource::VirtualMachines, AdminAction::Update)])
+    }
+
+    #[tokio::test]
+    async fn a_vm_transfer_is_audited() {
+        let f = fixture().await;
+        let to = f.mock.upsert_user(&[4u8; 32]).await.unwrap();
+        admin_transfer_vm(
+            mover(),
+            ClientInfo::default(),
+            State(f.state.clone()),
+            Path(f.vm_id),
+            transfer_request(to),
+        )
+        .await
+        .unwrap();
+        assert_eq!(f.audit_actions().await, vec!["admin.vm.transfer", "vm.history.transferred"]);
+        assert_eq!(f.mock.get_vm(f.vm_id).await.unwrap().user_id, to);
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_write_blocks_a_transfer() {
+        let f = fixture().await;
+        let to = f.mock.upsert_user(&[4u8; 32]).await.unwrap();
+        f.break_audit_log();
+        let res = admin_transfer_vm(
+            mover(),
+            ClientInfo::default(),
+            State(f.state.clone()),
+            Path(f.vm_id),
+            transfer_request(to),
+        )
+        .await;
+        assert!(res.is_err());
+        assert_eq!(f.mock.get_vm(f.vm_id).await.unwrap().user_id, f.owner_id);
+    }
+
+    fn refunder() -> AdminAuth {
+        admin(
+            9,
+            &[
+                (AdminResource::VirtualMachines, AdminAction::Update),
+                (AdminResource::Payments, AdminAction::Update),
+            ],
+        )
+    }
+
+    fn lightning_refund() -> Json<AdminProcessRefundRequest> {
+        Json(AdminProcessRefundRequest {
+            payment_method: Some("lightning".into()),
+            refund_from_date: None,
+            reason: Some("customer".into()),
+            lightning_invoice: Some(invoice(1_000_000)),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_lightning_refund_is_audited_and_queued() {
+        let f = fixture().await;
+        admin_process_vm_refund(
+            refunder(),
+            ClientInfo::default(),
+            State(f.state.clone()),
+            Path(f.vm_id),
+            lightning_refund(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(f.audit_actions().await, vec!["admin.refund"]);
+        assert_eq!(f.queued_jobs().await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_write_blocks_a_lightning_refund() {
+        let f = fixture().await;
+        f.break_audit_log();
+        let res = admin_process_vm_refund(
+            refunder(),
+            ClientInfo::default(),
+            State(f.state.clone()),
+            Path(f.vm_id),
+            lightning_refund(),
+        )
+        .await;
+        assert!(res.is_err());
+        assert_eq!(f.queued_jobs().await, 0);
+    }
+
+    fn record_request() -> Json<AdminRecordRefundRequest> {
+        Json(AdminRecordRefundRequest {
+            amount: Some(1_000_000),
+            reason: Some("manual".into()),
+            external_ref: Some("ref-1".into()),
+            refunded_at: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_recorded_refund_is_audited() {
+        let f = fixture().await;
+        let payment = paid_payment(&f).await;
+        admin_record_payment_refund(
+            refunder(),
+            ClientInfo::default(),
+            State(f.state.clone()),
+            Path((f.vm_id, hex::encode(&payment))),
+            record_request(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            f.audit_actions().await,
+            vec!["admin.refund", "vm.history.refunded"]
+        );
+        let rows = f.mock.list_refunds_for_payment(&payment).await.unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_write_blocks_a_recorded_refund() {
+        let f = fixture().await;
+        let payment = paid_payment(&f).await;
+        f.break_audit_log();
+        let res = admin_record_payment_refund(
+            refunder(),
+            ClientInfo::default(),
+            State(f.state.clone()),
+            Path((f.vm_id, hex::encode(&payment))),
+            record_request(),
+        )
+        .await;
+        assert!(res.is_err());
+        let rows = f.mock.list_refunds_for_payment(&payment).await.unwrap();
+        assert!(rows.is_empty());
     }
 }

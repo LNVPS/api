@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use crate::api_token::{TokenScope, is_api_token};
 use crate::session::{SessionClaims, verify_session_token};
 use crate::single_use::SingleUseGuard;
 
@@ -56,6 +57,7 @@ pub enum AuthKind {
     /// Session JWT issued after an external (OAuth/OIDC) login. The identity is
     /// a synthetic `oauth_pubkey`, NOT a real Nostr key.
     Session(SessionClaims),
+    ApiToken { token_id: u64, scope: TokenScope },
 }
 
 /// Request authentication.
@@ -75,6 +77,14 @@ pub struct Nip98Auth {
 }
 
 impl Nip98Auth {
+    pub fn auth_method(&self) -> &'static str {
+        match self.kind {
+            AuthKind::Nostr(_) => "nip98",
+            AuthKind::Session(_) => "session",
+            AuthKind::ApiToken { .. } => "api_token",
+        }
+    }
+
     /// The 32-byte identity that authenticated this request. This is the value
     /// used as the `users.pubkey` primary identity for both Nostr and OAuth
     /// accounts.
@@ -87,7 +97,7 @@ impl Nip98Auth {
     pub fn nostr_pubkey(&self) -> Option<PublicKey> {
         match &self.kind {
             AuthKind::Nostr(ev) => Some(ev.pubkey),
-            AuthKind::Session(_) => None,
+            AuthKind::Session(_) | AuthKind::ApiToken { .. } => None,
         }
     }
 
@@ -95,7 +105,7 @@ impl Nip98Auth {
     pub fn event(&self) -> Option<&Event> {
         match &self.kind {
             AuthKind::Nostr(ev) => Some(ev),
-            AuthKind::Session(_) => None,
+            AuthKind::Session(_) | AuthKind::ApiToken { .. } => None,
         }
     }
 
@@ -129,7 +139,7 @@ impl Nip98Auth {
     pub fn check(&self, path: &str, method: &str) -> anyhow::Result<()> {
         let event = match &self.kind {
             AuthKind::Nostr(ev) => ev,
-            AuthKind::Session(_) => return Ok(()),
+            AuthKind::Session(_) | AuthKind::ApiToken { .. } => return Ok(()),
         };
         if event.kind != Kind::HttpAuth {
             bail!("Wrong event kind");
@@ -181,6 +191,19 @@ impl Nip98Auth {
         Ok(())
     }
 
+    pub async fn check_shared(&self, path: &str, method: &str) -> anyhow::Result<()> {
+        self.check(path, method)?;
+        if let AuthKind::Nostr(ev) = &self.kind {
+            crate::consume_installed(
+                "nip98",
+                &ev.id.to_hex(),
+                Duration::from_secs(AUTH_WINDOW_SECS * 2),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Verify the `payload` tag against the actual request body.
     ///
     /// NIP-98 makes `payload` optional, so an event without one is accepted:
@@ -191,7 +214,7 @@ impl Nip98Auth {
     pub fn check_payload(&self, body_hash: Option<&str>) -> anyhow::Result<()> {
         let event = match &self.kind {
             AuthKind::Nostr(ev) => ev,
-            AuthKind::Session(_) => return Ok(()),
+            AuthKind::Session(_) | AuthKind::ApiToken { .. } => return Ok(()),
         };
 
         let Some(expected) = Self::tag_value(event, "payload") else {
@@ -394,6 +417,97 @@ mod tests {
 
     /// Regression (F-04): the `payload` tag was never verified, so a captured
     /// auth for a bodied request could be reused with a different body.
+    async fn token_fixture(
+        scope: &str,
+        expires_in_days: i64,
+    ) -> (lnvps_db::ApiToken, std::sync::Arc<crate::MockDb>, String) {
+        use lnvps_db::LNVpsDbBase;
+        let db = std::sync::Arc::new(crate::MockDb::default());
+        let uid = db.upsert_user(&[9u8; 32]).await.unwrap();
+        let raw = crate::new_api_token();
+        let row = lnvps_db::ApiToken {
+            user_id: uid,
+            name: "ci".into(),
+            token_hash: lnvps_db::hash_verify_token(&raw),
+            scope: scope.into(),
+            expires: chrono::Utc::now() + chrono::Duration::days(expires_in_days),
+            ..Default::default()
+        };
+        db.insert_api_token(&row).await.unwrap();
+        (row, db, raw)
+    }
+
+    #[tokio::test]
+    async fn an_api_token_authenticates_within_scope_and_records_use() {
+        use lnvps_db::LNVpsDbBase;
+        let (row, db, raw) = token_fixture("read", 30).await;
+        let ip: std::net::IpAddr = "203.0.113.5".parse().unwrap();
+        let auth = authenticate_api_token(
+            db.as_ref(),
+            &raw,
+            &axum::http::Method::GET,
+            "/api/v1/vm",
+            Some(ip),
+        )
+        .await
+        .unwrap();
+        assert_eq!(auth.auth_method(), "api_token");
+        let stored = db
+            .get_api_token_by_hash(&row.token_hash)
+            .await
+            .unwrap();
+        assert_eq!(stored.last_ip.as_deref(), Some("203.0.113.5"));
+        assert!(stored.last_used.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_api_token_is_refused_outside_its_scope_and_after_expiry() {
+        let (_, db, raw) = token_fixture("read", 30).await;
+        let denied = authenticate_api_token(
+            db.as_ref(),
+            &raw,
+            &axum::http::Method::POST,
+            "/api/v1/vm",
+            None,
+        )
+        .await;
+        assert_eq!(denied.err().unwrap().0, StatusCode::FORBIDDEN);
+        let admin = authenticate_api_token(
+            db.as_ref(),
+            &raw,
+            &axum::http::Method::GET,
+            "/api/admin/v1/users",
+            None,
+        )
+        .await;
+        assert_eq!(admin.err().unwrap().0, StatusCode::FORBIDDEN);
+
+        let (_, db, raw) = token_fixture("read", -1).await;
+        let expired = authenticate_api_token(
+            db.as_ref(),
+            &raw,
+            &axum::http::Method::GET,
+            "/api/v1/vm",
+            None,
+        )
+        .await;
+        assert_eq!(expired.err().unwrap().0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_api_token_is_refused() {
+        let (_, db, _) = token_fixture("read", 30).await;
+        let bad = authenticate_api_token(
+            db.as_ref(),
+            "lnvps_nope",
+            &axum::http::Method::GET,
+            "/api/v1/vm",
+            None,
+        )
+        .await;
+        assert_eq!(bad.err().unwrap().0, StatusCode::UNAUTHORIZED);
+    }
+
     #[test]
     fn payload_tag_binds_the_request_body() {
         let body = br#"{"ssh_key_id":1}"#;
@@ -553,6 +667,42 @@ mod tests {
     }
 }
 
+pub async fn authenticate_api_token(
+    db: &dyn lnvps_db::LNVpsDb,
+    token: &str,
+    method: &axum::http::Method,
+    path: &str,
+    ip: Option<std::net::IpAddr>,
+) -> Result<Nip98Auth, (StatusCode, String)> {
+    let invalid = || (StatusCode::UNAUTHORIZED, "Invalid API token".to_string());
+    let row = db
+        .get_api_token_by_hash(&lnvps_db::hash_verify_token(token))
+        .await
+        .map_err(|_| invalid())?;
+    if row.expires <= chrono::Utc::now() {
+        return Err((StatusCode::UNAUTHORIZED, "API token expired".to_string()));
+    }
+    let scope = TokenScope::parse(&row.scope).ok_or_else(invalid)?;
+    if !scope.allows(method, path) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "API token scope does not allow this request".to_string(),
+        ));
+    }
+    let user = db.get_user(row.user_id).await.map_err(|_| invalid())?;
+    let pubkey: [u8; 32] = user.pubkey.as_slice().try_into().map_err(|_| invalid())?;
+    let _ = db
+        .touch_api_token(row.id, ip.map(|i| i.to_string()).as_deref())
+        .await;
+    Ok(Nip98Auth {
+        pubkey,
+        kind: AuthKind::ApiToken {
+            token_id: row.id,
+            scope,
+        },
+    })
+}
+
 impl<S> FromRequestParts<S> for Nip98Auth
 where
     S: Send + Sync,
@@ -575,6 +725,17 @@ where
 
             // Session (bearer) scheme: JWT issued after an external OAuth login.
             if let Some(token) = auth_header.strip_prefix("Bearer ") {
+                if is_api_token(token.trim()) {
+                    let ip = crate::ClientIp::from_headers(&parts.headers).0;
+                    return authenticate_api_token(
+                        db.as_ref(),
+                        token.trim(),
+                        &parts.method,
+                        parts.uri.path(),
+                        ip,
+                    )
+                    .await;
+                }
                 let claims = verify_session_token(token.trim())
                     .map_err(|e| (StatusCode::UNAUTHORIZED, format!("Invalid session: {}", e)))?;
 
@@ -613,7 +774,7 @@ where
             let path = parts.uri.path();
             let method = parts.method.as_str();
 
-            auth.check(path, method).map_err(|e| {
+            auth.check_shared(path, method).await.map_err(|e| {
                 (
                     StatusCode::UNAUTHORIZED,
                     format!("Auth check failed: {}", e),

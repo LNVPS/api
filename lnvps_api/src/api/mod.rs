@@ -23,6 +23,7 @@ pub mod routeserver;
 mod subscriptions;
 #[cfg(feature = "agent")]
 mod support;
+pub mod tokens;
 mod vm_addons;
 mod vpn;
 mod webauthn;
@@ -212,13 +213,18 @@ pub(crate) async fn credit_line(
     db: &std::sync::Arc<dyn lnvps_db::LNVpsDb>,
     payment: &lnvps_db::SubscriptionPayment,
 ) -> Option<crate::api::model::ApiCredit> {
-    let debit = db
-        .get_account_credit_debit_by_payment(&payment.id)
+    let amount: u64 = db
+        .list_account_credit_debits_by_payment(&payment.id)
         .await
-        .ok()
-        .flatten()?;
+        .ok()?
+        .iter()
+        .map(|d| d.payment_amount)
+        .sum();
+    if amount == 0 {
+        return None;
+    }
     Some(crate::api::model::ApiCredit {
-        amount: debit.payment_amount,
+        amount,
         currency: payment.currency.clone(),
     })
 }

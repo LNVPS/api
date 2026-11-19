@@ -10,6 +10,14 @@ default-run = "lnvps_api"
 name = "lnvps_api"
 path = "src/bin/api.rs"
 
+[[bin]]
+name = "verify_audit_log"
+path = "src/bin/verify_audit_log.rs"
+
+[[bin]]
+name = "rotate_encryption_key"
+path = "src/bin/rotate_encryption_key.rs"
+
 # One-shot admin tool: re-credit LNURL-pay topups that landed on the wrong VM
 # (see PR #152). Decodes the stored BOLT11 memo in-process; no LND connection.
 [[bin]]
@@ -147,6 +155,7 @@ tempfile = "3"
 env_logger = "0.11"
 tower = { version = "0.5.3", features = ["util"] }
 wiremock = "0.6"
+sqlx = { version = "0.8", default-features = false, features = ["mysql", "runtime-tokio"] }
 
 [build-dependencies]
 openapi-build-gen = { git = "https://github.com/v0l/openapi-build-gen.git", rev = "b4c946ca891d22c5ab16ce13f17b1bf81c91587c", optional = true }

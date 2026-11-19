@@ -5,7 +5,7 @@
 #
 # Usage:
 #   ./build.sh [version] [arch] [variant]
-#     version   image version label used in filenames (default: derived channel, e.g. 24.11)
+#     version   image version label used in filenames (default: derived channel, e.g. 26.05)
 #     arch      x86_64 | arm64                        (default: x86_64)
 #     variant   cloudinit | encrypted | all           (default: all)
 #
@@ -16,7 +16,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-VERSION="${1:-24.11}"
+VERSION="${1:-26.05}"
 ARCH="${2:-x86_64}"
 
 case "$ARCH" in

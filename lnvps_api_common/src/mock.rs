@@ -19,8 +19,9 @@ use lnvps_db::{
     Tunnel, TunnelPool, TunnelRoute, User, UserPaymentMethod, UserSshKey, Vm, VmAddon, VmAddonKind,
     VmAddonPrice, VmCostPlan, VmCustomPricing, VmCustomPricingDisk, VmCustomTemplate,
     VmFirewallPolicy, VmFirewallRule, VmHistory, VmHost, VmHostDisk, VmHostKind, VmIpAssignment,
-    VmIpWait, VmOsImage, VmTemplate, VmTrafficDaily, VmTrafficSample, VmTrafficTotal, VpnDevice,
-    VpnPeerTemplate, VpnService, VpnSubscription, WebauthnCredential,
+    VmIpWait, VmMigration, VmMigrationState, VmOsImage, VmTemplate, VmTrafficDaily,
+    VmTrafficSample, VmTrafficTotal, VpnDevice, VpnPeerTemplate, VpnService, VpnSubscription,
+    WebauthnCredential,
 };
 
 use async_trait::async_trait;
@@ -43,6 +44,9 @@ fn paginate<T>(all: Vec<T>, limit: u64, offset: u64) -> (Vec<T>, u64) {
         .collect();
     (page, total)
 }
+
+pub const MOCK_SUPER_ADMIN_USER: u64 = 999;
+pub const MOCK_SUPER_ADMIN_ROLE: u64 = 999;
 
 #[derive(Debug, Clone)]
 pub struct MockDb {
@@ -100,8 +104,12 @@ pub struct MockDb {
     pub ip_providers: Arc<Mutex<HashMap<u64, IpProvider>>>,
     pub ip_provider_regions: Arc<Mutex<HashMap<u64, IpProviderRegion>>>,
     pub vm_ip_waits: Arc<Mutex<Vec<VmIpWait>>>,
+    pub vm_migrations: Arc<Mutex<HashMap<u64, VmMigration>>>,
     pub ip_orders: Arc<Mutex<HashMap<u64, IpOrder>>>,
     pub ip_order_audits: Arc<Mutex<Vec<IpOrderAudit>>>,
+    pub audit_log: Arc<Mutex<Vec<lnvps_db::AuditEntry>>>,
+    pub fail_audit_writes: Arc<std::sync::atomic::AtomicBool>,
+    pub role_assignments: Arc<Mutex<Vec<(u64, u64)>>>,
     pub ip_order_ranges: Arc<Mutex<Vec<IpOrderRange>>>,
     pub vm_addons: Arc<Mutex<HashMap<u64, VmAddon>>>,
     /// `vpn_service_pool`, keyed by pool id because an interface terminates at
@@ -126,6 +134,7 @@ pub struct MockDb {
     /// Last raw counter reading per VM.
     pub vm_traffic_samples: Arc<Mutex<HashMap<u64, VmTrafficSample>>>,
     pub webauthn_credentials: Arc<Mutex<HashMap<u64, WebauthnCredential>>>,
+    pub api_tokens: Arc<Mutex<HashMap<u64, lnvps_db::ApiToken>>>,
     pub apps: Arc<Mutex<HashMap<u64, App>>>,
     pub app_tags: Arc<Mutex<HashMap<u64, AppTag>>>,
     /// Assignments as `(app_id, tag_id)` pairs, standing in for the
@@ -619,8 +628,12 @@ impl Default for MockDb {
             ip_providers: Arc::new(Default::default()),
             ip_provider_regions: Arc::new(Default::default()),
             vm_ip_waits: Arc::new(Default::default()),
+            vm_migrations: Arc::new(Default::default()),
             ip_orders: Arc::new(Default::default()),
             ip_order_audits: Arc::new(Default::default()),
+            audit_log: Arc::new(Default::default()),
+            fail_audit_writes: Arc::new(Default::default()),
+            role_assignments: Arc::new(Default::default()),
             ip_order_ranges: Arc::new(Default::default()),
             vm_addons: Arc::new(Default::default()),
             vpn_service_pools: Arc::new(Default::default()),
@@ -635,6 +648,7 @@ impl Default for MockDb {
             router_bgp_routes: Arc::new(Default::default()),
             firewall_rules: Arc::new(Default::default()),
             webauthn_credentials: Arc::new(Default::default()),
+            api_tokens: Arc::new(Default::default()),
             apps: Arc::new(Default::default()),
             app_tags: Arc::new(Default::default()),
             app_tag_assignments: Arc::new(Default::default()),
@@ -793,6 +807,59 @@ impl LNVpsDbBase for MockDb {
             .find(|c| c.cred_id == cred_id)
             .ok_or(anyhow!("no credential"))?
             .clone())
+    }
+
+    async fn insert_api_token(&self, token: &lnvps_db::ApiToken) -> DbResult<u64> {
+        let mut tokens = self.api_tokens.lock().await;
+        let id = *tokens.keys().max().unwrap_or(&0) + 1;
+        tokens.insert(
+            id,
+            lnvps_db::ApiToken {
+                id,
+                created: Utc::now(),
+                ..token.clone()
+            },
+        );
+        Ok(id)
+    }
+
+    async fn get_api_token_by_hash(&self, token_hash: &str) -> DbResult<lnvps_db::ApiToken> {
+        self.api_tokens
+            .lock()
+            .await
+            .values()
+            .find(|t| t.token_hash == token_hash)
+            .cloned()
+            .ok_or_else(|| anyhow!("no such token").into())
+    }
+
+    async fn list_api_tokens(&self, user_id: u64) -> DbResult<Vec<lnvps_db::ApiToken>> {
+        let mut rows: Vec<_> = self
+            .api_tokens
+            .lock()
+            .await
+            .values()
+            .filter(|t| t.user_id == user_id)
+            .cloned()
+            .collect();
+        rows.sort_by_key(|t| t.id);
+        Ok(rows)
+    }
+
+    async fn delete_api_token(&self, id: u64, user_id: u64) -> DbResult<()> {
+        self.api_tokens
+            .lock()
+            .await
+            .retain(|_, t| !(t.id == id && t.user_id == user_id));
+        Ok(())
+    }
+
+    async fn touch_api_token(&self, id: u64, ip: Option<&str>) -> DbResult<()> {
+        if let Some(t) = self.api_tokens.lock().await.get_mut(&id) {
+            t.last_used = Some(Utc::now());
+            t.last_ip = ip.map(str::to_string);
+        }
+        Ok(())
     }
 
     async fn update_webauthn_credential(&self, id: u64, passkey: &str) -> DbResult<()> {
@@ -2737,6 +2804,10 @@ impl LNVpsDbBase for MockDb {
             compacted_upto: 0,
             created: now,
             updated: now,
+            escalated_at: None,
+            escalation_count: 0,
+            escalation_reason: None,
+            escalation_vm_ids: None,
         };
         conversations.insert(id, conversation.clone());
         Ok(conversation)
@@ -2771,6 +2842,10 @@ impl LNVpsDbBase for MockDb {
             updated: conversation.updated,
             message_count: own.len() as u64,
             last_message_at: own.iter().map(|m| m.created).max(),
+            escalated_at: conversation.escalated_at,
+            escalation_count: conversation.escalation_count,
+            escalation_reason: conversation.escalation_reason,
+            escalation_vm_ids: conversation.escalation_vm_ids,
         })
     }
 
@@ -2810,6 +2885,10 @@ impl LNVpsDbBase for MockDb {
                     updated: c.updated,
                     message_count: own.len() as u64,
                     last_message_at: own.iter().map(|m| m.created).max(),
+                    escalated_at: c.escalated_at,
+                    escalation_count: c.escalation_count,
+                    escalation_reason: c.escalation_reason.clone(),
+                    escalation_vm_ids: c.escalation_vm_ids.clone(),
                 }
             })
             .collect();
@@ -2825,6 +2904,23 @@ impl LNVpsDbBase for MockDb {
                 .collect(),
             total,
         ))
+    }
+
+    async fn record_agent_escalation(
+        &self,
+        conversation_id: u64,
+        reason: &str,
+        vm_ids: &str,
+    ) -> DbResult<()> {
+        let mut conversations = self.agent_conversations.lock().await;
+        let conversation = conversations.get_mut(&conversation_id).ok_or_else(|| {
+            DbError::from(anyhow!("agent conversation {} not found", conversation_id))
+        })?;
+        conversation.escalated_at = Some(chrono::Utc::now());
+        conversation.escalation_count += 1;
+        conversation.escalation_reason = Some(reason.to_string());
+        conversation.escalation_vm_ids = Some(vm_ids.to_string());
+        Ok(())
     }
 
     async fn count_agent_messages(&self, conversation_id: u64) -> DbResult<u64> {
@@ -4832,6 +4928,20 @@ impl LNVpsDbBase for MockDb {
         ))
     }
 
+    async fn list_account_credit_events_by_kind(
+        &self,
+        kind: &str,
+        currency: &str,
+        since: DateTime<Utc>,
+    ) -> DbResult<Vec<lnvps_db::AccountCreditEvent>> {
+        let events = self.account_credit_events.lock().await;
+        Ok(events
+            .iter()
+            .filter(|e| e.kind == kind && e.currency == currency && e.created >= since)
+            .cloned()
+            .collect())
+    }
+
     async fn reserve_account_credit(
         &self,
         debit: &lnvps_db::AccountCreditDebit,
@@ -4883,15 +4993,16 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
-    async fn get_account_credit_debit_by_payment(
+    async fn list_account_credit_debits_by_payment(
         &self,
         subscription_payment_id: &Vec<u8>,
-    ) -> DbResult<Option<lnvps_db::AccountCreditDebit>> {
+    ) -> DbResult<Vec<lnvps_db::AccountCreditDebit>> {
         let debits = self.account_credit_debits.lock().await;
         Ok(debits
             .iter()
-            .find(|d| d.subscription_payment_id.as_ref() == Some(subscription_payment_id))
-            .cloned())
+            .filter(|d| d.subscription_payment_id.as_ref() == Some(subscription_payment_id))
+            .cloned()
+            .collect())
     }
 
     async fn settle_account_credit_debit(
@@ -6025,6 +6136,72 @@ impl LNVpsDbBase for MockDb {
         Ok(())
     }
 
+    async fn insert_vm_migration(&self, migration: &VmMigration) -> DbResult<u64> {
+        let mut all = self.vm_migrations.lock().await;
+        if migration.state == VmMigrationState::InProgress
+            && all
+                .values()
+                .any(|m| m.vm_id == migration.vm_id && m.state == VmMigrationState::InProgress)
+        {
+            return Err(anyhow!("VM {} is already migrating", migration.vm_id).into());
+        }
+        let id = all.keys().max().copied().unwrap_or(0) + 1;
+        let mut m = migration.clone();
+        m.id = id;
+        m.created = Utc::now();
+        all.insert(id, m);
+        Ok(id)
+    }
+
+    async fn update_vm_migration(&self, migration: &VmMigration) -> DbResult<()> {
+        let mut all = self.vm_migrations.lock().await;
+        let m = all
+            .get_mut(&migration.id)
+            .ok_or_else(|| anyhow!("no migration {}", migration.id))?;
+        let created = m.created;
+        *m = migration.clone();
+        m.created = created;
+        Ok(())
+    }
+
+    async fn get_active_vm_migration(&self, vm_id: u64) -> DbResult<Option<VmMigration>> {
+        Ok(self
+            .vm_migrations
+            .lock()
+            .await
+            .values()
+            .find(|m| m.vm_id == vm_id && m.state == VmMigrationState::InProgress)
+            .cloned())
+    }
+
+    async fn list_vm_migrations(&self, vm_id: u64) -> DbResult<Vec<VmMigration>> {
+        let mut out: Vec<VmMigration> = self
+            .vm_migrations
+            .lock()
+            .await
+            .values()
+            .filter(|m| m.vm_id == vm_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|m| std::cmp::Reverse(m.id));
+        Ok(out)
+    }
+
+    async fn list_open_vm_migrations(&self) -> DbResult<Vec<VmMigration>> {
+        let mut out: Vec<VmMigration> = self
+            .vm_migrations
+            .lock()
+            .await
+            .values()
+            .filter(|m| {
+                m.state == VmMigrationState::InProgress || m.source_retained || m.needs_attention
+            })
+            .cloned()
+            .collect();
+        out.sort_by_key(|m| m.id);
+        Ok(out)
+    }
+
     async fn insert_ip_order(&self, order: &IpOrder) -> DbResult<u64> {
         let mut orders = self.ip_orders.lock().await;
         if let Some(k) = &order.idempotency_key {
@@ -6141,6 +6318,85 @@ impl LNVpsDbBase for MockDb {
             .filter(|o| o.ordered_at.unwrap_or(o.created) >= since)
             .map(|o| o.cost)
             .sum())
+    }
+
+    async fn transform_column_batch(
+        &self,
+        _table: &str,
+        _id_expr: &str,
+        _column: &str,
+        _skip_prefix: &str,
+        _limit: u64,
+        _transform: &(dyn for<'a> Fn(&'a str) -> anyhow::Result<Option<String>> + Send + Sync),
+    ) -> DbResult<u64> {
+        Ok(0)
+    }
+
+    async fn append_audit(&self, entry: lnvps_db::NewAuditEntry) -> DbResult<lnvps_db::AuditEntry> {
+        if self
+            .fail_audit_writes
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(anyhow!("audit log write failed").into());
+        }
+        let mut log = self.audit_log.lock().await;
+        let prev = log
+            .last()
+            .map(|e| e.hash.clone())
+            .unwrap_or_else(|| lnvps_db::audit::GENESIS_HASH.to_string());
+        let sealed =
+            lnvps_db::AuditEntry::seal(log.len() as u64 + 1, Utc::now().timestamp(), &prev, entry);
+        log.push(sealed.clone());
+        Ok(sealed)
+    }
+
+    async fn list_audit(
+        &self,
+        filter: &lnvps_db::AuditFilter,
+        limit: u64,
+        offset: u64,
+    ) -> DbResult<Vec<lnvps_db::AuditEntry>> {
+        Ok(self
+            .audit_log
+            .lock()
+            .await
+            .iter()
+            .rev()
+            .filter(|e| filter.matches(e))
+            .skip(offset as usize)
+            .take(limit as usize)
+            .cloned()
+            .collect())
+    }
+
+    async fn truncate_audit_ips(&self, days: u32) -> DbResult<u64> {
+        let cutoff = Utc::now().timestamp() - days as i64 * 86400;
+        let mut changed = 0;
+        for e in self.audit_log.lock().await.iter_mut() {
+            if e.created >= cutoff {
+                continue;
+            }
+            if let Some(ip) = e.ip.as_mut() {
+                let masked = lnvps_db::audit::truncate_ip(ip);
+                if !ip.is_empty() && masked != *ip {
+                    *ip = masked;
+                    changed += 1;
+                }
+            }
+        }
+        Ok(changed)
+    }
+
+    async fn audit_range(&self, after_id: u64, limit: u64) -> DbResult<Vec<lnvps_db::AuditEntry>> {
+        Ok(self
+            .audit_log
+            .lock()
+            .await
+            .iter()
+            .filter(|e| e.id > after_id)
+            .take(limit as usize)
+            .cloned()
+            .collect())
     }
 
     async fn insert_ip_order_audit(
@@ -7881,8 +8137,12 @@ impl lnvps_db::AdminDb for MockDb {
         Ok(std::collections::HashSet::new())
     }
 
-    async fn get_user_roles(&self, _user_id: u64) -> DbResult<Vec<u64>> {
-        Ok(vec![])
+    async fn get_user_roles(&self, user_id: u64) -> DbResult<Vec<u64>> {
+        Ok(if user_id == MOCK_SUPER_ADMIN_USER {
+            vec![MOCK_SUPER_ADMIN_ROLE]
+        } else {
+            vec![]
+        })
     }
 
     async fn is_admin_user(&self, _user_id: u64) -> DbResult<bool> {
@@ -7891,14 +8151,19 @@ impl lnvps_db::AdminDb for MockDb {
 
     async fn assign_user_role(
         &self,
-        _user_id: u64,
-        _role_id: u64,
+        user_id: u64,
+        role_id: u64,
         _assigned_by: u64,
     ) -> DbResult<()> {
+        self.role_assignments.lock().await.push((user_id, role_id));
         Ok(())
     }
 
-    async fn revoke_user_role(&self, _user_id: u64, _role_id: u64) -> DbResult<()> {
+    async fn revoke_user_role(&self, user_id: u64, role_id: u64) -> DbResult<()> {
+        self.role_assignments
+            .lock()
+            .await
+            .retain(|a| *a != (user_id, role_id));
         Ok(())
     }
 
@@ -7906,8 +8171,19 @@ impl lnvps_db::AdminDb for MockDb {
         Ok(1)
     }
 
-    async fn get_role(&self, _role_id: u64) -> DbResult<AdminRole> {
-        todo!()
+    async fn get_role(&self, role_id: u64) -> DbResult<AdminRole> {
+        Ok(AdminRole {
+            id: role_id,
+            name: if role_id == MOCK_SUPER_ADMIN_ROLE {
+                "super_admin".to_string()
+            } else {
+                "operator".to_string()
+            },
+            description: None,
+            is_system_role: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        })
     }
 
     async fn get_role_by_name(&self, _name: &str) -> DbResult<AdminRole> {
@@ -8538,7 +8814,8 @@ impl lnvps_db::AdminDb for MockDb {
                     renewal_source: None,
                     user_country_code: user.and_then(|u| u.country_code.clone()),
                     user_geo_country_code: user.and_then(|u| u.geo_country_code.clone()),
-                    user_billing_tax_id: user.and_then(|u| u.billing_tax_id.clone()),
+                    user_billing_tax_id: user
+                        .and_then(|u| u.billing_tax_id.as_ref().map(|t| t.as_str().to_string())),
                 });
             }
         }
@@ -14630,6 +14907,26 @@ mod vpn_tests {
 
     /// The routes behind a peer are a set, replaced wholesale, because the
     /// planner is told what should be there rather than what changed.
+    #[tokio::test]
+    async fn only_one_migration_of_a_vm_can_be_in_progress() {
+        let db = MockDb::default();
+        let m = VmMigration {
+            vm_id: 5,
+            ..Default::default()
+        };
+        let id = db.insert_vm_migration(&m).await.unwrap();
+        assert!(db.insert_vm_migration(&m).await.is_err());
+        let mut active = db.get_active_vm_migration(5).await.unwrap().unwrap();
+        assert_eq!(active.id, id);
+        active.state = VmMigrationState::Completed;
+        active.source_retained = true;
+        db.update_vm_migration(&active).await.unwrap();
+        assert!(db.get_active_vm_migration(5).await.unwrap().is_none());
+        assert_eq!(db.list_open_vm_migrations().await.unwrap().len(), 1);
+        db.insert_vm_migration(&m).await.unwrap();
+        assert_eq!(db.list_vm_migrations(5).await.unwrap().len(), 2);
+    }
+
     #[tokio::test]
     async fn tunnel_routes_are_replaced_not_merged() {
         let db = MockDb::default();

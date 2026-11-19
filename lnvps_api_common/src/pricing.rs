@@ -1265,7 +1265,7 @@ impl PricingEngine {
         let supply = place_of_supply(
             user.country_code.as_deref(),
             user.geo_country_code.as_deref(),
-            user.billing_tax_id.as_deref(),
+            user.billing_tax_id.as_ref().map(|t| t.as_str()),
             seller_cc.as_deref(),
         );
         match (supply.treatment, supply.country_code) {
@@ -4834,7 +4834,7 @@ mod tests {
                 pubkey: vec![],
                 country_code: country.map(|s| s.to_string()),
                 geo_country_code: geo.map(|s| s.to_string()),
-                billing_tax_id: vat.map(|s| s.to_string()),
+                billing_tax_id: vat.map(|s| s.into()),
                 ..Default::default()
             },
         );

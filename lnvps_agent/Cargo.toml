@@ -34,6 +34,7 @@ chrono = { version = "0.4", features = ["serde"] }
 nostr = { version = "0.44", default-features = false, features = ["std"] }
 nostr-sdk = { rev = "c69c4ae2bf1a5f340aba70c20d09323f5309a4e2", git = "https://github.com/rust-nostr/nostr", default-features = false }
 base64 = "0.22"
+regex = "1"
 hex = { workspace = true }
 
 # Email support channel (IMAP poll + SMTP reply)

@@ -181,6 +181,52 @@ impl SshClient {
         client.execute(&command).await
     }
 
+    pub async fn execute_with_stdin<R: tokio::io::AsyncRead + Unpin>(
+        &mut self,
+        command: &str,
+        mut stdin: R,
+        timeout: Duration,
+    ) -> Result<(i32, String)> {
+        use tokio::io::AsyncReadExt;
+        tokio::time::timeout(timeout, async {
+            info!("Executing command with streamed input: {}", command);
+            let mut channel = self.session()?.channel_open_session().await?;
+            channel.exec(true, command).await?;
+            let mut buf = vec![0u8; 1024 * 1024];
+            loop {
+                let n = stdin.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                channel.data(&buf[..n]).await?;
+            }
+            channel.eof().await?;
+            let mut out = Vec::new();
+            let mut code = None;
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    ChannelMsg::Data { ref data } | ChannelMsg::ExtendedData { ref data, .. } => {
+                        out.extend_from_slice(data)
+                    }
+                    ChannelMsg::ExitStatus { exit_status } => code = Some(exit_status as i32),
+                    _ => {}
+                }
+                if out.len() > MAX_OUTPUT_BYTES {
+                    bail!("Command produced more than {MAX_OUTPUT_BYTES} bytes of output");
+                }
+            }
+            let code = code.ok_or_else(|| anyhow!("Command did not report an exit status"))?;
+            Ok((code, String::from_utf8_lossy(&out).into_owned()))
+        })
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "Streamed command did not finish within {}s",
+                timeout.as_secs()
+            )
+        })?
+    }
+
     pub async fn execute(&mut self, command: &str) -> Result<(i32, String)> {
         // Bounded in both time and size: see COMMAND_TIMEOUT and
         // MAX_OUTPUT_BYTES. Both are properties of talking to a machine that

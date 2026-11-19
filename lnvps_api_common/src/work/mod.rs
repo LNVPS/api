@@ -204,6 +204,8 @@ pub enum WorkJob {
         live: bool,
         admin_user_id: Option<u64>,
         reason: Option<String>,
+        #[serde(default)]
+        options: crate::MigrationOptions,
     },
     /// Poll every host for the VMs it is running and re-point `vm.host_id` at
     /// whichever host actually has each VM, so a migration performed outside
@@ -439,6 +441,7 @@ impl WorkJob {
             // every 30s anyway (see `recover_missing_vm`), so nothing is lost by
             // letting the queued copy go.
             Self::SpawnVm { .. } => true,
+            Self::MigrateVm { .. } => true,
             _ => false,
         }
     }
@@ -607,5 +610,20 @@ mod snapshot_action_tests {
         };
         assert!(job.can_skip());
         assert_eq!(job.to_string(), "VmSnapshot");
+    }
+
+    #[test]
+    fn migrate_jobs_queued_before_the_options_existed_still_parse() {
+        let old = r#"{"MigrateVm":{"vm_id":4,"target_host_id":7,"live":true,"admin_user_id":1,"reason":null}}"#;
+        let job: WorkJob = serde_json::from_str(old).unwrap();
+        let WorkJob::MigrateVm { options, live, .. } = &job else {
+            panic!("{job}");
+        };
+        assert!(*live);
+        assert_eq!(*options, crate::MigrationOptions::default());
+        assert!(
+            job.can_skip(),
+            "a failed migration is retried by an admin, not by redelivery"
+        );
     }
 }

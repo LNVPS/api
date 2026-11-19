@@ -19,9 +19,23 @@ pub struct AdminAuth {
     /// `Authorization` header. `None` for the query-parameter/ticket path, which
     /// resolves an identity without retaining an event.
     pub nip98_auth: Option<Nip98Auth>,
+    pub step_up: bool,
 }
 
 impl AdminAuth {
+    pub fn require_step_up(&self) -> std::result::Result<(), ApiError> {
+        self.require_step_up_when(lnvps_api_common::step_up_required())
+    }
+
+    pub fn require_step_up_when(&self, required: bool) -> std::result::Result<(), ApiError> {
+        if !required || self.step_up {
+            return Ok(());
+        }
+        Err(ApiError::forbidden(
+            "Fresh passkey confirmation required (X-Step-Up header)",
+        ))
+    }
+
     pub async fn from_nip98_auth(nip98_auth: Nip98Auth, db: &Arc<dyn LNVpsDb>) -> Result<Self> {
         let pubkey = nip98_auth.pubkey();
         let user_id = db.upsert_user(&pubkey).await?;
@@ -32,6 +46,7 @@ impl AdminAuth {
             pubkey: pubkey.to_vec(),
             permissions,
             nip98_auth: Some(nip98_auth),
+            step_up: false,
         })
     }
 
@@ -43,6 +58,7 @@ impl AdminAuth {
             pubkey: pubkey.to_vec(),
             permissions: Self::load_permissions(user_id, db).await?,
             nip98_auth: None,
+            step_up: false,
         })
     }
 
@@ -146,9 +162,15 @@ where
 
             let state = RouterState::from_ref(state);
             // Check admin privileges
-            AdminAuth::from_nip98_auth(nip98_auth, &state.db)
+            let mut admin = AdminAuth::from_nip98_auth(nip98_auth, &state.db)
                 .await
-                .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))
+                .map_err(|e| (StatusCode::FORBIDDEN, e.to_string()))?;
+            admin.step_up = parts
+                .headers
+                .get(lnvps_api_common::STEP_UP_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|t| lnvps_api_common::verify_step_up_token(t, admin.user_id));
+            Ok(admin)
         })
     }
 }
@@ -174,7 +196,7 @@ impl AdminAuthQuery {
             (Some(ticket), _) => lnvps_api_common::consume_ticket(ticket, path)?,
             (None, Some(auth)) => {
                 let nip98 = Nip98Auth::from_base64(auth)?;
-                nip98.check(path, "GET")?;
+                nip98.check_shared(path, "GET").await?;
                 nip98.pubkey()
             }
             (None, None) => anyhow::bail!("Missing auth or ticket param"),
@@ -189,6 +211,31 @@ impl AdminAuthQuery {
 mod tests {
     use super::*;
     use lnvps_api_common::{DEFAULT_TICKET_TTL_SECS, MockDb, init_session_secret, issue_ticket};
+
+    fn bare_admin(step_up: bool) -> AdminAuth {
+        AdminAuth {
+            user_id: 1,
+            pubkey: vec![0; 32],
+            permissions: Default::default(),
+            nip98_auth: None,
+            step_up,
+        }
+    }
+
+    #[test]
+    fn step_up_is_required_only_when_enforced_and_missing() {
+        assert!(bare_admin(false).require_step_up_when(true).is_err());
+        assert!(bare_admin(true).require_step_up_when(true).is_ok());
+        assert!(bare_admin(false).require_step_up_when(false).is_ok());
+    }
+
+    #[test]
+    fn a_step_up_token_for_another_admin_does_not_count() {
+        init_session_secret(b"unit-test-secret".to_vec());
+        let t = lnvps_api_common::issue_step_up_token(2, 300).unwrap();
+        assert!(!lnvps_api_common::verify_step_up_token(&t, 1));
+        assert!(lnvps_api_common::verify_step_up_token(&t, 2));
+    }
 
     const FEEDBACK_PATH: &str = "/api/admin/v1/jobs/feedback";
 

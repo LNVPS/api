@@ -452,12 +452,14 @@ async fn admin_get_user_roles(
 /// Assign role to user
 async fn admin_assign_user_role(
     auth: AdminAuth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path(user_id): Path<u64>,
     Json(req): Json<AssignRoleRequest>,
 ) -> ApiResult<()> {
     // Role assignment is role management, not user management
     auth.require_permission(AdminResource::Roles, AdminAction::Update)?;
+    auth.require_step_up()?;
 
     // Check that user exists
     let _user = this.db.get_user(user_id).await?;
@@ -488,6 +490,17 @@ async fn admin_assign_user_role(
     )?;
 
     // Assign the role
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("admin", Some(auth.user_id), "admin.role.assign")
+                .auth("nip98", None)
+                .target("user", user_id)
+                .change(None, Some(format!("role {} ({})", role.name, role.id))),
+            &client,
+        ),
+    )
+    .await?;
     this.db
         .assign_user_role(user_id, req.role_id, auth.user_id)
         .await?;
@@ -498,11 +511,13 @@ async fn admin_assign_user_role(
 /// Revoke role from user
 async fn admin_revoke_user_role(
     auth: AdminAuth,
+    client: lnvps_api_common::ClientInfo,
     State(this): State<RouterState>,
     Path((user_id, role_id)): Path<(u64, u64)>,
 ) -> ApiResult<()> {
     // Role assignment is role management, not user management
     auth.require_permission(AdminResource::Roles, AdminAction::Update)?;
+    auth.require_step_up()?;
 
     // Check that user exists
     let _user = this.db.get_user(user_id).await?;
@@ -519,6 +534,17 @@ async fn admin_revoke_user_role(
     )?;
 
     // Revoke the role
+    lnvps_api_common::record_audit(
+        this.db.as_ref(),
+        lnvps_api_common::with_client(
+            lnvps_db::NewAuditEntry::new("admin", Some(auth.user_id), "admin.role.revoke")
+                .auth("nip98", None)
+                .target("user", user_id)
+                .change(Some(format!("role {} ({})", role.name, role.id)), None),
+            &client,
+        ),
+    )
+    .await?;
     this.db.revoke_user_role(user_id, role_id).await?;
 
     ApiData::ok(())
@@ -808,6 +834,7 @@ mod tests {
             pubkey: pubkey.to_vec(),
             permissions: Default::default(),
             nip98_auth: None,
+            step_up: false,
         };
         // single-threaded test body: env mutation is fine here
         unsafe { std::env::remove_var("LNVPS_DEMO_OPEN_ADMIN") };
@@ -816,5 +843,93 @@ mod tests {
             res.0.data.is_empty(),
             "a key with no roles must not be promoted without the opt-in"
         );
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use crate::admin::test_support::{admin, fixture};
+    use lnvps_api_common::MOCK_SUPER_ADMIN_USER;
+    use lnvps_db::AdminDb;
+
+    const OPERATOR_ROLE: u64 = 5;
+
+    fn caller() -> crate::admin::auth::AdminAuth {
+        admin(
+            MOCK_SUPER_ADMIN_USER,
+            &[(AdminResource::Roles, AdminAction::Update)],
+        )
+    }
+
+    #[tokio::test]
+    async fn assigning_a_role_is_audited() {
+        let f = fixture().await;
+        admin_assign_user_role(
+            caller(),
+            lnvps_api_common::ClientInfo::default(),
+            State(f.state.clone()),
+            Path(f.owner_id),
+            Json(AssignRoleRequest {
+                role_id: OPERATOR_ROLE,
+                expires_at: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(f.audit_actions().await, vec!["admin.role.assign"]);
+        assert_eq!(f.mock.role_assignments.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_audit_write_blocks_role_assignment() {
+        let f = fixture().await;
+        f.break_audit_log();
+        let res = admin_assign_user_role(
+            caller(),
+            lnvps_api_common::ClientInfo::default(),
+            State(f.state.clone()),
+            Path(f.owner_id),
+            Json(AssignRoleRequest {
+                role_id: OPERATOR_ROLE,
+                expires_at: None,
+            }),
+        )
+        .await;
+        assert!(res.is_err());
+        assert!(f.mock.role_assignments.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn revoking_a_role_is_audited_and_blocked_without_the_log() {
+        let f = fixture().await;
+        f.mock
+            .assign_user_role(f.owner_id, OPERATOR_ROLE, MOCK_SUPER_ADMIN_USER)
+            .await
+            .unwrap();
+        f.break_audit_log();
+        let res = admin_revoke_user_role(
+            caller(),
+            lnvps_api_common::ClientInfo::default(),
+            State(f.state.clone()),
+            Path((f.owner_id, OPERATOR_ROLE)),
+        )
+        .await;
+        assert!(res.is_err());
+        assert_eq!(f.mock.role_assignments.lock().await.len(), 1);
+
+        f.mock
+            .fail_audit_writes
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        admin_revoke_user_role(
+            caller(),
+            lnvps_api_common::ClientInfo::default(),
+            State(f.state.clone()),
+            Path((f.owner_id, OPERATOR_ROLE)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(f.audit_actions().await, vec!["admin.role.revoke"]);
+        assert!(f.mock.role_assignments.lock().await.is_empty());
     }
 }

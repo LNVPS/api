@@ -2,6 +2,7 @@ pub mod api;
 pub mod chain;
 pub mod data_migration;
 pub mod fee_estimate;
+pub mod key_rotation;
 pub mod notifications;
 pub mod payment_factory;
 pub mod payments;

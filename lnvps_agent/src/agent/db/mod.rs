@@ -46,6 +46,7 @@ use payments_rs::currency::{Currency, CurrencyAmount};
 
 use crate::agent::ToolExecutor;
 use crate::diag::Diagnostics;
+use crate::escalation::Escalation;
 
 use vms::PowerAction;
 
@@ -53,6 +54,7 @@ pub mod account;
 pub mod apps;
 pub mod billing;
 pub mod catalogue;
+mod escalation;
 pub mod partners;
 pub mod vms;
 
@@ -149,6 +151,8 @@ pub struct DbToolExecutor {
     rates: Option<Arc<dyn ExchangeRateService>>,
     /// Looking-glass and policy clients backing the diagnostic tools.
     diag: Diagnostics,
+    /// Mail path to support; `None` disables `escalate_to_support`.
+    escalation: Option<Escalation>,
 }
 
 impl DbToolExecutor {
@@ -162,6 +166,7 @@ impl DbToolExecutor {
             work_sender: None,
             rates: None,
             diag: Diagnostics::default(),
+            escalation: None,
         }
     }
 
@@ -181,6 +186,7 @@ impl DbToolExecutor {
             work_sender: None,
             rates: None,
             diag: Diagnostics::default(),
+            escalation: None,
         }
     }
 
@@ -212,6 +218,12 @@ impl DbToolExecutor {
     /// looking glass and website (tests, staging deployments).
     pub fn with_diagnostics(mut self, diag: Diagnostics) -> Self {
         self.diag = diag;
+        self
+    }
+
+    /// Enable `escalate_to_support`, sending through `escalation`.
+    pub fn with_escalation(mut self, escalation: Escalation) -> Self {
+        self.escalation = Some(escalation);
         self
     }
 
@@ -275,6 +287,7 @@ impl DbToolExecutor {
 #[async_trait]
 impl ToolExecutor for DbToolExecutor {
     async fn execute(&self, name: &str, arguments: &str) -> Result<String> {
+        crate::tools::guard::refuse_if_human_only(name)?;
         let args = parse_args(arguments);
 
         match name {
@@ -368,7 +381,11 @@ impl ToolExecutor for DbToolExecutor {
             "price_custom_vm" => pretty(&self.price_custom_vm(&args).await?),
             "get_exchange_rate" => pretty(&self.exchange_rate(&args).await?),
             "list_os_images" => pretty(&self.os_images().await?),
+            "list_payment_methods" => pretty(&self.accepted_payment_methods().await?),
             "get_terms_of_service" => Ok(self.diag.terms_of_service().await?.to_string()),
+
+            // ── Support handoff ──────────────────────────────────────
+            "escalate_to_support" => pretty(&self.escalate_to_support(&args).await?),
 
             // ── Diagnostics ──────────────────────────────────────────
             "ping_vm" => {
@@ -391,6 +408,27 @@ impl ToolExecutor for DbToolExecutor {
                 let ips = self.vm_ips(&vm).await;
                 pretty(&serde_json::to_value(
                     self.diag.check_port(&ips, wants_ipv6(&args), port).await?,
+                )?)
+            }
+
+            "scan_vm_ports" => {
+                let vm = self.owned_vm(&args).await?;
+                let ips = self.vm_ips(&vm).await;
+                let ports = args
+                    .get("ports")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|v| v.as_u64()).collect::<Vec<_>>());
+                let range = match (
+                    args.get("range_start").and_then(|v| v.as_u64()),
+                    args.get("range_end").and_then(|v| v.as_u64()),
+                ) {
+                    (Some(s), Some(e)) => Some((s, e)),
+                    _ => None,
+                };
+                pretty(&serde_json::to_value(
+                    self.diag
+                        .scan_ports(&ips, wants_ipv6(&args), ports, range)
+                        .await?,
                 )?)
             }
 
