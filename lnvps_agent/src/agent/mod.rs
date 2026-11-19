@@ -74,6 +74,31 @@ fn compaction_transcript(summary: Option<&str>, messages: &[ChatMessage]) -> Str
 /// The marker is not decoration: without it the model reads a transcript that
 /// stops mid-sentence as a complete account of the conversation, and answers
 /// confidently from a history it cannot see the end of.
+const SUMMARY_WORD_LIMIT: usize = 200;
+
+fn cap_summary(summary: &str) -> String {
+    let words: Vec<&str> = summary.split_whitespace().collect();
+    if words.len() <= SUMMARY_WORD_LIMIT {
+        return summary.trim().to_string();
+    }
+    let lines: Vec<&str> = summary.lines().collect();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = 0;
+    for line in lines.iter().rev() {
+        let n = line.split_whitespace().count();
+        if used + n > SUMMARY_WORD_LIMIT {
+            break;
+        }
+        used += n;
+        kept.push(line);
+    }
+    kept.reverse();
+    if kept.is_empty() {
+        return words[words.len() - SUMMARY_WORD_LIMIT..].join(" ");
+    }
+    kept.join("\n").trim().to_string()
+}
+
 fn fallback_summary(transcript: &str) -> String {
     let kept = truncate_chars(transcript, FALLBACK_SUMMARY_CHARS);
     if kept.chars().count() < transcript.chars().count() {
@@ -870,7 +895,7 @@ impl SupportAgent {
         // summary than `None`, and the two arrive interchangeably depending on
         // the provider.
         match choice.message.content.as_deref().map(str::trim) {
-            Some(summary) if !summary.is_empty() => Ok(summary.to_string()),
+            Some(summary) if !summary.is_empty() => Ok(cap_summary(summary)),
             _ => Err(anyhow!(
                 "LLM returned no summary text (finish_reason: {}); \
                  a reasoning model can exhaust max-tokens before emitting content",
@@ -1235,6 +1260,28 @@ mod tests {
 
     /// A transcript already under the cap is kept whole, and is not labelled as
     /// truncated when nothing was cut.
+    #[test]
+    fn an_oversized_summary_is_cut_to_the_word_limit_keeping_the_newest_lines() {
+        let long: String = (0..60)
+            .map(|i| format!("- point {i} one two three four five six\n"))
+            .collect();
+        let capped = cap_summary(&long);
+        assert!(capped.split_whitespace().count() <= SUMMARY_WORD_LIMIT);
+        assert!(capped.contains("point 59"));
+        assert!(!capped.contains("point 0 "));
+    }
+
+    #[test]
+    fn a_summary_within_the_limit_is_untouched() {
+        assert_eq!(cap_summary("- short note\n"), "- short note");
+    }
+
+    #[test]
+    fn a_single_oversized_line_still_respects_the_limit() {
+        let one_line = "word ".repeat(500);
+        assert_eq!(cap_summary(&one_line).split_whitespace().count(), SUMMARY_WORD_LIMIT);
+    }
+
     #[test]
     fn fallback_summary_keeps_a_short_transcript_whole() {
         let short = "User: hello\nAgent: hi\n";
