@@ -25,6 +25,14 @@ pub const GUEST_DNS_SERVERS: &[&str] = &[
     "2620:fe::fe",
 ];
 
+/// Name the guest's NIC is given, whatever its kernel name.
+///
+/// `eth0` because that is what Proxmox's own cloud-init network config names
+/// it, and most existing guests are on Proxmox: a guest's firewall, routing or
+/// VPN setup refers to its interface by name, and a guest migrated from one
+/// host kind to another must find the same name.
+pub const GUEST_NIC_NAME: &str = "eth0";
+
 /// Guest hostname for a VM.
 ///
 /// Matches the Proxmox backend's VM name so a guest keeps the same identity
@@ -48,6 +56,8 @@ pub struct NetworkConfig {
 ///
 /// Addresses are matched to the NIC by MAC rather than by interface name,
 /// because the guest's name for it depends on the distro's naming scheme.
+/// The match then renames it to [`GUEST_NIC_NAME`], so the guest sees the same
+/// name on every host kind and a migration does not change it under them.
 pub fn network_config(value: &FullVmInfo) -> Result<NetworkConfig> {
     let mut v4 = Vec::new();
     let mut v6 = Vec::new();
@@ -105,7 +115,9 @@ pub fn network_config(value: &FullVmInfo) -> Result<NetworkConfig> {
     // rest are fine.
     let mut cfg = String::from("version: 2\nethernets:\n  nic0:\n    match:\n      macaddress: \"");
     cfg.push_str(&value.vm.mac_address.to_lowercase());
-    cfg.push_str("\"\n    dhcp4: false\n    dhcp6: false\n");
+    cfg.push_str("\"\n    set-name: ");
+    cfg.push_str(GUEST_NIC_NAME);
+    cfg.push_str("\n    dhcp4: false\n    dhcp6: false\n");
     if accept_ra {
         cfg.push_str("    accept-ra: true\n");
     }
@@ -342,6 +354,22 @@ mod tests {
         assert!(net.yaml.contains("dhcp4: false"), "got {}", net.yaml);
         assert!(net.yaml.contains("to: default"), "got {}", net.yaml);
         assert!(net.v4_count >= 1);
+        Ok(())
+    }
+
+    /// The NIC is renamed to the same name on every host kind. Proxmox's own
+    /// `ipconfig` config calls it `eth0`; without the rename a libvirt guest
+    /// keeps its predictable kernel name (`enp1s0`), and a VM migrated between
+    /// the two finds its firewall and routing set up for an interface that is
+    /// not there.
+    #[test]
+    fn network_config_names_the_nic_eth0() -> Result<()> {
+        let out = network_config(&mock_full_vm())?.yaml;
+        assert!(
+            out.contains("  nic0:\n    match:\n      macaddress: \"")
+                && out.contains("\"\n    set-name: eth0\n    dhcp4: false\n"),
+            "{out}"
+        );
         Ok(())
     }
 
