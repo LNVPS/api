@@ -1354,7 +1354,6 @@ async fn v1_custom_template_calc(
     ApiData::ok(ApiCustomVmPrice::from_price(&price, &this.rates).await?)
 }
 
-/// Validate the customer's first-boot script before creating an order.
 fn validate_user_data(user_data: Option<&str>) -> Result<(), ApiError> {
     let Some(script) = user_data else {
         return Ok(());

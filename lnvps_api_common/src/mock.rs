@@ -3799,6 +3799,9 @@ impl LNVpsDbBase for MockDb {
         let mut vms = self.vms.lock().await;
         for vm in vms.values_mut() {
             if line_item_ids.contains(&vm.subscription_line_item_id) {
+                if vm.deleted {
+                    vm.user_data = None;
+                }
                 vm.deleted = false;
             }
         }
@@ -10564,6 +10567,7 @@ mod tests {
         vm.user_data = Some("#!/bin/sh\necho private-script-marker".into());
         vm.id = db.insert_vm(&vm).await.unwrap();
         let stored = db.get_vm(vm.id).await.unwrap();
+        let stored_id = stored.id;
         assert_eq!(
             stored.user_data.as_ref().unwrap().as_str(),
             vm.user_data.as_ref().unwrap().as_str()
@@ -10599,7 +10603,17 @@ mod tests {
         db.subscription_payment_paid(&payment).await.unwrap();
         let revived = db.get_vm(vm.id).await.unwrap();
         assert!(!revived.deleted);
-        assert_eq!(revived.user_data.as_ref().unwrap().as_str(), "");
+        assert!(revived.user_data.is_none());
+        assert_eq!(
+            db.get_vm(stored_id)
+                .await
+                .unwrap()
+                .user_data
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            "#!/bin/sh\necho private-script-marker"
+        );
 
         vm.id += 1;
         vm.user_data = None;

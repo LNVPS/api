@@ -225,10 +225,9 @@ impl VmProvisioner {
 
         if user_data.is_some() {
             let client = self.host_client(&host.host).await?;
-            ensure!(
-                client.supports_user_data().await?,
-                "This region's host cannot deliver user_data"
-            );
+            if !client.supports_user_data().await? {
+                return Err(lnvps_api_common::host::UserDataUnsupported.into());
+            }
         }
 
         let pick_disk = if let Some(hd) = host.disks.first() {
@@ -366,10 +365,9 @@ impl VmProvisioner {
 
         if user_data.is_some() {
             let client = self.host_client(&host.host).await?;
-            ensure!(
-                client.supports_user_data().await?,
-                "This region's host cannot deliver user_data"
-            );
+            if !client.supports_user_data().await? {
+                return Err(lnvps_api_common::host::UserDataUnsupported.into());
+            }
         }
 
         let pick_disk = if let Some(hd) = host.disks.first() {
@@ -1480,137 +1478,9 @@ mod tests {
     use super::*;
 
     use lnvps_api_common::VmRunningState;
-    use lnvps_api_common::host::{TerminalStream, TimeSeries, TimeSeriesData, VmHostInfo};
     use lnvps_db::VmOsImage;
 
-    struct UserDataHost(u8);
-
-    #[async_trait::async_trait]
-    impl VmHostClient for UserDataHost {
-        async fn supports_user_data(&self) -> OpResult<bool> {
-            match self.0 {
-                0 => Ok(false),
-                1 => Ok(true),
-                _ => Err(lnvps_api_common::retry::OpError::Fatal(anyhow!(
-                    "capability lookup failed"
-                ))),
-            }
-        }
-        async fn get_info(&self) -> OpResult<VmHostInfo> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .get_info()
-                .await
-        }
-        async fn list_snapshots(&self, vm: &Vm) -> OpResult<Vec<VmSnapshot>> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .list_snapshots(vm)
-                .await
-        }
-        async fn create_snapshot(
-            &self,
-            vm: &Vm,
-            name: &str,
-            description: Option<&str>,
-        ) -> OpResult<()> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .create_snapshot(vm, name, description)
-                .await
-        }
-        async fn rollback_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .rollback_snapshot(vm, name)
-                .await
-        }
-        async fn delete_snapshot(&self, vm: &Vm, name: &str) -> OpResult<()> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .delete_snapshot(vm, name)
-                .await
-        }
-        async fn download_os_image(&self, image: &VmOsImage) -> OpResult<()> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .download_os_image(image)
-                .await
-        }
-        async fn generate_mac(&self, vm: &Vm) -> OpResult<String> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .generate_mac(vm)
-                .await
-        }
-        async fn start_vm(&self, vm: &Vm) -> OpResult<()> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .start_vm(vm)
-                .await
-        }
-        async fn stop_vm(&self, vm: &Vm) -> OpResult<()> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .stop_vm(vm)
-                .await
-        }
-        async fn reset_vm(&self, vm: &Vm) -> OpResult<()> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .reset_vm(vm)
-                .await
-        }
-        async fn create_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .create_vm(cfg)
-                .await
-        }
-        async fn delete_vm(&self, vm: &Vm) -> OpResult<()> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .delete_vm(vm)
-                .await
-        }
-        async fn unlink_primary_disk(&self, vm: &Vm) -> OpResult<()> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .unlink_primary_disk(vm)
-                .await
-        }
-        async fn import_template_disk(&self, cfg: &FullVmInfo) -> OpResult<()> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .import_template_disk(cfg)
-                .await
-        }
-        async fn resize_disk(&self, cfg: &FullVmInfo) -> OpResult<()> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .resize_disk(cfg)
-                .await
-        }
-        async fn get_vm_state(&self, vm: &Vm) -> OpResult<VmRunningState> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .get_vm_state(vm)
-                .await
-        }
-        async fn get_all_vm_states(&self) -> OpResult<Vec<(u64, VmRunningState)>> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .get_all_vm_states()
-                .await
-        }
-        async fn configure_vm(&self, cfg: &FullVmInfo) -> OpResult<()> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .configure_vm(cfg)
-                .await
-        }
-        async fn patch_firewall(&self, cfg: &FullVmInfo) -> OpResult<()> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .patch_firewall(cfg)
-                .await
-        }
-        async fn get_time_series_data(
-            &self,
-            vm: &Vm,
-            series: TimeSeries,
-        ) -> OpResult<Vec<TimeSeriesData>> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .get_time_series_data(vm, series)
-                .await
-        }
-        async fn connect_terminal(&self, vm: &Vm) -> OpResult<TerminalStream> {
-            lnvps_api_common::host::dummy_host::DummyVmHost::new()
-                .connect_terminal(vm)
-                .await
-        }
-    }
+    use crate::mocks::UserDataHost;
 
     #[tokio::test]
     async fn user_data_is_checked_before_order_writes_and_stored_for_both_orders() -> Result<()> {
@@ -1619,7 +1489,7 @@ mod tests {
                 let db = Arc::new(MockDb::default());
                 let (user, key) = add_user(&db).await?;
                 let prov = make_provisioner(db.clone())
-                    .with_host_clients(move |_| Arc::new(UserDataHost(capability)));
+                    .with_host_clients(move |_| Arc::new(UserDataHost::new(capability)));
                 let before_vms = db.vms.lock().await.len();
                 let before_subs = db.subscriptions.lock().await.len();
                 let before_payments = db.subscription_payments.lock().await.len();
@@ -1656,7 +1526,16 @@ mod tests {
                         script
                     );
                 } else {
-                    let message = result.unwrap_err().to_string();
+                    let error = result.unwrap_err();
+                    let message = error.to_string();
+                    if capability == 0 {
+                        let api_error = lnvps_api_common::ApiError::from(error);
+                        assert_eq!(api_error.code, axum::http::StatusCode::BAD_REQUEST);
+                        assert_eq!(
+                            api_error.error,
+                            "This region's host cannot deliver user_data"
+                        );
+                    }
                     assert!(
                         message.contains(if capability == 0 {
                             "cannot deliver user_data"
@@ -1671,6 +1550,63 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn late_payment_revives_vm_without_script_but_build_needs_ssh_key_reassigned()
+    -> Result<()> {
+        let db = Arc::new(MockDb::default());
+        let sub_handler = make_sub_handler(db.clone()).await?;
+        let (user, key) = add_user(&db).await?;
+        let provisioner =
+            make_provisioner(db.clone()).with_host_clients(|_| Arc::new(UserDataHost::new(1)));
+        let vm = provisioner
+            .provision(
+                user.id,
+                1,
+                1,
+                key.id,
+                None,
+                Some("#!/bin/sh\necho erased".into()),
+            )
+            .await?;
+        let li = db
+            .get_subscription_line_item(vm.subscription_line_item_id)
+            .await?;
+        let payment = sub_handler
+            .renew_subscription(li.id, PaymentMethod::Lightning, 1)
+            .await?;
+        db.delete_vm(vm.id).await?;
+        assert_eq!(
+            db.vms.lock().await[&vm.id]
+                .user_data
+                .as_ref()
+                .unwrap()
+                .as_str(),
+            ""
+        );
+        sub_handler.complete_payment(&payment).await?;
+        let mut revived = db.get_vm(vm.id).await?;
+        assert!(!revived.deleted);
+        assert!(revived.user_data.is_none());
+        assert!(revived.ssh_key_id.is_none());
+        let error = FullVmInfo::load(vm.id, db.clone())
+            .await
+            .err()
+            .expect("revived VM still needs an SSH key");
+        assert_eq!(
+            error.to_string(),
+            format!("VM {} has no SSH key assigned", vm.id)
+        );
+        assert!(!error.to_string().contains("script was cleared"));
+        revived.ssh_key_id = Some(key.id);
+        db.update_vm(&revived).await?;
+        let info = FullVmInfo::load(vm.id, db.clone()).await?;
+        assert!(info.vm.user_data.is_none());
+        let data = lnvps_api_common::host::cloud_init::user_data(&info)?;
+        assert!(data.starts_with("#cloud-config\n"));
+        assert!(!data.contains("echo erased"));
         Ok(())
     }
 

@@ -652,3 +652,77 @@ async fn dry_run_plan_changes_nothing() {
     assert_eq!(state_on(&w, SRC).await, Some(VmRunningStates::Running));
     assert!(DummyVmHost::disk(DST, w.vm_id).await.is_none());
 }
+
+#[tokio::test(start_paused = true)]
+async fn adopt_checks_target_script_support_before_source_calls_or_migration_records() {
+    let _s = SERIAL.lock().await;
+    for script in [None, Some(""), Some("#!/bin/sh\necho once")] {
+        for capability in [0, 1, 2] {
+            let mut w = world(1).await;
+            w.db.vms.lock().await.get_mut(&w.vm_id).unwrap().user_data = script.map(Into::into);
+            let mut source = crate::mocks::UserDataHost::new(0);
+            source.inner = DummyVmHost::new().with_host_id(SRC);
+            let mut target = crate::mocks::UserDataHost::new(capability);
+            target.inner = DummyVmHost::new().with_host_id(DST);
+            let source_calls = source.calls.clone();
+            let target_calls = target.calls.clone();
+            w.provisioner = w.provisioner.with_host_clients(move |h| {
+                Arc::new(if h.id == SRC {
+                    source.clone()
+                } else {
+                    target.clone()
+                })
+            });
+            let plan = w
+                .provisioner
+                .plan_vm_migration(w.vm_id, DST, &Default::default())
+                .await
+                .unwrap();
+            let refused = script.is_some_and(|s| !s.is_empty()) && capability != 1;
+            assert_eq!(plan.allowed(), !refused, "{:?}", plan.refusals);
+            if !refused {
+                assert_eq!(plan.method, Some(MigrationMethod::CopyAndAdopt));
+                assert_eq!(plan.target_disk_id, Some(DST_DISK));
+                if script.is_none_or(|s| s.is_empty()) {
+                    assert!(target_calls.lock().unwrap().is_empty());
+                }
+                continue;
+            }
+            let result = w
+                .provisioner
+                .migrate_vm_with(w.vm_id, DST, false, &Default::default(), None)
+                .await;
+            if refused {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(if capability == 0 {
+                    "cannot deliver user_data"
+                } else {
+                    "capability lookup failed"
+                }));
+                assert!(source_calls.lock().unwrap().is_empty());
+                assert_eq!(w.db.get_vm(w.vm_id).await.unwrap().host_id, SRC);
+                assert!(w.db.list_vm_migrations(w.vm_id).await.unwrap().is_empty());
+                assert!(phases(&w).await.is_empty());
+                let db: Arc<dyn lnvps_db::LNVpsDb> = w.db.clone();
+                let stale_plan = load_migration_plan(&db, w.vm_id, DST, &Default::default())
+                    .await
+                    .unwrap();
+                assert!(
+                    w.provisioner
+                        .copy_and_adopt(stale_plan, Default::default(), None, false)
+                        .await
+                        .is_err()
+                );
+                assert!(source_calls.lock().unwrap().is_empty());
+                assert!(w.db.list_vm_migrations(w.vm_id).await.unwrap().is_empty());
+                assert!(
+                    target_calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .all(|c| *c == "supports_user_data")
+                );
+            }
+        }
+    }
+}

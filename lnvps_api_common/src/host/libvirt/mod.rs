@@ -1204,7 +1204,7 @@ mod tests {
                 .windows(document.len())
                 .any(|bytes| bytes == document.as_bytes())
         );
-        assert!(document.contains("text/x-shellscript"));
+        assert!(document.contains("Content-Type: text/x-shellscript-per-once; charset=\"utf-8\""));
         assert!(document.contains("Content-Transfer-Encoding: base64"));
         info.vm.user_data = None;
         assert_eq!(original, LibVirtHost::build_seed_image(&info)?);

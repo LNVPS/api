@@ -54,7 +54,13 @@ impl VmProvisioner {
         target_host_id: u64,
         options: &MigrationOptions,
     ) -> Result<MigrationPlan> {
-        load_migration_plan(self.db(), vm_id, target_host_id, options).await
+        let mut plan = load_migration_plan(self.db(), vm_id, target_host_id, options).await?;
+        let vm = self.db().get_vm(vm_id).await?;
+        let target = self.db().get_host(target_host_id).await?;
+        if let Err(e) = self.ensure_migration_user_data(&vm, &target).await {
+            plan.refusals.push(e.to_string());
+        }
+        Ok(plan)
     }
 
     pub async fn migrate_vm_with(
@@ -68,6 +74,9 @@ impl VmProvisioner {
         if self.read_only() {
             bail!("Cant migrate VM's in read-only mode");
         }
+        let vm = self.db().get_vm(vm_id).await?;
+        let target = self.db().get_host(target_host_id).await?;
+        self.ensure_migration_user_data(&vm, &target).await?;
         let inherited_running = self.expire_stale_migration(vm_id).await?;
         let plan = self
             .plan_vm_migration(vm_id, target_host_id, options)
@@ -166,6 +175,7 @@ impl VmProvisioner {
         let vm = db.get_vm(plan.vm_id).await?;
         let source_host = db.get_host(plan.source_host_id).await?;
         let target_host = db.get_host(plan.target_host_id).await?;
+        self.ensure_migration_user_data(&vm, &target_host).await?;
         let target_disk_id = plan
             .target_disk_id
             .ok_or_else(|| anyhow!("plan has no target disk"))?;

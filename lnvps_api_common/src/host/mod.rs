@@ -332,9 +332,19 @@ pub fn extract_host_from_url(input: &str) -> String {
 }
 
 /// Generic type for creating VM's
+#[derive(Debug)]
+pub struct UserDataUnsupported;
+
+impl std::fmt::Display for UserDataUnsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("This region's host cannot deliver user_data")
+    }
+}
+
+impl std::error::Error for UserDataUnsupported {}
+
 #[async_trait]
 pub trait VmHostClient: Send + Sync {
-    /// Whether this host can deliver a first-boot script to cloud-init.
     async fn supports_user_data(&self) -> OpResult<bool> {
         Ok(false)
     }

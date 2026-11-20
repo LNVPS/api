@@ -2599,8 +2599,6 @@ impl LNVpsDbBase for LNVpsDbMysql {
     }
 
     async fn delete_vm(&self, vm_id: u64) -> DbResult<()> {
-        // An encrypted empty script marks deletion so late payment cannot silently
-        // build the VM without the script it was ordered with.
         sqlx::query("update vm set deleted = 1, ssh_key_id = null, user_data = case when user_data is null then null else ? end where id = ?")
             .bind(EncryptedString::new(String::new()))
             .bind(vm_id)
@@ -4659,7 +4657,7 @@ impl LNVpsDbBase for LNVpsDbMysql {
         // Un-delete any VM linked to this subscription (e.g. auto-cleaned up before
         // payment arrived). This handles payment methods with longer timeouts.
         sqlx::query(
-            "UPDATE vm SET deleted = 0 WHERE subscription_line_item_id IN (SELECT id FROM subscription_line_item WHERE subscription_id = ?)",
+            "UPDATE vm SET user_data = CASE WHEN deleted = 1 THEN NULL ELSE user_data END, deleted = 0 WHERE subscription_line_item_id IN (SELECT id FROM subscription_line_item WHERE subscription_id = ?)",
         )
         .bind(payment.subscription_id)
         .execute(tx.as_mut())
@@ -9590,7 +9588,7 @@ impl AdminDb for LNVpsDbMysql {
         .fetch_one(&mut *tx)
         .await?;
 
-        // Move VM ownership and drop the old owner's SSH key and script
+        // Move VM ownership and drop the old owner's ssh key reference
         sqlx::query("UPDATE vm SET user_id = ?, ssh_key_id = NULL, user_data = NULL WHERE id = ?")
             .bind(new_user_id)
             .bind(vm_id)

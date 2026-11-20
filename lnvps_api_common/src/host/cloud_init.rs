@@ -176,12 +176,12 @@ pub fn meta_data(value: &FullVmInfo) -> Result<String> {
     Ok(serde_yaml_ng::to_string(&data)?)
 }
 
-/// Cloud-init `user-data`, optionally including a customer's script in scripts-user.
-///
-/// Libvirt's stable instance-id runs it once per disk; reinstalling runs it again.
-/// Proxmox reconfiguration (including address or SSH key changes) runs cloud-init
-/// and the script again. Scripts must be safe to run more than once.
+/// NoCloud `user-data` document.
 pub fn user_data(value: &FullVmInfo) -> Result<String> {
+    user_data_with_package_upgrade(value, false)
+}
+
+pub fn user_data_with_package_upgrade(value: &FullVmInfo, package_upgrade: bool) -> Result<String> {
     // NOTE: `EncryptedString`'s Display impl deliberately renders "[ENCRYPTED]"
     // so secrets cannot leak into logs. Using it here would authorise that
     // literal string as the customer's SSH key and lock them out of their VM.
@@ -237,7 +237,10 @@ pub fn user_data(value: &FullVmInfo) -> Result<String> {
         ),
     };
 
-    let config = format!("#cloud-config\n{}", serde_yaml_ng::to_string(&data)?);
+    let mut config = format!("#cloud-config\n{}", serde_yaml_ng::to_string(&data)?);
+    if package_upgrade && value.vm.user_data.is_some() {
+        config.push_str("package_upgrade: true\n");
+    }
     let Some(script) = &value.vm.user_data else {
         return Ok(config);
     };
@@ -251,12 +254,9 @@ pub fn user_data(value: &FullVmInfo) -> Result<String> {
     multipart_user_data(&config, script, &boundary)
 }
 
-/// A delimiter's leading CRLF is separate from the preceding payload.
 fn multipart_user_data(config: &str, script: &str, boundary: &str) -> Result<String> {
     let delimiter = format!("--{boundary}");
     for part in [config, script] {
-        // Reject delimiter prefixes too: MIME readers may accept trailing
-        // whitespace or a closing `--` after the boundary token.
         anyhow::ensure!(
             !part
                 .split(['\r', '\n'])
@@ -281,7 +281,7 @@ fn multipart_user_data(config: &str, script: &str, boundary: &str) -> Result<Str
          --{boundary}\r\nContent-Type: text/cloud-config; charset=\"utf-8\"\r\n\
          Content-Transfer-Encoding: base64\r\n\r\n\
          {config}\r\n--{boundary}\r\n\
-         Content-Type: text/x-shellscript; charset=\"utf-8\"\r\n\
+         Content-Type: text/x-shellscript-per-once; charset=\"utf-8\"\r\n\
          Content-Transfer-Encoding: base64\r\n\r\n\
          {script}\r\n--{boundary}--\r\n"
     ))
@@ -496,7 +496,7 @@ mod tests {
             assert_eq!(parts.len(), 4);
             for (part, content_type, expected) in [
                 (parts[1], "text/cloud-config", config.as_bytes()),
-                (parts[2], "text/x-shellscript", script.as_bytes()),
+                (parts[2], "text/x-shellscript-per-once", script.as_bytes()),
             ] {
                 let (headers, payload) = part.split_once("\r\n\r\n").unwrap();
                 assert_eq!(
@@ -517,6 +517,34 @@ mod tests {
             assert_eq!(parts[3], "--\r\n");
             assert_eq!(out, user_data(&cfg)?);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn package_upgrade_is_opt_in_and_only_for_scripted_guests() -> Result<()> {
+        let mut cfg = mock_full_vm();
+        assert_eq!(
+            user_data(&cfg)?,
+            user_data_with_package_upgrade(&cfg, true)?
+        );
+        cfg.vm.user_data = Some("#!/bin/sh\necho first-boot".into());
+        let plain = user_data(&cfg)?;
+        let proxmox = user_data_with_package_upgrade(&cfg, true)?;
+        let boundary = format!(
+            "lnvps-{:x}",
+            Sha256::digest(cfg.vm.user_data.as_ref().unwrap().as_str().as_bytes())
+        );
+        let decode = |out: &str| -> Result<String> {
+            let part = out.split(&format!("\r\n--{boundary}")).nth(1).unwrap();
+            let payload = part.split_once("\r\n\r\n").unwrap().1.replace("\r\n", "");
+            Ok(String::from_utf8(STANDARD.decode(payload)?)?)
+        };
+        assert!(!decode(&plain)?.contains("package_upgrade"));
+        assert_eq!(
+            decode(&proxmox)?,
+            format!("{}package_upgrade: true\n", decode(&plain)?)
+        );
+        assert!(!decode(&proxmox)?.contains("chpasswd"));
         Ok(())
     }
 

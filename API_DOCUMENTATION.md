@@ -435,7 +435,7 @@ interface CustomVmOrder extends CustomVmRequest {
   image_id: number;
   ssh_key_id: number;
   ref_code?: string;
-  user_data?: string; // Optional first-boot script; see VM order scripts below
+  user_data?: string;
 }
 
 interface CustomTemplateParams {
@@ -650,16 +650,20 @@ cloud-config, includes and MIME documents are not accepted. Omit the field for t
 usual image setup.
 
 Cloud-init runs the script once as root in its final `scripts-user` stage, after
-installing the SSH key and setting up host keys. A reinstall runs it again, and on
-Proxmox hosts a reconfiguration (such as an address or SSH key change) also runs it
-again. Scripts must be safe to run more than once.
+installing the SSH key and setting up host keys. It runs once per VM disk; a
+reinstall runs it again. The image needs cloud-init 22.1 or later; older images
+ignore the script part. Address, SSH key and template changes do not rerun it.
 
 The script is stored encrypted, is never returned by any API response, and is
-cleared when the VM is deleted. A VM revived after deletion cannot be built with
-that script. An order with a script is refused if the region's
+cleared when the VM is deleted. A VM revived after deletion by a late payment
+builds without its erased script once an SSH key is assigned again; deletion also
+clears the SSH key, as before. An order with a script is refused if the region's
 chosen host cannot deliver it. Proxmox operators must configure LNVPS's SSH access
 and a storage with the `snippets` content type. Libvirt hosts support scripts
-through their NoCloud seed.
+through their NoCloud seed. Scripted Proxmox VMs retain `package_upgrade: true`
+and omit Proxmox's generated `chpasswd` block because LNVPS sets no password.
+Migration to a host that cannot deliver a retained script is refused before the
+source VM is stopped.
 
 ### VM Upgrades
 

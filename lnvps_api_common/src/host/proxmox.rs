@@ -571,8 +571,6 @@ impl ProxmoxClient {
             .map_err(OpError::Transient)?;
             info!("Wrote cloud-init snippet to {}", snippet_path);
         } else if mode == 0o600 {
-            // A previous upload may have left matching content with a wider
-            // mode. Reconcile permissions before memoising success.
             let (exit_code, _) = ssh
                 .execute(&format!("chmod 600 '{snippet_path}'"))
                 .await
@@ -620,12 +618,12 @@ impl ProxmoxClient {
         }
     }
 
-    /// Write the complete user-data document only for VMs carrying a script.
     async fn ensure_user_snippet(&self, cfg: &FullVmInfo) -> OpResult<Option<String>> {
         if cfg.vm.user_data.is_none() {
             return Ok(None);
         }
-        let content = crate::host::cloud_init::user_data(cfg).map_err(OpError::Fatal)?;
+        let content = crate::host::cloud_init::user_data_with_package_upgrade(cfg, true)
+            .map_err(OpError::Fatal)?;
         match self
             .write_snippet(&format!("lnvps-user-{}.yaml", cfg.vm.id), &content, 0o600)
             .await?
@@ -638,7 +636,6 @@ impl ProxmoxClient {
         }
     }
 
-    /// Remove user-data only after the VM has been destroyed.
     async fn remove_user_snippet(&self, vm_id: u64) -> OpResult<()> {
         self.remove_snippet(&format!("lnvps-user-{vm_id}.yaml"))
             .await
@@ -649,11 +646,13 @@ impl ProxmoxClient {
     /// A VM cannot start when a `cicustom` volume it references is missing, so
     /// this only ever runs after the VM itself is gone.
     async fn remove_network_snippet(&self, vm_id: u64) -> OpResult<()> {
+        // Drop any memo first: the file is about to stop existing, so a cached
+        // "already reconciled" entry would let a later write_snippet hand back a
+        // vol_ref for a snippet that is no longer on the host.
         self.remove_snippet(&Self::network_snippet_filename(vm_id))
             .await
     }
 
-    /// Forget the memo before removing the file, including on failure.
     async fn remove_snippet(&self, filename: &str) -> OpResult<()> {
         self.forget_snippet(filename).await;
 
@@ -3989,7 +3988,6 @@ mod tests {
         assert!(!client.supports_user_data().await?);
         let original = client.make_config(&cfg, None, None, None)?;
         assert!(original.cicustom.is_none());
-        // Captured from e94d42d4 with this fixed VM and client configuration.
         let baseline: VmConfig = serde_json::from_str(
             r#"{
   "onboot": true,
@@ -4025,7 +4023,7 @@ mod tests {
         });
         client.snippet_storage.set(Some("local".into())).unwrap();
         assert!(client.supports_user_data().await?);
-        let content = crate::host::cloud_init::user_data(&cfg)?;
+        let content = crate::host::cloud_init::user_data_with_package_upgrade(&cfg, true)?;
         let filename = format!("lnvps-user-{}.yaml", cfg.vm.id);
         client.mark_snippet_written(&filename, &content).await;
         let volume = client.ensure_user_snippet(&cfg).await?.unwrap();
@@ -4042,6 +4040,7 @@ mod tests {
                 .to_string(),
             volume
         );
+        assert!(config.cicustom.as_ref().unwrap().meta.is_none());
         assert_eq!(config.ssh_keys, original.ssh_keys);
         assert_eq!(config.ip_config, original.ip_config);
         assert!(ProxmoxClient::config_drift(&original, &config).contains(&"cicustom".to_string()));

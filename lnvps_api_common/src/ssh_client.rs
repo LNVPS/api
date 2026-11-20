@@ -321,8 +321,6 @@ impl SshClient {
                     },
                 )
                 .await?;
-            // Creation attributes do not change an existing file's mode.
-            // Restrict the open file before writing any script bytes.
             file.set_metadata(FileAttributes {
                 permissions: Some(0o600),
                 ..FileAttributes::empty()
