@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **VM order scripts** (2026-11-19): `POST /api/v1/vm` and `POST /api/v1/vm/custom-template` accept optional `user_data`, a `#!` first-boot script up to 16 KiB. Stored encrypted, never returned, and cleared on VM deletion. Runs as root after SSH setup once per VM disk (again on reinstall), requiring cloud-init 22.1 or later. After late-payment revival, the VM builds without the erased script once an SSH key is assigned again; deletion clears the key, as before. Orders return HTTP 400 when the host cannot deliver scripts; migrations check the target before stopping the source. Proxmox needs SSH and snippet storage, retains package upgrades, and omits the unused password block.
+
 - **API tokens**: `GET`/`POST /api/v1/account/tokens` and `DELETE /api/v1/account/tokens/{id}`. Create with `{name, scope: "read"|"vm", expires_in_days}` (default 90, max 365); the secret (`lnvps_...`) is returned once. Use as `Authorization: Bearer`. `read` allows GET on `/api/v1`, `vm` adds start, stop and restart. Tokens cannot reach the admin API, payments, or token management. Responses list `last_used` and `last_ip`. Needs migration `20261201000100_api_token.sql`.
 - **Per-account rate limits** on VM orders (20/h), renew and upgrade payments (60/h) and admin refunds (10/h), shared through Redis when configured. Exceeding returns 429.
 - **Step-up**: `POST /api/v1/webauthn/step-up/start` and `/finish` return a 5 minute token for the `X-Step-Up` header. With admin config `require-step-up: true`, refunds, VM purge, credit adjustment and role changes need it.

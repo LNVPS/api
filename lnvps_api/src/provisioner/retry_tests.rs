@@ -218,6 +218,7 @@ mod tests {
                 disk_id: 1,
                 mac_address: "bc:24:11:00:00:01".to_string(),
                 ssh_host_keys: None,
+                user_data: None,
                 deleted: false,
                 ref_code: None,
                 disabled: false,

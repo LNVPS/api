@@ -1354,6 +1354,22 @@ async fn v1_custom_template_calc(
     ApiData::ok(ApiCustomVmPrice::from_price(&price, &this.rates).await?)
 }
 
+fn validate_user_data(user_data: Option<&str>) -> Result<(), ApiError> {
+    let Some(script) = user_data else {
+        return Ok(());
+    };
+    if script.len() > 16384 {
+        return Err(ApiError::new("user_data must be at most 16384 bytes"));
+    }
+    if !script.starts_with("#!") {
+        return Err(ApiError::new("user_data must start with #!"));
+    }
+    if script.contains('\0') {
+        return Err(ApiError::new("user_data must not contain NUL bytes"));
+    }
+    Ok(())
+}
+
 /// Create a new VM order
 ///
 /// After order is created please use /api/v1/vm/{id}/renew to pay for VM,
@@ -1366,6 +1382,7 @@ async fn v1_create_custom_vm_order(
     State(this): State<RouterState>,
     Json(req): Json<ApiCustomVmOrder>,
 ) -> ApiResult<ApiVmStatus> {
+    validate_user_data(req.user_data.as_deref())?;
     let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     enforce_account_limit(AccountAction::VmOrder, uid).await?;
@@ -1390,7 +1407,14 @@ async fn v1_create_custom_vm_order(
     let rsp = this
         .sub_handler
         .vm_provisioner()
-        .provision_custom(uid, template, req.image_id, req.ssh_key_id, req.ref_code)
+        .provision_custom(
+            uid,
+            template,
+            req.image_id,
+            req.ssh_key_id,
+            req.ref_code,
+            req.user_data,
+        )
         .await?;
     flag_suspicious_order(&this, &user, rsp.id, spec_cpu, spec_memory).await;
 
@@ -1520,6 +1544,7 @@ async fn v1_create_vm_order(
     State(this): State<RouterState>,
     Json(req): Json<CreateVmRequest>,
 ) -> ApiResult<ApiVmStatus> {
+    validate_user_data(req.user_data.as_deref())?;
     let pubkey = auth.pubkey();
     let uid = this.db.upsert_user(&pubkey).await?;
     enforce_account_limit(AccountAction::VmOrder, uid).await?;
@@ -1546,6 +1571,7 @@ async fn v1_create_vm_order(
             req.image_id,
             req.ssh_key_id,
             req.ref_code,
+            req.user_data,
         )
         .await?;
     flag_suspicious_order(&this, &user, rsp.id, template.cpu, template.memory).await;
@@ -3286,6 +3312,78 @@ fn is_vm_expired(expires: Option<DateTime<Utc>>, now: DateTime<Utc>) -> bool {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn both_order_handlers_reject_invalid_scripts_before_writing() {
+        use base64::Engine;
+        use nostr_sdk::prelude::{EventBuilder, Keys, Kind};
+        for custom in [false, true] {
+            let db = Arc::new(lnvps_api_common::MockDb::default());
+            let state = mock_router_state(db.clone()).await;
+            let users = db.users.lock().await.len();
+            let vms = db.vms.lock().await.len();
+            let subscriptions = db.subscriptions.lock().await.len();
+            let event = EventBuilder::new(Kind::HttpAuth, "")
+                .sign_with_keys(&Keys::generate())
+                .unwrap();
+            let encoded = base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&event).unwrap());
+            let auth = Nip98Auth::from_base64(&encoded).unwrap();
+            let error = if custom {
+                let req = serde_json::from_value(serde_json::json!({
+                    "pricing_id": 1, "cpu": 2, "memory": 2147483648_u64, "disk": 21474836480_u64,
+                    "disk_type": "ssd", "disk_interface": "pcie", "image_id": 1, "ssh_key_id": 1,
+                    "user_data": ""
+                }))
+                .unwrap();
+                v1_create_custom_vm_order(auth, ClientIp(None), State(state), Json(req))
+                    .await
+                    .err()
+                    .unwrap()
+            } else {
+                v1_create_vm_order(
+                    auth,
+                    ClientIp(None),
+                    State(state),
+                    Json(CreateVmRequest {
+                        template_id: 1,
+                        image_id: 1,
+                        ssh_key_id: 1,
+                        ref_code: None,
+                        user_data: Some(String::new()),
+                    }),
+                )
+                .await
+                .err()
+                .unwrap()
+            };
+            assert_eq!(error.code, axum::http::StatusCode::BAD_REQUEST);
+            assert!(error.error.contains("#!"));
+            assert_eq!(db.users.lock().await.len(), users);
+            assert_eq!(db.vms.lock().await.len(), vms);
+            assert_eq!(db.subscriptions.lock().await.len(), subscriptions);
+        }
+    }
+
+    #[test]
+    fn user_data_validation_checks_script_bytes() {
+        assert!(validate_user_data(None).is_ok());
+        assert!(validate_user_data(Some("#!/bin/sh\necho ok")).is_ok());
+        let limit = format!("#!{}", "x".repeat(16382));
+        assert!(validate_user_data(Some(&limit)).is_ok());
+        for (script, message) in [
+            (String::new(), "start with #!"),
+            ("#cloud-config\n{}".into(), "start with #!"),
+            ("Content-Type: multipart/mixed".into(), "start with #!"),
+            ("#!/bin/sh\n\0".into(), "NUL"),
+            (format!("#!{}", "é".repeat(8192)), "16384 bytes"),
+            (format!("{limit}x"), "16384 bytes"),
+        ] {
+            let err = validate_user_data(Some(&script)).unwrap_err();
+            assert_eq!(err.code, axum::http::StatusCode::BAD_REQUEST);
+            assert!(err.error.contains(message));
+        }
+    }
+
     use lnvps_db::LNVpsDbBase;
 
     async fn mock_router_state(db: Arc<lnvps_api_common::MockDb>) -> RouterState {
@@ -3346,7 +3444,7 @@ mod tests {
         let vm = state
             .sub_handler
             .vm_provisioner()
-            .provision(uid, 1, 1, key, None)
+            .provision(uid, 1, 1, key, None, None)
             .await
             .unwrap();
         assert!(
@@ -3959,6 +4057,7 @@ mod tests {
                     disk_id: 1,
                     mac_address: "ff:ff:ff:ff:ff:ff".to_string(),
                     ssh_host_keys: None,
+                    user_data: None,
                     deleted: false,
                     ref_code: None,
                     disabled: false,

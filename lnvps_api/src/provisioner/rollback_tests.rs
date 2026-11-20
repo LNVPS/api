@@ -121,7 +121,7 @@ mod tests {
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
 
         // Get initial ARP count
@@ -179,7 +179,7 @@ mod tests {
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
 
         // Spawn the VM
@@ -251,7 +251,7 @@ mod tests {
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
 
         // Get initial DNS zone counts
@@ -332,7 +332,7 @@ mod tests {
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
 
         // Before spawn - no IPs should exist
@@ -391,7 +391,7 @@ mod tests {
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
 
         // Spawn VM once
@@ -431,7 +431,7 @@ mod tests {
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
 
         // Spawn and get the MAC address
@@ -481,7 +481,7 @@ mod tests {
         let provisioner = VmProvisioner::new(settings, db.clone());
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
 
         // Build the real spawn pipeline, then append a step that always fails so
@@ -548,7 +548,7 @@ mod tests {
         let provisioner = VmProvisioner::new(settings, db.clone());
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
 
         // First spawn succeeds: the VM now has a real MAC and its IPs.
@@ -608,7 +608,7 @@ mod tests {
         let provisioner = VmProvisioner::new(settings, db.clone());
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
 
         let pipeline = provisioner.spawn_vm_pipeline(vm.id).await?;
@@ -659,7 +659,7 @@ mod tests {
         let provisioner = VmProvisioner::new(settings, db.clone());
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         provisioner
             .spawn_vm_pipeline(vm.id)
@@ -705,7 +705,7 @@ mod tests {
         let provisioner = VmProvisioner::new(settings, db.clone());
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         provisioner
             .spawn_vm_pipeline(vm.id)
@@ -731,7 +731,7 @@ mod tests {
         }
 
         let vm2 = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         let mut vm2 = db.get_vm(vm2.id).await?;
         vm2.mac_address = "02:00:00:00:00:02".to_string();
@@ -767,7 +767,7 @@ mod tests {
         let provisioner = VmProvisioner::new(settings, db.clone());
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         provisioner
             .spawn_vm_pipeline(vm.id)
@@ -812,7 +812,7 @@ mod tests {
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
 
         // Spawn the VM
@@ -899,6 +899,7 @@ mod tests {
             disk_id: 1,
             mac_address: "02:00:00:00:00:01".to_string(), // A valid MAC
             ssh_host_keys: None,
+            user_data: None,
             ref_code: None,
             deleted: false,
             disabled: false,
@@ -987,7 +988,7 @@ mod tests {
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         let vm_id = vm.id;
 
@@ -1034,7 +1035,7 @@ mod tests {
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         let vm_id = vm.id;
 
@@ -1079,7 +1080,7 @@ mod tests {
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
 
         let pipeline = provisioner.spawn_vm_pipeline(vm.id).await?;
@@ -1130,7 +1131,7 @@ mod tests {
 
         let (user, ssh_key) = add_user(&db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
 
         // Spawn the VM first so it exists on the (mock) host.
@@ -1146,7 +1147,7 @@ mod tests {
     async fn spawned_vm(provisioner: &VmProvisioner, db: &Arc<MockDb>) -> Result<lnvps_db::Vm> {
         let (user, ssh_key) = add_user(db).await?;
         let vm = provisioner
-            .provision(user.id, 1, 1, ssh_key.id, None)
+            .provision(user.id, 1, 1, ssh_key.id, None, None)
             .await?;
         provisioner
             .spawn_vm_pipeline(vm.id)

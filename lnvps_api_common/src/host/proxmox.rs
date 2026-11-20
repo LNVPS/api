@@ -459,6 +459,7 @@ impl ProxmoxClient {
         self.write_snippet(
             "lnvps-vendor.yaml",
             &build_vendor_snippet(GUEST_DNS_SERVERS),
+            0o644,
         )
         .await
     }
@@ -500,7 +501,12 @@ impl ProxmoxClient {
 
     /// Resolve the on-disk path of a snippet volume, writing it only when the
     /// content differs. Returns the volume reference to put in `cicustom`.
-    async fn write_snippet(&self, filename: &str, content: &str) -> OpResult<Option<String>> {
+    async fn write_snippet(
+        &self,
+        filename: &str,
+        content: &str,
+        mode: i32,
+    ) -> OpResult<Option<String>> {
         let ssh_config = match &self.ssh {
             Some(s) => s,
             None => return Ok(None),
@@ -559,11 +565,21 @@ impl ProxmoxClient {
             ssh.scp_upload(
                 content.as_bytes(),
                 std::path::Path::new(&snippet_path),
-                0o644,
+                mode,
             )
             .await
             .map_err(OpError::Transient)?;
             info!("Wrote cloud-init snippet to {}", snippet_path);
+        } else if mode == 0o600 {
+            let (exit_code, _) = ssh
+                .execute(&format!("chmod 600 '{snippet_path}'"))
+                .await
+                .map_err(OpError::Transient)?;
+            if exit_code != 0 {
+                return Err(OpError::Transient(anyhow::anyhow!(
+                    "Cannot restrict user snippet permissions: {snippet_path}"
+                )));
+            }
         }
 
         // Recorded only once the host is known to hold this exact content, so a
@@ -589,7 +605,7 @@ impl ProxmoxClient {
             None => return Ok(None),
         };
         match self
-            .write_snippet(&Self::network_snippet_filename(cfg.vm.id), &content)
+            .write_snippet(&Self::network_snippet_filename(cfg.vm.id), &content, 0o644)
             .await?
         {
             Some(vol_ref) => Ok(Some(vol_ref)),
@@ -602,6 +618,29 @@ impl ProxmoxClient {
         }
     }
 
+    async fn ensure_user_snippet(&self, cfg: &FullVmInfo) -> OpResult<Option<String>> {
+        if cfg.vm.user_data.is_none() {
+            return Ok(None);
+        }
+        let content = crate::host::cloud_init::user_data_with_package_upgrade(cfg, true)
+            .map_err(OpError::Fatal)?;
+        match self
+            .write_snippet(&format!("lnvps-user-{}.yaml", cfg.vm.id), &content, 0o600)
+            .await?
+        {
+            Some(volume) => Ok(Some(volume)),
+            None => op_fatal!(
+                "VM {} needs a cloud-init user snippet but none could be written; snippet storage and SSH access are required",
+                cfg.vm.id
+            ),
+        }
+    }
+
+    async fn remove_user_snippet(&self, vm_id: u64) -> OpResult<()> {
+        self.remove_snippet(&format!("lnvps-user-{vm_id}.yaml"))
+            .await
+    }
+
     /// Remove a VM's network snippet, if one was ever written.
     ///
     /// A VM cannot start when a `cicustom` volume it references is missing, so
@@ -610,8 +649,12 @@ impl ProxmoxClient {
         // Drop any memo first: the file is about to stop existing, so a cached
         // "already reconciled" entry would let a later write_snippet hand back a
         // vol_ref for a snippet that is no longer on the host.
-        self.forget_snippet(&Self::network_snippet_filename(vm_id))
-            .await;
+        self.remove_snippet(&Self::network_snippet_filename(vm_id))
+            .await
+    }
+
+    async fn remove_snippet(&self, filename: &str) -> OpResult<()> {
+        self.forget_snippet(filename).await;
 
         let ssh_config = match &self.ssh {
             Some(s) => s,
@@ -627,10 +670,7 @@ impl ProxmoxClient {
             .await
             .map_err(OpError::Transient)?;
 
-        let vol_ref = format!(
-            "{storage_name}:snippets/{}",
-            Self::network_snippet_filename(vm_id)
-        );
+        let vol_ref = format!("{storage_name}:snippets/{filename}");
         let (exit_code, path_output) = ssh
             .execute(&format!("pvesm path '{vol_ref}'"))
             .await
@@ -1431,7 +1471,12 @@ impl ProxmoxClient {
         value: &FullVmInfo,
         vendor_snippet: Option<&str>,
         network_snippet: Option<&str>,
+        user_snippet: Option<&str>,
     ) -> Result<VmConfig> {
+        anyhow::ensure!(
+            value.vm.user_data.is_none() || user_snippet.is_some(),
+            "VM script requires a user snippet"
+        );
         // `ipconfig[n]` holds at most one address per family; repeating a key
         // produces something the guest cannot act on. Any address beyond the
         // first of each family is carried by the network snippet instead.
@@ -1494,6 +1539,11 @@ impl ProxmoxClient {
         };
 
         let cicustom = CiCustom {
+            user: if value.vm.user_data.is_some() {
+                user_snippet.map(str::parse).transpose()?
+            } else {
+                None
+            },
             vendor: vendor_snippet.and_then(|v| v.parse().ok()),
             network: network_snippet.and_then(|n| n.parse().ok()),
             ..Default::default()
@@ -1835,6 +1885,10 @@ struct CreateVmContext<'a> {
 
 #[async_trait]
 impl VmHostClient for ProxmoxClient {
+    async fn supports_user_data(&self) -> OpResult<bool> {
+        Ok(self.ssh.is_some() && self.snippet_storage().await?.is_some())
+    }
+
     async fn get_info(&self) -> OpResult<VmHostInfo> {
         use anyhow::Context;
         let nodes = self.list_nodes().await?;
@@ -2241,8 +2295,14 @@ impl VmHostClient for ProxmoxClient {
         }
         let vendor_snippet = self.ensure_vendor_snippet().await?;
         let network_snippet = self.ensure_network_snippet(req).await?;
+        let user_snippet = self.ensure_user_snippet(req).await?;
         let config = self
-            .make_config(req, vendor_snippet.as_deref(), network_snippet.as_deref())
+            .make_config(
+                req,
+                vendor_snippet.as_deref(),
+                network_snippet.as_deref(),
+                user_snippet.as_deref(),
+            )
             .map_err(OpError::Fatal)?;
         let task = self
             .create_vm(CreateVm {
@@ -2352,8 +2412,13 @@ impl VmHostClient for ProxmoxClient {
     async fn create_vm(&self, req: &FullVmInfo) -> OpResult<()> {
         let vendor_snippet = self.ensure_vendor_snippet().await?;
         let network_snippet = self.ensure_network_snippet(req).await?;
-        let config =
-            self.make_config(req, vendor_snippet.as_deref(), network_snippet.as_deref())?;
+        let user_snippet = self.ensure_user_snippet(req).await?;
+        let config = self.make_config(
+            req,
+            vendor_snippet.as_deref(),
+            network_snippet.as_deref(),
+            user_snippet.as_deref(),
+        )?;
         let vm_id: ProxmoxVmId = req.vm.id.into();
 
         let ctx = CreateVmContext {
@@ -2464,6 +2529,9 @@ impl VmHostClient for ProxmoxClient {
         if let Err(e) = self.remove_network_snippet(vm.id).await {
             warn!("Failed to remove network snippet for VM {}: {}", vm.id, e);
         }
+        if let Err(e) = self.remove_user_snippet(vm.id).await {
+            warn!("Failed to remove user snippet for VM {}: {}", vm.id, e);
+        }
         Ok(())
     }
 
@@ -2523,8 +2591,13 @@ impl VmHostClient for ProxmoxClient {
         // Rewrites the file when the assignments changed, so the volume ref can
         // compare equal while the config behind it is new.
         let network_snippet = self.ensure_network_snippet(cfg).await?;
-        let mut config =
-            self.make_config(cfg, vendor_snippet.as_deref(), network_snippet.as_deref())?;
+        let user_snippet = self.ensure_user_snippet(cfg).await?;
+        let mut config = self.make_config(
+            cfg,
+            vendor_snippet.as_deref(),
+            network_snippet.as_deref(),
+            user_snippet.as_deref(),
+        )?;
 
         // Work out which keys must be *removed* from the host config before the
         // resend-suppression below rewrites `config` — Proxmox leaves a key at
@@ -2566,8 +2639,13 @@ impl VmHostClient for ProxmoxClient {
 
         let vendor_snippet = self.ensure_vendor_snippet().await?;
         let network_snippet = self.ensure_network_snippet(cfg).await?;
-        let expected =
-            self.make_config(cfg, vendor_snippet.as_deref(), network_snippet.as_deref())?;
+        let user_snippet = self.ensure_user_snippet(cfg).await?;
+        let expected = self.make_config(
+            cfg,
+            vendor_snippet.as_deref(),
+            network_snippet.as_deref(),
+            user_snippet.as_deref(),
+        )?;
 
         let mut drift = Self::config_drift(&current.config, &expected);
 
@@ -2600,7 +2678,13 @@ impl VmHostClient for ProxmoxClient {
         // Check and fix cloud-init IP config if it doesn't match expected
         let current_config = self.get_vm_config(&self.node, vm_id).await?;
         let network_snippet = self.ensure_network_snippet(cfg).await?;
-        let expected_config = self.make_config(cfg, None, network_snippet.as_deref())?;
+        let user_snippet = self.ensure_user_snippet(cfg).await?;
+        let expected_config = self.make_config(
+            cfg,
+            None,
+            network_snippet.as_deref(),
+            user_snippet.as_deref(),
+        )?;
         if current_config.config.ip_config != expected_config.ip_config {
             info!(
                 "IP config mismatch for VM {}: current={:?}, expected={:?}",
@@ -3874,6 +3958,124 @@ mod tests {
     use wiremock::matchers::{method, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn user_data_client() -> ProxmoxClient {
+        ProxmoxClient::new(
+            "http://localhost:8006".parse().unwrap(),
+            "pve",
+            "",
+            None,
+            QemuConfig {
+                machine: "q35".into(),
+                os_type: "l26".into(),
+                bridge: "vmbr0".into(),
+                cpu: "kvm64".into(),
+                kvm: true,
+                arch: "x86_64".into(),
+                balloon_min_pct: None,
+                firewall_config: None,
+            },
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn user_snippet_is_required_only_for_a_script() -> Result<()> {
+        let mut client = user_data_client();
+        let mut cfg = mock_full_vm();
+        cfg.image.release_date = chrono::DateTime::UNIX_EPOCH;
+        cfg.ssh_key.key_data = "ssh-ed25519 AAAAtest user@host".into();
+        assert_eq!(client.ensure_user_snippet(&cfg).await?, None);
+        assert!(!client.supports_user_data().await?);
+        let original = client.make_config(&cfg, None, None, None)?;
+        assert!(original.cicustom.is_none());
+        let baseline: VmConfig = serde_json::from_str(
+            r#"{
+  "onboot": true,
+  "bios": "ovmf",
+  "boot": "order=scsi0",
+  "cores": 2,
+  "cpu": "kvm64",
+  "ipconfig0": "ip=192.168.1.2/16,gw=192.168.1.1,ip6=auto",
+  "machine": "q35",
+  "memory": "2048",
+  "name": "VM1",
+  "net0": "virtio=FF:FF:FF:FF:FF:FE,bridge=vmbr0,firewall=1,tag=100",
+  "ostype": "l26",
+  "scsi1": "ssd:cloudinit",
+  "scsihw": "virtio-scsi-single",
+  "sshkeys": "ssh-ed25519%20AAAAtest%20user%40host",
+  "efidisk0": "ssd:0,efitype=4m",
+  "kvm": true,
+  "serial0": "socket"
+}"#,
+        )?;
+        assert_eq!(original, baseline);
+        assert!(ProxmoxClient::config_drift(&baseline, &original).is_empty());
+        cfg.vm.user_data = Some("#!/bin/sh\necho snippet".into());
+        assert!(matches!(
+            client.ensure_user_snippet(&cfg).await,
+            Err(OpError::Fatal(_))
+        ));
+        assert!(client.make_config(&cfg, None, None, None).is_err());
+        client.ssh = Some(SshConfig {
+            key: "unused-test-key".into(),
+            user: "root".into(),
+        });
+        client.snippet_storage.set(Some("local".into())).unwrap();
+        assert!(client.supports_user_data().await?);
+        let content = crate::host::cloud_init::user_data_with_package_upgrade(&cfg, true)?;
+        let filename = format!("lnvps-user-{}.yaml", cfg.vm.id);
+        client.mark_snippet_written(&filename, &content).await;
+        let volume = client.ensure_user_snippet(&cfg).await?.unwrap();
+        assert_eq!(volume, "local:snippets/lnvps-user-1.yaml");
+        let config = client.make_config(&cfg, None, None, Some(&volume))?;
+        assert_eq!(
+            config
+                .cicustom
+                .as_ref()
+                .unwrap()
+                .user
+                .as_ref()
+                .unwrap()
+                .to_string(),
+            volume
+        );
+        assert!(config.cicustom.as_ref().unwrap().meta.is_none());
+        assert_eq!(config.ssh_keys, original.ssh_keys);
+        assert_eq!(config.ip_config, original.ip_config);
+        assert!(ProxmoxClient::config_drift(&original, &config).contains(&"cicustom".to_string()));
+        client.ssh = None;
+        client.remove_user_snippet(cfg.vm.id).await?;
+        assert!(!client.snippet_is_current(&filename, &content).await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn user_data_capability_requires_storage_and_propagates_lookup_errors() -> Result<()> {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r".*/storage$"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let mut client = user_data_client();
+        client.api = JsonApi::token(&server.uri(), "", true)?;
+        client.ssh = Some(SshConfig {
+            key: "unused-test-key".into(),
+            user: "root".into(),
+        });
+        assert!(client.supports_user_data().await.is_err());
+        client.snippet_storage.set(None).unwrap();
+        assert!(!client.supports_user_data().await?);
+        let mut cfg = mock_full_vm();
+        cfg.vm.user_data = Some("#!/bin/sh".into());
+        assert!(matches!(
+            client.ensure_user_snippet(&cfg).await,
+            Err(OpError::Fatal(_))
+        ));
+        Ok(())
+    }
+
     /// Regression test: a host whose `ip` points at a different node than its
     /// `name` must be rejected, not worked around.
     ///
@@ -4528,7 +4730,10 @@ mod tests {
             None,
         );
 
-        assert_eq!(p.write_snippet("lnvps-vendor.yaml", "body").await?, None);
+        assert_eq!(
+            p.write_snippet("lnvps-vendor.yaml", "body", 0o644).await?,
+            None
+        );
         // Nothing was written, so a later call with real SSH must still do the work.
         assert!(!p.snippet_is_current("lnvps-vendor.yaml", "body").await);
 
@@ -4668,7 +4873,7 @@ mod tests {
             None,
         );
 
-        let vm = p.make_config(&cfg, None, None)?;
+        let vm = p.make_config(&cfg, None, None, None)?;
         assert_eq!(vm.cpu, Some(q_cfg.cpu));
         assert_eq!(vm.cores, Some(template.cpu as i32));
         assert_eq!(vm.memory, Some((template.memory / MB).to_string()));
@@ -4705,7 +4910,7 @@ mod tests {
         };
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
-        let vm = p.make_config(&cfg, None, None)?;
+        let vm = p.make_config(&cfg, None, None, None)?;
         // Full memory is still the sold amount; balloon is the 90% floor.
         assert_eq!(vm.memory, Some(memory_mb.to_string()));
         assert_eq!(vm.balloon, Some((memory_mb * 90 / 100) as i32));
@@ -4742,7 +4947,7 @@ mod tests {
         };
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
-        let vm = p.make_config(&cfg, None, None)?;
+        let vm = p.make_config(&cfg, None, None, None)?;
         let ip_config = vm.ip_config.unwrap();
         // The IP should use /24 (gateway prefix), not /26 (range prefix),
         // so the gateway 185.18.221.1 is inside the VM's subnet.
@@ -4829,7 +5034,7 @@ mod tests {
 
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
-        let vm = p.make_config(&cfg, None, None)?;
+        let vm = p.make_config(&cfg, None, None, None)?;
         // 800 Mbit/s ÷ 8 = 100 MB/s
         assert_eq!(vm.net.unwrap().rate, Some(100.0));
         Ok(())
@@ -4852,25 +5057,28 @@ mod tests {
 
         cfg.transfer_throttled = true;
         assert_eq!(
-            p.make_config(&cfg, None, None)?.net.unwrap().rate,
+            p.make_config(&cfg, None, None, None)?.net.unwrap().rate,
             Some(1.25)
         );
 
         cfg.template.as_mut().unwrap().network_mbps = Some(800);
         assert_eq!(
-            p.make_config(&cfg, None, None)?.net.unwrap().rate,
+            p.make_config(&cfg, None, None, None)?.net.unwrap().rate,
             Some(1.25)
         );
 
         cfg.template.as_mut().unwrap().network_mbps = Some(4);
         assert_eq!(
-            p.make_config(&cfg, None, None)?.net.unwrap().rate,
+            p.make_config(&cfg, None, None, None)?.net.unwrap().rate,
             Some(0.5)
         );
 
         cfg.transfer_throttled = false;
         cfg.template.as_mut().unwrap().network_mbps = None;
-        assert_eq!(p.make_config(&cfg, None, None)?.net.unwrap().rate, None);
+        assert_eq!(
+            p.make_config(&cfg, None, None, None)?.net.unwrap().rate,
+            None
+        );
         Ok(())
     }
 
@@ -4892,7 +5100,7 @@ mod tests {
 
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
-        let vm = p.make_config(&cfg, None, None)?;
+        let vm = p.make_config(&cfg, None, None, None)?;
         assert_eq!(vm.cpu_limit, Some(0.5));
         Ok(())
     }
@@ -5081,7 +5289,7 @@ mod tests {
 
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
-        let vm = p.make_config(&cfg, None, None)?;
+        let vm = p.make_config(&cfg, None, None, None)?;
         assert_eq!(
             vm.net.unwrap().rate,
             None,
@@ -5125,14 +5333,14 @@ mod tests {
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
 
         // With vendor snippet
-        let vm = p.make_config(&cfg, Some("local:snippets/lnvps-vendor.yaml"), None)?;
+        let vm = p.make_config(&cfg, Some("local:snippets/lnvps-vendor.yaml"), None, None)?;
         assert_eq!(
             vm.cicustom,
             Some("vendor=local:snippets/lnvps-vendor.yaml".parse().unwrap())
         );
 
         // Without vendor snippet
-        let vm = p.make_config(&cfg, None, None)?;
+        let vm = p.make_config(&cfg, None, None, None)?;
         assert_eq!(vm.cicustom, None);
 
         // Both snippets
@@ -5140,6 +5348,7 @@ mod tests {
             &cfg,
             Some("local:snippets/lnvps-vendor.yaml"),
             Some("local:snippets/lnvps-net-1.yaml"),
+            None,
         )?;
         assert_eq!(
             vm.cicustom,
@@ -5252,7 +5461,7 @@ mod tests {
             firewall_config: None,
         };
         let p = ProxmoxClient::new("http://localhost:8006".parse()?, "", "", None, q_cfg, None);
-        let vm = p.make_config(&cfg, None, Some("local:snippets/lnvps-net-1.yaml"))?;
+        let vm = p.make_config(&cfg, None, Some("local:snippets/lnvps-net-1.yaml"), None)?;
         let ip_config = vm.ip_config.unwrap();
 
         // One address per family — the first assignment of each, matching what
@@ -5997,7 +6206,7 @@ mod tests {
             None,
         );
 
-        let vm = p.make_config(&cfg, None, None)?;
+        let vm = p.make_config(&cfg, None, None, None)?;
         assert_eq!(vm.scsi_hw.as_deref(), Some("virtio-scsi-single"));
 
         Ok(())
