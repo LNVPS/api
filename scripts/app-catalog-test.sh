@@ -41,6 +41,7 @@ app_config() {
         # merely pattern-shaped string would crashloop the container.
         haven) CONFIG_ARGS=(--config owner_npub=npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqshp52w2) ;;
         buzz)  CONFIG_ARGS=(--config owner_pubkey=0000000000000000000000000000000000000000000000000000000000000001) ;;
+        appweaver) CONFIG_ARGS=(--config master_pubkey=79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798) ;;
         minecraft-java) CONFIG_ARGS=(--config eula=TRUE --config rcon_password=testpass1234) ;;
         ditto-relay) CONFIG_ARGS=(
             --config policy_kinds=1

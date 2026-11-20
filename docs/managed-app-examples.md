@@ -840,6 +840,117 @@ where the image allows it.
 
 ---
 
+## AppWeaver — AI-powered app hub
+
+- **Image:** `ghcr.io/getappweaver/core:alpine-v14.27.4@sha256:1ecd9562ce8cd7e005093a0442599503fee2b6d4c8856c3994e42c3246f4a8e2`
+  — the reduced `linux/amd64` runtime published from
+  <https://github.com/getappweaver/core>. It includes Bun, OpenCode,
+  ngit and Python/Piper, but deliberately excludes browser automation, Chromium,
+  Playwright browsers, desktop and VNC functionality. Node/npm are not installed
+  in this reduced image; apps needing them require separate runtime support.
+- **Application source:** AppWeaver **14.27.4**, commit
+  `88e8cb53b4119461738887c4d5a72c7cc5d17e3d`, fixed by `APPWEAVER_GIT_SHA` in
+  both the image and catalog. On an empty workspace the entrypoint fetches that
+  commit, verifies it and checks it out detached. Every start verifies the
+  repository root, HEAD and absence of staged/unstaged changes to tracked core
+  files before `bun install --frozen-lockfile` and `bun run start`. Ignored or
+  untracked plugin code and generated files are outside this check. The image
+  digest pins the runtime; its commit-named tag alone is not immutable.
+- **Runtime:** runs as UID 1000, binds plain HTTP on `0.0.0.0:5551`, and builds
+  the web UI at startup. TLS is terminated by the platform ingress; do not run
+  the bare-metal Alpine setup script, Caddy or SSH server inside the container.
+  GitHub, dependency downloads, provider APIs and Nostr relays need outbound
+  connectivity. Piper and OpenCode are internal services, not extra public ports.
+- **Authentication:** API-key and device-code OpenCode providers are the intended
+  managed flows; verify the selected provider on the VPS. Localhost browser
+  callbacks (for example port `1455`) require a separate operator-arranged tunnel
+  into the container. The bare-metal SSH forwarding instructions do not provide
+  that tunnel for a managed pod, and HTTPS ingress does not replace it.
+- **Setup access:** the order form requires the owner's 64-character lowercase
+  hex Nostr pubkey. AppWeaver receives it as `BOT_MASTER_PUBKEY`; the `/setup`
+  page uses a matching NIP-98 signature to obtain an in-memory setup session.
+  This does not use the bare-metal generated-secret link or require container
+  log access. Restarting the process requires setup-session authentication again.
+- **Storage and backups:** the 20Gi workspace at `/workspace/appweaver` retains
+  the checkout, `.env`, core databases, installed plugins/apps, their databases
+  and files, and HOME/XDG credentials under `.data/`. The whole volume is backed
+  up with `quiesce: true`: the operator stops the service before copying SQLite
+  databases and their sidecars, then restarts it. Daily backups run at 03:00 UTC,
+  retaining seven runs; expect downtime during the copy. Preserve the original
+  encryption key material (including externally supplied secrets) alongside the
+  backup. Do not independently copy live SQLite files.
+- **Health:** `GET /api/health` returns `{ ok: true, version: ... }` even in setup
+  mode. This proves the HTTP handler is serving, not that provider authentication,
+  Piper or FIPS connectivity works. The current operator does not render
+  application startup/readiness/liveness probes; pod running status and the local
+  catalog script's listening-port check are not end-to-end application health.
+
+### Optional FIPS networking
+
+The current FIPS plugin uses ordinary Nostr relays over WebSocket for signaling,
+outbound UDP STUN (defaults include ports `19302` and `3478`), and dynamically
+allocated IPv4 UDP sockets for peer traversal. It has no fixed UDP listening-port
+mode. Its `plugins/fips/db.sqlite` stores identity, pairing records, peers and
+relay settings; preserve it and the core encryption key material on upgrades.
+
+The operator's NetworkPolicy allows DNS, same-namespace traffic, and public
+IPv4/IPv6 egress without port restrictions, excluding private/internal ranges.
+Ingress is restricted to the deployment's own namespace and ingress-controller
+namespace. Actual UDP reply/traversal behavior depends on CNI policy enforcement,
+connection tracking, pod/node NAT and VPS/provider firewalls. HTTPS ingress
+carries HTTP/WebSocket traffic, **not UDP**. The platform's fixed `expose: udp`
+forwarding is not a fit for this plugin's dynamic sockets, so no UDP port range,
+host networking or additional privileges are configured here.
+
+The developer reports successful bidirectional encrypted FIPS ping between a local
+machine and an LNVPS Alpine VM. The managed Kubernetes networking path remains
+unverified. Optional WebSocket seeds are not an automatic fallback after failed
+UDP traversal.
+
+### Upgrades and manual VPS verification
+
+Registry metadata and the published entrypoint were inspected for the pinned
+digest: its embedded source SHA and OCI revision match the commit above, and
+the [14.27.4 publication workflow](https://github.com/getappweaver/core/actions/runs/44606929834)
+succeeded. These are artifact/static checks; this revision has not been started
+or reconciled on a live cluster as part of this update.
+
+1. On an amd64 app node, inspect the resolved image digest and
+   `APPWEAVER_GIT_SHA`. Provision a UID/GID-1000-writable workspace that is truly
+   empty for first boot (filesystem metadata such as `lost+found` also causes the
+   entrypoint to refuse cloning). Confirm the actual PVC layout with the storage
+   provisioner; do not delete existing volume contents to force initialization.
+2. Deploy with the catalog's read-only root filesystem, dropped capabilities,
+   writable workspace and `/tmp`. Allow initial fetch/install/web-build time;
+   check logs for `AppWeaver core HEAD verified:` and the exact SHA above.
+3. Check `/`, `/setup`, `/api/setup/auth` and `/api/health` through HTTPS ingress.
+   Confirm the reported version is `14.27.4`, owner-signed setup succeeds, and
+   unsigned/wrong-owner requests to `POST /api/setup/session` are rejected.
+4. Finish provider setup using an API key or supported device-code flow. Exercise
+   an AI request, Nostr relay connection, Piper output and web UI WebSocket path
+   separately; health HTTP 200 is not a substitute.
+5. Install/configure FIPS explicitly if required. Pair with a peer on a different
+   network, confirm signaling relay acceptance and STUN results, and run encrypted
+   `/fips ping <id>` in both directions. Diagnose traversal against the real CNI,
+   NAT and firewalls if it fails; do not widen UDP exposure without discussion.
+6. Restart/recreate the pod and verify credentials, core data, FIPS identity,
+   pairing/relay settings and bidirectional ping recover without re-pairing. Run
+   a quiesced backup and restore into a separate stopped workspace to check
+   completeness and decryptability before relying on it.
+7. For an existing workspace, stop all writers and take a complete pre-upgrade
+   backup. An image change does not upgrade its checkout. Preserve local tracked
+   edits separately, fetch/verify the intended full SHA, and explicitly check it
+   out detached without forced reset/clean. Tracked core files must match the
+   selected commit before restart. Follow the pinned source's
+   [Alpine container upgrade instructions](https://github.com/getappweaver/core/blob/88e8cb53b4119461738887c4d5a72c7cc5d17e3d/ALPINE_DOCKER.md#updates-and-persistent-state).
+   Keep the matching old image/SHA and full snapshot for rollback; database
+   migrations may require restoring the snapshot rather than only old code.
+
+**Document:** [`catalog/appweaver.yaml`](../catalog/appweaver.yaml) —
+`scripts/app-catalog-test.sh catalog/appweaver.yaml` starts it locally.
+
+---
+
 ## YALR: LLM router
 
 - **Image:** `voidic/yalr` (official, built from the repo on every push to
