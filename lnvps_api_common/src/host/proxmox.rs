@@ -3939,20 +3939,20 @@ mod tests {
     async fn ipfilter_set_drops_the_old_ip_when_the_assignment_changes() -> Result<()> {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
-            .and(path_regex(r".*/qemu/1/firewall/ipset/ipfilter-net0$"))
+            .and(path_regex(r".*/qemu/101/firewall/ipset/ipfilter-net0$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": [{"cidr": "10.9.9.244"}, {"cidr": "192.168.1.2"}]
             })))
             .mount(&server)
             .await;
         Mock::given(method("DELETE"))
-            .and(path_regex(r".*/qemu/1/firewall/ipset/ipfilter-net0/10\.9\.9\.244$"))
+            .and(path_regex(r".*/qemu/101/firewall/ipset/ipfilter-net0/10\.9\.9\.244$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})))
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path_regex(r".*/qemu/1/firewall/ipset/ipfilter-net0$"))
+            .and(path_regex(r".*/qemu/101/firewall/ipset/ipfilter-net0$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": null})))
             .expect(1)
             .mount(&server)
