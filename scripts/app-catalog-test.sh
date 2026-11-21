@@ -95,7 +95,7 @@ docker compose -f "$COMPOSE_FILE" up --no-start
 # Docker has no fsGroup, so a fresh named volume is root-owned and a non-root
 # service cannot write to it. The renderer prints the chown that stands in for
 # it; run exactly those, so the local difference stays in one place.
-echo "$RENDER" | grep -E '^\s+docker run --rm -u 0 ' | while read -r cmd; do
+{ echo "$RENDER" | grep -E '^\s+docker run --rm -u 0 ' || true; } | while read -r cmd; do
     echo "==> $cmd"
     eval "$cmd"
 done
@@ -116,19 +116,22 @@ sleep "$SETTLE"
 # exited init step is expected — it renders as a one-shot service the app waits
 # on — so only a non-zero exit or a restart counts against it.
 failed=0
-states="$(docker compose -f "$COMPOSE_FILE" ps -a --format '{{.Name}} {{.State}} {{.ExitCode}}')"
-while read -r name state status; do
-    [ -n "$name" ] || continue
-    # Without a stdin of its own, docker would eat the rest of the loop's input.
-    restarts="$(docker inspect -f '{{.RestartCount}}' "$name" </dev/null 2>/dev/null || echo 0)"
-    case "$state" in
-        running) [ "$restarts" -eq 0 ] || { echo "FAIL $name restarted $restarts time(s)"; failed=1; } ;;
-        exited)  [ "$status" = "0" ] || { echo "FAIL $name exited with status $status"; failed=1; } ;;
-        *)       echo "FAIL $name is $state"; failed=1 ;;
-    esac
-done <<EOF
+check_states() {
+    local states name state status restarts
+    states="$(docker compose -f "$COMPOSE_FILE" ps -a --format '{{.Name}} {{.State}} {{.ExitCode}}')"
+    while read -r name state status; do
+        [ -n "$name" ] || continue
+        restarts="$(docker inspect -f '{{.RestartCount}}' "$name" </dev/null 2>/dev/null || echo 0)"
+        case "$state" in
+            running) [ "$restarts" -eq 0 ] || { echo "FAIL $name restarted $restarts time(s)"; failed=1; } ;;
+            exited)  [ "$status" = "0" ] || { echo "FAIL $name exited with status $status"; failed=1; } ;;
+            *)       echo "FAIL $name is $state"; failed=1 ;;
+        esac
+    done <<EOF
 $states
 EOF
+}
+check_states
 
 # An ingress port is what a customer reaches, so a stack that is "running" but
 # never binds is not up. The renderer publishes those on loopback at the
@@ -149,25 +152,41 @@ if printf '%s\n' "$doc_body" | grep -qE 'expose:[[:space:]]*"?ingress"?' && [ -z
     echo "FAIL $APP: declares an ingress port but nothing was published"
     failed=1
 fi
+http_ports="$(printf '%s\n' "$doc_body" | grep -E 'protocol:[[:space:]]*"?http"?[,[:space:]}]' \
+    | grep -E 'expose:[[:space:]]*"?ingress"?' | grep -oE 'container:[[:space:]]*[0-9]+' | grep -oE '[0-9]+$' || true)"
 if [ "$failed" -eq 0 ]; then
     for port in $ports; do
-        # Accepting a connection is the only signal that generalises: an
-        # ingress port can be a websocket relay, and asking one for a page can
-        # legitimately return nothing. The HTTP status, when there is one, is
-        # printed as information rather than asserted on.
         echo "==> probing 127.0.0.1:$port"
         deadline=$((SECONDS + PROBE_TIMEOUT))
-        until (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do
-            if [ "$SECONDS" -ge "$deadline" ]; then
-                echo "FAIL $APP: nothing listening on port $port within ${PROBE_TIMEOUT}s"
-                failed=1
-                break
-            fi
-            sleep 2
-        done
-        if [ "$failed" -eq 0 ]; then
-            code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$port/" 2>/dev/null || true)"
-            echo "    open (HTTP ${code:-000})"
+        container_port=$((port - ${HOST_PORT_OFFSET:-0}))
+        if printf '%s\n' "$http_ports" | grep -qx "$container_port"; then
+            # docker-proxy accepts the connection whether or not anything in
+            # the container listens, so an HTTP port must return a status.
+            code=000
+            until [ "$code" != "000" ]; do
+                code="$(curl -s -o /dev/null -m 5 -w '%{http_code}' "http://127.0.0.1:$port/" 2>/dev/null || true)"
+                code="${code:-000}"
+                [ "$code" != "000" ] && break
+                if [ "$SECONDS" -ge "$deadline" ]; then
+                    echo "FAIL $APP: no HTTP response on port $port within ${PROBE_TIMEOUT}s"
+                    failed=1
+                    break
+                fi
+                sleep 2
+            done
+            [ "$failed" -ne 0 ] || echo "    open (HTTP $code)"
+        else
+            # A non-HTTP port can be a websocket relay or a game server, so
+            # only the connection is required.
+            until (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do
+                if [ "$SECONDS" -ge "$deadline" ]; then
+                    echo "FAIL $APP: nothing listening on port $port within ${PROBE_TIMEOUT}s"
+                    failed=1
+                    break
+                fi
+                sleep 2
+            done
+            [ "$failed" -ne 0 ] || echo "    open"
         fi
     done
 fi
@@ -180,6 +199,10 @@ if [ "$failed" -eq 0 ] && [ -x "$APP_CHECK" ]; then
         break
     done
 fi
+
+# A first boot that builds for a while and then crashes outlives the settle, so
+# the state is read again now that the probes and app check are done.
+check_states
 
 if [ "$failed" -ne 0 ]; then
     docker compose -f "$COMPOSE_FILE" ps -a
