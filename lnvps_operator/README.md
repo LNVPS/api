@@ -85,6 +85,7 @@ kubectl get ingress -n your-namespace
 | `prometheus.url` | string | unset | Prometheus HTTP API to read deployment CPU/memory/volume usage from. Omit to collect no usage |
 | `prometheus.timeout-seconds` | number | `10` | Per-query timeout; collection is best-effort and never blocks a reconcile |
 | `l4.forwarder` | string | `"ingress-nginx"` | Who delivers `expose: tcp\|udp` ports: `ingress-nginx` or `traefik`. `nodeport` and `loadbalancer` are recognised but refused at startup with a "not supported yet" error |
+| `l4.traefik.udp` | bool | `false` | Create `IngressRouteUDP` routes for `expose: udp` apps. Needs `gu<port>` UDP entrypoints in Traefik |
 | `l4.traefik.tcp-entrypoint-prefix` / `udp-entrypoint-prefix` | string | `"g"` / `"gu"` | Entrypoint name is the prefix plus the public port |
 | `l4.port-range.start` / `end` | number | `25565` / `25584` | Public ports allocated to deployments, lowest free first |
 | `l4.ingress-nginx.namespace` | string | `"ingress-nginx"` | Namespace holding the controller's port-map ConfigMaps |
@@ -113,13 +114,19 @@ exhausted the deployment goes to `error` with
 
 With the `traefik` forwarder the operator instead creates one `IngressRouteTCP`
 (or `IngressRouteUDP`) named `l4-<port>` inside the deployment's namespace,
-bound to the entrypoint `g<port>` (`gu<port>` for UDP; prefixes set by
-`l4.traefik.tcp-entrypoint-prefix` / `udp-entrypoint-prefix`) and routing
+bound to the entrypoint `g<port>` (prefix set by `l4.traefik.tcp-entrypoint-prefix`) and routing
 `HostSNI(\`*\`)` to the app service. Routes in other namespaces are never
 touched and their entrypoint ports are skipped on allocation. Traefik must be
 started with an entrypoint for every port in the range, its Service must expose
 them, and the deployment NetworkPolicy must admit the Traefik namespace
 (`ingress-namespace`).
+
+UDP is off by default (`l4.traefik.udp: false`). While off, `expose: udp` apps get no
+route and the operator logs one warning. Turning it on creates `IngressRouteUDP`
+objects bound to `gu<port>` (prefix `l4.traefik.udp-entrypoint-prefix`), so the Traefik
+values must first define a matching `gu<port>` entrypoint with `protocol: UDP` for
+every port in the range; a missing entrypoint makes the apply fail with a log line
+naming it.
 
 With `ingress-nginx`, the cluster needs, none of which the operator creates:
 

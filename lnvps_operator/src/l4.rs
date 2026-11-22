@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
@@ -96,6 +97,8 @@ pub struct TraefikConfig {
     pub tcp_entrypoint_prefix: String,
     #[serde(default = "default_udp_entrypoint_prefix")]
     pub udp_entrypoint_prefix: String,
+    #[serde(default)]
+    pub udp: bool,
 }
 
 fn default_tcp_entrypoint_prefix() -> String {
@@ -111,6 +114,7 @@ impl Default for TraefikConfig {
         Self {
             tcp_entrypoint_prefix: default_tcp_entrypoint_prefix(),
             udp_entrypoint_prefix: default_udp_entrypoint_prefix(),
+            udp: false,
         }
     }
 }
@@ -452,9 +456,28 @@ impl RouteStore for KubeRoutes {
 pub struct TraefikForwarder {
     config: TraefikConfig,
     routes: Arc<dyn RouteStore>,
+    udp_warned: AtomicBool,
 }
 
 impl TraefikForwarder {
+    fn protocols(&self) -> &'static [L4Protocol] {
+        if self.config.udp {
+            &[L4Protocol::Tcp, L4Protocol::Udp]
+        } else {
+            &[L4Protocol::Tcp]
+        }
+    }
+
+    fn warn_udp_disabled(&self, entries: &[L4Entry]) {
+        let wants_udp = entries.iter().any(|e| e.target.protocol == L4Protocol::Udp);
+        if wants_udp && !self.udp_warned.swap(true, Ordering::Relaxed) {
+            log::warn!(
+                "UDP game ports are not routed: l4.traefik.udp is false. Enable it only after defining {}<port> entrypoints with protocol UDP in the Traefik values",
+                self.config.udp_entrypoint_prefix
+            );
+        }
+    }
+
     fn prefix(&self, protocol: L4Protocol) -> &str {
         match protocol {
             L4Protocol::Tcp => &self.config.tcp_entrypoint_prefix,
@@ -508,7 +531,7 @@ impl L4Forwarder for TraefikForwarder {
 
     async fn foreign_ports(&self) -> Result<BTreeSet<u16>> {
         let mut ports = BTreeSet::new();
-        for protocol in [L4Protocol::Tcp, L4Protocol::Udp] {
+        for &protocol in self.protocols() {
             for route in self.routes.list(protocol).await? {
                 if is_owned_namespace(&route.namespace) {
                     continue;
@@ -525,7 +548,8 @@ impl L4Forwarder for TraefikForwarder {
     }
 
     async fn sync(&self, entries: &[L4Entry]) -> Result<()> {
-        for protocol in [L4Protocol::Tcp, L4Protocol::Udp] {
+        self.warn_udp_disabled(entries);
+        for &protocol in self.protocols() {
             let current = self.routes.list(protocol).await?;
             let wanted: Vec<&L4Entry> = entries
                 .iter()
@@ -556,7 +580,13 @@ impl L4Forwarder for TraefikForwarder {
                 if !unchanged {
                     self.routes
                         .apply(protocol, &namespace, &name, &spec)
-                        .await?;
+                        .await
+                        .map_err(|e| {
+                            anyhow!(
+                                "applying {namespace}/{name} on entrypoint {} (it must exist in the Traefik static config): {e}",
+                                self.entry_point(protocol, entry.public_port)
+                            )
+                        })?;
                 }
             }
             for route in current {
@@ -583,6 +613,7 @@ pub fn build_forwarder(
         ForwarderKind::Traefik => Arc::new(TraefikForwarder {
             config: config.traefik.clone(),
             routes,
+            udp_warned: AtomicBool::new(false),
         }),
         _ => Arc::new(IngressNginxForwarder {
             config: config.ingress_nginx.clone(),
@@ -836,9 +867,56 @@ mod tests {
     fn traefik(routes: Arc<FakeRoutes>) -> Arc<dyn L4Forwarder> {
         let config = L4Config {
             forwarder: ForwarderKind::Traefik,
+            traefik: TraefikConfig {
+                udp: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         build_forwarder(&config, Arc::new(FakeStore::default()), routes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn traefik_with_udp_off_never_applies_a_udp_route_and_warns_once() {
+        let routes = Arc::new(FakeRoutes::default());
+        let f = TraefikForwarder {
+            config: TraefikConfig::default(),
+            routes: routes.clone(),
+            udp_warned: AtomicBool::new(false),
+        };
+        let entries = [
+            entry(25565, 7, L4Protocol::Tcp),
+            entry(25566, 8, L4Protocol::Udp),
+        ];
+        f.sync(&entries).await.unwrap();
+        assert!(f.udp_warned.load(Ordering::Relaxed));
+        f.sync(&entries).await.unwrap();
+        assert_eq!(routes.names(L4Protocol::Udp), Vec::<String>::new());
+        assert_eq!(routes.names(L4Protocol::Tcp), vec!["app-7/l4-25565"]);
+        assert_eq!(*routes.writes.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn traefik_udp_defaults_to_off() {
+        let config: L4Config = serde_json::from_str(r#"{"forwarder":"traefik"}"#).unwrap();
+        assert!(!config.traefik.udp);
+    }
+
+    #[test]
+    fn render_ingress_route_tcp_for_dry_run() {
+        let f = TraefikForwarder {
+            config: TraefikConfig::default(),
+            routes: Arc::new(FakeRoutes::default()),
+            udp_warned: AtomicBool::new(false),
+        };
+        let e = entry(25565, 7, L4Protocol::Tcp);
+        let obj = serde_json::json!({
+            "apiVersion": "traefik.io/v1alpha1",
+            "kind": "IngressRouteTCP",
+            "metadata": {"name": route_name(25565), "namespace": "lnvps-dryrun-scratch"},
+            "spec": f.spec(&e),
+        });
+        println!("{}", serde_json::to_string_pretty(&obj).unwrap());
     }
 
     #[tokio::test]
