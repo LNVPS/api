@@ -8,6 +8,15 @@ use std::sync::Mutex;
 pub const GATEWAY_EXTERNAL_ID_PREFIX: &str = "pgw:";
 pub const GATEWAY_WEBHOOK_PATH: &str = "/api/v1/webhook/gateway";
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OffSessionRenewals {
+    #[default]
+    Off,
+    DryRun,
+    Live,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct GatewayConfig {
@@ -18,6 +27,8 @@ pub struct GatewayConfig {
     pub methods: Vec<String>,
     #[serde(default = "default_tolerance")]
     pub webhook_tolerance_seconds: i64,
+    #[serde(default)]
+    pub off_session_renewals: OffSessionRenewals,
 }
 
 fn default_tolerance() -> i64 {
@@ -312,6 +323,7 @@ mod tests {
             webhook_secret: "s3cret".into(),
             methods: vec!["lightning".into()],
             webhook_tolerance_seconds: 0,
+            off_session_renewals: OffSessionRenewals::Off,
         }
     }
 

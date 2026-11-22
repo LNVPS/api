@@ -20,7 +20,7 @@ use lnvps_api_common::{
     CostResult, ExchangeRateService, NewPaymentInfo, PricingEngine, UpgradeConfig, VatClient,
     WorkCommander, round_msat_to_sat,
 };
-use lnvps_api_common::{GatewayInvoice, GatewayInvoiceRequest, PaymentGateway};
+use lnvps_api_common::{GatewayInvoice, GatewayInvoiceRequest, OffSessionRenewals, PaymentGateway};
 use lnvps_db::{
     LNVpsDb, LineItemType, PaymentMethod, RenewalSource, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentType, User, UserPaymentMethod, VmAddonKind,
@@ -285,6 +285,7 @@ pub struct SubscriptionHandler {
     node: Arc<dyn LightningNode>,
     lightning_gateway: Arc<dyn PaymentGateway>,
     card_gateway: Option<Arc<dyn PaymentGateway>>,
+    off_session: OffSessionRenewals,
     onchain: Arc<dyn OnChainProvider>,
     revolut: Option<Arc<dyn FiatPaymentService>>,
     swap: Option<Arc<dyn SwapProvider>>,
@@ -318,6 +319,7 @@ impl SubscriptionHandler {
             revolut,
             swap: None,
             card_gateway: None,
+            off_session: OffSessionRenewals::Off,
             lightning_gateway: Arc::new(crate::payments::gateway::InProcessGateway::new(
                 node.clone(),
             )),
@@ -526,6 +528,11 @@ impl SubscriptionHandler {
 
     pub fn with_card_gateway(mut self, gateway: Arc<dyn PaymentGateway>) -> Self {
         self.card_gateway = Some(gateway);
+        self
+    }
+
+    pub fn with_off_session_renewals(mut self, mode: OffSessionRenewals) -> Self {
+        self.off_session = mode;
         self
     }
 
@@ -2701,6 +2708,14 @@ impl SubscriptionHandler {
                     bail!("NWC auto-renewal is not supported by this build")
                 }
             }
+            "revolut" if self.holds_gateway_method(&method) => {
+                self.auto_renew_via_gateway_card(sub_id, PaymentMethod::Revolut)
+                    .await
+            }
+            "stripe" if self.holds_gateway_method(&method) => {
+                self.auto_renew_via_gateway_card(sub_id, PaymentMethod::Stripe)
+                    .await
+            }
             "revolut" => self.auto_renew_via_revolut(sub_id).await,
             other => bail!("No auto-renewal handler for provider {other}"),
         }
@@ -3547,6 +3562,74 @@ pub(crate) mod revolut_offline_tests {
             .is_err()
         );
         assert!(fake.charges.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn off_session_gateway_renewal_is_off_by_default_and_charges_nothing() {
+        let (db, sub, fake, _user, sub_id) = gateway_setup("stripe", Some(77)).await;
+        let before = db.list_subscription_payments(sub_id).await.unwrap().len();
+        assert!(sub.auto_renew(sub_id).await.is_err());
+        assert!(fake.charges.lock().unwrap().is_empty());
+        assert_eq!(
+            db.list_subscription_payments(sub_id).await.unwrap().len(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn off_session_gateway_renewal_dry_run_charges_nothing() {
+        use lnvps_api_common::OffSessionRenewals;
+        let (db, sub, fake, _user, sub_id) = gateway_setup("stripe", Some(77)).await;
+        let sub = sub.with_off_session_renewals(OffSessionRenewals::DryRun);
+        let before = db.list_subscription_payments(sub_id).await.unwrap().len();
+        let err = sub.auto_renew(sub_id).await.unwrap_err();
+        assert!(err.to_string().contains("dry-run"));
+        assert!(fake.charges.lock().unwrap().is_empty());
+        assert_eq!(
+            db.list_subscription_payments(sub_id).await.unwrap().len(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn off_session_gateway_renewal_live_charges_once_and_settles_once() {
+        use crate::payments::gateway::{GatewayEventOutcome, handle_gateway_event};
+        use lnvps_api_common::OffSessionRenewals;
+        let (db, sub, fake, _user, sub_id) = gateway_setup("revolut", Some(77)).await;
+        let sub = sub.with_off_session_renewals(OffSessionRenewals::Live);
+        let payment = sub.auto_renew(sub_id).await.unwrap();
+        assert_eq!(fake.charges.lock().unwrap().len(), 1);
+        assert_eq!(payment.renewal_source, Some(lnvps_db::RenewalSource::Auto));
+        let db_dyn: Arc<dyn lnvps_db::LNVpsDb> = db.clone();
+        let event = lnvps_api_common::GatewayEvent {
+            event_id: "e9".into(),
+            kind: "payment.paid".into(),
+            reference: hex::encode(&payment.id),
+            status: "paid".into(),
+        };
+        assert_eq!(
+            handle_gateway_event(&db_dyn, &sub, &event).await.unwrap(),
+            GatewayEventOutcome::Settled
+        );
+        assert_eq!(
+            handle_gateway_event(&db_dyn, &sub, &event).await.unwrap(),
+            GatewayEventOutcome::AlreadySettled
+        );
+        assert_eq!(fake.charges.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn off_session_gateway_renewal_live_declined_card_errors_without_a_row() {
+        use lnvps_api_common::OffSessionRenewals;
+        let (db, sub, fake, _user, sub_id) = gateway_setup("stripe", Some(77)).await;
+        let sub = sub.with_off_session_renewals(OffSessionRenewals::Live);
+        *fake.fail_charges.lock().unwrap() = true;
+        let before = db.list_subscription_payments(sub_id).await.unwrap().len();
+        assert!(sub.auto_renew(sub_id).await.is_err());
+        assert_eq!(
+            db.list_subscription_payments(sub_id).await.unwrap().len(),
+            before
+        );
     }
 
     /// A renewal freezes the VAT determination (rate/country/treatment/evidence

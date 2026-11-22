@@ -29,7 +29,7 @@ truth for receipts. Sending lines is stage 3 work, when card receipts need them.
 
 1. A `PaymentGateway` trait in `lnvps_api_common::gateway` with `InProcessGateway` (the LND node, default) and `GatewayClient` (the gateway API). Chosen per method by config. Done.
 2. Lightning invoices through the gateway, settled by the signed `payment.paid` webhook. Done behind config.
-3. Cards and saved methods. Follow up issue.
+3. Saved cards through the gateway. Done behind config: `gateway_method_id` on `user_payment_method`, charge and delete through the gateway, off-session renewals gated by `off-session-renewals` (`off`, `dry-run`, `live`). Not done: gateway line items and importing existing Stripe and Revolut methods, both blocked on the pinned client (payment-gateway issue 1027); the real client returns a "not supported by the pinned client" error for import.
 4. On-chain, FixedFloat, refunds, `payment_method_config` import script with dry run. Follow up issue.
 5. Remove `payments/` and `payment_factory.rs` after a clean month. Follow up issue.
 

@@ -317,6 +317,22 @@ async fn main() -> Result<(), Error> {
         }
         None => sub_handler,
     };
+    let sub_handler = match settings
+        .gateway
+        .as_ref()
+        .filter(|g| g.handles("stripe") || g.handles("revolut"))
+    {
+        Some(g) => {
+            info!(
+                "Saved card methods use the payment gateway (off-session renewals: {:?})",
+                g.off_session_renewals
+            );
+            sub_handler
+                .with_card_gateway(Arc::new(lnvps_api_common::GatewayClient::new(g)))
+                .with_off_session_renewals(g.off_session_renewals)
+        }
+        None => sub_handler,
+    };
     sub_handler.vm_provisioner().init().await?;
 
     // On-chain provider for the worker's automated on-chain referral payouts.

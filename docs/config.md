@@ -37,7 +37,10 @@ gateway:
   api-key: "..."
   webhook-secret: "..."
   methods: ["lightning"]
+  off-session-renewals: off
 ```
+
+`off-session-renewals` is `off` (default), `dry-run` or `live`. Saved cards held by the gateway (`user_payment_method.gateway_method_id` set) are only charged by the renewal job in `live` mode. `dry-run` logs the amount it would charge and charges nothing. Adding `stripe` or `revolut` to `methods` routes saved-card charges and saved-method deletion through the gateway; methods without a gateway id keep the in-process path.
 
 > **Payment providers** (Lightning node, on-chain wallet, Revolut) are **not**
 > configured here — they live in the `payment_method_config` DB table and are

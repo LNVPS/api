@@ -1,8 +1,11 @@
 use super::{RenewMode, SubscriptionHandler};
 use anyhow::{Result, bail};
 use chrono::{Datelike, Utc};
-use lnvps_api_common::GatewaySavedCharge;
-use lnvps_db::{PaymentMethod, SubscriptionPaymentType, UserPaymentMethod};
+use lnvps_api_common::{GatewaySavedCharge, OffSessionRenewals};
+use lnvps_db::{
+    PaymentMethod, RenewalSource, SubscriptionPayment, SubscriptionPaymentType, UserPaymentMethod,
+};
+use log::info;
 
 pub(crate) const GATEWAY_CARD_EXTERNAL_DATA: &str = r#"{"token":"","session_id":""}"#;
 
@@ -80,6 +83,41 @@ impl SubscriptionHandler {
             payment_id: payment_id.to_vec(),
             external_id: charge.external_id,
         })
+    }
+
+    pub(crate) fn holds_gateway_method(&self, method: &UserPaymentMethod) -> bool {
+        self.card_gateway().is_some() && method.gateway_method_id.is_some()
+    }
+
+    pub(crate) async fn auto_renew_via_gateway_card(
+        &self,
+        sub_id: u64,
+        method: PaymentMethod,
+    ) -> Result<SubscriptionPayment> {
+        match self.off_session {
+            OffSessionRenewals::Off => {
+                bail!("Off-session card renewals through the gateway are not enabled")
+            }
+            OffSessionRenewals::DryRun => {
+                let quote = self.quote_renewal(sub_id, method, 1, None).await?;
+                info!(
+                    "DRY RUN: would charge saved {:?} method for subscription {}: {} {} (+{} tax)",
+                    method, sub_id, quote.amount, quote.currency, quote.tax
+                );
+                bail!("Off-session renewal is in dry-run mode, nothing was charged")
+            }
+            OffSessionRenewals::Live => {
+                self.renew_subscription_inner(
+                    sub_id,
+                    method,
+                    1,
+                    RenewMode::Saved { method_id: None },
+                    None,
+                    RenewalSource::Auto,
+                )
+                .await
+            }
+        }
     }
 
     pub(crate) fn wants_gateway_saved(&self, method: PaymentMethod, mode: &RenewMode) -> bool {
