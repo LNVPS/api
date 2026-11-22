@@ -1160,6 +1160,10 @@ pub trait LNVpsDbBase: Send + Sync {
         payment_id: &Vec<u8>,
     ) -> DbResult<Vec<SubscriptionPayment>>;
     async fn insert_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()>;
+    async fn list_expired_unpaid_gateway_payments(
+        &self,
+        now: DateTime<Utc>,
+    ) -> DbResult<Vec<SubscriptionPayment>>;
     async fn update_subscription_payment(&self, payment: &SubscriptionPayment) -> DbResult<()>;
     async fn subscription_payment_paid(&self, payment: &SubscriptionPayment) -> DbResult<()>;
     async fn last_paid_subscription_invoice(&self) -> DbResult<Option<SubscriptionPayment>>;

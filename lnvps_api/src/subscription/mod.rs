@@ -277,6 +277,16 @@ const SAVED_PAYMENT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// returning it as still-pending.
 const SAVED_PAYMENT_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
 
+struct LightningInvoiceSpec {
+    subscription_id: u64,
+    user_id: u64,
+    payment_type: SubscriptionPaymentType,
+    amount_msat: u64,
+    tax_msat: u64,
+    description: String,
+    expires_in_secs: u32,
+}
+
 #[derive(Clone)]
 pub struct SubscriptionHandler {
     db: Arc<dyn LNVpsDb>,
@@ -541,28 +551,19 @@ impl SubscriptionHandler {
         self
     }
 
-    async fn new_lightning_invoice(
-        &self,
-        subscription_id: u64,
-        user_id: u64,
-        payment_type: SubscriptionPaymentType,
-        amount_msat: u64,
-        tax_msat: u64,
-        description: String,
-        expires_in_secs: u32,
-    ) -> Result<GatewayInvoice> {
+    async fn new_lightning_invoice(&self, spec: LightningInvoiceSpec) -> Result<GatewayInvoice> {
         let payment_id: [u8; 32] = rand::random();
         self.lightning_gateway
             .create_lightning_invoice(GatewayInvoiceRequest {
                 payment_id: payment_id.to_vec(),
-                amount_msat,
-                tax_msat,
-                description,
-                expires_in_secs,
-                customer_ref: user_id.to_string(),
+                amount_msat: spec.amount_msat,
+                tax_msat: spec.tax_msat,
+                description: spec.description,
+                expires_in_secs: spec.expires_in_secs,
+                customer_ref: spec.user_id.to_string(),
                 metadata: serde_json::json!({
-                    "subscription_id": subscription_id,
-                    "payment_type": format!("{payment_type:?}"),
+                    "subscription_id": spec.subscription_id,
+                    "payment_type": format!("{:?}", spec.payment_type),
                 }),
             })
             .await
@@ -1643,15 +1644,15 @@ impl SubscriptionHandler {
                 );
 
                 let invoice = self
-                    .new_lightning_invoice(
+                    .new_lightning_invoice(LightningInvoiceSpec {
                         subscription_id,
-                        subscription.user_id,
+                        user_id: subscription.user_id,
                         payment_type,
-                        invoice_amount,
-                        tax,
-                        desc,
-                        INVOICE_EXPIRE as u32,
-                    )
+                        amount_msat: invoice_amount,
+                        tax_msat: tax,
+                        description: desc,
+                        expires_in_secs: INVOICE_EXPIRE as u32,
+                    })
                     .await?;
 
                 SubscriptionPayment {
@@ -2404,15 +2405,15 @@ impl SubscriptionHandler {
                     credit_covered / 1000
                 );
                 let invoice = self
-                    .new_lightning_invoice(
+                    .new_lightning_invoice(LightningInvoiceSpec {
                         subscription_id,
                         user_id,
                         payment_type,
-                        total_amount,
-                        p.tax,
-                        desc,
-                        INVOICE_EXPIRE as u32,
-                    )
+                        amount_msat: total_amount,
+                        tax_msat: p.tax,
+                        description: desc,
+                        expires_in_secs: INVOICE_EXPIRE as u32,
+                    })
                     .await?;
                 SubscriptionPayment {
                     // Every caller here is a customer action (renew, upgrade, purchase);
@@ -3465,6 +3466,7 @@ pub(crate) mod revolut_offline_tests {
             kind: "payment.paid".into(),
             reference: hex::encode(&payment.id),
             status: "paid".into(),
+            ..Default::default()
         };
         assert_eq!(
             handle_gateway_event(&db_dyn, &sub, &event).await.unwrap(),
@@ -3606,6 +3608,7 @@ pub(crate) mod revolut_offline_tests {
             kind: "payment.paid".into(),
             reference: hex::encode(&payment.id),
             status: "paid".into(),
+            ..Default::default()
         };
         assert_eq!(
             handle_gateway_event(&db_dyn, &sub, &event).await.unwrap(),

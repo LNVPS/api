@@ -4596,6 +4596,19 @@ impl LNVpsDbBase for LNVpsDbMysql {
         )
     }
 
+    async fn list_expired_unpaid_gateway_payments(
+        &self,
+        now: DateTime<Utc>,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        Ok(sqlx::query_as(
+            "SELECT * FROM subscription_payment WHERE is_paid = 0 AND expires < ? AND external_id LIKE 'pgw:%' AND payment_type != ? ORDER BY expires LIMIT 500",
+        )
+        .bind(now)
+        .bind(crate::SubscriptionPaymentType::Refund)
+        .fetch_all(&self.db)
+        .await?)
+    }
+
     async fn get_subscription_payment_with_company(
         &self,
         id: &Vec<u8>,

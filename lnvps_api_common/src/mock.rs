@@ -3661,6 +3661,25 @@ impl LNVpsDbBase for MockDb {
             .collect())
     }
 
+    async fn list_expired_unpaid_gateway_payments(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> DbResult<Vec<SubscriptionPayment>> {
+        let payments = self.subscription_payments.lock().await;
+        Ok(payments
+            .iter()
+            .filter(|p| {
+                !p.is_paid
+                    && p.expires < now
+                    && p.payment_type != lnvps_db::SubscriptionPaymentType::Refund
+                    && p.external_id
+                        .as_deref()
+                        .is_some_and(|e| e.starts_with("pgw:"))
+            })
+            .cloned()
+            .collect())
+    }
+
     async fn get_subscription_payment_with_company(
         &self,
         id: &Vec<u8>,

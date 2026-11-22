@@ -85,12 +85,15 @@ pub struct GatewayImportMethod {
     pub external_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GatewayEvent {
     pub event_id: String,
     pub kind: String,
     pub reference: String,
     pub status: String,
+    pub refund_id: Option<u64>,
+    pub amount: Option<u64>,
+    pub reason: Option<String>,
 }
 
 #[async_trait]
@@ -219,11 +222,22 @@ pub fn parse_gateway_event(
     let text =
         |v: Option<&serde_json::Value>| v.and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let payment = value.pointer("/data/payment");
+    let detail = value.pointer("/data/detail");
     Ok(GatewayEvent {
         event_id: text(value.get("id")),
         kind: text(value.get("type")),
         reference: text(payment.and_then(|p| p.get("reference"))),
         status: text(payment.and_then(|p| p.get("status"))),
+        refund_id: detail
+            .and_then(|d| d.get("refund_id"))
+            .and_then(|v| v.as_u64()),
+        amount: detail
+            .and_then(|d| d.get("amount"))
+            .and_then(|v| v.as_u64()),
+        reason: detail
+            .and_then(|d| d.get("reason"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
     })
 }
 
@@ -232,6 +246,7 @@ pub struct FakeGateway {
     pub created: Mutex<Vec<GatewayInvoiceRequest>>,
     pub cancelled: Mutex<Vec<String>>,
     pub fail: Mutex<bool>,
+    pub fail_cancel: Mutex<bool>,
     pub charges: Mutex<Vec<GatewaySavedCharge>>,
     pub deleted_methods: Mutex<Vec<u64>>,
     pub imported: Mutex<Vec<GatewayImportMethod>>,
@@ -273,6 +288,9 @@ impl PaymentGateway for FakeGateway {
         let Some(id) = external_id.and_then(|e| e.strip_prefix(GATEWAY_EXTERNAL_ID_PREFIX)) else {
             bail!("not a gateway payment");
         };
+        if *self.fail_cancel.lock().unwrap() {
+            bail!("gateway unavailable");
+        }
         self.cancelled.lock().unwrap().push(id.to_string());
         Ok(())
     }
