@@ -60,7 +60,8 @@ mod tests {
             pubkey: vec![1u8; 32],
             permissions: permissions.into_iter().collect(),
             nip98_auth: None,
-            step_up: false,        }
+            step_up: false,
+        }
     }
 
     #[tokio::test]

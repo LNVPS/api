@@ -209,6 +209,7 @@ impl RevolutPaymentHandler {
             name: None,
             external_customer_id: Some(customer_id.to_string().into()),
             external_id: method.id.clone().into(),
+            gateway_method_id: None,
             card_brand: card.and_then(|c| c.brand.clone()),
             card_last_four: card.and_then(|c| c.last4.clone()),
             exp_month: card.and_then(|c| c.expiry_month),

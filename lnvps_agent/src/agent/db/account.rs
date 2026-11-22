@@ -213,6 +213,7 @@ mod tests {
                 name: Some("Personal".to_string()),
                 external_customer_id: Some("SECRET-CUSTOMER".to_string().into()),
                 external_id: "SECRET-INSTRUMENT".to_string().into(),
+                gateway_method_id: None,
                 card_brand: Some("visa".to_string()),
                 card_last_four: Some("4242".to_string()),
                 exp_month: Some(3),

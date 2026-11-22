@@ -169,7 +169,10 @@ impl Escalation {
         if !req.recent_customer_messages.is_empty() {
             out.push_str("\nLast customer messages (oldest first):\n");
             for message in &req.recent_customer_messages {
-                out.push_str(&format!("> {}\n", clip(&redact(message), MAX_MESSAGE_CHARS)));
+                out.push_str(&format!(
+                    "> {}\n",
+                    clip(&redact(message), MAX_MESSAGE_CHARS)
+                ));
             }
         }
         out
@@ -206,10 +209,7 @@ fn domain_of(address: &str) -> Option<&str> {
 }
 
 fn short_reason(reason: &str) -> String {
-    let single: String = reason
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let single: String = reason.split_whitespace().collect::<Vec<_>>().join(" ");
     clip(&redact(&single), MAX_SUBJECT_REASON)
 }
 
@@ -316,7 +316,8 @@ mod tests {
     #[test]
     fn secrets_are_removed_everywhere() {
         let mut req = request(0);
-        let key = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAAB3Nza\n-----END OPENSSH PRIVATE KEY-----";
+        let key =
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAAB3Nza\n-----END OPENSSH PRIVATE KEY-----";
         req.summary = format!("they pasted {key} and password: hunter2 here");
         req.recent_customer_messages = vec![
             format!("my key {key}"),

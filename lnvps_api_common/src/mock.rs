@@ -10023,6 +10023,7 @@ mod tests {
             name: None,
             external_customer_id: Some("cust".to_string().into()),
             external_id: "pm".to_string().into(),
+            gateway_method_id: None,
             card_brand: Some("VISA".to_string()),
             card_last_four: Some("5709".to_string()),
             exp_month: Some(12),

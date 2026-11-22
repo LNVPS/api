@@ -40,7 +40,10 @@ mod tests {
         assert!(token.starts_with("lnvps_"));
 
         let anon = user_client_no_auth();
-        let read = anon.get_with_bearer("/api/v1/account", &token).await.unwrap();
+        let read = anon
+            .get_with_bearer("/api/v1/account", &token)
+            .await
+            .unwrap();
         assert_eq!(read.status(), StatusCode::OK);
 
         let write = reqwest::Client::new()
@@ -69,7 +72,10 @@ mod tests {
             .unwrap();
         assert_eq!(del.status(), StatusCode::OK);
 
-        let after = anon.get_with_bearer("/api/v1/account", &token).await.unwrap();
+        let after = anon
+            .get_with_bearer("/api/v1/account", &token)
+            .await
+            .unwrap();
         assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
 
         assert_eq!(

@@ -22,9 +22,10 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use lnvps_api_common::{
-    AccountAction, ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage, ApiVmTemplate,
-    ClientInfo, ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery, SnapshotAction,
-    TraderDetails, UpgradeConfig, UserRateLimiter, VatClient, WorkJob, apply_custom_pricing_limits, enforce_account_limit,
+    AccountAction, ApiCurrency, ApiData, ApiError, ApiResult, ApiUserSshKey, ApiVmOsImage,
+    ApiVmTemplate, ClientInfo, ClientIp, JobFeedback, JobFeedbackStatus, Nip98Auth, PageQuery,
+    SnapshotAction, TraderDetails, UpgradeConfig, UserRateLimiter, VatClient, WorkJob,
+    apply_custom_pricing_limits, enforce_account_limit,
 };
 use lnvps_db::{
     CpuArch, LNVpsDb, PaymentMethod, Region, Vm, VmCustomPricing, VmCustomPricingDisk,
@@ -237,14 +238,15 @@ async fn capture_client_geo(this: &RouterState, uid: u64, client_ip: ClientIp) {
     }
 }
 
-async fn flag_suspicious_order(this: &RouterState, user: &lnvps_db::User, vm_id: u64, cpu: u16, memory: u64) {
-    let signals = lnvps_api_common::order_signals(
-        user.created,
-        Utc::now(),
-        cpu,
-        memory,
-        user.email.as_str(),
-    );
+async fn flag_suspicious_order(
+    this: &RouterState,
+    user: &lnvps_db::User,
+    vm_id: u64,
+    cpu: u16,
+    memory: u64,
+) {
+    let signals =
+        lnvps_api_common::order_signals(user.created, Utc::now(), cpu, memory, user.email.as_str());
     if !lnvps_api_common::should_alert(&signals) {
         return;
     }
@@ -726,6 +728,7 @@ async fn v1_add_nwc_payment_method(
             .filter(|n| !n.is_empty()),
         external_customer_id: None,
         external_id: nwc.into(),
+        gateway_method_id: None,
         card_brand: None,
         card_last_four: None,
         exp_month: None,

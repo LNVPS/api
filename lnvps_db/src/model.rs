@@ -245,6 +245,8 @@ pub struct UserPaymentMethod {
     pub external_customer_id: Option<EncryptedString>,
     /// Encrypted reusable payment method id charged off-session
     pub external_id: EncryptedString,
+    #[sqlx(default)]
+    pub gateway_method_id: Option<u64>,
     pub card_brand: Option<String>,
     pub card_last_four: Option<String>,
     pub exp_month: Option<u16>,
