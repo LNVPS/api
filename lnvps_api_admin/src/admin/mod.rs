@@ -13,6 +13,7 @@ mod agent;
 mod apps;
 mod auth;
 mod bulk_message;
+mod capabilities;
 pub mod chain;
 mod companies;
 mod cost_plans;
@@ -82,6 +83,7 @@ pub fn admin_router(
 ) -> Router {
     Router::new()
         .merge(docs::router())
+        .merge(capabilities::router())
         .merge(activity::router())
         .merge(users::router())
         .merge(agent::router())

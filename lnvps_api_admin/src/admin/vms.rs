@@ -514,6 +514,7 @@ async fn admin_transfer_vm(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AdminMigrateVmRequest {
     /// Host to move the VM onto
     target_host_id: u64,
@@ -2022,6 +2023,16 @@ mod tests {
         assert!(body.get("job_id").is_none());
         assert!(queued(&commander).await.is_empty());
         assert_eq!(this.db.get_vm(vm_id).await.unwrap().host_id, 1);
+    }
+
+    #[test]
+    fn migrate_request_rejects_unknown_fields() {
+        let err = serde_json::from_str::<AdminMigrateVmRequest>(
+            r#"{"target_host_id":2,"dry_runn":true}"#,
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("unknown field"), "{err}");
     }
 
     #[tokio::test]
