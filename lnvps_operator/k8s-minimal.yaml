@@ -65,6 +65,11 @@ rules:
 - apiGroups: ["networking.k8s.io"]
   resources: ["networkpolicies"]
   verbs: ["create", "patch"]
+# L4 forwarding with the `traefik` forwarder: one route per exposed port, listed
+# cluster-wide to find ports already taken, applied and deleted per namespace.
+- apiGroups: ["traefik.io"]
+  resources: ["ingressroutetcps", "ingressrouteudps"]
+  verbs: ["list", "create", "patch", "delete"]
 ---
 # L4 forwarding with the `ingress-nginx` forwarder: the operator reads and
 # merge-patches the two port maps the controller is told to watch. Scoped to
