@@ -47,6 +47,21 @@ Authorization: Nostr <base64-encoded-event>
 
 ## Endpoints
 
+### Capabilities
+
+```
+GET /api/admin/v1/capabilities
+```
+
+Required Permission: any admin permission. No side effects.
+
+Returns a stable marker of optional features, so a client does not have to
+probe for them. Servers without this route answer `404`.
+
+```json
+{"data": {"vm_migrate": {"version": 2, "options": ["ip_policy", "keep_source", "target_disk_id", "dry_run", "timeout_secs_per_gb"]}}}
+```
+
 ### User Management
 
 #### List Users
@@ -707,6 +722,10 @@ Returns `409` if the VM is deleted or already belongs to the target user, and
 ```
 POST /api/admin/v1/vms/{id}/migrate
 ```
+
+The request body rejects unknown fields with `422`. Clients can discover the
+supported options first with `GET /api/admin/v1/capabilities` (see
+[Capabilities](#capabilities)).
 
 Required Permission: `virtual_machines::update`
 

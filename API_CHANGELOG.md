@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Admin capabilities marker**: `GET /api/admin/v1/capabilities` (any admin permission) returns `{vm_migrate: {version: 2, options: [...]}}` listing the migrate options the server supports (`ip_policy`, `keep_source`, `target_disk_id`, `dry_run`, `timeout_secs_per_gb`). `POST /api/admin/v1/vms/{id}/migrate` now rejects unknown body fields with 422 instead of ignoring them; the old `{target_host_id, live, reason}` body still works.
+
 - **Migrate VMs between host kinds and regions**: `POST /api/admin/v1/vms/{id}/migrate` accepts `ip_policy` (`keep` default, `reassign`), `keep_source` (default `true`), `target_disk_id`, `timeout_secs_per_gb` and `dry_run`. libvirt and marketplace node VMs, and Proxmox VMs changing region, move to Proxmox by an offline checksummed disk copy with rollback; Proxmox to Proxmox in one region still uses `qm migrate`. The response gains `plan` (method, bytes, estimate, address changes, warnings, refusals); `dry_run: true` returns only the plan. Plans with refusals now return 409 instead of failing in the job. VM history gains the `migration_progress` action, also returned by the admin VM history endpoints. Old request bodies behave as before. Needs migration `20261106215109_vm_migration.sql`.
 
 - **Admin credit per currency and activity payment fields**: `GET /api/admin/v1/users/{id}/credit/events` accepts `currency` to list one currency's ledger. `GET /api/admin/v1/reports/activity` payments gain `vm_id` and `refund_trigger` (`owner_delete`, `admin_delete`, `admin`, `manual`; null for non-refunds). Documented the existing `balances` array on the credit response and the `currency` field on `PATCH /api/admin/v1/users/{id}/credit`.
