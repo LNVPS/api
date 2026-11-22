@@ -68,6 +68,15 @@ pub async fn handle_gateway_event(
         return Ok(GatewayEventOutcome::UnknownPayment);
     };
     let Ok(payment) = db.get_subscription_payment(&id).await else {
+        if let Some(topup) = db.get_account_credit_topup_by_hash(&id).await? {
+            if topup.is_paid {
+                return Ok(GatewayEventOutcome::AlreadySettled);
+            }
+            return Ok(match sub_handler.settle_credit_topup(topup.id).await? {
+                Some(_) => GatewayEventOutcome::Settled,
+                None => GatewayEventOutcome::AlreadySettled,
+            });
+        }
         return Ok(GatewayEventOutcome::UnknownPayment);
     };
     if payment.is_paid {

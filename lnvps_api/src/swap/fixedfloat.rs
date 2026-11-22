@@ -124,6 +124,7 @@ impl SwapProvider for FixedFloat {
                 receive_address: req.receive_address,
             },
             expires,
+            external_id: None,
         })
     }
 }

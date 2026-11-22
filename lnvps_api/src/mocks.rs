@@ -672,6 +672,7 @@ impl crate::swap::SwapProvider for MockSwapProvider {
                 receive_address: req.receive_address,
             },
             expires: Utc::now() + chrono::Duration::minutes(30),
+            external_id: None,
         })
     }
 }

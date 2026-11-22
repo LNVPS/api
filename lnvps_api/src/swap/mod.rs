@@ -20,6 +20,7 @@ pub struct SwapOrderRequest {
 pub struct SwapOrder {
     pub data: SwapData,
     pub expires: DateTime<Utc>,
+    pub external_id: Option<String>,
 }
 
 #[async_trait]

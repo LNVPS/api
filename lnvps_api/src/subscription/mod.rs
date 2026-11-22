@@ -20,7 +20,9 @@ use lnvps_api_common::{
     CostResult, ExchangeRateService, NewPaymentInfo, PricingEngine, UpgradeConfig, VatClient,
     WorkCommander, round_msat_to_sat,
 };
-use lnvps_api_common::{GatewayInvoice, GatewayInvoiceRequest, PaymentGateway};
+use lnvps_api_common::{
+    GatewayCryptoRequest, GatewayInvoice, GatewayInvoiceRequest, PaymentGateway,
+};
 use lnvps_db::{
     LNVpsDb, LineItemType, PaymentMethod, RenewalSource, Subscription, SubscriptionLineItem,
     SubscriptionPayment, SubscriptionPaymentType, User, UserPaymentMethod, VmAddonKind,
@@ -36,8 +38,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::swap::{SwapOrder, SwapOrderRequest, SwapProvider};
+pub use crypto::OnChainAddress;
+use crypto::{CryptoContext, ONCHAIN_EXPIRE_SECS, SWAP_EXPIRE_SECS};
 
 mod app;
+mod crypto;
+#[cfg(test)]
+mod gateway_crypto_tests;
 mod ip_range;
 mod marketplace_node_fee;
 mod vm;
@@ -285,6 +292,8 @@ pub struct SubscriptionHandler {
     lightning_gateway: Arc<dyn PaymentGateway>,
     card_gateway: Option<Arc<dyn PaymentGateway>>,
     onchain: Arc<dyn OnChainProvider>,
+    onchain_gateway: Option<Arc<dyn PaymentGateway>>,
+    swap_gateway: Option<Arc<dyn PaymentGateway>>,
     revolut: Option<Arc<dyn FiatPaymentService>>,
     swap: Option<Arc<dyn SwapProvider>>,
 
@@ -316,6 +325,8 @@ impl SubscriptionHandler {
         Ok(Self {
             revolut,
             swap: None,
+            onchain_gateway: None,
+            swap_gateway: None,
             card_gateway: None,
             lightning_gateway: Arc::new(crate::payments::gateway::InProcessGateway::new(
                 node.clone(),
@@ -367,7 +378,17 @@ impl SubscriptionHandler {
         amount_msat: u64,
         memo: String,
         label: String,
-    ) -> Result<String> {
+        ctx: &CryptoContext,
+    ) -> Result<OnChainAddress> {
+        if let Some(gateway) = &self.onchain_gateway {
+            let created = gateway
+                .create_onchain_address(ctx.request(amount_msat, memo, ONCHAIN_EXPIRE_SECS, None))
+                .await?;
+            return Ok(OnChainAddress {
+                address: created.address,
+                external_id: Some(created.external_id),
+            });
+        }
         let resp = self
             .onchain
             .new_address(NewAddressRequest {
@@ -376,9 +397,13 @@ impl SubscriptionHandler {
                 label: Some(label),
             })
             .await?;
-        Ok(resp.address)
+        Ok(OnChainAddress {
+            address: resp.address,
+            external_id: None,
+        })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn new_fixedfloat_swap(
         &self,
         company_id: u64,
@@ -387,6 +412,7 @@ impl SubscriptionHandler {
         amount_msat: u64,
         memo: String,
         label: String,
+        ctx: &CryptoContext,
     ) -> Result<SwapOrder> {
         ensure!(
             currency == Currency::BTC,
@@ -406,11 +432,29 @@ impl SubscriptionHandler {
             "{} is not accepted for FixedFloat payments",
             coin
         );
+        if let Some(gateway) = &self.swap_gateway {
+            let created = gateway
+                .create_swap(ctx.request(
+                    amount_msat,
+                    memo,
+                    SWAP_EXPIRE_SECS,
+                    Some(coin.to_string()),
+                ))
+                .await?;
+            return Ok(SwapOrder {
+                data: created.data,
+                expires: created.expires,
+                external_id: Some(created.external_id),
+            });
+        }
         let swap = match &self.swap {
             Some(swap) => swap.clone(),
             None => crate::swap::provider_for_config(&config)?,
         };
-        let receive_address = self.new_onchain_address(amount_msat, memo, label).await?;
+        let receive_address = self
+            .new_onchain_address(amount_msat, memo, label, ctx)
+            .await?
+            .address;
         swap.create_order(SwapOrderRequest {
             coin: coin.to_string(),
             receive_sats: amount_msat / 1000,
@@ -472,9 +516,10 @@ impl SubscriptionHandler {
 
     pub async fn new_credit_topup_address(
         &self,
+        user_id: u64,
+        reference: [u8; 32],
         amount_msat: u64,
-        label: String,
-    ) -> Result<String> {
+    ) -> Result<OnChainAddress> {
         let enabled = self
             .db
             .list_payment_method_configs()
@@ -482,15 +527,21 @@ impl SubscriptionHandler {
             .iter()
             .any(|c| c.enabled && c.payment_method == PaymentMethod::OnChain);
         ensure!(enabled, "On-chain payments are not enabled");
-        self.new_onchain_address(amount_msat, "LNVPS credit top-up".to_string(), label)
-            .await
+        self.new_onchain_address(
+            amount_msat,
+            "LNVPS credit top-up".to_string(),
+            hex::encode(reference),
+            &CryptoContext::topup(user_id, reference),
+        )
+        .await
     }
 
     pub async fn new_credit_topup_swap(
         &self,
+        user_id: u64,
+        reference: [u8; 32],
         coin: Currency,
         amount_msat: u64,
-        label: String,
     ) -> Result<SwapOrder> {
         let company_id = self
             .db
@@ -510,7 +561,8 @@ impl SubscriptionHandler {
             Currency::BTC,
             amount_msat,
             "LNVPS credit top-up".to_string(),
-            label,
+            hex::encode(reference),
+            &CryptoContext::topup(user_id, reference),
         )
         .await
     }
@@ -533,6 +585,22 @@ impl SubscriptionHandler {
         self
     }
 
+    pub fn with_onchain_gateway(mut self, gateway: Arc<dyn PaymentGateway>) -> Self {
+        self.onchain_gateway = Some(gateway);
+        self
+    }
+
+    pub fn with_swap_gateway(mut self, gateway: Arc<dyn PaymentGateway>) -> Self {
+        self.swap_gateway = Some(gateway);
+        self
+    }
+
+    pub fn refund_gateway(&self) -> Option<Arc<dyn PaymentGateway>> {
+        self.card_gateway
+            .clone()
+            .or_else(|| self.onchain_gateway.clone())
+            .or_else(|| self.swap_gateway.clone())
+    }
     async fn new_lightning_invoice(
         &self,
         subscription_id: u64,
@@ -1753,7 +1821,18 @@ impl SubscriptionHandler {
 
                 let new_id: [u8; 32] = rand::random();
                 let address = self
-                    .new_onchain_address(invoice_amount, desc, hex::encode(new_id))
+                    .new_onchain_address(
+                        invoice_amount,
+                        desc,
+                        hex::encode(new_id),
+                        &CryptoContext::payment(
+                            new_id,
+                            subscription.user_id,
+                            subscription_id,
+                            payment_type,
+                            tax,
+                        ),
+                    )
                     .await?;
 
                 SubscriptionPayment {
@@ -1767,10 +1846,8 @@ impl SubscriptionHandler {
                     currency: converted_currency.to_string(),
                     payment_method: method,
                     payment_type,
-                    external_data: address.into(),
-                    // txid is not known until the payment arrives; the chain
-                    // watcher fills this in when the deposit is seen.
-                    external_id: None,
+                    external_data: address.address.into(),
+                    external_id: address.external_id,
                     is_paid: false,
                     rate,
                     time_value: if time_value > 0 {
@@ -1819,6 +1896,13 @@ impl SubscriptionHandler {
                         receive_amount,
                         desc,
                         hex::encode(new_id),
+                        &CryptoContext::payment(
+                            new_id,
+                            subscription.user_id,
+                            subscription_id,
+                            payment_type,
+                            tax,
+                        ),
                     )
                     .await?;
 
@@ -1834,7 +1918,7 @@ impl SubscriptionHandler {
                     payment_method: method,
                     payment_type,
                     external_data: order.data.to_json()?.into(),
-                    external_id: None,
+                    external_id: order.external_id,
                     is_paid: false,
                     rate,
                     time_value: if time_value > 0 {
@@ -2468,7 +2552,18 @@ impl SubscriptionHandler {
                 );
                 let new_id: [u8; 32] = rand::random();
                 let address = self
-                    .new_onchain_address(total_amount, desc, hex::encode(new_id))
+                    .new_onchain_address(
+                        total_amount,
+                        desc,
+                        hex::encode(new_id),
+                        &CryptoContext::payment(
+                            new_id,
+                            user_id,
+                            subscription_id,
+                            payment_type,
+                            p.tax,
+                        ),
+                    )
                     .await?;
                 SubscriptionPayment {
                     // Every caller here is a customer action (renew, upgrade, purchase);
@@ -2483,10 +2578,8 @@ impl SubscriptionHandler {
                     currency: p.currency.to_string(),
                     payment_method: method,
                     payment_type,
-                    external_data: address.into(),
-                    // txid is filled in by the chain watcher when the
-                    // deposit is seen.
-                    external_id: None,
+                    external_data: address.address.into(),
+                    external_id: address.external_id,
                     is_paid: false,
                     rate: p.rate.rate,
                     time_value: Some(p.time_value),
@@ -2515,6 +2608,13 @@ impl SubscriptionHandler {
                         receive_amount,
                         desc,
                         hex::encode(new_id),
+                        &CryptoContext::payment(
+                            new_id,
+                            user_id,
+                            subscription_id,
+                            payment_type,
+                            p.tax,
+                        ),
                     )
                     .await?;
                 SubscriptionPayment {
@@ -2529,7 +2629,7 @@ impl SubscriptionHandler {
                     payment_method: method,
                     payment_type,
                     external_data: order.data.to_json()?.into(),
-                    external_id: None,
+                    external_id: order.external_id,
                     is_paid: false,
                     rate: p.rate.rate,
                     time_value: Some(p.time_value),

@@ -11,12 +11,11 @@
 use axum::extract::{Path, Query, State};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use payments_rs::lightning::AddInvoiceRequest;
 use serde::{Deserialize, Serialize};
 
 use lnvps_api_common::{
-    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, Nip98Auth, PageQuery,
-    round_msat_to_sat,
+    ApiData, ApiError, ApiPaginatedData, ApiPaginatedResult, ApiResult, GatewayInvoiceRequest,
+    Nip98Auth, PageQuery, round_msat_to_sat,
 };
 use lnvps_db::{AccountCredit, AccountCreditEvent, AccountCreditTopup, PaymentMethod};
 
@@ -144,7 +143,7 @@ impl ApiCreditTopup {
                 "onchain",
                 ApiPaymentData::OnChain {
                     address: t.external_data.clone(),
-                    outpoint: t.external_id.clone(),
+                    outpoint: lnvps_api_common::deposit_outpoint(&t.external_id),
                 },
                 None,
             ),
@@ -155,7 +154,7 @@ impl ApiCreditTopup {
                         coin: d.coin,
                         address: d.deposit_address,
                         amount: d.deposit_amount,
-                        outpoint: t.external_id.clone(),
+                        outpoint: lnvps_api_common::deposit_outpoint(&t.external_id),
                     })
                     .unwrap_or(ApiPaymentData::Lightning(String::new())),
                 None,
@@ -230,39 +229,46 @@ async fn v1_topup_credit(
             expire = LIGHTNING_TOPUP_EXPIRE;
             let invoice = this
                 .sub_handler
-                .node()
-                .add_invoice(AddInvoiceRequest {
-                    memo: Some("LNVPS credit top-up".to_string()),
-                    amount,
-                    expire: Some(LIGHTNING_TOPUP_EXPIRE as u32),
+                .lightning_gateway()
+                .create_lightning_invoice(GatewayInvoiceRequest {
+                    payment_id: rand::random::<[u8; 32]>().to_vec(),
+                    amount_msat: amount,
+                    tax_msat: 0,
+                    description: "LNVPS credit top-up".to_string(),
+                    expires_in_secs: LIGHTNING_TOPUP_EXPIRE as u32,
+                    customer_ref: uid.to_string(),
+                    metadata: serde_json::json!({ "payment_type": "credit_topup" }),
                 })
                 .await
                 .map_err(|e| ApiError::new(format!("Failed to create invoice: {e}")))?;
             topup.payment_method = PaymentMethod::Lightning;
-            topup.invoice_hash = hex::decode(invoice.payment_hash())
-                .map_err(|e| ApiError::new(format!("Failed to decode payment hash: {e}")))?;
-            topup.external_data = invoice.pr();
+            topup.invoice_hash = invoice.payment_id.clone();
+            topup.external_data = invoice.bolt11.clone();
+            topup.external_id = invoice.external_id.clone();
         }
         "onchain" => {
             expire = ONCHAIN_TOPUP_EXPIRE;
             let reference: [u8; 32] = rand::random();
             topup.payment_method = PaymentMethod::OnChain;
             topup.invoice_hash = reference.to_vec();
-            topup.external_data = this
+            let created = this
                 .sub_handler
-                .new_credit_topup_address(amount, hex::encode(reference))
+                .new_credit_topup_address(uid, reference, amount)
                 .await
                 .map_err(|e| ApiError::new(e.to_string()))?;
+            topup.external_data = created.address;
+            topup.external_id = created.external_id;
         }
         "fixedfloat" => {
             let coin = parse_fixedfloat_coin(req.coin.as_deref())?;
             let reference: [u8; 32] = rand::random();
             let order = this
                 .sub_handler
-                .new_credit_topup_swap(coin, amount, hex::encode(reference))
+                .new_credit_topup_swap(uid, reference, coin, amount)
                 .await
                 .map_err(|e| ApiError::new(e.to_string()))?;
             expire = (order.expires - chrono::Utc::now()).num_seconds().max(0);
+            topup.external_id = order.external_id.clone();
             topup.payment_method = PaymentMethod::FixedFloat;
             topup.invoice_hash = reference.to_vec();
             topup.external_data = order
@@ -305,11 +311,15 @@ pub(crate) async fn new_lightning_topup(
     let amount = round_msat_to_sat(amount_msat);
     let invoice = this
         .sub_handler
-        .node()
-        .add_invoice(AddInvoiceRequest {
-            memo: Some(memo),
-            amount,
-            expire: Some(LIGHTNING_TOPUP_EXPIRE as u32),
+        .lightning_gateway()
+        .create_lightning_invoice(GatewayInvoiceRequest {
+            payment_id: rand::random::<[u8; 32]>().to_vec(),
+            amount_msat: amount,
+            tax_msat: 0,
+            description: memo,
+            expires_in_secs: LIGHTNING_TOPUP_EXPIRE as u32,
+            customer_ref: user_id.to_string(),
+            metadata: serde_json::json!({ "payment_type": "credit_topup" }),
         })
         .await?;
     let topup = AccountCreditTopup {
@@ -317,8 +327,9 @@ pub(crate) async fn new_lightning_topup(
         amount,
         currency: "BTC".to_string(),
         payment_method: PaymentMethod::Lightning,
-        invoice_hash: hex::decode(invoice.payment_hash())?,
-        external_data: invoice.pr(),
+        invoice_hash: invoice.payment_id,
+        external_data: invoice.bolt11,
+        external_id: invoice.external_id,
         ..Default::default()
     };
     this.db.insert_account_credit_topup(&topup).await?;

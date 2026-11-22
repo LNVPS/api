@@ -375,7 +375,8 @@ impl Worker {
             db.clone(),
             node,
             subscription_handler.pricing_engine(),
-        );
+        )
+        .with_gateway(subscription_handler.refund_gateway());
 
         let feedback: Arc<dyn WorkFeedback> = if let Some(c) = &settings.redis {
             Arc::new(RedisWorkFeedback::new(&c.url).await?)
@@ -4320,19 +4321,31 @@ impl Worker {
                 reason,
                 payment_method,
                 lightning_invoice,
+                destination,
             } => {
                 let vm = self.db.get_vm(*vm_id).await?;
-                let outcome = self
-                    .refunds
-                    .process(
-                        *vm_id,
-                        *admin_user_id,
-                        *refund_from_date,
-                        reason.as_deref(),
-                        payment_method,
-                        lightning_invoice.as_deref(),
-                    )
-                    .await?;
+                let outcome = if payment_method == "gateway" {
+                    self.refunds
+                        .process_gateway(
+                            *vm_id,
+                            *admin_user_id,
+                            *refund_from_date,
+                            reason.as_deref(),
+                            destination.as_deref(),
+                        )
+                        .await?
+                } else {
+                    self.refunds
+                        .process(
+                            *vm_id,
+                            *admin_user_id,
+                            *refund_from_date,
+                            reason.as_deref(),
+                            payment_method,
+                            lightning_invoice.as_deref(),
+                        )
+                        .await?
+                };
 
                 // A refunded VM is deleted — the customer has been paid for the
                 // time it would have run. Queued rather than done here so the

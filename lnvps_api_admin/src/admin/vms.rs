@@ -726,6 +726,8 @@ struct AdminProcessRefundRequest {
     refund_from_date: Option<DateTime<Utc>>,
     reason: Option<String>,
     lightning_invoice: Option<String>,
+    #[serde(default)]
+    destination: Option<String>,
 }
 
 /// Delete a VM
@@ -1283,12 +1285,34 @@ async fn admin_process_vm_refund(
         .clone()
         .unwrap_or_else(|| "lightning".to_string());
     match payment_method.as_str() {
-        "lightning" | "revolut" | "paypal" => {}
+        "lightning" | "revolut" | "paypal" | "gateway" => {}
         _ => {
             return ApiData::err(
-                "Invalid payment method. Must be 'lightning', 'revolut', or 'paypal'",
+                "Invalid payment method. Must be 'lightning', 'gateway', 'revolut', or 'paypal'",
             );
         }
+    }
+
+    if payment_method == "gateway" {
+        if req.lightning_invoice.is_some() {
+            return ApiData::err("Lightning invoice should not be provided for gateway refunds");
+        }
+        let refund_job = WorkJob::ProcessVmRefund {
+            vm_id,
+            admin_user_id: auth.user_id,
+            refund_from_date: req.refund_from_date,
+            reason: req.reason.clone(),
+            payment_method,
+            lightning_invoice: None,
+            destination: req.destination.clone(),
+        };
+        return match this.work_commander.send(refund_job).await {
+            Ok(stream_id) => ApiData::ok(JobResponse { job_id: stream_id }),
+            Err(e) => {
+                error!("Failed to queue VM refund job: {}", e);
+                ApiData::err("Failed to queue VM refund job")
+            }
+        };
     }
 
     // For lightning payments, require invoice
@@ -1358,6 +1382,7 @@ async fn admin_process_vm_refund(
         reason: req.reason.clone(),
         payment_method,
         lightning_invoice: Some(invoice.to_string()),
+        destination: None,
     };
 
     match this.work_commander.send(refund_job).await {
@@ -2989,6 +3014,7 @@ mod audit_tests {
             refund_from_date: None,
             reason: Some("customer".into()),
             lightning_invoice: Some(invoice(1_000_000)),
+            destination: None,
         })
     }
 

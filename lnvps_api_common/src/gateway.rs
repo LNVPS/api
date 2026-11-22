@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use payment_gateway_client::{CreateAttempt, CreatePayment, Gateway, verify_webhook};
+use payment_gateway_client::{CreateAttempt, CreatePayment, Gateway, RefundInput, verify_webhook};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -49,6 +49,37 @@ pub struct GatewayInvoice {
 }
 
 #[derive(Debug, Clone)]
+pub struct GatewayCryptoRequest {
+    pub payment_id: Vec<u8>,
+    pub amount_msat: u64,
+    pub tax_msat: u64,
+    pub description: String,
+    pub expires_in_secs: u32,
+    pub customer_ref: String,
+    pub metadata: serde_json::Value,
+    pub coin: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GatewayOnChain {
+    pub address: String,
+    pub external_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GatewaySwap {
+    pub data: crate::SwapData,
+    pub expires: chrono::DateTime<chrono::Utc>,
+    pub external_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayRefund {
+    pub id: u64,
+    pub status: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct GatewaySavedCharge {
     pub payment_id: Vec<u8>,
     pub gateway_method_id: u64,
@@ -88,6 +119,23 @@ pub trait PaymentGateway: Send + Sync {
 
     async fn cancel(&self, external_id: Option<&str>, payment_id: &[u8]) -> Result<()>;
 
+    async fn create_onchain_address(&self, _req: GatewayCryptoRequest) -> Result<GatewayOnChain> {
+        bail!("on-chain payments are not supported by this gateway")
+    }
+
+    async fn create_swap(&self, _req: GatewayCryptoRequest) -> Result<GatewaySwap> {
+        bail!("swaps are not supported by this gateway")
+    }
+
+    async fn refund_payment(
+        &self,
+        _external_id: &str,
+        _amount: Option<u64>,
+        _destination: Option<&str>,
+    ) -> Result<GatewayRefund> {
+        bail!("refunds are not supported by this gateway")
+    }
+
     async fn charge_saved_method(&self, _req: GatewaySavedCharge) -> Result<GatewayCharge> {
         bail!("saved methods are not supported by this gateway")
     }
@@ -110,6 +158,43 @@ impl GatewayClient {
         Self {
             client: Gateway::new(&config.url, &config.api_key),
         }
+    }
+}
+
+impl GatewayClient {
+    async fn create_crypto_attempt(
+        &self,
+        req: &GatewayCryptoRequest,
+        method: &str,
+        option: Option<String>,
+    ) -> Result<(payment_gateway_client::Payment, serde_json::Value)> {
+        let reference = hex::encode(&req.payment_id);
+        let mut input = CreatePayment::new(req.amount_msat, "BTC").reference(&reference);
+        input.tax = Some(req.tax_msat.min(req.amount_msat));
+        input.expires_in = Some(req.expires_in_secs as i64);
+        input.description = Some(req.description.clone());
+        input.customer_ref = Some(req.customer_ref.clone());
+        input.metadata = Some(req.metadata.clone());
+        input.methods = Some(vec![method.to_string()]);
+        let payment = self
+            .client
+            .create_payment_with_key(&input, &reference)
+            .await
+            .context("gateway create_payment failed")?;
+        let mut attempt = CreateAttempt::new(method);
+        attempt.option = option;
+        let payment = self
+            .client
+            .create_attempt(&payment.id, &attempt)
+            .await
+            .context("gateway create_attempt failed")?;
+        let details = payment
+            .attempts
+            .iter()
+            .find(|a| a.method == method)
+            .map(|a| a.details.clone())
+            .unwrap_or_default();
+        Ok((payment, details))
     }
 }
 
@@ -177,6 +262,84 @@ impl PaymentGateway for GatewayClient {
         })
     }
 
+    async fn create_onchain_address(&self, req: GatewayCryptoRequest) -> Result<GatewayOnChain> {
+        let (payment, details) = self.create_crypto_attempt(&req, "onchain", None).await?;
+        let address = details
+            .get("address")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let Some(address) = address else {
+            bail!("gateway payment {} has no on-chain address", payment.id);
+        };
+        Ok(GatewayOnChain {
+            address,
+            external_id: format!("{GATEWAY_EXTERNAL_ID_PREFIX}{}", payment.id),
+        })
+    }
+
+    async fn create_swap(&self, req: GatewayCryptoRequest) -> Result<GatewaySwap> {
+        let Some(coin) = req.coin.clone() else {
+            bail!("a coin is required for swaps");
+        };
+        let (payment, details) = self
+            .create_crypto_attempt(&req, "fixedfloat", Some(coin))
+            .await?;
+        let text = |k: &str| {
+            details
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .with_context(|| format!("gateway swap details have no {k}"))
+        };
+        let expires = payment
+            .expires
+            .as_deref()
+            .and_then(|e| chrono::DateTime::parse_from_rfc3339(e).ok())
+            .map(|e| e.with_timezone(&chrono::Utc))
+            .unwrap_or_else(|| {
+                chrono::Utc::now() + chrono::Duration::seconds(req.expires_in_secs as i64)
+            });
+        Ok(GatewaySwap {
+            data: crate::SwapData {
+                coin: text("coin")?,
+                order_id: text("order_id")?,
+                order_token: text("order_token")?,
+                deposit_address: text("deposit_address")?,
+                deposit_amount: text("deposit_amount")?,
+                receive_address: text("receive_address")?,
+            },
+            expires,
+            external_id: format!("{GATEWAY_EXTERNAL_ID_PREFIX}{}", payment.id),
+        })
+    }
+
+    async fn refund_payment(
+        &self,
+        external_id: &str,
+        amount: Option<u64>,
+        destination: Option<&str>,
+    ) -> Result<GatewayRefund> {
+        let Some(id) = external_id.strip_prefix(GATEWAY_EXTERNAL_ID_PREFIX) else {
+            bail!("not a gateway payment");
+        };
+        let refund = self
+            .client
+            .refund_payment(
+                id,
+                &RefundInput {
+                    amount,
+                    destination: destination.map(str::to_string),
+                    attempt_id: None,
+                },
+            )
+            .await
+            .context("gateway refund_payment failed")?;
+        Ok(GatewayRefund {
+            id: refund.id,
+            status: refund.status,
+        })
+    }
+
     async fn delete_saved_method(&self, gateway_method_id: u64) -> Result<()> {
         self.client
             .delete_saved_method(gateway_method_id)
@@ -191,6 +354,12 @@ impl PaymentGateway for GatewayClient {
 
 pub fn is_gateway_payment(external_id: Option<&str>) -> bool {
     external_id.is_some_and(|e| e.starts_with(GATEWAY_EXTERNAL_ID_PREFIX))
+}
+
+pub fn deposit_outpoint(external_id: &Option<String>) -> Option<String> {
+    external_id
+        .clone()
+        .filter(|e| !is_gateway_payment(Some(e.as_str())))
 }
 
 pub fn parse_gateway_event(
@@ -225,6 +394,9 @@ pub struct FakeGateway {
     pub deleted_methods: Mutex<Vec<u64>>,
     pub imported: Mutex<Vec<GatewayImportMethod>>,
     pub fail_charges: Mutex<bool>,
+    pub crypto: Mutex<Vec<GatewayCryptoRequest>>,
+    pub refunds: Mutex<Vec<(String, Option<u64>, Option<String>)>>,
+    pub fail_refunds: Mutex<bool>,
     pub charge_leaves_pending: Mutex<bool>,
     ids: Mutex<HashMap<Vec<u8>, String>>,
 }
@@ -282,6 +454,60 @@ impl PaymentGateway for FakeGateway {
         Ok(GatewayCharge {
             external_id: format!("{GATEWAY_EXTERNAL_ID_PREFIX}{gateway_id}"),
             paid: !*self.charge_leaves_pending.lock().unwrap(),
+        })
+    }
+
+    async fn create_onchain_address(&self, req: GatewayCryptoRequest) -> Result<GatewayOnChain> {
+        if *self.fail.lock().unwrap() {
+            bail!("gateway unavailable");
+        }
+        let hexid = hex::encode(&req.payment_id[..4.min(req.payment_id.len())]);
+        self.crypto.lock().unwrap().push(req);
+        Ok(GatewayOnChain {
+            address: format!("bc1qfake{hexid}"),
+            external_id: format!("{GATEWAY_EXTERNAL_ID_PREFIX}gw{hexid}"),
+        })
+    }
+
+    async fn create_swap(&self, req: GatewayCryptoRequest) -> Result<GatewaySwap> {
+        if *self.fail.lock().unwrap() {
+            bail!("gateway unavailable");
+        }
+        let hexid = hex::encode(&req.payment_id[..4.min(req.payment_id.len())]);
+        let coin = req.coin.clone().unwrap_or_default();
+        self.crypto.lock().unwrap().push(req);
+        Ok(GatewaySwap {
+            data: crate::SwapData {
+                coin,
+                order_id: format!("FF{hexid}"),
+                order_token: "tok".to_string(),
+                deposit_address: format!("4fakedeposit{hexid}"),
+                deposit_amount: "1.5".to_string(),
+                receive_address: format!("bc1qfake{hexid}"),
+            },
+            expires: chrono::Utc::now() + chrono::Duration::minutes(30),
+            external_id: format!("{GATEWAY_EXTERNAL_ID_PREFIX}gw{hexid}"),
+        })
+    }
+
+    async fn refund_payment(
+        &self,
+        external_id: &str,
+        amount: Option<u64>,
+        destination: Option<&str>,
+    ) -> Result<GatewayRefund> {
+        if *self.fail_refunds.lock().unwrap() {
+            bail!("refund rejected");
+        }
+        let mut refunds = self.refunds.lock().unwrap();
+        refunds.push((
+            external_id.to_string(),
+            amount,
+            destination.map(str::to_string),
+        ));
+        Ok(GatewayRefund {
+            id: refunds.len() as u64,
+            status: "completed".to_string(),
         })
     }
 

@@ -135,6 +135,7 @@ impl OnChainPaymentHandler {
         );
         Ok(topups
             .into_iter()
+            .filter(|t| !lnvps_api_common::is_gateway_payment(t.external_id.as_deref()))
             .filter(|t| topup_receive_address(t).as_deref() == Some(address))
             .max_by_key(|t| t.created))
     }
@@ -440,6 +441,7 @@ impl OnChainPaymentHandler {
         );
         Ok(payments
             .into_iter()
+            .filter(|p| !lnvps_api_common::is_gateway_payment(p.external_id.as_deref()))
             .filter(|p| receive_address(p).as_deref() == Some(address))
             .max_by_key(|p| p.created))
     }

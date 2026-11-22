@@ -175,6 +175,8 @@ pub enum WorkJob {
         reason: Option<String>,
         payment_method: String,            // "lightning", "revolut", "paypal"
         lightning_invoice: Option<String>, // Required when payment_method is "lightning"
+        #[serde(default)]
+        destination: Option<String>,
     },
     /// Discover VMs present on a host that are not tracked in the database and
     /// publish the resulting list (JSON `Vec<HostVmSpec>`) to a temporary Redis
